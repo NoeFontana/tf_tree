@@ -1,0 +1,169 @@
+name: Wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  schedule:
+    # Monthly Linux-only canary to catch toolchain drift early.
+    - cron: "0 6 1 * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: linux (${{ matrix.target }}, ${{ matrix.manylinux }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        manylinux: [auto, musllinux_1_2]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --strip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: macos (${{ matrix.target }})
+    if: github.event_name != 'schedule'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --strip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows:
+    name: windows (${{ matrix.target }})
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --strip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: sdist
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  smoke:
+    name: smoke
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-linux-x86_64-*
+          path: dist
+          merge-multiple: true
+      - name: install and import
+        run: |
+          python -m venv .venv-smoke
+          . .venv-smoke/bin/activate
+          pip install --no-index --find-links dist rust-python-template
+          python -c "import rust_python_template; print(rust_python_template.__version__); assert rust_python_template.add(2, 3) == 5"
+
+  verify-tag:
+    name: verify-tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: assert tag == workspace.package.version == project.version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          workspace_version=$(python -c "import tomllib,sys; print(tomllib.loads(open('Cargo.toml','rb').read().decode())['workspace']['package']['version'])")
+          project_version=$(python -c "import tomllib,sys; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")
+          echo "tag:                    ${tag}"
+          echo "workspace.package.version: ${workspace_version}"
+          echo "project.version:         ${project_version}"
+          if [[ "${tag}" != "${workspace_version}" || "${tag}" != "${project_version}" ]]; then
+            echo "::error::version mismatch — tag, [workspace.package].version, and [project].version must all match"
+            exit 1
+          fi
+
+  publish:
+    name: publish
+    needs: [linux, macos, windows, sdist, smoke, verify-tag]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/rust-python-template/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

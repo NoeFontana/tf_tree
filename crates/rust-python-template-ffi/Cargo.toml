@@ -1,0 +1,24 @@
+[package]
+name = "rust-python-template-ffi"
+description = "PyO3 bindings for rust-python-template."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+rust-python-template-core = { workspace = true }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
