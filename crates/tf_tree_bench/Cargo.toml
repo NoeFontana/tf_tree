@@ -1,0 +1,22 @@
+[package]
+name = "tf_tree_bench"
+description = "Criterion benchmarks for tf_tree, including the tf2 comparison harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tf_tree.workspace = true
+tf_tree_core.workspace = true
+tf_tree_math.workspace = true
+
+# Benchmarks (criterion targets) and the tf2 differential harness are added by
+# the Phase 1 bench PR. Kept as a plain library crate until then.

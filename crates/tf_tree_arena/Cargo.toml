@@ -1,6 +1,6 @@
 [package]
-name = "rust-python-template-core"
-description = "Pure-Rust core for rust-python-template."
+name = "tf_tree_arena"
+description = "no_std+alloc pointer-free arena abstraction and layout math for tf_tree."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,8 +19,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-thiserror.workspace = true
+bytemuck.workspace = true
 
-[[test]]
-name = "add"
-path = "../../tests/rust/add.rs"
+[dev-dependencies]
+proptest.workspace = true

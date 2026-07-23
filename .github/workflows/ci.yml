@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-rust:
-    name: lint-rust
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -31,9 +31,15 @@ jobs:
         with:
           command: check
 
-  test-rust:
-    name: test-rust
-    runs-on: ubuntu-latest
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 is a first-class target for the atomic-ordering guarantees;
+        # run the suite there as well as on x86_64.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -42,12 +48,12 @@ jobs:
         with:
           tool: cargo-nextest
       - name: cargo nextest
-        run: cargo nextest run --workspace --exclude rust-python-template-ffi
+        run: cargo nextest run --workspace --no-tests=pass
       - name: cargo test --doc
-        run: cargo test --doc --workspace --exclude rust-python-template-ffi
+        run: cargo test --doc --workspace
 
-  docs-rust:
-    name: docs-rust
+  docs:
+    name: docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -56,66 +62,28 @@ jobs:
       - name: cargo doc
         env:
           RUSTDOCFLAGS: "-D warnings --cfg docsrs"
-        run: cargo doc --workspace --exclude rust-python-template-ffi --no-deps --all-features
+        run: cargo doc --workspace --no-deps --all-features
 
-  build-wheel:
-    name: build-wheel
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo miri test
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance"
+        run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core
+
+  loom:
+    name: loom
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
-      - uses: astral-sh/setup-uv@v7
-      - name: maturin build
-        run: uv run --with maturin maturin build --out dist
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheel
-          path: dist/*.whl
-          if-no-files-found: error
-
-  lint-py:
-    name: lint-py
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
-      - uses: astral-sh/setup-uv@v7
-      - name: uv sync (dev deps only, skip building the project)
-        run: uv sync --locked --all-extras --no-install-project
-      - name: ruff check
-        run: uv run ruff check .
-      - name: ruff format --check
-        run: uv run ruff format --check .
-      - name: pyright
-        run: uv run pyright
-
-  test-py:
-    name: test-py
-    needs: build-wheel
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.14"]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-      - uses: astral-sh/setup-uv@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: wheel
-          path: dist
-      - name: install wheel into a fresh venv
-        run: |
-          uv venv --python "${{ matrix.python-version }}"
-          uv pip install dist/*.whl pytest
-      - name: pytest
-        run: uv run pytest tests/python -m "not slow"
+      - name: cargo xtask loom
+        run: cargo xtask loom
