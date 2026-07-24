@@ -11,6 +11,8 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# `cfg(loom)` is registered in the root `[workspace.lints.rust]` (unexpected_cfgs),
+# so this crate can inherit the full lint set normally.
 [lints]
 workspace = true
 
@@ -28,6 +30,10 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
+# Force libm's soft-float paths in test builds only: its default `arch` feature
+# uses x86 inline `sqrt` asm that Miri cannot execute. This is additive and
+# affects only this crate's test/bench binaries, never the production build.
+libm = { workspace = true, features = ["force-soft-floats"] }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom.workspace = true

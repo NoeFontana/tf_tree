@@ -1,0 +1,248 @@
+//! The seqlock sample ring — the concurrency core.
+//!
+//! # SAFETY (module invariant)
+//!
+//! This module is one of the crate's two `unsafe` islands (the other is
+//! [`crate::arena_view`]). Under a production (`not(loom)`) build it reinterprets
+//! raw arena bytes as `&[PoseSlot]` / `&[AtomicI64]`. That reinterpretation is
+//! sound because:
+//!
+//! * [`PoseSlot`] is `#[repr(C, align(64))]` and exactly 64 bytes (asserted at
+//!   compile time), containing only atomics whose all-zero bit pattern is a valid
+//!   value. The arena is zero-initialized and 64-byte aligned, so a zeroed region
+//!   is already a valid array of `PoseSlot`.
+//! * The stamp arena is a contiguous run of `i64`-sized, `i64`-aligned slots; an
+//!   `AtomicI64` has identical layout, and any bit pattern is a valid `i64`.
+//! * The caller (via [`crate::arena_view::ArenaView`]) guarantees the byte offset
+//!   and length name a region that lies wholly inside the arena and is used by no
+//!   other typed view for a different purpose.
+//!
+//! All *interior mutation* of the reinterpreted memory happens through the
+//! atomics, so aliasing the region as `&PoseSlot` from multiple threads is sound.
+//!
+//! The `push`/`read_slot` protocol carries **normative** ordering annotations
+//! (decision `0003`). Every ordering below is load-bearing and is exercised by
+//! the loom tests; do not weaken any to `Relaxed` because an x86 test passes.
+#![allow(unsafe_code)]
+
+use tf_tree_math::Iso3;
+
+use crate::error::{EdgeId, LookupError, PushError};
+use crate::sync::{fence, spin, AtomicI64, AtomicU32, AtomicU64, Ordering};
+
+/// Maximum consecutive odd-seqlock observations before a read gives up with
+/// [`LookupError::SlotContended`]. A single writer holds a slot odd for only a
+/// handful of stores, so 64 is astronomically generous.
+pub const SEQ_RETRY_LIMIT: u32 = 64;
+
+/// One cacheline of published pose, guarded by a per-slot seqlock.
+///
+/// `seq` is even when the slot is stable and odd while a write is in progress.
+/// `data` holds the seven `f64` bit patterns of an [`Iso3`] (`qw qx qy qz tx ty
+/// tz`, see [`Iso3::to_bits`]).
+///
+/// The pose is stored as `[AtomicU64; 7]` rather than `[f64; 7]` behind an
+/// `UnsafeCell` on purpose: the classic seqlock reads the payload non-atomically
+/// and discards it on a version mismatch, which is a data race and therefore UB
+/// in the Rust memory model even though it works on every real CPU. Relaxed
+/// atomic loads compile to the same instruction (`mov` / `ldr`) and make the
+/// protocol sound. **Do not replace this with a `memcpy`.**
+#[cfg(not(loom))]
+#[repr(C, align(64))]
+pub struct PoseSlot {
+    seq: AtomicU32,
+    _pad: u32,
+    data: [AtomicU64; 7],
+}
+
+#[cfg(not(loom))]
+const _: () = {
+    assert!(core::mem::size_of::<PoseSlot>() == 64);
+    assert!(core::mem::align_of::<PoseSlot>() == 64);
+};
+
+/// Under `loom`, `PoseSlot` holds loom's instrumented atomics and lives on the
+/// heap (loom atomics are neither `repr(C)` nor constructible from zeroed bytes),
+/// so it carries no `repr`/size guarantee. The `push`/`read_slot` algorithm is
+/// byte-for-byte identical across the two definitions.
+#[cfg(loom)]
+pub struct PoseSlot {
+    seq: AtomicU32,
+    data: [AtomicU64; 7],
+}
+
+impl PoseSlot {
+    /// A fresh, stable (`seq == 0`), identity-ish slot. Used to build heap rings
+    /// for the loom tests and the wrapped-ring property test; the production
+    /// arena views zeroed bytes instead of constructing.
+    #[must_use]
+    pub fn new() -> PoseSlot {
+        #[cfg(not(loom))]
+        {
+            PoseSlot {
+                seq: AtomicU32::new(0),
+                _pad: 0,
+                data: core::array::from_fn(|_| AtomicU64::new(0)),
+            }
+        }
+        #[cfg(loom)]
+        {
+            PoseSlot {
+                seq: AtomicU32::new(0),
+                data: core::array::from_fn(|_| AtomicU64::new(0)),
+            }
+        }
+    }
+}
+
+impl Default for PoseSlot {
+    fn default() -> Self {
+        PoseSlot::new()
+    }
+}
+
+/// A borrowed view of one edge's sample ring: its monotone head, its writer
+/// heartbeat, and the parallel stamp/pose arrays.
+///
+/// The same struct backs both worlds. In production the slices are reinterpreted
+/// arena bytes (via [`crate::arena_view`]); in the loom tests they borrow
+/// heap-allocated arrays. All fields are shared references because every mutation
+/// goes through the contained atomics.
+///
+/// # INVARIANT
+///
+/// `stamps.len() == poses.len()`, that length is a power of two equal to the
+/// edge's ring capacity, and `mask == capacity - 1`.
+pub struct SampleRing<'a> {
+    /// Monotone count of samples ever published (invariant 5). Never masked in
+    /// storage, only at access.
+    pub head: &'a AtomicU64,
+    /// Bumped by the writer on every successful push (Phase 2 liveness input).
+    pub heartbeat: &'a AtomicU64,
+    /// Per-slot stamps, parallel to `poses`.
+    pub stamps: &'a [AtomicI64],
+    /// Per-slot poses.
+    pub poses: &'a [PoseSlot],
+    /// `capacity - 1`; AND a logical index with this to get a physical index.
+    pub mask: u64,
+    /// The edge this ring belongs to (named by every error it can raise).
+    pub edge: EdgeId,
+}
+
+impl SampleRing<'_> {
+    /// Ring capacity (number of physical slots).
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> u64 {
+        self.poses.len() as u64
+    }
+
+    /// Publish one sample. **Single writer only** — exclusivity is a type-level
+    /// property of the `Publisher` that owns this ring, not a convention.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::NonMonotonicStamp`] if `stamp` is strictly older than the
+    /// edge's newest stamp (invariant 6). Equal stamps are accepted and the newer
+    /// value wins (idempotent replay).
+    pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
+        // Single writer: a Relaxed load of our own monotone head is correct.
+        let h = self.head.load(Ordering::Relaxed);
+        if h > 0 {
+            let last = self.stamps[((h - 1) & self.mask) as usize].load(Ordering::Relaxed);
+            if stamp < last {
+                return Err(PushError::NonMonotonicStamp { last, got: stamp });
+            }
+        }
+        let idx = (h & self.mask) as usize;
+        let slot = &self.poses[idx];
+
+        // Flip the slot's seqlock to odd (write in progress). The Release fence
+        // that follows keeps the payload stores below from being hoisted above
+        // this point on a weakly-ordered target.
+        let s = slot.seq.load(Ordering::Relaxed);
+        slot.seq.store(s.wrapping_add(1), Ordering::Relaxed); // -> odd
+        fence(Ordering::Release);
+
+        self.stamps[idx].store(stamp, Ordering::Relaxed);
+        let bits = iso.to_bits();
+        for (i, w) in bits.iter().enumerate() {
+            slot.data[i].store(*w, Ordering::Relaxed);
+        }
+
+        // Back to even publishes the payload; the head store publishes the
+        // sample to the bracket search.
+        slot.seq.store(s.wrapping_add(2), Ordering::Release); // -> even
+        self.head.store(h + 1, Ordering::Release);
+        self.heartbeat.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Read one physical slot under the seqlock. Returns the consistent pose, or
+    /// [`LookupError::SlotContended`] if the slot stayed odd for
+    /// [`SEQ_RETRY_LIMIT`] attempts.
+    ///
+    /// This does **not** check whether the ring has since lapped the reader — the
+    /// bracket search does that revalidation once, after reading both endpoints.
+    ///
+    /// # Errors
+    ///
+    /// [`LookupError::SlotContended`] as above.
+    pub fn read_slot(&self, idx: usize) -> Result<Iso3, LookupError> {
+        let slot = &self.poses[idx];
+        for _ in 0..SEQ_RETRY_LIMIT {
+            let s1 = slot.seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                spin();
+                continue;
+            }
+            let mut bits = [0u64; 7];
+            for (i, b) in bits.iter_mut().enumerate() {
+                *b = slot.data[i].load(Ordering::Relaxed);
+            }
+            // The Acquire fence stops the payload loads above from being reordered
+            // after the re-read of `seq` on a weakly-ordered target. If `seq` is
+            // unchanged and even, the payload we read is exactly this version.
+            fence(Ordering::Acquire);
+            if slot.seq.load(Ordering::Relaxed) == s1 {
+                return Ok(Iso3::from_bits(&bits));
+            }
+        }
+        Err(LookupError::SlotContended { edge: self.edge })
+    }
+}
+
+/// Reinterpret a run of zeroed, 64-byte-aligned arena bytes as a `PoseSlot`
+/// array.
+///
+/// # Safety
+///
+/// `base.add(byte_off)` must be 64-byte aligned and name `len * 64` valid,
+/// zero-initialized, owned bytes that outlive `'a` and are never accessed as any
+/// type other than `PoseSlot` for that lifetime.
+#[cfg(not(loom))]
+pub(crate) unsafe fn pose_slots<'a>(base: *mut u8, byte_off: usize, len: usize) -> &'a [PoseSlot] {
+    // SAFETY: module invariant — PoseSlot is repr(C, align(64)), exactly 64
+    // bytes, all-zero is a valid instance, and the caller guarantees the region
+    // is in-bounds, aligned, and exclusively typed as PoseSlot.
+    unsafe { core::slice::from_raw_parts(base.add(byte_off).cast::<PoseSlot>(), len) }
+}
+
+/// Reinterpret a run of the stamp arena as an `AtomicI64` array.
+///
+/// # Safety
+///
+/// `base.add(byte_off)` must be 8-byte aligned and name `len * 8` valid, owned
+/// bytes that outlive `'a` and are never accessed as any type other than
+/// `AtomicI64` for that lifetime.
+#[cfg(not(loom))]
+pub(crate) unsafe fn stamp_slots<'a>(
+    base: *mut u8,
+    byte_off: usize,
+    len: usize,
+) -> &'a [AtomicI64] {
+    // SAFETY: module invariant — AtomicI64 has the same layout as i64, any bit
+    // pattern is a valid i64, and the caller guarantees the region is in-bounds,
+    // 8-byte aligned, and exclusively typed as AtomicI64.
+    unsafe { core::slice::from_raw_parts(base.add(byte_off).cast::<AtomicI64>(), len) }
+}
