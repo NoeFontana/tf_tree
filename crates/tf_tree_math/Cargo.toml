@@ -24,3 +24,8 @@ bytemuck.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Force libm's soft-float paths in test/bench builds only: its default `arch`
+# feature uses inline asm (e.g. x86 `sqrt`) that Miri cannot execute. Additive,
+# affects only this crate's test binaries; the production build keeps the
+# arch-accelerated path.
+libm = { workspace = true, features = ["force-soft-floats"] }

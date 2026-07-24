@@ -5,8 +5,21 @@ use bytemuck::{Pod, Zeroable};
 use core::ops::Mul;
 
 /// Angle threshold below which the `V`/`V⁻¹` coefficients switch to their Taylor
-/// series. NORMATIVE (decision `0003`): `0.1`, not the `1e-8` most libraries
-/// use — the closed forms lose 4–11 digits to cancellation well before that.
+/// series. NORMATIVE (decision `0003`): `0.1`.
+///
+/// `0.1` is optimal in `f64` from *both* sides, which is why it is neither the
+/// `1e-8` most libraries use nor something larger:
+/// * **Below** it, the closed forms lose digits to cancellation — even with the
+///   half-angle rewrite, `c3`'s `1/θ² − cot(θ/2)/(2θ)` subtracts two `O(1/θ²)`
+///   terms, costing ~`log10(1/θ²)` digits (≈8 at `1e-4`, ≈2 at `0.1`). So the
+///   series must take over by ~`0.1`.
+/// * **Above** it, the four-term series truncates at `O(θ⁸)`; its error at
+///   `θ = 0.1` is ≈`θ⁸/9!` ≈ `2.7e-15` ≈ `ε_mach`. Any larger threshold would
+///   let the series run past machine precision.
+///
+/// The two meet at `0.1`, so the branch boundary is continuous to ~`ε_mach`
+/// (no derivative "pop" for downstream optimizers). See
+/// `branch_boundary_value_is_continuous`.
 const THETA_SMALL: f64 = 0.1;
 
 /// Series coefficients of `c1 = (1 − cos θ)/θ²`, powers of `θ²` (Horner order).
@@ -157,6 +170,28 @@ impl Iso3 {
         Self::new(q, t)
     }
 
+    /// Return a copy with the rotation renormalized to unit norm.
+    ///
+    /// Every rigid-transform op here — [`Mul`], [`inverse`](Self::inverse),
+    /// [`mul_inv`](Self::mul_inv), and [`Quat::rotate`] — assumes a unit
+    /// quaternion (`q⁻¹ = q*`) and preserves unit-ness only to first order: each
+    /// composition adds ~`1e-16` of norm drift. For this engine's own use — plans
+    /// of depth ≤ 16 — that is negligible (well inside the `1e-12` tolerances).
+    ///
+    /// Callers that compose **long** chains (dead-reckoning thousands of poses,
+    /// pose-graph accumulation) should call `normalized()` periodically: once
+    /// `‖q‖ ≠ 1`, `q*` is no longer the inverse rotation and [`Quat::rotate`]
+    /// mis-scales by `‖q‖²`, compounding into the translation.
+    ///
+    /// This is deliberately **not** done inside every op: it would add a `sqrt`
+    /// to the lookup hot path to correct drift the engine never accumulates
+    /// (the idiomatic choice, as in Sophus/manif).
+    #[inline]
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self::new(self.q.normalize(), self.t)
+    }
+
     /// The 7 `f64` bit patterns in canonical slot order
     /// `[qw, qx, qy, qz, tx, ty, tz]`.
     #[inline]
@@ -212,35 +247,60 @@ fn horner(coeffs: &[f64; 4], theta2: f64) -> f64 {
     coeffs[0] + theta2 * (coeffs[1] + theta2 * (coeffs[2] + theta2 * coeffs[3]))
 }
 
-/// The three left-Jacobian coefficients `c1, c2, c3` for angle `θ`.
+/// The left-Jacobian coefficients `c1, c2` of `V(ω) = I + c1·[ω]× + c2·[ω]×²`,
+/// for angle `θ = ‖ω‖`. Used by [`exp_se3`].
 ///
-/// Below [`THETA_SMALL`] each uses its four-term Taylor series; above it the
-/// closed form. `c3` is only needed by [`log_se3`], but computing all three
-/// together keeps the branch in one place.
+/// Finite for **all** `θ` (including full rotations `θ = 2kπ`): neither term
+/// divides by `sin(θ/2)`. The `V⁻¹` coefficient `c3`, which *does* divide by
+/// `sin(θ/2)` and is singular at `θ = 2kπ`, is computed separately by
+/// [`vinv_c3`] — and only on the `log_se3` path, where `θ ∈ [0, π]`.
+///
+/// Below [`THETA_SMALL`] uses the four-term Taylor series; above it the
+/// half-angle closed form.
 #[inline]
-fn v_coeffs(theta: f64) -> (f64, f64, f64) {
+fn v_coeffs(theta: f64) -> (f64, f64) {
     let theta2 = theta * theta;
     if theta < THETA_SMALL {
-        (
-            horner(&C1, theta2),
-            horner(&C2, theta2),
-            horner(&C3, theta2),
-        )
+        (horner(&C1, theta2), horner(&C2, theta2))
     } else {
-        // Half-angle forms, all from a single sincos(θ/2). This keeps every
-        // coefficient well-conditioned up to θ = π, where the naive closed forms
-        // fail: `1 + cosθ` in c3 cancels catastrophically as cosθ → −1 (a
-        // rear-facing camera is a π rotation), and `1 − cosθ` in c1 cancels near
-        // the θ = 0.1 boundary. Identities used:
-        //   1 − cosθ = 2 sin²(θ/2)                          (cancellation-free c1)
+        // Half-angle forms from a single sincos(θ/2), well-conditioned to θ = π:
+        //   1 − cosθ = 2 sin²(θ/2)   (cancellation-free c1)
         //   sinθ      = 2 sin(θ/2) cos(θ/2)
-        //   (1 + cosθ)/(2θ sinθ) = cot(θ/2)/(2θ)            (well-conditioned c3)
         let (sh, ch) = libm::sincos(0.5 * theta);
         let sin = 2.0 * sh * ch;
         let c1 = 2.0 * sh * sh / theta2;
         let c2 = (theta - sin) / (theta2 * theta);
-        let c3 = 1.0 / theta2 - (ch / sh) / (2.0 * theta);
-        (c1, c2, c3)
+        (c1, c2)
+    }
+}
+
+/// The inverse-left-Jacobian coefficient `c3` of
+/// `V⁻¹(ω) = I − ½·[ω]× + c3·[ω]×²`, for angle `θ = ‖ω‖`. Used by [`log_se3`].
+///
+/// # Domain
+///
+/// **`θ ∈ [0, π]` only.** `V(ω)` loses rank at `θ = 2kπ` (`k ≠ 0`), where the
+/// closed form's `cot(θ/2)` divides by `sin(θ/2) = 0` and `c3` diverges — the
+/// map is genuinely non-invertible there. This is safe because the only caller,
+/// [`log_se3`], derives `θ` from [`log_so3`], which returns the principal branch
+/// `θ ∈ [0, π]` (so `sin(θ/2) ∈ [sin(0.05), 1]` in the closed branch, bounded
+/// away from zero). The debug assertion pins that contract.
+#[inline]
+fn vinv_c3(theta: f64) -> f64 {
+    debug_assert!(
+        theta <= core::f64::consts::PI + 1e-9,
+        "vinv_c3 is only valid on the principal branch θ ∈ [0, π]; V⁻¹ is \
+         singular at θ = 2kπ"
+    );
+    let theta2 = theta * theta;
+    if theta < THETA_SMALL {
+        horner(&C3, theta2)
+    } else {
+        // (1 + cosθ)/(2θ sinθ) = cot(θ/2)/(2θ), well-conditioned up to θ = π
+        // (the naive `1 + cosθ` cancels as cosθ → −1 near π — a rear-facing
+        // camera is a π rotation). sin(θ/2) is bounded away from 0 on [0.1, π].
+        let (sh, ch) = libm::sincos(0.5 * theta);
+        1.0 / theta2 - (ch / sh) / (2.0 * theta)
     }
 }
 
@@ -253,7 +313,7 @@ pub fn exp_se3(xi: [f64; 6]) -> Iso3 {
     let w = Vec3::new(xi[0], xi[1], xi[2]);
     let v = Vec3::new(xi[3], xi[4], xi[5]);
     let theta = w.norm();
-    let (c1, c2, _c3) = v_coeffs(theta);
+    let (c1, c2) = v_coeffs(theta);
     // V·v = v + c1·(ω × v) + c2·(ω × (ω × v)).
     let wxv = w.cross(v);
     let wxwxv = w.cross(wxv);
@@ -271,7 +331,7 @@ pub fn exp_se3(xi: [f64; 6]) -> Iso3 {
 pub fn log_se3(t: Iso3) -> [f64; 6] {
     let w = log_so3(t.q);
     let theta = w.norm();
-    let (_c1, _c2, c3) = v_coeffs(theta);
+    let c3 = vinv_c3(theta);
     // V⁻¹·t = t − ½·(ω × t) + c3·(ω × (ω × t)).
     let wxt = w.cross(t.t);
     let wxwxt = w.cross(wxt);
@@ -518,7 +578,9 @@ mod tests {
     #[test]
     fn theta_sweep_matches_reference() {
         for &(theta, r1, r2, r3) in REF.iter() {
-            let (c1, c2, c3) = v_coeffs(theta);
+            // REF only samples θ ∈ [1e-12, π], the valid domain of vinv_c3.
+            let (c1, c2) = v_coeffs(theta);
+            let c3 = vinv_c3(theta);
             let e1 = ((c1 - r1) / r1).abs();
             let e2 = ((c2 - r2) / r2).abs();
             let e3 = ((c3 - r3) / r3).abs();
@@ -563,6 +625,70 @@ mod tests {
         assert!(
             j1 < 1e-14 && j2 < 1e-14 && j3 < 1e-14,
             "boundary jump: j1={j1:e} j2={j2:e} j3={j3:e}"
+        );
+    }
+
+    // --- full-rotation singularity (V⁻¹ at θ = 2kπ) -------------------------
+
+    #[test]
+    fn exp_se3_is_finite_at_full_rotations() {
+        use core::f64::consts::PI;
+        // V(θ) must stay finite for full/multi-turn rotations, even though the
+        // (unused-here) V⁻¹ coefficient c3 is singular at θ = 2kπ. Splitting c3
+        // onto the log_se3-only path keeps it off exp_se3 entirely.
+        for &mag in &[2.0 * PI, 4.0 * PI, 2.0 * PI + 0.05] {
+            let iso = exp_se3([mag, 0.0, 0.0, 0.5, -0.3, 0.8]);
+            assert!(
+                iso.q.w.is_finite()
+                    && iso.q.x.is_finite()
+                    && iso.q.y.is_finite()
+                    && iso.q.z.is_finite(),
+                "non-finite rotation at |ω|={mag}"
+            );
+            assert!(
+                iso.t.x.is_finite() && iso.t.y.is_finite() && iso.t.z.is_finite(),
+                "non-finite translation at |ω|={mag}"
+            );
+        }
+        // A 2π turn is the identity rotation: the quaternion axis is ≈ 0.
+        let full = exp_se3([2.0 * PI, 0.0, 0.0, 1.0, 2.0, 3.0]);
+        let axis = libm::sqrt(full.q.x * full.q.x + full.q.y * full.q.y + full.q.z * full.q.z);
+        assert!(
+            axis < 1e-14,
+            "2π rotation should be identity, |q_v|={axis:e}"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "principal branch")]
+    fn vinv_c3_rejects_off_domain_theta() {
+        // V⁻¹ is singular at θ = 2π; vinv_c3's domain is [0, π], debug-asserted.
+        let _ = vinv_c3(2.0 * core::f64::consts::PI);
+    }
+
+    // --- quaternion norm drift over long composition chains -----------------
+
+    #[test]
+    #[cfg_attr(miri, ignore = "50k compositions is too slow under Miri")]
+    fn normalized_restores_unit_norm_after_long_chains() {
+        // Mul does not renormalize, so ‖q‖ drifts over a long chain. Assert the
+        // drift stays small (the engine's short chains are unaffected) and that
+        // normalized() restores exact unit norm for callers who accumulate more.
+        let step = exp_se3([0.3, -0.2, 0.5, 0.1, 0.0, -0.1]);
+        let mut acc = Iso3::IDENTITY;
+        for _ in 0..50_000 {
+            acc = acc * step;
+        }
+        let drift = (acc.q.norm() - 1.0).abs();
+        assert!(
+            drift < 1e-9,
+            "drift over 50k composes stayed bounded: {drift:e}"
+        );
+        let fixed = acc.normalized();
+        assert!(
+            (fixed.q.norm() - 1.0).abs() < 1e-15,
+            "normalized() must restore unit norm"
         );
     }
 }
