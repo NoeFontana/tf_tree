@@ -17,5 +17,15 @@
 
 extern crate alloc;
 
-// Modules are added by the Phase 1 `tf_tree_arena` implementation PR:
-//   header, layout, heap.
+// The test harness and `proptest` require `std`; the crate itself stays
+// `no_std + alloc`.
+#[cfg(test)]
+extern crate std;
+
+pub mod header;
+pub mod heap;
+pub mod layout;
+
+pub use header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
+pub use heap::{Arena, HeapArena};
+pub use layout::{layout_hash, ArenaLayout, LayoutError, Region};
