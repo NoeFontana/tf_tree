@@ -98,7 +98,12 @@ fn compute(max_frames: u32, max_edges: u32, edge_capacities: &[u32]) -> Computed
     let me = max_edges as usize;
     let slots: usize = edge_capacities.iter().map(|&c| c as usize).sum();
 
-    let topo_stride = align64(mf * 6);
+    // 10 B / frame: parent u32 + depth u16 + edge_of_child u32. edge_of_child
+    // lives in the block (not a separate region) so plan compilation is an O(1)
+    // array walk and the (parent, depth, edge_of_child) triple is double-buffered
+    // together under the topology seqlock. (Resolves the 0003 6-vs-edge_of_child
+    // inconsistency.)
+    let topo_stride = align64(mf * 10);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
         256usize,                             // header
@@ -285,8 +290,9 @@ pub const fn layout_hash() -> u32 {
     h = fnv1a_u32(h, core::mem::size_of::<ArenaHeader>() as u32);
     h = fnv1a_u32(h, core::mem::align_of::<ArenaHeader>() as u32);
     // Region strides in header order: header size, frame/edge/claim/pose byte
-    // widths, frame-hash entry width, topology per-frame width, stamp width.
-    let strides: [u32; 8] = [256, 64, 12, 6, 64, 128, 8, 64];
+    // widths, frame-hash entry width, topology per-frame width (10 = parent u32 +
+    // depth u16 + edge_of_child u32), stamp width.
+    let strides: [u32; 8] = [256, 64, 12, 10, 64, 128, 8, 64];
     let mut i = 0;
     while i < strides.len() {
         h = fnv1a_u32(h, strides[i]);
@@ -381,8 +387,8 @@ mod tests {
         );
         assert_eq!(l.frame_table().size, 64_000); // 1000 * 64
         assert_eq!(l.frame_hash().size, 24_576); // next_pow2(2000)=2048 * 12
-        assert_eq!(l.topo_block_stride(), 6_016); // align64(6000)
-        assert_eq!(l.topo_blocks().size, 12_032); // 2 * 6016
+        assert_eq!(l.topo_block_stride(), 10_048); // align64(1000 * 10)
+        assert_eq!(l.topo_blocks().size, 20_096); // 2 * 10048
         assert_eq!(l.claim_table().size, 64_000); // 1000 * 64
         assert_eq!(l.edge_table().size, 128_000); // 1000 * 128
         assert_eq!(l.stamp_arena().size, 32_768_000); // 4_096_000 * 8
@@ -390,7 +396,7 @@ mod tests {
 
         // Pose arena is ~260 MB.
         assert!((260_000_000..=263_000_000).contains(&l.pose_arena().size));
-        assert_eq!(l.total_size(), 295_204_864);
+        assert_eq!(l.total_size(), 295_212_928);
 
         // Every region offset is 64-byte aligned and regions are contiguous.
         let regions = all_regions(&l);
@@ -410,14 +416,14 @@ mod tests {
 
         assert_eq!(l.frame_table().size, 512); // 8 * 64
         assert_eq!(l.frame_hash().size, 192); // next_pow2(16)=16 * 12
-        assert_eq!(l.topo_block_stride(), 64); // align64(48)
-        assert_eq!(l.topo_blocks().size, 128); // 2 * 64
+        assert_eq!(l.topo_block_stride(), 128); // align64(8 * 10 = 80)
+        assert_eq!(l.topo_blocks().size, 256); // 2 * 128
         assert_eq!(l.claim_table().size, 256); // 4 * 64
         assert_eq!(l.edge_table().size, 512); // 4 * 128
         assert_eq!(l.stamp_slots(), 84);
         assert_eq!(l.stamp_arena().size, 704); // align64(84 * 8 = 672)
         assert_eq!(l.pose_arena().size, 5_376); // 84 * 64 (already aligned)
-        assert_eq!(l.total_size(), 7_936);
+        assert_eq!(l.total_size(), 8_064);
 
         let regions = all_regions(&l);
         for w in regions.windows(2) {
@@ -433,7 +439,7 @@ mod tests {
         // this value, which is exactly what Phase 2's attach check relies on.
         assert_eq!(layout_hash(), layout_hash());
         assert_ne!(layout_hash(), 0);
-        assert_eq!(layout_hash(), 0xe968_78a8);
+        assert_eq!(layout_hash(), 0x4135_25e4);
     }
 
     #[test]
