@@ -101,8 +101,11 @@ impl HeapArena {
     }
 
     fn write_header(&self, layout: &ArenaLayout, creator_pid: u32, creator_boot_id: u64) {
-        // Offsets are stored as u32 in the header; the arena addressing model
-        // requires them to fit. Every realistic arena is far under 4 GiB.
+        // Offsets and slot counts are stored as u32 in the header. This is
+        // enforced (not merely assumed) by `ArenaLayout::new`, which rejects any
+        // layout whose `total_size` exceeds `u32::MAX` with `ArenaTooLarge`. So
+        // every `as u32` below is a truncation that provably cannot lose bits;
+        // this assert restates that invariant at the point it is relied on.
         debug_assert!(self.len <= u32::MAX as usize);
 
         let hdr = self.ptr.as_ptr().cast::<ArenaHeader>();

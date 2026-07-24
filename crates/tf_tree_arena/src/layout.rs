@@ -50,18 +50,28 @@ pub enum LayoutError {
         /// Number of capacities actually supplied.
         got: usize,
     },
+    /// The computed arena is too large to address with the `u32` region offsets
+    /// stored in [`ArenaHeader`]. Every region offset must fit in `u32`, which
+    /// caps `total_size` at `u32::MAX` (~4 GiB); larger configurations would
+    /// silently truncate offsets and corrupt the arena.
+    ArenaTooLarge {
+        /// The total size, in bytes, that overflowed the `u32` offset model.
+        total_size: u64,
+    },
 }
 
 /// Description of an arena's fixed capacities and the derived region layout.
 ///
 /// Fields are private so the power-of-two invariant on `edge_capacities`
 /// (load-bearing invariant 3) cannot be violated after construction; use
-/// [`ArenaLayout::new`] and the accessors.
+/// [`ArenaLayout::new`] and the accessors. The region layout is computed once in
+/// [`ArenaLayout::new`] and cached, so the accessors are pure reads.
 #[derive(Clone, Debug)]
 pub struct ArenaLayout {
     max_frames: u32,
     max_edges: u32,
     edge_capacities: Vec<u32>,
+    computed: Computed,
 }
 
 // The eight regions in header order. These indices are used only internally.
@@ -74,10 +84,50 @@ const R_EDGE: usize = 5;
 const R_STAMP: usize = 6;
 const R_POSE: usize = 7;
 
+#[derive(Clone, Copy, Debug)]
 struct Computed {
     regions: [Region; 8],
     topo_stride: usize,
     slots: usize,
+}
+
+/// Derive the region layout from the fixed capacities. Pure arithmetic; called
+/// exactly once, from [`ArenaLayout::new`].
+fn compute(max_frames: u32, max_edges: u32, edge_capacities: &[u32]) -> Computed {
+    let mf = max_frames as usize;
+    let me = max_edges as usize;
+    let slots: usize = edge_capacities.iter().map(|&c| c as usize).sum();
+
+    let topo_stride = align64(mf * 6);
+    // Sizes in header order; each aligned so the running offset stays 64-aligned.
+    let sizes = [
+        256usize,                             // header
+        align64(mf * 64),                     // frame table (64 B / frame)
+        align64(next_pow2(2 * mf) * (8 + 4)), // frame hash (AtomicU64 + AtomicU32)
+        2 * topo_stride,                      // two topology blocks
+        align64(me * 64),                     // claim table (64 B / edge)
+        align64(me * 128),                    // edge table (128 B / edge)
+        align64(slots * 8),                   // stamp arena (i64 / slot)
+        align64(slots * 64),                  // pose arena (PoseSlot / slot)
+    ];
+
+    let mut regions = [Region { offset: 0, size: 0 }; 8];
+    let mut off = 0usize;
+    let mut i = 0;
+    while i < 8 {
+        regions[i] = Region {
+            offset: off,
+            size: sizes[i],
+        };
+        off += sizes[i];
+        i += 1;
+    }
+
+    Computed {
+        regions,
+        topo_stride,
+        slots,
+    }
 }
 
 impl ArenaLayout {
@@ -106,10 +156,24 @@ impl ArenaLayout {
                 return Err(LayoutError::CapacityNotPowerOfTwo { edge, capacity });
             }
         }
+
+        let computed = compute(max_frames, max_edges, &edge_capacities);
+        // Every region offset and the slot counts are stored as `u32` in the
+        // header. The pose arena is the last region, so its end is `total_size`;
+        // if that fits `u32`, every offset (<= total_size) and every slot count
+        // (slots * 64 <= total_size) fits too. Reject rather than truncate.
+        let total_size = computed.regions[R_POSE].offset + computed.regions[R_POSE].size;
+        if total_size > u32::MAX as usize {
+            return Err(LayoutError::ArenaTooLarge {
+                total_size: total_size as u64,
+            });
+        }
+
         Ok(ArenaLayout {
             max_frames,
             max_edges,
             edge_capacities,
+            computed,
         })
     }
 
@@ -128,101 +192,67 @@ impl ArenaLayout {
         &self.edge_capacities
     }
 
-    fn compute(&self) -> Computed {
-        let mf = self.max_frames as usize;
-        let me = self.max_edges as usize;
-        let slots: usize = self.edge_capacities.iter().map(|&c| c as usize).sum();
-
-        let topo_stride = align64(mf * 6);
-        // Sizes in header order; each aligned so the running offset stays 64-aligned.
-        let sizes = [
-            256usize,                             // header
-            align64(mf * 64),                     // frame table (64 B / frame)
-            align64(next_pow2(2 * mf) * (8 + 4)), // frame hash (AtomicU64 + AtomicU32)
-            2 * topo_stride,                      // two topology blocks
-            align64(me * 64),                     // claim table (64 B / edge)
-            align64(me * 128),                    // edge table (128 B / edge)
-            align64(slots * 8),                   // stamp arena (i64 / slot)
-            align64(slots * 64),                  // pose arena (PoseSlot / slot)
-        ];
-
-        let mut regions = [Region { offset: 0, size: 0 }; 8];
-        let mut off = 0usize;
-        let mut i = 0;
-        while i < 8 {
-            regions[i] = Region {
-                offset: off,
-                size: sizes[i],
-            };
-            off += sizes[i];
-            i += 1;
-        }
-
-        Computed {
-            regions,
-            topo_stride,
-            slots,
-        }
-    }
-
     /// The header region (offset 0, size 256).
     pub fn header_region(&self) -> Region {
-        self.compute().regions[R_HEADER]
+        self.computed.regions[R_HEADER]
     }
 
     /// The frame table region.
     pub fn frame_table(&self) -> Region {
-        self.compute().regions[R_FRAME_TABLE]
+        self.computed.regions[R_FRAME_TABLE]
     }
 
     /// The frame interning hash region.
     pub fn frame_hash(&self) -> Region {
-        self.compute().regions[R_FRAME_HASH]
+        self.computed.regions[R_FRAME_HASH]
     }
 
     /// The topology region (both blocks, contiguous).
     pub fn topo_blocks(&self) -> Region {
-        self.compute().regions[R_TOPO]
+        self.computed.regions[R_TOPO]
     }
 
     /// Byte stride between the two topology blocks.
     pub fn topo_block_stride(&self) -> usize {
-        self.compute().topo_stride
+        self.computed.topo_stride
     }
 
     /// The claim table region.
     pub fn claim_table(&self) -> Region {
-        self.compute().regions[R_CLAIM]
+        self.computed.regions[R_CLAIM]
     }
 
     /// The edge table region.
     pub fn edge_table(&self) -> Region {
-        self.compute().regions[R_EDGE]
+        self.computed.regions[R_EDGE]
     }
 
     /// The stamp arena region.
     pub fn stamp_arena(&self) -> Region {
-        self.compute().regions[R_STAMP]
+        self.computed.regions[R_STAMP]
     }
 
     /// The pose arena region.
     pub fn pose_arena(&self) -> Region {
-        self.compute().regions[R_POSE]
+        self.computed.regions[R_POSE]
     }
 
     /// Total stamp slots across all edges (sum of ring capacities).
+    ///
+    /// Guaranteed to fit `u32`: [`ArenaLayout::new`] rejects any layout whose
+    /// `total_size` (>= `slots * 64`) exceeds `u32::MAX`.
     pub fn stamp_slots(&self) -> u32 {
-        self.compute().slots as u32
+        self.computed.slots as u32
     }
 
     /// Total pose slots across all edges (equal to [`Self::stamp_slots`]).
     pub fn pose_slots(&self) -> u32 {
-        self.compute().slots as u32
+        self.computed.slots as u32
     }
 
-    /// Total arena size in bytes, 64-byte aligned.
+    /// Total arena size in bytes, 64-byte aligned. Guaranteed `<= u32::MAX`.
     pub fn total_size(&self) -> usize {
-        let last = self.compute().regions[R_POSE];
+        let last = self.computed.regions[R_POSE];
         last.offset + last.size
     }
 }
@@ -309,6 +339,25 @@ mod tests {
                 got: 1
             }
         );
+    }
+
+    #[test]
+    fn rejects_arena_exceeding_u32_offsets() {
+        // One edge with a 2^27-slot ring => pose arena alone is 8 GiB, past the
+        // u32 offset model. Must be a hard error, not a silent truncation. (The
+        // check is pure arithmetic; no 8 GiB allocation happens here.)
+        let err = ArenaLayout::new(1, 1, vec![1 << 27]).unwrap_err();
+        assert!(
+            matches!(err, LayoutError::ArenaTooLarge { total_size } if total_size > u32::MAX as u64),
+            "expected ArenaTooLarge with total_size > u32::MAX, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_arena_just_under_the_u32_limit() {
+        // Sanity floor: a multi-hundred-MB arena is fine; only >4 GiB is refused.
+        let l = ArenaLayout::new(1000, 1000, vec![4096; 1000]).unwrap();
+        assert!(l.total_size() <= u32::MAX as usize);
     }
 
     #[test]
