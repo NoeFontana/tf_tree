@@ -49,6 +49,8 @@ tf_tree_math = { path = "crates/tf_tree_math", version = "0.1.0" }
 tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.1.0" }
 tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0" }
 tf_tree = { path = "crates/tf_tree", version = "0.1.0" }
+# publish = false crates, wired by path only (no version requirement published).
+tf_tree_bench = { path = "crates/tf_tree_bench" }
 # no_std numeric + POD casting (the entire core dependency budget, plus blake3).
 libm = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
