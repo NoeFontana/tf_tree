@@ -192,7 +192,8 @@ impl Mul for Quat {
 /// quaternion.
 ///
 /// `q = (cos(θ/2), sinc(θ/2)·½·ω)` with `θ = |ω|`; the `sin(θ/2)/θ` scale uses a
-/// Taylor series below [`EXP_SO3_SMALL`] to stay finite at `θ = 0`.
+/// Taylor series below `EXP_SO3_SMALL` (a private threshold) to stay finite at
+/// `θ = 0`.
 #[inline]
 #[must_use]
 pub fn exp_so3(w: Vec3) -> Quat {
