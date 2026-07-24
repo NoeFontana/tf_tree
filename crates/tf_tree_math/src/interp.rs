@@ -66,10 +66,18 @@ impl Interp for LerpSlerp {
 
 impl Iso3 {
     /// `self⁻¹ · rhs`, the relative transform from `self` to `rhs`.
+    ///
+    /// Computed directly — rotation `q_self*·q_rhs`, translation
+    /// `q_self*·(t_rhs − t_self)` — rather than materializing `self.inverse()`
+    /// and composing, which saves a vector rotation and a negation pass on the
+    /// ScLerp interpolation hot path.
     #[inline]
     #[must_use]
     fn inv_mul(&self, rhs: &Iso3) -> Iso3 {
-        self.inverse() * *rhs
+        let qi = self.q.conjugate();
+        let q = qi * rhs.q;
+        let t = qi.rotate(rhs.t.sub(self.t));
+        Iso3::new(q, t)
     }
 }
 

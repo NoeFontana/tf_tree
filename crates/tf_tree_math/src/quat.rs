@@ -196,15 +196,25 @@ impl Mul for Quat {
 #[inline]
 #[must_use]
 pub fn exp_so3(w: Vec3) -> Quat {
-    let theta2 = w.dot(w);
-    let theta = libm::sqrt(theta2);
+    exp_so3_theta(w, w.norm())
+}
+
+/// [`exp_so3`] with the rotation magnitude `theta = ‖w‖` supplied by the caller.
+///
+/// `exp_se3` already computes `‖w‖` for the `V` coefficients; threading it here
+/// avoids recomputing the `sqrt`. `theta` must equal `w.norm()`.
+#[inline]
+#[must_use]
+pub(crate) fn exp_so3_theta(w: Vec3, theta: f64) -> Quat {
     let half = 0.5 * theta;
-    let cos_half = libm::cos(half);
+    // One sincos for both the scalar part and the sin(θ/2)/θ scale.
+    let (sin_half, cos_half) = libm::sincos(half);
     // scale = sin(θ/2)/θ, so that q_v = scale · ω.
     let scale = if theta > EXP_SO3_SMALL {
-        libm::sin(half) / theta
+        sin_half / theta
     } else {
         // sin(θ/2)/θ = 1/2 − θ²/48 + θ⁴/3840 − …
+        let theta2 = theta * theta;
         0.5 - theta2 / 48.0 + theta2 * theta2 / 3840.0
     };
     Quat {

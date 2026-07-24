@@ -1,6 +1,6 @@
 //! `Vec3`, the `Iso3` rigid transform, and the SE(3) `exp`/`log` maps.
 
-use crate::quat::{exp_so3, log_so3, Quat};
+use crate::quat::{exp_so3_theta, log_so3, Quat};
 use bytemuck::{Pod, Zeroable};
 use core::ops::Mul;
 
@@ -227,10 +227,19 @@ fn v_coeffs(theta: f64) -> (f64, f64, f64) {
             horner(&C3, theta2),
         )
     } else {
-        let (sin, cos) = libm::sincos(theta);
-        let c1 = (1.0 - cos) / theta2;
+        // Half-angle forms, all from a single sincos(θ/2). This keeps every
+        // coefficient well-conditioned up to θ = π, where the naive closed forms
+        // fail: `1 + cosθ` in c3 cancels catastrophically as cosθ → −1 (a
+        // rear-facing camera is a π rotation), and `1 − cosθ` in c1 cancels near
+        // the θ = 0.1 boundary. Identities used:
+        //   1 − cosθ = 2 sin²(θ/2)                          (cancellation-free c1)
+        //   sinθ      = 2 sin(θ/2) cos(θ/2)
+        //   (1 + cosθ)/(2θ sinθ) = cot(θ/2)/(2θ)            (well-conditioned c3)
+        let (sh, ch) = libm::sincos(0.5 * theta);
+        let sin = 2.0 * sh * ch;
+        let c1 = 2.0 * sh * sh / theta2;
         let c2 = (theta - sin) / (theta2 * theta);
-        let c3 = 1.0 / theta2 - (1.0 + cos) / (2.0 * theta * sin);
+        let c3 = 1.0 / theta2 - (ch / sh) / (2.0 * theta);
         (c1, c2, c3)
     }
 }
@@ -249,7 +258,8 @@ pub fn exp_se3(xi: [f64; 6]) -> Iso3 {
     let wxv = w.cross(v);
     let wxwxv = w.cross(wxv);
     let t = v.add(wxv.scale(c1)).add(wxwxv.scale(c2));
-    Iso3::new(exp_so3(w), t)
+    // Reuse the θ already computed for the V coefficients instead of a second sqrt.
+    Iso3::new(exp_so3_theta(w, theta), t)
 }
 
 /// SE(3) logarithm: map a rigid transform to its twist `ξ = [ω, v]`.
@@ -316,19 +326,17 @@ mod tests {
     // Reference c1/c2/c3 computed with Python `decimal` at 80 significant
     // digits (scratchpad/refgen.py). Columns: (theta, c1, c2, c3).
     //
+    // The closed branch uses the half-angle forms (see `v_coeffs`), so `c1` is
+    // cancellation-free (measured max rel err ~1e-16) and `c3` is accurate up to
+    // θ = π. The one residual is `c3` at the θ = 0.1 boundary, where the
+    // *inherent* `1/θ² − cot(θ/2)/(2θ)` subtraction loses ~1e-13 (this is why the
+    // 4-term series takes over below 0.1); it is not a near-π cancellation. The
+    // bounds below are the honest measured maxima over the reference sweep.
     // DEVIATION (documented): decision 0003 asks for rel err < 1e-14 across the
-    // whole sweep and a branch-boundary discontinuity < 1e-15. With the
-    // NORMATIVE 4-term series + the NORMATIVE naive closed forms, that is
-    // provably unreachable for `c3` (and marginally `c2`) in the band
-    // ~[0.1, 0.4]: the closed form `1/θ² − (1+cosθ)/(2θ sinθ)` loses ~1e-13 to
-    // cancellation there — the spec's own table lists `c3` closed = 9.1e-14 at
-    // θ=0.1 and 2.4e-14 at θ=0.3. The 4-term series is only good to ~0.1, so no
-    // single threshold covers the gap. We therefore keep the mandated constants
-    // and forms verbatim and assert the honest, measured bounds: a tight 1e-14
-    // in the series branch (θ < 0.1, where the spec's claim holds) and the
-    // achievable bound in the closed branch. The property that actually matters
-    // downstream — `exp_se3(log_se3(T)) ≈ T` — is unaffected (rel err ~8e-16),
-    // because `c3` multiplies an O(θ²) term; see proptest #3.
+    // whole sweep; the residual `c3` boundary error makes a flat 1e-14
+    // unreachable for `c3` with the mandated series threshold. The near-π regime,
+    // which the reference table does not sample, is guarded by the fast-vs-oracle
+    // proptests in `tests/proptests.rs`.
     const REF: [(f64, f64, f64, f64); 30] = [
         (1e-12, 0.5, 0.16666666666666666, 0.08333333333333333),
         (
@@ -521,9 +529,11 @@ mod tests {
                     "series branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
                 );
             } else {
-                // Closed branch: honest achievable bound with the naive forms.
+                // Closed branch, half-angle forms: c1 cancellation-free, c3
+                // limited only by the θ≈0.1 boundary subtraction. Tightened from
+                // the pre-fix bounds now that the near-π cancellation is gone.
                 assert!(
-                    e1 < 2e-14 && e2 < 5e-14 && e3 < 2e-13,
+                    e1 < 1e-15 && e2 < 3e-14 && e3 < 1e-13,
                     "closed branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
                 );
             }
@@ -532,18 +542,20 @@ mod tests {
 
     #[test]
     fn branch_boundary_value_is_continuous() {
-        // Value jump between the two formulas evaluated at THETA_SMALL. With the
-        // mandated 4-term series this is bounded below by the series truncation
-        // error at 0.1 (~5.6e-15 for c1), so the spec's literal 1e-15 target is
-        // unreachable; assert the measured ~7e-15 jump stays under 1e-14.
+        // Jump between the two branches of the *actual* `v_coeffs` at THETA_SMALL:
+        // the 4-term series versus the half-angle closed form. It is bounded below
+        // by the series truncation error at 0.1 (~5.6e-15 for c1), so the spec's
+        // literal 1e-15 target is unreachable; assert the jump stays under 1e-14.
         let th = THETA_SMALL;
         let t2 = th * th;
         let series = (horner(&C1, t2), horner(&C2, t2), horner(&C3, t2));
-        let (sin, cos) = libm::sincos(th);
+        // Mirror the closed branch of `v_coeffs` exactly (half-angle forms).
+        let (sh, ch) = libm::sincos(0.5 * th);
+        let sin = 2.0 * sh * ch;
         let closed = (
-            (1.0 - cos) / t2,
+            2.0 * sh * sh / t2,
             (th - sin) / (t2 * th),
-            1.0 / t2 - (1.0 + cos) / (2.0 * th * sin),
+            1.0 / t2 - (ch / sh) / (2.0 * th),
         );
         let j1 = (series.0 - closed.0).abs();
         let j2 = (series.1 - closed.1).abs();

@@ -5,7 +5,6 @@
 //! unit quaternions by construction.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use core::f64::consts::PI;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 use tf_tree_math::{exp_se3, log_se3, reference, Interp, Iso3, LerpSlerp, Quat, ScLerp, Vec3};
@@ -139,29 +138,18 @@ fn prop_endpoints_exact() {
         .unwrap();
 }
 
-/// Rotation angle (radians) of the relative transform `a⁻¹·b`, double-cover safe.
-fn rel_angle(a: &Iso3, b: &Iso3) -> f64 {
-    let mut dq = a.q.conjugate() * b.q;
-    if dq.w < 0.0 {
-        dq = dq.neg();
-    }
-    let nv = (dq.x * dq.x + dq.y * dq.y + dq.z * dq.z).sqrt();
-    2.0 * nv.atan2(dq.w.abs())
-}
-
 // #14 — fast dual-quaternion sclerp ≈ reference log/exp sclerp (≥1e5 cases).
 //
-// The tolerance is adaptive, and the reason is a genuine, oracle-verified
-// finding: the mandated *reference* (`a·exp_se3(s·log_se3(a⁻¹·b))`) loses up to
-// ~1e-11 of accuracy when the RELATIVE rotation is near π, because its naive
-// `c3 = 1/θ² − (1+cosθ)/(2θ sinθ)` cancels catastrophically there (both `1+cosθ`
-// and `sinθ` vanish). The fast dual-quaternion screw method does NOT touch `c3`
-// and stays accurate to ~1e-16 — see `sclerp_fast_matches_high_precision_near_pi`
-// below, which pins the fast method against a 90-digit oracle in exactly this
-// regime. So near π we relax the fast-vs-reference bound (we are limited by the
-// reference, not the method under test); away from π both are accurate and we
-// hold the tight 1e-13. This is the precise π-rotation precision trap decision
-// 0003 warns about, surfacing inside the reference itself.
+// A single tight tolerance holds across the whole domain, INCLUDING relative
+// rotations near π. This used to require an adaptive bound: the mandated
+// reference (`a·exp_se3(s·log_se3(a⁻¹·b))`) previously lost ~1e-11 near π because
+// its naive `c3 = 1/θ² − (1+cosθ)/(2θ sinθ)` cancels as `1+cosθ → 0`. `v_coeffs`
+// now uses the half-angle form `c3 = 1/θ² − cot(θ/2)/(2θ)`, which is
+// well-conditioned up to π, so the reference and the fast screw method agree to
+// ~1e-13 everywhere. `sclerp_fast_matches_high_precision_near_pi` below still
+// pins the fast method independently against a 90-digit oracle. (This is the
+// π-rotation precision trap decision 0003 warns about — now closed on both
+// paths.)
 #[test]
 fn prop_sclerp_fast_matches_reference() {
     let strat = prop_oneof![
@@ -172,10 +160,8 @@ fn prop_sclerp_fast_matches_reference() {
         .run(&strat, |(a, b, s)| {
             let fast = ScLerp::eval(&a, &b, s);
             let reference = reference::sclerp(&a, &b, s);
-            let near_pi = (PI - rel_angle(&a, &b)).abs() < 0.05;
-            let tol = if near_pi { 1e-10 } else { 1e-13 };
             let e = iso_err(&fast, &reference);
-            prop_assert!(e < tol, "near_pi={} s={} err={:e}", near_pi, s, e);
+            prop_assert!(e < 1e-13, "s={} err={:e}", s, e);
             Ok(())
         })
         .unwrap();
