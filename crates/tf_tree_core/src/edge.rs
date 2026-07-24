@@ -25,6 +25,22 @@ pub enum EdgeKind {
     Tombstone = 2,
 }
 
+impl EdgeKind {
+    /// Decode the [`EdgeRecord::kind`] discriminant. Any value other than the
+    /// three defined discriminants maps to [`EdgeKind::Tombstone`] (a zeroed edge
+    /// slot has `kind == 0` = [`EdgeKind::Dynamic`], which is only ever read for a
+    /// slot that was actually declared).
+    #[inline]
+    #[must_use]
+    pub const fn from_u8(v: u8) -> EdgeKind {
+        match v {
+            0 => EdgeKind::Dynamic,
+            1 => EdgeKind::Static,
+            _ => EdgeKind::Tombstone,
+        }
+    }
+}
+
 /// Per-edge control record. `EdgeId` indexes the edge table.
 ///
 /// # Layout

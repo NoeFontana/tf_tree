@@ -34,8 +34,8 @@ use tf_tree_arena::{Arena, ArenaHeader};
 use crate::buffer::{pose_slots, stamp_slots, SampleRing};
 use crate::edge::{ClaimRecord, EdgeRecord};
 use crate::error::{EdgeId, FrameError, FrameId, TopologyError};
-use crate::frame::{blake3_64, intern_core, FrameRecord};
-use crate::sync::{AtomicU16, AtomicU32, AtomicU64};
+use crate::frame::{blake3_64, intern_core, FrameRecord, ID_FAILED, ID_UNPUBLISHED};
+use crate::sync::{spin, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use crate::topology::{Block, TopologyView};
 
 /// Smallest power of two `>= n` (matching the arena layout's `next_pow2`).
@@ -88,7 +88,7 @@ impl<'a> ArenaView<'a> {
     }
 
     /// The interning id array (parallel to the hashes; `0` = unpublished, see
-    /// [`ID_UNPUBLISHED`](crate::frame::ID_UNPUBLISHED)).
+    /// [`ID_UNPUBLISHED`]).
     fn frame_ids(&self) -> &'a [AtomicU32] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
         let off = self.header.frame_hash_off as usize + slots * 8;
@@ -173,6 +173,57 @@ impl<'a> ArenaView<'a> {
             write_record,
         )?;
         FrameId::new(id).ok_or(FrameError::CapacityExceeded)
+    }
+
+    /// Look up an already-interned frame by name **without** creating one.
+    ///
+    /// Returns `Ok(Some(id))` if `name` was previously interned, `Ok(None)` if it
+    /// was never interned. Unlike [`Self::intern`] this never inserts, so the
+    /// read-only lookup path (`tree.lookup`) can distinguish "unknown frame" from
+    /// "known but disconnected".
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::FrameHashCollision`] if a different name occupies this hash.
+    pub fn find_frame(&self, name: &str) -> Result<Option<FrameId>, FrameError> {
+        let hash = blake3_64(name);
+        let hashes = self.frame_hashes();
+        let ids = self.frame_ids();
+        let mask = (hashes.len() - 1) as u64;
+        let mut i = (hash & mask) as usize;
+        for _ in 0..hashes.len() {
+            let cur = hashes[i].load(Ordering::Acquire);
+            if cur == 0 {
+                return Ok(None); // reached an empty slot: name was never interned
+            }
+            if cur == hash {
+                // Wait for the winning interner to publish the id (Phase 2 may have
+                // a concurrent writer mid-intern; costs nothing in Phase 1).
+                let id = loop {
+                    let id = ids[i].load(Ordering::Acquire);
+                    if id != ID_UNPUBLISHED {
+                        break id;
+                    }
+                    spin();
+                };
+                if id == ID_FAILED {
+                    // An interner claimed this slot and then lost the capacity
+                    // race: the name was never actually interned.
+                    return Ok(None);
+                }
+                let matches = match FrameId::new(id).and_then(|f| self.frame_record(f)) {
+                    Some(rec) => rec.name_matches(name),
+                    None => false,
+                };
+                return if matches {
+                    Ok(FrameId::new(id))
+                } else {
+                    Err(FrameError::FrameHashCollision { hash })
+                };
+            }
+            i = (i + 1) & (mask as usize);
+        }
+        Ok(None)
     }
 
     /// Read an interned frame record (for name display / diagnostics), or `None`

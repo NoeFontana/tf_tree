@@ -304,11 +304,11 @@ fn unpublished_sentinel_is_reachable_in_a_zeroed_arena() {
     assert_eq!(crate::frame::ID_UNPUBLISHED, 0, "sentinel must be zero");
     let arena = single_dyn_edge_arena();
     let view = ArenaView::new(&arena);
-    // Re-interning must observe the *published* id through the wait loop, not the
-    // zero a non-zero sentinel would let it read straight out of a fresh slot.
+    // A never-interned name reaches an empty hash slot and reports "not found"
+    // rather than spinning on, or misreading, an unpublished id.
+    assert_eq!(view.find_frame("never_interned").unwrap(), None);
     let a = view.intern("base_link").unwrap();
-    assert_eq!(view.intern("base_link").unwrap(), a);
-    assert_ne!(a.get(), 0);
+    assert_eq!(view.find_frame("base_link").unwrap(), Some(a));
 }
 
 /// A rejected intern must not poison its hash slot: `frame_count` stays exact and
@@ -322,6 +322,7 @@ fn capacity_rejection_leaves_the_table_usable() {
     view.intern("c").unwrap();
     assert_eq!(view.intern("d").unwrap_err(), FrameError::CapacityExceeded);
     // The full table still resolves what it holds, and did not over-count.
+    assert_eq!(view.find_frame("a").unwrap(), Some(a));
     assert_eq!(view.intern("a").unwrap(), a);
     assert_eq!(
         view.header()
@@ -434,6 +435,37 @@ fn arena_push_claim_sample_roundtrip() {
     drop(pubr);
     // After the publisher drops, the edge can be re-claimed.
     assert!(claim(view.claim(edge).unwrap(), 1, 2).is_ok());
+}
+
+// ---- plan compilation ---------------------------------------------------
+
+/// `set_parent` accepts `edge == 0` to mean "only the parent link matters", but
+/// edge slot `0` is a real edge record. Compiling a path across such a link must
+/// name the problem, not emit `Step::Dyn { edge: EdgeId(0) }` and silently sample
+/// an unrelated edge's ring.
+#[test]
+fn compile_rejects_the_no_edge_sentinel() {
+    let arena = single_dyn_edge_arena();
+    let view = ArenaView::new(&arena);
+    let a = view.intern("a").unwrap();
+    let b = view.intern("b").unwrap();
+    // `b` has a parent, but the link records no edge.
+    view.topology().set_parent(b, a.get(), 0).unwrap();
+
+    let err = crate::plan::compile(
+        &view.topology(),
+        |eid| {
+            view.edge(eid).map(|e| crate::plan::EdgeMeta {
+                kind: crate::edge::EdgeKind::from_u8(e.kind),
+                domain: e.domain,
+                static_pose: Iso3::from_bits(&e.static_pose),
+            })
+        },
+        b,
+        a,
+    )
+    .unwrap_err();
+    assert_eq!(err, LookupError::MissingEdge { child: b });
 }
 
 // ---- topology -----------------------------------------------------------
