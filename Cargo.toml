@@ -1,8 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rust-python-template-core",
-    "crates/rust-python-template-ffi",
+    "crates/tf_tree_math",
+    "crates/tf_tree_arena",
+    "crates/tf_tree_core",
+    "crates/tf_tree",
+    "crates/tf_tree_bench",
+    "crates/tf_tree_cli",
+    "xtask",
 ]
 
 [workspace.package]
@@ -10,11 +15,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/NoeFontana/rust-python-template"
-homepage = "https://github.com/NoeFontana/rust-python-template"
+repository = "https://github.com/NoeFontana/tf_tree"
+homepage = "https://github.com/NoeFontana/tf_tree"
 authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
-keywords = []
-categories = []
+keywords = ["robotics", "tf", "transform", "se3", "ros"]
+categories = ["science::robotics", "no-std"]
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
@@ -34,12 +39,24 @@ unreachable_pub = "warn"
 unused_must_use = "deny"
 
 [workspace.dependencies]
-rust-python-template-core = { path = "crates/rust-python-template-core" }
+# Intra-workspace crates (version pinned so publishable crates carry a real
+# requirement, not a path wildcard).
+tf_tree_math = { path = "crates/tf_tree_math", version = "0.1.0" }
+tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.1.0" }
+tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0" }
+tf_tree = { path = "crates/tf_tree", version = "0.1.0" }
+# no_std numeric + POD casting (the entire core dependency budget, plus blake3).
+libm = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
+blake3 = { version = "1", default-features = false }
+# std-side facade / tooling only.
 thiserror = "2"
-pyo3 = { version = "0.28", default-features = false, features = ["macros", "abi3-py310"] }
-numpy = "0.28"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# dev / bench only.
+proptest = "1"
+loom = "0.7"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.release]
 lto = "thin"

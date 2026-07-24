@@ -1,89 +1,71 @@
-# CLAUDE.md — agent guidance for rust-python-template
+# CLAUDE.md — agent guidance for tf_tree
 
 This file is for AI coding agents working in this repository. Humans, see
 [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
-## Project shape
+## What this is
 
-A mixed Rust/Python monorepo: a pure-Rust core, a thin PyO3 FFI layer, and a
-Python wrapper. Built with `maturin` + `uv`, tasks run through `just`.
+`tf_tree` is a transform tree engine (a faster, more scalable alternative to ROS
+`tf2`). It is being built along a fixed six-phase roadmap. **The decisions in
+[`docs/decisions/`](./docs/decisions/) are the contract** — read
+[`0002`](./docs/decisions/0002-tf-tree-architecture.md) (architecture + decision
+log D1–D16) and [`0003`](./docs/decisions/0003-phase-1-single-process-core.md)
+(the full Phase 1 spec) before touching code. When a `ready` decision does not
+answer a question, **stop and ask** — do not invent an answer, especially in the
+concurrency or arena-layout sections.
+
+## Project shape (Phase 1 — pure Rust)
 
 ```
-crates/
-├── rust-python-template-core/   pure Rust; #![forbid(unsafe_code)]; source of truth
-└── rust-python-template-ffi/    PyO3 → rust_python_template._core; publish = false;
-                                 data conversion only, no business logic
-python/rust_python_template/     user-facing Python wrapper + .pyi stubs
-tests/rust/                      cargo integration tests against -core
-tests/python/                    pytest against the FFI boundary
+crates/tf_tree_math/    no_std; SE(3)/SO(3), quats, dual quats; #![forbid(unsafe_code)]
+crates/tf_tree_arena/   no_std+alloc; pointer-free arena + layout math (unsafe allowed)
+crates/tf_tree_core/    no_std+alloc; the engine; unsafe only in buffer.rs / arena_view.rs
+crates/tf_tree/         std facade; #![forbid(unsafe_code)]
+crates/tf_tree_bench/   criterion + tf2 differential harness
+crates/tf_tree_cli/     binary `tf_tree` (alias `tft`)
+xtask/                  loom / miri / bench-gate runners
 ```
 
-**Hard rules:**
-- `-core` is `#![forbid(unsafe_code)]`. No unsafe, no exceptions. If you
-  need unsafe interop, it goes in `-ffi` with a `// SAFETY:` comment that
-  states the invariants relied on.
-- `-core` has zero Python dependencies. It must compile and test without
-  libpython.
-- `-ffi` does conversion only. Business logic must live in `-core`.
-- Stable Rust only. Channel is pinned by `rust-toolchain.toml`.
-- The workspace `[lints]` table denies `unwrap_used`, `expect_used`,
-  `panic`, `todo`, `unimplemented`, `dbg_macro`. If you reach for any of
-  these, you are signaling that a real error type is missing.
+Python bindings are **Phase 3**, not now. Phase 1 is pure Rust.
+
+## Hard rules (from the decisions — do not relitigate)
+
+- **Dependency budget:** `tf_tree_core` = `libm` + `bytemuck` + `blake3` (no_std)
+  and nothing else. `tf_tree_math` = `libm` + `bytemuck`. blake3 is the one
+  addition, resolving a spec conflict over frame-name hashing.
+- **Unsafe budget:** `#![forbid(unsafe_code)]` on `tf_tree_math`, `tf_tree`,
+  `tf_tree_cli`. `unsafe` is permitted only in `tf_tree_arena` and in
+  `tf_tree_core::{buffer, arena_view}`, each with a module `// SAFETY:` block and
+  a per-block `// SAFETY:` comment naming the invariant relied on.
+- **No pointers in the arena; fixed capacity; no growth/realloc; `#[repr(C)]`
+  everywhere; append-only `FrameId`/`EdgeId` (tombstone, never recycle).**
+- **`ArcSwap`/`Arc`/`Box`/`Vec` inside an arena structure is forbidden** (D4).
+- **Do not weaken an atomic ordering** because a test passes on x86-64 — the loom
+  tests and the aarch64 CI target exist for exactly that.
+- No `String` in any error type or hot path; errors are `Copy` and name the
+  offending edge. No `async`/runtime. No GPU/point-cloud/`deskew`. `f64` only.
+- `LerpSlerp`'s right-invariance test is **supposed to fail** — do not "fix" it.
 
 ## Commands
 
-Every workflow goes through `just`. CI mirrors these recipes 1:1.
+Everything goes through `just`; CI mirrors it 1:1.
 
 | Recipe | What it does |
 | --- | --- |
-| `just bootstrap` | `uv sync --all-extras` + `uv run maturin develop --release`. Run once after clone. |
-| `just develop` | Rebuild the FFI extension in debug mode (fast iteration). |
-| `just build` | Build a release wheel into `target/wheels/`. |
-| `just test` | Full suite: `cargo nextest run --workspace` then `pytest`. |
-| `just test-rust` | Rust tests only. |
-| `just test-py` | Python tests only. |
-| `just lint` | `cargo fmt --check`, `clippy -D warnings`, `ruff check`, `ruff format --check`, `pyright`. |
-| `just fmt` | Auto-fix: `cargo fmt`, `ruff format`, `ruff check --fix`. |
-| `just audit` | `cargo deny check` (advisories, licenses, bans, sources). |
-| `just clean` | Remove `target/`, `.venv/`, built `_core*.so` artifacts. |
-| `just versions` | Print toolchain versions. |
+| `just build` | `cargo build --workspace --all-targets` |
+| `just test` | `cargo nextest run --workspace` + doctests |
+| `just lint` | `cargo fmt --check`, `clippy -D warnings`, `cargo deny check` |
+| `just fmt` | auto-format + clippy `--fix` |
+| `just loom` | concurrency model checking (`cargo xtask loom`) |
+| `just miri` | UB checking on arena + core |
+| `just bench` | benchmark suite + go/no-go gate |
 
-## Single-test invocations
-
-- Rust: `cargo nextest run -p rust-python-template-core -- add_works`
-- Python: `uv run pytest tests/python/test_add.py::test_add`
-
-## Prerequisites
-
-- `rustup` with the stable channel (`rust-toolchain.toml` enforces this).
-- `uv` (Python + venv + dep management).
-- `just`.
-- `cargo-nextest` (`cargo install cargo-nextest --locked`).
-- `cargo-deny` (`cargo install cargo-deny --locked`).
+Single test — Rust: `cargo nextest run -p tf_tree_math -- exp_log_roundtrip`.
 
 ## Decision-document workflow
 
-Architectural changes (public API, crate boundaries, build/release process)
-start as a `draft` decision in [`docs/decisions/`](./docs/decisions/), not
-as a PR. Read [`docs/decisions/README.md`](./docs/decisions/README.md) for
-the lifecycle. When status is `ready`, the *Decision* is final; implement
-it as stated — do not redesign mid-flight. If you find an unresolved
-question while implementing a `ready` doc, stop and ask.
-
-## Conventions you might not pick up from the code
-
-- **Errors:** use `thiserror` in `-core` for typed errors. `-ffi` converts
-  them to `PyErr` at the boundary.
-- **Docs:** `missing_docs` is a warn-by-default lint. Every public item in
-  `-core` should have a doc comment.
-- **PyO3 version:** 0.28 with `abi3-py310`. One wheel covers Python
-  3.10–3.14. Do not pin a specific Python version.
-- **`unreachable_pub`** is a warn lint; prefer `pub(crate)` for items not in
-  the public API.
-
-## What's deliberately out of scope
-
-CLI, fuzzing, benchmarks, reference-impl oracle, real-model integration
-tests, mkdocs user docs, design docs, slow-tier CI workflow. See the
-"Opt-in extensions" section of [`docs/decisions/README.md`](./docs/decisions/README.md).
-These are documented recipes, not promised features.
+Architectural changes start as a `draft` decision in
+[`docs/decisions/`](./docs/decisions/), not as a PR. Read
+[`docs/decisions/README.md`](./docs/decisions/README.md) for the lifecycle. When
+a decision is `ready`, implement it as stated; its *Implementation plan* is the
+per-PR work breakdown.
