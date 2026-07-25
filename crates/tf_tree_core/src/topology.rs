@@ -314,7 +314,11 @@ impl<'a> TopoLockView<'a> {
                 })
             }
             Err(cur) => Err(TopoLockError::Contended {
-                owner_slot: slot_of(cur),
+                // `slot_of(0)` is 0 because of the `saturating_sub`, so a lock
+                // that was *freed* between the load and this CAS would report
+                // "held by slot 0" and name whichever process holds that slot —
+                // the same plausible-looking wrong answer `doctor` was fixed for.
+                owner_slot: if cur == 0 { u32::MAX } else { slot_of(cur) },
             }),
         }
     }
