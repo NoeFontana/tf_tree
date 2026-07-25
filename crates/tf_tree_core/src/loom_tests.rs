@@ -1,6 +1,7 @@
 //! `loom` model-checked concurrency tests (run under `--cfg loom`).
 //!
-//! These are the hard gate for decision `0003` step 5: the publish/read/claim/
+//! These are the hard gate for step 5 of `docs/PHASE1.md`'s implementation
+//! order, and for its §10.2 *Concurrency (loom)*: the publish/read/claim/
 //! intern protocols must be sound under every interleaving loom explores, not
 //! merely on x86. Buffers are capacity 2–4 and push counts <= 3 to keep the
 //! state space tractable. Each test drives the *shared* algorithm code (the same

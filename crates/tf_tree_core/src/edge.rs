@@ -1,7 +1,8 @@
 //! Edge records, the claim table, and the exclusive-writer `Publisher` handle.
 //!
 //! `unsafe`-free: raw arena access to these records lives in
-//! [`crate::arena_view`]. The claim protocol (decision `0003` / D7) is a single
+//! [`crate::arena_view`]. The claim protocol (`docs/PHASE1.md` §5.4;
+//! `docs/PROJECT.md` §5 D7) is a single
 //! `compare_exchange`; a second claim on a live edge is an error, never a silent
 //! success.
 
@@ -46,10 +47,10 @@ impl EdgeKind {
 /// # Layout
 ///
 /// `#[repr(C, align(64))]`, **exactly 128 bytes** to match the frozen arena edge
-/// stride (`max_edges * 128`). The nominal field list in decision `0003` sums to
-/// more than 128 bytes once the `head` atomic is 8-aligned; this record keeps the
-/// same field order and semantics and trims the trailing pad (`_pad2`) so the
-/// whole thing lands on the 128-byte stride. See the crate's `openQuestions`.
+/// stride (`max_edges * 128`). The nominal field list in `docs/PHASE1.md` §5.3
+/// sums to more than 128 bytes once the `head` atomic is 8-aligned; this record
+/// keeps the same field order and semantics and trims the trailing pad (`_pad2`)
+/// so the whole thing lands on the 128-byte stride.
 #[cfg(not(loom))]
 #[repr(C, align(64))]
 pub struct EdgeRecord {
@@ -141,9 +142,9 @@ impl EdgeRecord {
 /// # Layout
 ///
 /// `#[repr(C, align(64))]`, exactly 64 bytes. `owner_pid`/`owner_boot_id` are
-/// documented in `0003` as plain integers; they are modeled here as atomics of
-/// identical layout so the failing claimer's diagnostic read is UB-free (the spec
-/// does not pin the memory ordering of their publication — see `openQuestions`).
+/// documented in `docs/PHASE1.md` §5.4 as plain integers; they are modeled here
+/// as atomics of identical layout so the failing claimer's diagnostic read is
+/// UB-free (the spec does not pin the memory ordering of their publication).
 #[cfg(not(loom))]
 #[repr(C, align(64))]
 pub struct ClaimRecord {

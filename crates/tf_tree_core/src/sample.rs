@@ -3,7 +3,7 @@
 //! Given a query stamp `t`, locate the two published samples that bracket it and
 //! interpolate. The search is over **logical** indices with `& mask` applied on
 //! every probe: searching the physical array directly is wrong once the ring has
-//! wrapped, and is a classic off-by-one source (decision `0003`). The trailing
+//! wrapped, and is a classic off-by-one source (`docs/PHASE1.md` §6.4). The trailing
 //! revalidation makes the read wait-free in practice — it fails only if the ring
 //! lapped the reader mid-read, which cannot happen within the buffer's time-slack
 //! under any sane configuration.

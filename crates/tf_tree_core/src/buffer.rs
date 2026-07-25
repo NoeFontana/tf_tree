@@ -21,7 +21,7 @@
 //! atomics, so aliasing the region as `&PoseSlot` from multiple threads is sound.
 //!
 //! The `push`/`read_slot` protocol carries **normative** ordering annotations
-//! (decision `0003`). Every ordering below is load-bearing and is exercised by
+//! (`docs/PHASE1.md` §6.2–§6.3). Every ordering below is load-bearing and is exercised by
 //! the loom tests; do not weaken any to `Relaxed` because an x86 test passes.
 #![allow(unsafe_code)]
 

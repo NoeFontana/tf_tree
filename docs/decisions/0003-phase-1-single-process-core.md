@@ -1,8 +1,22 @@
 # 0003: Phase 1 — single-process transform tree core
 
-**Status:** ready
+> ## ⚠️ Superseded — do not cite this document
+>
+> This record has been consolidated into **[`docs/PHASE1.md`](../PHASE1.md)**,
+> which is now the normative Phase 1 specification (numbered sections: §2
+> invariants, §3 math, §4 arena layout, §5 records, §6 concurrency core, §7
+> plans, §8 API, §9 errors, §10 test plan, §11 benchmarks and gate, §12 CLI).
+> The architecture and decision log moved to
+> **[`docs/PROJECT.md`](../PROJECT.md)** §5.
+>
+> Phase 1 amendments A1–A8, which are **not yet applied**, live in
+> [`docs/PHASE2.md`](../PHASE2.md) §1.
+>
+> It is kept unedited as history. New work must cite `docs/PHASE1.md`.
+
+**Status:** superseded by `docs/PHASE1.md`
 **Owner:** @NoeFontana
-**Implementation:** _(none yet — PRs linked as work lands)_
+**Implementation:** _(PRs linked as work lands)_
 
 > **Companion decision:** [`0002-tf-tree-architecture.md`](./0002-tf-tree-architecture.md) holds
 > the project overview, the six-phase roadmap, and the decision log (D1–D16)

@@ -3,7 +3,8 @@
 //! `unsafe`-free: the atomic slices are handed in by [`crate::arena_view`]. Two
 //! blocks are kept; a mutation is applied to the inactive block, its depths are
 //! recomputed, and the active index is flipped — so a reader sees the old
-//! topology or the new one, never a mix (decision `0003`, D4). **`ArcSwap` is
+//! topology or the new one, never a mix (`docs/PHASE1.md` §5.2;
+//! `docs/PROJECT.md` §5 D4). **`ArcSwap` is
 //! forbidden here**: `Arc` refcounts do not cross a process boundary.
 //!
 //! # Arena-layout resolution
@@ -11,11 +12,11 @@
 //! Each block reserves **10 bytes per frame** (`align64(max_frames * 10)`):
 //! `parent: u32` + `edge_of_child: u32` + `depth: u16`. The `edge_of_child[c]`
 //! side array (frame → the edge whose child is that frame) lives in the block, as
-//! decision `0003` intends, so plan compilation is an O(1) array walk and the
-//! `(parent, depth, edge_of_child)` triple is double-buffered together under this
-//! seqlock — a reader always sees a consistent snapshot. (This resolves the
-//! 0003 inconsistency between "edge_of_child lives in the topology block" and the
-//! nominal 6-byte stride.)
+//! `docs/PHASE1.md` §5.2 intends, so plan compilation is an O(1) array walk and
+//! the `(parent, depth, edge_of_child)` triple is double-buffered together under
+//! this seqlock — a reader always sees a consistent snapshot. (This resolves the
+//! inconsistency between "edge_of_child lives in the topology block" (§5.2) and
+//! the nominal 6-byte stride in the §4.3 layout table.)
 //!
 //! The two `u32` arrays are placed first (`parent`, then `edge_of_child`) and the
 //! `u16` `depth` last, so both `u32` arrays stay 4-byte aligned for any

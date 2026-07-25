@@ -17,6 +17,11 @@ just tf2-native-control # pure C++ tf2, no Rust and no FFI — the bias control
 All five run in a container (`docker/tf2/`), so no ROS install is needed on the
 host.
 
+The bridge all five go through has its own check, `just tf2-check`: fmt, clippy
+and the unit tests of `tf_tree_tf2_sys` and of `tf_tree_bench --features tf2`.
+It exists because that crate is excluded from the workspace (it only builds
+where ROS 2 does), so `just lint` and `just test` cannot see it.
+
 ## Setup
 
 | | |
@@ -43,7 +48,7 @@ identical sample stream, then asked the same random queries.
 | Synthetic fixture (24 frames, depth 6) | 95,909 | **2.876e-15** | 1e-12 |
 | Recorded `/tf` stream (10 frames, depth 3) | 50,000 | **6.665e-15** | 1e-12 |
 
-Both are ~150-350x tighter than decision `0003`'s 1e-12 gate, and are at the
+Both are ~150-350x tighter than [`PHASE1.md`](../PHASE1.md) §10.5's 1e-12 gate, and are at the
 level of `f64` round-off for the composition depths involved.
 
 On the recorded stream the two engines also declined **exactly the same queries**
@@ -71,7 +76,7 @@ but the harness), 8 logical CPUs / **4 physical cores** (2-way SMT), AMD
 EPYC-Milan pinned at 2445 MHz with no frequency governor exposed. Criterion
 confidence intervals were within ±0.2%.
 
-These are still **not** the decision `0003` go/no-go gate, which calls for
+These are still **not** the [`PHASE1.md`](../PHASE1.md) §11.3 go/no-go gate, which calls for
 dedicated core-pinned hardware; a shared-tenancy VM with SMT is closer than
 before but is not that.
 
@@ -117,7 +122,7 @@ The honest headline is therefore **~2.7x**, not the 3.3x first reported.
 ### Where the win comes from
 
 tf_tree compiles the topology walk **once** into a `Plan` and thereafter only
-samples (decision `0003` / D3); tf2 walks per call. Benchmarking only that would
+samples ([`PROJECT.md`](../PROJECT.md) §5 D3); tf2 walks per call. Benchmarking only that would
 be self-serving, so the suite also measures tf_tree recompiling a fresh plan for
 *every single query*:
 
@@ -148,20 +153,41 @@ tree, two more levels) costs tf_tree 16% and tf2 23%.
 
 | | tf_tree | tf2 | Ratio |
 |---|---|---|---|
-| One sample onto one edge | **8.6 ns** | 139 ns | **16.1x** |
+| One sample onto one edge | **8.7 ns** | 123 ns | **14.1x** |
 
-Both bounded, differently, and that difference is part of the comparison:
+Both publish paths are allocation-free. tf_tree's `push` takes no strings; the
+tf2 row hands the shim the `std::string`s a `FrameName` already owns and assigns
+them into the message, which is what a native C++ publisher does. The earlier
+139 ns figure was measured through a path that built a NUL-terminated copy of
+each name per call — two heap allocations charged to tf2 that a C++ caller never
+pays. The `push/tf2_alloc` row keeps that naive binding as a control: **187 ns**,
+so the marshalling was worth ~15 ns and a fully naive binding ~64 ns.
+
+Both caches are bounded, differently, and that difference is part of the comparison:
 tf_tree's ring is count-bounded (fixed power-of-two slots, overwritten in place,
 never allocating — invariant 8, enforced by the zero-allocation gate); tf2's
 cache is time-bounded and prunes on insert, here at the realistic 10 s default.
 
 ### Concurrent read scaling — 1 / 2 / 4 / 8 threads
 
-`just tf2-scaling`. **tf_tree's readers take no lock**; every
-`tf2::lookupTransform` acquires `BufferCore`'s internal frame mutex. One shared
-tree and one shared buffer, as both engines are meant to be used — per-thread
-buffers would erase the contention being studied. 101 rounds per point, engines
-**interleaved within every round** so drift lands on both equally.
+**tf_tree's readers take no lock**; every `tf2::lookupTransform` acquires
+`BufferCore`'s internal frame mutex. One shared tree and one shared buffer, as
+both engines are meant to be used — per-thread buffers would erase the
+contention being studied. 101 rounds per point, engines **interleaved within
+every round** so drift lands on both equally.
+
+The tables below were **not** taken with a bare `just tf2-scaling`: the harness
+defaults are 51 rounds and 50,000 latency samples, and both were raised for this
+run. The exact command was
+
+```bash
+./docker/tf2/run.sh 'TF2_ROUNDS=101 TF2_LATENCY_SAMPLES=100000 \
+  cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
+```
+
+(the overrides go *inside* the quoted command — `run.sh` does not forward the
+host environment into the container). `just tf2-scaling` runs the same harness
+at its defaults, which is faster and noisier.
 
 Throughput, million lookups/s, recorded stream:
 
@@ -177,14 +203,24 @@ thread, the signature of a contended global mutex.
 
 **This is tf2's behaviour, not an artifact of our binding.** The pure C++ control
 (`docker/tf2/native_scaling.sh`, no Rust, no FFI, same stream, same queries)
-reproduces it:
+reproduces it. Both were re-run back-to-back on the same host so the columns are
+directly comparable (which is why the bridge's 4-thread figure here is 1.39
+rather than the noisier 1.56 of the run tabulated above), and the control sweeps **exactly** the Rust harness's
+`common_window` (max of the per-edge first stamps to min of the per-edge last
+stamps — it previously ran to the global last stamp, so ~11% of its queries were
+past the end of the shortest edge and answered by tf2's throw path rather than
+its lookup path):
 
-| Threads | native C++ tf2 | via our bridge |
-|---|---|---|
-| 1 | 1.00x | 1.00x |
-| 2 | 0.49x | 0.50x |
-| 4 | 0.42x | 0.43x |
-| 8 | **0.30x** | **0.31x** |
+| Threads | native C++ tf2 M/s | via our bridge M/s | native vs 1thr | bridge vs 1thr |
+|---|---|---|---|---|
+| 1 | 3.80 | 3.66 | 1.00x | 1.00x |
+| 2 | 1.84 | 1.83 | 0.48x | 0.50x |
+| 4 | 1.38 | 1.39 | 0.36x | 0.38x |
+| 8 | 1.12 | 1.12 | **0.30x** | **0.31x** |
+
+The bridge is within 4% of native at one thread and within 1% at two, four and
+eight — it costs a little on an uncontended call and nothing once the mutex
+dominates. The collapse is tf2's.
 
 The tail is starker than the throughput. Per-lookup latency, recorded stream:
 
@@ -215,7 +251,7 @@ deeper path is rejected with `LookupError::TreeTooDeep`. **tf2 has no such
 limit.**
 
 This is a deliberate design choice — the fixed `[Step; MAX_DEPTH]` array is what
-makes `Plan` `Copy`, heap-free and allocation-free — and decision `0003` argues
+makes `Plan` `Copy`, heap-free and allocation-free — and [`PHASE1.md`](../PHASE1.md) §7.1 argues
 16 is generous when real trees are 4-8 deep. It was hit while building the
 scaling row above (a 24-deep spine is refused outright), so it is recorded here
 rather than discovered by a user.
@@ -245,7 +281,7 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
   (`just tf2-scaling`); the numbers above are from a smoke run on a busy host and
   must be re-taken before they are cited.
 * **Read scaling under concurrent writers.** Every reader benchmark here runs
-  against a quiescent tree. Decision `0003`'s gate specifies 4 concurrent
+  against a quiescent tree. [`PHASE1.md`](../PHASE1.md) §11.2 specifies 4 concurrent
   writers, which would additionally stress tf_tree's seqlock retry path and
   tf2's writer/reader lock exclusion.
 * **Per-thread core pinning.** The harness pins nothing; `taskset` on the whole
@@ -265,5 +301,5 @@ taskset -c 2 ./docker/tf2/run.sh \
   'cargo bench -p tf_tree_bench --features tf2 --bench tf2_compare'
 ```
 
-Report p50/p99/p99.9, not means — decision `0003` is explicit that the tail is
+Report p50/p99/p99.9, not means — [`PHASE1.md`](../PHASE1.md) §11.2 is explicit that the tail is
 what a control loop cares about.

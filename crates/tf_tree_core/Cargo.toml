@@ -38,7 +38,8 @@ tf_tree_math.workspace = true
 tf_tree_arena.workspace = true
 libm.workspace = true
 bytemuck.workspace = true
-# no_std; resolves the 0003 name-hash mandate. See docs/decisions/0003.
+# no_std; resolves the BLAKE3 name-hash mandate of `docs/PHASE1.md` §5.1 against
+# the dependency budget in `docs/PHASE1.md` §0.
 blake3 = { workspace = true }
 
 [dev-dependencies]
