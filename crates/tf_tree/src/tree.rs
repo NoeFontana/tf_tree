@@ -284,9 +284,11 @@ impl TreeBuilder {
         let backing = ArenaBacking::Heap(arena);
         let participant = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
+        let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            liveness,
             decl: Mutex::new(()),
         })
     }
@@ -316,9 +318,11 @@ impl TreeBuilder {
         let backing = ArenaBacking::Mapped(arena);
         let participant = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
+        let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            liveness,
             decl: Mutex::new(()),
         })
     }
@@ -522,6 +526,18 @@ pub struct Tree {
     /// is what lets a claim publish its owner and its identity in one store.
     /// The topology lock names it the same way, and for the same reason.
     participant: u32,
+    /// Decides whether a participant slot's owner is still running.
+    ///
+    /// Boxed and stored rather than built per call because it must outlive the
+    /// [`ArenaView`] that borrows it, and because the reboot check is a property
+    /// of the *arena*, not of any one record: if the segment predates this boot,
+    /// every pid it names belongs to a dead world and no `/proc` lookup can tell
+    /// you so. That comparison is made once, here, and collapses into the
+    /// closure.
+    ///
+    /// This is the seam `docs/PHASE2.md` §5.1 replaces with the OFD lock file,
+    /// which is authoritative where `/proc` is inference.
+    liveness: Box<dyn Fn(&tf_tree_core::ParticipantRecord) -> bool + Send + Sync>,
     /// Serializes *this process's* threads through [`Self::reparent`].
     ///
     /// Not the real lock and never was — a `Mutex` is per-process, so it
@@ -535,7 +551,17 @@ pub struct Tree {
 
 impl Tree {
     fn view(&self) -> ArenaView<'_> {
+        // Both builders are load-bearing for A8, and neither is optional:
+        //
+        // * `as_participant` — a rescuer publishes *itself* into `claiming`, so
+        //   an anonymous view can wait on a stalled interner but may never take
+        //   the entry over. Without this, A8's recovery is inert.
+        // * `with_liveness` — the default is "believed alive", the right
+        //   fail-safe but one that never fires. This is what makes a dead
+        //   claimant's entry actually recoverable.
         ArenaView::new(self.arena.as_dyn())
+            .as_participant(self.participant)
+            .with_liveness(&*self.liveness)
     }
 
     /// Resolve a frame name to its stable id.
@@ -753,9 +779,11 @@ impl Tree {
         } else {
             u32::MAX
         };
+        let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            liveness,
             decl: Mutex::new(()),
         })
     }
@@ -928,6 +956,53 @@ fn now_nanos() -> i64 {
 /// the topology lock from a live mutator and lets two writers race one scratch
 /// block; a false positive only makes the caller retry. §6.2 states the
 /// asymmetry and the default it demands.
+/// Is the process that owns this participant record still running?
+///
+/// The per-record half of [`participant_is_alive`], in the shape A8's rescue
+/// path needs: it is handed a record, not a slot index.
+///
+/// A slot that is not `LIVE` is reported dead — that covers a released slot and
+/// one whose registrant died partway through filling it in, since `RESERVED` is
+/// held for a handful of instructions by a healthy process
+/// (`docs/PHASE2.md` §11.3, `attach.after_slot_assigned_before_publish`).
+///
+/// `Unreadable` resolves to **alive**, and every branch is chosen the same way:
+/// a false "dead" lets a rescuer take an entry from a running process, which is
+/// corruption; a false "alive" only delays recovery.
+fn record_is_alive(rec: &tf_tree_core::ParticipantRecord) -> bool {
+    use core::sync::atomic::Ordering;
+    if rec.state.load(Ordering::Acquire) != tf_tree_core::participant::LIVE {
+        return false;
+    }
+    let pid = rec.pid.load(Ordering::Relaxed);
+    let start_time = rec.start_time.load(Ordering::Relaxed);
+    match read_start_time(pid) {
+        // PID reuse: same number, different process. Not our participant.
+        ProcStartTime::Known(st) => st == start_time,
+        ProcStartTime::NoSuchProcess => false,
+        ProcStartTime::Unreadable => true,
+    }
+}
+
+/// Build the liveness predicate for an arena, folding in the one-time reboot
+/// check.
+///
+/// If the arena's boot id is known and differs from this host's, the segment
+/// outlived a reboot: every pid in it refers to a process from a previous boot,
+/// so nothing in it is alive and no per-record check could discover that. When
+/// either id is unknown the comparison is skipped — treating "unknown" as
+/// "different" would declare every participant dead, the false negative this
+/// must never produce.
+fn liveness_for(
+    arena_boot: [u8; 16],
+) -> Box<dyn Fn(&tf_tree_core::ParticipantRecord) -> bool + Send + Sync> {
+    let host = *host_boot_id();
+    if arena_boot != [0u8; 16] && host != [0u8; 16] && arena_boot != host {
+        return Box::new(|_| false);
+    }
+    Box::new(record_is_alive)
+}
+
 fn participant_is_alive(
     participants: &tf_tree_core::ParticipantTable<'_>,
     slot: u32,
