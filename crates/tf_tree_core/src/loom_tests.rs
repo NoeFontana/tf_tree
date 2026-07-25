@@ -201,15 +201,15 @@ fn claim_race_exactly_one_wins() {
         let rec = Arc::new(ClaimRecord::new());
 
         let a = Arc::clone(&rec);
-        let t1 = thread::spawn(move || claim(&a, 1, 10).is_ok());
+        let t1 = thread::spawn(move || claim(&a, 1).is_ok());
         let b = Arc::clone(&rec);
-        let t2 = thread::spawn(move || claim(&b, 2, 20).is_ok());
+        let t2 = thread::spawn(move || claim(&b, 2).is_ok());
 
         let ok1 = t1.join().unwrap();
         let ok2 = t2.join().unwrap();
         assert!(ok1 ^ ok2, "expected exactly one claim to succeed");
         // The winner incremented the epoch exactly once.
-        assert_eq!(rec.claim_epoch.load(Ordering::Relaxed), 1);
+        assert_eq!(rec.epoch.load(Ordering::Relaxed), 1);
     });
 }
 

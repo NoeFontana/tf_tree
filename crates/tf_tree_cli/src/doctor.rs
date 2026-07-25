@@ -233,6 +233,8 @@ impl Snapshot {
                 continue;
             };
             let kind = EdgeKind::from_u8(rec.kind);
+            let owner_word = claim.owner.load(Ordering::Relaxed);
+            let owner_slot = u32::try_from(owner_word.saturating_sub(1)).unwrap_or(u32::MAX);
             // `ring` is `None` for a static/tombstoned edge (capacity 0), so this
             // needs no separate power-of-two guard.
             let newest_stamp = view.ring(eid).and_then(|r| r.newest_stamp());
@@ -245,8 +247,16 @@ impl Snapshot {
                 interp: InterpPolicy::from_u8(rec.interp),
                 domain: rec.domain,
                 head: rec.head.load(Ordering::Relaxed),
-                claimed: claim.state.load(Ordering::Relaxed) == 1,
-                owner_pid: claim.owner_pid.load(Ordering::Relaxed),
+                claimed: owner_word != 0,
+                // A3: the claim names a *participant slot*, not a PID, so the
+                // owning process is resolved through the participant table. A
+                // slot that no longer resolves means the owner detached or died
+                // between the two reads, which reports as pid 0 — the honest
+                // answer, and what the reaper will act on.
+                owner_pid: view
+                    .participants()
+                    .identity(owner_slot)
+                    .map_or(0, |(pid, _start, _inc)| pid),
                 newest_stamp,
             });
         }

@@ -72,6 +72,25 @@ pub struct PoseSlot {
 }
 
 impl PoseSlot {
+    /// Test-only access to the slot's sequence number.
+    ///
+    /// `seq` stays private because nothing outside the seqlock protocol may
+    /// touch it; these exist so a test can *simulate a writer killed
+    /// mid-publish*, which is the one state the protocol has to recover from and
+    /// which no in-process API can otherwise produce (see
+    /// `stale_odd_seq_from_a_dead_writer_is_healed_by_the_next_push`).
+    #[cfg(test)]
+    pub(crate) fn set_seq_for_test(&self, v: u32) {
+        self.seq.store(v, Ordering::Relaxed);
+    }
+
+    /// Read the slot's sequence number. Test-only; see
+    /// [`PoseSlot::set_seq_for_test`].
+    #[cfg(test)]
+    pub(crate) fn seq_for_test(&self) -> u32 {
+        self.seq.load(Ordering::Relaxed)
+    }
+
     /// A fresh, stable (`seq == 0`), identity-ish slot. Used to build heap rings
     /// for the loom tests and the wrapped-ring property test; the production
     /// arena views zeroed bytes instead of constructing.
@@ -198,8 +217,20 @@ impl SampleRing<'_> {
         // Flip the slot's seqlock to odd (write in progress). The Release fence
         // that follows keeps the payload stores below from being hoisted above
         // this point on a weakly-ordered target.
-        let s = slot.seq.load(Ordering::Relaxed);
-        slot.seq.store(s.wrapping_add(1), Ordering::Relaxed); // -> odd
+        //
+        // **Force the parity; do not increment** (`docs/PHASE2.md` §1, A5). A
+        // writer killed between the two stores below leaves the slot odd
+        // forever. Within one process that was unobservable — the crash took the
+        // readers with it — but across processes the readers survive, and when
+        // the ring laps, an incrementing writer would read the stale odd `s` and
+        // land its `s+1` on an *even* value, inverting the protocol for that slot
+        // from then on: readers would accept mid-write payloads as published.
+        //
+        // `s | 1` is idempotent on a stale odd value, so this self-heals. Any
+        // reader that saw the stale odd retried without reading, so none can be
+        // mid-read holding it.
+        let odd = slot.seq.load(Ordering::Relaxed) | 1;
+        slot.seq.store(odd, Ordering::Relaxed); // -> odd (idempotent if already)
         fence(Ordering::Release);
 
         self.stamps[idx].store(stamp, Ordering::Relaxed);
@@ -210,7 +241,7 @@ impl SampleRing<'_> {
 
         // Back to even publishes the payload; the head store publishes the
         // sample to the bracket search.
-        slot.seq.store(s.wrapping_add(2), Ordering::Release); // -> even
+        slot.seq.store(odd.wrapping_add(1), Ordering::Release); // -> even
         self.head.store(h + 1, Ordering::Release);
         self.heartbeat.fetch_add(1, Ordering::Relaxed);
         Ok(())

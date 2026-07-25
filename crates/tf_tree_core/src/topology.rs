@@ -1,16 +1,32 @@
-//! Double-buffered topology blocks and the seqlock that publishes mutations.
+//! Multi-buffered topology blocks and the single store that publishes mutations.
 //!
-//! `unsafe`-free: the atomic slices are handed in by [`crate::arena_view`]. Two
-//! blocks are kept; a mutation is applied to the inactive block, its depths are
-//! recomputed, and the active index is flipped — so a reader sees the old
-//! topology or the new one, never a mix (`docs/PHASE1.md` §5.2;
-//! `docs/PROJECT.md` §5 D4). **`ArcSwap` is
-//! forbidden here**: `Arc` refcounts do not cross a process boundary.
+//! `unsafe`-free: the atomic slices are handed in by [`crate::arena_view`].
+//! [`TOPO_BLOCKS`] blocks are kept; a mutation is applied to an *inactive* one,
+//! its depths are recomputed, and the active index is advanced — so a reader
+//! sees the old topology or the new one, never a mix (`docs/PHASE1.md` §5.2;
+//! `docs/PROJECT.md` §5 D4). **`ArcSwap` is forbidden here**: `Arc` refcounts do
+//! not cross a process boundary.
+//!
+//! # There is no odd state (`docs/PHASE2.md` §1, A1)
+//!
+//! Phase 1 used a seqlock: bump the generation to odd, copy, flip, bump to even.
+//! In one process that was fine, because a writer that died mid-mutation took
+//! every reader with it. Across processes it is not: a writer `SIGKILL`ed after
+//! the first bump leaves the generation **permanently odd**, and every reader in
+//! every other process then spins forever in plan compilation. That wedges the
+//! whole arena with no recovery.
+//!
+//! The odd state was never necessary. The writer only ever mutates a block *no
+//! reader is looking at*, and the active block is never modified in place — so
+//! publication is a **single store** of `pack(generation + 1, next)` and there is
+//! no window to make atomic. A writer killed at any instruction now leaves the
+//! arena indistinguishable from one where the mutation never started, which is
+//! also what makes the A2 lock stealable with no rollback.
 //!
 //! # Arena-layout resolution
 //!
-//! Each block reserves **10 bytes per frame** (`align64(max_frames * 10)`):
-//! `parent: u32` + `edge_of_child: u32` + `depth: u16`. The `edge_of_child[c]`
+//! Each block reserves **12 bytes per frame** (`align64(max_frames * 12)`):
+//! `parent: u32` + `edge_of_child: u32` + `depth: u16` + 2 bytes of padding. The `edge_of_child[c]`
 //! side array (frame → the edge whose child is that frame) lives in the block, as
 //! `docs/PHASE1.md` §5.2 intends, so plan compilation is an O(1) array walk and
 //! the `(parent, depth, edge_of_child)` triple is double-buffered together under
@@ -26,8 +42,19 @@
 //! build does not model. The topology loom test reimplements the identical
 //! generation/active protocol with wider atoms.
 
+use tf_tree_arena::{pack_topo, unpack_topo, TOPO_BLOCKS};
+
 use crate::error::{FrameId, TopologyError};
-use crate::sync::{fence, spin, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use crate::sync::{fence, AtomicU16, AtomicU32, AtomicU64, Ordering};
+
+/// How many times a reader re-reads a topology block before giving up.
+///
+/// A reader is only disturbed if the writer advances the active index all the
+/// way around while the reader is between its first and last field load — with
+/// [`TOPO_BLOCKS`] = 4 that takes four mutations inside a three-load window.
+/// Topology mutations happen a few hundred times per process lifetime, so this
+/// bound is a safety net, not a tuning knob.
+const TOPO_RETRY_LIMIT: u32 = 64;
 
 /// One topology block: parallel `parent`/`edge_of_child`/`depth` arrays, each
 /// `max_frames` long and indexed by frame id. Index `0` is the reserved root slot.
@@ -41,57 +68,48 @@ pub struct Block<'a> {
     pub depth: &'a [AtomicU16],
 }
 
-/// A view over the header's topology seqlock and both double-buffered blocks.
+/// A view over the header's packed topology word and all of its blocks.
 pub struct TopologyView<'a> {
-    generation: &'a AtomicU64,
-    active: &'a AtomicU32,
-    blocks: [Block<'a>; 2],
+    /// Packed `(generation << 8) | active`, published by a single store.
+    topo: &'a AtomicU64,
+    blocks: [Block<'a>; TOPO_BLOCKS],
     max_frames: u32,
 }
 
 impl<'a> TopologyView<'a> {
-    /// Assemble a view from the header atomics and the two blocks.
+    /// Assemble a view from the header's topology word and the blocks.
     #[must_use]
     pub fn new(
-        generation: &'a AtomicU64,
-        active: &'a AtomicU32,
-        blocks: [Block<'a>; 2],
+        topo: &'a AtomicU64,
+        blocks: [Block<'a>; TOPO_BLOCKS],
         max_frames: u32,
     ) -> TopologyView<'a> {
         TopologyView {
-            generation,
-            active,
+            topo,
             blocks,
             max_frames,
         }
     }
 
-    /// The raw topology generation counter. **Odd while a mutation is in
-    /// flight** — callers that key a cache or pin a snapshot on it want
-    /// [`Self::stable_generation`] instead; this accessor exists for the seqlock
-    /// retry loops that check the parity themselves.
+    /// The current topology generation.
+    ///
+    /// Every published generation is stable — A1 removed the odd state — so
+    /// there is nothing to spin on and no parity to check.
     #[inline]
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        unpack_topo(self.topo.load(Ordering::Acquire)).0
     }
 
-    /// The current generation, spun until it is stable (even).
+    /// The current generation.
     ///
-    /// Every value a plan is stamped with, and every value a reader pins for a
-    /// batch, must come from here: an odd generation names a torn topology, and
-    /// pinning one makes every subsequent `Plan::at` fail with
-    /// [`crate::LookupError::TopologyChanged`] for no reason.
+    /// Retained as a distinct name because callers that pin a snapshot read
+    /// better for it, but since A1 there is no unstable generation to wait for
+    /// and this is exactly [`Self::generation`].
     #[inline]
     #[must_use]
     pub fn stable_generation(&self) -> u64 {
-        loop {
-            let g = self.generation.load(Ordering::Acquire);
-            if g & 1 == 0 {
-                return g;
-            }
-            spin();
-        }
+        self.generation()
     }
 
     /// Attach `child` under `parent` via edge `edge`: set `parent[child]` and
@@ -118,14 +136,14 @@ impl<'a> TopologyView<'a> {
             return Err(TopologyError::UnknownFrame { frame: parent });
         }
 
-        let g = self.generation.load(Ordering::Relaxed);
-        debug_assert!(g % 2 == 0, "topology writer saw an odd generation");
-        self.generation.store(g + 1, Ordering::Release); // mark unstable
-
-        let active = self.active.load(Ordering::Relaxed) as usize;
-        let inactive = 1 - active;
+        // The caller holds the mutation lock (A2 in a shared arena, the facade's
+        // mutex in a private one), so this load races nothing.
+        let word = self.topo.load(Ordering::Relaxed);
+        let (g, active) = unpack_topo(word);
+        let active = active as usize % TOPO_BLOCKS;
+        let next = (active + 1) % TOPO_BLOCKS;
         let src = &self.blocks[active];
-        let dst = &self.blocks[inactive];
+        let dst = &self.blocks[next];
 
         // Copy the active block into the inactive one, then apply the mutation.
         // parent and edge_of_child move together so the snapshot stays consistent.
@@ -140,49 +158,61 @@ impl<'a> TopologyView<'a> {
         dst.edge_of_child[c as usize].store(edge, Ordering::Relaxed);
 
         if creates_cycle(dst.parent, c, mf) {
-            // Abort: `active` is untouched, so the published topology is
-            // byte-identical to what it was on entry. Restore the *original*
-            // generation rather than advancing it — bumping to `g + 2` here would
-            // invalidate every compiled `Plan` in the process (they would all
-            // return `TopologyChanged`) for a mutation that never happened. The
-            // inactive block is left dirty, which is harmless: the next mutation
-            // copies the active block over it wholesale before touching it.
-            self.generation.store(g, Ordering::Release);
+            // Abort costs nothing to undo: the active block was never touched, so
+            // the published topology is byte-identical to what it was on entry
+            // and the topology word was never stored. The scratch block is left
+            // dirty, which is harmless — the next mutation copies the active
+            // block over it wholesale before touching it. This is the same
+            // property that makes a *crashed* writer harmless, and it is why the
+            // A2 lock can be stolen with no rollback.
             return Err(TopologyError::WouldCreateCycle { child });
         }
 
         recompute_depths(dst, mf);
 
-        self.active.store(inactive as u32, Ordering::Release);
-        self.generation.store(g + 2, Ordering::Release); // mark stable
+        // Publish. The Release fence orders every block store above before the
+        // single publishing store, which is the only thing a reader observes.
+        fence(Ordering::Release);
+        self.topo
+            .store(pack_topo(g + 1, next as u8), Ordering::Release);
         Ok(())
     }
 
-    /// Read `child`'s `(parent, depth, edge_of_child)` under the seqlock. Retries
-    /// while a write is in progress; returns the consistent triple plus the
-    /// generation it was read at, or `None` if `child` is out of range for this
-    /// arena (`FrameId` only guarantees non-zero, not in-bounds).
+    /// Read `child`'s `(parent, depth, edge_of_child)` plus the generation it was
+    /// read at.
+    ///
+    /// Wait-free: it never spins on a writer, because there is no state a writer
+    /// can leave that a reader must wait out. The loop re-reads only if the
+    /// *whole* topology word changed between the first and last field load,
+    /// which needs [`TOPO_BLOCKS`] mutations inside a three-load window.
+    ///
+    /// `None` means `child` is out of range for this arena (`FrameId` only
+    /// guarantees non-zero, not in-bounds), or — after [`TOPO_RETRY_LIMIT`]
+    /// attempts — that the topology is churning hard enough that no consistent
+    /// snapshot could be taken. Callers turn either into an error; neither is a
+    /// state a caller can usefully distinguish, and both mean "do not use this
+    /// frame".
     #[must_use]
     pub fn read_frame(&self, child: FrameId) -> Option<(u32, u16, u32, u64)> {
         if child.get() >= self.max_frames {
             return None;
         }
         let c = child.get() as usize;
-        loop {
-            let g1 = self.generation.load(Ordering::Acquire);
-            if g1 & 1 != 0 {
-                spin();
-                continue;
-            }
-            let blk = self.active.load(Ordering::Acquire) as usize;
+        for _ in 0..TOPO_RETRY_LIMIT {
+            let w1 = self.topo.load(Ordering::Acquire);
+            let (g1, active) = unpack_topo(w1);
+            // Bounds-check the index out of the word before using it: a torn or
+            // scribbled word must not index past the block array.
+            let blk = active as usize % TOPO_BLOCKS;
             let parent = self.blocks[blk].parent[c].load(Ordering::Relaxed);
             let depth = self.blocks[blk].depth[c].load(Ordering::Relaxed);
             let edge = self.blocks[blk].edge_of_child[c].load(Ordering::Relaxed);
             fence(Ordering::Acquire);
-            if self.generation.load(Ordering::Relaxed) == g1 {
+            if self.topo.load(Ordering::Relaxed) == w1 {
                 return Some((parent, depth, edge, g1));
             }
         }
+        None
     }
 }
 

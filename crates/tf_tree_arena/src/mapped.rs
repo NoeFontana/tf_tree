@@ -116,6 +116,8 @@ pub enum ShmError {
     /// The segment is smaller than an `ArenaHeader`, so it cannot even be
     /// validated.
     TooSmall,
+    /// Every participant slot is taken, so this process cannot join.
+    ParticipantTableFull,
     /// The header's region offsets do not match the geometry its own capacities
     /// imply, so the regions cannot be trusted to lie within the segment.
     ///
@@ -159,7 +161,8 @@ impl MappedArena {
         name: &str,
         layout: &ArenaLayout,
         creator_pid: u32,
-        creator_boot_id: u64,
+        owner_start_time: u64,
+        boot_id: [u8; 16],
     ) -> Result<MappedArena, ShmError> {
         const {
             assert!(
@@ -192,7 +195,16 @@ impl MappedArena {
         // zero-filled and was just sized), page-aligned hence 64-byte aligned,
         // and no other mapping of this fd exists yet, so this call uniquely owns
         // the region.
-        unsafe { write_header_at(base.as_ptr(), len, layout, creator_pid, creator_boot_id) };
+        unsafe {
+            write_header_at(
+                base.as_ptr(),
+                len,
+                layout,
+                creator_pid,
+                owner_start_time,
+                boot_id,
+            )
+        };
 
         // Step 5, the load-bearing one. SEAL itself prevents any future seal
         // being added, so a peer cannot later add F_SEAL_WRITE and freeze the

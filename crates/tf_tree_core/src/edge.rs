@@ -12,7 +12,7 @@ use tf_tree_math::Iso3;
 
 use crate::buffer::SampleRing;
 use crate::error::{ClaimError, EdgeId, PushError};
-use crate::sync::{AtomicU32, AtomicU64, Ordering};
+use crate::sync::{AtomicI64, AtomicU64, Ordering};
 
 /// Discriminant stored in [`EdgeRecord::kind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,17 +148,31 @@ impl EdgeRecord {
 #[cfg(not(loom))]
 #[repr(C, align(64))]
 pub struct ClaimRecord {
-    /// `0` free, `1` held.
-    pub state: AtomicU32,
-    /// PID of the current owner (diagnostic; written after winning the claim).
-    pub owner_pid: AtomicU32,
-    /// Boot id of the current owner's host (Phase 2 staleness check).
-    pub owner_boot_id: AtomicU64,
-    /// Bumped by the writer on every push (Phase 2 liveness input).
+    /// `0` = free, else `participant_slot + 1`.
+    ///
+    /// **One word carries both the state and the full identity** (`docs/PHASE2.md`
+    /// §1, A3), because the identity is an *indirection* into a participant
+    /// record that was completely written at attach time, long before any claim.
+    ///
+    /// Phase 1 stored `state` and `owner_pid` separately and wrote the PID
+    /// *after* winning the CAS. A writer killed in between left `state = HELD,
+    /// owner_pid = 0` — held by nobody, reclaimable by nobody, and
+    /// indistinguishable from a valid claim, so the edge leaked for the life of
+    /// the arena. In one process that was unobservable; across processes it is a
+    /// permanent resource leak.
+    pub owner: AtomicU64,
+    /// Bumped on every successful claim **and every reap**.
+    ///
+    /// This is what fences a zombie writer (A4): a `Publisher` records the epoch
+    /// it claimed at and re-checks it on every push, so a process that was
+    /// stopped, judged dead, reaped, and then resumed cannot write to an edge
+    /// somebody else now owns.
+    pub epoch: AtomicU64,
+    /// Advisory liveness hint, bumped by the writer on every push. **Never a
+    /// reaping trigger on its own** (`docs/PHASE2.md` §6.4).
     pub heartbeat: AtomicU64,
-    /// Incremented on every successful claim; a `Publisher` records the value it
-    /// observed so a future reaper/reclaim can be detected.
-    pub claim_epoch: AtomicU64,
+    /// Arena-local nanoseconds of the last push; diagnostics only.
+    pub last_push_nanos: AtomicI64,
     _pad: [u8; 32],
 }
 
@@ -173,16 +187,14 @@ const _: () = {
 /// touches. The `claim`/`release` algorithm is identical to the production one.
 #[cfg(loom)]
 pub struct ClaimRecord {
-    /// `0` free, `1` held.
-    pub state: AtomicU32,
-    /// PID of the current owner.
-    pub owner_pid: AtomicU32,
-    /// Boot id of the current owner's host.
-    pub owner_boot_id: AtomicU64,
+    /// `0` = free, else `participant_slot + 1`.
+    pub owner: AtomicU64,
+    /// Claim epoch; bumped on claim and on reap.
+    pub epoch: AtomicU64,
     /// Writer heartbeat.
     pub heartbeat: AtomicU64,
-    /// Claim epoch.
-    pub claim_epoch: AtomicU64,
+    /// Arena-local nanoseconds of the last push.
+    pub last_push_nanos: AtomicI64,
 }
 
 impl ClaimRecord {
@@ -193,22 +205,20 @@ impl ClaimRecord {
         #[cfg(not(loom))]
         {
             ClaimRecord {
-                state: AtomicU32::new(0),
-                owner_pid: AtomicU32::new(0),
-                owner_boot_id: AtomicU64::new(0),
+                owner: AtomicU64::new(0),
+                epoch: AtomicU64::new(0),
                 heartbeat: AtomicU64::new(0),
-                claim_epoch: AtomicU64::new(0),
+                last_push_nanos: AtomicI64::new(0),
                 _pad: [0; 32],
             }
         }
         #[cfg(loom)]
         {
             ClaimRecord {
-                state: AtomicU32::new(0),
-                owner_pid: AtomicU32::new(0),
-                owner_boot_id: AtomicU64::new(0),
+                owner: AtomicU64::new(0),
+                epoch: AtomicU64::new(0),
                 heartbeat: AtomicU64::new(0),
-                claim_epoch: AtomicU64::new(0),
+                last_push_nanos: AtomicI64::new(0),
             }
         }
     }
@@ -220,27 +230,34 @@ impl Default for ClaimRecord {
     }
 }
 
-/// Attempt to claim exclusive write access to an edge.
+/// Attempt to claim exclusive write access to an edge, on behalf of
+/// `participant_slot`.
 ///
-/// On success, records the owner PID/boot id and returns the freshly incremented
-/// claim epoch. Exactly one of any set of racing claimers succeeds (loom-tested).
+/// **One `compare_exchange` publishes both the held state and the owner's
+/// identity** (`docs/PHASE2.md` §1, A3). There is no window in which the edge is
+/// held by an unidentified owner, so a claimer killed at any instruction leaves
+/// the edge either free or owned by a participant record that a reaper can
+/// resolve and check for liveness.
+///
+/// On success the epoch is incremented and returned; the caller stores it and
+/// re-checks it on every push (A4).
+///
+/// Exactly one of any set of racing claimers succeeds (loom-tested).
 ///
 /// # Errors
 ///
-/// [`ClaimError::EdgeAlreadyClaimed`] if the edge is already held.
-pub fn claim(rec: &ClaimRecord, owner_pid: u32, owner_boot_id: u64) -> Result<u64, ClaimError> {
+/// [`ClaimError::EdgeAlreadyClaimed`] if the edge is already held. The reported
+/// `owner_pid` is the raw owner word — the participant slot plus one — which the
+/// facade resolves to a PID through the participant table.
+pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<u64, ClaimError> {
+    let want = u64::from(participant_slot) + 1;
     match rec
-        .state
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .owner
+        .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire)
     {
-        Ok(_) => {
-            rec.owner_pid.store(owner_pid, Ordering::Relaxed);
-            rec.owner_boot_id.store(owner_boot_id, Ordering::Relaxed);
-            let epoch = rec.claim_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            Ok(epoch)
-        }
-        Err(_) => Err(ClaimError::EdgeAlreadyClaimed {
-            owner_pid: rec.owner_pid.load(Ordering::Relaxed),
+        Ok(_) => Ok(rec.epoch.fetch_add(1, Ordering::AcqRel) + 1),
+        Err(held) => Err(ClaimError::EdgeAlreadyClaimed {
+            owner_pid: (held.saturating_sub(1)) as u32,
         }),
     }
 }
@@ -248,7 +265,21 @@ pub fn claim(rec: &ClaimRecord, owner_pid: u32, owner_boot_id: u64) -> Result<u6
 /// Release a held claim. Idempotent at the memory level but should be called
 /// exactly once, by the owner, via `Publisher::drop`.
 pub fn release(rec: &ClaimRecord) {
-    rec.state.store(0, Ordering::Release);
+    rec.owner.store(0, Ordering::Release);
+}
+
+/// Forcibly reclaim an edge whose owner is dead.
+///
+/// **The epoch is bumped *before* the owner word is cleared** (`docs/PHASE2.md`
+/// §6.3), which closes the zombie window from both ends: a stopped writer that
+/// resumes after this sees a changed epoch and refuses to push (A4), and it
+/// cannot re-acquire the same epoch because the next claimer bumps it again.
+///
+/// Cooperative and idempotent: reaping an already-free edge is a no-op beyond
+/// the epoch bump, so two reapers racing is harmless.
+pub fn reap(rec: &ClaimRecord) {
+    rec.epoch.fetch_add(1, Ordering::AcqRel);
+    rec.owner.store(0, Ordering::Release);
 }
 
 /// Exclusive writer handle for one edge.
@@ -313,6 +344,25 @@ impl<'a> Publisher<'a> {
     ///
     /// [`PushError::NonMonotonicStamp`] if the stamp regresses (invariant 6).
     pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
+        // A4: the zombie-writer check. One Relaxed load, on a cacheline this
+        // writer already owns and touches, so it costs about a nanosecond — and
+        // it is not optional.
+        //
+        // A process stopped by SIGSTOP, a GC pause, or a page fault against a
+        // slow device can be judged dead, have its claim reaped, and then
+        // *resume*. Without this it would carry on publishing into an edge
+        // another process now owns: two writers on a single-writer ring, tearing
+        // each other's samples silently. That is precisely the failure the claim
+        // model exists to prevent, so the model has to survive its own owner
+        // being wrong about who is alive.
+        //
+        // `reap` bumps the epoch *before* freeing the claim, so the window is
+        // closed from both ends.
+        if self.claim.epoch.load(Ordering::Relaxed) != self.epoch {
+            return Err(PushError::ClaimRevoked {
+                edge: self.ring.edge,
+            });
+        }
         self.ring.push(stamp, iso)
     }
 }

@@ -1,0 +1,169 @@
+//! The participant table — who is attached, and are they still alive.
+//!
+//! `docs/PHASE2.md` §1 A6 and §5. A participant is a process that has mapped the
+//! arena. Its **slot index** is the identity everything else names: a claim
+//! records `participant_slot + 1`, and the topology lock records the same, so
+//! both publish an owner and its full identity in a *single* store.
+//!
+//! That indirection is the whole point (A3). Phase 1's claim record wrote
+//! `state` and then `owner_pid` as two stores; a writer `SIGKILL`ed between them
+//! left `state = HELD, owner_pid = 0` — held by nobody, reclaimable by nobody, a
+//! permanently leaked edge. Pointing at a participant record that was **fully
+//! written at attach time, long before any claim** collapses that to one store.
+//!
+//! `unsafe`-free: the record slice is handed in by [`crate::arena_view`].
+//!
+//! # Identity is PID + start time, never a bare PID
+//!
+//! PIDs wrap. A reaper that trusted a bare PID would eventually conclude that a
+//! long-dead participant is alive because an unrelated process now holds its
+//! number — and then refuse to reclaim its resources forever. The process start
+//! time (`/proc/<pid>/stat` field 22) pins the identity: the pair is unique for
+//! as long as the machine is up, and [`crate::arena_view::ArenaView`]'s header
+//! carries the boot id that scopes it (§5.1).
+
+use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+
+/// Slot is unused.
+pub const FREE: u32 = 0;
+/// Slot is being filled in by a registrant that has not published yet.
+pub const RESERVED: u32 = 1;
+/// Slot is fully written and its participant is attached.
+pub const LIVE: u32 = 2;
+
+/// One participant's record. 128 bytes, matching the arena's participant stride.
+#[repr(C, align(64))]
+pub struct ParticipantRecord {
+    /// [`FREE`] / [`RESERVED`] / [`LIVE`].
+    pub state: AtomicU32,
+    /// Operating-system process id.
+    pub pid: AtomicU32,
+    /// Process start time in clock ticks since boot — what makes `pid`
+    /// reuse-proof.
+    pub start_time: AtomicU64,
+    /// Bumped every time this slot is reused, so a claim naming a slot can be
+    /// told apart from one naming the *same* slot a generation earlier.
+    pub incarnation: AtomicU64,
+    /// When the participant attached (arena-local nanoseconds; diagnostics).
+    pub attached_at_nanos: AtomicI64,
+    /// Advisory liveness hint. **Never a reaping trigger on its own**
+    /// (`docs/PHASE2.md` §6.4): a participant that is merely idle, or stopped by
+    /// a debugger, is not dead.
+    pub heartbeat: AtomicU64,
+    _pad: [u8; 88],
+}
+
+#[cfg(not(loom))]
+const _: () = {
+    assert!(core::mem::size_of::<ParticipantRecord>() == 128);
+    assert!(core::mem::align_of::<ParticipantRecord>() == 64);
+};
+
+/// Why a process could not join the arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParticipantError {
+    /// Every slot is occupied. Capacity is fixed at construction (invariant 3).
+    TableFull,
+}
+
+/// A borrowed view over the participant table.
+pub struct ParticipantTable<'a> {
+    slots: &'a [ParticipantRecord],
+}
+
+impl<'a> ParticipantTable<'a> {
+    /// Wrap the arena's participant records.
+    #[must_use]
+    pub fn new(slots: &'a [ParticipantRecord]) -> ParticipantTable<'a> {
+        ParticipantTable { slots }
+    }
+
+    /// Number of slots.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The record at `slot`, or `None` if out of range.
+    #[must_use]
+    pub fn get(&self, slot: u32) -> Option<&'a ParticipantRecord> {
+        self.slots.get(slot as usize)
+    }
+
+    /// Register this process, returning its slot index and incarnation.
+    ///
+    /// # Crash consistency
+    ///
+    /// Publication is two-phase, and the intermediate state is **distinguishable
+    /// garbage** rather than a plausible-looking record:
+    ///
+    /// 1. CAS [`FREE`] -> [`RESERVED`], which wins the slot exclusively.
+    /// 2. Write the identity fields, which nobody may read yet.
+    /// 3. Release-store [`LIVE`], which publishes them.
+    ///
+    /// A process killed between 1 and 3 leaves a [`RESERVED`] slot. No live
+    /// participant is ever `RESERVED` for more than a few instructions, so a
+    /// reaper can reclaim one on sight without having to decide whether it is
+    /// looking at a valid record — which is exactly the judgement A3's broken
+    /// claim record forced and could not make.
+    ///
+    /// # Errors
+    ///
+    /// [`ParticipantError::TableFull`] if no slot is free.
+    pub fn register(
+        &self,
+        pid: u32,
+        start_time: u64,
+        now_nanos: i64,
+    ) -> Result<(u32, u64), ParticipantError> {
+        for (i, rec) in self.slots.iter().enumerate() {
+            if rec
+                .state
+                .compare_exchange(FREE, RESERVED, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            // Exclusively ours: no other registrant can be here, and no reader
+            // trusts a non-LIVE slot.
+            rec.pid.store(pid, Ordering::Relaxed);
+            rec.start_time.store(start_time, Ordering::Relaxed);
+            rec.attached_at_nanos.store(now_nanos, Ordering::Relaxed);
+            rec.heartbeat.store(0, Ordering::Relaxed);
+            let incarnation = rec.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
+            // Release publishes every store above to anyone who sees LIVE.
+            rec.state.store(LIVE, Ordering::Release);
+            return Ok((i as u32, incarnation));
+        }
+        Err(ParticipantError::TableFull)
+    }
+
+    /// Release a slot on clean detach.
+    ///
+    /// Idempotent at the memory level. The identity fields are deliberately left
+    /// behind: a reaper inspecting a freed slot gets a truthful record of who was
+    /// last there, and the next registrant overwrites them under [`RESERVED`]
+    /// before anyone can read them.
+    pub fn release(&self, slot: u32) {
+        if let Some(rec) = self.get(slot) {
+            rec.state.store(FREE, Ordering::Release);
+        }
+    }
+
+    /// Read a slot's `(pid, start_time, incarnation)` if it is [`LIVE`].
+    ///
+    /// The Acquire load pairs with `register`'s Release store, so a caller that
+    /// sees `LIVE` sees fully-written identity fields.
+    #[must_use]
+    pub fn identity(&self, slot: u32) -> Option<(u32, u64, u64)> {
+        let rec = self.get(slot)?;
+        if rec.state.load(Ordering::Acquire) != LIVE {
+            return None;
+        }
+        Some((
+            rec.pid.load(Ordering::Relaxed),
+            rec.start_time.load(Ordering::Relaxed),
+            rec.incarnation.load(Ordering::Relaxed),
+        ))
+    }
+}

@@ -23,7 +23,7 @@ use tf_tree_core::arena_view::{ArenaBuilder, ArenaView};
 use tf_tree_core::edge::{claim, EdgeKind, EdgeRecord, Publisher};
 use tf_tree_core::frame::blake3_64;
 use tf_tree_core::plan::{compile, Domain, EdgeMeta, Guard, InterpPolicy, Stamp, SystemDomain};
-use tf_tree_core::{EdgeId, FrameError, FrameId, LookupError, TopologyError};
+use tf_tree_core::{EdgeId, FrameError, FrameId, LookupError, ParticipantError, TopologyError};
 use tf_tree_math::Iso3;
 
 use crate::cache;
@@ -278,11 +278,14 @@ impl TreeBuilder {
     /// arena would exceed the `u32` offset model), a frame name collides on its
     /// 64-bit hash, or an edge would create a cycle.
     pub fn build(self) -> Result<Tree, BuildError> {
-        let (arena, boot_id) =
-            self.build_with(|layout, pid, boot| Ok(HeapArena::new(layout, pid, boot)))?;
+        let arena = self
+            .build_with(|layout, pid, start, boot| Ok(HeapArena::new(layout, pid, start, boot)))?;
+        let backing = ArenaBacking::Heap(arena);
+        let participant = register_participant(&ArenaView::new(backing.as_dyn()))
+            .map_err(BuildError::Participant)?;
         Ok(Tree {
-            arena: ArenaBacking::Heap(arena),
-            boot_id,
+            arena: backing,
+            participant,
             decl: Mutex::new(()),
         })
     }
@@ -306,12 +309,15 @@ impl TreeBuilder {
     /// sealed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn build_shared(self, name: &str) -> Result<Tree, BuildError> {
-        let (arena, boot_id) = self.build_with(|layout, pid, boot| {
-            MappedArena::create(name, layout, pid, boot).map_err(BuildError::Shm)
+        let arena = self.build_with(|layout, pid, start, boot| {
+            MappedArena::create(name, layout, pid, start, boot).map_err(BuildError::Shm)
         })?;
+        let backing = ArenaBacking::Mapped(arena);
+        let participant = register_participant(&ArenaView::new(backing.as_dyn()))
+            .map_err(BuildError::Participant)?;
         Ok(Tree {
-            arena: ArenaBacking::Mapped(arena),
-            boot_id,
+            arena: backing,
+            participant,
             decl: Mutex::new(()),
         })
     }
@@ -326,8 +332,8 @@ impl TreeBuilder {
     /// claim of Phase 2.
     fn build_with<A: Arena>(
         self,
-        make: impl FnOnce(&ArenaLayout, u32, u64) -> Result<A, BuildError>,
-    ) -> Result<(A, u64), BuildError> {
+        make: impl FnOnce(&ArenaLayout, u32, u64, [u8; 16]) -> Result<A, BuildError>,
+    ) -> Result<A, BuildError> {
         // 1. Unique frame names in first-seen order (explicit frames, then edge
         //    endpoints). Order only affects id assignment, not correctness.
         let mut names: Vec<&str> = Vec::new();
@@ -379,7 +385,7 @@ impl TreeBuilder {
         //    them sound: no shared `ArenaView` can exist while one happens.
         let layout = ArenaLayout::new(max_frames, max_edges, caps)?;
         let boot_id = boot_id();
-        let mut arena = make(&layout, std::process::id(), boot_id)?;
+        let mut arena = make(&layout, std::process::id(), process_start_time(), boot_id)?;
         // Scoped so the builder's exclusive borrow ends before `arena` moves into
         // the `Tree`; nothing may declare an edge once the tree is shareable.
         {
@@ -447,7 +453,7 @@ impl TreeBuilder {
             }
         }
 
-        Ok((arena, boot_id))
+        Ok(arena)
     }
 }
 
@@ -508,7 +514,11 @@ impl ArenaBacking {
 /// caches its own [`crate::Plan`]s.
 pub struct Tree {
     arena: ArenaBacking,
-    boot_id: u64,
+    /// This process's slot in the arena's participant table.
+    ///
+    /// Claims name this slot rather than a PID (`docs/PHASE2.md` §1, A3), which
+    /// is what lets a claim publish its owner and its identity in one store.
+    participant: u32,
     /// Serializes runtime topology mutations (the single seqlock writer).
     decl: Mutex<()>,
 }
@@ -554,13 +564,11 @@ impl Tree {
             return Err(ReparentError::ReadOnly);
         }
         // `decl` is a process-local mutex, so it serializes nothing against a
-        // peer process. Worse, `set_parent` publishes an *odd* generation for
-        // the duration of its block copy, so a writer killed mid-mutation would
-        // leave every reader in every process spinning forever in plan
-        // compilation. `docs/PHASE2.md` §1 amendments A1 and A2 exist to fix
-        // exactly that — an in-arena reapable lock and a single publishing store
-        // with no odd state — and until they land, runtime topology mutation on
-        // a shared arena is refused rather than raced.
+        // peer process. A1 has since removed the odd-generation window, so a
+        // crashed mutator no longer wedges readers — but two *concurrent*
+        // mutators would still race the block copy, because A2's in-arena lock
+        // is not yet wired up here. Until it is, runtime topology mutation on a
+        // shared arena is refused rather than raced.
         if self.arena.is_shared() {
             return Err(ReparentError::SharedArena);
         }
@@ -613,7 +621,7 @@ impl Tree {
         let (Some(ring), Some(claim_rec)) = (view.ring(eid), view.claim(eid)) else {
             return Err(ClaimApiError::NotDynamic { child, edge: eid });
         };
-        let epoch = claim(claim_rec, std::process::id(), self.boot_id)?;
+        let epoch = claim(claim_rec, self.participant)?;
         Ok(Publisher::new(ring, claim_rec, epoch))
     }
 
@@ -657,7 +665,7 @@ impl Tree {
         let view = self.view();
         let t = find(&view, target)?;
         let s = find(&view, source)?;
-        // Must be the *stable* generation: an odd one names a torn topology, and
+        // Always a stable generation since A1: there is no torn value, and
         // caching a plan under it would key the cache on a value `compile` never
         // stamps a plan with — so every lookup during a mutation would miss the
         // cache and then fail with `TopologyChanged`.
@@ -713,10 +721,19 @@ impl Tree {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn attach_shared(fd: std::os::fd::OwnedFd, mode: AttachMode) -> Result<Tree, ShmError> {
         let arena = MappedArena::attach(fd, mode)?;
-        let boot_id = arena.header().creator_boot_id;
+        let backing = ArenaBacking::Mapped(arena);
+        // A read-only peer cannot register — the table is in the arena and
+        // registration writes to it. It takes the sentinel slot instead, and
+        // every mutating entry point already refuses before reaching a claim.
+        let participant = if backing.is_writable() {
+            register_participant(&ArenaView::new(backing.as_dyn()))
+                .map_err(|_| ShmError::ParticipantTableFull)?
+        } else {
+            u32::MAX
+        };
         Ok(Tree {
-            arena: ArenaBacking::Mapped(arena),
-            boot_id,
+            arena: backing,
+            participant,
             decl: Mutex::new(()),
         })
     }
@@ -739,6 +756,17 @@ impl Tree {
     #[must_use]
     pub fn is_shared(&self) -> bool {
         self.arena.is_shared()
+    }
+
+    /// The boot id of the host that created this arena, all 16 bytes.
+    ///
+    /// Read from the header rather than cached: a `Tree` that attached to
+    /// somebody else's segment must report the *creator's* boot id, which is
+    /// what makes a segment surviving a reboot detectable (`docs/PHASE2.md` §1,
+    /// A7).
+    #[must_use]
+    pub fn boot_id(&self) -> [u8; 16] {
+        self.view().header().boot_id
     }
 
     /// Whether this tree may publish — false for a read-only attachment.
@@ -815,18 +843,86 @@ fn edge_meta(view: &ArenaView, eid: EdgeId) -> Option<EdgeMeta> {
 
 /// Best-effort Linux boot id folded to a `u64` (Phase 2 staleness input); `0` if
 /// unavailable. Phase 1 stores it and does nothing else with it.
-fn boot_id() -> u64 {
-    match std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
-        Ok(s) => {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-            for b in s.trim().bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            h
+impl Drop for Tree {
+    fn drop(&mut self) {
+        // Release the participant slot on a clean exit. A slot leaked by a
+        // *crash* is the reaper's problem (`docs/PHASE2.md` §6); this is the
+        // orderly path, and skipping it would exhaust the table across
+        // repeated attach/detach cycles in a long-lived arena.
+        //
+        // Read-only attachments never registered (they cannot write the table),
+        // so they have nothing to release.
+        if self.participant != u32::MAX && self.arena.is_writable() {
+            self.view().participants().release(self.participant);
         }
-        Err(_) => 0,
     }
+}
+
+/// Register this process in the arena's participant table.
+///
+/// Every `Tree` — created or attached — takes a slot, because a claim names a
+/// slot and there is no other way to be named. The slot is released in
+/// [`Tree`]'s `Drop`.
+fn register_participant(view: &ArenaView) -> Result<u32, ParticipantError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    view.participants()
+        .register(std::process::id(), process_start_time(), now)
+        .map(|(slot, _incarnation)| slot)
+}
+
+/// The host's Linux boot id, all 16 bytes; zeros if unavailable.
+///
+/// **Not hashed to 64 bits** (`docs/PHASE2.md` §1, A7). A boot id is a 128-bit
+/// UUID, and folding it into a `u64` throws away exactly the property that makes
+/// it useful — that two hosts, or one host across a reboot, do not collide. A
+/// stale segment surviving a reboot is precisely what this detects.
+fn boot_id() -> [u8; 16] {
+    let Ok(text) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return [0u8; 16];
+    };
+    let mut out = [0u8; 16];
+    let mut nibbles = text.trim().bytes().filter_map(|b| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None, // the dashes
+    });
+    for byte in &mut out {
+        let (Some(hi), Some(lo)) = (nibbles.next(), nibbles.next()) else {
+            return [0u8; 16]; // malformed: report "unknown" rather than partial
+        };
+        *byte = (hi << 4) | lo;
+    }
+    out
+}
+
+/// This process's start time in clock ticks since boot (`/proc/self/stat` field
+/// 22); `0` if unavailable.
+///
+/// Paired with the PID this is a **reuse-proof** process identity
+/// (`docs/PHASE2.md` §1, A7 and §5.1): PIDs wrap, and a reaper that trusted a
+/// bare PID could conclude a long-dead participant is alive because an unrelated
+/// process now holds its number.
+///
+/// Field 22 is counted after the comm field, which is parenthesised and may
+/// itself contain spaces and parentheses — so the scan starts after the *last*
+/// `)`, not at a naive whitespace split.
+fn process_start_time() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0;
+    };
+    let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return 0;
+    };
+    // After `)` the fields are state(3), ppid(4), ... starttime(22), so
+    // starttime is the 20th whitespace-separated token here.
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// A [`LookupError`] paired with the [`Tree`] that can resolve its ids to names.
@@ -940,6 +1036,9 @@ pub enum BuildError {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[error("shared memory error: {0:?}")]
     Shm(ShmError),
+    /// The participant table is full, so this process cannot join the arena.
+    #[error("participant table full: {0:?}")]
+    Participant(ParticipantError),
 }
 
 impl From<LayoutError> for BuildError {

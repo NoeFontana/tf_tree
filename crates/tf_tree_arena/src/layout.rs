@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::header::ArenaHeader;
+use crate::header::{ArenaHeader, TOPO_BLOCKS};
 
 /// Round `n` up to the next multiple of 64.
 const fn align64(n: usize) -> usize {
@@ -70,6 +70,7 @@ pub enum LayoutError {
 pub struct ArenaLayout {
     max_frames: u32,
     max_edges: u32,
+    max_participants: u32,
     edge_capacities: Vec<u32>,
     computed: Computed,
 }
@@ -80,47 +81,66 @@ const R_FRAME_TABLE: usize = 1;
 const R_FRAME_HASH: usize = 2;
 const R_TOPO: usize = 3;
 const R_CLAIM: usize = 4;
-const R_EDGE: usize = 5;
-const R_STAMP: usize = 6;
-const R_POSE: usize = 7;
+const R_PARTICIPANT: usize = 5;
+const R_EDGE: usize = 6;
+const R_STAMP: usize = 7;
+const R_POSE: usize = 8;
+/// Number of regions in header order.
+const N_REGIONS: usize = 9;
+
+/// Default participant-table capacity (`docs/PHASE2.md` §1 A6).
+pub const DEFAULT_MAX_PARTICIPANTS: u32 = 64;
 
 #[derive(Clone, Copy, Debug)]
 struct Computed {
-    regions: [Region; 8],
+    regions: [Region; N_REGIONS],
     topo_stride: usize,
     slots: usize,
 }
 
 /// Derive the region layout from the fixed capacities. Pure arithmetic; called
 /// exactly once, from [`ArenaLayout::new`].
-fn compute(max_frames: u32, max_edges: u32, edge_capacities: &[u32]) -> Computed {
+fn compute(
+    max_frames: u32,
+    max_edges: u32,
+    max_participants: u32,
+    edge_capacities: &[u32],
+) -> Computed {
     let mf = max_frames as usize;
     let me = max_edges as usize;
+    let mp = max_participants as usize;
     let slots: usize = edge_capacities.iter().map(|&c| c as usize).sum();
 
-    // 10 B / frame: parent u32 + depth u16 + edge_of_child u32. edge_of_child
-    // lives in the block (not a separate region) so plan compilation is an O(1)
-    // array walk and the (parent, depth, edge_of_child) triple is double-buffered
-    // together under the topology seqlock. (Resolves the inconsistency between
-    // the 6-byte stride in `docs/PHASE1.md` §4.3 and edge_of_child living in the
-    // topology block per §5.2.)
-    let topo_stride = align64(mf * 10);
+    // 12 B / frame: parent AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16
+    // + 2 B pad. edge_of_child lives in the block (not a separate region) so plan
+    // compilation is an O(1) array walk and the (parent, depth, edge_of_child)
+    // triple is published together by the single topology store. (Resolves the
+    // inconsistency between the 6-byte stride in `docs/PHASE1.md` §4.3 and
+    // edge_of_child living in the topology block per §5.2.)
+    //
+    // The fields are **atomics** (`docs/PHASE2.md` §1 A1): a reader racing a
+    // writer on the same block reads garbage and discards it, but reading a
+    // non-atomic `u32` while another *process* writes it is a data race and
+    // therefore UB even when the value is thrown away. Relaxed atomic loads
+    // compile to the same instruction.
+    let topo_stride = align64(mf * 12);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
         256usize,                             // header
         align64(mf * 64),                     // frame table (64 B / frame)
         align64(next_pow2(2 * mf) * (8 + 4)), // frame hash (AtomicU64 + AtomicU32)
-        2 * topo_stride,                      // two topology blocks
+        TOPO_BLOCKS * topo_stride,            // topology blocks (A1: four)
         align64(me * 64),                     // claim table (64 B / edge)
+        align64(mp * 128),                    // participant table (128 B / slot)
         align64(me * 128),                    // edge table (128 B / edge)
         align64(slots * 8),                   // stamp arena (i64 / slot)
         align64(slots * 64),                  // pose arena (PoseSlot / slot)
     ];
 
-    let mut regions = [Region { offset: 0, size: 0 }; 8];
+    let mut regions = [Region { offset: 0, size: 0 }; N_REGIONS];
     let mut off = 0usize;
     let mut i = 0;
-    while i < 8 {
+    while i < N_REGIONS {
         regions[i] = Region {
             offset: off,
             size: sizes[i],
@@ -163,7 +183,8 @@ impl ArenaLayout {
             }
         }
 
-        let computed = compute(max_frames, max_edges, &edge_capacities);
+        let max_participants = DEFAULT_MAX_PARTICIPANTS;
+        let computed = compute(max_frames, max_edges, max_participants, &edge_capacities);
         // Every region offset and the slot counts are stored as `u32` in the
         // header. The pose arena is the last region, so its end is `total_size`;
         // if that fits `u32`, every offset (<= total_size) and every slot count
@@ -178,6 +199,7 @@ impl ArenaLayout {
         Ok(ArenaLayout {
             max_frames,
             max_edges,
+            max_participants,
             edge_capacities,
             computed,
         })
@@ -203,7 +225,8 @@ impl ArenaLayout {
         max_edges: u32,
         total_slots: u32,
     ) -> Result<ArenaLayout, LayoutError> {
-        let computed = compute(max_frames, max_edges, &[total_slots]);
+        let max_participants = DEFAULT_MAX_PARTICIPANTS;
+        let computed = compute(max_frames, max_edges, max_participants, &[total_slots]);
         let total_size = computed.regions[R_POSE].offset + computed.regions[R_POSE].size;
         if total_size > u32::MAX as usize {
             return Err(LayoutError::ArenaTooLarge {
@@ -213,6 +236,7 @@ impl ArenaLayout {
         Ok(ArenaLayout {
             max_frames,
             max_edges,
+            max_participants,
             edge_capacities: Vec::new(),
             computed,
         })
@@ -226,6 +250,16 @@ impl ArenaLayout {
     /// Maximum number of edges.
     pub fn max_edges(&self) -> u32 {
         self.max_edges
+    }
+
+    /// Capacity of the participant table, in records.
+    pub fn max_participants(&self) -> u32 {
+        self.max_participants
+    }
+
+    /// The participant table region (`docs/PHASE2.md` §1 A6).
+    pub fn participant_table(&self) -> Region {
+        self.computed.regions[R_PARTICIPANT]
     }
 
     /// The validated per-edge ring capacities.
@@ -325,10 +359,11 @@ pub const fn layout_hash() -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     h = fnv1a_u32(h, core::mem::size_of::<ArenaHeader>() as u32);
     h = fnv1a_u32(h, core::mem::align_of::<ArenaHeader>() as u32);
-    // Region strides in header order: header size, frame/edge/claim/pose byte
-    // widths, frame-hash entry width, topology per-frame width (10 = parent u32 +
-    // depth u16 + edge_of_child u32), stamp width.
-    let strides: [u32; 8] = [256, 64, 12, 10, 64, 128, 8, 64];
+    // Region strides in header order: header size, frame/edge/claim/participant/
+    // pose byte widths, frame-hash entry width, topology per-frame width
+    // (12 = parent AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16 + pad),
+    // topology block count, stamp width.
+    let strides: [u32; 10] = [256, 64, 12, 12, TOPO_BLOCKS as u32, 64, 128, 128, 8, 64];
     let mut i = 0;
     while i < strides.len() {
         h = fnv1a_u32(h, strides[i]);
@@ -346,13 +381,14 @@ mod tests {
     use proptest::prelude::*;
     use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
-    fn all_regions(l: &ArenaLayout) -> [Region; 8] {
+    fn all_regions(l: &ArenaLayout) -> [Region; N_REGIONS] {
         [
             l.header_region(),
             l.frame_table(),
             l.frame_hash(),
             l.topo_blocks(),
             l.claim_table(),
+            l.participant_table(),
             l.edge_table(),
             l.stamp_arena(),
             l.pose_arena(),
@@ -423,16 +459,17 @@ mod tests {
         );
         assert_eq!(l.frame_table().size, 64_000); // 1000 * 64
         assert_eq!(l.frame_hash().size, 24_576); // next_pow2(2000)=2048 * 12
-        assert_eq!(l.topo_block_stride(), 10_048); // align64(1000 * 10)
-        assert_eq!(l.topo_blocks().size, 20_096); // 2 * 10048
+        assert_eq!(l.topo_block_stride(), 12_032); // align64(1000 * 12)
+        assert_eq!(l.topo_blocks().size, 48_128); // TOPO_BLOCKS * 12032
         assert_eq!(l.claim_table().size, 64_000); // 1000 * 64
+        assert_eq!(l.participant_table().size, 8_192); // 64 * 128
         assert_eq!(l.edge_table().size, 128_000); // 1000 * 128
         assert_eq!(l.stamp_arena().size, 32_768_000); // 4_096_000 * 8
         assert_eq!(l.pose_arena().size, 262_144_000); // 4_096_000 * 64
 
         // Pose arena is ~260 MB.
         assert!((260_000_000..=263_000_000).contains(&l.pose_arena().size));
-        assert_eq!(l.total_size(), 295_212_928);
+        assert_eq!(l.total_size(), 295_249_152);
 
         // Every region offset is 64-byte aligned and regions are contiguous.
         let regions = all_regions(&l);
@@ -452,14 +489,15 @@ mod tests {
 
         assert_eq!(l.frame_table().size, 512); // 8 * 64
         assert_eq!(l.frame_hash().size, 192); // next_pow2(16)=16 * 12
-        assert_eq!(l.topo_block_stride(), 128); // align64(8 * 10 = 80)
-        assert_eq!(l.topo_blocks().size, 256); // 2 * 128
+        assert_eq!(l.topo_block_stride(), 128); // align64(8 * 12 = 96)
+        assert_eq!(l.topo_blocks().size, 512); // TOPO_BLOCKS * 128
         assert_eq!(l.claim_table().size, 256); // 4 * 64
+        assert_eq!(l.participant_table().size, 8_192); // 64 * 128
         assert_eq!(l.edge_table().size, 512); // 4 * 128
         assert_eq!(l.stamp_slots(), 84);
         assert_eq!(l.stamp_arena().size, 704); // align64(84 * 8 = 672)
         assert_eq!(l.pose_arena().size, 5_376); // 84 * 64 (already aligned)
-        assert_eq!(l.total_size(), 8_064);
+        assert_eq!(l.total_size(), 16_512);
 
         let regions = all_regions(&l);
         for w in regions.windows(2) {
@@ -475,7 +513,7 @@ mod tests {
         // this value, which is exactly what Phase 2's attach check relies on.
         assert_eq!(layout_hash(), layout_hash());
         assert_ne!(layout_hash(), 0);
-        assert_eq!(layout_hash(), 0x4135_25e4);
+        assert_eq!(layout_hash(), 0x1F32_7F69);
     }
 
     #[test]
@@ -516,7 +554,7 @@ mod tests {
                     prop_assert_eq!(w[0].size % 64, 0);
                     prop_assert_eq!(w[0].offset + w[0].size, w[1].offset);
                 }
-                let last = regions[7];
+                let last = regions[N_REGIONS - 1];
                 prop_assert_eq!(l.total_size(), last.offset + last.size);
                 prop_assert_eq!(l.total_size() % 64, 0);
                 prop_assert_eq!(u64::from(l.stamp_slots()), sum);
