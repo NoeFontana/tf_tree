@@ -435,6 +435,20 @@ oversubscribes 2:1, which is why its per-lookup latency doubles while aggregate
 throughput stays flat — the correct and expected shape, not contention. There is
 no lock for the processes to contend on.
 
+That last claim is checkable rather than rhetorical. Eight processes sharing four
+cores each get 50% of a core, so a lookup that takes 213 ns at full speed should
+take 426 ns. **Measured: 431 ns.** The 8-process row is pure oversubscription,
+with ~1% left over for anything else — there is no hidden cross-process cost to
+go looking for.
+
+One inference, flagged as such because this host's `perf_event_paranoid` forbids
+the counters that would confirm it: because the arena is *shared*, N processes
+touch the **same cache lines**, so the cache footprint of transform data is
+independent of consumer count. tf2's N private buffers would be N x 1.4 MB of
+distinct lines — 5.6 MB at four consumers, past many L3s. This is consistent with
+the 4-process row costing only 21% more per lookup than one process, but it is
+not measured.
+
 Two things worth noting against the thread table above. Multi-**process** scaling
 at 4 (3.31x) is slightly *better* than multi-thread scaling at 4 (2.79-3.09x):
 separate address spaces share no allocator, no TLS and no false-shared cache
