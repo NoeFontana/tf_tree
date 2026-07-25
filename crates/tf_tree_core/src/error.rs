@@ -212,6 +212,15 @@ pub enum FrameError {
     /// The frame table is full (`max_frames` reached). Capacity is fixed at
     /// construction (invariant 3); there is no growth.
     CapacityExceeded,
+    /// Another interner holds this name's slot and cannot be judged.
+    ///
+    /// Raised when the claimant is an *anonymous* view (one built without
+    /// `ArenaView::as_participant`), which names no participant record, so no
+    /// caller can decide whether it is alive. Taking the entry over would
+    /// allocate a second id for one name; waiting forever is the hang A8 exists
+    /// to prevent. Reporting it is the only remaining option, and it is
+    /// actionable: identify the view.
+    InternContended,
     /// The arena is mapped read-only, so a name that is not already interned
     /// cannot be added.
     ///

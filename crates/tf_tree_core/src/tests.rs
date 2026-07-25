@@ -258,7 +258,8 @@ fn claim_is_exclusive_and_epoch_increments() {
     let rec = ClaimRecord::new();
     let (e1, owner1) = claim(&rec, 111).unwrap();
     assert_eq!(e1, 1);
-    assert_eq!(owner1, 112, "owner word is participant_slot + 1");
+    assert_eq!(owner1 & 0xFFFF, 112, "low bits are participant_slot + 1");
+    assert_eq!(owner1 >> 16, e1, "high bits are the claim epoch");
     // Second claim on a live edge fails, naming the owning *slot* — not a pid.
     let err = claim(&rec, 222).unwrap_err();
     assert_eq!(err, ClaimError::EdgeAlreadyClaimed { owner_slot: 111 });
@@ -275,6 +276,40 @@ fn claim_is_exclusive_and_epoch_increments() {
 /// unconditional `owner.store(0)` in `release` would free *P2's* live claim and
 /// let a third process claim the same edge — two writers on a single-writer
 /// ring, which is the failure A4 exists to prevent, arriving through `Drop`.
+/// The case the first version of this test missed, and the one that matters.
+///
+/// A revoked writer is *told* by `PushError::ClaimRevoked` to re-claim. Doing so
+/// from the same participant slot produced an identical owner word under the
+/// original `slot + 1` encoding, so dropping the stale `Publisher` freed the
+/// brand-new claim while it was still publishing. Folding the epoch into the
+/// word is what makes each acquisition distinguishable.
+#[test]
+fn a_stale_release_cannot_free_the_same_slots_new_claim() {
+    use crate::edge::{reap, release, ClaimRecord};
+    use crate::sync::Ordering;
+
+    let rec = ClaimRecord::new();
+    let (_old_epoch, old_owner) = claim(&rec, 7).unwrap();
+
+    // Reaped, then the *same* participant re-claims — what ClaimRevoked says to do.
+    reap(&rec);
+    let (new_epoch, new_owner) = claim(&rec, 7).unwrap();
+    assert_ne!(
+        old_owner, new_owner,
+        "two acquisitions by one slot produced the same owner word"
+    );
+
+    // The stale Publisher drops.
+    release(&rec, old_owner);
+
+    assert_eq!(
+        rec.owner.load(Ordering::Acquire),
+        new_owner,
+        "a stale release freed the same participant's new claim"
+    );
+    assert_eq!(rec.epoch.load(Ordering::Acquire), new_epoch);
+}
+
 #[test]
 fn a_stale_release_cannot_free_someone_elses_claim() {
     use crate::edge::{reap, release, ClaimRecord};
@@ -435,11 +470,17 @@ fn wedge_intern_slot(view: &ArenaView, name: &str, owner_slot: u32) -> usize {
 /// spin*, and a test that simply calls `intern` would wedge CI instead of
 /// reporting a failure. The worker is deliberately detached: if it is stuck it
 /// stays stuck, and the process exits out from under it once the suite ends.
+///
+/// The deadline is a hang detector, not a performance assertion, so it scales
+/// with the interpreter: a bounded spin that finishes in milliseconds natively
+/// takes ~10 s under Miri, which put the tightest of these tests right on the
+/// edge and made it fail only when the suite ran in parallel.
 fn assert_completes_within<T: Send + 'static>(
     secs: u64,
     what: &str,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> T {
+    let secs = if cfg!(miri) { secs * 30 } else { secs };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
@@ -859,4 +900,101 @@ fn stale_odd_seq_from_a_dead_writer_is_healed_by_the_next_push() {
     // the seqlock's monotonicity — what lets a reader detect a concurrent
     // overwrite — is preserved rather than reset.
     assert!(seq > 1, "seq went backwards: {seq}");
+}
+
+/// A stale `release` must not free a slot that has been reaped and re-registered.
+///
+/// This is the cheap half of the check, and it is honest about what it covers:
+/// the *sequential* case, which the previous two-word guard (load `incarnation`,
+/// then CAS `state`) also passed. The failure that guard actually had needs the
+/// reap and the re-`register` to land between its two words, so the test that
+/// exercises it is `loom_tests::a_late_release_racing_a_slot_handover_frees_nobody`.
+/// Keep both: this one runs on every `just test`, the loom one on `just loom`.
+#[test]
+fn a_stale_release_cannot_free_a_reused_participant_slot() {
+    use crate::participant::{state_of, ParticipantTable, LIVE};
+    use core::sync::atomic::Ordering;
+
+    let slots: Vec<ParticipantRecord> = (0..2).map(|_| ParticipantRecord::default()).collect();
+    let table = ParticipantTable::new(&slots);
+
+    let (slot, inc1) = table.register(1234, 99, 0).expect("register");
+    // The process dies; a reaper frees the slot, and another process takes it.
+    table.release(slot, inc1);
+    let (slot2, inc2) = table.register(5678, 100, 0).expect("re-register");
+    assert_eq!(slot2, slot, "the freed slot should be the one reused");
+    assert_ne!(inc2, inc1);
+
+    // The first process's `Drop` finally runs, one incarnation too late.
+    table.release(slot, inc1);
+
+    let rec = table.get(slot).expect("slot");
+    assert_eq!(
+        state_of(rec.state.load(Ordering::Acquire)),
+        LIVE,
+        "a stale release freed the slot's new occupant"
+    );
+    assert_eq!(
+        table.identity(slot).map(|id| id.0),
+        Some(5678),
+        "the new occupant's identity must survive the stale release"
+    );
+}
+
+/// A stalled *anonymous* claimant must be reported, in bounded time, to both a
+/// would-be interner and a reader — never waited on forever, never stolen from.
+///
+/// `CLAIM_ANONYMOUS` is the one owner value that is simultaneously (a) evidence
+/// that somebody real is working and (b) unjudgeable, because there is no
+/// participant slot to ask `/proc` about. Neither of A8's two normal answers
+/// applies: takeover would allocate a second id for one name and permanently
+/// inflate `frame_count`, and abandoning would report "no such frame" for a name
+/// that is being published right now. So the bound has to terminate in a third
+/// way, `InternContended` — a caller-visible "try again", which is exactly the
+/// contract A8 asks for and the first version of this wiring did not have (it
+/// `continue`d, reintroducing the unbounded spin A8 exists to remove).
+#[test]
+fn an_anonymous_claimant_is_reported_contended_rather_than_spun_on() {
+    use crate::sync::Ordering;
+
+    /// Wedge "victim" as claimed by an anonymous interner that never publishes.
+    fn wedge_anonymous(arena: &HeapArena) -> u32 {
+        let view = ArenaView::new(arena);
+        let (slot, _) = view.participants().register(LIVE_PID, 8, 0).unwrap();
+        let hash = crate::frame::blake3_64("victim");
+        let hashes = view.frame_hashes();
+        let i = (hash & (hashes.len() - 1) as u64) as usize;
+        hashes[i].store(hash, Ordering::Release);
+        view.frame_claiming()[i].store(crate::frame::CLAIM_ANONYMOUS, Ordering::Release);
+        assert_eq!(
+            view.frame_ids()[i].load(Ordering::Relaxed),
+            crate::frame::ID_UNPUBLISHED,
+            "the anonymous claimant must not have published"
+        );
+        slot
+    }
+
+    // The interner path: a registered participant that finds the name claimed.
+    let interner = assert_completes_within(10, "intern behind an anonymous claim", || {
+        let arena = single_dyn_edge_arena();
+        let slot = wedge_anonymous(&arena);
+        ArenaView::new(&arena).as_participant(slot).intern("victim")
+    });
+    assert_eq!(
+        interner.unwrap_err(),
+        FrameError::InternContended,
+        "an interner must be told to retry, not steal and not spin"
+    );
+
+    // The reader path, which has no takeover option at all.
+    let reader = assert_completes_within(10, "find behind an anonymous claim", || {
+        let arena = single_dyn_edge_arena();
+        wedge_anonymous(&arena);
+        ArenaView::new(&arena).find_frame("victim")
+    });
+    assert_eq!(
+        reader.unwrap_err(),
+        FrameError::InternContended,
+        "a reader must be told to retry, not told the frame does not exist"
+    );
 }

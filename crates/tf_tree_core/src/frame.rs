@@ -173,6 +173,26 @@ impl FrameRecord {
 /// claim and topology-lock owners, so slot `0` is a legal owner everywhere).
 pub const CLAIM_UNRECORDED: u32 = 0;
 
+/// A claimant that is working but cannot name itself.
+///
+/// An [`crate::arena_view::ArenaView`] built without `as_participant` has no
+/// slot to publish, so under the original encoding it left `claiming` at
+/// [`CLAIM_UNRECORDED`] **permanently** — indistinguishable from "the winner
+/// died in the two-instruction window before it recorded itself". That
+/// conflation caused two distinct bugs:
+///
+/// * a reader gave up and answered `Ok(None)` — *no such frame* — for a name a
+///   live process was actively publishing, and
+/// * an identified rescuer took the entry over from a healthy anonymous
+///   claimant, allocating a second id for one name and leaking the loser's,
+///   inflating `frame_count` for the life of the arena.
+///
+/// Writing this sentinel instead keeps the two cases apart: `CLAIM_ANONYMOUS`
+/// means *somebody is working and nobody can judge them*, so neither a reader
+/// nor a rescuer may act on it. Only [`CLAIM_UNRECORDED`] after the spin budget
+/// means the window was genuinely abandoned.
+pub const CLAIM_ANONYMOUS: u32 = u32::MAX;
+
 /// How many times a waiter spins on an unpublished id before it stops trusting
 /// the claimant and checks whether it is still alive (`docs/PHASE2.md` §1 A8).
 ///
@@ -226,6 +246,9 @@ enum Wait {
     /// The claimant is gone and this caller may not take over (it is read-only).
     /// Nothing was written.
     Abandoned,
+    /// An anonymous claimant holds the entry and cannot be judged. Nothing was
+    /// written; the caller must report rather than wait or steal.
+    Contended,
 }
 
 /// Who is waiting, and therefore what they are allowed to do about a claimant
@@ -323,6 +346,18 @@ impl InternTable<'_> {
                 let owner = self.claiming[i].load(Ordering::Acquire);
                 match role {
                     Role::Reader => {
+                        if owner == CLAIM_ANONYMOUS {
+                            // Somebody is working and nobody can judge them, so
+                            // this is not evidence of absence. Wait — but
+                            // *bounded*, because an unbounded wait here is the
+                            // hang A8 exists to prevent, and an anonymous
+                            // claimant that dies can never be proven dead.
+                            unrecorded_rounds += 1;
+                            if unrecorded_rounds >= READER_UNRECORDED_ROUNDS {
+                                return Wait::Contended;
+                            }
+                            continue;
+                        }
                         if owner != CLAIM_UNRECORDED && !claimant_alive(owner) {
                             // Proven dead: nobody is going to publish this.
                             return Wait::Abandoned;
@@ -348,6 +383,20 @@ impl InternTable<'_> {
                         }
                     }
                     Role::Interner(me) => {
+                        if owner == CLAIM_ANONYMOUS {
+                            // A live anonymous claimant. Taking this over would
+                            // allocate a second id for one name and leak the
+                            // loser's, permanently inflating `frame_count` —
+                            // the module note about "has not yet touched
+                            // frame_count" holds only for an *identified*
+                            // claimant, which this is not. Wait, bounded, then
+                            // report; never steal.
+                            unrecorded_rounds += 1;
+                            if unrecorded_rounds >= READER_UNRECORDED_ROUNDS {
+                                return Wait::Contended;
+                            }
+                            continue;
+                        }
                         let recoverable = if owner == CLAIM_UNRECORDED {
                             // Nobody recorded themselves: either the claimant was
                             // killed in the window between the two CASes, or it is
@@ -450,6 +499,10 @@ pub fn intern_core(
                 Wait::TakenOver => table.finish(i, hash, &name_matches, &write_record),
                 // `Role::Interner` never abandons: it either publishes or waits.
                 Wait::Abandoned => Err(FrameError::CapacityExceeded),
+                // An anonymous claimant holds the entry and cannot be judged.
+                // Reporting beats stealing (a second id for one name) and beats
+                // waiting forever (the hang A8 exists to prevent).
+                Wait::Contended => Err(FrameError::InternContended),
             };
         }
         if cur == 0 {
@@ -462,17 +515,27 @@ pub fn intern_core(
                 Ok(_) => {
                     // A8: record who is working on this slot *before* allocating
                     // an id, so a crash from here on is recoverable and so that
-                    // losing this CAS costs nothing. Anonymous callers skip it —
-                    // `CLAIM_UNRECORDED` is what they would write anyway.
-                    if me != CLAIM_UNRECORDED
-                        && table.claiming[i]
-                            .compare_exchange(
-                                CLAIM_UNRECORDED,
-                                me,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_err()
+                    // losing this CAS costs nothing.
+                    //
+                    // An anonymous caller records `CLAIM_ANONYMOUS` rather than
+                    // nothing. Leaving `CLAIM_UNRECORDED` behind made a healthy
+                    // anonymous winner look exactly like a crashed one, so a
+                    // reader would answer "no such frame" for a name being
+                    // published right then, and a rescuer would take the entry
+                    // over and allocate a second id for it.
+                    let mark = if me == CLAIM_UNRECORDED {
+                        CLAIM_ANONYMOUS
+                    } else {
+                        me
+                    };
+                    if table.claiming[i]
+                        .compare_exchange(
+                            CLAIM_UNRECORDED,
+                            mark,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
                     {
                         // A rescuer decided we were gone and took the entry over
                         // before we recorded ourselves. It publishes; we wait.
@@ -525,6 +588,9 @@ pub fn find_core(
                 Wait::Abandoned => return Ok(None),
                 // `Role::Reader` never takes over.
                 Wait::TakenOver => return Ok(None),
+                // An anonymous claimant is mid-publish. `Ok(None)` would be a
+                // lie — the name exists — so say what is actually true.
+                Wait::Contended => return Err(FrameError::InternContended),
             };
             if id == ID_FAILED {
                 // An interner claimed this slot and then lost the capacity race:
