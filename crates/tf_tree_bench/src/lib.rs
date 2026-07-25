@@ -18,6 +18,8 @@
 
 pub mod differential;
 pub mod fixture;
+/// Multi-process evaluation harness: open-loop latency, CPU and PSS accounting.
+pub mod mp;
 pub mod replay;
 /// Spawning child processes attached to a shared arena (Phase 2). Linux-only.
 #[cfg(all(feature = "shm", target_os = "linux"))]

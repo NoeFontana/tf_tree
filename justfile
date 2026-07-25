@@ -148,6 +148,28 @@ shm-scaling:
     cargo build --release --features shm -p tf_tree_bench --bins
     ./target/release/shm_scaling
 
+# Multi-process NODE evaluation: N consumer processes at a fixed rate, with a
+# live publisher. Answers the deployment question ("what does each node
+# experience, and what does it cost?") rather than shm-scaling's roofline
+# question ("how many lookups can N processes extract in total?").
+#
+# REFUSES TO RUN on a busy machine and names what is running — latency here is
+# largely a measurement of the scheduler, so a number taken against somebody
+# else's workload describes that workload. Override with TF_TREE_BENCH_FORCE=1
+# only if you are certain the load is irrelevant.
+mp-bench:
+    cargo build --release --features shm -p tf_tree_bench --bins
+    taskset -c 0-7 ./target/release/mp_bench tf_tree
+
+# The same evaluation against tf2, in the container. The tf2 column is a FLOOR:
+# each consumer holds a private BufferCore built from the identical stream, so it
+# shows the duplication that having no shared arena forces, but no transport.
+# A deployed tf2 consumer reaches the tree only over DDS and pays more.
+mp-bench-tf2:
+    ./docker/tf2/run.sh 'set -e; cargo build --release --features "shm tf2" -p tf_tree_bench --bins; \
+        ./target/tf2-docker/release/mp_bench tf_tree; \
+        echo; ./target/tf2-docker/release/mp_bench tf2'
+
 # fmt + clippy + tests for everything behind the `shm` feature, which plain
 # `just lint` and `just test` do not compile.
 shm-check:

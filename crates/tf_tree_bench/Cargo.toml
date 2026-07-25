@@ -92,6 +92,17 @@ required-features = ["shm"]
 
 # Multi-process benchmark driver: N reader processes on one shared arena.
 [[bin]]
+name = "mp_consumer"
+path = "src/bin/mp_consumer.rs"
+required-features = ["shm"]
+
+# Coordinator for the multi-process node evaluation.
+[[bin]]
+name = "mp_bench"
+path = "src/bin/mp_bench.rs"
+required-features = ["shm"]
+
+[[bin]]
 name = "shm_scaling"
 path = "src/bin/shm_scaling.rs"
 required-features = ["shm"]
