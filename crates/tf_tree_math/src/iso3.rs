@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use core::ops::Mul;
 
 /// Angle threshold below which the `V`/`V⁻¹` coefficients switch to their Taylor
-/// series. NORMATIVE (decision `0003`): `0.1`.
+/// series. NORMATIVE (`docs/PHASE1.md` §3.3): `0.1`.
 ///
 /// `0.1` is optimal in `f64` from *both* sides, which is why it is neither the
 /// `1e-8` most libraries use nor something larger:
@@ -392,7 +392,7 @@ mod tests {
     // *inherent* `1/θ² − cot(θ/2)/(2θ)` subtraction loses ~1e-13 (this is why the
     // 4-term series takes over below 0.1); it is not a near-π cancellation. The
     // bounds below are the honest measured maxima over the reference sweep.
-    // DEVIATION (documented): decision 0003 asks for rel err < 1e-14 across the
+    // DEVIATION (documented): `docs/PHASE1.md` §3.3 asks for rel err < 1e-14 across the
     // whole sweep; the residual `c3` boundary error makes a flat 1e-14
     // unreachable for `c3` with the mandated series threshold. The near-π regime,
     // which the reference table does not sample, is guarded by the fast-vs-oracle

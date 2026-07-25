@@ -135,6 +135,23 @@ impl Quat {
         }
     }
 
+    /// Component-wise difference.
+    ///
+    /// Exists for the chord form `|a − b|² = 2 − 2·(a·b)`, which is how `slerp`
+    /// obtains the angle between two near-parallel quaternions **without**
+    /// forming `1 − dot` — a subtraction that cancels catastrophically exactly
+    /// when the two are close, which is the case that dominates.
+    #[inline]
+    #[must_use]
+    pub const fn sub(self, rhs: Self) -> Self {
+        Self {
+            w: self.w - rhs.w,
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z,
+        }
+    }
+
     /// The vector (imaginary) part `(x, y, z)`.
     #[inline]
     #[must_use]

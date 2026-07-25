@@ -1,4 +1,4 @@
-//! The differential harness (decision `0003`, *Differential against tf2*).
+//! The differential harness (`docs/PHASE1.md` §10.5 *Differential against tf2*).
 //!
 //! Drives an identical tree and an identical sample stream through two
 //! independent lookup pipelines and compares the results across many random
@@ -276,7 +276,7 @@ impl Rng {
 
 /// The agreement bound both references are held to.
 ///
-/// `1e-12` is decision `0003`'s number. It is far above `f64` epsilon and far
+/// `1e-12` is `docs/PHASE1.md` §10.5's number. It is far above `f64` epsilon and far
 /// below anything a robot cares about, so it catches a genuine algorithmic
 /// divergence (a wrong branch, a transposed quaternion, an off-by-one bracket)
 /// without tripping on the last bits of a different-but-equivalent operation
@@ -394,7 +394,7 @@ pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
 
 /// Run the differential harness against ROS 2's `tf2::BufferCore`.
 ///
-/// This is the migration-credibility test from decision `0003`: identical tree,
+/// This is the migration-credibility test from `docs/PHASE1.md` §10.5: identical tree,
 /// identical sample stream, `LerpSlerp` on both sides (tf2's policy), compared
 /// across `queries` random lookups.
 ///
