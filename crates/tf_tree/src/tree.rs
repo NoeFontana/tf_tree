@@ -23,6 +23,7 @@ use tf_tree_core::arena_view::{ArenaBuilder, ArenaView};
 use tf_tree_core::edge::{claim, EdgeKind, EdgeRecord, Publisher};
 use tf_tree_core::frame::blake3_64;
 use tf_tree_core::plan::{compile, Domain, EdgeMeta, Guard, InterpPolicy, Stamp, SystemDomain};
+use tf_tree_core::topology::{TopoLockError, TopoLockView};
 use tf_tree_core::{EdgeId, FrameError, FrameId, LookupError, ParticipantError, TopologyError};
 use tf_tree_math::Iso3;
 
@@ -281,11 +282,14 @@ impl TreeBuilder {
         let arena = self
             .build_with(|layout, pid, start, boot| Ok(HeapArena::new(layout, pid, start, boot)))?;
         let backing = ArenaBacking::Heap(arena);
-        let participant = register_participant(&ArenaView::new(backing.as_dyn()))
+        let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
+        let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            incarnation,
+            liveness,
             decl: Mutex::new(()),
         })
     }
@@ -313,11 +317,14 @@ impl TreeBuilder {
             MappedArena::create(name, layout, pid, start, boot).map_err(BuildError::Shm)
         })?;
         let backing = ArenaBacking::Mapped(arena);
-        let participant = register_participant(&ArenaView::new(backing.as_dyn()))
+        let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
+        let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            incarnation,
+            liveness,
             decl: Mutex::new(()),
         })
     }
@@ -509,23 +516,73 @@ impl ArenaBacking {
 /// publishing samples and looking up transforms. Build one with [`TreeBuilder`].
 ///
 /// `Send + Sync`: the arena's interior mutation is all atomic, the single runtime
-/// topology mutation ([`Self::reparent`]) is serialized by an internal mutex, and
-/// lookups are read-only. Share one `Tree` across threads; each reader compiles or
-/// caches its own [`crate::Plan`]s.
+/// topology mutation ([`Self::reparent`]) is serialized by the in-arena topology
+/// lock (`docs/PHASE2.md` §1, A2) behind a process-local mutex, and lookups are
+/// read-only. Share one `Tree` across threads; each reader compiles or caches its
+/// own [`crate::Plan`]s.
 pub struct Tree {
     arena: ArenaBacking,
     /// This process's slot in the arena's participant table.
     ///
     /// Claims name this slot rather than a PID (`docs/PHASE2.md` §1, A3), which
     /// is what lets a claim publish its owner and its identity in one store.
+    /// The topology lock names it the same way, and for the same reason.
     participant: u32,
-    /// Serializes runtime topology mutations (the single seqlock writer).
+    /// The incarnation this process's participant slot carried when it
+    /// registered.
+    ///
+    /// Checked on release so a slot that was reaped and handed to another
+    /// process is not freed by *this* process's `Drop` — see
+    /// `ParticipantTable::release`.
+    incarnation: u64,
+    /// Decides whether a participant slot's owner is still running.
+    ///
+    /// Boxed and stored rather than built per call because it must outlive the
+    /// [`ArenaView`] that borrows it, and because the reboot check is a property
+    /// of the *arena*, not of any one record: if the segment predates this boot,
+    /// every pid it names belongs to a dead world and no `/proc` lookup can tell
+    /// you so. That comparison is made once, here, and collapses into the
+    /// closure.
+    ///
+    /// This is the seam `docs/PHASE2.md` §5.1 replaces with the OFD lock file,
+    /// which is authoritative where `/proc` is inference.
+    liveness: Box<dyn Fn(&tf_tree_core::ParticipantRecord) -> bool + Send + Sync>,
+    /// Serializes *this process's* threads through [`Self::reparent`].
+    ///
+    /// Not the real lock and never was — a `Mutex` is per-process, so it
+    /// serializes nothing against a peer that mapped the same segment
+    /// (`docs/PHASE2.md` §1, A2). The arena's `TopoLock` is what makes the
+    /// mutation exclusive; this one is **also load-bearing**, and not merely an
+    /// optimisation, so do not remove it as redundant.
+    ///
+    /// `TopoGuard`'s release compares only the owner word, which is
+    /// `participant_slot + 1` and therefore identical for every thread of this
+    /// process. Two overlapping guards on one slot — thread A stolen from,
+    /// thread B re-acquiring, then A dropping — would let A's release free B's
+    /// lock. Distinct processes have distinct slots, so the only way to build
+    /// that overlap is two threads of *this* process in `reparent` at once,
+    /// which this mutex makes unrepresentable. Removing it would require a
+    /// per-acquisition token in the owner word instead.
+    ///
+    /// It also stops two threads of one process spending the arena lock's spin
+    /// budget on each
+    /// other before one of them gets to do any work.
     decl: Mutex<()>,
 }
 
 impl Tree {
     fn view(&self) -> ArenaView<'_> {
+        // Both builders are load-bearing for A8, and neither is optional:
+        //
+        // * `as_participant` — a rescuer publishes *itself* into `claiming`, so
+        //   an anonymous view can wait on a stalled interner but may never take
+        //   the entry over. Without this, A8's recovery is inert.
+        // * `with_liveness` — the default is "believed alive", the right
+        //   fail-safe but one that never fires. This is what makes a dead
+        //   claimant's entry actually recoverable.
         ArenaView::new(self.arena.as_dyn())
+            .as_participant(self.participant)
+            .with_liveness(&*self.liveness)
     }
 
     /// Resolve a frame name to its stable id.
@@ -554,26 +611,38 @@ impl Tree {
     /// runtime topology mutation; it bumps the topology generation, invalidating
     /// compiled [`crate::Plan`]s so they recompile against the new shape.
     ///
+    /// # Serialization (`docs/PHASE2.md` §1, A2)
+    ///
+    /// Two locks, doing two different jobs:
+    ///
+    /// * `self.decl`, a plain `Mutex`, keeps *this* process's threads out of
+    ///   each other's way. It serializes nothing across a process boundary and
+    ///   never did; it is kept because it is free and stops two threads of one
+    ///   process burning the arena lock's spin budget against each other.
+    /// * The **in-arena** [`TopoLockView`] is the real one. Its word lives in
+    ///   the header, so every participant that mapped the segment contends on
+    ///   the same bytes, and it is stealable from a participant that died
+    ///   holding it — which is why this is no longer refused on a shared arena.
+    ///
     /// # Errors
     ///
-    /// [`ReparentError::NoEdge`] if `child` has no incoming edge to reuse, or
+    /// [`ReparentError::NoEdge`] if `child` has no incoming edge to reuse,
     /// [`ReparentError::Topology`] if the move would create a cycle or references
-    /// an out-of-range frame.
+    /// an out-of-range frame, or [`ReparentError::LockContended`] if a live peer
+    /// holds the topology lock (retry).
     pub fn reparent(&self, child: FrameId, new_parent: FrameId) -> Result<(), ReparentError> {
         if !self.arena.is_writable() {
             return Err(ReparentError::ReadOnly);
         }
-        // `decl` is a process-local mutex, so it serializes nothing against a
-        // peer process. A1 has since removed the odd-generation window, so a
-        // crashed mutator no longer wedges readers — but two *concurrent*
-        // mutators would still race the block copy, because A2's in-arena lock
-        // is not yet wired up here. Until it is, runtime topology mutation on a
-        // shared arena is refused rather than raced.
-        if self.arena.is_shared() {
-            return Err(ReparentError::SharedArena);
-        }
-        let _guard = self.decl.lock().unwrap_or_else(|e| e.into_inner());
+        let _local = self.decl.lock().unwrap_or_else(|e| e.into_inner());
         let view = self.view();
+        let header = view.header();
+        let lock = TopoLockView::new(&header.topo_lock.owner, &header.topo_lock.acquired_at_nanos);
+        let participants = view.participants();
+        let arena_boot = header.boot_id;
+        let is_alive = move |slot: u32| participant_is_alive(&participants, slot, &arena_boot);
+        let _topo = lock.acquire(self.participant, now_nanos(), &is_alive)?;
+
         let (_p, _depth, edge, _gen) =
             view.topology()
                 .read_frame(child)
@@ -621,8 +690,8 @@ impl Tree {
         let (Some(ring), Some(claim_rec)) = (view.ring(eid), view.claim(eid)) else {
             return Err(ClaimApiError::NotDynamic { child, edge: eid });
         };
-        let epoch = claim(claim_rec, self.participant)?;
-        Ok(Publisher::new(ring, claim_rec, epoch))
+        let (epoch, owner) = claim(claim_rec, self.participant)?;
+        Ok(Publisher::new(ring, claim_rec, epoch, owner))
     }
 
     /// Compile a `lookup(target, source)` path into a reusable [`crate::Plan`].
@@ -725,15 +794,18 @@ impl Tree {
         // A read-only peer cannot register — the table is in the arena and
         // registration writes to it. It takes the sentinel slot instead, and
         // every mutating entry point already refuses before reaching a claim.
-        let participant = if backing.is_writable() {
+        let (participant, incarnation) = if backing.is_writable() {
             register_participant(&ArenaView::new(backing.as_dyn()))
                 .map_err(|_| ShmError::ParticipantTableFull)?
         } else {
-            u32::MAX
+            (u32::MAX, 0)
         };
+        let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            incarnation,
+            liveness,
             decl: Mutex::new(()),
         })
     }
@@ -853,7 +925,9 @@ impl Drop for Tree {
         // Read-only attachments never registered (they cannot write the table),
         // so they have nothing to release.
         if self.participant != u32::MAX && self.arena.is_writable() {
-            self.view().participants().release(self.participant);
+            self.view()
+                .participants()
+                .release(self.participant, self.incarnation);
         }
     }
 }
@@ -863,13 +937,168 @@ impl Drop for Tree {
 /// Every `Tree` — created or attached — takes a slot, because a claim names a
 /// slot and there is no other way to be named. The slot is released in
 /// [`Tree`]'s `Drop`.
-fn register_participant(view: &ArenaView) -> Result<u32, ParticipantError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+fn register_participant(view: &ArenaView) -> Result<(u32, u64), ParticipantError> {
     view.participants()
-        .register(std::process::id(), process_start_time(), now)
-        .map(|(slot, _incarnation)| slot)
+        .register(std::process::id(), process_start_time(), now_nanos())
+}
+
+/// Wall-clock nanoseconds since the epoch, saturating; `0` if the clock is
+/// before the epoch. Diagnostics only — nothing correctness-critical reads it.
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// **The liveness predicate** — the single seam where "is participant `slot`
+/// still running?" is answered, injected into
+/// [`tf_tree_core::topology::TopoLockView::acquire`].
+///
+/// `tf_tree_core` deliberately does not answer this: it is `no_std` and
+/// `docs/PHASE2.md` §2 forbids it a syscall dependency, so the arena lock takes
+/// the answer as a parameter and this is what supplies it.
+///
+/// # This is the interim implementation, and it is meant to be replaced
+///
+/// `docs/PHASE2.md` §5.1 is explicit: **the OFD lock file is authoritative and
+/// these records are advisory** — "any code deciding liveness from `state` or
+/// `heartbeat` is a bug". §6.1 explains why: a `SIGSTOP`ped or GC-stalled
+/// process still holds its kernel lock, so `F_OFD_GETLK` reporting the byte free
+/// is a *fact* about death rather than a heuristic about it, and the whole
+/// zombie class disappears. The lock file is not built yet.
+///
+/// Until it is, this implements §6.2's `/proc` predicate, which is the same
+/// question asked less reliably. When the lock file lands, replacing the body of
+/// this function with an `F_OFD_GETLK` on `PARTICIPANT_BASE + slot` is the entire
+/// change: nothing in `tf_tree_core` and nothing else in this crate knows how
+/// the answer is reached.
+///
+/// # It fails safe, in every branch
+///
+/// Every path that cannot *prove* death returns `true`. A false negative steals
+/// the topology lock from a live mutator and lets two writers race one scratch
+/// block; a false positive only makes the caller retry. §6.2 states the
+/// asymmetry and the default it demands.
+/// Is the process that owns this participant record still running?
+///
+/// The per-record half of [`participant_is_alive`], in the shape A8's rescue
+/// path needs: it is handed a record, not a slot index.
+///
+/// A slot that is not `LIVE` is reported dead — that covers a released slot and
+/// one whose registrant died partway through filling it in, since `RESERVED` is
+/// held for a handful of instructions by a healthy process
+/// (`docs/PHASE2.md` §11.3, `attach.after_slot_assigned_before_publish`).
+///
+/// `Unreadable` resolves to **alive**, and every branch is chosen the same way:
+/// a false "dead" lets a rescuer take an entry from a running process, which is
+/// corruption; a false "alive" only delays recovery.
+fn record_is_alive(rec: &tf_tree_core::ParticipantRecord) -> bool {
+    use core::sync::atomic::Ordering;
+    if rec.state.load(Ordering::Acquire) != tf_tree_core::participant::LIVE {
+        return false;
+    }
+    let pid = rec.pid.load(Ordering::Relaxed);
+    let start_time = rec.start_time.load(Ordering::Relaxed);
+    match read_start_time(pid) {
+        // PID reuse: same number, different process. Not our participant.
+        ProcStartTime::Known(st) => st == start_time,
+        ProcStartTime::NoSuchProcess => false,
+        ProcStartTime::Unreadable => true,
+    }
+}
+
+/// Build the liveness predicate for an arena, folding in the one-time reboot
+/// check.
+///
+/// If the arena's boot id is known and differs from this host's, the segment
+/// outlived a reboot: every pid in it refers to a process from a previous boot,
+/// so nothing in it is alive and no per-record check could discover that. When
+/// either id is unknown the comparison is skipped — treating "unknown" as
+/// "different" would declare every participant dead, the false negative this
+/// must never produce.
+fn liveness_for(
+    arena_boot: [u8; 16],
+) -> Box<dyn Fn(&tf_tree_core::ParticipantRecord) -> bool + Send + Sync> {
+    let host = *host_boot_id();
+    if arena_boot != [0u8; 16] && host != [0u8; 16] && arena_boot != host {
+        return Box::new(|_| false);
+    }
+    Box::new(record_is_alive)
+}
+
+fn participant_is_alive(
+    participants: &tf_tree_core::ParticipantTable<'_>,
+    slot: u32,
+    arena_boot: &[u8; 16],
+) -> bool {
+    // The arena outlived a reboot: every pid it records belongs to a previous
+    // boot and means nothing now. Only decided when *both* ids are known — an
+    // unreadable boot id is stored as all-zeros, and treating "unknown" as
+    // "different" would declare every participant dead, which is precisely the
+    // false negative this must never produce.
+    let host_boot = host_boot_id();
+    if *arena_boot != [0u8; 16] && *host_boot != [0u8; 16] && arena_boot != host_boot {
+        return false;
+    }
+
+    // `identity` returns `None` unless the slot is `LIVE`, so a slot that was
+    // released, or that a registrant died halfway through filling in, resolves
+    // to no participant at all — held by nobody, and therefore reclaimable.
+    let Some((pid, start_time, _incarnation)) = participants.identity(slot) else {
+        return false;
+    };
+
+    match read_start_time(pid) {
+        // PID reuse: same number, different process. Not our participant.
+        ProcStartTime::Known(st) => st == start_time,
+        ProcStartTime::NoSuchProcess => false,
+        ProcStartTime::Unreadable => true,
+    }
+}
+
+/// The outcome of asking `/proc` when a process started.
+///
+/// Three cases, not two: "no such process" is the only one that proves death,
+/// and collapsing it with "could not read" is what turns a hardened `/proc`, a
+/// container without `hidepid` access, or an `EMFILE` into a false report of
+/// death (`docs/PHASE2.md` §6.2).
+enum ProcStartTime {
+    /// Field 22 of `/proc/<pid>/stat`, in clock ticks since boot.
+    Known(u64),
+    /// The process does not exist.
+    NoSuchProcess,
+    /// It might; `/proc` would not say.
+    Unreadable,
+}
+
+/// Read another process's start time (`/proc/<pid>/stat` field 22).
+///
+/// Field 2 is `comm`, parenthesised and free to contain spaces *and*
+/// parentheses, so the scan starts after the **last** `)` — the parsing trap
+/// `docs/PHASE2.md` §5.1 calls out by name.
+fn read_start_time(pid: u32) -> ProcStartTime {
+    let stat = match std::fs::read_to_string(std::format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProcStartTime::NoSuchProcess,
+        Err(_) => return ProcStartTime::Unreadable,
+    };
+    let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return ProcStartTime::Unreadable;
+    };
+    after_comm
+        .split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse().ok())
+        .map_or(ProcStartTime::Unreadable, ProcStartTime::Known)
+}
+
+/// This host's boot id, read once per process.
+///
+/// Constant for the life of the machine, so caching it keeps the contended
+/// topology-lock path off the filesystem.
+fn host_boot_id() -> &'static [u8; 16] {
+    static ID: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    ID.get_or_init(boot_id)
 }
 
 /// The host's Linux boot id, all 16 bytes; zeros if unavailable.
@@ -1064,15 +1293,29 @@ pub enum ReparentError {
     /// The arena is mapped read-only; it cannot be mutated.
     #[error("arena is mapped read-only")]
     ReadOnly,
-    /// The arena is shared with other processes, where runtime topology
-    /// mutation is not yet safe (`docs/PHASE2.md` §1, amendments A1/A2).
-    #[error("runtime re-parenting is not supported on a shared arena")]
-    SharedArena,
+    /// The in-arena topology mutation lock (`docs/PHASE2.md` §1, A2) is held by
+    /// another participant that is still alive.
+    ///
+    /// Not a fault and not a wedge: the lock is bounded-spin and steals from a
+    /// dead holder, so this only ever means a live peer is mid-mutation. Retry.
+    #[error("the topology lock is held by live participant slot {owner_slot}")]
+    LockContended {
+        /// Participant slot of the holder observed when the attempt gave up.
+        owner_slot: u32,
+    },
 }
 
 impl From<TopologyError> for ReparentError {
     fn from(e: TopologyError) -> ReparentError {
         ReparentError::Topology(e)
+    }
+}
+
+impl From<TopoLockError> for ReparentError {
+    fn from(e: TopoLockError) -> ReparentError {
+        match e {
+            TopoLockError::Contended { owner_slot } => ReparentError::LockContended { owner_slot },
+        }
     }
 }
 
@@ -1112,7 +1355,11 @@ pub enum ClaimApiError {
         actual: u32,
     },
     /// The edge is already claimed by a live writer.
-    #[error("edge already claimed by pid {}", .0.owner_pid())]
+    ///
+    /// The message names the owning **participant slot**, not a pid: A3 made the
+    /// claim word an indirection into the participant table, and resolving it
+    /// needs the arena. `tf_tree doctor` prints both.
+    #[error("edge already claimed by participant slot {}", .0.owner_slot())]
     AlreadyClaimed(tf_tree_core::ClaimError),
     /// The arena is mapped read-only, so no edge can be claimed for writing.
     #[error("arena is mapped read-only")]
@@ -1125,14 +1372,14 @@ impl From<tf_tree_core::ClaimError> for ClaimApiError {
     }
 }
 
-// Small accessor so the `#[error]` attribute above can read the owner pid.
+// Small accessor so the `#[error]` attribute above can read the owning slot.
 trait ClaimErrorExt {
-    fn owner_pid(&self) -> u32;
+    fn owner_slot(&self) -> u32;
 }
 impl ClaimErrorExt for tf_tree_core::ClaimError {
-    fn owner_pid(&self) -> u32 {
+    fn owner_slot(&self) -> u32 {
         match self {
-            tf_tree_core::ClaimError::EdgeAlreadyClaimed { owner_pid } => *owner_pid,
+            tf_tree_core::ClaimError::EdgeAlreadyClaimed { owner_slot } => *owner_slot,
             _ => 0,
         }
     }

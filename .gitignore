@@ -204,3 +204,6 @@ logs/
 # Bags are large and license-encumbered to redistribute; only the derived
 # .tfstream files (see testdata/tfstream/ATTRIBUTION.md) are committed.
 /testdata/bags/
+
+# Subagent worktrees (git worktrees live here; never part of a commit).
+.claude/worktrees/

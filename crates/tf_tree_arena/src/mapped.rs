@@ -305,6 +305,13 @@ impl MappedArena {
             && implied.topo_blocks().offset as u32 == h.topo_block_off
             && implied.topo_block_stride() as u32 == h.topo_block_stride
             && implied.claim_table().offset as u32 == h.claim_table_off
+            // A6's region. Omitting these was a real hole: `ArenaView::participants`
+            // builds a slice from `participant_table_off` and `max_participants`
+            // and its SAFETY comment cites *this* check as what bounds them, so a
+            // header carrying garbage there produced an out-of-bounds slice —
+            // exactly the failure this validation exists to prevent.
+            && implied.participant_table().offset as u32 == h.participant_table_off
+            && implied.max_participants() == h.max_participants
             && implied.edge_table().offset as u32 == h.edge_table_off
             && implied.stamp_arena().offset as u32 == h.stamp_arena_off
             && implied.pose_arena().offset as u32 == h.pose_arena_off

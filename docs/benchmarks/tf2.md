@@ -14,7 +14,8 @@ just tf2-scaling        # concurrent read scaling, 1/2/4/8 threads
 just tf2-native-control # pure C++ tf2, no Rust and no FFI — the bias control
 just footprint           # memory + instructions per lookup (no idle machine needed)
 just shm-test            # multi-process gate: another process, bit-identical
-just shm-scaling         # N reader PROCESSES on one shared arena
+just shm-scaling         # N reader PROCESSES on one shared arena (roofline)
+just mp-bench            # N node-shaped consumers at a fixed rate (deployment)
 ```
 
 All of them run in a container (`docker/tf2/`), so no ROS install is needed on
@@ -470,6 +471,62 @@ measured for one `BufferCore` on this fixture. Timing a real `tf2_ros` listener
 would drag DDS into the comparison, which every other row in this document is
 careful to exclude — so the structural cost is stated as arithmetic rather than
 measured badly.
+
+### The multi-process *node* evaluation — methodology
+
+`just shm-scaling` above answers a roofline question: *how many lookups can N
+processes extract from one arena in total?* That is a property of the machine.
+The question an integrator actually has is different — **N nodes each need
+transforms at their own rate; what does each experience, and what does it
+cost?** — and `just mp-bench` is the harness for it. Five things had to change,
+and each was a defect in the old one:
+
+1. **Open loop, not a tight loop.** A tight loop is a *closed-loop* generator:
+   the next request starts when the last finishes, so a slow response reduces
+   the offered load and every recorded sample still looks fast. That is
+   **coordinated omission**, and it is why a saturating loop reports a beautiful
+   p99.9 for a system that is visibly stuttering. The new harness fixes the
+   schedule in advance — tick `i` is due at `t0 + i/rate` — and measures from the
+   *intended* time, so a node that falls behind reports the backlog.
+2. **A publisher runs throughout.** The old harness read a quiescent tree:
+   nothing exercised the seqlock retry path, nothing invalidated the readers'
+   cache lines, and — decisively for the comparison — nothing ever held
+   `tf2::BufferCore`'s mutex.
+3. **Two clocks, reported separately.** `service` is work-start to done: what
+   the engine costs. `cycle` is intended-tick to done: what the node
+   experiences. At 100 Hz the second is ~95% OS wakeup latency, so reporting
+   only it would make every engine look identical and excellent; reporting only
+   the first would hide that a node's real latency is mostly not up to the
+   engine at all.
+4. **CPU per consumer.** §12.4's industrial claim is that tf_tree is *O(1) in
+   the number of consumers* where `/tf` is O(consumers × edges × rate). Nothing
+   measured it. A flat CPU column is that claim holding.
+5. **PSS, not summed RSS.** Summed RSS counts a shared page once per mapper.
+   The earlier table corrected for it by subtracting a known arena size, which
+   only works because we know it; PSS is the kernel's own answer and is equally
+   correct for tf2's private per-process buffers.
+
+**The tf2 column will be a floor, and must be labelled as one.** Every other row
+in this document excludes middleware, because for a single-process
+library-vs-library comparison DDS would measure the transport rather than the
+engine. That reasoning does not survive this question: across processes the
+transport **is** tf2's mechanism — there is no other way for a second process to
+obtain the tree. So `mp-bench-tf2` measures N private `BufferCore`s fed the
+identical stream, which shows the duplication that having no shared arena forces
+and nothing else. A deployed consumer additionally pays a `TransformListener`
+and its DDS fan-out, and the write-up must say so rather than let the floor be
+read as the cost.
+
+**The harness refuses to run on a busy machine**, naming the top CPU consumers.
+That guard exists because the first run of it was taken on a host carrying an
+unrelated 600%-CPU job and nothing in the output said so. Every row also carries
+its own measured foreign-load percentage and is flagged `NOISY` above 10%, so a
+contaminated row cannot be published by accident.
+
+**No numbers yet.** The harness is complete and its unit tests pass — including
+one asserting that an overrunning tick registers as latency rather than
+vanishing — but this machine has not been idle since it was written. Results
+land here when it is.
 
 ### What is implemented, and what is not
 

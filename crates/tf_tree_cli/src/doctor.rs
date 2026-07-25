@@ -234,7 +234,15 @@ impl Snapshot {
             };
             let kind = EdgeKind::from_u8(rec.kind);
             let owner_word = claim.owner.load(Ordering::Relaxed);
-            let owner_slot = u32::try_from(owner_word.saturating_sub(1)).unwrap_or(u32::MAX);
+            // `owner_word == 0` means *unclaimed*. Without this guard the
+            // `saturating_sub(1)` below yields slot 0 and the edge is reported as
+            // owned by whichever process happens to hold participant slot 0 — a
+            // plausible-looking wrong pid, which is worse than none.
+            let owner_slot = if owner_word == 0 {
+                None
+            } else {
+                u32::try_from(owner_word - 1).ok()
+            };
             // `ring` is `None` for a static/tombstoned edge (capacity 0), so this
             // needs no separate power-of-two guard.
             let newest_stamp = view.ring(eid).and_then(|r| r.newest_stamp());
@@ -253,9 +261,8 @@ impl Snapshot {
                 // slot that no longer resolves means the owner detached or died
                 // between the two reads, which reports as pid 0 — the honest
                 // answer, and what the reaper will act on.
-                owner_pid: view
-                    .participants()
-                    .identity(owner_slot)
+                owner_pid: owner_slot
+                    .and_then(|slot| view.participants().identity(slot))
                     .map_or(0, |(pid, _start, _inc)| pid),
                 newest_stamp,
             });

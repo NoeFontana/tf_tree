@@ -282,3 +282,36 @@ fn latest_and_latest_common_differ_when_edges_are_uneven() {
         "latest and latest_common should differ"
     );
 }
+
+/// A8's rescue path must be **wired**, not merely present.
+///
+/// The core tests inject a liveness predicate and name a participant slot by
+/// hand. That proves the algorithm; it does not prove `Tree` supplies either —
+/// and at first it supplied neither. `Tree::view` built an anonymous view with
+/// no liveness source, so a rescuer had no identity to publish into `claiming`
+/// and believed every claimant alive. A8 was correct, loom-tested, and totally
+/// inert through the public API.
+///
+/// An earlier version of this test interned a fresh name and asserted it
+/// terminated. That passed with the wiring deliberately removed — interning an
+/// unclaimed name never reaches the rescue path, so it asserted nothing. This
+/// checks the two properties that were actually missing.
+#[test]
+fn a_tree_can_rescue_a_wedged_intern() {
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(16)))
+        .build()
+        .unwrap();
+    let view = tree.arena_view();
+
+    assert!(
+        view.interning_identity().is_some(),
+        "Tree interns anonymously: it can wait on a stalled claimant but never \
+         take the entry over, so A8's recovery is inert"
+    );
+    assert!(
+        view.has_liveness_source(),
+        "Tree has no liveness source: every claimant is believed alive, so A8's \
+         takeover can never fire"
+    );
+}

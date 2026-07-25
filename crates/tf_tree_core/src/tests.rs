@@ -3,7 +3,10 @@
 //! Concurrency *interleavings* are checked by the loom suite (`src/loom_tests.rs`,
 //! run under `--cfg loom`); this module covers single-threaded correctness, the
 //! arena-view unsafe surface (for Miri), and the wrapped-ring property test (#15).
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `panic` is allowed for the same reason the loom suite allows it: a test that
+// detects an *unbounded spin* (see `assert_completes_within`) has to report the
+// timeout itself, and the message must name what timed out.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use alloc::vec::Vec;
 
@@ -14,6 +17,7 @@ use crate::arena_view::{ArenaBuilder, ArenaView};
 use crate::buffer::{PoseSlot, SampleRing};
 use crate::edge::{claim, EdgeRecord, Publisher};
 use crate::error::{ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError};
+use crate::participant::ParticipantRecord;
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU64};
 
@@ -252,15 +256,95 @@ fn wrapped_ring_retained_samples_read_back_exactly() {
 fn claim_is_exclusive_and_epoch_increments() {
     use crate::edge::{release, ClaimRecord};
     let rec = ClaimRecord::new();
-    let e1 = claim(&rec, 111).unwrap();
+    let (e1, owner1) = claim(&rec, 111).unwrap();
     assert_eq!(e1, 1);
-    // Second claim on a live edge fails, naming the owner.
+    assert_eq!(owner1, 112, "owner word is participant_slot + 1");
+    // Second claim on a live edge fails, naming the owning *slot* — not a pid.
     let err = claim(&rec, 222).unwrap_err();
-    assert_eq!(err, ClaimError::EdgeAlreadyClaimed { owner_pid: 111 });
-    release(&rec);
+    assert_eq!(err, ClaimError::EdgeAlreadyClaimed { owner_slot: 111 });
+    release(&rec, owner1);
     // Re-claim after release bumps the epoch.
-    let e2 = claim(&rec, 333).unwrap();
+    let (e2, _) = claim(&rec, 333).unwrap();
     assert_eq!(e2, 2);
+}
+
+/// A stale `release` must not free a claim that has passed to somebody else.
+///
+/// The sequence this guards: P1 claims, is `SIGSTOP`ped, is reaped, P2 claims,
+/// P1 resumes and drops its `Publisher`. `push` already refuses (A4), but an
+/// unconditional `owner.store(0)` in `release` would free *P2's* live claim and
+/// let a third process claim the same edge — two writers on a single-writer
+/// ring, which is the failure A4 exists to prevent, arriving through `Drop`.
+#[test]
+fn a_stale_release_cannot_free_someone_elses_claim() {
+    use crate::edge::{reap, release, ClaimRecord};
+    use crate::sync::Ordering;
+
+    let rec = ClaimRecord::new();
+    let (_p1_epoch, p1_owner) = claim(&rec, 1).unwrap();
+
+    // P1 is judged dead and reaped; P2 takes the edge.
+    reap(&rec);
+    let (p2_epoch, p2_owner) = claim(&rec, 2).unwrap();
+    assert_ne!(p1_owner, p2_owner);
+
+    // P1 resumes and drops its stale Publisher.
+    release(&rec, p1_owner);
+
+    assert_eq!(
+        rec.owner.load(Ordering::Acquire),
+        p2_owner,
+        "a stale release freed the new owner's claim"
+    );
+    assert_eq!(
+        rec.epoch.load(Ordering::Acquire),
+        p2_epoch,
+        "a stale release must not disturb the epoch either"
+    );
+
+    // And P2's own release still works.
+    release(&rec, p2_owner);
+    assert_eq!(rec.owner.load(Ordering::Acquire), 0);
+}
+
+/// A4: a writer whose claim was reaped must refuse to publish.
+///
+/// `reap` bumps the epoch *before* clearing the owner, so the window is closed
+/// from both ends. This was the only amendment with no test.
+#[test]
+fn a_reaped_writer_refuses_to_push() {
+    use crate::edge::reap;
+
+    let mut arena = single_dyn_edge_arena();
+    let mut builder = ArenaBuilder::new(&mut arena);
+    let parent = builder.view().intern("odom").unwrap();
+    let child = builder.view().intern("base_link").unwrap();
+    let edge = EdgeId(0);
+    builder
+        .declare_edge(
+            edge,
+            EdgeRecord::dynamic(parent.get(), child.get(), 4, 0, 0, 0, 0),
+        )
+        .unwrap();
+
+    let view = builder.view();
+    let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+    let pubr = Publisher::new(
+        view.ring(edge).unwrap(),
+        view.claim(edge).unwrap(),
+        epoch,
+        owner,
+    );
+    let pose = exp_se3([0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+    pubr.push(10, &pose).expect("push before the reap");
+
+    reap(view.claim(edge).unwrap());
+
+    assert_eq!(
+        pubr.push(20, &pose),
+        Err(PushError::ClaimRevoked { edge }),
+        "a reaped writer kept publishing — two writers can now share one ring"
+    );
 }
 
 #[test]
@@ -309,6 +393,204 @@ fn unpublished_sentinel_is_reachable_in_a_zeroed_arena() {
     assert_eq!(view.find_frame("never_interned").unwrap(), None);
     let a = view.intern("base_link").unwrap();
     assert_eq!(view.find_frame("base_link").unwrap(), Some(a));
+}
+
+// ---- A8: interning must not spin forever on a dead claimant --------------
+//
+// `docs/PHASE2.md` §1 A8, and its §11.3 crash point
+// `intern.after_hash_cas_before_id_store`. The interleavings are checked by
+// `loom_tests::intern_takes_over_from_a_claimant_that_died_before_publishing`;
+// these tests cover the arena-view wiring — the `claiming` array's placement in
+// the frame-hash region, the participant lookup, and the injected predicate.
+
+/// PID of the participant these tests declare dead.
+const DEAD_PID: u32 = 90_001;
+/// PID of the participant that does the rescuing.
+const LIVE_PID: u32 = 90_002;
+
+/// Wedge `name`'s hash slot exactly as a process killed between the hash CAS and
+/// the id store would leave it: hash claimed, `claiming` naming `owner_slot`, id
+/// never published.
+///
+/// Returns the wedged slot index.
+fn wedge_intern_slot(view: &ArenaView, name: &str, owner_slot: u32) -> usize {
+    use crate::sync::Ordering;
+    let hash = crate::frame::blake3_64(name);
+    let hashes = view.frame_hashes();
+    let i = (hash & (hashes.len() - 1) as u64) as usize;
+    hashes[i].store(hash, Ordering::Release);
+    view.frame_claiming()[i].store(owner_slot + 1, Ordering::Release);
+    assert_eq!(
+        view.frame_ids()[i].load(Ordering::Relaxed),
+        crate::frame::ID_UNPUBLISHED,
+        "the crash point is *before* the id store"
+    );
+    i
+}
+
+/// Run `f` on its own thread and fail — rather than hang the suite — if it has
+/// not finished within `secs`.
+///
+/// A regression in A8 does not produce a wrong answer, it produces an *infinite
+/// spin*, and a test that simply calls `intern` would wedge CI instead of
+/// reporting a failure. The worker is deliberately detached: if it is stuck it
+/// stays stuck, and the process exits out from under it once the suite ends.
+fn assert_completes_within<T: Send + 'static>(
+    secs: u64,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(v) => v,
+        Err(_) => panic!("{what} did not finish within {secs}s — A8 regression (unbounded spin)"),
+    }
+}
+
+/// A8: an interner whose hash-slot claimant is dead takes the entry over instead
+/// of spinning on an id that will never be published.
+#[test]
+fn intern_recovers_from_a_claimant_that_died_before_publishing() {
+    use crate::sync::Ordering;
+
+    let arena = single_dyn_edge_arena();
+    let (dead_slot, live_slot, wedged) = {
+        let view = ArenaView::new(&arena);
+        let (dead_slot, _) = view.participants().register(DEAD_PID, 7, 0).unwrap();
+        let (live_slot, _) = view.participants().register(LIVE_PID, 8, 0).unwrap();
+        // The dead participant's slot still reads LIVE — a `SIGKILL`ed process
+        // never gets to clear it. That is exactly why the injected predicate,
+        // and not the `state` field, is what detects the crash.
+        let wedged = wedge_intern_slot(&view, "victim", dead_slot);
+        (dead_slot, live_slot, wedged)
+    };
+
+    let (id, again, count, claimant, found) =
+        assert_completes_within(10, "intern of a name whose claimant died", move || {
+            let is_alive = |rec: &ParticipantRecord| rec.pid.load(Ordering::Relaxed) != DEAD_PID;
+            let view = ArenaView::new(&arena)
+                .as_participant(live_slot)
+                .with_liveness(&is_alive);
+            let id = view.intern("victim").unwrap();
+            (
+                id,
+                // Idempotent afterwards: the rescued entry behaves like any other.
+                view.intern("victim").unwrap(),
+                view.header().frame_count.load(Ordering::Relaxed),
+                view.frame_claiming()[wedged].load(Ordering::Relaxed),
+                view.find_frame("victim").unwrap(),
+            )
+        });
+
+    assert_eq!(id.get(), 1, "the rescued name gets the first frame id");
+    assert_eq!(again, id, "a rescued entry must still be idempotent");
+    assert_eq!(found, Some(id));
+    assert_eq!(count, 1, "the dead claimant never allocated an id");
+    assert_eq!(
+        claimant,
+        live_slot + 1,
+        "the rescuer must record itself as the entry's claimant"
+    );
+    assert_ne!(dead_slot, live_slot);
+}
+
+/// A8: a claimant that died in the two-instruction window *before* it could
+/// record itself is recoverable too — `claiming` is still `CLAIM_UNRECORDED`, and
+/// a registered interner may take that over.
+#[test]
+fn intern_recovers_when_the_claimant_died_before_recording_itself() {
+    use crate::sync::Ordering;
+
+    let arena = single_dyn_edge_arena();
+    let live_slot = {
+        let view = ArenaView::new(&arena);
+        let (slot, _) = view.participants().register(LIVE_PID, 8, 0).unwrap();
+        // Hash claimed, nothing else: no claimant recorded, no id published.
+        let hash = crate::frame::blake3_64("victim");
+        let hashes = view.frame_hashes();
+        let i = (hash & (hashes.len() - 1) as u64) as usize;
+        hashes[i].store(hash, Ordering::Release);
+        assert_eq!(
+            view.frame_claiming()[i].load(Ordering::Relaxed),
+            crate::frame::CLAIM_UNRECORDED
+        );
+        slot
+    };
+
+    // No liveness predicate is needed or consulted: there is no claimant to
+    // resolve. Being a registered participant is the whole requirement.
+    let id = assert_completes_within(10, "intern of an unrecorded claimed slot", move || {
+        ArenaView::new(&arena)
+            .as_participant(live_slot)
+            .intern("victim")
+    })
+    .unwrap();
+    assert_eq!(id.get(), 1);
+}
+
+/// A8, the fail-safe direction (`docs/PHASE2.md` §6.2): a claimant that cannot be
+/// proven dead is **never** stolen from. Waiting costs latency; stealing from a
+/// working process costs correctness.
+///
+/// Asserting a negative about a spin needs a bounded wait, so the interner is
+/// deliberately unblocked afterwards — that both keeps the test from leaking a
+/// spinning thread and proves the waiter was still on the normal publish path.
+#[test]
+fn a_claimant_that_cannot_be_proven_dead_is_never_stolen_from() {
+    use crate::sync::Ordering;
+
+    let arena = single_dyn_edge_arena();
+    let view = ArenaView::new(&arena);
+    let (owner_slot, _) = view.participants().register(DEAD_PID, 7, 0).unwrap();
+    let (live_slot, _) = view.participants().register(LIVE_PID, 8, 0).unwrap();
+    let wedged = wedge_intern_slot(&view, "victim", owner_slot);
+    // Pretend the claimant did allocate id 1 and write its record, so the
+    // publish we perform below is a real one.
+    let real = ArenaView::new(&arena)
+        .as_participant(owner_slot)
+        .intern("other")
+        .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // No injected predicate: the claimant's slot reads LIVE, so it is
+            // presumed alive however long it takes. This must block.
+            let _ = tx.send(
+                ArenaView::new(&arena)
+                    .as_participant(live_slot)
+                    .intern("victim"),
+            );
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "an unproven claimant was stolen from — A8 must fail safe"
+        );
+        assert_eq!(
+            view.frame_claiming()[wedged].load(Ordering::Relaxed),
+            owner_slot + 1,
+            "the claim must still name the original claimant"
+        );
+
+        // Unblock the waiter by publishing on the claimant's behalf.
+        view.frame_ids()[wedged].store(real.get(), Ordering::Release);
+    });
+
+    // ...and it then resolves to whatever the claimant published, exactly as the
+    // pre-A8 publish-then-spin handshake always did. ("victim" and "other" share
+    // a record only because this test hand-published; the name check is what
+    // reports the mismatch.)
+    assert_eq!(
+        rx.recv().unwrap().unwrap_err(),
+        FrameError::FrameHashCollision {
+            hash: crate::frame::blake3_64("victim")
+        }
+    );
 }
 
 /// A rejected intern must not poison its hash slot: `frame_count` stays exact and
@@ -413,8 +695,13 @@ fn arena_push_claim_sample_roundtrip() {
         .unwrap();
 
     let view = builder.view();
-    let epoch = claim(view.claim(edge).unwrap(), 7).unwrap();
-    let pubr = Publisher::new(view.ring(edge).unwrap(), view.claim(edge).unwrap(), epoch);
+    let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+    let pubr = Publisher::new(
+        view.ring(edge).unwrap(),
+        view.claim(edge).unwrap(),
+        epoch,
+        owner,
+    );
     for i in 0..3u64 {
         pubr.push(i as i64 * 1000, &pose(i + 1)).unwrap();
     }
