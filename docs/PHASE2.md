@@ -366,6 +366,10 @@ A stale *socket path* can be left behind, and is handled by: connect first; on `
 
 **NORMATIVE:** the diff against Phase 1 outside `tf_tree_arena` and the new `tf_tree_ipc` crate must be **zero lines in the read path**. `PoseSlot`, `EdgeBuffer`, `Plan::at`, bracket search, and interning are byte-identical code operating on a different base pointer.
 
+**The premise is now tested, not merely asserted.** "A different base pointer" only works if nothing in the arena is an absolute address, which Phase 1 documented but never checked. `crates/tf_tree_bench/tests/relocation.rs` is that check: it byte-copies a populated arena to a different address, wraps the copy in a minimal `Arena` impl standing in for `MappedArena`, and requires **bit-identical** results — not approximate — across every frame pair in the fixture, plus frame-name resolution and header validation. It guards against a vacuous pass twice (the copy must land at a different address; more than 1000 queries must actually be compared).
+
+It passes today, which is the evidence that the "zero lines in the read path" claim above is achievable rather than aspirational. Keep it green: a regression that caches one resolved address would otherwise surface for the first time in another process, as a wild read rather than an error.
+
 ```rust
 pub struct MappedArena {
     base: NonNull<u8>,

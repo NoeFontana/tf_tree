@@ -31,6 +31,9 @@ tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+# Only the relocation gate needs this: it implements `Arena` over a byte copy of
+# a live arena, standing in for Phase 2's `MappedArena`.
+tf_tree_arena.workspace = true
 
 # Criterion benches (harness = false, driven by `criterion_group!`/`main!`). These
 # compile and run on any machine, but they are *not* the official go/no-go gate,
