@@ -22,7 +22,7 @@ Sections marked **NORMATIVE** are requirements. Where a syscall behaviour is ass
 | Zero-diff read path, proven by the relocation gate (§4) | **Done, and tested** (`just shm-test`) |
 | Multi-process read scaling (part of §12.2) | **Done** (`just shm-scaling`; results in `docs/benchmarks/tf2.md`) |
 | Amendment A2 — in-arena topology lock | `TopoLock` defined and carried in the header; **not wired into `set_parent`** |
-| Amendment A8 — bounded intern spin | **Not applied** |
+| Amendment A8 — bounded intern spin | **Applied** in `tf_tree_arena`/`tf_tree_core` (`claiming` array, `layout_hash` 0x9075_90F5). Takeover is **dormant** until two things land: `Tree::view` must call `ArenaView::as_participant`, and `ArenaView::with_liveness` needs the §5.1/§6.2 predicate — without it a crashed claimant still reads `LIVE` and is presumed alive |
 | Discovery, rendezvous, `open()`, ownership migration (§3) | Not implemented — fd inheritance stands in |
 | Attach protocol — `SOCK_SEQPACKET` + `SCM_RIGHTS` (§3.7) | Not implemented |
 | Claims as OFD locks (§6.1); reaping (§6.3) | Not implemented — `ClaimRecord` CAS only |

@@ -91,6 +91,26 @@ const N_REGIONS: usize = 9;
 /// Default participant-table capacity (`docs/PHASE2.md` §1 A6).
 pub const DEFAULT_MAX_PARTICIPANTS: u32 = 64;
 
+/// Bytes per interning slot in the frame-hash region.
+///
+/// Three parallel arrays, in this order, over `next_pow2(2 * max_frames)` slots:
+///
+/// | array | width | meaning |
+/// |---|---|---|
+/// | `hashes` | `AtomicU64`, 8 B | the 64-bit frame-name hash; `0` = empty |
+/// | `ids` | `AtomicU32`, 4 B | published `FrameId`; `0` = not yet published |
+/// | `claiming` | `AtomicU32`, 4 B | **A8**: participant slot + 1 of the interner that won the hash CAS; `0` = unrecorded |
+///
+/// `claiming` is what makes a crashed interner recoverable (`docs/PHASE2.md` §1
+/// A8, §11.3 `intern.after_hash_cas_before_id_store`): without it, a waiter that
+/// sees a claimed hash with an unpublished id has no way to find out *who* it is
+/// waiting for, and so must wait forever.
+///
+/// The arrays are laid out contiguously rather than interleaved into a 16-byte
+/// record so the hot path — probing `hashes` — keeps its dense cache lines; the
+/// other two are touched once per intern.
+pub const FRAME_HASH_STRIDE: usize = 8 + 4 + 4;
+
 #[derive(Clone, Copy, Debug)]
 struct Computed {
     regions: [Region; N_REGIONS],
@@ -126,15 +146,15 @@ fn compute(
     let topo_stride = align64(mf * 12);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
-        256usize,                             // header
-        align64(mf * 64),                     // frame table (64 B / frame)
-        align64(next_pow2(2 * mf) * (8 + 4)), // frame hash (AtomicU64 + AtomicU32)
-        TOPO_BLOCKS * topo_stride,            // topology blocks (A1: four)
-        align64(me * 64),                     // claim table (64 B / edge)
-        align64(mp * 128),                    // participant table (128 B / slot)
-        align64(me * 128),                    // edge table (128 B / edge)
-        align64(slots * 8),                   // stamp arena (i64 / slot)
-        align64(slots * 64),                  // pose arena (PoseSlot / slot)
+        256usize,                                       // header
+        align64(mf * 64),                               // frame table (64 B / frame)
+        align64(next_pow2(2 * mf) * FRAME_HASH_STRIDE), // frame hash (A8)
+        TOPO_BLOCKS * topo_stride,                      // topology blocks (A1: four)
+        align64(me * 64),                               // claim table (64 B / edge)
+        align64(mp * 128),                              // participant table (128 B / slot)
+        align64(me * 128),                              // edge table (128 B / edge)
+        align64(slots * 8),                             // stamp arena (i64 / slot)
+        align64(slots * 64),                            // pose arena (PoseSlot / slot)
     ];
 
     let mut regions = [Region { offset: 0, size: 0 }; N_REGIONS];
@@ -360,10 +380,22 @@ pub const fn layout_hash() -> u32 {
     h = fnv1a_u32(h, core::mem::size_of::<ArenaHeader>() as u32);
     h = fnv1a_u32(h, core::mem::align_of::<ArenaHeader>() as u32);
     // Region strides in header order: header size, frame/edge/claim/participant/
-    // pose byte widths, frame-hash entry width, topology per-frame width
-    // (12 = parent AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16 + pad),
-    // topology block count, stamp width.
-    let strides: [u32; 10] = [256, 64, 12, 12, TOPO_BLOCKS as u32, 64, 128, 128, 8, 64];
+    // pose byte widths, frame-hash entry width ([`FRAME_HASH_STRIDE`], 16 since
+    // A8 added the `claiming` array), topology per-frame width (12 = parent
+    // AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16 + pad), topology
+    // block count, stamp width.
+    let strides: [u32; 10] = [
+        256,
+        64,
+        FRAME_HASH_STRIDE as u32,
+        12,
+        TOPO_BLOCKS as u32,
+        64,
+        128,
+        128,
+        8,
+        64,
+    ];
     let mut i = 0;
     while i < strides.len() {
         h = fnv1a_u32(h, strides[i]);
@@ -458,7 +490,7 @@ mod tests {
             }
         );
         assert_eq!(l.frame_table().size, 64_000); // 1000 * 64
-        assert_eq!(l.frame_hash().size, 24_576); // next_pow2(2000)=2048 * 12
+        assert_eq!(l.frame_hash().size, 32_768); // next_pow2(2000)=2048 * 16 (A8)
         assert_eq!(l.topo_block_stride(), 12_032); // align64(1000 * 12)
         assert_eq!(l.topo_blocks().size, 48_128); // TOPO_BLOCKS * 12032
         assert_eq!(l.claim_table().size, 64_000); // 1000 * 64
@@ -469,7 +501,7 @@ mod tests {
 
         // Pose arena is ~260 MB.
         assert!((260_000_000..=263_000_000).contains(&l.pose_arena().size));
-        assert_eq!(l.total_size(), 295_249_152);
+        assert_eq!(l.total_size(), 295_257_344);
 
         // Every region offset is 64-byte aligned and regions are contiguous.
         let regions = all_regions(&l);
@@ -488,7 +520,7 @@ mod tests {
         let l = ArenaLayout::new(8, 4, vec![16, 0, 4, 64]).unwrap();
 
         assert_eq!(l.frame_table().size, 512); // 8 * 64
-        assert_eq!(l.frame_hash().size, 192); // next_pow2(16)=16 * 12
+        assert_eq!(l.frame_hash().size, 256); // next_pow2(16)=16 * 16 (A8)
         assert_eq!(l.topo_block_stride(), 128); // align64(8 * 12 = 96)
         assert_eq!(l.topo_blocks().size, 512); // TOPO_BLOCKS * 128
         assert_eq!(l.claim_table().size, 256); // 4 * 64
@@ -497,7 +529,7 @@ mod tests {
         assert_eq!(l.stamp_slots(), 84);
         assert_eq!(l.stamp_arena().size, 704); // align64(84 * 8 = 672)
         assert_eq!(l.pose_arena().size, 5_376); // 84 * 64 (already aligned)
-        assert_eq!(l.total_size(), 16_512);
+        assert_eq!(l.total_size(), 16_576);
 
         let regions = all_regions(&l);
         for w in regions.windows(2) {
@@ -511,9 +543,13 @@ mod tests {
     fn layout_hash_is_deterministic_and_stable() {
         // Snapshot: any change to the header layout or region strides changes
         // this value, which is exactly what Phase 2's attach check relies on.
+        //
+        // Last changed by A8 (`claiming` widened the frame-hash stride from 12 to
+        // 16 bytes): 0x1F32_7F69 -> 0x9075_90F5. `FORMAT_VERSION` stays 2 — it was
+        // already bumped for A6's participant table and has not shipped.
         assert_eq!(layout_hash(), layout_hash());
         assert_ne!(layout_hash(), 0);
-        assert_eq!(layout_hash(), 0x1F32_7F69);
+        assert_eq!(layout_hash(), 0x9075_90F5);
     }
 
     #[test]

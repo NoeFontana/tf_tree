@@ -34,10 +34,26 @@ use tf_tree_arena::{Arena, ArenaHeader};
 use crate::buffer::{pose_slots, stamp_slots, SampleRing};
 use crate::edge::{ClaimRecord, EdgeRecord};
 use crate::error::{EdgeId, FrameError, FrameId, TopologyError};
-use crate::frame::{blake3_64, intern_core, FrameRecord, ID_FAILED, ID_UNPUBLISHED};
-use crate::participant::{ParticipantRecord, ParticipantTable};
-use crate::sync::{spin, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use crate::frame::{blake3_64, find_core, intern_core, FrameRecord, InternTable, CLAIM_UNRECORDED};
+use crate::participant::{ParticipantRecord, ParticipantTable, LIVE};
+use crate::sync::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use crate::topology::{Block, TopologyView};
+
+/// A caller-supplied liveness predicate for A8's interning takeover, and for the
+/// claim/topology-lock reaping that will use the same source
+/// (`docs/PHASE2.md` §6.2).
+///
+/// It is injected rather than implemented here for two reasons. This crate is
+/// `no_std` and cannot read `/proc`. And `docs/PHASE2.md` §5.1 makes the **OFD
+/// lock file** — not `/proc`, not the participant `state` field — the
+/// authoritative answer to "is that participant still running"; that machinery
+/// lives outside `tf_tree_core` and is built independently. Handing the answer in
+/// as a closure keeps the arena algorithms unchanged when it arrives.
+///
+/// **It must fail safe** (§6.2): return `true` whenever it cannot tell. A false
+/// "dead" verdict steals an in-flight entry from a working process; a false
+/// "alive" verdict only postpones recovery.
+pub type LivenessFn = dyn Fn(&ParticipantRecord) -> bool;
 
 /// Smallest power of two `>= n` (matching the arena layout's `next_pow2`).
 const fn next_pow2(n: usize) -> usize {
@@ -55,10 +71,21 @@ const fn next_pow2(n: usize) -> usize {
 pub struct ArenaView<'a> {
     base: *mut u8,
     header: &'a ArenaHeader,
+    /// A8: this caller's participant slot **+ 1**, or [`CLAIM_UNRECORDED`] if it
+    /// is not a registered participant. Recorded in `claiming` when this view
+    /// wins an interning hash slot, and required to *rescue* one.
+    me: u32,
+    /// A8's injected liveness predicate; `None` means "assume alive", which
+    /// disables takeover of a claimant whose participant slot still reads `LIVE`.
+    is_alive: Option<&'a LivenessFn>,
 }
 
 impl<'a> ArenaView<'a> {
     /// Build a view over `arena`, reading its header.
+    ///
+    /// The view is anonymous and has no liveness source: it can wait on another
+    /// interner but never takes an entry over. Add both with
+    /// [`Self::as_participant`] and [`Self::with_liveness`].
     #[must_use]
     pub fn new(arena: &'a dyn Arena) -> ArenaView<'a> {
         let base = arena.base();
@@ -66,7 +93,43 @@ impl<'a> ArenaView<'a> {
         // `ArenaHeader` (written by `HeapArena::new`), 64-byte aligned, and lives
         // as long as the borrowed `arena`, hence as long as `'a`.
         let header = unsafe { &*base.cast::<ArenaHeader>() };
-        ArenaView { base, header }
+        ArenaView {
+            base,
+            header,
+            me: CLAIM_UNRECORDED,
+            is_alive: None,
+        }
+    }
+
+    /// Identify this view as participant `slot` (`docs/PHASE2.md` §1 A6/A8).
+    ///
+    /// `slot` is what [`ParticipantTable::register`] returned. An out-of-range
+    /// slot — including the `u32::MAX` a read-only attachment carries — leaves the
+    /// view anonymous rather than recording a claim nobody can resolve.
+    ///
+    /// A view must be identified before it can rescue an interning slot whose
+    /// claimant died: the rescuer publishes *itself* into `claiming`, so an
+    /// anonymous one would erase the entry's owner.
+    #[must_use]
+    pub fn as_participant(mut self, slot: u32) -> ArenaView<'a> {
+        self.me = if slot < self.header.max_participants {
+            slot + 1
+        } else {
+            CLAIM_UNRECORDED
+        };
+        self
+    }
+
+    /// Attach the liveness predicate used to decide whether a claimant that has
+    /// not published is dead (see [`LivenessFn`], `docs/PHASE2.md` §6.2).
+    ///
+    /// Without one, a participant whose slot still reads `LIVE` is always
+    /// believed — the fail-safe default, and the reason a crashed process is only
+    /// *detected* once the real (OFD-lock) predicate is wired in.
+    #[must_use]
+    pub fn with_liveness(mut self, is_alive: &'a LivenessFn) -> ArenaView<'a> {
+        self.is_alive = Some(is_alive);
+        self
     }
 
     /// The arena header.
@@ -79,18 +142,19 @@ impl<'a> ArenaView<'a> {
     // ---- frame interning -------------------------------------------------
 
     /// The interning hash array (`next_pow2(2 * max_frames)` slots).
-    fn frame_hashes(&self) -> &'a [AtomicU64] {
+    pub(crate) fn frame_hashes(&self) -> &'a [AtomicU64] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
         let off = self.header.frame_hash_off as usize;
         // SAFETY: module invariant — the frame-hash region begins at
-        // `frame_hash_off`, is 64-byte aligned, and reserves `slots * (8 + 4)`
-        // bytes; the first `slots * 8` are the `AtomicU64` hash array.
+        // `frame_hash_off`, is 64-byte aligned, and reserves
+        // `slots * FRAME_HASH_STRIDE` bytes; the first `slots * 8` are the
+        // `AtomicU64` hash array.
         unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU64>(), slots) }
     }
 
     /// The interning id array (parallel to the hashes; `0` = unpublished, see
-    /// [`ID_UNPUBLISHED`]).
-    fn frame_ids(&self) -> &'a [AtomicU32] {
+    /// [`crate::frame::ID_UNPUBLISHED`]).
+    pub(crate) fn frame_ids(&self) -> &'a [AtomicU32] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
         let off = self.header.frame_hash_off as usize + slots * 8;
         // SAFETY: module invariant — the id array follows the hash array within
@@ -99,8 +163,57 @@ impl<'a> ArenaView<'a> {
         unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU32>(), slots) }
     }
 
-    fn frame_count(&self) -> &'a AtomicU32 {
-        &self.header.frame_count
+    /// **A8**: the interning claim array (parallel to the hashes; participant
+    /// slot + 1 of the in-flight interner, [`CLAIM_UNRECORDED`] if none).
+    pub(crate) fn frame_claiming(&self) -> &'a [AtomicU32] {
+        let slots = next_pow2(2 * self.header.max_frames as usize);
+        // Third array in the region: hashes (8 B) then ids (4 B) then claiming.
+        let off = self.header.frame_hash_off as usize + slots * (8 + 4);
+        // SAFETY: module invariant — `ArenaLayout` sizes the frame-hash region at
+        // `slots * FRAME_HASH_STRIDE` (16) bytes, of which this is the last
+        // `slots * 4`; `off` is 4-byte aligned because `slots * 12` is.
+        unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU32>(), slots) }
+    }
+
+    /// The three interning arrays plus the id allocator, as `frame`'s algorithms
+    /// want them.
+    fn intern_table(&self) -> InternTable<'a> {
+        InternTable {
+            hashes: self.frame_hashes(),
+            ids: self.frame_ids(),
+            claiming: self.frame_claiming(),
+            frame_count: &self.header.frame_count,
+            // Usable ids are 1..max_frames (slot 0 is the root sentinel), so the
+            // interned-frame capacity is one less than the table slot count.
+            capacity: self.header.max_frames.saturating_sub(1),
+        }
+    }
+
+    /// A8's claimant-liveness test, as [`crate::frame`] wants it: given a
+    /// `claiming` entry (participant slot + 1), may that interner still publish?
+    ///
+    /// Two conditions, both required, and **both fail safe** — anything this
+    /// cannot resolve counts as alive (`docs/PHASE2.md` §6.2):
+    ///
+    /// 1. the participant slot still reads `LIVE` (a `FREE` slot detached, a
+    ///    `RESERVED` one died mid-attach — neither is going to finish an intern);
+    /// 2. the injected [`LivenessFn`] agrees, when one was supplied.
+    ///
+    /// Condition 1 alone cannot see a *crash*: a `SIGKILL`ed process leaves its
+    /// slot `LIVE` forever, which is exactly what condition 2 exists to catch.
+    fn claimant_alive(&self) -> impl Fn(u32) -> bool + '_ {
+        move |owner: u32| {
+            if owner == CLAIM_UNRECORDED {
+                return true; // nobody named: not ours to judge
+            }
+            match self.participants().get(owner - 1) {
+                None => true, // out of range for this arena: cannot judge
+                Some(rec) => {
+                    rec.state.load(Ordering::Acquire) == LIVE
+                        && self.is_alive.is_none_or(|f| f(rec))
+                }
+            }
+        }
     }
 
     /// Pointer to frame record slot `id` (1-based; slot 0 is the root sentinel),
@@ -129,18 +242,19 @@ impl<'a> ArenaView<'a> {
     /// Intern `name`, returning its stable [`FrameId`]. Idempotent: the same name
     /// always maps to the same id, even across concurrent interners (loom-tested).
     ///
+    /// If another interner won this name's hash slot and died before publishing
+    /// the id, this call takes the entry over rather than spinning forever
+    /// (`docs/PHASE2.md` §1 A8) — but only if the view was given an identity with
+    /// [`Self::as_participant`] and enough information to declare the claimant
+    /// dead (see [`Self::with_liveness`]).
+    ///
     /// # Errors
     ///
     /// [`FrameError::FrameHashCollision`] on a 64-bit hash collision with a
     /// different name; [`FrameError::CapacityExceeded`] when the table is full.
     pub fn intern(&self, name: &str) -> Result<FrameId, FrameError> {
         let hash = blake3_64(name);
-        let hashes = self.frame_hashes();
-        let ids = self.frame_ids();
-        let count = self.frame_count();
-        // Usable ids are 1..max_frames (slot 0 is the root sentinel), so the
-        // interned-frame capacity is one less than the table slot count.
-        let capacity = self.header.max_frames.saturating_sub(1);
+        let table = self.intern_table();
 
         let name_matches = |id: u32| -> bool {
             match self.frame_record_ptr(id) {
@@ -165,11 +279,10 @@ impl<'a> ArenaView<'a> {
         };
 
         let id = intern_core(
-            hashes,
-            ids,
-            count,
-            capacity,
+            &table,
             hash,
+            self.me,
+            self.claimant_alive(),
             name_matches,
             write_record,
         )?;
@@ -183,48 +296,25 @@ impl<'a> ArenaView<'a> {
     /// read-only lookup path (`tree.lookup`) can distinguish "unknown frame" from
     /// "known but disconnected".
     ///
+    /// A lookup never writes, so it cannot rescue a slot whose interner died; it
+    /// reports `Ok(None)` instead (`docs/PHASE2.md` §1 A8). That is truthful — no
+    /// id exists for the name — and self-correcting, since the next *interner* of
+    /// the name takes the entry over.
+    ///
     /// # Errors
     ///
     /// [`FrameError::FrameHashCollision`] if a different name occupies this hash.
     pub fn find_frame(&self, name: &str) -> Result<Option<FrameId>, FrameError> {
         let hash = blake3_64(name);
-        let hashes = self.frame_hashes();
-        let ids = self.frame_ids();
-        let mask = (hashes.len() - 1) as u64;
-        let mut i = (hash & mask) as usize;
-        for _ in 0..hashes.len() {
-            let cur = hashes[i].load(Ordering::Acquire);
-            if cur == 0 {
-                return Ok(None); // reached an empty slot: name was never interned
+        let table = self.intern_table();
+        let name_matches = |id: u32| -> bool {
+            match FrameId::new(id).and_then(|f| self.frame_record(f)) {
+                Some(rec) => rec.name_matches(name),
+                None => false,
             }
-            if cur == hash {
-                // Wait for the winning interner to publish the id (Phase 2 may have
-                // a concurrent writer mid-intern; costs nothing in Phase 1).
-                let id = loop {
-                    let id = ids[i].load(Ordering::Acquire);
-                    if id != ID_UNPUBLISHED {
-                        break id;
-                    }
-                    spin();
-                };
-                if id == ID_FAILED {
-                    // An interner claimed this slot and then lost the capacity
-                    // race: the name was never actually interned.
-                    return Ok(None);
-                }
-                let matches = match FrameId::new(id).and_then(|f| self.frame_record(f)) {
-                    Some(rec) => rec.name_matches(name),
-                    None => false,
-                };
-                return if matches {
-                    Ok(FrameId::new(id))
-                } else {
-                    Err(FrameError::FrameHashCollision { hash })
-                };
-            }
-            i = (i + 1) & (mask as usize);
-        }
-        Ok(None)
+        };
+        let id = find_core(&table, hash, self.claimant_alive(), name_matches)?;
+        Ok(id.and_then(FrameId::new))
     }
 
     /// Read an interned frame record (for name display / diagnostics), or `None`

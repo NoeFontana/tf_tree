@@ -17,7 +17,7 @@ use tf_tree_math::{exp_se3, Iso3, LerpSlerp};
 use crate::buffer::{PoseSlot, SampleRing};
 use crate::edge::{claim, ClaimRecord};
 use crate::error::{EdgeId, LookupError};
-use crate::frame::intern_core;
+use crate::frame::{intern_core, InternTable, CLAIM_UNRECORDED};
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
@@ -144,53 +144,160 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
     });
 }
 
+/// The interning table's three parallel arrays plus its id allocator, on the heap
+/// and built from loom atomics — the same shape `ArenaView` hands `intern_core`.
+///
+/// Every array is **zero-initialized, exactly like the production arena**
+/// (`alloc_zeroed`). Seeding `ids` with a different "unpublished" sentinel is what
+/// once let this model check pass while the real publish-then-spin handshake was
+/// inert: nothing in the arena ever writes a non-zero unpublished marker.
+struct HeapInternTable {
+    hashes: alloc::vec::Vec<AtomicU64>,
+    ids: alloc::vec::Vec<AtomicU32>,
+    claiming: alloc::vec::Vec<AtomicU32>,
+    count: AtomicU32,
+}
+
+impl HeapInternTable {
+    /// `slots` must be a power of two (the mask is `slots - 1`).
+    fn new(slots: usize) -> HeapInternTable {
+        let mut hashes = alloc::vec::Vec::with_capacity(slots);
+        let mut ids = alloc::vec::Vec::with_capacity(slots);
+        let mut claiming = alloc::vec::Vec::with_capacity(slots);
+        for _ in 0..slots {
+            hashes.push(AtomicU64::new(0));
+            ids.push(AtomicU32::new(crate::frame::ID_UNPUBLISHED));
+            claiming.push(AtomicU32::new(CLAIM_UNRECORDED));
+        }
+        HeapInternTable {
+            hashes,
+            ids,
+            claiming,
+            count: AtomicU32::new(0),
+        }
+    }
+
+    fn table(&self, capacity: u32) -> InternTable<'_> {
+        InternTable {
+            hashes: &self.hashes,
+            ids: &self.ids,
+            claiming: &self.claiming,
+            frame_count: &self.count,
+            capacity,
+        }
+    }
+}
+
 /// Loom test 3: two threads racing `intern` on the same name get the same
 /// `FrameId`.
 #[test]
 fn intern_race_same_id() {
     loom::model(|| {
         // Interning table: 4 hash slots (mask 3), capacity 3 usable frames.
-        let hashes = Arc::new({
-            let mut v = alloc::vec::Vec::new();
-            for _ in 0..4 {
-                v.push(AtomicU64::new(0));
-            }
-            v
-        });
-        // Zero-initialized, exactly like the production arena (`alloc_zeroed`).
-        // Seeding this with a different sentinel is what let the model check pass
-        // while the real publish-then-spin handshake was inert: nothing in the
-        // arena ever writes a non-zero "unpublished" marker.
-        let ids = Arc::new({
-            let mut v = alloc::vec::Vec::new();
-            for _ in 0..4 {
-                v.push(AtomicU32::new(crate::frame::ID_UNPUBLISHED));
-            }
-            v
-        });
-        let count = Arc::new(AtomicU32::new(0));
+        let t = Arc::new(HeapInternTable::new(4));
         let hash: u64 = 0xdead_beef_0000_0001;
 
-        let spawn_one = |hashes: Arc<_>, ids: Arc<_>, count: Arc<AtomicU32>| {
+        // Two *live* registered participants (slots 0 and 1, so `me` is 1 and 2).
+        // Neither may be taken over: `claimant_alive` always agrees they are
+        // running, which is what the fail-safe default does in production.
+        let spawn_one = |t: Arc<HeapInternTable>, me: u32| {
             thread::spawn(move || {
-                let hashes: &alloc::vec::Vec<AtomicU64> = &hashes;
-                let ids: &alloc::vec::Vec<AtomicU32> = &ids;
-                intern_core(hashes, ids, &count, 3, hash, |_| true, |_| {}).unwrap()
+                intern_core(&t.table(3), hash, me, |_| true, |_| true, |_| {}).unwrap()
             })
         };
 
-        let t1 = spawn_one(Arc::clone(&hashes), Arc::clone(&ids), Arc::clone(&count));
-        let t2 = spawn_one(Arc::clone(&hashes), Arc::clone(&ids), Arc::clone(&count));
+        let t1 = spawn_one(Arc::clone(&t), 1);
+        let t2 = spawn_one(Arc::clone(&t), 2);
         let id1 = t1.join().unwrap();
         let id2 = t2.join().unwrap();
 
         assert_eq!(id1, id2, "concurrent intern of same name diverged");
         assert_eq!(id1, 1);
         assert_eq!(
-            count.load(Ordering::Relaxed),
+            t.count.load(Ordering::Relaxed),
             1,
             "one distinct name -> one id"
         );
+    });
+}
+
+/// Loom test 6 — **amendment A8** (`docs/PHASE2.md` §1 A8, §11.3 crash point
+/// `intern.after_hash_cas_before_id_store`).
+///
+/// One thread plays the process that wins the hash slot and is `SIGKILL`ed before
+/// publishing the id: it performs exactly the stores a killed interner would have
+/// completed and then vanishes. The other thread must still terminate with the
+/// name interned. Before A8 it spun forever, in every interleaving where the
+/// "dead" thread got there first.
+///
+/// The dying thread's writes are open-coded rather than done through
+/// `intern_core` because there is no way to abandon that function part-way; the
+/// two CASes below are precisely its prefix up to the crash point.
+#[test]
+fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
+    /// Participant slot of the doomed interner, as stored in `claiming` (slot + 1).
+    const DEAD: u32 = 1;
+    /// The survivor's own `claiming` value.
+    const ME: u32 = 2;
+
+    loom::model(|| {
+        let t = Arc::new(HeapInternTable::new(4));
+        let hash: u64 = 0xdead_beef_0000_0001;
+        let slot = (hash & 3) as usize;
+
+        let d = Arc::clone(&t);
+        let dying = thread::spawn(move || {
+            if d.hashes[slot]
+                .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Record the claim, then die: no id is allocated, no record is
+                // written, nothing is ever published into `ids[slot]`.
+                let _ = d.claiming[slot].compare_exchange(
+                    CLAIM_UNRECORDED,
+                    DEAD,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        });
+
+        let s = Arc::clone(&t);
+        let survivor = thread::spawn(move || {
+            // Liveness predicate: participant `DEAD` is gone, everyone else runs.
+            // In production this is the injected OFD-lock/`/proc` predicate
+            // (`docs/PHASE2.md` §5.1, §6.2).
+            intern_core(
+                &s.table(3),
+                hash,
+                ME,
+                |owner| owner != DEAD,
+                |_| true,
+                |_| {},
+            )
+        });
+
+        dying.join().unwrap();
+        let id = survivor
+            .join()
+            .unwrap()
+            .expect("A8: intern must recover from a dead claimant, not fail");
+
+        assert_eq!(id, 1, "the rescued entry gets the first frame id");
+        assert_eq!(
+            t.ids[slot].load(Ordering::Relaxed),
+            1,
+            "the rescuer must publish a terminal id into the wedged slot"
+        );
+        assert_eq!(
+            t.claiming[slot].load(Ordering::Relaxed),
+            ME,
+            "the rescuer must record itself as the entry's claimant"
+        );
+        // Whoever wins, exactly one id is allocated: the dead claimant never got
+        // as far as `frame_count`, and the takeover happens before the rescuer
+        // touches it.
+        assert_eq!(t.count.load(Ordering::Relaxed), 1, "no id was leaked");
     });
 }
 
