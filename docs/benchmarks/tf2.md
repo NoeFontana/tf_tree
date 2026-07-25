@@ -11,9 +11,10 @@ just tf2-differential   # correctness, synthetic fixture
 just tf2-replay         # correctness, real recorded /tf stream
 just tf2-bench          # performance, head-to-head, single-threaded
 just tf2-scaling        # concurrent read scaling, 1/2/4/8 threads
+just tf2-native-control # pure C++ tf2, no Rust and no FFI — the bias control
 ```
 
-All four run in a container (`docker/tf2/`), so no ROS install is needed on the
+All five run in a container (`docker/tf2/`), so no ROS install is needed on the
 host.
 
 ## Setup
@@ -65,140 +66,147 @@ A differential can "pass" by comparing nothing. Two safeguards:
 
 ## Performance
 
-**Read the caveat before the table.** These were measured on a shared 8-vCPU
-AMD EPYC-Milan VM with no core pinning and no isolation. Run-to-run variation of
-±20% was observed on the tf2 rows. The **ratios** below were stable across runs;
-the **absolute** numbers are indicative only and are *not* the decision `0003`
-go/no-go gate, which requires dedicated core-pinned hardware. Nothing here is
-claimed as a gate pass.
+All figures below were taken on an **idle** machine (load < 0.6, nothing running
+but the harness), 8 logical CPUs / **4 physical cores** (2-way SMT), AMD
+EPYC-Milan pinned at 2445 MHz with no frequency governor exposed. Criterion
+confidence intervals were within ±0.2%.
 
-### Measurement bias found and removed
+These are still **not** the decision `0003` go/no-go gate, which calls for
+dedicated core-pinned hardware; a shared-tenancy VM with SMT is closer than
+before but is not that.
 
-An earlier revision of this benchmark **overstated tf2's cost**, and the
-correction is recorded here rather than quietly applied.
+### Measuring the measurement: three biases found and removed
 
-`Tf2Buffer::lookup(&str, &str, ..)` converts both frame names to NUL-terminated
-C strings on every call — two heap allocations per lookup. `tf_tree`'s
-`Plan::at` takes no strings and allocates nothing, so timing the two against each
-other charged this repository's FFI marshalling to tf2.
+Every bias found so far favoured tf_tree. They are listed here, with what each
+cost, because a benchmark whose author only checked in one direction is not
+evidence.
 
-The bridge now exposes `FrameName` plus `lookup_by_name` /
-`set_transform_by_name`, which convert once and allocate never; every benchmark
-row uses them. Two permanent control rows keep the correction measurable rather
-than asserted:
+| # | Bias | Cost charged to tf2 | Found by |
+|---|---|---|---|
+| 1 | `CString::new` x2 per call in the Rust binding | **63-65 ns (14-18%)** | code review |
+| 2 | `const char*` -> two `std::string` temporaries at the C++ call site | **~17 ns (7%)** | native C++ control |
+| 3 | Residual FFI boundary (cross-TU, no inlining, extra copy) | ~21 ns (8%) | native C++ control |
 
-| Row (recorded stream, per lookup) | | |
-|---|---|---|
-| `tf2/lookupTransform` — allocation-free | **309 ns** | what is reported |
-| `tf2/lookupTransform_alloc` — the old path | 354 ns | **+45 ns (+15%)** of bias |
-| `tf2/shim_overhead` — FFI + `std::string` marshalling, no `BufferCore` call | 11 ns | ~3% residual |
+Bias 2 is the instructive one. The in-tree `shim_overhead` probe reported only
+11 ns and **missed it entirely**, because the probe measured the Rust side while
+the cost was incurred inside C++ at the `lookupTransform` call site. No amount of
+staring at the Rust code would have found it. What found it was
+`docker/tf2/native_scaling.cpp` — the same load and the same queries with the
+binding deleted outright.
 
-So the residual bridge cost is about **11 ns (3%)**, and it sits on tf2's side of
-the ledger — meaning tf2's true cost is very slightly *better* than the tables
-below show. The allocation bias was larger, and is gone.
+Fixes: `FrameName` now owns a heap `std::string` on the C++ side and
+`tft2_lookup_pre` passes it by `const&`, which is byte-for-byte the call a native
+C++ user makes. Two controls run on every benchmark invocation so this cannot
+silently regress — `tf2/lookupTransform_alloc` re-measures the naive binding, and
+`tf2/shim_overhead` isolates what the bridge still costs.
 
-(The same comparison on the fixture load falls inside run-to-run noise on this
-host; the recorded-stream figures above have non-overlapping confidence
-intervals and are the trustworthy ones.)
+Bias 3 is irreducible for any FFI comparison, so **the single-threaded ratio is
+reported against the native C++ figure**, which has no binding in it at all.
 
 ### Steady-state lookup
 
-1024 queries per iteration, stamps swept across the history window so the bracket
-search does real work rather than repeatedly hitting one cached pair.
+1024 queries per iteration, stamps swept across the history window.
 
-| Load | tf_tree | tf2 | Ratio |
-|---|---|---|---|
-| Fixture, depth 6 | 182 ns | 422 ns | **2.3x** |
-| Recorded stream, depth 3 | 95 ns | 309 ns | **3.3x** |
+| Load | tf_tree | tf2 (via bridge) | tf2 (native C++) | Ratio vs native |
+|---|---|---|---|---|
+| Fixture, depth 6 | 178 ns | 379 ns | - | 2.1x |
+| Recorded stream, depth 3 | 94 ns | 292 ns | **253 ns** | **2.7x** |
+
+The honest headline is therefore **~2.7x**, not the 3.3x first reported.
 
 ### Where the win comes from
 
-tf_tree's structural claim (decision `0003` / D3) is that it compiles the
-topology walk **once** into a `Plan` and thereafter only samples, whereas tf2
-walks the tree on every `lookupTransform`. Equalising that away would benchmark
-an engine nobody would ship — but it is worth isolating, so the suite also
-measures tf_tree recompiling a fresh plan for *every single query*:
+tf_tree compiles the topology walk **once** into a `Plan` and thereafter only
+samples (decision `0003` / D3); tf2 walks per call. Benchmarking only that would
+be self-serving, so the suite also measures tf_tree recompiling a fresh plan for
+*every single query*:
 
 | Load | tf_tree (plan reused) | tf_tree (replanned every query) | tf2 |
 |---|---|---|---|
-| Fixture, depth 6 | 182 ns | 369 ns | 422 ns |
-| Recorded stream | 95 ns | 242 ns | 309 ns |
+| Fixture, depth 6 | 178 ns | 361 ns | 379 ns |
+| Recorded stream | 94 ns | 243 ns | 292 ns |
 
-So plan reuse is worth about 2x — and tf_tree is still faster than tf2 *even when
-throwing the plan away every time*. The advantage is therefore not solely
-architectural bookkeeping; the sample path itself is faster.
+Plan reuse is worth about 2x — and tf_tree stays ahead of tf2 *even when
+throwing the plan away every time*, so the sample path is faster on its own
+merits, not only the bookkeeping.
 
 ### Scaling with tree size and depth
 
-Deepest-pair lookup (leaf sensor back to root), 256 queries per iteration.
+Deepest-pair lookup, 256 queries per iteration.
 
 | Shape | tf_tree | tf2 | Ratio |
 |---|---|---|---|
-| 12 frames, depth 4 | 266 ns | 1408 ns | **5.3x** |
-| 35 frames, depth 7 | 520 ns | 2818 ns | **5.4x** |
-| 117 frames, depth 13 | 1051 ns | 6204 ns | **5.9x** |
-| 375 frames, depth 15 | 1204 ns | 7522 ns | **6.3x** |
+| 12 frames, depth 4 | 262 ns | 1377 ns | **5.3x** |
+| 35 frames, depth 7 | 514 ns | 2592 ns | **5.0x** |
+| 117 frames, depth 13 | 1031 ns | 5948 ns | **5.8x** |
+| 375 frames, depth 15 | 1193 ns | 7337 ns | **6.2x** |
 
-Both engines scale primarily with **depth** rather than frame count: going from
-117 to 375 frames (3.2x the tree) while adding only two levels costs tf_tree 15%
-and tf2 21%.
+Both scale primarily with **depth**, not frame count: 117 -> 375 frames (3.2x the
+tree, two more levels) costs tf_tree 16% and tf2 23%.
 
 ### Publish
 
 | | tf_tree | tf2 | Ratio |
 |---|---|---|---|
-| One sample onto one edge | **8.9 ns** | 137 ns | **15.3x** |
+| One sample onto one edge | **8.6 ns** | 139 ns | **16.1x** |
 
-Both sides are bounded, or this would degenerate into a memory-growth benchmark
-— but they are bounded *differently*, and that difference is part of what is
-being compared. tf_tree's ring is count-bounded: a fixed power-of-two slot count,
-overwritten in place, never allocating (this is invariant 8, enforced by the
-zero-allocation gate). tf2's cache is time-bounded and prunes on insert. The
-benchmark uses a 10 s tf2 cache, the realistic ROS default.
+Both bounded, differently, and that difference is part of the comparison:
+tf_tree's ring is count-bounded (fixed power-of-two slots, overwritten in place,
+never allocating — invariant 8, enforced by the zero-allocation gate); tf2's
+cache is time-bounded and prunes on insert, here at the realistic 10 s default.
 
 ### Concurrent read scaling — 1 / 2 / 4 / 8 threads
 
-`just tf2-scaling`. This is the measurement most likely to separate the two
-engines: **tf_tree's readers take no lock at all**, while every
+`just tf2-scaling`. **tf_tree's readers take no lock**; every
 `tf2::lookupTransform` acquires `BufferCore`'s internal frame mutex. One shared
 tree and one shared buffer, as both engines are meant to be used — per-thread
-buffers would erase the contention being studied.
+buffers would erase the contention being studied. 101 rounds per point, engines
+**interleaved within every round** so drift lands on both equally.
 
-> **PRELIMINARY.** The figures below come from a smoke run on a *busy* VM. They
-> are recorded to show the harness works and what shape the result takes; they
-> are not a result. Re-run on an idle machine before citing.
+Throughput, million lookups/s, recorded stream:
 
-Throughput, million lookups/s (recorded stream):
-
-| Threads | tf_tree | tf2 | Ratio | tf_tree vs 1 thread | tf2 vs 1 thread |
+| Threads | tf_tree | tf2 | Ratio | tf_tree vs 1thr | tf2 vs 1thr |
 |---|---|---|---|---|---|
-| 1 | 9.54 | 2.09 | 4.6x | 1.00x | 1.00x |
-| 2 | 17.09 | 1.37 | 12.5x | 1.79x | **0.66x** |
-| 4 | 33.94 | 1.10 | 30.9x | 3.56x | **0.53x** |
-| 8 | 36.35 | 1.18 | 30.9x | 3.81x | **0.56x** |
+| 1 | 10.64 | 3.65 | 2.9x | 1.00x | 1.00x |
+| 2 | 19.76 | 1.84 | 10.8x | 1.86x | **0.50x** |
+| 4 | 37.80 | 1.56 | 24.3x | 3.55x | **0.43x** |
+| 8 | 64.71 | 1.12 | 57.9x | 6.08x | **0.31x** |
 
-tf_tree scales; **tf2 anti-scales** — adding threads makes it slower than a single
-thread, the classic signature of a contended global mutex (cache-line ping-pong
-plus futex sleep/wake).
+tf_tree scales; **tf2 anti-scales** — more threads make it slower than one
+thread, the signature of a contended global mutex.
 
-The tail is where it is starkest. Per-lookup latency, recorded stream:
+**This is tf2's behaviour, not an artifact of our binding.** The pure C++ control
+(`docker/tf2/native_scaling.sh`, no Rust, no FFI, same stream, same queries)
+reproduces it:
 
-| Threads | Engine | p50 | p99 | p99.9 |
-|---|---|---|---|---|
-| 1 | tf_tree | 131 ns | 181 ns | 280 ns |
-| 1 | tf2 | 331 ns | 921 ns | 2.0 us |
-| 8 | tf_tree | 150 ns | 181 ns | **250 ns** |
-| 8 | tf2 | 581 ns | 58.9 us | **258 us** |
+| Threads | native C++ tf2 | via our bridge |
+|---|---|---|
+| 1 | 1.00x | 1.00x |
+| 2 | 0.49x | 0.50x |
+| 4 | 0.42x | 0.43x |
+| 8 | **0.30x** | **0.31x** |
 
-At 8 threads tf_tree's p99.9 is *lower* than at 1 thread (250 ns vs 280 ns, i.e.
-flat within noise), while tf2's grows to **258 microseconds** — a factor of about
-1000. For a control loop, that is the difference between a bounded and an
-unbounded worst case.
+The tail is starker than the throughput. Per-lookup latency, recorded stream:
 
-Two internal cross-checks that the harness is measuring what it claims: at one
-thread, tf_tree's p50 of 210 ns minus the ~20 ns timer overhead matches the
-182 ns implied by its batch-timed throughput, and tf2's 411 ns likewise matches
-its 383 ns.
+| Threads | Engine | p50 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| 1 | tf_tree | 130 ns | 180 ns | 290 ns | 5.2 us |
+| 1 | tf2 | 291 ns | 821 ns | 1.4 us | 7.6 us |
+| 8 | tf_tree | 160 ns | 230 ns | **350 ns** | 6.8 us |
+| 8 | tf2 | 3.4 us | 48 us | **87 us** | 183 us |
+
+At 8 threads tf_tree's p99.9 is 350 ns against tf2's 87 us — a factor of ~250.
+For a control loop that is the difference between a bounded and an unbounded
+worst case.
+
+**Caveat on the scaling factor.** This host has 4 physical cores; tf_tree's 6.08x
+at 8 threads is SMT-assisted and should not be quoted as a clean scaling number.
+The 4-thread figure (3.55x on 4 cores) is the defensible one. The harness prints
+the physical core count for exactly this reason.
+
+Two internal cross-checks that the harness measures what it claims: for each
+engine, p50 minus the ~20 ns timer overhead matches the figure implied by its
+independently batch-timed throughput.
 
 ## A real difference: maximum chain depth
 
@@ -242,6 +250,7 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
   tf2's writer/reader lock exclusion.
 * **Per-thread core pinning.** The harness pins nothing; `taskset` on the whole
   process is the current best approximation.
+* **A non-SMT machine.** 4 physical cores cap what an 8-thread row can show.
 
 ## Runbook for pinned hardware
 

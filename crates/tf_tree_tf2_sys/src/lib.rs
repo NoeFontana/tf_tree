@@ -58,13 +58,6 @@ mod ffi {
             pose: *const c_double,
             is_static: c_int,
         ) -> c_int;
-        pub(super) fn tft2_lookup(
-            h: *mut c_void,
-            target: *const c_char,
-            source: *const c_char,
-            stamp_ns: i64,
-            out: *mut c_double,
-        ) -> c_int;
         pub(super) fn tft2_can_transform(
             h: *mut c_void,
             target: *const c_char,
@@ -73,8 +66,17 @@ mod ffi {
         ) -> c_int;
         pub(super) fn tft2_lookup_noop(
             h: *mut c_void,
-            target: *const c_char,
-            source: *const c_char,
+            target: *const c_void,
+            source: *const c_void,
+            stamp_ns: i64,
+            out: *mut c_double,
+        ) -> c_int;
+        pub(super) fn tft2_name_new(s: *const c_char) -> *mut c_void;
+        pub(super) fn tft2_name_free(n: *mut c_void);
+        pub(super) fn tft2_lookup_pre(
+            h: *mut c_void,
+            target: *const c_void,
+            source: *const c_void,
             stamp_ns: i64,
             out: *mut c_double,
         ) -> c_int;
@@ -202,7 +204,10 @@ impl Tf2Buffer {
         if stamp_ns < 0 {
             return Err(Tf2Error::NegativeStamp(stamp_ns));
         }
-        let (p, c) = (&parent.0, &child.0);
+        // `setTransform` fills `std::string` members of a message rather than
+        // taking them by reference, so a `const char*` is what it wants anyway.
+        let p = cstr(&parent.text)?;
+        let c = cstr(&child.text)?;
         let bits = pose.to_bits();
         // `to_bits` is f64 bit patterns; the shim wants the values themselves.
         let vals: [f64; 7] = core::array::from_fn(|i| f64::from_bits(bits[i]));
@@ -261,19 +266,18 @@ impl Tf2Buffer {
         if stamp_ns < 0 {
             return Err(Tf2Error::NegativeStamp(stamp_ns));
         }
-        let (t, s) = (&target.0, &source.0);
         let mut out = [0.0f64; 7];
 
-        // SAFETY: module invariant — `self.handle` is live; `t`/`s` are
-        // NUL-terminated and outlive the call; `out` is exactly the `double[7]`
-        // the shim writes, and is written only on rc == 0.
+        // SAFETY: module invariant — `self.handle` is live; the `FrameName`s own
+        // live `std::string`s that outlive the call and are only read; `out` is
+        // exactly the `double[7]` the shim writes, and only on rc == 0.
         let rc = unsafe {
-            ffi::tft2_lookup(
+            ffi::tft2_lookup_pre(
                 self.handle,
-                t.as_ptr(),
-                s.as_ptr(),
+                target.cpp,
+                source.cpp,
                 stamp_ns,
-                out.as_mut_ptr() as *mut c_double,
+                out.as_mut_ptr().cast::<c_double>(),
             )
         };
         if rc != 0 {
@@ -329,30 +333,67 @@ impl Drop for Tf2Buffer {
     }
 }
 
-/// A frame name converted **once** for the FFI boundary.
+/// A frame name prepared **once** for the FFI boundary, as a C++ `std::string`.
 ///
-/// Frame names are stable for the life of a query loop, so converting on every
-/// call is pure waste — and, in a benchmark, waste that would be misattributed
-/// to tf2. Build these up front and pass them to [`Tf2Buffer::lookup_by_name`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrameName(CString);
+/// `BufferCore::lookupTransform` takes `const std::string&`. Passing it a
+/// `const char*` constructs a temporary on every call — measurably, about 20 ns
+/// for a target/source pair — which a benchmark would charge to tf2 rather than
+/// to this bridge. A native C++ caller holds its frame names as `std::string`
+/// and pays nothing per call; owning the `std::string` here lets the bridge make
+/// byte-for-byte the same call.
+///
+/// The underlying string is immutable after construction, hence `Send + Sync`.
+#[derive(Debug)]
+pub struct FrameName {
+    /// Owning pointer to a heap `std::string` from `tft2_name_new`.
+    cpp: *mut std::ffi::c_void,
+    /// The Rust-side name, kept for diagnostics and for the `&str` API.
+    text: String,
+}
+
+// SAFETY: `cpp` points to a `std::string` that is written once at construction
+// and only ever read afterwards (`lookupTransform` takes it by const reference).
+// There is no interior mutability and no aliasing writer, so sharing a
+// `&FrameName` across threads — which the concurrent benchmark requires — is
+// sound, as is moving one.
+unsafe impl Send for FrameName {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for FrameName {}
 
 impl FrameName {
-    /// Convert a frame name, rejecting interior NULs.
+    /// Prepare a frame name, rejecting interior NULs.
     ///
     /// # Errors
     ///
-    /// [`Tf2Error::FrameNameHasNul`] if the name cannot be a C string.
+    /// [`Tf2Error::FrameNameHasNul`] if the name cannot cross into C, or
+    /// [`Tf2Error::Alloc`] if the C++ string could not be allocated.
     pub fn new(s: &str) -> Result<FrameName, Tf2Error> {
-        CString::new(s)
-            .map(FrameName)
-            .map_err(|_| Tf2Error::FrameNameHasNul(s.to_owned()))
+        let c = cstr(s)?;
+        // SAFETY: module invariant — `c` is NUL-terminated and outlives the
+        // call; `tft2_name_new` copies it into an owned `std::string`.
+        let cpp = unsafe { ffi::tft2_name_new(c.as_ptr()) };
+        if cpp.is_null() {
+            return Err(Tf2Error::Alloc);
+        }
+        Ok(FrameName {
+            cpp,
+            text: s.to_owned(),
+        })
     }
 
     /// The name as a `&str`, for diagnostics.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        self.0.to_str().unwrap_or("<invalid-utf8>")
+        &self.text
+    }
+}
+
+impl Drop for FrameName {
+    fn drop(&mut self) {
+        // SAFETY: module invariant — `cpp` came from exactly one
+        // `tft2_name_new`, was never duplicated (the type is not `Clone`), and
+        // is freed exactly once here.
+        unsafe { ffi::tft2_name_free(self.cpp) }
     }
 }
 
@@ -383,8 +424,8 @@ pub fn lookup_overhead_probe(
     let rc = unsafe {
         ffi::tft2_lookup_noop(
             buffer.handle,
-            target.0.as_ptr(),
-            source.0.as_ptr(),
+            target.cpp,
+            source.cpp,
             stamp_ns,
             out.as_mut_ptr().cast::<c_double>(),
         )

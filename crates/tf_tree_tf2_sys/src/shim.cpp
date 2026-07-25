@@ -112,16 +112,33 @@ int tft2_set(void *h, const char *parent, const char *child,
   }
 }
 
-/// Look up `T_target_source` at `stamp_ns`, writing `{qw,qx,qy,qz,tx,ty,tz}`
-/// into `out`. Returns 0 on success, non-zero on any tf2 exception (which is
-/// the *expected* outcome for an extrapolation or a disconnected pair — read the
-/// reason with `tft2_last_error`).
-int tft2_lookup(void *h, const char *target, const char *source,
-                std::int64_t stamp_ns, double *out) {
+/// Allocate a persistent `std::string` for a frame name. Free with
+/// `tft2_name_free`.
+///
+/// `BufferCore::lookupTransform` takes `const std::string&`. Handing it a
+/// `const char*` constructs a temporary on **every** call — around 20 ns for the
+/// pair, which a benchmark would charge to tf2. A native C++ caller holds its
+/// frame names as `std::string` members and pays nothing, so this lets the
+/// bridge do the same and keeps the comparison honest.
+///
+/// The returned string is immutable after construction, so it is safe to share
+/// across threads.
+void *tft2_name_new(const char *s) { return new (std::nothrow) std::string(s); }
+
+/// Free a name from `tft2_name_new`. Null is a no-op.
+void tft2_name_free(void *n) { delete static_cast<std::string *>(n); }
+
+/// Look up `T_target_source` using names from `tft2_name_new`.
+///
+/// The allocation-free, temporary-free path: byte-for-byte the call a native
+/// C++ user makes.
+int tft2_lookup_pre(void *h, const void *target, const void *source,
+                    std::int64_t stamp_ns, double *out) {
   Handle *self = static_cast<Handle *>(h);
   try {
-    auto t = self->buffer.lookupTransform(target, source, time_point(stamp_ns));
-    // w-last (tf2) -> w-first (tf_tree).
+    auto t = self->buffer.lookupTransform(
+        *static_cast<const std::string *>(target),
+        *static_cast<const std::string *>(source), time_point(stamp_ns));
     out[QW] = t.transform.rotation.w;
     out[QX] = t.transform.rotation.x;
     out[QY] = t.transform.rotation.y;
@@ -157,36 +174,32 @@ int tft2_can_transform(void *h, const char *target, const char *source,
 /// across repetitions without paying reallocation.
 void tft2_clear(void *h) { static_cast<Handle *>(h)->buffer.clear(); }
 
-/// Everything `tft2_lookup` does **except** the `BufferCore` call: the same FFI
-/// crossing, the same `const char*` -> `std::string` marshalling, the same
+/// Everything `tft2_lookup_pre` does **except** the `BufferCore` call: the same
+/// FFI crossing, the same by-reference `std::string` access, the same
 /// `double[7]` write-back.
 ///
-/// Subtracting this from a `tft2_lookup` measurement gives tf2's own cost with
-/// the bridge's overhead removed, so a benchmark can state how much of the
-/// reported tf2 latency is this shim rather than tf2. It exists purely to keep
-/// the comparison honest; nothing in the library calls it.
+/// Subtracting this from a `tft2_lookup_pre` measurement gives tf2's own cost
+/// with the bridge's overhead removed, so a benchmark can state how much of the
+/// reported tf2 latency is this shim rather than tf2. It takes the *same*
+/// argument types as the real call deliberately — an earlier version took
+/// `const char*` and was therefore measuring a different code path than the one
+/// it claimed to model.
 ///
-/// `volatile` and the `out` write stop the optimiser deleting the marshalling
-/// we are trying to measure.
-int tft2_lookup_noop(void *h, const char *target, const char *source,
+/// `volatile` and the `out` write stop the optimiser deleting what we are
+/// trying to measure.
+int tft2_lookup_noop(void *h, const void *target, const void *source,
                      std::int64_t stamp_ns, double *out) {
   (void)h;
   volatile std::size_t sink = 0;
-  try {
-    // Exactly the conversions `lookupTransform(target, source, tp)` performs on
-    // its arguments at the call site.
-    std::string t(target);
-    std::string s(source);
-    auto tp = time_point(stamp_ns);
-    sink = t.size() + s.size() +
-           static_cast<std::size_t>(tp.time_since_epoch().count() & 1);
-    for (std::size_t i = 0; i < 7; ++i) {
-      out[i] = static_cast<double>(sink);
-    }
-    return 0;
-  } catch (...) {
-    return 1;
+  const auto &t = *static_cast<const std::string *>(target);
+  const auto &s = *static_cast<const std::string *>(source);
+  auto tp = time_point(stamp_ns);
+  sink = t.size() + s.size() +
+         static_cast<std::size_t>(tp.time_since_epoch().count() & 1);
+  for (std::size_t i = 0; i < 7; ++i) {
+    out[i] = static_cast<double>(sink);
   }
+  return 0;
 }
 
 /// The message from the most recent failure **on the calling thread**, as a

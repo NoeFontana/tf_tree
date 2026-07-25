@@ -84,3 +84,8 @@ versions:
     @echo "rustc:  $(rustc --version)"
     @echo "cargo:  $(cargo --version)"
     @echo "just:   $(just --version)"
+
+# Pure-C++ tf2 read scaling: no Rust, no FFI. The control that proves the
+# benchmark's tf2 numbers are not an artifact of our binding.
+tf2-native-control:
+    ./docker/tf2/run.sh 'bash docker/tf2/native_scaling.sh'
