@@ -1,0 +1,448 @@
+//! The lock file — `docs/PHASE2.md` §3.3.
+//!
+//! A small regular file that holds no state, only locks. **The design principle
+//! is to not implement leader election but to borrow the kernel's.** A
+//! rendezvous needs exactly three properties: mutual exclusion, automatic
+//! release when the holder dies, and a way to ask whether anyone holds it. Linux
+//! byte-range OFD locks provide all three, maintained by the kernel, with no
+//! timeouts, no heartbeats, and no state that can survive a `SIGKILL`.
+//!
+//! | Offset | Meaning |
+//! |---|---|
+//! | byte 0 | **Ownership.** Exclusive. The holder serves the socket. |
+//! | bytes 1–15 | reserved |
+//! | bytes 16 + *i* | **Participant liveness** for slot *i*, held for the lifetime of the attachment. |
+//! | 4096 + 64·*i* | **Identity record** for slot *i*, written with `pwrite`. Advisory. |
+//!
+//! Two properties of this arrangement are easy to get wrong and are asserted by
+//! tests rather than assumed:
+//!
+//! * **`F_OFD_GETLK` cannot name a holder.** An OFD lock belongs to an open file
+//!   description, not a process, so the kernel reports `l_pid = -1`. The lock
+//!   file answers *"is anyone alive?"* — all the rendezvous needs — and *"who?"*
+//!   comes from the identity records. That is exactly why those records exist as
+//!   plain `pwrite` data instead of living only in the arena: a process that
+//!   cannot reach the arena can still run `doctor` and get names and pids.
+//! * **A description's own locks are invisible to its own `GETLK`.** The kernel
+//!   reports *conflicts*, and nothing conflicts with itself. Every query here is
+//!   therefore "does anyone **else** hold this", which is what the §3.4
+//!   split-brain check wants, and a trap for any future code that tries to read
+//!   back its own state.
+
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::Path;
+
+use crate::error::{IpcError, LockRole};
+use crate::identity::{Identity, IDENTITY_RECORD_LEN};
+use crate::ofd::{self, LockAttempt, LockKind, Range};
+
+pub use crate::ofd::LockProbe;
+
+/// Participant slots, and therefore participant lock bytes.
+///
+/// Matches `tf_tree_arena::DEFAULT_MAX_PARTICIPANTS`, which is the arena-side
+/// table this indexes. The two must agree; they are separate constants only
+/// because `docs/PHASE2.md` §2 forbids this crate from depending on the arena.
+pub const MAX_PARTICIPANTS: u32 = 64;
+
+/// Byte 0: ownership.
+const OWNERSHIP_OFFSET: u64 = 0;
+/// Participant liveness starts at byte 16, leaving 1–15 reserved.
+const PARTICIPANT_BASE: u64 = 16;
+/// Identity records start on the second page.
+const IDENTITY_BASE: u64 = 4096;
+
+/// Base offset reserved for §6.1 claim locks (`CLAIM_BASE + edge_id`).
+///
+/// Nothing takes these yet — claims land with the arena in a later pass — but
+/// the region is reserved here so the offset arithmetic lives in one file. It
+/// starts at 1 MiB, far past the identity records, because a collision between
+/// a claim byte and a participant byte would hand one edge to two writers and
+/// present as impossible numerical results rather than as an error.
+pub const CLAIM_BASE: u64 = 1 << 20;
+
+/// Handle on the lock file for one open file description.
+///
+/// **Ownership of the `File` is the lock's lifetime.** OFD locks are released
+/// when the last descriptor referring to this description closes, which happens
+/// on `Drop` and, identically, on process death by any means including
+/// `SIGKILL`. There is no unlock path that can be missed, which is the entire
+/// reason this is not a heartbeat protocol.
+#[derive(Debug)]
+pub struct LockFile {
+    file: File,
+}
+
+impl LockFile {
+    /// Open (creating if absent) the lock file at `path`.
+    ///
+    /// Mode `0600`: the rendezvous is same-user by construction (§3.10) and the
+    /// containing directory is `0700`, so a wider mode would only be misleading.
+    /// Opened read-write because `F_WRLCK` requires a descriptor open for
+    /// writing.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFileOpen`] if the file cannot be opened or created.
+    pub fn open(path: &Path) -> Result<LockFile, IpcError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| IpcError::LockFileOpen {
+                raw_os_error: IpcError::os(&e),
+            })?;
+        Ok(LockFile { file })
+    }
+
+    /// Try to take byte 0 — become the owner.
+    ///
+    /// Returns [`LockAttempt::Contended`] when someone else holds it. That is
+    /// not an error: in the §3.4 loop it means another process is mid-bind and
+    /// will be serving shortly.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`] for any `fcntl` failure that is not contention.
+    pub fn try_take_ownership(&self) -> Result<LockAttempt, IpcError> {
+        self.set(
+            Range::byte(OWNERSHIP_OFFSET),
+            LockKind::Exclusive,
+            LockRole::Ownership,
+        )
+    }
+
+    /// Release byte 0 without closing the file, so a process can yield
+    /// ownership (§3.4 step 4) and keep its participant slot.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`].
+    pub fn release_ownership(&self) -> Result<(), IpcError> {
+        self.set(
+            Range::byte(OWNERSHIP_OFFSET),
+            LockKind::Unlock,
+            LockRole::Ownership,
+        )
+        .map(|_| ())
+    }
+
+    /// Try to take the liveness byte for `slot`.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`], or [`IpcError::NoParticipantSlots`] if `slot`
+    /// is out of range.
+    pub fn try_take_participant(&self, slot: u32) -> Result<LockAttempt, IpcError> {
+        self.set(
+            participant_range(slot)?,
+            LockKind::Exclusive,
+            LockRole::Participant(slot),
+        )
+    }
+
+    /// Release the liveness byte for `slot`.
+    ///
+    /// # Errors
+    ///
+    /// As [`LockFile::try_take_participant`].
+    pub fn release_participant(&self, slot: u32) -> Result<(), IpcError> {
+        self.set(
+            participant_range(slot)?,
+            LockKind::Unlock,
+            LockRole::Participant(slot),
+        )
+        .map(|_| ())
+    }
+
+    /// Take the lowest free participant slot.
+    ///
+    /// Scanning is honest here only because this crate does not yet speak the
+    /// §3.7 attach protocol. In the finished design the *owner* assigns the slot
+    /// under its accept loop and hands it back in the `HelloResponse`, which is
+    /// what makes the arena-side record fully populated before any claim can
+    /// reference it. Until then, a joiner picks its own — the locks make that
+    /// race-free even if it is not the final protocol.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::NoParticipantSlots`] when every slot is live.
+    pub fn take_any_participant(&self) -> Result<u32, IpcError> {
+        for slot in 0..MAX_PARTICIPANTS {
+            if self.try_take_participant(slot)? == LockAttempt::Acquired {
+                return Ok(slot);
+            }
+        }
+        Err(IpcError::NoParticipantSlots {
+            limit: MAX_PARTICIPANTS,
+        })
+    }
+
+    /// Query byte 0.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`].
+    pub fn probe_ownership(&self) -> Result<LockProbe, IpcError> {
+        self.probe(Range::byte(OWNERSHIP_OFFSET), LockRole::Ownership)
+    }
+
+    /// Query one participant byte.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`] or [`IpcError::NoParticipantSlots`] for an
+    /// out-of-range slot.
+    pub fn probe_participant(&self, slot: u32) -> Result<LockProbe, IpcError> {
+        self.probe(participant_range(slot)?, LockRole::Participant(slot))
+    }
+
+    /// Bitmask of participant slots held by *other* open file descriptions.
+    ///
+    /// This is the §3.4 step 4 question. It is deliberately a full scan rather
+    /// than an early exit: the caller that fails the check needs the whole set
+    /// to name the stuck slots in [`IpcError::ArenaHeldButUnreachable`], and 64
+    /// `fcntl` calls on a cold path are free.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`].
+    pub fn held_participants(&self) -> Result<u64, IpcError> {
+        let mut mask = 0u64;
+        for slot in 0..MAX_PARTICIPANTS {
+            if self.probe_participant(slot)?.held {
+                mask |= 1u64 << slot;
+            }
+        }
+        Ok(mask)
+    }
+
+    /// Whether any participant byte is held — the split-brain predicate.
+    ///
+    /// Early-exits, because the §3.4 loop asks this on every iteration and only
+    /// needs a yes/no.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`].
+    pub fn any_participant_held(&self) -> Result<bool, IpcError> {
+        for slot in 0..MAX_PARTICIPANTS {
+            if self.probe_participant(slot)?.held {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Write the identity record for `slot`.
+    ///
+    /// Written *before* the slot's lock is taken (§3.3), so that any process
+    /// which observes the lock can also read a fully-formed record for it. The
+    /// record is advisory (§5.1) — the lock is the liveness — but "advisory"
+    /// must not mean "sometimes absent when a lock is held".
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::IdentityIo`] on a short or failed `pwrite`.
+    pub fn write_identity(&self, slot: u32, id: &Identity) -> Result<(), IpcError> {
+        let offset = identity_offset(slot)?;
+        let bytes = id.to_bytes();
+        let n = self
+            .file
+            .write_at(&bytes, offset)
+            .map_err(|e| IpcError::IdentityIo {
+                slot,
+                raw_os_error: IpcError::os(&e),
+            })?;
+        if n != bytes.len() {
+            return Err(IpcError::IdentityIo {
+                slot,
+                raw_os_error: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Read the identity record for `slot`, or `None` if it was never written.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::IdentityIo`] if the read fails for a reason other than the
+    /// file being short.
+    pub fn read_identity(&self, slot: u32) -> Result<Option<Identity>, IpcError> {
+        let offset = identity_offset(slot)?;
+        let mut buf = [0u8; IDENTITY_RECORD_LEN];
+        let n = self
+            .file
+            .read_at(&mut buf, offset)
+            .map_err(|e| IpcError::IdentityIo {
+                slot,
+                raw_os_error: IpcError::os(&e),
+            })?;
+        if n != buf.len() {
+            // Short read means the file has never been grown to this record, so
+            // nobody has ever taken the slot.
+            return Ok(None);
+        }
+        Ok(Identity::from_bytes(&buf))
+    }
+
+    /// The descriptor, for code that needs to prove two `LockFile`s are distinct
+    /// open file descriptions.
+    #[must_use]
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+
+    fn set(&self, range: Range, kind: LockKind, role: LockRole) -> Result<LockAttempt, IpcError> {
+        ofd::try_lock(self.file.as_fd(), range, kind)
+            .map_err(|errno| IpcError::LockFailed { role, errno })
+    }
+
+    fn probe(&self, range: Range, role: LockRole) -> Result<LockProbe, IpcError> {
+        ofd::probe(self.file.as_fd(), range).map_err(|errno| IpcError::LockFailed { role, errno })
+    }
+}
+
+/// The lock byte for `slot`.
+fn participant_range(slot: u32) -> Result<Range, IpcError> {
+    if slot >= MAX_PARTICIPANTS {
+        return Err(IpcError::NoParticipantSlots {
+            limit: MAX_PARTICIPANTS,
+        });
+    }
+    Ok(Range::byte(PARTICIPANT_BASE + u64::from(slot)))
+}
+
+/// The identity record offset for `slot`.
+fn identity_offset(slot: u32) -> Result<u64, IpcError> {
+    if slot >= MAX_PARTICIPANTS {
+        return Err(IpcError::NoParticipantSlots {
+            limit: MAX_PARTICIPANTS,
+        });
+    }
+    Ok(IDENTITY_BASE + u64::from(slot) * IDENTITY_RECORD_LEN as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::identity::AccessMode;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tf_tree_ipc_lock-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("test.lock")
+    }
+
+    #[test]
+    fn the_byte_layout_is_the_one_the_spec_tabulates() {
+        assert_eq!(OWNERSHIP_OFFSET, 0);
+        assert_eq!(participant_range(0).unwrap(), Range::byte(16));
+        assert_eq!(participant_range(63).unwrap(), Range::byte(79));
+        assert_eq!(identity_offset(0).unwrap(), 4096);
+        assert_eq!(identity_offset(1).unwrap(), 4096 + 64);
+        assert_eq!(identity_offset(63).unwrap(), 4096 + 64 * 63);
+        // Participant bytes must not reach into the identity page, and claims
+        // must start past every identity record.
+        assert!(PARTICIPANT_BASE + u64::from(MAX_PARTICIPANTS) <= IDENTITY_BASE);
+        assert!(CLAIM_BASE > identity_offset(MAX_PARTICIPANTS - 1).unwrap());
+        assert!(participant_range(MAX_PARTICIPANTS).is_err());
+        assert!(identity_offset(MAX_PARTICIPANTS).is_err());
+    }
+
+    #[test]
+    fn two_descriptions_in_one_process_still_conflict() {
+        // The property that makes OFD locks usable in a library: unlike classic
+        // POSIX locks, which are per-process and would let this succeed twice,
+        // two separate `open`s conflict even inside one process.
+        let path = scratch("two-fds");
+        let a = LockFile::open(&path).unwrap();
+        let b = LockFile::open(&path).unwrap();
+        assert_eq!(a.try_take_ownership().unwrap(), LockAttempt::Acquired);
+        assert_eq!(b.try_take_ownership().unwrap(), LockAttempt::Contended);
+        a.release_ownership().unwrap();
+        assert_eq!(b.try_take_ownership().unwrap(), LockAttempt::Acquired);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_holder_does_not_see_its_own_lock() {
+        // Documented trap: GETLK reports conflicts, and nothing conflicts with
+        // itself. Any future "read back my own state" code is wrong.
+        let path = scratch("self-blind");
+        let a = LockFile::open(&path).unwrap();
+        assert_eq!(a.try_take_participant(3).unwrap(), LockAttempt::Acquired);
+        assert!(!a.probe_participant(3).unwrap().held);
+        let b = LockFile::open(&path).unwrap();
+        assert!(b.probe_participant(3).unwrap().held);
+        assert_eq!(b.held_participants().unwrap(), 1 << 3);
+        assert!(b.any_participant_held().unwrap());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dropping_the_file_releases_every_lock() {
+        let path = scratch("drop");
+        let observer = LockFile::open(&path).unwrap();
+        {
+            let a = LockFile::open(&path).unwrap();
+            a.try_take_ownership().unwrap();
+            a.try_take_participant(0).unwrap();
+            assert!(observer.probe_ownership().unwrap().held);
+        }
+        assert!(!observer.probe_ownership().unwrap().held);
+        assert_eq!(observer.held_participants().unwrap(), 0);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn slots_are_handed_out_lowest_first() {
+        let path = scratch("slots");
+        let a = LockFile::open(&path).unwrap();
+        let b = LockFile::open(&path).unwrap();
+        let c = LockFile::open(&path).unwrap();
+        assert_eq!(a.take_any_participant().unwrap(), 0);
+        assert_eq!(b.take_any_participant().unwrap(), 1);
+        drop(a);
+        // Slot 0 is free again the instant its description closed.
+        assert_eq!(c.take_any_participant().unwrap(), 0);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn identity_records_round_trip_at_the_specified_offsets() {
+        let path = scratch("identity");
+        let lf = LockFile::open(&path).unwrap();
+        assert_eq!(lf.read_identity(5).unwrap(), None, "never written");
+        let id = Identity {
+            pid: 4242,
+            start_time: 987_654,
+            boot_id: [7u8; 16],
+            mode: AccessMode::ReadWrite,
+            name: {
+                let mut n = [0u8; 32];
+                n[..4].copy_from_slice(b"node");
+                n
+            },
+        };
+        lf.write_identity(5, &id).unwrap();
+        assert_eq!(lf.read_identity(5).unwrap(), Some(id));
+        // Neighbouring records are untouched: the stride is 64, not "whatever
+        // the struct happens to be".
+        assert_eq!(lf.read_identity(4).unwrap(), None);
+        assert_eq!(lf.read_identity(6).unwrap(), None);
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, 4096 + 64 * 6);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}

@@ -4,6 +4,7 @@ members = [
     "crates/tf_tree_math",
     "crates/tf_tree_arena",
     "crates/tf_tree_core",
+    "crates/tf_tree_ipc",
     "crates/tf_tree",
     "crates/tf_tree_bench",
     "crates/tf_tree_cli",
