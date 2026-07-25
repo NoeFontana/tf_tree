@@ -14,7 +14,7 @@
 //!
 //! Requires `--features shm` (Linux). Run: `just shm-test`.
 #![cfg(all(feature = "shm", target_os = "linux"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader};
 
@@ -281,28 +281,174 @@ fn read_only_refuses_mutation_instead_of_faulting() {
     );
 }
 
-/// Runtime re-parenting is refused on a shared arena even when writable.
+/// Runtime re-parenting **works** on a shared arena, and another process sees
+/// the result (`docs/PHASE2.md` §1, A2).
 ///
-/// `Tree::reparent` is serialized only by a **process-local** mutex, and
-/// `set_parent` publishes an odd generation for the duration of its block copy —
-/// so a writer killed mid-mutation leaves every reader in every process spinning
-/// forever in plan compilation. `docs/PHASE2.md` §1 amendments A1/A2 fix that;
-/// until they land the operation is refused rather than raced.
+/// This replaces `reparent_is_refused_on_a_shared_arena`. That test asserted a
+/// placeholder: `Tree::reparent` was serialized only by a *process-local* mutex,
+/// which serializes nothing against a peer that mapped the same segment, so the
+/// operation was refused rather than raced. A1 removed the wedge a crashed
+/// mutator caused; A2 put the mutation lock in the arena header where every
+/// participant contends on it. The refusal is gone and this is what replaces it.
 ///
-/// This test is also what makes `PHASE2.md` §0.0's claim that "topology is
-/// immutable after `build_shared`" true by construction rather than by hope.
+/// The reparent is non-trivial on purpose: moving `imu_link` from `base_link` to
+/// `odom` drops the `odom → base_link` leg out of every `map → imu_link` path,
+/// so the answers *must* change. Asserting they changed is what stops the test
+/// passing vacuously against a reparent that silently did nothing.
 #[test]
-fn reparent_is_refused_on_a_shared_arena() {
+fn reparent_on_a_shared_arena_is_visible_to_another_process() {
     let tree = shared_fixture();
     assert!(tree.is_writable(), "creator's tree should be writable");
 
+    const COUNT: usize = 64;
+    let base_ns = fixture::NOW_NS;
+    let before = parent_answers(&tree, "imu_link", "map", base_ns, COUNT);
+
     let child = tree.frame("imu_link").expect("imu_link");
-    let parent = tree.frame("odom").expect("odom");
+    let new_parent = tree.frame("odom").expect("odom");
+    let generation_before = tree.guard().generation();
+    tree.reparent(child, new_parent)
+        .expect("reparent on a shared arena");
     assert!(
-        matches!(
-            tree.reparent(child, parent),
-            Err(tf_tree::ReparentError::SharedArena)
-        ),
-        "reparent on a shared arena was not refused"
+        tree.guard().generation() > generation_before,
+        "reparent did not publish a new topology generation"
     );
+
+    let after = parent_answers(&tree, "imu_link", "map", base_ns, COUNT);
+    assert_ne!(
+        before, after,
+        "the reparent changed nothing; this test would pass vacuously"
+    );
+    assert!(
+        after.iter().filter(|a| a.is_some()).count() > COUNT / 2,
+        "the reparented topology answers almost nothing; the comparison is vacuous"
+    );
+
+    // Now a *second process* maps the same segment and is asked the same
+    // questions. It compiles its own plan from the topology block, so it can
+    // only agree if the reparent reached the shared bytes.
+    let child_bin = sibling_binary("shm_child").expect("shm_child binary");
+    let fd = tree.shared_fd().expect("shared tree exposes its fd");
+    let args: Vec<String> = [
+        "verify",
+        "imu_link",
+        "map",
+        &base_ns.to_string(),
+        &COUNT.to_string(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+
+    let mut proc = spawn_attached(&child_bin, fd, &args).expect("spawn child");
+    let out = BufReader::new(proc.stdout.take().expect("child stdout"));
+    let got: Vec<Option<[u64; 7]>> = out
+        .lines()
+        .map(|line| {
+            let line = line.expect("read child line");
+            if line == "err" {
+                return None;
+            }
+            let mut it = line.split_whitespace();
+            assert_eq!(it.next(), Some("ok"), "unexpected child output: {line:?}");
+            let mut bits = [0u64; 7];
+            for b in &mut bits {
+                *b = it.next().expect("bit field").parse().expect("u64");
+            }
+            Some(bits)
+        })
+        .collect();
+    let status = proc.wait().expect("wait for child");
+    assert!(status.success(), "child exited with {status}");
+
+    assert_eq!(got.len(), COUNT, "child answered {} of {COUNT}", got.len());
+    assert_eq!(
+        got, after,
+        "the peer process did not see the re-parented topology"
+    );
+    assert_ne!(
+        got, before,
+        "the peer process answered from the pre-reparent topology"
+    );
+}
+
+/// Two independent attachments race `reparent`, and only the **arena** lock can
+/// stop them colliding.
+///
+/// Each `Tree` here is its own attachment: its own participant slot and its own
+/// process-local `decl` mutex. That mutex is precisely the thing that does not
+/// generalise across a boundary, so it serializes nothing between these two —
+/// exactly the situation a second process is in. What is left is A2's in-arena
+/// lock, and if it did not work these threads would race the topology block copy
+/// and lose or corrupt mutations.
+///
+/// Verified in-process rather than across a `fork` because the failure being
+/// tested is a *data race on the shared bytes*, which needs both mutators alive
+/// and interleaved; the process-boundary half is covered by the test above.
+#[test]
+fn concurrent_reparents_from_separate_attachments_are_serialized() {
+    let tree = shared_fixture();
+
+    let attach = || {
+        let fd = tree
+            .shared_fd()
+            .expect("shared fd")
+            .try_clone_to_owned()
+            .expect("dup fd");
+        Tree::attach_shared(fd, AttachMode::ReadWrite).expect("attach read-write")
+    };
+    let a = attach();
+    let b = attach();
+
+    // Two frames with their own edges, moved between two parents that are
+    // themselves unrelated, so neither mutation can create a cycle.
+    const ROUNDS: u32 = 64;
+    let start = tree.guard().generation();
+
+    std::thread::scope(|s| {
+        for (t, child_name) in [(&a, "imu_link"), (&b, "lidar")] {
+            s.spawn(move || {
+                let child = t.frame(child_name).expect("child frame");
+                let p1 = t.frame("odom").expect("odom");
+                let p2 = t.frame("base_link").expect("base_link");
+                for r in 0..ROUNDS {
+                    let parent = if r % 2 == 0 { p1 } else { p2 };
+                    loop {
+                        match t.reparent(child, parent) {
+                            Ok(()) => break,
+                            // The only tolerated failure: a live peer holds the
+                            // lock. Anything else is a real defect.
+                            Err(tf_tree::ReparentError::LockContended { .. }) => {
+                                std::hint::spin_loop();
+                            }
+                            Err(other) => panic!("reparent failed: {other}"),
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Every mutation published exactly once. A lost generation means two writers
+    // shared one scratch block; there is no way to gain one.
+    assert_eq!(
+        tree.guard().generation() - start,
+        u64::from(2 * ROUNDS),
+        "topology generations were lost — the mutations were not serialized"
+    );
+
+    // And the tree is intact and consistent from a third view of the segment.
+    let final_parent = tree.frame("base_link").expect("base_link");
+    for name in ["imu_link", "lidar"] {
+        let f = tree.frame(name).expect("frame");
+        let plan = tree
+            .plan(f, final_parent)
+            .expect("plan against a live tree");
+        let guard = tree.guard();
+        let stamp: Stamp = Stamp::from_nanos(fixture::NOW_NS);
+        // `lidar`'s ring is the 10 Hz edge and `imu_link`'s the 1 kHz one; both
+        // cover NOW_NS, so a well-formed topology must resolve.
+        plan.at(&guard, stamp)
+            .unwrap_or_else(|e| panic!("{name} unresolvable after the race: {e:?}"));
+    }
 }
