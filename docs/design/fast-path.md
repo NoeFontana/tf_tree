@@ -1,6 +1,8 @@
 # Design: the next-generation lookup hot path
 
-**Status:** draft — proposal, nothing here is implemented
+**Status:** partly implemented, partly **falsified by measurement**. Levers 1
+and 1b are in; Lever 3 is rejected on real data. See §11 for what each lever
+actually returned versus what this document projected.
 **Measured on:** AMD EPYC-Milan, 4 physical cores, 2445 MHz fixed, idle
 **Reproduce:** `cargo run --release -p tf_tree_bench --example cost_model`
 
@@ -190,7 +192,41 @@ on its own and phase 2 is dropped rather than smuggled in via an unsafe island.
 
 ---
 
-## 5. Lever 3 — interpolation-seeded bracket search (21 ns → ~4 ns/step)
+## 5. Lever 3 — interpolation-seeded bracket search — **FALSIFIED, not implemented**
+
+> **Rejected.** §10 made this lever conditional on measuring the correction-step
+> distribution on real recorded data first. That measurement
+> (`cargo run --release -p tf_tree_bench --example search_seed`) rejects it:
+>
+> | Stream | Jitter (CV) | Seed error p50 | p99 | Within ±2 |
+> |---|---|---|---|---|
+> | Synthetic fixture (isochronous) | 0.00 | 0 | 0 | 100% |
+> | Recorded, `base_link->*_link` | 1.44 | **11** | 42 | 16% |
+> | Recorded, `odom_combined->base_footprint` | 2.85 | **48** | 90 | 8% |
+>
+> The seed lands a median of 11–48 indices from the answer, where a binary
+> search over the same 203–254 samples needs ~8 probes *in total*. The seeded
+> search would be slower, not faster.
+>
+> **The reason is not jitter in the usual sense.** The recording's median period
+> is a clean 100.0 ms — the nominal rate, dead on. What breaks the seed is that
+> a real robot publishes *intermittently*: 29–44 gaps longer than 3x the median,
+> together covering **50–71% of the timeline**. Excluding gaps the CV drops from
+> 1.44 to 0.43. A linear index-vs-time seed assumes uniform sample density, and
+> that is precisely what a gap destroys — which no amount of tuning the seed
+> repairs, because the information simply is not in the two window endpoints.
+>
+> This is exactly the falsification §10 asked for, and it is why the harness
+> exists. Had this been implemented on the strength of the synthetic fixture —
+> where the seed is *perfect*, 0 error at every rate — it would have shipped a
+> regression on real workloads and the fixture would never have caught it.
+>
+> The intent survives elsewhere: `sample_from`'s galloping cursor already
+> exploits query-to-query locality, which is the form of seeding that *is* robust
+> to gaps, and `bracket` is now branchless so its cost no longer depends on the
+> stamp distribution at all.
+
+### The original proposal, retained for the record
 
 Stamps on a real edge are near-isochronous, so the index is *predictable*:
 
@@ -302,3 +338,60 @@ just the depth.
 
 Re-run `cargo run --release -p tf_tree_bench --example cost_model` after each
 step; the table in §1 is the regression baseline.
+
+---
+
+## 11. Results — what each lever actually returned
+
+Every projection in §8 was labelled "a target to falsify, not a result". This is
+the falsification. Three of the five held up; one was rejected outright; one
+returned a tenth of its estimate.
+
+| Lever | Projected | Measured | Verdict |
+|---|---|---|---|
+| **1** — transcendental-free `slerp` | 50 → ~10 ns/step | 50.1 → 27.0 ns/step; depth-3 263.5 → 197.7 ns | **In.** Half the projected gain |
+| **1b** — transcendental-free `screw_pow` | *not proposed* | ScLerp 51.6 → 43.6 ns/eval (−15%) | **In.** Not in this document at all |
+| **3** — interpolation-seeded search | 21 → ~4 ns/step | seed misses by 11–48 indices on real data | **Rejected** (§5) |
+| **3b** — branchless `bracket` | *not proposed* | −1.2% instructions; 237.0 → 231.2 ns @ cap 16384 | **In.** A tenth of the expected gain |
+| **2**, **4**, **5** | — | not attempted | Open |
+
+### What this document got wrong, and the pattern in it
+
+**§1's cost model was right; §5's premise was not.** The measurement-first
+discipline correctly identified interpolation as the dominant term and correctly
+ranked search second. Where it went wrong was in reasoning about *why* the
+second term costs what it does — twice, in the same direction:
+
+* §5 assumed real `/tf` stamps are near-isochronous, so an interpolated index
+  guess would land close. Real stamps have a clean 100.0 ms median period and
+  **gaps covering 50–71% of the timeline**. The nominal rate was right and the
+  inference from it was wrong.
+* The branchless rewrite assumed the search's data-dependent `if` was costing
+  most of the fixture's 8.16 mispredicts per lookup. LLVM had already turned it
+  into a `cmov`, so there was almost nothing there to win.
+
+Both errors share a shape: a plausible mechanism was reasoned about instead of
+measured, in a document whose own §1 opens by warning against exactly that. The
+lesson is not "measure the bottom line" — §1 did — but that **the explanation for
+a cost needs its own measurement**, separate from the measurement of the cost.
+
+Lever 1b exists for the same reason and points the other way: it was found by
+noticing that `ScLerp` is the *default* policy and had never been profiled
+separately, not by following this document's plan.
+
+### Where the remaining time goes
+
+Depth-3, three dynamic steps, capacity 4096, pinned: **217 ns `LerpSlerp`**,
+296 ns `ScLerp`. Against §11.3's 100 ns / 150 ns gate this still fails by ~2x,
+and §9's flag stands. The per-step budget is now roughly:
+
+| Term | ns/step | Note |
+|---|---|---|
+| Interpolation | ~27 | was 50; Lever 1 |
+| Bracket search | ~20 | latency-bound on a serial dependent-load chain |
+| Slot reads, composition, bounds checks | ~25 | |
+
+Closing a 2x gap from here needs Lever 2's restructure — overlapping the *d*
+independent dependent-load chains — not another arithmetic win. That is the one
+remaining lever with a plausible 2x in it, and it is also the one most likely to
+be defeated by the `#![forbid(unsafe_code)]` constraint on autovectorisation.

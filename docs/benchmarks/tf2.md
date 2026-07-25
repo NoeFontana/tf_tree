@@ -350,12 +350,18 @@ instructions. The mispredict and cache columns are the likely remainder, along
 with tf2's per-lookup mutex, but attributing it precisely needs cycle counters
 this host does not permit (`perf_event_paranoid=4`).
 
-One number here is aimed at tf_tree rather than tf2: **8.16 conditional
-mispredicts per lookup** is high for a path this short, and it is the bracket
-search's data-dependent binary search. That is an independent measurement
-arriving at the same target as the interpolation-seeded search proposed in
-[`docs/design/fast-path.md`](../design/fast-path.md) §5, which was argued from
-latency alone.
+A third caveat applies to the mispredict column specifically: **cachegrind's
+branch predictor is a simple two-level model, not a Zen 3 TAGE.** Comparing two
+engines under the same model is sound, and that is all this table does; reading
+"8.16" as the count a real CPU incurs is not. Acting on that distinction matters
+— the 8.16 figure was first read as the bracket search's data-dependent branch,
+and rewriting that search branchlessly recovered only 0.46 of it, because LLVM
+had already emitted a `cmov`. The mispredicts are spread across `fold_at`'s 124
+conditional branches per lookup, not concentrated in the search.
+
+The corresponding tf2 number, 6.00 *indirect* mispredicts, is on firmer ground:
+indirect targets are a structural property of virtual dispatch, not an artifact
+of predictor modelling, and a compiled `Plan` has no indirect branches at all.
 
 ## A real difference: maximum chain depth
 

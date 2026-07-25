@@ -89,19 +89,7 @@ impl SampleRing<'_> {
             return self.read_slot((newest & self.mask) as usize);
         }
 
-        // Binary search over LOGICAL indices in [lo_logical, newest] for the last
-        // index whose stamp is <= t. Invariant: stamp[lo] <= t < stamp[hi].
-        let mut lo = lo_logical;
-        let mut hi = newest;
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.stamp_at(mid) <= t {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let i = lo;
+        let i = self.bracket(lo_logical, newest, t);
         let t_i = self.stamp_at(i);
 
         let result = if t_i == t {
@@ -190,7 +178,7 @@ impl SampleRing<'_> {
         // <= t, resuming from `cursor`. Here t_old <= t < t_new, so the window
         // endpoints already bracket `t`: stamp[lo_logical] <= t < stamp[newest].
         let hint = (*cursor).clamp(lo_logical, newest);
-        let (mut lo, mut hi) = if self.stamp_at(hint) <= t {
+        let (lo, hi) = if self.stamp_at(hint) <= t {
             // Gallop upward while the probe stays <= t.
             let mut step = 1u64;
             while hint + step < newest && self.stamp_at(hint + step) <= t {
@@ -206,17 +194,9 @@ impl SampleRing<'_> {
             (hint.saturating_sub(step).max(lo_logical), hint - step / 2)
         };
 
-        // Binary search within the galloped bracket. Invariant: stamp[lo] <= t <
-        // stamp[hi].
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.stamp_at(mid) <= t {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let i = lo;
+        // Binary search within the galloped bracket, branchless — see
+        // [`Self::bracket`]. Invariant: stamp[lo] <= t < stamp[hi].
+        let i = self.bracket(lo, hi, t);
         *cursor = i;
         let t_i = self.stamp_at(i);
 
@@ -243,6 +223,73 @@ impl SampleRing<'_> {
     #[inline]
     fn stamp_at(&self, logical: u64) -> i64 {
         self.stamps[(logical & self.mask) as usize].load(Ordering::Relaxed)
+    }
+
+    /// Last logical index in `[lo, hi]` whose stamp is `<= t`, **branchlessly**.
+    ///
+    /// Caller guarantees `stamp[lo] <= t < stamp[hi]`, which `sample` and
+    /// `sample_from` establish before calling. Under that precondition the
+    /// result is always `< hi`, so `i + 1` is a valid index for the upper
+    /// bracket.
+    ///
+    /// # Why branchless, and how much it is actually worth
+    ///
+    /// The textbook form is `if stamp <= t { lo = mid } else { hi = mid }`,
+    /// whose branch is by construction a coin flip: a binary search able to
+    /// predict its own comparisons would not need to make them. This form
+    /// instead does `base += half * (cmp as u64)` — a multiply by 0 or 1 — and
+    /// shrinks `len` unconditionally, so the trip count depends only on the
+    /// window size.
+    ///
+    /// **The measured gain is small, and the reason is worth recording so nobody
+    /// re-derives the same wrong expectation.** The hypothesis was that the
+    /// branchy form was paying most of the fixture's 8.16 mispredicted branches
+    /// per depth-3 lookup. It was not: LLVM already compiled that `if` to a
+    /// `cmov`, so the two forms were nearly the same machine code. Rewriting it
+    /// bought **1.2% fewer instructions** and, on the pinned `cost_model`,
+    /// 219.2 -> 217.0 ns at capacity 4096 and 237.0 -> 231.2 ns at 16384 — real,
+    /// largest where the search is deepest, and about a tenth of what was
+    /// expected.
+    ///
+    /// It is kept because it is the same amount of code, it does not depend on
+    /// the optimizer continuing to choose `cmov` across future edits, and its
+    /// cost is independent of the stamp distribution. It is *not* kept on the
+    /// strength of a branch-prediction argument, which did not survive contact
+    /// with the measurement.
+    ///
+    /// The serial dependent-load chain remains — each probe's address depends on
+    /// the previous result — and dominates: at ~1.7 ns/probe the search is
+    /// latency-bound, not branch-bound.
+    ///
+    /// (The 8.16 figure comes from cachegrind, whose branch predictor is a
+    /// simple two-level model, not a Zen 3 TAGE. It is sound for comparing two
+    /// engines under the *same* model, which is how
+    /// `docs/benchmarks/tf2.md` uses it, and should not be read as the count a
+    /// real CPU incurs.)
+    ///
+    /// # Why not an interpolated seed
+    ///
+    /// `docs/design/fast-path.md` §5 proposed seeding from
+    /// `lo + (t − t_lo)(hi − lo)/(t_hi − t_lo)` instead, which is exact for
+    /// isochronous stamps. Its §10 made that conditional on measuring real data
+    /// first, and `cargo run --example search_seed` did: on the recorded stream
+    /// the seed lands a **median of 11–48 indices** from the answer, because a
+    /// real robot's `/tf` publishing is intermittent — 29–44 gaps covering
+    /// 50–71% of the timeline — so sample density is nowhere near uniform. That
+    /// is more correction steps than binary search needs probes in total. The
+    /// lever is falsified; this one subsumes its intent without assuming
+    /// anything about the stamp distribution.
+    #[inline]
+    fn bracket(&self, lo: u64, hi: u64, t: i64) -> u64 {
+        let mut base = lo;
+        let mut len = hi - lo + 1;
+        while len > 1 {
+            let half = len / 2;
+            let cmp = u64::from(self.stamp_at(base + half) <= t);
+            base += half * cmp;
+            len -= half;
+        }
+        base
     }
 
     /// [`ExtrapPolicy::ConstantTwist`] extrapolation past the newest sample.
