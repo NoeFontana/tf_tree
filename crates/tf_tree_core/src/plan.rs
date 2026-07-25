@@ -715,7 +715,7 @@ impl<'a> Guard<'a> {
 /// * [`LookupError::FrameOutOfRange`] — a frame id is out of range for `topo`.
 /// * [`LookupError::MissingEdge`] — a parent link on the path records no edge.
 /// * [`LookupError::UnknownEdge`] / [`LookupError::MixedTimeDomains`] — as
-///   [`fold`].
+///   `fold`.
 pub fn compile(
     topo: &TopologyView,
     edge_meta: impl Fn(EdgeId) -> Option<EdgeMeta>,

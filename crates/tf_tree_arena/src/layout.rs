@@ -227,7 +227,7 @@ impl ArenaLayout {
 
     /// The layout implied by totals alone, for validating a header.
     ///
-    /// [`compute`] uses only the **sum** of the per-edge capacities, never their
+    /// `compute` uses only the **sum** of the per-edge capacities, never their
     /// split, so a segment's `stamp_slots` is enough to reconstruct every region
     /// offset without knowing how the slots were divided between edges. That is
     /// what lets [`crate::mapped::MappedArena::attach`] check a received header

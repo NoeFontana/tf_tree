@@ -472,7 +472,7 @@ impl<'a> TopologyView<'a> {
     /// which needs [`TOPO_BLOCKS`] mutations inside a three-load window.
     ///
     /// `None` means `child` is out of range for this arena (`FrameId` only
-    /// guarantees non-zero, not in-bounds), or — after [`TOPO_RETRY_LIMIT`]
+    /// guarantees non-zero, not in-bounds), or — after `TOPO_RETRY_LIMIT`
     /// attempts — that the topology is churning hard enough that no consistent
     /// snapshot could be taken. Callers turn either into an error; neither is a
     /// state a caller can usefully distinguish, and both mean "do not use this
