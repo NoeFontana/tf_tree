@@ -35,7 +35,7 @@ use crate::buffer::{pose_slots, stamp_slots, SampleRing};
 use crate::edge::{ClaimRecord, EdgeRecord};
 use crate::error::{EdgeId, FrameError, FrameId, TopologyError};
 use crate::frame::{blake3_64, find_core, intern_core, FrameRecord, InternTable, CLAIM_UNRECORDED};
-use crate::participant::{ParticipantRecord, ParticipantTable, LIVE};
+use crate::participant::{state_of, ParticipantRecord, ParticipantTable, LIVE};
 use crate::sync::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use crate::topology::{Block, TopologyView};
 
@@ -236,7 +236,7 @@ impl<'a> ArenaView<'a> {
             match self.participants().get(owner - 1) {
                 None => true, // out of range for this arena: cannot judge
                 Some(rec) => {
-                    rec.state.load(Ordering::Acquire) == LIVE
+                    state_of(rec.state.load(Ordering::Acquire)) == LIVE
                         && self.is_alive.is_none_or(|f| f(rec))
                 }
             }

@@ -18,6 +18,7 @@ use crate::buffer::{PoseSlot, SampleRing};
 use crate::edge::{claim, ClaimRecord};
 use crate::error::{EdgeId, LookupError};
 use crate::frame::{intern_core, InternTable, CLAIM_UNRECORDED};
+use crate::participant::{ParticipantRecord, ParticipantTable};
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
@@ -658,5 +659,63 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
         assert_eq!(generation, 1, "exactly one mutation should have published");
         assert_eq!(topo.parent[active].load(Ordering::Relaxed), P_NEW);
         assert_eq!(topo.depth[active].load(Ordering::Relaxed), D_NEW);
+    });
+}
+
+/// A late `release` racing a reap + re-`register` must not free the new occupant.
+///
+/// The single-threaded version of this (`tests.rs`) cannot fail on the code this
+/// guards against, and saying so matters: the old guard *did* reject a stale
+/// incarnation — but as a load of `incarnation` followed by a CAS on `state`,
+/// two words apart. The bug lives entirely in the window between them, so only
+/// an interleaving exhibits it. Here, thread A is the departing participant's
+/// late `release(slot, 1)`; thread B reaps the same slot and hands it to a new
+/// process. Loom explores the schedule where A reads "still incarnation 1",
+/// B completes the whole handover, and A's CAS then lands on the new occupant.
+///
+/// Packing the incarnation into `state` makes that schedule harmless: there is
+/// one word, so "still LIVE and still mine" is decided by the CAS itself.
+///
+/// The consequence of getting it wrong is not a lost slot — it is two live
+/// processes sharing a slot index, after which the `slot + 1` owner encoding
+/// used by claims (A3) and by the topology lock (A2) no longer names one process.
+#[test]
+fn a_late_release_racing_a_slot_handover_frees_nobody() {
+    const P_LATE: u32 = 111;
+    const P_NEW: u32 = 222;
+
+    loom::model(|| {
+        let table = Arc::new(alloc::vec![ParticipantRecord::default()]);
+        let (slot, inc) = ParticipantTable::new(&table)
+            .register(P_LATE, 1, 0)
+            .unwrap();
+        assert_eq!((slot, inc), (0, 1));
+
+        // A: the departing process finally gets around to detaching.
+        let a = Arc::clone(&table);
+        let late = thread::spawn(move || ParticipantTable::new(&a).release(0, 1));
+
+        // B: a reaper decides that participant is gone, and a new process takes
+        // the freed slot. Modelled as the same release (a reap *is* a release
+        // performed by somebody else) followed by a registration.
+        let b = Arc::clone(&table);
+        let handover = thread::spawn(move || {
+            let t = ParticipantTable::new(&b);
+            t.release(0, 1);
+            t.register(P_NEW, 2, 0).ok()
+        });
+
+        late.join().unwrap();
+        let registered = handover.join().unwrap();
+
+        let t = ParticipantTable::new(&table);
+        if let Some((new_slot, new_inc)) = registered {
+            assert_eq!(new_slot, 0, "only one slot exists");
+            assert_eq!(
+                t.identity(new_slot),
+                Some((P_NEW, 2, new_inc)),
+                "the late release freed a slot that had already been handed over"
+            );
+        }
     });
 }
