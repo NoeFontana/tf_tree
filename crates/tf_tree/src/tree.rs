@@ -473,6 +473,30 @@ impl ArenaBacking {
             ArenaBacking::Mapped(a) => a,
         }
     }
+
+    /// Whether the mapping accepts stores.
+    ///
+    /// Every mutating entry point on [`Tree`] consults this. A `PROT_READ`
+    /// mapping does not fault politely on a `compare_exchange` — it delivers
+    /// `SIGSEGV`, killing the consumer process. Turning that into an `Err` is
+    /// the difference between read-only being a safety boundary and being a
+    /// loaded gun.
+    fn is_writable(&self) -> bool {
+        match self {
+            ArenaBacking::Heap(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Mapped(a) => a.is_writable(),
+        }
+    }
+
+    /// Whether other processes may be mapping the same arena.
+    fn is_shared(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Mapped(_) => true,
+            ArenaBacking::Heap(_) => false,
+        }
+    }
 }
 
 /// A transform tree: a fixed-capacity arena plus the ergonomic operations for
@@ -504,6 +528,14 @@ impl Tree {
     ///
     /// [`FrameError`] if the frame table is full or a name hash collides.
     pub fn frame(&self, name: &str) -> Result<FrameId, FrameError> {
+        if !self.arena.is_writable() {
+            // Interning a *new* name publishes into the hash table with a
+            // `compare_exchange`; through a `PROT_READ` mapping that is a
+            // `SIGSEGV`, not an error. Resolving an existing name is a pure
+            // read, so a read-only participant can still do that — which is
+            // every name the creator declared.
+            return self.view().find_frame(name)?.ok_or(FrameError::ReadOnly);
+        }
         self.view().intern(name)
     }
 
@@ -518,6 +550,20 @@ impl Tree {
     /// [`ReparentError::Topology`] if the move would create a cycle or references
     /// an out-of-range frame.
     pub fn reparent(&self, child: FrameId, new_parent: FrameId) -> Result<(), ReparentError> {
+        if !self.arena.is_writable() {
+            return Err(ReparentError::ReadOnly);
+        }
+        // `decl` is a process-local mutex, so it serializes nothing against a
+        // peer process. Worse, `set_parent` publishes an *odd* generation for
+        // the duration of its block copy, so a writer killed mid-mutation would
+        // leave every reader in every process spinning forever in plan
+        // compilation. `docs/PHASE2.md` §1 amendments A1 and A2 exist to fix
+        // exactly that — an in-arena reapable lock and a single publishing store
+        // with no odd state — and until they land, runtime topology mutation on
+        // a shared arena is refused rather than raced.
+        if self.arena.is_shared() {
+            return Err(ReparentError::SharedArena);
+        }
         let _guard = self.decl.lock().unwrap_or_else(|e| e.into_inner());
         let view = self.view();
         let (_p, _depth, edge, _gen) =
@@ -543,6 +589,9 @@ impl Tree {
     /// does not match, the edge carries no sample ring (it is static or
     /// tombstoned), or the edge is already claimed.
     pub fn claim(&self, child: FrameId, parent: FrameId) -> Result<Publisher<'_>, ClaimApiError> {
+        if !self.arena.is_writable() {
+            return Err(ClaimApiError::ReadOnly);
+        }
         let view = self.view();
         let (p, _depth, edge, _gen) = view
             .topology()
@@ -689,11 +738,18 @@ impl Tree {
     /// Whether this tree's arena is shared with other processes.
     #[must_use]
     pub fn is_shared(&self) -> bool {
-        match &self.arena {
-            #[cfg(all(feature = "shm", target_os = "linux"))]
-            ArenaBacking::Mapped(_) => true,
-            ArenaBacking::Heap(_) => false,
-        }
+        self.arena.is_shared()
+    }
+
+    /// Whether this tree may publish — false for a read-only attachment.
+    ///
+    /// Every mutating method checks this and returns an error rather than
+    /// letting the store reach a `PROT_READ` page, so callers do not have to;
+    /// it is exposed so a consumer can branch on capability instead of on an
+    /// error it was going to get.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.arena.is_writable()
     }
 
     /// Wrap a [`LookupError`] so its `Display` resolves ids to frame names.
@@ -906,6 +962,13 @@ pub enum ReparentError {
     /// The topology mutation failed (cycle or out-of-range frame).
     #[error("topology error: {0:?}")]
     Topology(TopologyError),
+    /// The arena is mapped read-only; it cannot be mutated.
+    #[error("arena is mapped read-only")]
+    ReadOnly,
+    /// The arena is shared with other processes, where runtime topology
+    /// mutation is not yet safe (`docs/PHASE2.md` §1, amendments A1/A2).
+    #[error("runtime re-parenting is not supported on a shared arena")]
+    SharedArena,
 }
 
 impl From<TopologyError> for ReparentError {
@@ -952,6 +1015,9 @@ pub enum ClaimApiError {
     /// The edge is already claimed by a live writer.
     #[error("edge already claimed by pid {}", .0.owner_pid())]
     AlreadyClaimed(tf_tree_core::ClaimError),
+    /// The arena is mapped read-only, so no edge can be claimed for writing.
+    #[error("arena is mapped read-only")]
+    ReadOnly,
 }
 
 impl From<tf_tree_core::ClaimError> for ClaimApiError {

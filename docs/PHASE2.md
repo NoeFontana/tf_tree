@@ -21,7 +21,7 @@ Sections marked **NORMATIVE** are requirements. Where a syscall behaviour is ass
 | Zero-diff read path — unmodified Phase 1 reader over a shared segment (§4) | **Done, and tested** (`just shm-test`) |
 | Multi-process benchmarks (§12.2) | **Done** (`just shm-scaling`; results in `docs/benchmarks/tf2.md`) |
 | Attach protocol — `SOCK_SEQPACKET` + `SCM_RIGHTS`, negotiation (§3.3) | Not implemented — fd inheritance stands in |
-| Amendments A1-A4, A6-A8 (§1) | **Not applied** |
+| Amendments A1-A4, A6-A8 (§1) | **Not applied** — the operations that need them are refused, not raced |
 | Participant registry, liveness, reaping (§5, §6) | Not implemented |
 | `tf_treed`, `tf_tree_record`, `/tf` ingest, diagnostics (§9, §10) | Not implemented |
 | Fault injection, `shm_torture` (§11.3, §11.4) | Not implemented |
@@ -35,10 +35,17 @@ process killed while holding a claim currently leaks that edge (A3/A4), and one
 killed mid-topology-mutation could leave the generation permanently odd and spin
 readers forever (A1).
 
-Those failure modes cannot occur in the flows implemented today — topology is
-immutable after `build_shared`, per decision `0004`'s builder-time declaration —
-but they *will* the moment a long-lived daemon owns the segment, which is §9.
-**Apply §1's amendments before anything ships against this.**
+Those failure modes cannot occur in the flows implemented today, and that is now
+enforced rather than asserted: `Tree::reparent` returns
+`ReparentError::SharedArena` on a shared arena, and every mutating entry point
+returns an error on a read-only one instead of faulting. An earlier draft of this
+section claimed topology was immutable after `build_shared` "per decision 0004" —
+that was **false**, because `reparent` was reachable, and a review caught it.
+The claim is true now because the code makes it true.
+
+They *will* become reachable the moment a long-lived daemon owns the segment and
+needs to re-parent, which is §9. **Apply §1's amendments before anything ships
+against this.**
 
 ---
 

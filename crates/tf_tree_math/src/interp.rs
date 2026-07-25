@@ -161,13 +161,22 @@ fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 /// `1 − dot` or feeds `acos` an argument near 1.
 ///
 /// ```text
-/// C₀..C₇ = 1, 1/6, 2/45, 1/70, 8/1575, 4/2079, 16/21021, 128/315315
+/// C₀..C₇ = 1, 1/6, 2/45, 1/70, 8/1575, 4/2079, 16/21021, 2/6435
 /// ```
 ///
 /// **Eight terms, and the count is load-bearing.** This series converges much
 /// more slowly than it looks: at θ = 0.15, four terms give 8e-11 relative error,
 /// six give 1.6e-15, and eight are exact to `f64`. Four terms would silently cap
 /// the whole fast path at ~1e-10.
+///
+/// The closed form is `Cₙ = 2ⁿ⁺¹ / ((n+1)²·C(2n+2, n+1))`; deriving each term
+/// from it rather than by hand is the only reliable way to get eight right. The
+/// shipped `C₇` was `128/315315` until a review caught it — the correct value is
+/// `2/6435`, 31% smaller. Inside the θ ≤ 0.15 fast path the term contributes
+/// ~1e-17 relative, so no test could see it and no result was ever wrong; at
+/// θ = 0.3 it is the difference between 3.2e-14 and 1.2e-15. It mattered because
+/// the "exact to `f64`" claim above is what any future threshold increase would
+/// rest on.
 ///
 /// The first draft of this function had `C₂ = 3/40` instead of `2/45` — a
 /// hand-derivation slip. It cost 3.8e-6 relative error at θ = 0.15, which the
@@ -186,7 +195,7 @@ pub(crate) fn theta_sq_from_chord(h: f64) -> f64 {
         8.0 / 1575.0,
         4.0 / 2079.0,
         16.0 / 21021.0,
-        128.0 / 315_315.0,
+        2.0 / 6435.0,
     ];
     let mut acc = C[7];
     for &c in C[..7].iter().rev() {
@@ -377,28 +386,40 @@ mod tests {
         let n = (0.3f64 * 0.3 + 0.5 * 0.5 + 0.81 * 0.81).sqrt();
         let axis = Vec3::new(0.3 / n, -0.5 / n, 0.81 / n);
         let s = 0.37;
-        let mut prev: Option<(f64, Quat)> = None;
-        let mut worst_jump = 0.0f64;
+        let mut worst = 0.0f64;
+        // Straddle the threshold from half of it to one and a half times it, so
+        // roughly half these samples take the series branch and half the exact
+        // one.
         for i in 0..4000 {
-            // Sweep the angle between qa and qb straight through the threshold.
-            let theta = THETA_SLERP_SMALL * 0.5 + (i as f64) * (THETA_SLERP_SMALL / 2000.0);
+            let theta = THETA_SLERP_SMALL * 0.5 + (i as f64) * (THETA_SLERP_SMALL / 4000.0);
             let qa = Quat::IDENTITY;
             // `exp_so3` takes a rotation vector; the quaternion angle is half it.
             let qb = exp_so3(axis.scale(2.0 * theta));
+
+            // Compare against the exact closed form directly. Comparing adjacent
+            // *samples* to each other cannot work: consecutive angles differ by
+            // the step, so the difference is the function's own slope, which
+            // swamps any branch mismatch. Requiring both branches to track one
+            // reference is the statement with content — and the previous version
+            // of this test, which compared neighbours behind an unreachable
+            // `if`, asserted nothing at all.
+            let angle = libm::acos(qa.dot(qb).min(1.0));
+            let sin_angle = libm::sin(angle);
+            let want = qa
+                .scale(libm::sin((1.0 - s) * angle) / sin_angle)
+                .add(qb.scale(libm::sin(s * angle) / sin_angle));
+
             let got = slerp(qa, qb, s);
-            if let Some((pt, pq)) = prev {
-                if (theta - pt).abs() < 1e-6 {
-                    let d = (got.w - pq.w).abs().max((got.x - pq.x).abs());
-                    let _ = pt;
-                    worst_jump = worst_jump.max(d);
-                }
-            }
-            prev = Some((theta, got));
+            let d = (got.w - want.w)
+                .abs()
+                .max((got.x - want.x).abs())
+                .max((got.y - want.y).abs())
+                .max((got.z - want.z).abs());
+            assert!(d < 1e-15, "theta={theta} err={d:e}");
+            worst = worst.max(d);
         }
-        assert!(
-            worst_jump < 1e-14,
-            "slerp jumps by {worst_jump:e} across THETA_SLERP_SMALL"
-        );
+        // A tolerance nothing reached would be as vacuous as the old guard.
+        assert!(worst > 0.0, "no sample was actually compared");
     }
 
     /// Endpoints stay exact (proptest #6 in `docs/PHASE1.md` §10.1) on both

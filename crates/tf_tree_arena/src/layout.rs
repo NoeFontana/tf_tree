@@ -183,6 +183,41 @@ impl ArenaLayout {
         })
     }
 
+    /// The layout implied by totals alone, for validating a header.
+    ///
+    /// [`compute`] uses only the **sum** of the per-edge capacities, never their
+    /// split, so a segment's `stamp_slots` is enough to reconstruct every region
+    /// offset without knowing how the slots were divided between edges. That is
+    /// what lets [`crate::mapped::MappedArena::attach`] check a received header
+    /// against the layout its own counts imply.
+    ///
+    /// The returned value carries an empty `edge_capacities` and must not be
+    /// used to *build* an arena — only to compare region geometry.
+    ///
+    /// # Errors
+    ///
+    /// [`LayoutError::ArenaTooLarge`] if the implied size exceeds the `u32`
+    /// offset model.
+    pub fn from_totals(
+        max_frames: u32,
+        max_edges: u32,
+        total_slots: u32,
+    ) -> Result<ArenaLayout, LayoutError> {
+        let computed = compute(max_frames, max_edges, &[total_slots]);
+        let total_size = computed.regions[R_POSE].offset + computed.regions[R_POSE].size;
+        if total_size > u32::MAX as usize {
+            return Err(LayoutError::ArenaTooLarge {
+                total_size: total_size as u64,
+            });
+        }
+        Ok(ArenaLayout {
+            max_frames,
+            max_edges,
+            edge_capacities: Vec::new(),
+            computed,
+        })
+    }
+
     /// Maximum number of frames.
     pub fn max_frames(&self) -> u32 {
         self.max_frames

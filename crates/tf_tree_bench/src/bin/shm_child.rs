@@ -93,8 +93,14 @@ fn bench(tree: &Tree, target: &str, source: &str, count: usize) {
     let plan = tree.plan(t, s).expect("plan");
     let guard = tree.guard();
 
+    // A 100 ms window, matching `footprint::window_stamp` and every other
+    // latency row. The obvious `(k % 100_000) * 1_000` over `k < 4096` leaves
+    // the modulo inert and spans only 4 ms — about four samples of the 1 kHz
+    // edge — which measures a cache- and branch-predictor best case rather than
+    // the intended window. `cost_model`'s own header warns about exactly this.
+    const WINDOW_NS: i64 = 100_000_000;
     let stamps: Vec<i64> = (0..4096)
-        .map(|k: i64| tf_tree_bench::fixture::NOW_NS - (k % 100_000) * 1_000)
+        .map(|k: i64| tf_tree_bench::fixture::NOW_NS - k * (WINDOW_NS / 4096))
         .collect();
 
     let run = |n: usize| {

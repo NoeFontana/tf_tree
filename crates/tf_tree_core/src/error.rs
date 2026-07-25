@@ -197,6 +197,15 @@ pub enum FrameError {
     /// The frame table is full (`max_frames` reached). Capacity is fixed at
     /// construction (invariant 3); there is no growth.
     CapacityExceeded,
+    /// The arena is mapped read-only, so a name that is not already interned
+    /// cannot be added.
+    ///
+    /// Interning publishes into the arena's hash table with a
+    /// `compare_exchange`, which a `PROT_READ` mapping cannot service — the
+    /// process would take `SIGSEGV` rather than an error. A read-only
+    /// participant can *resolve* any name the creator declared; it cannot
+    /// introduce new ones.
+    ReadOnly,
 }
 
 /// A failed topology mutation.

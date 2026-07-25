@@ -39,7 +39,12 @@ use tf_tree_bench::shm_util::{sibling_binary, spawn_attached};
 /// Lookups each reader process performs per round.
 const LOOKUPS: usize = 2_000_000;
 
-/// Process counts to sweep. Capped at the physical core count in `main`.
+/// Process counts to sweep.
+///
+/// Deliberately run past the physical core count: the oversubscribed row is
+/// informative (it shows latency degrading exactly in proportion while aggregate
+/// throughput stays at the roofline). `main` prints the core count so a row
+/// above it can be read as SMT-assisted rather than as clean scaling.
 const PROCESSES: &[usize] = &[1, 2, 4, 8];
 
 fn build_shared() -> Tree {
