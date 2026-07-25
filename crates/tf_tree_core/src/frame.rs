@@ -18,6 +18,56 @@
 //! leave it in a terminal state, either the real id or [`ID_FAILED`]; returning
 //! `Err` with the slot claimed and the id unpublished hangs every later interner
 //! of that name.
+//!
+//! # A8 — a dead claimant must not wedge the table
+//!
+//! `docs/PHASE2.md` §1 A8, and its §11.3 crash point
+//! `intern.after_hash_cas_before_id_store`. [`ID_FAILED`] covers the interner
+//! that *fails* — it publishes a terminal marker on the way out. It cannot cover
+//! the interner that is `SIGKILL`ed between winning the hash CAS and publishing
+//! the id, because a killed process publishes nothing at all. Phase 1's wait was
+//! unbounded, so that slot wedged **every future interner of that name, in every
+//! process, forever**. In one process the defect is unobservable (the dead
+//! process took its readers with it); across processes it is fatal.
+//!
+//! The fix is a third parallel array, `claiming`, holding the *participant slot +
+//! 1* of whoever owns the slot's in-flight intern ([`CLAIM_UNRECORDED`] = nobody
+//! recorded). A waiter that has spun [`INTERN_SPIN_LIMIT`] times stops trusting
+//! the claimant, resolves it, and — if it is gone — takes the entry over.
+//!
+//! ## Liveness is injected, never inferred here
+//!
+//! `claimant_alive` is a **caller-supplied predicate**, deliberately: this crate
+//! is `no_std` and has no business parsing `/proc`, and `docs/PHASE2.md` §5.1
+//! makes the **OFD lock file** the authoritative liveness source, with the
+//! participant record's `state`/`pid`/`start_time` (§6.2) as the fallback. That
+//! source is being built separately; wiring it in must not require touching this
+//! algorithm. Callers pass a closure; [`crate::arena_view::ArenaView`] defaults
+//! it to *"assume alive"*, which is the fail-safe direction §6.2 mandates — a
+//! false "dead" verdict steals an entry from a working process, a false "alive"
+//! verdict merely delays recovery.
+//!
+//! ## Why the claim is CASed, not stored
+//!
+//! A8 says `claiming` is "written BEFORE the hash is published". It cannot
+//! literally be: the hash CAS is what *grants* ownership of the slot, so nothing
+//! may be written to `claiming[i]` before it. That leaves a two-instruction
+//! window in which a crash leaves `hashes[i]` set and `claiming[i] == 0` — the
+//! very hang A8 exists to remove, just narrower. So the winner *CASes*
+//! `CLAIM_UNRECORDED -> me`, and a waiter that finds `CLAIM_UNRECORDED` after the
+//! spin limit may take the slot over too. That takeover is **leak-free even when
+//! it is wrong**, because the claim CAS happens strictly before any id is
+//! allocated: a claimant that loses it has not yet touched `frame_count`, falls
+//! back to waiting, and adopts the rescuer's id.
+//!
+//! ## Residual gap (documented, not fixed here)
+//!
+//! `claiming` is a `u32` slot index with no incarnation, exactly as A8 specifies.
+//! If the claimant dies and its participant slot is recycled by a *live* process
+//! before any waiter looks, the waiter judges the entry live and keeps waiting —
+//! until that new occupant itself exits. Recovery is delayed, never lost, and
+//! nothing is corrupted. Closing it needs a wider `claiming` word carrying
+//! `ParticipantRecord::incarnation`, which is a layout change beyond A8.
 
 use crate::error::FrameError;
 use crate::sync::{spin, AtomicU32, AtomicU64, Ordering};
@@ -116,12 +166,221 @@ impl FrameRecord {
     }
 }
 
+/// Value of a `claiming` entry that names nobody.
+///
+/// `0` because the arena is `alloc_zeroed` and because participant slots are
+/// recorded as `slot + 1` (`docs/PHASE2.md` §1 A3/A6 use the same +1 encoding for
+/// claim and topology-lock owners, so slot `0` is a legal owner everywhere).
+pub const CLAIM_UNRECORDED: u32 = 0;
+
+/// How many times a waiter spins on an unpublished id before it stops trusting
+/// the claimant and checks whether it is still alive (`docs/PHASE2.md` §1 A8).
+///
+/// The bound is a *liveness-poll interval*, not a timeout: a claimant that the
+/// predicate reports alive is waited on again, without limit. Only a claimant
+/// that is provably gone (or never recorded itself — see the module docs) loses
+/// the entry, so the value trades a little recovery latency against the cost of
+/// the check. Under `loom` it is tiny: every extra iteration multiplies the
+/// interleavings the model checker must explore.
+#[cfg(not(loom))]
+pub const INTERN_SPIN_LIMIT: u32 = 10_000;
+/// See the `not(loom)` variant.
+#[cfg(loom)]
+pub const INTERN_SPIN_LIMIT: u32 = 2;
+
+/// The three parallel interning arrays plus the frame allocator they draw ids
+/// from — the whole mutable state of `docs/PHASE1.md` §5.1's interning table.
+///
+/// All three slices have the same length, `next_pow2(2 * max_frames)`, a power of
+/// two so `mask == len - 1`.
+pub struct InternTable<'a> {
+    /// Frame-name hashes; `0` = empty slot.
+    pub hashes: &'a [AtomicU64],
+    /// Published frame ids; [`ID_UNPUBLISHED`] / [`ID_FAILED`] are the sentinels.
+    pub ids: &'a [AtomicU32],
+    /// **A8**: participant slot + 1 of the in-flight interner of each slot,
+    /// [`CLAIM_UNRECORDED`] if none.
+    pub claiming: &'a [AtomicU32],
+    /// Frames interned so far; the id allocator.
+    pub frame_count: &'a AtomicU32,
+    /// Maximum interned frames (`max_frames - 1`; slot 0 is the root sentinel).
+    pub capacity: u32,
+}
+
+/// What a bounded wait on an unpublished slot concluded.
+enum Wait {
+    /// The slot reached a terminal id (a real id, or [`ID_FAILED`]).
+    Published(u32),
+    /// The claimant is gone and this caller now owns the entry: `claiming` names
+    /// it, and it must publish a terminal id.
+    TakenOver,
+    /// The claimant is gone and this caller may not take over (it is read-only).
+    /// Nothing was written.
+    Abandoned,
+}
+
+/// Who is waiting, and therefore what they are allowed to do about a claimant
+/// that never published.
+#[derive(Clone, Copy)]
+enum Role {
+    /// A writer, identified by its participant slot + 1 ([`CLAIM_UNRECORDED`] if
+    /// it is not a registered participant — single-process Phase 1 use).
+    Interner(u32),
+    /// A lookup. Must not write to the arena, so it can only report the absence.
+    Reader,
+}
+
+impl InternTable<'_> {
+    /// Publish `value` into slot `i` unless a terminal id is already there.
+    ///
+    /// Returns whichever value is now visible — `value` if we won, otherwise the
+    /// one that beat us. The CAS (rather than A8's plain store) is what makes a
+    /// takeover racing a resurrected claimant safe: exactly one id is ever
+    /// visible for a hash, so no two callers can hand out different ids for the
+    /// same name.
+    fn publish(&self, i: usize, value: u32) -> u32 {
+        match self.ids[i].compare_exchange(
+            ID_UNPUBLISHED,
+            value,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => value,
+            Err(observed) => observed,
+        }
+    }
+
+    /// Allocate an id, write its record, and publish it — the tail every owner of
+    /// slot `i` runs, whether it won the hash CAS or rescued the slot.
+    fn finish(
+        &self,
+        i: usize,
+        hash: u64,
+        name_matches: &impl Fn(u32) -> bool,
+        write_record: &impl Fn(u32),
+    ) -> Result<u32, FrameError> {
+        let n = self.frame_count.fetch_add(1, Ordering::AcqRel);
+        if n >= self.capacity {
+            // Lost the capacity race (only reachable when several threads intern
+            // distinct names at exactly capacity). Give the id back so
+            // `frame_count` stays exact, and publish ID_FAILED so waiters on this
+            // slot terminate.
+            self.frame_count.fetch_sub(1, Ordering::AcqRel);
+            return match self.publish(i, ID_FAILED) {
+                ID_FAILED => Err(FrameError::CapacityExceeded),
+                other => resolve(other, hash, name_matches),
+            };
+        }
+        let id = n + 1;
+        write_record(id);
+        // The record write above is ordered before this Release CAS; a waiter's
+        // Acquire load of `ids[i]` therefore sees a fully-written record.
+        let winner = self.publish(i, id);
+        if winner == id {
+            return Ok(id);
+        }
+        // Somebody that judged us dead rescued this slot and published first. Its
+        // id is the one the name resolves to; ours is abandoned — the record stays
+        // written
+        // but unreferenced, and `frame_count` over-counts by one. That is the
+        // deliberate trade: `fetch_sub`bing it here could hand a *live* id back to
+        // the allocator and alias two frames onto one record.
+        resolve(winner, hash, name_matches)
+    }
+
+    /// Wait for slot `i` to publish, giving up on the claimant if it dies.
+    ///
+    /// Spins at most [`INTERN_SPIN_LIMIT`] times between liveness checks; see the
+    /// module docs for why a `CLAIM_UNRECORDED` claimant is also recoverable and
+    /// why doing so cannot leak an id.
+    fn wait_for_publish(
+        &self,
+        i: usize,
+        role: Role,
+        claimant_alive: &impl Fn(u32) -> bool,
+    ) -> Wait {
+        let mut spins: u32 = 0;
+        loop {
+            let id = self.ids[i].load(Ordering::Acquire);
+            if id != ID_UNPUBLISHED {
+                return Wait::Published(id);
+            }
+            spins += 1;
+            if spins >= INTERN_SPIN_LIMIT {
+                spins = 0;
+                // Acquire pairs with the claiming CAS below and in the winner
+                // path, so an owner we read is a fully-published participant slot.
+                let owner = self.claiming[i].load(Ordering::Acquire);
+                match role {
+                    Role::Reader => {
+                        if owner == CLAIM_UNRECORDED || !claimant_alive(owner) {
+                            return Wait::Abandoned;
+                        }
+                    }
+                    Role::Interner(me) => {
+                        let recoverable = if owner == CLAIM_UNRECORDED {
+                            // Nobody recorded themselves: either the claimant was
+                            // killed in the window between the two CASes, or it is
+                            // anonymous. Only a registered participant may take
+                            // over — an anonymous rescuer would CAS 0 -> 0, which
+                            // "succeeds" against a perfectly healthy anonymous
+                            // claimant and would leak an id every time a thread is
+                            // preempted here.
+                            me != CLAIM_UNRECORDED
+                        } else {
+                            !claimant_alive(owner)
+                        };
+                        if recoverable
+                            && self.claiming[i]
+                                .compare_exchange(owner, me, Ordering::AcqRel, Ordering::Acquire)
+                                .is_ok()
+                        {
+                            // The claimant may have published between our load and
+                            // our CAS; if so its id stands and we allocate nothing.
+                            let id = self.ids[i].load(Ordering::Acquire);
+                            if id != ID_UNPUBLISHED {
+                                return Wait::Published(id);
+                            }
+                            return Wait::TakenOver;
+                        }
+                        // Either the claimant is alive, or another rescuer won the
+                        // takeover. Both mean somebody is still on the hook for
+                        // this slot: keep waiting.
+                    }
+                }
+            }
+            spin();
+        }
+    }
+}
+
+/// Interpret a published id for the caller that was waiting on it.
+fn resolve(id: u32, hash: u64, name_matches: &impl Fn(u32) -> bool) -> Result<u32, FrameError> {
+    if id == ID_FAILED {
+        // The owner of this slot ran out of table; the name is not, and never
+        // will be, interned (capacity is fixed for the arena's life).
+        return Err(FrameError::CapacityExceeded);
+    }
+    if name_matches(id) {
+        Ok(id)
+    } else {
+        Err(FrameError::FrameHashCollision { hash })
+    }
+}
+
 /// The lock-free interning core.
 ///
-/// Open addressing with linear probing over `hashes`/`ids` (both `len ==
-/// next_pow2(2 * max_frames)`, a power of two so `mask == len - 1`). `name_matches`
-/// is consulted on a hash hit to detect a collision; `write_record` is called by
-/// the unique winner to populate the frame record before the id is published.
+/// Open addressing with linear probing over [`InternTable`]. `name_matches` is
+/// consulted on a hash hit to detect a collision; `write_record` is called by the
+/// slot's owner to populate the frame record before the id is published (at most
+/// once per call, from whichever of the two paths — winner or rescuer — this call
+/// takes).
+///
+/// `me` is this interner's participant slot **+ 1**, or [`CLAIM_UNRECORDED`] if
+/// the caller is not a registered participant. `claimant_alive` is A8's injected
+/// liveness predicate, called with another interner's `me`; see the module docs
+/// for why it is a parameter and why it must fail *safe* (return `true` when it
+/// cannot tell).
 ///
 /// # Errors
 ///
@@ -133,67 +392,63 @@ impl FrameRecord {
 ///
 /// # Panics
 ///
-/// Never panics for a correctly sized table (`hashes.len()` a power of two `>=
-/// 2 * max_frames`, `hashes.len() == ids.len()`); the mask indexing stays in
-/// bounds by construction.
+/// Never panics for a correctly sized table (a power-of-two length `>= 2 *
+/// max_frames`, equal across all three arrays); the mask indexing stays in bounds
+/// by construction.
 pub fn intern_core(
-    hashes: &[AtomicU64],
-    ids: &[AtomicU32],
-    frame_count: &AtomicU32,
-    capacity: u32,
+    table: &InternTable<'_>,
     hash: u64,
+    me: u32,
+    claimant_alive: impl Fn(u32) -> bool,
     name_matches: impl Fn(u32) -> bool,
-    write_record: impl FnOnce(u32),
+    write_record: impl Fn(u32),
 ) -> Result<u32, FrameError> {
-    let mask = (hashes.len() - 1) as u64;
+    debug_assert_eq!(table.hashes.len(), table.ids.len());
+    debug_assert_eq!(table.hashes.len(), table.claiming.len());
+    let mask = (table.hashes.len() - 1) as u64;
     let mut i = (hash & mask) as usize;
     // Guard against an infinite probe on a full table (only reachable on genuine
     // misuse; capacity is checked before we claim a slot). `2 * len` covers the
     // at-most-one wasted iteration a lost CAS costs before advancing.
-    for _ in 0..(2 * hashes.len()) {
-        let cur = hashes[i].load(Ordering::Acquire);
+    for _ in 0..(2 * table.hashes.len()) {
+        let cur = table.hashes[i].load(Ordering::Acquire);
         if cur == hash {
-            // Existing (or in-flight) entry for this hash: wait for publication.
-            let id = loop {
-                let id = ids[i].load(Ordering::Acquire);
-                if id != ID_UNPUBLISHED {
-                    break id;
-                }
-                spin();
-            };
-            if id == ID_FAILED {
-                // The winner of this slot ran out of table; the name is not, and
-                // never will be, interned (capacity is fixed for the arena's life).
-                return Err(FrameError::CapacityExceeded);
-            }
-            return if name_matches(id) {
-                Ok(id)
-            } else {
-                Err(FrameError::FrameHashCollision { hash })
+            // Existing (or in-flight) entry for this hash: wait for publication,
+            // rescuing the slot if its claimant died mid-intern (A8).
+            return match table.wait_for_publish(i, Role::Interner(me), &claimant_alive) {
+                Wait::Published(id) => resolve(id, hash, &name_matches),
+                Wait::TakenOver => table.finish(i, hash, &name_matches, &write_record),
+                // `Role::Interner` never abandons: it either publishes or waits.
+                Wait::Abandoned => Err(FrameError::CapacityExceeded),
             };
         }
         if cur == 0 {
             // Cheap pre-check: reject an obviously-full table before burning a
             // hash slot on a name that cannot be interned.
-            if frame_count.load(Ordering::Relaxed) >= capacity {
+            if table.frame_count.load(Ordering::Relaxed) >= table.capacity {
                 return Err(FrameError::CapacityExceeded);
             }
-            match hashes[i].compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire) {
+            match table.hashes[i].compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
-                    let n = frame_count.fetch_add(1, Ordering::AcqRel);
-                    if n >= capacity {
-                        // Lost the capacity race (only reachable when several
-                        // threads intern distinct names at exactly capacity).
-                        // Give the id back so `frame_count` stays exact, and
-                        // publish ID_FAILED so waiters on this slot terminate.
-                        frame_count.fetch_sub(1, Ordering::AcqRel);
-                        ids[i].store(ID_FAILED, Ordering::Release);
-                        return Err(FrameError::CapacityExceeded);
+                    // A8: record who is working on this slot *before* allocating
+                    // an id, so a crash from here on is recoverable and so that
+                    // losing this CAS costs nothing. Anonymous callers skip it —
+                    // `CLAIM_UNRECORDED` is what they would write anyway.
+                    if me != CLAIM_UNRECORDED
+                        && table.claiming[i]
+                            .compare_exchange(
+                                CLAIM_UNRECORDED,
+                                me,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                    {
+                        // A rescuer decided we were gone and took the entry over
+                        // before we recorded ourselves. It publishes; we wait.
+                        continue;
                     }
-                    let id = n + 1;
-                    write_record(id);
-                    ids[i].store(id, Ordering::Release);
-                    return Ok(id);
+                    return table.finish(i, hash, &name_matches, &write_record);
                 }
                 // Lost the race for this slot: re-read it (someone else's hash is
                 // now here, or ours — the loop handles both).
@@ -203,4 +458,52 @@ pub fn intern_core(
         i = (i + 1) & (mask as usize);
     }
     Err(FrameError::CapacityExceeded)
+}
+
+/// Look up an already-interned hash **without** inserting: the read-only half of
+/// [`intern_core`], sharing its bounded wait.
+///
+/// Returns `Ok(None)` when the name was never interned, when its slot was
+/// poisoned with [`ID_FAILED`], and — A8 — when its claimant is provably gone and
+/// nothing was ever published. The last case is why a read-only participant
+/// cannot wedge on a dead writer; it is truthful (no id exists for that name at
+/// that instant) and self-correcting (the next interner rescues the slot).
+///
+/// # Errors
+///
+/// [`FrameError::FrameHashCollision`] if a different name occupies this hash.
+pub fn find_core(
+    table: &InternTable<'_>,
+    hash: u64,
+    claimant_alive: impl Fn(u32) -> bool,
+    name_matches: impl Fn(u32) -> bool,
+) -> Result<Option<u32>, FrameError> {
+    debug_assert_eq!(table.hashes.len(), table.ids.len());
+    debug_assert_eq!(table.hashes.len(), table.claiming.len());
+    let mask = (table.hashes.len() - 1) as u64;
+    let mut i = (hash & mask) as usize;
+    for _ in 0..table.hashes.len() {
+        let cur = table.hashes[i].load(Ordering::Acquire);
+        if cur == 0 {
+            return Ok(None); // reached an empty slot: name was never interned
+        }
+        if cur == hash {
+            let id = match table.wait_for_publish(i, Role::Reader, &claimant_alive) {
+                Wait::Published(id) => id,
+                // Nothing was ever published for this name, and nobody live is
+                // going to publish it.
+                Wait::Abandoned => return Ok(None),
+                // `Role::Reader` never takes over.
+                Wait::TakenOver => return Ok(None),
+            };
+            if id == ID_FAILED {
+                // An interner claimed this slot and then lost the capacity race:
+                // the name was never actually interned.
+                return Ok(None);
+            }
+            return resolve(id, hash, &name_matches).map(Some);
+        }
+        i = (i + 1) & (mask as usize);
+    }
+    Ok(None)
 }
