@@ -10,10 +10,10 @@ use alloc::vec::Vec;
 use tf_tree_arena::{ArenaLayout, HeapArena};
 use tf_tree_math::{exp_se3, Iso3, LerpSlerp};
 
-use crate::arena_view::ArenaView;
+use crate::arena_view::{ArenaBuilder, ArenaView};
 use crate::buffer::{PoseSlot, SampleRing};
 use crate::edge::{claim, EdgeRecord, Publisher};
-use crate::error::{ClaimError, EdgeId, LookupError, PushError};
+use crate::error::{ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError};
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU64};
 
@@ -142,6 +142,46 @@ fn non_monotonic_push_rejected() {
     assert_eq!(got.to_bits(), pose(9).to_bits());
 }
 
+/// Regression: on a wrapped ring, logical index `head - capacity` shares a
+/// physical slot with the sample `push` writes next, so retaining `capacity`
+/// samples read the *newest* stamp as `t_old`. Every in-window query below that
+/// stamp then failed immediately with an `Extrapolation` carrying a fabricated
+/// `oldest` — no bracket search, no revalidation.
+#[test]
+fn a_wrapped_ring_does_not_retain_the_slot_push_overwrites() {
+    let hr = HeapRing::new(4);
+    let ring = hr.ring();
+    // Five pushes into four slots: logical 4 (stamp 40) overwrote logical 0's
+    // physical slot, so logical 1..=4 (stamps 10..40) look retained but only
+    // 2..=4 actually are.
+    for i in 0..5i64 {
+        ring.push(i * 10, &pose(i as u64 + 1)).unwrap();
+    }
+
+    // An in-window query must interpolate, not report extrapolation.
+    let got = ring.sample::<LerpSlerp>(25, ExtrapPolicy::Error).unwrap();
+    let want = <LerpSlerp as tf_tree_math::Interp>::eval(&pose(3), &pose(4), 0.5);
+    assert_eq!(got.to_bits(), want.to_bits(), "bracketed query at t=25");
+
+    // The window's true edges: 20 is the oldest retained, 10 is not.
+    assert!(ring.sample::<LerpSlerp>(20, ExtrapPolicy::Error).is_ok());
+    let err = ring
+        .sample::<LerpSlerp>(10, ExtrapPolicy::Error)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LookupError::Extrapolation {
+                requested: 10,
+                oldest: 20,
+                newest: 40,
+                ..
+            }
+        ),
+        "the reported window must be the real one: {err:?}"
+    );
+}
+
 /// Property test #15: after `3.5 * capacity` pushes onto a wrapped ring, every
 /// still-retained sample reads back exactly, and older ones extrapolate-before.
 #[test]
@@ -174,7 +214,10 @@ fn wrapped_ring_retained_samples_read_back_exactly() {
                     ring.push(i as i64 * 10, p).unwrap();
                 }
                 let total = poses.len() as u64;
-                let oldest_retained = total - cap as u64;
+                // `capacity - 1`, not `capacity`: logical index `head - capacity`
+                // shares a physical slot with the sample `push` writes next, so it
+                // is not retained. See `SampleRing::retained`.
+                let oldest_retained = total - (cap as u64 - 1);
 
                 // Retained samples read back bit-exactly at their stamps.
                 for logical in oldest_retained..total {
@@ -249,7 +292,97 @@ fn arena_intern_is_idempotent() {
     assert_eq!(a.get(), 1);
     assert_eq!(b.get(), 2);
     // Record round-trips the stored name.
-    assert!(view.frame_record(a).name_matches("base_link"));
+    assert!(view.frame_record(a).unwrap().name_matches("base_link"));
+}
+
+/// Regression: the `ids` array lives in a zero-initialized arena, so the
+/// "unpublished" sentinel has to be `0`. With `u32::MAX` nothing ever wrote the
+/// sentinel, the publish-then-spin wait loop exited immediately with `id == 0`,
+/// and a reader racing an interner got a bogus id.
+#[test]
+fn unpublished_sentinel_is_reachable_in_a_zeroed_arena() {
+    assert_eq!(crate::frame::ID_UNPUBLISHED, 0, "sentinel must be zero");
+    let arena = single_dyn_edge_arena();
+    let view = ArenaView::new(&arena);
+    // Re-interning must observe the *published* id through the wait loop, not the
+    // zero a non-zero sentinel would let it read straight out of a fresh slot.
+    let a = view.intern("base_link").unwrap();
+    assert_eq!(view.intern("base_link").unwrap(), a);
+    assert_ne!(a.get(), 0);
+}
+
+/// A rejected intern must not poison its hash slot: `frame_count` stays exact and
+/// the table keeps answering for the names that did fit.
+#[test]
+fn capacity_rejection_leaves_the_table_usable() {
+    let arena = single_dyn_edge_arena();
+    let view = ArenaView::new(&arena);
+    let a = view.intern("a").unwrap();
+    view.intern("b").unwrap();
+    view.intern("c").unwrap();
+    assert_eq!(view.intern("d").unwrap_err(), FrameError::CapacityExceeded);
+    // The full table still resolves what it holds, and did not over-count.
+    assert_eq!(view.intern("a").unwrap(), a);
+    assert_eq!(
+        view.header()
+            .frame_count
+            .load(crate::sync::Ordering::Relaxed),
+        3
+    );
+}
+
+/// Regression: `EdgeId` is a public `u32` newtype and `FrameId::new` accepts any
+/// non-zero `u32`, so out-of-range ids reach these accessors from safe code —
+/// including from the `#![forbid(unsafe_code)]` facade. They must report the
+/// miss, not form an out-of-bounds pointer.
+#[test]
+fn out_of_range_ids_are_rejected_not_dereferenced() {
+    let arena = single_dyn_edge_arena();
+    let view = ArenaView::new(&arena);
+    // The arena has 1 edge slot and 4 frame slots.
+    for bad in [EdgeId(1), EdgeId(50_000_000), EdgeId(u32::MAX)] {
+        assert!(view.edge(bad).is_none(), "edge({bad:?})");
+        assert!(view.claim(bad).is_none(), "claim({bad:?})");
+        assert!(view.ring(bad).is_none(), "ring({bad:?})");
+        assert!(view.sampler(bad).is_none(), "sampler({bad:?})");
+    }
+    let bad_frame = FrameId::new(4).unwrap();
+    assert!(view.frame_record(bad_frame).is_none());
+    assert!(view.topology().read_frame(bad_frame).is_none());
+    assert!(view.frame_record(FrameId::new(u32::MAX).unwrap()).is_none());
+}
+
+/// A static (zero-capacity) edge has no ring: asking for one is a `None`, not a
+/// debug assertion or a mask of `u64::MAX` over an empty slot slice.
+#[test]
+fn static_edge_has_no_ring() {
+    let mut arena = single_dyn_edge_arena();
+    let mut builder = ArenaBuilder::new(&mut arena);
+    let parent = builder.view().intern("odom").unwrap();
+    let child = builder.view().intern("base_link").unwrap();
+    builder
+        .declare_edge(
+            EdgeId(0),
+            EdgeRecord::static_edge(parent.get(), child.get(), Iso3::IDENTITY.to_bits(), 0),
+        )
+        .unwrap();
+    let view = builder.view();
+    assert!(view.edge(EdgeId(0)).is_some(), "the record itself exists");
+    assert!(view.ring(EdgeId(0)).is_none());
+    assert!(view.sampler(EdgeId(0)).is_none());
+}
+
+/// Declaring an edge outside the edge table is refused, not written past the end
+/// of the arena.
+#[test]
+fn declare_edge_rejects_an_out_of_range_id() {
+    let mut arena = single_dyn_edge_arena();
+    let mut builder = ArenaBuilder::new(&mut arena);
+    let rec = EdgeRecord::dynamic(1, 2, 4, 0, 0, 0, 0);
+    assert_eq!(
+        builder.declare_edge(EdgeId(u32::MAX), rec).unwrap_err(),
+        crate::error::TopologyError::CapacityExceeded
+    );
 }
 
 #[test]
@@ -266,23 +399,26 @@ fn arena_capacity_exceeded() {
 
 #[test]
 fn arena_push_claim_sample_roundtrip() {
-    let arena = single_dyn_edge_arena();
-    let view = ArenaView::new(&arena);
-    let parent = view.intern("odom").unwrap();
-    let child = view.intern("base_link").unwrap();
+    let mut arena = single_dyn_edge_arena();
+    let mut builder = ArenaBuilder::new(&mut arena);
+    let parent = builder.view().intern("odom").unwrap();
+    let child = builder.view().intern("base_link").unwrap();
     let edge = EdgeId(0);
-    view.declare_edge(
-        edge,
-        EdgeRecord::dynamic(parent.get(), child.get(), 4, 0, 0, 0, 0),
-    );
+    builder
+        .declare_edge(
+            edge,
+            EdgeRecord::dynamic(parent.get(), child.get(), 4, 0, 0, 0, 0),
+        )
+        .unwrap();
 
-    let epoch = claim(view.claim(edge), 4242, 0xfeed).unwrap();
-    let pubr = Publisher::new(view.ring(edge), view.claim(edge), epoch);
+    let view = builder.view();
+    let epoch = claim(view.claim(edge).unwrap(), 4242, 0xfeed).unwrap();
+    let pubr = Publisher::new(view.ring(edge).unwrap(), view.claim(edge).unwrap(), epoch);
     for i in 0..3u64 {
         pubr.push(i as i64 * 1000, &pose(i + 1)).unwrap();
     }
     // A fresh reader ring over the same arena sees the samples.
-    let reader = view.ring(edge);
+    let reader = view.ring(edge).unwrap();
     let got = reader
         .sample::<LerpSlerp>(2000, ExtrapPolicy::Error)
         .unwrap();
@@ -290,13 +426,14 @@ fn arena_push_claim_sample_roundtrip() {
     // The claim heartbeat advanced once per push.
     assert_eq!(
         view.claim(edge)
+            .unwrap()
             .heartbeat
             .load(crate::sync::Ordering::Relaxed),
         3
     );
     drop(pubr);
     // After the publisher drops, the edge can be re-claimed.
-    assert!(claim(view.claim(edge), 1, 2).is_ok());
+    assert!(claim(view.claim(edge).unwrap(), 1, 2).is_ok());
 }
 
 // ---- topology -----------------------------------------------------------
@@ -313,17 +450,19 @@ fn topology_depth_and_cycle_detection() {
     // a is a root; b under a via edge 10; c under b via edge 20 => depths 0,1,2.
     topo.set_parent(b, a.get(), 10).unwrap();
     topo.set_parent(c, b.get(), 20).unwrap();
-    assert_eq!(topo.read_frame(a).1, 0);
-    assert_eq!(topo.read_frame(b).1, 1);
-    assert_eq!(topo.read_frame(c).1, 2);
-    assert_eq!(topo.read_frame(b).0, a.get()); // parent
-                                               // edge_of_child round-trips and stays consistent with parent across flips.
-    assert_eq!(topo.read_frame(b).2, 10);
-    assert_eq!(topo.read_frame(c).2, 20);
-    assert_eq!(topo.read_frame(a).2, 0); // root has no edge
+    let read = |f| topo.read_frame(f).unwrap();
+    assert_eq!(read(a).1, 0);
+    assert_eq!(read(b).1, 1);
+    assert_eq!(read(c).1, 2);
+    assert_eq!(read(b).0, a.get()); // parent
+                                    // edge_of_child round-trips and stays consistent with parent across flips.
+    assert_eq!(read(b).2, 10);
+    assert_eq!(read(c).2, 20);
+    assert_eq!(read(a).2, 0); // root has no edge
 
     // Each successful mutation advanced the generation by 2 (even, stable).
     assert_eq!(topo.generation() % 2, 0);
+    let before = topo.generation();
 
     // Attaching a under c would close a cycle a->b->c->a.
     let err = topo.set_parent(a, c.get(), 30).unwrap_err();
@@ -333,9 +472,17 @@ fn topology_depth_and_cycle_detection() {
     );
     // The failed mutation left the tree intact and the generation stable/even.
     assert_eq!(topo.generation() % 2, 0);
-    assert_eq!(topo.read_frame(a).0, 0);
+    assert_eq!(read(a).0, 0);
     // And edge_of_child for the earlier attach survived the aborted mutation.
-    assert_eq!(topo.read_frame(c).2, 20);
+    assert_eq!(read(c).2, 20);
+    // The published topology is byte-identical, so the generation must not have
+    // advanced — advancing it would invalidate every compiled plan in the process
+    // for a mutation that never happened.
+    assert_eq!(
+        topo.generation(),
+        before,
+        "an aborted set_parent must not bump the generation"
+    );
 }
 
 // ---- layout asserts -----------------------------------------------------

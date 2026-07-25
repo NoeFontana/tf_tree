@@ -137,6 +137,29 @@ impl SampleRing<'_> {
         self.poses.len() as u64
     }
 
+    /// How many of the most recent logical indices a reader may safely touch.
+    ///
+    /// **Not** `capacity`. [`Self::push`] writes logical index `head` into
+    /// physical slot `head & mask`; logical index `head - capacity` maps to that
+    /// same physical slot, so it is the slot currently being overwritten, not a
+    /// retained sample. The readable window is therefore
+    /// `[head - capacity + 1, head - 1]` — `capacity - 1` samples. Reading the
+    /// lapped slot is what made an in-window query race a `push` and come back
+    /// with a fabricated `Extrapolation`.
+    ///
+    /// A one-slot ring is degenerate (its readable window is empty). It keeps a
+    /// window of `1` so a quiescent ring is still readable at all; concurrent
+    /// reads of one are guarded only by the per-slot seqlock, which is why
+    /// `Capacity` should never be configured that small.
+    #[inline]
+    #[must_use]
+    pub fn retained(&self) -> u64 {
+        let cap = self.capacity();
+        // Branchless `max(cap - 1, 1)` for the power-of-two capacities this ring
+        // is built with (`cap >= 1`).
+        cap - u64::from(cap > 1)
+    }
+
     /// Publish one sample. **Single writer only** — exclusivity is a type-level
     /// property of the `Publisher` that owns this ring, not a convention.
     ///

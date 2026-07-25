@@ -10,13 +10,37 @@
 //! writes the record, and only then publishes the id; a concurrent interner of
 //! the same name observes the hash, spins until the id is published, and returns
 //! it. It costs nothing in Phase 1 and cannot be retrofitted.
+//!
+//! The protocol only works if the "unpublished" state is the state a **zeroed
+//! arena** is already in — see [`ID_UNPUBLISHED`]. Nothing pre-fills the id
+//! array, so a non-zero sentinel makes the wait loop inert: it exits on the first
+//! read and hands back a bogus id. Every interner that claims a slot must also
+//! leave it in a terminal state, either the real id or [`ID_FAILED`]; returning
+//! `Err` with the slot claimed and the id unpublished hangs every later interner
+//! of that name.
 
 use crate::error::FrameError;
 use crate::sync::{spin, AtomicU32, AtomicU64, Ordering};
 
 /// Sentinel stored in the `ids` array before a winning interner publishes the
 /// real id.
-pub const ID_UNPUBLISHED: u32 = u32::MAX;
+///
+/// It **must** be `0`: the arena is `alloc_zeroed` and nothing ever pre-fills
+/// the id array, so any other sentinel would be unreachable and the
+/// publish-then-spin wait loop below would exit immediately on an unpublished
+/// slot with a bogus id. `0` is safe to use because frame ids are 1-based (slot
+/// `0` of the frame table is the reserved root sentinel), so a published id is
+/// never `0`.
+pub const ID_UNPUBLISHED: u32 = 0;
+
+/// Published into the `ids` array when the winning interner could *not* complete
+/// (the frame table turned out to be full after it had already claimed the hash
+/// slot). Waiters observe it and return [`FrameError::CapacityExceeded`] instead
+/// of spinning forever on a slot that will never be filled.
+///
+/// `u32::MAX` is never a real frame id: ids are bounded by `max_frames`, which
+/// the arena layout caps far below `u32::MAX`.
+pub const ID_FAILED: u32 = u32::MAX;
 
 /// The 64-bit frame-name hash: the first eight bytes of `blake3(name)`, read as a
 /// little-endian `u64`.
@@ -102,7 +126,9 @@ impl FrameRecord {
 ///
 /// * [`FrameError::FrameHashCollision`] — a different name already occupies this
 ///   hash.
-/// * [`FrameError::CapacityExceeded`] — the frame table is full.
+/// * [`FrameError::CapacityExceeded`] — the frame table is full, or this name's
+///   hash slot was poisoned with [`ID_FAILED`] by an interner that lost the
+///   capacity race.
 ///
 /// # Panics
 ///
@@ -134,6 +160,11 @@ pub fn intern_core(
                 }
                 spin();
             };
+            if id == ID_FAILED {
+                // The winner of this slot ran out of table; the name is not, and
+                // never will be, interned (capacity is fixed for the arena's life).
+                return Err(FrameError::CapacityExceeded);
+            }
             return if name_matches(id) {
                 Ok(id)
             } else {
@@ -141,10 +172,8 @@ pub fn intern_core(
             };
         }
         if cur == 0 {
-            // Reject before claiming a slot so a rejected intern never leaves a
-            // hash slot with an unpublished id (which would hang later interners).
-            // Frame mutations are serialized by the builder mutex, so this
-            // pre-check is exact in Phase 1.
+            // Cheap pre-check: reject an obviously-full table before burning a
+            // hash slot on a name that cannot be interned.
             if frame_count.load(Ordering::Relaxed) >= capacity {
                 return Err(FrameError::CapacityExceeded);
             }
@@ -152,9 +181,12 @@ pub fn intern_core(
                 Ok(_) => {
                     let n = frame_count.fetch_add(1, Ordering::AcqRel);
                     if n >= capacity {
-                        // Lost the capacity race (only possible under concurrent
-                        // interning at exactly capacity). Publish the id anyway so
-                        // waiters do not hang; the caller sized the table wrong.
+                        // Lost the capacity race (only reachable when several
+                        // threads intern distinct names at exactly capacity).
+                        // Give the id back so `frame_count` stays exact, and
+                        // publish ID_FAILED so waiters on this slot terminate.
+                        frame_count.fetch_sub(1, Ordering::AcqRel);
+                        ids[i].store(ID_FAILED, Ordering::Release);
                         return Err(FrameError::CapacityExceeded);
                     }
                     let id = n + 1;

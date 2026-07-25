@@ -21,8 +21,13 @@ loom:
     cargo xtask loom
 
 # Undefined-behavior checking under Miri (arena + core).
+#
+# `miri-soft-float` is opt-in here and nowhere else: Miri cannot execute the x86
+# inline `sqrt` asm libm's default `arch` feature emits. Enabling it globally
+# would compile the shipped binaries and the benchmarks with soft floats too.
 miri:
-    cargo +nightly miri test -p tf_tree_arena -p tf_tree_core
+    cargo +nightly miri test -p tf_tree_arena -p tf_tree_core \
+        --features tf_tree_core/miri-soft-float
 
 # Lint everything. Pure checks; does not mutate files.
 lint:

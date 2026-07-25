@@ -1,13 +1,19 @@
 //! Bracket search over an edge's sample ring.
 //!
 //! Given a query stamp `t`, locate the two published samples that bracket it and
-//! interpolate. The search is over **logical** indices (the monotone
-//! `[head - n, head - 1]` window) with `& mask` applied on every probe: searching
-//! the physical array directly is wrong once the ring has wrapped, and is a
-//! classic off-by-one source (decision `0003`). The trailing revalidation makes
-//! the read wait-free in practice — it fails only if the ring lapped the reader
-//! mid-read, which cannot happen within the buffer's time-slack under any sane
-//! configuration.
+//! interpolate. The search is over **logical** indices with `& mask` applied on
+//! every probe: searching the physical array directly is wrong once the ring has
+//! wrapped, and is a classic off-by-one source (decision `0003`). The trailing
+//! revalidation makes the read wait-free in practice — it fails only if the ring
+//! lapped the reader mid-read, which cannot happen within the buffer's time-slack
+//! under any sane configuration.
+//!
+//! The searched window is `[head - n, head - 1]` where `n = min(head,
+//! `[`SampleRing::retained`]`)` — and `retained` is `capacity - 1`, **not**
+//! `capacity`. Logical index `head - capacity` shares a physical slot with the
+//! sample `push` is writing right now, so including it means reading a slot
+//! mid-overwrite. Both the window and the trailing revalidation use the same
+//! bound; keep them in step.
 //!
 //! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
 //! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
@@ -51,9 +57,9 @@ impl SampleRing<'_> {
         if h == 0 {
             return Err(LookupError::NoData { edge: self.edge });
         }
-        let cap = self.capacity();
-        let n = h.min(cap);
-        let lo_logical = h - n; // oldest retained logical index
+        let retained = self.retained();
+        let n = h.min(retained);
+        let lo_logical = h - n; // oldest *safely readable* logical index
         let newest = h - 1;
 
         let t_old = self.stamp_at(lo_logical);
@@ -112,8 +118,10 @@ impl SampleRing<'_> {
 
         // Revalidate: if the ring lapped past `i` while we read, the endpoints we
         // used may be stale. Return the error rather than looping; the caller
-        // knows whether a retry makes sense.
-        if self.head.load(Ordering::Acquire) - i > cap {
+        // knows whether a retry makes sense. The bound is `retained`, not
+        // `capacity`: `head - i == capacity` already means slot `i` is the one
+        // `push` is overwriting.
+        if self.head.load(Ordering::Acquire) - i > retained {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
         Ok(result)
@@ -162,7 +170,7 @@ impl SampleRing<'_> {
             ];
             a * exp_se3(scaled)
         };
-        if self.head.load(Ordering::Acquire) - prev > self.capacity() {
+        if self.head.load(Ordering::Acquire) - prev > self.retained() {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
         Ok(result)

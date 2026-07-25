@@ -453,10 +453,14 @@ mod tests {
             )
         });
 
-        // Fixed 32-byte seed: reproducible across runs and CI.
+        // Fixed 32-byte seed: reproducible across runs and CI. The case count is
+        // cut hard under Miri: 10_000 cases of the interpreter is tens of minutes
+        // and makes `just miri` impractical to run at all. The layout math is pure
+        // integer arithmetic, so a small sample exercises the same code paths for
+        // UB purposes; the full sweep still runs on the normal test path.
         let mut runner = TestRunner::new_with_rng(
             Config {
-                cases: 10_000,
+                cases: if cfg!(miri) { 64 } else { 10_000 },
                 failure_persistence: None,
                 ..Config::default()
             },

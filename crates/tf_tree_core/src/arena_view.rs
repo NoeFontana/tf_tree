@@ -19,6 +19,12 @@
 //!   [`EdgeRecord`] scalar fields, through writes that are ordered *before* the
 //!   atomic publish that exposes them), so aliasing a region as a shared
 //!   reference from multiple threads is sound.
+//! * **Every record index is bounds-checked against the header's `max_frames` /
+//!   `max_edges` before a pointer is formed.** [`EdgeId`] is a plain public
+//!   `u32` newtype and [`FrameId::new`] accepts any non-zero `u32`, so an
+//!   out-of-range id is reachable from perfectly safe caller code (including
+//!   from `tf_tree`, which is `#![forbid(unsafe_code)]`). The checked accessors
+//!   return `None` rather than forming an out-of-bounds pointer.
 //!
 //! Every `unsafe` block below names which of these invariants it relies on.
 #![allow(unsafe_code)]
@@ -27,7 +33,7 @@ use tf_tree_arena::{Arena, ArenaHeader};
 
 use crate::buffer::{pose_slots, stamp_slots, SampleRing};
 use crate::edge::{ClaimRecord, EdgeRecord};
-use crate::error::{EdgeId, FrameError, FrameId};
+use crate::error::{EdgeId, FrameError, FrameId, TopologyError};
 use crate::frame::{blake3_64, intern_core, FrameRecord};
 use crate::sync::{AtomicU16, AtomicU32, AtomicU64};
 use crate::topology::{Block, TopologyView};
@@ -81,7 +87,8 @@ impl<'a> ArenaView<'a> {
         unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU64>(), slots) }
     }
 
-    /// The interning id array (parallel to the hashes; `u32::MAX` = unpublished).
+    /// The interning id array (parallel to the hashes; `0` = unpublished, see
+    /// [`ID_UNPUBLISHED`](crate::frame::ID_UNPUBLISHED)).
     fn frame_ids(&self) -> &'a [AtomicU32] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
         let off = self.header.frame_hash_off as usize + slots * 8;
@@ -95,13 +102,27 @@ impl<'a> ArenaView<'a> {
         &self.header.frame_count
     }
 
-    /// Pointer to frame record slot `id` (1-based; slot 0 is the root sentinel).
-    fn frame_record_ptr(&self, id: u32) -> *mut FrameRecord {
+    /// Pointer to frame record slot `id` (1-based; slot 0 is the root sentinel),
+    /// or `None` if `id` is out of range for this arena.
+    fn frame_record_ptr(&self, id: u32) -> Option<*mut FrameRecord> {
+        if id >= self.header.max_frames {
+            return None;
+        }
         let off = self.header.frame_table_off as usize + id as usize * 64;
         // SAFETY: module invariant — the frame table reserves `max_frames` 64-byte
-        // records at `frame_table_off`; `id < max_frames` is guaranteed by the
-        // interning capacity check, so this pointer is in-bounds and 64-aligned.
-        unsafe { self.base.add(off).cast::<FrameRecord>() }
+        // records at `frame_table_off`, and `id < max_frames` was just checked, so
+        // this pointer is in-bounds and 64-aligned.
+        Some(unsafe { self.base.add(off).cast::<FrameRecord>() })
+    }
+
+    /// Byte offset of record `id` in a table of `stride`-byte records starting at
+    /// `table_off`, or `None` if `id` is out of range for this arena's edge table.
+    #[inline]
+    fn edge_slot_off(&self, id: EdgeId, table_off: u32, stride: usize) -> Option<usize> {
+        if id.get() >= self.header.max_edges {
+            return None;
+        }
+        Some(table_off as usize + id.get() as usize * stride)
     }
 
     /// Intern `name`, returning its stable [`FrameId`]. Idempotent: the same name
@@ -121,21 +142,25 @@ impl<'a> ArenaView<'a> {
         let capacity = self.header.max_frames.saturating_sub(1);
 
         let name_matches = |id: u32| -> bool {
-            let ptr = self.frame_record_ptr(id);
-            // SAFETY: `id` was published (its record was fully written before the
-            // `ids` Release store this reader synchronized with via Acquire), and
-            // records are append-only, so no writer aliases it. Reading a shared
-            // `&FrameRecord` is sound.
-            let rec = unsafe { &*ptr };
-            rec.name_matches(name)
+            match self.frame_record_ptr(id) {
+                // SAFETY: `id` is in bounds (checked by `frame_record_ptr`) and was
+                // published (its record was fully written before the `ids` Release
+                // store this reader synchronized with via Acquire); records are
+                // append-only, so no writer aliases it. Reading a shared
+                // `&FrameRecord` is sound.
+                Some(ptr) => unsafe { &*ptr }.name_matches(name),
+                None => false,
+            }
         };
         let write_record = |id: u32| {
-            let ptr = self.frame_record_ptr(id);
-            let rec = FrameRecord::for_name(name, hash);
-            // SAFETY: this runs only for the unique CAS winner, before the `ids`
-            // Release store publishes `id`; no other thread holds a reference to
-            // this (append-only) slot yet, so the raw write does not race.
-            unsafe { core::ptr::write(ptr, rec) };
+            if let Some(ptr) = self.frame_record_ptr(id) {
+                let rec = FrameRecord::for_name(name, hash);
+                // SAFETY: `id < max_frames` (checked), and this runs only for the
+                // unique CAS winner, before the `ids` Release store publishes `id`;
+                // no other thread holds a reference to this (append-only) slot yet,
+                // so the raw write does not race.
+                unsafe { core::ptr::write(ptr, rec) };
+            }
         };
 
         let id = intern_core(
@@ -150,13 +175,15 @@ impl<'a> ArenaView<'a> {
         FrameId::new(id).ok_or(FrameError::CapacityExceeded)
     }
 
-    /// Read an interned frame record (for name display / diagnostics).
+    /// Read an interned frame record (for name display / diagnostics), or `None`
+    /// if `id` is out of range for this arena.
     #[must_use]
-    pub fn frame_record(&self, id: FrameId) -> &'a FrameRecord {
-        let ptr = self.frame_record_ptr(id.get());
-        // SAFETY: a live `FrameId` names a published, append-only record slot in
-        // bounds; a shared read does not race any writer.
-        unsafe { &*ptr }
+    pub fn frame_record(&self, id: FrameId) -> Option<&'a FrameRecord> {
+        let ptr = self.frame_record_ptr(id.get())?;
+        // SAFETY: `id.get() < max_frames` (checked by `frame_record_ptr`); a live
+        // `FrameId` names a published, append-only record slot, and a shared read
+        // does not race any writer.
+        Some(unsafe { &*ptr })
     }
 
     // ---- topology --------------------------------------------------------
@@ -201,73 +228,133 @@ impl<'a> ArenaView<'a> {
 
     // ---- edges & claims --------------------------------------------------
 
-    /// The claim record for edge `id`.
+    /// The claim record for edge `id`, or `None` if `id` is out of range.
     #[must_use]
-    pub fn claim(&self, id: EdgeId) -> &'a ClaimRecord {
-        let off = self.header.claim_table_off as usize + id.get() as usize * 64;
+    pub fn claim(&self, id: EdgeId) -> Option<&'a ClaimRecord> {
+        let off = self.edge_slot_off(id, self.header.claim_table_off, 64)?;
         // SAFETY: module invariant — the claim table reserves `max_edges` 64-byte
-        // records at `claim_table_off`; a valid `EdgeId` is in bounds and the
-        // record is 64-aligned. All its mutation is atomic, so sharing is sound.
-        unsafe { &*self.base.add(off).cast::<ClaimRecord>() }
+        // records at `claim_table_off`, and `id < max_edges` was just checked, so
+        // the record is in bounds and 64-aligned. All its mutation is atomic, so
+        // sharing it across threads is sound.
+        Some(unsafe { &*self.base.add(off).cast::<ClaimRecord>() })
     }
 
-    /// The edge record for edge `id`.
+    /// The edge record for edge `id`, or `None` if `id` is out of range.
     #[must_use]
-    pub fn edge(&self, id: EdgeId) -> &'a EdgeRecord {
-        let off = self.header.edge_table_off as usize + id.get() as usize * 128;
+    pub fn edge(&self, id: EdgeId) -> Option<&'a EdgeRecord> {
+        let off = self.edge_slot_off(id, self.header.edge_table_off, 128)?;
         // SAFETY: module invariant — the edge table reserves `max_edges` 128-byte
-        // records at `edge_table_off`; a valid `EdgeId` is in bounds and the
-        // record is 64-aligned.
-        unsafe { &*self.base.add(off).cast::<EdgeRecord>() }
+        // records at `edge_table_off`, and `id < max_edges` was just checked, so
+        // the record is in bounds and 64-aligned.
+        Some(unsafe { &*self.base.add(off).cast::<EdgeRecord>() })
     }
 
-    /// Write a fresh edge record. Called at declaration time, single-threaded,
-    /// before any reader or writer touches the edge.
+    /// The [`SampleRing`] for a dynamic edge, assembled from its edge record
+    /// (head, capacity, region offsets) and claim record (heartbeat).
     ///
-    /// # Safety-relevant contract
-    ///
-    /// The caller must hold the builder mutex and declare each `id` at most once,
-    /// before publishing it — no concurrent access to this slot may exist.
-    pub fn declare_edge(&self, id: EdgeId, record: EdgeRecord) {
-        let off = self.header.edge_table_off as usize + id.get() as usize * 128;
-        // SAFETY: declaration is single-threaded and happens before the edge is
-        // published; no other reference aliases this in-bounds, 64-aligned slot.
-        unsafe {
-            let ptr = self.base.add(off).cast::<EdgeRecord>();
-            core::ptr::write(ptr, record);
-        }
-    }
-
-    /// Assemble the [`SampleRing`] for a dynamic edge from its edge record (head,
-    /// capacity, region offsets) and claim record (heartbeat).
-    ///
-    /// # Panics
-    ///
-    /// Debug-asserts the edge is dynamic (non-zero, power-of-two capacity). The
-    /// caller must not request a ring for a static or tombstoned edge.
+    /// Returns `None` if `id` is out of range, or if the edge is not a ring —
+    /// a static or tombstoned edge has `capacity == 0`, which is not a power of
+    /// two, so there is no ring to build.
     #[must_use]
-    pub fn ring(&self, id: EdgeId) -> SampleRing<'a> {
-        let edge = self.edge(id);
-        let claim = self.claim(id);
+    pub fn ring(&self, id: EdgeId) -> Option<SampleRing<'a>> {
+        let edge = self.edge(id)?;
+        let claim = self.claim(id)?;
+        self.ring_of(id, edge, claim)
+    }
+
+    /// Everything the sampling hot path needs for one edge — its interpolation
+    /// discriminant and its ring — resolved behind a single bounds check.
+    ///
+    /// Returns `None` under exactly the conditions [`Self::ring`] does.
+    #[must_use]
+    pub fn sampler(&self, id: EdgeId) -> Option<(u8, SampleRing<'a>)> {
+        let edge = self.edge(id)?;
+        let claim = self.claim(id)?;
+        Some((edge.interp, self.ring_of(id, edge, claim)?))
+    }
+
+    /// Assemble a ring from already-resolved records. `None` if `edge` is not a
+    /// dynamic ring.
+    #[inline]
+    fn ring_of(
+        &self,
+        id: EdgeId,
+        edge: &'a EdgeRecord,
+        claim: &'a ClaimRecord,
+    ) -> Option<SampleRing<'a>> {
         let cap = edge.capacity as usize;
-        debug_assert!(cap.is_power_of_two(), "ring() on a non-ring edge");
+        if !cap.is_power_of_two() {
+            return None;
+        }
 
         let stamp_byte_off = self.header.stamp_arena_off as usize + edge.stamp_off as usize * 8;
         let pose_byte_off = self.header.pose_arena_off as usize + edge.pose_off as usize * 64;
 
-        // SAFETY: `declare_edge` sized `stamp_off`/`pose_off`/`capacity` to name a
-        // `cap`-slot sub-range wholly inside the stamp/pose arenas; the helpers'
-        // own SAFETY contracts (in `crate::buffer`) cover alignment and validity.
+        // SAFETY: `ArenaBuilder::declare_edge` sized `stamp_off`/`pose_off`/
+        // `capacity` to name a `cap`-slot sub-range wholly inside the stamp/pose
+        // arenas; the helpers' own SAFETY contracts (in `crate::buffer`) cover
+        // alignment and validity.
         let stamps = unsafe { stamp_slots(self.base, stamp_byte_off, cap) };
         let poses = unsafe { pose_slots(self.base, pose_byte_off, cap) };
 
-        SampleRing {
+        Some(SampleRing {
             head: &edge.head,
             heartbeat: &claim.heartbeat,
             stamps,
             poses,
             mask: (cap as u64) - 1,
             edge: id,
+        })
+    }
+}
+
+/// Exclusive, construction-time access to an arena.
+///
+/// Writing an [`EdgeRecord`] is a raw, non-atomic write of a whole 128-byte
+/// record: it is sound only when nothing else can observe the slot. Rather than
+/// leave that as a comment on a safe `pub fn` — where any caller, including the
+/// `#![forbid(unsafe_code)]` facade, could violate it — the capability is gated
+/// behind an `&mut` borrow of the arena. Holding one *proves* no other
+/// [`ArenaView`] exists, because a shared view borrows the same arena.
+///
+/// Hand out shared views for the rest of construction with [`Self::view`].
+pub struct ArenaBuilder<'a> {
+    arena: &'a mut dyn Arena,
+}
+
+impl<'a> ArenaBuilder<'a> {
+    /// Take exclusive access to `arena` for declaration-time writes.
+    #[must_use]
+    pub fn new(arena: &'a mut dyn Arena) -> ArenaBuilder<'a> {
+        ArenaBuilder { arena }
+    }
+
+    /// A shared view over the same arena, borrowed from this builder (so it
+    /// cannot coexist with a [`Self::declare_edge`] call).
+    #[must_use]
+    pub fn view(&self) -> ArenaView<'_> {
+        ArenaView::new(self.arena)
+    }
+
+    /// Write a fresh edge record into slot `id`.
+    ///
+    /// # Errors
+    ///
+    /// [`TopologyError::CapacityExceeded`] if `id` is out of range for this
+    /// arena's edge table.
+    pub fn declare_edge(&mut self, id: EdgeId, record: EdgeRecord) -> Result<(), TopologyError> {
+        let view = ArenaView::new(self.arena);
+        let off = view
+            .edge_slot_off(id, view.header.edge_table_off, 128)
+            .ok_or(TopologyError::CapacityExceeded)?;
+        let base = view.base;
+        // SAFETY: `id < max_edges` (checked above), so the slot is in bounds and
+        // 64-aligned. `&mut self` proves this builder holds the arena exclusively,
+        // so no `ArenaView` — and therefore no `&EdgeRecord` — aliases the slot
+        // while the raw write happens.
+        unsafe {
+            core::ptr::write(base.add(off).cast::<EdgeRecord>(), record);
         }
+        Ok(())
     }
 }

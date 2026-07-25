@@ -388,7 +388,17 @@ is reserved as "no parent" (root sentinel).
 
 **Interning table:** open addressing, linear probing, `next_pow2(2 *
 max_frames)` slots. Two parallel arrays: `hashes: [AtomicU64]` (0 = empty) and
-`ids: [AtomicU32]` (`u32::MAX` = not yet published).
+`ids: [AtomicU32]` (`0` = not yet published).
+
+> **Correction (implementation).** An earlier draft of this block used
+> `u32::MAX` as the "not yet published" sentinel. That is unreachable: the arena
+> is `alloc_zeroed` and nothing pre-fills `ids`, so the wait loop below would
+> exit immediately on an unpublished slot and return `0`. The sentinel **must**
+> be `0`, which is safe because frame ids are 1-based (frame-table slot `0` is
+> the root sentinel). `u32::MAX` is repurposed as `ID_FAILED`, published by an
+> interner that claims a slot and then loses the capacity race, so waiters
+> terminate with `CapacityExceeded` instead of spinning on a slot that will
+> never be filled.
 
 ```
 intern(name):
@@ -397,10 +407,18 @@ intern(name):
   loop:
     cur = hashes[i].load(Acquire)
     if cur == h:
-       spin until ids[i].load(Acquire) != U32_MAX; return that id
+       spin until ids[i].load(Acquire) != ID_UNPUBLISHED (0)
+       if that id == ID_FAILED (u32::MAX) -> Err(CapacityExceeded)
+       return that id
     if cur == 0:
+       if frame_count.load(Relaxed) >= capacity -> Err(CapacityExceeded)
        if hashes[i].compare_exchange(0, h, AcqRel, Acquire).is_ok():
-          id = frame_count.fetch_add(1, AcqRel) + 1
+          n = frame_count.fetch_add(1, AcqRel)
+          if n >= capacity:                  // lost the capacity race
+             frame_count.fetch_sub(1, AcqRel)     // keep the count exact
+             ids[i].store(ID_FAILED, Release)     // do not hang waiters
+             return Err(CapacityExceeded)
+          id = n + 1
           write FrameRecord[id]
           ids[i].store(id, Release)
           return id
@@ -602,12 +620,25 @@ catch exactly that.
 
 #### Bracket search
 
+> **Correction (implementation).** An earlier draft retained `min(h, capacity)`
+> samples. That is one too many: `push` writes logical index `head` into physical
+> slot `head & mask`, and logical `head - capacity` maps to that *same* slot — so
+> it names the sample being overwritten, not a retained one. Reading it let an
+> in-window query race a `push`, observe the brand-new stamp as `t_old`, and
+> return `Extrapolation` with a fabricated `oldest` and no revalidation. The
+> readable window is `[head - capacity + 1, head - 1]`: `retained = capacity - 1`
+> samples. The trailing revalidation uses the same bound (`head - i > retained`,
+> not `> capacity`) for the same reason. A one-slot ring is degenerate — its
+> readable window is empty — and keeps `retained == 1` so a quiescent ring stays
+> readable; do not configure one.
+
 ```
 sample(edge, t, policy):
   h = head.load(Acquire)
   if h == 0                            -> Err(NoData)
-  n = min(h, capacity)
-  lo_logical = h - n                    // oldest valid logical index
+  retained = capacity - 1               // NOT capacity; see the correction above
+  n = min(h, retained)
+  lo_logical = h - n                    // oldest safely readable logical index
   t_old = stamps[lo_logical & mask]
   t_new = stamps[(h-1) & mask]
 
@@ -624,7 +655,7 @@ sample(edge, t, policy):
   result = Interp::eval(&a, &b, s)
 
   // revalidate: the ring must not have lapped us mid-read
-  if head.load(Acquire) - i > capacity  -> Err(SlotRecycled{ edge })
+  if head.load(Acquire) - i > retained  -> Err(SlotRecycled{ edge })
 ```
 
 The trailing revalidation is what makes the read wait-free-in-practice rather
@@ -685,6 +716,13 @@ compile(target, source):
   // up_s is [source, .., child_of_lca]; emit REVERSED, forward
   for f in up_s.rev():      steps.push(Dyn{ edge_of_child[f], inverted: false })
 ```
+
+> **Correction (implementation).** `edge_of_child[f] == 0` is the "no edge"
+> sentinel `set_parent` accepts when only the parent link matters — but edge
+> index `0` is *also* a real edge-table slot (unlike frames, edges are not
+> sentinel-indexed). Emitting it as a `Dyn` step silently samples edge 0's ring.
+> Every edge collected by the walk above must be checked: `edge_of_child[f] == 0`
+> on a frame that has a parent is `LookupError::MissingEdge { child: f }`.
 
 Verify the direction by hand once against a three-frame example before writing
 code; getting it backwards produces a plausible-looking transform that is wrong
@@ -806,6 +844,21 @@ Domains are phantom types in Phase 1 with a runtime `u8` tag stored on the edge.
 Cross-domain lookup is `TimeDomainMismatch`. The alignment machinery is Phase 6;
 the type-level separation must exist now so it is not a breaking change later.
 
+A plan carries **one** domain tag, so a path whose dynamic edges do not all agree
+has no correct tag to carry. Constant folding must reject it with
+`MixedTimeDomains { edge, expected, got }` rather than take the last edge's tag:
+the plan would then pass `check_domain` for that one domain and sample every
+other edge on the path with the wrong clock — precisely the silent misread D9
+exists to prevent. Relating domains is Phase 6; until then, refuse.
+
+The generation a plan is stamped with, and the one a `Guard` pins, must both be a
+**stable (even)** read of the seqlock. An odd value names a torn topology; pinning
+one makes every `Plan::at` against that guard fail with `TopologyChanged` for no
+reason, and caching a plan under one keys it on a value `compile` never produces.
+Symmetrically, a `set_parent` that aborts (cycle rejected) leaves `active`
+untouched, so it must restore the generation it read, not advance it — advancing
+invalidates every compiled plan in the process for a mutation that never happened.
+
 ### Errors
 
 ```rust
@@ -883,6 +936,15 @@ unnecessary or the test coverage is insufficient — investigate which.
 `cargo +nightly miri test -p tf_tree_arena -p tf_tree_core` with strict
 provenance. Must be clean.
 
+Miri cannot execute the inline `sqrt` asm `libm`'s default `arch` feature emits,
+so the run needs `--features tf_tree_core/miri-soft-float`. That must be an
+**opt-in feature, never a dev-dependency feature**: cargo unifies dev-dependency
+features with the normal dependency whenever dev-deps are built, so a
+`[dev-dependencies] libm = { features = ["force-soft-floats"] }` silently
+compiles every `sqrt`/`sin`/`cos` in `cargo build --workspace --all-targets`,
+`cargo nextest run` and any workspace-wide `cargo bench` with soft floats —
+invalidating the latency gate below while appearing to affect tests only.
+
 #### Allocation
 
 A `CountingAllocator` wrapping the system allocator, with a test that asserts
@@ -924,6 +986,16 @@ Do not benchmark a synthetic two-frame tree. Use:
 
 **p99.9 is the number that matters**, not the mean. A control loop cares about
 the tail.
+
+Two harness requirements for the read-scaling row, both learned the hard way:
+thread creation must happen **once**, outside the timed region (workers park on a
+barrier; an iteration only releases and rejoins it), and the driver must carry a
+share of the work rather than spawn `N` workers alongside itself — `N + 1`
+runnable threads on `N` cores turns the row into a measurement of scheduler
+latency. The query stamps must genuinely sweep the intended window; a sweep that
+collapses into a few microseconds puts every query in one bracket on one pair of
+cache lines, which is a degenerate best case for the row meant to expose
+contention.
 
 #### Gate
 

@@ -156,10 +156,14 @@ fn intern_race_same_id() {
             }
             v
         });
+        // Zero-initialized, exactly like the production arena (`alloc_zeroed`).
+        // Seeding this with a different sentinel is what let the model check pass
+        // while the real publish-then-spin handshake was inert: nothing in the
+        // arena ever writes a non-zero "unpublished" marker.
         let ids = Arc::new({
             let mut v = alloc::vec::Vec::new();
             for _ in 0..4 {
-                v.push(AtomicU32::new(u32::MAX));
+                v.push(AtomicU32::new(crate::frame::ID_UNPUBLISHED));
             }
             v
         });

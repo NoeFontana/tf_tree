@@ -20,6 +20,19 @@ workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+# Route libm through its soft-float paths. Needed **only** under Miri, whose
+# interpreter cannot execute the x86 inline `sqrt` asm libm's default `arch`
+# feature emits. `just miri` turns it on explicitly.
+#
+# This is deliberately NOT a dev-dependency feature: cargo's feature resolution
+# unifies dev-dependency features with the normal dependency whenever dev-deps
+# are built, so `cargo build --workspace --all-targets`, `cargo nextest run` and
+# any workspace-wide `cargo bench` would all have compiled libm — and therefore
+# every `sqrt`/`sin`/`cos` in the shipped binaries and the benchmarks — with
+# soft floats, silently invalidating the perf gate.
+miri-soft-float = ["libm/force-soft-floats", "tf_tree_math/miri-soft-float"]
+
 [dependencies]
 tf_tree_math.workspace = true
 tf_tree_arena.workspace = true
@@ -30,10 +43,6 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
-# Force libm's soft-float paths in test builds only: its default `arch` feature
-# uses x86 inline `sqrt` asm that Miri cannot execute. This is additive and
-# affects only this crate's test/bench binaries, never the production build.
-libm = { workspace = true, features = ["force-soft-floats"] }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom.workspace = true

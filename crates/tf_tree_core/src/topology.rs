@@ -65,12 +65,32 @@ impl<'a> TopologyView<'a> {
         }
     }
 
-    /// The current topology generation (even = stable). Plan evaluation compares
-    /// this against the generation it was compiled at.
+    /// The raw topology generation counter. **Odd while a mutation is in
+    /// flight** — callers that key a cache or pin a snapshot on it want
+    /// [`Self::stable_generation`] instead; this accessor exists for the seqlock
+    /// retry loops that check the parity themselves.
     #[inline]
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    /// The current generation, spun until it is stable (even).
+    ///
+    /// Every value a plan is stamped with, and every value a reader pins for a
+    /// batch, must come from here: an odd generation names a torn topology, and
+    /// pinning one makes every subsequent `Plan::at` fail with
+    /// [`crate::LookupError::TopologyChanged`] for no reason.
+    #[inline]
+    #[must_use]
+    pub fn stable_generation(&self) -> u64 {
+        loop {
+            let g = self.generation.load(Ordering::Acquire);
+            if g & 1 == 0 {
+                return g;
+            }
+            spin();
+        }
     }
 
     /// Attach `child` under `parent` via edge `edge`: set `parent[child]` and
@@ -119,8 +139,14 @@ impl<'a> TopologyView<'a> {
         dst.edge_of_child[c as usize].store(edge, Ordering::Relaxed);
 
         if creates_cycle(dst.parent, c, mf) {
-            // Abort: leave `active` untouched, return generation to stable.
-            self.generation.store(g + 2, Ordering::Release);
+            // Abort: `active` is untouched, so the published topology is
+            // byte-identical to what it was on entry. Restore the *original*
+            // generation rather than advancing it — bumping to `g + 2` here would
+            // invalidate every compiled `Plan` in the process (they would all
+            // return `TopologyChanged`) for a mutation that never happened. The
+            // inactive block is left dirty, which is harmless: the next mutation
+            // copies the active block over it wholesale before touching it.
+            self.generation.store(g, Ordering::Release);
             return Err(TopologyError::WouldCreateCycle { child });
         }
 
@@ -133,9 +159,13 @@ impl<'a> TopologyView<'a> {
 
     /// Read `child`'s `(parent, depth, edge_of_child)` under the seqlock. Retries
     /// while a write is in progress; returns the consistent triple plus the
-    /// generation it was read at.
+    /// generation it was read at, or `None` if `child` is out of range for this
+    /// arena (`FrameId` only guarantees non-zero, not in-bounds).
     #[must_use]
-    pub fn read_frame(&self, child: FrameId) -> (u32, u16, u32, u64) {
+    pub fn read_frame(&self, child: FrameId) -> Option<(u32, u16, u32, u64)> {
+        if child.get() >= self.max_frames {
+            return None;
+        }
         let c = child.get() as usize;
         loop {
             let g1 = self.generation.load(Ordering::Acquire);
@@ -149,7 +179,7 @@ impl<'a> TopologyView<'a> {
             let edge = self.blocks[blk].edge_of_child[c].load(Ordering::Relaxed);
             fence(Ordering::Acquire);
             if self.generation.load(Ordering::Relaxed) == g1 {
-                return (parent, depth, edge, g1);
+                return Some((parent, depth, edge, g1));
             }
         }
     }

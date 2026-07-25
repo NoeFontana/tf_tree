@@ -125,6 +125,37 @@ pub enum LookupError {
         /// The domain actually supplied.
         got: u8,
     },
+    /// The path crosses dynamic edges in **different** time domains, so no single
+    /// query stamp can address all of them. Rejected at compile time rather than
+    /// silently sampling one edge's clock with another's stamp (D9).
+    MixedTimeDomains {
+        /// The edge whose domain differs from the rest of the path.
+        edge: EdgeId,
+        /// The domain established by the path's earlier dynamic edges.
+        expected: u8,
+        /// The domain `edge` declares.
+        got: u8,
+    },
+    /// An edge id that names no usable edge record in this arena: out of range
+    /// for the edge table, or naming a slot with no sample ring.
+    UnknownEdge {
+        /// The offending edge id.
+        edge: EdgeId,
+    },
+    /// A frame id out of range for this arena's frame table. [`FrameId`] only
+    /// guarantees non-zero, not that the frame exists here.
+    FrameOutOfRange {
+        /// The offending frame id.
+        frame: FrameId,
+    },
+    /// The topology says this frame has a parent, but records no edge for the
+    /// link (`edge_of_child == 0`, the "no edge" sentinel). The path cannot be
+    /// evaluated; edge slot `0` is a real record and must not be sampled in its
+    /// place.
+    MissingEdge {
+        /// The child frame whose parent link carries no edge.
+        child: FrameId,
+    },
 }
 
 /// A failed `push` onto an edge's sample ring.
