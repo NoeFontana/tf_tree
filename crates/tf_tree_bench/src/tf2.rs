@@ -98,4 +98,13 @@ impl Tf2Fixture {
     pub fn buffer(&self) -> &Tf2Buffer {
         &self.buffer
     }
+
+    /// Consume the fixture, yielding just the loaded buffer.
+    ///
+    /// Lets a benchmark hold a plain [`Tf2Buffer`] for every workload, so the
+    /// timed body is identical regardless of where the data came from.
+    #[must_use]
+    pub fn into_buffer(self) -> Tf2Buffer {
+        self.buffer
+    }
 }

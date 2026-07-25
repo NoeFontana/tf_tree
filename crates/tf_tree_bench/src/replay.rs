@@ -277,6 +277,60 @@ impl QuerySet {
     }
 }
 
+/// Synthesise a [`TfStream`] shaped like a real robot description, at a chosen
+/// scale.
+///
+/// Real URDFs produce a characteristic frame tree: one kinematic spine of
+/// dynamic joints, with mostly-static sensor and link subtrees hanging off it.
+/// `chain_depth` sets the spine length (the thing lookup cost is sensitive to)
+/// and `branches_per_link` the fan-out (the thing tree *size* is sensitive to),
+/// so the two can be varied independently — which is exactly what a scaling
+/// comparison needs and what a single fixed robot cannot give.
+///
+/// Only the spine is dynamic, matching how real robots publish: a handful of
+/// moving joints and a large static skeleton from `robot_state_publisher`.
+#[must_use]
+pub fn synth_robot(
+    chain_depth: usize,
+    branches_per_link: usize,
+    samples_per_edge: usize,
+    rate_hz: f64,
+) -> TfStream {
+    let mut s = TfStream::default();
+    s.provenance.push(format!(
+        "synthetic robot: chain_depth={chain_depth} branches={branches_per_link} \
+         samples={samples_per_edge} rate={rate_hz}Hz"
+    ));
+
+    // Dynamic spine: link_0 -> link_1 -> ... -> link_n.
+    for d in 0..chain_depth {
+        s.dynamic_edges
+            .push((format!("link_{d}"), format!("link_{}", d + 1)));
+    }
+    // Static sensor/appendage subtrees hanging off every spine link.
+    for d in 0..=chain_depth {
+        for b in 0..branches_per_link {
+            let pose = crate::fixture::dynamic_pose((d * 31 + b) as f64 * 0.017, 0);
+            s.static_edges
+                .push((format!("link_{d}"), format!("s_{d}_{b}"), pose));
+        }
+    }
+
+    let period_ns = (1e9 / rate_hz) as i64;
+    for k in 0..samples_per_edge {
+        let stamp = k as i64 * period_ns;
+        for edge in 0..s.dynamic_edges.len() {
+            s.samples.push(Sample {
+                edge,
+                stamp_ns: stamp,
+                pose: crate::fixture::dynamic_pose(edge as f64, stamp),
+            });
+        }
+    }
+    s.samples.sort_by_key(|x| x.stamp_ns);
+    s
+}
+
 /// SplitMix64, so the harness needs no `rand` dependency and every run is
 /// byte-reproducible from its seed.
 struct Rng(u64);

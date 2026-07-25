@@ -59,6 +59,11 @@ tf2-differential:
 tf2-replay:
     ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test replay -- --nocapture'
 
+# Head-to-head performance against tf2. Indicative unless run on pinned cores —
+# see docs/benchmarks/tf2.md for the caveats and the pinned-hardware runbook.
+tf2-bench:
+    ./docker/tf2/run.sh 'cargo bench -p tf_tree_bench --features tf2 --bench tf2_compare'
+
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
     ./docker/tf2/run.sh

@@ -54,3 +54,10 @@ harness = false
 [[bench]]
 name = "read_scaling"
 harness = false
+
+# The head-to-head against ROS 2 tf2. `required-features` keeps it out of a
+# normal `cargo bench`, so the suite still builds on hosts without ROS.
+[[bench]]
+name = "tf2_compare"
+harness = false
+required-features = ["tf2"]
