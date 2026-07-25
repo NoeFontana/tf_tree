@@ -130,6 +130,33 @@ footprint:
           done; \
         done'
 
+# --- Phase 2: shared memory (Linux only) -------------------------------------
+#
+# `shm` is off by default so the single-process build never grows a syscall
+# dependency it does not use. These recipes need no container: shared memory is
+# a kernel feature, not a ROS one.
+
+# Multi-process gate: a second process maps the same arena and must answer
+# bit-identically. Builds `shm_child` first — the test spawns it.
+shm-test:
+    cargo build --features shm -p tf_tree_bench --bin shm_child
+    cargo nextest run -p tf_tree_bench --features shm --test multiprocess
+
+# N reader processes on one shared arena, plus the memory that sharing saves.
+# RUN THIS ON AN IDLE MACHINE — the 8-process row oversubscribes 4 cores 2:1.
+shm-scaling:
+    cargo build --release --features shm -p tf_tree_bench --bins
+    ./target/release/shm_scaling
+
+# fmt + clippy + tests for everything behind the `shm` feature, which plain
+# `just lint` and `just test` do not compile.
+shm-check:
+    cargo clippy -p tf_tree_arena --features shm --all-targets -- -D warnings
+    cargo clippy -p tf_tree --features shm --all-targets -- -D warnings
+    cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
+    cargo build --features shm -p tf_tree_bench --bin shm_child
+    cargo nextest run -p tf_tree_bench --features shm --test multiprocess
+
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
     ./docker/tf2/run.sh

@@ -101,43 +101,18 @@ impl HeapArena {
     }
 
     fn write_header(&self, layout: &ArenaLayout, creator_pid: u32, creator_boot_id: u64) {
-        // Offsets and slot counts are stored as u32 in the header. This is
-        // enforced (not merely assumed) by `ArenaLayout::new`, which rejects any
-        // layout whose `total_size` exceeds `u32::MAX` with `ArenaTooLarge`. So
-        // every `as u32` below is a truncation that provably cannot lose bits;
-        // this assert restates that invariant at the point it is relied on.
-        debug_assert!(self.len <= u32::MAX as usize);
-
-        let hdr = self.ptr.as_ptr().cast::<ArenaHeader>();
-
-        // SAFETY: `hdr` is the arena base, which is 64-byte aligned (matching
-        // ArenaHeader's align(64)) and backed by at least size_of::<ArenaHeader>()
-        // owned bytes (total_size >= 256 >= header size). The bytes were just
-        // zero-initialized, and an all-zero bit pattern is a valid ArenaHeader
-        // (integers and atomics accept any pattern), so forming `&mut *hdr` and
-        // assigning scalar fields is sound. The atomic fields are deliberately
-        // left at their zeroed value (topo_generation/topo_active/frame_count/
-        // edge_count all start at 0). `self` uniquely owns the allocation, so no
-        // other reference aliases it during this write.
-        let h = unsafe { &mut *hdr };
-        h.magic = u64::from_le_bytes(TF_TREE_MAGIC);
-        h.format_version = FORMAT_VERSION;
-        h.layout_hash = layout_hash();
-        h.arena_size = self.len as u64;
-        h.max_frames = layout.max_frames();
-        h.max_edges = layout.max_edges();
-        h.stamp_slots = layout.stamp_slots();
-        h.pose_slots = layout.pose_slots();
-        h.frame_table_off = layout.frame_table().offset as u32;
-        h.frame_hash_off = layout.frame_hash().offset as u32;
-        h.topo_block_off = layout.topo_blocks().offset as u32;
-        h.topo_block_stride = layout.topo_block_stride() as u32;
-        h.claim_table_off = layout.claim_table().offset as u32;
-        h.edge_table_off = layout.edge_table().offset as u32;
-        h.stamp_arena_off = layout.stamp_arena().offset as u32;
-        h.pose_arena_off = layout.pose_arena().offset as u32;
-        h.creator_pid = creator_pid;
-        h.creator_boot_id = creator_boot_id;
+        // SAFETY: `self.ptr` is the base of a freshly zeroed, 64-byte-aligned
+        // allocation of `self.len >= 256` bytes that `self` uniquely owns, which
+        // is exactly `write_header_at`'s contract.
+        unsafe {
+            write_header_at(
+                self.ptr.as_ptr(),
+                self.len,
+                layout,
+                creator_pid,
+                creator_boot_id,
+            )
+        }
     }
 
     /// Borrow the arena header living at the base of the allocation.
@@ -178,6 +153,61 @@ unsafe impl Arena for HeapArena {
     fn len(&self) -> usize {
         self.len
     }
+}
+
+/// Write an [`ArenaHeader`] into the first bytes of a freshly zeroed arena
+/// region.
+///
+/// Shared by [`HeapArena`] and (behind the `shm` feature) `MappedArena`, because
+/// a mapped arena that disagreed with a heap arena about its own header would
+/// break the one property Phase 2 rests on: that the two are the same bytes,
+/// read by the same code.
+///
+/// # Safety
+///
+/// `base` must point to `len >= size_of::<ArenaHeader>()` writable, zeroed bytes
+/// that the caller uniquely owns for the duration of the call, aligned to
+/// [`ARENA_ALIGN`], with `len == layout.total_size()`.
+pub(crate) unsafe fn write_header_at(
+    base: *mut u8,
+    len: usize,
+    layout: &ArenaLayout,
+    creator_pid: u32,
+    creator_boot_id: u64,
+) {
+    // Offsets and slot counts are stored as u32 in the header. This is enforced
+    // (not merely assumed) by `ArenaLayout::new`, which rejects any layout whose
+    // `total_size` exceeds `u32::MAX` with `ArenaTooLarge`. So every `as u32`
+    // below is a truncation that provably cannot lose bits; this assert restates
+    // that invariant at the point it is relied on.
+    debug_assert!(len <= u32::MAX as usize);
+
+    // SAFETY: by contract `base` is 64-byte aligned (matching ArenaHeader's
+    // align(64)) and backed by at least size_of::<ArenaHeader>() owned, zeroed
+    // bytes. An all-zero bit pattern is a valid ArenaHeader (integers and
+    // atomics accept any pattern), so forming `&mut *hdr` and assigning scalar
+    // fields is sound. The atomic fields are deliberately left at their zeroed
+    // value (topo_generation/topo_active/frame_count/edge_count all start at 0).
+    // The caller uniquely owns the region, so nothing aliases it.
+    let h = unsafe { &mut *base.cast::<ArenaHeader>() };
+    h.magic = u64::from_le_bytes(TF_TREE_MAGIC);
+    h.format_version = FORMAT_VERSION;
+    h.layout_hash = layout_hash();
+    h.arena_size = len as u64;
+    h.max_frames = layout.max_frames();
+    h.max_edges = layout.max_edges();
+    h.stamp_slots = layout.stamp_slots();
+    h.pose_slots = layout.pose_slots();
+    h.frame_table_off = layout.frame_table().offset as u32;
+    h.frame_hash_off = layout.frame_hash().offset as u32;
+    h.topo_block_off = layout.topo_blocks().offset as u32;
+    h.topo_block_stride = layout.topo_block_stride() as u32;
+    h.claim_table_off = layout.claim_table().offset as u32;
+    h.edge_table_off = layout.edge_table().offset as u32;
+    h.stamp_arena_off = layout.stamp_arena().offset as u32;
+    h.pose_arena_off = layout.pose_arena().offset as u32;
+    h.creator_pid = creator_pid;
+    h.creator_boot_id = creator_boot_id;
 }
 
 #[cfg(test)]

@@ -19,6 +19,9 @@ workspace = true
 # for this PR (there is no ROS 2 here). Enabling it without the shim is expected
 # to fail to link — that is the honest signal the ROS toolchain is absent.
 tf2 = ["dep:tf_tree_tf2_sys"]
+# Phase 2 shared memory: the multi-process integration test and benchmark.
+# Linux-only; needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
+shm = ["tf_tree/shm"]
 
 [dependencies]
 tf_tree.workspace = true
@@ -31,6 +34,9 @@ tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+# Only the relocation gate needs this: it implements `Arena` over a byte copy of
+# a live arena, standing in for Phase 2's `MappedArena`.
+tf_tree_arena.workspace = true
 
 # Criterion benches (harness = false, driven by `criterion_group!`/`main!`). These
 # compile and run on any machine, but they are *not* the official go/no-go gate,
@@ -76,3 +82,16 @@ required-features = ["tf2"]
 [[bin]]
 name = "footprint"
 path = "src/bin/footprint.rs"
+
+# Reader child for the multi-process test and benchmark. It attaches to a shared
+# arena over an inherited fd, so it must be a separate executable.
+[[bin]]
+name = "shm_child"
+path = "src/bin/shm_child.rs"
+required-features = ["shm"]
+
+# Multi-process benchmark driver: N reader processes on one shared arena.
+[[bin]]
+name = "shm_scaling"
+path = "src/bin/shm_scaling.rs"
+required-features = ["shm"]

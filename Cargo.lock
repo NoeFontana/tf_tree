@@ -944,6 +944,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "proptest",
+ "rustix",
 ]
 
 [[package]]
@@ -953,6 +954,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "tf_tree",
+ "tf_tree_arena",
  "tf_tree_core",
  "tf_tree_math",
  "tf_tree_tf2_sys",

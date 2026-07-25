@@ -18,6 +18,12 @@ workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+# Phase 2 shared memory: `TreeBuilder::build_shared` / `Tree::attach_shared`.
+# Linux-only and off by default — the single-process build must not grow a
+# syscall dependency it never uses.
+shm = ["tf_tree_arena/shm"]
+
 [dependencies]
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true

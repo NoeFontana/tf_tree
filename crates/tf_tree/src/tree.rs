@@ -16,7 +16,9 @@ use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-use tf_tree_arena::{ArenaLayout, HeapArena, LayoutError};
+use tf_tree_arena::{Arena, ArenaLayout, HeapArena, LayoutError};
+#[cfg(all(feature = "shm", target_os = "linux"))]
+use tf_tree_arena::{AttachMode, MappedArena, ShmError};
 use tf_tree_core::arena_view::{ArenaBuilder, ArenaView};
 use tf_tree_core::edge::{claim, EdgeKind, EdgeRecord, Publisher};
 use tf_tree_core::frame::blake3_64;
@@ -276,6 +278,56 @@ impl TreeBuilder {
     /// arena would exceed the `u32` offset model), a frame name collides on its
     /// 64-bit hash, or an edge would create a cycle.
     pub fn build(self) -> Result<Tree, BuildError> {
+        let (arena, boot_id) =
+            self.build_with(|layout, pid, boot| Ok(HeapArena::new(layout, pid, boot)))?;
+        Ok(Tree {
+            arena: ArenaBacking::Heap(arena),
+            boot_id,
+            decl: Mutex::new(()),
+        })
+    }
+
+    /// Build the tree into a **shared-memory** segment instead of the heap.
+    ///
+    /// The returned [`Tree`] behaves identically — the read path does not know
+    /// which backend it has (`docs/PHASE2.md` §4) — but its arena lives in a
+    /// sealed `memfd` that other processes can map with [`Tree::attach_shared`].
+    /// Hand them [`Tree::shared_fd`].
+    ///
+    /// `name` is a debug label only; it appears in `/proc/<pid>/fd` and is
+    /// truncated past 63 bytes. Segments are **not** discoverable by name — the
+    /// fd is the capability, which is what keeps an unrelated process from
+    /// attaching by guessing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError`] as for [`TreeBuilder::build`], plus
+    /// [`BuildError::Shm`] if the segment could not be created, sized, mapped or
+    /// sealed.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub fn build_shared(self, name: &str) -> Result<Tree, BuildError> {
+        let (arena, boot_id) = self.build_with(|layout, pid, boot| {
+            MappedArena::create(name, layout, pid, boot).map_err(BuildError::Shm)
+        })?;
+        Ok(Tree {
+            arena: ArenaBacking::Mapped(arena),
+            boot_id,
+            decl: Mutex::new(()),
+        })
+    }
+
+    /// The shared body of [`TreeBuilder::build`] and
+    /// [`TreeBuilder::build_shared`]: everything except *which* allocation the
+    /// bytes land in.
+    ///
+    /// Generic over the backend rather than duplicated, because the moment the
+    /// two paths differ by a line, the heap and shared arenas stop being the
+    /// same bytes — and "the same bytes, read by the same code" is the entire
+    /// claim of Phase 2.
+    fn build_with<A: Arena>(
+        self,
+        make: impl FnOnce(&ArenaLayout, u32, u64) -> Result<A, BuildError>,
+    ) -> Result<(A, u64), BuildError> {
         // 1. Unique frame names in first-seen order (explicit frames, then edge
         //    endpoints). Order only affects id assignment, not correctness.
         let mut names: Vec<&str> = Vec::new();
@@ -327,7 +379,7 @@ impl TreeBuilder {
         //    them sound: no shared `ArenaView` can exist while one happens.
         let layout = ArenaLayout::new(max_frames, max_edges, caps)?;
         let boot_id = boot_id();
-        let mut arena = HeapArena::new(&layout, std::process::id(), boot_id);
+        let mut arena = make(&layout, std::process::id(), boot_id)?;
         // Scoped so the builder's exclusive borrow ends before `arena` moves into
         // the `Tree`; nothing may declare an edge once the tree is shareable.
         {
@@ -395,11 +447,31 @@ impl TreeBuilder {
             }
         }
 
-        Ok(Tree {
-            arena,
-            boot_id,
-            decl: Mutex::new(()),
-        })
+        Ok((arena, boot_id))
+    }
+}
+
+/// Which allocation backs a [`Tree`]'s arena.
+///
+/// An enum rather than `Box<dyn Arena>` so the backend stays a concrete,
+/// statically-known type and no allocation is added to construct a tree. The
+/// read path is unaffected either way: [`ArenaView`] already takes
+/// `&dyn Arena`, and it is built once per [`Tree::guard`], not per lookup.
+enum ArenaBacking {
+    /// Single-process: one heap allocation (Phase 1).
+    Heap(HeapArena),
+    /// Multi-process: a sealed `memfd` mapped `MAP_SHARED` (Phase 2).
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Mapped(MappedArena),
+}
+
+impl ArenaBacking {
+    fn as_dyn(&self) -> &dyn Arena {
+        match self {
+            ArenaBacking::Heap(a) => a,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Mapped(a) => a,
+        }
     }
 }
 
@@ -411,7 +483,7 @@ impl TreeBuilder {
 /// lookups are read-only. Share one `Tree` across threads; each reader compiles or
 /// caches its own [`crate::Plan`]s.
 pub struct Tree {
-    arena: HeapArena,
+    arena: ArenaBacking,
     boot_id: u64,
     /// Serializes runtime topology mutations (the single seqlock writer).
     decl: Mutex<()>,
@@ -419,7 +491,7 @@ pub struct Tree {
 
 impl Tree {
     fn view(&self) -> ArenaView<'_> {
-        ArenaView::new(&self.arena)
+        ArenaView::new(self.arena.as_dyn())
     }
 
     /// Resolve a frame name to its stable id.
@@ -568,6 +640,60 @@ impl Tree {
     #[must_use]
     pub fn arena_size_bytes(&self) -> usize {
         self.view().header().arena_size as usize
+    }
+
+    /// Attach to a shared arena another process created, over its file
+    /// descriptor.
+    ///
+    /// The arena arrives **already built** — topology, frames and edges were all
+    /// declared by the creator — so there is no builder here and none is
+    /// possible: `docs/PROJECT.md` §5 D4 forbids growth, and a second process
+    /// declaring edges into a fixed layout is exactly the growth that is
+    /// forbidden. An attached process reads, and publishes to edges it claims.
+    ///
+    /// Use [`AttachMode::ReadOnly`] unless this process actually publishes. It
+    /// maps `PROT_READ`, which makes corruption impossible rather than merely
+    /// impolite — the only real safety boundary in the trust model
+    /// (`docs/PHASE2.md` §0), and enforced by the MMU rather than by convention.
+    ///
+    /// # Errors
+    ///
+    /// [`ShmError`] if the segment is unsealed (and so could be truncated under
+    /// a reader, faulting it with `SIGBUS`), is not a tf_tree arena, or was
+    /// written by a build with a different `FORMAT_VERSION` or record layout.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub fn attach_shared(fd: std::os::fd::OwnedFd, mode: AttachMode) -> Result<Tree, ShmError> {
+        let arena = MappedArena::attach(fd, mode)?;
+        let boot_id = arena.header().creator_boot_id;
+        Ok(Tree {
+            arena: ArenaBacking::Mapped(arena),
+            boot_id,
+            decl: Mutex::new(()),
+        })
+    }
+
+    /// The shared segment's file descriptor, to hand to another process.
+    ///
+    /// `None` for a heap-backed tree. Pass it over a unix socket with
+    /// `SCM_RIGHTS`, or let a child inherit it — the fd *is* the capability to
+    /// attach, so whoever holds it is a participant.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[must_use]
+    pub fn shared_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        match &self.arena {
+            ArenaBacking::Mapped(a) => Some(a.as_raw_fd()),
+            ArenaBacking::Heap(_) => None,
+        }
+    }
+
+    /// Whether this tree's arena is shared with other processes.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        match &self.arena {
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Mapped(_) => true,
+            ArenaBacking::Heap(_) => false,
+        }
     }
 
     /// Wrap a [`LookupError`] so its `Display` resolves ids to frame names.
@@ -754,6 +880,10 @@ pub enum BuildError {
     /// Wiring an edge into the topology failed (cycle or out-of-range frame).
     #[error("topology error: {0:?}")]
     Topology(TopologyError),
+    /// The shared-memory segment could not be created, sized, mapped or sealed.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[error("shared memory error: {0:?}")]
+    Shm(ShmError),
 }
 
 impl From<LayoutError> for BuildError {

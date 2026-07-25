@@ -25,7 +25,11 @@ extern crate std;
 pub mod header;
 pub mod heap;
 pub mod layout;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod mapped;
 
 pub use header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
 pub use heap::{Arena, HeapArena};
 pub use layout::{layout_hash, ArenaLayout, LayoutError, Region};
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use mapped::{AttachMode, MappedArena, ShmError};

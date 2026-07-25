@@ -43,6 +43,10 @@ pub use tree::{
     BuildError, Capacity, ClaimApiError, Described, EdgeCfg, ReparentError, Tree, TreeBuilder,
 };
 
+/// Shared-memory attachment surface (Phase 2). Linux-only, behind `--features shm`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use tf_tree_arena::{AttachMode, ShmError};
+
 // Re-export the core engine surface so downstream code depends only on `tf_tree`.
 pub use tf_tree_core::arena_view::ArenaView;
 pub use tf_tree_core::edge::{EdgeKind, Publisher};
