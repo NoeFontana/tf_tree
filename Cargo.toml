@@ -9,6 +9,11 @@ members = [
     "crates/tf_tree_cli",
     "xtask",
 ]
+# `tf_tree_tf2_sys` bridges to ROS 2's `tf2::BufferCore` and only builds where
+# ROS 2 is installed. Excluding it keeps `cargo build --workspace` working on
+# every host; `tf_tree_bench --features tf2` pulls it in as a path dependency
+# when a ROS toolchain is actually present.
+exclude = ["crates/tf_tree_tf2_sys"]
 
 [workspace.package]
 version = "0.1.0"

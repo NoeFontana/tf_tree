@@ -47,6 +47,17 @@ audit:
 bench:
     cargo xtask bench-gate
 
+# The tf2::BufferCore differential — the migration-credibility test.
+#
+# Runs in a container (ROS 2 Lyrical) so no ROS install is needed on the host.
+# First run builds the image; afterwards it is cached.
+tf2-differential:
+    ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test differential -- --nocapture'
+
+# Interactive shell in the ROS 2 / tf2 build environment.
+tf2-shell:
+    ./docker/tf2/run.sh
+
 # Remove build artifacts.
 clean:
     cargo clean

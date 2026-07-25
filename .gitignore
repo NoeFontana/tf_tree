@@ -197,3 +197,6 @@ logs/
 
 # Cache directories
 .cache/
+
+# Container build artifacts (docker/tf2/run.sh redirects CARGO_TARGET_DIR here).
+/target/tf2-docker/

@@ -112,18 +112,66 @@ fn run_bench_gate() -> ExitCode {
     println!("[gate]        read throughput scales >= 6x from 1 to 8 threads ... UNAVAILABLE");
     println!("                  reason: needs pinned cores + concurrent writers;");
     println!("                  measure indicatively with `cargo bench -p tf_tree_bench --bench read_scaling`.");
-    println!("[compare]     tf2::BufferCore ratio per row ... UNAVAILABLE");
-    println!("                  reason: no ROS 2 on this host; build with `--features tf2` on a ROS machine.");
+    // 4. The tf2 differential — decisive wherever ROS 2 is reachable. Unlike the
+    //    latency rows this is a *correctness* comparison, so it does not need
+    //    pinned hardware: run it whenever we can, report honestly when we can't.
+    print!("[correctness] tf2::BufferCore differential within 1e-12 ... ");
+    let tf2 = if ros_available() {
+        let ok = run_ok(Command::new(cargo).args([
+            "test",
+            "-p",
+            "tf_tree_bench",
+            "--features",
+            "tf2",
+            "--release",
+            "--test",
+            "differential",
+        ]));
+        println!("{}", if ok { "PASS" } else { "FAIL" });
+        Some(ok)
+    } else {
+        println!("UNAVAILABLE");
+        println!("                  reason: no ROS 2 install found on this host.");
+        println!("                  run `just tf2-differential` to run it in a container.");
+        None
+    };
 
-    println!("\nSummary: the runnable gates (zero-alloc, differential) are decisive here;");
-    println!("the latency/scaling/tf2 rows require dedicated hardware and are NOT claimed passed.");
+    println!("[compare]     tf2::BufferCore latency ratio per row ... UNAVAILABLE");
+    println!("                  reason: a ratio needs dedicated, core-pinned hardware;");
+    println!("                  run `just tf2-bench` for indicative numbers.");
 
-    if benches_built && zero_alloc && differential {
+    println!("\nSummary: the correctness gates (zero-alloc, differentials) are decisive here;");
+    println!("the latency/scaling rows require dedicated hardware and are NOT claimed passed.");
+
+    if benches_built && zero_alloc && differential && tf2.unwrap_or(true) {
         ExitCode::SUCCESS
     } else {
         eprintln!("\nxtask bench-gate: a runnable gate FAILED (see rows above)");
         ExitCode::FAILURE
     }
+}
+
+/// Whether a ROS 2 install with `tf2` is reachable from this environment.
+///
+/// Mirrors `tf_tree_tf2_sys`'s `build.rs` discovery so the gate never *attempts*
+/// a build it knows will fail with a wall of missing-header errors.
+fn ros_available() -> bool {
+    let has_tf2 = |prefix: &std::path::Path| {
+        prefix.join("include/tf2").is_dir() && prefix.join("lib/libtf2.so").exists()
+    };
+    if let Ok(p) = std::env::var("TF_TREE_ROS_PREFIX") {
+        return has_tf2(std::path::Path::new(&p));
+    }
+    if let Ok(distro) = std::env::var("ROS_DISTRO") {
+        if has_tf2(std::path::Path::new(&format!("/opt/ros/{distro}"))) {
+            return true;
+        }
+    }
+    std::fs::read_dir("/opt/ros")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|e| has_tf2(&e.path()))
 }
 
 /// Run a command inheriting stdio, returning whether it exited successfully.

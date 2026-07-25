@@ -1,87 +1,101 @@
-//! The `tf2::BufferCore` differential seam — **compile-gated, not built here**.
+//! The `tf2::BufferCore` differential seam — the migration-credibility test.
 //!
-//! This module is behind `#[cfg(feature = "tf2")]`. It is the migration-
-//! credibility test from decision `0003`: drive ROS 2's `tf2::BufferCore` with
-//! the *identical* tree and sample stream as [`crate::fixture`] and compare
-//! `lookupTransform` against tf_tree across 10⁵ random `LerpSlerp` queries,
-//! asserting agreement within `1e-12`.
+//! Compile-gated behind `--features tf2`, which pulls in `tf_tree_tf2_sys` (the
+//! FFI bridge; see that crate for why the `unsafe` lives there and not here).
+//! Building this module needs a ROS 2 install; `just tf2-differential` runs it
+//! in a container so no host setup is required.
 //!
-//! It is **not** compiled or run in this PR: the build host has no ROS 2
-//! (`/opt/ros` does not exist), so no tf2 numbers are produced and none are
-//! claimed. The seam is laid out here so a ROS-equipped machine can finish it
-//! without touching any other crate.
+//! # What this module owns
 //!
-//! # What a ROS-equipped machine needs to do
+//! Turning the shared [`crate::fixture`] into a stream tf2 can consume, and
+//! nothing else. The comparison logic lives in [`crate::differential`], so the
+//! tf2 and naive-Rust references go through the identical query loop and any
+//! disagreement is attributable to the engine, not the harness.
 //!
-//! 1. Install ROS 2 (Humble or newer) and source it (`. /opt/ros/<distro>/setup.bash`).
-//! 2. Provide a C++ shim (a `build.rs` + `cc`/`cxx` bridge, or a small extern-"C"
-//!    wrapper library) exposing `tf2::BufferCore::setTransform` and
-//!    `lookupTransform`. `tf2` is a C++ library, so the FFI seam is a thin C++
-//!    shim compiled and linked against `libtf2`.
-//! 3. Fill in [`Tf2Buffer`] below to call that shim: `set_transform` mirrors each
-//!    [`crate::fixture::PushSample`] (converting `Iso3` → `geometry_msgs`
-//!    `TransformStamped`, remembering tf2 stores `w`-last quaternions — transpose
-//!    the storage order), and `lookup` calls `lookupTransform` and converts back.
-//! 4. Run `cargo test -p tf_tree_bench --features tf2 -- tf2_differential`.
+//! # Two conventions this has to reconcile
 //!
-//! Enabling the feature without that shim + a linked `libtf2` is *expected* to
-//! fail to link; that is the honest signal that the ROS toolchain is absent.
+//! * **Time.** tf_tree stamps are `i64` nanoseconds and may be negative; ROS
+//!   time is unsigned. The fixture starts at 0, so no rebasing is needed, but
+//!   [`tf_tree_tf2_sys::Tf2Error::NegativeStamp`] catches it if that ever changes.
+//! * **Cache horizon.** tf2 drops transforms older than its cache and then
+//!   reports extrapolation. The buffer is sized to the fixture's full history
+//!   plus slack so the horizon never silently truncates the comparison.
 
 use anyhow::{anyhow, Result};
 
 use tf_tree::Iso3;
+use tf_tree_tf2_sys::Tf2Buffer;
 
-/// A handle to a `tf2::BufferCore` behind the FFI shim.
-///
-/// The fields are intentionally empty until the C++ shim exists; the methods
-/// return an error naming the missing seam rather than fabricating a result.
-pub struct Tf2Buffer {
-    _private: (),
+use crate::fixture::{self, EdgeDefKind, EDGES};
+
+/// Cache span for the comparison buffer: the fixture's history plus generous
+/// slack, so tf2's horizon never truncates a query the engine can answer.
+const CACHE_SECS: f64 = fixture::HISTORY_SECS * 3.0;
+
+/// A `tf2::BufferCore` loaded with the fixture's topology and history.
+pub struct Tf2Fixture {
+    buffer: Tf2Buffer,
 }
 
-impl Tf2Buffer {
-    /// Construct a `BufferCore` with a cache long enough to hold the fixture's
-    /// history.
+impl Tf2Fixture {
+    /// Build a `BufferCore` and replay the *identical* declarations and sample
+    /// stream the engine tree receives.
+    ///
+    /// Static edges are inserted once with tf2's static flag (`/tf_static`
+    /// semantics). Dynamic edges are replayed sample by sample, reproducing the
+    /// same `dynamic_pose(seed, stamp)` values `fixture::spin_up` publishes — so
+    /// the two engines hold bit-identical inputs and every observed difference is
+    /// a difference in lookup, not in data.
     ///
     /// # Errors
     ///
-    /// Always errors until the ROS 2 FFI shim (see the module docs) is wired in.
-    pub fn new() -> Result<Tf2Buffer> {
-        Err(anyhow!(
-            "tf2::BufferCore FFI shim is not present; this needs a ROS 2 install \
-             and the C++ bridge described in the `tf2` module docs"
-        ))
+    /// If the buffer cannot be allocated or tf2 rejects a transform.
+    pub fn load() -> Result<Tf2Fixture> {
+        let buffer = Tf2Buffer::new(CACHE_SECS).map_err(|e| anyhow!("tf2 buffer: {e}"))?;
+
+        let mut dyn_seed = 0.0f64;
+        for e in EDGES {
+            match e.kind {
+                EdgeDefKind::Static { xi } => {
+                    let pose = tf_tree_math::exp_se3(xi);
+                    buffer
+                        .set_transform(e.parent, e.child, 0, &pose, true)
+                        .map_err(|err| anyhow!("tf2 static {}->{}: {err}", e.parent, e.child))?;
+                }
+                EdgeDefKind::Dynamic { rate_hz } => {
+                    let period_ns = (1e9 / rate_hz) as i64;
+                    let count = (fixture::HISTORY_SECS * rate_hz) as i64;
+                    for k in 0..count {
+                        let stamp = k * period_ns;
+                        let pose = fixture::dynamic_pose(dyn_seed, stamp);
+                        buffer
+                            .set_transform(e.parent, e.child, stamp, &pose, false)
+                            .map_err(|err| {
+                                anyhow!("tf2 dynamic {}->{}@{stamp}: {err}", e.parent, e.child)
+                            })?;
+                    }
+                    dyn_seed += 1.0;
+                }
+            }
+        }
+
+        Ok(Tf2Fixture { buffer })
     }
 
-    /// Mirror one published transform into the `BufferCore`.
+    /// `T_target_source` at `stamp_ns` per tf2, or `None` if tf2 cannot answer
+    /// (extrapolation past its horizon, or an unknown pair).
     ///
-    /// `// FFI SEAM:` convert `T_parent_child` to a `geometry_msgs`
-    /// `TransformStamped` (transpose the quaternion to tf2's `w`-last storage) and
-    /// call `tf2::BufferCore::setTransform`.
-    ///
-    /// # Errors
-    ///
-    /// Always errors until the shim exists.
-    pub fn set_transform(
-        &self,
-        _parent: &str,
-        _child: &str,
-        _stamp_ns: i64,
-        _pose: &Iso3,
-    ) -> Result<()> {
-        Err(anyhow!("tf2 set_transform: FFI shim absent"))
+    /// Returning `None` rather than an error is deliberate: the differential
+    /// scores only the queries *both* engines can resolve, so a tf2-side horizon
+    /// miss is skipped rather than counted as a disagreement.
+    #[must_use]
+    pub fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Option<Iso3> {
+        self.buffer.lookup(target, source, stamp_ns).ok()
     }
 
-    /// Look up `T_target_source` at `stamp_ns` via `tf2::BufferCore::lookupTransform`.
-    ///
-    /// `// FFI SEAM:` call `lookupTransform` and convert the returned
-    /// `TransformStamped` back to an [`Iso3`] (transpose the quaternion back to
-    /// `w`-first).
-    ///
-    /// # Errors
-    ///
-    /// Always errors until the shim exists.
-    pub fn lookup(&self, _target: &str, _source: &str, _stamp_ns: i64) -> Result<Iso3> {
-        Err(anyhow!("tf2 lookup: FFI shim absent"))
+    /// The underlying buffer, for benchmarks that need to time raw tf2 calls.
+    #[must_use]
+    pub fn buffer(&self) -> &Tf2Buffer {
+        &self.buffer
     }
 }

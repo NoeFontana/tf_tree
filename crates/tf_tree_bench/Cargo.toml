@@ -18,13 +18,16 @@ workspace = true
 # FFI shim described in `src/tf2.rs`; deliberately *not* built on the host used
 # for this PR (there is no ROS 2 here). Enabling it without the shim is expected
 # to fail to link — that is the honest signal the ROS toolchain is absent.
-tf2 = []
+tf2 = ["dep:tf_tree_tf2_sys"]
 
 [dependencies]
 tf_tree.workspace = true
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
 anyhow.workspace = true
+# Optional, and outside the workspace on purpose (see the root manifest): this
+# is the only edge that reaches ROS 2, and it is pulled in solely by `--features tf2`.
+tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

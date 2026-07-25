@@ -1,0 +1,38 @@
+# Deliberately NOT a workspace member (see `exclude` in the root manifest): this
+# crate only builds where ROS 2 is installed, so making it a member would break
+# `cargo build --workspace` on every host without ROS — including CI and the
+# normal development loop. It is reached only as an optional path dependency of
+# `tf_tree_bench --features tf2`.
+#
+# Being outside the workspace also means it cannot use `field.workspace = true`
+# inheritance, so the metadata and lints below are spelled out.
+[package]
+name = "tf_tree_tf2_sys"
+description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential and benchmark harnesses."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/NoeFontana/tf_tree"
+homepage = "https://github.com/NoeFontana/tf_tree"
+authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
+publish = false
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[dependencies]
+tf_tree_math = { path = "../tf_tree_math", version = "0.1.0" }
+
+[build-dependencies]
+cc = "1"

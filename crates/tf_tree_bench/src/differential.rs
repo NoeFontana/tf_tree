@@ -11,12 +11,18 @@
 //!   `LerpSlerp` composition over the *same* sample values the engine holds. It
 //!   shares only the input data, never the engine's code path, so agreement to
 //!   ~`1e-12` is a real cross-check of the seqlock ring + plan evaluation.
-//! * [`Reference::Tf2`] (behind `--features tf2`, **not built here**): drives
-//!   ROS 2's `tf2::BufferCore`. That is the migration-credibility test and needs
-//!   a ROS-equipped machine — see the `tf2` module (feature-gated) for the seam and setup.
+//! * [`Reference::Tf2`] (behind `--features tf2`): drives ROS 2's real
+//!   `tf2::BufferCore` through the `tf_tree_tf2_sys` FFI bridge. This is the
+//!   migration-credibility test — if it fails, code moving from tf2 to tf_tree
+//!   would observe a different transform. It needs a ROS 2 install; run it with
+//!   `just tf2-differential`, which containerises the toolchain.
 //!
-//! There is no ROS 2 on the build host used for this PR, so the tf2 path is
-//! compile-gated and the numbers it would produce are **not** generated here.
+//! Both references implement one private `Oracle` trait and go through the
+//! *same* query loop, so a disagreement is attributable to the engine under test
+//! rather than to two subtly different harnesses.
+//!
+//! Queries an oracle declines are skipped and counted, never scored as
+//! agreement — see [`DiffReport::compared`].
 
 use std::collections::HashMap;
 
@@ -36,25 +42,62 @@ pub enum Reference {
     Tf2,
 }
 
+/// The query that produced the worst disagreement, so a failure is reproducible
+/// rather than just a number.
+#[derive(Clone, Copy, Debug)]
+pub struct WorstQuery {
+    /// Target frame name.
+    pub target: &'static str,
+    /// Source frame name.
+    pub source: &'static str,
+    /// The stamp queried, in nanoseconds.
+    pub stamp_ns: i64,
+}
+
 /// The outcome of a differential run.
 #[derive(Clone, Copy, Debug)]
 pub struct DiffReport {
     /// Which reference was used.
     pub reference: Reference,
-    /// How many random queries were compared.
+    /// How many random queries were drawn.
     pub queries: usize,
+    /// How many were actually scored. Lower than `queries` because identical
+    /// target/source pairs are skipped, and because an oracle may decline a
+    /// query (tf2 does, past its cache horizon). A run with a low `compared`
+    /// proved little, so this is reported rather than hidden.
+    pub compared: usize,
     /// The worst observed disagreement (max of rotation-angle error in radians
-    /// and translation error in metres) across all queries.
+    /// and translation error in metres) across all scored queries.
     pub max_error: f64,
     /// The agreement tolerance the run was checked against.
     pub tolerance: f64,
+    /// Which query was worst, for reproduction.
+    pub worst_query: Option<WorstQuery>,
 }
 
 impl DiffReport {
     /// Whether the run stayed within [`Self::tolerance`].
+    ///
+    /// A run that scored **nothing** does not pass: an oracle that declined every
+    /// query would otherwise report a `max_error` of `0.0` and look like perfect
+    /// agreement.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.max_error <= self.tolerance
+        self.compared > 0 && self.max_error <= self.tolerance
+    }
+}
+
+impl core::fmt::Display for DiffReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{:?}: max_error={:e} tol={:e} ({}/{} queries scored)",
+            self.reference, self.max_error, self.tolerance, self.compared, self.queries
+        )?;
+        if let Some(w) = self.worst_query {
+            write!(f, " worst: {}<-{} @ {} ns", w.target, w.source, w.stamp_ns)?;
+        }
+        Ok(())
     }
 }
 
@@ -231,23 +274,49 @@ impl Rng {
     }
 }
 
-/// Run the differential harness against the naive Rust reference.
+/// The agreement bound both references are held to.
 ///
-/// Builds a `LerpSlerp` engine tree with pre-populated history and an independent
-/// an independent reference model over the same stream, then compares `queries` random
-/// `lookup(target, source)` results at random in-window stamps. Returns the worst
-/// disagreement; the caller asserts it is within `1e-12`.
-///
-/// # Errors
-///
-/// Propagates fixture build / spin-up failures, or an engine lookup error (a
-/// disconnected pair, which the connected fixture never produces).
-pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
-    const TOLERANCE: f64 = 1e-12;
+/// `1e-12` is decision `0003`'s number. It is far above `f64` epsilon and far
+/// below anything a robot cares about, so it catches a genuine algorithmic
+/// divergence (a wrong branch, a transposed quaternion, an off-by-one bracket)
+/// without tripping on the last bits of a different-but-equivalent operation
+/// order.
+pub const TOLERANCE: f64 = 1e-12;
 
+/// The oracle a differential run compares the engine against.
+///
+/// Both references answer the same question — `T_target_source` at a stamp — so
+/// [`run`] drives them through one identical query loop.
+trait Oracle {
+    /// `T_target_source` at `stamp_ns`, or `None` if this oracle cannot answer
+    /// (only tf2 declines, at its cache horizon).
+    fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Option<Iso3>;
+}
+
+impl Oracle for RefModel {
+    fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Option<Iso3> {
+        Some(RefModel::lookup(
+            self,
+            self.index[target],
+            self.index[source],
+            stamp_ns,
+        ))
+    }
+}
+
+/// Run the differential query loop against an arbitrary oracle.
+///
+/// Builds a `LerpSlerp` engine tree with pre-populated history, then compares
+/// `queries` random `lookup(target, source)` results at random in-window stamps.
+/// Returns the worst disagreement; the caller asserts it is within [`TOLERANCE`].
+///
+/// Queries the oracle declines are **skipped, not scored**, and counted in
+/// [`DiffReport::compared`] — so a tf2 cache-horizon miss never masquerades as
+/// agreement, and a run where the oracle answered almost nothing is visible
+/// rather than a silent pass.
+fn run(reference: Reference, oracle: &dyn Oracle, queries: usize, seed: u64) -> Result<DiffReport> {
     let tree: Tree = fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
     let (_writers, _samples) = fixture::spin_up(&tree)?;
-    let model = RefModel::build();
     let names = fixture::frame_names();
 
     // Query stamps stay inside every edge's window: [NOW - 100 ms, NOW].
@@ -256,6 +325,8 @@ pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
 
     let mut rng = Rng(seed ^ 0xD1B5_4A32_D192_ED03);
     let mut max_error = 0.0f64;
+    let mut compared = 0usize;
+    let mut worst: Option<(&'static str, &'static str, i64)> = None;
 
     let guard = tree.guard();
     for _ in 0..queries {
@@ -265,6 +336,10 @@ pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
             continue;
         }
         let stamp_ns = lo + (rng.next_u64() % (now - lo) as u64) as i64;
+
+        let Some(reference_pose) = oracle.lookup(names[ti], names[si], stamp_ns) else {
+            continue; // the oracle cannot answer this one; do not score it
+        };
 
         let target = tree
             .frame(names[ti])
@@ -280,14 +355,61 @@ pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
             .at(&guard, stamp)
             .map_err(|e| anyhow!("eval {}<-{}: {e:?}", names[ti], names[si]))?;
 
-        let reference = model.lookup(model.index[names[ti]], model.index[names[si]], stamp_ns);
-        max_error = max_error.max(pose_error(&engine, &reference));
+        let err = pose_error(&engine, &reference_pose);
+        compared += 1;
+        if err > max_error {
+            max_error = err;
+            worst = Some((names[ti], names[si], stamp_ns));
+        }
     }
 
     Ok(DiffReport {
-        reference: Reference::NaiveRust,
+        reference,
         queries,
+        compared,
         max_error,
         tolerance: TOLERANCE,
+        worst_query: worst.map(|(t, s, n)| WorstQuery {
+            target: t,
+            source: s,
+            stamp_ns: n,
+        }),
     })
+}
+
+/// Run the differential harness against the naive Rust reference.
+///
+/// The reference is an independent Rust lookup over the *same* sample values,
+/// sharing no code with the engine, so agreement is a real cross-check of the
+/// seqlock ring and plan evaluation. Always available.
+///
+/// # Errors
+///
+/// Propagates fixture build / spin-up failures, or an engine lookup error (a
+/// disconnected pair, which the connected fixture never produces).
+pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
+    let model = RefModel::build();
+    run(Reference::NaiveRust, &model, queries, seed)
+}
+
+/// Run the differential harness against ROS 2's `tf2::BufferCore`.
+///
+/// This is the migration-credibility test from decision `0003`: identical tree,
+/// identical sample stream, `LerpSlerp` on both sides (tf2's policy), compared
+/// across `queries` random lookups.
+///
+/// # Errors
+///
+/// Propagates fixture failures, or a failure loading the tf2 buffer.
+#[cfg(feature = "tf2")]
+pub fn run_tf2(queries: usize, seed: u64) -> Result<DiffReport> {
+    let fixture = crate::tf2::Tf2Fixture::load()?;
+    run(Reference::Tf2, &fixture, queries, seed)
+}
+
+#[cfg(feature = "tf2")]
+impl Oracle for crate::tf2::Tf2Fixture {
+    fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Option<Iso3> {
+        crate::tf2::Tf2Fixture::lookup(self, target, source, stamp_ns)
+    }
 }

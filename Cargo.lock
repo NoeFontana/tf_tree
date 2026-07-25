@@ -955,6 +955,7 @@ dependencies = [
  "tf_tree",
  "tf_tree_core",
  "tf_tree_math",
+ "tf_tree_tf2_sys",
 ]
 
 [[package]]
@@ -989,6 +990,14 @@ dependencies = [
  "bytemuck",
  "libm",
  "proptest",
+]
+
+[[package]]
+name = "tf_tree_tf2_sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tf_tree_math",
 ]
 
 [[package]]
