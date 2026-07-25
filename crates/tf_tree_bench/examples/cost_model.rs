@@ -18,7 +18,19 @@
 //!   branch-predictor behaviour of the search.
 //! * **interp sweep** — LerpSlerp vs ScLerp at fixed depth and capacity.
 //!
-//! Run: `cargo run --release -p tf_tree_bench --example cost_model`
+//! **Run pinned, or do not run it at all:**
+//! `taskset -c 2 cargo run --release -p tf_tree_bench --example cost_model`
+//!
+//! Unpinned, this harness migrates cores and swings by >30% — enough to invent
+//! a 16% "regression" in a policy whose code did not change. Pinned, it repeats
+//! to under 1% (measured: three consecutive runs at 253.8 / 255.3 / 254.4 ns).
+//!
+//! A second caveat that pinning does *not* fix: `sample::<LerpSlerp>` and
+//! `sample::<ScLerp>` are monomorphized into the same hot function behind a
+//! `match` on the policy byte, so changing the size of one relocates the other.
+//! Cross-policy comparisons within one build are sound; comparing one policy
+//! across two builds is not. Use `interp_cost` for that — it calls
+//! `Interp::eval` directly and moves only when the interpolation math moves.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::hint::black_box;

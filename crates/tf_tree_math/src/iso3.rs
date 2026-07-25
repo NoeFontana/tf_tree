@@ -107,11 +107,22 @@ impl Vec3 {
         }
     }
 
+    /// Squared Euclidean norm.
+    ///
+    /// Exists so hot paths that only need `‖v‖²` — notably
+    /// [`crate::dualquat::screw_pow`], where it *is* `sin²(θ/2)` — never take
+    /// the `sqrt` that [`Vec3::norm`] would.
+    #[inline]
+    #[must_use]
+    pub fn norm_squared(self) -> f64 {
+        self.dot(self)
+    }
+
     /// Euclidean norm.
     #[inline]
     #[must_use]
     pub fn norm(self) -> f64 {
-        libm::sqrt(self.dot(self))
+        libm::sqrt(self.norm_squared())
     }
 }
 

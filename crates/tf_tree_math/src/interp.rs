@@ -37,7 +37,11 @@ const SLERP_LERP_FALLBACK: f64 = 1e-6;
 /// velocity. At a brisk 180 °/s: 1 kHz → 3 mrad, 200 Hz → 16 mrad, 50 Hz →
 /// 63 mrad — all inside. A 10 Hz edge on such a body (314 mrad) takes the exact
 /// path, which is correct: that is a genuinely large arc.
-const THETA_SLERP_SMALL: f64 = 0.15;
+/// Shared with [`crate::dualquat::screw_pow`], which raises a unit dual
+/// quaternion to a real power and needs the identical `sin(a·φ)/sin(φ)` series
+/// over the identical range — in both cases `φ` is the *half* angle between two
+/// adjacent samples on one edge.
+pub(crate) const THETA_SLERP_SMALL: f64 = 0.15;
 
 /// Interpolate between two poses `a` (at `s = 0`) and `b` (at `s = 1`).
 pub trait Interp {
@@ -173,7 +177,7 @@ fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 /// tested on its own rather than only through `slerp`.
 #[inline]
 #[must_use]
-fn theta_sq_from_chord(h: f64) -> f64 {
+pub(crate) fn theta_sq_from_chord(h: f64) -> f64 {
     const C: [f64; 8] = [
         1.0,
         1.0 / 6.0,
@@ -227,7 +231,7 @@ fn theta_sq_from_chord(h: f64) -> f64 {
 /// shape a vectorizer can take.
 #[inline]
 #[must_use]
-fn slerp_weight(a: f64, u: f64) -> f64 {
+pub(crate) fn slerp_weight(a: f64, u: f64) -> f64 {
     let x = a * a;
     let k = 1.0 - x; // (1 − a²) factors out of every term
     let c1 = 1.0 / 6.0;
