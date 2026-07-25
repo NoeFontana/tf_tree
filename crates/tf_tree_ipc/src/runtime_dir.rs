@@ -139,7 +139,7 @@ fn finish(path: PathBuf, source: RuntimeDirSource, uid: u32) -> Result<RuntimeDi
         raw_os_error: IpcError::os(&e),
     })?;
 
-    let meta = std::fs::metadata(&path).map_err(|e| IpcError::RuntimeDirUnusable {
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| IpcError::RuntimeDirUnusable {
         source,
         raw_os_error: IpcError::os(&e),
     })?;
@@ -204,8 +204,30 @@ fn reject_network_filesystem(path: &Path, source: RuntimeDirSource) -> Result<()
 /// started with `umask 000` would otherwise publish a world-writable rendezvous
 /// directory.
 fn ensure_dir(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        return Ok(());
+    // `symlink_metadata`, not `is_dir()`, and a symlink is refused outright.
+    //
+    // `/tmp/tf_tree-<uid>` is the one candidate whose parent is world-writable,
+    // so another user can pre-create the path. If they make it a *symlink* to a
+    // directory this uid happens to own, a following stat sees a directory owned
+    // by us, the ownership check passes, the 0700 chmod is skipped, and the
+    // whole rendezvous — lock file, socket, identity records — lands somewhere
+    // the operator never chose. Since this directory *is* the sharing boundary,
+    // that is the one thing here worth being strict about.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "runtime directory is a symlink; refusing to follow it",
+            ))
+        }
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "runtime directory path exists and is not a directory",
+            ))
+        }
+        Err(_) => {}
     }
     std::fs::create_dir_all(path)?;
     use std::os::unix::fs::PermissionsExt;
@@ -347,7 +369,10 @@ mod tests {
             assert_eq!(rd.path(), PathBuf::from(format!("/tmp/tf_tree-{uid}")));
             assert!(rd.path().is_dir());
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(rd.path()).unwrap().permissions().mode();
+            let mode = std::fs::symlink_metadata(rd.path())
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o700, "the /tmp fallback must be 0700");
         }
     }
