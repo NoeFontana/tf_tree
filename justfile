@@ -64,6 +64,13 @@ tf2-replay:
 tf2-bench:
     ./docker/tf2/run.sh 'cargo bench -p tf_tree_bench --features tf2 --bench tf2_compare'
 
+# Concurrent read scaling at 1/2/4/8 threads — tf_tree's lock-free readers vs
+# tf2's per-lookup mutex. Reports p50/p99/p99.9, not means.
+#
+# RUN THIS ON AN IDLE MACHINE. Competing load makes the 8-thread rows worthless.
+tf2-scaling:
+    ./docker/tf2/run.sh 'cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
+
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
     ./docker/tf2/run.sh

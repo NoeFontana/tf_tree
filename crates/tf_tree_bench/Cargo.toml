@@ -61,3 +61,11 @@ harness = false
 name = "tf2_compare"
 harness = false
 required-features = ["tf2"]
+
+# Concurrent read-scaling harness. A binary rather than a criterion bench because
+# decision 0003 wants p99.9 per *lookup*, and criterion reports the distribution
+# of batch times, which hides exactly the outliers a lock introduces.
+[[bin]]
+name = "tf2_scaling"
+path = "src/bin/tf2_scaling.rs"
+required-features = ["tf2"]

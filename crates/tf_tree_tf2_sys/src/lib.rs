@@ -29,13 +29,17 @@
 //!   `{qw, qx, qy, qz, tx, ty, tz}` on both sides — the same order as
 //!   [`Iso3::to_bits`], so no reordering happens in Rust.
 //!
-//! `Tf2Buffer` is deliberately **not** `Sync`: `tf2::BufferCore` guards itself
-//! with a mutex, but the `last_error` slot in the shim does not, so sharing one
-//! handle across threads could interleave error messages. Benchmarks give each
-//! thread its own buffer.
+//! `Tf2Buffer` is `Send + Sync`. `tf2::BufferCore` guards its frame table with
+//! an internal mutex and is documented as thread-safe, and the shim's only other
+//! mutable state — the last-error message — is `thread_local`, so no shared
+//! mutable state crosses the boundary unsynchronised.
+//!
+//! Sharing **one** buffer across reader threads is not incidental: it is how tf2
+//! is used, and its per-lookup mutex is precisely what the concurrent read
+//! benchmark exists to measure against tf_tree's lock-free readers. Giving each
+//! thread a private buffer would erase the contention being studied.
 
 use std::ffi::{c_char, c_double, c_int, CStr, CString};
-use std::marker::PhantomData;
 
 use tf_tree_math::Iso3;
 
@@ -66,6 +70,13 @@ mod ffi {
             target: *const c_char,
             source: *const c_char,
             stamp_ns: i64,
+        ) -> c_int;
+        pub(super) fn tft2_lookup_noop(
+            h: *mut c_void,
+            target: *const c_char,
+            source: *const c_char,
+            stamp_ns: i64,
+            out: *mut c_double,
         ) -> c_int;
         pub(super) fn tft2_clear(h: *mut c_void);
         pub(super) fn tft2_last_error(h: *mut c_void) -> *const c_char;
@@ -113,16 +124,19 @@ impl std::error::Error for Tf2Error {}
 /// drive both engines from one loop: insert transforms, then look them up.
 pub struct Tf2Buffer {
     handle: *mut std::ffi::c_void,
-    // `BufferCore` is internally locked, but the shim's error slot is not, so
-    // this handle is Send-but-not-Sync. `PhantomData<Cell<()>>` projects exactly
-    // that auto-trait profile regardless of the raw pointer field.
-    _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
-// SAFETY: the handle is uniquely owned by this value and `BufferCore`'s own
-// state is mutex-guarded, so moving one to another thread is sound. `Sync` is
-// deliberately NOT implemented (see `_not_sync`).
+// SAFETY: the handle is uniquely owned by this value, and everything reachable
+// through it is either mutex-guarded by `tf2::BufferCore` itself or
+// `thread_local` in the shim. There is therefore no unsynchronised shared
+// mutable state behind the pointer, so the handle may both be moved between
+// threads and shared by reference across them.
+//
+// The raw pointer field is what suppresses the automatic impls; these restore
+// exactly what the C++ side actually guarantees, no more.
 unsafe impl Send for Tf2Buffer {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for Tf2Buffer {}
 
 impl Tf2Buffer {
     /// Create a buffer whose cache spans `cache_secs` of history.
@@ -140,10 +154,7 @@ impl Tf2Buffer {
         if handle.is_null() {
             return Err(Tf2Error::Alloc);
         }
-        Ok(Tf2Buffer {
-            handle,
-            _not_sync: PhantomData,
-        })
+        Ok(Tf2Buffer { handle })
     }
 
     /// Insert `T_parent_child` at `stamp_ns`.
@@ -162,11 +173,36 @@ impl Tf2Buffer {
         pose: &Iso3,
         is_static: bool,
     ) -> Result<(), Tf2Error> {
+        self.set_transform_by_name(
+            &FrameName::new(parent)?,
+            &FrameName::new(child)?,
+            stamp_ns,
+            pose,
+            is_static,
+        )
+    }
+
+    /// Insert `T_parent_child` with pre-converted frame names.
+    ///
+    /// The allocation-free publish path, and the one a benchmark must use:
+    /// `tf_tree`'s `Publisher::push` takes no strings and allocates nothing, so
+    /// converting names per call would charge this bridge's marshalling to tf2.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_transform`].
+    pub fn set_transform_by_name(
+        &self,
+        parent: &FrameName,
+        child: &FrameName,
+        stamp_ns: i64,
+        pose: &Iso3,
+        is_static: bool,
+    ) -> Result<(), Tf2Error> {
         if stamp_ns < 0 {
             return Err(Tf2Error::NegativeStamp(stamp_ns));
         }
-        let p = cstr(parent)?;
-        let c = cstr(child)?;
+        let (p, c) = (&parent.0, &child.0);
         let bits = pose.to_bits();
         // `to_bits` is f64 bit patterns; the shim wants the values themselves.
         let vals: [f64; 7] = core::array::from_fn(|i| f64::from_bits(bits[i]));
@@ -191,18 +227,41 @@ impl Tf2Buffer {
         }
     }
 
-    /// Look up `T_target_source` at `stamp_ns`.
+    /// Look up `T_target_source` at `stamp_ns`, taking `&str` frame names.
+    ///
+    /// **Not for benchmarks.** Converting a `&str` to a NUL-terminated C string
+    /// costs a heap allocation *per name, per call* — so timing this against
+    /// `tf_tree`'s `Plan::at`, which takes no strings and allocates nothing,
+    /// measures this crate's marshalling as if it were tf2's cost. Use
+    /// [`Self::lookup_by_name`] with names converted once up front.
     ///
     /// # Errors
     ///
     /// [`Tf2Error::Lookup`] carrying tf2's own message — extrapolation, an
     /// unknown frame, or a disconnected pair.
     pub fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Result<Iso3, Tf2Error> {
+        self.lookup_by_name(&FrameName::new(target)?, &FrameName::new(source)?, stamp_ns)
+    }
+
+    /// Look up `T_target_source` at `stamp_ns` with pre-converted frame names.
+    ///
+    /// The allocation-free hot path, and the only one a benchmark should use:
+    /// the C++ side receives the same `const char*` a native tf2 caller would
+    /// hand `lookupTransform`, so what is timed is tf2, not this bridge.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lookup`].
+    pub fn lookup_by_name(
+        &self,
+        target: &FrameName,
+        source: &FrameName,
+        stamp_ns: i64,
+    ) -> Result<Iso3, Tf2Error> {
         if stamp_ns < 0 {
             return Err(Tf2Error::NegativeStamp(stamp_ns));
         }
-        let t = cstr(target)?;
-        let s = cstr(source)?;
+        let (t, s) = (&target.0, &source.0);
         let mut out = [0.0f64; 7];
 
         // SAFETY: module invariant — `self.handle` is live; `t`/`s` are
@@ -270,9 +329,71 @@ impl Drop for Tf2Buffer {
     }
 }
 
+/// A frame name converted **once** for the FFI boundary.
+///
+/// Frame names are stable for the life of a query loop, so converting on every
+/// call is pure waste — and, in a benchmark, waste that would be misattributed
+/// to tf2. Build these up front and pass them to [`Tf2Buffer::lookup_by_name`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameName(CString);
+
+impl FrameName {
+    /// Convert a frame name, rejecting interior NULs.
+    ///
+    /// # Errors
+    ///
+    /// [`Tf2Error::FrameNameHasNul`] if the name cannot be a C string.
+    pub fn new(s: &str) -> Result<FrameName, Tf2Error> {
+        CString::new(s)
+            .map(FrameName)
+            .map_err(|_| Tf2Error::FrameNameHasNul(s.to_owned()))
+    }
+
+    /// The name as a `&str`, for diagnostics.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.to_str().unwrap_or("<invalid-utf8>")
+    }
+}
+
 /// Convert a frame name for the FFI boundary, rejecting interior NULs.
 fn cstr(s: &str) -> Result<CString, Tf2Error> {
     CString::new(s).map_err(|_| Tf2Error::FrameNameHasNul(s.to_owned()))
+}
+
+/// Time the bridge's own overhead: everything [`Tf2Buffer::lookup_by_name`] does
+/// except the `BufferCore` call.
+///
+/// Lets a benchmark state how much of a reported tf2 latency is this crate
+/// rather than tf2 — the difference between an honest comparison and a
+/// flattering one.
+///
+/// # Errors
+///
+/// Never in practice; the signature mirrors the real call.
+pub fn lookup_overhead_probe(
+    buffer: &Tf2Buffer,
+    target: &FrameName,
+    source: &FrameName,
+    stamp_ns: i64,
+) -> Result<Iso3, Tf2Error> {
+    let mut out = [0.0f64; 7];
+    // SAFETY: module invariant — live handle, NUL-terminated names outliving the
+    // call, and a `double[7]` the shim writes exactly seven doubles into.
+    let rc = unsafe {
+        ffi::tft2_lookup_noop(
+            buffer.handle,
+            target.0.as_ptr(),
+            source.0.as_ptr(),
+            stamp_ns,
+            out.as_mut_ptr().cast::<c_double>(),
+        )
+    };
+    if rc != 0 {
+        return Err(Tf2Error::Lookup("overhead probe failed".to_owned()));
+    }
+    let bits: [u64; 7] = core::array::from_fn(|i| out[i].to_bits());
+    Ok(Iso3::from_bits(&bits))
 }
 
 #[cfg(test)]
@@ -379,10 +500,39 @@ mod tests {
         assert!(dt < 1e-12, "chain differs by {dt}: {got:?} vs {want:?}");
     }
 
+    /// One buffer, many reader threads — the sharing the concurrent benchmark
+    /// depends on, and the reason the shim's error slot is `thread_local`.
     #[test]
-    fn buffer_is_send_but_not_sync() {
-        fn assert_send<T: Send>() {}
-        assert_send::<Tf2Buffer>();
-        // `Sync` is intentionally absent; see the module SAFETY block.
+    fn buffer_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Tf2Buffer>();
+    }
+
+    /// Concurrent readers against one shared buffer must all get the right
+    /// answer. `BufferCore` locks internally; this pins that we are allowed to
+    /// rely on it, and that a failing lookup on one thread cannot corrupt
+    /// another thread's error reporting.
+    #[test]
+    fn concurrent_readers_share_one_buffer() {
+        let buf = Tf2Buffer::new(60.0).unwrap();
+        let p = pose(0.6);
+        buf.set_transform("map", "odom", 0, &p, false).unwrap();
+        buf.set_transform("map", "odom", 1_000_000_000, &p, false)
+            .unwrap();
+
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let buf = &buf;
+                s.spawn(move || {
+                    for _ in 0..2_000 {
+                        let got = buf.lookup("map", "odom", 500_000_000).unwrap();
+                        assert_eq!(got.to_bits(), p.to_bits(), "thread {t}");
+                        // Interleave a failing lookup: with a shared error slot
+                        // this would race; with thread_local it cannot.
+                        assert!(buf.lookup("nope", "nah", 0).is_err());
+                    }
+                });
+            }
+        });
     }
 }

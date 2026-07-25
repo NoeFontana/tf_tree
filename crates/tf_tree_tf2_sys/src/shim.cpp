@@ -31,14 +31,26 @@
 
 namespace {
 
-/// A `BufferCore` plus a slot for the last exception message, so a throwing
-/// lookup becomes a return code plus a readable reason instead of unwinding
-/// across the FFI boundary (which would be undefined behaviour).
+/// The last exception message, **per calling thread**.
+///
+/// This is deliberately not a member of `Handle`. `tf2::BufferCore` is itself
+/// thread-safe (it guards its frame table with an internal mutex), so one buffer
+/// is meant to be shared by many reader threads — and measuring exactly that
+/// sharing is the point of the concurrent read benchmark. A single error slot on
+/// the handle would have been an unsynchronised shared mutable `std::string`,
+/// making the whole handle unshareable for a reason that has nothing to do with
+/// tf2.
+///
+/// Per-thread storage fixes that with no lock on the measured path, and gives
+/// the semantics a caller actually wants: `tft2_last_error` reports why *your*
+/// call failed, not whatever another thread failed at meanwhile.
+thread_local std::string t_last_error;
+
+/// Owns the buffer. Deliberately holds nothing else, so it is safe to share.
 struct Handle {
   explicit Handle(double cache_secs)
       : buffer(tf2::durationFromSec(cache_secs)) {}
   tf2::BufferCore buffer;
-  std::string last_error;
 };
 
 /// Indices into the flat `double[7]` pose array.
@@ -87,15 +99,15 @@ int tft2_set(void *h, const char *parent, const char *child,
     t.transform.translation.y = pose[TY];
     t.transform.translation.z = pose[TZ];
     if (!self->buffer.setTransform(t, "tf_tree_differential", is_static != 0)) {
-      self->last_error = "tf2 setTransform rejected the transform";
+      t_last_error = "tf2 setTransform rejected the transform";
       return 1;
     }
     return 0;
   } catch (const std::exception &e) {
-    self->last_error = e.what();
+    t_last_error = e.what();
     return 2;
   } catch (...) {
-    self->last_error = "unknown exception in setTransform";
+    t_last_error = "unknown exception in setTransform";
     return 2;
   }
 }
@@ -119,10 +131,10 @@ int tft2_lookup(void *h, const char *target, const char *source,
     out[TZ] = t.transform.translation.z;
     return 0;
   } catch (const std::exception &e) {
-    self->last_error = e.what();
+    t_last_error = e.what();
     return 1;
   } catch (...) {
-    self->last_error = "unknown exception in lookupTransform";
+    t_last_error = "unknown exception in lookupTransform";
     return 1;
   }
 }
@@ -145,10 +157,44 @@ int tft2_can_transform(void *h, const char *target, const char *source,
 /// across repetitions without paying reallocation.
 void tft2_clear(void *h) { static_cast<Handle *>(h)->buffer.clear(); }
 
-/// The message from the most recent failure on this handle, as a NUL-terminated
-/// string owned by the handle. Valid until the next failing call.
+/// Everything `tft2_lookup` does **except** the `BufferCore` call: the same FFI
+/// crossing, the same `const char*` -> `std::string` marshalling, the same
+/// `double[7]` write-back.
+///
+/// Subtracting this from a `tft2_lookup` measurement gives tf2's own cost with
+/// the bridge's overhead removed, so a benchmark can state how much of the
+/// reported tf2 latency is this shim rather than tf2. It exists purely to keep
+/// the comparison honest; nothing in the library calls it.
+///
+/// `volatile` and the `out` write stop the optimiser deleting the marshalling
+/// we are trying to measure.
+int tft2_lookup_noop(void *h, const char *target, const char *source,
+                     std::int64_t stamp_ns, double *out) {
+  (void)h;
+  volatile std::size_t sink = 0;
+  try {
+    // Exactly the conversions `lookupTransform(target, source, tp)` performs on
+    // its arguments at the call site.
+    std::string t(target);
+    std::string s(source);
+    auto tp = time_point(stamp_ns);
+    sink = t.size() + s.size() +
+           static_cast<std::size_t>(tp.time_since_epoch().count() & 1);
+    for (std::size_t i = 0; i < 7; ++i) {
+      out[i] = static_cast<double>(sink);
+    }
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+
+/// The message from the most recent failure **on the calling thread**, as a
+/// NUL-terminated string. Valid until this thread's next failing call. The
+/// handle argument is accepted for symmetry but unused.
 const char *tft2_last_error(void *h) {
-  return static_cast<Handle *>(h)->last_error.c_str();
+  (void)h;  // the slot is per-thread, not per-handle
+  return t_last_error.c_str();
 }
 
 }  // extern "C"

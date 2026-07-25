@@ -36,7 +36,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use tf_tree::{InterpPolicy, Iso3, Stamp, Tree};
 use tf_tree_bench::{fixture, replay, replay_tf2, tf2::Tf2Fixture};
-use tf_tree_tf2_sys::Tf2Buffer;
+use tf_tree_tf2_sys::{FrameName, Tf2Buffer};
 
 /// One comparable workload: a populated tf_tree, an equally populated tf2
 /// buffer, and a query set valid on both.
@@ -123,12 +123,53 @@ fn bench_lookup(c: &mut Criterion, load: &Load) {
     });
 
     // tf2, used as intended: it has no plan concept, so every call walks.
+    // Frame names are converted ONCE, outside the timed loop. `lookup(&str,..)`
+    // heap-allocates a C string per name per call; timing that against
+    // `Plan::at` — which takes no strings and never allocates — would charge
+    // this crate's marshalling to tf2. See `overhead/` below for what remains.
     group.bench_function(BenchmarkId::new("tf2", "lookupTransform"), |b| {
+        let (t, s, _) = &load.queries[0];
+        let (t, s) = (FrameName::new(t).unwrap(), FrameName::new(s).unwrap());
+        b.iter(|| {
+            let mut acc = 0.0f64;
+            for (_, _, stamp_ns) in &load.queries {
+                if let Ok(p) = load.tf2.lookup_by_name(&t, &s, *stamp_ns) {
+                    acc += p.t.x;
+                }
+            }
+            black_box(acc)
+        });
+    });
+
+    // The naive binding, kept as a *control*: `lookup(&str, ..)` converts both
+    // frame names to C strings on every call, which is two heap allocations per
+    // lookup. An earlier revision of this benchmark used it, which charged this
+    // crate's marshalling to tf2. The row stays so the size of that mistake is
+    // measured rather than asserted.
+    group.bench_function(BenchmarkId::new("tf2", "lookupTransform_alloc"), |b| {
         let (t, s, _) = &load.queries[0];
         b.iter(|| {
             let mut acc = 0.0f64;
             for (_, _, stamp_ns) in &load.queries {
                 if let Ok(p) = load.tf2.lookup(t, s, *stamp_ns) {
+                    acc += p.t.x;
+                }
+            }
+            black_box(acc)
+        });
+    });
+
+    // The bridge's own cost: the same FFI crossing and the same
+    // `const char*` -> `std::string` marshalling, with the BufferCore call
+    // removed. Subtract this from the tf2 row to get tf2's own cost.
+    group.bench_function(BenchmarkId::new("tf2", "shim_overhead"), |b| {
+        let (t, s, _) = &load.queries[0];
+        let (t, s) = (FrameName::new(t).unwrap(), FrameName::new(s).unwrap());
+        b.iter(|| {
+            let mut acc = 0.0f64;
+            for (_, _, stamp_ns) in &load.queries {
+                if let Ok(p) = tf_tree_tf2_sys::lookup_overhead_probe(&load.tf2, &t, &s, *stamp_ns)
+                {
                     acc += p.t.x;
                 }
             }
@@ -187,12 +228,19 @@ fn bench_push(c: &mut Criterion) {
         });
     });
 
+    // Names converted once, for the same reason as the lookup rows: `push` takes
+    // no strings, so a per-call conversion would charge this bridge to tf2.
     let buf = Tf2Buffer::new(10.0).unwrap();
+    let (mp, od) = (
+        FrameName::new("map").unwrap(),
+        FrameName::new("odom").unwrap(),
+    );
     let mut t2 = 0i64;
     group.bench_function("tf2", |b| {
         b.iter(|| {
             t2 += STEP_NS;
-            buf.set_transform("map", "odom", t2, &pose, false).unwrap();
+            buf.set_transform_by_name(&mp, &od, t2, &pose, false)
+                .unwrap();
         });
     });
     group.finish();
@@ -264,10 +312,12 @@ fn bench_scale(c: &mut Criterion) {
         });
 
         group.bench_function(BenchmarkId::new("tf2", &label), |b| {
+            let t = FrameName::new(&target).unwrap();
+            let s = FrameName::new(&source).unwrap();
             b.iter(|| {
                 let mut acc = 0.0f64;
                 for &ns in &stamps {
-                    if let Ok(p) = tf2.lookup(&target, &source, ns) {
+                    if let Ok(p) = tf2.lookup_by_name(&t, &s, ns) {
                         acc += p.t.x;
                     }
                 }
