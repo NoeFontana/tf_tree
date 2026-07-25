@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: just
@@ -112,11 +112,18 @@ jobs:
   # (`memfd_create` + `F_ADD_SEALS`), which is why it is not in the `test`
   # matrix.
   shm:
-    name: shared memory (linux)
-    runs-on: ubuntu-latest
+    name: shared memory (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 is not optional here. A1 and A5 are *ordering* fixes, and the
+        # whole atomics discipline exists for weak memory models — x86-64's
+        # near-TSO would hide exactly the bugs they prevent.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
