@@ -13,6 +13,8 @@ just tf2-bench          # performance, head-to-head, single-threaded
 just tf2-scaling        # concurrent read scaling, 1/2/4/8 threads
 just tf2-native-control # pure C++ tf2, no Rust and no FFI — the bias control
 just footprint           # memory + instructions per lookup (no idle machine needed)
+just shm-test            # multi-process gate: another process, bit-identical
+just shm-scaling         # N reader PROCESSES on one shared arena
 ```
 
 All of them run in a container (`docker/tf2/`), so no ROS install is needed on
@@ -402,6 +404,77 @@ conditional branches per lookup, not concentrated in the search.
 The corresponding tf2 number, 6.00 *indirect* mispredicts, is on firmer ground:
 indirect targets are a structural property of virtual dispatch, not an artifact
 of predictor modelling, and a compiled `Plan` has no indirect branches at all.
+
+## Multi-process: the comparison tf2 cannot enter
+
+Reproduce with `just shm-scaling` (Linux, `--features shm`). Two back-to-back
+runs on an idle host; every row below repeated to within 1% except where noted.
+
+Robot software is deployed as *separate executables* — perception, planning,
+control — not as threads in one process. So the thread-scaling table above,
+where tf_tree already wins, is not actually the deployment shape. This is.
+
+**`tf2::BufferCore` has no shared-memory mode.** Every process needing
+transforms runs its own `tf2_ros::TransformListener`, which subscribes to `/tf`,
+deserializes every message, and maintains a private, complete copy of the
+history. N consumers therefore cost N buffers, N deserialization pipelines and
+N-way DDS fan-out — and the copies drift apart in time, because each is updated
+by its own callback thread. tf_tree maps one arena N times.
+
+| Processes | Aggregate M/s | ns/lookup | vs 1 proc | Unique resident | tf2 history would be |
+|---|---|---|---|---|---|
+| 1 | 4.66 | 213 | 1.00x | 3.5 MiB | 1.4 MiB |
+| 2 | 9.04 | 219 | 1.94x | 5.7 MiB | 2.7 MiB |
+| 4 | 15.43 | 257 | 3.31x | 9.9 MiB | 5.4 MiB |
+| 8 | 18.17 | 431 | 3.90x | 18.7 MiB | 10.8 MiB |
+
+**Scaling is bounded by cores, not by the design.** This host has 4 physical
+cores, and 4 processes x 213 ns/lookup is a 18.8 M/s roofline; the 8-process row
+measures 18.2, i.e. **the readers saturate the machine**. The 8-process row
+oversubscribes 2:1, which is why its per-lookup latency doubles while aggregate
+throughput stays flat — the correct and expected shape, not contention. There is
+no lock for the processes to contend on.
+
+Two things worth noting against the thread table above. Multi-**process** scaling
+at 4 (3.31x) is slightly *better* than multi-thread scaling at 4 (2.79-3.09x):
+separate address spaces share no allocator, no TLS and no false-shared cache
+lines. And per-lookup cost at one process is 213 ns against the 217 ns
+`cost_model` measures in-process for the same three-dynamic-step chain — **there
+is no penalty for the arena being shared.** That is the single most important
+number here: `MAP_SHARED` costs nothing per lookup.
+
+The memory columns need care, and getting them wrong would have flattered the
+design in the wrong place. Summing each process's RSS **double-counts** the
+arena, because every mapper's `/proc/self/statm` includes pages that are
+physically resident once. "Unique resident" subtracts the `(n-1)` redundant
+copies. The remaining per-process growth (~2.2 MiB) is executable, stack and
+libc — not transform data.
+
+The last column is **arithmetic, not a measurement**, and is labelled as such
+here and in the tool's own output: `n` x the 1,421,392 B `just footprint`
+measured for one `BufferCore` on this fixture. Timing a real `tf2_ros` listener
+would drag DDS into the comparison, which every other row in this document is
+careful to exclude — so the structural cost is stated as arithmetic rather than
+measured badly.
+
+### What is implemented, and what is not
+
+`just shm-test` is the gate: a **separate process**, after `exec`, maps the same
+sealed `memfd` and answers **bit-identically** over 512 queries, plus a
+read-only (`PROT_READ`) attachment and a check that samples published *after* a
+peer attached are visible to it. The reader in that child is the unmodified
+Phase 1 reader — [`PHASE2.md`](../PHASE2.md) §4's "zero lines in the read path",
+tested rather than asserted.
+
+What is **not** implemented, and what each would protect against, is listed in
+[`PHASE2.md`](../PHASE2.md) §1 and §5-6. The short version: this is the mapping,
+not yet the lifecycle. Segments are handed over by fd inheritance rather than the
+`SOCK_SEQPACKET` + `SCM_RIGHTS` handshake, and there is no participant registry,
+no liveness detection and no reaping — so a participant that **dies while holding
+a claim** leaks that edge, and one that dies mid-topology-mutation could wedge
+readers (amendments A1-A4). Those are crash-consistency properties, not
+correctness-under-normal-operation properties, and the numbers above do not
+depend on them. They must be in place before this is production-safe.
 
 ## A real difference: maximum chain depth
 

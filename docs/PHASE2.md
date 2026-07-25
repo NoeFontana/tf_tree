@@ -10,6 +10,38 @@ Sections marked **NORMATIVE** are requirements. Where a syscall behaviour is ass
 
 ---
 
+## 0.0 Implementation status
+
+**Partially implemented.** The mapping works; the lifecycle does not yet exist.
+
+| Area | Status |
+|---|---|
+| `MappedArena` — `memfd`, sealed, `MAP_SHARED`, `MADV_DONTFORK`/`HUGEPAGE` (§4, §7) | **Done** (`tf_tree_arena::mapped`, behind `--features shm`) |
+| `TreeBuilder::build_shared` / `Tree::attach_shared`, read-only mode (§8) | **Done** |
+| Zero-diff read path — unmodified Phase 1 reader over a shared segment (§4) | **Done, and tested** (`just shm-test`) |
+| Multi-process benchmarks (§12.2) | **Done** (`just shm-scaling`; results in `docs/benchmarks/tf2.md`) |
+| Attach protocol — `SOCK_SEQPACKET` + `SCM_RIGHTS`, negotiation (§3.3) | Not implemented — fd inheritance stands in |
+| Amendments A1-A4, A6-A8 (§1) | **Not applied** |
+| Participant registry, liveness, reaping (§5, §6) | Not implemented |
+| `tf_treed`, `tf_tree_record`, `/tf` ingest, diagnostics (§9, §10) | Not implemented |
+| Fault injection, `shm_torture` (§11.3, §11.4) | Not implemented |
+
+**What the gap means.** Everything above the line works and is measured: N
+processes map one arena, read it with byte-identical results, and see each
+other's writes, at no per-lookup cost over the single-process path. What is
+missing is entirely the **crash-consistency and lifecycle** half — the machinery
+that makes it safe when a participant dies at an arbitrary instruction. A
+process killed while holding a claim currently leaks that edge (A3/A4), and one
+killed mid-topology-mutation could leave the generation permanently odd and spin
+readers forever (A1).
+
+Those failure modes cannot occur in the flows implemented today — topology is
+immutable after `build_shared`, per decision `0004`'s builder-time declaration —
+but they *will* the moment a long-lived daemon owns the segment, which is §9.
+**Apply §1's amendments before anything ships against this.**
+
+---
+
 ## 0. Scope
 
 ### In scope

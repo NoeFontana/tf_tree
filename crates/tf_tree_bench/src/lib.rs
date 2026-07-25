@@ -19,6 +19,9 @@
 pub mod differential;
 pub mod fixture;
 pub mod replay;
+/// Spawning child processes attached to a shared arena (Phase 2). Linux-only.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod shm_util;
 
 #[cfg(feature = "tf2")]
 pub mod replay_tf2;

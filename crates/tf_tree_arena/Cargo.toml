@@ -18,8 +18,17 @@ workspace = true
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+# Phase 2 shared memory. Linux-only (`memfd_create` + `F_ADD_SEALS`, kernel >=
+# 3.17) and off by default so the crate stays `no_std + alloc` with a
+# two-dependency budget everywhere else.
+shm = ["dep:rustix"]
+
 [dependencies]
 bytemuck.workspace = true
+# `docs/PHASE2.md` §2 names rustix specifically: raw syscalls with no libc crate
+# and no C build step. `default-features = false` keeps it `no_std`.
+rustix = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
