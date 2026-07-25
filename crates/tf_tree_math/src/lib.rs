@@ -22,7 +22,7 @@
 //! # Numerics
 //!
 //! The two findings that drive the implementation (verified against a 50-digit
-//! reference in decision `0003`):
+//! reference in `docs/PHASE1.md` §3.3):
 //!
 //! * [`log_so3`] goes through the quaternion (`2·atan2(‖q_v‖, q_w)`), never
 //!   through `acos((tr − 1)/2)`, which loses nine digits near `θ = π`.

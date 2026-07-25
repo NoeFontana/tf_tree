@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! Shared fixtures and harnesses for the `tf_tree` benchmark suite.
 //!
-//! This crate holds the mobile-robot [`fixture`] tree (decision `0003`,
-//! *Benchmarks*) that the criterion benches (`benches/*.rs`), the CLI demo
+//! This crate holds the mobile-robot [`fixture`] tree (`docs/PHASE1.md` §11.1
+//! *Fixture*) that the criterion benches (`benches/*.rs`), the CLI demo
 //! (`tf_tree_cli`), the tf2 [`differential`] harness, and the zero-allocation
 //! gate all share, so they never drift apart.
 //!

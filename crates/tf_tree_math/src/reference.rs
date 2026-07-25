@@ -1,6 +1,6 @@
 //! Obvious, slow reference implementations kept forever as the definition of
 //! correct. Every fast routine in this crate is proptested against its
-//! reference twin (decision `0003`, D13).
+//! reference twin (`docs/PROJECT.md` §5 D13; `docs/PHASE1.md` §3.4).
 
 use crate::iso3::{exp_se3, log_se3, Iso3};
 

@@ -1,4 +1,4 @@
-//! The shared mobile-robot fixture tree (decision `0003`, *Benchmarks*).
+//! The shared mobile-robot fixture tree (`docs/PHASE1.md` §11.1 *Fixture*).
 //!
 //! A single 24-frame tree, max depth 6, shaped like a real mobile robot: four
 //! dynamic edges (`map→odom` @ 50 Hz, `odom→base_link` @ 200 Hz,

@@ -1,4 +1,4 @@
-//! Property tests for `tf_tree_math` (decision `0003`, *Test plan*).
+//! Property tests for `tf_tree_math` (`docs/PHASE1.md` §10.1 *Property tests*).
 //!
 //! Every test uses a fixed, deterministic RNG so CI is reproducible. Random
 //! valid `Iso3`/`Quat` are built by `exp_se3` of a random twist, guaranteeing
@@ -148,7 +148,7 @@ fn prop_endpoints_exact() {
 // well-conditioned up to π, so the reference and the fast screw method agree to
 // ~1e-13 everywhere. `sclerp_fast_matches_high_precision_near_pi` below still
 // pins the fast method independently against a 90-digit oracle. (This is the
-// π-rotation precision trap decision 0003 warns about — now closed on both
+// π-rotation precision trap `docs/PHASE1.md` §3.3 warns about — now closed on both
 // paths.)
 #[test]
 fn prop_sclerp_fast_matches_reference() {
@@ -298,7 +298,7 @@ fn prop_sclerp_right_invariant() {
 // This is a positive test that `LerpSlerp` breaks the property `ScLerp`
 // preserves. It is exactly why `ScLerp` is the default. If someone "fixes"
 // `LerpSlerp` so this passes, they have silently changed its tf2-compatible
-// semantics — do NOT weaken or delete this assertion (decision `0003`).
+// semantics — do NOT weaken or delete this assertion (`docs/PHASE1.md` §3.4).
 #[test]
 fn prop_lerpslerp_not_right_invariant() {
     // A fixed, seeded set built from a deterministic xorshift PRNG.

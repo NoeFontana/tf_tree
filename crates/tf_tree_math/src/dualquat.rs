@@ -4,21 +4,72 @@
 //! (see [`crate::reference::sclerp`]). That route spends two transcendental
 //! pairs (an `atan2`+more in `log`, a `sin_cos` in `exp`) and the full `V`/`V⁻¹`
 //! series. The screw form here computes the identical result raising the
-//! relative transform's unit dual quaternion to the power `s`, spending exactly
-//! **one `atan2` and one `sin_cos`** total.
+//! relative transform's unit dual quaternion to the power `s`.
 //!
 //! A unit dual quaternion `q̂ = q_r + ε q_d` of a rigid transform `(q, t)` has
 //! `q_r = q` and `q_d = ½·(0,t)⊗q`. Its screw parameters are the angle `θ`,
 //! pitch translation `d`, axis direction `l`, and moment `m`; the power `q̂ˢ`
 //! scales `θ` and `d` by `s` and leaves `l`, `m` fixed.
+//!
+//! # The hot path spends no transcendental at all
+//!
+//! Writing `φ = θ/2`, the screw power needs exactly two scalars from the angle:
+//! `cos(sφ)` and `sin(sφ)`. The naive route computes `φ = atan2(sin φ, cos φ)`
+//! and then `sincos(sφ)` — and, separately, `1/sin φ` to normalize the axis,
+//! which is why the old code also needed a `sqrt` and a near-identity fallback.
+//!
+//! Two observations remove all of it:
+//!
+//! 1. **`sin φ` never appears alone.** `l = q_v/sin φ`, `d = −2·q_d.w/sin φ`
+//!    and `m` are each singular as `φ → 0`, but the *products* that actually
+//!    reach the result — `sin(sφ)·l`, `m·sin(sφ)`, `½sd·sin(sφ)` — are all
+//!    finite, because every `1/sin φ` cancels against a `sin(sφ)` or a
+//!    `q_v ∝ sin φ`. Grouping the algebra that way deletes the `sqrt`, both
+//!    divisions by `sin φ`, and the reason the `SCREW_SMALL` fallback existed.
+//! 2. **`sin(sφ)/sin(φ)` is the slerp weight.** It is the same function
+//!    [`crate::interp`] already evaluates as a transcendental-free polynomial in
+//!    `u = φ²`, valid over the same range, for the same reason (the two samples
+//!    are adjacent on one edge, so `φ` is milliradians). With
+//!    `w = sin(sφ)/sin φ` and `wa = sin((1−s)φ)/sin φ` in hand,
+//!    `cos(sφ) = wa + w·cos φ` — an all-positive sum for `s ∈ [0,1]` and
+//!    `cos φ ≥ 0`, so it cancels nothing.
+//!
+//! What remains on the fast path is two Horner polynomials, one reciprocal and
+//! multiply–adds: **no `sqrt`, no `atan2`, no `sincos`, no division by a
+//! quantity that approaches zero.**
 
+use crate::interp::{slerp_weight, theta_sq_from_chord};
 use crate::iso3::{exp_se3, log_se3, Iso3, Vec3};
 use crate::quat::Quat;
 
-/// Below this rotation half-angle (`sin(θ/2) = ‖q_v‖`) the screw axis and moment
-/// are ill-defined (division by `sin(θ/2)`), so the degenerate case routes
-/// through the exact `exp_se3(s·log_se3(rel))` fallback instead.
-const SCREW_SMALL: f64 = 1e-8;
+/// `sin²(THETA_SLERP_SMALL)` — the fast-path predicate expressed in `sin²(θ/2)`,
+/// which is `‖q_v‖²` and therefore already in hand.
+///
+/// Branching on this instead of on `φ²` keeps `theta_sq_from_chord` off the slow
+/// path entirely. Pinned against `sin(0.15)²` by
+/// `sin_half_theta_small_sq_matches_the_shared_threshold`.
+const SIN_HALF_THETA_SMALL_SQ: f64 = 0.022_331_755_437_196_99;
+
+/// Below this `sin²(θ/2)` the dual part underflows, so the degenerate case
+/// routes through the exact `exp_se3(s·log_se3(rel))` fallback.
+///
+/// **~280 orders of magnitude below the old `1e-8` bound on `sin(θ/2)`.** The
+/// old formulation materialized the moment `m`, which genuinely diverges as
+/// `θ → 0`, so it had to bail out while `sin(θ/2)` was still large. The
+/// regrouped algebra never forms a divergent intermediate, so the only
+/// remaining hazard is `q_d.w/‖q_v‖²` overflowing once `‖q_v‖²` denormalizes —
+/// which is what this guards, and nothing else.
+///
+/// This is a **simplicity and robustness** change, not a speed one: a stationary
+/// robot's near-identity relative transforms did take the `log`/`exp` fallback
+/// on every lookup, but `interp_cost` measures that fallback at 50.9 ns against
+/// 51.6 ns for the main path — i.e. it never cost anything. Widening the fast
+/// path is worth doing because it deletes a whole second code path with its own
+/// accuracy characteristics, not because the old one was slow.
+///
+/// Validated by `screw_pow_is_accurate_down_to_the_degenerate_threshold`, which
+/// sweeps θ from 3 rad down past 1e-160 against the reference.
+const SCREW_DEGENERATE_SQ: f64 = 1e-290;
 
 /// Raise the rigid transform `rel` to the real power `s` along its screw axis.
 ///
@@ -29,22 +80,21 @@ const SCREW_SMALL: f64 = 1e-8;
 #[must_use]
 pub fn screw_pow(rel: &Iso3, s: f64) -> Iso3 {
     // Canonicalize the real quaternion to the w ≥ 0 hemisphere so θ/2 ∈ [0, π/2]
-    // lands in the principal branch, matching the reference log/exp route.
+    // lands in the principal branch, matching the reference log/exp route. It
+    // also makes `cos φ ≥ 0`, which is what keeps `wa + w·cos φ` cancellation
+    // free below.
     let q = if rel.q.w < 0.0 { rel.q.neg() } else { rel.q };
     let t = rel.t;
 
-    let sin_half = q.vector().norm(); // sin(θ/2) = ‖q_v‖ (unit quaternion)
-    let cos_half = q.w; // cos(θ/2) ≥ 0
+    let q_v = q.vector();
+    let sh2 = q_v.norm_squared(); // sin²(θ/2) — no sqrt taken
+    let ch = q.w; // cos(θ/2) ≥ 0
 
-    if sin_half < SCREW_SMALL {
-        // Near-identity rotation: the screw axis and moment are ill-defined
-        // (they divide by sin(θ/2) → 0). A crude t' = s·t here would drop the
-        // O(θ·‖t‖) rotation/translation screw coupling — large enough to blow
-        // past 1e-14 for meter-scale translations. Route through the exact
-        // (and, at this θ, fully accurate) log/exp form instead. This branch is
-        // rare, so its cost is irrelevant.
-        let rel = Iso3::new(q, t);
-        let xi = log_se3(rel);
+    if sh2 < SCREW_DEGENERATE_SQ {
+        // `q_d.w/sh2` would overflow. The rotation is the identity to far
+        // beyond f64 resolution, so the exact form costs nothing in accuracy,
+        // and this branch is unreachable for any physically meaningful input.
+        let xi = log_se3(Iso3::new(q, t));
         return exp_se3([
             s * xi[0],
             s * xi[1],
@@ -55,29 +105,175 @@ pub fn screw_pow(rel: &Iso3, s: f64) -> Iso3 {
         ]);
     }
 
-    let inv_sin_half = 1.0 / sin_half;
-    let l = q.vector().scale(inv_sin_half); // unit screw axis
-
-    // Dual part q_d = ½·(0,t)⊗q, from which the screw pitch and moment follow.
+    // Dual part q_d = ½·(0,t)⊗q = ½·(−t·q_v, cos(θ/2)·t + t×q_v).
     let q_d = (Quat::from_pure(t) * q).scale(0.5);
-    let d = -2.0 * q_d.w * inv_sin_half; // pitch translation ( = l·t )
-                                         // Moment m = (q_d_v − (d/2)·cos(θ/2)·l) / sin(θ/2).
-    let m = q_d
-        .vector()
-        .sub(l.scale(0.5 * d * cos_half))
-        .scale(inv_sin_half);
 
-    // Scale the screw: θ' = s·θ, d' = s·d. θ/2 = atan2(sin_half, cos_half).
-    let half_ang = s * libm::atan2(sin_half, cos_half);
-    let (sin_sh, cos_sh) = libm::sincos(half_ang);
-    let half_sd = 0.5 * s * d;
+    // k = q_d.w / sin²(θ/2). Divergent on its own (q_d.w ∝ sin(θ/2)), but it
+    // only ever reaches the result multiplied by q_v ∝ sin(θ/2), so every
+    // product below is finite and relatively accurate down to
+    // SCREW_DEGENERATE_SQ.
+    let k = q_d.w / sh2;
 
-    // Recompose the scaled unit dual quaternion.
-    let q_r2 = Quat::new(cos_sh, sin_sh * l.x, sin_sh * l.y, sin_sh * l.z);
-    let q_d2_v = m.scale(sin_sh).add(l.scale(half_sd * cos_sh));
-    let q_d2 = Quat::new(-half_sd * sin_sh, q_d2_v.x, q_d2_v.y, q_d2_v.z);
+    // m·sin(θ/2) = q_d_v + q_v·k·cos(θ/2). The moment `m` itself diverges as
+    // θ → 0; this product does not, and it is the only form the result needs.
+    let m_sh = q_d.vector().add(q_v.scale(k * ch));
+
+    // cos(sφ), and w = sin(sφ)/sin(φ).
+    let (cos_sh, w) = if sh2 <= SIN_HALF_THETA_SMALL_SQ {
+        // h = 1 − cos(θ/2) via sin²/(1+cos): the direct subtraction cancels
+        // catastrophically here, this form cannot (1+cos ∈ [1,2]).
+        let phi_sq = theta_sq_from_chord(sh2 / (1.0 + ch));
+        let wa = slerp_weight(1.0 - s, phi_sq);
+        let wb = slerp_weight(s, phi_sq);
+        // cos(sφ) = [sin((1−s)φ) + sin(sφ)·cos φ] / sin φ = wa + wb·cos φ.
+        (wa + wb * ch, wb)
+    } else {
+        // Large arc: reached by a low-rate edge on a fast-rotating body, and by
+        // `at_adaptive`'s wide bisection spans. sin(φ) is exactly ‖q_v‖.
+        let sh = libm::sqrt(sh2);
+        let phi = libm::atan2(sh, ch);
+        let (sin_sp, cos_sp) = libm::sincos(s * phi);
+        (cos_sp, sin_sp / sh)
+    };
+
+    // Recompose the scaled unit dual quaternion. Every `l` and `m` has been
+    // folded into `w`, `k` and `m_sh`, so nothing here divides by sin(θ/2).
+    let q_r2 = Quat::new(cos_sh, w * q_v.x, w * q_v.y, w * q_v.z);
+    let q_d2_v = m_sh.scale(w).add(q_v.scale(-s * k * cos_sh));
+    let q_d2 = Quat::new(s * q_d.w * w, q_d2_v.x, q_d2_v.y, q_d2_v.z);
 
     // Recover translation: (0, t') = 2·q_d'⊗q_r'*.
     let t2q = q_d2 * q_r2.conjugate();
     Iso3::new(q_r2, Vec3::new(2.0 * t2q.x, 2.0 * t2q.y, 2.0 * t2q.z))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interp::THETA_SLERP_SMALL;
+    use crate::reference;
+
+    /// A fixed, deliberately non-axis-aligned unit screw axis.
+    const AXIS: Vec3 = Vec3 {
+        x: 0.267_261_241_912_424_4,
+        y: 0.534_522_483_824_848_8,
+        z: 0.801_783_725_737_273_2,
+    };
+
+    /// Rotation `theta` about [`AXIS`] with a translation deliberately *not*
+    /// perpendicular to it, so the screw pitch term is exercised.
+    fn rot(theta: f64) -> Iso3 {
+        let half = theta * 0.5;
+        let (s, c) = libm::sincos(half);
+        Iso3::new(
+            Quat::new(c, s * AXIS.x, s * AXIS.y, s * AXIS.z),
+            Vec3::new(0.5, -0.3, 0.8),
+        )
+    }
+
+    fn err(a: &Iso3, b: &Iso3) -> f64 {
+        let dq = (a.q.w - b.q.w).abs().max(
+            (a.q.x - b.q.x)
+                .abs()
+                .max((a.q.y - b.q.y).abs().max((a.q.z - b.q.z).abs())),
+        );
+        let dt = (a.t.x - b.t.x)
+            .abs()
+            .max((a.t.y - b.t.y).abs().max((a.t.z - b.t.z).abs()));
+        dq.max(dt)
+    }
+
+    /// The `sin²` form of the fast-path predicate must agree with the shared
+    /// angle threshold it stands in for; otherwise `slerp` and `screw_pow`
+    /// silently disagree about where the series is valid.
+    #[test]
+    fn sin_half_theta_small_sq_matches_the_shared_threshold() {
+        let expected = libm::sin(THETA_SLERP_SMALL) * libm::sin(THETA_SLERP_SMALL);
+        assert_eq!(SIN_HALF_THETA_SMALL_SQ, expected);
+    }
+
+    /// The regrouped algebra claims to be well conditioned all the way down to
+    /// `SCREW_DEGENERATE_SQ`, which is the justification for lowering the
+    /// fallback bound by ~280 orders of magnitude. Sweep it and prove it.
+    #[test]
+    fn screw_pow_is_accurate_down_to_the_degenerate_threshold() {
+        let mut theta = 3.0;
+        let mut worst: f64 = 0.0;
+        while theta > 1e-160 {
+            let rel = rot(theta);
+            for &s in &[0.0, 0.125, 0.5, 0.7314, 1.0] {
+                let fast = screw_pow(&rel, s);
+                let re = reference::sclerp(&Iso3::IDENTITY, &rel, s);
+                let e = err(&fast, &re);
+                assert!(e < 1e-13, "theta={theta:e} s={s} err={e:e}");
+                worst = worst.max(e);
+            }
+            // s = 1 must return `rel` itself, to near machine precision — the
+            // strongest check available at angles where the reference's own
+            // log/exp starts to lose digits.
+            let e1 = err(&screw_pow(&rel, 1.0), &rel);
+            assert!(e1 < 1e-14, "theta={theta:e} s=1 err={e1:e}");
+            theta *= 0.5;
+        }
+        assert!(worst < 1e-13, "worst={worst:e}");
+    }
+
+    /// Nothing may jump at the series/exact boundary: a discontinuity there
+    /// would surface as a visible glitch on any edge whose rate straddles it.
+    ///
+    /// Comparing `screw_pow` just below the threshold against `screw_pow` just
+    /// above it does **not** test this — the two inputs are different angles, so
+    /// they differ by the function's own slope (~3e-13 across 2e-12 of θ), which
+    /// swamps any branch mismatch. The continuity statement that actually has
+    /// content is that *both* branches track the same smooth reference.
+    #[test]
+    fn no_discontinuity_across_the_series_threshold() {
+        // sin²(θ/2) = SIN_HALF_THETA_SMALL_SQ  =>  θ = 2·THETA_SLERP_SMALL.
+        let theta_c = 2.0 * THETA_SLERP_SMALL;
+        for d in [1e-12, 1e-9, 1e-6, 1e-3] {
+            for theta in [theta_c - d, theta_c + d] {
+                let rel = rot(theta);
+                for &s in &[0.1, 0.4, 0.9] {
+                    let fast = screw_pow(&rel, s);
+                    let re = reference::sclerp(&Iso3::IDENTITY, &rel, s);
+                    let e = err(&fast, &re);
+                    assert!(e < 1e-14, "theta={theta} s={s} err={e:e}");
+                }
+            }
+        }
+    }
+
+    /// Both branches must reproduce the endpoints — the interpolation contract
+    /// `s = 0 → I`, `s = 1 → rel` is relied on by `Plan::at`.
+    #[test]
+    fn endpoints_are_exact_on_both_branches() {
+        for theta in [1e-9, 0.01, 0.29, 0.31, 1.0, 3.0] {
+            let rel = rot(theta);
+            assert!(
+                err(&screw_pow(&rel, 0.0), &Iso3::IDENTITY) < 1e-15,
+                "theta={theta}"
+            );
+            assert!(err(&screw_pow(&rel, 1.0), &rel) < 1e-14, "theta={theta}");
+        }
+    }
+
+    /// A pure translation *along* the screw axis is the case where `m·sin(θ/2)`
+    /// cancels down to near zero; check the pitch is still carried exactly.
+    #[test]
+    fn pure_axial_translation_keeps_its_pitch() {
+        for theta in [1e-7, 1e-3, 0.1, 0.5] {
+            let half = theta * 0.5;
+            let (s, c) = libm::sincos(half);
+            let rel = Iso3::new(
+                Quat::new(c, s * AXIS.x, s * AXIS.y, s * AXIS.z),
+                AXIS.scale(2.0),
+            );
+            for &u in &[0.25, 0.5, 0.75] {
+                let fast = screw_pow(&rel, u);
+                let re = reference::sclerp(&Iso3::IDENTITY, &rel, u);
+                let e = err(&fast, &re);
+                assert!(e < 1e-14, "theta={theta:e} s={u} err={e:e}");
+            }
+        }
+    }
 }
