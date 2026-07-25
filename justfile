@@ -54,6 +54,11 @@ bench:
 tf2-differential:
     ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test differential -- --nocapture'
 
+# The same differential, but over a real recorded /tf stream (see
+# testdata/tfstream/ATTRIBUTION.md for provenance and licensing).
+tf2-replay:
+    ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test replay -- --nocapture'
+
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
     ./docker/tf2/run.sh
