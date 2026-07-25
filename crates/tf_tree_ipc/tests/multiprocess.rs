@@ -241,7 +241,7 @@ fn a_live_participant_prevents_a_second_arena() {
                 first_pid,
             } => {
                 assert_eq!(holder_slots, 1 << 3, "iteration {i}");
-                assert_eq!(first_slot, 3, "iteration {i}");
+                assert_eq!(first_slot, Some(3), "iteration {i}");
                 assert_eq!(
                     first_pid,
                     survivor.0.id(),
@@ -293,7 +293,13 @@ fn a_child_that_created_the_arena_blocks_a_second_creator() {
         .open(&mut NoServer)
         .expect_err("a second process must not create a second arena");
     assert!(
-        matches!(err, IpcError::ArenaHeldButUnreachable { first_slot: 0, .. }),
+        matches!(
+            err,
+            IpcError::ArenaHeldButUnreachable {
+                first_slot: Some(0),
+                ..
+            }
+        ),
         "unexpected error: {err}"
     );
 

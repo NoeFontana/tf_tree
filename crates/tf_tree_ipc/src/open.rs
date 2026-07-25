@@ -330,15 +330,18 @@ impl Open {
     /// Build the timeout error, naming the slots an operator has to deal with.
     fn held_but_unreachable(&self, lock: &LockFile) -> Result<IpcError, IpcError> {
         let holder_slots = lock.held_participants()?;
-        let first_slot = holder_slots.trailing_zeros();
-        let first_pid = if holder_slots == 0 {
-            0
-        } else {
-            lock.read_identity(first_slot)?.map_or(0, |id| id.pid)
+        // `trailing_zeros()` is 64 on an empty mask, which is not a slot any
+        // arena has. `Display` happened to special-case the empty mask, but the
+        // field is public and a supervisor logging it would have recorded a
+        // fictional slot — so make "no holder" unrepresentable instead.
+        let first = (holder_slots != 0).then(|| holder_slots.trailing_zeros());
+        let first_pid = match first {
+            Some(slot) => lock.read_identity(slot)?.map_or(0, |id| id.pid),
+            None => 0,
         };
         Ok(IpcError::ArenaHeldButUnreachable {
             holder_slots,
-            first_slot,
+            first_slot: first,
             first_pid,
         })
     }
@@ -504,7 +507,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(holder_slots, 1 << 2);
-                assert_eq!(first_slot, 2);
+                assert_eq!(first_slot, Some(2));
             }
             other => panic!("expected ArenaHeldButUnreachable, got {other}"),
         }

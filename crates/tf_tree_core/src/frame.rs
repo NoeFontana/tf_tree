@@ -184,6 +184,15 @@ pub const CLAIM_UNRECORDED: u32 = 0;
 /// interleavings the model checker must explore.
 #[cfg(not(loom))]
 pub const INTERN_SPIN_LIMIT: u32 = 10_000;
+
+/// Spin rounds a *reader* waits on an unrecorded claimant before concluding the
+/// name is not there.
+///
+/// A reader cannot tell "healthy winner mid-CAS" from "dead before it recorded
+/// itself" — both read `CLAIM_UNRECORDED`. Giving up after one round made
+/// `find_frame` report a live, in-flight name as absent, so it waits several.
+/// Still bounded, which is the whole point of A8.
+pub const READER_UNRECORDED_ROUNDS: u32 = 4;
 /// See the `not(loom)` variant.
 #[cfg(loom)]
 pub const INTERN_SPIN_LIMIT: u32 = 2;
@@ -300,6 +309,7 @@ impl InternTable<'_> {
         claimant_alive: &impl Fn(u32) -> bool,
     ) -> Wait {
         let mut spins: u32 = 0;
+        let mut unrecorded_rounds: u32 = 0;
         loop {
             let id = self.ids[i].load(Ordering::Acquire);
             if id != ID_UNPUBLISHED {
@@ -313,8 +323,28 @@ impl InternTable<'_> {
                 let owner = self.claiming[i].load(Ordering::Acquire);
                 match role {
                     Role::Reader => {
-                        if owner == CLAIM_UNRECORDED || !claimant_alive(owner) {
+                        if owner != CLAIM_UNRECORDED && !claimant_alive(owner) {
+                            // Proven dead: nobody is going to publish this.
                             return Wait::Abandoned;
+                        }
+                        if owner == CLAIM_UNRECORDED {
+                            // **Not proof of anything.** `CLAIM_UNRECORDED` is
+                            // also (a) the two-instruction window between a
+                            // healthy winner's hash CAS and its claiming CAS,
+                            // and (b) the permanent state of an anonymous
+                            // interner. Abandoning on sight made `find_frame`
+                            // answer `Ok(None)` — "no such frame" — for a name a
+                            // live process was in the middle of publishing.
+                            //
+                            // A reader cannot resolve the ambiguity, so it buys
+                            // patience instead: several full spin rounds before
+                            // giving up. That keeps the bound A8 requires while
+                            // making the false negative require a claimant
+                            // descheduled across ~40 000 spins rather than one.
+                            unrecorded_rounds += 1;
+                            if unrecorded_rounds >= READER_UNRECORDED_ROUNDS {
+                                return Wait::Abandoned;
+                            }
                         }
                     }
                     Role::Interner(me) => {

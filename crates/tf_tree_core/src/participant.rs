@@ -144,10 +144,21 @@ impl<'a> ParticipantTable<'a> {
     /// behind: a reaper inspecting a freed slot gets a truthful record of who was
     /// last there, and the next registrant overwrites them under [`RESERVED`]
     /// before anyone can read them.
-    pub fn release(&self, slot: u32) {
-        if let Some(rec) = self.get(slot) {
-            rec.state.store(FREE, Ordering::Release);
+    pub fn release(&self, slot: u32, incarnation: u64) {
+        let Some(rec) = self.get(slot) else { return };
+        // **A CAS on the incarnation, not a store.** Once §6's reaper exists, a
+        // participant whose slot was reaped and handed to another process would
+        // otherwise free the *new* occupant's slot on its own `Drop` — after
+        // which two live processes hold the same slot index, and the `slot + 1`
+        // owner encoding that claims (A3) and the topology lock (A2) both rely on
+        // stops being unique. Same shape of bug as `edge::release`, and cheaper
+        // to close now while there is exactly one call site.
+        if rec.incarnation.load(Ordering::Acquire) != incarnation {
+            return;
         }
+        let _ = rec
+            .state
+            .compare_exchange(LIVE, FREE, Ordering::AcqRel, Ordering::Acquire);
     }
 
     /// Read a slot's `(pid, start_time, incarnation)` if it is [`LIVE`].

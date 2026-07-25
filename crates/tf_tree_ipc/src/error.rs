@@ -253,7 +253,12 @@ pub enum IpcError {
         holder_slots: u64,
         /// Lowest held slot, for a message that does not need bit twiddling.
         /// Meaningless when `holder_slots` is zero.
-        first_slot: u32,
+        /// The lowest held slot, or `None` when no participant byte is held.
+        ///
+        /// `Option` rather than a sentinel: an empty mask has no first slot, and
+        /// encoding that as a number invites a consumer to log a slot that does
+        /// not exist.
+        first_slot: Option<u32>,
         /// The pid in that slot's identity record, or `0` if it was never
         /// written. Advisory (§5.1): the lock is the liveness, this is the name.
         first_pid: u32,
@@ -364,12 +369,19 @@ impl fmt::Display for IpcError {
                 holder_slots,
                 first_slot,
                 first_pid,
-            } => write!(
-                f,
-                "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
-                 hold their lock bytes (slot {first_slot}, pid {first_pid}) and none took over \
-                 ownership before the deadline; refusing to create a second arena"
-            ),
+            } => match first_slot {
+                Some(slot) => write!(
+                    f,
+                    "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
+                     hold their lock bytes (slot {slot}, pid {first_pid}) and none took over \
+                     ownership before the deadline; refusing to create a second arena"
+                ),
+                None => write!(
+                    f,
+                    "an arena is alive but unreachable: no participant byte is held, yet ownership \
+                     could not be taken before the deadline; refusing to create a second arena"
+                ),
+            },
             IpcError::Proc(e) => write!(f, "{e}"),
         }
     }

@@ -256,15 +256,95 @@ fn wrapped_ring_retained_samples_read_back_exactly() {
 fn claim_is_exclusive_and_epoch_increments() {
     use crate::edge::{release, ClaimRecord};
     let rec = ClaimRecord::new();
-    let e1 = claim(&rec, 111).unwrap();
+    let (e1, owner1) = claim(&rec, 111).unwrap();
     assert_eq!(e1, 1);
-    // Second claim on a live edge fails, naming the owner.
+    assert_eq!(owner1, 112, "owner word is participant_slot + 1");
+    // Second claim on a live edge fails, naming the owning *slot* — not a pid.
     let err = claim(&rec, 222).unwrap_err();
-    assert_eq!(err, ClaimError::EdgeAlreadyClaimed { owner_pid: 111 });
-    release(&rec);
+    assert_eq!(err, ClaimError::EdgeAlreadyClaimed { owner_slot: 111 });
+    release(&rec, owner1);
     // Re-claim after release bumps the epoch.
-    let e2 = claim(&rec, 333).unwrap();
+    let (e2, _) = claim(&rec, 333).unwrap();
     assert_eq!(e2, 2);
+}
+
+/// A stale `release` must not free a claim that has passed to somebody else.
+///
+/// The sequence this guards: P1 claims, is `SIGSTOP`ped, is reaped, P2 claims,
+/// P1 resumes and drops its `Publisher`. `push` already refuses (A4), but an
+/// unconditional `owner.store(0)` in `release` would free *P2's* live claim and
+/// let a third process claim the same edge — two writers on a single-writer
+/// ring, which is the failure A4 exists to prevent, arriving through `Drop`.
+#[test]
+fn a_stale_release_cannot_free_someone_elses_claim() {
+    use crate::edge::{reap, release, ClaimRecord};
+    use crate::sync::Ordering;
+
+    let rec = ClaimRecord::new();
+    let (_p1_epoch, p1_owner) = claim(&rec, 1).unwrap();
+
+    // P1 is judged dead and reaped; P2 takes the edge.
+    reap(&rec);
+    let (p2_epoch, p2_owner) = claim(&rec, 2).unwrap();
+    assert_ne!(p1_owner, p2_owner);
+
+    // P1 resumes and drops its stale Publisher.
+    release(&rec, p1_owner);
+
+    assert_eq!(
+        rec.owner.load(Ordering::Acquire),
+        p2_owner,
+        "a stale release freed the new owner's claim"
+    );
+    assert_eq!(
+        rec.epoch.load(Ordering::Acquire),
+        p2_epoch,
+        "a stale release must not disturb the epoch either"
+    );
+
+    // And P2's own release still works.
+    release(&rec, p2_owner);
+    assert_eq!(rec.owner.load(Ordering::Acquire), 0);
+}
+
+/// A4: a writer whose claim was reaped must refuse to publish.
+///
+/// `reap` bumps the epoch *before* clearing the owner, so the window is closed
+/// from both ends. This was the only amendment with no test.
+#[test]
+fn a_reaped_writer_refuses_to_push() {
+    use crate::edge::reap;
+
+    let mut arena = single_dyn_edge_arena();
+    let mut builder = ArenaBuilder::new(&mut arena);
+    let parent = builder.view().intern("odom").unwrap();
+    let child = builder.view().intern("base_link").unwrap();
+    let edge = EdgeId(0);
+    builder
+        .declare_edge(
+            edge,
+            EdgeRecord::dynamic(parent.get(), child.get(), 4, 0, 0, 0, 0),
+        )
+        .unwrap();
+
+    let view = builder.view();
+    let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+    let pubr = Publisher::new(
+        view.ring(edge).unwrap(),
+        view.claim(edge).unwrap(),
+        epoch,
+        owner,
+    );
+    let pose = exp_se3([0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+    pubr.push(10, &pose).expect("push before the reap");
+
+    reap(view.claim(edge).unwrap());
+
+    assert_eq!(
+        pubr.push(20, &pose),
+        Err(PushError::ClaimRevoked { edge }),
+        "a reaped writer kept publishing — two writers can now share one ring"
+    );
 }
 
 #[test]
@@ -615,8 +695,13 @@ fn arena_push_claim_sample_roundtrip() {
         .unwrap();
 
     let view = builder.view();
-    let epoch = claim(view.claim(edge).unwrap(), 7).unwrap();
-    let pubr = Publisher::new(view.ring(edge).unwrap(), view.claim(edge).unwrap(), epoch);
+    let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+    let pubr = Publisher::new(
+        view.ring(edge).unwrap(),
+        view.claim(edge).unwrap(),
+        epoch,
+        owner,
+    );
     for i in 0..3u64 {
         pubr.push(i as i64 * 1000, &pose(i + 1)).unwrap();
     }

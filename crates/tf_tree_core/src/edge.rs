@@ -247,25 +247,40 @@ impl Default for ClaimRecord {
 /// # Errors
 ///
 /// [`ClaimError::EdgeAlreadyClaimed`] if the edge is already held. The reported
-/// `owner_pid` is the raw owner word — the participant slot plus one — which the
-/// facade resolves to a PID through the participant table.
-pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<u64, ClaimError> {
+/// The reported `owner_slot` is a participant slot, which the facade resolves to
+/// a PID through the participant table.
+pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), ClaimError> {
     let want = u64::from(participant_slot) + 1;
     match rec
         .owner
         .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire)
     {
-        Ok(_) => Ok(rec.epoch.fetch_add(1, Ordering::AcqRel) + 1),
+        Ok(_) => Ok((rec.epoch.fetch_add(1, Ordering::AcqRel) + 1, want)),
         Err(held) => Err(ClaimError::EdgeAlreadyClaimed {
-            owner_pid: (held.saturating_sub(1)) as u32,
+            // The *slot*, not a pid — the claim word names a participant record
+            // (A3) and only the facade can resolve it to a process.
+            owner_slot: u32::try_from(held.saturating_sub(1)).unwrap_or(u32::MAX),
         }),
     }
 }
 
 /// Release a held claim. Idempotent at the memory level but should be called
 /// exactly once, by the owner, via `Publisher::drop`.
-pub fn release(rec: &ClaimRecord) {
-    rec.owner.store(0, Ordering::Release);
+pub fn release(rec: &ClaimRecord, owner: u64) {
+    // **A CAS, not a store.** An unconditional store frees whatever claim is
+    // there, including one that belongs to somebody else.
+    //
+    // The sequence that breaks: P1 claims E, is `SIGSTOP`ped, is reaped, and P2
+    // claims E. P1 resumes — `push` correctly refuses with `ClaimRevoked` (A4),
+    // but dropping its now-stale `Publisher` would store `owner = 0` and free
+    // *P2's* live claim. A third process could then claim E while P2 still holds
+    // a `Publisher`: two writers on a single-writer ring, which is the exact
+    // failure A4 exists to prevent, arriving through the back door.
+    //
+    // Comparing against our own owner word makes a stale release a no-op.
+    let _ = rec
+        .owner
+        .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Forcibly reclaim an edge whose owner is dead.
@@ -304,6 +319,12 @@ pub struct Publisher<'a> {
     ring: SampleRing<'a>,
     claim: &'a ClaimRecord,
     epoch: u64,
+    /// The owner word this writer wrote when it claimed — `participant_slot + 1`.
+    ///
+    /// Retained so `Drop` can release with a compare-exchange instead of a
+    /// store, and therefore cannot free a claim that has since passed to
+    /// somebody else. See [`release`].
+    owner: u64,
     // `Cell<()>` is `Send + !Sync`, which is exactly the auto-trait profile we
     // want to project onto `Publisher` regardless of what its other fields allow.
     _not_sync: PhantomData<core::cell::Cell<()>>,
@@ -315,11 +336,17 @@ impl<'a> Publisher<'a> {
     /// `epoch` is the value returned by [`claim`]; it is retained so a Phase 2
     /// reaper/reclaim can be detected.
     #[must_use]
-    pub fn new(ring: SampleRing<'a>, claim: &'a ClaimRecord, epoch: u64) -> Publisher<'a> {
+    pub fn new(
+        ring: SampleRing<'a>,
+        claim: &'a ClaimRecord,
+        epoch: u64,
+        owner: u64,
+    ) -> Publisher<'a> {
         Publisher {
             ring,
             claim,
             epoch,
+            owner,
             _not_sync: PhantomData,
         }
     }
@@ -369,6 +396,6 @@ impl<'a> Publisher<'a> {
 
 impl Drop for Publisher<'_> {
     fn drop(&mut self) {
-        release(self.claim);
+        release(self.claim, self.owner);
     }
 }

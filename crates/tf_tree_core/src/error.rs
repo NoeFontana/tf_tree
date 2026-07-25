@@ -190,8 +190,12 @@ pub enum PushError {
 pub enum ClaimError {
     /// The edge is already claimed by a live writer (invariant 4 / D7).
     EdgeAlreadyClaimed {
-        /// The PID recorded by the current owner (best-effort diagnostic).
-        owner_pid: u32,
+        /// The participant **slot** recorded by the current owner — not a PID.
+        ///
+        /// A3 made the claim word name a participant record rather than a
+        /// process, so only a caller holding the arena can turn this into a pid.
+        /// `Tree::claim` does; `doctor` prints both.
+        owner_slot: u32,
     },
 }
 

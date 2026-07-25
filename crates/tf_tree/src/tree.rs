@@ -282,12 +282,13 @@ impl TreeBuilder {
         let arena = self
             .build_with(|layout, pid, start, boot| Ok(HeapArena::new(layout, pid, start, boot)))?;
         let backing = ArenaBacking::Heap(arena);
-        let participant = register_participant(&ArenaView::new(backing.as_dyn()))
+        let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
         let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            incarnation,
             liveness,
             decl: Mutex::new(()),
         })
@@ -316,12 +317,13 @@ impl TreeBuilder {
             MappedArena::create(name, layout, pid, start, boot).map_err(BuildError::Shm)
         })?;
         let backing = ArenaBacking::Mapped(arena);
-        let participant = register_participant(&ArenaView::new(backing.as_dyn()))
+        let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
         let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            incarnation,
             liveness,
             decl: Mutex::new(()),
         })
@@ -526,6 +528,13 @@ pub struct Tree {
     /// is what lets a claim publish its owner and its identity in one store.
     /// The topology lock names it the same way, and for the same reason.
     participant: u32,
+    /// The incarnation this process's participant slot carried when it
+    /// registered.
+    ///
+    /// Checked on release so a slot that was reaped and handed to another
+    /// process is not freed by *this* process's `Drop` — see
+    /// `ParticipantTable::release`.
+    incarnation: u64,
     /// Decides whether a participant slot's owner is still running.
     ///
     /// Boxed and stored rather than built per call because it must outlive the
@@ -543,8 +552,20 @@ pub struct Tree {
     /// Not the real lock and never was — a `Mutex` is per-process, so it
     /// serializes nothing against a peer that mapped the same segment
     /// (`docs/PHASE2.md` §1, A2). The arena's `TopoLock` is what makes the
-    /// mutation exclusive; this one is kept because it is free and it stops two
-    /// threads of one process spending the arena lock's spin budget on each
+    /// mutation exclusive; this one is **also load-bearing**, and not merely an
+    /// optimisation, so do not remove it as redundant.
+    ///
+    /// `TopoGuard`'s release compares only the owner word, which is
+    /// `participant_slot + 1` and therefore identical for every thread of this
+    /// process. Two overlapping guards on one slot — thread A stolen from,
+    /// thread B re-acquiring, then A dropping — would let A's release free B's
+    /// lock. Distinct processes have distinct slots, so the only way to build
+    /// that overlap is two threads of *this* process in `reparent` at once,
+    /// which this mutex makes unrepresentable. Removing it would require a
+    /// per-acquisition token in the owner word instead.
+    ///
+    /// It also stops two threads of one process spending the arena lock's spin
+    /// budget on each
     /// other before one of them gets to do any work.
     decl: Mutex<()>,
 }
@@ -669,8 +690,8 @@ impl Tree {
         let (Some(ring), Some(claim_rec)) = (view.ring(eid), view.claim(eid)) else {
             return Err(ClaimApiError::NotDynamic { child, edge: eid });
         };
-        let epoch = claim(claim_rec, self.participant)?;
-        Ok(Publisher::new(ring, claim_rec, epoch))
+        let (epoch, owner) = claim(claim_rec, self.participant)?;
+        Ok(Publisher::new(ring, claim_rec, epoch, owner))
     }
 
     /// Compile a `lookup(target, source)` path into a reusable [`crate::Plan`].
@@ -773,16 +794,17 @@ impl Tree {
         // A read-only peer cannot register — the table is in the arena and
         // registration writes to it. It takes the sentinel slot instead, and
         // every mutating entry point already refuses before reaching a claim.
-        let participant = if backing.is_writable() {
+        let (participant, incarnation) = if backing.is_writable() {
             register_participant(&ArenaView::new(backing.as_dyn()))
                 .map_err(|_| ShmError::ParticipantTableFull)?
         } else {
-            u32::MAX
+            (u32::MAX, 0)
         };
         let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
         Ok(Tree {
             arena: backing,
             participant,
+            incarnation,
             liveness,
             decl: Mutex::new(()),
         })
@@ -903,7 +925,9 @@ impl Drop for Tree {
         // Read-only attachments never registered (they cannot write the table),
         // so they have nothing to release.
         if self.participant != u32::MAX && self.arena.is_writable() {
-            self.view().participants().release(self.participant);
+            self.view()
+                .participants()
+                .release(self.participant, self.incarnation);
         }
     }
 }
@@ -913,10 +937,9 @@ impl Drop for Tree {
 /// Every `Tree` — created or attached — takes a slot, because a claim names a
 /// slot and there is no other way to be named. The slot is released in
 /// [`Tree`]'s `Drop`.
-fn register_participant(view: &ArenaView) -> Result<u32, ParticipantError> {
+fn register_participant(view: &ArenaView) -> Result<(u32, u64), ParticipantError> {
     view.participants()
         .register(std::process::id(), process_start_time(), now_nanos())
-        .map(|(slot, _incarnation)| slot)
 }
 
 /// Wall-clock nanoseconds since the epoch, saturating; `0` if the clock is
@@ -1332,7 +1355,11 @@ pub enum ClaimApiError {
         actual: u32,
     },
     /// The edge is already claimed by a live writer.
-    #[error("edge already claimed by pid {}", .0.owner_pid())]
+    ///
+    /// The message names the owning **participant slot**, not a pid: A3 made the
+    /// claim word an indirection into the participant table, and resolving it
+    /// needs the arena. `tf_tree doctor` prints both.
+    #[error("edge already claimed by participant slot {}", .0.owner_slot())]
     AlreadyClaimed(tf_tree_core::ClaimError),
     /// The arena is mapped read-only, so no edge can be claimed for writing.
     #[error("arena is mapped read-only")]
@@ -1345,14 +1372,14 @@ impl From<tf_tree_core::ClaimError> for ClaimApiError {
     }
 }
 
-// Small accessor so the `#[error]` attribute above can read the owner pid.
+// Small accessor so the `#[error]` attribute above can read the owning slot.
 trait ClaimErrorExt {
-    fn owner_pid(&self) -> u32;
+    fn owner_slot(&self) -> u32;
 }
 impl ClaimErrorExt for tf_tree_core::ClaimError {
-    fn owner_pid(&self) -> u32 {
+    fn owner_slot(&self) -> u32 {
         match self {
-            tf_tree_core::ClaimError::EdgeAlreadyClaimed { owner_pid } => *owner_pid,
+            tf_tree_core::ClaimError::EdgeAlreadyClaimed { owner_slot } => *owner_slot,
             _ => 0,
         }
     }

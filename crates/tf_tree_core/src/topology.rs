@@ -139,6 +139,14 @@ pub struct TopoGuard<'a> {
     want: u64,
 }
 
+// The release CAS below compares only the owner word, which is
+// `participant_slot + 1` — constant per participant, not per acquisition. That
+// is enough here because a slot can never hold two guards at once: distinct
+// processes have distinct slots, and `Tree::reparent` takes a process-local
+// mutex before the arena lock, so two threads of one process cannot both be in
+// the critical section. If that mutex is ever removed, this CAS needs a
+// per-acquisition token (e.g. a generation packed into the owner word) or a
+// stale guard could free a live holder's lock.
 impl TopoGuard<'_> {
     /// The participant slot this guard holds the lock on behalf of.
     #[inline]

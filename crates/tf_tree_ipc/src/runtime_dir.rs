@@ -180,7 +180,14 @@ fn reject_network_filesystem(path: &Path, source: RuntimeDirSource) -> Result<()
     })?;
     // `f_type` is signed on some architectures; the magics are compared as
     // unsigned, and 0xFF534D42 is where the difference would bite.
-    let magic = st.f_type as u64;
+    // `f_type` is `__fsword_t`: i64 on 64-bit, **i32 on 32-bit** (armv7, i686).
+    // `CIFS_MAGIC_NUMBER` (0xFF53_4D42) has its top bit set, so a plain
+    // `as u64` sign-extends it to 0xFFFF_FFFF_FF53_4D42 there and the comparison
+    // silently never matches — the NORMATIVE refusal would pass a CIFS mount
+    // through on exactly the targets where it is least likely to be noticed.
+    // Masking to 32 bits is correct for both widths: every magic here fits.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = (st.f_type as i64 as u64) & 0xFFFF_FFFF;
     if matches!(
         magic,
         NFS_SUPER_MAGIC | CIFS_MAGIC_NUMBER | SMB_SUPER_MAGIC | SMB2_MAGIC_NUMBER
