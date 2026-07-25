@@ -29,7 +29,30 @@ pub const FREE: u32 = 0;
 /// Slot is being filled in by a registrant that has not published yet.
 pub const RESERVED: u32 = 1;
 /// Slot is fully written and its participant is attached.
+///
+/// Stored in the low 2 bits of `state`; the high 30 carry the incarnation, so a
+/// release can check "LIVE and still mine" with one compare-exchange. See
+/// [`ParticipantTable::release`] for why two words were not enough.
 pub const LIVE: u32 = 2;
+
+/// The `state` word for a live slot at `incarnation`.
+///
+/// Only the low 30 bits of the incarnation survive. The authoritative counter
+/// stays the full `AtomicU64` in the record; this is a *guard*, and 2^30
+/// re-registrations of one slot would have to occur between a process's last
+/// instruction and its `release` for the truncation to alias.
+#[inline]
+#[must_use]
+pub fn live_word(incarnation: u64) -> u32 {
+    ((incarnation as u32) << 2) | LIVE
+}
+
+/// The lifecycle state encoded in a `state` word.
+#[inline]
+#[must_use]
+pub fn state_of(word: u32) -> u32 {
+    word & 0b11
+}
 
 /// One participant's record. 128 bytes, matching the arena's participant stride.
 #[repr(C, align(64))]
@@ -58,6 +81,25 @@ const _: () = {
     assert!(core::mem::size_of::<ParticipantRecord>() == 128);
     assert!(core::mem::align_of::<ParticipantRecord>() == 64);
 };
+
+/// Zeroed, i.e. [`FREE`] — the state a fresh arena's participant region is in.
+///
+/// Test-only because the real records live in mapped arena bytes, which are
+/// zero by construction; nothing in the engine ever builds one on the heap.
+#[cfg(test)]
+impl Default for ParticipantRecord {
+    fn default() -> ParticipantRecord {
+        ParticipantRecord {
+            state: AtomicU32::new(FREE),
+            pid: AtomicU32::new(0),
+            start_time: AtomicU64::new(0),
+            incarnation: AtomicU64::new(0),
+            attached_at_nanos: AtomicI64::new(0),
+            heartbeat: AtomicU64::new(0),
+            _pad: [0; 88],
+        }
+    }
+}
 
 /// Why a process could not join the arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,8 +173,10 @@ impl<'a> ParticipantTable<'a> {
             rec.attached_at_nanos.store(now_nanos, Ordering::Relaxed);
             rec.heartbeat.store(0, Ordering::Relaxed);
             let incarnation = rec.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
-            // Release publishes every store above to anyone who sees LIVE.
-            rec.state.store(LIVE, Ordering::Release);
+            // Release publishes every store above to anyone who sees LIVE, and
+            // folds the incarnation in so a release can prove the slot is still
+            // the same occupancy it registered.
+            rec.state.store(live_word(incarnation), Ordering::Release);
             return Ok((i as u32, incarnation));
         }
         Err(ParticipantError::TableFull)
@@ -146,19 +190,23 @@ impl<'a> ParticipantTable<'a> {
     /// before anyone can read them.
     pub fn release(&self, slot: u32, incarnation: u64) {
         let Some(rec) = self.get(slot) else { return };
-        // **A CAS on the incarnation, not a store.** Once §6's reaper exists, a
-        // participant whose slot was reaped and handed to another process would
-        // otherwise free the *new* occupant's slot on its own `Drop` — after
-        // which two live processes hold the same slot index, and the `slot + 1`
-        // owner encoding that claims (A3) and the topology lock (A2) both rely on
-        // stops being unique. Same shape of bug as `edge::release`, and cheaper
-        // to close now while there is exactly one call site.
-        if rec.incarnation.load(Ordering::Acquire) != incarnation {
-            return;
-        }
-        let _ = rec
-            .state
-            .compare_exchange(LIVE, FREE, Ordering::AcqRel, Ordering::Acquire);
+        // **One CAS on one word.** An earlier version loaded `incarnation`,
+        // compared it, and then CAS'd `state` — two words, not atomic. Between
+        // them a reaper could free the slot and another process `register` into
+        // it, and the `LIVE -> FREE` CAS would then free the *new* occupant's
+        // slot: exactly the bug the guard was added to close. Two live processes
+        // would then share a slot index, and the `slot + 1` owner encoding that
+        // both claims (A3) and the topology lock (A2) rest on stops being
+        // unique.
+        //
+        // `state` therefore carries the incarnation in its high bits, so
+        // "still LIVE *and* still mine" is a single comparison.
+        let _ = rec.state.compare_exchange(
+            live_word(incarnation),
+            FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Read a slot's `(pid, start_time, incarnation)` if it is [`LIVE`].
@@ -168,7 +216,7 @@ impl<'a> ParticipantTable<'a> {
     #[must_use]
     pub fn identity(&self, slot: u32) -> Option<(u32, u64, u64)> {
         let rec = self.get(slot)?;
-        if rec.state.load(Ordering::Acquire) != LIVE {
+        if state_of(rec.state.load(Ordering::Acquire)) != LIVE {
             return None;
         }
         Some((

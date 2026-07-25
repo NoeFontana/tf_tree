@@ -250,18 +250,54 @@ impl Default for ClaimRecord {
 /// The reported `owner_slot` is a participant slot, which the facade resolves to
 /// a PID through the participant table.
 pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), ClaimError> {
-    let want = u64::from(participant_slot) + 1;
-    match rec
-        .owner
-        .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire)
-    {
-        Ok(_) => Ok((rec.epoch.fetch_add(1, Ordering::AcqRel) + 1, want)),
-        Err(held) => Err(ClaimError::EdgeAlreadyClaimed {
-            // The *slot*, not a pid — the claim word names a participant record
-            // (A3) and only the facade can resolve it to a process.
-            owner_slot: u32::try_from(held.saturating_sub(1)).unwrap_or(u32::MAX),
-        }),
+    // Win the record exclusively first. `CLAIMING` is distinguishable garbage,
+    // not a plausible owner: a claimer killed before step 3 leaves a word no
+    // participant could legitimately hold, so a reaper clears it on sight —
+    // the same shape as A6's `RESERVED` participant slot.
+    rec.owner
+        .compare_exchange(0, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|held| ClaimError::EdgeAlreadyClaimed {
+            owner_slot: slot_of(held),
+        })?;
+    let epoch = rec.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    let word = pack_owner(epoch, participant_slot);
+    rec.owner.store(word, Ordering::Release);
+    Ok((epoch, word))
+}
+
+/// Owner word for a mid-claim record: no epoch, no valid slot.
+const CLAIMING: u64 = u64::MAX;
+
+/// `(epoch, slot + 1)` packed into the owner word.
+///
+/// **The epoch is in the word, and that is the whole point.** A bare
+/// `slot + 1` is constant per participant, not per acquisition, so this
+/// sequence frees a live claim:
+///
+/// 1. P (slot 7) claims E; it is `SIGSTOP`ped and reaped.
+/// 2. P resumes, `push` returns `ClaimRevoked` — and P does exactly what that
+///    error documents: it re-claims. Same slot, so the *same* owner word.
+/// 3. P drops the old `Publisher`. A release comparing only `slot + 1` matches
+///    the new claim and frees it, while the new one is still publishing.
+///
+/// A third process then claims E and two writers share a single-writer ring:
+/// the failure A4 exists to prevent, reached through `Drop`. Folding the epoch
+/// in makes every acquisition's word distinct, so a stale release cannot match.
+#[inline]
+#[must_use]
+fn pack_owner(epoch: u64, participant_slot: u32) -> u64 {
+    (epoch << 16) | (u64::from(participant_slot) + 1)
+}
+
+/// The participant slot named by an owner word, or `u32::MAX` if it names none
+/// (free, or a claim still in flight).
+#[inline]
+#[must_use]
+fn slot_of(word: u64) -> u32 {
+    if word == 0 || word == CLAIMING {
+        return u32::MAX;
     }
+    u32::try_from((word & 0xFFFF).saturating_sub(1)).unwrap_or(u32::MAX)
 }
 
 /// Release a held claim. Idempotent at the memory level but should be called
@@ -277,7 +313,10 @@ pub fn release(rec: &ClaimRecord, owner: u64) {
     // a `Publisher`: two writers on a single-writer ring, which is the exact
     // failure A4 exists to prevent, arriving through the back door.
     //
-    // Comparing against our own owner word makes a stale release a no-op.
+    // Comparing against our own owner word makes a stale release a no-op — and
+    // the word carries the *epoch*, so it is unique per acquisition. Comparing
+    // only `slot + 1` would still match a re-claim by the same participant,
+    // which is exactly what `ClaimRevoked` tells a revoked writer to do.
     let _ = rec
         .owner
         .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);

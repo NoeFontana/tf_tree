@@ -994,7 +994,9 @@ fn now_nanos() -> i64 {
 /// corruption; a false "alive" only delays recovery.
 fn record_is_alive(rec: &tf_tree_core::ParticipantRecord) -> bool {
     use core::sync::atomic::Ordering;
-    if rec.state.load(Ordering::Acquire) != tf_tree_core::participant::LIVE {
+    if tf_tree_core::participant::state_of(rec.state.load(Ordering::Acquire))
+        != tf_tree_core::participant::LIVE
+    {
         return false;
     }
     let pid = rec.pid.load(Ordering::Relaxed);
