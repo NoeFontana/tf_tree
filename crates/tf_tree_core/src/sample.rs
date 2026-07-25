@@ -1,0 +1,178 @@
+//! Bracket search over an edge's sample ring.
+//!
+//! Given a query stamp `t`, locate the two published samples that bracket it and
+//! interpolate. The search is over **logical** indices with `& mask` applied on
+//! every probe: searching the physical array directly is wrong once the ring has
+//! wrapped, and is a classic off-by-one source (decision `0003`). The trailing
+//! revalidation makes the read wait-free in practice — it fails only if the ring
+//! lapped the reader mid-read, which cannot happen within the buffer's time-slack
+//! under any sane configuration.
+//!
+//! The searched window is `[head - n, head - 1]` where `n = min(head,
+//! `[`SampleRing::retained`]`)` — and `retained` is `capacity - 1`, **not**
+//! `capacity`. Logical index `head - capacity` shares a physical slot with the
+//! sample `push` is writing right now, so including it means reading a slot
+//! mid-overwrite. Both the window and the trailing revalidation use the same
+//! bound; keep them in step.
+//!
+//! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
+//! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
+
+use tf_tree_math::{exp_se3, log_se3, Interp, Iso3};
+
+use crate::buffer::SampleRing;
+use crate::error::LookupError;
+use crate::sync::Ordering;
+
+/// What to do when the requested stamp is newer than every published sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExtrapPolicy {
+    /// Refuse: return [`LookupError::Extrapolation`]. The safe default for a
+    /// control loop that must not act on invented data.
+    #[default]
+    Error,
+    /// Hold the newest sample constant (tf2's behaviour under some settings).
+    Hold,
+    /// Extend the constant screw twist implied by the two newest samples. Falls
+    /// back to [`ExtrapPolicy::Hold`] when fewer than two samples exist.
+    ConstantTwist,
+}
+
+impl SampleRing<'_> {
+    /// Sample the edge at stamp `t` under interpolation policy `I` and
+    /// extrapolation policy `policy`.
+    ///
+    /// # Errors
+    ///
+    /// * [`LookupError::NoData`] — the ring is empty.
+    /// * [`LookupError::Extrapolation`] — `t` is older than the oldest retained
+    ///   sample, or newer than the newest and `policy` is
+    ///   [`ExtrapPolicy::Error`].
+    /// * [`LookupError::SlotContended`] — a slot stayed mid-write too long.
+    /// * [`LookupError::SlotRecycled`] — the ring lapped the reader mid-read.
+    pub fn sample<I: Interp>(&self, t: i64, policy: ExtrapPolicy) -> Result<Iso3, LookupError> {
+        // Publishes the sample set; every stamp below was written before the
+        // matching head store, so this Acquire load orders them into view.
+        let h = self.head.load(Ordering::Acquire);
+        if h == 0 {
+            return Err(LookupError::NoData { edge: self.edge });
+        }
+        let retained = self.retained();
+        let n = h.min(retained);
+        let lo_logical = h - n; // oldest *safely readable* logical index
+        let newest = h - 1;
+
+        let t_old = self.stamp_at(lo_logical);
+        let t_new = self.stamp_at(newest);
+
+        if t < t_old {
+            return Err(LookupError::Extrapolation {
+                edge: self.edge,
+                requested: t,
+                oldest: t_old,
+                newest: t_new,
+            });
+        }
+        if t > t_new {
+            return match policy {
+                ExtrapPolicy::Error => Err(LookupError::Extrapolation {
+                    edge: self.edge,
+                    requested: t,
+                    oldest: t_old,
+                    newest: t_new,
+                }),
+                ExtrapPolicy::Hold => self.read_slot((newest & self.mask) as usize),
+                ExtrapPolicy::ConstantTwist => self.constant_twist(lo_logical, newest, t, t_new),
+            };
+        }
+        if t == t_new {
+            return self.read_slot((newest & self.mask) as usize);
+        }
+
+        // Binary search over LOGICAL indices in [lo_logical, newest] for the last
+        // index whose stamp is <= t. Invariant: stamp[lo] <= t < stamp[hi].
+        let mut lo = lo_logical;
+        let mut hi = newest;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.stamp_at(mid) <= t {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let i = lo;
+        let t_i = self.stamp_at(i);
+
+        let result = if t_i == t {
+            // Exact hit — no interpolation.
+            self.read_slot((i & self.mask) as usize)?
+        } else {
+            let t_j = self.stamp_at(i + 1);
+            let a = self.read_slot((i & self.mask) as usize)?;
+            let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+            // t_i < t < t_j guaranteed here, so the denominator is non-zero.
+            let s = (t - t_i) as f64 / (t_j - t_i) as f64;
+            I::eval(&a, &b, s)
+        };
+
+        // Revalidate: if the ring lapped past `i` while we read, the endpoints we
+        // used may be stale. Return the error rather than looping; the caller
+        // knows whether a retry makes sense. The bound is `retained`, not
+        // `capacity`: `head - i == capacity` already means slot `i` is the one
+        // `push` is overwriting.
+        if self.head.load(Ordering::Acquire) - i > retained {
+            return Err(LookupError::SlotRecycled { edge: self.edge });
+        }
+        Ok(result)
+    }
+
+    /// Load the stamp at a logical index (masked to physical). Relaxed is correct:
+    /// the `head` Acquire load in [`Self::sample`] already ordered every stamp of
+    /// a published sample into view, and the stamp arrays are atomic so even a
+    /// racing overwrite of a since-lapped slot is not a data race.
+    #[inline]
+    fn stamp_at(&self, logical: u64) -> i64 {
+        self.stamps[(logical & self.mask) as usize].load(Ordering::Relaxed)
+    }
+
+    /// [`ExtrapPolicy::ConstantTwist`] extrapolation past the newest sample.
+    fn constant_twist(
+        &self,
+        lo_logical: u64,
+        newest: u64,
+        t: i64,
+        t_new: i64,
+    ) -> Result<Iso3, LookupError> {
+        if newest == lo_logical {
+            // Only one sample retained: no twist to extend.
+            return self.read_slot((newest & self.mask) as usize);
+        }
+        let prev = newest - 1;
+        let t_prev = self.stamp_at(prev);
+        let a = self.read_slot((prev & self.mask) as usize)?;
+        let b = self.read_slot((newest & self.mask) as usize)?;
+        let dt = (t_new - t_prev) as f64;
+        let result = if dt == 0.0 {
+            b
+        } else {
+            // Constant screw twist of a->b, extended to `t`. At t == t_new this
+            // reproduces `b` exactly (param == 1).
+            let twist = log_se3(a.inverse() * b);
+            let param = (t - t_prev) as f64 / dt;
+            let scaled = [
+                twist[0] * param,
+                twist[1] * param,
+                twist[2] * param,
+                twist[3] * param,
+                twist[4] * param,
+                twist[5] * param,
+            ];
+            a * exp_se3(scaled)
+        };
+        if self.head.load(Ordering::Acquire) - prev > self.retained() {
+            return Err(LookupError::SlotRecycled { edge: self.edge });
+        }
+        Ok(result)
+    }
+}

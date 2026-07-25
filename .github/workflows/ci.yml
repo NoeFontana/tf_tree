@@ -76,7 +76,7 @@ jobs:
       - name: cargo miri test
         env:
           MIRIFLAGS: "-Zmiri-strict-provenance"
-        run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core
+        run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core --features tf_tree_core/miri-soft-float
 
   loom:
     name: loom

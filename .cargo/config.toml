@@ -1,0 +1,7 @@
+# Workspace cargo aliases.
+#
+# `cargo xtask <task>` runs the automation binary in `xtask/` (loom / miri /
+# bench-gate). Referenced by the `just` recipes and by decision 0003's
+# verification steps.
+[alias]
+xtask = "run --quiet --package xtask --"

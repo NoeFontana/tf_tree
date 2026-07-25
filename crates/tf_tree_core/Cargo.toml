@@ -11,12 +11,27 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# `cfg(loom)` is registered in the root `[workspace.lints.rust]` (unexpected_cfgs),
+# so this crate can inherit the full lint set normally.
 [lints]
 workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Route libm through its soft-float paths. Needed **only** under Miri, whose
+# interpreter cannot execute the x86 inline `sqrt` asm libm's default `arch`
+# feature emits. `just miri` turns it on explicitly.
+#
+# This is deliberately NOT a dev-dependency feature: cargo's feature resolution
+# unifies dev-dependency features with the normal dependency whenever dev-deps
+# are built, so `cargo build --workspace --all-targets`, `cargo nextest run` and
+# any workspace-wide `cargo bench` would all have compiled libm — and therefore
+# every `sqrt`/`sin`/`cos` in the shipped binaries and the benchmarks — with
+# soft floats, silently invalidating the perf gate.
+miri-soft-float = ["libm/force-soft-floats", "tf_tree_math/miri-soft-float"]
 
 [dependencies]
 tf_tree_math.workspace = true
