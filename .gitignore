@@ -197,3 +197,10 @@ logs/
 
 # Cache directories
 .cache/
+
+# Container build artifacts (docker/tf2/run.sh redirects CARGO_TARGET_DIR here).
+/target/tf2-docker/
+
+# Bags are large and license-encumbered to redistribute; only the derived
+# .tfstream files (see testdata/tfstream/ATTRIBUTION.md) are committed.
+/testdata/bags/

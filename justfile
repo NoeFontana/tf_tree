@@ -47,6 +47,64 @@ audit:
 bench:
     cargo xtask bench-gate
 
+# `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
+# where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
+# `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one
+# crate in the repo carrying `unsafe` with no lint coverage, and its unit tests —
+# the quaternion-convention guard and the Send/Sync justification among them —
+# run nowhere else. This recipe is where they run. Run it whenever anything under
+# `crates/tf_tree_tf2_sys/` or behind `tf_tree_bench`'s `tf2` feature changes.
+#
+# `--manifest-path` is how the excluded crate is addressed: from the workspace
+# root, `-p tf_tree_tf2_sys` does not resolve.
+#
+# The `tf_tree_bench` half is what puts the feature-gated code — the benches, the
+# `tf2_scaling` binary, the tf2 modules — under clippy at all; without
+# `--features tf2` the host's `just lint` compiles none of it. Its `--lib` run
+# finds no unit tests today (`--no-tests=pass`), and is there so that one added
+# behind the feature actually runs; the tf2 *integration* tests keep their own
+# recipes, `tf2-differential` and `tf2-replay`.
+#
+# fmt + clippy + unit tests for the tf2 bridge, in the container. `lint` and `test` cannot see it.
+tf2-check:
+    ./docker/tf2/run.sh 'set -euo pipefail; \
+        cargo fmt --manifest-path crates/tf_tree_tf2_sys/Cargo.toml -- --check; \
+        cargo clippy --manifest-path crates/tf_tree_tf2_sys/Cargo.toml --all-targets -- -D warnings; \
+        cargo nextest run --manifest-path crates/tf_tree_tf2_sys/Cargo.toml --release; \
+        cargo clippy -p tf_tree_bench --features tf2 --all-targets -- -D warnings; \
+        cargo nextest run -p tf_tree_bench --features tf2 --release --lib --no-tests=pass'
+
+# The tf2::BufferCore differential — the migration-credibility test.
+#
+# Runs in a container (ROS 2 Lyrical) so no ROS install is needed on the host.
+# First run builds the image; afterwards it is cached.
+#
+# Everything below is container-only, as is `tf2-check` above — run that one
+# after touching the bridge, since no host-side recipe lints or tests it.
+tf2-differential:
+    ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test differential -- --nocapture'
+
+# The same differential, but over a real recorded /tf stream (see
+# testdata/tfstream/ATTRIBUTION.md for provenance and licensing).
+tf2-replay:
+    ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test replay -- --nocapture'
+
+# Head-to-head performance against tf2. Indicative unless run on pinned cores —
+# see docs/benchmarks/tf2.md for the caveats and the pinned-hardware runbook.
+tf2-bench:
+    ./docker/tf2/run.sh 'cargo bench -p tf_tree_bench --features tf2 --bench tf2_compare'
+
+# Concurrent read scaling at 1/2/4/8 threads — tf_tree's lock-free readers vs
+# tf2's per-lookup mutex. Reports p50/p99/p99.9, not means.
+#
+# RUN THIS ON AN IDLE MACHINE. Competing load makes the 8-thread rows worthless.
+tf2-scaling:
+    ./docker/tf2/run.sh 'cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
+
+# Interactive shell in the ROS 2 / tf2 build environment.
+tf2-shell:
+    ./docker/tf2/run.sh
+
 # Remove build artifacts.
 clean:
     cargo clean
@@ -56,3 +114,8 @@ versions:
     @echo "rustc:  $(rustc --version)"
     @echo "cargo:  $(cargo --version)"
     @echo "just:   $(just --version)"
+
+# Pure-C++ tf2 read scaling: no Rust, no FFI. The control that proves the
+# benchmark's tf2 numbers are not an artifact of our binding.
+tf2-native-control:
+    ./docker/tf2/run.sh 'bash docker/tf2/native_scaling.sh'

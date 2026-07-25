@@ -78,6 +78,33 @@ jobs:
           MIRIFLAGS: "-Zmiri-strict-provenance"
         run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core --features tf_tree_core/miri-soft-float
 
+  # The only job that needs a container, because it is the only job that needs
+  # ROS 2. `tf_tree_tf2_sys` is excluded from the workspace (it links `-ltf2`, so
+  # it does not build on a plain runner), which also excludes it from the `lint`
+  # and `test` jobs above: their `--workspace` never sees its `unsafe`, its
+  # clippy lints or its unit tests. Nor do they see anything behind
+  # `tf_tree_bench`'s `tf2` feature. This job is where all of that is checked.
+  #
+  # It builds `docker/tf2/` on every run (a ROS 2 base image plus a rustup
+  # toolchain, several minutes) and it is deliberately the same `just` recipe a
+  # developer runs locally — CI mirrors the recipes 1:1 rather than restating
+  # the commands.
+  #
+  # The heavier tf2 recipes (`tf2-differential`, `tf2-replay`, `tf2-bench`,
+  # `tf2-scaling`) stay out of CI: the first two are minutes of work and the last
+  # two are measurements, which a shared runner cannot produce meaningfully.
+  tf2:
+    name: tf2 bridge (container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just tf2-check
+        run: just tf2-check
+
   loom:
     name: loom
     runs-on: ubuntu-latest

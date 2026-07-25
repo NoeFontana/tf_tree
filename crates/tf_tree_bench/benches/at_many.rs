@@ -1,4 +1,4 @@
-// Batch sampling: `at_many` with 1024 monotone stamps (decision `0003`,
+// Batch sampling: `at_many` with 1024 monotone stamps (`docs/PHASE1.md` §11.2
 // *Measurements* — reported as ns/sample). Monotone input lets each dynamic edge
 // gallop from a resumable cursor, so this is the O(1)-amortized path.
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
