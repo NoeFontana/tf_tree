@@ -62,11 +62,20 @@
 //!
 //! # Platform
 //!
-//! Linux only (§2), on x86-64 or aarch64. The architecture list is explicit
-//! rather than optimistic because the OFD lock commands are issued as raw
-//! `fcntl` syscalls — `rustix` 1.1 has no OFD locking, and §2 permits no libc
-//! crate and no C build step — and `struct flock`'s layout is not the same
-//! everywhere. Building elsewhere is a `compile_error!`, not a silent guess.
+//! Linux only (§2), on any architecture Rust and `libc` support.
+//!
+//! OFD locks reach the kernel through `libc`'s `fcntl`, which is a **documented
+//! deviation from §2's "no libc crate"**: `rustix` 1.1 has no OFD locking at
+//! all, and the classic whole-file locks it does offer are rejected by name in
+//! §3.3, because they are dropped when *any* descriptor to the file closes
+//! anywhere in the process.
+//!
+//! The first implementation issued the syscall by hand and was restricted to
+//! x86-64 and aarch64 by a `compile_error!`, because `struct flock`'s layout and
+//! the syscall numbering are not the same everywhere. That was the wrong trade
+//! for the primitive the entire rendezvous rests on: `libc` maintains those
+//! definitions for every target, and it introduces no C build step, which is
+//! what §2's rule was actually protecting against.
 #![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 

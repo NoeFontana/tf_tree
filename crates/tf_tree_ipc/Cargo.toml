@@ -15,10 +15,14 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-# `docs/PHASE2.md` §2 names rustix and nothing else: raw syscalls with no libc
-# crate and no C build step. `process` is on top of the workspace default set
-# for `getuid` (the `/tmp/tf_tree-<uid>` fallback and the same-user check).
+# `docs/PHASE2.md` §2 names rustix: raw syscalls with no C build step.
+# `process` is on top of the workspace default set for `getuid` (the
+# `/tmp/tf_tree-<uid>` fallback and the same-user check).
 rustix = { workspace = true, features = ["process"] }
+# A documented deviation from §2's "no libc crate", for exactly one call:
+# `fcntl(F_OFD_*)`. rustix has no OFD locking, and §3.3 rejects the classic
+# whole-file locks it does have. See `src/ofd.rs` for the full reasoning.
+libc.workspace = true
 
 # Helper for the multi-process tests. A thread cannot stand in for it: half of
 # what this crate relies on is what the *kernel* does when a lock holder dies,

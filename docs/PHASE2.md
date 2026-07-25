@@ -305,11 +305,13 @@ Do not build a POSIX abstraction layer. macOS and Windows keep `HeapArena` and i
 | Crate | New dependencies |
 |---|---|
 | `tf_tree_arena` | `rustix` (feature `shm`, `mm`, `fs`, `net`) — no libc crate, no C build step |
-| `tf_tree_ipc` (new) | `rustix`. Attach protocol, participant registry, reaping. |
+| `tf_tree_ipc` (new) | `rustix`, **and `libc` for `fcntl(F_OFD_*)` only**. Attach protocol, participant registry, reaping. |
 | `tf_tree_record` (new) | `mcap`, `serde` — **isolated here specifically so D14 holds for the core** |
 | `tf_tree_core` | **none.** Unchanged. |
 
 `tf_tree_core` gaining a dependency in this phase is a design failure, not a tradeoff. If you find yourself needing one, stop and report it.
+
+**The `libc` exception, recorded rather than hidden.** This section originally said "no libc crate". `rustix` 1.1 turned out to have **no OFD locking at all** — its `fcntl_lock` is the classic, whole-file `F_SETLK` that §3.3 rejects by name, and `flock` is whole-file too. The alternatives were to hand-roll the `fcntl` syscall or to take `libc`. Hand-rolling was implemented first and then rejected on review: it pinned syscall numbers and `struct flock`'s layout by hand and refused to compile on any architecture except x86-64 and aarch64 — including riscv64 and ppc64le. A hand-maintained kernel ABI underneath the primitive the whole rendezvous depends on is a worse risk than one more dependency, and `libc` introduces **no C build step**, which is what this rule was protecting against. Scope it to `tf_tree_ipc` and to that one call.
 
 ---
 

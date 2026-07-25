@@ -283,40 +283,35 @@ fn latest_and_latest_common_differ_when_edges_are_uneven() {
     );
 }
 
-/// A8's rescue path must be **live through the public API**, not merely present.
+/// A8's rescue path must be **wired**, not merely present.
 ///
-/// The core-level tests inject a liveness predicate and name a participant slot
-/// by hand. That proves the algorithm; it does not prove `Tree` supplies either.
-/// It did not, at first: `Tree::view` built an anonymous view with no liveness
-/// source, so a rescuer had no identity to publish into `claiming` and believed
-/// every claimant alive. A8 was correct, tested, and completely inert.
+/// The core tests inject a liveness predicate and name a participant slot by
+/// hand. That proves the algorithm; it does not prove `Tree` supplies either —
+/// and at first it supplied neither. `Tree::view` built an anonymous view with
+/// no liveness source, so a rescuer had no identity to publish into `claiming`
+/// and believed every claimant alive. A8 was correct, loom-tested, and totally
+/// inert through the public API.
 ///
-/// This asserts the wiring. A `Tree` interning a name it has never seen must
-/// terminate — and would hang without the bounded spin — while the arena carries
-/// a claim wedged by a participant that is not running.
+/// An earlier version of this test interned a fresh name and asserted it
+/// terminated. That passed with the wiring deliberately removed — interning an
+/// unclaimed name never reaches the rescue path, so it asserted nothing. This
+/// checks the two properties that were actually missing.
 #[test]
-fn interning_through_the_public_api_recovers_from_a_dead_claimant() {
-    use std::sync::mpsc;
-
+fn a_tree_can_rescue_a_wedged_intern() {
     let tree = TreeBuilder::new()
         .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(16)))
-        // Headroom, or interning a new name fails on capacity before it can
-        // reach the claim protocol at all.
-        .frame_headroom(4)
         .build()
         .unwrap();
+    let view = tree.arena_view();
 
-    // Run on a worker so a regression fails the test in bounded time instead of
-    // hanging CI forever — which is the exact failure A8 exists to prevent, and
-    // therefore the one this test must not reproduce in itself.
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let id = tree.frame("newly-interned-name");
-        let _ = tx.send(id.map(|f| f.get()));
-    });
-
-    let got = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("interning through Tree did not terminate — A8's bounded spin is not wired in");
-    assert!(got.is_ok(), "intern failed: {got:?}");
+    assert!(
+        view.interning_identity().is_some(),
+        "Tree interns anonymously: it can wait on a stalled claimant but never \
+         take the entry over, so A8's recovery is inert"
+    );
+    assert!(
+        view.has_liveness_source(),
+        "Tree has no liveness source: every claimant is believed alive, so A8's \
+         takeover can never fire"
+    );
 }

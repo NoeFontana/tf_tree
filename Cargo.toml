@@ -55,6 +55,9 @@ tf_tree_math = { path = "crates/tf_tree_math", version = "0.1.0" }
 tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.1.0" }
 # Phase 2 shared memory (see docs/PHASE2.md §2). Linux-only, opt-in via the
 # `shm` feature; `linux_raw` backend so there is no libc crate and no C build.
+# Only `tf_tree_ipc`, and only for `fcntl(F_OFD_*)`: rustix has no OFD locking
+# (see crates/tf_tree_ipc/src/ofd.rs for why the alternative was worse).
+libc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "std"] }
 tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0" }
 tf_tree = { path = "crates/tf_tree", version = "0.1.0" }

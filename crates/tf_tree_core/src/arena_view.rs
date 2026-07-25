@@ -132,6 +132,33 @@ impl<'a> ArenaView<'a> {
         self
     }
 
+    /// The participant slot this view interns as, or `None` if it is anonymous.
+    ///
+    /// A rescuer publishes *itself* into `claiming` when it takes over a stalled
+    /// entry, so an anonymous view can wait but never rescue (A8). Exposed
+    /// because "can this handle recover a wedged intern?" is a real diagnostic
+    /// question — `doctor` should be able to answer it — and because it is the
+    /// only way to assert from outside this crate that a `Tree` wired itself up.
+    #[must_use]
+    pub fn interning_identity(&self) -> Option<u32> {
+        if self.me == CLAIM_UNRECORDED {
+            None
+        } else {
+            Some(self.me - 1)
+        }
+    }
+
+    /// Whether this view can decide that a claimant died.
+    ///
+    /// Without a liveness source every claimant is believed alive — the correct
+    /// fail-safe, and one that means A8's takeover never fires. A view with an
+    /// identity but no predicate is *silently* inert, which is exactly the
+    /// failure worth being able to test for.
+    #[must_use]
+    pub fn has_liveness_source(&self) -> bool {
+        self.is_alive.is_some()
+    }
+
     /// The arena header.
     #[inline]
     #[must_use]

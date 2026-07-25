@@ -28,12 +28,12 @@
 //!
 //! # SAFETY (module invariant)
 //!
-//! [`fcntl_flock`] performs the `fcntl` syscall with a pointer to a `Flock`
+//! [`fcntl_flock`] performs the `fcntl` syscall with a pointer to a `libc::flock`
 //! owned by its caller's stack frame for the duration of the call. The kernel
 //! reads it for `F_OFD_SETLK` and reads *and writes* it for `F_OFD_GETLK`, never
 //! retains it, and never touches any other user memory. Every caller in this
-//! module passes `&mut Flock`, so the pointer is valid, aligned, unaliased and
-//! sized correctly by construction; `Flock` is `#[repr(C)]` and field-for-field
+//! module passes `&mut libc::flock`, so the pointer is valid, aligned, unaliased
+//! and sized correctly by construction; `libc::flock` is the kernel's own
 //! identical to the kernel's `struct flock` on the two 64-bit architectures this
 //! module supports.
 
@@ -41,43 +41,30 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use rustix::io::Errno;
 
-// The kernel's `struct flock` is architecture-dependent in ways that matter
-// (32-bit needs `flock64` and the `fcntl64` syscall; sparc and hppa renumber
-// `F_RDLCK`/`F_WRLCK`/`F_UNLCK`). Rather than guess, refuse to build anywhere
-// the constants below have not been checked. `docs/PHASE2.md` §2 scopes Phase 2
-// to Linux, and CI runs x86-64 and aarch64.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-compile_error!(
-    "tf_tree_ipc issues fcntl(F_OFD_SETLK) directly and has only been verified \
-     for the x86_64 and aarch64 syscall ABIs (docs/PHASE2.md §2 scopes Phase 2 \
-     to Linux on those two architectures)"
-);
-
-/// `fcntl` syscall number. `asm-generic/unistd.h` numbering on aarch64, the
-/// x86-64 table otherwise. Both take a 64-bit `struct flock` directly, so no
-/// `fcntl64` variant is involved.
-#[cfg(target_arch = "x86_64")]
-const SYS_FCNTL: usize = 72;
-#[cfg(target_arch = "aarch64")]
-const SYS_FCNTL: usize = 25;
+// `struct flock`, the `F_OFD_*` command numbers, and the `fcntl` syscall number
+// are all architecture- and ABI-dependent in ways that bite: 32-bit targets need
+// `flock64` and `fcntl64`, and sparc and hppa renumber `F_RDLCK`/`F_WRLCK`/
+// `F_UNLCK`. `libc` carries the correct definitions for every target Rust
+// supports, which is why this module uses them rather than its own.
+//
+// **This is a documented deviation from `docs/PHASE2.md` §2**, which names
+// `rustix` and says "no libc crate". rustix 1.1.4 has no OFD locking at all —
+// its `fcntl_lock` is *classic* `F_SETLK` and whole-file, which §3.3 rejects by
+// name, and `flock` is whole-file too. So the choice was between hand-rolling
+// the syscall and taking `libc`.
+//
+// Hand-rolling was tried first and rejected on review: it pinned the syscall
+// number and `struct flock` layout by hand and `compile_error!`d on every
+// architecture except x86-64 and aarch64 — including riscv64 and ppc64le. A
+// lock primitive that the entire rendezvous depends on is the wrong place to
+// carry a hand-maintained ABI, and §2's rationale is "no C build step", which
+// `libc` does not introduce: it is declarations, not compilation.
 
 /// `F_OFD_GETLK` — query without taking. Reports only *conflicting* locks, so a
 /// lock held by the querying description itself always reads as free.
-const F_OFD_GETLK: usize = 36;
+const F_OFD_GETLK: i32 = libc::F_OFD_GETLK;
 /// `F_OFD_SETLK` — non-blocking acquire or release.
-const F_OFD_SETLK: usize = 37;
-
-/// The kernel's `struct flock` for x86-64 and aarch64: two 16-bit fields, two
-/// 64-bit offsets, one 32-bit pid, `align(8)`, 32 bytes total.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct Flock {
-    l_type: i16,
-    l_whence: i16,
-    l_start: i64,
-    l_len: i64,
-    l_pid: i32,
-}
+const F_OFD_SETLK: i32 = libc::F_OFD_SETLK;
 
 /// `F_RDLCK`, `F_WRLCK`, `F_UNLCK` from `asm-generic/fcntl.h`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +138,7 @@ pub(crate) fn try_lock(
     range: Range,
     kind: LockKind,
 ) -> Result<LockAttempt, Errno> {
-    let mut lock = Flock {
+    let mut lock = libc::flock {
         l_type: kind as i16,
         l_whence: SEEK_SET,
         l_start: range.start as i64,
@@ -172,7 +159,7 @@ pub(crate) fn try_lock(
 
 /// Ask whether anyone *else* holds a conflicting lock on `range`.
 pub(crate) fn probe(fd: BorrowedFd<'_>, range: Range) -> Result<LockProbe, Errno> {
-    let mut lock = Flock {
+    let mut lock = libc::flock {
         // Ask about an exclusive lock: it conflicts with both shared and
         // exclusive holders, so this reports any holder at all.
         l_type: LockKind::Exclusive as i16,
@@ -192,50 +179,17 @@ pub(crate) fn probe(fd: BorrowedFd<'_>, range: Range) -> Result<LockProbe, Errno
 }
 
 /// `fcntl(fd, cmd, &mut flock)`, returning the kernel's errno on failure.
-fn fcntl_flock(fd: BorrowedFd<'_>, cmd: usize, lock: &mut Flock) -> Result<(), Errno> {
-    let raw = fd.as_fd().as_raw_fd() as usize;
-    let ptr: *mut Flock = lock;
-
-    // SAFETY (both arms): the syscall convention is the platform's, `raw` is a
-    // descriptor borrowed for the whole call, and `ptr` points at the caller's
-    // live, aligned, uniquely-borrowed `Flock` — the only memory the kernel
-    // touches for `F_OFD_SETLK`/`F_OFD_GETLK`, and it does not retain it.
-    // `nostack` holds because a syscall does not use the user stack.
-    #[cfg(target_arch = "x86_64")]
-    let ret: isize = unsafe {
-        let ret: isize;
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") SYS_FCNTL => ret,
-            in("rdi") raw,
-            in("rsi") cmd,
-            in("rdx") ptr,
-            // `syscall` clobbers rcx (return address) and r11 (saved rflags).
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-        ret
-    };
-    #[cfg(target_arch = "aarch64")]
-    let ret: isize = unsafe {
-        let ret: isize;
-        core::arch::asm!(
-            "svc 0",
-            in("x8") SYS_FCNTL,
-            inlateout("x0") raw => ret,
-            in("x1") cmd,
-            in("x2") ptr,
-            options(nostack),
-        );
-        ret
-    };
-
-    // Linux returns errors as -errno in the return register, so the range
-    // (-4095, -1] is the error window and everything else is a success value.
-    if (-4095..0).contains(&ret) {
-        // `Errno::from_raw_os_error` wants the positive C value.
-        return Err(Errno::from_raw_os_error(-ret as i32));
+fn fcntl_flock(fd: BorrowedFd<'_>, cmd: i32, lock: &mut libc::flock) -> Result<(), Errno> {
+    // SAFETY: `fcntl` with an `F_OFD_*` command reads (and, for `F_OFD_GETLK`,
+    // writes) exactly one `struct flock` through the pointer, and does not
+    // retain it. `lock` is a live, aligned, uniquely-borrowed `libc::flock` —
+    // libc's own definition, so the layout is the kernel's by construction — and
+    // the descriptor is borrowed for the whole call.
+    let ret = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), cmd, lock as *mut libc::flock) };
+    if ret < 0 {
+        return Err(Errno::from_raw_os_error(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
     }
     Ok(())
 }
@@ -245,19 +199,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use std::mem::{align_of, offset_of, size_of};
 
     #[test]
     fn flock_matches_the_kernel_abi() {
         // If this ever drifts, every lock in the crate is placed at a garbage
         // offset and the failure mode is silent.
-        assert_eq!(size_of::<Flock>(), 32);
-        assert_eq!(align_of::<Flock>(), 8);
-        assert_eq!(offset_of!(Flock, l_type), 0);
-        assert_eq!(offset_of!(Flock, l_whence), 2);
-        assert_eq!(offset_of!(Flock, l_start), 8);
-        assert_eq!(offset_of!(Flock, l_len), 16);
-        assert_eq!(offset_of!(Flock, l_pid), 24);
+        // libc owns the layout now, so pinning field offsets here would only
+        // re-assert libc's own definition. What this crate still relies on is
+        // that the OFD commands exist and are distinct from the classic ones —
+        // if a target ever aliased them, `F_OFD_SETLK` would silently become a
+        // process-owned `F_SETLK` and every liveness guarantee in §3.3 would
+        // quietly evaporate.
+        assert_ne!(libc::F_OFD_SETLK, libc::F_SETLK);
+        assert_ne!(libc::F_OFD_GETLK, libc::F_GETLK);
+        assert_ne!(libc::F_OFD_SETLK, libc::F_OFD_GETLK);
     }
 
     #[test]

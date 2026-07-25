@@ -151,13 +151,16 @@ it can only fail to **intern a new one**, because interning writes.
 
 ## Shared memory and startup
 
-### `ReparentError::SharedArena`
+### `ReparentError::LockContended { owner_slot }`
 
-Runtime re-parenting on a shared arena is refused while
-[`PHASE2.md`](./PHASE2.md) §1 amendment A2's in-arena lock is unwired. A1 already
-removed the wedge a *crashed* mutator caused, but two *concurrent* mutators
-would still race the block copy, so the operation is refused rather than raced.
-Declare the topology at build time instead.
+Another participant holds the arena's topology lock and is still alive, so this
+re-parent could not proceed. `owner_slot` names the holder; `tf_tree doctor`
+resolves it to a pid.
+
+The lock is stolen automatically when its holder is **dead**, so seeing this
+means a live process is mutating topology concurrently. Sustained contention is
+a design smell rather than a fault: topology should be near-static after startup
+([`PHASE2.md`](./PHASE2.md) §1, A2).
 
 ### `LayoutMismatch { found, expected }`
 
