@@ -203,12 +203,16 @@ impl Snapshot {
             let Some(fid) = FrameId::new(id) else {
                 continue;
             };
-            let rec = view.frame_record(fid);
+            let Some(rec) = view.frame_record(fid) else {
+                continue;
+            };
             let n = rec.name_len as usize;
             let name = core::str::from_utf8(&rec.name[..n.min(rec.name.len())])
                 .unwrap_or("<invalid-utf8>")
                 .to_owned();
-            let (parent, depth, edge_of_child, _gen) = topo.read_frame(fid);
+            let Some((parent, depth, edge_of_child, _gen)) = topo.read_frame(fid) else {
+                continue;
+            };
             frames.push(FrameInfo {
                 id,
                 name,
@@ -224,14 +228,13 @@ impl Snapshot {
         let mut edges = Vec::with_capacity(edge_count.saturating_sub(1) as usize);
         for id in 1..edge_count {
             let eid = EdgeId(id);
-            let rec = view.edge(eid);
-            let claim = view.claim(eid);
-            let kind = EdgeKind::from_u8(rec.kind);
-            let newest_stamp = if kind == EdgeKind::Dynamic && rec.capacity.is_power_of_two() {
-                view.ring(eid).newest_stamp()
-            } else {
-                None
+            let (Some(rec), Some(claim)) = (view.edge(eid), view.claim(eid)) else {
+                continue;
             };
+            let kind = EdgeKind::from_u8(rec.kind);
+            // `ring` is `None` for a static/tombstoned edge (capacity 0), so this
+            // needs no separate power-of-two guard.
+            let newest_stamp = view.ring(eid).and_then(|r| r.newest_stamp());
             edges.push(EdgeInfo {
                 id,
                 parent: rec.parent,
@@ -551,6 +554,12 @@ pub fn check_out_of_order(obs: &Observations) -> Vec<Finding> {
 }
 
 /// The median inter-sample interval (nanoseconds) of a per-edge event slice.
+///
+/// `None` when the median is not a usable period. Intervals are raw stamp
+/// differences, so an edge whose stamps arrive out of order (check 7's condition)
+/// can have a **negative** median; letting that through made `capacity × period`
+/// negative and flagged every dynamic edge as a short buffer, burying the real
+/// finding under noise.
 fn median_period(samples: &[&PushSample]) -> Option<i64> {
     if samples.len() < 2 {
         return None;
@@ -560,7 +569,11 @@ fn median_period(samples: &[&PushSample]) -> Option<i64> {
         .map(|w| w[1].stamp_ns - w[0].stamp_ns)
         .collect();
     intervals.sort_unstable();
-    Some(intervals[intervals.len() / 2])
+    let median = intervals[intervals.len() / 2];
+    if median <= 0 {
+        return None;
+    }
+    Some(median)
 }
 
 /// Run all seven checks over a captured snapshot and observed history.
@@ -723,6 +736,31 @@ mod tests {
             sample(1, 1, 30_000_000, 20_000_000),
         ]);
         assert!(check_short_buffers(&snap, &obs).is_empty());
+    }
+
+    /// Regression: `median_period` is a median of raw stamp differences, so a
+    /// stream that arrives out of order has a **negative** one. Using it made
+    /// `capacity × period` negative, so `max_latency > span` held for every
+    /// dynamic edge and one bad stream turned into a ShortBuffer warning on all
+    /// of them — burying check 7's real finding.
+    #[test]
+    fn out_of_order_stamps_do_not_fake_short_buffers() {
+        let snap = Snapshot {
+            frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
+            edges: vec![dyn_edge(1, 1, 2, 4096, true)],
+        };
+        // Stamps march backwards: every interval, and so the median, is negative.
+        let obs = Observations::from_samples(
+            (0..8)
+                .map(|k| sample(1, 1, 100_000_000 - k * 10_000_000, 20_000_000))
+                .collect(),
+        );
+        assert!(
+            check_short_buffers(&snap, &obs).is_empty(),
+            "an out-of-order stream must not be reported as a short buffer"
+        );
+        // The condition is still reported, by the check that owns it.
+        assert_eq!(check_out_of_order(&obs).len(), 1);
     }
 
     // --- (5) inconsistent publish rate ----------------------------------
