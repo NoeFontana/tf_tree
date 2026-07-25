@@ -892,11 +892,19 @@ Ship this table as `docs/RUNBOOK.md`. Every row must correspond to a `doctor` ch
 
 ## 14. Phase 3 handoff — constraints you must not break
 
-Phase 3 binds Python directly to the Rust core. Four Phase 2 properties must be preserved or Python users will hit them hard:
+> **Superseded in part by [`PHASE3.md`](./PHASE3.md) §1.** That document's §1.1
+> corrects item 5 below: `abi3` alone is not a sufficient distribution target,
+> because it does not work on free-threaded builds — and §1.2 adds the constraint
+> that turned out to matter most, which this section missed entirely. Read
+> `PHASE3.md` §1 before acting on items 4 or 5.
+
+Phase 3 binds Python directly to the Rust core. Five Phase 2 properties must be preserved or Python users will hit them hard:
 
 1. **`fork` safety.** `multiprocessing` defaults to `fork` on Linux. `MADV_DONTFORK` means the child's mapping is gone and any inherited handle is a fault waiting to happen. Phase 3 must register an `os.register_at_fork(after_in_child=...)` hook that poisons every inherited `Tree` handle so the child gets a clear Python exception rather than a segfault.
 2. **GIL and liveness.** The socket carries liveness, not the heartbeat, so a long GIL-held pause does not risk reaping. Preserve that: do not add heartbeat-based reaping to make Python "safer" — it would make it strictly less safe (§6.4).
-3. **Read-only by default.** The Python `attach()` default must be `ReadOnly`. Most Python consumers are analysis and visualization tools; they should be incapable of corrupting a robot's transform tree, and the default is what determines whether that is true in practice.
+3. **Read-only by default.** The Python `attach()` default must be `ReadOnly`. Most Python consumers are analysis and visualization tools; they should be incapable of corrupting a robot's transform tree, and the default is what determines whether that is true in practice. Pair it with `CreatePolicy::Never` so a notebook started before the robot fails loudly instead of creating an empty arena that a later publisher then refuses to join.
+4. **`tf_tree.open()` with no arguments must work in a notebook.** Zero-config discovery (§3) is most of the perceived quality of the Python binding; if a user has to pass paths, the seam has leaked.
+5. **Distribution: `abi3` wheels via maturin.** ~~One wheel per platform.~~ **Corrected by `PHASE3.md` §1.1** — `abi3` does not cover free-threaded builds, so the matrix needs version-specific `cp313t`/`cp314t` wheels alongside it, and an `abi3t` job (PEP 803) for 3.15 onward.
 
 Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers from §12.
 
@@ -917,8 +925,8 @@ Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers 
 - [ ] `HeapArena` / `MappedArena` replay produces **bit-identical** results (§10)
 - [ ] §12.3 gate met, or a written explanation of which criterion failed and by how much
 - [ ] `tf_treed` ships with a systemd unit and a container example
-- [ ] `docs/RUNBOOK.md` complete; every row maps to a `doctor` check
-- [ ] `docs/PHASE3.md` written, carrying §14 forward with the measured numbers
+- [x] `docs/RUNBOOK.md` complete; every row maps to a `doctor` check (rows for unimplemented Phase 2 errors are marked as such)
+- [~] `docs/PHASE3.md` written and carrying §14 forward; the measured numbers land with §12
 
 ---
 
