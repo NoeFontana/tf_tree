@@ -127,6 +127,115 @@ impl SampleRing<'_> {
         Ok(result)
     }
 
+    /// Sample at stamp `t` like [`Self::sample`], but resume the bracket search
+    /// from the logical index in `cursor` using an exponential (galloping) search.
+    ///
+    /// For a monotone non-decreasing sweep of stamps this turns the per-query
+    /// `O(log n)` binary search into `O(1)` amortized: each call gallops from the
+    /// previous result rather than restarting at the window midpoint. `cursor` is
+    /// updated to the lower bracket index found, so the next call resumes there.
+    /// Pass a `cursor` seeded to `0` for the first call.
+    ///
+    /// The result is identical to [`Self::sample`] for the same `t`; only the
+    /// search path differs.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::sample`].
+    pub fn sample_from<I: Interp>(
+        &self,
+        t: i64,
+        policy: ExtrapPolicy,
+        cursor: &mut u64,
+    ) -> Result<Iso3, LookupError> {
+        let h = self.head.load(Ordering::Acquire);
+        if h == 0 {
+            return Err(LookupError::NoData { edge: self.edge });
+        }
+        let retained = self.retained();
+        let n = h.min(retained);
+        let lo_logical = h - n;
+        let newest = h - 1;
+
+        let t_old = self.stamp_at(lo_logical);
+        let t_new = self.stamp_at(newest);
+
+        if t < t_old {
+            return Err(LookupError::Extrapolation {
+                edge: self.edge,
+                requested: t,
+                oldest: t_old,
+                newest: t_new,
+            });
+        }
+        if t > t_new {
+            *cursor = newest;
+            return match policy {
+                ExtrapPolicy::Error => Err(LookupError::Extrapolation {
+                    edge: self.edge,
+                    requested: t,
+                    oldest: t_old,
+                    newest: t_new,
+                }),
+                ExtrapPolicy::Hold => self.read_slot((newest & self.mask) as usize),
+                ExtrapPolicy::ConstantTwist => self.constant_twist(lo_logical, newest, t, t_new),
+            };
+        }
+        if t == t_new {
+            *cursor = newest;
+            return self.read_slot((newest & self.mask) as usize);
+        }
+
+        // Exponential (galloping) search for the last logical index whose stamp is
+        // <= t, resuming from `cursor`. Here t_old <= t < t_new, so the window
+        // endpoints already bracket `t`: stamp[lo_logical] <= t < stamp[newest].
+        let hint = (*cursor).clamp(lo_logical, newest);
+        let (mut lo, mut hi) = if self.stamp_at(hint) <= t {
+            // Gallop upward while the probe stays <= t.
+            let mut step = 1u64;
+            while hint + step < newest && self.stamp_at(hint + step) <= t {
+                step *= 2;
+            }
+            (hint + step / 2, (hint + step).min(newest))
+        } else {
+            // Gallop downward while the probe stays > t.
+            let mut step = 1u64;
+            while hint.saturating_sub(step) > lo_logical && self.stamp_at(hint - step) > t {
+                step *= 2;
+            }
+            (hint.saturating_sub(step).max(lo_logical), hint - step / 2)
+        };
+
+        // Binary search within the galloped bracket. Invariant: stamp[lo] <= t <
+        // stamp[hi].
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.stamp_at(mid) <= t {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let i = lo;
+        *cursor = i;
+        let t_i = self.stamp_at(i);
+
+        let result = if t_i == t {
+            self.read_slot((i & self.mask) as usize)?
+        } else {
+            let t_j = self.stamp_at(i + 1);
+            let a = self.read_slot((i & self.mask) as usize)?;
+            let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+            let s = (t - t_i) as f64 / (t_j - t_i) as f64;
+            I::eval(&a, &b, s)
+        };
+
+        if self.head.load(Ordering::Acquire) - i > retained {
+            return Err(LookupError::SlotRecycled { edge: self.edge });
+        }
+        Ok(result)
+    }
+
     /// Load the stamp at a logical index (masked to physical). Relaxed is correct:
     /// the `head` Acquire load in [`Self::sample`] already ordered every stamp of
     /// a published sample into view, and the stamp arrays are atomic so even a

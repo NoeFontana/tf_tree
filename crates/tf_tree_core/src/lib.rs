@@ -61,10 +61,21 @@ pub(crate) mod sync;
 // production configuration; the loom tests reimplement the protocols they need.
 #[cfg(not(loom))]
 pub mod arena_view;
+// Plan compilation, typed time, and evaluation. Depends on `arena_view`/
+// `topology` (production-only), so it is `not(loom)`; the loom suite exercises
+// the concurrency core beneath it, not the plan layer.
+#[cfg(not(loom))]
+pub mod plan;
 #[cfg(not(loom))]
 pub mod topology;
 
 pub use error::{ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, TopologyError};
+
+#[cfg(not(loom))]
+pub use plan::{
+    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query,
+    SensorDomain, Stamp, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
+};
 
 /// Maximum combined path depth of a compiled plan (used by the next PR). Real
 /// trees are 4–8; 16 is generous. Declared here so the fixed step array and the

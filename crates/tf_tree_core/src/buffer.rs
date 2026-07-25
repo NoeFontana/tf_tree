@@ -160,6 +160,21 @@ impl SampleRing<'_> {
         cap - u64::from(cap > 1)
     }
 
+    /// The newest published stamp, or `None` if the ring is empty.
+    ///
+    /// Reads `head` with `Acquire` (matching [`Self::sample`]) so the stamp of the
+    /// most recently published sample is ordered into view. Used by the plan layer
+    /// to resolve `Latest` and `LatestCommon` queries.
+    #[inline]
+    #[must_use]
+    pub fn newest_stamp(&self) -> Option<i64> {
+        let h = self.head.load(Ordering::Acquire);
+        if h == 0 {
+            return None;
+        }
+        Some(self.stamps[((h - 1) & self.mask) as usize].load(Ordering::Relaxed))
+    }
+
     /// Publish one sample. **Single writer only** — exclusivity is a type-level
     /// property of the `Publisher` that owns this ring, not a convention.
     ///

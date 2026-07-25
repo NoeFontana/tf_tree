@@ -22,6 +22,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
 tf_tree_arena.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
