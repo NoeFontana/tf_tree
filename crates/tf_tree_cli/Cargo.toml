@@ -13,16 +13,24 @@ publish = false
 [lints]
 workspace = true
 
+# `doc = false`: the binaries carry no public API to document, and the `tf_tree`
+# bin name otherwise collides with the `tf_tree` library crate's rustdoc output.
 [[bin]]
 name = "tf_tree"
 path = "src/main.rs"
+doc = false
 
 [[bin]]
 name = "tft"
 path = "src/bin/tft.rs"
+doc = false
 
 [dependencies]
 tf_tree.workspace = true
 tf_tree_core.workspace = true
+tf_tree_math.workspace = true
+# The CLI operates on an in-process tree; Phase 1 has no cross-process attach
+# (that is Phase 2 shared memory), so it drives the shared benchmark fixture.
+tf_tree_bench.workspace = true
 anyhow.workspace = true
 clap.workspace = true

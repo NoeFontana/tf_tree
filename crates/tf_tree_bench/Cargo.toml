@@ -13,10 +13,41 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The `tf2::BufferCore` differential path. Requires a ROS 2 install and the C++
+# FFI shim described in `src/tf2.rs`; deliberately *not* built on the host used
+# for this PR (there is no ROS 2 here). Enabling it without the shim is expected
+# to fail to link — that is the honest signal the ROS toolchain is absent.
+tf2 = []
+
 [dependencies]
 tf_tree.workspace = true
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
+anyhow.workspace = true
 
-# Benchmarks (criterion targets) and the tf2 differential harness are added by
-# the Phase 1 bench PR. Kept as a plain library crate until then.
+[dev-dependencies]
+criterion.workspace = true
+
+# Criterion benches (harness = false, driven by `criterion_group!`/`main!`). These
+# compile and run on any machine, but they are *not* the official go/no-go gate,
+# which needs dedicated, core-pinned hardware (see `docs/decisions/0003`).
+[[bench]]
+name = "lookup"
+harness = false
+
+[[bench]]
+name = "query_mix"
+harness = false
+
+[[bench]]
+name = "at_many"
+harness = false
+
+[[bench]]
+name = "push"
+harness = false
+
+[[bench]]
+name = "read_scaling"
+harness = false
