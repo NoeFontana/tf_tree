@@ -223,3 +223,86 @@ fn writes_are_visible_to_an_already_attached_peer() {
         "cross-process read of a fresh sample disagreed"
     );
 }
+
+/// A read-only attachment must **refuse** mutations, not fault on them.
+///
+/// This is the test that makes `AttachMode::ReadOnly` a safety boundary rather
+/// than a loaded gun. Every one of these calls reaches a `compare_exchange` in
+/// the arena, and a `PROT_READ` mapping does not report that politely — the
+/// process takes `SIGSEGV`. A consumer that merely misspells a frame name would
+/// have died instead of getting an `Err`.
+///
+/// Verified against the real failure: before the guards, `ro.claim(..)` exited
+/// with `signal: 11`, and so did `ro.frame("never-declared")` once the frame
+/// table had headroom for the intern to get past its capacity pre-check.
+#[test]
+fn read_only_refuses_mutation_instead_of_faulting() {
+    let tree = shared_fixture();
+    let fd = tree
+        .shared_fd()
+        .expect("shared fd")
+        .try_clone_to_owned()
+        .expect("dup fd");
+    let ro = Tree::attach_shared(fd, AttachMode::ReadOnly).expect("attach read-only");
+    assert!(
+        !ro.is_writable(),
+        "read-only attach reports itself writable"
+    );
+
+    // Resolving a name the creator declared is a pure read and must still work.
+    let child = ro.frame("imu_link").expect("declared frame still resolves");
+    let parent = ro
+        .frame("base_link")
+        .expect("declared frame still resolves");
+
+    // Interning a *new* name would publish into the hash table.
+    assert_eq!(
+        ro.frame("never-declared-anywhere"),
+        Err(tf_tree_core::FrameError::ReadOnly),
+        "interning through a read-only mapping was not refused"
+    );
+
+    // Claiming writes the claim record.
+    assert!(
+        matches!(
+            ro.claim(child, parent),
+            Err(tf_tree::ClaimApiError::ReadOnly)
+        ),
+        "claim through a read-only mapping was not refused"
+    );
+
+    // Re-parenting writes the topology block.
+    assert!(
+        matches!(
+            ro.reparent(child, parent),
+            Err(tf_tree::ReparentError::ReadOnly)
+        ),
+        "reparent through a read-only mapping was not refused"
+    );
+}
+
+/// Runtime re-parenting is refused on a shared arena even when writable.
+///
+/// `Tree::reparent` is serialized only by a **process-local** mutex, and
+/// `set_parent` publishes an odd generation for the duration of its block copy —
+/// so a writer killed mid-mutation leaves every reader in every process spinning
+/// forever in plan compilation. `docs/PHASE2.md` §1 amendments A1/A2 fix that;
+/// until they land the operation is refused rather than raced.
+///
+/// This test is also what makes `PHASE2.md` §0.0's claim that "topology is
+/// immutable after `build_shared`" true by construction rather than by hope.
+#[test]
+fn reparent_is_refused_on_a_shared_arena() {
+    let tree = shared_fixture();
+    assert!(tree.is_writable(), "creator's tree should be writable");
+
+    let child = tree.frame("imu_link").expect("imu_link");
+    let parent = tree.frame("odom").expect("odom");
+    assert!(
+        matches!(
+            tree.reparent(child, parent),
+            Err(tf_tree::ReparentError::SharedArena)
+        ),
+        "reparent on a shared arena was not refused"
+    );
+}

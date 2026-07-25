@@ -116,6 +116,14 @@ pub enum ShmError {
     /// The segment is smaller than an `ArenaHeader`, so it cannot even be
     /// validated.
     TooSmall,
+    /// The header's region offsets do not match the geometry its own capacities
+    /// imply, so the regions cannot be trusted to lie within the segment.
+    ///
+    /// Distinct from [`ShmError::LayoutMismatch`], which compares against a
+    /// *build* constant: this catches a header that is internally inconsistent,
+    /// whether from a peer bug, a scribbled byte, or a build that shares this
+    /// one's record sizes but not its capacities.
+    HeaderInconsistent,
 }
 
 /// An [`Arena`] backed by a sealed `memfd` mapped `MAP_SHARED`.
@@ -267,6 +275,31 @@ impl MappedArena {
                 expected: h.arena_size,
             });
         }
+
+        // `layout_hash()` is a *build* constant — it pins the record sizes this
+        // binary was compiled against, not this segment's capacities. Two builds
+        // can agree on it and disagree about `max_frames`. Since `ArenaView`
+        // forms slices straight off these offsets, an inconsistent header would
+        // produce out-of-bounds reads rather than an error, so recompute the
+        // geometry the header's own counts imply and require it to match.
+        //
+        // `from_totals` is exact here: the region layout depends only on the
+        // *sum* of the per-edge capacities, which is `stamp_slots`.
+        let implied = ArenaLayout::from_totals(h.max_frames, h.max_edges, h.stamp_slots)
+            .map_err(|_| ShmError::HeaderInconsistent)?;
+        let matches = implied.total_size() as u64 == h.arena_size
+            && implied.frame_table().offset as u32 == h.frame_table_off
+            && implied.frame_hash().offset as u32 == h.frame_hash_off
+            && implied.topo_blocks().offset as u32 == h.topo_block_off
+            && implied.topo_block_stride() as u32 == h.topo_block_stride
+            && implied.claim_table().offset as u32 == h.claim_table_off
+            && implied.edge_table().offset as u32 == h.edge_table_off
+            && implied.stamp_arena().offset as u32 == h.stamp_arena_off
+            && implied.pose_arena().offset as u32 == h.pose_arena_off
+            && h.stamp_slots == h.pose_slots;
+        if !matches {
+            return Err(ShmError::HeaderInconsistent);
+        }
         Ok(arena)
     }
 
@@ -377,9 +410,16 @@ impl CName {
     fn new(name: &str) -> CName {
         let mut buf = [0u8; Self::CAP];
         let src = name.as_bytes();
-        // Leave room for the NUL, and never split a UTF-8 sequence in a way that
-        // matters — the kernel treats this as opaque bytes.
-        let n = core::cmp::min(src.len(), Self::CAP - 1);
+        // Truncate at the first interior NUL. `from_bytes_with_nul_unchecked`
+        // requires exactly one NUL, at the end, and `name` is arbitrary caller
+        // input — `build_shared("a\0b")` would otherwise violate that contract.
+        // The kernel would stop at the first NUL anyway, so this only makes the
+        // Rust-side invariant match what actually happens.
+        let end = src.iter().position(|&b| b == 0).unwrap_or(src.len());
+        // Leave room for the terminator. The kernel treats the name as opaque
+        // bytes, so a truncated multi-byte sequence is harmless — it is a debug
+        // label in /proc/<pid>/fd, nothing more.
+        let n = core::cmp::min(end, Self::CAP - 1);
         buf[..n].copy_from_slice(&src[..n]);
         CName { buf, len: n }
     }
