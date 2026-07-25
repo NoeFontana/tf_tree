@@ -207,17 +207,35 @@ run. The exact command was
 host environment into the container). `just tf2-scaling` runs the same harness
 at its defaults, which is faster and noisier.
 
-Throughput, million lookups/s, recorded stream:
+Throughput, million lookups/s, recorded stream. `spread` is
+`(best - median)/best` for that cell — small means the machine was quiet, and it
+is quoted because it is what makes the 4-thread row interpretable:
 
-| Threads | tf_tree | tf2 | Ratio | tf_tree vs 1thr | tf2 vs 1thr |
-|---|---|---|---|---|---|
-| 1 | 10.64 | 3.65 | 2.9x | 1.00x | 1.00x |
-| 2 | 19.76 | 1.84 | 10.8x | 1.86x | **0.50x** |
-| 4 | 37.80 | 1.56 | 24.3x | 3.55x | **0.43x** |
-| 8 | 64.71 | 1.12 | 57.9x | 6.08x | **0.31x** |
+| Threads | tf_tree | spread | tf2 | spread | Ratio | tf_tree vs 1thr | tf2 vs 1thr |
+|---|---|---|---|---|---|---|---|
+| 1 | 12.70 | 1.9% | 3.61 | 1.0% | 3.5x | 1.00x | 1.00x |
+| 2 | 23.42 | 8.8% | 1.82 | 1.8% | 12.9x | 1.84x | **0.50x** |
+| 4 | 35.44 | 24.0% | 1.31 | 49.9% | 27.0x | 2.79x | **0.36x** |
+| 8 | 68.02 | 29.1% | 1.13 | 4.5% | **60.3x** | 5.35x | **0.31x** |
 
 tf_tree scales; **tf2 anti-scales** — more threads make it slower than one
 thread, the signature of a contended global mutex.
+
+tf_tree's one-thread figure moved from 10.64 to 12.70 M/s against the previous
+edition of this table; that is the interpolation work in
+[`docs/design/fast-path.md`](../design/fast-path.md) §11, not a change of method.
+
+**The 4-thread row is the noisiest point in the whole suite, and now it is
+labelled as such.** A previous edition of this document carried an unexplained
+discrepancy there (1.56 vs 1.39 M/s for tf2 across two back-to-back runs) and
+flagged it as unresolved. Two fresh runs on an idle host reproduce the
+instability rather than the value — tf_tree 38.20 then 35.44 M/s, tf2 spread
+reaching 49.9% — while every other row repeats to within 1% (8 threads: 68.09
+then 68.02). The explanation is the host: with 4 physical cores, 4 threads is the
+point where the runnable set exactly matches the core count, so which SMT sibling
+each thread lands on decides the result and nothing pins it. It is not a
+measurement to be re-taken until it settles; it is a row this hardware cannot
+measure precisely.
 
 **This is tf2's behaviour, not an artifact of our binding.** The pure C++ control
 (`docker/tf2/native_scaling.sh`, no Rust, no FFI, same stream, same queries)
@@ -244,19 +262,41 @@ The tail is starker than the throughput. Per-lookup latency, recorded stream:
 
 | Threads | Engine | p50 | p99 | p99.9 | p99.99 |
 |---|---|---|---|---|---|
-| 1 | tf_tree | 130 ns | 180 ns | 290 ns | 5.2 us |
-| 1 | tf2 | 291 ns | 821 ns | 1.4 us | 7.6 us |
-| 8 | tf_tree | 160 ns | 230 ns | **350 ns** | 6.8 us |
-| 8 | tf2 | 3.4 us | 48 us | **87 us** | 183 us |
+| 1 | tf_tree | 110 ns | 141 ns | 179 ns | 6.5 us |
+| 1 | tf2 | 291 ns | 852 ns | 1.2 us | 7.7 us |
+| 8 | tf_tree | 151 ns | 220 ns | **331 ns** | 7.1 us |
+| 8 | tf2 | 3.4 us | 47 us | **83 us** | 204 us |
 
-At 8 threads tf_tree's p99.9 is 350 ns against tf2's 87 us — a factor of ~250.
+At 8 threads tf_tree's p99.9 is 331 ns against tf2's 83 us — a factor of **252**.
 For a control loop that is the difference between a bounded and an unbounded
-worst case.
+worst case, and it is the strongest result in this document: unlike the
+throughput ratio it does not depend on core count, and unlike the single-threaded
+ratio it is not sensitive to any FFI residue.
 
-**Caveat on the scaling factor.** This host has 4 physical cores; tf_tree's 6.08x
-at 8 threads is SMT-assisted and should not be quoted as a clean scaling number.
-The 4-thread figure (3.55x on 4 cores) is the defensible one. The harness prints
-the physical core count for exactly this reason.
+Note the shape, not just the size. tf_tree's p50 rises 110 -> 151 ns from 1 to 8
+threads and its p99.9 rises 179 -> 331 ns: both grow slightly and stay bounded.
+tf2's p50 rises 291 ns -> 3.4 us and its p99.9 rises 1.2 us -> 83 us — the tail
+degrades ~14x faster than the median, which is what a convoy looks like.
+
+**Caveat on the scaling factor, and the gate.** This host has **4 physical
+cores**; tf_tree's 5.35x (recorded) / 5.62x (fixture) at 8 threads is SMT-assisted
+and is not a clean scaling number. The harness prints the physical core count for
+exactly this reason.
+
+[`PHASE1.md`](../PHASE1.md) §11.3's third gate criterion is "read throughput
+scales at least **6x** from 1 to 8 threads". **Measured 5.35x-5.62x, so the
+criterion is not met as written** — but it cannot be fairly evaluated on this
+machine, because 8 threads on 4 cores can only exceed 4x through SMT at all. The
+honest reading is that tf_tree reached 2.79x-3.09x at 4 threads on 4 cores and
+then gained a further ~1.8x from hyperthreading. Re-running on a host with >= 8
+physical cores is the only way to settle it; §11.3 asks for dedicated pinned
+hardware for precisely this reason.
+
+What the criterion was actually protecting is not in doubt. Its stated purpose is
+that "if tf_tree scales cleanly, the value proposition is your perception nodes
+stop contending". Against an engine that goes *backwards* — 0.31x at 8 threads —
+a 5.4x that is core-count-limited rather than contention-limited settles that
+question regardless of where it lands against 6.
 
 Two internal cross-checks that the harness measures what it claims: for each
 engine, p50 minus the ~20 ns timer overhead matches the figure implied by its
@@ -350,12 +390,18 @@ instructions. The mispredict and cache columns are the likely remainder, along
 with tf2's per-lookup mutex, but attributing it precisely needs cycle counters
 this host does not permit (`perf_event_paranoid=4`).
 
-One number here is aimed at tf_tree rather than tf2: **8.16 conditional
-mispredicts per lookup** is high for a path this short, and it is the bracket
-search's data-dependent binary search. That is an independent measurement
-arriving at the same target as the interpolation-seeded search proposed in
-[`docs/design/fast-path.md`](../design/fast-path.md) §5, which was argued from
-latency alone.
+A third caveat applies to the mispredict column specifically: **cachegrind's
+branch predictor is a simple two-level model, not a Zen 3 TAGE.** Comparing two
+engines under the same model is sound, and that is all this table does; reading
+"8.16" as the count a real CPU incurs is not. Acting on that distinction matters
+— the 8.16 figure was first read as the bracket search's data-dependent branch,
+and rewriting that search branchlessly recovered only 0.46 of it, because LLVM
+had already emitted a `cmov`. The mispredicts are spread across `fold_at`'s 124
+conditional branches per lookup, not concentrated in the search.
+
+The corresponding tf2 number, 6.00 *indirect* mispredicts, is on firmer ground:
+indirect targets are a structural property of virtual dispatch, not an artifact
+of predictor modelling, and a compiled `Plan` has no indirect branches at all.
 
 ## A real difference: maximum chain depth
 
@@ -390,9 +436,15 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
   LerpSlerp). Needs dedicated, core-pinned hardware. The indicative numbers above
   are in the right territory, but a mean over a loop on a shared VM is not a p50
   on isolated cores, and must not be reported as one.
-* **Concurrent read scaling on an idle machine.** The harness exists and works
-  (`just tf2-scaling`); the numbers above are from a smoke run on a busy host and
-  must be re-taken before they are cited.
+* ~~**Concurrent read scaling on an idle machine.**~~ **Done** — the scaling
+  tables above are from two runs on an idle host (load < 1.0, nothing but the
+  harness), 101 rounds and 100,000 latency samples per point, engines interleaved
+  within each round. Every row except the 4-thread one repeats to within 1%
+  across the two runs; the 4-thread row is discussed above and this hardware
+  cannot measure it precisely.
+* **The 6x scaling gate, on >= 8 physical cores.** Measured 5.35x-5.62x on a
+  4-core host, where 8 threads can only exceed 4x via SMT. Not a fair test of the
+  criterion either way.
 * **Read scaling under concurrent writers.** Every reader benchmark here runs
   against a quiescent tree. [`PHASE1.md`](../PHASE1.md) §11.2 specifies 4 concurrent
   writers, which would additionally stress tf_tree's seqlock retry path and
