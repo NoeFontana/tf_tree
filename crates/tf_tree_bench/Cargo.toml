@@ -34,7 +34,7 @@ criterion.workspace = true
 
 # Criterion benches (harness = false, driven by `criterion_group!`/`main!`). These
 # compile and run on any machine, but they are *not* the official go/no-go gate,
-# which needs dedicated, core-pinned hardware (see `docs/decisions/0003`).
+# which needs dedicated, core-pinned hardware (see `docs/PHASE1.md` §11.3).
 [[bench]]
 name = "lookup"
 harness = false
@@ -63,7 +63,7 @@ harness = false
 required-features = ["tf2"]
 
 # Concurrent read-scaling harness. A binary rather than a criterion bench because
-# decision 0003 wants p99.9 per *lookup*, and criterion reports the distribution
+# `docs/PHASE1.md` §11.2 wants p99.9 per *lookup*, and criterion reports the distribution
 # of batch times, which hides exactly the outliers a lock introduces.
 [[bin]]
 name = "tf2_scaling"

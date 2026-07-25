@@ -17,6 +17,12 @@ repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
 authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
 publish = false
+# Declares the native library this crate links, which is what lets `build.rs`
+# publish metadata (`cargo:rpath=...`) to the build scripts of crates that
+# depend on it. `cargo:rustc-link-arg` only reaches *this* package's own
+# targets, so `tf_tree_bench`'s bench/test/bin binaries have to re-emit the
+# rpath themselves — and this is how they learn where ROS was found.
+links = "tf_tree_tf2_shim"
 
 [lints.clippy]
 unwrap_used = "deny"

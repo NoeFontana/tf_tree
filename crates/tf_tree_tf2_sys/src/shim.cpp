@@ -73,19 +73,25 @@ void *tft2_new(double cache_secs) {
 /// Free a handle from `tft2_new`. Null is a no-op.
 void tft2_free(void *h) { delete static_cast<Handle *>(h); }
 
-/// Insert `T_parent_child` at `stamp_ns`.
+/// Insert `T_parent_child` at `stamp_ns`, using names from `tft2_name_new`.
 ///
 /// `pose` is `{qw, qx, qy, qz, tx, ty, tz}`. `is_static` mirrors
 /// `setTransform`'s static flag (`/tf_static` semantics: one entry, valid at any
 /// time). Returns 0 on success, 1 if `setTransform` rejected the transform
 /// (tf2's own validation: NaN, self-parent, empty frame id), 2 on an exception.
-int tft2_set(void *h, const char *parent, const char *child,
-             std::int64_t stamp_ns, const double *pose, int is_static) {
+///
+/// The names are `std::string`s assigned into the message, which is what a
+/// native C++ publisher does — for names of any realistic length that is an SSO
+/// copy and allocates nothing. Taking `const char*` here instead would have made
+/// every caller build a NUL-terminated string per call (a heap allocation per
+/// name in Rust), and a benchmark would have charged that to tf2.
+int tft2_set_pre(void *h, const void *parent, const void *child,
+                 std::int64_t stamp_ns, const double *pose, int is_static) {
   Handle *self = static_cast<Handle *>(h);
   try {
     geometry_msgs::msg::TransformStamped t;
-    t.header.frame_id = parent;
-    t.child_frame_id = child;
+    t.header.frame_id = *static_cast<const std::string *>(parent);
+    t.child_frame_id = *static_cast<const std::string *>(child);
     // ROS time is (sec: int32, nanosec: uint32) and must be non-negative;
     // `stamp_ns` is validated as non-negative by the Rust caller.
     t.header.stamp.sec = static_cast<std::int32_t>(stamp_ns / 1000000000LL);

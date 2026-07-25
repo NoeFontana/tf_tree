@@ -1,4 +1,5 @@
-//! The differential harness test (decision `0003`, *Differential against tf2*).
+//! The differential harness test (`docs/PHASE1.md` §10.5 *Differential against
+//! tf2*).
 //!
 //! Two references, one query loop:
 //!
@@ -40,7 +41,7 @@ fn naive_rust_reference_agrees_within_1e_12() {
 /// The migration-credibility test: tf_tree vs ROS 2's `tf2::BufferCore` over an
 /// identical tree and an identical sample stream, `LerpSlerp` on both sides.
 ///
-/// A failure here is a release blocker (decision `0003`): it means code migrating
+/// A failure here is a release blocker (`docs/PHASE1.md` §10.5): it means code migrating
 /// from tf2 to tf_tree would observe a different transform.
 #[cfg(feature = "tf2")]
 #[test]

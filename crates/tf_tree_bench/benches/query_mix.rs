@@ -1,4 +1,4 @@
-// The query-mix benchmark (decision `0003`, *Measurements*): 70% At(t) uniform in
+// The query-mix benchmark (`docs/PHASE1.md` §11.2 *Measurements*): 70% At(t) uniform in
 // [now-100ms, now], 20% Latest, 10% LatestCommon, over a depth-3 plan.
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 

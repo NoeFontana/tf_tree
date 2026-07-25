@@ -1,4 +1,4 @@
-// Single-writer push throughput (decision `0003`, *Measurements* — ns/push).
+// Single-writer push throughput (`docs/PHASE1.md` §11.2 *Measurements* — ns/push).
 //
 // Claims one dynamic edge and times `Publisher::push` with monotone stamps. The
 // pose is precomputed so the loop measures only the seqlock publish protocol.

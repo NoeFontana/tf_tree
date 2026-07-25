@@ -1,7 +1,7 @@
 //! Concurrent read scaling: tf_tree (lock-free readers) vs `tf2::BufferCore`
 //! (one internal mutex per lookup), at 1 / 2 / 4 / 8 threads.
 //!
-//! This is the measurement decision `0003` calls for and the one most likely to
+//! This is the measurement `docs/PHASE1.md` §11.2 calls for and the one most likely to
 //! separate the two engines: tf_tree's readers take no lock at all, while every
 //! `tf2::lookupTransform` acquires `BufferCore`'s frame mutex. If that matters,
 //! it shows up here and nowhere else.
@@ -12,7 +12,7 @@
 //!
 //! # Why a standalone binary rather than criterion
 //!
-//! Decision `0003` is explicit that "p99.9 is the number that matters, not the
+//! `docs/PHASE1.md` §11.2 is explicit that "p99.9 is the number that matters, not the
 //! mean. A control loop cares about the tail." Criterion reports the
 //! distribution of *batch* times, which is the wrong distribution — it hides
 //! exactly the per-lookup outliers a lock introduces. This harness records
@@ -44,23 +44,45 @@ use tf_tree::{InterpPolicy, Plan, Stamp, Tree};
 use tf_tree_bench::{fixture, replay, replay_tf2};
 use tf_tree_tf2_sys::{FrameName, Tf2Buffer};
 
+/// The sweep used when `TF2_THREADS` is unset or unusable.
+const DEFAULT_THREADS: [usize; 4] = [1, 2, 4, 8];
+
 /// Thread counts to sweep. Override with `TF2_THREADS=1,2,4,8`.
+///
+/// An override that yields no usable count — `TF2_THREADS=foo`, `TF2_THREADS=0`,
+/// `TF2_THREADS=` — falls back to the default sweep. Returning the empty vector
+/// instead would print the table headers with no rows under them, which reads as
+/// "the engines produced nothing" rather than "the override was a typo".
 fn thread_counts() -> Vec<usize> {
-    match std::env::var("TF2_THREADS") {
-        Ok(v) => v
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .filter(|&n: &usize| n > 0)
-            .collect(),
-        Err(_) => std::vec![1, 2, 4, 8],
+    let parsed: Vec<usize> = std::env::var("TF2_THREADS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    if parsed.is_empty() {
+        DEFAULT_THREADS.to_vec()
+    } else {
+        parsed
     }
 }
 
+/// A count read from the environment, clamped to at least 1.
+///
+/// Zero is never a meaningful setting here and is not silently honoured: every
+/// caller sizes a vector by this value and then indexes it. `TF2_ROUNDS=0` would
+/// leave `v[0]` reading past the end of an empty round vector, and
+/// `TF2_LATENCY_SAMPLES=0` would underflow `v.len() - 1` in
+/// `Percentiles::from_sorted`.
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+        .max(1)
 }
 
 /// A workload both engines can serve identically.

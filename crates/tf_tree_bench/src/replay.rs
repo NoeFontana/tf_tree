@@ -184,8 +184,10 @@ impl TfStream {
     /// Build a [`Tree`] with this recording's topology and replay its history
     /// into it.
     ///
-    /// Ring capacities are sized to each edge's actual sample count, which is
-    /// what the recording demands rather than a guess.
+    /// Ring capacities are sized to each edge's actual sample count (plus the
+    /// one slot a ring cannot hand back), which is what the recording demands
+    /// rather than a guess: every sample stays readable, so a query anywhere in
+    /// [`Self::common_window`] is answered rather than declined.
     ///
     /// # Errors
     ///
@@ -198,9 +200,17 @@ impl TfStream {
         }
         let counts = self.samples_per_edge();
         for (i, (p, c)) in self.dynamic_edges.iter().enumerate() {
-            // `slots` rounds up to a power of two, so this always holds the whole
-            // recording with no lapping.
-            let cap = Capacity::slots(u32::try_from(counts[i]).unwrap_or(u32::MAX));
+            // `slots` rounds up to a power of two, but a ring of `cap` slots
+            // *retains* only `cap - 1` samples (`SampleRing::retained`): the slot
+            // the writer is about to overwrite is not readable. Sizing for
+            // `count` alone therefore loses the oldest sample whenever `count` is
+            // an exact power of two — and the oldest sample is precisely the one
+            // `common_window`'s lower bound points at, so every query at `lo`
+            // would be declined. Ask for one more than the recording holds.
+            let want = u32::try_from(counts[i])
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            let cap = Capacity::slots(want);
             b = b.dynamic_edge(p, c, EdgeCfg::new(cap));
         }
         let tree = b.build().map_err(|e| anyhow!("build replay tree: {e}"))?;

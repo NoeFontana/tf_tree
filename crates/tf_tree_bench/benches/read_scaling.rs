@@ -1,4 +1,4 @@
-// Read-scaling benchmark (decision `0003` gate: read throughput should scale
+// Read-scaling benchmark (`docs/PHASE1.md` §11.3 gate: read throughput should scale
 // >= 6x from 1 to 8 threads). Each thread runs its own `Guard` over the shared,
 // lock-free `Tree` and evaluates a copy of the same depth-3 plan.
 //

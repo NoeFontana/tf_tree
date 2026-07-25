@@ -13,7 +13,7 @@
 // # What is deliberately NOT equalised
 //
 // tf_tree's headline structural claim is that it compiles the topology walk once
-// into a `Plan` and then only samples (decision 0003 / D3), whereas tf2 walks the
+// into a `Plan` and then only samples (`docs/PROJECT.md` §5 D3), whereas tf2 walks the
 // tree on every `lookupTransform`. Equalising that away would benchmark an engine
 // nobody would ship. So the rows are:
 //
@@ -64,7 +64,13 @@ fn fixture_load() -> Load {
     // row reflects a real chain rather than a one-edge lookup. The stamps sweep
     // the whole 100 ms window so the bracket search does real work instead of
     // hitting one cached pair over and over.
-    debug_assert!(names.contains(&"camera_optical") && names.contains(&"map"));
+    // `assert!`, not `debug_assert!`: criterion builds in the release profile,
+    // where a debug assertion is compiled out and would guard nothing.
+    assert!(
+        names.contains(&"camera_optical") && names.contains(&"map"),
+        "fixture no longer declares `camera_optical` and `map`; the benchmark's \
+         query pair must be updated to the current longest chain"
+    );
     let queries = (0..1024i64)
         .map(|k| {
             let stamp = lo + (now - lo) * k / 1024;
@@ -99,7 +105,68 @@ fn replay_load() -> Load {
     }
 }
 
+/// Check, **once and outside every timed loop**, that the pair the rows actually
+/// drive resolves on both engines across the whole stamp range.
+///
+/// Every row below queries `queries[0]`'s target/source pair at all of the query
+/// set's stamps. On the recorded stream that pair is drawn at random
+/// (`QuerySet::draw`, seed `0xBEEF_F00D`); nothing about the seed, the RNG or the
+/// recording guarantees it stays resolvable. An unresolvable pair does not fail
+/// the benchmark, it *corrupts* it silently: tf_tree's `if let Ok` would skip
+/// every sample and measure an empty loop, while tf2 would measure a C++
+/// throw/catch per call (microseconds), and the ratio of the two would be
+/// meaningless. So it is asserted rather than assumed.
+fn assert_pair_resolves(load: &Load) {
+    let (target, source, _) = &load.queries[0];
+    let why = "the benchmark drives this one pair at every stamp; if it does not \
+               resolve, the tf_tree rows time an empty loop and the tf2 rows time \
+               a C++ throw/catch, and the published ratio is nonsense";
+
+    // First and last stamp of the set: the ends of the window the rows sweep.
+    let first = load.queries.first().expect("empty query set").2;
+    let last = load.queries.last().expect("empty query set").2;
+
+    let t = load.tree.frame(target);
+    let s = load.tree.frame(source);
+    assert!(
+        t.is_ok() && s.is_ok(),
+        "{}: tf_tree does not know frame `{target}` or `{source}` — {why}",
+        load.name
+    );
+    let plan = load.tree.plan(t.unwrap(), s.unwrap());
+    assert!(
+        plan.is_ok(),
+        "{}: tf_tree cannot compile a plan for `{target}` <- `{source}` \
+         ({:?}) — {why}",
+        load.name,
+        plan.err()
+    );
+    let plan = plan.unwrap();
+    let guard = load.tree.guard();
+
+    let tc = FrameName::new(target).expect("target frame name");
+    let sc = FrameName::new(source).expect("source frame name");
+
+    for (which, ns) in [("first", first), ("last", last)] {
+        let stamp: Stamp = Stamp::from_nanos(ns);
+        assert!(
+            plan.at(&guard, stamp).is_ok(),
+            "{}: tf_tree cannot resolve `{target}` <- `{source}` at the {which} \
+             stamp ({ns} ns) — {why}",
+            load.name
+        );
+        assert!(
+            load.tf2.lookup_by_name(&tc, &sc, ns).is_ok(),
+            "{}: tf2 cannot resolve `{target}` <- `{source}` at the {which} \
+             stamp ({ns} ns) — {why}",
+            load.name
+        );
+    }
+}
+
 fn bench_lookup(c: &mut Criterion, load: &Load) {
+    assert_pair_resolves(load);
+
     let mut group = c.benchmark_group(format!("lookup_hot/{}", load.name));
     group.throughput(Throughput::Elements(load.queries.len() as u64));
 
@@ -229,7 +296,10 @@ fn bench_push(c: &mut Criterion) {
     });
 
     // Names converted once, for the same reason as the lookup rows: `push` takes
-    // no strings, so a per-call conversion would charge this bridge to tf2.
+    // no strings, so a per-call conversion would charge this bridge to tf2. The
+    // names cross as the `std::string`s the message wants and are assigned into
+    // it — what a native C++ publisher does, and no allocation for names this
+    // short.
     let buf = Tf2Buffer::new(10.0).unwrap();
     let (mp, od) = (
         FrameName::new("map").unwrap(),
@@ -240,6 +310,22 @@ fn bench_push(c: &mut Criterion) {
         b.iter(|| {
             t2 += STEP_NS;
             buf.set_transform_by_name(&mp, &od, t2, &pose, false)
+                .unwrap();
+        });
+    });
+
+    // The naive binding as a *control*, exactly as in the lookup group:
+    // `set_transform(&str, ..)` converts both names per call. An earlier
+    // revision published the tf2 push figure through a path that did this
+    // internally; the row stays so the size of that bias is measured rather than
+    // asserted.
+    let alloc_buf = Tf2Buffer::new(10.0).unwrap();
+    let mut t3 = 0i64;
+    group.bench_function("tf2_alloc", |b| {
+        b.iter(|| {
+            t3 += STEP_NS;
+            alloc_buf
+                .set_transform("map", "odom", t3, &pose, false)
                 .unwrap();
         });
     });

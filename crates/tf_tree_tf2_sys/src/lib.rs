@@ -24,6 +24,10 @@
 //!   to return codes. No unwinding crosses the FFI edge.
 //! * Every `*const c_char` passed in is a [`CString`] that outlives the call.
 //!   Frame names are validated to be NUL-free before conversion.
+//! * Every `const void*` name handle passed in is a live `std::string` owned by
+//!   a borrowed [`FrameName`], so it outlives the call, and the shim only reads
+//!   it (`lookupTransform` takes it by const reference; `tft2_set_pre` copies it
+//!   into the message).
 //! * Every pose buffer passed in or out is exactly `[f64; 7]`, matching the
 //!   `double[7]` the shim reads and writes. The layout is
 //!   `{qw, qx, qy, qz, tx, ty, tz}` on both sides — the same order as
@@ -50,10 +54,10 @@ mod ffi {
     extern "C" {
         pub(super) fn tft2_new(cache_secs: c_double) -> *mut c_void;
         pub(super) fn tft2_free(h: *mut c_void);
-        pub(super) fn tft2_set(
+        pub(super) fn tft2_set_pre(
             h: *mut c_void,
-            parent: *const c_char,
-            child: *const c_char,
+            parent: *const c_void,
+            child: *const c_void,
             stamp_ns: i64,
             pose: *const c_double,
             is_static: c_int,
@@ -159,9 +163,14 @@ impl Tf2Buffer {
         Ok(Tf2Buffer { handle })
     }
 
-    /// Insert `T_parent_child` at `stamp_ns`.
+    /// Insert `T_parent_child` at `stamp_ns`, taking `&str` frame names.
     ///
     /// `is_static` mirrors `/tf_static`: one entry, valid at any query time.
+    ///
+    /// **Not for benchmarks.** Like [`Self::lookup`], this converts both names
+    /// on every call — here into the `std::string`s the message wants — which a
+    /// benchmark would charge to tf2. Use [`Self::set_transform_by_name`] with
+    /// names converted once up front.
     ///
     /// # Errors
     ///
@@ -190,6 +199,11 @@ impl Tf2Buffer {
     /// `tf_tree`'s `Publisher::push` takes no strings and allocates nothing, so
     /// converting names per call would charge this bridge's marshalling to tf2.
     ///
+    /// The names cross as the `std::string`s a [`FrameName`] already owns and
+    /// are assigned into the message, exactly as a native C++ publisher fills a
+    /// `TransformStamped` — no `CString`, no per-call heap traffic on either
+    /// side of the boundary.
+    ///
     /// # Errors
     ///
     /// As [`Self::set_transform`].
@@ -204,22 +218,18 @@ impl Tf2Buffer {
         if stamp_ns < 0 {
             return Err(Tf2Error::NegativeStamp(stamp_ns));
         }
-        // `setTransform` fills `std::string` members of a message rather than
-        // taking them by reference, so a `const char*` is what it wants anyway.
-        let p = cstr(&parent.text)?;
-        let c = cstr(&child.text)?;
         let bits = pose.to_bits();
         // `to_bits` is f64 bit patterns; the shim wants the values themselves.
         let vals: [f64; 7] = core::array::from_fn(|i| f64::from_bits(bits[i]));
 
         // SAFETY: module invariant — `self.handle` is live and uniquely owned;
-        // `p`/`c` are NUL-terminated and outlive the call; `vals` is exactly the
-        // `double[7]` the shim reads.
+        // the `FrameName`s own live `std::string`s that outlive the call and are
+        // only read; `vals` is exactly the `double[7]` the shim reads.
         let rc = unsafe {
-            ffi::tft2_set(
+            ffi::tft2_set_pre(
                 self.handle,
-                p.as_ptr(),
-                c.as_ptr(),
+                parent.cpp,
+                child.cpp,
                 stamp_ns,
                 vals.as_ptr() as *const c_double,
                 c_int::from(is_static),

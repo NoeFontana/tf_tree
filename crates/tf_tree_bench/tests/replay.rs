@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use tf_tree::InterpPolicy;
+use tf_tree::{InterpPolicy, Stamp};
 use tf_tree_bench::replay::{self, QuerySet, TfStream};
 
 fn stream_path() -> PathBuf {
@@ -92,6 +92,46 @@ fn engine_replays_the_recording_and_answers_queries() {
             assert!(
                 f64::from_bits(w).is_finite(),
                 "non-finite component in a replayed lookup"
+            );
+        }
+    }
+}
+
+/// Everything replayed must stay readable — including the oldest sample.
+///
+/// A ring of `cap` slots retains `cap - 1` samples, so sizing it at
+/// `next_pow2(count)` silently drops the first sample of any edge whose count is
+/// an exact power of two. `common_window`'s lower bound *is* that first stamp,
+/// so the loss shows up as the engine declining the very first query of a sweep
+/// — one-sided, invisible, and worst of all inside a benchmark row that compares
+/// against tf2. 512 samples per edge reproduces it exactly (it is what
+/// `bench_scale` uses); the recorded stream is checked too, so the property is
+/// pinned on real data rather than only on the shape that once broke.
+#[test]
+fn build_tree_retains_every_replayed_sample() {
+    for stream in [replay::synth_robot(3, 2, 512, 100.0), load()] {
+        let tree = stream
+            .build_tree(InterpPolicy::LerpSlerp)
+            .expect("build tree");
+
+        for s in &stream.samples {
+            let (parent, child) = &stream.dynamic_edges[s.edge];
+            let stamp: Stamp = Stamp::from_nanos(s.stamp_ns);
+            assert!(
+                tree.lookup(parent, child, stamp).is_ok(),
+                "sample at {} ns on {parent}->{child} is not readable: {:?}",
+                s.stamp_ns,
+                tree.lookup(parent, child, stamp).unwrap_err()
+            );
+        }
+
+        // The first stamp of the common window is the one the off-by-one ate.
+        let (lo, _hi) = stream.common_window().expect("common window");
+        for (parent, child) in &stream.dynamic_edges {
+            let stamp: Stamp = Stamp::from_nanos(lo);
+            assert!(
+                tree.lookup(parent, child, stamp).is_ok(),
+                "the first common-window stamp ({lo} ns) is declined on {parent}->{child}"
             );
         }
     }

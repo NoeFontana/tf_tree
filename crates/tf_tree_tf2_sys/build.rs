@@ -72,7 +72,20 @@ fn main() {
     // The consuming test/bench binaries are run directly, not through
     // `ros2 run`, so bake the library path in rather than relying on
     // LD_LIBRARY_PATH being set at run time.
+    //
+    // `rustc-link-arg` applies only to *this* package's own targets, so it
+    // covers this crate's tests and nothing else. Dependent packages must emit
+    // their own link args; the `links` key in Cargo.toml lets us hand them the
+    // path here (they read it as `DEP_TF_TREE_TF2_SHIM_RPATH`) instead of each
+    // rediscovering the ROS install. See `crates/tf_tree_bench/build.rs`.
+    //
+    // `--disable-new-dtags` emits `DT_RPATH` instead of `DT_RUNPATH`: the
+    // former is inherited by the whole dependency chain, the latter covers only
+    // direct dependencies — and `libtf2.so` in turn needs `librcutils.so`,
+    // which carries no rpath of its own.
+    println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    println!("cargo:rpath={}", lib_dir.display());
 }
 
 /// Locate a ROS 2 install prefix, most explicit source first.

@@ -1,5 +1,6 @@
-//! The zero-allocation gate (decision `0003`, *Test plan* → *Allocation* and
-//! load-bearing invariant 8: "every heap allocation happens at construction").
+//! The zero-allocation gate (`docs/PHASE1.md` §10.4 *Allocation* and
+//! load-bearing invariant 8 in §2: "every heap allocation happens at
+//! construction").
 //!
 //! A `CountingAllocator` wraps the system allocator and tallies every
 //! `alloc`/`realloc`. After the tree is built and its history populated (all

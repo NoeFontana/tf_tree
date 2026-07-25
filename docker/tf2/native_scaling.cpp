@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -92,7 +94,7 @@ geometry_msgs::msg::TransformStamped to_msg(const Sample &x) {
 int main(int argc, char **argv) {
   const std::string path =
       argc > 1 ? argv[1] : "testdata/tfstream/indoor_atelier.tfstream";
-  const std::string target = argc > 3 ? argv[2] : "camera_link";
+  const std::string target = argc > 2 ? argv[2] : "camera_link";
   const std::string source = argc > 3 ? argv[3] : "odom_combined";
   const int rounds = argc > 4 ? std::atoi(argv[4]) : 101;
 
@@ -101,22 +103,44 @@ int main(int argc, char **argv) {
   for (const auto &x : s.statics) buf.setTransform(to_msg(x), "native", true);
   for (const auto &x : s.dynamics) buf.setTransform(to_msg(x), "native", false);
 
-  // Query window: the span every dynamic edge covers, matching the Rust
-  // harness's `common_window`.
-  std::int64_t lo = 0, hi = 0;
-  for (const auto &x : s.dynamics) hi = std::max(hi, x.stamp_ns);
-  for (const auto &x : s.dynamics) lo = std::max(lo, x.stamp_ns == 0 ? 0 : lo);
-  // First stamp of the latest-starting edge, computed the simple way.
+  // Query window: the span every dynamic edge covers.
+  //
+  // This must be *identical* to the Rust harness's `TfStream::common_window`,
+  // or the control sweeps different stamps than the thing it is controlling for
+  // and its numbers cannot be compared. That definition is: the latest of the
+  // per-edge first stamps, to the earliest of the per-edge last stamps. Taking
+  // the global maximum for `hi` instead — as an earlier version did — pushes the
+  // window past the end of the shortest edge, so a chunk of the sweep is
+  // extrapolation on at least one edge and is answered from a different code
+  // path (or not at all).
+  std::int64_t lo = std::numeric_limits<std::int64_t>::min();
+  std::int64_t hi = std::numeric_limits<std::int64_t>::max();
   {
-    std::vector<std::pair<std::string, std::int64_t>> first;
+    // (parent, child) -> [first, last], in the same edge granularity the Rust
+    // side uses: one entry per published edge, not per parent frame.
+    std::map<std::pair<std::string, std::string>, std::pair<std::int64_t, std::int64_t>> span;
     for (const auto &x : s.dynamics) {
-      auto key = x.parent + "->" + x.child;
-      bool seen = false;
-      for (auto &p : first)
-        if (p.first == key) { p.second = std::min(p.second, x.stamp_ns); seen = true; }
-      if (!seen) first.emplace_back(key, x.stamp_ns);
+      auto key = std::make_pair(x.parent, x.child);
+      auto it = span.find(key);
+      if (it == span.end()) {
+        span.emplace(key, std::make_pair(x.stamp_ns, x.stamp_ns));
+      } else {
+        it->second.first = std::min(it->second.first, x.stamp_ns);
+        it->second.second = std::max(it->second.second, x.stamp_ns);
+      }
     }
-    for (auto &p : first) lo = std::max(lo, p.second);
+    if (span.empty()) {
+      std::fprintf(stderr, "%s has no dynamic samples\n", path.c_str());
+      std::exit(1);
+    }
+    for (const auto &e : span) {
+      lo = std::max(lo, e.second.first);
+      hi = std::min(hi, e.second.second);
+    }
+    if (lo >= hi) {
+      std::fprintf(stderr, "no window is covered by every dynamic edge\n");
+      std::exit(1);
+    }
   }
 
   const int per_round = 4096;
@@ -125,8 +149,11 @@ int main(int argc, char **argv) {
     stamps[k] = lo + (hi - lo) * k / per_round;
 
   std::printf("native C++ tf2 read scaling (no Rust, no FFI)\n");
-  std::printf("stream=%s  %s <- %s  %d rounds x %d lookups/thread\n\n",
+  std::printf("stream=%s  %s <- %s  %d rounds x %d lookups/thread\n",
               path.c_str(), target.c_str(), source.c_str(), rounds, per_round);
+  // Printed so the window can be checked against the Rust harness's, which is
+  // the whole point of the control.
+  std::printf("common window: %.3f s .. %.3f s\n\n", lo / 1e9, hi / 1e9);
   std::printf("%-8s %14s %10s\n", "threads", "tf2 M/s", "vs 1 thread");
 
   double base = 0.0;

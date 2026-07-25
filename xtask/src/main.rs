@@ -1,7 +1,8 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 //! Workspace automation runner (`cargo xtask <task>`).
 //!
-//! `loom` and `bench-gate` are wired up (decision `0003` steps 5 and 9); `miri`
+//! `loom` and `bench-gate` are wired up (steps 5 and 9 of `docs/PHASE1.md`'s
+//! implementation order; §10.2 and §11.3); `miri`
 //! is wired up by its own Phase 1 PR.
 
 use std::process::{Command, ExitCode};
@@ -58,7 +59,7 @@ fn run_loom() -> ExitCode {
     }
 }
 
-/// Evaluate the decision `0003` go/no-go gate — honestly.
+/// Evaluate the `docs/PHASE1.md` §11.3 go/no-go gate — honestly.
 ///
 /// Two of the three gate criteria (depth-3 p50 latency; read throughput scaling
 /// 1→8 threads) and the `tf2::BufferCore` comparison ratio are *measurements*
@@ -71,7 +72,7 @@ fn run_loom() -> ExitCode {
 /// Exit status: non-zero iff a *decisive, runnable* gate fails.
 fn run_bench_gate() -> ExitCode {
     let cargo = env!("CARGO");
-    println!("xtask bench-gate: decision 0003 go/no-go gate\n");
+    println!("xtask bench-gate: docs/PHASE1.md §11.3 go/no-go gate\n");
 
     // 0. The criterion benches must at least compile and link.
     print!("[compile]     criterion benches build ... ");
