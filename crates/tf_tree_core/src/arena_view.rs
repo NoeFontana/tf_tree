@@ -35,6 +35,7 @@ use crate::buffer::{pose_slots, stamp_slots, SampleRing};
 use crate::edge::{ClaimRecord, EdgeRecord};
 use crate::error::{EdgeId, FrameError, FrameId, TopologyError};
 use crate::frame::{blake3_64, intern_core, FrameRecord, ID_FAILED, ID_UNPUBLISHED};
+use crate::participant::{ParticipantRecord, ParticipantTable};
 use crate::sync::{spin, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use crate::topology::{Block, TopologyView};
 
@@ -266,15 +267,29 @@ impl<'a> ArenaView<'a> {
         }
     }
 
-    /// A view over the topology seqlock and both double-buffered blocks.
+    /// A view over the packed topology word and every block.
     #[must_use]
     pub fn topology(&self) -> TopologyView<'a> {
         TopologyView::new(
-            &self.header.topo_generation,
-            &self.header.topo_active,
-            [self.topo_block(0), self.topo_block(1)],
+            &self.header.topo,
+            core::array::from_fn(|i| self.topo_block(i)),
             self.header.max_frames,
         )
+    }
+
+    /// The participant table (`docs/PHASE2.md` §1, A6).
+    #[must_use]
+    pub fn participants(&self) -> ParticipantTable<'a> {
+        let n = self.header.max_participants as usize;
+        let off = self.header.participant_table_off as usize;
+        // SAFETY: module invariant — the participant region reserves
+        // `max_participants` 128-byte records at `participant_table_off`, sized
+        // by `ArenaLayout` and validated on attach, and every field is atomic so
+        // sharing the slice across processes is sound.
+        let slots = unsafe {
+            core::slice::from_raw_parts(self.base.add(off).cast::<ParticipantRecord>(), n)
+        };
+        ParticipantTable::new(slots)
     }
 
     // ---- edges & claims --------------------------------------------------

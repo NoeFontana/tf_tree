@@ -252,14 +252,14 @@ fn wrapped_ring_retained_samples_read_back_exactly() {
 fn claim_is_exclusive_and_epoch_increments() {
     use crate::edge::{release, ClaimRecord};
     let rec = ClaimRecord::new();
-    let e1 = claim(&rec, 111, 0xaa).unwrap();
+    let e1 = claim(&rec, 111).unwrap();
     assert_eq!(e1, 1);
     // Second claim on a live edge fails, naming the owner.
-    let err = claim(&rec, 222, 0xbb).unwrap_err();
+    let err = claim(&rec, 222).unwrap_err();
     assert_eq!(err, ClaimError::EdgeAlreadyClaimed { owner_pid: 111 });
     release(&rec);
     // Re-claim after release bumps the epoch.
-    let e2 = claim(&rec, 333, 0xcc).unwrap();
+    let e2 = claim(&rec, 333).unwrap();
     assert_eq!(e2, 2);
 }
 
@@ -277,7 +277,7 @@ fn publisher_is_send() {
 fn single_dyn_edge_arena() -> HeapArena {
     // 4 frame slots (root + 3), 1 dynamic edge, ring capacity 4.
     let layout = ArenaLayout::new(4, 1, alloc::vec![4]).unwrap();
-    HeapArena::new(&layout, 4242, 0xfeed)
+    HeapArena::new(&layout, 4242, 0, [0u8; 16])
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn arena_push_claim_sample_roundtrip() {
         .unwrap();
 
     let view = builder.view();
-    let epoch = claim(view.claim(edge).unwrap(), 4242, 0xfeed).unwrap();
+    let epoch = claim(view.claim(edge).unwrap(), 7).unwrap();
     let pubr = Publisher::new(view.ring(edge).unwrap(), view.claim(edge).unwrap(), epoch);
     for i in 0..3u64 {
         pubr.push(i as i64 * 1000, &pose(i + 1)).unwrap();
@@ -434,7 +434,7 @@ fn arena_push_claim_sample_roundtrip() {
     );
     drop(pubr);
     // After the publisher drops, the edge can be re-claimed.
-    assert!(claim(view.claim(edge).unwrap(), 1, 2).is_ok());
+    assert!(claim(view.claim(edge).unwrap(), 1).is_ok());
 }
 
 // ---- plan compilation ---------------------------------------------------
@@ -527,4 +527,49 @@ fn record_sizes_are_pinned() {
     assert_eq!(size_of::<EdgeRecord>(), 128);
     assert_eq!(size_of::<crate::edge::ClaimRecord>(), 64);
     assert_eq!(size_of::<crate::frame::FrameRecord>(), 64);
+}
+
+// ---- A5: a dead writer must not invert a slot's parity ------------------
+
+/// A writer killed between the two `seq` stores leaves the slot **odd**, and the
+/// next writer to reach it must recover.
+///
+/// This is the cross-process failure `docs/PHASE2.md` §1 A5 describes. Within one
+/// process it was unobservable, because the crash that stranded the slot also
+/// took every reader with it; across processes the readers survive. An
+/// incrementing writer would read the stale odd `s` and store `s+1` — an *even*
+/// value — while the payload was still being written, so readers would accept a
+/// torn pose as published. Forcing the parity (`s | 1`) is idempotent on a stale
+/// odd value and heals it.
+#[test]
+fn stale_odd_seq_from_a_dead_writer_is_healed_by_the_next_push() {
+    let ring = HeapRing::new(4);
+    let pose = exp_se3([0.1, 0.2, 0.3, 1.0, 2.0, 3.0]);
+
+    // Simulate a writer killed after flipping slot 0 to odd but before
+    // publishing: the slot is odd and `head` was never bumped.
+    ring.poses[0].set_seq_for_test(1);
+    assert_eq!(
+        ring.ring().read_slot(0),
+        Err(LookupError::SlotContended { edge: EdgeId(0) }),
+        "a slot left odd must read as contended, not as published"
+    );
+
+    // The next writer takes that slot and must leave it even.
+    ring.ring().push(1_000, &pose).unwrap();
+    let seq = ring.poses[0].seq_for_test();
+    assert_eq!(
+        seq & 1,
+        0,
+        "slot still odd after a completed push (seq={seq})"
+    );
+
+    // And the payload must now be readable, not merely even.
+    let got = ring.ring().read_slot(0).expect("healed slot is readable");
+    assert_eq!(got.to_bits(), pose.to_bits());
+
+    // The healed value must also still be *greater* than the stale odd one, so
+    // the seqlock's monotonicity — what lets a reader detect a concurrent
+    // overwrite — is preserved rather than reset.
+    assert!(seq > 1, "seq went backwards: {seq}");
 }

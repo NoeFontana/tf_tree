@@ -57,16 +57,23 @@ impl HeapArena {
     /// Allocate a zeroed, 64-byte-aligned arena sized for `layout`, then write
     /// the [`ArenaHeader`] into its first bytes.
     ///
-    /// `creator_pid` and `creator_boot_id` are constructor parameters, not
-    /// self-discovered: this is a `no_std` crate and cannot read `/proc` or call
-    /// `getpid`. The `std` facade supplies real values (Phase 2 uses `boot_id`
-    /// to detect a segment that outlived a reboot); tests may pass `0`.
+    /// `creator_pid`, `owner_start_time` and `boot_id` are constructor
+    /// parameters, not self-discovered: this is a `no_std` crate and cannot read
+    /// `/proc` or call `getpid`. The `std` facade supplies real values —
+    /// `boot_id` detects a segment that outlived a reboot, and
+    /// `owner_start_time` is what makes the PID reuse-proof — and tests may pass
+    /// zeros.
     ///
     /// # Panics
     ///
     /// Aborts (via [`handle_alloc_error`]) if the allocation fails. Asserts the
     /// host is little-endian (load-bearing invariant 7).
-    pub fn new(layout: &ArenaLayout, creator_pid: u32, creator_boot_id: u64) -> HeapArena {
+    pub fn new(
+        layout: &ArenaLayout,
+        creator_pid: u32,
+        owner_start_time: u64,
+        boot_id: [u8; 16],
+    ) -> HeapArena {
         // Invariant 7: the arena is host-native little-endian. Refuse to even
         // compile for a big-endian host rather than silently producing garbage.
         const {
@@ -96,11 +103,17 @@ impl HeapArena {
             len: size,
             alloc_layout,
         };
-        arena.write_header(layout, creator_pid, creator_boot_id);
+        arena.write_header(layout, creator_pid, owner_start_time, boot_id);
         arena
     }
 
-    fn write_header(&self, layout: &ArenaLayout, creator_pid: u32, creator_boot_id: u64) {
+    fn write_header(
+        &self,
+        layout: &ArenaLayout,
+        creator_pid: u32,
+        owner_start_time: u64,
+        boot_id: [u8; 16],
+    ) {
         // SAFETY: `self.ptr` is the base of a freshly zeroed, 64-byte-aligned
         // allocation of `self.len >= 256` bytes that `self` uniquely owns, which
         // is exactly `write_header_at`'s contract.
@@ -110,7 +123,8 @@ impl HeapArena {
                 self.len,
                 layout,
                 creator_pid,
-                creator_boot_id,
+                owner_start_time,
+                boot_id,
             )
         }
     }
@@ -173,7 +187,8 @@ pub(crate) unsafe fn write_header_at(
     len: usize,
     layout: &ArenaLayout,
     creator_pid: u32,
-    creator_boot_id: u64,
+    owner_start_time: u64,
+    boot_id: [u8; 16],
 ) {
     // Offsets and slot counts are stored as u32 in the header. This is enforced
     // (not merely assumed) by `ArenaLayout::new`, which rejects any layout whose
@@ -203,11 +218,14 @@ pub(crate) unsafe fn write_header_at(
     h.topo_block_off = layout.topo_blocks().offset as u32;
     h.topo_block_stride = layout.topo_block_stride() as u32;
     h.claim_table_off = layout.claim_table().offset as u32;
+    h.participant_table_off = layout.participant_table().offset as u32;
+    h.max_participants = layout.max_participants();
     h.edge_table_off = layout.edge_table().offset as u32;
     h.stamp_arena_off = layout.stamp_arena().offset as u32;
     h.pose_arena_off = layout.pose_arena().offset as u32;
     h.creator_pid = creator_pid;
-    h.creator_boot_id = creator_boot_id;
+    h.owner_start_time = owner_start_time;
+    h.boot_id = boot_id;
 }
 
 #[cfg(test)]
@@ -225,7 +243,7 @@ mod tests {
     #[test]
     fn allocation_is_sized_and_aligned() {
         let layout = fixture();
-        let arena = HeapArena::new(&layout, 0, 0);
+        let arena = HeapArena::new(&layout, 0, 0, [0u8; 16]);
         assert_eq!(arena.len(), layout.total_size());
         assert!(!arena.base().is_null());
         assert_eq!(arena.base() as usize % 64, 0);
@@ -234,7 +252,7 @@ mod tests {
     #[test]
     fn header_is_written_correctly() {
         let layout = fixture();
-        let arena = HeapArena::new(&layout, 4321, 0xdead_beef);
+        let arena = HeapArena::new(&layout, 4321, 99, [7u8; 16]);
         let h = arena.header();
 
         assert_eq!(h.magic, u64::from_le_bytes(TF_TREE_MAGIC));
@@ -256,11 +274,18 @@ mod tests {
         assert_eq!(h.pose_arena_off as usize, layout.pose_arena().offset);
 
         assert_eq!(h.creator_pid, 4321);
-        assert_eq!(h.creator_boot_id, 0xdead_beef);
+        assert_eq!(h.boot_id, [7u8; 16]);
+        assert_eq!(h.owner_start_time, 99);
+        assert_eq!(
+            h.participant_table_off as usize,
+            layout.participant_table().offset
+        );
+        assert_eq!(h.max_participants, layout.max_participants());
 
         // Atomics start zeroed.
-        assert_eq!(h.topo_generation.load(Ordering::Relaxed), 0);
-        assert_eq!(h.topo_active.load(Ordering::Relaxed), 0);
+        assert_eq!(h.topo.load(Ordering::Relaxed), 0);
+        assert_eq!(h.participant_count.load(Ordering::Relaxed), 0);
+        assert_eq!(h.topo_lock.owner.load(Ordering::Relaxed), 0);
         assert_eq!(h.frame_count.load(Ordering::Relaxed), 0);
         assert_eq!(h.edge_count.load(Ordering::Relaxed), 0);
     }
@@ -268,7 +293,7 @@ mod tests {
     #[test]
     fn body_is_zeroed_past_the_header() {
         let layout = fixture();
-        let arena = HeapArena::new(&layout, 0, 0);
+        let arena = HeapArena::new(&layout, 0, 0, [0u8; 16]);
         // Sample a byte well past the header region.
         let off = layout.pose_arena().offset;
         // SAFETY: `off` is within the arena (`< len`); reading one owned byte.

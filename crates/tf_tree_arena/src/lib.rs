@@ -28,8 +28,10 @@ pub mod layout;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod mapped;
 
-pub use header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
+pub use header::{
+    pack_topo, unpack_topo, ArenaHeader, TopoLock, FORMAT_VERSION, TF_TREE_MAGIC, TOPO_BLOCKS,
+};
 pub use heap::{Arena, HeapArena};
-pub use layout::{layout_hash, ArenaLayout, LayoutError, Region};
+pub use layout::{layout_hash, ArenaLayout, LayoutError, Region, DEFAULT_MAX_PARTICIPANTS};
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use mapped::{AttachMode, MappedArena, ShmError};

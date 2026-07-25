@@ -66,11 +66,15 @@ pub mod arena_view;
 // `topology` (production-only), so it is `not(loom)`; the loom suite exercises
 // the concurrency core beneath it, not the plan layer.
 #[cfg(not(loom))]
+pub mod participant;
+#[cfg(not(loom))]
 pub mod plan;
 #[cfg(not(loom))]
 pub mod topology;
 
 pub use error::{ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, TopologyError};
+#[cfg(not(loom))]
+pub use participant::{ParticipantError, ParticipantRecord, ParticipantTable};
 
 #[cfg(not(loom))]
 pub use plan::{

@@ -624,7 +624,8 @@ impl<'a> Guard<'a> {
     /// Pin the current topology generation and wrap the arena view for a batch of
     /// lookups.
     ///
-    /// The pinned value is a *stable* (even) generation: pinning the odd value a
+    /// The pinned value is always a stable generation — A1 removed the odd
+    /// "write in progress" state, so there is no torn value to pin. Formerly the
     /// mutation publishes mid-flight would make every [`Plan::at`] against this
     /// guard fail with [`LookupError::TopologyChanged`] for no reason.
     #[must_use]
@@ -735,11 +736,10 @@ pub fn compile(
     // Retry the whole walk if a topology mutation lands between reads, so every
     // read is from one consistent generation (`docs/PHASE1.md` §5.2 reader protocol).
     'walk: loop {
+        // Every published generation is stable since A1 removed the odd state,
+        // so there is no parity to check and nothing to wait for. The retry
+        // below exists only to discard a walk that straddled a mutation.
         let start_gen = topo.generation();
-        if start_gen & 1 != 0 {
-            spin();
-            continue;
-        }
 
         // Read (parent, depth, edge_of_child) for `f`, or signal a restart if the
         // read observed a different generation.

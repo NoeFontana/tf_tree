@@ -171,6 +171,17 @@ pub enum PushError {
         /// The (rejected) stamp that was pushed.
         got: i64,
     },
+    /// The claim this writer holds was revoked — the edge was reaped and is now
+    /// free or owned by someone else.
+    ///
+    /// Returned instead of writing, because the alternative is two writers on a
+    /// single-writer ring (`docs/PHASE2.md` §1, A4). A process that sees this was
+    /// judged dead while it was stopped or stalled; the correct response is to
+    /// stop publishing and re-claim if it still wants the edge.
+    ClaimRevoked {
+        /// The edge whose claim was revoked.
+        edge: EdgeId,
+    },
 }
 
 /// A failed attempt to claim exclusive write access to an edge.
