@@ -1,0 +1,370 @@
+//! The rendezvous against real processes.
+//!
+//! Everything this crate claims is a claim about what the **kernel** does across
+//! a process boundary: that exactly one of two contenders gets a byte, that a
+//! `SIGKILL`ed holder's lock is released immediately and without its
+//! cooperation, and that a live participant's byte is visible to a process that
+//! knows nothing about it. None of that is testable with threads — a thread
+//! cannot be `SIGKILL`ed out from under its locks, and (unlike classic POSIX
+//! locks) the interesting failure is not one a single process can stage.
+//!
+//! So these tests spawn `ipc_child`, which opens the lock file **by path** and
+//! parks holding a lock until it is killed. Opening by path rather than
+//! inheriting a descriptor is load-bearing: OFD locks belong to an open file
+//! description, so a child holding the parent's inherited fd would conflict with
+//! nobody and every assertion here would pass vacuously.
+//!
+//! `docs/PHASE2.md` §11.2 scenario 9 — split-brain — is the important one, and
+//! per Appendix A it exists before the code it tests is finished.
+#![cfg(target_os = "linux")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use tf_tree_ipc::{
+    ArenaName, CreatePolicy, EnvLookup, EnvVar, IpcError, LockAttempt, LockFile, NoServer, Open,
+    OpenOutcome, Rendezvous, RuntimeDir,
+};
+
+/// A scratch runtime directory, removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let p = std::env::temp_dir().join(format!("tf_tree_ipc_mp-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Scratch(p)
+    }
+
+    fn rendezvous(&self) -> Rendezvous {
+        let rd =
+            RuntimeDir::resolve_with(&Fixed(self.0.clone()), tf_tree_ipc::current_uid()).unwrap();
+        let rv = Rendezvous::new(rd, 0, ArenaName::new("default", EnvVar::Name).unwrap());
+        rv.ensure_dir().unwrap();
+        rv
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An environment with only `TF_TREE_RUNTIME_DIR` set, so a test never depends
+/// on the runner's own environment.
+struct Fixed(PathBuf);
+
+impl EnvLookup for Fixed {
+    fn var(&self, key: &str) -> Option<std::ffi::OsString> {
+        (key == "TF_TREE_RUNTIME_DIR").then(|| self.0.clone().into_os_string())
+    }
+}
+
+/// A spawned `ipc_child`, killed on drop so a failing assertion cannot leave a
+/// process holding a lock in `/tmp` forever.
+struct Kid(Child);
+
+impl Kid {
+    fn spawn(args: &[&str]) -> Kid {
+        let exe = env!("CARGO_BIN_EXE_ipc_child");
+        let child = Command::new(exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn ipc_child");
+        Kid(child)
+    }
+
+    /// The child's next line. The child flushes before it parks, so this
+    /// returning is proof the lock has actually been taken — no sleeps, no
+    /// polling, no "probably by now".
+    fn line(&mut self) -> String {
+        let out = self.0.stdout.as_mut().expect("piped stdout");
+        let mut reader = BufReader::new(out);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read child line");
+        line.trim_end().to_string()
+    }
+
+    /// `SIGKILL`, then reap. After `wait` returns, the kernel has torn down the
+    /// process's descriptors, so its locks are gone — with no cooperation from
+    /// the child, which is the entire point.
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Kid {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Two (here: eight) processes contend for the ownership byte. Exactly one wins.
+///
+/// Each child retries for five seconds before reporting "lost", so the result
+/// does not depend on scheduling order: the loser is the one that could not get
+/// the byte while somebody held it, not the one that started second.
+#[test]
+fn exactly_one_process_wins_the_ownership_byte() {
+    let scratch = Scratch::new("ownership");
+    let rv = scratch.rendezvous();
+    let lock_path = rv.lock_path().to_str().unwrap();
+
+    let mut kids: Vec<Kid> = (0..8)
+        .map(|_| Kid::spawn(&["hold-ownership", lock_path, "1500"]))
+        .collect();
+    let lines: Vec<String> = kids.iter_mut().map(Kid::line).collect();
+
+    let won = lines.iter().filter(|l| *l == "won").count();
+    let lost = lines.iter().filter(|l| *l == "lost").count();
+    assert_eq!(won, 1, "exactly one process may own the arena: {lines:?}");
+    assert_eq!(lost, 7, "everyone else must be told no: {lines:?}");
+}
+
+/// `F_OFD_GETLK` on a held byte reports `l_pid = -1`.
+///
+/// `docs/PHASE2.md` §3.3 states this as verified behaviour on Linux 6.18, and
+/// the whole reason identity records exist as separate `pwrite` data is that it
+/// is true. Verify it on *this* kernel rather than trusting the table: if some
+/// kernel ever did name the holder, the identity records would be redundant, and
+/// if it named the wrong one they would be actively misleading.
+#[test]
+fn getlk_on_a_held_byte_cannot_name_the_holder() {
+    let scratch = Scratch::new("getlk-pid");
+    let rv = scratch.rendezvous();
+    let lock_path = rv.lock_path().to_str().unwrap();
+
+    let mut holder = Kid::spawn(&["hold-ownership", lock_path]);
+    assert_eq!(holder.line(), "won");
+
+    let observer = LockFile::open(rv.lock_path()).unwrap();
+    let probe = observer.probe_ownership().unwrap();
+    assert!(probe.held, "the child holds byte 0");
+    assert_eq!(
+        probe.holder_pid, -1,
+        "an OFD lock belongs to a file description, so GETLK cannot name a pid"
+    );
+    assert_ne!(
+        probe.holder_pid,
+        holder.0.id() as i32,
+        "if this ever names the child, §3.3's table is wrong on this kernel"
+    );
+}
+
+/// A `SIGKILL`ed holder's lock is released by the kernel, immediately.
+///
+/// This is the property that replaces every heartbeat, timeout and reaping
+/// heuristic in the previous draft of §6. The child is killed with a signal it
+/// cannot handle, runs no destructor, and unlinks nothing — and the byte is free
+/// the moment it is reaped.
+#[test]
+fn a_sigkilled_holder_releases_its_locks() {
+    let scratch = Scratch::new("sigkill");
+    let rv = scratch.rendezvous();
+    let lock_path = rv.lock_path().to_str().unwrap();
+
+    let mut holder = Kid::spawn(&["hold-participant", lock_path, "4"]);
+    assert_eq!(holder.line(), "held 4");
+
+    let observer = LockFile::open(rv.lock_path()).unwrap();
+    assert!(observer.probe_participant(4).unwrap().held);
+    assert_eq!(observer.held_participants().unwrap(), 1 << 4);
+    // The identity record names who it was, which GETLK cannot.
+    let id = observer.read_identity(4).unwrap().expect("identity record");
+    assert_eq!(id.pid, holder.0.id());
+    assert!(id.start_time > 0);
+
+    holder.kill();
+
+    assert!(
+        !observer.probe_participant(4).unwrap().held,
+        "the kernel must release a dead process's lock without its cooperation"
+    );
+    assert_eq!(observer.held_participants().unwrap(), 0);
+    assert_eq!(
+        observer.try_take_participant(4).unwrap(),
+        LockAttempt::Acquired
+    );
+    // The record outlives the process: it is advisory (§5.1), and this is
+    // exactly why it must never be consulted for liveness.
+    assert_eq!(
+        observer.read_identity(4).unwrap().map(|i| i.pid),
+        Some(id.pid)
+    );
+}
+
+/// **§11.2 scenario 9 — split-brain.** The single most important race in the
+/// phase.
+///
+/// A participant is alive (its lock byte is held) and nothing is serving: the
+/// state immediately after an owner dies, before any survivor has noticed the
+/// `HUP`. A fresh `open()` must **not** create a second arena. It must fail,
+/// naming the slot that is holding things up.
+///
+/// Run in a loop, because the failure this prevents is a race. The spec asks for
+/// a thousand consecutive runs; that is what `$TF_TREE_SPLIT_BRAIN_ITERS` is
+/// for, and the default of 128 keeps `just test` quick without letting the loop
+/// disappear. Every iteration re-opens the lock file, so nothing carries over
+/// except the child's held byte.
+#[test]
+fn a_live_participant_prevents_a_second_arena() {
+    let scratch = Scratch::new("split-brain");
+    let rv = scratch.rendezvous();
+    let lock_path = rv.lock_path().to_str().unwrap();
+
+    let mut survivor = Kid::spawn(&["hold-participant", lock_path, "3"]);
+    assert_eq!(survivor.line(), "held 3");
+
+    let iterations: usize = std::env::var("TF_TREE_SPLIT_BRAIN_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    for i in 0..iterations {
+        let err = Open::new(rv.clone())
+            .timeout(Duration::from_millis(15))
+            .open(&mut NoServer)
+            .expect_err("open() created a second arena while one was alive");
+        match err {
+            IpcError::ArenaHeldButUnreachable {
+                holder_slots,
+                first_slot,
+                first_pid,
+            } => {
+                assert_eq!(holder_slots, 1 << 3, "iteration {i}");
+                assert_eq!(first_slot, 3, "iteration {i}");
+                assert_eq!(
+                    first_pid,
+                    survivor.0.id(),
+                    "the error must name the process an operator has to kill"
+                );
+            }
+            other => panic!("iteration {i}: expected ArenaHeldButUnreachable, got {other}"),
+        }
+        // Every refusal must have released byte 0 again, or the survivor could
+        // never take over and the refusal would become permanent.
+        let heir = LockFile::open(rv.lock_path()).unwrap();
+        assert_eq!(
+            heir.try_take_ownership().unwrap(),
+            LockAttempt::Acquired,
+            "iteration {i}: a yielding opener must not keep the ownership byte"
+        );
+    }
+
+    // The positive control. Without it this test would still pass if `open()`
+    // simply never created anything.
+    survivor.kill();
+    let session = Open::new(rv.clone())
+        .timeout(Duration::from_millis(500))
+        .open(&mut NoServer)
+        .expect("nothing alive: open() must create");
+    assert_eq!(session.outcome(), OpenOutcome::Created);
+}
+
+/// The same race from the child's side: the child runs the real `open()`, wins,
+/// and holds both bytes; the parent's `open()` must refuse rather than create.
+///
+/// This is the shape of `docs/PHASE2.md` §11.3's `open.after_create_before_bind`
+/// crash point — an arena exists with nothing serving it — and the recovery it
+/// requires: once the creator is gone and no participant byte is held, a fresh
+/// `open()` is free to create, and the orphan segment dies with its last
+/// mapping.
+#[test]
+fn a_child_that_created_the_arena_blocks_a_second_creator() {
+    let scratch = Scratch::new("child-open");
+    let rv = scratch.rendezvous();
+    let dir = scratch.0.to_str().unwrap();
+
+    let mut creator = Kid::spawn(&["open", dir, "500"]);
+    let line = creator.line();
+    assert_eq!(line, "created 0", "the first process must create: {line}");
+
+    let err = Open::new(rv.clone())
+        .timeout(Duration::from_millis(50))
+        .open(&mut NoServer)
+        .expect_err("a second process must not create a second arena");
+    assert!(
+        matches!(err, IpcError::ArenaHeldButUnreachable { first_slot: 0, .. }),
+        "unexpected error: {err}"
+    );
+
+    creator.kill();
+    let session = Open::new(rv)
+        .timeout(Duration::from_millis(500))
+        .open(&mut NoServer)
+        .expect("with the creator dead, nothing is alive");
+    assert_eq!(session.outcome(), OpenOutcome::Created);
+    assert_eq!(session.slot(), 0, "the dead creator's slot is reusable");
+}
+
+/// `CreatePolicy::Never` fails fast rather than waiting out the timeout, and
+/// leaves no lock behind for the next process.
+#[test]
+fn a_consumer_that_refuses_to_create_fails_fast() {
+    let scratch = Scratch::new("never");
+    let rv = scratch.rendezvous();
+
+    let started = std::time::Instant::now();
+    let err = Open::new(rv.clone())
+        .create(CreatePolicy::Never)
+        .timeout(Duration::from_secs(60))
+        .open(&mut NoServer)
+        .expect_err("nothing to join");
+    assert_eq!(err, IpcError::ArenaAbsent);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "fail fast means fail fast, not wait out the timeout"
+    );
+
+    let after = LockFile::open(rv.lock_path()).unwrap();
+    assert_eq!(after.try_take_ownership().unwrap(), LockAttempt::Acquired);
+}
+
+/// Domain and runtime-directory isolation (§11.2 scenario 11): two arenas that
+/// differ in either dimension never observe each other.
+#[test]
+fn different_domains_and_directories_never_meet() {
+    let a = Scratch::new("iso-a");
+    let b = Scratch::new("iso-b");
+    let rd_a = RuntimeDir::resolve_with(&Fixed(a.0.clone()), tf_tree_ipc::current_uid()).unwrap();
+    let rd_b = RuntimeDir::resolve_with(&Fixed(b.0.clone()), tf_tree_ipc::current_uid()).unwrap();
+    let name = ArenaName::new("default", EnvVar::Name).unwrap();
+
+    let cases = [
+        Rendezvous::new(rd_a.clone(), 0, name),
+        Rendezvous::new(rd_a, 1, name),
+        Rendezvous::new(rd_b, 0, name),
+    ];
+    let mut sessions = Vec::new();
+    for rv in cases {
+        rv.ensure_dir().unwrap();
+        let s = Open::new(rv).open(&mut NoServer).unwrap();
+        // Every one of them creates: none of them can see the others.
+        assert_eq!(s.outcome(), OpenOutcome::Created);
+        assert_eq!(s.slot(), 0);
+        sessions.push(s);
+    }
+    assert_eq!(sessions.len(), 3);
+}
+
+/// The lock file path is the one §3.1 specifies, verified against the filesystem
+/// rather than against the code that built it.
+#[test]
+fn the_paths_on_disk_are_the_specified_ones() {
+    let scratch = Scratch::new("paths");
+    let rv = scratch.rendezvous();
+    let _s = Open::new(rv.clone()).open(&mut NoServer).unwrap();
+    let expected: PathBuf = scratch.0.join("0").join("default.lock");
+    assert_eq!(rv.lock_path(), expected.as_path());
+    assert!(Path::new(&expected).is_file());
+    assert_eq!(rv.sock_path(), scratch.0.join("0").join("default.sock"));
+}
