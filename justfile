@@ -101,6 +101,35 @@ tf2-bench:
 tf2-scaling:
     ./docker/tf2/run.sh 'cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
 
+# Memory footprint and computation-per-lookup vs tf2 (docs/benchmarks/tf2.md).
+#
+# Not timing-based, so unlike `tf2-bench` and `tf2-scaling` this does NOT need an
+# idle machine: cachegrind and memcheck simulate, so every number here is exact
+# and reproducible under load. It is slow for the same reason (~50x).
+#
+# Each mode runs in its own process on purpose — building both engines in one
+# would let the first's freed chunks satisfy the second's requests.
+footprint:
+    ./docker/tf2/run.sh 'set -e; cargo build --release -q -p tf_tree_bench --features tf2 --bin footprint; \
+        B=./target/tf2-docker/release/footprint; \
+        echo "=== memory: identical topology + 10 s of history ==="; \
+        $B mem-tf_tree; $B mem-tf2; \
+        echo; echo "=== computation: cachegrind, N=0 baseline subtracted ==="; \
+        for m in lookup-tf_tree lookup-tf_tree-sclerp lookup-tf2; do \
+          for n in 0 100000; do \
+            valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes \
+              --cachegrind-out-file=/dev/null $B $m $n 2>&1 \
+              | grep -E "I refs|D1  misses|LLd misses|Mispredicts" | tr -s " " | sed "s|^|[$m n=$n] |"; \
+          done; \
+        done; \
+        echo; echo "=== allocations: memcheck, N=0 baseline subtracted ==="; \
+        for m in lookup-tf_tree lookup-tf2 push-tf_tree push-tf2; do \
+          for n in 0 10000; do \
+            valgrind --tool=memcheck $B $m $n 2>&1 \
+              | grep "total heap usage" | sed "s|^|[$m n=$n] |"; \
+          done; \
+        done'
+
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
     ./docker/tf2/run.sh

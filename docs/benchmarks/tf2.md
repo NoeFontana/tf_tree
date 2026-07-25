@@ -12,10 +12,11 @@ just tf2-replay         # correctness, real recorded /tf stream
 just tf2-bench          # performance, head-to-head, single-threaded
 just tf2-scaling        # concurrent read scaling, 1/2/4/8 threads
 just tf2-native-control # pure C++ tf2, no Rust and no FFI — the bias control
+just footprint           # memory + instructions per lookup (no idle machine needed)
 ```
 
-All five run in a container (`docker/tf2/`), so no ROS install is needed on the
-host.
+All of them run in a container (`docker/tf2/`), so no ROS install is needed on
+the host.
 
 The bridge all five go through has its own check, `just tf2-check`: fmt, clippy
 and the unit tests of `tf_tree_tf2_sys` and of `tf_tree_bench --features tf2`.
@@ -80,17 +81,29 @@ These are still **not** the [`PHASE1.md`](../PHASE1.md) §11.3 go/no-go gate, wh
 dedicated core-pinned hardware; a shared-tenancy VM with SMT is closer than
 before but is not that.
 
-### Measuring the measurement: three biases found and removed
+### Measuring the measurement: four biases found and removed
 
-Every bias found so far favoured tf_tree. They are listed here, with what each
-cost, because a benchmark whose author only checked in one direction is not
-evidence.
+Three of the four favoured tf_tree; the fourth favoured tf2. They are listed
+here, with what each cost, because a benchmark whose author only checked in one
+direction is not evidence — and checking in both directions is what turned up
+number 4.
 
 | # | Bias | Cost charged to tf2 | Found by |
 |---|---|---|---|
 | 1 | `CString::new` x2 per call in the Rust binding | **63-65 ns (14-18%)** | code review |
 | 2 | `const char*` -> two `std::string` temporaries at the C++ call site | **~17 ns (7%)** | native C++ control |
 | 3 | Residual FFI boundary (cross-TU, no inlining, extra copy) | ~21 ns (8%) | native C++ control |
+| 4 | `setTransform` authority passed as a string *literal* | **~8 ns + 1 malloc/free per publish** | `just footprint` |
+
+Bias 4 was found last and is the only one so far that ran the *other* way — it
+was charged to tf2 and made tf_tree look better. `tf2::BufferCore::setTransform`
+takes `const std::string&`, so a literal constructs a temporary per call, and at
+20 characters `"tf_tree_differential"` is past libstdc++'s 15-byte SSO buffer:
+one heap allocation on every publish. A real broadcaster stores its authority
+once. Fixing it (a `static const std::string`) moved tf2's publish from 123 ns to
+114 ns and **the published push ratio from 14.1x to 12.1x**. It was found only
+because the allocation-count measurement below asked a question timing does not:
+*how many times did each engine call the allocator?*
 
 Bias 2 is the instructive one. The in-tree `shim_overhead` probe reported only
 11 ns and **missed it entirely**, because the probe measured the Rust side while
@@ -153,9 +166,14 @@ tree, two more levels) costs tf_tree 16% and tf2 23%.
 
 | | tf_tree | tf2 | Ratio |
 |---|---|---|---|
-| One sample onto one edge | **8.7 ns** | 123 ns | **14.1x** |
+| One sample onto one edge | **9.4 ns** | 114 ns | **12.1x** |
 
-Both publish paths are allocation-free. tf_tree's `push` takes no strings; the
+tf_tree's publish path is allocation-free; **tf2's is not** — it calls the
+allocator exactly once per stored transform (measured below). The earlier claim
+that both were allocation-free was wrong, and the earlier 14.1x ratio included a
+second allocation that was the shim's fault, not tf2's (bias 4 above).
+
+tf_tree's `push` takes no strings; the
 tf2 row hands the shim the `std::string`s a `FrameName` already owns and assigns
 them into the message, which is what a native C++ publisher does. The earlier
 139 ns figure was measured through a path that built a NUL-terminated copy of
@@ -243,6 +261,101 @@ the physical core count for exactly this reason.
 Two internal cross-checks that the harness measures what it claims: for each
 engine, p50 minus the ~20 ns timer overhead matches the figure implied by its
 independently batch-timed throughput.
+
+## Memory and computation
+
+Reproduce with `just footprint`. Unlike every timing row above, **these numbers
+do not need an idle machine**: `cachegrind` and `memcheck` simulate, so the
+counts are exact and reproducible under load. They are also the only rows here
+that survive a change of CPU.
+
+Each engine is measured in its **own process**. Building both in one would let
+the first engine's freed chunks satisfy the second's requests, making whichever
+ran second look cheaper by an amount nobody can bound.
+
+Memory is `mallinfo2`'s `uordblks + hblkhd`, not RSS. RSS is page-granular and
+includes text and stacks; `mallinfo2` is glibc's own accounting, and since C++
+`operator new` bottoms out in `malloc` it measures the C++ and the Rust engine on
+identical terms. The `hblkhd` term is not optional: tf_tree's arena is a single
+allocation above glibc's 128 KiB mmap threshold, so `uordblks` alone would report
+it as using almost nothing.
+
+### Memory — identical topology, identical 10 s of history (12,600 samples)
+
+| | tf_tree | tf2 |
+|---|---|---|
+| Heap held | 1,388,352 B | 1,421,392 B |
+| Bytes per stored sample | 109.6 | **112.8** |
+| Bytes per *declared slot* | **72.4** | n/a |
+| Allocations to build | **96** | 88,459 |
+| Allocations per published transform | **0** | 1.00 |
+| Allocations per lookup | **0** | **0** |
+
+**tf_tree is not meaningfully smaller — it is within 2.4%.** That is worth
+stating plainly, because the arena design invites the assumption that it would
+win here, and it does not.
+
+The two per-sample figures differ because tf_tree's rings are sized by *declared
+capacity*, not by what is stored: `Capacity::history` rounds each ring up to a
+power of two, so a 1 kHz edge over 10 s asks for 10,000 slots and reserves
+16,384. At 72.4 B/slot (a 64 B cacheline-padded `Iso3` plus an 8 B stamp)
+tf_tree is 1.56x denser than tf2 per unit of capacity, and this fixture's
+rounding hands almost all of that back. Fixed capacity that never reallocates is
+the point of the design; the rounding is what it costs.
+
+**The real difference is on the write path, not the read path.** Both engines
+turn out to be allocation-free per lookup — that is a genuine tf2 result, and the
+naive expectation that a C++ `std::map` engine must be allocating on reads is
+simply wrong when the caller passes prebuilt string handles. But tf2 allocates
+and frees **once per published transform**, forever. A robot publishing ten
+dynamic edges at 1 kHz puts 10,000 malloc/free pairs per second through the
+allocator; tf_tree puts through zero, and its 96 lifetime allocations all happen
+before the first lookup.
+
+That figure was 2.00 before bias 4 was found and fixed — the extra one was the
+shim's, not tf2's. The remaining one is genuine: tf2 stores each transform in a
+per-frame node it must allocate, which is the direct cost of a container that
+grows to fit what it is given rather than reserving a fixed ring.
+
+### Computation — per lookup, three dynamic steps, 100 ms query window
+
+Baseline-subtracted: mode `N=0` performs the full setup and no lookups, so
+subtracting it removes construction, teardown and process start exactly.
+
+| Per lookup | tf_tree `LerpSlerp` | tf_tree `ScLerp` | tf2 |
+|---|---|---|---|
+| Instructions | **2,105** | 2,900 | 4,085 |
+| L1-D misses | **0.002** | 0.002 | **18.5** |
+| LL-D misses | 0.00005 | 0.00005 | 0.0003 |
+| Branch mispredicts | **8.16** | 8.19 | 14.00 |
+| — of which *indirect* | **0.00002** | 0.00002 | **6.00** |
+
+Against tf2 on the comparable policy: **1.94x fewer instructions, ~9,700x fewer
+L1-D misses, and effectively zero indirect branch mispredicts against six.**
+
+The six indirect mispredicts are virtual dispatch — tf2 reaches its per-frame
+caches through `TimeCacheInterface`, and the target is unpredictable because a
+walk visits a different frame each step. tf_tree's compiled `Plan` is a flat
+`[Step; 16]` with no dynamic dispatch anywhere on the path, so the indirect
+predictor is never consulted.
+
+**Two caveats that cut against the headline.** First, LL-D misses are ~0 for
+*both* engines: this fixture's whole working set is 1.4 MB and fits in L3, so
+tf2's 18.5 L1 misses per lookup are being served by L2/L3, not DRAM. On a tree
+large enough to fall out of L3 those become memory accesses and the gap widens —
+but that is a prediction, and it is not measured here. Second, the instruction
+ratio (1.94x) is *smaller* than the measured wall-clock ratio (2.7x), so roughly
+a third of the observed speed advantage is not explained by executing fewer
+instructions. The mispredict and cache columns are the likely remainder, along
+with tf2's per-lookup mutex, but attributing it precisely needs cycle counters
+this host does not permit (`perf_event_paranoid=4`).
+
+One number here is aimed at tf_tree rather than tf2: **8.16 conditional
+mispredicts per lookup** is high for a path this short, and it is the bracket
+search's data-dependent binary search. That is an independent measurement
+arriving at the same target as the interpolation-seeded search proposed in
+[`docs/design/fast-path.md`](../design/fast-path.md) §5, which was argued from
+latency alone.
 
 ## A real difference: maximum chain depth
 

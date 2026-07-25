@@ -69,3 +69,10 @@ required-features = ["tf2"]
 name = "tf2_scaling"
 path = "src/bin/tf2_scaling.rs"
 required-features = ["tf2"]
+
+# Memory footprint and instructions-per-lookup. No `required-features`: the
+# tf_tree-side modes must run on a host without ROS, so the tf2 modes are gated
+# inside the binary instead of excluding the whole target.
+[[bin]]
+name = "footprint"
+path = "src/bin/footprint.rs"

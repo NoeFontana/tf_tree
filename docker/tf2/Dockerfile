@@ -12,11 +12,16 @@ FROM ros:lyrical-ros-base
 # baked into the image and the container runs as an unprivileged host UID.
 ARG RUST_TOOLCHAIN=stable
 
+# `valgrind` is for the instructions-per-lookup comparison (`just footprint`).
+# cachegrind *simulates*, so its instruction counts are exact and reproducible on
+# any host — including one where `perf_event_paranoid` forbids hardware counters,
+# which is the case on the machine this was developed on.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         ca-certificates \
         pkg-config \
+        valgrind \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the toolchain to the workspace's rust-version so a container run and a host

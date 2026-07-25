@@ -104,7 +104,13 @@ int tft2_set_pre(void *h, const void *parent, const void *child,
     t.transform.translation.x = pose[TX];
     t.transform.translation.y = pose[TY];
     t.transform.translation.z = pose[TZ];
-    if (!self->buffer.setTransform(t, "tf_tree_differential", is_static != 0)) {
+    // `setTransform` takes `const std::string&`. Passing a string literal would
+    // construct a temporary on every call, and at 20 characters that is past
+    // libstdc++'s 15-byte SSO buffer — i.e. one heap allocation per publish,
+    // charged to tf2 by a benchmark. A real broadcaster stores its authority
+    // once and passes it by reference; so does this.
+    static const std::string kAuthority = "tf_tree_differential";
+    if (!self->buffer.setTransform(t, kAuthority, is_static != 0)) {
       t_last_error = "tf2 setTransform rejected the transform";
       return 1;
     }
