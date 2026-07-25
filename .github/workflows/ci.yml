@@ -59,10 +59,17 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Every crate except `tf_tree_bench`, whose `tf2` feature reaches the
+      # ROS-only bridge: `--all-features` would enable it, and its build script
+      # needs a ROS 2 install this runner does not have. Nothing is lost —
+      # `tf_tree_bench` is `publish = false` and documents nothing public.
       - name: cargo doc
         env:
           RUSTDOCFLAGS: "-D warnings --cfg docsrs"
-        run: cargo doc --workspace --no-deps --all-features
+        run: |
+          cargo doc --no-deps --all-features \
+            -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
+            -p tf_tree_ipc -p tf_tree_cli
 
   miri:
     name: miri
