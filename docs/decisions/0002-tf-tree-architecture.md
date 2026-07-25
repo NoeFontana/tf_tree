@@ -1,8 +1,16 @@
 # 0002: tf_tree engine architecture and phase roadmap
 
-**Status:** ready
+> ## ⚠️ Superseded — do not cite this document
+>
+> This record has been consolidated into **[`docs/PROJECT.md`](../PROJECT.md)**,
+> which is now the canonical project overview, architecture summary, roadmap, and
+> decision log (D1–D20 live in its §5, extending the D1–D16 recorded here).
+>
+> It is kept unedited as history. New work must cite `docs/PROJECT.md`.
+
+**Status:** superseded by `docs/PROJECT.md`
 **Owner:** @NoeFontana
-**Implementation:** _(none yet — delivered phase by phase; Phase 1 is [`0003`](./0003-phase-1-single-process-core.md))_
+**Implementation:** _(none — delivered phase by phase; Phase 1 is [`docs/PHASE1.md`](../PHASE1.md))_
 
 > **Read this before [`0003-phase-1-single-process-core.md`](./0003-phase-1-single-process-core.md).** This decision
 > establishes *what* we are building and *why*. The Phase 1 decision covers

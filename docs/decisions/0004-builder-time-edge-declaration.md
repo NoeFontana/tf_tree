@@ -1,5 +1,19 @@
 # 0004: Builder-time edge declaration, arena sized from the declared edges
 
+> ## ✅ Still authoritative
+>
+> Unlike [`0002`](./0002-tf-tree-architecture.md) and
+> [`0003`](./0003-phase-1-single-process-core.md), this record was **not**
+> absorbed into the consolidated documents: `docs/PHASE1.md` does not describe
+> builder-time edge declaration. **This document remains authoritative for the
+> builder-time edge declaration API and for arena sizing from the declared
+> edges**, and it overrides the post-build `declare_*` sketch in the superseded
+> `0003`.
+>
+> Read it alongside [`docs/PROJECT.md`](../PROJECT.md) and
+> [`docs/PHASE1.md`](../PHASE1.md). Its references below to "the Phase 1 spec
+> (`0003`)" now mean `docs/PHASE1.md`.
+
 **Status:** ready
 **Owner:** @NoeFontana
 **Implementation:** _(PR linked as work lands — phase1/plan-api)_

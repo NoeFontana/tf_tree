@@ -5,7 +5,7 @@
 //! arena view and by the loom test. Raw access to [`FrameRecord`] bytes lives in
 //! [`crate::arena_view`].
 //!
-//! The publish-then-spin protocol (decision `0003`) exists because Phase 2 has
+//! The publish-then-spin protocol (`docs/PHASE1.md` §5.1) exists because Phase 2 has
 //! two processes interning concurrently: a writer claims a hash slot with a CAS,
 //! writes the record, and only then publishes the id; a concurrent interner of
 //! the same name observes the hash, spins until the id is published, and returns
@@ -45,8 +45,9 @@ pub const ID_FAILED: u32 = u32::MAX;
 /// The 64-bit frame-name hash: the first eight bytes of `blake3(name)`, read as a
 /// little-endian `u64`.
 ///
-/// This is the approved resolution of the `0003` BLAKE3-vs-dependency-budget
-/// conflict: `blake3` is an accepted `no_std` dependency of `tf_tree_core`.
+/// This is the approved resolution of the conflict between `docs/PHASE1.md`
+/// §5.1 (BLAKE3 name hashing) and its §0 dependency budget: `blake3` is an
+/// accepted `no_std` dependency of `tf_tree_core`.
 #[must_use]
 pub fn blake3_64(name: &str) -> u64 {
     let digest = blake3::hash(name.as_bytes());

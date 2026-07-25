@@ -2,7 +2,8 @@
 //! per-edge [`Capacity`]/[`EdgeCfg`] declarations, and the `Display` wrapper
 //! [`Described`].
 //!
-//! Per decision `0004`, the tree's topology is declared on the [`TreeBuilder`]
+//! Per decision `0004` (`docs/decisions/0004-builder-time-edge-declaration.md`,
+//! still authoritative for this API), the tree's topology is declared on the [`TreeBuilder`]
 //! *before* [`TreeBuilder::build`]. `build()` sizes the arena from exactly those
 //! declarations (via `ArenaLayout` / `from_edges` sizing), so the arena reserves
 //! ring slots **only** for dynamic edges, each sized to its own capacity. There

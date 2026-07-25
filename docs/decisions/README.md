@@ -4,6 +4,26 @@ Significant architectural changes start as a decision document in this folder,
 not as a PR. The decision is the artifact; the PR(s) implementing it link back
 here.
 
+## Current state of this folder
+
+**The decision-record process below is retained for future decisions.** What
+changed is where the *existing* architecture and Phase 1 contract live:
+
+| Record | State |
+|---|---|
+| [`0001`](./0001-record-architectural-decisions.md) | Active — the meta-decision that this folder exists. |
+| [`0002`](./0002-tf-tree-architecture.md) | **Superseded.** Consolidated into [`docs/PROJECT.md`](../PROJECT.md) (overview, roadmap, decision log D1–D20 in §5). |
+| [`0003`](./0003-phase-1-single-process-core.md) | **Superseded.** Consolidated into [`docs/PHASE1.md`](../PHASE1.md) (normative Phase 1 spec, §0–§13). |
+| [`0004`](./0004-builder-time-edge-declaration.md) | **Still authoritative** — builder-time edge declaration and arena sizing from the declared edges are not represented in `PHASE1.md`. |
+
+Cite `docs/PROJECT.md` and `docs/PHASE1.md`, never `0002`/`0003`; they are kept
+in place, unedited apart from their banners, as history.
+[`docs/PHASE2.md`](../PHASE2.md) is the Phase 2 spec and its §1 holds the Phase 1
+amendments A1–A8, which are not yet applied.
+
+A new decision is still the right vehicle for anything the phase specs do not
+already answer.
+
 ## Lifecycle
 
 Every decision has one of four statuses on a single document type. There are no

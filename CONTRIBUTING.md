@@ -18,8 +18,16 @@ crates/
 ├── tf_tree_bench/         criterion benches + tf2 differential harness
 └── tf_tree_cli/           binary `tf_tree` (alias `tft`)
 xtask/                     loom / miri / bench-gate runners
-docs/decisions/            architectural decision records (the contract)
+docs/PROJECT.md            overview, roadmap, decision log D1–D20 (§5)
+docs/PHASE1.md             normative Phase 1 spec (the contract for current work)
+docs/PHASE2.md             normative Phase 2 spec; §1 = Phase 1 amendments A1–A8
+docs/decisions/            architectural decision records (process, kept for new decisions)
 ```
+
+`docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that
+order before proposing a change. `docs/PHASE2.md` §1 lists amendments A1–A8 to
+Phase 1 that are agreed but **not yet applied**; check them before altering a
+concurrency protocol so a Phase 1 change does not contradict one.
 
 `tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
 separately publishable and separately testable — keeping the math crate free of
@@ -48,8 +56,12 @@ just bench            # benchmark suite + go/no-go gate
 
 ## Workflow for significant changes
 
-Anything that touches the public API, crate boundaries, build system, or release
-process starts as a **decision document** in `docs/decisions/`:
+Work already scoped by `docs/PHASE1.md` (or, later, `docs/PHASE2.md`) is
+implemented directly against that spec — cite the section number in the PR.
+
+Anything *not* covered there that touches the public API, crate boundaries, build
+system, or release process starts as a **decision document** in
+`docs/decisions/`. The process below is retained for exactly those cases:
 
 1. Copy [`docs/decisions/template.md`](./docs/decisions/template.md) to
    `docs/decisions/NNNN-kebab-case-title.md` (next sequential number).
@@ -75,8 +87,9 @@ decision document — just open a PR.
       builds docs with `-D warnings`).
 - [ ] Every `unsafe` block has a `// SAFETY:` comment; `unsafe` stays within its
       budgeted crates/modules.
-- [ ] If the change is architectural, the linked decision is `ready` or
-      `implemented`.
+- [ ] If the change is architectural, it cites the `docs/PHASE1.md` /
+      `docs/PHASE2.md` section it implements, or a linked decision that is
+      `ready` or `implemented`.
 
 ## License
 

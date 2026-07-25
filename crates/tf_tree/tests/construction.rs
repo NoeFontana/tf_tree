@@ -1,4 +1,6 @@
-//! Construction tests for decision `0004`: the arena is sized from exactly the
+//! Construction tests for decision `0004`
+//! (`docs/decisions/0004-builder-time-edge-declaration.md`, still authoritative
+//! for the builder-time edge declaration API): the arena is sized from exactly the
 //! declared edges, per-edge capacities are honored (including one far larger than
 //! its siblings), edges of different capacities each sample their own ring (which
 //! guards the cumulative `stamp_off`/`pose_off` math), and `Capacity::history`

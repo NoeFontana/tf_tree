@@ -1,5 +1,5 @@
 //! Public-surface lookup tests: compile direction, static folding, and the
-//! decision-`0003` lookup proptests (#4, #5, #10, #11, #12).
+//! `docs/PHASE1.md` §10.1 lookup proptests (#4, #5, #10, #11, #12).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

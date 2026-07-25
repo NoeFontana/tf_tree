@@ -7,7 +7,8 @@
 //! shared-memory design (Phase 1) backed by a heap allocation — every layout
 //! decision exists so Phase 2's `MappedArena` is a one-line swap.
 //!
-//! This PR implements decision `0003` steps 4 and 5: the concurrency core —
+//! This PR implements steps 4 and 5 of `docs/PHASE1.md`'s implementation order
+//! (see its appendix): the concurrency core —
 //! frame interning ([`frame`]), topology ([`topology`]), edge records and the
 //! claim table ([`edge`]), the seqlock sample buffer ([`buffer`]), and bracket
 //! search ([`sample`]). Plan compilation, `Guard`, `at`/`at_many`, `TreeBuilder`

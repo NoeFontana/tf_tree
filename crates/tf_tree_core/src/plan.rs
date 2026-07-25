@@ -5,7 +5,7 @@
 //! generation it was compiled against. Evaluating it many times against a
 //! [`Guard`] separates the (rare) topology walk from the (hot) temporal sampling
 //! — the single largest structural win over tf2's per-lookup topology walk
-//! (decision `0003` / D3).
+//! (`docs/PHASE1.md` §7; `docs/PROJECT.md` §5 D3).
 //!
 //! `unsafe`-free: it drives the arena through the safe [`crate::arena_view`] and
 //! [`crate::sample`] surfaces. This module is `#[cfg(not(loom))]` because [`Guard`]
@@ -51,7 +51,8 @@ pub const MAX_ADAPTIVE_DEPTH: u32 = 16;
 /// by its domain, so a cross-domain lookup is a type error at best and a
 /// [`LookupError::TimeDomainMismatch`] at worst — never a silent misread. The
 /// alignment machinery that *relates* domains is Phase 6; the separation must
-/// exist now so adding it is not a breaking change (decision `0003` / D9).
+/// exist now so adding it is not a breaking change (`docs/PROJECT.md` §5 D9;
+/// `docs/PHASE1.md` §8 *Time*).
 pub trait Domain: Copy {
     /// The runtime tag stored on an edge's `domain` field and compared against a
     /// query's domain. Must be unique per domain.
@@ -732,7 +733,7 @@ pub fn compile(
     }
 
     // Retry the whole walk if a topology mutation lands between reads, so every
-    // read is from one consistent generation (decision `0003` reader protocol).
+    // read is from one consistent generation (`docs/PHASE1.md` §5.2 reader protocol).
     'walk: loop {
         let start_gen = topo.generation();
         if start_gen & 1 != 0 {

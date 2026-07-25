@@ -1,4 +1,5 @@
-//! `tf_tree doctor` — the seven Phase 1 health checks (decision `0003`, *CLI*).
+//! `tf_tree doctor` — the seven Phase 1 health checks (`docs/PHASE1.md` §12
+//! *CLI*).
 //!
 //! Each check is a pure function over a captured [`Snapshot`] of the tree plus,
 //! where the condition is only visible in history, the [`Observations`] stream of
@@ -8,7 +9,7 @@
 //! second writer is rejected by the claim table), which the tests exercise by
 //! constructing the offending snapshot directly.
 //!
-//! The seven checks (decision `0003`):
+//! The seven checks (`docs/PHASE1.md` §12):
 //!
 //! 1. [`check_cycles`] — a parent chain that never reaches a root.
 //! 2. [`check_unclaimed_dynamic`] — a dynamic edge with no live writer.

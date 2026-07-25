@@ -10,10 +10,11 @@ sensor edges, many concurrent readers in one process, multiple processes on one
 host (zero-copy shared memory), and multiple hosts on one robot.
 
 > **Status: Phase 1 (single-process core), under construction.** The
-> architecture and the full Phase 1 specification live in
-> [`docs/decisions/`](./docs/decisions/) — read
-> [`0002`](./docs/decisions/0002-tf-tree-architecture.md) then
-> [`0003`](./docs/decisions/0003-phase-1-single-process-core.md).
+> architecture and the full Phase 1 specification live in [`docs/`](./docs/) —
+> read [`PROJECT.md`](./docs/PROJECT.md) (overview, roadmap, decision log D1–D20)
+> then [`PHASE1.md`](./docs/PHASE1.md) (the normative Phase 1 spec).
+> [`PHASE2.md`](./docs/PHASE2.md) specifies the shared-memory phase and, in its
+> §1, the Phase 1 amendments A1–A8 that are not yet applied.
 
 ## Workspace
 
@@ -26,6 +27,7 @@ crates/
 ├── tf_tree_bench/   criterion benches + tf2 differential harness
 └── tf_tree_cli/     binary `tf_tree` (alias `tft`): tree / echo / doctor / bench
 xtask/               loom, miri, and bench-gate runners
+docs/                PROJECT.md, PHASE1.md, PHASE2.md, benchmarks/, decisions/
 ```
 
 ## Commands

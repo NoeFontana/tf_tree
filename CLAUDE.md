@@ -6,13 +6,26 @@ This file is for AI coding agents working in this repository. Humans, see
 ## What this is
 
 `tf_tree` is a transform tree engine (a faster, more scalable alternative to ROS
-`tf2`). It is being built along a fixed six-phase roadmap. **The decisions in
-[`docs/decisions/`](./docs/decisions/) are the contract** — read
-[`0002`](./docs/decisions/0002-tf-tree-architecture.md) (architecture + decision
-log D1–D16) and [`0003`](./docs/decisions/0003-phase-1-single-process-core.md)
-(the full Phase 1 spec) before touching code. When a `ready` decision does not
-answer a question, **stop and ask** — do not invent an answer, especially in the
-concurrency or arena-layout sections.
+`tf2`). It is being built along a fixed six-phase roadmap. **The canonical
+documents in [`docs/`](./docs/) are the contract** — read
+[`docs/PROJECT.md`](./docs/PROJECT.md) (project overview, architecture, roadmap,
+and the decision log D1–D20 in its §5) **then**
+[`docs/PHASE1.md`](./docs/PHASE1.md) (the full, normative Phase 1 spec) before
+touching code. When these documents do not answer a question, **stop and ask** —
+do not invent an answer, especially in the concurrency or arena-layout sections.
+
+[`docs/PHASE2.md`](./docs/PHASE2.md) is the Phase 2 spec (shared memory). Its §1
+holds **Phase 1 amendments A1–A8**, which are **NOT yet applied** to this
+codebase. Do not implement them as part of Phase 1 work unless explicitly asked;
+do read them before changing a concurrency protocol, so a Phase 1 change does not
+contradict an amendment already agreed for Phase 2.
+
+| Document | Role |
+| --- | --- |
+| [`docs/PROJECT.md`](./docs/PROJECT.md) | Overview, architecture, roadmap, decision log D1–D20 (§5). Supersedes `docs/decisions/0002`. |
+| [`docs/PHASE1.md`](./docs/PHASE1.md) | Normative Phase 1 spec: layouts, atomic orderings, test plan (§10), benchmark gate (§11). Supersedes `docs/decisions/0003`. |
+| [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 contains the unapplied Phase 1 amendments A1–A8. |
+| [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md) is still authoritative for the builder-time edge declaration API. |
 
 ## Project shape (Phase 1 — pure Rust)
 
@@ -28,7 +41,7 @@ xtask/                  loom / miri / bench-gate runners
 
 Python bindings are **Phase 3**, not now. Phase 1 is pure Rust.
 
-## Hard rules (from the decisions — do not relitigate)
+## Hard rules (from `docs/PROJECT.md` and `docs/PHASE1.md` — do not relitigate)
 
 - **Dependency budget:** `tf_tree_core` = `libm` + `bytemuck` + `blake3` (no_std)
   and nothing else. `tf_tree_math` = `libm` + `bytemuck`. blake3 is the one
@@ -39,12 +52,14 @@ Python bindings are **Phase 3**, not now. Phase 1 is pure Rust.
   a per-block `// SAFETY:` comment naming the invariant relied on.
 - **No pointers in the arena; fixed capacity; no growth/realloc; `#[repr(C)]`
   everywhere; append-only `FrameId`/`EdgeId` (tombstone, never recycle).**
-- **`ArcSwap`/`Arc`/`Box`/`Vec` inside an arena structure is forbidden** (D4).
+- **`ArcSwap`/`Arc`/`Box`/`Vec` inside an arena structure is forbidden**
+  (`docs/PROJECT.md` §5 D4).
 - **Do not weaken an atomic ordering** because a test passes on x86-64 — the loom
   tests and the aarch64 CI target exist for exactly that.
 - No `String` in any error type or hot path; errors are `Copy` and name the
   offending edge. No `async`/runtime. No GPU/point-cloud/`deskew`. `f64` only.
-- `LerpSlerp`'s right-invariance test is **supposed to fail** — do not "fix" it.
+- `LerpSlerp`'s right-invariance test is **supposed to fail** — do not "fix" it
+  (`docs/PROJECT.md` §5 D5; `docs/PHASE1.md` §3.4).
 
 ## Commands
 
@@ -64,8 +79,14 @@ Single test — Rust: `cargo nextest run -p tf_tree_math -- exp_log_roundtrip`.
 
 ## Decision-document workflow
 
-Architectural changes start as a `draft` decision in
-[`docs/decisions/`](./docs/decisions/), not as a PR. Read
-[`docs/decisions/README.md`](./docs/decisions/README.md) for the lifecycle. When
-a decision is `ready`, implement it as stated; its *Implementation plan* is the
-per-PR work breakdown.
+The phase specs (`docs/PROJECT.md`, `docs/PHASE1.md`, `docs/PHASE2.md`) are the
+contract for work already scoped. A change that those documents do not cover —
+new public API, new crate boundary, a different concurrency protocol — still
+starts as a `draft` decision record in [`docs/decisions/`](./docs/decisions/),
+not as a PR. Read [`docs/decisions/README.md`](./docs/decisions/README.md) for
+the lifecycle. When a decision is `ready`, implement it as stated; its
+*Implementation plan* is the per-PR work breakdown.
+
+Records `0002` and `0003` are **superseded** by `docs/PROJECT.md` and
+`docs/PHASE1.md` and are kept only as history — cite the new documents, never
+them. `0004` is still authoritative for the builder-time edge declaration API.

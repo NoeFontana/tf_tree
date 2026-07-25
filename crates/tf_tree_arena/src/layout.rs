@@ -101,8 +101,9 @@ fn compute(max_frames: u32, max_edges: u32, edge_capacities: &[u32]) -> Computed
     // 10 B / frame: parent u32 + depth u16 + edge_of_child u32. edge_of_child
     // lives in the block (not a separate region) so plan compilation is an O(1)
     // array walk and the (parent, depth, edge_of_child) triple is double-buffered
-    // together under the topology seqlock. (Resolves the 0003 6-vs-edge_of_child
-    // inconsistency.)
+    // together under the topology seqlock. (Resolves the inconsistency between
+    // the 6-byte stride in `docs/PHASE1.md` §4.3 and edge_of_child living in the
+    // topology block per §5.2.)
     let topo_stride = align64(mf * 10);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
