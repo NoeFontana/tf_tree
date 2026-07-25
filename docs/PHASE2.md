@@ -16,13 +16,13 @@ Sections marked **NORMATIVE** are requirements. Where a syscall behaviour is ass
 
 | Area | Status |
 |---|---|
-| Amendments A1, A3–A7 (§1) | **Applied** — `FORMAT_VERSION` 2 |
+| Amendments A1–A7 (§1) | **Applied** — `FORMAT_VERSION` 2 |
 | `MappedArena` — `memfd`, sealed, `MAP_SHARED`, `MADV_DONTFORK`/`HUGEPAGE` (§4) | **Done** (`tf_tree_arena::mapped`, behind `--features shm`) |
 | `TreeBuilder::build_shared` / `Tree::attach_shared`, read-only mode (§8) | **Done** |
 | Zero-diff read path, proven by the relocation gate (§4) | **Done, and tested** (`just shm-test`) |
 | Multi-process read scaling (part of §12.2) | **Done** (`just shm-scaling`; results in `docs/benchmarks/tf2.md`) |
-| Amendment A2 — in-arena topology lock | `TopoLock` defined and carried in the header; **not wired into `set_parent`** |
-| Amendment A8 — bounded intern spin | **Applied** in `tf_tree_arena`/`tf_tree_core` (`claiming` array, `layout_hash` 0x9075_90F5). Takeover is **dormant** until two things land: `Tree::view` must call `ArenaView::as_participant`, and `ArenaView::with_liveness` needs the §5.1/§6.2 predicate — without it a crashed claimant still reads `LIVE` and is presumed alive |
+| Amendment A2 — in-arena topology lock | **Applied** — `Tree::reparent` holds it; bounded spin, liveness-gated steal, loom- and multi-process-tested |
+| Amendment A8 — bounded intern spin | **Applied** — `claiming` array, bounded spin, takeover of a dead claimant (`layout_hash` 0x9075_90F5) |
 | Discovery, rendezvous, `open()`, ownership migration (§3) | Not implemented — fd inheritance stands in |
 | Attach protocol — `SOCK_SEQPACKET` + `SCM_RIGHTS` (§3.7) | Not implemented |
 | Claims as OFD locks (§6.1); reaping (§6.3) | Not implemented — `ClaimRecord` CAS only |
@@ -36,7 +36,8 @@ Sections marked **NORMATIVE** are requirements. Where a syscall behaviour is ass
 results, and see each other's writes, at no per-lookup cost over the
 single-process path. The amendments close the crash-consistency holes that made
 that unsafe: a killed writer no longer leaks an edge (A3), inverts a slot's
-parity (A5), or wedges every reader with a permanently odd generation (A1).
+parity (A5), wedges every reader with a permanently odd generation (A1), or
+wedges every other mutator by dying mid-topology-mutation (A2).
 
 What is missing is the **rendezvous and lifecycle** half — how processes find
 each other without configuration, and who cleans up after a death. Three
@@ -47,9 +48,17 @@ consequences are live today:
 * Nothing reaps. A participant that dies holding a claim leaves it held until the
   arena is destroyed, because §6.1's kernel lock — the thing that would make the
   death observable — is not there yet.
-* `Tree::reparent` refuses on a shared arena. A1 removed the wedge a *crashed*
-  mutator caused, but two *concurrent* mutators would still race the block copy
-  until A2's lock is wired up.
+* **Liveness is a `/proc` heuristic, not a kernel fact.** A2's lock steals from a
+  dead holder, and it asks *something* whether the holder is dead. §5.1 says the
+  answer must come from the participant's OFD lock byte; that file does not exist
+  yet, so the `tf_tree` facade supplies §6.2's `(pid, start_time, boot_id)` check
+  instead. The lock itself takes the answer as an **injected predicate**
+  (`TopoLockView::acquire`'s `is_alive`) and `tf_tree_core` never learns how it is
+  reached — §2 forbids it the dependency — so replacing the heuristic with
+  `F_OFD_GETLK` is a change to one function in `tf_tree::tree` and to nothing
+  else. Until then the predicate fails **safe** in every branch: an unreadable
+  `/proc` reports "alive", so the worst case is a caller that retries, never a
+  live mutator that is stolen from.
 
 **§7.1 and the code disagree, deliberately and temporarily.** `MappedArena` maps
 `MAP_POPULATE`, which was correct against the previous draft and is forbidden by
