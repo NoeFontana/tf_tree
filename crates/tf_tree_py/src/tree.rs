@@ -344,8 +344,24 @@ impl PyPlan {
         // The 177 ns is NumPy building the array *object*, not zeroing it —
         // replacing `zeros` with an uninitialized `new` was measured at no
         // change and reverted. The only way past it is not to allocate.
-        if let Ok(arr) = out.cast::<PyArray2<f64>>() {
+        // **Dispatch on `stamps`, then validate `out` against it.** Probing
+        // `out` first blamed the wrong argument: a scalar stamp with an
+        // `(1, 4, 4)` buffer reported "stamps must be an (N,) int64 array", and
+        // an `(N,)` stamps array with a `(4, 4)` buffer escaped as numpy's own
+        // `TypeError: only integer scalar arrays can be converted to a scalar
+        // index` from `stamp_from_any`. Both named the argument the caller had
+        // got right.
+        //
+        // `is_instance_of::<PyInt>` is a pointer comparison against the type
+        // object, so the scalar path still leads.
+        if stamps.is_instance_of::<pyo3::types::PyInt>() {
             let stamp = stamp_from_any(stamps)?;
+            let arr = out.cast::<PyArray2<f64>>().map_err(|_| {
+                BufferError::new_err(
+                    "a scalar stamp needs out to be a writable, C-contiguous (4, 4) \
+                     float64 numpy array",
+                )
+            })?;
             if !arr.is_c_contiguous() {
                 return Err(BufferError::new_err(
                     "out must be C-contiguous; pass np.ascontiguousarray(...) \
@@ -397,6 +413,9 @@ impl PyPlan {
             return Ok(());
         }
 
+        let stamps = stamps
+            .cast::<PyArray1<i64>>()
+            .map_err(|_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?;
         let arr = match out.cast::<PyArray3<f64>>() {
             Ok(a) => a,
             Err(_) => {
@@ -404,16 +423,21 @@ impl PyPlan {
                 // than fault (§5.5): a CPU store to a `cudaMalloc` pointer is
                 // undefined, not slow.
                 reject_device_memory(out)?;
+                // **Only `numpy.ndarray` is accepted, subclasses included.** The
+                // message used to offer "an object exposing the buffer
+                // protocol", and `PHASE3.md` §5.5 still describes pinned torch
+                // and CuPy allocations as qualifying — but `cast` matches the
+                // numpy type, so a `memoryview` or a pinned torch tensor is
+                // refused here whatever its layout. Advertising a path that does
+                // not exist sends people to debug their buffer instead of their
+                // expectations.
                 return Err(BufferError::new_err(
-                    "out must be a writable, C-contiguous (N, 4, 4) float64 array — or \
-                     (4, 4) for a scalar stamp — or an object exposing the buffer \
-                     protocol with that layout",
+                    "out must be a writable, C-contiguous (N, 4, 4) float64 numpy array \
+                     — or (4, 4) for a scalar stamp. Other buffer-protocol objects are \
+                     not accepted yet; np.asarray(...) it first",
                 ));
             }
         };
-        let stamps = stamps
-            .cast::<PyArray1<i64>>()
-            .map_err(|_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?;
         let n = stamps.len();
         self.fill(py, stamps, arr, n)
     }

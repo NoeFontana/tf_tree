@@ -328,12 +328,6 @@ py-lint:
 py-wheel:
     VIRTUAL_ENV=.venv .venv/bin/maturin build --release
 
-# tf_tree's Python API against tf2_ros's, in the ROS container (PHASE3 §12.1).
-#
-# The wheel is built on the host and installed in the container: both are
-# CPython 3.14, so the cp314 ABI matches. tf2 is fed its BufferCore directly —
-# no DDS, no TransformListener — which is the most generous in-process
-# comparison available, not the least.
 # N Python consumer nodes on one shared arena, against N private `tf2_ros`
 # buffers (PHASE2 §12.4, PHASE3 §12.1).
 #
@@ -350,6 +344,12 @@ py-mp-bench:
         python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/mp_compare.py'
 
+# tf_tree's Python API against tf2_ros's, in the ROS container (PHASE3 §12.1).
+#
+# The wheel is built on the host and installed in the container: both are
+# CPython 3.14, so the cp314 ABI matches. tf2 is fed its BufferCore directly —
+# no DDS, no TransformListener — which is the most generous in-process
+# comparison available, not the least.
 py-vs-tf2:
     just py-wheel
     # The container has no pip, and does not need one: a wheel is a zip, and

@@ -64,10 +64,15 @@ class Plan:
         input is refused rather than silently copied — a silent copy would
         defeat the point of this method while appearing to work.
 
-        `out` is typed `object` rather than `NDArray` because any *host* buffer
-        is accepted — pinned allocations from torch, CuPy and Numba all
-        qualify. **Device memory is refused**, with a message naming the fix: a
-        CPU store to a `cudaMalloc` pointer is undefined, not slow.
+        `out` is typed `object` rather than `NDArray` because the device check
+        below accepts anything and then refuses it by message. **Only
+        `numpy.ndarray` is written to** (subclasses included); a `memoryview`,
+        or a pinned torch or CuPy allocation, is refused whatever its layout.
+        `PHASE3.md` §5.5 describes those as qualifying and that is **not
+        implemented** — `np.asarray(...)` first.
+
+        **Device memory is refused** with a message naming the fix: a CPU store
+        to a `cudaMalloc` pointer is undefined, not slow.
 
         A genuine `numpy.ndarray` skips the device check, because its data
         pointer is host memory by construction; CuPy and torch arrays are not

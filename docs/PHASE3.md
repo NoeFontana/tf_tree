@@ -307,6 +307,28 @@ In practice almost every host-accessible buffer reports `kDLCPU` — PyTorch tre
 3. Only if the object has no buffer protocol support but does offer a versioned DLPack capsule, fall back to `np.from_dlpack()` and take the pointer from the resulting array — **never hand-parse the capsule.**
 4. Otherwise raise, naming both protocols.
 
+> **Implementation status: steps 2–4 are NOT implemented, deliberately and
+> recorded here rather than silently.** `at_into` acquires its pointer by
+> casting to `numpy.ndarray` (subclasses included), not through the buffer
+> protocol. So a `memoryview`, or a pinned `torch`/`cupyx` allocation that is
+> not a NumPy array, is **refused whatever its layout** — the error says so and
+> suggests `np.asarray(...)`. Step 1 is implemented and does its stated job.
+>
+> This deviation had a cost worth naming. Step 2's "validates writability,
+> contiguity, and itemsize in one call" was the *only* place writability was
+> ever going to be checked, so acquiring by cast instead left it unchecked: a
+> `flags.writeable = False` array was silently overwritten and a read-only
+> `np.memmap` — a `PROT_READ` page — took `SIGSEGV` inside an ordinary lookup.
+> That is fixed by an explicit `NPY_ARRAY_WRITEABLE` test, which is one field
+> read where `PyObject_GetBuffer` is a protocol call; but the general lesson is
+> that dropping a step of a NORMATIVE sequence drops whatever else that step
+> was carrying.
+>
+> Implementing steps 2–4 is a real feature, not a cleanup, and it is not owed to
+> any measured use: §5.4 already notes that pinned torch tensors and
+> `cupyx.empty_pinned` report `kDLCPU`, and the latter *is* a NumPy array. Until
+> somebody has a buffer this refuses, the honest position is that it is refused.
+
 **Drop `__cuda_array_interface__` entirely.** An earlier draft listed it. Since device memory is rejected anyway, its only remaining role would be pinned buffers that expose CAI but not DLPack — a set that is empty in practice. It is CUDA-only, gives strictly less information than DLPack, and would be dead code.
 
 **Stream synchronization is the caller's responsibility.** We accept only host-accessible memory and we have no CUDA runtime to synchronize against. Pass `stream=None`; document that a caller handing us a buffer a GPU kernel recently touched must synchronize first.
