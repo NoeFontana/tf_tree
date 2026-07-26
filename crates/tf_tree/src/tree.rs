@@ -1065,7 +1065,7 @@ impl Tree {
         // this method can stay infallible for the several dozen call sites that
         // will never fork.
         if self.detached() {
-            return Guard::poisoned(self.view(), LookupError::ChildDetached);
+            return Guard::detached(self.view());
         }
         Guard::new(self.view())
     }
