@@ -98,21 +98,25 @@ impl PyTree {
 
         // SAFETY: the only `unsafe` in this binding that is not a numpy slice.
         //
-        // `Publisher<'a>` borrows the `Tree`, and a `#[pyclass]` cannot carry a
+        // `EdgeWriter<'a>` borrows the `Tree`, and a `#[pyclass]` cannot carry a
         // lifetime, so the borrow is extended to `'static` and its validity
         // moved to a runtime guarantee: the `Py<PyTree>` stored alongside is a
         // strong reference, so the `Tree` — and the arena the claim points into
-        // — outlives this `Publisher` for certain.
+        // — outlives this writer for certain.
         //
         // That is the same guarantee `Plan` relies on, and it is spelled with a
         // refcount rather than a comment *because* the comment version was a
-        // use-after-free (see `PyPlan::tree`). The `Publisher` is never handed
-        // out, only borrowed under the mutex, so no caller can outlive it
-        // either.
-        let publisher: tf_tree::Publisher<'static> = unsafe { core::mem::transmute(publisher) };
+        // use-after-free (see `PyPlan::tree`). The writer is never handed out,
+        // only borrowed under the mutex, so no caller can outlive it either.
+        //
+        // The transmute is behind `extend_to_static`, whose signature pins both
+        // types so only the lifetime can differ. Inline, it read
+        // `transmute::<EdgeWriter, Publisher>` and compiled for as long as the
+        // two happened to be the same size — see `PyPublisher::inner`.
+        let writer = unsafe { extend_to_static(publisher) };
 
         Ok(PyPublisher {
-            inner: Mutex::new(Some(publisher)),
+            inner: Mutex::new(Some(writer)),
             _tree: slf.clone().unbind(),
         })
     }
@@ -470,7 +474,30 @@ impl PyPlan {
 pub struct PyPublisher {
     /// `None` after `__exit__` or `release()`, so a use-after-release is a
     /// clear Python error rather than a claim held past its scope.
-    inner: Mutex<Option<tf_tree::Publisher<'static>>>,
+    ///
+    /// # This is an `EdgeWriter`, not a `Publisher`, and the difference is two
+    /// silent bugs
+    ///
+    /// It held a `Publisher` until a `transmute::<EdgeWriter, Publisher>`
+    /// stopped compiling on a size change. That transmute was not a lifetime
+    /// extension — it reinterpreted one type as another, and since `publisher`
+    /// is `EdgeWriter`'s first field the bytes lined up and the rest were
+    /// dropped on the floor:
+    ///
+    /// * the **claim lease** was never released. `ClaimLease`'s `Drop` is what
+    ///   unlocks the edge's OFD byte, so every Python publisher leaked one for
+    ///   the life of the process — and a leaked lease is indistinguishable from
+    ///   a live writer, so no reaper would ever collect the edge either.
+    /// * the **fork guard** was bypassed. `EdgeWriter::push` checks the fork
+    ///   generation and `Publisher::push` does not, so a `push` from a
+    ///   `multiprocessing` child would have written through a dangling pointer
+    ///   into an unmapped page instead of returning `ChildDetached` — and
+    ///   `multiprocessing` defaults to `fork` on Linux.
+    ///
+    /// Neither had a test, because nothing built this crate: it is excluded
+    /// from the workspace, so `just test` and `just lint` never saw it. That is
+    /// fixed in the `justfile` alongside this.
+    inner: Mutex<Option<tf_tree::EdgeWriter<'static>>>,
     /// Keeps the arena alive for at least as long as the claim points into it.
     _tree: Py<PyTree>,
 }
@@ -561,7 +588,7 @@ impl PyPublisher {
 }
 
 impl PyPublisher {
-    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Option<tf_tree::Publisher<'static>>>> {
+    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Option<tf_tree::EdgeWriter<'static>>>> {
         self.inner
             .lock()
             .map_err(|_| TfTreeError::new_err("publisher mutex was poisoned by a panic"))
@@ -649,6 +676,27 @@ fn iso_from_quat7(q: &[f64]) -> PyResult<tf_tree::Iso3> {
     ))
 }
 
+/// Extend an [`tf_tree::EdgeWriter`]'s borrow to `'static`.
+///
+/// # Safety
+///
+/// The caller must keep the `Tree` the writer borrows alive for at least as
+/// long as the returned value. [`PyTree::publisher`] does that with a
+/// `Py<PyTree>` — a refcount, not a promise.
+///
+/// # Why a function and not an inline `transmute`
+///
+/// **The signature is the point.** `transmute` will happily convert between two
+/// *different* types whose sizes agree, and that is what this replaced: a
+/// `transmute::<EdgeWriter, Publisher>` that compiled until a field was added,
+/// and until then discarded the claim lease and the fork guard. Here the input
+/// and output types are written out and only the lifetime is free, so the same
+/// mistake does not compile.
+unsafe fn extend_to_static(w: tf_tree::EdgeWriter<'_>) -> tf_tree::EdgeWriter<'static> {
+    // SAFETY: same type, and a lifetime the caller has undertaken to honour.
+    unsafe { core::mem::transmute(w) }
+}
+
 /// Build an in-process tree from a simple edge list.
 ///
 /// Topology is builder-time (decision `0004`), so there is no `declare_*` on a
@@ -715,15 +763,34 @@ pub fn push(
 
 /// Attach to a running arena (`docs/PHASE3.md` §4.1).
 ///
-/// **`mode="ro"`, and creation is refused outright** — both differ from the
-/// Rust in-process defaults on purpose (D18). Most Python consumers are notebooks,
-/// analysis scripts and visualisers; they must be *incapable* of corrupting a
-/// robot's transform tree, which a `PROT_READ` mapping enforces with the MMU.
-/// And a notebook started before the robot must fail loudly rather than create
-/// an empty arena the real publisher then refuses to join.
+/// **`mode="ro"`, and creation off** — both differ from the Rust in-process
+/// defaults on purpose (D18). Most Python consumers are notebooks, analysis
+/// scripts and visualisers; they must be *incapable* of corrupting a robot's
+/// transform tree, which a `PROT_READ` mapping enforces with the MMU. And a
+/// notebook started before the robot must fail loudly rather than create an
+/// empty arena the real publisher then refuses to join.
+///
+/// # Creating
+///
+/// Pass `create=[(parent, child), ...]` — the same edge list [`build`] takes —
+/// to create the arena when it is absent. Decision `0004` sizes an arena from
+/// its declared edges, so there is no way to create one without saying what is
+/// in it; that is why this is an edge list and not a boolean.
+///
+/// **Creating requires `mode="rw"`**, and is refused otherwise rather than
+/// quietly ignored. Both of §4.1's reasons for the read-only default survive
+/// that: a `ro` consumer still cannot bring an arena into existence, and an
+/// `rw` publisher — which has already opted into being able to corrupt the tree
+/// — still has to ask.
 #[pyfunction]
-#[pyo3(signature = (*, name = None, domain = None, mode = "ro"))]
-pub fn open_arena(name: Option<&str>, domain: Option<u32>, mode: &str) -> PyResult<PyTree> {
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024))]
+pub fn open_arena(
+    name: Option<&str>,
+    domain: Option<u32>,
+    mode: &str,
+    create: Option<Vec<(String, String)>>,
+    capacity: u32,
+) -> PyResult<PyTree> {
     let attach = match mode {
         "ro" => AttachMode::ReadOnly,
         "rw" => AttachMode::ReadWrite,
@@ -733,13 +800,23 @@ pub fn open_arena(name: Option<&str>, domain: Option<u32>, mode: &str) -> PyResu
             )))
         }
     };
-    // `create` is deliberately not a parameter yet: creating an arena needs a
-    // layout (decision `0004` sizes it from the declared edges), and that is
-    // not wired through from Python. A consumer-only default is also what §4.1
-    // asks for — a notebook started before the robot must fail loudly.
-    let mut o = tf_tree::Open::new()
-        .mode(attach)
-        .create(tf_tree::CreatePolicy::Never);
+    if create.is_some() && attach == AttachMode::ReadOnly {
+        return Err(PyValueError::new_err(
+            "create= requires mode='rw': a read-only participant cannot write \
+             the arena it would have created",
+        ));
+    }
+    let mut o = tf_tree::Open::new().mode(attach).create(match &create {
+        None => tf_tree::CreatePolicy::Never,
+        Some(_) => tf_tree::CreatePolicy::IfAbsent,
+    });
+    if let Some(edges) = &create {
+        let mut b = tf_tree::TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
+        for (parent, child) in edges {
+            b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
+        }
+        o = o.layout_if_creating(b);
+    }
     if let Some(d) = domain {
         o = o.domain(d);
     }

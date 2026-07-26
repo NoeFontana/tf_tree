@@ -146,19 +146,30 @@ Passing a `float` raises `TypeError` naming `from_sec` and stating the ULP at th
 ```python
 import tf_tree
 
-tree = tf_tree.open()                                 # join or create, zero config
-tree = tf_tree.open(name="robot", domain=7,
-                    mode="ro", create="never")        # explicit
+tree = tf_tree.open()                                 # join, zero config
+tree = tf_tree.open(name="robot", domain=7, mode="ro")   # explicit
 with tf_tree.open() as tree: ...                      # context manager, explicit detach
 ```
 
-**NORMATIVE defaults:** `mode="ro"` and `create="never"`.
+**NORMATIVE defaults:** `mode="ro"` and no creation.
 
 Both differ from the Rust defaults, deliberately. Most Python consumers are notebooks, analysis scripts, and visualization tools; they must be incapable of corrupting a robot's transform tree (Phase 2 §8), and a notebook started before the robot must fail loudly rather than create an empty arena that the real publisher then refuses to join. A Python process that wants to publish says so:
 
 ```python
-tree = tf_tree.open(mode="rw", create="if_absent")
+tree = tf_tree.open(mode="rw", create=[("map", "base"), ("base", "cam")])
 ```
+
+**`create` is an edge list, not `"if_absent"`.** This draft assumed a string
+policy, which is not implementable: decision `0004` sizes an arena from its
+declared edges, so there is no way to *create* one without saying what is in it,
+and `Open::layout_if_creating` takes a `TreeBuilder` for exactly that reason. An
+edge list is the same thing `tf_tree.build()` already takes, so the two creation
+paths read alike.
+
+Creating **requires `mode="rw"`** and is refused otherwise rather than silently
+ignored. Both reasons for the read-only default survive: a `ro` consumer still
+cannot bring an arena into existence, and an `rw` publisher — which has already
+opted into being able to corrupt the tree — still has to ask.
 
 `tf_tree.has_shared_memory()` reports whether the platform build includes the IPC layer (§10).
 

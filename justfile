@@ -30,9 +30,31 @@ miri:
         --features tf_tree_core/miri-soft-float
 
 # Lint everything. Pure checks; does not mutate files.
-lint:
+lint: py-compile
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
+
+# **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
+#
+# That gap shipped a real bug: `PyPublisher` held a
+# `transmute::<EdgeWriter, Publisher>` which compiled only while the two types
+# happened to be the same size, and which silently discarded the claim lease and
+# the fork guard. It went unnoticed across six PRs because `just test` and
+# `just lint` never compiled the crate at all.
+#
+# A compile is cheap and needs only an interpreter, so `lint` depends on it. It
+# is skipped with a loud message rather than failing when no venv exists — a
+# clean checkout should not be blocked on `just py-setup` — but on any machine
+# that has ever run the Python suite, it is a real gate.
+py-compile:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x .venv/bin/python ]; then
+        echo "py-compile: SKIPPED — no .venv. Run \`just py-setup\` to gate the bindings." >&2
+        exit 0
+    fi
+    PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy \
+        --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
 
 # Format and auto-fix safe lint issues.
 fmt:

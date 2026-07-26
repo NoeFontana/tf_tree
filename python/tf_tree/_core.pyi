@@ -150,13 +150,22 @@ def open_arena(
     name: str | None = ...,
     domain: int | None = ...,
     mode: Literal["ro", "rw"] = ...,
+    create: list[tuple[str, str]] | None = ...,
+    capacity: int = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
 
-    `mode="ro"` by default, and creation is refused: a consumer must be
-    incapable of corrupting a robot's tree (the MMU enforces it), and a
-    notebook started before the robot must fail loudly rather than create an
-    empty arena the real publisher then refuses to join.
+    `mode="ro"` by default and `create=None`: a consumer must be incapable of
+    corrupting a robot's tree (the MMU enforces it), and a notebook started
+    before the robot must fail loudly rather than create an empty arena the
+    real publisher then refuses to join.
+
+    Pass `create=[(parent, child), ...]` — the same edge list `build` takes —
+    to create the arena when it is absent. An arena is sized from its declared
+    edges, so there is no way to create one without saying what is in it; that
+    is why this is an edge list rather than a boolean. **It requires
+    `mode="rw"`** and is refused otherwise, so a read-only consumer still
+    cannot bring an arena into existence.
     """
 
 def from_sec(seconds: float, /) -> int:
