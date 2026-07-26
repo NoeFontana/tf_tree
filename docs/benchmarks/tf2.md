@@ -18,6 +18,7 @@ just shm-scaling         # N reader PROCESSES on one shared arena (roofline)
 just mp-bench            # N node-shaped consumers at a fixed rate (deployment)
 just mp-bench-tf2        # the same, both engines, in the ROS container
 just py-vs-tf2           # tf_tree's Python API vs tf2_ros's (PHASE3 §12.1)
+just profile-lookup      # where the lookup spends itself, by file
 ```
 
 All of them run in a container (`docker/tf2/`), so no ROS install is needed on
@@ -598,6 +599,40 @@ took CPU time from `/proc/self/stat`'s `utime + stime`, in 10 ms clock ticks —
 and a consumer here spends about 4 ms of CPU per 6-second window, less than one
 tick, so the counter read zero. It now reads `/proc/<pid>/schedstat`, which is
 nanoseconds. Any CPU-per-node figure quoted from an earlier run is meaningless.
+
+### Where the lookup actually spends itself
+
+`just profile-lookup`, 2026-07-26. Cachegrind over 60 000 depth-3 lookups,
+attributed by file.
+
+| file | instructions | branch mispredicts |
+|---|---:|---:|
+| `tf_tree_core/src/sample.rs` (inlined into `fold_at`) | 27.1% | **76.8%** |
+| `tf_tree_math/src/quat.rs` | ~19% | ~0% |
+| `tf_tree_math/src/iso3.rs` | ~16% | ~0% |
+| `tf_tree_core/src/buffer.rs` | ~13% | ~0% |
+| `tf_tree_core/src/plan.rs` | ~9% | ~0% |
+
+Two things follow, and they point at different optimisations:
+
+- **Essentially every mispredict is in the sampling path**, not in the maths.
+  The bracket search is already branchless (a `cmp` folded into the index), so
+  what remains is the bounds and seqlock structure around it.
+- **The maths is ~35% of instructions and mispredicts nothing.** That is the
+  shape that rewards SIMD and does not reward branch work — the opposite of
+  where intuition sends you after reading the mispredict column.
+
+**This profile was not obtainable before.** `[profile.release]` sets
+`strip = "debuginfo"`, so cachegrind, perf and callgrind all fall back to
+function-level attribution — and `fold_at` inlines the entire sampling chain
+into itself, so the answer was "96.6% of mispredicts are in `fold_at`". True,
+and useless, because `fold_at` *is* the hot path. The `profiling` profile
+(release codegen, debuginfo kept) is what makes the table above possible.
+
+Per-*line* attribution is still not working: `cg_annotate --auto=yes` in this
+image emits no annotated source even with the debuginfo present. That is the
+next thing to fix before any of the optimisations above should be attempted,
+because picking a line to change without it is guessing.
 
 ### Python: `tf_tree` against `tf2_ros`
 

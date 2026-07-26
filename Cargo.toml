@@ -93,3 +93,18 @@ opt-level = 0
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# Release code that a profiler can attribute to source lines.
+#
+# `[profile.release]` strips debuginfo, which is right for what ships and wrong
+# for finding anything: cachegrind, perf and callgrind all fall back to
+# function-level attribution, and `fold_at` inlines the entire sampling chain
+# into itself. A function-level profile of this engine therefore says "96.6% of
+# branch mispredicts are in `fold_at`" and stops — true, and useless, because
+# `fold_at` *is* the hot path.
+#
+# Same codegen as release so the numbers transfer; only the debuginfo differs.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"

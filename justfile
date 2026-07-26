@@ -130,6 +130,22 @@ footprint:
           done; \
         done'
 
+# Line-level profile of the lookup hot path (docs/benchmarks/tf2.md).
+#
+# Uses the `profiling` profile — release codegen with debuginfo kept — because
+# `[profile.release]` strips it and every tool then falls back to function-level
+# attribution. `fold_at` inlines the whole sampling chain, so a function-level
+# answer is "it is all in fold_at", which is true and tells you nothing.
+#
+# Simulated, so no idle machine is needed and the counts are exact.
+profile-lookup n="200000":
+    ./docker/tf2/run.sh 'set -e; \
+        cargo build --profile profiling -q -p tf_tree_bench --features tf2 --bin footprint; \
+        B=./target/tf2-docker/profiling/footprint; \
+        valgrind --tool=cachegrind --branch-sim=yes --cache-sim=yes \
+            --cachegrind-out-file=/tmp/cg.out $B lookup-tf_tree {{n}} >/dev/null 2>&1; \
+        cg_annotate --show=Ir,Bcm,D1mr --sort=Ir --auto=yes /tmp/cg.out'
+
 # --- Phase 2: shared memory (Linux only) -------------------------------------
 #
 # `shm` is off by default so the single-process build never grows a syscall
