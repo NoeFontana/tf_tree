@@ -257,9 +257,6 @@ impl PyPlan {
         // held across it: NumPy refuses to resize an array while a buffer is
         // exported, which is what keeps these pointers valid (§6.2).
         let (src, dst) = unsafe { (stamps.as_slice()?, out.as_slice_mut()?) };
-        // `Stamp<SystemDomain>` is `#[repr(transparent)]`-equivalent over i64 in
-        // layout, but rather than assume that, build the typed slice cheaply.
-        let typed: Vec<Stamp<SystemDomain>> = src.iter().map(|ns| Stamp::from_nanos(*ns)).collect();
 
         let est = (n as u64)
             .saturating_mul(self.plan.len() as u64)
@@ -269,7 +266,10 @@ impl PyPlan {
 
         let mut run = || {
             let g = tree.guard();
-            plan.at_many_into(&g, &typed, Layout::Mat4, dst)
+            // Raw nanoseconds: `at_many_into` takes `&[i64]` precisely so this
+            // path does not have to allocate a `Vec<Stamp>` — which would be
+            // the intermediate buffer `at_into` exists to avoid.
+            plan.at_many_into::<SystemDomain>(&g, src, Layout::Mat4, dst)
         };
         let res = if est >= GIL_RELEASE_THRESHOLD_NS {
             // `detach` is PyO3 0.29's name for what was `allow_threads`.
@@ -348,8 +348,8 @@ pub fn push(
 
 /// Attach to a running arena (`docs/PHASE3.md` §4.1).
 ///
-/// **Defaults are `mode="ro"` and `create="never"`** and differ from the Rust
-/// in-process defaults on purpose (D18). Most Python consumers are notebooks,
+/// **`mode="ro"`, and creation is refused outright** — both differ from the
+/// Rust in-process defaults on purpose (D18). Most Python consumers are notebooks,
 /// analysis scripts and visualisers; they must be *incapable* of corrupting a
 /// robot's transform tree, which a `PROT_READ` mapping enforces with the MMU.
 /// And a notebook started before the robot must fail loudly rather than create
@@ -366,9 +366,13 @@ pub fn open_arena(name: Option<&str>, domain: Option<u32>, mode: &str) -> PyResu
             )))
         }
     };
+    // `create` is deliberately not a parameter yet: creating an arena needs a
+    // layout (decision `0004` sizes it from the declared edges), and that is
+    // not wired through from Python. A consumer-only default is also what §4.1
+    // asks for — a notebook started before the robot must fail loudly.
     let mut o = tf_tree::Open::new()
         .mode(attach)
-        .create(tf_tree_ipc_create_never());
+        .create(tf_tree::CreatePolicy::Never);
     if let Some(d) = domain {
         o = o.domain(d);
     }
@@ -379,8 +383,4 @@ pub fn open_arena(name: Option<&str>, domain: Option<u32>, mode: &str) -> PyResu
     }
     let inner = o.open().map_err(|e| TfTreeError::new_err(format!("{e}")))?;
     Ok(PyTree { inner })
-}
-
-fn tf_tree_ipc_create_never() -> tf_tree::CreatePolicy {
-    tf_tree::CreatePolicy::Never
 }
