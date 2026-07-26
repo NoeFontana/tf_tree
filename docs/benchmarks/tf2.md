@@ -650,6 +650,37 @@ image emits no annotated source even with the debuginfo present. That is the
 next thing to fix before any of the optimisations above should be attempted,
 because picking a line to change without it is guessing.
 
+### Optimisations tried and rejected
+
+Kept because a negative result nobody records gets retried.
+
+**Constant divisions in `slerp_weight` → reciprocal multiplies. No effect.**
+Per-line profiling puts two lines of `interp.rs` at ~9% of all instructions,
+and `slerp_weight` contains four divisions by non-power-of-two constants —
+which LLVM may *not* rewrite as reciprocal multiplies, because that changes
+rounding and Rust grants no fast-math permission. Four per call, two calls per
+slerp, three slerps in a depth-3 lookup: **24 real `divsd` per lookup**, on the
+one arithmetic instruction that is not pipelined at one per cycle. It looks
+like an obvious win.
+
+It is not one. Moving the reciprocals to `const` and multiplying measured
+`p = 0.74` at depth 3 / sclerp, `p = 0.91` at depth 3 / lerpslerp and
+`p = 0.67` at depth 6 — no change at any depth. The divisions are *independent
+of each other and of the Horner chain*, so they issue in parallel with work
+that has to happen anyway; the critical path is the dependent chain of
+multiply-adds, not division throughput. Instruction counts mislead here
+precisely because they do not model that.
+
+The numerics were checked before the timing, and passed:
+`slerp_series_matches_exact_below_threshold` holds at 1e-15 across the whole
+threshold range with the reciprocals in place. So the change was safe, and
+still not worth making.
+
+**A note on `depth1/sclerp` on this host.** It has now twice shown a ~3%
+"regression" (p < 0.05) that did not reproduce on a second run. Treat
+single-run depth-1 results here as layout noise unless they repeat; the depth 3
+and 6 rows have been stable across every comparison in this document.
+
 ### Python: `tf_tree` against `tf2_ros`
 
 `just py-vs-tf2`, 2026-07-26, in the same container. One dynamic edge, 2000
