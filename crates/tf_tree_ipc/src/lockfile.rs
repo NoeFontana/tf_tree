@@ -63,6 +63,14 @@ const IDENTITY_BASE: u64 = 4096;
 /// present as impossible numerical results rather than as an error.
 pub const CLAIM_BASE: u64 = 1 << 20;
 
+/// How many claim bytes the reserved region can address.
+///
+/// A whole mebibyte of byte-range locks, which is far more edges than
+/// `ArenaLayout` will accept — the bound exists so a corrupt `max_edges` cannot
+/// walk a lock request out of the region rather than because the space is
+/// tight.
+pub const MAX_CLAIM_BYTES: u64 = 1 << 20;
+
 /// Handle on the lock file for one open file description.
 ///
 /// **Ownership of the `File` is the lock's lifetime.** OFD locks are released
@@ -202,6 +210,62 @@ impl LockFile {
         self.probe(participant_range(slot)?, LockRole::Participant(slot))
     }
 
+    /// Take the lease on `edge`'s claim byte (`docs/PHASE2.md` §6.1).
+    ///
+    /// **The lease is not the claim.** `docs/decisions/0005` §5 makes the
+    /// arena's `ClaimRecord` CAS the decision and this the thing that makes
+    /// death *observable*: a process that dies for any reason has its byte
+    /// released by the kernel, with no cooperation and no timeout, which is
+    /// the predicate §6.3's reaper needs.
+    ///
+    /// §6.1's literal wording — "the lock file is authoritative … any code
+    /// that makes a decision from `ClaimRecord` alone is a bug" — is not
+    /// implementable: the lock file and the arena are two files with no atomic
+    /// cross-update, so exactly one has to be the linearization point, and the
+    /// record also has to keep working for a `HeapArena` that has no lock file
+    /// at all.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`], or [`IpcError::ClaimOutOfRange`] if `edge`
+    /// exceeds what the reserved byte range can address.
+    pub fn try_take_claim(&self, edge: u32) -> Result<LockAttempt, IpcError> {
+        self.set(
+            claim_range(edge)?,
+            LockKind::Exclusive,
+            LockRole::Claim(edge),
+        )
+    }
+
+    /// Drop the lease on `edge`'s claim byte.
+    ///
+    /// **Order matters**: clear the arena record *first*, then unlock. The
+    /// reverse leaves a window in which the record says held and the byte says
+    /// free — which is exactly the signature a reaper treats as "the holder is
+    /// dead" (`0005` §5).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_take_claim`].
+    pub fn release_claim(&self, edge: u32) -> Result<(), IpcError> {
+        self.set(claim_range(edge)?, LockKind::Unlock, LockRole::Claim(edge))
+            .map(|_| ())
+    }
+
+    /// Whether `edge`'s claim byte is held, and by whom.
+    ///
+    /// Subject to the same self-blindness as every other `F_OFD_GETLK` here: a
+    /// description does not see its own locks, so a process asking about an
+    /// edge *it* holds is told the byte is free. Callers must skip their own
+    /// edges — see `a_holder_does_not_see_its_own_lock`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_take_claim`].
+    pub fn probe_claim(&self, edge: u32) -> Result<LockProbe, IpcError> {
+        self.probe(claim_range(edge)?, LockRole::Claim(edge))
+    }
+
     /// Bitmask of participant slots held by *other* open file descriptions.
     ///
     /// This is the §3.4 step 4 question. It is deliberately a full scan rather
@@ -317,6 +381,23 @@ fn participant_range(slot: u32) -> Result<Range, IpcError> {
         });
     }
     Ok(Range::byte(PARTICIPANT_BASE + u64::from(slot)))
+}
+
+/// The identity record offset for `slot`.
+/// The claim-lease byte for `edge`.
+///
+/// Bounded so an edge id from a corrupt header cannot address a byte outside
+/// the reserved region and collide with an identity record — which would hand
+/// one edge to two writers and present as impossible numbers rather than as an
+/// error.
+fn claim_range(edge: u32) -> Result<Range, IpcError> {
+    if u64::from(edge) >= MAX_CLAIM_BYTES {
+        return Err(IpcError::ClaimOutOfRange {
+            edge,
+            limit: MAX_CLAIM_BYTES,
+        });
+    }
+    Ok(Range::byte(CLAIM_BASE + u64::from(edge)))
 }
 
 /// The identity record offset for `slot`.

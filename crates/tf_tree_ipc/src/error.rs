@@ -95,6 +95,10 @@ pub enum LockRole {
     Ownership,
     /// Byte `16 + i` — participant liveness for slot `i`.
     Participant(u32),
+    /// A per-edge claim lease (`docs/PHASE2.md` §6.1). The edge id, not a
+    /// participant slot — the two index different byte ranges of the same file
+    /// and confusing them would hand one edge to two writers.
+    Claim(u32),
 }
 
 /// A `/proc/<pid>/stat` parse failure, split out from the read failure so a
@@ -221,6 +225,19 @@ pub enum IpcError {
         role: LockRole,
         /// `errno`.
         errno: Errno,
+    },
+    /// An edge id that cannot be addressed within the reserved claim region.
+    ///
+    /// Only reachable from a corrupt header: `ArenaLayout` accepts far fewer
+    /// edges than the region holds. Bounded anyway, because the failure it
+    /// prevents — a claim byte colliding with an identity record — hands one
+    /// edge to two writers and presents as impossible numbers rather than as
+    /// an error.
+    ClaimOutOfRange {
+        /// The edge asked for.
+        edge: u32,
+        /// The number of claim bytes reserved.
+        limit: u64,
     },
     /// Every participant slot is locked, so this process cannot register.
     ///
@@ -449,9 +466,15 @@ impl fmt::Display for IpcError {
                 match role {
                     LockRole::Ownership => f.write_str("ownership byte")?,
                     LockRole::Participant(slot) => write!(f, "participant byte for slot {slot}")?,
+                    LockRole::Claim(edge) => write!(f, "claim byte for edge {edge}")?,
                 }
                 write!(f, ": fcntl failed with errno {}", errno.raw_os_error())
             }
+            IpcError::ClaimOutOfRange { edge, limit } => write!(
+                f,
+                "edge {edge} is outside the {limit} claim bytes reserved in the lock file; \
+                 the arena header is inconsistent"
+            ),
             IpcError::NoParticipantSlots { limit } => write!(
                 f,
                 "all {limit} participant slots are live; raising the limit requires \

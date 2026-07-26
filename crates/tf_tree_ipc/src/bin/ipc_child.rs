@@ -20,6 +20,7 @@
 //! ipc_child hold-ownership   <lock> [ms]     -> "won" | "lost", then parks
 //! ipc_child hold-participant <lock> <slot>   -> "held <slot>" | "lost", then parks
 //! ipc_child probe            <lock> <slot>   -> "ownership <held> <pid> participants <mask>"
+//! ipc_child hold-claim       <lock> <edge>   -> "held <edge>" | "lost", then parks
 //! ipc_child open             <lock-dir>      -> "<outcome> <slot>" | "error <display>"
 //! ipc_child serve            <sock> <size>   -> "serving", then serves until killed
 //! ipc_child attach           <sock>          -> "attached <slot> <size> <uuid>" | "error <display>"
@@ -105,6 +106,19 @@ fn main() {
                 LockAttempt::Contended => {
                     say("lost");
                 }
+            }
+        }
+        // Take an edge's claim lease and park holding it, so the parent can
+        // kill the process and watch the kernel release the byte.
+        "hold-claim" => {
+            let lock = LockFile::open(&path).expect("open lock file");
+            let edge: u32 = args.get(3).and_then(|s| s.parse().ok()).expect("edge");
+            match lock.try_take_claim(edge).expect("fcntl") {
+                LockAttempt::Acquired => {
+                    say(&format!("held {edge}"));
+                    park();
+                }
+                LockAttempt::Contended => say("lost"),
             }
         }
         "probe" => {

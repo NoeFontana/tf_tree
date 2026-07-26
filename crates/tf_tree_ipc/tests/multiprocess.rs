@@ -690,3 +690,101 @@ fn a_rejection_is_terminal_and_does_not_burn_the_deadline() {
         started.elapsed()
     );
 }
+
+// ---------------------------------------------------------------------------
+// §6.1 claim leases
+// ---------------------------------------------------------------------------
+
+/// **A killed claim holder's lease is released by the kernel, immediately.**
+///
+/// This is what the lease buys over the arena's `ClaimRecord` alone: the record
+/// is a word in shared memory that a `SIGKILL`ed process leaves set forever,
+/// while the byte is released with no cooperation and no timeout. That
+/// distinction is the whole predicate §6.3's reaper runs on.
+///
+/// Asserted with **no sleep**: `wait()` returning means the kernel has torn the
+/// process's descriptors down, so if the byte were not free by then, no amount
+/// of waiting would help and the test would be measuring a race instead.
+#[test]
+fn a_killed_holder_releases_its_claim_lease_at_once() {
+    let scratch = Scratch::new("claim-lease");
+    let lock_path = scratch.0.join("claims.lock");
+    let observer = LockFile::open(&lock_path).unwrap();
+
+    let mut kid = Kid::spawn(&["hold-claim", lock_path.to_str().unwrap(), "7"]);
+    assert_eq!(kid.line(), "held 7");
+
+    assert!(
+        observer.probe_claim(7).unwrap().held,
+        "the child's lease is not visible to another description"
+    );
+    // A different edge is independent — byte-range locks, not a whole-file one.
+    assert!(!observer.probe_claim(8).unwrap().held);
+
+    kid.kill();
+    assert!(
+        !observer.probe_claim(7).unwrap().held,
+        "the lease survived the holder, so a dead writer would leak its edge"
+    );
+}
+
+/// Two processes cannot hold one edge's lease.
+#[test]
+fn only_one_process_holds_an_edge_lease() {
+    let scratch = Scratch::new("claim-exclusive");
+    let lock_path = scratch.0.join("claims.lock");
+
+    let mut first = Kid::spawn(&["hold-claim", lock_path.to_str().unwrap(), "3"]);
+    assert_eq!(first.line(), "held 3");
+
+    let mut second = Kid::spawn(&["hold-claim", lock_path.to_str().unwrap(), "3"]);
+    assert_eq!(second.line(), "lost", "two processes took one edge's lease");
+}
+
+/// An edge id past the reserved region is refused, not silently wrapped.
+///
+/// Only reachable from a corrupt header — but a byte outside the region would
+/// collide with an identity record, hand one edge to two writers, and present
+/// as impossible numbers rather than as an error.
+#[test]
+fn an_edge_beyond_the_reserved_region_is_refused() {
+    let scratch = Scratch::new("claim-range");
+    let lock = LockFile::open(&scratch.0.join("claims.lock")).unwrap();
+    match lock.probe_claim(u32::MAX) {
+        Err(IpcError::ClaimOutOfRange { edge, .. }) => assert_eq!(edge, u32::MAX),
+        other => panic!("expected ClaimOutOfRange, got {other:?}"),
+    }
+}
+
+/// **A claim byte and a participant byte with the same index must not collide.**
+///
+/// This is what `CLAIM_BASE` is for, and the reason it is worth a test rather
+/// than a comment: a collision would make edge *n*'s lease indistinguishable
+/// from participant *n*'s registration, so one edge would be handed to two
+/// writers — and the symptom is impossible numerical results, not an error.
+///
+/// Removing the offset leaves every other test in this file passing, which is
+/// how the gap was found.
+#[test]
+fn claim_bytes_and_participant_bytes_do_not_overlap() {
+    let scratch = Scratch::new("claim-vs-participant");
+    let lock_path = scratch.0.join("both.lock");
+    let observer = LockFile::open(&lock_path).unwrap();
+
+    // A child holds *participant* slot 3.
+    let mut kid = Kid::spawn(&["hold-participant", lock_path.to_str().unwrap(), "3"]);
+    assert_eq!(kid.line(), "held 3");
+    assert!(observer.probe_participant(3).unwrap().held);
+
+    // *Edge* 3's lease must still be free, and takeable.
+    assert!(
+        !observer.probe_claim(3).unwrap().held,
+        "edge 3's claim byte aliases participant slot 3's byte"
+    );
+    assert_eq!(
+        observer.try_take_claim(3).unwrap(),
+        LockAttempt::Acquired,
+        "edge 3's lease could not be taken while participant 3 was registered"
+    );
+    observer.release_claim(3).unwrap();
+}
