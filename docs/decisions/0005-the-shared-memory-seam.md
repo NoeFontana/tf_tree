@@ -331,6 +331,14 @@ distance, into a parent that is still running:
 deleted. Two mechanisms for one invariant, only one load-bearing, is how the
 load-bearing one eventually gets removed as redundant.
 
+**Measured cost.** `EdgeWriter::push` on a shared arena: **9.041 ns against
+8.846 ns** with the branch forced not-taken — `+0.195 ns`, one relaxed load of a
+process-local static plus a predictable branch (`benches/push.rs`,
+`--features shm`). A heap tree carries `None` and pays only the discriminant test,
+so the single-process path is unchanged at 8.71 ns. `Tree::view()`'s check is once
+per `guard()`, i.e. once per batch, and `benches/lookup.rs` is unchanged within
+noise (depth-3 64.60 ns vs 64.11 ns on `main`).
+
 Two of the five guards have **no failing mutant**, and the code says so at each
 site rather than implying coverage it does not have. `MappedArena`'s needs the child
 to have mapped something into the hole, which the harness cannot arrange without a

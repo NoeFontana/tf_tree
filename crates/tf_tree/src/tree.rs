@@ -589,6 +589,18 @@ impl EdgeWriter<'_> {
     /// through a dangling reference into an unmapped page. The `Deref` is kept
     /// because it is what makes every pre-existing caller compile unchanged, but
     /// **do not route `push` around it.**
+    ///
+    /// # Cost, measured
+    ///
+    /// `+0.195 ns` on a shared-arena push — 9.041 ns against 8.846 ns for the
+    /// same benchmark with the branch forced not-taken (`benches/push.rs`,
+    /// `--features shm`). One relaxed load of a process-local static plus a
+    /// predictable branch. A heap tree carries `None` and pays only the
+    /// discriminant test, so the single-process path is unchanged (8.71 ns).
+    ///
+    /// That is the price of a `fork` child not writing through a dangling
+    /// pointer into an unmapped page, which is not a trade this hot path gets
+    /// to decline.
     pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         if self.detached() {
