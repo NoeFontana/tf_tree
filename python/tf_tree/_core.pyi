@@ -40,6 +40,19 @@ class Plan:
         amortises to near-native.
         """
 
+    @overload
+    def at_into(self, stamps: int, out: object, /) -> None:
+        """Evaluate one stamp into a caller-provided `(4, 4)` float64 array.
+
+        **The allocation-free scalar path, for a control loop.** A node does one
+        lookup per tick and cannot batch, so `at`'s per-call array allocation is
+        paid every tick forever. Measured on a depth-3 chain, release build:
+        `at` 224 ns against `at_into` **173 ns**, and nothing allocated.
+
+        Allocate `out` once, outside the loop.
+        """
+
+    @overload
     def at_into(self, stamps: NDArray[np.int64], out: object, /) -> None:
         """Evaluate into a caller-provided `(N, 4, 4)` float64 array.
 
@@ -55,6 +68,12 @@ class Plan:
         is accepted — pinned allocations from torch, CuPy and Numba all
         qualify. **Device memory is refused**, with a message naming the fix: a
         CPU store to a `cudaMalloc` pointer is undefined, not slow.
+
+        A genuine `numpy.ndarray` skips the device check, because its data
+        pointer is host memory by construction; CuPy and torch arrays are not
+        numpy subclasses, so they still pay for it. The probe is a Python method
+        call — `__dlpack_device__()` — and running it on every numpy call cost
+        ~120 ns of a ~173 ns lookup.
         """
 
     def adaptive(

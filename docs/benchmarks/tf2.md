@@ -767,10 +767,10 @@ by exactly the amount being claimed.
 
 | nodes | tf_tree svc p50 | `tf2_ros` svc p50 | ratio | tf_tree PSS | `tf2_ros` PSS |
 |---:|---:|---:|---:|---:|---:|
-| 1 | **1 773 ns** | 114 051 ns | 64× | 23.9 MiB | 55.3 MiB |
-| 2 | **1 702 ns** | 115 875 ns | 68× | 40.0 MiB | 93.2 MiB |
-| 4 | **1 643 ns** | 132 270 ns | 80× | 70.6 MiB | 170.4 MiB |
-| 8 | **1 923 ns** | 140 092 ns | **73×** | 128.7 MiB | 320.0 MiB |
+| 1 | **1 112 ns** | 111 598 ns | 100× | 23.6 MiB | 55.1 MiB |
+| 2 | **1 192 ns** | 118 028 ns | 99× | 39.6 MiB | 92.2 MiB |
+| 4 | **1 342 ns** | 125 139 ns | 93× | 70.3 MiB | 168.5 MiB |
+| 8 | **1 321 ns** | 140 701 ns | **106×** | 128.3 MiB | 320.6 MiB |
 
 **The slope is the claim, not the totals.** Both engines pay identically for the
 Python interpreter and numpy, which dominate the absolute figures. What the
@@ -778,9 +778,9 @@ shared arena changes is what each *additional* node costs:
 
 | marginal, per node | tf_tree | `tf2_ros` | ratio |
 |---|---:|---:|---:|
-| memory (PSS) | **15.0 MiB** | 37.8 MiB | 2.5× |
-| CPU | **0.11 %** | 5.65 % | **51×** |
-| time to first usable lookup | **0–1 ms** | 62–108 ms | ~70× |
+| memory (PSS) | **15.0 MiB** | 37.9 MiB | 2.5× |
+| CPU | **0.10 %** | 6.44 % | **64×** |
+| time to first usable lookup | **0–1 ms** | 62–116 ms | ~70× |
 
 The CPU row is `docs/PHASE2.md` §12.4's "O(1) in the number of consumers"
 measured rather than asserted, and 51× is what O(1) against
@@ -805,6 +805,46 @@ where scheduling starts to dominate — `cycle p99.9` is mostly OS wakeup at
 100 Hz and is reported but not compared. And tf_tree's service p50 is flat
 across the sweep to within noise, which is the expected shape but is measured on
 one machine, not proven.
+
+#### The consumer loop was 1.5x slower than it needed to be, and the profile said why
+
+The first run of this benchmark used `plan.at(t)` and reported **1 923 ns** at
+eight nodes. Attributing that, on a depth-3 chain, release build, in-process:
+
+| | ns |
+|---|---:|
+| empty Python loop | 5.6 |
+| `plan.depth()` — PyO3 dispatch and nothing else | 15.6 |
+| **native Rust `plan.at(&g, t)`** | **114** |
+| `plan.latest()` | 118 |
+| `plan.at(t)` | 211 |
+| `plan.at_into(t, buf)`, as first written | **265** |
+
+Three things fell out, two of which killed a hypothesis:
+
+* **`Tree::guard()` costs 1.1 ns**, measured directly in Rust
+  (`examples/guard_cost.rs`) after suspecting it. Building a guard per call is
+  free; hoisting it out of a loop buys nothing.
+* **The output allocation is not the cost.** `np.empty((4,4))` is ~90 ns *from
+  Python*, but from Rust it is ~25 ns — the 90 is mostly the Python call.
+  Replacing `zeros` with an uninitialized `new` measured **no change** and was
+  reverted rather than kept for the story.
+* **`at_into` was slower than `at`**, which is the result that pointed at the
+  real cost. It called `reject_device_memory` first, which does
+  `getattr("__dlpack_device__")` and then **calls** it — a full Python method
+  call, ~120 ns, on every invocation. NumPy has had `__dlpack_device__` since
+  1.22, so an ordinary `np.empty((4,4))` paid all of it.
+
+A successful cast to `numpy.ndarray` proves the buffer is host memory, because
+CuPy and torch arrays are not numpy subclasses. Skipping the probe on that path
+leaves §5.5's guarantee intact — the objects that can actually trip it still pay
+— and takes `at_into` from 265 ns to **173 ns**, which is now 1.3x faster than
+`at` *and* allocates nothing.
+
+Switching the consumer loop to it took the multi-process p50 from 1 923 ns to
+**1 321 ns** at eight nodes, and p99.9 from 29.3 us to 15.3 us. The ratio against
+tf2 went from 73x to **106x**. A node does one lookup per tick and cannot batch,
+so this is the number a real deployment sees.
 
 ### What is implemented, and what is not
 
