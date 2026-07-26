@@ -45,6 +45,21 @@ impl AccessMode {
             AccessMode::ReadOnly
         }
     }
+
+    /// Strict decode, for a byte a *decision* will be made from.
+    ///
+    /// [`AccessMode::from_byte`]'s leniency is right for a `doctor` listing and
+    /// wrong for the §3.7 handshake: silently downgrading a mode the peer named
+    /// and we did not understand hands back a read-only mapping the client
+    /// never asked for, and the failure then surfaces at its first write with
+    /// nothing to connect it to the handshake. The wire wants `Malformed`.
+    pub(crate) fn try_from_byte(b: u8) -> Option<AccessMode> {
+        match b {
+            0 => Some(AccessMode::ReadOnly),
+            1 => Some(AccessMode::ReadWrite),
+            _ => None,
+        }
+    }
 }
 
 /// Who holds a participant slot.
