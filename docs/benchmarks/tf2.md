@@ -408,9 +408,25 @@ branch predictor is a simple two-level model, not a Zen 3 TAGE.** Comparing two
 engines under the same model is sound, and that is all this table does; reading
 "7.70" as the count a real CPU incurs is not. Acting on that distinction matters
 — that figure was first read as the bracket search's data-dependent branch,
-and rewriting that search branchlessly recovered only 0.46 of it, because LLVM
-had already emitted a `cmov`. The mispredicts are spread across `fold_at`'s 124
-conditional branches per lookup, not concentrated in the search.
+and an early branchless rewrite recovered only 0.46 of it, which was written up
+here as "LLVM had already emitted a `cmov`". **That explanation was wrong**, and
+per-line profiling (`just profile-lookup`, once it worked) shows why: 99.97% of
+`sample.rs`'s mispredicts really are in the bracket loop —
+
+    248,173  base += half * cmp;
+    131,112  while len > 1 {
+
+— so the search was the right suspect all along. `half * cmp` reads as
+branchless and is not; the backend emits a branch for it. Replacing the
+multiply with a mask (`half & (0 - cmp)`, an AND the backend cannot turn back
+into control flow) moves simulated mispredicts 7.70 -> 7.32 per lookup and
+wall-clock by **-2.8% at depth 3 / sclerp, -1.5% at depth 3 / lerpslerp, -1.2%
+at depth 6**, with no change at depth 1 and no change in instruction count.
+Confirmed over two runs; the first run's apparent +3.3% at depth 1 did not
+reproduce (p = 0.09).
+
+The lesson stands, just not the one originally drawn: the simple predictor
+model was not the problem, the *absence of line-level data* was
 
 The corresponding tf2 number, 6.00 *indirect* mispredicts, is on firmer ground:
 indirect targets are a structural property of virtual dispatch, not an artifact
