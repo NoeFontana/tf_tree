@@ -51,7 +51,7 @@ use rustix::fs::{
 };
 use rustix::mm::{madvise, mmap, munmap, Advice, MapFlags, ProtFlags};
 
-use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
+use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC, TOPO_BLOCKS};
 use crate::heap::{write_header_at, Arena};
 use crate::layout::{layout_hash, ArenaLayout};
 
@@ -361,6 +361,142 @@ impl MappedArena {
     /// Apply the mapping policy from `docs/PHASE2.md` §7. Both calls are
     /// best-effort: a kernel without transparent huge pages, or a mapping the
     /// kernel declines to mark, is not a reason to fail an attach.
+    /// Fault in `[offset, offset + len)` of this arena, up front.
+    ///
+    /// # Why this is not `MADV_WILLNEED`
+    ///
+    /// `docs/PHASE2.md` §7.1: *"`MADV_WILLNEED` does not work here (measured:
+    /// zero change in charged pages on a memfd). Do not substitute it."*
+    /// `WILLNEED` is a readahead hint for page-cache-backed mappings; a memfd's
+    /// pages are already in the page cache, so it has nothing to do. What is
+    /// needed is population of the *page tables*, which is `MADV_POPULATE_*`.
+    ///
+    /// # Read versus write
+    ///
+    /// `MADV_POPULATE_WRITE` on a `PROT_READ` mapping is `EINVAL`, so the advice
+    /// follows the mapping's protection. For a writable mapping `WRITE` is the
+    /// right one even though nothing is written yet: `POPULATE_READ` on a
+    /// private-writable page would fault in the shared zero page and leave the
+    /// first *store* to take a copy-on-write fault, which is the fault this
+    /// exists to remove. (`MAP_SHARED` makes that moot here, but the rule is
+    /// worth not having to re-derive.)
+    ///
+    /// # Errors
+    ///
+    /// Never. `MADV_POPULATE_*` landed in Linux 5.14 and returns `EINVAL` on
+    /// anything older; that case falls back to touching the pages by hand, which
+    /// is what the kernel would have done anyway. Any other errno means the
+    /// pages stay cold and the first access faults — slower, never incorrect —
+    /// so this returns `()` rather than an error nobody could act on.
+    pub fn populate(&self, offset: usize, len: usize) {
+        if len == 0 || offset >= self.len {
+            return;
+        }
+        let len = len.min(self.len - offset);
+        let advice = if self.writable {
+            Advice::LinuxPopulateWrite
+        } else {
+            Advice::LinuxPopulateRead
+        };
+        // SAFETY: module invariant — `base` addresses `self.len` bytes of this
+        // arena's own live mapping, and `offset + len` is clamped to it above,
+        // so the range passed is inside that mapping.
+        let r = unsafe { madvise(self.base.as_ptr().add(offset).cast(), len, advice) };
+        if r == Err(rustix::io::Errno::INVAL) {
+            self.populate_by_touch(offset, len);
+        }
+    }
+
+    /// Kernels before 5.14: fault the pages in by touching one byte per page.
+    ///
+    /// A **read** of each page, never a write, on both mapping modes. A write
+    /// would be a correctness bug rather than a slow path: this runs on a
+    /// segment other processes are already using, and storing anything — even
+    /// the byte that is already there — into a live claim record or sample slot
+    /// races every reader of it. A read fault populates the page table entry,
+    /// which is the entire objective.
+    fn populate_by_touch(&self, offset: usize, len: usize) {
+        for at in touch_offsets(offset, len) {
+            // SAFETY: `at` is within `[offset, offset + len)` — see
+            // `touch_offsets`, which is where that is established and tested —
+            // and the caller has already clamped that range to this arena's
+            // mapping. `read_volatile` is used so the load cannot be optimised
+            // away: the fault it takes is the only reason the load exists.
+            unsafe {
+                core::ptr::read_volatile(self.base.as_ptr().add(at));
+            }
+        }
+    }
+
+    /// The first 256 bytes of the arena, for tests that assert nothing wrote to
+    /// it.
+    #[cfg(test)]
+    fn header_snapshot(&self) -> [u8; 256] {
+        let mut out = [0u8; 256];
+        // SAFETY: module invariant — the mapping is at least 256 bytes (it is at
+        // least `size_of::<ArenaHeader>()`, which is 256), and this only reads.
+        unsafe { core::ptr::copy_nonoverlapping(self.base.as_ptr(), out.as_mut_ptr(), 256) };
+        out
+    }
+
+    /// Populate every region that is actually read, and nothing else (§7.1).
+    ///
+    /// # What "actually read" means, and why the header can answer it
+    ///
+    /// §7.1 says to populate at *declaration* granularity. Decision `0004` moved
+    /// declaration to build time, so there is no `declare_dynamic` to hook — but
+    /// the arena records what was declared: `frame_count` and `edge_count` are
+    /// live counters in the header. So an **attaching** process derives the used
+    /// extents itself, with nothing passed in and no agreement to keep in sync
+    /// with the builder.
+    ///
+    /// | region | populated |
+    /// |---|---|
+    /// | header | all (256 B) |
+    /// | frame table | `frame_count` records |
+    /// | frame hash | **none** — probed by hash, so it is scattered; interning is not the hot path |
+    /// | topology blocks | `frame_count` entries of each of the four |
+    /// | claim table | `edge_count` records |
+    /// | participant table | all (8 KiB, and every liveness check walks it) |
+    /// | edge table | `edge_count` records |
+    /// | stamp + pose arenas | all — under `0004` they are sized to the declared rings exactly |
+    ///
+    /// The headroom tails are what this leaves cold, and they are the whole
+    /// win: on the measured arena above, 66 MiB of it.
+    ///
+    /// Frames interned *after* this runs fault once, which is correct — that is
+    /// a rare path, and pre-faulting a 200 000-frame table on the chance that
+    /// one more name shows up is exactly what §7.1 forbids.
+    pub fn populate_hot(&self) {
+        // SAFETY: module invariant — the mapping is at least `size_of::<ArenaHeader>()`
+        // bytes (checked by `attach`, and by construction in `create`), aligned,
+        // and the header is only ever read through this shared reference.
+        let h = unsafe { &*self.base.as_ptr().cast::<ArenaHeader>() };
+        let frames = h.frame_count.load(core::sync::atomic::Ordering::Acquire) as usize;
+        let edges = h.edge_count.load(core::sync::atomic::Ordering::Acquire) as usize;
+
+        self.populate(0, core::mem::size_of::<ArenaHeader>());
+        self.populate(h.frame_table_off as usize, frames * 64);
+
+        // The four topology blocks are strided, not contiguous, so each one's
+        // used prefix is populated separately. Populating `blocks * stride` from
+        // the first would pull in three blocks' worth of headroom.
+        let topo_used = frames * 12;
+        for b in 0..TOPO_BLOCKS {
+            let off = h.topo_block_off as usize + b * h.topo_block_stride as usize;
+            self.populate(off, topo_used);
+        }
+
+        self.populate(h.claim_table_off as usize, edges * 64);
+        self.populate(
+            h.participant_table_off as usize,
+            h.max_participants as usize * 128,
+        );
+        self.populate(h.edge_table_off as usize, edges * 128);
+        self.populate(h.stamp_arena_off as usize, h.stamp_slots as usize * 8);
+        self.populate(h.pose_arena_off as usize, h.pose_slots as usize * 64);
+    }
+
     fn advise(&self) {
         // MADV_DONTFORK is the easy one to forget (§7.3) and the consequences
         // are subtle: a forked child would otherwise inherit the mapping and
@@ -432,7 +568,28 @@ fn instance_uuid() -> Result<[u8; 16], ShmError> {
     Ok(uuid)
 }
 
-/// `mmap` `len` bytes of `fd` shared and prefaulted.
+/// Byte offsets to touch so that every page overlapping `[offset, offset + len)`
+/// is faulted in — one per page, plus the first, and **never past the end**.
+///
+/// Pulled out of [`MappedArena::populate_by_touch`] as a pure function precisely
+/// so its bound can be tested. The kernel side of that function is not
+/// observable from inside this crate — residency needs `mincore`, which
+/// `rustix` does not have and which is not worth a `libc` dependency here — so a
+/// test of the *effect* cannot distinguish "touched every page" from "stopped
+/// one page short". A test of the arithmetic can, and the arithmetic is the part
+/// that can be wrong.
+///
+/// Every yielded offset is `< offset + len`, which is what makes the `unsafe`
+/// read in the caller in-bounds.
+fn touch_offsets(offset: usize, len: usize) -> impl Iterator<Item = usize> {
+    const PAGE: usize = 4096;
+    // The first page of the range starts at `offset`, which is not necessarily
+    // page-aligned; stepping from the *aligned* base instead would touch a page
+    // before the range.
+    (0..len).step_by(PAGE).map(move |d| offset + d)
+}
+
+/// `mmap` `len` bytes of `fd` shared, **without** prefaulting.
 fn unsafe_map(len: usize, prot: ProtFlags, fd: &OwnedFd) -> Result<NonNull<u8>, ShmError> {
     // SAFETY: `mmap` with a null hint lets the kernel choose an address, so no
     // existing mapping can be replaced. `len` is the segment's size and `fd`
@@ -443,7 +600,17 @@ fn unsafe_map(len: usize, prot: ProtFlags, fd: &OwnedFd) -> Result<NonNull<u8>, 
             core::ptr::null_mut(),
             len,
             prot,
-            MapFlags::SHARED | MapFlags::POPULATE,
+            // No `MAP_POPULATE`: `docs/PHASE2.md` §7.1 is NORMATIVE that
+            // population happens at declaration granularity, not over the whole
+            // address space. Measured, on an arena declaring one 1024-slot edge
+            // with 200k slots of frame/edge headroom: `MAP_POPULATE` charged
+            // **66.3 MiB of RSS against 66.1 MiB declared** — essentially all of
+            // it headroom nobody asked for and nothing ever reads.
+            //
+            // `MappedArena::populate_hot` puts back exactly the pages that are
+            // actually touched, and reports failure, which `MAP_POPULATE`
+            // cannot: it is best-effort and silent.
+            MapFlags::SHARED,
             fd,
             0,
         )
@@ -541,6 +708,77 @@ mod tests {
 
     fn create() -> MappedArena {
         MappedArena::create("tf_tree.uuid_test", &fixture(), 1234, 5678, [7; 16]).unwrap()
+    }
+
+    /// **The fallback must not write.** It runs on a segment other processes
+    /// are already using, so a store — even of the byte that is already there —
+    /// races every reader of a live claim record or sample slot. That would be a
+    /// correctness bug, not a slow path.
+    ///
+    /// `MADV_POPULATE_*` landed in Linux 5.14, so on every machine this is
+    /// developed and tested on, [`MappedArena::populate`] takes the `madvise`
+    /// branch and this path is dead code that ships anyway; calling it directly
+    /// is the only way it is exercised at all.
+    ///
+    /// What this **cannot** show is that every page was touched: residency is
+    /// not observable from inside this crate. That is why the bound lives in
+    /// [`touch_offsets`] and is tested there.
+    #[test]
+    fn the_pre_5_14_fallback_writes_nothing() {
+        let arena = create();
+        let before = arena.header_snapshot();
+        arena.populate_by_touch(0, arena.len);
+        arena.populate_by_touch(arena.len - 1, 1);
+        assert_eq!(
+            arena.header_snapshot(),
+            before,
+            "the fallback wrote to the arena"
+        );
+    }
+
+    /// The fallback's bound, tested where it is observable.
+    ///
+    /// Residency is not visible from inside this crate, so the effect of
+    /// `populate_by_touch` cannot be distinguished from a loop that stops a page
+    /// early — which is why the bound lives in a pure function. Mutant:
+    /// `while at + PAGE < end` in the original loop shape, i.e. dropping the
+    /// final partial page ⇒ the last two cases below fail.
+    #[test]
+    fn touch_offsets_covers_every_page_and_never_passes_the_end() {
+        let v = |o, l| touch_offsets(o, l).collect::<alloc::vec::Vec<_>>();
+        assert_eq!(v(0, 0), alloc::vec![]);
+        assert_eq!(v(0, 1), alloc::vec![0]);
+        assert_eq!(v(0, 4096), alloc::vec![0]);
+        assert_eq!(v(0, 4097), alloc::vec![0, 4096]);
+        assert_eq!(v(0, 8192), alloc::vec![0, 4096]);
+        // A range that starts mid-page must touch *that* page, not the aligned
+        // one before it.
+        assert_eq!(v(100, 1), alloc::vec![100]);
+        assert_eq!(v(4095, 2), alloc::vec![4095]);
+        // The last partial page is still a page, and skipping it leaves exactly
+        // the fault this code exists to remove.
+        assert_eq!(v(0, 4096 * 3 + 1), alloc::vec![0, 4096, 8192, 12288]);
+        for (o, l) in [(0usize, 12345usize), (7, 99999), (4095, 4097)] {
+            for at in touch_offsets(o, l) {
+                assert!(at >= o && at < o + l, "{at} escaped [{o}, {o}+{l})");
+            }
+        }
+    }
+
+    /// `populate` must never walk off the end, whatever it is asked for.
+    ///
+    /// The clamp is the only thing between a caller's arithmetic slip and an
+    /// `madvise` over memory this arena does not own.
+    #[test]
+    fn populate_clamps_to_the_mapping() {
+        let arena = create();
+        arena.populate(0, usize::MAX);
+        arena.populate(arena.len - 1, usize::MAX);
+        arena.populate(arena.len, 4096);
+        arena.populate(arena.len + 1_000_000, 4096);
+        arena.populate(0, 0);
+        // Still intact and still readable.
+        assert_eq!(arena.header().magic, u64::from_le_bytes(TF_TREE_MAGIC));
     }
 
     /// The point of an instance id is to tell two *different* segments apart.

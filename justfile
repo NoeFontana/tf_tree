@@ -223,6 +223,10 @@ shm-check:
     # `shm-rendezvous` because it needs no second executable and no scratch
     # rendezvous beyond its own: the second process is a `fork` of the first.
     cargo nextest run -p tf_tree_bench --features shm --test fork
+    # §7.1 page population. `nextest` runs each test in its own process, which
+    # this needs: the measurements are RSS and minor-fault deltas, and threads
+    # sharing a process would read each other's.
+    cargo nextest run -p tf_tree_bench --features shm --test population
     cargo nextest run -p tf_tree_ipc
 
 # The zero-config rendezvous end to end: a foreign process calls
