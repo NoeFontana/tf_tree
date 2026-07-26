@@ -98,6 +98,12 @@ required-features = ["shm"]
 
 # The workspace's only `fork()`. See the file header for why `unsafe` here is a
 # recorded exception (`docs/decisions/0005` step 9) rather than an oversight.
+# Needs a real `memfd`, so it only builds with `shm` — otherwise
+# `--workspace --all-targets` tries to compile it and fails.
+[[example]]
+name = "heap_vs_shared"
+required-features = ["shm"]
+
 [[bin]]
 name = "fork_child"
 path = "src/bin/fork_child.rs"
