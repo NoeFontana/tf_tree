@@ -6,34 +6,43 @@ This file is for AI coding agents working in this repository. Humans, see
 ## What this is
 
 `tf_tree` is a transform tree engine (a faster, more scalable alternative to ROS
-`tf2`). It is being built along a fixed six-phase roadmap. **The canonical
+`tf2`). It is being built along a fixed **eight-phase** roadmap (re-cut from six
+by [`0006`](./docs/decisions/0006-the-eight-phase-roadmap.md)). **The canonical
 documents in [`docs/`](./docs/) are the contract** — read
 [`docs/PROJECT.md`](./docs/PROJECT.md) (project overview, architecture, roadmap,
-and the decision log D1–D20 in its §5) **then**
-[`docs/PHASE1.md`](./docs/PHASE1.md) (the full, normative Phase 1 spec) before
-touching code. When these documents do not answer a question, **stop and ask** —
-do not invent an answer, especially in the concurrency or arena-layout sections.
+and the decision log D1–D22 in its §5) **then** the spec for the phase you are
+touching, before touching code. When these documents do not answer a question,
+**stop and ask** — do not invent an answer, especially in the concurrency or
+arena-layout sections.
 
-[`docs/PHASE2.md`](./docs/PHASE2.md) is the Phase 2 spec (shared memory). Its §1
-holds **Phase 1 amendments A1–A8, which are now all applied** (`FORMAT_VERSION =
-2`) — read them before changing any concurrency protocol, because they are the
-reason several orderings look the way they do. §0.0 is the live status table for
-what remains.
+**Phases 1–3 are implemented.** `FORMAT_VERSION = 2`; `tf_tree::open()` exists;
+the rendezvous, fd passing, ownership migration, claims-as-leases, reaping, fork
+poisoning and the Python bindings all shipped. `docs/PHASE2.md` §0.0 and
+`docs/PHASE3.md` are the authoritative status tables.
 
-What remains is the **lifecycle**, scoped by decision
-[`0005`](./docs/decisions/0005-the-shared-memory-seam.md): §3.7 fd passing, so
-`tf_tree::open()` does not exist yet and only a child can attach; `F_OFD_GETLK`
-liveness; and reaping. `0005` is `ready`, so its *Implementation plan* is the
-work breakdown — implement it as stated, and if you find an open question, stop
-and ask rather than inventing an answer.
+[`docs/PHASE2.md`](./docs/PHASE2.md) §1 holds **Phase 1 amendments A1–A8, all
+applied** — read them before changing any concurrency protocol, because they are
+the reason several orderings look the way they do.
+
+**Current work is Phases 4 and 5.** Two cautions specific to them:
+
+- `docs/PHASE5.md` §1 bumps `FORMAT_VERSION` to **3**. That is a real break —
+  every participant must be rebuilt and restarted together. §1.2 lists what goes
+  in, *including regions Phase 6 will fill*, so the break happens exactly once.
+  **Do not add arena fields opportunistically outside that commit.**
+- `docs/PHASE5.md` §8 is a section about **not** building something. Visualization
+  is deliberately absent, with the argument recorded. Do not propose a viewer
+  integration without refuting §8.1 first.
 
 | Document | Role |
 | --- | --- |
-| [`docs/PROJECT.md`](./docs/PROJECT.md) | Overview, architecture, roadmap, decision log D1–D20 (§5). Supersedes `docs/decisions/0002`. |
-| [`docs/PHASE1.md`](./docs/PHASE1.md) | Normative Phase 1 spec: layouts, atomic orderings, test plan (§10), benchmark gate (§11). Supersedes `docs/decisions/0003`. |
-| [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 holds Phase 1 amendments A1–A8 (all applied), §0.0 is the status table. |
-| [`docs/PHASE3.md`](./docs/PHASE3.md) | Normative Phase 3 spec (Python bindings). Blocked on `0005`; not started. |
-| [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md) (builder-time edge declaration) and [`0005`](./docs/decisions/0005-the-shared-memory-seam.md) (the shared-memory seam) are authoritative. |
+| [`docs/PROJECT.md`](./docs/PROJECT.md) | Overview, architecture, roadmap, decision log D1–D22 (§5). Supersedes `docs/decisions/0002`. |
+| [`docs/PHASE1.md`](./docs/PHASE1.md) | Normative Phase 1 spec: layouts, atomic orderings, test plan (§10), benchmark gate (§11). Supersedes `docs/decisions/0003`. **Implemented.** |
+| [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 holds Phase 1 amendments A1–A8 (all applied), §0.0 is the status table. **Engine half implemented.** |
+| [`docs/PHASE3.md`](./docs/PHASE3.md) | Normative Phase 3 spec (Python bindings). **Implemented.** |
+| [`docs/PHASE4.md`](./docs/PHASE4.md) | Normative Phase 4 spec (C ABI, C++ wrapper, ROS 2 ingest bridge, `sample_with_derivatives`). §0.0 records what this environment cannot gate — **there is no ROS 2 here.** |
+| [`docs/PHASE5.md`](./docs/PHASE5.md) | Normative Phase 5 spec (frozen `.tft` arena, bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, `TFT001`–`TFT016`, `tf_tree top`). |
+| [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md), [`0005`](./docs/decisions/0005-the-shared-memory-seam.md) and [`0006`](./docs/decisions/0006-the-eight-phase-roadmap.md) are authoritative. |
 
 ## Project shape (Phase 1 — pure Rust)
 
@@ -42,12 +51,17 @@ crates/tf_tree_math/    no_std; SE(3)/SO(3), quats, dual quats; #![forbid(unsafe
 crates/tf_tree_arena/   no_std+alloc; pointer-free arena + layout math (unsafe allowed)
 crates/tf_tree_core/    no_std+alloc; the engine; unsafe only in buffer.rs / arena_view.rs
 crates/tf_tree/         std facade; #![forbid(unsafe_code)]
+crates/tf_tree_ipc/     std; rendezvous, lock file, fd passing (unsafe: one atfork shim)
+crates/tf_tree_py/      PyO3 bindings; binds the Rust core directly, not the C ABI
 crates/tf_tree_bench/   criterion + tf2 differential harness
+crates/tf_tree_tf2_sys/ the tf2 side of the differential harness
 crates/tf_tree_cli/     binary `tf_tree` (alias `tft`)
 xtask/                  loom / miri / bench-gate runners
 ```
 
-Python bindings are **Phase 3**, not now. Phase 1 is pure Rust.
+Phase 4 adds a C ABI crate and a header-only C++ wrapper. **The Python binding
+does not go through it** — PyO3 binds Rust directly, and `docs/PHASE3.md` §0
+records why (typed errors and zero-copy buffers do not survive a C boundary).
 
 ## Hard rules (from `docs/PROJECT.md` and `docs/PHASE1.md` — do not relitigate)
 

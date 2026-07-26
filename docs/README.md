@@ -1,9 +1,9 @@
 # Docs
 
-Four canonical documents carry the project. Read them in this order:
+Six canonical documents carry the project. Read them in this order:
 
 1. [`PROJECT.md`](./PROJECT.md) — what tf_tree is, the architecture in one page,
-   the six-phase roadmap, and the **decision log D1–D20** (§5) with the rationale
+   the eight-phase roadmap, and the **decision log D1–D22** (§5) with the rationale
    behind each entry. Start here.
 2. [`PHASE1.md`](./PHASE1.md) — the **normative** Phase 1 specification:
    workspace layout, load-bearing invariants (§2), math requirements (§3), arena
@@ -21,6 +21,22 @@ Four canonical documents carry the project. Read them in this order:
    free-threading declaration that, if missed, silently re-enables the GIL for a
    user's entire process. §2's measured call-overhead budgets drive the whole
    API shape.
+5. [`PHASE4.md`](./PHASE4.md) — the **normative** Phase 4 specification
+   (dogfooding integration: `sample_with_derivatives`, the two-tier C ABI, the
+   header-only C++ wrapper, the one-way ROS 2 ingest bridge). Its §1 is the
+   thing to read first: **the exit criterion is operational, not a feature
+   list**, and §0.0 records which parts this development environment cannot
+   gate at all.
+6. [`PHASE5.md`](./PHASE5.md) — the **normative** Phase 5 specification
+   (offline, observability, and the adoption wedge: the frozen `.tft` arena,
+   bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, the `TFT001`–`TFT016`
+   catalogue, `tf_tree top`). §8 is a section about **not** building something,
+   and it is deliberate — read it before proposing a viewer integration.
+
+The roadmap was re-cut from six phases to eight by
+[`decisions/0006`](./decisions/0006-the-eight-phase-roadmap.md), which also holds
+the alias table for the decision numbers `PHASE4.md`/`PHASE5.md` cite (D28, D29,
+D30, D34) against this repository's log.
 
 Supporting material:
 

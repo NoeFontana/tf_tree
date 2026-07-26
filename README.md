@@ -12,7 +12,7 @@ host (zero-copy shared memory), and multiple hosts on one robot.
 > **Status: Phase 1 complete; Phase 2 (shared memory) complete except for the
 > daemon and recorder.** The architecture and specifications live in
 > [`docs/`](./docs/) — read [`PROJECT.md`](./docs/PROJECT.md) (overview,
-> roadmap, decision log D1–D20), then [`PHASE1.md`](./docs/PHASE1.md) and
+> roadmap, decision log D1–D22), then [`PHASE1.md`](./docs/PHASE1.md) and
 > [`PHASE2.md`](./docs/PHASE2.md), whose §0.0 has the current status table.
 > Phase 3 (Python bindings) is specified in [`PHASE3.md`](./docs/PHASE3.md).
 
