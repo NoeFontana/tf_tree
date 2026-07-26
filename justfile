@@ -228,7 +228,11 @@ shm-check:
 # The zero-config rendezvous end to end: a foreign process calls
 # `tf_tree::open()`, joins a served arena, and reads the same transform.
 shm-rendezvous:
-    cargo nextest run -p tf_tree --features shm --test rendezvous
+    # `test-hooks` adds one injection point inside `Tree::claim`, between the
+    # arena CAS and the lease `SETLK`. The window is a single syscall wide, so
+    # `the_acquire_window_backs_out` cannot place a reaper inside it by racing.
+    # The hook is inert when unset, so the other tests run as they always did.
+    cargo nextest run -p tf_tree --features shm,test-hooks --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:

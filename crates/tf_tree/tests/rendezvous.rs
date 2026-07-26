@@ -361,3 +361,122 @@ fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
         "expected exactly the dead peer's edge to be reaped, got {line}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The CAS-to-lease window (`docs/decisions/0005` §5)
+// ---------------------------------------------------------------------------
+
+/// The tree the in-window hook reaps from. A second, independent participant —
+/// the reaper must not be the claimer, or the self-skip would fire.
+#[cfg(feature = "test-hooks")]
+static REAPER: std::sync::OnceLock<tf_tree::Tree> = std::sync::OnceLock::new();
+
+/// Fires once. A `OnceLock` cannot be unset, so the hook disarms itself instead
+/// — the point of the test is that the *retry* succeeds, which it cannot do if
+/// a reaper keeps running inside every window.
+#[cfg(feature = "test-hooks")]
+static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// How many claims the in-window reaper actually cleared.
+#[cfg(feature = "test-hooks")]
+static REAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "test-hooks")]
+fn reap_from_inside_the_window() {
+    use std::sync::atomic::Ordering;
+    if !ARMED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    if let Some(t) = REAPER.get() {
+        REAPED.fetch_add(t.reap_dead(), Ordering::Relaxed);
+    }
+}
+
+/// **The acquire window backs out.** `0005` step 7 has shipped this guard since
+/// the lease landed and, until now, nothing could fail without it.
+///
+/// Between `edge::claim`'s CAS and the lease `SETLK` there is one syscall of
+/// exposure. A reaper that runs inside it sees `record held ∧ lease free` —
+/// which is precisely its "the holder is dead" signature — and clears a claim
+/// that is in the middle of being taken. The claimer would then hold a lease on
+/// an edge the arena reports free, and a third process could claim it: two
+/// writers on one ring, which is what D7 and A4 exist to prevent.
+///
+/// `edge::reap` bumps the epoch *before* clearing the owner, and that ordering
+/// is the whole reason the window is recoverable: re-reading the epoch after
+/// taking the lease detects the reap.
+///
+/// The window is a syscall wide, so it cannot be hit by racing — hence
+/// `CLAIM_WINDOW_HOOK`, which is what `--features test-hooks` exists for. Two
+/// participants in one process, because the reaper must not be the claimer: a
+/// process skips its own slots, so a self-reap would prove nothing.
+///
+/// **Mutant: delete the epoch re-check in `take_claim_lease`** ⇒ `claim`
+/// returns `Ok`, and the writer it hands back publishes onto a record that was
+/// reaped out from under it — visible immediately as `ClaimRevoked` from A4,
+/// and as a second process being free to claim the same edge.
+#[test]
+#[cfg(feature = "test-hooks")]
+fn the_acquire_window_backs_out() {
+    use std::sync::atomic::Ordering;
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let _scratch = Scratch::new("acquire-window");
+
+    let claimer = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .open()
+        .expect("create");
+    let reaper = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Never)
+        .open()
+        .expect("join as a second read-write participant");
+    assert_ne!(
+        claimer.participant_slot(),
+        reaper.participant_slot(),
+        "both handles took the same slot, so the reaper would skip the claim as its own"
+    );
+
+    REAPER.set(reaper).ok().expect("set reaper");
+    tf_tree::CLAIM_WINDOW_HOOK
+        .set(reap_from_inside_the_window as fn())
+        .ok()
+        .expect("install hook");
+
+    let child = claimer.frame("base").unwrap();
+    let parent = claimer.frame("map").unwrap();
+
+    let err = claimer
+        .claim(child, parent)
+        .err()
+        .expect("a claim reaped inside its own acquire window must not succeed");
+    assert!(
+        matches!(err, tf_tree::ClaimApiError::ReapedDuringClaim { .. }),
+        "expected ReapedDuringClaim, got {err:?}"
+    );
+    assert_eq!(
+        REAPED.load(Ordering::Relaxed),
+        1,
+        "the hook did not actually reap anything, so the guard was never exercised"
+    );
+
+    // **Backing out must give everything back.** A guard that detects the reap
+    // and then leaks the record or the lease turns a recoverable race into a
+    // permanently unclaimable edge, which is worse than the race.
+    let writer = claimer
+        .claim(child, parent)
+        .expect("the retry after ReapedDuringClaim must succeed");
+    writer
+        .push(
+            1_000,
+            &tf_tree_math::exp_se3([0.0, 0.0, 0.1, 1.0, 0.0, 0.0]),
+        )
+        .expect("and the reclaimed edge must be publishable");
+}
