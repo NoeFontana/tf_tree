@@ -96,14 +96,30 @@ pub enum OpenOutcome {
     TookOver,
 }
 
-/// Whether a server is reachable at the socket path.
+/// Whether a server is reachable at the socket path, and what it gave us.
+///
+/// Generic over what a successful probe yields, because the real probe does not
+/// merely *observe* a server — it completes the §3.7 handshake and comes back
+/// holding the segment fd. Splitting "is anyone there?" from "attach to them"
+/// would mean connecting twice and re-running the race in between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reach {
-    /// `connect` succeeded — an owner is serving.
-    Serving,
-    /// `ECONNREFUSED` or no socket at all. A stale socket path is not an error:
-    /// §3.9 says whoever wins ownership unlinks it.
+pub enum Reach<T> {
+    /// The handshake succeeded. Carries whatever the probe obtained.
+    Serving(T),
+    /// `ECONNREFUSED`, no socket at all, or a server that died mid-handshake.
+    ///
+    /// **Not an error.** §3.9 makes a stale socket path an expected state and
+    /// the ownership byte is the real discriminator, so all three collapse to
+    /// the same verdict and the §3.4 loop carries on.
     Absent,
+    /// The owner answered, and refused.
+    ///
+    /// Terminal, unlike [`Reach::Absent`]. §3.4's loop has no exit for a
+    /// rejection, so a `LayoutMismatch` would otherwise be retried until the
+    /// deadline and then reported as [`IpcError::ArenaHeldButUnreachable`] —
+    /// the exact multi-hour debugging session §3.7 says the message exists to
+    /// prevent.
+    Rejected(IpcError),
 }
 
 /// Step 1 of the algorithm, injected.
@@ -114,22 +130,23 @@ pub enum Reach {
 /// simultaneously unreachable, which is precisely the split-brain race and is
 /// otherwise a matter of winning a timing window on purpose.
 pub trait ServerProbe {
+    /// What a successful probe yields — for the real one, the attachment.
+    type Attached;
+
     /// Try to reach a server bound at `sock`.
     ///
     /// # Errors
     ///
-    /// Only for failures that are not "nobody is listening" — those are
-    /// [`Reach::Absent`].
-    fn probe(&mut self, sock: &Path) -> Result<Reach, IpcError>;
-}
+    /// Only for failures that are neither "nobody is listening" nor "the owner
+    /// refused" — those are [`Reach::Absent`] and [`Reach::Rejected`].
+    fn probe(&mut self, sock: &Path) -> Result<Reach<Self::Attached>, IpcError>;
 
-impl<F> ServerProbe for F
-where
-    F: FnMut(&Path) -> Result<Reach, IpcError>,
-{
-    fn probe(&mut self, sock: &Path) -> Result<Reach, IpcError> {
-        self(sock)
-    }
+    /// The participant slot the owner granted in this attachment.
+    ///
+    /// On the trait rather than read from a concrete type, because this crate
+    /// must not know what `Attached` is — for the real probe it holds a segment
+    /// fd, which is exactly the arena knowledge §2 keeps out of here.
+    fn slot_of(&self, attached: &Self::Attached) -> u32;
 }
 
 /// A probe that always reports nothing listening.
@@ -140,8 +157,15 @@ where
 pub struct NoServer;
 
 impl ServerProbe for NoServer {
-    fn probe(&mut self, _sock: &Path) -> Result<Reach, IpcError> {
+    type Attached = ();
+
+    fn probe(&mut self, _sock: &Path) -> Result<Reach<()>, IpcError> {
         Ok(Reach::Absent)
+    }
+
+    fn slot_of(&self, _attached: &()) -> u32 {
+        // Unreachable: this probe never returns `Serving`.
+        u32::MAX
     }
 }
 
@@ -237,7 +261,7 @@ impl Open {
     /// but nothing serves it; [`IpcError::ArenaAbsent`] under
     /// [`CreatePolicy::Never`]; [`IpcError::NoParticipantSlots`] when the
     /// participant table is full; and any lock or directory failure.
-    pub fn open<P: ServerProbe>(&self, probe: &mut P) -> Result<Session, IpcError> {
+    pub fn open<P: ServerProbe>(&self, probe: &mut P) -> Result<Session<P::Attached>, IpcError> {
         self.rendezvous.ensure_dir()?;
         let lock = LockFile::open(self.rendezvous.lock_path())?;
         let identity = Identity::of_self_best_effort(self.mode);
@@ -246,14 +270,36 @@ impl Open {
         let mut backoff = MIN_BACKOFF;
         loop {
             // 1. Someone is already serving. Join.
-            if probe.probe(self.rendezvous.sock_path())? == Reach::Serving {
-                let slot = self.register(&lock, &identity)?;
-                return Ok(Session {
-                    outcome: OpenOutcome::Joined,
-                    lock,
-                    slot,
-                    owner: false,
-                });
+            match probe.probe(self.rendezvous.sock_path())? {
+                // Terminal. Retrying cannot change a version or layout
+                // disagreement, and burning the deadline on it would replace a
+                // precise message with a timeout.
+                Reach::Rejected(why) => return Err(why),
+                Reach::Serving(attached) => {
+                    // The owner named the slot, so §3.3's specified order —
+                    // write the identity, *then* take the lock — is restorable
+                    // here. It was not in the fallback below, which has to find
+                    // a free slot itself and would race two writers onto one
+                    // record. See `register_any`.
+                    // `None` means the byte the owner named is held by somebody
+                    // the owner has not noticed leaving yet. Drop this
+                    // attachment and go round again: the owner re-probes its
+                    // table and will name a different slot. Nothing was written
+                    // to the arena, so nothing is left behind — which is the
+                    // point of taking the byte before touching it.
+                    if let Some(slot) =
+                        self.register_at(&lock, &identity, probe.slot_of(&attached))?
+                    {
+                        return Ok(Session {
+                            outcome: OpenOutcome::Joined,
+                            lock,
+                            slot,
+                            owner: false,
+                            attached: Some(attached),
+                        });
+                    }
+                }
+                Reach::Absent => {}
             }
 
             // 2. Nobody is serving. Try to become the owner.
@@ -263,12 +309,13 @@ impl Open {
                 //    that already holds the arena is the one thing that cannot
                 //    create a second one.
                 if self.already_attached {
-                    let slot = self.register(&lock, &identity)?;
+                    let slot = self.register_any(&lock, &identity)?;
                     return Ok(Session {
                         outcome: OpenOutcome::TookOver,
                         lock,
                         slot,
                         owner: true,
+                        attached: None,
                     });
                 }
 
@@ -287,12 +334,13 @@ impl Open {
                 } else {
                     // 5. Serve. The caller owes: memfd create + seal (§3.6),
                     //    unlink stale sock, bind, listen.
-                    let slot = self.register(&lock, &identity)?;
+                    let slot = self.register_any(&lock, &identity)?;
                     return Ok(Session {
                         outcome: OpenOutcome::Created,
                         lock,
                         slot,
                         owner: true,
+                        attached: None,
                     });
                 }
             }
@@ -320,11 +368,42 @@ impl Open {
     ///
     /// So: lock, then write. The window where a slot is held with a stale record
     /// is a few microseconds long, and the record is advisory (§5.1) — the lock
-    /// is the liveness. Restore the spec's order when §3.7 lands.
-    fn register(&self, lock: &LockFile, identity: &Identity) -> Result<u32, IpcError> {
+    /// is the liveness.
+    ///
+    /// **This path is now only for a creator or a taker-over**, neither of which
+    /// has an owner to ask. A joiner uses [`Open::register_at`], where §3.3's
+    /// order *is* restored because the slot is known before anything is written.
+    fn register_any(&self, lock: &LockFile, identity: &Identity) -> Result<u32, IpcError> {
         let slot = lock.take_any_participant()?;
         lock.write_identity(slot, identity)?;
         Ok(slot)
+    }
+
+    /// Take the slot the owner named, in §3.3's specified order.
+    ///
+    /// Write the identity record first, then the lock byte. That ordering is
+    /// safe here and unsafe in [`Open::register_any`], and the difference is
+    /// who chose the slot: nobody else is racing us for *this* byte, because the
+    /// owner hands each client a different one. So the record can be in place
+    /// before the byte is held, and a reader that sees the byte held never sees
+    /// it nameless.
+    ///
+    /// Returns `None` if the byte is already held — the owner named a slot whose
+    /// previous holder it has not seen leave yet. The caller retries the
+    /// handshake rather than falling back to another slot: falling back would
+    /// re-open the split between the byte and the arena record that
+    /// `register_at` exists to close.
+    fn register_at(
+        &self,
+        lock: &LockFile,
+        identity: &Identity,
+        slot: u32,
+    ) -> Result<Option<u32>, IpcError> {
+        lock.write_identity(slot, identity)?;
+        match lock.try_take_participant(slot)? {
+            LockAttempt::Acquired => Ok(Some(slot)),
+            LockAttempt::Contended => Ok(None),
+        }
     }
 
     /// Build the timeout error, naming the slots an operator has to deal with.
@@ -354,14 +433,15 @@ impl Open {
 /// participant bytes — the same thing the kernel does when the process dies, by
 /// the same mechanism. There is no separate teardown to forget.
 #[derive(Debug)]
-pub struct Session {
+pub struct Session<A = ()> {
     outcome: OpenOutcome,
     lock: LockFile,
     slot: u32,
     owner: bool,
+    attached: Option<A>,
 }
 
-impl Session {
+impl<A> Session<A> {
     /// How `open()` resolved, and therefore what the caller owes: nothing for
     /// [`OpenOutcome::Joined`], create-and-bind for [`OpenOutcome::Created`],
     /// bind-only for [`OpenOutcome::TookOver`].
@@ -406,6 +486,20 @@ impl Session {
         }
         Ok(())
     }
+
+    /// Take what the §3.7 handshake yielded, if this session joined one.
+    ///
+    /// `None` for [`OpenOutcome::Created`] and [`OpenOutcome::TookOver`]: both
+    /// already have the arena and never ran a handshake.
+    ///
+    /// Taking rather than borrowing, because the payload owns file descriptors —
+    /// the segment and the connection whose closure tells the owner this
+    /// participant is gone (D17). Leaving it inside the `Session` would make the
+    /// lifetime of the liveness signal the lifetime of a struct the caller has
+    /// no reason to keep.
+    pub fn take_attached(&mut self) -> Option<A> {
+        self.attached.take()
+    }
 }
 
 #[cfg(test)]
@@ -440,16 +534,23 @@ mod tests {
     }
 
     /// A probe that reports "serving" only after `n` calls, so a test can make
-    /// the owner appear mid-loop.
+    /// the owner appear mid-loop. Grants slot `1`, since the creator in these
+    /// tests already holds slot `0`.
     struct ServingAfter(u32);
 
     impl ServerProbe for ServingAfter {
-        fn probe(&mut self, _sock: &Path) -> Result<Reach, IpcError> {
+        type Attached = u32;
+
+        fn probe(&mut self, _sock: &Path) -> Result<Reach<u32>, IpcError> {
             if self.0 == 0 {
-                return Ok(Reach::Serving);
+                return Ok(Reach::Serving(1));
             }
             self.0 -= 1;
             Ok(Reach::Absent)
+        }
+
+        fn slot_of(&self, attached: &u32) -> u32 {
+            *attached
         }
     }
 

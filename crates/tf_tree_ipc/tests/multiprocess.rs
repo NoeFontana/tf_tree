@@ -599,3 +599,94 @@ fn a_silent_client_cannot_wedge_the_owner() {
 
     drop(mute);
 }
+
+/// **`Joined` is reachable for the first time.**
+///
+/// Until §3.7 existed, `NoServer` was the only probe and every `open()` in this
+/// file resolved to `Created` or timed out — `CreatePolicy::Never` could not
+/// succeed at all, because nothing could hand a second process the segment.
+/// This is the path the whole milestone was for.
+#[test]
+fn a_second_process_joins_a_served_arena() {
+    let scratch = Scratch::new("real-join");
+    let rd =
+        RuntimeDir::resolve_with(&Fixed(scratch.0.clone()), tf_tree_ipc::current_uid()).unwrap();
+    let rv = Rendezvous::new(rd, 0, ArenaName::new("default", EnvVar::Name).unwrap());
+
+    // An owner takes the lock file, then serves the socket the rendezvous names.
+    let mut creator = Open::new(rv.clone()).open(&mut NoServer).unwrap();
+    assert_eq!(creator.outcome(), OpenOutcome::Created);
+    let _server = serve(rv.sock_path(), 4096);
+
+    // A joiner with `create = Never` — it must find the arena or fail. Before
+    // this PR that combination could only ever fail.
+    let mut probe = tf_tree_ipc::SocketProbe::new(good_request(), Duration::from_secs(5));
+    let mut joiner = Open::new(rv)
+        .create(CreatePolicy::Never)
+        .open(&mut probe)
+        .expect("a served arena must be joinable");
+
+    assert_eq!(joiner.outcome(), OpenOutcome::Joined);
+    assert!(
+        !joiner.is_owner(),
+        "a joiner must not hold the ownership byte"
+    );
+
+    // It came back holding the segment, and the slot it locked is the one the
+    // owner named.
+    let attached = joiner
+        .take_attached()
+        .expect("Joined carries an attachment");
+    assert_eq!(attached.response.participant_slot, joiner.slot());
+    assert_eq!(
+        rustix::fs::fstat(&attached.segment).unwrap().st_size,
+        4096,
+        "the joiner did not receive the served segment"
+    );
+
+    let _ = creator.release_ownership();
+}
+
+/// A rejection is terminal and must not consume the open deadline.
+///
+/// §3.4's loop retries until `open_timeout`. A `LayoutMismatch` cannot be fixed
+/// by waiting, so retrying it would replace the one message §3.7 says exists to
+/// prevent a multi-hour debugging session with a generic timeout error — and
+/// would take the full five seconds to do it.
+#[test]
+fn a_rejection_is_terminal_and_does_not_burn_the_deadline() {
+    let scratch = Scratch::new("terminal-reject");
+    let rd =
+        RuntimeDir::resolve_with(&Fixed(scratch.0.clone()), tf_tree_ipc::current_uid()).unwrap();
+    let rv = Rendezvous::new(rd, 0, ArenaName::new("default", EnvVar::Name).unwrap());
+
+    let _creator = Open::new(rv.clone()).open(&mut NoServer).unwrap();
+    let _server = serve(rv.sock_path(), 4096);
+
+    let mut bad = good_request();
+    bad.layout_hash = 0x0BAD_0BAD;
+    let mut probe = tf_tree_ipc::SocketProbe::new(bad, Duration::from_secs(1));
+
+    let started = std::time::Instant::now();
+    let err = Open::new(rv)
+        .timeout(Duration::from_secs(30))
+        .open(&mut probe)
+        .expect_err("a layout mismatch must not be joinable");
+
+    match err {
+        IpcError::HandshakeRejected {
+            status,
+            owner_layout_hash,
+            ..
+        } => {
+            assert_eq!(status, tf_tree_ipc::HelloStatus::LayoutMismatch);
+            assert_eq!(owner_layout_hash, 0xDEAD_BEEF);
+        }
+        other => panic!("expected the rejection to surface intact, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the rejection was retried instead of returned: took {:?}",
+        started.elapsed()
+    );
+}

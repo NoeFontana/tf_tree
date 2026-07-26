@@ -179,3 +179,49 @@ pub(crate) fn socket_addr(path: &Path) -> Result<SocketAddrUnix, IpcError> {
         limit: MAX_SOCKET_PATH,
     })
 }
+
+/// The real [`crate::ServerProbe`]: connect and complete the §3.7 handshake.
+///
+/// Attaching *is* the probe. Answering "is anyone serving?" and then attaching
+/// as a second step would connect twice, and the owner could die or be replaced
+/// between the two — re-running the very race §3.4 exists to settle. So a
+/// successful probe comes back holding the segment.
+pub struct SocketProbe {
+    request: HelloRequest,
+    timeout: Duration,
+}
+
+impl SocketProbe {
+    /// A probe that will introduce itself as `request`.
+    #[must_use]
+    pub fn new(request: HelloRequest, timeout: Duration) -> SocketProbe {
+        SocketProbe { request, timeout }
+    }
+}
+
+impl crate::open::ServerProbe for SocketProbe {
+    type Attached = Attached;
+
+    fn probe(&mut self, sock: &Path) -> Result<crate::open::Reach<Attached>, IpcError> {
+        match attach(sock, &self.request, self.timeout) {
+            Ok(a) => Ok(crate::open::Reach::Serving(a)),
+            // Nobody listening, or an owner that died mid-handshake. Both are
+            // "no server" (§3.9), and the ownership byte decides from here.
+            Err(IpcError::ServerUnreachable { .. }) | Err(IpcError::HandshakeIo { .. }) => {
+                Ok(crate::open::Reach::Absent)
+            }
+            // The owner answered and refused. Terminal: retrying cannot change
+            // a version or layout disagreement, and burning the §3.4 deadline
+            // would replace a precise message with a timeout.
+            Err(e @ IpcError::HandshakeRejected { .. })
+            | Err(e @ IpcError::HandshakeMalformed(_))
+            | Err(e @ IpcError::RejectionCarriedFd { .. })
+            | Err(e @ IpcError::NoFdReceived) => Ok(crate::open::Reach::Rejected(e)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn slot_of(&self, attached: &Attached) -> u32 {
+        attached.response.participant_slot
+    }
+}
