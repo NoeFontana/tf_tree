@@ -127,12 +127,65 @@ impl PyTree {
         self.inner.is_writable()
     }
 
+    /// Which arena instance this tree is attached to, as 32 hex characters.
+    ///
+    /// All-zero for an in-process tree. Two processes that resolved the same
+    /// name can still hold *different* segments if the owner was replaced
+    /// between their `open()` calls; this is what tells them apart, and
+    /// comparing names cannot.
+    fn instance_uuid(&self) -> String {
+        self.inner
+            .instance_uuid()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
+        let uuid = self.instance_uuid();
+        // Show the instance only when there is one. An all-zero field on an
+        // in-process tree is noise that reads like a bug.
+        let instance = if uuid.chars().all(|c| c == '0') {
+            String::new()
+        } else {
+            format!(" instance={}", &uuid[..8])
+        };
+        // `True`/`False`, not Rust's `true`/`false`. A repr is read by a Python
+        // programmer, and lowercase booleans there look like a stringly-typed
+        // field rather than a bool.
         format!(
-            "<tf_tree.Tree shared={} writable={}>",
-            self.inner.is_shared(),
-            self.inner.is_writable()
+            "<tf_tree.Tree shared={} writable={}{instance}>",
+            py_bool(self.inner.is_shared()),
+            py_bool(self.inner.is_writable())
         )
+    }
+
+    /// One transform, without compiling a plan first (§4.2).
+    ///
+    /// The plan is cached per **thread**, keyed on
+    /// `(target, source, topology generation)` — a shared cache behind a lock
+    /// would turn the convenience API into a contention point on exactly the
+    /// workload free-threading exists to serve (§7.2).
+    ///
+    /// Prefer `tree.plan(...)` in a loop: this pays a cache probe per call, and
+    /// a plan compiled once pays nothing.
+    #[pyo3(signature = (target, source, stamp_ns, /))]
+    fn lookup<'py>(
+        &self,
+        py: Python<'py>,
+        target: &str,
+        source: &str,
+        stamp_ns: i64,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let iso = self
+            .inner
+            .lookup(target, source, Stamp::<SystemDomain>::from_nanos(stamp_ns))
+            .map_err(lookup_err)?;
+        let out = PyArray2::<f64>::zeros(py, [4, 4], false);
+        // SAFETY: freshly allocated here; no other reference exists.
+        let slice = unsafe { out.as_slice_mut()? };
+        tf_tree::write_mat4(&iso, slice);
+        Ok(out)
     }
 }
 
@@ -503,7 +556,7 @@ impl PyPublisher {
 
     fn __repr__(&self) -> String {
         let held = self.inner.lock().map(|g| g.is_some()).unwrap_or(false);
-        format!("<tf_tree.Publisher held={held}>")
+        format!("<tf_tree.Publisher held={}>", py_bool(held))
     }
 }
 
@@ -564,6 +617,15 @@ fn reject_device_memory(obj: &Bound<'_, PyAny>) -> PyResult<()> {
          adaptive knot array is about a kilobyte, so that transfer is ~6 us and \
          is not what limits you."
     )))
+}
+
+/// Render a bool the way Python spells it, for `__repr__`.
+fn py_bool(b: bool) -> &'static str {
+    if b {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 fn released() -> PyErr {

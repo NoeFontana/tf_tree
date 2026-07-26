@@ -108,6 +108,20 @@ class Tree:
     def publisher(self, child: str, parent: str, /) -> Publisher:
         """Claim `child`'s edge. Argument order is **(child, parent)**."""
 
+    def lookup(self, target: str, source: str, stamp_ns: int, /) -> NDArray[np.float64]:
+        """One transform, without compiling a plan first.
+
+        The plan is cached per *thread*. Prefer `tree.plan(...)` in a loop —
+        this pays a cache probe per call and a compiled plan pays nothing.
+        """
+
+    def instance_uuid(self) -> str:
+        """Which arena instance this is, as 32 hex characters.
+
+        All-zero in-process. Two processes that resolved the same *name* can
+        still hold different segments; this is what tells them apart.
+        """
+
     def is_shared(self) -> bool:
         """Whether this tree's arena is shared with other processes."""
 

@@ -376,3 +376,43 @@ def test_a_plain_numpy_array_still_works(tree):
     out = np.empty((3, 4, 4))
     p.at_into(stamps, out)
     np.testing.assert_array_equal(out, p.at(stamps))
+
+
+def test_lookup_matches_a_compiled_plan_exactly(tree):
+    """§4.2's convenience must not be a *different* answer.
+
+    It goes through a per-thread plan cache rather than a fresh compile, so a
+    stale or mis-keyed entry would show up as a wrong transform here and
+    nowhere else.
+    """
+    p = tree.plan("map", "base")
+    for stamp in (1_000, 1_500, 2_000):
+        np.testing.assert_array_equal(tree.lookup("map", "base", stamp), p.at(stamp))
+
+
+def test_lookup_reports_an_unknown_frame(tree):
+    with pytest.raises(tf_tree.FrameNotDeclaredError):
+        tree.lookup("map", "nope", 1_500)
+
+
+def test_an_in_process_tree_has_no_instance_uuid(tree):
+    """All-zero is the "not a shared instance" sentinel, and `__repr__` hides it.
+
+    Showing 32 zeros on an in-process tree reads like a bug in the uuid rather
+    than like the absence of one.
+    """
+    assert tree.instance_uuid() == "0" * 32
+    assert "instance=" not in repr(tree)
+    assert "shared=False" in repr(tree)
+
+
+def test_reprs_spell_booleans_the_python_way(tree):
+    """A repr is read by a Python programmer.
+
+    Rust's `false` in a repr looks like a stringly-typed field rather than a
+    bool, and someone will eventually compare against the string.
+    """
+    assert "writable=True" in repr(tree)
+    with tree.publisher("base", "map") as pub:
+        assert "held=True" in repr(pub)
+    assert "held=False" in repr(pub)
