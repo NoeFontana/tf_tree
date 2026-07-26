@@ -443,28 +443,40 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 >
 > | threads | 1 | 2 | 4 | 8 |
 > |---|---|---|---|---|
-> | counters on | 21.7–22.5 | 22.0–23.1 | 22.4–25.5 | 38.0–39.2 |
-> | counters off | 22.4–22.9 | 22.8–23.2 | 22.8–24.3 | 38.4–39.2 |
+> | counters on | 21.1–21.5 | 21.4–22.6 | 22.0–22.8 | 38.0–40.2 |
+> | counters off | 18.5–18.9 | 18.5–20.1 | 19.1–19.6 | 34.1–36.8 |
+> | ratio | 1.13× | 1.14× | 1.16× | 1.11× |
 >
-> **The ranges overlap at every row, so the sharding fallback is not
-> justified.** A single earlier run showed 27.6 against 23.7 at four threads and
-> looked like a 16 % contention cost; repeating it three times put that number
-> inside the control's own spread.
+> **The counters cost about 2.6 ns per lookup, and the ratio is flat.** Those
+> are two separate findings and only the second answers §5.7's question. A
+> constant overhead that does not grow from one thread to eight is not
+> contention: the flush is one relaxed atomic per *batch*, so eight threads make
+> eight of them rather than eight thousand. **§5.7's sharding fallback is
+> therefore not justified** — it would address a cost that is not there.
 >
-> Two notes on how the measurement is made honest, both of which changed the
-> answer:
+> The 2.6 ns is the `Cell` increment, the `first_dynamic_edge` walk over the
+> plan's steps, and the branch on `is_writable`, on a ~19 ns lookup. It is a real
+> 14 % and it is what §5.5's compile-time switch exists to remove for a build
+> that cannot pay it.
 >
-> * **The control is the same binary built `--no-default-features`**, not a
->   different code path. Comparing two loop shapes in one build would have
->   measured the loop shapes.
-> * **The 16-thread row is not quoted.** It is 2× oversubscribed here, and the
->   two configurations disagree by more than either differs from itself — 82.7
->   with counters against 114.1 without, i.e. *faster* with the extra work,
->   which is not a thing. §5.7 asks whether the flush contends; a scheduling
->   artifact answering for it would be the wrong number.
+> **An earlier revision of this section reported "no measurable contention" and
+> an overlap at every row. That measurement was invalid**, and the reason is
+> worth recording because nothing in the output showed it: the workspace's
+> `tf_tree_core` dependency did not set `default-features = false`, so a
+> downstream `--no-default-features` still enabled `counters` and the "control"
+> build was the counters-on engine measured twice. The banner printed `OFF` — it
+> reads the *bench crate's* features — while the engine counted. Both the
+> dependency declaration and the banner are fixed; the numbers above are from
+> builds verified with `cargo tree -e features`.
 >
-> The batched-versus-per-lookup row is **+5.8 ns**, which is an upper bound on
-> the atomic §5.4 removes (it includes the guard's own construction).
+> The 16-thread row is still not quoted: it is 2× oversubscribed here, and a
+> scheduling artifact answering §5.7's question would be the wrong number.
+>
+> Batched against per-lookup flushing is **+5.8 ns** *within* the counters-on
+> build — an upper bound on the atomic §5.4 removes, since it includes the
+> guard's own construction.
+
+---
 
 ## 6. The diagnostics catalogue
 

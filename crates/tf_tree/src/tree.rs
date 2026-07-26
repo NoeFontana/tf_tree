@@ -1071,7 +1071,23 @@ impl Tree {
         if self.detached() {
             return Guard::detached(self.view());
         }
-        Guard::new(self.view())
+        let g = Guard::new(self.view());
+        // The counter flush is a write from a *destructor*, and a shared
+        // mapping is `MADV_DONTFORK` — so a guard created here and dropped in a
+        // `fork` child would write into a hole in the address space. The check
+        // above catches a guard *created* after the fork; this catches one that
+        // crossed it, which is the case `EdgeWriter::drop` already guards and
+        // which `Guard` walked straight into.
+        //
+        // Only for a shared arena: a heap one is ordinary memory the child
+        // inherits intact, and there is nothing to protect against.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let g = if self.is_shared() {
+            g.with_fork_check(tf_tree_ipc::fork::generation)
+        } else {
+            g
+        };
+        g
     }
 
     /// Convenience lookup by name at a stamp: interns the names, compiles (or

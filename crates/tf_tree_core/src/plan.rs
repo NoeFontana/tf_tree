@@ -954,6 +954,21 @@ pub struct Guard<'a> {
     /// participant total and no edge, which is the honest answer.
     #[cfg(feature = "counters")]
     ok_edge: core::cell::Cell<Option<EdgeId>>,
+    /// `(generation at creation, how to read it now)`, for the fork check.
+    ///
+    /// **The flush is a write into the arena from a destructor**, and a shared
+    /// mapping is `MADV_DONTFORK` — so in a `fork` child that arena is a hole in
+    /// the address space and the destructor faults. That is the same trap
+    /// `EdgeWriter::drop` already carries a guard for (`docs/decisions/0005`
+    /// step 9), and `Guard` walked straight into it: a guard created before a
+    /// fork and dropped in the child segfaults, which review reproduced.
+    ///
+    /// A function pointer rather than a direct call because `tf_tree_core` is
+    /// `no_std` and knows nothing about processes; the facade supplies
+    /// `tf_tree_ipc::fork::generation`. `None` for a heap arena, which cannot
+    /// have the problem.
+    #[cfg(feature = "counters")]
+    fork: Option<(u64, fn() -> u64)>,
 }
 
 /// The generation a [`Guard::detached`] guard carries.
@@ -996,6 +1011,26 @@ impl CounterField {
             CounterField::NoData => &c.err_no_data,
             CounterField::SlotRecycled => &c.err_slot_recycled,
             CounterField::SlotContended => &c.err_slot_contended,
+        };
+        f.fetch_add(1, Relaxed);
+    }
+
+    /// The same classification against the participant mirror.
+    ///
+    /// Two `match`es rather than a generic over the two structs: they are
+    /// `#[repr(C)]` records in a cross-process layout, and a trait that made
+    /// them interchangeable would make it easy to add a field to one and not
+    /// the other without noticing. `counters.rs` has a test pinning their
+    /// shared prefix for the same reason.
+    #[inline]
+    fn bump_participant(self, p: &crate::counters::ParticipantCounters) {
+        use crate::sync::Ordering::Relaxed;
+        let f = match self {
+            CounterField::ExtrapBefore => &p.err_extrap_before,
+            CounterField::ExtrapAfter => &p.err_extrap_after,
+            CounterField::NoData => &p.err_no_data,
+            CounterField::SlotRecycled => &p.err_slot_recycled,
+            CounterField::SlotContended => &p.err_slot_contended,
         };
         f.fetch_add(1, Relaxed);
     }
@@ -1058,6 +1093,16 @@ impl Drop for Guard<'_> {
         if n == 0 || !self.view.is_writable() {
             return;
         }
+        // And the fork guard. A shared mapping is `MADV_DONTFORK`, so in a child
+        // the arena is a hole in the address space and this write faults —
+        // exactly the failure `EdgeWriter::drop` already guards against. A
+        // destructor is the worst place to discover it, because it runs whether
+        // or not the child ever called anything.
+        if let Some((born, read)) = self.fork {
+            if read() != born {
+                return;
+            }
+        }
         use crate::sync::Ordering::Relaxed;
         // Credited to an edge only when the whole batch went through one. A
         // multi-edge plan credits nothing here rather than crediting the last
@@ -1094,6 +1139,28 @@ impl<'a> Guard<'a> {
             ok: core::cell::Cell::new(0),
             #[cfg(feature = "counters")]
             ok_edge: core::cell::Cell::new(None),
+            #[cfg(feature = "counters")]
+            fork: None,
+        }
+    }
+
+    /// Attach a fork-generation check to this guard's counter flush.
+    ///
+    /// `read` must return a value that changes when the process forks. The
+    /// facade passes `tf_tree_ipc::fork::generation`; a heap arena passes
+    /// nothing, because it has no mapping to lose.
+    #[must_use]
+    pub fn with_fork_check(self, read: fn() -> u64) -> Guard<'a> {
+        #[cfg(feature = "counters")]
+        {
+            let mut g = self;
+            g.fork = Some((read(), read));
+            g
+        }
+        #[cfg(not(feature = "counters"))]
+        {
+            let _ = read;
+            self
         }
     }
 
@@ -1107,6 +1174,24 @@ impl<'a> Guard<'a> {
         #[cfg(feature = "counters")]
         {
             self.ok.set(self.ok.get().saturating_add(1));
+            // **`EdgeId(0)` is the "no edge" sentinel and must not latch.**
+            // `first_dynamic_edge` returns it for a multi-edge plan, and the
+            // comment there claimed this folded it into "credit no edge". It
+            // did not: `Some(0)` latched, and the flush went into the reserved
+            // edge-0 counter record — which `edge_counters` happily returns,
+            // since it bounds only against `max_edges`.
+            //
+            // Two consequences, and the second is the worse one. A consumer
+            // iterating edges from 0 rather than 1 sees a phantom count (the
+            // same off-by-one `error.rs` records `tf_tree_c` having already
+            // shipped once). And on a real robot the common query — `map` to
+            // `base_link` — *is* multi-edge, so every reader in every process
+            // would have funnelled its flush into one 64-byte line: precisely
+            // the false sharing `EdgeCounters`' padding exists to prevent.
+            if edge == EdgeId(0) {
+                self.ok_edge.set(None);
+                return;
+            }
             match self.ok_edge.get() {
                 None if self.ok.get() == 1 => self.ok_edge.set(Some(edge)),
                 Some(e) if e != edge => self.ok_edge.set(None),
@@ -1141,8 +1226,33 @@ impl<'a> Guard<'a> {
             let Some((edge, field)) = counter_of(err) else {
                 return;
             };
+            // The failure's own stamp when it has one, so "when" is in the
+            // arena's time domain rather than the reader's wall clock — which
+            // `tf_tree_core` has no access to anyway (`no_std`, no clock).
+            // Zero when the error carries no stamp, which reads as "never" and
+            // is honest: the alternative is inventing a time.
+            let now = match *err {
+                LookupError::Extrapolation { requested, .. } => requested,
+                _ => 0,
+            };
+            // **Both halves, not just the edge.** §5.2 is explicit that
+            // per-participant counters are what make a diagnostic actionable —
+            // "which consumer is failing", not merely "failures exist" — and
+            // the first version wrote only the edge side, leaving the entire
+            // participant failure surface, and `last_err_edge` with it, dead.
+            if let Some(slot) = self.view.interning_identity() {
+                if let Some(p) = self.view.participant_counters(slot) {
+                    field.bump_participant(p);
+                    p.last_err_edge.store(edge.get(), Relaxed);
+                    p.last_err_nanos.store(now, Relaxed);
+                }
+            }
             if let Some(c) = self.view.edge_counters(edge) {
                 field.bump(c);
+                // `last_err_nanos` was declared and never written, so "when did
+                // this last fail" always read "never" — the field that turns a
+                // count into an incident, per its own doc comment.
+                c.last_err_nanos.store(now, Relaxed);
                 if let LookupError::Extrapolation {
                     requested,
                     oldest,
@@ -1159,10 +1269,22 @@ impl<'a> Guard<'a> {
                     } else {
                         oldest.saturating_sub(requested)
                     };
-                    let prev = c.worst_extrap_gap_ns.load(Relaxed);
-                    if gap > prev {
-                        c.worst_extrap_gap_ns.store(gap, Relaxed);
-                    }
+                    // **`fetch_max`, not load/compare/store.** The latter is a
+                    // non-atomic read-modify-write on a location several
+                    // consumers write concurrently, and the failure is worse
+                    // than a lost update: the mark can *regress*. Two threads
+                    // load 0; one stores 10 s; the other then stores 500 ms, and
+                    // a value that had already been published as 10 s reads
+                    // 500 ms afterwards. `TFT011` compares this against the
+                    // ring's span to decide whether the buffer is too short, so
+                    // a regression makes it conclude the ring is fine for a ring
+                    // that lapped by ten seconds — the check silently inverts.
+                    //
+                    // Reproduced by review at 154 regressions in 200 000 trials
+                    // on x86-64, which is the *friendly* memory model. Relaxed
+                    // is still the right ordering; what was missing is
+                    // atomicity, not ordering.
+                    c.worst_extrap_gap_ns.fetch_max(gap, Relaxed);
                 }
             }
         }
@@ -1210,6 +1332,8 @@ impl<'a> Guard<'a> {
             ok: core::cell::Cell::new(0),
             #[cfg(feature = "counters")]
             ok_edge: core::cell::Cell::new(None),
+            #[cfg(feature = "counters")]
+            fork: None,
         }
     }
 

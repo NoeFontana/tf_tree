@@ -65,9 +65,17 @@ tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.1.0" }
 # (see crates/tf_tree_ipc/src/ofd.rs for why the alternative was worse).
 libc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "std"] }
-tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0" }
+# **`default-features = false`, and it is load-bearing.** Without it a
+# downstream `--no-default-features` still gets `tf_tree_core/default`, because
+# a workspace dependency carries its own defaults independently of the
+# depending crate's feature flags. That made `docs/PHASE5.md` §5.5's
+# compile-time switch unreachable *and* silently invalidated §5.7's control
+# measurement — the "counters off" row was measuring the counters-on engine.
+# Every crate that wants them re-enables them through its own `counters`
+# feature, which is what makes the switch actually switch.
+tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0", default-features = false }
 tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.1.0" }
-tf_tree = { path = "crates/tf_tree", version = "0.1.0" }
+tf_tree = { path = "crates/tf_tree", version = "0.1.0", default-features = false }
 # publish = false crates, wired by path only (no version requirement published).
 tf_tree_bench = { path = "crates/tf_tree_bench" }
 # no_std numeric + POD casting (the entire core dependency budget, plus blake3).
