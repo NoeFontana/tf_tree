@@ -258,6 +258,11 @@ py-lint:
     PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
     .venv/bin/ruff check python tests/python crates/tf_tree_bench/python
     .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python
+    # `--strict` over the package and its stubs (PHASE3 §9). Not over
+    # tests/: numpy's own stubs are partially typed, so strict there reports
+    # ~120 errors that are numpy's and not ours, and a gate nobody can keep
+    # green is a gate nobody runs.
+    .venv/bin/pyright python
 
 # Build a release wheel.
 py-wheel:
