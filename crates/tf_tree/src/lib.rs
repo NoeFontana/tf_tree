@@ -44,6 +44,12 @@ pub use tree::{
     TreeBuilder,
 };
 
+/// Test scaffolding for `docs/decisions/0005` §5's CAS-to-lease window. Absent
+/// unless `--features test-hooks`; see [`tree::CLAIM_WINDOW_HOOK`].
+#[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
+#[doc(hidden)]
+pub use tree::CLAIM_WINDOW_HOOK;
+
 /// Shared-memory attachment surface (Phase 2). Linux-only, behind `--features shm`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use tf_tree_arena::{AttachMode, ShmError};

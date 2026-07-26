@@ -540,19 +540,35 @@ nightly). `shm-check` extends to `-p tf_tree --features shm`, `-p tf_tree_ipc` a
 
 ## Found while implementing
 
-**`the_acquire_window_backs_out` (step 7) still does not exist.** Step 8 landed the
-reaper that finally makes the epoch re-check reachable, and did not bring its test
-with it. This is recorded here rather than left implicit: the guard is present, is
-correct as far as reading it goes, and is unverified. It is the next thing owed.
+**The acquire window cannot be tested by racing, so it is tested by injection.**
+`the_acquire_window_backs_out` finally exists — it was owed from step 7 and did not
+arrive with the step 8 reaper that made it reachable. The window between the claim
+CAS and the lease `SETLK` is *one syscall* wide, which is not a thing a test can
+land inside by repetition. `tf_tree` therefore gains a `test-hooks` feature — off by
+default, absent from the API entirely unless enabled — carrying a single
+`CLAIM_WINDOW_HOOK` fired at exactly that point.
+
+The reaper in the hook must be a **second participant**, not the claimer: §6.3's
+self-skip means a process never reaps its own slots, so a self-reap would prove
+nothing. Two `open()` calls in one process give two slots, two lock-file
+descriptions, and therefore a genuine cross-participant reap.
+
+The test also asserts the **retry succeeds and publishes**. A guard that detects the
+reap and then leaks the record or the lease converts a recoverable race into a
+permanently unclaimable edge, which is worse than the race it fixed.
+
+Mutant: `if claim_rec.epoch.load(..) != epoch` ⇒ `if false`. `claim` returns `Ok`,
+and the writer publishes onto a record that was reaped out from under it.
 
 
-**The epoch re-check cannot be tested until step 8 exists.** Step 7's
+**The epoch re-check could not be tested until step 8 existed.** Step 7's
 CAS-to-`SETLK` window is guarded by re-reading `ClaimRecord::epoch`, and
 removing that guard leaves every test green — because nothing reaps yet, so no
 reaper can run inside the window. The guard is written anyway: the window is
 created by step 7, and a reader arriving with step 8 would otherwise have to
 re-derive why it is needed. **Its test belongs with the reaper**, and step 8 is
-not complete without one that fails when the check is removed.
+not complete without one that fails when the check is removed. *(Landed after
+step 9; see the injection note above.)*
 
 The same is true of `ClaimApiError::LeaseContended` and `ReapedDuringClaim`:
 both are reachable only once a reaper or `CreatePolicy::Always` aliasing exists.

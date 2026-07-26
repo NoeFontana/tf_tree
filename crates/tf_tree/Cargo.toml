@@ -23,6 +23,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Linux-only and off by default — the single-process build must not grow a
 # syscall dependency it never uses.
 shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
+# A single injection point inside `Tree::claim`, between the arena CAS and the
+# lease `SETLK` (`docs/decisions/0005` §5). Off by default and absent from the
+# API entirely unless enabled: the window it exposes is one syscall wide and
+# there is no other way to place a reaper inside it deterministically, but a
+# published hook that runs arbitrary code mid-claim is not something a shipped
+# build should carry. Enabled by `just shm-rendezvous`.
+test-hooks = []
 
 [dependencies]
 tf_tree_core.workspace = true

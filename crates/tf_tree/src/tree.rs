@@ -639,6 +639,24 @@ impl<'a> core::ops::Deref for EdgeWriter<'a> {
     }
 }
 
+/// Fired inside [`Tree::claim`], after the arena CAS and before the lease
+/// `SETLK`.
+///
+/// **Test scaffolding, and present only under `--features test-hooks`.** The
+/// window between those two operations is one syscall wide; a reaper that runs
+/// inside it sees `record held ∧ lease free`, which is its exact "the holder is
+/// dead" signature, and clears a claim that was in the middle of being taken.
+/// `take_claim_lease` recovers by re-reading the epoch, and there is no way to
+/// demonstrate that recovery — or to catch its removal — without putting a
+/// reaper in the window deliberately.
+///
+/// Set it once, from a test, before the `claim` under test. `fn()` rather than a
+/// boxed closure so this is a bare function pointer with no allocation and no
+/// `Sync` bound to reason about.
+#[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
+#[doc(hidden)]
+pub static CLAIM_WINDOW_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
 /// Holds an edge's claim byte for as long as this value lives.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub(crate) struct ClaimLease {
@@ -928,6 +946,15 @@ impl Tree {
         // one of them is the linearization point, and it is this CAS.
         let (epoch, owner) = claim(claim_rec, self.participant)?;
 
+        // The CAS has landed and the lease has not been taken: this is the
+        // one-syscall window `take_claim_lease`'s epoch re-check exists to
+        // recover from, and the only place a reaper can be placed inside it on
+        // purpose. Compiled out entirely without `test-hooks`.
+        #[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
+        if let Some(hook) = CLAIM_WINDOW_HOOK.get() {
+            hook();
+        }
+
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let lease = self.take_claim_lease(eid, claim_rec, epoch, owner)?;
 
@@ -984,11 +1011,10 @@ impl Tree {
             }
         }
 
-        // **Untestable until step 8.** Removing this check leaves every test
-        // passing, because nothing reaps yet — there is no reaper to run inside
-        // the window. It is written now because the window is created by *this*
-        // commit and a reader arriving with step 8 would otherwise have to
-        // re-derive why it is needed. Its test belongs with the reaper.
+        // Verified by `the_acquire_window_backs_out`, which places a reaper
+        // inside the window through `CLAIM_WINDOW_HOOK` — the window is one
+        // syscall wide and cannot be hit by racing. Mutant: `if false` here ⇒
+        // `claim` returns `Ok` and the writer publishes onto a reaped record.
         if claim_rec.epoch.load(Ordering::Acquire) != epoch {
             // A reaper ran inside the window. Give everything back.
             tf_tree_core::edge::release(claim_rec, owner);
