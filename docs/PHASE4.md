@@ -124,6 +124,37 @@ Verified numerically against central differences: **max relative error 2.4 × 10
 
 `ξ` is *already computed* by the ScLerp evaluation. **The first derivative costs one scalar multiply.**
 
+> **Amendment — the preceding two sentences are false against the shipped code, and the conclusion survives anyway.**
+>
+> `ScLerp::eval` does not compute `ξ`. It computes `rel = a.inv_mul(b)` and then
+> `screw_pow(&rel, s)`, which works entirely in unit-dual-quaternion screw form
+> (`crates/tf_tree_math/src/interp.rs:61-75`, `dualquat.rs:81-148`). The
+> quantities actually in hand are `sh2 = sin²(θ/2)`, `ch = cos(θ/2)`,
+> `k = q_d.w/sin²(θ/2)` and `m_sh = m·sin(θ/2)` — deliberately, because each is
+> finite where the factored form diverges. The only `log_se3` in the function is
+> the degenerate branch guarded by `SCREW_DEGENERATE_SQ = 1e-290`
+> (`dualquat.rs:93-106`), which is unreachable for physically meaningful input.
+> There is therefore no `ξ` to multiply by `1/Δt`.
+>
+> **What is true:** `ξ` is recoverable from those intermediates without any
+> additional transcendental. `ω = 2φ·q_v/sin(θ/2)` needs `φ` and `sin(θ/2)`,
+> which on the large-arc branch are already materialised as `phi` and `sh`
+> (`dualquat.rs:133-134`) and on the small-angle branch cost **two `sqrt`s**
+> against the `phi_sq` and `sh2` already computed (`dualquat.rs:125`, `:90`).
+>
+> So the honest form of the claim is: **the first derivative costs two `sqrt`s
+> on the small-angle branch and nothing on the large-arc branch, and adds no
+> transcendental call on either.** That is still cheap enough to carry §2.1's
+> argument — the reason to pull this forward was never one multiply — but "one
+> scalar multiply" must not be quoted as a budget, and an implementation written
+> against it would go looking for a variable that does not exist.
+>
+> `screw_pow` is `pub` in `tf_tree_math`, so the derivative path must either
+> gain a variant returning the screw intermediates alongside the pose, or
+> recompute them. Prefer the variant: recomputing means a second
+> `Quat::from_pure(t) * q` on a path whose whole justification is that it is
+> nearly free.
+
 Composition along a plan, both verified to ~5 × 10⁻¹¹:
 
 ```
@@ -132,6 +163,24 @@ S = T⁻¹              ⇒   V_S^b   = −Ad(T) · V_T^b
 ```
 
 So `at_with_derivatives` accumulates one 6×6 adjoint application per plan step — roughly 2× a plain lookup, opt-in, no transcendentals. Add these two identities as proptests alongside the Phase 1 set.
+
+> **Amendment — "6×6 adjoint application" is the identity, not a required
+> representation, and building the matrix would be the slower choice.**
+>
+> There is no adjoint anywhere in the workspace today; the word appears only in
+> prose (`crates/tf_tree_math/src/lib.rs:15-17`). Nothing needs to be built as a
+> 6×6. For `T = (q, t)` the two identities above are, in the primitives that
+> already exist:
+>
+> ```text
+> Ad(T⁻¹)·[ω; v] = [ q*·ω ;  q*·(v − t × ω) ]
+> Ad(T) ·[ω; v] = [ q·ω  ;  t × (q·ω) + q·v ]
+> ```
+>
+> — two `Quat::rotate` and one `Vec3::cross` per plan step
+> (`quat.rs:184`, `iso3.rs:102`, `:73`), against 36 multiply-adds plus the
+> rotation-matrix extraction a literal 6×6 would need. `Twist::to_spatial`
+> is the second identity and is the only place a caller sees `Ad(T)` at all.
 
 ### 2.4 The finding worth putting in the docs
 
