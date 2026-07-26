@@ -441,7 +441,10 @@ impl MappedArena {
     fn header_snapshot(&self) -> [u8; 256] {
         let mut out = [0u8; 256];
         // SAFETY: module invariant — the mapping is at least 256 bytes (it is at
-        // least `size_of::<ArenaHeader>()`, which is 256), and this only reads.
+        // least `size_of::<ArenaHeader>()`, which is 320 since FORMAT_VERSION 3
+        // and was 256 before it), and this only reads. The snapshot deliberately
+        // stays 256: it exists to compare the *pinned* header prefix across a
+        // remap, and every field it is used to check lives below 256.
         unsafe { core::ptr::copy_nonoverlapping(self.base.as_ptr(), out.as_mut_ptr(), 256) };
         out
     }
@@ -459,7 +462,7 @@ impl MappedArena {
     ///
     /// | region | populated |
     /// |---|---|
-    /// | header | all (256 B) |
+    /// | header | all (320 B) |
     /// | frame table | `frame_count` records |
     /// | frame hash | **none** — probed by hash, so it is scattered; interning is not the hot path |
     /// | topology blocks | `frame_count` entries of each of the four |

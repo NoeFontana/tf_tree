@@ -8,9 +8,11 @@
 //! implementation detail. All multi-byte fields are little-endian (load-bearing
 //! invariant 7); construction asserts a little-endian host.
 //!
-//! The header lives inside the 256-byte header *region* (see
-//! [`crate::layout`]); the struct itself is smaller (it rounds up to its 64-byte
-//! alignment) and the remainder of the region is reserved padding.
+//! The header lives inside the header *region* (see [`crate::layout`]), which is
+//! **320 bytes since `FORMAT_VERSION` 3** and was 256 before it. The struct is
+//! exactly that size — its reserved space is named fields (`_reserved`,
+//! `_reserved_v3`) plus the alignment padding in front of `topo_lock`, not slack
+//! at the end of the region.
 
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
 
@@ -190,13 +192,16 @@ pub struct ArenaHeader {
     /// with and no randomness is drawn — which also keeps the no-`shm` build
     /// free of an RNG dependency.
     ///
-    /// Lands at offset 136, inside padding that already existed because
-    /// [`TopoLock`] is `align(64)`: `boot_id` ends at 128, `_reserved` at 136,
-    /// and the next 64-byte boundary is 192. So adding it moved no pinned
-    /// offset, did not grow the header past 256, and — because
-    /// [`crate::layout::layout_hash`] covers region sizes and strides rather
-    /// than header fields — did not change the layout hash either. That is why
-    /// [`FORMAT_VERSION`] is still 2.
+    /// Lands at offset 136. **When it was added, for `FORMAT_VERSION` 2**, that
+    /// was inside padding which already existed because [`TopoLock`] is
+    /// `align(64)`: `boot_id` ended at 128, `_reserved` at 136, and the next
+    /// 64-byte boundary was 192. So it moved no pinned offset, did not grow the
+    /// header, and did not change the layout hash — which is why version 2 did
+    /// not have to be version 3 for it.
+    ///
+    /// `FORMAT_VERSION` 3 then spent the rest of that padding on the fields
+    /// below, and the header grew to 320. The offset of this field is unchanged;
+    /// what changed is that there is no longer free space after it.
     pub instance_uuid: [u8; 16],
     // -----------------------------------------------------------------------
     // FORMAT_VERSION 3 additions — `docs/PHASE5.md` §1.2

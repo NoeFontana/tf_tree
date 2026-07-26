@@ -324,7 +324,7 @@ impl ArenaLayout {
         &self.edge_capacities
     }
 
-    /// The header region (offset 0, size 256).
+    /// The header region (offset 0, size 320 since FORMAT_VERSION 3).
     pub fn header_region(&self) -> Region {
         self.computed.regions[R_HEADER]
     }
@@ -651,10 +651,14 @@ mod tests {
         //                                header 256->320, plus the two counter
         //                                region strides appended
         //
-        // **`tf_tree_ipc`'s wire tests hold this literal too** (§1.2's amendment
-        // says so, and it is right). Change it here and there in one commit, or
-        // the rendezvous rejects every client with a layout mismatch that is
-        // really a stale constant.
+        // **This is the only copy.** `docs/PHASE5.md` §1.2 used to say the hash
+        // was "duplicated as the literal 0x9075_90F5 in `tf_tree_ipc`'s wire
+        // tests, so those move with it", and an earlier draft of this comment
+        // repeated it. Both were wrong, and the spec now says so: those literals
+        // are *fixture values* in byte-position assertions — any distinctive
+        // `u32` would do — and `tf_tree_ipc` does not depend on
+        // `tf_tree_arena` at all (`docs/decisions/0005`), so it cannot see this
+        // function. All 83 of its tests pass unchanged across a hash change.
         assert_eq!(layout_hash(), layout_hash());
         assert_ne!(layout_hash(), 0);
         assert_eq!(layout_hash(), 0x3D10_4195);

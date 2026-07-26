@@ -33,7 +33,8 @@ const ARENA_ALIGN: usize = 64;
 /// reads and writes of [`Arena::len`] bytes for as long as `self` is alive, that
 /// the pointer is 64-byte aligned, and that the region may be shared across
 /// threads (all interior mutation goes through atomics).
-// An arena is never empty (it always holds at least the 256-byte header), so an
+// An arena is never empty (it always holds at least the header region, 320 B
+// since FORMAT_VERSION 3 and never smaller than 256), so an
 // `is_empty` companion would be dead weight.
 #[allow(clippy::len_without_is_empty)]
 pub unsafe trait Arena: Send + Sync {
