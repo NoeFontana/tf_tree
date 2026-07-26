@@ -68,10 +68,18 @@ records why (typed errors and zero-copy buffers do not survive a C boundary).
 - **Dependency budget:** `tf_tree_core` = `libm` + `bytemuck` + `blake3` (no_std)
   and nothing else. `tf_tree_math` = `libm` + `bytemuck`. blake3 is the one
   addition, resolving a spec conflict over frame-name hashing.
-- **Unsafe budget:** `#![forbid(unsafe_code)]` on `tf_tree_math`, `tf_tree`,
-  `tf_tree_cli`. `unsafe` is permitted only in `tf_tree_arena` and in
-  `tf_tree_core::{buffer, arena_view}`, each with a module `// SAFETY:` block and
-  a per-block `// SAFETY:` comment naming the invariant relied on.
+- **Unsafe budget** (restated by [`0007`](./docs/decisions/0007-the-unsafe-budget-and-the-c-abi.md);
+  the old enumeration had been stale since Phase 2): `unsafe` is permitted **only
+  at a boundary the compiler cannot see across**, and there are four —
+  the arena's raw memory (`tf_tree_arena`, `tf_tree_core::{buffer, arena_view}`),
+  the OS (`tf_tree_ipc`), a foreign runtime (`tf_tree_py`), and a foreign caller
+  (`tf_tree_c`). A fifth kind needs a decision record.
+  `#![forbid(unsafe_code)]` stays on `tf_tree_math`, `tf_tree` and `tf_tree_cli`
+  — **the facade does not move**, because its provable safety is what lets a
+  reader trust the C ABI's `unsafe` is confined to argument validation.
+  Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
+  relies on; every crate with `unsafe` carries a module `// SAFETY:` block and
+  `#![deny(unsafe_op_in_unsafe_fn)]`.
 - **No pointers in the arena; fixed capacity; no growth/realloc; `#[repr(C)]`
   everywhere; append-only `FrameId`/`EdgeId` (tombstone, never recycle).**
 - **`ArcSwap`/`Arc`/`Box`/`Vec` inside an arena structure is forbidden**

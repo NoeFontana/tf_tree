@@ -16,6 +16,7 @@ changed is where the *existing* architecture and Phase 1 contract live:
 | [`0003`](./0003-phase-1-single-process-core.md) | **Superseded.** Consolidated into [`docs/PHASE1.md`](../PHASE1.md) (normative Phase 1 spec, §0–§13). |
 | [`0004`](./0004-builder-time-edge-declaration.md) | **Still authoritative** — builder-time edge declaration and arena sizing from the declared edges are not represented in `PHASE1.md`. |
 | [`0005`](./0005-the-shared-memory-seam.md) | **Implemented** — the `tf_tree → tf_tree_ipc` seam, §3.7 fd passing, claims as leases, reaping, fork poisoning. Amends D16. |
+| [`0007`](./0007-the-unsafe-budget-and-the-c-abi.md) | **Ready** — restates the unsafe budget as a criterion rather than a crate list (it had been stale since Phase 2), and places the Phase 4 C ABI in `tf_tree_c`. |
 | [`0006`](./0006-the-eight-phase-roadmap.md) | **Ready** — the roadmap re-cut from six phases to eight, adds D21/D22, and holds the alias table for the decision numbers `PHASE4.md`/`PHASE5.md` cite but this repository does not use. |
 
 Cite `docs/PROJECT.md` and `docs/PHASE1.md`, never `0002`/`0003`; they are kept
