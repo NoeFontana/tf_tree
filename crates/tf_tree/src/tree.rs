@@ -811,9 +811,15 @@ impl Tree {
     /// # Errors
     ///
     /// As [`Tree::attach_shared`], plus [`ShmError::ParticipantTableFull`] if
-    /// the named slot is not free — which means the owner's view of its table
-    /// is stale and the caller should retry the handshake rather than take a
-    /// different slot.
+    /// the named slot is not free.
+    ///
+    /// That last case means the arena still holds a record for a participant
+    /// whose lock byte is already gone — the owner grants only slots its table
+    /// reports free, and this process only got here after taking the byte. A
+    /// **stale record with a free byte is exactly what reaping is for**
+    /// (`docs/PHASE2.md` §6.3, `docs/decisions/0005` step 8), and until that
+    /// lands there is nothing useful to retry: the owner would name the same
+    /// slot again. It is surfaced rather than papered over.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn attach_shared_at(
         fd: std::os::fd::OwnedFd,

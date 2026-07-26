@@ -406,10 +406,16 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
 }
 
 /// `dup` a borrowed fd into an owned one.
+///
+/// Reported as [`IpcError::ClientSocketSetup`] — a local resource failure of
+/// this process, which is what running out of descriptors is. Naming it after
+/// the lock file, as an earlier version did, would point an operator at a file
+/// that is not involved.
 fn rustix_dup(fd: std::os::fd::BorrowedFd<'_>) -> Result<std::os::fd::OwnedFd, IpcError> {
-    fd.try_clone_to_owned().map_err(|e| IpcError::LockFileOpen {
-        raw_os_error: e.raw_os_error().unwrap_or(0),
-    })
+    fd.try_clone_to_owned()
+        .map_err(|e| IpcError::ClientSocketSetup {
+            raw_os_error: e.raw_os_error().unwrap_or(0),
+        })
 }
 
 /// This process's name, NUL-padded, for the handshake's diagnostic field.
