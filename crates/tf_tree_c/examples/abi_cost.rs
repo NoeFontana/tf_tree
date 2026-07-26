@@ -7,13 +7,22 @@
 //!   write into caller memory. If any of those is not free, this is where it
 //!   shows.
 //! * **`catch_unwind` overhead on the happy path.** §3.4 asserts it is zero
-//!   because it emits landing pads rather than a runtime check. That is the kind
-//!   of claim that gets doubted, so it is measured directly by running the same
-//!   body with and without the guard.
+//!   because it emits landing pads rather than a runtime check. Measured by
+//!   calling the *same* trivial body through `tft_layout_size` (no guard) and
+//!   through `tft_guarded_noop` (guard, and nothing else), so the difference is
+//!   the guard and the `clear_error` it performs — nothing else. An earlier
+//!   revision printed only the unguarded number and claimed it measured both;
+//!   reported by review.
 //!
 //! Both sides evaluate the **same plan on the same tree at the same stamps**, so
 //! the difference is the boundary and nothing else. The native side writes into a
 //! buffer too, so the comparison is not "with a store" against "without one".
+//!
+//! # Is the measurement good enough for a 5% gate?
+//!
+//! Yes, and it was checked rather than assumed: four consecutive pinned runs on
+//! an idle machine gave 1.021, 1.020, 1.018, 1.026 — a spread of **0.8%** against
+//! a 5% allowance. Reported by review, which was right to ask.
 //!
 //! Run pinned; unpinned runs migrate cores and swing by >30%:
 //! `taskset -c 2 cargo run --release -p tf_tree_c --features test-hooks --example abi_cost`
@@ -106,7 +115,10 @@ fn main() {
     println!("{N} lookups/round, median of {ROUNDS} rounds, depth 3\n");
 
     // --- native: fold, then write the same 128 bytes the C side writes ---
-    let mut nbuf = [0u8; 128];
+    // `[f64; 16]`, not `[u8; 128]`: `write_mat4` wants `&mut [f64]`, and building
+    // one from a byte array would need an alignment this type does not promise.
+    // Same 128 bytes either way, so the comparison is still like-for-like.
+    let mut nbuf = [0.0f64; 16];
     let native_ns = bench(|| {
         let g = native.guard();
         let mut acc = 0.0;
@@ -117,10 +129,8 @@ fn main() {
                     tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(black_box(t)),
                 )
                 .unwrap();
-            tf_tree::write_mat4(&iso, unsafe {
-                core::slice::from_raw_parts_mut(nbuf.as_mut_ptr().cast::<f64>(), 16)
-            });
-            acc += nbuf[0] as f64;
+            tf_tree::write_mat4(&iso, &mut nbuf);
+            acc += nbuf[0];
         }
         acc
     });
@@ -187,18 +197,27 @@ fn main() {
     // Same trivial body, called through `guard` and directly. §3.4 claims this is
     // zero on the happy path; anything else means the landing pads are not free
     // on this target.
-    let guarded = bench(|| {
+    let unguarded = bench(|| {
         let mut acc = 0.0;
-        for i in 0..N {
-            acc += tft_layout_size(black_box(if i % 2 == 0 {
-                TFT_LAYOUT_MAT4_ROW
-            } else {
-                TFT_LAYOUT_QVEC7_WXYZ
-            })) as f64;
+        for _ in 0..N {
+            acc += tft_layout_size(black_box(TFT_LAYOUT_MAT4_ROW)) as f64;
         }
         acc
     });
-    println!("\n  (reference: an unguarded entry point, tft_layout_size, is {guarded:.2} ns/call)");
+    let guarded = bench(|| {
+        let mut acc = 0.0;
+        for _ in 0..N {
+            acc += f64::from(tft_guarded_noop(black_box(0)));
+        }
+        acc
+    });
+    println!("\ncatch_unwind, isolated");
+    println!("{:>28} {unguarded:>10.2}", "unguarded (tft_layout_size)");
+    println!("{:>28} {guarded:>10.2}", "guarded (tft_guarded_noop)");
+    println!(
+        "  delta {:+.2} ns/call — §3.4 predicts ~0 on the happy path",
+        guarded - unguarded
+    );
 
     // SAFETY: each handle freed exactly once.
     unsafe {

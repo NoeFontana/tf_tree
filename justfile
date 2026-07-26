@@ -29,6 +29,29 @@ miri:
     cargo +nightly miri test -p tf_tree_arena -p tf_tree_core \
         --features tf_tree_core/miri-soft-float
 
+# **The C ABI under Miri and ASan — `docs/PHASE4.md` §6.1 and §7 gate 4.**
+#
+# `miri` above deliberately excludes `tf_tree_c`, because the crate did not exist
+# when that recipe was written. It must not stay excluded: the C ABI is the only
+# place in the workspace where `unsafe` faces a caller the compiler cannot see,
+# and Miri caught a real alignment UB there — in a *test* that claimed foreign
+# pointers were safely rejected.
+#
+# `-Zmiri-disable-isolation` is needed because the fixture reads the clock.
+# ASan needs `-Zbuild-std` so the standard library is instrumented too; without
+# it a use-after-free inside `Box::from_raw` is invisible.
+#
+# The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
+c-abi-check:
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+        -p tf_tree_c -p tf_tree_core \
+        --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test abi
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+        -p tf_tree_c -p tf_tree_core \
+        --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test live
+    RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
+        --features test-hooks --target x86_64-unknown-linux-gnu -Zbuild-std
+
 # Lint everything. Pure checks; does not mutate files.
 lint: py-compile
     cargo fmt --all -- --check

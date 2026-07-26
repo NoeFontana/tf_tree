@@ -313,4 +313,74 @@ mod tests {
         assert_eq!(read_f64(&d, 3).to_bits(), t.q.z.to_bits());
         assert_eq!(read_f64(&d, 6).to_bits(), t.t.z.to_bits());
     }
+
+    /// **A general rotation, because `Rz(90°)` is degenerate for this purpose.**
+    ///
+    /// Found by review: in `rot3`, `Rz(90°)` makes seven of the nine quaternion
+    /// products identically zero (`x = y = 0`, so `xx`, `yy`, `xy`, `xz`, `yz`,
+    /// `wx`, `wy` all vanish). The hand-computed byte-pattern tests above are
+    /// therefore checking two live terms out of nine — they pin the *layout*,
+    /// which is what §3.5 asks for, but they cannot catch a swapped or
+    /// sign-flipped product in `rot3` itself.
+    ///
+    /// This uses a rotation with all three components non-zero and checks the
+    /// matrix against an **independent** construction: three successive
+    /// axis-angle rotations composed as matrices, sharing no code with `rot3`.
+    ///
+    /// Mutant: swap `wx` and `wy` in `rot3`, or flip the sign of any
+    /// `2.0 * (.. - ..)` term ⇒ fails here while every test above still passes.
+    #[test]
+    fn rot3_matches_an_independent_construction_for_a_general_rotation() {
+        // A rotation whose axis has three comparable components, so every one
+        // of the nine products in `rot3` is live.
+        let w = Vec3::new(0.62, -0.51, 0.74);
+        let t = Iso3::new(tf_tree::exp_so3(w), Vec3::new(1.0, 2.0, 3.0));
+
+        // The oracle: Rodrigues, straight from the axis-angle vector. Shares no
+        // code with `rot3`'s quaternion algebra, so a matched pair of errors
+        // cannot satisfy both.
+        let th = (w.x * w.x + w.y * w.y + w.z * w.z).sqrt();
+        let (a, b) = (th.sin() / th, (1.0 - th.cos()) / (th * th));
+        let k = [[0.0, -w.z, w.y], [w.z, 0.0, -w.x], [-w.y, w.x, 0.0]];
+        let mut kk = [[0.0f64; 3]; 3];
+        for (r, row) in kk.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = (0..3).map(|m| k[r][m] * k[m][c]).sum();
+            }
+        }
+        let mut want = [[0.0f64; 3]; 3];
+        for r in 0..3 {
+            for c in 0..3 {
+                want[r][c] = f64::from(u8::from(r == c)) + a * k[r][c] + b * kk[r][c];
+            }
+        }
+
+        // Non-vacuity: every product in `rot3` must be live, or this is no
+        // better than the `Rz(90°)` fixture it exists to complement.
+        assert!(
+            t.q.x.abs() > 0.15 && t.q.y.abs() > 0.15 && t.q.z.abs() > 0.15 && t.q.w.abs() > 0.15,
+            "the fixture is not a general rotation: {:?}",
+            t.q
+        );
+
+        let mut d = [0u8; 128];
+        write(&t, TFT_LAYOUT_MAT4_ROW, &mut d);
+        for (r, row) in want.iter().enumerate() {
+            for (c, expect) in row.iter().enumerate() {
+                let got = read_f64(&d, r * 4 + c);
+                assert!(
+                    (got - expect).abs() < 1e-12,
+                    "R[{r}][{c}]: got {got} want {expect}"
+                );
+            }
+        }
+        // ...and the column-major form is still its transpose.
+        let mut c4 = [0u8; 128];
+        write(&t, TFT_LAYOUT_MAT4_COL, &mut c4);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!(close(read_f64(&d, r * 4 + c), read_f64(&c4, c * 4 + r)));
+            }
+        }
+    }
 }

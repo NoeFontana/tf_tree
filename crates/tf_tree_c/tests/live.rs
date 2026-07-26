@@ -345,32 +345,18 @@ fn a_plan_outlives_the_tree_handle_it_was_compiled_from() {
     unsafe { tft_plan_free(p) };
 }
 
-/// **A freed handle is rejected, not followed.** The magic word is zeroed on
-/// free, so the allocation-intact case is caught.
-///
-/// Mutant: remove the magic-zeroing write from `tft_plan_free` ⇒ the second call
-/// dereferences a freed `Box`.
-#[test]
-fn a_freed_handle_is_rejected_by_the_magic_word() {
-    let tree = Tree::new();
-    let name_a = std::ffi::CString::new("map").unwrap();
-    let name_b = std::ffi::CString::new("base").unwrap();
-    let mut p: *mut tft_plan = ptr::null_mut();
-    // SAFETY: live handle and names.
-    assert_eq!(
-        unsafe { tft_plan_create(tree.0, name_a.as_ptr(), name_b.as_ptr(), &mut p) },
-        TFT_OK
-    );
-    // SAFETY: freed exactly once here.
-    unsafe { tft_plan_free(p) };
-
-    // The pointer is now dangling but the magic was zeroed before the drop, so a
-    // second free is a no-op rather than a double-free.
-    // SAFETY: this is the case under test; the allocation may be reused, which is
-    // why the ABI documents double-free as undefined and this test only asserts
-    // the common case where it has not been.
-    unsafe { tft_plan_free(p) };
-}
+// **There is deliberately no "a freed handle is rejected" test.**
+//
+// One was written, and it was wrong in a way worth recording: reading a freed
+// handle's magic word *is* a heap-use-after-free, so the test made
+// `docs/PHASE4.md` §7 gate criterion 4 ("zero ASan findings") fail on unmutated
+// code. ASan was right and the test was not.
+//
+// The magic-zeroing in `tft_tree_free`/`tft_plan_free` is still worth doing —
+// it turns the common double-free into a no-op while the allocation is
+// untouched — but that is a best-effort mitigation, not a checkable contract,
+// and the ABI documents double-free as undefined. A test cannot assert
+// undefined behaviour behaves; it can only commit the UB.
 
 /// An unknown frame name is refused by name, not by crashing.
 #[test]
@@ -383,4 +369,85 @@ fn an_unknown_frame_is_refused() {
     let rc = unsafe { tft_plan_create(tree.0, a.as_ptr(), b.as_ptr(), &mut p) };
     assert_eq!(rc, TFT_ERR_UNKNOWN_FRAME);
     assert!(p.is_null(), "no handle may be produced on failure");
+}
+
+/// **A batch failure must carry the same detail a single call would**, plus the
+/// index of the element that failed.
+///
+/// Found by review: `at_many` called `set_error` after `record_lookup`, and
+/// `set_error` blanks the slot first — so a batch caller got `edge = INVALID` and
+/// `oldest = newest = 0` where the equivalent single call reported the edge and
+/// the retained window it needs to clamp its next query. That is exactly the
+/// information loss §3.3 exists to prevent.
+///
+/// Mutant: use `set_error` instead of `amend_error` ⇒ fails on the window.
+#[test]
+fn a_batch_failure_keeps_the_detail_a_single_call_would_give() {
+    let tree = Tree::new();
+    let plan = tree.plan("map", "base");
+    let bad = i64::MAX / 2;
+
+    // What the single-shot path reports.
+    let mut one = [0u8; 56];
+    // SAFETY: live plan, correctly sized buffer.
+    let rc1 = unsafe { tft_plan_at(plan.0, bad, TFT_LAYOUT_QVEC7_WXYZ, one.as_mut_ptr().cast()) };
+    assert_eq!(rc1, TFT_ERR_EXTRAPOLATION);
+    let single = fetch_error();
+    assert_ne!(
+        single.edge, TFT_INVALID_ID,
+        "the single path names the edge"
+    );
+    assert_ne!(single.newest, 0, "the single path reports the window");
+
+    // The same failure as the second element of a batch.
+    let stamps = [250_000_000i64, bad];
+    let mut buf = [0u8; 2 * 56];
+    // SAFETY: live plan, 2 stamps, 112 bytes.
+    let rc2 = unsafe {
+        tft_plan_at_many(
+            plan.0,
+            stamps.as_ptr(),
+            2,
+            TFT_LAYOUT_QVEC7_WXYZ,
+            buf.as_mut_ptr().cast(),
+            0,
+        )
+    };
+    assert_eq!(rc2, rc1, "the same failure must give the same status");
+    let batch = fetch_error();
+    assert_eq!(batch.edge, single.edge, "the batch path lost the edge id");
+    assert_eq!(batch.oldest, single.oldest, "the batch path lost `oldest`");
+    assert_eq!(batch.newest, single.newest, "the batch path lost `newest`");
+    // ...and it says which element failed, which the single path cannot.
+    assert_eq!(batch.frame_b, 1, "the failing index must be reported");
+}
+
+/// A plan whose compilation fails must return the failure, not a handle.
+///
+/// Found by review: this arm was untested, and returning `TFT_OK` there survived
+/// the whole suite — which would hand the caller an uninitialised `out` pointer
+/// it believes is a handle.
+///
+/// Mutant: return `TFT_OK` from `tft_plan_create`'s `Err` arm ⇒ fails.
+#[test]
+fn a_plan_that_cannot_compile_returns_no_handle() {
+    let tree = Tree::new();
+    // `sensor` and `map` are connected, so force the other failure the compiler
+    // can produce: a frame that exists in neither direction.
+    let a = std::ffi::CString::new("sensor").unwrap();
+    let b = std::ffi::CString::new("").unwrap();
+    let mut p: *mut tft_plan = ptr::null_mut();
+    // SAFETY: live handle, NUL-terminated names, live out-pointer.
+    let rc = unsafe { tft_plan_create(tree.0, a.as_ptr(), b.as_ptr(), &mut p) };
+    assert_ne!(rc, TFT_OK, "an empty frame name must not compile");
+    assert!(p.is_null(), "no handle may be produced on failure");
+}
+
+/// Read this thread's error detail.
+fn fetch_error() -> tft_error {
+    let mut e: tft_error = unsafe { core::mem::zeroed() };
+    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    // SAFETY: `e` is live, aligned, and its struct_size is set.
+    assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_OK);
+    e
 }

@@ -15,6 +15,7 @@ use core::ptr;
 use tf_tree_c::*;
 
 /// Read this thread's error detail. Returns `None` if the call itself failed.
+#[cfg(feature = "test-hooks")]
 fn last_error() -> Option<tft_error> {
     let mut e: tft_error = unsafe { core::mem::zeroed() };
     e.struct_size = core::mem::size_of::<tft_error>() as u32;
@@ -23,6 +24,7 @@ fn last_error() -> Option<tft_error> {
     (rc == TFT_OK).then_some(e)
 }
 
+#[cfg(feature = "test-hooks")]
 fn message(e: &tft_error) -> String {
     let bytes: Vec<u8> = e
         .message
@@ -77,36 +79,64 @@ fn null_arguments_are_refused_not_dereferenced() {
     }
 }
 
-/// **A pointer that is not one of our handles must be rejected**, not followed.
+/// **Handle-type confusion is rejected** — passing a `tft_plan*` where a
+/// `tft_tree*` is expected, and the reverse.
 ///
-/// This is what the magic word buys. The buffer below is a plausible-looking
-/// heap allocation of the right size — exactly what a caller passing the wrong
-/// variable would produce.
+/// This is what the magic word actually buys, and it is the mistake a C caller
+/// really makes. Both pointers here are live, aligned, correctly sized handles;
+/// only the *type* is wrong, so the read is well-defined and the magic differs.
 ///
-/// Mutant: remove the magic check from `check_plan` ⇒ the ABI dereferences
-/// arbitrary memory as a `Plan`.
+/// **What this deliberately does not test:** an arbitrary foreign pointer. An
+/// earlier version passed a `vec![0u8; 512]`, and Miri correctly reported the
+/// resulting 8-byte read as Undefined Behaviour — *the test asserting that
+/// foreign pointers are safely rejected was itself the UB reproducer.* No check
+/// can make an out-of-bounds read well-defined; the module docs now say so
+/// rather than promising otherwise.
+#[cfg(feature = "test-hooks")]
 #[test]
-fn a_foreign_pointer_is_rejected_by_the_magic_word() {
-    let junk = vec![0u8; 512];
+fn handle_type_confusion_is_rejected() {
+    use core::ptr;
+    let mut tree: *mut tft_tree = ptr::null_mut();
+    // SAFETY: `tree` is a live local.
+    assert_eq!(unsafe { tft_test_tree_create(&mut tree) }, TFT_OK);
+    let a = std::ffi::CString::new("map").unwrap();
+    let b = std::ffi::CString::new("base").unwrap();
+    let mut plan: *mut tft_plan = ptr::null_mut();
+    // SAFETY: live handle, NUL-terminated names.
+    assert_eq!(
+        unsafe { tft_plan_create(tree, a.as_ptr(), b.as_ptr(), &mut plan) },
+        TFT_OK
+    );
+
+    // A tree where a plan is expected: live, aligned, big enough — and wrong.
     let mut out = [0u8; 128];
-    // SAFETY: `junk` is a live allocation; the point is that it is not a handle,
-    // and the ABI must not follow it.
+    // SAFETY: `tree` is a live handle, so the magic read is in bounds; it simply
+    // holds the wrong value.
     let rc = unsafe {
         tft_plan_at(
-            junk.as_ptr().cast(),
+            tree.cast::<tft_plan>(),
             0,
             TFT_LAYOUT_MAT4_ROW,
             out.as_mut_ptr().cast(),
         )
     };
-    assert_eq!(rc, TFT_ERR_BAD_HANDLE);
+    assert_eq!(rc, TFT_ERR_BAD_HANDLE, "a tree is not a plan");
+
+    // ...and a plan where a tree is expected.
+    let mut p2: *mut tft_plan = ptr::null_mut();
+    // SAFETY: `plan` is a live handle; only its type is wrong here.
+    let rc = unsafe { tft_plan_create(plan.cast::<tft_tree>(), a.as_ptr(), b.as_ptr(), &mut p2) };
+    assert_eq!(rc, TFT_ERR_BAD_HANDLE, "a plan is not a tree");
+
     let e = last_error().expect("detail must be available");
     assert_eq!(e.code, TFT_ERR_BAD_HANDLE);
-    assert!(
-        message(&e).contains("handle"),
-        "the message should name the problem: {:?}",
-        message(&e)
-    );
+    assert!(message(&e).contains("handle"), "{:?}", message(&e));
+
+    // SAFETY: each freed exactly once.
+    unsafe {
+        tft_plan_free(plan);
+        tft_tree_free(tree);
+    }
 }
 
 /// **An unknown layout is an error, never a silent default.**

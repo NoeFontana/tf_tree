@@ -66,6 +66,8 @@ pub const TFT_ERR_NO_DERIVATIVES: tft_status = -19;
 pub const TFT_ERR_NO_SEGMENT: tft_status = -20;
 /// A `tft_publisher` was used from a thread other than its creator's.
 pub const TFT_ERR_WRONG_THREAD: tft_status = -30;
+/// The path between the two frames is deeper than `TFT_MAX_DEPTH`.
+pub const TFT_ERR_TREE_TOO_DEEP: tft_status = -21;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
 
@@ -159,6 +161,21 @@ pub(crate) fn set_error(code: tft_status, message: &str, fill: impl FnOnce(&mut 
             e.code = code;
             fill(&mut e);
             e.set_message(message);
+        }
+    });
+}
+
+/// Add detail to this thread's error **without** discarding what is already
+/// there.
+///
+/// [`set_error`] deliberately blanks first, so a fresh error cannot inherit a
+/// stale field. That makes it the wrong tool for layering: `tft_plan_at_many`
+/// used it after `record_lookup` and wiped the edge id and the retained window
+/// the caller needs — reported by review, and the reason this exists.
+pub(crate) fn amend_error(fill: impl FnOnce(&mut tft_error)) {
+    LAST_ERROR.with(|slot| {
+        if let Ok(mut e) = slot.try_borrow_mut() {
+            fill(&mut e);
         }
     });
 }
@@ -308,6 +325,38 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
                 |e| e.edge = edge.get(),
             );
             TFT_ERR_NO_SEGMENT
+        }
+        L::TreeTooDeep { depth } => {
+            set_error(
+                TFT_ERR_TREE_TOO_DEEP,
+                "the path between these frames is deeper than the engine's fixed limit",
+                |e| e.requested = i64::from(depth),
+            );
+            TFT_ERR_TREE_TOO_DEEP
+        }
+        L::UnknownEdge { edge } => {
+            set_error(TFT_ERR_BAD_HANDLE, "edge id names no usable edge", |e| {
+                e.edge = edge.get();
+            });
+            TFT_ERR_BAD_HANDLE
+        }
+        L::FrameOutOfRange { frame } => {
+            set_error(
+                TFT_ERR_UNKNOWN_FRAME,
+                "frame id is out of range for this arena",
+                |e| {
+                    e.frame_a = frame.get();
+                },
+            );
+            TFT_ERR_UNKNOWN_FRAME
+        }
+        L::MissingEdge { child } => {
+            set_error(
+                TFT_ERR_NO_DATA,
+                "the topology records a parent for this frame but no edge for the link",
+                |e| e.frame_a = child.get(),
+            );
+            TFT_ERR_NO_DATA
         }
         L::BufferTooSmall { .. } => {
             set_error(TFT_ERR_BUFFER_TOO_SMALL, "output buffer too small", |_| {});

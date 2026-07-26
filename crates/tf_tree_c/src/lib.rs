@@ -11,11 +11,31 @@
 //! Three rules make that auditable, and every `unsafe` block below relies on
 //! them:
 //!
-//! 1. **Handles are validated before dereference.** Every handle begins with a
-//!    magic word written by its constructor and zeroed by its destructor, so a
-//!    NULL, freed, or foreign pointer is rejected rather than followed
-//!    (§3.2). This cannot catch a pointer into freed-and-reused memory — nothing
-//!    can, in C — but it catches every case that leaves the allocation intact.
+//! 1. **Handles carry a magic word, and its guarantee is narrower than it
+//!    looks.** Every handle begins with a magic word written by its constructor
+//!    and zeroed by its destructor (§3.2). What that actually buys, stated
+//!    precisely because an earlier version of this comment overpromised and the
+//!    overpromise was itself Undefined Behaviour:
+//!
+//!    * **NULL is rejected.** Always, and before anything is read.
+//!    * **Handle-type confusion is rejected.** Passing a `tft_plan*` where a
+//!      `tft_tree*` is expected reads a live, aligned, sufficiently large
+//!      allocation and finds the wrong magic. This is the common mistake and it
+//!      is caught.
+//!    * **An arbitrary foreign pointer is *not* reliably rejected, and cannot
+//!      be.** Reading 8 bytes through a pointer about which nothing is known is
+//!      UB in Rust regardless of what the bytes turn out to be — it may be
+//!      misaligned, or 4 bytes from the end of a smaller object. The read is
+//!      [`core::ptr::read_unaligned`] so alignment at least is not a hazard,
+//!      but no check can make an out-of-bounds read well-defined. **The caller's
+//!      contract is that the pointer is NULL or a handle**; the magic word is
+//!      defence in depth against a plausible mistake, not a validator for
+//!      arbitrary memory.
+//!    * **Use-after-free is best-effort.** The magic is zeroed before the
+//!      allocation is released, so a second free is a no-op *while the memory is
+//!      untouched*. Once the allocator reuses it, nothing can help — and reading
+//!      it at all is a use-after-free that ASan will (correctly) flag, which is
+//!      why there is no test for it.
 //! 2. **`#![deny(unsafe_op_in_unsafe_fn)]`.** An `unsafe fn` confers no
 //!    permission on its body, so each dereference carries its own `// SAFETY:`
 //!    naming what it relies on.
@@ -55,15 +75,15 @@ pub use error::{
     TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED,
     TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION, TFT_ERR_INTERNAL, TFT_ERR_NO_DATA,
     TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG, TFT_ERR_SLOT_CONTENDED,
-    TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_UNKNOWN_FRAME,
-    TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
+    TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP,
+    TFT_ERR_UNKNOWN_FRAME, TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
     TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW,
 };
 
-use error::{guard, record_lookup, set_error};
+use error::{amend_error, guard, record_lookup, set_error};
 
 // ---------------------------------------------------------------------------
 // ABI version — §3.6
@@ -133,31 +153,45 @@ struct TreeShare {
 
 /// Generate a magic-word validator that reads the field **by name**.
 ///
-/// Reading by name rather than by `cast::<u64>()` matters twice over: the
-/// projection is correct whatever the layout turns out to be, and it means the
-/// `magic` field is genuinely *read*, so `dead_code` keeps watching it. An
-/// earlier version cast to `*const u64` and assumed offset zero — which
-/// `repr(Rust)` does not promise.
+/// Two deliberate choices, both of which were wrong in an earlier revision:
+///
+/// * **By name, not `cast::<u64>()`.** The projection is correct whatever the
+///   layout turns out to be, and it means `magic` is genuinely *read* so
+///   `dead_code` keeps watching it. The first version cast to `*const u64` and
+///   assumed offset zero, which `repr(Rust)` does not promise — hence the
+///   `#[repr(C)]` on the handle types as well.
+/// * **[`core::ptr::read_unaligned`], not `read`.** A caller that passes a
+///   pointer to something that is not a handle at all — the case the check
+///   exists to catch — offers no alignment guarantee, and an aligned read there
+///   is Undefined Behaviour *even when the value read would have failed the
+///   comparison*. Miri caught exactly that on this crate's own test.
 ///
 /// `addr_of!` is used rather than `&(*p).magic` so no reference to a
-/// possibly-invalid handle is ever created; only the read itself requires the
-/// memory to be live.
+/// possibly-invalid handle is ever created.
+///
+/// **This is not a validator for arbitrary memory** — see the module docs. It
+/// cannot be: an out-of-bounds read stays out of bounds however it is spelled.
 macro_rules! magic_check {
     ($name:ident, $ty:ty, $magic:expr) => {
         /// # Safety
         ///
-        /// `p` must be NULL or point to a live, aligned allocation of the handle
-        /// type. A freed handle is safe to pass **only** while its allocation has
-        /// not been reused — the magic word is zeroed on free, so this rejects it.
+        /// `p` must be NULL, or point to at least `size_of::<u64>()` readable
+        /// bytes at the offset of the handle's `magic` field. Every handle this
+        /// crate hands out satisfies that, as does any other live handle type
+        /// (which is what makes type-confusion detection work).
+        ///
+        /// Passing a pointer to an unrelated, smaller object is Undefined
+        /// Behaviour and no amount of checking here can change that.
         #[inline]
         unsafe fn $name(p: *const $ty) -> bool {
             if p.is_null() {
                 return false;
             }
-            // SAFETY: `p` is non-null and, per the contract above, points at a
-            // live allocation of this handle type. The projection reads only the
-            // magic field, which every constructor initialises.
-            unsafe { core::ptr::addr_of!((*p).magic).read() == $magic }
+            // SAFETY: `p` is non-null and, per the contract above, has at least
+            // eight readable bytes at the magic field's offset. `read_unaligned`
+            // so a caller's misaligned handle-shaped pointer is not additionally
+            // UB; the projection reads only the magic field.
+            unsafe { core::ptr::addr_of!((*p).magic).read_unaligned() == $magic }
         }
     };
 }
@@ -454,17 +488,25 @@ pub unsafe extern "C" fn tft_plan_at_many(
                 }
                 // Stop at the first failure. A partially written buffer is worse
                 // than none because it looks like data (PHASE3 §5.3's reasoning,
-                // which applies identically here), so the error names the index
-                // through `requested`.
+                // applies identically here).
+                //
+                // `amend_error`, **not** `set_error`: the latter blanks the slot
+                // first, which would erase the edge id and the retained window
+                // `record_lookup` just recorded — leaving a batch caller with
+                // strictly less information than the equivalent single call, the
+                // exact loss §3.3 exists to prevent. Found by review.
+                //
+                // The index goes in `frame_b`, which no lookup error uses, so a
+                // caller learns *which element* failed as well as why, and
+                // `requested` keeps the stamp.
                 Err(e) => {
                     let status = record_lookup(e);
-                    set_error(
-                        status,
-                        "at_many failed; see `requested` for the stamp",
-                        |d| {
+                    amend_error(|d| {
+                        d.frame_b = u32::try_from(i).unwrap_or(TFT_INVALID_ID);
+                        if d.requested == 0 {
                             d.requested = t;
-                        },
-                    );
+                        }
+                    });
                     return status;
                 }
             }
@@ -485,6 +527,18 @@ pub extern "C" fn tft_layout_size(layout: tft_layout) -> usize {
 // ---------------------------------------------------------------------------
 // Test-only panic hook — §6.1
 // ---------------------------------------------------------------------------
+
+/// A guarded entry point that does nothing, for measuring what [`guard`] costs.
+///
+/// Pairs with `tft_layout_size`, which is deliberately *not* guarded, so the
+/// difference between the two is `catch_unwind`'s landing pads plus the
+/// `clear_error` every guarded body performs — and nothing else. §3.4's
+/// zero-cost claim is checked by `examples/abi_cost.rs`, not asserted.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub extern "C" fn tft_guarded_noop(x: i32) -> tft_status {
+    guard(|| x)
+}
 
 /// Force a panic inside an `extern "C"` body, to prove the guard converts it
 /// into a status rather than aborting. Compiled only under `--features test-hooks`.
