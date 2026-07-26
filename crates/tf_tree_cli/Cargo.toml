@@ -34,3 +34,12 @@ tf_tree_math.workspace = true
 tf_tree_bench.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+# `tf_tree participants` reads the lock file **without the arena** (§3.3), which
+# is the whole point of that subcommand: it must work when the segment is gone.
+tf_tree_ipc = { workspace = true, optional = true }
+
+[features]
+# Attach to a live arena (`--attach`) and `tf_tree participants`. Linux-only,
+# and off by default so the single-process CLI does not grow a syscall
+# dependency it never uses.
+shm = ["tf_tree/shm", "dep:tf_tree_ipc"]

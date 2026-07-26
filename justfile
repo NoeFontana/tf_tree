@@ -216,6 +216,7 @@ shm-check:
     cargo clippy -p tf_tree --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree_ipc --all-targets -- -D warnings
     cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
+    cargo clippy -p tf_tree_cli --features shm --all-targets -- -D warnings
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo build --features shm -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
@@ -227,6 +228,10 @@ shm-check:
     # this needs: the measurements are RSS and minor-fault deltas, and threads
     # sharing a process would read each other's.
     cargo nextest run -p tf_tree_bench --features shm --test population
+    # The CLI against a live arena, and `participants` against no arena at all.
+    # This is the milestone's acceptance test: the shipped binary, through clap,
+    # joining somebody else's tree.
+    cargo nextest run -p tf_tree_cli --features shm --test attach
     cargo nextest run -p tf_tree_ipc
 
 # The zero-config rendezvous end to end: a foreign process calls
