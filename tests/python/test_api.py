@@ -500,3 +500,34 @@ def test_at_into_refuses_a_read_only_memmap_instead_of_faulting(tree, tmp_path):
     p = tree.plan("map", "base")
     with pytest.raises(tf_tree.BufferError, match="not writable"):
         p.at_into(1_500, m)
+
+
+def test_at_into_errors_name_the_argument_that_is_wrong(tree):
+    """A mismatch must blame `out`, not the `stamps` the caller got right.
+
+    Probing `out` before dispatching on `stamps` produced two misleading
+    messages: a scalar stamp with an `(1, 4, 4)` buffer reported "stamps must be
+    an (N,) int64 array", and an `(N,)` array with a `(4, 4)` buffer escaped as
+    numpy's own `TypeError: only integer scalar arrays can be converted to a
+    scalar index` — leaked from `stamp_from_any`, and not even a `BufferError`.
+    """
+    p = tree.plan("map", "base")
+    with pytest.raises(tf_tree.BufferError, match=r"scalar stamp needs out"):
+        p.at_into(1_500, np.empty((1, 4, 4)))
+    with pytest.raises(tf_tree.BufferError, match=r"\(N, 4, 4\)"):
+        p.at_into(np.array([1_500], dtype=np.int64), np.empty((4, 4)))
+
+
+def test_at_into_refuses_a_non_numpy_buffer_and_says_so(tree):
+    """`PHASE3.md` §5.5 steps 2-4 are not implemented, and the error admits it.
+
+    The spec's acquisition order goes through the buffer protocol; `at_into`
+    casts to `numpy.ndarray` instead. A `memoryview` with a perfectly correct
+    `(4, 4)` float64 layout is therefore refused, and the message names
+    `np.asarray(...)` rather than leaving the caller to debug a buffer that is
+    fine.
+    """
+    p = tree.plan("map", "base")
+    mv = memoryview(bytearray(128)).cast("d", (4, 4))
+    with pytest.raises(tf_tree.BufferError, match="numpy array"):
+        p.at_into(1_500, mv)
