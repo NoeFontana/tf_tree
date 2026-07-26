@@ -934,6 +934,7 @@ dependencies = [
  "proptest",
  "tf_tree_arena",
  "tf_tree_core",
+ "tf_tree_ipc",
  "tf_tree_math",
  "thiserror",
 ]

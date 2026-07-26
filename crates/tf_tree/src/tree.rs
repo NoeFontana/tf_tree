@@ -291,6 +291,8 @@ impl TreeBuilder {
             incarnation,
             liveness,
             decl: Mutex::new(()),
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            attachment: None,
         })
     }
 
@@ -326,6 +328,8 @@ impl TreeBuilder {
             incarnation,
             liveness,
             decl: Mutex::new(()),
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            attachment: None,
         })
     }
 
@@ -568,6 +572,13 @@ pub struct Tree {
     /// budget on each
     /// other before one of them gets to do any work.
     decl: Mutex<()>,
+    /// What keeps this process attached, for a tree obtained from
+    /// [`crate::open`].
+    ///
+    /// `None` for a heap tree, for `build_shared`, and for `attach_shared` over
+    /// an inherited fd — none of those went through a rendezvous.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    attachment: Option<crate::open::Attachment>,
 }
 
 impl Tree {
@@ -789,14 +800,50 @@ impl Tree {
     /// written by a build with a different `FORMAT_VERSION` or record layout.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn attach_shared(fd: std::os::fd::OwnedFd, mode: AttachMode) -> Result<Tree, ShmError> {
+        Tree::attach_shared_inner(fd, mode, None)
+    }
+
+    /// Attach into the participant slot an owner granted (`docs/PHASE2.md` §3.7).
+    ///
+    /// Used by [`crate::open`]; [`Tree::attach_shared`] is the fd-inheritance
+    /// path, where there is no owner to ask and the slot is self-assigned.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tree::attach_shared`], plus [`ShmError::ParticipantTableFull`] if
+    /// the named slot is not free — which means the owner's view of its table
+    /// is stale and the caller should retry the handshake rather than take a
+    /// different slot.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub fn attach_shared_at(
+        fd: std::os::fd::OwnedFd,
+        mode: AttachMode,
+        slot: u32,
+    ) -> Result<Tree, ShmError> {
+        Tree::attach_shared_inner(fd, mode, Some(slot))
+    }
+
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fn attach_shared_inner(
+        fd: std::os::fd::OwnedFd,
+        mode: AttachMode,
+        slot: Option<u32>,
+    ) -> Result<Tree, ShmError> {
         let arena = MappedArena::attach(fd, mode)?;
         let backing = ArenaBacking::Mapped(arena);
         // A read-only peer cannot register — the table is in the arena and
         // registration writes to it. It takes the sentinel slot instead, and
         // every mutating entry point already refuses before reaching a claim.
         let (participant, incarnation) = if backing.is_writable() {
-            register_participant(&ArenaView::new(backing.as_dyn()))
-                .map_err(|_| ShmError::ParticipantTableFull)?
+            let view = ArenaView::new(backing.as_dyn());
+            match slot {
+                Some(s) => (
+                    s,
+                    register_participant_at(&view, s)
+                        .map_err(|_| ShmError::ParticipantTableFull)?,
+                ),
+                None => register_participant(&view).map_err(|_| ShmError::ParticipantTableFull)?,
+            }
         } else {
             (u32::MAX, 0)
         };
@@ -807,6 +854,8 @@ impl Tree {
             incarnation,
             liveness,
             decl: Mutex::new(()),
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            attachment: None,
         })
     }
 
@@ -850,6 +899,36 @@ impl Tree {
     #[must_use]
     pub fn is_writable(&self) -> bool {
         self.arena.is_writable()
+    }
+
+    /// Park what keeps a joined process attached (`docs/decisions/0005`).
+    ///
+    /// The session holds this process's participant lock byte and the socket is
+    /// the owner's liveness signal for it (D17). Both must live exactly as long
+    /// as the `Tree`, and there is nowhere else with that lifetime.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn hold_attachment(
+        &mut self,
+        session: crate::open::JoinedSession,
+        socket: std::os::fd::OwnedFd,
+    ) {
+        self.attachment = Some(crate::open::Attachment::Joined {
+            _session: session,
+            _socket: socket,
+        });
+    }
+
+    /// Park the owner's session and serving thread.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn hold_ownership(
+        &mut self,
+        session: crate::open::JoinedSession,
+        server: crate::open::OwnerThread,
+    ) {
+        self.attachment = Some(crate::open::Attachment::Owner {
+            _session: session,
+            server,
+        });
     }
 
     /// Wrap a [`LookupError`] so its `Display` resolves ids to frame names.
@@ -940,6 +1019,18 @@ impl Drop for Tree {
 fn register_participant(view: &ArenaView) -> Result<(u32, u64), ParticipantError> {
     view.participants()
         .register(std::process::id(), process_start_time(), now_nanos())
+}
+
+/// Register into the slot the arena's owner named (`docs/PHASE2.md` §3.7).
+///
+/// A joiner does not get to choose: the slot in the `HelloResponse` is also the
+/// lock-file byte it took, and §5.1's liveness predicate asks the kernel about
+/// that byte and then reads the record it indexes. Two independently-chosen
+/// numbers would make every liveness answer be about somebody else.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn register_participant_at(view: &ArenaView, slot: u32) -> Result<u64, ParticipantError> {
+    view.participants()
+        .register_at(slot, std::process::id(), process_start_time(), now_nanos())
 }
 
 /// Wall-clock nanoseconds since the epoch, saturating; `0` if the clock is

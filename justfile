@@ -172,12 +172,22 @@ mp-bench-tf2:
 
 # fmt + clippy + tests for everything behind the `shm` feature, which plain
 # `just lint` and `just test` do not compile.
+#
+# `tf_tree + tf_tree_ipc` only exist together under `--features shm`
+# (`docs/decisions/0005`), so `--workspace` never sees the seam at all.
 shm-check:
     cargo clippy -p tf_tree_arena --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree --features shm --all-targets -- -D warnings
+    cargo clippy -p tf_tree_ipc --all-targets -- -D warnings
     cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
+    cargo nextest run -p tf_tree_ipc
+
+# The zero-config rendezvous end to end: a foreign process calls
+# `tf_tree::open()`, joins a served arena, and reads the same transform.
+shm-rendezvous:
+    cargo nextest run -p tf_tree --features shm --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
