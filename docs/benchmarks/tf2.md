@@ -751,6 +751,61 @@ shows up. Sentinels earn their keep by being unreachable, so
 collision — a plan from one arena's generation evaluated against another arena
 at generation 0 — and fails against `DETACHED = 0` or `1`.
 
+### Python, multi-process: N nodes on one arena against N private buffers
+
+`just py-mp-bench`, 2026-07-26, 8 cpus, in the same container. Eight Python
+consumer nodes at 100 Hz over a depth-3 chain, open-loop, with a live publisher
+for tf_tree. **This is where the shared arena earns its keep, and it is the row
+the single-process comparison cannot show**: a Python `tf2_ros` node
+materialises the whole history privately, and every node pays for it again.
+
+The methodology is `crates/tf_tree_bench/src/mp.rs`'s — open loop against
+*intended* tick times so a stall shows up as latency rather than as fewer
+samples, per-consumer tails rather than one mean, and PSS rather than summed
+RSS, which would count the shared arena once per consumer and flatter tf_tree
+by exactly the amount being claimed.
+
+| nodes | tf_tree svc p50 | `tf2_ros` svc p50 | ratio | tf_tree PSS | `tf2_ros` PSS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | **1 773 ns** | 114 051 ns | 64× | 23.9 MiB | 55.3 MiB |
+| 2 | **1 702 ns** | 115 875 ns | 68× | 40.0 MiB | 93.2 MiB |
+| 4 | **1 643 ns** | 132 270 ns | 80× | 70.6 MiB | 170.4 MiB |
+| 8 | **1 923 ns** | 140 092 ns | **73×** | 128.7 MiB | 320.0 MiB |
+
+**The slope is the claim, not the totals.** Both engines pay identically for the
+Python interpreter and numpy, which dominate the absolute figures. What the
+shared arena changes is what each *additional* node costs:
+
+| marginal, per node | tf_tree | `tf2_ros` | ratio |
+|---|---:|---:|---:|
+| memory (PSS) | **15.0 MiB** | 37.8 MiB | 2.5× |
+| CPU | **0.11 %** | 5.65 % | **51×** |
+| time to first usable lookup | **0–1 ms** | 62–108 ms | ~70× |
+
+The CPU row is `docs/PHASE2.md` §12.4's "O(1) in the number of consumers"
+measured rather than asserted, and 51× is what O(1) against
+O(consumers x edges x rate) looks like at eight nodes on one machine. It grows
+with the fleet.
+
+"time to first usable lookup" is the startup cost, and it is structural rather
+than incidental. tf_tree joins an arena somebody else is already publishing
+into: a handshake, a mapping, and the pages §7.1 populates. tf2 has nothing to
+join, so each node fills its own buffer before it can answer anything — which
+is also why its p50 rises with node count while tf_tree's does not.
+
+**tf2 is given every advantage again.** Its consumers are fed directly, with no
+DDS, no serialisation and no `TransformListener`; a deployed node pays more than
+this and nothing pays less. The one asymmetry that favours tf_tree is
+architectural rather than a harness choice: a compiled `Plan` resolves the chain
+once, and tf2 re-walks it per lookup because it has no equivalent concept. That
+*is* the difference §12.1 exists to report.
+
+Two honest caveats. The machine has 8 cpus, so the 8-node row is at the edge of
+where scheduling starts to dominate — `cycle p99.9` is mostly OS wakeup at
+100 Hz and is reported but not compared. And tf_tree's service p50 is flat
+across the sweep to within noise, which is the expected shape but is measured on
+one machine, not proven.
+
 ### What is implemented, and what is not
 
 `just shm-test` is the gate: a **separate process**, after `exec`, maps the same

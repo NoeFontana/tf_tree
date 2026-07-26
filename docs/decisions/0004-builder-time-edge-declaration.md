@@ -14,7 +14,14 @@
 > [`docs/PHASE1.md`](../PHASE1.md). Its references below to "the Phase 1 spec
 > (`0003`)" now mean `docs/PHASE1.md`.
 
-**Status:** ready
+**Status:** implemented
+
+**Implementation.** `TreeBuilder`'s `static_edge`/`dynamic_edge` and the absence
+of any post-build `declare_*` (`crates/tf_tree/src/tree.rs`). Phase 2 inherits
+it: `Open::layout_if_creating` takes a `TreeBuilder` rather than an
+`ArenaLayout`, and Phase 3's `tf_tree.open(create=[(parent, child), ...])` takes
+an edge list for the same reason — an arena is sized from its declared edges, so
+there is no way to create one without saying what is in it.
 **Owner:** @NoeFontana
 **Implementation:** _(PR linked as work lands — phase1/plan-api)_
 
