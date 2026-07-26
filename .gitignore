@@ -210,3 +210,6 @@ logs/
 
 # uv-managed venvs for the Python bindings (`just py-setup`).
 /.venv-t/
+
+# Profiler output (`just profile-lookup`).
+/target/cg-annotated.txt

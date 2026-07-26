@@ -146,6 +146,26 @@ profile-lookup n="200000":
             --cachegrind-out-file=/tmp/cg.out $B lookup-tf_tree {{n}} >/dev/null 2>&1; \
         cg_annotate --show=Ir,Bcm,D1mr --sort=Ir --auto=yes /tmp/cg.out'
 
+# ThreadSanitizer over the concurrent read path (PHASE3 §7.3).
+#
+# Complements `just loom`, which model-checks the protocols exhaustively but
+# over `loom::sync` substitutes with a bounded interleaving budget. TSan runs
+# real threads against the real generated code, so it sees races the model
+# cannot — one introduced by the facade rather than the protocol.
+#
+# This is also what makes `tf_tree_py`'s `gil_used = false` honest: PyO3 0.29
+# defaults that flag to false, so no test of the attribute can be non-vacuous
+# (PHASE3 §1.2, corrected). The declaration rests on the Rust underneath being
+# race-free, which is what this checks.
+#
+# `-Zbuild-std` because std must be instrumented too — an uninstrumented std
+# reports false positives on its own internals and misses real races through
+# them.
+tsan:
+    RUSTFLAGS="-Zsanitizer=thread" \
+    cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
+        -p tf_tree --features shm --test tsan --release
+
 # --- Phase 2: shared memory (Linux only) -------------------------------------
 #
 # `shm` is off by default so the single-process build never grows a syscall
