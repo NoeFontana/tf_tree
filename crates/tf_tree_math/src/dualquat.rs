@@ -208,7 +208,7 @@ impl ScrewParts {
     /// whole range, and `sqrt(theta_sq_from_chord(·))` matches it to `f64`
     /// inside `θ ≤ 0.15` where it is used — so replacing this branch with an
     /// unconditional `atan2` is *correct*, merely slower. No unit test can tell
-    /// them apart, and none pretends to: `interp_deriv_cost` is the guard.
+    /// them apart, and none pretends to: `deriv_cost` is the guard.
     #[inline]
     fn twist(&self) -> Twist {
         let sh = libm::sqrt(self.sh2);
@@ -249,6 +249,23 @@ pub fn screw_pow(rel: &Iso3, s: f64) -> Iso3 {
     match screw_parts(rel) {
         Screw::Degenerate(c) => scaled_exp(log_se3(c), s),
         Screw::Regular(p) => p.pow(s),
+    }
+}
+
+/// The segment's body twist `ξ = log_se3(rel)` **without** raising `rel` to any
+/// power — `docs/PHASE4.md` §2.3.
+///
+/// `ξ` is a property of the segment, not of `s`, so the endpoints of an
+/// interpolation still need it while having no use for the power. This is the
+/// entry point [`crate::ScLerp::eval_with_twist`] takes at `s ∈ {0, 1}`, which
+/// is where an exact hit on a published sample and a `t == t_new` query both
+/// land — the two most frequently queried stamps on any edge.
+#[inline]
+#[must_use]
+pub fn screw_twist(rel: &Iso3) -> Twist {
+    match screw_parts(rel) {
+        Screw::Degenerate(c) => Twist::from_se3(log_se3(c)),
+        Screw::Regular(p) => p.twist(),
     }
 }
 

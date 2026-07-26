@@ -10,7 +10,7 @@
 //!   SLERP. Left-invariant but **not** right-invariant; that asymmetry is why
 //!   `ScLerp` is the default (`docs/PHASE1.md` §3.4; `docs/PROJECT.md` §5 D5).
 
-use crate::dualquat::{screw_pow, screw_pow_with_twist};
+use crate::dualquat::{screw_pow, screw_pow_with_twist, screw_twist};
 use crate::iso3::Iso3;
 use crate::quat::Quat;
 use crate::twist::Twist;
@@ -93,17 +93,26 @@ impl ScLerp {
     #[inline]
     #[must_use]
     pub fn eval_with_twist(a: &Iso3, b: &Iso3, s: f64) -> (Iso3, Twist) {
-        let (rel_pow, xi) = screw_pow_with_twist(&a.inv_mul(b), s);
-        // Mirror `eval`'s exact endpoints rather than trusting `a · rel^0` to
-        // round back to `a`. It does, but "does today" is not the contract.
-        let pose = if s == 0.0 {
-            *a
-        } else if s == 1.0 {
-            *b
-        } else {
-            *a * rel_pow
-        };
-        (pose, xi)
+        let rel = a.inv_mul(b);
+        // The endpoints are exact by construction, exactly as in `eval` — and the
+        // test is made *before* the power, not after. `ScrewParts::pow` is the
+        // half of the decomposition that carries the transcendental on the
+        // large-arc branch, and at `s ∈ {0, 1}` its result is discarded. LLVM
+        // does not sink the call out of the untaken branch, so computing it first
+        // and then throwing it away is a real cost on the two stamps most likely
+        // to be queried: an exact hit on a published sample, and `t == t_new`.
+        //
+        // The twist is still needed at the endpoints — it is a property of the
+        // segment, not of `s` — so only the power is skipped, never the screw
+        // decomposition itself.
+        if s == 0.0 {
+            return (*a, screw_twist(&rel));
+        }
+        if s == 1.0 {
+            return (*b, screw_twist(&rel));
+        }
+        let (rel_pow, xi) = screw_pow_with_twist(&rel, s);
+        (*a * rel_pow, xi)
     }
 }
 

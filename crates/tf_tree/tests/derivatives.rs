@@ -613,3 +613,191 @@ fn lerpslerp_body_velocity_swings_while_its_magnitude_does_not() {
         "the |v| trap did not reproduce: vector spread {l_vec:e}, magnitude spread {l_mag:e}"
     );
 }
+
+/// **A plan where only *some* edges are LerpSlerp must still be refused.**
+///
+/// Found by review: the original refusal test used a single-edge, uniformly
+/// LerpSlerp plan, so an implementation that checked only the *first* dynamic
+/// step — or only the last — passed the whole suite. This puts the LerpSlerp edge
+/// in the middle of an otherwise ScLerp chain, and asserts the refusal names
+/// *that* edge and not one of its neighbours.
+///
+/// Mutant: check the policy of `steps()[0]` once instead of per-step ⇒ fails.
+#[test]
+fn a_single_lerpslerp_edge_mid_chain_refuses_and_names_that_edge() {
+    let cfg = EdgeCfg::new(Capacity::slots(64));
+    // Default ScLerp; the middle edge is explicitly LerpSlerp.
+    let tree = TreeBuilder::new()
+        .default_interp(InterpPolicy::ScLerp)
+        .dynamic_edge("map", "odom", cfg)
+        .dynamic_edge("odom", "base", cfg.interp(InterpPolicy::LerpSlerp))
+        .dynamic_edge("base", "tool", cfg)
+        .build()
+        .unwrap();
+    let names = ["map", "odom", "base", "tool"];
+    for i in 0..3 {
+        let parent = tree.frame(names[i]).unwrap();
+        let child = tree.frame(names[i + 1]).unwrap();
+        let w = tree.claim(child, parent).unwrap();
+        for j in 0..8i64 {
+            w.push(
+                j * 10_000_000,
+                &common::pose((i * 10 + j as usize) as u64 + 1),
+            )
+            .unwrap();
+        }
+        core::mem::forget(w);
+    }
+    let map = tree.frame("map").unwrap();
+    let tool = tree.frame("tool").unwrap();
+    let plan = tree.plan(map, tool).unwrap();
+    let g = tree.guard();
+    let t = ns(35_000_000);
+
+    // The plain lookup works across all three edges.
+    plan.at(&g, t).expect("at() must still work");
+
+    // The middle edge is the one that must be named. Read it from the plan
+    // rather than assuming an id: the chain is linear and end-to-end, so the
+    // middle dynamic step is the middle edge whichever way the walk emits them.
+    let dyn_edges: Vec<_> = plan
+        .steps()
+        .iter()
+        .filter_map(|s| match s {
+            tf_tree::Step::Dyn { edge, .. } => Some(*edge),
+            tf_tree::Step::Static(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        dyn_edges.len(),
+        3,
+        "the fixture should have three dynamic edges"
+    );
+    let want = dyn_edges[1];
+
+    match plan.at_with_derivatives(&g, t) {
+        Err(LookupError::DerivativesUnavailable { edge, interp }) => {
+            assert_eq!(interp, InterpPolicy::LerpSlerp.as_u8());
+            assert_eq!(
+                edge, want,
+                "the refusal named the wrong edge; only one of the three is LerpSlerp"
+            );
+        }
+        other => panic!("expected DerivativesUnavailable, got {other:?}"),
+    }
+}
+
+/// **A stale plan must be refused before any sampling happens.**
+///
+/// Found by review: `check_generation` could be deleted from
+/// `at_with_derivatives` with the whole suite green, which would let a plan
+/// compiled against an old topology silently evaluate against a new one.
+///
+/// Mutant: remove `self.check_generation(g)?` ⇒ fails.
+#[test]
+fn at_with_derivatives_refuses_a_stale_plan() {
+    let rig = Rig::new();
+    let plan = rig.tree.plan(rig.map, rig.sensor).unwrap();
+    // A guard taken before the topology moves, and a re-parent that moves it.
+    let base = rig.tree.frame("base").unwrap();
+    let map = rig.tree.frame("map").unwrap();
+    rig.tree.reparent(rig.sensor, map).expect("reparent");
+    let g = rig.tree.guard();
+    let _ = base;
+    assert!(
+        matches!(
+            plan.at_with_derivatives(&g, ns(25 * Rig::DT)),
+            Err(LookupError::TopologyChanged { .. })
+        ),
+        "a plan compiled against the old topology must be refused"
+    );
+}
+
+/// **A cross-domain query must be refused**, the same way `at` refuses it.
+///
+/// Mutant: remove `self.check_domain::<D>()?` ⇒ the sensor-domain stamp is used
+/// to index a system-domain edge and returns a confident wrong answer.
+#[test]
+fn at_with_derivatives_refuses_a_cross_domain_stamp() {
+    use tf_tree::{SensorDomain, Stamp};
+    let rig = Rig::new();
+    let plan = rig.tree.plan(rig.map, rig.sensor).unwrap();
+    let g = rig.tree.guard();
+    let t = Stamp::<SensorDomain>::from_nanos(25 * Rig::DT);
+    assert!(
+        matches!(
+            plan.at_with_derivatives(&g, t),
+            Err(LookupError::TimeDomainMismatch { .. })
+        ),
+        "a sensor-domain stamp must not address system-domain edges"
+    );
+}
+
+/// **The twist is in the plan's SOURCE frame, not its target frame.**
+///
+/// Found by review, and the docstring said the opposite. This is the one fact a
+/// caller must have right, and it is invisible to every sanity check they are
+/// likely to apply: the error is the full rotation `R_target_source`, so `‖v‖`
+/// is *identical* either way.
+///
+/// The fixture makes the two answers maximally distinguishable. `base` is rotated
+/// +90° about z relative to `map`, and moves along **map**'s +x at exactly 1 m/s.
+/// `plan(map, base)` evaluates `T_map_base`, so:
+///
+/// * source (base) axes — what the API returns: `v = (0, −1, 0)`
+/// * target (map) axes — what `to_spatial` returns: `v = (1, 0, 0)`
+///
+/// Mutant: swap `adjoint` and `adjoint_inv` anywhere in the fold, or "fix" the
+/// docs back to "target" ⇒ this fails.
+#[test]
+fn the_twist_is_in_the_source_frame_not_the_target_frame() {
+    use tf_tree::Quat;
+
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let base = tree.frame("base").unwrap();
+    let w = tree.claim(base, map).unwrap();
+    let h = core::f64::consts::FRAC_PI_4; // half of 90°
+    let q = Quat::new(h.cos(), 0.0, 0.0, h.sin());
+    for i in 0..8i64 {
+        // T_map_base(t) = (Rz(+90°), (t, 0, 0)) with t in seconds.
+        w.push(
+            i * 1_000_000_000,
+            &Iso3::new(q, Vec3::new(i as f64, 0.0, 0.0)),
+        )
+        .unwrap();
+    }
+    core::mem::forget(w);
+
+    let plan = tree.plan(map, base).unwrap();
+    let g = tree.guard();
+    let s = plan.at_with_derivatives(&g, ns(3_500_000_000)).unwrap();
+
+    let body = s.twist.v;
+    let spatial = s.twist.to_spatial(&s.pose).v;
+
+    // Both describe 1 m/s — the magnitudes are equal, which is exactly why a
+    // magnitude check cannot catch a frame mix-up.
+    assert!(
+        (body.norm() - 1.0).abs() < 1e-9,
+        "body speed should be 1 m/s"
+    );
+    assert!(
+        (spatial.norm() - 1.0).abs() < 1e-9,
+        "spatial speed should be 1 m/s"
+    );
+
+    // The body twist is resolved in BASE (the source), so +x of map is −y of base.
+    assert!(
+        body.sub(Vec3::new(0.0, -1.0, 0.0)).norm() < 1e-9,
+        "body twist is not in the source frame: {body:?}"
+    );
+    // to_spatial brings it to MAP (the target).
+    assert!(
+        spatial.sub(Vec3::new(1.0, 0.0, 0.0)).norm() < 1e-9,
+        "to_spatial did not land in the target frame: {spatial:?}"
+    );
+}

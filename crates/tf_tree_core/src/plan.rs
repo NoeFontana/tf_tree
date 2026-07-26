@@ -198,8 +198,9 @@ impl InterpPolicy {
 /// A pose and its derivatives at one instant — `docs/PHASE4.md` §2.2.
 ///
 /// Returned by [`Plan::at_with_derivatives`]. The twist is **body-frame
-/// (right)**, expressed in the plan's target frame; see [`tf_tree_math::twist`]
-/// for the convention and for `to_spatial`.
+/// (right)**, expressed in the plan's **source** frame — see
+/// [`Plan::at_with_derivatives`] for why that is the source and not the target,
+/// and [`tf_tree_math::twist`] for the convention generally.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
     /// The transform at the requested stamp — bit-identical to [`Plan::at`].
@@ -430,9 +431,26 @@ impl Plan {
     /// Evaluate the plan at `t`, returning the pose **and its derivatives** —
     /// `docs/PHASE4.md` §2.2.
     ///
+    /// # Which frame the twist is in — read this once
+    ///
     /// The twist is body-frame (right), `V^b = (T⁻¹Ṫ)^∨`, expressed in the
-    /// plan's *target* frame. Use [`tf_tree_math::Twist::to_spatial`] with the
-    /// returned pose for the spatial form.
+    /// plan's **source** frame. Use [`tf_tree_math::Twist::to_spatial`] with the
+    /// returned pose to get it in the **target** frame.
+    ///
+    /// It is the source frame because `plan(target, source)` evaluates
+    /// `T_target_source`, and `T⁻¹Ṫ` is by construction resolved in the frame `T`
+    /// maps *from*. Concretely, for `plan(map, base)` where `base` is rotated
+    /// +90° about z and moves along **map**'s +x at 1 m/s:
+    ///
+    /// ```text
+    /// sample.twist.v              == (0, −1, 0)   // resolved in base axes
+    /// sample.twist.to_spatial(&p) == (1,  0, 0)   // resolved in map axes
+    /// ```
+    ///
+    /// Both are 1 m/s, so **`‖v‖` is identical and a magnitude check cannot tell
+    /// them apart**. Getting this wrong is wrong by the full rotation
+    /// `R_target_source`, silently. An earlier revision of this doc comment said
+    /// "target", which is why the example is here rather than a sentence.
     ///
     /// Costs roughly two plain lookups: the same sampling work, plus one adjoint
     /// application per plan step (two quaternion rotations and a cross product,

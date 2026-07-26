@@ -18,7 +18,7 @@
 //! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
 //! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
 
-use tf_tree_math::{exp_se3, log_se3, Interp, Iso3, ScLerp, Twist};
+use tf_tree_math::{Interp, Iso3, ScLerp, Twist};
 
 /// Nanoseconds per second, as the `f64` the twist scaling needs.
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
@@ -85,7 +85,9 @@ impl SampleRing<'_> {
                     newest: t_new,
                 }),
                 ExtrapPolicy::Hold => self.read_slot((newest & self.mask) as usize),
-                ExtrapPolicy::ConstantTwist => self.constant_twist(lo_logical, newest, t, t_new),
+                ExtrapPolicy::ConstantTwist => self
+                    .constant_twist(lo_logical, newest, t, t_new)
+                    .map(|(pose, _)| pose),
             };
         }
         if t == t_new {
@@ -169,7 +171,9 @@ impl SampleRing<'_> {
                     newest: t_new,
                 }),
                 ExtrapPolicy::Hold => self.read_slot((newest & self.mask) as usize),
-                ExtrapPolicy::ConstantTwist => self.constant_twist(lo_logical, newest, t, t_new),
+                ExtrapPolicy::ConstantTwist => self
+                    .constant_twist(lo_logical, newest, t, t_new)
+                    .map(|(pose, _)| pose),
             };
         }
         if t == t_new {
@@ -368,13 +372,13 @@ impl SampleRing<'_> {
                     return Ok((self.read_slot((newest & self.mask) as usize)?, Twist::ZERO));
                 }
                 ExtrapPolicy::ConstantTwist => {
-                    let pose = self.constant_twist(lo_logical, newest, t, t_new)?;
+                    // Degraded to Hold: there is a pose to extend from but no
+                    // segment to extend *along*, so the derivative is missing
+                    // while the pose is fine — which is exactly `NoSegment`.
                     if newest == lo_logical {
-                        // ConstantTwist degraded to Hold: one sample, no twist.
                         return Err(LookupError::NoSegment { edge: self.edge });
                     }
-                    let tw = self.segment_twist(newest - 1)?;
-                    return Ok((pose, tw));
+                    return self.constant_twist(lo_logical, newest, t, t_new);
                 }
             }
         }
@@ -416,34 +420,42 @@ impl SampleRing<'_> {
         Ok((pose, xi.scale(NANOS_PER_SEC / dt)))
     }
 
-    /// The body twist of the segment `[i, i+1]`, in units of 1/second.
+    /// [`ExtrapPolicy::ConstantTwist`] extrapolation past the newest sample,
+    /// returning the extrapolated pose **and** the twist it was extended along.
     ///
-    /// Shared by the `ConstantTwist` arm, which needs the twist of a segment it
-    /// has already located.
-    fn segment_twist(&self, i: u64) -> Result<Twist, LookupError> {
-        let t_i = self.stamp_at(i);
-        let t_j = self.stamp_at(i + 1);
-        let dt = (t_j - t_i) as f64;
-        if dt == 0.0 {
-            return Err(LookupError::NoSegment { edge: self.edge });
-        }
-        let a = self.read_slot((i & self.mask) as usize)?;
-        let b = self.read_slot(((i + 1) & self.mask) as usize)?;
-        let (_, xi) = ScLerp::eval_with_twist(&a, &b, 0.0);
-        Ok(xi.scale(NANOS_PER_SEC / dt))
-    }
-
-    /// [`ExtrapPolicy::ConstantTwist`] extrapolation past the newest sample.
+    /// # One decomposition, one revalidation
+    ///
+    /// Both outputs come from a single [`ScLerp::eval_with_twist`] on a single
+    /// read of the two newest slots. That is not a micro-optimization; it is what
+    /// makes the read sound. An earlier split — `constant_twist` for the pose and
+    /// a separate `segment_twist` for the twist — read the same two slots twice
+    /// and revalidated only the first pair, so a writer that lapped the ring
+    /// between them produced a pose that was correctly rejected beside a twist
+    /// that was silently wrong. `read_slot`'s seqlock proves each pose is
+    /// internally consistent, never that two poses came from the same era; only
+    /// the trailing `head - prev > retained` check does that, and it has to cover
+    /// every slot the result depends on.
+    ///
+    /// `Twist::ZERO` accompanies the degraded single-sample case: there is a pose
+    /// to hold but no segment to differentiate. Callers that need to distinguish
+    /// "held, so stationary" from "extended along a real twist" check
+    /// `newest == lo_logical` themselves, as [`Self::sample_with_twist`] does.
+    ///
+    /// The screw route here is the same one [`ScLerp`] uses everywhere else,
+    /// rather than the `log_se3`/`exp_se3` reference form this used to take —
+    /// so `sample` and `sample_with_twist` agree bit-for-bit under this policy,
+    /// and the extrapolation now costs one screw decomposition instead of a full
+    /// log and exp.
     fn constant_twist(
         &self,
         lo_logical: u64,
         newest: u64,
         t: i64,
         t_new: i64,
-    ) -> Result<Iso3, LookupError> {
+    ) -> Result<(Iso3, Twist), LookupError> {
         if newest == lo_logical {
             // Only one sample retained: no twist to extend.
-            return self.read_slot((newest & self.mask) as usize);
+            return Ok((self.read_slot((newest & self.mask) as usize)?, Twist::ZERO));
         }
         let prev = newest - 1;
         let t_prev = self.stamp_at(prev);
@@ -451,21 +463,16 @@ impl SampleRing<'_> {
         let b = self.read_slot((newest & self.mask) as usize)?;
         let dt = (t_new - t_prev) as f64;
         let result = if dt == 0.0 {
-            b
+            // Equal stamps span no time: nothing to extend along, and the
+            // velocity would be infinite rather than unknown.
+            (b, Twist::ZERO)
         } else {
-            // Constant screw twist of a->b, extended to `t`. At t == t_new this
-            // reproduces `b` exactly (param == 1).
-            let twist = log_se3(a.inverse() * b);
+            // Constant screw twist of a->b, extended to `t`. `param > 1` walks
+            // past `b` along the same screw; at `t == t_new` it is exactly 1 and
+            // reproduces `b`.
             let param = (t - t_prev) as f64 / dt;
-            let scaled = [
-                twist[0] * param,
-                twist[1] * param,
-                twist[2] * param,
-                twist[3] * param,
-                twist[4] * param,
-                twist[5] * param,
-            ];
-            a * exp_se3(scaled)
+            let (pose, xi) = ScLerp::eval_with_twist(&a, &b, param);
+            (pose, xi.scale(NANOS_PER_SEC / dt))
         };
         if self.head.load(Ordering::Acquire) - prev > self.retained() {
             return Err(LookupError::SlotRecycled { edge: self.edge });
