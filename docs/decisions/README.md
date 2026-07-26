@@ -15,11 +15,12 @@ changed is where the *existing* architecture and Phase 1 contract live:
 | [`0002`](./0002-tf-tree-architecture.md) | **Superseded.** Consolidated into [`docs/PROJECT.md`](../PROJECT.md) (overview, roadmap, decision log D1–D20 in §5). |
 | [`0003`](./0003-phase-1-single-process-core.md) | **Superseded.** Consolidated into [`docs/PHASE1.md`](../PHASE1.md) (normative Phase 1 spec, §0–§13). |
 | [`0004`](./0004-builder-time-edge-declaration.md) | **Still authoritative** — builder-time edge declaration and arena sizing from the declared edges are not represented in `PHASE1.md`. |
+| [`0005`](./0005-the-shared-memory-seam.md) | **Ready** — the `tf_tree → tf_tree_ipc` seam, §3.7 fd passing, claims as leases, reaping, fork poisoning. Amends D16. Its *Implementation plan* is the Phase 2 completion milestone. |
 
 Cite `docs/PROJECT.md` and `docs/PHASE1.md`, never `0002`/`0003`; they are kept
 in place, unedited apart from their banners, as history.
 [`docs/PHASE2.md`](../PHASE2.md) is the Phase 2 spec and its §1 holds the Phase 1
-amendments A1–A8, which are not yet applied.
+amendments A1–A8, which are all applied; §0.0 is the live status table.
 
 A new decision is still the right vehicle for anything the phase specs do not
 already answer.

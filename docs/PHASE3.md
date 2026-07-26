@@ -186,15 +186,27 @@ Scalar-vs-array dispatch on the same method is the NumPy idiom and is what makes
 ### 4.3 Publishing
 
 ```python
-with tree.publisher("odom", "base_link") as pub:      # claims on enter, releases on exit
+with tree.publisher("base_link", "odom") as pub:      # (child, parent) — claims on enter
     pub.push(stamp_ns, T)                             # T: (4,4) or (7,)
     pub.push_many(stamps, poses)                      # vectorized
-
-tree.declare_static("base_link", "camera_mount", T)
-tree.declare_dynamic("odom", "base_link", capacity=8192, interp="sclerp")
 ```
 
 The context manager is the documented form. A `Publisher` that is garbage-collected without `__exit__` still releases its claim via `Drop`, but Python finalization order is not guaranteed and the explicit form is what the docs show.
+
+Argument order is **(child, parent)**, matching `Tree::claim(child, parent)`. An earlier draft of this section wrote it parent-first; a binding that silently accepted either would make a reversed edge a runtime mystery rather than an import-time error.
+
+**There is no `declare_static` / `declare_dynamic` — NORMATIVE.** An earlier draft showed both as `Tree` methods. That contradicts decision [`0004`](./decisions/0004-builder-time-edge-declaration.md), which is still authoritative: topology is declared at builder time, the arena is sized from the declared edges, and `crates/tf_tree/src/tree.rs:5` states plainly that "there is no post-build `declare_*`". Adding one to the *Python* API would not be a binding convenience — it would require exactly the growth D4 forbids.
+
+A Python process that needs to define topology creates the arena and passes the layout, which is the `layout_if_creating` path of `tf_tree::open()`:
+
+```python
+tree = tf_tree.open(mode="rw", create="if_absent", layout=[
+    tf_tree.static_edge("base_link", "camera_mount", T),
+    tf_tree.dynamic_edge("odom", "base_link", capacity=8192, interp="sclerp"),
+])
+```
+
+The distinction is worth stating in the docstring rather than only here: the layout is a property of *the arena*, fixed when it is created, not a method on a tree that already exists. `Tree.reparent` remains the only runtime topology mutation.
 
 ### 4.4 Errors
 
@@ -361,7 +373,14 @@ The per-thread plan cache behind `tree.lookup` must be genuinely per-thread (`th
 
 ### 8.1 Fork — NORMATIVE
 
-Phase 2 applies `MADV_DONTFORK` to the arena, so **a forked child has no mapping and any inherited handle is a segfault waiting to happen.** Phase 2 also holds claims as OFD locks, which *are* inherited across fork — so without intervention a child both appears to hold the claim and has no memory to write to.
+Phase 2 applies `MADV_DONTFORK` to the arena (`MappedArena::advise`, `crates/tf_tree_arena/src/mapped.rs:328`), so **a forked child has no mapping and any inherited handle is a segfault waiting to happen.**
+
+An earlier draft added "Phase 2 also holds claims as OFD locks, which *are* inherited across fork". That is not what the code does, and the correction matters because it moves where the fix has to go:
+
+- **Claims are in-arena CAS words** on `ClaimRecord` (`crates/tf_tree_core/src/edge.rs:150`), owner = participant slot + 1 (A3), guarded by an epoch (A4). The OFD locks in `crates/tf_tree_ipc/` cover the *rendezvous lock file* only; `CLAIM_BASE` is reserved and unused (`lockfile.rs:64`). Decision [`0005`](./decisions/0005-the-shared-memory-seam.md) adds a lock *lease* alongside the CAS, but the CAS remains the decision.
+- So the child's failure is not a stale-but-held claim. It is **`SIGSEGV` on any use of the vanished mapping** — and, critically, that includes `Tree::drop`, which calls `self.view().participants().release(..)` (`crates/tf_tree/src/tree.rs:918-933`). A child that never touches the API at all still dies at exit.
+
+The consequence for this section: **poisoning must suppress the destructor, not only the API surface.** A hook that makes every method raise while leaving `Drop` intact converts a segfault-on-use into a segfault-on-exit, which is harder to attribute, not easier. `0005` step 9 implements the Rust half (a process-global fork generation bumped by `pthread_atfork`, checked in `Drop`); the Python hook below is then belt-and-braces rather than the only line of defence.
 
 Python 3.14 changed the default `multiprocessing` start method on POSIX from `fork` to `forkserver`, and `fork` is no longer the default on any platform — which reduces the hazard but does not remove it: 3.9–3.13 still default to `fork`, and `mp.get_context("fork")` and bare `os.fork()` remain entirely ordinary things to write.
 
