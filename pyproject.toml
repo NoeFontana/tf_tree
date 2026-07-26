@@ -1,0 +1,59 @@
+[build-system]
+requires = ["maturin>=1.14.1,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tf_tree"
+version = "0.1.0"
+description = "A transform tree engine — faster and more scalable than ROS tf2"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Noé Fontana", email = "noe.fontana.pro@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = ["numpy>=1.24"]
+
+[dependency-groups]
+# Floors from `docs/PHASE3.md` §10.1. Each is there for a reason recorded in
+# that section, not merely because it is current.
+dev = ["maturin>=1.14.1,<2.0", "pytest>=9.1", "ruff>=0.16", "pyright>=1.1.411"]
+
+[tool.maturin]
+manifest-path = "crates/tf_tree_py/Cargo.toml"
+module-name = "tf_tree._core"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = [".venv", "target", "dist"]
+
+[tool.ruff.format]
+# ruff 0.16 formats Python code blocks inside Markdown *by default*, and
+# `docs/` is this project's contract — its fenced blocks are line-broken to
+# make an argument and sometimes elided with `...`. See PHASE3 §10.1.
+exclude = ["**/*.md"]
+
+[tool.ruff.lint]
+# Explicit, because ruff 0.16 raised the default set from 59 rules to 413 and
+# an implicit set would change under us on every upgrade (PHASE3 §10.1).
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+minversion = "9.1"
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+testpaths = ["tests/python"]
+
+[tool.pyright]
+include = ["python", "tests/python"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"

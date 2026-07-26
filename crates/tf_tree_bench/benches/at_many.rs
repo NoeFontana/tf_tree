@@ -5,7 +5,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use tf_tree::{Iso3, Layout, Stamp};
+use tf_tree::{Iso3, Layout, Stamp, SystemDomain};
 use tf_tree_bench::fixture;
 
 const N: usize = 1024;
@@ -43,10 +43,13 @@ fn at_many(c: &mut Criterion) {
     // `Iso3` buffer, then convert. `Iso3` is 64 B with 8 of padding and no
     // layout below shares its stride, so that second pass is not avoidable by
     // any amount of care on the caller's side.
+    // Raw nanoseconds: `at_many_into` takes `&[i64]` so an FFI caller does not
+    // have to allocate a `Vec<Stamp>` to use it.
+    let nanos: Vec<i64> = stamps.iter().map(|s| s.nanos()).collect();
     let mut mat = vec![0.0f64; N * Layout::Mat4.elems()];
     group.bench_function("into_mat4_1024", |b| {
         b.iter(|| {
-            plan.at_many_into(&guard, black_box(&stamps), Layout::Mat4, &mut mat)
+            plan.at_many_into::<SystemDomain>(&guard, black_box(&nanos), Layout::Mat4, &mut mat)
                 .expect("at_many_into");
             black_box(&mat);
         });
@@ -55,7 +58,7 @@ fn at_many(c: &mut Criterion) {
     let mut quat = vec![0.0f64; N * Layout::Quat.elems()];
     group.bench_function("into_quat_1024", |b| {
         b.iter(|| {
-            plan.at_many_into(&guard, black_box(&stamps), Layout::Quat, &mut quat)
+            plan.at_many_into::<SystemDomain>(&guard, black_box(&nanos), Layout::Quat, &mut quat)
                 .expect("at_many_into");
             black_box(&quat);
         });
@@ -64,8 +67,13 @@ fn at_many(c: &mut Criterion) {
     let mut aff = vec![0.0f32; N * Layout::Affine32.elems()];
     group.bench_function("into_affine32_1024", |b| {
         b.iter(|| {
-            plan.at_many_into_f32(&guard, black_box(&stamps), Layout::Affine32, &mut aff)
-                .expect("at_many_into_f32");
+            plan.at_many_into_f32::<SystemDomain>(
+                &guard,
+                black_box(&nanos),
+                Layout::Affine32,
+                &mut aff,
+            )
+            .expect("at_many_into_f32");
             black_box(&aff);
         });
     });

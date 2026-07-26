@@ -207,3 +207,42 @@ versions:
 # benchmark's tf2 numbers are not an artifact of our binding.
 tf2-native-control:
     ./docker/tf2/run.sh 'bash docker/tf2/native_scaling.sh'
+
+# ---------------------------------------------------------------------------
+# Python bindings (docs/PHASE3.md). `tf_tree_py` is excluded from the workspace
+# because it links libpython, so none of this is reachable from `just test`.
+#
+# Interpreters come from uv rather than the host, so the floors in PHASE3 §10.1
+# are what actually gets used. 3.14 is the GIL build; 3.14t is free-threaded,
+# and §7.3 requires the suite to pass on both.
+# ---------------------------------------------------------------------------
+
+# Create both venvs and install the toolchain.
+py-setup:
+    uv python install 3.14 3.14t
+    uv venv --python 3.14 .venv
+    VIRTUAL_ENV=.venv uv pip install -q maturin numpy pytest ruff pyright
+    uv venv --python 3.14t .venv-t
+    VIRTUAL_ENV=.venv-t uv pip install -q maturin numpy pytest
+
+# Build the extension into the GIL venv and run the suite.
+py-test:
+    VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q
+    .venv/bin/python -m pytest tests/python -q
+
+# The same on the free-threaded interpreter — §7.3's requirement, and the only
+# place the concurrency claims are actually exercised.
+py-test-freethreaded:
+    VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
+    .venv-t/bin/python -m pytest tests/python -q
+
+# fmt + lint for both languages of the binding.
+py-lint:
+    cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
+    PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
+    .venv/bin/ruff check python tests/python
+    .venv/bin/ruff format --check python tests/python
+
+# Build a release wheel.
+py-wheel:
+    VIRTUAL_ENV=.venv .venv/bin/maturin build --release

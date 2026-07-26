@@ -106,3 +106,7 @@ required-features = ["shm"]
 name = "shm_scaling"
 path = "src/bin/shm_scaling.rs"
 required-features = ["shm"]
+
+[[bench]]
+name = "py_parity"
+harness = false

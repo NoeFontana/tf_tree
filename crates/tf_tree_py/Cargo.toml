@@ -1,0 +1,61 @@
+# Deliberately NOT a workspace member (see `exclude` in the root manifest): the
+# extension links libpython, which `cargo build --workspace` cannot assume is
+# present. Making it a member would break the normal development loop on every
+# host without Python development files — the same reasoning as
+# `tf_tree_tf2_sys` and ROS.
+#
+# Being outside the workspace also means it cannot use `field.workspace = true`
+# inheritance, so the metadata and lints below are spelled out.
+#
+# Built and tested through `just py-*`, which point PyO3 at a uv-managed
+# interpreter so the toolchain floors in `docs/PHASE3.md` §10.1 are what is
+# actually used rather than whatever the host happens to ship.
+[package]
+name = "tf_tree_py"
+description = "PyO3 bindings for tf_tree (docs/PHASE3.md)"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/NoeFontana/tf_tree"
+homepage = "https://github.com/NoeFontana/tf_tree"
+authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
+publish = false
+
+[lib]
+# `cdylib` is the extension module; `rlib` so the crate's own tests can link it.
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[dependencies]
+tf_tree = { path = "../tf_tree", version = "0.1.0", features = ["shm"] }
+tf_tree_core = { path = "../tf_tree_core", version = "0.1.0" }
+tf_tree_math = { path = "../tf_tree_math", version = "0.1.0" }
+# 0.29 is the floor: `abi3t` / `abi3t-py315` and the free-threading story do not
+# exist below it (`docs/PHASE3.md` §10.1).
+pyo3 = { version = "0.29", features = ["macros"] }
+numpy = "0.29"
+
+# Being outside the workspace means the root `[profile.release]` does not apply,
+# and cargo's defaults are opt-level 3 with **no LTO and 16 codegen units**.
+# That is not a small difference for this crate: the hot path is a call from the
+# extension into `tf_tree_core`'s batch kernel, which only inlines across the
+# crate boundary with LTO on. Measured at n=4096: 51.7 -> 40.6 ns/sample.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+strip = "debuginfo"

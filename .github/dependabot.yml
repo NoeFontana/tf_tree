@@ -17,3 +17,15 @@ updates:
       rust-deps:
         patterns: ["*"]
     open-pull-requests-limit: 10
+
+  # Restored with `pyproject.toml` (`docs/PHASE3.md` §14). The Phase 1 scaffold
+  # removed both together, which is why PR #3 sat unmergeable against files
+  # that no longer existed.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      py-deps:
+        patterns: ["*"]
+    open-pull-requests-limit: 10

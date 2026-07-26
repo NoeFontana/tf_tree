@@ -477,6 +477,14 @@ impl Plan {
     /// `out` is a flat `f64` slice of at least `stamps.len() * layout.elems()`.
     /// Use [`Self::at_many_into_f32`] for [`Layout::Affine32`].
     ///
+    /// **`stamps` is raw nanoseconds, with the domain as the type parameter.**
+    /// `Stamp<D>` is a newtype and not `repr(transparent)`, so a caller holding
+    /// `&[i64]` — every FFI caller, and the NumPy path in particular — would
+    /// have to *allocate and copy* to produce `&[Stamp<D>]`, which is exactly
+    /// the intermediate buffer this method exists to remove. Nothing is lost:
+    /// the domain is still checked, once per call rather than carried in eight
+    /// bytes of `PhantomData` per element.
+    ///
     /// # Errors
     ///
     /// [`LookupError::BufferTooSmall`] if `out` cannot hold the batch, or
@@ -489,7 +497,7 @@ impl Plan {
     pub fn at_many_into<D: Domain>(
         &self,
         g: &Guard,
-        stamps: &[Stamp<D>],
+        stamps: &[i64],
         layout: Layout,
         out: &mut [f64],
     ) -> Result<(), LookupError> {
@@ -531,7 +539,7 @@ impl Plan {
     pub fn at_many_into_f32<D: Domain>(
         &self,
         g: &Guard,
-        stamps: &[Stamp<D>],
+        stamps: &[i64],
         layout: Layout,
         out: &mut [f32],
     ) -> Result<(), LookupError> {
@@ -559,10 +567,10 @@ impl Plan {
     /// copy of the cursor logic — which is the part that must not be duplicated,
     /// because it is where the galloping search and the seqlock retry live.
     #[inline]
-    fn fold_batch<D: Domain, T, W>(
+    fn fold_batch<T, W>(
         &self,
         g: &Guard,
-        stamps: &[Stamp<D>],
+        stamps: &[i64],
         write: W,
         elems: usize,
         out: &mut [T],
@@ -581,16 +589,16 @@ impl Plan {
         // already elides the check and because ~245 us of interpolation dwarfs
         // it either way. It stays because it says what it means and drops the
         // manual index arithmetic, not because it is faster.
-        let monotone = stamps.windows(2).all(|w| w[0].nanos() <= w[1].nanos());
+        let monotone = stamps.windows(2).all(|w| w[0] <= w[1]);
         if monotone {
             let mut cursors = [0u64; MAX_DEPTH];
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
-                let iso = self.fold_at_cursors(g, s.nanos(), &mut cursors)?;
+                let iso = self.fold_at_cursors(g, *s, &mut cursors)?;
                 write(&iso, dst);
             }
         } else {
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
-                let iso = self.fold_at(g, s.nanos())?;
+                let iso = self.fold_at(g, *s)?;
                 write(&iso, dst);
             }
         }

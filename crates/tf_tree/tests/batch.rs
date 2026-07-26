@@ -163,7 +163,7 @@ fn at_many_into_agrees_with_at_many_exactly() {
 
     // Quat: the engine's own order, so equality is exact and unarguable.
     let mut quat = vec![0.0f64; stamps.len() * Layout::Quat.elems()];
-    plan.at_many_into(&g, &stamps, Layout::Quat, &mut quat)
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::Quat, &mut quat)
         .unwrap();
     for (i, iso) in reference.iter().enumerate() {
         let row = &quat[i * 7..(i + 1) * 7];
@@ -179,7 +179,7 @@ fn at_many_into_agrees_with_at_many_exactly() {
     // Mat4: translation column is exact; the rotation block is checked by its
     // action in `tf_tree_core::layout`'s own tests.
     let mut mat = vec![0.0f64; stamps.len() * Layout::Mat4.elems()];
-    plan.at_many_into(&g, &stamps, Layout::Mat4, &mut mat)
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::Mat4, &mut mat)
         .unwrap();
     for (i, iso) in reference.iter().enumerate() {
         let m = &mat[i * 16..(i + 1) * 16];
@@ -209,9 +209,9 @@ fn at_many_into_handles_unsorted_stamps() {
 
     let mut a = vec![0.0f64; sorted.len() * 7];
     let mut b = vec![0.0f64; sorted.len() * 7];
-    plan.at_many_into(&g, &sorted, Layout::Quat, &mut a)
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&sorted), Layout::Quat, &mut a)
         .unwrap();
-    plan.at_many_into(&g, &shuffled, Layout::Quat, &mut b)
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&shuffled), Layout::Quat, &mut b)
         .unwrap();
 
     for (i, _) in sorted.iter().enumerate() {
@@ -242,7 +242,7 @@ fn a_rejected_call_leaves_the_buffer_untouched() {
     let mut out = vec![SENTINEL; 4 * 7 - 1]; // one element short
 
     let err = plan
-        .at_many_into(&g, &stamps, Layout::Quat, &mut out)
+        .at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::Quat, &mut out)
         .unwrap_err();
     assert_eq!(err, LookupError::BufferTooSmall { need: 28, got: 27 });
     assert!(
@@ -254,7 +254,7 @@ fn a_rejected_call_leaves_the_buffer_untouched() {
     // writing a differently-sized element into the caller's memory.
     let mut big = vec![SENTINEL; 4 * 12];
     assert_eq!(
-        plan.at_many_into(&g, &stamps, Layout::Affine32, &mut big)
+        plan.at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::Affine32, &mut big)
             .unwrap_err(),
         LookupError::WrongElementType
     );
@@ -262,8 +262,13 @@ fn a_rejected_call_leaves_the_buffer_untouched() {
 
     let mut f32s = vec![0.0f32; 4 * 7];
     assert_eq!(
-        plan.at_many_into_f32(&g, &stamps, Layout::Quat, &mut f32s)
+        plan.at_many_into_f32::<SystemDomain>(&g, &nanos(&stamps), Layout::Quat, &mut f32s)
             .unwrap_err(),
         LookupError::WrongElementType
     );
+}
+
+/// Raw nanoseconds from typed stamps, for the `*_into` entry points.
+fn nanos(stamps: &[Stamp]) -> Vec<i64> {
+    stamps.iter().map(|s| s.nanos()).collect()
 }

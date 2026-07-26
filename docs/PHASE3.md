@@ -59,6 +59,12 @@ Sections marked **NORMATIVE** are requirements.
 
 **If an extension module does not declare itself free-threading-safe, importing it silently re-enables the GIL for the entire process.** No error, no warning to the application, no failed import — the user's threads keep running and simply stop running in parallel.
 
+> **Correction — the default flipped in PyO3 0.29, which §10.1 pins.** `pyo3-macros-backend-0.29.0/src/module.rs:394` computes the flag as `options.gil_used.is_some_and(|op| op.value.value)`, and `None` yields `false`. An **absent** attribute therefore now declares the module free-threading-*safe*. Confirmed by experiment, not only by reading: removing `gil_used = false` from `tf_tree_py` leaves `sys._is_gil_enabled()` false on `3.14t`.
+>
+> **The hazard is worse, not better.** The old default cost parallelism — bad, but loud enough that somebody eventually profiles it. The new default costs *correctness*: a module nobody audited claims a safety it may not have, and the failure is a data race rather than a slowdown.
+>
+> Two consequences. Keep writing `gil_used = false` explicitly, because explicit beats inherited and a future PyO3 could flip it back. But **stop treating the CI assertion below as the check** — no test of the flag can be non-vacuous when its absence produces the same value. Keep the `sys._is_gil_enabled()` assertion for what it does catch (any *other* import-time effect that re-enables the GIL); the things that make the claim true are §7.1's `Send + Sync` audit, the concurrent-evaluation test, and TSan.
+
 For this library that failure is particularly bad: a perception application on free-threaded Python imports `tf_tree` to go faster and instead loses all parallelism everywhere, with the regression attributable to nothing.
 
 ```rust
