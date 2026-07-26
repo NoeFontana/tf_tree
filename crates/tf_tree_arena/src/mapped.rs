@@ -89,6 +89,13 @@ pub enum ShmError {
     Unsealed,
     /// `fstat` on the segment failed.
     Stat(rustix::io::Errno),
+    /// `getrandom` could not fill the arena's `instance_uuid`.
+    ///
+    /// Deliberately fatal rather than falling back to a counter or a timestamp:
+    /// a *guessable* instance id still compares equal to itself, so the
+    /// split-brain check it exists for would keep passing while no longer
+    /// meaning anything.
+    Random(rustix::io::Errno),
     /// The fd's size disagrees with the header's `arena_size`.
     SizeMismatch {
         /// Bytes the segment actually has.
@@ -203,6 +210,7 @@ impl MappedArena {
                 creator_pid,
                 owner_start_time,
                 boot_id,
+                instance_uuid()?,
             )
         };
 
@@ -361,6 +369,41 @@ impl MappedArena {
     }
 }
 
+/// Draw 16 random bytes for a new arena's `instance_uuid`.
+///
+/// `getrandom` is documented not to return a short read for buffers this small
+/// **except when interrupted by a signal**, and "except when interrupted" is the
+/// entire hazard here: a partially-filled uuid is still 16 bytes that look
+/// random, so a short read would not announce itself anywhere downstream. The
+/// loop therefore refills from where it stopped rather than assuming one call
+/// suffices.
+///
+/// The call **blocks** (no `GRND_NONBLOCK`), deliberately. Arena creation is a
+/// startup operation, so waiting for the entropy pool on a freshly-booted
+/// embedded target is correct where spinning on `EAGAIN` would not be — and
+/// with blocking flags `EAGAIN` cannot be returned at all, so there is no arm
+/// for it to hide in.
+fn instance_uuid() -> Result<[u8; 16], ShmError> {
+    use rustix::rand::{getrandom, GetRandomFlags};
+
+    let mut uuid = [0u8; 16];
+    let mut filled = 0;
+    while filled < uuid.len() {
+        match getrandom(&mut uuid[filled..], GetRandomFlags::empty()) {
+            // A zero-length read with no error would spin forever; there is no
+            // legitimate way for `getrandom` to make no progress on a non-empty
+            // buffer, so treat it as the I/O failure it is.
+            Ok(0) => return Err(ShmError::Random(rustix::io::Errno::IO)),
+            Ok(n) => filled += n,
+            // A blocking `getrandom` is interruptible; every other errno is a
+            // real failure and must not be retried.
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(ShmError::Random(e)),
+        }
+    }
+    Ok(uuid)
+}
+
 /// `mmap` `len` bytes of `fd` shared and prefaulted.
 fn unsafe_map(len: usize, prot: ProtFlags, fd: &OwnedFd) -> Result<NonNull<u8>, ShmError> {
     // SAFETY: `mmap` with a null hint lets the kernel choose an address, so no
@@ -448,5 +491,71 @@ impl CName {
         // with `len <= CAP - 1`, so `buf[len]` is a NUL and the slice up to and
         // including it contains exactly one NUL, at the end.
         unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(&self.buf[..=self.len]) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use alloc::vec;
+
+    fn fixture() -> ArenaLayout {
+        ArenaLayout::new(8, 4, vec![16, 0, 4, 64]).unwrap()
+    }
+
+    fn create() -> MappedArena {
+        MappedArena::create("tf_tree.uuid_test", &fixture(), 1234, 5678, [7; 16]).unwrap()
+    }
+
+    /// The point of an instance id is to tell two *different* segments apart.
+    ///
+    /// A constant would satisfy every other assertion in this file — the field
+    /// would round-trip through `attach`, land at the right offset, and survive
+    /// sealing — while making the split-brain check (`docs/PHASE2.md` §11.2
+    /// scenario 9) compare equal for two unrelated arenas, which is exactly the
+    /// answer it must never give.
+    #[test]
+    fn two_arenas_never_share_an_instance_uuid() {
+        let a = create();
+        let b = create();
+        assert_ne!(a.header().instance_uuid, b.header().instance_uuid);
+        // ...and neither is the all-zero "not a shared instance" sentinel that
+        // a heap arena writes.
+        assert_ne!(a.header().instance_uuid, [0; 16]);
+        assert_ne!(b.header().instance_uuid, [0; 16]);
+    }
+
+    /// A joiner must read the *creator's* id, not one of its own.
+    ///
+    /// This is the direction the wire depends on: `HelloResponse` carries the
+    /// owner's `instance_uuid` and the client compares it against the header it
+    /// just mapped. If `attach` minted a fresh id the comparison would fail for
+    /// every legitimate join.
+    #[test]
+    fn attach_preserves_the_creators_instance_uuid() {
+        let created = create();
+        let uuid = created.header().instance_uuid;
+        // Assert non-zero *before* comparing: if `write_header_at` never wrote
+        // the field, both sides would read all-zero and the equality below would
+        // hold while proving nothing.
+        assert_ne!(uuid, [0; 16], "instance_uuid was never written");
+
+        let fd = rustix::io::fcntl_dupfd_cloexec(created.as_raw_fd(), 0).unwrap();
+        let attached = MappedArena::attach(fd, AttachMode::ReadOnly).unwrap();
+
+        assert_eq!(attached.header().instance_uuid, uuid);
+    }
+
+    /// Adding a field must not have moved the segment's size or its hash, or
+    /// every already-running peer would fail to attach to a new build.
+    #[test]
+    fn the_new_field_did_not_change_the_wire_contract() {
+        let arena = create();
+        let h = arena.header();
+        assert_eq!(h.format_version, FORMAT_VERSION);
+        assert_eq!(h.layout_hash, layout_hash());
+        assert_eq!(h.arena_size, fixture().total_size() as u64);
     }
 }
