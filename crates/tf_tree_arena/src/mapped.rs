@@ -376,10 +376,13 @@ impl MappedArena {
 /// entire hazard here: a partially-filled uuid is still 16 bytes that look
 /// random, so a short read would not announce itself anywhere downstream. The
 /// loop therefore refills from where it stopped rather than assuming one call
-/// suffices, and treats `EINTR` and `EAGAIN` as retryable rather than fatal —
-/// `EAGAIN` only occurs before the entropy pool is initialised, which on a
-/// freshly-booted embedded target is a real state and not an error.
-#[cfg(target_os = "linux")]
+/// suffices.
+///
+/// The call **blocks** (no `GRND_NONBLOCK`), deliberately. Arena creation is a
+/// startup operation, so waiting for the entropy pool on a freshly-booted
+/// embedded target is correct where spinning on `EAGAIN` would not be — and
+/// with blocking flags `EAGAIN` cannot be returned at all, so there is no arm
+/// for it to hide in.
 fn instance_uuid() -> Result<[u8; 16], ShmError> {
     use rustix::rand::{getrandom, GetRandomFlags};
 
@@ -392,7 +395,9 @@ fn instance_uuid() -> Result<[u8; 16], ShmError> {
             // buffer, so treat it as the I/O failure it is.
             Ok(0) => return Err(ShmError::Random(rustix::io::Errno::IO)),
             Ok(n) => filled += n,
-            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {}
+            // A blocking `getrandom` is interruptible; every other errno is a
+            // real failure and must not be retried.
+            Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(ShmError::Random(e)),
         }
     }
