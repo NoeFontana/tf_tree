@@ -1,0 +1,370 @@
+//! The owner half of the §3.7 attach handshake.
+//!
+//! # Who serves
+//!
+//! A thread in the **owning process**, not a daemon (`docs/decisions/0005` §3).
+//! §3.5 makes ownership a role a surviving participant *inherits*, which is only
+//! possible if any participant can bind. A daemon-only design would make
+//! `tf_treed` a hard prerequisite and owner death fatal instead of recoverable.
+//!
+//! # Why this loop exists after the handshake is done
+//!
+//! §3.7 step 9 says keep the client sockets open; it never says who watches
+//! them. D17 answers it: *"Participants hold their Unix socket open for the
+//! lifetime of the attachment. Process death of any kind closes it, and the
+//! owner sees `EPOLLHUP` in microseconds — exact, immediate, with no timeout to
+//! tune."* That is the reap trigger, so the server keeps every accepted fd in
+//! its `epoll` set and reports a hangup with the slot it granted. Holding the
+//! fds without watching them would keep the cost and throw away the signal.
+//!
+//! # Policy is the caller's
+//!
+//! Slot assignment and reaping live in `tf_tree`, which has the arena. This
+//! module does the protocol and calls out: `assign` turns a validated request
+//! into a slot or a rejection, and `on_hangup` is told which slot went away. So
+//! `tf_tree_ipc` still knows nothing about arenas (§2).
+
+use std::path::{Path, PathBuf};
+
+use rustix::event::epoll;
+use rustix::fd::{BorrowedFd, OwnedFd};
+use rustix::net::{
+    accept_with, bind, listen, recvmsg, sendmsg, socket_with, AddressFamily, RecvFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
+};
+
+use crate::error::IpcError;
+use crate::wire::{HelloRequest, HelloResponse, HelloStatus, SegmentDescriptor, HELLO_REQUEST_LEN};
+
+/// Connection backlog. Generous: a thundering herd of participants at boot is
+/// the expected case (§11.2 scenario 7), not an anomaly to shed.
+const BACKLOG: i32 = 64;
+
+/// `epoll` token for the listening socket.
+const TOKEN_LISTENER: u64 = 0;
+/// `epoll` token for the shutdown `eventfd`.
+const TOKEN_SHUTDOWN: u64 = 1;
+/// Client tokens start here, so neither of the above can be mistaken for one.
+const TOKEN_CLIENT_BASE: u64 = 2;
+
+/// A bound, listening §3.7 server.
+pub struct OwnerServer {
+    listener: OwnedFd,
+    shutdown: OwnedFd,
+    sock_path: PathBuf,
+    desc: SegmentDescriptor,
+    owner_pid: u32,
+}
+
+/// Ask a running [`OwnerServer`] to stop.
+///
+/// Cloneable and `Send`, so the thread that owns the server does not have to be
+/// the thread that stops it.
+#[derive(Debug)]
+pub struct ShutdownHandle {
+    eventfd: OwnedFd,
+}
+
+impl ShutdownHandle {
+    /// Wake the server and make it return.
+    ///
+    /// # Errors
+    ///
+    /// If the `eventfd` write fails, which means the server is already gone.
+    pub fn stop(&self) -> Result<(), IpcError> {
+        rustix::io::write(&self.eventfd, &1u64.to_ne_bytes()).map_err(|e| {
+            IpcError::HandshakeIo {
+                raw_os_error: e.raw_os_error(),
+            }
+        })?;
+        Ok(())
+    }
+}
+
+impl OwnerServer {
+    /// Bind `sock_path` and start listening.
+    ///
+    /// # The bind sequence, and why it is not just `bind`
+    ///
+    /// §3.4 step 5 says "bind sock.tmp", naming no per-process suffix. Two
+    /// processes taking ownership in sequence — or one stale file from a binder
+    /// that died — then collide on `EADDRINUSE`, and a Unix socket path is not
+    /// removed when its process exits. So: unlink any stale path, bind a
+    /// **pid-suffixed** temporary, restrict it to the owner, and `rename` it
+    /// into place. `rename` is atomic, so a client either sees no socket or a
+    /// fully-listening one, never a bound-but-not-listening one.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::SocketPathTooLong`] if the runtime directory pushes the path
+    /// past `sun_path`; [`IpcError::HandshakeIo`] for the syscalls.
+    pub fn bind_at(
+        sock_path: &Path,
+        desc: SegmentDescriptor,
+        owner_pid: u32,
+    ) -> Result<OwnerServer, IpcError> {
+        let tmp = sock_path.with_extension(format!("sock.{owner_pid}"));
+        let addr = crate::client::socket_addr(&tmp)?;
+        // Validate the final path too, so an over-long name fails here rather
+        // than after a successful bind to the temporary.
+        let _ = crate::client::socket_addr(sock_path)?;
+
+        let listener = socket_with(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(io)?;
+
+        // A leftover from a previous owner is expected (§3.9), not exceptional.
+        let _ = std::fs::remove_file(&tmp);
+        bind(&listener, &addr).map_err(io)?;
+        // The trust model is same-user cooperating processes (§0), and the
+        // runtime directory is already 0700 — but the socket inherits the
+        // umask, so an operator running with `umask 000` would otherwise widen
+        // it. Set it explicitly rather than depend on ambient state.
+        rustix::fs::chmod(&tmp, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).map_err(io)?;
+        listen(&listener, BACKLOG).map_err(io)?;
+        // Publish atomically: a client sees the old socket, or this one
+        // listening, never a half-built one.
+        std::fs::rename(&tmp, sock_path).map_err(|e| IpcError::HandshakeIo {
+            raw_os_error: e.raw_os_error().unwrap_or(0),
+        })?;
+
+        let shutdown = rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .map_err(io)?;
+
+        Ok(OwnerServer {
+            listener,
+            shutdown,
+            sock_path: sock_path.to_path_buf(),
+            desc,
+            owner_pid,
+        })
+    }
+
+    /// A handle that can stop this server from another thread.
+    ///
+    /// # Errors
+    ///
+    /// If the `eventfd` cannot be duplicated.
+    pub fn shutdown_handle(&self) -> Result<ShutdownHandle, IpcError> {
+        let eventfd = rustix::io::fcntl_dupfd_cloexec(&self.shutdown, 0).map_err(io)?;
+        Ok(ShutdownHandle { eventfd })
+    }
+
+    /// The path this server is listening on.
+    #[must_use]
+    pub fn sock_path(&self) -> &Path {
+        &self.sock_path
+    }
+
+    /// Serve until [`ShutdownHandle::stop`].
+    ///
+    /// `assign` validates a request against arena policy and returns the slot to
+    /// grant, or the [`HelloStatus`] to reject with. `on_hangup` is called with
+    /// a granted slot when that client's socket closes — the D17 reap trigger.
+    ///
+    /// A failed handshake never takes the server down: the client is dropped and
+    /// the loop continues. An owner that died because one peer sent a short
+    /// datagram would be a denial of service from any process that can reach the
+    /// socket.
+    ///
+    /// # Errors
+    ///
+    /// Only for failures of the loop itself (`epoll`), not of any one client.
+    pub fn serve<A, H>(
+        self,
+        segment: BorrowedFd<'_>,
+        mut assign: A,
+        mut on_hangup: H,
+    ) -> Result<(), IpcError>
+    where
+        A: FnMut(&HelloRequest) -> Result<u32, HelloStatus>,
+        H: FnMut(u32),
+    {
+        let ep = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(io)?;
+        epoll::add(
+            &ep,
+            &self.listener,
+            epoll::EventData::new_u64(TOKEN_LISTENER),
+            epoll::EventFlags::IN,
+        )
+        .map_err(io)?;
+        epoll::add(
+            &ep,
+            &self.shutdown,
+            epoll::EventData::new_u64(TOKEN_SHUTDOWN),
+            epoll::EventFlags::IN,
+        )
+        .map_err(io)?;
+
+        // Token -> (client socket, granted slot). The fd must be kept alive
+        // here: dropping it would close the connection and tell the client the
+        // *owner* died, which is the opposite of the truth.
+        let mut clients: Vec<Option<(OwnedFd, u32)>> = Vec::new();
+
+        // A fixed buffer, reused across iterations: this loop wakes on every
+        // attach and every participant death, and an allocation per wakeup
+        // would be pure waste.
+        //
+        // It must NOT be a `Vec`. rustix's `Buffer` impl for `&mut Vec<T>`
+        // reports `len()` as the capacity, not the spare capacity, so a
+        // `Vec::with_capacity(16)` passes `maxevents = 0` and `epoll_wait`
+        // fails with `EINVAL` — it compiles cleanly and only fails at runtime.
+        let mut events = [core::mem::MaybeUninit::<epoll::Event>::uninit(); 16];
+
+        loop {
+            let (ready, _) = epoll::wait(&ep, &mut events, None).map_err(io)?;
+
+            for ev in ready.iter() {
+                match ev.data.u64() {
+                    TOKEN_SHUTDOWN => {
+                        let _ = std::fs::remove_file(&self.sock_path);
+                        return Ok(());
+                    }
+                    TOKEN_LISTENER => {
+                        if let Ok((sock, slot)) = self.accept_one(segment, &mut assign) {
+                            let token = TOKEN_CLIENT_BASE + clients.len() as u64;
+                            // Watch for the peer going away. RDHUP catches a
+                            // clean shutdown, HUP an abrupt death; both mean the
+                            // participant is gone.
+                            if epoll::add(
+                                &ep,
+                                &sock,
+                                epoll::EventData::new_u64(token),
+                                epoll::EventFlags::RDHUP | epoll::EventFlags::HUP,
+                            )
+                            .is_ok()
+                            {
+                                clients.push(Some((sock, slot)));
+                            }
+                        }
+                    }
+                    token => {
+                        let idx = (token - TOKEN_CLIENT_BASE) as usize;
+                        if let Some(entry) = clients.get_mut(idx) {
+                            if let Some((sock, slot)) = entry.take() {
+                                let _ = epoll::delete(&ep, &sock);
+                                drop(sock);
+                                on_hangup(slot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Accept one connection and run the handshake on it.
+    ///
+    /// Returns the connection and the slot granted, or an error if the client
+    /// was rejected or misbehaved — in which case its socket is dropped here.
+    fn accept_one<A>(
+        &self,
+        segment: BorrowedFd<'_>,
+        assign: &mut A,
+    ) -> Result<(OwnedFd, u32), IpcError>
+    where
+        A: FnMut(&HelloRequest) -> Result<u32, HelloStatus>,
+    {
+        let sock = accept_with(&self.listener, SocketFlags::CLOEXEC).map_err(io)?;
+
+        let mut buf = [0u8; HELLO_REQUEST_LEN];
+        let recv = recvmsg(
+            &sock,
+            &mut [std::io::IoSliceMut::new(&mut buf)],
+            &mut Default::default(),
+            RecvFlags::empty(),
+        )
+        .map_err(io)?;
+
+        // Length, then magic, then everything else — and a decode failure is a
+        // `Malformed` rejection rather than a dropped connection, so a client
+        // built against a different protocol learns why instead of seeing its
+        // connection vanish.
+        let (status, slot) = match HelloRequest::from_bytes(&buf[..recv.bytes]) {
+            Err(_) => (HelloStatus::Malformed, u32::MAX),
+            Ok(req) => match self.check(&req) {
+                Some(bad) => (bad, u32::MAX),
+                None => match assign(&req) {
+                    Ok(slot) => (HelloStatus::Ok, slot),
+                    Err(bad) => (bad, u32::MAX),
+                },
+            },
+        };
+
+        let response = if status == HelloStatus::Ok {
+            HelloResponse::accept(&self.desc, slot, self.owner_pid)
+        } else {
+            HelloResponse::reject(status, &self.desc, self.owner_pid)
+        };
+        let bytes = response.to_bytes();
+
+        let mut space = [core::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut cmsg = SendAncillaryBuffer::new(&mut space);
+        // A rejection carries **no fd** (§3.7): handing a segment to a peer we
+        // just refused would make the refusal advisory.
+        let granted = [segment];
+        if status == HelloStatus::Ok {
+            cmsg.push(SendAncillaryMessage::ScmRights(&granted));
+        }
+
+        sendmsg(
+            &sock,
+            &[std::io::IoSlice::new(&bytes)],
+            &mut cmsg,
+            SendFlags::empty(),
+        )
+        .map_err(io)?;
+
+        if status == HelloStatus::Ok {
+            Ok((sock, slot))
+        } else {
+            Err(IpcError::HandshakeRejected {
+                status,
+                owner_format_version: self.desc.format_version,
+                owner_layout_hash: self.desc.layout_hash,
+            })
+        }
+    }
+
+    /// The checks that do not need the arena: version, then layout, then boot id.
+    ///
+    /// Order matters. A version mismatch makes every later field's meaning
+    /// uncertain, so it is reported first rather than surfacing as a confusing
+    /// layout complaint about a struct the peer lays out differently anyway.
+    fn check(&self, req: &HelloRequest) -> Option<HelloStatus> {
+        if req.format_version != self.desc.format_version {
+            return Some(HelloStatus::VersionMismatch);
+        }
+        if req.layout_hash != self.desc.layout_hash {
+            return Some(HelloStatus::LayoutMismatch);
+        }
+        if req.client_boot_id != self.desc.boot_id {
+            return Some(HelloStatus::BootIdMismatch);
+        }
+        None
+    }
+}
+
+impl Drop for OwnerServer {
+    fn drop(&mut self) {
+        // Best effort: if this server never ran, or returned by error rather
+        // than by `stop`, the path would otherwise be left behind for the next
+        // owner to find and unlink. Harmless either way — §3.9 makes a stale
+        // socket path an expected state.
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+/// Every rustix error in this module becomes the same shape.
+fn io(e: rustix::io::Errno) -> IpcError {
+    IpcError::HandshakeIo {
+        raw_os_error: e.raw_os_error(),
+    }
+}

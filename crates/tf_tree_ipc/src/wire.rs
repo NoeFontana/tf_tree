@@ -42,6 +42,9 @@ pub const HELLO_REQUEST_LEN: usize = 88;
 /// Encoded size of a [`HelloResponse`].
 pub const HELLO_RESPONSE_LEN: usize = 56;
 
+/// Maximum usable length of a `sockaddr_un.sun_path`, NUL included.
+pub const MAX_SOCKET_PATH: usize = 108;
+
 /// Outcome of a handshake, as carried in [`HelloResponse::status`].
 ///
 /// The discriminants are a **wire contract**: they cross a process boundary
