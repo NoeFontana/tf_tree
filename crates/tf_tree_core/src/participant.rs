@@ -265,9 +265,13 @@ impl<'a> ParticipantTable<'a> {
     ) -> Result<u64, ParticipantError> {
         let rec = self.get(slot).ok_or(ParticipantError::SlotOutOfRange {
             slot,
-            // `capacity()` is bounded by `max_participants`, a u32 in the
-            // header, so this cannot truncate.
-            capacity: self.slots.len() as u32,
+            // Saturate rather than `as u32`. In an arena the length is bounded
+            // by the header's `max_participants`, which is a u32 — but
+            // `ParticipantTable::new` accepts any slice, so that is a property
+            // of the caller and not of this type. A silent truncation here
+            // would report a *smaller* capacity than the table has and make the
+            // error read as though the slot were out of range when it was not.
+            capacity: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
         })?;
         fill_slot(rec, pid, start_time, now_nanos).ok_or(ParticipantError::SlotTaken { slot })
     }
