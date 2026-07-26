@@ -16,6 +16,8 @@ just footprint           # memory + instructions per lookup (no idle machine nee
 just shm-test            # multi-process gate: another process, bit-identical
 just shm-scaling         # N reader PROCESSES on one shared arena (roofline)
 just mp-bench            # N node-shaped consumers at a fixed rate (deployment)
+just mp-bench-tf2        # the same, both engines, in the ROS container
+just py-vs-tf2           # tf_tree's Python API vs tf2_ros's (PHASE3 §12.1)
 ```
 
 All of them run in a container (`docker/tf2/`), so no ROS install is needed on
@@ -528,54 +530,53 @@ contaminated row cannot be published by accident.
 `just mp-bench-tf2`, 2026-07-26. Both engines in the same container on the same
 host, back to back: AMD EPYC-Milan, **4 physical cores / 8 SMT threads**,
 `taskset -c 0-7`, 100 Hz × 6 s per point, 8 lookups per tick, depth-3 chain, a
-publisher running throughout. Foreign load 2–5% on every row; none flagged
+publisher running throughout. Foreign load 1–7% on every row; none flagged
 `NOISY`.
 
 **tf_tree**
 
 | nodes | svc p50 | svc p99 | svc p99.9 | cyc p50 | cyc p99 | cyc p99.9 | CPU %/node | PSS MiB |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 2.94 | 5.22 | 6.94 | 67.1 | 95.2 | 970.8 | 0.125 | 3.93 |
-| 2 | 2.64 | 5.50 | 16.00 | 67.6 | 117.8 | 888.8 | 0.130 | 4.88 |
-| 4 | 2.34 | 4.58 | 6.88 | 67.1 | 89.6 | 909.3 | 0.120 | 6.20 |
-| 8 | 2.18 | 4.80 | 30.72 | 65.0 | 95.2 | 1638.4 | 0.111 | 11.12 |
-| 16 | 1.99 | 3.82 | 20.74 | 64.5 | 82.4 | 2211.8 | 0.106 | 18.88 |
+| 1 | 3.22 | 7.04 | 11.65 | 67.6 | 87.0 | 198.7 | 0.139 | 4.00 |
+| 2 | 2.53 | 6.27 | 122.37 | 66.0 | 93.2 | 432.1 | 0.120 | 4.82 |
+| 4 | 2.30 | 5.50 | 23.30 | 66.0 | 87.6 | 331.8 | 0.119 | 6.36 |
+| 8 | 2.11 | 4.86 | 16.64 | 64.8 | 88.1 | 2801.7 | 0.112 | 11.83 |
+| 16 | 1.93 | 4.19 | 15.68 | 64.5 | 79.4 | 630.8 | 0.108 | 16.96 |
 
 **tf2** (floor — see above)
 
 | nodes | svc p50 | svc p99 | svc p99.9 | cyc p50 | cyc p99 | cyc p99.9 | CPU %/node | PSS MiB |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 13.63 | 24.70 | 41.47 | 77.8 | 96.3 | 321.5 | 0.233 | 5.11 |
-| 2 | 14.27 | 29.06 | 43.26 | 78.3 | 153.6 | 1007.6 | 0.227 | 7.28 |
-| 4 | 14.91 | 28.16 | 159.74 | 78.8 | 115.2 | 1220.6 | 0.246 | 11.13 |
-| 8 | 14.66 | 26.50 | 41.73 | 77.3 | 124.9 | 3571.7 | 0.230 | 18.30 |
-| 16 | 14.59 | 28.16 | 60.67 | 77.3 | 105.0 | 3735.6 | 0.235 | 37.77 |
+| 1 | 15.94 | 34.05 | 38.66 | 79.9 | 105.5 | 2129.9 | 0.254 | 5.25 |
+| 2 | 14.78 | 28.29 | 34.05 | 78.3 | 108.5 | 655.4 | 0.232 | 7.26 |
+| 4 | 14.91 | 27.39 | 46.08 | 77.8 | 106.0 | 1237.0 | 0.234 | 11.31 |
+| 8 | 14.91 | 29.70 | 53.25 | 76.3 | 102.9 | 1097.7 | 0.226 | 18.57 |
+| 16 | 14.72 | 29.18 | 64.26 | 76.8 | 101.9 | 704.5 | 0.229 | 41.12 |
 
 Times are microseconds. What the two tables say:
 
-- **Service latency: 4.6× at one node, 7.3× at sixteen** (13.63 → 2.94 µs; 14.59
-  → 1.99 µs), and the same ratio at p99. The gap *widens* with node count because
+- **Service latency: 5.0× at one node, 7.6× at sixteen** (15.94 → 3.22 µs;
+  14.72 → 1.93 µs), and 7.0× at p99. The gap *widens* with node count because
   tf_tree's median falls as consumers are added while tf2's is flat — the shared
   arena stays warm across readers, whereas each `BufferCore` must warm its own.
   This is not a claim that consumers make tf_tree faster; it is a claim that they
   do not make it slower, which is the deployment question.
-- **CPU per node: 2.2× (0.235% vs 0.106% at sixteen nodes)**, and — the actual
-  `PHASE2.md` §12.4 claim — tf_tree's *falls* from 0.125% to 0.106% across a 16×
+- **CPU per node: 2.1× (0.229% vs 0.108% at sixteen nodes)**, and — the actual
+  `PHASE2.md` §12.4 claim — tf_tree's *falls* from 0.139% to 0.108% across a 16×
   increase in consumers while tf2's stays flat at ~0.23%. Both are O(1) in
-  consumers here; only tf_tree is O(1) *and* cheap. Note that tf2 being flat is a
-  property of the floor: with a real `TransformListener` each consumer would
-  deserialize the full `/tf` stream itself, which is where the O(consumers) term
-  actually enters.
-- **Memory: 2.0× at sixteen nodes (37.77 vs 18.88 MiB PSS)**, or per *marginal*
-  node, 2.18 MiB against 1.00 MiB — 2.2×. tf_tree's marginal megabyte is process
-  overhead (binary, stacks, allocator), not tree data; the arena is counted once
-  no matter how many map it, which is the whole point of PSS here.
+  consumers here; only tf_tree is O(1) *and* cheap. tf2 being flat is a property
+  of the floor: with a real `TransformListener` each consumer would deserialize
+  the full `/tf` stream itself, which is where the O(consumers) term enters.
+- **Memory: 2.4× at sixteen nodes (41.12 vs 16.96 MiB PSS)**, or per *marginal*
+  node, 2.39 MiB against 0.86 MiB — **2.8×**. tf_tree's marginal megabyte is
+  process overhead (binary, stacks, allocator), not tree data; the arena is
+  counted once no matter how many map it, which is the point of PSS here.
 - **Cycle latency is not an engine measurement** and is reported to show that.
-  Both sit near the 100 Hz OS wakeup (65 µs vs 78 µs p50, the ~12 µs gap tracking
-  the service difference), and the p99.9 column — 0.9–3.7 ms for both — is the
-  scheduler on a 4-core host running up to 16 processes. Rows at 8 and 16 nodes
-  oversubscribe the physical cores 2:1 and 4:1; read their tails as a property of
-  this host, not of either library.
+  Both sit near the 100 Hz OS wakeup (65 µs vs 77 µs p50, the ~12 µs gap tracking
+  the service difference), and the p99.9 column is the scheduler on a 4-core host
+  running up to 16 processes. Rows at 8 and 16 nodes oversubscribe the physical
+  cores 2:1 and 4:1; read their tails as a property of this host, not of either
+  library.
 
 **Caveats that belong with these numbers.** One run per point, no repeats, so
 treat single-row differences under ~10% as noise — the trends across five rows
@@ -584,14 +585,53 @@ transport, as set out above. And this is a 4-core cloud instance: the absolute
 microseconds will differ on the pinned hardware in the runbook below, though the
 ratios should not.
 
-**The CPU column was wrong until this run.** It read `0.0` for every row of both
-engines, which looks exactly like the O(1) claim holding. `ProcStats` took CPU
-time from `/proc/self/stat`'s `utime + stime`, in 10 ms clock ticks — and a
-consumer here spends about 4 ms of CPU per 6-second window, less than one tick,
-so the counter read zero. It now reads `/proc/<pid>/schedstat`, which is
-nanoseconds. A test spins 3 ms and requires the reading to see it; against the
-old code it fails with *"3 ms of spinning read as 0 ns of CPU"*. Any CPU-per-node
-figure quoted from a run before 2026-07-26 is meaningless.
+**The CPU column was unresolvable before 2026-07-26.** It read `0.0` for every
+row of both engines, which looks exactly like the O(1) claim holding. `ProcStats`
+took CPU time from `/proc/self/stat`'s `utime + stime`, in 10 ms clock ticks —
+and a consumer here spends about 4 ms of CPU per 6-second window, less than one
+tick, so the counter read zero. It now reads `/proc/<pid>/schedstat`, which is
+nanoseconds. Any CPU-per-node figure quoted from an earlier run is meaningless.
+
+### Python: `tf_tree` against `tf2_ros`
+
+`just py-vs-tf2`, 2026-07-26, in the same container. One dynamic edge, 2000
+samples at 1 ms, queried inside the retained window so neither engine is
+extrapolating. **tf2 is given every advantage available in-process**:
+`tf2_ros.Buffer` wraps the same `BufferCore` a real node uses, fed directly —
+no DDS, no serialisation, no `TransformListener`. A deployed consumer pays more
+than this; nothing here pays less.
+
+| | tf_tree | `tf2_ros` | ratio |
+|---|---:|---:|---:|
+| scalar lookup | **178.6 ns** | 11 708.8 ns | **65.6×** |
+| batch, n = 64 (per sample) | **37.9 ns** | 12 289.5 ns | **324.6×** |
+| batch, n = 4096 (per sample) | **35.7 ns** | 12 311.5 ns | **344.5×** |
+
+The batch rows deserve a word, because they are the easiest to misread. **tf2
+has no batch API**, so its per-sample figure is simply its scalar figure — the
+comparison is a vectorised call against the Python loop a user would otherwise
+write. That is the honest framing: the absence of a vectorised path *is* the
+cost, and reporting only the scalar row would understate what a user
+experiences. The scalar row, 65.6×, is the like-for-like number.
+
+Both figures are release builds with LTO. Before `tf_tree_py` gained a
+`[profile.release]` — it is excluded from the workspace, so it inherited none —
+the same measurements read 253.9 ns scalar and 51.7 ns/sample at n = 4096. The
+hot path is a call from the extension into `tf_tree_core`'s batch kernel, which
+only inlines across the crate boundary with LTO on.
+
+Against `docs/PHASE3.md` §12.2's gate, measured on the *identical* fixture with
+`benches/py_parity.rs` (native: 36.3 ns/sample at n = 4096):
+
+| gate | result | |
+|---|---|---|
+| 1. scalar `plan.at` p50 under 250 ns | 228.8 ns | **pass** |
+| 2. `at_many` at n = 4096 within 1.3× of native | 0.93× | **pass** |
+| 3. `at_into` eliminates the allocation | 8.1 µs/call saved at n = 4096 | **pass** |
+
+Criterion 2's parity bench exists because `benches/at_many.rs` uses the deep
+mobile-robot fixture; dividing a Python figure by *its* ns/sample would have
+produced a meaningless ratio in either direction.
 
 ### What is implemented, and what is not
 

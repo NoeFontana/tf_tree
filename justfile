@@ -240,9 +240,25 @@ py-test-freethreaded:
 py-lint:
     cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
     PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
-    .venv/bin/ruff check python tests/python
-    .venv/bin/ruff format --check python tests/python
+    .venv/bin/ruff check python tests/python crates/tf_tree_bench/python
+    .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python
 
 # Build a release wheel.
 py-wheel:
     VIRTUAL_ENV=.venv .venv/bin/maturin build --release
+
+# tf_tree's Python API against tf2_ros's, in the ROS container (PHASE3 §12.1).
+#
+# The wheel is built on the host and installed in the container: both are
+# CPython 3.14, so the cp314 ABI matches. tf2 is fed its BufferCore directly —
+# no DDS, no TransformListener — which is the most generous in-process
+# comparison available, not the least.
+py-vs-tf2:
+    just py-wheel
+    # The container has no pip, and does not need one: a wheel is a zip, and
+    # numpy is already present (2.3.5). Unpacking onto PYTHONPATH also keeps
+    # the container's system site-packages untouched.
+    ./docker/tf2/run.sh 'set -e; \
+        rm -rf target/pywheel && mkdir -p target/pywheel; \
+        python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")[0]).extractall(\"target/pywheel\")"; \
+        PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/tf2_ros_compare.py'
