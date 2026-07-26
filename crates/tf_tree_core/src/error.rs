@@ -148,6 +148,19 @@ pub enum LookupError {
         /// The offending frame id.
         frame: FrameId,
     },
+    /// A caller's output buffer is too small for the batch.
+    ///
+    /// Checked before any element is written, so the buffer is untouched
+    /// (`docs/PHASE3.md` §5.3): a partially-written output is worse than none,
+    /// because it looks like data.
+    BufferTooSmall {
+        /// Elements required.
+        need: usize,
+        /// Elements the buffer has.
+        got: usize,
+    },
+    /// An `f32` layout was passed to the `f64` entry point, or the reverse.
+    WrongElementType,
     /// The topology says this frame has a parent, but records no edge for the
     /// link (`edge_of_child == 0`, the "no edge" sentinel). The path cannot be
     /// evaluated; edge slot `0` is a real record and must not be sampled in its
