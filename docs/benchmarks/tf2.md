@@ -523,10 +523,75 @@ unrelated 600%-CPU job and nothing in the output said so. Every row also carries
 its own measured foreign-load percentage and is flagged `NOISY` above 10%, so a
 contaminated row cannot be published by accident.
 
-**No numbers yet.** The harness is complete and its unit tests pass — including
-one asserting that an overrunning tick registers as latency rather than
-vanishing — but this machine has not been idle since it was written. Results
-land here when it is.
+### The multi-process node evaluation — results
+
+`just mp-bench-tf2`, 2026-07-26. Both engines in the same container on the same
+host, back to back: AMD EPYC-Milan, **4 physical cores / 8 SMT threads**,
+`taskset -c 0-7`, 100 Hz × 6 s per point, 8 lookups per tick, depth-3 chain, a
+publisher running throughout. Foreign load 2–5% on every row; none flagged
+`NOISY`.
+
+**tf_tree**
+
+| nodes | svc p50 | svc p99 | svc p99.9 | cyc p50 | cyc p99 | cyc p99.9 | CPU %/node | PSS MiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2.94 | 5.22 | 6.94 | 67.1 | 95.2 | 970.8 | 0.125 | 3.93 |
+| 2 | 2.64 | 5.50 | 16.00 | 67.6 | 117.8 | 888.8 | 0.130 | 4.88 |
+| 4 | 2.34 | 4.58 | 6.88 | 67.1 | 89.6 | 909.3 | 0.120 | 6.20 |
+| 8 | 2.18 | 4.80 | 30.72 | 65.0 | 95.2 | 1638.4 | 0.111 | 11.12 |
+| 16 | 1.99 | 3.82 | 20.74 | 64.5 | 82.4 | 2211.8 | 0.106 | 18.88 |
+
+**tf2** (floor — see above)
+
+| nodes | svc p50 | svc p99 | svc p99.9 | cyc p50 | cyc p99 | cyc p99.9 | CPU %/node | PSS MiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 13.63 | 24.70 | 41.47 | 77.8 | 96.3 | 321.5 | 0.233 | 5.11 |
+| 2 | 14.27 | 29.06 | 43.26 | 78.3 | 153.6 | 1007.6 | 0.227 | 7.28 |
+| 4 | 14.91 | 28.16 | 159.74 | 78.8 | 115.2 | 1220.6 | 0.246 | 11.13 |
+| 8 | 14.66 | 26.50 | 41.73 | 77.3 | 124.9 | 3571.7 | 0.230 | 18.30 |
+| 16 | 14.59 | 28.16 | 60.67 | 77.3 | 105.0 | 3735.6 | 0.235 | 37.77 |
+
+Times are microseconds. What the two tables say:
+
+- **Service latency: 4.6× at one node, 7.3× at sixteen** (13.63 → 2.94 µs; 14.59
+  → 1.99 µs), and the same ratio at p99. The gap *widens* with node count because
+  tf_tree's median falls as consumers are added while tf2's is flat — the shared
+  arena stays warm across readers, whereas each `BufferCore` must warm its own.
+  This is not a claim that consumers make tf_tree faster; it is a claim that they
+  do not make it slower, which is the deployment question.
+- **CPU per node: 2.2× (0.235% vs 0.106% at sixteen nodes)**, and — the actual
+  `PHASE2.md` §12.4 claim — tf_tree's *falls* from 0.125% to 0.106% across a 16×
+  increase in consumers while tf2's stays flat at ~0.23%. Both are O(1) in
+  consumers here; only tf_tree is O(1) *and* cheap. Note that tf2 being flat is a
+  property of the floor: with a real `TransformListener` each consumer would
+  deserialize the full `/tf` stream itself, which is where the O(consumers) term
+  actually enters.
+- **Memory: 2.0× at sixteen nodes (37.77 vs 18.88 MiB PSS)**, or per *marginal*
+  node, 2.18 MiB against 1.00 MiB — 2.2×. tf_tree's marginal megabyte is process
+  overhead (binary, stacks, allocator), not tree data; the arena is counted once
+  no matter how many map it, which is the whole point of PSS here.
+- **Cycle latency is not an engine measurement** and is reported to show that.
+  Both sit near the 100 Hz OS wakeup (65 µs vs 78 µs p50, the ~12 µs gap tracking
+  the service difference), and the p99.9 column — 0.9–3.7 ms for both — is the
+  scheduler on a 4-core host running up to 16 processes. Rows at 8 and 16 nodes
+  oversubscribe the physical cores 2:1 and 4:1; read their tails as a property of
+  this host, not of either library.
+
+**Caveats that belong with these numbers.** One run per point, no repeats, so
+treat single-row differences under ~10% as noise — the trends across five rows
+are what carry weight, not any one cell. The tf2 column is a floor with no
+transport, as set out above. And this is a 4-core cloud instance: the absolute
+microseconds will differ on the pinned hardware in the runbook below, though the
+ratios should not.
+
+**The CPU column was wrong until this run.** It read `0.0` for every row of both
+engines, which looks exactly like the O(1) claim holding. `ProcStats` took CPU
+time from `/proc/self/stat`'s `utime + stime`, in 10 ms clock ticks — and a
+consumer here spends about 4 ms of CPU per 6-second window, less than one tick,
+so the counter read zero. It now reads `/proc/<pid>/schedstat`, which is
+nanoseconds. A test spins 3 ms and requires the reading to see it; against the
+old code it fails with *"3 ms of spinning read as 0 ns of CPU"*. Any CPU-per-node
+figure quoted from a run before 2026-07-26 is meaningless.
 
 ### What is implemented, and what is not
 
