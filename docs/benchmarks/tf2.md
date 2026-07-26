@@ -329,10 +329,10 @@ it as using almost nothing.
 
 | | tf_tree | tf2 |
 |---|---|---|
-| Heap held | 1,388,352 B | 1,421,392 B |
-| Bytes per stored sample | 109.6 | **112.8** |
-| Bytes per *declared slot* | **72.4** | n/a |
-| Allocations to build | **96** | 88,459 |
+| Heap held | 1,397,616 B | 1,421,392 B |
+| Bytes per stored sample | 110.3 | **112.8** |
+| Bytes per *declared slot* | **72.9** | n/a |
+| Allocations to build | **108** | 88,459 |
 | Allocations per published transform | **0** | 1.00 |
 | Allocations per lookup | **0** | **0** |
 
@@ -343,7 +343,7 @@ win here, and it does not.
 The two per-sample figures differ because tf_tree's rings are sized by *declared
 capacity*, not by what is stored: `Capacity::history` rounds each ring up to a
 power of two, so a 1 kHz edge over 10 s asks for 10,000 slots and reserves
-16,384. At 72.4 B/slot (a 64 B cacheline-padded `Iso3` plus an 8 B stamp)
+16,384. At 72.9 B/slot (a 64 B cacheline-padded `Iso3` plus an 8 B stamp)
 tf_tree is 1.56x denser than tf2 per unit of capacity, and this fixture's
 rounding hands almost all of that back. Fixed capacity that never reallocates is
 the point of the design; the rounding is what it costs.
@@ -369,14 +369,21 @@ subtracting it removes construction, teardown and process start exactly.
 
 | Per lookup | tf_tree `LerpSlerp` | tf_tree `ScLerp` | tf2 |
 |---|---|---|---|
-| Instructions | **2,105** | 2,900 | 4,085 |
-| L1-D misses | **0.002** | 0.002 | **18.5** |
-| LL-D misses | 0.00005 | 0.00005 | 0.0003 |
-| Branch mispredicts | **8.16** | 8.19 | 14.00 |
+| Instructions | **2,072** | 2,863 | 4,083 |
+| L1-D misses | **0.002** | 0.002 | **15.3** |
+| LL-D misses | 0.00002 | 0.00003 | 0.0003 |
+| Branch mispredicts | **7.70** | 7.70 | 14.00 |
 | — of which *indirect* | **0.00002** | 0.00002 | **6.00** |
 
-Against tf2 on the comparable policy: **1.94x fewer instructions, ~9,700x fewer
+Against tf2 on the comparable policy: **1.97x fewer instructions, ~8,000x fewer
 L1-D misses, and effectively zero indirect branch mispredicts against six.**
+
+Re-measured 2026-07-26 after the layout-kernel work; the previous run read
+2,105 instructions, 18.5 L1-D misses and 8.16 mispredicts for tf_tree. The
+change is small and in the right direction, and it is recorded rather than
+quietly overwritten so that a later regression has something to be a regression
+*from*. These are simulated counts, so unlike every timing table here they are
+exact and reproducible under load — which is why they are the numbers to watch.
 
 The six indirect mispredicts are virtual dispatch — tf2 reaches its per-frame
 caches through `TimeCacheInterface`, and the target is unpredictable because a
@@ -386,10 +393,10 @@ predictor is never consulted.
 
 **Two caveats that cut against the headline.** First, LL-D misses are ~0 for
 *both* engines: this fixture's whole working set is 1.4 MB and fits in L3, so
-tf2's 18.5 L1 misses per lookup are being served by L2/L3, not DRAM. On a tree
+tf2's 15.3 L1 misses per lookup are being served by L2/L3, not DRAM. On a tree
 large enough to fall out of L3 those become memory accesses and the gap widens —
 but that is a prediction, and it is not measured here. Second, the instruction
-ratio (1.94x) is *smaller* than the measured wall-clock ratio (2.7x), so roughly
+ratio (1.97x) is *smaller* than the measured wall-clock ratio (2.7x), so roughly
 a third of the observed speed advantage is not explained by executing fewer
 instructions. The mispredict and cache columns are the likely remainder, along
 with tf2's per-lookup mutex, but attributing it precisely needs cycle counters
@@ -398,8 +405,8 @@ this host does not permit (`perf_event_paranoid=4`).
 A third caveat applies to the mispredict column specifically: **cachegrind's
 branch predictor is a simple two-level model, not a Zen 3 TAGE.** Comparing two
 engines under the same model is sound, and that is all this table does; reading
-"8.16" as the count a real CPU incurs is not. Acting on that distinction matters
-— the 8.16 figure was first read as the bracket search's data-dependent branch,
+"7.70" as the count a real CPU incurs is not. Acting on that distinction matters
+— that figure was first read as the bracket search's data-dependent branch,
 and rewriting that search branchlessly recovered only 0.46 of it, because LLVM
 had already emitted a `cmov`. The mispredicts are spread across `fold_at`'s 124
 conditional branches per lookup, not concentrated in the search.
