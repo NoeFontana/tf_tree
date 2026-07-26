@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(tf_tree_consumer LANGUAGES CXX)
+find_package(tf_tree CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE tf_tree::tf_tree_static)

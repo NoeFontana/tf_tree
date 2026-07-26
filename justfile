@@ -101,6 +101,67 @@ c-header-check:
         "$out/smoke"
     done
 
+# **The C++ wrapper across §6.2's full matrix, then ASan/UBSan.**
+#
+# 2 compilers x 2 standards x 2 error modes = 8 builds, each of which is also
+# *run*: the wrapper is header-only inline code, so "it compiles" and "it
+# computes the right transform" are different claims and §6.2 wants both.
+#
+# Sophus is optional. Its absence is reported rather than skipped silently,
+# because §4.3's stride hazard only exists where Sophus does — `sizeof(SE3d)`
+# is 64 against a 56-byte payload on this host, so an array of them is NOT
+# tightly packed and a packed write would corrupt every element after the
+# first. Run `just cpp-deps` once to fetch it.
+cpp-check:
+    ./crates/tf_tree_c/tests/cpp/run.sh
+
+# **The CMake package, proved by a downstream consumer** (§4.4).
+#
+# Configure, build, install, then build a separate project that reaches tf_tree
+# only through `find_package(tf_tree CONFIG)` — no include path, no -lpthread,
+# no -std flag. All three must arrive through the imported target. Three real
+# packaging defects were invisible until that consumer existed; the script says
+# which.
+cmake-check:
+    ./crates/tf_tree_c/tests/cmake_consumer/run.sh
+
+# **The §7 gate-2 benchmark: the C++ wrapper against the raw C ABI.**
+#
+# The wrapper is inline code over an `extern "C"` call, so the gate is a tight
+# 2 % — anything more means it is not inline. Also reports §7's Eigen batch and
+# Sophus strided-vs-packed rows.
+#
+# Pinned, because an unpinned run migrates cores and swings by more than the
+# gate allows.
+cpp-bench:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -q -p tf_tree_c --features test-hooks
+    out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+    sophus=""
+    [ -f target/thirdparty/Sophus/sophus/se3.hpp ] && \
+        sophus="-isystem target/thirdparty/Sophus -DSOPHUS_USE_BASIC_LOGGING"
+    g++ -O2 -std=c++17 -Wall -Wextra -Werror -I crates/tf_tree_c/include \
+        -isystem /usr/include/eigen3 $sophus -o "$out/bench" \
+        crates/tf_tree_c/tests/cpp/bench.cpp target/release/libtf_tree_c.a \
+        -lpthread -ldl -lm
+    taskset -c 2 "$out/bench"
+
+# Fetch Sophus (header-only) into target/thirdparty so `cpp-check` can exercise
+# §4.3. Not vendored: it is a test dependency of one recipe, it is ~10 MB, and
+# putting somebody else's headers in the repo to test a stride is a poor trade.
+cpp-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/thirdparty
+    if [ -d target/thirdparty/Sophus ]; then
+        echo "cpp-deps: Sophus already present"
+        exit 0
+    fi
+    git clone -q --depth 1 --branch 1.22.10 \
+        https://github.com/strasdat/Sophus.git target/thirdparty/Sophus
+    echo "cpp-deps: fetched Sophus 1.22.10"
+
 # Lint everything. Pure checks; does not mutate files.
 lint: py-compile
     cargo fmt --all -- --check

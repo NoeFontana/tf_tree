@@ -1,0 +1,35 @@
+@PACKAGE_INIT@
+
+# tf_tree — find_package(tf_tree CONFIG) support. docs/PHASE4.md §4.4.
+#
+# Provides tf_tree::tf_tree (shared) and tf_tree::tf_tree_static.
+# Both carry the headers and cxx_std_17 as INTERFACE properties.
+
+include(CMakeFindDependencyMacro)
+
+set_and_check(TF_TREE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+
+find_library(TF_TREE_LIBRARY_SHARED NAMES tf_tree_c
+             PATHS "@PACKAGE_CMAKE_INSTALL_LIBDIR@" NO_DEFAULT_PATH)
+find_library(TF_TREE_LIBRARY_STATIC NAMES libtf_tree_c.a
+             PATHS "@PACKAGE_CMAKE_INSTALL_LIBDIR@" NO_DEFAULT_PATH)
+
+if(TF_TREE_LIBRARY_SHARED AND NOT TARGET tf_tree::tf_tree)
+  add_library(tf_tree::tf_tree SHARED IMPORTED)
+  set_target_properties(tf_tree::tf_tree PROPERTIES
+      IMPORTED_LOCATION "${TF_TREE_LIBRARY_SHARED}"
+      INTERFACE_INCLUDE_DIRECTORIES "${TF_TREE_INCLUDE_DIR}"
+      INTERFACE_COMPILE_FEATURES cxx_std_17)
+endif()
+
+if(TF_TREE_LIBRARY_STATIC AND NOT TARGET tf_tree::tf_tree_static)
+  add_library(tf_tree::tf_tree_static STATIC IMPORTED)
+  set_target_properties(tf_tree::tf_tree_static PROPERTIES
+      IMPORTED_LOCATION "${TF_TREE_LIBRARY_STATIC}"
+      INTERFACE_INCLUDE_DIRECTORIES "${TF_TREE_INCLUDE_DIR}"
+      INTERFACE_COMPILE_FEATURES cxx_std_17
+      # A Rust staticlib carries none of its own system dependencies.
+      INTERFACE_LINK_LIBRARIES "pthread;dl;m")
+endif()
+
+check_required_components(tf_tree)
