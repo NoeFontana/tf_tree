@@ -518,11 +518,44 @@ Each step lands as one PR, in order.
    description is not optional: OFD locks are self-blind, so the tree's own lock file
    reports its byte free whether or not it still holds it, and without that vantage
    point the `ClaimLease` guard has no test that can fail.
-10. **§7.1 per-region population** — drop `MapFlags::POPULATE` (`mapped.rs:375`); use
-    `Advice::LinuxPopulateWrite` with a zeroing-write fallback on `EINVAL` for kernels
-    < 5.14. Verified with `mincore` over an over-provisioned arena: declared edges
-    resident, headroom not; mutant: restore `MAP_POPULATE` ⇒ headroom is resident.
-    Guard against vacuity by asserting the headroom region is ≥ 2 MiB.
+10. **§7.1 per-region population** — drop `MapFlags::POPULATE`; populate per region
+    with `MADV_POPULATE_WRITE`/`_READ`, falling back on `EINVAL` (kernels < 5.14) to
+    touching one byte per page. **The fallback reads, it does not write** — the
+    "zeroing write" this step originally called for would store into a segment other
+    processes are already using, racing every reader of a live claim record or sample
+    slot. A read fault populates the page-table entry, which is the whole objective.
+
+    **Declaration granularity comes from the arena, not from the builder.**
+    `frame_count` and `edge_count` are live header counters, so an *attaching*
+    process derives the used extents itself: nothing crosses the handshake and there
+    is no agreement with the creator to keep in sync. Population therefore runs
+    **after** `build_with`, not inside `create` — at `create` time nothing is declared
+    and both counters are zero. The frame hash is deliberately left cold (probed by
+    hash, so scattered; interning is not the hot path), and the four topology blocks
+    are populated per block, since they are strided and one range would pull in three
+    blocks of headroom.
+
+    Measured, on an arena declaring one 1024-slot edge with 200k slots of frame and
+    edge headroom: **66.3 MiB of RSS against 66.1 MiB declared → 3.8 MiB. 17x.** The
+    3.8 MiB residue is `MADV_HUGEPAGE` (§7.2) rounding a handful of small live regions
+    up to 2 MiB pages, not slack in the accounting.
+
+    Verified by RSS and minor-fault deltas rather than `mincore`, which would need the
+    mapping's base pointer — something `tf_tree` does not expose and should not start
+    exposing for a test. **The test is two-sided**, because "headroom is not charged"
+    is satisfied perfectly by populating nothing, which reintroduces the exact fault
+    storm §7.1 exists to prevent:
+
+    | test | mutant that fails it |
+    |---|---|
+    | `declared_headroom_is_not_charged` | restore `MAP_POPULATE` ⇒ 100% charged |
+    | `declared_content_is_charged` | `populate_hot` a no-op ⇒ 0.7% charged |
+    | `the_first_lookup_after_attach_does_not_fault` | drop the `populate_hot` in `attach_shared_inner` ⇒ 1 minor fault |
+    | `touch_offsets_covers_every_page_and_never_passes_the_end` | drop the final partial page; align the start down |
+
+    The last of those exists because the fallback's *effect* is not observable from
+    inside `tf_tree_arena` — a test of it cannot tell "touched every page" from
+    "stopped one page short" — so the bound is a pure function and is tested as one.
 11. **CLI adoption** — `--attach`/`--domain`/`--name`/`--rw`/`--create`/`--timeout`; new
     `tf_tree participants` reading `LockFile::read_identity`, which **must work without
     the arena** (§3.3). Verified by an integration test that starts a publisher and

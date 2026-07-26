@@ -326,6 +326,13 @@ impl TreeBuilder {
         let arena = self.build_with(|layout, pid, start, boot| {
             MappedArena::create(name, layout, pid, start, boot).map_err(BuildError::Shm)
         })?;
+        // **After** `build_with`, not inside `create` (§7.1). Population is at
+        // declaration granularity, and at `create` time nothing is declared yet
+        // — `frame_count` and `edge_count` are still zero, so `populate_hot`
+        // would fault in the header and stop. `build_with` is what interns the
+        // frames and declares the edges, so this is the first moment the arena
+        // can say what is actually in use.
+        arena.populate_hot();
         let backing = ArenaBacking::Mapped(arena);
         let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
@@ -1174,6 +1181,11 @@ impl Tree {
         slot: Option<u32>,
     ) -> Result<Tree, ShmError> {
         let arena = MappedArena::attach(fd, mode)?;
+        // The attacher derives the used extents from the arena's own
+        // `frame_count`/`edge_count`, so nothing has to be passed across the
+        // handshake and there is no agreement with the creator to keep in sync
+        // (§7.1, `docs/decisions/0005` step 10).
+        arena.populate_hot();
         let backing = ArenaBacking::Mapped(arena);
         // A read-only peer cannot register — the table is in the arena and
         // registration writes to it. It takes the sentinel slot instead, and
