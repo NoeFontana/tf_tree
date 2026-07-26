@@ -1,0 +1,147 @@
+# Wheel matrix — `docs/PHASE3.md` §10.
+#
+# Two maturin invocations per platform row, and that is not an accident of the
+# scripting: maturin emits **at most one stable-ABI family per invocation**
+# (PyO3/maturin#3226). Selection happens after interpreter resolution — `abi3t`
+# when a CPython >= 3.15 interpreter is present, otherwise `abi3` — so `abi3`
+# and `abi3.abi3t` cannot come out of the same build. A single job with an extra
+# flag would silently produce only one of them.
+#
+# `cp313t` is deliberately absent (§1.1): PyO3 0.29 refuses to build for 3.13t,
+# manylinux dropped it from its images, and `--find-interpreters` skips it. That
+# is the right outcome rather than a loss — 3.13t was PEP 703's experimental
+# phase; free-threading became *supported* in 3.14 under PEP 779.
+#
+# NOTE: this workflow has never executed. GitHub Actions has produced no run for
+# this repository since 2026-07-23 (see #24), which is an account- or org-level
+# problem rather than a syntax one. Treat the first real run as unproven.
+name: wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Row 1 of §10's matrix: the stable-ABI wheel, one per platform.
+  abi3:
+    name: abi3 ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
+          - { os: macos-latest, target: aarch64, manylinux: auto }
+          - { os: macos-13, target: x86_64, manylinux: auto }
+          - { os: windows-latest, target: x64, manylinux: auto }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          # `abi3-py39` covers every GIL build from 3.9 up in one artifact.
+          args: --release --out dist --features pyo3/extension-module,pyo3/abi3-py39
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-abi3-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: dist
+
+  # Row 2: the free-threaded wheel. Version-specific by necessity — abi3 does
+  # not cover free-threaded builds, and PEP 803's `abi3t` needs 3.15.
+  freethreaded:
+    name: cp314t ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { os: macos-latest, target: aarch64, manylinux: auto }
+          - { os: windows-latest, target: x64, manylinux: auto }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14t"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          # No abi3 feature: it is ignored on a free-threaded build and the
+          # wheel would be rejected by the interpreter anyway (§1.1).
+          args: --release --out dist --features pyo3/extension-module --interpreter python3.14t
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cp314t-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  # Row 3: PEP 803's combined stable ABI. Written now, skipped until CPython
+  # 3.15 ships — PyO3 0.29 and maturin 1.14.1 already do their halves, so the
+  # only unmet precondition is the interpreter (§1.1, corrected in #25).
+  #
+  # Having the job written is the difference between a same-week and a
+  # same-quarter response when 3.15 lands.
+  abi3t:
+    name: abi3.abi3t (awaiting CPython 3.15)
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.15"
+      - uses: PyO3/maturin-action@v1
+        with:
+          manylinux: "2_28"
+          args: >-
+            --release --out dist
+            --features pyo3/extension-module,pyo3/abi3-py315,pyo3/abi3t-py315
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-abi3t
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  # Publishing is deliberately a separate, tag-only job.
+  #
+  # PEP 740 attestations are produced by the *upload* step under Trusted
+  # Publishing, not by `maturin build` — maturin adopting them for its own
+  # releases is precedent for the workflow shape, not a feature inherited by
+  # building with it (§10, corrected in #25).
+  publish:
+    needs: [abi3, freethreaded, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write      # Trusted Publishing
+      attestations: write  # PEP 740
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
