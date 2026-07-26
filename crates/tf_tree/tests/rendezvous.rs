@@ -47,7 +47,7 @@ impl Kid {
         let child = Command::new(exe)
             .args(args)
             .env("TF_TREE_RUNTIME_DIR", dir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -69,6 +69,14 @@ impl Kid {
     /// `SIGKILL`, then reap. After `wait` returns the kernel has torn down the
     /// process's descriptors, so its locks are gone with no cooperation from
     /// it — which is the entire point.
+    /// Nudge a child that is waiting on stdin.
+    fn poke(&mut self) {
+        use std::io::Write;
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = writeln!(stdin, "go");
+        }
+    }
+
     fn kill(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -293,5 +301,63 @@ fn a_claim_takes_a_lease_and_a_dead_holder_releases_it() {
     assert!(
         !lock.probe_claim(edge).unwrap().held,
         "the lease outlived its holder: a dead writer would leak its edge"
+    );
+}
+
+/// **A reaper must not reap itself.** `0005` calls this the single most
+/// valuable test in the milestone, and it is, because the failure looks like a
+/// bug somewhere else.
+///
+/// `F_OFD_GETLK` reports only *conflicting* locks, so a description never sees
+/// its own — every edge this process holds reads lease-free. A literal §6.3
+/// loop therefore revokes its own live writers, and A4 then *correctly* reports
+/// `ClaimRevoked` on the next push. The operator sees a publisher that stopped
+/// working and a reaper that says it reaped something; nothing points at the
+/// reaper.
+///
+/// So the assertion is not "reaped 0" alone — it is that **the claim still
+/// works afterwards**, which is the property that actually matters.
+#[test]
+fn a_reaper_does_not_reap_its_own_live_claim() {
+    let scratch = Scratch::new("self-reap");
+    let mut kid = Kid::spawn(&scratch.0, &["own-reap"]);
+    assert_eq!(kid.line(), "claimed");
+    kid.poke();
+    assert_eq!(
+        kid.line(),
+        "reaped 0 still_ours true",
+        "the reaper revoked its own live claim — F_OFD_GETLK does not report a \
+         description's own locks, so every edge this process holds reads free"
+    );
+}
+
+/// A killed writer's edge is reclaimed, and then reclaimable.
+///
+/// Reaping that clears the record but leaves the edge unclaimable would be
+/// worse than not reaping: the operator sees a freed record and still cannot
+/// publish.
+#[test]
+fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
+    let scratch = Scratch::new("reap-dead");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own-reap"]);
+    assert_eq!(owner.line(), "claimed");
+
+    // A second process joins and claims the *other* edge of the fixture.
+    let mut peer = Kid::spawn(&scratch.0, &["join-claiming"]);
+    let claimed = peer.line();
+    assert!(
+        claimed.starts_with("claimed "),
+        "peer did not claim: {claimed}"
+    );
+
+    peer.kill();
+
+    // The owner sweeps. Its own claim survives; the dead peer's is reclaimed.
+    owner.poke();
+    let line = owner.line();
+    assert!(
+        line.starts_with("reaped 1 ") && line.ends_with("still_ours true"),
+        "expected exactly the dead peer's edge to be reaped, got {line}"
     );
 }

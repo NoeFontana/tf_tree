@@ -230,14 +230,14 @@ by any claimer that gets `EdgeAlreadyClaimed`; and `Tree::reap_dead()` for
 # PRECONDITION: self.participant != u32::MAX. A read-only tree never registers
 # (tree.rs:801) and cannot reap; assert it rather than assume it, because
 # `u32::MAX + 1` overflows — see Consequences.
-own_word = self.participant as u64 + 1
+own_slot = self.participant           # NOT `+ 1` — see below
 
 for edge in 0..edge_count:
     owner = claim[edge].owner.load(Acquire)
     if owner == 0                        { continue }   # cheap filter, no syscall
-    if owner == own_word                 { continue }   # ADDED — see Consequences
+    if slot_of(owner) == own_slot        { continue }   # ADDED — see Consequences
     if let Some(dead) = only_slot        {              # see "one syscall per
-        if owner != dead + 1 { continue }               #  *dead* edge", below
+        if slot_of(owner) != dead { continue }          #  *dead* edge", below
     }
     if lock.probe_claim(edge)?.held      { continue }   # alive: never reapable
     edge::reap(&claim[edge])                            # epoch++ then owner = 0
@@ -357,6 +357,13 @@ named test:
    spurious reap.
 4. **No self-skip in the liveness predicate** ⇒ the same blindness makes a `Tree`
    declare *itself* dead and steal the topology lock from itself.
+4a. **Comparing the whole owner word against `slot + 1`** ⇒ the self-skip never
+   fires. `pack_owner` is `(epoch << 16) | (slot + 1)` (A3, and #20's "one
+   acquisition, not just one slot"), so that comparison matches only at epoch 0
+   — which `claim` never produces, since it starts at 1. **The pseudocode above
+   originally had this bug**, written before the packed encoding was fully in
+   mind, and `a_reaper_does_not_reap_its_own_live_claim` failed on its first run
+   with `reaped 1 still_ours false`. Compare `slot_of(owner)`, not the word.
 4b. **`self.participant + 1` on a read-only tree** ⇒ arithmetic overflow.
    `u32::MAX` is the read-only sentinel (`tree.rs:801`), so the expression panics
    in a debug build and wraps to `0` in release. The release behaviour is

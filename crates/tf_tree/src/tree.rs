@@ -1125,6 +1125,106 @@ impl Tree {
         self.claim_lock = Some(lock);
     }
 
+    /// Reclaim edges whose holder is provably dead (`docs/PHASE2.md` §6.3).
+    ///
+    /// Returns how many claims were reaped.
+    ///
+    /// # The predicate
+    ///
+    /// `record held and lease free` means the holder is dead — **or** is inside
+    /// the one-syscall window between its CAS and its `SETLK`. That second case
+    /// is closed from the *claimer's* side by the epoch re-check in
+    /// [`Self::claim`], not by this loop backing off, which is strictly better
+    /// than a grace period because there is no timing constant to tune.
+    ///
+    /// # Two skips that are not optional
+    ///
+    /// **Never judge ourselves.** `F_OFD_GETLK` reports only *conflicting*
+    /// locks, so a description does not see its own — every edge this process
+    /// holds reads lease-free. A literal §6.3 loop therefore revokes its own
+    /// live writers, and A4 then correctly reports `ClaimRevoked` on the next
+    /// push: a self-inflicted outage presenting as a spurious reap. §6.3 does
+    /// not mention this.
+    ///
+    /// **Only a read-write participant may reap**, because a read-only tree
+    /// never registered and its `participant` is the `u32::MAX` sentinel, where
+    /// `sentinel + 1` overflows. It also has nothing to reap *with*: reaping
+    /// writes to the arena.
+    ///
+    /// An unreadable lease is treated as held, which is the fail-safe direction
+    /// (§6.2) — a false "alive" postpones recovery, a false "dead" steals an
+    /// edge from a working process.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[must_use]
+    pub fn reap_dead(&self) -> usize {
+        self.reap_inner(None)
+    }
+
+    /// Reap only the edges a *named* participant held — the D17 fast path.
+    ///
+    /// The owner learns a participant died from `EPOLLHUP` on its socket, and
+    /// therefore knows *which slot* went away. Passing it turns an `O(edges)`
+    /// sweep of `fcntl` calls into `O(edges)` relaxed loads plus one syscall per
+    /// edge that slot actually held, which matters because `probe_claim` is a
+    /// syscall and an arena can hold thousands of edges.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[must_use]
+    pub fn reap_participant(&self, slot: u32) -> usize {
+        self.reap_inner(Some(slot))
+    }
+
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fn reap_inner(&self, only_slot: Option<u32>) -> usize {
+        let Some(lock) = self.claim_lock.as_ref() else {
+            return 0; // no rendezvous, no leases, nothing provable
+        };
+        // A read-only tree cannot reap and cannot form an owner word.
+        if self.participant == u32::MAX || !self.arena.is_writable() {
+            return 0;
+        }
+        // Compare the *slot*, not the word. `pack_owner` is
+        // `(epoch << 16) | (slot + 1)`, so a whole-word comparison against
+        // `slot + 1` matches only at epoch 0 — which `claim` never produces.
+        // A reaper making that mistake does not recognise its own claims and
+        // revokes them.
+        let own_slot = self.participant;
+
+        let view = self.view();
+        let max_edges = view.header().max_edges;
+        let mut reaped = 0;
+
+        for edge in 0..max_edges {
+            let Some(rec) = view.claim(EdgeId(edge)) else {
+                continue;
+            };
+            // The cheap filter that keeps this from being one syscall per edge:
+            // an unclaimed edge costs a relaxed load and nothing else.
+            let owner = rec.owner.load(Ordering::Acquire);
+            if owner == 0 {
+                continue;
+            }
+            // `u32::MAX` for a claim still in flight (the `CLAIMING` sentinel),
+            // which is never ours and *should* be reaped: it is distinguishable
+            // garbage a killed claimer leaves behind. A live claimer caught in
+            // that few-instruction window is protected from the other side, by
+            // the epoch re-check in `claim`.
+            let owner_slot = tf_tree_core::edge::slot_of(owner);
+            if owner_slot == own_slot {
+                continue;
+            }
+            if only_slot.is_some_and(|s| owner_slot != s) {
+                continue;
+            }
+            // Unreadable reads as held (§6.2): fail safe.
+            if lock.probe_claim(edge).map_or(true, |p| p.held) {
+                continue;
+            }
+            tf_tree_core::edge::reap(rec);
+            reaped += 1;
+        }
+        reaped
+    }
+
     /// Whether the participant in `slot` is still running.
     ///
     /// The kernel's answer for a tree obtained from [`crate::open`], a `/proc`
