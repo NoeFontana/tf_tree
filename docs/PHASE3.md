@@ -577,9 +577,10 @@ invocation in it was run by hand on this host for the rows this host can build,
 but the cross-platform rows — musllinux, macOS, Windows, aarch64 — are
 unproven. Treat the first real run as a first run.
 
-Not implemented: `at_adaptive`'s `adaptive_into` variant, `tree.lookup`'s
-plan-cached convenience, `__repr__` carrying `instance_uuid` (the field exists;
-the accessor does not), and the `tf_tree.ros` submodule, which is Phase 4's.
+Not implemented: `at_adaptive`'s `adaptive_into` variant — the Rust side
+returns slices borrowed from an internal scratch, so a Python `adaptive_into`
+would copy out of it and could not honour §5.2's tier-2 "no copies" claim; and
+the `tf_tree.ros` submodule, which is Phase 4's.
 
 ## Appendix A — measurements
 

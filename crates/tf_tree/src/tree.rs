@@ -996,6 +996,21 @@ impl Tree {
         }
     }
 
+    /// Which arena *instance* this tree is attached to (A7, §3.7).
+    ///
+    /// All-zero for a heap tree, which is single-process by construction and so
+    /// has no second attacher to disambiguate against.
+    ///
+    /// Distinct from the arena *name*: two processes that both resolved
+    /// `<runtime_dir>/<domain>/<name>` can still hold different segments if the
+    /// owner died and was replaced between their `open()` calls. Comparing
+    /// names cannot detect that; comparing this can, which is why it appears in
+    /// a `Tree`'s `__repr__` and in `doctor`.
+    #[must_use]
+    pub fn instance_uuid(&self) -> [u8; 16] {
+        self.view().header().instance_uuid
+    }
+
     /// Wrap a [`LookupError`] so its `Display` resolves ids to frame names.
     #[must_use]
     pub fn describe(&self, err: LookupError) -> Described<'_> {
