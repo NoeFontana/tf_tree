@@ -45,7 +45,7 @@
 //!
 //! # SAFETY (module invariant)
 //!
-//! The single `unsafe` block calls [`pthread_atfork`] with a `child` handler
+//! The single `unsafe` block calls `pthread_atfork` with a `child` handler
 //! that is an `extern "C" fn` with no arguments and no return value, and no
 //! `prepare` or `parent` handler. The handler is a `'static` item, so the
 //! pointer the C library retains for the lifetime of the process is always

@@ -235,7 +235,7 @@ impl ArenaLayout {
     /// to go and the crates that need one deny `unwrap`/`expect`/`panic`.
     ///
     /// Its consumer is `tf_tree`'s fork poison: a detached `Tree` must still
-    /// hand back an [`crate::ArenaView`] that is *safe to read*, and it cannot be
+    /// hand back an `ArenaView` that is *safe to read*, and it cannot be
     /// a view over the mapping that just went away. An arena with no frames and
     /// no edges answers every query "not here", which is the truthful answer.
     #[must_use]
@@ -255,7 +255,7 @@ impl ArenaLayout {
     /// `compute` uses only the **sum** of the per-edge capacities, never their
     /// split, so a segment's `stamp_slots` is enough to reconstruct every region
     /// offset without knowing how the slots were divided between edges. That is
-    /// what lets [`crate::mapped::MappedArena::attach`] check a received header
+    /// what lets `MappedArena::attach` check a received header
     /// against the layout its own counts imply.
     ///
     /// The returned value carries an empty `edge_capacities` and must not be

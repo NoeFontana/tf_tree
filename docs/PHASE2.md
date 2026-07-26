@@ -12,60 +12,43 @@ Sections marked **NORMATIVE** are requirements. Where a syscall behaviour is ass
 
 ## 0.0 Implementation status
 
-**Partially implemented.** The crash-consistency amendments and the mapping are done; the rendezvous and lifecycle are not.
+**Implemented**, except for the daemon/tooling surface (§9, §10) and the
+long-running fault harness (§11.3, §11.4). The rendezvous, the attach protocol,
+ownership migration, claims-as-leases, reaping, fork poisoning and per-region
+population all landed under
+[`0005`](./decisions/0005-the-shared-memory-seam.md).
 
 | Area | Status |
 |---|---|
-| Amendments A1–A7 (§1) | **Applied** — `FORMAT_VERSION` 2 |
+| Amendments A1–A8 (§1) | **Applied** — `FORMAT_VERSION` 2 |
 | `MappedArena` — `memfd`, sealed, `MAP_SHARED`, `MADV_DONTFORK`/`HUGEPAGE` (§4) | **Done** (`tf_tree_arena::mapped`, behind `--features shm`) |
 | `TreeBuilder::build_shared` / `Tree::attach_shared`, read-only mode (§8) | **Done** |
 | Zero-diff read path, proven by the relocation gate (§4) | **Done, and tested** (`just shm-test`) |
 | Multi-process read scaling (part of §12.2) | **Done** (`just shm-scaling`; results in `docs/benchmarks/tf2.md`) |
 | Amendment A2 — in-arena topology lock | **Applied** — `Tree::reparent` holds it; bounded spin, liveness-gated steal, loom- and multi-process-tested |
-| Amendment A8 — bounded intern spin | **Applied** — `claiming` array, bounded spin, takeover of a dead claimant (`layout_hash` 0x9075_90F5) |
-| Discovery, rendezvous, `open()`, ownership migration (§3) | Not implemented — fd inheritance stands in |
-| Attach protocol — `SOCK_SEQPACKET` + `SCM_RIGHTS` (§3.7) | Not implemented |
-| Claims as OFD locks (§6.1); reaping (§6.3) | Not implemented — `ClaimRecord` CAS only |
-| Per-edge page population (§7.1) | **Not implemented — currently maps `MAP_POPULATE`, which §7.1 forbids** |
-| `instance_uuid` (§3.6 step 4, A7) | Not implemented |
-| Participant registry — owner-side slot assignment (§5) | Table exists (A6); slots are self-assigned by CAS, not by the owner |
+| Amendment A8 — bounded intern spin | **Applied** — `claiming` array, bounded spin, takeover of a dead claimant |
+| `instance_uuid` (§3.6 step 4, A7) | **Done** — header offset 136, in pre-existing alignment padding |
+| Discovery, rendezvous, `open()` (§3.1–§3.4) | **Done** (`tf_tree_ipc`, `tf_tree::open`) |
+| Attach protocol — `SOCK_SEQPACKET` + `SCM_RIGHTS` (§3.7) | **Done** — owner serves from a thread, not a daemon |
+| Ownership migration (§3.5) | **Done** — the kernel picks the heir; D16 amended accordingly |
+| Participant registry — owner-side slot assignment (§5) | **Done** — the arena slot and the lock byte are the same integer |
+| §5.1 liveness from `F_OFD_GETLK` | **Done** — `/proc` survives as a diagnostic for heap and fd-inherited trees |
+| Claims as OFD leases (§6.1) | **Done** — the arena CAS is the decision, the lease makes death observable |
+| Reaping (§6.3) | **Done** — any read-write participant reaps; `Tree::reap_dead`, `reap_participant` |
+| Fork poisoning (§7.3) | **Done** — `pthread_atfork` counter; five destructors guarded |
+| Per-edge page population (§7.1) | **Done** — measured 66.3 MiB → 3.8 MiB on an over-provisioned arena |
+| CLI adoption — `--attach`, `tf_tree participants` | **Done** |
 | `tf_treed`, `tf_tree_record`, `/tf` ingest, diagnostics (§9, §10) | Not implemented |
 | Fault injection, `shm_torture` (§11.3, §11.4) | Not implemented |
+| §3.8's generous default layout | **Superseded by decision `0004`**, which sizes the arena from declared edges. Reconciling the two is its own decision; `0005` records the conflict rather than resolving it silently. |
 
-**What the gap means.** N processes map one arena, read it with byte-identical
-results, and see each other's writes, at no per-lookup cost over the
-single-process path. The amendments close the crash-consistency holes that made
-that unsafe: a killed writer no longer leaks an edge (A3), inverts a slot's
-parity (A5), wedges every reader with a permanently odd generation (A1), or
-wedges every other mutator by dying mid-topology-mutation (A2).
-
-What is missing is the **rendezvous and lifecycle** half — how processes find
-each other without configuration, and who cleans up after a death. Three
-consequences are live today:
-
-* Segments are handed over by **fd inheritance**, so only a child of the creator
-  can attach. There is no late join, no restart-and-reattach, and no `open()`.
-* Nothing reaps. A participant that dies holding a claim leaves it held until the
-  arena is destroyed, because §6.1's kernel lock — the thing that would make the
-  death observable — is not there yet.
-* **Liveness is a `/proc` heuristic, not a kernel fact.** A2's lock steals from a
-  dead holder, and it asks *something* whether the holder is dead. §5.1 says the
-  answer must come from the participant's OFD lock byte; that file does not exist
-  yet, so the `tf_tree` facade supplies §6.2's `(pid, start_time, boot_id)` check
-  instead. The lock itself takes the answer as an **injected predicate**
-  (`TopoLockView::acquire`'s `is_alive`) and `tf_tree_core` never learns how it is
-  reached — §2 forbids it the dependency — so replacing the heuristic with
-  `F_OFD_GETLK` is a change to one function in `tf_tree::tree` and to nothing
-  else. Until then the predicate fails **safe** in every branch: an unreadable
-  `/proc` reports "alive", so the worst case is a caller that retries, never a
-  live mutator that is stolen from.
-
-**§7.1 and the code disagree, deliberately and temporarily.** `MappedArena` maps
-`MAP_POPULATE`, which was correct against the previous draft and is forbidden by
-this one. It is harmless at the current arena sizes (~1.3 MiB) and becomes a real
-problem the moment §3.8's generous default layout lands, because it would fault
-in and charge hundreds of megabytes nobody declared. Fix it with §3.8, not before
-— the two changes are one change.
+**What the remaining gap means.** There is no daemon and no recorder, so "an
+owner always exists" is the operator's job rather than something a service
+guarantees — which is exactly what D16 says it should be. And there is no
+long-running fault harness, so the crash matrix in §11.3 is covered by targeted
+tests at each crash point rather than by randomised injection over hours. Both
+are additions, not corrections: nothing in the shipped protocol is waiting on
+them.
 
 ## 0. Scope
 

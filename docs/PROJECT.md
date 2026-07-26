@@ -55,6 +55,8 @@ Phases are ordered by *what constrains what*, not by user-visible value.
 
 **Phase 2 — shared memory.** `MappedArena` via sealed `memfd`, FD passing over a Unix socket that doubles as the liveness signal, a participant registry with PID-reuse-proof identity, cooperative crash-consistent reaping, and read-only attach as an MMU-enforced safety boundary. Highest technical risk in the project. Also ships `tf_tree_record` (the bit-identical replay harness) and a `/tf` ingest bridge so benchmarks run against real robot data. Fully specified in `docs/PHASE2.md`, including eight mandatory amendments to Phase 1 that the multi-process crash matrix exposed.
 
+> **Status: the engine half is complete** — amendments A1–A8, rendezvous, attach protocol, ownership migration, liveness, claim leases, reaping, fork poisoning, page population, and CLI adoption, all under [`0005`](./decisions/0005-the-shared-memory-seam.md). What remains is the **tooling** half: `tf_treed`, `tf_tree_record`, `/tf` ingest, and the long-running fault harness. `docs/PHASE2.md` §0.0 is the authoritative status table.
+
 **Phase 3 — Python bindings.** PyO3 binding the Rust core directly (not through the C ABI — that would cost error types and zero-copy ergonomics), abi3 wheels via maturin, GIL released on lookup, `at_many` returning zero-copy NumPy `(N, 4, 4)`, `__dlpack__` and `__cuda_array_interface__` export.
 
 **Phase 4 — C ABI and ROS 2.** `cbindgen` C ABI, C++ RAII header wrapper with Eigen conversions, `tf2_ros::Buffer`-compatible shim, bidirectional `/tf` bridge. By volume this is the largest phase and the first point at which an ABI is frozen. Budget accordingly.

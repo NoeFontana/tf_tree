@@ -1,8 +1,29 @@
 # 0005: The shared-memory seam
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+
+**Implementation.** Twelve steps, twelve-plus PRs, in order:
+
+| step | what | PR |
+|---|---|---|
+| — | this decision record | #27 |
+| 1 | `instance_uuid` + `SegmentDescriptor` | #28 |
+| 2 | `ParticipantTable::register_at` | #29 |
+| 3 | §3.7 wire, `SOCK_SEQPACKET` + `SCM_RIGHTS` | #30, #31 |
+| 4 | wire §3.7 into `Open` | #32 |
+| 5 | `tf_tree::open()` — the seam | #33 |
+| 6 | §5.1 liveness from `F_OFD_GETLK` | #39, #43 |
+| 7 | §6.1 claims as leases | #52, #53 |
+| 8 | §6.3 reaping | #54 |
+| 9 | fork poisoning | #55 |
+| 7b | `the_acquire_window_backs_out`, owed from step 7 | #56 |
+| 10 | §7.1 per-region population | #57 |
+| 11 | CLI adoption | #58 |
+| 12 | docs close-out | this one |
+
+Milestone B (layout kernels, #34) and Phase 3's Python work (#35, #37, #44–#51)
+ran alongside and are not part of this decision.
 
 ## Context
 
