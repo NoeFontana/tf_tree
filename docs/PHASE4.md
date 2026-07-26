@@ -18,7 +18,7 @@
 | Area | Status |
 |---|---|
 | §2 `at_with_derivatives` | **Done** — `Twist`, `Sample`, the adjoint fold, `DerivativesUnavailable`/`NoSegment`. §2.3's cost model was **false** and is amended in place. |
-| §3 C ABI — `tf_tree.h`, `tf_tree_unstable.h` | Not implemented |
+| §3 C ABI — `tf_tree.h`, `tf_tree_unstable.h` | **Partial** — `tf_tree_c` carries the handle model, error model, panic guard, ABI versioning, all five layouts and the hot path (§3.2–§3.7). The generated headers, `cbindgen`/xtask and the publisher surface are not written yet. |
 | §4 C++ wrapper, CMake package | Not implemented |
 | §5 ROS 2 ingest bridge | Not implemented — **not blocked**, see below |
 | §6 test plan | Follows its section; §6.3's QoS test is **amended** (as specified it cannot pass) |

@@ -1,0 +1,37 @@
+[package]
+name = "tf_tree_c"
+description = "C ABI for tf_tree — docs/PHASE4.md §3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+# `staticlib` and `cdylib` are the shipped artifacts; `rlib` exists so the
+# integration tests in `tests/` can link the crate as a normal Rust dependency
+# and drive the same entry points a C caller would.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+tf_tree = { workspace = true }
+
+[features]
+# Test-only hook that forces a panic inside an `extern "C"` body, so §6.1's
+# "the process must survive" claim is testable rather than asserted.
+test-hooks = []
+# Pass through to tf_tree: tft_tree_open needs the shared-memory rendezvous.
+shm = ["tf_tree/shm"]
+
+[lints]
+workspace = true
+
+# Needs the fixture constructor, so it cannot build in a default `--all-targets`
+# pass. Declaring it here is what keeps `just lint` (which builds every target
+# with no features) from failing on it.
+[[example]]
+name = "abi_cost"
+required-features = ["test-hooks"]
