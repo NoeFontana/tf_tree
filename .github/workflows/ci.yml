@@ -31,6 +31,36 @@ jobs:
         with:
           command: check
 
+  # `crates/tf_tree_py` is excluded from the workspace, so `cargo clippy
+  # --workspace` above never compiles it. That gap shipped a real bug: a
+  # `transmute::<EdgeWriter, Publisher>` that compiled only while the two types
+  # happened to be the same size, and which silently dropped the claim lease and
+  # the fork guard. It survived six PRs because nothing built the crate.
+  #
+  # `just lint` gained a `py-compile` dependency for this, but it skips when
+  # there is no venv — correct for a clean checkout, useless as a gate. This job
+  # is the gate: it needs only an interpreter, not maturin or a wheel.
+  bindings:
+    name: python bindings compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check (tf_tree_py)
+        run: cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
+      - name: cargo clippy (tf_tree_py)
+        env:
+          PYO3_PYTHON: python3
+        run: |
+          cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml \
+            --all-targets -- -D warnings
+
   test:
     name: test (${{ matrix.os }})
     strategy:
