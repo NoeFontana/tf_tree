@@ -138,6 +138,12 @@ pub struct SegmentDescriptor {
     /// Identifies this segment as distinct from another with the same name.
     pub instance_uuid: [u8; 16],
     /// Boot id of the host that created the segment.
+    ///
+    /// Not encoded into [`HelloResponse`] — §3.7's response layout has no field
+    /// for it (see that type's docs). The owner holds it so that the server can
+    /// compare it against [`HelloRequest::client_boot_id`] and emit
+    /// [`HelloStatus::BootIdMismatch`], which is the one §3.7 rejection this
+    /// message cannot itself explain. Unused until the server lands.
     pub boot_id: [u8; 16],
 }
 
@@ -326,8 +332,14 @@ fn check(raw: &[u8], expected: usize) -> Result<&[u8], WireError> {
     Ok(raw)
 }
 
-// Fixed-offset readers. `at` is always a literal below and every call site is
-// covered by the offset test, so the indexing cannot go out of range.
+// Fixed-offset readers.
+//
+// These index without a bounds check of their own, and that is sound because
+// `check` runs first on every path and returns `Err` unless the slice is
+// *exactly* `HELLO_REQUEST_LEN`/`HELLO_RESPONSE_LEN` — not merely at least
+// that, which is the distinction the length mutant is there to protect. Every
+// `at` below is a literal inside that length. So the guarantee comes from the
+// control flow, not from the tests agreeing with it.
 fn le32(raw: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
 }
