@@ -459,3 +459,44 @@ def test_at_into_still_rejects_a_non_contiguous_scalar_buffer(tree):
     p = tree.plan("map", "base")
     with pytest.raises(tf_tree.BufferError):
         p.at_into(1_500, np.empty((4, 8))[:, ::2])
+
+
+@pytest.mark.parametrize(
+    ("stamps", "shape"),
+    [(1_500, (4, 4)), (np.array([1_500], dtype=np.int64), (1, 4, 4))],
+)
+def test_at_into_refuses_a_non_writable_buffer(tree, stamps, shape):
+    """**A read-only buffer must be refused, not written and not faulted.**
+
+    `as_slice_mut` checks neither `NPY_ARRAY_WRITEABLE` nor aliasing, so without
+    an explicit check a `flags.writeable = False` array was *silently
+    overwritten* — and a read-only `np.memmap`, which is a `PROT_READ` page,
+    took `SIGSEGV` inside what looks like an ordinary lookup. §5.5's rule is
+    refuse rather than fault, and it applies to host memory the caller cannot
+    write exactly as much as to device memory.
+
+    Both the scalar and the batch path had this; both are checked here.
+    """
+    p = tree.plan("map", "base")
+    out = np.zeros(shape)
+    out.flags.writeable = False
+    with pytest.raises(tf_tree.BufferError, match="not writable"):
+        p.at_into(stamps, out)
+    # And nothing was written on the way to the refusal.
+    assert not out.any()
+
+
+def test_at_into_refuses_a_read_only_memmap_instead_of_faulting(tree, tmp_path):
+    """The same check, against memory the process genuinely cannot write.
+
+    `flags.writeable = False` is NumPy's own bookkeeping and a store to it would
+    "work"; a read-only `mmap` is enforced by the MMU and a store is `SIGSEGV`.
+    This is the case that turns a missing check into a crash, so it is tested
+    against the real thing rather than the flag alone.
+    """
+    path = tmp_path / "ro.bin"
+    path.write_bytes(b"\0" * 128)
+    m = np.memmap(path, dtype=np.float64, mode="r", shape=(4, 4))
+    p = tree.plan("map", "base")
+    with pytest.raises(tf_tree.BufferError, match="not writable"):
+        p.at_into(1_500, m)
