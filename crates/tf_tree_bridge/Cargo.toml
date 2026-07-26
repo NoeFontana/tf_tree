@@ -1,0 +1,33 @@
+[package]
+name = "tf_tree_bridge"
+description = "The ROS-independent half of the tf_tree ingest bridge — docs/PHASE4.md §5.4-§5.7, §5.9."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+# **A workspace member with no ROS dependency, and that is the design.**
+#
+# `docs/PHASE4.md` §0.0 says it outright: §5.4 (authority), §5.5 (clock), §5.6
+# (frame names) and §5.7 (static semantics) are *pure functions*, and "a
+# `TransformStamped`-shaped plain struct is legitimate" for them. So they live
+# here, where `just test` and `just lint` see them on every host, rather than
+# behind a container nobody runs on the normal development loop.
+#
+# `tf_tree_tf2_sys` is the counter-example and the reason this matters: it is
+# excluded from the workspace because it needs ROS headers, and as a result it
+# is the one crate carrying `unsafe` with no lint coverage — its own comment
+# says so. The rclcpp shell (§5.8) will have the same problem. Everything that
+# does not *have* to be over there belongs here.
+# **No dependencies at all**, and that is the strongest form of the split above.
+# These are decision functions over plain data; the moment one of them needs the
+# engine, it is doing something the ROS half should be doing. `tf_tree` was here
+# briefly and nothing used it.
+[dependencies]
+
+[lints]
+workspace = true

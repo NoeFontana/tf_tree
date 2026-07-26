@@ -8,6 +8,7 @@ members = [
     "crates/tf_tree",
     "crates/tf_tree_bench",
     "crates/tf_tree_cli",
+    "crates/tf_tree_bridge",
     "crates/tf_tree_c",
     "xtask",
 ]
