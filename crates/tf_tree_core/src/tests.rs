@@ -902,6 +902,44 @@ fn stale_odd_seq_from_a_dead_writer_is_healed_by_the_next_push() {
     assert!(seq > 1, "seq went backwards: {seq}");
 }
 
+/// `register_at` takes the slot it is named, or nothing.
+///
+/// The exclusivity property under concurrency is
+/// `loom_tests::two_joiners_handed_the_same_slot_cannot_both_take_it`; this
+/// covers the two error paths, which are ordinary sequential behaviour and do
+/// not need a 30-second model check to state.
+#[test]
+fn register_at_takes_the_named_slot_or_fails() {
+    use crate::participant::{ParticipantError, ParticipantTable};
+
+    let slots: Vec<ParticipantRecord> = (0..4).map(|_| ParticipantRecord::default()).collect();
+    let table = ParticipantTable::new(&slots);
+
+    let inc = table.register_at(2, 1234, 99, 0).expect("slot 2 is free");
+    assert_eq!(inc, 1);
+    assert_eq!(table.identity(2).map(|id| id.0), Some(1234));
+
+    // A second joiner handed the same slot is refused, and — the part that
+    // matters — is *not* quietly given a different one, which would break the
+    // slot/lock-byte correspondence the method exists to establish.
+    assert_eq!(
+        table.register_at(2, 5678, 100, 0),
+        Err(ParticipantError::SlotTaken { slot: 2 })
+    );
+    for other in [0, 1, 3] {
+        assert_eq!(table.identity(other), None, "slot {other} was touched");
+    }
+
+    // A slot from a malformed peer response is an error, not a panic.
+    assert_eq!(
+        table.register_at(4, 1, 1, 0),
+        Err(ParticipantError::SlotOutOfRange {
+            slot: 4,
+            capacity: 4
+        })
+    );
+}
+
 /// A stale `release` must not free a slot that has been reaped and re-registered.
 ///
 /// This is the cheap half of the check, and it is honest about what it covers:

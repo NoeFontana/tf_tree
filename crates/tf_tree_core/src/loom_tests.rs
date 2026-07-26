@@ -719,3 +719,65 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
         }
     });
 }
+
+/// Two joiners told to take the *same* slot: exactly one may get it.
+///
+/// `docs/PHASE2.md` §3.7 has the owner hand each client a `participant_slot`,
+/// and `docs/decisions/0005` makes that integer double as the lock-file byte.
+/// Two clients can be handed the same slot — by an owner bug, by a takeover
+/// mid-handshake, or by a stale `HelloResponse` replayed after a reap — and the
+/// arena must be the thing that says no.
+///
+/// This has to be a loom test rather than a sequential one. The window is
+/// between `register_at`'s CAS and its release-store: a sequential test calls
+/// them in order and can never place a second thread inside. Restore the
+/// pre-CAS shape (load `state`, compare to `FREE`, store `RESERVED`) and loom
+/// finds the interleaving where both threads observe `FREE` and both proceed to
+/// publish — two live processes sharing one slot index, which is exactly what
+/// the `slot + 1` owner encoding behind A3 claims cannot happen.
+#[test]
+fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
+    const P_A: u32 = 101;
+    const P_B: u32 = 202;
+
+    loom::model(|| {
+        // Four slots, so a losing thread has somewhere it *could* have gone —
+        // the assertion is that it does not go there, because `register_at`
+        // takes the named slot or nothing.
+        let table = Arc::new(alloc::vec![
+            ParticipantRecord::default(),
+            ParticipantRecord::default(),
+            ParticipantRecord::default(),
+            ParticipantRecord::default(),
+        ]);
+
+        let a = Arc::clone(&table);
+        let ta = thread::spawn(move || ParticipantTable::new(&a).register_at(2, P_A, 1, 0));
+        let b = Arc::clone(&table);
+        let tb = thread::spawn(move || ParticipantTable::new(&b).register_at(2, P_B, 2, 0));
+
+        let ra = ta.join().unwrap();
+        let rb = tb.join().unwrap();
+
+        assert!(
+            ra.is_ok() ^ rb.is_ok(),
+            "exactly one joiner may take slot 2: {ra:?} / {rb:?}"
+        );
+
+        let t = ParticipantTable::new(&table);
+        let (pid, _, inc) = t.identity(2).expect("the winner published a LIVE record");
+        // The record must belong to the winner *entire* — not a mix of A's pid
+        // and B's incarnation, which is what a torn publication would leave.
+        let (winner_pid, winner_inc) = if let Ok(i) = ra {
+            (P_A, i)
+        } else {
+            (P_B, rb.unwrap())
+        };
+        assert_eq!((pid, inc), (winner_pid, winner_inc));
+
+        // And the loser did not silently land somewhere else.
+        for other in [0, 1, 3] {
+            assert_eq!(t.identity(other), None, "slot {other} should be untouched");
+        }
+    });
+}
