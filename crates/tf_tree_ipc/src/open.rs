@@ -104,8 +104,19 @@ pub enum OpenOutcome {
 /// would mean connecting twice and re-running the race in between.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach<T> {
-    /// The handshake succeeded. Carries whatever the probe obtained.
-    Serving(T),
+    /// The handshake succeeded.
+    ///
+    /// Carries whatever the probe obtained **and the slot the owner granted**.
+    /// The slot lives in the variant rather than behind a separate accessor so
+    /// that a probe cannot report success without saying which slot it was
+    /// given — the two are one fact, and splitting them lets them disagree.
+    Serving {
+        /// What the probe obtained; for the real one, the attachment.
+        attached: T,
+        /// The participant slot the owner granted, which is also the lock-file
+        /// byte this client must take.
+        slot: u32,
+    },
     /// `ECONNREFUSED`, no socket at all, or a server that died mid-handshake.
     ///
     /// **Not an error.** §3.9 makes a stale socket path an expected state and
@@ -140,13 +151,6 @@ pub trait ServerProbe {
     /// Only for failures that are neither "nobody is listening" nor "the owner
     /// refused" — those are [`Reach::Absent`] and [`Reach::Rejected`].
     fn probe(&mut self, sock: &Path) -> Result<Reach<Self::Attached>, IpcError>;
-
-    /// The participant slot the owner granted in this attachment.
-    ///
-    /// On the trait rather than read from a concrete type, because this crate
-    /// must not know what `Attached` is — for the real probe it holds a segment
-    /// fd, which is exactly the arena knowledge §2 keeps out of here.
-    fn slot_of(&self, attached: &Self::Attached) -> u32;
 }
 
 /// A probe that always reports nothing listening.
@@ -161,11 +165,6 @@ impl ServerProbe for NoServer {
 
     fn probe(&mut self, _sock: &Path) -> Result<Reach<()>, IpcError> {
         Ok(Reach::Absent)
-    }
-
-    fn slot_of(&self, _attached: &()) -> u32 {
-        // Unreachable: this probe never returns `Serving`.
-        u32::MAX
     }
 }
 
@@ -275,7 +274,7 @@ impl Open {
                 // disagreement, and burning the deadline on it would replace a
                 // precise message with a timeout.
                 Reach::Rejected(why) => return Err(why),
-                Reach::Serving(attached) => {
+                Reach::Serving { attached, slot } => {
                     // The owner named the slot, so §3.3's specified order —
                     // write the identity, *then* take the lock — is restorable
                     // here. It was not in the fallback below, which has to find
@@ -287,9 +286,7 @@ impl Open {
                     // table and will name a different slot. Nothing was written
                     // to the arena, so nothing is left behind — which is the
                     // point of taking the byte before touching it.
-                    if let Some(slot) =
-                        self.register_at(&lock, &identity, probe.slot_of(&attached))?
-                    {
+                    if let Some(slot) = self.register_at(&lock, &identity, slot)? {
                         return Ok(Session {
                             outcome: OpenOutcome::Joined,
                             lock,
@@ -543,14 +540,13 @@ mod tests {
 
         fn probe(&mut self, _sock: &Path) -> Result<Reach<u32>, IpcError> {
             if self.0 == 0 {
-                return Ok(Reach::Serving(1));
+                return Ok(Reach::Serving {
+                    attached: 1,
+                    slot: 1,
+                });
             }
             self.0 -= 1;
             Ok(Reach::Absent)
-        }
-
-        fn slot_of(&self, attached: &u32) -> u32 {
-            *attached
         }
     }
 

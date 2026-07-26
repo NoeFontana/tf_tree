@@ -257,6 +257,18 @@ pub enum IpcError {
         /// `connect` errno.
         raw_os_error: i32,
     },
+    /// This process could not set up its own socket to attach with.
+    ///
+    /// **Deliberately distinct from [`IpcError::HandshakeIo`].** A probe reads
+    /// `HandshakeIo` as "no server" (§3.9), which is right for a peer that died
+    /// mid-handshake and catastrophically wrong for `EMFILE` in *this* process:
+    /// running out of descriptors would be read as "the arena is not there",
+    /// and this process would go on to create a second one beside a live arena
+    /// it simply failed to reach.
+    ClientSocketSetup {
+        /// The errno.
+        raw_os_error: i32,
+    },
     /// A send or receive during the handshake failed, or timed out.
     HandshakeIo {
         /// The errno.
@@ -352,6 +364,11 @@ impl fmt::Display for IpcError {
             IpcError::ServerUnreachable { raw_os_error } => write!(
                 f,
                 "nothing is listening on the attach socket (errno {raw_os_error})"
+            ),
+            IpcError::ClientSocketSetup { raw_os_error } => write!(
+                f,
+                "could not create a socket to attach with (errno {raw_os_error}); \
+                 this is a local resource failure, not an absent arena"
             ),
             IpcError::HandshakeIo { raw_os_error } => {
                 write!(f, "attach handshake failed (errno {raw_os_error})")
