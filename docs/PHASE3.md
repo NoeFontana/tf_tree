@@ -371,7 +371,21 @@ The per-thread plan cache behind `tree.lookup` must be genuinely per-thread (`th
 - The full test suite on both `3.14` and `3.14t`.
 - The `sys._is_gil_enabled()` assertion from §1.2.
 - A scaling test: 1/2/4/8 threads calling `plan.at` on a shared `Tree`, asserting near-linear aggregate throughput on `3.14t` — this is the claim the phase exists to make.
-- **ThreadSanitizer** on the free-threaded build. TSan finding nothing is the evidence behind `gil_used = false`; without it that declaration is an assertion.
+- **ThreadSanitizer**, via `just tsan` — real threads over the real generated
+  code, eight readers against a live writer. It complements `just loom`, which
+  model-checks the protocols exhaustively but over `loom::sync` substitutes with
+  a bounded interleaving budget; TSan sees what a model cannot, such as a race
+  introduced by the facade rather than by the protocol.
+
+  It runs against the **Rust** layer rather than under a Python interpreter,
+  deliberately: CPython is not TSan-instrumented, so running the extension under
+  it reports the interpreter's own internals as races and buries anything real.
+  The Python layer calls straight through, so the races that matter are here.
+
+  Verified non-vacuous — a deliberate two-thread increment of a shared `u64` is
+  reported immediately, so a clean run means TSan is instrumenting rather than
+  silently absent. `-Zbuild-std` is required: an uninstrumented std both reports
+  false positives on its own internals and misses real races through them.
 
 ---
 
