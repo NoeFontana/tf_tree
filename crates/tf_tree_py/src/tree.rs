@@ -27,7 +27,7 @@ const NS_PER_STEP_ESTIMATE: u64 = 55;
 /// A transform tree.
 #[pyclass(name = "Tree", module = "tf_tree", frozen)]
 pub struct PyTree {
-    inner: Tree,
+    pub(crate) inner: Tree,
 }
 
 /// Reject a `float` stamp with the measurement that justifies it (§3).
@@ -54,19 +54,21 @@ impl PyTree {
     /// Compiling once and reusing is the whole point: the path walk and the
     /// per-edge metadata lookup happen here, not per sample.
     #[pyo3(signature = (target, source, /))]
-    fn plan(&self, target: &str, source: &str) -> PyResult<PyPlan> {
-        let t = self
+    fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str) -> PyResult<PyPlan> {
+        let this = slf.get();
+        let t = this
             .inner
             .frame(target)
             .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {target:?}")))?;
-        let s = self
+        let s = this
             .inner
             .frame(source)
             .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {source:?}")))?;
-        let plan = self.inner.plan(t, s).map_err(lookup_err)?;
+        let plan = this.inner.plan(t, s).map_err(lookup_err)?;
         Ok(PyPlan {
             plan: Box::new(plan),
-            tree: self.inner_ptr(),
+            // The refcount that makes the borrow real.
+            tree: slf.clone().unbind(),
         })
     }
 
@@ -86,12 +88,6 @@ impl PyTree {
             self.inner.is_shared(),
             self.inner.is_writable()
         )
-    }
-}
-
-impl PyTree {
-    fn inner_ptr(&self) -> *const Tree {
-        &self.inner
     }
 }
 
@@ -126,32 +122,35 @@ type Knots<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray3<f64>>);
 #[pyclass(name = "Plan", module = "tf_tree", frozen)]
 pub struct PyPlan {
     plan: Box<tf_tree::Plan>,
-    /// The tree the plan reads through.
+    /// A **reference-counted handle** to the tree this plan reads through.
     ///
-    /// # Safety
+    /// An earlier version held a `*const Tree` and a doc comment asserting it
+    /// was "kept valid by the `_tree` attribute Python holds on every `Plan`".
+    /// There was no such attribute, so this was a use-after-free:
     ///
-    /// A raw pointer because `Plan` must not borrow the `Tree` across the
-    /// Python boundary — `#[pyclass]` cannot carry a lifetime. It is kept valid
-    /// by the `_tree` attribute Python holds on every `Plan`, which keeps the
-    /// owning `Tree` object alive for at least as long as the plan.
-    tree: *const Tree,
+    /// ```python
+    /// p = tree.plan("map", "base")
+    /// del tree          # last reference gone, arena freed
+    /// p.at(1500)        # reads freed memory
+    /// ```
+    ///
+    /// It surfaced as a wrong *error* rather than a crash, which is the worse
+    /// failure: the allocation was still mapped, so the read succeeded and
+    /// returned nonsense. A `Py<PyTree>` is an actual refcount, so the arena
+    /// cannot outlive its readers — and it removes the two `unsafe impl`s that
+    /// stood in for the guarantee.
+    tree: Py<PyTree>,
 }
 
-// SAFETY: `Tree` is `Send + Sync` (its arena is accessed only through
-// `tf_tree_core`'s atomic protocols), and this pointer is never used to create a
-// `&mut`. The pointee outlives every use because Python holds a reference to the
-// owning `Tree` for the life of the `Plan`.
-unsafe impl Send for PyPlan {}
-unsafe impl Sync for PyPlan {}
-
 impl PyPlan {
-    /// # Safety
+    /// The tree this plan reads through.
     ///
-    /// Relies on the module invariant above: the owning `Tree` is kept alive by
-    /// a Python reference for at least as long as this `Plan`.
+    /// `get` rather than `borrow` because [`PyTree`] is `frozen`: there is no
+    /// interior mutability to guard, so no runtime borrow check is needed and
+    /// no GIL token is required — which is also what lets this work unchanged
+    /// on a free-threaded interpreter.
     fn tree(&self) -> &Tree {
-        // SAFETY: see the field's docs and the `unsafe impl`s above.
-        unsafe { &*self.tree }
+        &self.tree.get().inner
     }
 }
 
