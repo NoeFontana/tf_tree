@@ -21,6 +21,13 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
+# **Default-on** (`docs/PHASE5.md` §5.5). Disabling it removes the counter
+# fields, the increments and the `Guard` destructor — what executes is then
+# provably nothing, which is what a safety-certified or minimal-embedded build
+# needs. The arena *regions* remain either way (D34), so the layout hash does
+# not fork and the two builds still attach to each other.
+default = ["counters"]
+counters = []
 # Route libm through its soft-float paths. Needed **only** under Miri, whose
 # interpreter cannot execute the x86 inline `sqrt` asm libm's default `arch`
 # feature emits. `just miri` turns it on explicitly.

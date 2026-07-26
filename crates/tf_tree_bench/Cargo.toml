@@ -14,6 +14,11 @@ publish = false
 workspace = true
 
 [features]
+default = ["counters"]
+# Passthrough, so `counter_cost` can measure both sides of §5.5's switch from
+# one crate. Without it, `cfg!(feature = "counters")` here reads *this* crate's
+# features and reports OFF while the engine is counting.
+counters = ["tf_tree/counters"]
 # The `tf2::BufferCore` differential path. Requires a ROS 2 install and the C++
 # FFI shim described in `src/tf2.rs`; deliberately *not* built on the host used
 # for this PR (there is no ROS 2 here). Enabling it without the shim is expected
@@ -129,3 +134,9 @@ required-features = ["shm"]
 [[bench]]
 name = "py_parity"
 harness = false
+
+# **PHASE5 §5.7's required measurement.** Not a criterion bench: the question is
+# a ratio between two loop shapes and a contention curve, not a distribution,
+# and criterion's per-iteration setup would sit inside the thing being measured.
+[[bin]]
+name = "counter_cost"

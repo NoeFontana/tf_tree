@@ -379,7 +379,45 @@ impl Plan {
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
         self.check_domain::<D>()?;
-        self.fold_at(g, t.nanos())
+        // **The counter calls bracket the fold, not the whole function.**
+        //
+        // The two checks above fail on properties of the *query* — a plan
+        // compiled against an old topology, or a domain mismatch — and neither
+        // names an edge. Counting them would file a caller's mistake against a
+        // publisher that is working correctly, which is worse than not counting
+        // them at all (`docs/PHASE5.md` §5.2's attribution argument, applied in
+        // the other direction).
+        match self.fold_at(g, t.nanos()) {
+            Ok(iso) => {
+                g.note_ok(self.first_dynamic_edge());
+                Ok(iso)
+            }
+            Err(e) => {
+                g.note_err(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// The single dynamic edge this plan traverses, for counter attribution.
+    ///
+    /// `EdgeId(0)` when the plan crosses several — the sentinel id no builder
+    /// hands out, which [`Guard::note_ok`] then folds into "credit no edge".
+    /// Attributing a multi-edge plan's success to one of its edges would put a
+    /// number in `doctor`'s table that means something different from every
+    /// other number in the same column.
+    #[inline]
+    fn first_dynamic_edge(&self) -> EdgeId {
+        let mut found = None;
+        for step in self.steps() {
+            if let Step::Dyn { edge, .. } = step {
+                if found.is_some() {
+                    return EdgeId(0);
+                }
+                found = Some(*edge);
+            }
+        }
+        found.unwrap_or(EdgeId(0))
     }
 
     /// Fold the plan at `t`, accumulating the body twist alongside the pose.
@@ -889,6 +927,33 @@ pub struct Guard<'a> {
     /// The pinned topology generation, or [`DETACHED`] for a guard built by
     /// [`Guard::detached`].
     generation: u64,
+    /// Successful lookups so far, flushed to the arena on drop.
+    ///
+    /// **A plain `Cell<u32>`, not an atomic, and that is the whole design**
+    /// (`docs/PHASE5.md` §5.4). `Guard` is `!Sync` by construction — it holds an
+    /// `ArenaView` and is created per batch on one thread — so nothing else can
+    /// observe this, and a non-atomic increment on a line already in L1 is what
+    /// the hot path pays.
+    ///
+    /// The alternative is a relaxed `fetch_add` per lookup, which is both a
+    /// per-lookup cost and, worse, a *contended* one: sixteen readers on one
+    /// edge would serialize on that cache line. Accumulating and flushing once
+    /// turns N atomics into one.
+    ///
+    /// `u32` rather than `u64`: a guard spanning four billion lookups is a
+    /// guard nobody holds, and the flush saturates rather than wrapping.
+    #[cfg(feature = "counters")]
+    ok: core::cell::Cell<u32>,
+    /// Which edge's counters to credit, when every lookup in the batch went
+    /// through one plan.
+    ///
+    /// `None` while the guard has seen no lookup, and **also** once it has seen
+    /// lookups on two different edges — because a single count cannot be
+    /// attributed to both, and attributing it to whichever came last would be
+    /// worse than not attributing it. A plan crossing several edges credits the
+    /// participant total and no edge, which is the honest answer.
+    #[cfg(feature = "counters")]
+    ok_edge: core::cell::Cell<Option<EdgeId>>,
 }
 
 /// The generation a [`Guard::detached`] guard carries.
@@ -905,10 +970,111 @@ pub struct Guard<'a> {
 /// 32 bytes on a struct built once per `at()` call.
 const DETACHED: u64 = u64::MAX;
 
+/// Which [`EdgeCounters`] field a lookup error belongs in.
+///
+/// A tiny enum rather than a closure so `counter_of` stays a pure classification
+/// with no borrow of the arena — the caller does the lookup, and the mapping is
+/// readable as a table.
+#[cfg(feature = "counters")]
+#[derive(Clone, Copy)]
+enum CounterField {
+    ExtrapBefore,
+    ExtrapAfter,
+    NoData,
+    SlotRecycled,
+    SlotContended,
+}
+
+#[cfg(feature = "counters")]
+impl CounterField {
+    #[inline]
+    fn bump(self, c: &crate::counters::EdgeCounters) {
+        use crate::sync::Ordering::Relaxed;
+        let f = match self {
+            CounterField::ExtrapBefore => &c.err_extrap_before,
+            CounterField::ExtrapAfter => &c.err_extrap_after,
+            CounterField::NoData => &c.err_no_data,
+            CounterField::SlotRecycled => &c.err_slot_recycled,
+            CounterField::SlotContended => &c.err_slot_contended,
+        };
+        f.fetch_add(1, Relaxed);
+    }
+}
+
+/// Classify a lookup error into `(edge, field)`, or `None` when it names no
+/// edge.
+///
+/// **Only errors that name an edge are counted**, which is most of them by
+/// design (D11: every variant that *can* name an edge does). The ones that
+/// cannot — `UnknownFrame`, `Disconnected`, `TopologyChanged` — are properties
+/// of the *query*, not of an edge, and filing them under one would send an
+/// operator to inspect a publisher that is working correctly.
+#[cfg(feature = "counters")]
+#[inline]
+fn counter_of(err: &LookupError) -> Option<(EdgeId, CounterField)> {
+    Some(match *err {
+        LookupError::Extrapolation {
+            edge,
+            requested,
+            newest,
+            ..
+        } => (
+            edge,
+            // Split, because the two mean opposite things. Past the newest
+            // stamp usually means a publisher stopped; before the oldest means
+            // a consumer is running behind, or the ring is too short. `TFT010`
+            // and `TFT011` key off exactly this distinction.
+            if requested > newest {
+                CounterField::ExtrapAfter
+            } else {
+                CounterField::ExtrapBefore
+            },
+        ),
+        LookupError::NoData { edge } => (edge, CounterField::NoData),
+        LookupError::SlotRecycled { edge } => (edge, CounterField::SlotRecycled),
+        LookupError::SlotContended { edge } => (edge, CounterField::SlotContended),
+        _ => return None,
+    })
+}
+
 /// [`DETACHED`], for the test that pins it. Any other value is a generation some
 /// tree can reach.
 #[cfg(test)]
 pub(crate) const DETACHED_FOR_TEST: u64 = DETACHED;
+
+/// Flush the batch's success count into the arena — **one relaxed atomic per
+/// guard, not per lookup** (`docs/PHASE5.md` §5.4).
+///
+/// A guard spanning 1000 lookups pays one `fetch_add` per 1000, per thread, so
+/// the contention a per-lookup atomic would create on a hot edge simply does not
+/// arise. That is the entire argument for buffering, and it is why the
+/// destructor exists at all.
+#[cfg(feature = "counters")]
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        let n = self.ok.get();
+        // Same read-only guard as `note_err`, and this is the path that
+        // actually faulted: a consumer's guard drops at the end of every batch.
+        if n == 0 || !self.view.is_writable() {
+            return;
+        }
+        use crate::sync::Ordering::Relaxed;
+        // Credited to an edge only when the whole batch went through one. A
+        // multi-edge plan credits nothing here rather than crediting the last
+        // edge it happened to touch, which would be a number no operator could
+        // interpret.
+        if let Some(edge) = self.ok_edge.get() {
+            if let Some(c) = self.view.edge_counters(edge) {
+                c.lookups_ok.fetch_add(u64::from(n), Relaxed);
+            }
+        }
+        if let Some(slot) = self.view.interning_identity() {
+            if let Some(p) = self.view.participant_counters(slot) {
+                p.lookups_ok.fetch_add(u64::from(n), Relaxed);
+            }
+        }
+    }
+}
 
 impl<'a> Guard<'a> {
     /// Pin the current topology generation and wrap the arena view for a batch of
@@ -921,7 +1087,87 @@ impl<'a> Guard<'a> {
     #[must_use]
     pub fn new(view: ArenaView<'a>) -> Guard<'a> {
         let generation = view.topology().stable_generation();
-        Guard { view, generation }
+        Guard {
+            view,
+            generation,
+            #[cfg(feature = "counters")]
+            ok: core::cell::Cell::new(0),
+            #[cfg(feature = "counters")]
+            ok_edge: core::cell::Cell::new(None),
+        }
+    }
+
+    /// Record a successful lookup through `edge` (`docs/PHASE5.md` §5.4).
+    ///
+    /// One non-atomic increment. Compiled away entirely without the `counters`
+    /// feature — §5.5's point being that "off" should mean *no code*, not a
+    /// runtime branch.
+    #[inline]
+    pub(crate) fn note_ok(&self, edge: EdgeId) {
+        #[cfg(feature = "counters")]
+        {
+            self.ok.set(self.ok.get().saturating_add(1));
+            match self.ok_edge.get() {
+                None if self.ok.get() == 1 => self.ok_edge.set(Some(edge)),
+                Some(e) if e != edge => self.ok_edge.set(None),
+                _ => {}
+            }
+        }
+        #[cfg(not(feature = "counters"))]
+        let _ = edge;
+    }
+
+    /// Record a failed lookup, on the error path where cost is irrelevant.
+    ///
+    /// Unlike [`Self::note_ok`] this writes straight through to the arena: a
+    /// failure is rare by construction, and buffering it would mean a process
+    /// that dies mid-fault takes the evidence with it — which is precisely the
+    /// case §5.3 exists for.
+    #[inline]
+    pub(crate) fn note_err(&self, err: &LookupError) {
+        #[cfg(feature = "counters")]
+        {
+            use crate::sync::Ordering::Relaxed;
+            // **A read-only view must not write.** A consumer maps the arena
+            // read-only (D18), so this would fault with SIGSEGV — which it did,
+            // killing a read-only child in the multiprocess suite before the
+            // check existed. §5 does not discuss the interaction; the resolution
+            // is that a read-only participant keeps no counters, because it
+            // cannot, and refusing to run would be far worse than losing a
+            // diagnostic.
+            if !self.view.is_writable() {
+                return;
+            }
+            let Some((edge, field)) = counter_of(err) else {
+                return;
+            };
+            if let Some(c) = self.view.edge_counters(edge) {
+                field.bump(c);
+                if let LookupError::Extrapolation {
+                    requested,
+                    oldest,
+                    newest,
+                    ..
+                } = *err
+                {
+                    // The high-water mark, not a total: "we were 4 seconds past
+                    // the end once" is actionable and "we were past the end 900
+                    // times" is not. `TFT011` reads this against the ring's
+                    // span to answer whether the buffer is simply too short.
+                    let gap = if requested > newest {
+                        requested.saturating_sub(newest)
+                    } else {
+                        oldest.saturating_sub(requested)
+                    };
+                    let prev = c.worst_extrap_gap_ns.load(Relaxed);
+                    if gap > prev {
+                        c.worst_extrap_gap_ns.store(gap, Relaxed);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "counters"))]
+        let _ = err;
     }
 
     /// A guard that fails every evaluation with [`LookupError::ChildDetached`],
@@ -957,6 +1203,13 @@ impl<'a> Guard<'a> {
         Guard {
             view,
             generation: DETACHED,
+            // A detached guard fails every evaluation, so it never counts a
+            // success and its destructor is a no-op — but the fields must
+            // exist, and starting them at zero is what makes that true.
+            #[cfg(feature = "counters")]
+            ok: core::cell::Cell::new(0),
+            #[cfg(feature = "counters")]
+            ok_edge: core::cell::Cell::new(None),
         }
     }
 

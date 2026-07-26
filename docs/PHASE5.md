@@ -21,7 +21,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §2 Frozen arena (`.tft`) | Not implemented |
 | §3 Bag ingestion | Not implemented |
 | §4 Offline Python API | Not implemented |
-| §5 Diagnostic counters | **Partial** — `EdgeCounters`/`ParticipantCounters` and their arena regions exist (they are part of §1's one-time break, so they had to land with it). The `Guard` accumulation of §5.4 and the increments themselves are not wired yet. |
+| §5 Diagnostic counters | **Done**, except §5.6's freeze-side capture, which needs §2. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | Not implemented |
 | §7 `tf_tree top` | Not implemented |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
@@ -414,6 +414,20 @@ counters = []
 
 Disabling it removes the fields, the increments, and the arena regions' *use* (the regions remain, per D34, so the layout hash does not fork). What executes is then provably nothing, which is what that audience actually needs.
 
+> **A read-only participant keeps no counters, and this section does not say
+> so.** D18 makes a consumer's attachment read-only — the MMU is what stops it
+> corrupting a robot's transform tree — so *any* write from a read path faults.
+> The `Guard` flush is a write from a read path, and it killed a read-only child
+> in the multiprocess suite with `SIGSEGV` before the check existed.
+>
+> The resolution: a read-only participant silently records nothing. It cannot,
+> and refusing to run would be far worse than losing a diagnostic. `doctor`
+> reports what the *writable* participants recorded, which on a real robot is
+> the bridge and every publisher — the processes whose failures the counters are
+> mostly about. `ArenaView` carries a `writable` flag, default `false`, so
+> forgetting to opt in loses a counter and forgetting to opt out cannot crash
+> anything.
+
 ### 5.6 Counters are captured in snapshots
 
 Arena counters die with the arena. On a robot, the interesting question is usually "what did the counters say just before this went wrong", so:
@@ -423,6 +437,34 @@ Arena counters die with the arena. On a robot, the interesting question is usual
 ### 5.7 What must still be measured
 
 Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen concurrent readers that the flush-on-drop pattern shows no measurable contention. If it somehow does, shard by participant slot (`counters[edge][slot & 7]`) and sum on read — but measure before adding that complexity.
+
+> **Measured.** `cargo run --release -p tf_tree_bench --bin counter_cost`, on
+> this host (4 physical cores + SMT). Three runs each, `ns/lookup/thread`:
+>
+> | threads | 1 | 2 | 4 | 8 |
+> |---|---|---|---|---|
+> | counters on | 21.7–22.5 | 22.0–23.1 | 22.4–25.5 | 38.0–39.2 |
+> | counters off | 22.4–22.9 | 22.8–23.2 | 22.8–24.3 | 38.4–39.2 |
+>
+> **The ranges overlap at every row, so the sharding fallback is not
+> justified.** A single earlier run showed 27.6 against 23.7 at four threads and
+> looked like a 16 % contention cost; repeating it three times put that number
+> inside the control's own spread.
+>
+> Two notes on how the measurement is made honest, both of which changed the
+> answer:
+>
+> * **The control is the same binary built `--no-default-features`**, not a
+>   different code path. Comparing two loop shapes in one build would have
+>   measured the loop shapes.
+> * **The 16-thread row is not quoted.** It is 2× oversubscribed here, and the
+>   two configurations disagree by more than either differs from itself — 82.7
+>   with counters against 114.1 without, i.e. *faster* with the extra work,
+>   which is not a thing. §5.7 asks whether the flush contends; a scheduling
+>   artifact answering for it would be the wrong number.
+>
+> The batched-versus-per-lookup row is **+5.8 ns**, which is an upper bound on
+> the atomic §5.4 removes (it includes the guard's own construction).
 
 ## 6. The diagnostics catalogue
 

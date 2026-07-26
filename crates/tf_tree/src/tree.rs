@@ -825,6 +825,10 @@ impl Tree {
         ArenaView::new(self.arena.as_dyn())
             .as_participant(self.participant)
             .with_liveness(&*self.liveness)
+            // Third builder, and as load-bearing as the other two: without it
+            // the diagnostic counters (`docs/PHASE5.md` §5) write through a
+            // read-only mapping and the process dies with SIGSEGV.
+            .writable(self.is_writable())
     }
 
     /// Resolve a frame name to its stable id.
