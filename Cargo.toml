@@ -8,6 +8,7 @@ members = [
     "crates/tf_tree",
     "crates/tf_tree_bench",
     "crates/tf_tree_cli",
+    "crates/tf_tree_c",
     "xtask",
 ]
 # `tf_tree_tf2_sys` bridges to ROS 2's `tf2::BufferCore` and only builds where
