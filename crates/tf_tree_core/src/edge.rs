@@ -291,9 +291,17 @@ fn pack_owner(epoch: u64, participant_slot: u32) -> u64 {
 
 /// The participant slot named by an owner word, or `u32::MAX` if it names none
 /// (free, or a claim still in flight).
+///
+/// **Public because a reaper cannot do without it.** The word is
+/// `(epoch << 16) | (slot + 1)` (A3, and #20's "one acquisition, not just one
+/// slot"), so comparing a whole owner word against `slot + 1` matches only at
+/// epoch 0 — which `claim` never produces, since it starts at 1. A reaper that
+/// made that comparison would fail to recognise its *own* claims and revoke
+/// them; `docs/decisions/0005` §6's pseudocode had exactly that bug, and
+/// `a_reaper_does_not_reap_its_own_live_claim` is what found it.
 #[inline]
 #[must_use]
-fn slot_of(word: u64) -> u32 {
+pub fn slot_of(word: u64) -> u32 {
     if word == 0 || word == CLAIMING {
         return u32::MAX;
     }
