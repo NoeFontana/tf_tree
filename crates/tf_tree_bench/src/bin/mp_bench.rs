@@ -258,7 +258,10 @@ fn main() {
         let flag = if foreign > 0.10 { " <-- NOISY" } else { "" };
 
         println!(
-            "{n:>6} | {:>9.2} {:>9.2} {:>10.2} | {:>9.1} {:>9.1} {:>10.1} | {:>10.1} {:>9.2}  {:>5.0}%{flag}",
+            // CPU %/node gets three decimals, not one: the column exists to
+            // show whether per-node cost *rises* with n, and at ~0.1% a single
+            // decimal renders a doubling and a flat line identically.
+            "{n:>6} | {:>9.2} {:>9.2} {:>10.2} | {:>9.1} {:>9.1} {:>10.1} | {:>10.3} {:>9.2}  {:>5.0}%{flag}",
             us(svc.quantile(0.50)),
             us(svc.quantile(0.99)),
             us(worst_svc_p999),

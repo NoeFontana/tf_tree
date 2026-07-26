@@ -287,12 +287,52 @@ impl ProcStats {
     }
 }
 
-/// User + system CPU time of this process, in nanoseconds.
+/// CPU time of this process, in nanoseconds.
+///
+/// **Read from `schedstat`, not `stat`, and the difference is the whole
+/// measurement.** `/proc/self/stat`'s `utime`/`stime` are USER_HZ clock ticks —
+/// 10 ms each. A consumer here runs 600 ticks of 8 lookups, which is about 4 ms
+/// of CPU per 6-second window: *less than one clock tick*. Read that way the
+/// column reports `0.0` for every row, which reads like the O(1)-in-consumers
+/// claim holding when it is really the instrument having no resolution — and it
+/// would flatten the tf2 comparison, where CPU per node is the whole point.
+///
+/// `/proc/<pid>/schedstat` field 1 is time-on-cpu in nanoseconds. Summed over
+/// `task/*` so a threaded consumer is counted whole; the process-level file
+/// covers only the main thread.
+fn self_cpu_ns() -> u64 {
+    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+        let mut ns = 0u64;
+        let mut any = false;
+        for t in tasks.flatten() {
+            // A thread can exit between readdir and open; skip it rather than
+            // abandoning the sum, which would silently under-report.
+            if let Some(v) = schedstat_ns(&t.path().join("schedstat")) {
+                ns += v;
+                any = true;
+            }
+        }
+        if any {
+            return ns;
+        }
+    }
+    // CONFIG_SCHEDSTATS=n. Fall back to 10 ms ticks, which is worse but is not
+    // nothing, rather than reporting zero and looking like an answer.
+    stat_cpu_ns()
+}
+
+/// Field 1 of a `schedstat` file: time on cpu, in nanoseconds.
+fn schedstat_ns(path: &std::path::Path) -> Option<u64> {
+    let s = std::fs::read_to_string(path).ok()?;
+    s.split_whitespace().next()?.parse().ok()
+}
+
+/// User + system CPU time in nanoseconds, quantized to 10 ms. Fallback only.
 ///
 /// Fields 14 and 15 of `/proc/self/stat`, in clock ticks. Parsed after the
 /// **last** `)` because `comm` may contain spaces and parentheses — the same
 /// trap `docs/PHASE2.md` §5.1 documents for field 22.
-fn self_cpu_ns() -> u64 {
+fn stat_cpu_ns() -> u64 {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return 0;
     };
@@ -525,6 +565,43 @@ mod tests {
         assert!(
             b.pss_kib > 0,
             "PSS unreadable — /proc/self/smaps_rollup absent?"
+        );
+    }
+
+    /// The counter must resolve less than one 10 ms clock tick.
+    ///
+    /// Monotonicity above is satisfied by a counter that is always zero, which
+    /// is exactly what `utime + stime` gives for this workload: a consumer
+    /// spends ~4 ms of CPU per 6 s window, so the tick-based reading is `0` and
+    /// the whole `CPU %/node` column prints `0.0` — indistinguishable from the
+    /// O(1) claim holding. Spin for a few milliseconds and require the reading
+    /// to see it.
+    #[test]
+    fn cpu_time_resolves_below_one_clock_tick() {
+        if !std::path::Path::new("/proc/self/schedstat").exists() {
+            // CONFIG_SCHEDSTATS=n: the 10 ms fallback is all there is, and
+            // asserting sub-tick resolution against it would be a false alarm.
+            return;
+        }
+        let spin = Duration::from_millis(3);
+        let a = ProcStats::read();
+        let start = Instant::now();
+        let mut x = 0u64;
+        while start.elapsed() < spin {
+            x = x.wrapping_add(std::hint::black_box(1));
+        }
+        std::hint::black_box(x);
+        let d = ProcStats::read().since(a);
+        assert!(
+            d.cpu_ns >= 1_000_000,
+            "3 ms of spinning read as {} ns of CPU — the counter is quantized \
+             coarser than the thing it measures",
+            d.cpu_ns
+        );
+        assert!(
+            d.cpu_ns < 500_000_000,
+            "3 ms of spinning read as {} ns of CPU — implausible, check the units",
+            d.cpu_ns
         );
     }
 }
