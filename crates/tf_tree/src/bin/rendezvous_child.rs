@@ -10,7 +10,9 @@
 //!
 //! ```text
 //! rendezvous_child own    -> "owning <transform>", then parks serving
-//! rendezvous_child join   -> "joined <transform>" | "error <display>"
+//! rendezvous_child join   -> "joined <transform>" | "error <display>"   (read-only)
+//! rendezvous_child join-rw -> as above, but registers in the arena table
+//! rendezvous_child peer-alive <slot> -> "alive <bool>", then parks
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -82,14 +84,49 @@ fn main() {
                 std::thread::park();
             }
         }
-        "join" => {
+        // `join` is read-only (the consumer default, D18); `join-rw` registers
+        // in the arena table, which is what a liveness probe can see.
+        "join" | "join-rw" => {
+            let mode = if mode == "join-rw" {
+                AttachMode::ReadWrite
+            } else {
+                AttachMode::ReadOnly
+            };
             match tf_tree::Open::new()
+                .mode(mode)
                 .create(CreatePolicy::Never)
                 .timeout(std::time::Duration::from_millis(500))
                 .open()
             {
-                Ok(tree) => say(&format!("joined {}", render(&tree, 1_500))),
+                Ok(tree) => {
+                    say(&format!("joined {}", render(&tree, 1_500)));
+                    // Park holding the tree. Exiting here would release the
+                    // participant slot immediately, so any test that asks
+                    // whether this peer is alive would be racing its teardown
+                    // rather than measuring liveness.
+                    loop {
+                        std::thread::park();
+                    }
+                }
                 Err(e) => say(&format!("error {e}")),
+            }
+        }
+        // Join, then report whether a *named* peer slot reads alive. This is
+        // what separates the kernel's answer from the /proc inference: a
+        // SIGSTOPped holder still holds its lock byte.
+        "peer-alive" => {
+            let slot: u32 = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .expect("slot");
+            let tree = tf_tree::Open::new()
+                .create(CreatePolicy::Never)
+                .timeout(std::time::Duration::from_millis(500))
+                .open()
+                .expect("join");
+            say(&format!("alive {}", tree.participant_alive(slot)));
+            loop {
+                std::thread::park();
             }
         }
         other => panic!("unknown mode {other}"),

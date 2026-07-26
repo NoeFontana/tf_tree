@@ -65,6 +65,14 @@ impl Kid {
         reader.read_line(&mut line).expect("read child line");
         line.trim_end().to_string()
     }
+
+    /// `SIGKILL`, then reap. After `wait` returns the kernel has torn down the
+    /// process's descriptors, so its locks are gone with no cooperation from
+    /// it — which is the entire point.
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 impl Drop for Kid {
@@ -120,5 +128,78 @@ fn a_consumer_that_will_not_create_fails_fast_on_an_empty_machine() {
     assert!(
         line.contains("no arena"),
         "the error should name the absent arena: {line}"
+    );
+}
+
+/// A `SIGSTOP`ped participant is alive; a `SIGKILL`ed one is not.
+///
+/// `docs/PROJECT.md` §5 D17 forbids treating staleness as death, because a
+/// legitimately slow publisher is indistinguishable from a hung one. This is
+/// that rule as an executable assertion.
+///
+/// **What this does *not* prove, stated because the obvious reading is wrong.**
+/// It does not discriminate between `F_OFD_GETLK` and the `/proc` heuristic it
+/// replaced: swapping the implementation back leaves this test passing, which
+/// was verified rather than assumed. `/proc` gets both cases right here — a
+/// stopped process still has a `/proc` entry, and a killed-and-reaped one does
+/// not.
+///
+/// The case where `/proc` is genuinely wrong is **pid reuse**: a dead
+/// participant's number handed to an unrelated process, which `record_is_alive`
+/// only survives because it also compares the start time. Staging that requires
+/// exhausting the pid space, so it is not tested here. What OFD actually buys
+/// is that the answer is the kernel's rather than an inference — no parsing, no
+/// permission dependence, and no window between reading a pid and acting on it.
+/// That is an argument from construction, and this test is not evidence for it.
+#[test]
+fn a_stopped_peer_is_alive_and_a_killed_one_is_not() {
+    let scratch = Scratch::new("liveness");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "));
+
+    // A joiner that will be stopped, then killed. The owner holds slot 0, so
+    // the first joiner takes slot 1.
+    // Read-write, deliberately. A **read-only** joiner takes a lock byte but
+    // writes no arena record — `attach_shared` skips registration when the
+    // mapping is not writable — so `participant_alive` reports it dead before
+    // the OFD probe is ever consulted. That asymmetry is real and is written up
+    // in `docs/decisions/0005`; here it would only make the test measure the
+    // wrong thing.
+    let mut peer = Kid::spawn(&scratch.0, &["join-rw"]);
+    assert!(peer.line().starts_with("joined "), "peer did not join");
+
+    let observer_alive = |scratch: &PathBuf| {
+        let mut k = Kid::spawn(scratch, &["peer-alive", "1"]);
+        let line = k.line();
+        k.kill();
+        line
+    };
+
+    // Stopped: still holding its byte, so still alive.
+    let pid = peer.0.id();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "could not SIGSTOP the peer"
+    );
+    assert_eq!(
+        observer_alive(&scratch.0),
+        "alive true",
+        "a SIGSTOPped participant was reported dead — a slow publisher must \
+         never be mistaken for a hung one (D17)"
+    );
+
+    // Killed: the kernel releases the byte, with no cooperation from the peer.
+    let _ = std::process::Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status();
+    peer.kill();
+    assert_eq!(
+        observer_alive(&scratch.0),
+        "alive false",
+        "a SIGKILLed participant was still reported alive"
     );
 }

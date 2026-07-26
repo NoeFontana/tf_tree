@@ -466,6 +466,38 @@ nightly). `shm-check` extends to `-p tf_tree --features shm`, `-p tf_tree_ipc` a
 `--workspace` never sees it. CI extends the existing `shm` job on **both** x86-64 and
 `ubuntu-24.04-arm` rather than adding a job.
 
+## Found while implementing
+
+**A read-only participant holds a lock byte but has no arena record.**
+`Tree::attach_shared` skips registration when the mapping is not writable — it
+*cannot* write the table — so a `mode="ro"` joiner, which is the consumer
+default (D18) and the Python default (`PHASE3.md` §4.1), occupies
+`participant` byte *n* in the lock file while arena slot *n* stays `FREE`.
+
+That is the byte/record split step 2's `register_at` exists to close, reappearing
+from the other side. Two consequences:
+
+1. `Tree::participant_alive(n)` reports such a peer **dead**, because it checks
+   the arena record before consulting the lock. For a reaper that is the safe
+   direction — there is nothing to reap — but it means the predicate answers
+   "dead" for a live process, and any future code that reads it as "this slot is
+   free" would be wrong.
+2. The owner's slot assigner scans the *arena* table, so it can hand out a slot
+   whose lock byte is already held by a read-only peer. Today the granted-slot
+   bitmask (step 5) prevents an immediate re-grant, so the joiner retries and
+   gets a different slot — but the bitmask does not survive an owner restart,
+   and after a takeover the new owner would name that slot again and the joiner
+   would loop.
+
+Neither is reachable as a *correctness* failure today, which is why this is
+recorded rather than hot-fixed. The fix belongs with step 8 (reaping), which is
+the first code that must decide what a slot's true occupancy is: either the
+owner consults `held_participants()` as well as the arena table, or a read-only
+attach stops taking an arena-indexed byte at all. **Resolve it there; do not
+paper over it by making `participant_alive` consult the lock first**, which
+would report a phantom participant as alive and give the reaper nothing to act
+on.
+
 ## Open questions
 
 None. Items that PHASE2 §3 leaves under-specified are resolved above rather than left

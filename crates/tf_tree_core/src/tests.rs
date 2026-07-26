@@ -511,7 +511,8 @@ fn intern_recovers_from_a_claimant_that_died_before_publishing() {
 
     let (id, again, count, claimant, found) =
         assert_completes_within(10, "intern of a name whose claimant died", move || {
-            let is_alive = |rec: &ParticipantRecord| rec.pid.load(Ordering::Relaxed) != DEAD_PID;
+            let is_alive =
+                |_slot: u32, rec: &ParticipantRecord| rec.pid.load(Ordering::Relaxed) != DEAD_PID;
             let view = ArenaView::new(&arena)
                 .as_participant(live_slot)
                 .with_liveness(&is_alive);
