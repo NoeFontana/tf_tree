@@ -363,6 +363,8 @@ impl Drop for OwnerThread {
 /// A thread rather than a daemon: §3.5 makes ownership a role a survivor
 /// inherits, which is only possible if any participant can bind.
 fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenError> {
+    // The assigner's own view of the lock file — see the closure below.
+    let lock_probe = LivenessProbe::open(rv)?;
     let view = tree.arena_view();
     let header = view.header();
     let desc = SegmentDescriptor {
@@ -419,12 +421,36 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                 |_req| {
                     let view = crate::ArenaView::new(&table_arena);
                     let table = view.participants();
-                    for slot in 0..table.capacity() as u32 {
+                    // `granted` is a u64, so the shift below is defined only
+                    // for the first 64 slots. The const assert at the top of
+                    // this file ties the table to exactly 64; this bound keeps
+                    // that assert's failure a compile error rather than a
+                    // shift overflow at runtime.
+                    let n = table.capacity().min(64) as u32;
+                    for slot in 0..n {
                         let bit = 1u64 << slot;
-                        if granted_assign.get() & bit == 0 && table.identity(slot).is_none() {
-                            granted_assign.set(granted_assign.get() | bit);
-                            return Ok(slot);
+                        if granted_assign.get() & bit != 0 {
+                            continue; // granted, not yet hung up
                         }
+                        if table.identity(slot).is_some() {
+                            continue; // a registered participant lives here
+                        }
+                        // **And the lock byte must be free too.** A read-only
+                        // participant takes its byte but writes no arena
+                        // record — `attach_shared` cannot register a
+                        // `PROT_READ` mapping — so the table alone reports its
+                        // slot empty. `mode="ro"` is the consumer default
+                        // (D18) *and* the Python default, so this is the
+                        // common case, not a corner. Granting such a slot
+                        // hands the joiner a byte it cannot take; the
+                        // `granted` bitmask hides that until an owner restart
+                        // or a takeover clears it, after which the owner names
+                        // the same slot forever and the joiner loops.
+                        if lock_probe.is_held(slot).unwrap_or(false) {
+                            continue;
+                        }
+                        granted_assign.set(granted_assign.get() | bit);
+                        return Ok(slot);
                     }
                     Err(HelloStatus::NoParticipantSlots)
                 },
