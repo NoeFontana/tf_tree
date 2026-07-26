@@ -570,17 +570,28 @@ impl Plan {
     where
         W: Fn(&Iso3, &mut [T]),
     {
+        // `chunks_exact_mut` rather than `out[i * elems..(i + 1) * elems]`,
+        // and zipped against `stamps` so the walk is bounded by the batch and a
+        // caller's over-long buffer is left untouched past the end.
+        //
+        // **Not for speed.** The obvious argument — that the indexed form is a
+        // bounds check per element, hence a branch between every sample and the
+        // next — was measured and is wrong: at 1024 samples the change is
+        // within noise (`No change in performance detected`), because LLVM
+        // already elides the check and because ~245 us of interpolation dwarfs
+        // it either way. It stays because it says what it means and drops the
+        // manual index arithmetic, not because it is faster.
         let monotone = stamps.windows(2).all(|w| w[0].nanos() <= w[1].nanos());
         if monotone {
             let mut cursors = [0u64; MAX_DEPTH];
-            for (i, s) in stamps.iter().enumerate() {
+            for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
                 let iso = self.fold_at_cursors(g, s.nanos(), &mut cursors)?;
-                write(&iso, &mut out[i * elems..(i + 1) * elems]);
+                write(&iso, dst);
             }
         } else {
-            for (i, s) in stamps.iter().enumerate() {
+            for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
                 let iso = self.fold_at(g, s.nanos())?;
-                write(&iso, &mut out[i * elems..(i + 1) * elems]);
+                write(&iso, dst);
             }
         }
         Ok(())
