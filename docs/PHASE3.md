@@ -541,17 +541,17 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 ## 14. Definition of done
 
 - [ ] `import tf_tree; tf_tree.open()` works with zero arguments on a machine with a running arena, and in a bare notebook with none
-- [ ] `#[pymodule(gil_used = false)]` set and asserted by CI on `3.14t`
-- [ ] Every `#[pyclass]` is `Send + Sync`; `Publisher` wrapped
-- [ ] No `float` stamp accepted anywhere; `TypeError` names `from_sec` and states the ULP
+- [x] `#[pymodule(gil_used = false)]` set; asserted on `3.14t` — but see §1.2's correction, the attribute is not what the assertion proves
+- [x] Every `#[pyclass]` is `Send + Sync`; `Publisher` wrapped
+- [x] No `float` stamp accepted anywhere; `TypeError` names `from_sec` and states the ULP
 - [ ] No API returns a view into the arena (grep-able review item, documented in the README)
-- [ ] `at_into` validates fully before writing; non-contiguous `out` rejected
-- [ ] `out` device classification via `__dlpack_device__`; CUDA device memory rejected with an actionable message
-- [ ] No hand-written DLPack capsule parsing anywhere in the codebase
+- [x] `at_into` validates fully before writing; non-contiguous `out` rejected
+- [x] `out` device classification via `__dlpack_device__`; CUDA device memory rejected with an actionable message
+- [x] No hand-written DLPack capsule parsing anywhere in the codebase
 - [ ] `os.register_at_fork` poisoning tested under all three start methods
 - [ ] Hand-written stubs; `mypy --strict` and `pyright --strict` clean over stubs and examples
-- [ ] CI asserts no public symbol exists in the generated stubs but not the hand-written ones (§9)
-- [ ] Wheels for every row of §10 — two invocations each — with the `abi3.abi3t` job present and skipped
+- [x] CI asserts no public symbol exists in the generated stubs but not the hand-written ones (§9)
+- [x] Wheels for every row of §10 — two invocations each — with the `abi3.abi3t` job present and skipped (`.github/workflows/wheels.yml`; **never executed**, see below)
 - [ ] Toolchain floors of §10.1 pinned in `pyproject.toml`; `[tool.ruff.format] exclude` covers `**/*.md`
 - [ ] `.github/dependabot.yml` regains its `uv` entry when `pyproject.toml` lands (the Phase 1 scaffold removed both)
 - [ ] PEP 740 attestations and SBOM published with the first release
@@ -559,6 +559,27 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 - [ ] `docs/PHASE4.md` written, carrying §13 forward with the measured numbers
 
 ---
+
+## Appendix B — what is built, and what is unproven
+
+Implemented and gated locally (`just py-test`, `py-test-freethreaded`,
+`py-lint`, `tsan`): `open()`/`build()`, `Plan.at` scalar and batch, `at_into`
+with DLPack device classification, `adaptive`, `Publisher` with `push` and
+`push_many`, the exception hierarchy, hand-written stubs with a bidirectional
+drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
+path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
+verified to import and run on 3.14.
+
+**`.github/workflows/wheels.yml` has never executed.** GitHub Actions has
+produced no run for this repository since 2026-07-23, which is an account- or
+org-level problem rather than a syntax one. Its YAML parses and every maturin
+invocation in it was run by hand on this host for the rows this host can build,
+but the cross-platform rows — musllinux, macOS, Windows, aarch64 — are
+unproven. Treat the first real run as a first run.
+
+Not implemented: `at_adaptive`'s `adaptive_into` variant, `tree.lookup`'s
+plan-cached convenience, `__repr__` carrying `instance_uuid` (the field exists;
+the accessor does not), and the `tf_tree.ros` submodule, which is Phase 4's.
 
 ## Appendix A — measurements
 
