@@ -293,6 +293,8 @@ impl TreeBuilder {
             decl: Mutex::new(()),
             #[cfg(all(feature = "shm", target_os = "linux"))]
             attachment: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            claim_lock: None,
         })
     }
 
@@ -330,6 +332,8 @@ impl TreeBuilder {
             decl: Mutex::new(()),
             #[cfg(all(feature = "shm", target_os = "linux"))]
             attachment: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            claim_lock: None,
         })
     }
 
@@ -522,6 +526,58 @@ impl ArenaBacking {
 /// that borrows it, and because which implementation applies is decided once —
 /// `/proc` inference for a heap or fd-inherited tree, the kernel's `F_OFD_GETLK`
 /// answer for one that came through [`crate::open`] (`docs/PHASE2.md` §5.1).
+/// A claimed edge: the arena record, and the lease that makes its holder's
+/// death observable (`docs/PHASE2.md` §6.1, `docs/decisions/0005` §5).
+///
+/// Derefs to the [`Publisher`], so `push` and friends work unchanged.
+///
+/// # Drop order is load-bearing
+///
+/// The fields below are declared **publisher first, `_lease` second**, and Rust
+/// drops struct fields in declaration order. That yields *clear the record,
+/// then unlock* — the order `0005` §5 specifies.
+///
+/// Reversing it is not catastrophic but is wrong: it leaves a window in which
+/// the byte is free while the record still says held, which is precisely the
+/// signature a reaper reads as "the holder is dead". The reap that follows is
+/// harmless (our own release is a CAS and cannot clear a successor's claim) but
+/// it is a spurious epoch bump and a `ClaimRevoked` somebody has to explain.
+///
+/// This cannot be enforced by `ManuallyDrop` here — that needs `unsafe`, and
+/// this crate is `#![forbid(unsafe_code)]`. **Do not reorder these fields.**
+pub struct EdgeWriter<'a> {
+    publisher: Publisher<'a>,
+    /// Held purely for its `Drop`, hence the underscore — nothing reads it, and
+    /// the observable effect is releasing the byte when this value dies.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    _lease: Option<ClaimLease>,
+}
+
+impl<'a> core::ops::Deref for EdgeWriter<'a> {
+    type Target = Publisher<'a>;
+
+    fn deref(&self) -> &Publisher<'a> {
+        &self.publisher
+    }
+}
+
+/// Holds an edge's claim byte for as long as this value lives.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub(crate) struct ClaimLease {
+    lock: std::sync::Arc<tf_tree_ipc::LockFile>,
+    edge: u32,
+}
+
+#[cfg(all(feature = "shm", target_os = "linux"))]
+impl Drop for ClaimLease {
+    fn drop(&mut self) {
+        // Best effort: if the unlock fails the process is in no state to react,
+        // and the kernel releases the byte at exit regardless — which is the
+        // property the lease exists for.
+        let _ = self.lock.release_claim(self.edge);
+    }
+}
+
 type BoxedLiveness = Box<dyn Fn(u32, &tf_tree_core::ParticipantRecord) -> bool + Send + Sync>;
 
 /// A transform tree: a fixed-capacity arena plus the ergonomic operations for
@@ -587,6 +643,13 @@ pub struct Tree {
     /// an inherited fd — none of those went through a rendezvous.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     attachment: Option<crate::open::Attachment>,
+    /// The lock file this tree takes claim leases against (§6.1).
+    ///
+    /// `None` for a heap tree and for `attach_shared` over an inherited fd —
+    /// neither went through a rendezvous, so there is no lock file, and the
+    /// arena CAS alone is the claim exactly as it was before leases existed.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    claim_lock: Option<std::sync::Arc<tf_tree_ipc::LockFile>>,
 }
 
 impl Tree {
@@ -684,7 +747,7 @@ impl Tree {
     /// [`ClaimApiError`] if `child` is unknown, no edge attaches it, the parent
     /// does not match, the edge carries no sample ring (it is static or
     /// tombstoned), or the edge is already claimed.
-    pub fn claim(&self, child: FrameId, parent: FrameId) -> Result<Publisher<'_>, ClaimApiError> {
+    pub fn claim(&self, child: FrameId, parent: FrameId) -> Result<EdgeWriter<'_>, ClaimApiError> {
         if !self.arena.is_writable() {
             return Err(ClaimApiError::ReadOnly);
         }
@@ -709,8 +772,85 @@ impl Tree {
         let (Some(ring), Some(claim_rec)) = (view.ring(eid), view.claim(eid)) else {
             return Err(ClaimApiError::NotDynamic { child, edge: eid });
         };
+        // ---- Two-phase acquire (`docs/decisions/0005` §5) --------------
+        //
+        // The arena CAS is the *decision*; the lock-file byte is a *lease* that
+        // makes the holder's death observable. §6.1's literal "the lock file is
+        // authoritative" is not implementable — two files, no atomic
+        // cross-update, and a `HeapArena` has no lock file at all — so exactly
+        // one of them is the linearization point, and it is this CAS.
         let (epoch, owner) = claim(claim_rec, self.participant)?;
-        Ok(Publisher::new(ring, claim_rec, epoch, owner))
+
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let lease = self.take_claim_lease(eid, claim_rec, epoch, owner)?;
+
+        Ok(EdgeWriter {
+            publisher: Publisher::new(ring, claim_rec, epoch, owner),
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            _lease: lease,
+        })
+    }
+
+    /// Phase two: take the lease, then prove the record is still ours.
+    ///
+    /// # The epoch re-check, which §6.3 does not mention and which is required
+    ///
+    /// Between the CAS above and the `SETLK` here there is a one-syscall
+    /// window. A reaper that runs inside it sees `record held ∧ lock free` —
+    /// its exact "the holder is dead" signature — and clears the record. This
+    /// process would then hold a lease on an edge the arena reports free, and a
+    /// third process could claim it: two writers on one edge, which is what D7
+    /// and A4 exist to prevent.
+    ///
+    /// `edge::reap` bumps the epoch *before* clearing the owner, which is what
+    /// makes the window recoverable at all: re-reading the epoch after taking
+    /// the lease detects the reap, and this backs out and lets the caller
+    /// retry.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fn take_claim_lease(
+        &self,
+        eid: EdgeId,
+        claim_rec: &tf_tree_core::edge::ClaimRecord,
+        epoch: u64,
+        owner: u64,
+    ) -> Result<Option<ClaimLease>, ClaimApiError> {
+        let Some(lock) = self.claim_lock.as_ref() else {
+            // No rendezvous (a heap tree, or an `attach_shared` over an
+            // inherited fd). The CAS alone is the claim, exactly as before —
+            // the lease adds observability, not correctness.
+            return Ok(None);
+        };
+        match lock.try_take_claim(eid.0) {
+            Ok(tf_tree_ipc::LockAttempt::Acquired) => {}
+            Ok(tf_tree_ipc::LockAttempt::Contended) => {
+                // The record was free but a live process holds the lease.
+                // Reachable only through a reaper bug or `--force-new` byte
+                // aliasing; back the CAS out rather than publish beside them.
+                tf_tree_core::edge::release(claim_rec, owner);
+                return Err(ClaimApiError::LeaseContended { edge: eid });
+            }
+            Err(_) => {
+                tf_tree_core::edge::release(claim_rec, owner);
+                return Err(ClaimApiError::LeaseUnavailable { edge: eid });
+            }
+        }
+
+        // **Untestable until step 8.** Removing this check leaves every test
+        // passing, because nothing reaps yet — there is no reaper to run inside
+        // the window. It is written now because the window is created by *this*
+        // commit and a reader arriving with step 8 would otherwise have to
+        // re-derive why it is needed. Its test belongs with the reaper.
+        if claim_rec.epoch.load(Ordering::Acquire) != epoch {
+            // A reaper ran inside the window. Give everything back.
+            tf_tree_core::edge::release(claim_rec, owner);
+            let _ = lock.release_claim(eid.0);
+            return Err(ClaimApiError::ReapedDuringClaim { edge: eid });
+        }
+
+        Ok(Some(ClaimLease {
+            lock: std::sync::Arc::clone(lock),
+            edge: eid.0,
+        }))
     }
 
     /// Compile a `lookup(target, source)` path into a reusable [`crate::Plan`].
@@ -870,6 +1010,8 @@ impl Tree {
             decl: Mutex::new(()),
             #[cfg(all(feature = "shm", target_os = "linux"))]
             attachment: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            claim_lock: None,
         })
     }
 
@@ -975,6 +1117,12 @@ impl Tree {
             }
             probe.is_held(slot).unwrap_or_else(|| record_is_alive(rec))
         });
+    }
+
+    /// Take claim leases against `lock` from now on (§6.1).
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn use_claim_leases(&mut self, lock: std::sync::Arc<tf_tree_ipc::LockFile>) {
+        self.claim_lock = Some(lock);
     }
 
     /// Whether the participant in `slot` is still running.
@@ -1494,6 +1642,31 @@ impl From<TopoLockError> for ReparentError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClaimApiError {
+    /// The arena record was free but a live process holds the edge's lease.
+    ///
+    /// Reachable only through a reaper bug or `CreatePolicy::Always` byte
+    /// aliasing (`docs/decisions/0005` §5). The CAS is backed out before this
+    /// returns, so retrying is safe.
+    #[error("edge {edge:?}: the claim record was free but its lease is held")]
+    LeaseContended {
+        /// The edge.
+        edge: EdgeId,
+    },
+    /// The lock file could not be asked about the edge's lease.
+    #[error("edge {edge:?}: the claim lease could not be taken")]
+    LeaseUnavailable {
+        /// The edge.
+        edge: EdgeId,
+    },
+    /// A reaper cleared this claim inside the CAS-to-lease window.
+    ///
+    /// Everything is given back before this returns, so the correct response is
+    /// simply to claim again.
+    #[error("edge {edge:?}: reaped while being claimed; retry")]
+    ReapedDuringClaim {
+        /// The edge.
+        edge: EdgeId,
+    },
     /// `child` is not a frame of this tree (out of range for its frame table).
     #[error("frame {} is not a frame of this tree", child.get())]
     UnknownFrame {

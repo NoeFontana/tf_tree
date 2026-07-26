@@ -265,3 +265,33 @@ fn a_read_only_peer_holds_a_byte_without_an_arena_record() {
          peer's lock byte with no arena record, slot 2 a registered one"
     );
 }
+
+/// **A claim taken through `open()` also holds a kernel lease.**
+///
+/// The arena `ClaimRecord` alone cannot tell a live holder from a dead one — a
+/// `SIGKILL`ed process leaves it set forever. The lease can, because the kernel
+/// releases the byte with no cooperation. This checks both halves: that the
+/// lease is taken at all, and that it is released when the holder dies.
+#[test]
+fn a_claim_takes_a_lease_and_a_dead_holder_releases_it() {
+    let scratch = Scratch::new("claim-lease-e2e");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own-claiming"]);
+    let line = owner.line();
+    assert!(line.starts_with("claimed "), "got {line}");
+    let edge: u32 = line.strip_prefix("claimed ").unwrap().parse().unwrap();
+
+    // A separate description, from a process that knows nothing about the
+    // claim, must see the byte held.
+    let lock = tf_tree_ipc::LockFile::open(&scratch.0.join("0/default.lock")).unwrap();
+    assert!(
+        lock.probe_claim(edge).unwrap().held,
+        "claiming through open() did not take the edge's lease"
+    );
+
+    owner.kill();
+    assert!(
+        !lock.probe_claim(edge).unwrap().held,
+        "the lease outlived its holder: a dead writer would leak its edge"
+    );
+}

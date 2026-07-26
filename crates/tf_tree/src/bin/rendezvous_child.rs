@@ -13,6 +13,7 @@
 //! rendezvous_child join   -> "joined <transform>" | "error <display>"   (read-only)
 //! rendezvous_child join-rw -> as above, but registers in the arena table
 //! rendezvous_child peer-alive <slot> -> "alive <bool>", then parks
+//! rendezvous_child own-claiming      -> "claimed <edge>", then parks holding it
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -109,6 +110,23 @@ fn main() {
                     }
                 }
                 Err(e) => say(&format!("error {e}")),
+            }
+        }
+        // Create the arena, claim an edge, and park holding it — so the parent
+        // can probe the lease and then kill this process.
+        "own-claiming" => {
+            let tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::IfAbsent)
+                .layout_if_creating(layout())
+                .open()
+                .expect("create the arena");
+            let child = tree.frame("base").unwrap();
+            let parent = tree.frame("map").unwrap();
+            let w = tree.claim(child, parent).expect("claim");
+            say(&format!("claimed {}", w.edge().get()));
+            loop {
+                std::thread::park();
             }
         }
         // Join, then report whether a *named* peer slot reads alive. This is

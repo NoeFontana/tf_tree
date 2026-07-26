@@ -42,6 +42,19 @@ use crate::tree::{BuildError, Tree, TreeBuilder};
 /// just to name a policy `open()` already takes.
 pub use tf_tree_ipc::CreatePolicy;
 
+/// A third description of the lock file, for claim leases (§6.1).
+///
+/// Its own description, like the liveness probe's and for the same reason:
+/// `F_OFD_SETLK` conflicts are per open-file-description, so sharing one with
+/// the `Session` would make this process's participant byte and its claim bytes
+/// indistinguishable to itself. Separate descriptions keep each answer about
+/// the thing it names.
+fn open_claim_lock(rv: &Rendezvous) -> Result<std::sync::Arc<tf_tree_ipc::LockFile>, OpenError> {
+    Ok(std::sync::Arc::new(
+        tf_tree_ipc::LockFile::open(rv.lock_path()).map_err(OpenError::Rendezvous)?,
+    ))
+}
+
 /// A kernel-authoritative liveness probe over the lock file (§5.1).
 ///
 /// Holds its **own** open file description, deliberately. The alternative —
@@ -313,6 +326,7 @@ impl Open {
                 let slot = attached.response.participant_slot;
                 let mut tree = Tree::attach_shared_at(attached.segment, self.mode, slot)?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
+                tree.use_claim_leases(open_claim_lock(&rv)?);
                 // The socket and the lock file must outlive the handshake: the
                 // first is how the owner learns we died (D17), the second is
                 // what holds our participant byte. Parking them in the `Tree`
@@ -324,6 +338,7 @@ impl Open {
                 let builder = self.layout.ok_or(OpenError::NoLayoutToCreate)?;
                 let mut tree = builder.build_shared(rv.name().as_str())?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
+                tree.use_claim_leases(open_claim_lock(&rv)?);
                 let server = spawn_owner_server(&rv, &tree)?;
                 tree.hold_ownership(session, server);
                 Ok(tree)

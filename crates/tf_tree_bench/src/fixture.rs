@@ -14,7 +14,7 @@
 
 use anyhow::{anyhow, Result};
 
-use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Iso3, Publisher, Tree, TreeBuilder};
+use tf_tree::{Capacity, EdgeCfg, EdgeWriter, InterpPolicy, Iso3, Tree, TreeBuilder};
 use tf_tree_math::exp_se3;
 
 /// Seconds of history every dynamic ring is sized to retain.
@@ -285,7 +285,7 @@ pub struct PushSample {
 }
 
 /// Claim every dynamic edge and publish [`HISTORY_SECS`] of synthetic history,
-/// returning the live [`Publisher`]s (claims stay held while they live) and the
+/// returning the live [`EdgeWriter`]s (claims stay held while they live) and the
 /// recorded push stream.
 ///
 /// Keeping the publishers alive is what lets the CLI `tree`/`doctor` demo show
@@ -296,7 +296,7 @@ pub struct PushSample {
 /// If a frame is unknown, an edge cannot be claimed, or a push is rejected — none
 /// of which can happen for the fixed fixture, but all surfaced rather than
 /// unwrapped.
-pub fn spin_up(tree: &Tree) -> Result<(Vec<Publisher<'_>>, Vec<PushSample>)> {
+pub fn spin_up(tree: &Tree) -> Result<(Vec<EdgeWriter<'_>>, Vec<PushSample>)> {
     let pid = std::process::id();
     let mut writers = Vec::new();
     let mut samples = Vec::new();

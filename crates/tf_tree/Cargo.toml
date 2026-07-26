@@ -38,6 +38,8 @@ thiserror.workspace = true
 tf_tree_ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The rendezvous tests probe the lock file directly, from outside the tree.
+tf_tree_ipc = { workspace = true }
 proptest.workspace = true
 
 # The rendezvous is a between-processes claim, so `tests/rendezvous.rs` needs a

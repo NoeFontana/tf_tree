@@ -468,6 +468,19 @@ nightly). `shm-check` extends to `-p tf_tree --features shm`, `-p tf_tree_ipc` a
 
 ## Found while implementing
 
+**The epoch re-check cannot be tested until step 8 exists.** Step 7's
+CAS-to-`SETLK` window is guarded by re-reading `ClaimRecord::epoch`, and
+removing that guard leaves every test green — because nothing reaps yet, so no
+reaper can run inside the window. The guard is written anyway: the window is
+created by step 7, and a reader arriving with step 8 would otherwise have to
+re-derive why it is needed. **Its test belongs with the reaper**, and step 8 is
+not complete without one that fails when the check is removed.
+
+The same is true of `ClaimApiError::LeaseContended` and `ReapedDuringClaim`:
+both are reachable only once a reaper or `CreatePolicy::Always` aliasing exists.
+
+
+
 **A read-only participant holds a lock byte but has no arena record.**
 `Tree::attach_shared` skips registration when the mapping is not writable — it
 *cannot* write the table — so a `mode="ro"` joiner, which is the consumer
