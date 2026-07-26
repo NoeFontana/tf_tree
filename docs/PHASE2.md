@@ -915,7 +915,7 @@ Phase 3 binds Python directly to the Rust core. Five Phase 2 properties must be 
 2. **GIL and liveness.** The socket carries liveness, not the heartbeat, so a long GIL-held pause does not risk reaping. Preserve that: do not add heartbeat-based reaping to make Python "safer" — it would make it strictly less safe (§6.4).
 3. **Read-only by default.** The Python `attach()` default must be `ReadOnly`. Most Python consumers are analysis and visualization tools; they should be incapable of corrupting a robot's transform tree, and the default is what determines whether that is true in practice. Pair it with `CreatePolicy::Never` so a notebook started before the robot fails loudly instead of creating an empty arena that a later publisher then refuses to join.
 4. **`tf_tree.open()` with no arguments must work in a notebook.** Zero-config discovery (§3) is most of the perceived quality of the Python binding; if a user has to pass paths, the seam has leaked.
-5. **Distribution: `abi3` wheels via maturin.** ~~One wheel per platform.~~ **Corrected by `PHASE3.md` §1.1** — `abi3` does not cover free-threaded builds, so the matrix needs version-specific `cp313t`/`cp314t` wheels alongside it, and an `abi3t` job (PEP 803) for 3.15 onward.
+5. **Distribution: `abi3` wheels via maturin.** ~~One wheel per platform.~~ **Corrected by `PHASE3.md` §1.1** — `abi3` does not cover free-threaded builds, so the matrix needs a version-specific `cp314t` wheel alongside it (built by a *second* maturin invocation, not a flag), and an `abi3.abi3t` job (PEP 803) for 3.15 onward. `cp313t` is not buildable on PyO3 0.29 and is deliberately not in the matrix.
 
 Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers from §12.
 
