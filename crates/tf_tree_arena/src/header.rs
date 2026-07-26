@@ -155,6 +155,28 @@ pub struct ArenaHeader {
     pub boot_id: [u8; 16],
     /// Reserved padding to keep the layout stable across future additions.
     _reserved: [u8; 8],
+    /// Identifies *this* arena instance, as distinct from this arena *name*
+    /// (`docs/PHASE2.md` §3.7, `docs/decisions/0005`).
+    ///
+    /// Two processes that both resolved `<runtime_dir>/<domain>/<name>` can
+    /// still have attached to different segments — the owner may have died and
+    /// been replaced between their two `open()` calls, which is the split-brain
+    /// §11.2 scenario 9 exists to catch. Comparing names cannot detect that;
+    /// comparing this can, which is why `HelloResponse` carries it.
+    ///
+    /// **All-zero means "not a shared instance".** A [`crate::HeapArena`] is
+    /// single-process by construction, so there is no second attacher to agree
+    /// with and no randomness is drawn — which also keeps the no-`shm` build
+    /// free of an RNG dependency.
+    ///
+    /// Lands at offset 136, inside padding that already existed because
+    /// [`TopoLock`] is `align(64)`: `boot_id` ends at 128, `_reserved` at 136,
+    /// and the next 64-byte boundary is 192. So adding it moved no pinned
+    /// offset, did not grow the header past 256, and — because
+    /// [`crate::layout::layout_hash`] covers region sizes and strides rather
+    /// than header fields — did not change the layout hash either. That is why
+    /// [`FORMAT_VERSION`] is still 2.
+    pub instance_uuid: [u8; 16],
     /// The topology mutation lock (A2). Last so it lands on its own 64-byte
     /// line: it is contended only by mutators, and false-sharing it with the
     /// header fields every reader touches would be a needless cost.
@@ -203,10 +225,34 @@ mod tests {
         assert_eq!(offset_of!(ArenaHeader, creator_pid), 100);
         assert_eq!(offset_of!(ArenaHeader, owner_start_time), 104);
         assert_eq!(offset_of!(ArenaHeader, boot_id), 112);
+        assert_eq!(offset_of!(ArenaHeader, instance_uuid), 136);
         // The lock sits on its own cacheline, so its offset is a multiple of 64
         // and it is the last thing in the 256-byte header region.
         assert_eq!(offset_of!(ArenaHeader, topo_lock), 192);
         assert_eq!(size_of::<ArenaHeader>(), 256);
+    }
+
+    /// `instance_uuid` had to fit without disturbing anything already published.
+    ///
+    /// `key_field_offsets_are_stable` catches the field *moving*; this one
+    /// records why 136 was available in the first place, so that a later field
+    /// added in the same gap does not silently push the lock off its cacheline.
+    #[test]
+    fn instance_uuid_occupies_pre_existing_alignment_padding() {
+        let after_boot_id = offset_of!(ArenaHeader, boot_id) + 16;
+        let uuid_at = offset_of!(ArenaHeader, instance_uuid);
+        let lock_at = offset_of!(ArenaHeader, topo_lock);
+
+        // It sits after `boot_id` + `_reserved`, and entirely before the lock.
+        assert!(uuid_at >= after_boot_id, "{uuid_at} < {after_boot_id}");
+        assert!(
+            uuid_at + 16 <= lock_at,
+            "uuid overruns the lock at {lock_at}"
+        );
+        // And the lock still lands exactly where its own alignment puts it,
+        // so the field consumed padding rather than adding any.
+        assert_eq!(align_of::<TopoLock>(), 64);
+        assert_eq!(lock_at, (uuid_at + 16).next_multiple_of(64));
     }
 
     /// A1 packs the generation and the active-block index into one word so that

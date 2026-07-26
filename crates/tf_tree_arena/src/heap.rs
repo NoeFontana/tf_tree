@@ -125,6 +125,11 @@ impl HeapArena {
                 creator_pid,
                 owner_start_time,
                 boot_id,
+                // All-zero: a heap arena is single-process by construction, so
+                // there is no second attacher for an instance id to disambiguate
+                // against. Drawing randomness here would also put an RNG in the
+                // no-`shm` dependency budget for no reader.
+                [0; 16],
             )
         }
     }
@@ -189,6 +194,7 @@ pub(crate) unsafe fn write_header_at(
     creator_pid: u32,
     owner_start_time: u64,
     boot_id: [u8; 16],
+    instance_uuid: [u8; 16],
 ) {
     // Offsets and slot counts are stored as u32 in the header. This is enforced
     // (not merely assumed) by `ArenaLayout::new`, which rejects any layout whose
@@ -226,6 +232,7 @@ pub(crate) unsafe fn write_header_at(
     h.creator_pid = creator_pid;
     h.owner_start_time = owner_start_time;
     h.boot_id = boot_id;
+    h.instance_uuid = instance_uuid;
 }
 
 #[cfg(test)]
