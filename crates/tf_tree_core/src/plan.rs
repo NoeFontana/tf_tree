@@ -24,7 +24,7 @@
 
 use core::marker::PhantomData;
 
-use tf_tree_math::{log_so3, Interp, Iso3, LerpSlerp, ScLerp};
+use tf_tree_math::{log_so3, Interp, Iso3, LerpSlerp, ScLerp, Twist};
 
 use crate::arena_view::ArenaView;
 use crate::edge::EdgeKind;
@@ -192,6 +192,32 @@ impl InterpPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// Sampled pose plus derivatives
+// ---------------------------------------------------------------------------
+
+/// A pose and its derivatives at one instant — `docs/PHASE4.md` §2.2.
+///
+/// Returned by [`Plan::at_with_derivatives`]. The twist is **body-frame
+/// (right)**, expressed in the plan's target frame; see [`tf_tree_math::twist`]
+/// for the convention and for `to_spatial`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sample {
+    /// The transform at the requested stamp — bit-identical to [`Plan::at`].
+    pub pose: Iso3,
+    /// First derivative, body frame, rad/s and m/s.
+    pub twist: Twist,
+    /// Second derivative, when the interpolant has one.
+    ///
+    /// Always `None` today: ScLerp's body twist is *constant* across a segment,
+    /// so the acceleration is identically zero within a segment and undefined
+    /// (a delta) at the knots. Reporting `Some(ZERO)` would claim a smoothness
+    /// the piecewise-geodesic path does not have. Phase 6's cumulative B-splines
+    /// are the first interpolant with a genuine second derivative, and this
+    /// field exists now so that adding them is not a breaking change.
+    pub accel: Option<Twist>,
+}
+
+// ---------------------------------------------------------------------------
 // Steps and the compiled plan
 // ---------------------------------------------------------------------------
 
@@ -353,6 +379,87 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain::<D>()?;
         self.fold_at(g, t.nanos())
+    }
+
+    /// Fold the plan at `t`, accumulating the body twist alongside the pose.
+    ///
+    /// The composition identity (`docs/PHASE4.md` §2.3), for `T_ac = T_ab·T_bc`:
+    ///
+    /// ```text
+    /// V_ac^c = Ad(T_bc⁻¹)·V_ab^b + V_bc^c
+    /// ```
+    ///
+    /// so each step re-expresses the accumulated twist in the *new* body frame
+    /// and adds the step's own. Two consequences worth naming, because both are
+    /// easy to get subtly wrong:
+    ///
+    /// * **A static step still costs an adjoint.** Its own twist is zero, but the
+    ///   frame changes, so the accumulator must still be mapped through
+    ///   `Ad(m⁻¹)`. Skipping it leaves the twist expressed in an ancestor's
+    ///   frame — a valid-looking vector, wrong by exactly that transform.
+    /// * **An inverted step folds to one adjoint, not two.** For `S = p⁻¹`,
+    ///   `V_S = −Ad(p)·V_p` and `Ad(S⁻¹) = Ad(p)`, so
+    ///   `V' = Ad(p)·V_acc − Ad(p)·V_p = Ad(p)·(V_acc − V_p)`. Subtract first,
+    ///   then rotate once.
+    fn fold_at_with_derivatives(&self, g: &Guard, t: i64) -> Result<(Iso3, Twist), LookupError> {
+        let mut acc = Iso3::IDENTITY;
+        let mut vel = Twist::ZERO;
+        for step in self.steps() {
+            match step {
+                Step::Static(m) => {
+                    // Constant transform: no twist of its own, but the body
+                    // frame moves, so the accumulator must follow it.
+                    vel = m.adjoint_inv(&vel);
+                    acc = acc * *m;
+                }
+                Step::Dyn { edge, inverted } => {
+                    let (p, vp) = g.sample_with_twist(*edge, t, ExtrapPolicy::Error)?;
+                    if *inverted {
+                        vel = p.adjoint(&vel.sub(vp));
+                        acc = acc.mul_inv(&p);
+                    } else {
+                        vel = p.adjoint_inv(&vel).add(vp);
+                        acc = acc * p;
+                    }
+                }
+            }
+        }
+        Ok((acc, vel))
+    }
+
+    /// Evaluate the plan at `t`, returning the pose **and its derivatives** —
+    /// `docs/PHASE4.md` §2.2.
+    ///
+    /// The twist is body-frame (right), `V^b = (T⁻¹Ṫ)^∨`, expressed in the
+    /// plan's *target* frame. Use [`tf_tree_math::Twist::to_spatial`] with the
+    /// returned pose for the spatial form.
+    ///
+    /// Costs roughly two plain lookups: the same sampling work, plus one adjoint
+    /// application per plan step (two quaternion rotations and a cross product,
+    /// no transcendentals — see [`tf_tree_math::twist`]).
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::at`] can return, plus:
+    ///
+    /// * [`LookupError::DerivativesUnavailable`] — some edge on the path is
+    ///   `LerpSlerp`, whose body twist is an artifact of the interpolant rather
+    ///   than of the motion. Refused rather than returned (§2.4).
+    /// * [`LookupError::NoSegment`] — an edge has a pose at `t` but no segment to
+    ///   differentiate (one retained sample, or two with equal stamps).
+    pub fn at_with_derivatives<D: Domain>(
+        &self,
+        g: &Guard,
+        t: Stamp<D>,
+    ) -> Result<Sample, LookupError> {
+        self.check_generation(g)?;
+        self.check_domain::<D>()?;
+        let (pose, twist) = self.fold_at_with_derivatives(g, t.nanos())?;
+        Ok(Sample {
+            pose,
+            twist,
+            accel: None,
+        })
     }
 
     /// Dispatch a [`Query`] against the plan.
@@ -871,6 +978,26 @@ impl<'a> Guard<'a> {
         match InterpPolicy::from_u8(interp) {
             InterpPolicy::LerpSlerp => ring.sample::<LerpSlerp>(t, policy),
             InterpPolicy::ScLerp => ring.sample::<ScLerp>(t, policy),
+        }
+    }
+
+    /// Sample edge `edge` at `t` and also return its body twist, in 1/second.
+    ///
+    /// Refuses `LerpSlerp` rather than dispatching to it —
+    /// [`LookupError::DerivativesUnavailable`] carries the reasoning.
+    pub(crate) fn sample_with_twist(
+        &self,
+        edge: EdgeId,
+        t: i64,
+        policy: ExtrapPolicy,
+    ) -> Result<(Iso3, Twist), LookupError> {
+        let (interp, ring) = self
+            .view
+            .sampler(edge)
+            .ok_or(LookupError::UnknownEdge { edge })?;
+        match InterpPolicy::from_u8(interp) {
+            InterpPolicy::ScLerp => ring.sample_with_twist(t, policy),
+            InterpPolicy::LerpSlerp => Err(LookupError::DerivativesUnavailable { edge, interp }),
         }
     }
 
