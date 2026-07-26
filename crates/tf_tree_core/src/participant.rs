@@ -103,9 +103,70 @@ impl Default for ParticipantRecord {
 
 /// Why a process could not join the arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParticipantError {
     /// Every slot is occupied. Capacity is fixed at construction (invariant 3).
     TableFull,
+    /// [`ParticipantTable::register_at`] was told to take a slot that is not
+    /// [`FREE`].
+    ///
+    /// Distinct from [`ParticipantError::TableFull`] because the caller asked
+    /// for *this* slot and cannot simply take another: the slot came from an
+    /// owner's `HelloResponse` (`docs/PHASE2.md` §3.7) and is also the lock-file
+    /// byte the client is about to take, so silently landing elsewhere would
+    /// break the very correspondence `register_at` exists to establish.
+    SlotTaken {
+        /// The slot that was already occupied.
+        slot: u32,
+    },
+    /// [`ParticipantTable::register_at`] was given a slot beyond the table.
+    ///
+    /// Reachable only from a malformed or hostile `HelloResponse`, which is
+    /// exactly why it is an error rather than a panic — the owner is a peer
+    /// process, and a peer's bug must not take this process down.
+    SlotOutOfRange {
+        /// The slot that was asked for.
+        slot: u32,
+        /// The table's capacity.
+        capacity: u32,
+    },
+}
+
+/// Take one slot and publish an identity into it, or fail if it is not free.
+///
+/// The single implementation of the publication protocol both
+/// [`ParticipantTable::register`] and [`ParticipantTable::register_at`] use.
+/// Returns the new incarnation on success, `None` if the slot was not [`FREE`].
+///
+/// # Crash consistency
+///
+/// The CAS is what makes this exclusive: the winner owns the slot from that
+/// instruction, and the identity stores that follow are invisible to anyone,
+/// because no reader trusts a non-[`LIVE`] slot. The final store is `Release`,
+/// so a peer that observes `LIVE` observes every field written above it.
+///
+/// A process killed between the CAS and the store leaves the slot [`RESERVED`],
+/// which is **distinguishable garbage** rather than a plausible-looking record:
+/// no live participant is `RESERVED` for more than a few instructions, so a
+/// reaper can reclaim one on sight without having to judge whether it is
+/// looking at a valid record.
+#[inline]
+fn fill_slot(rec: &ParticipantRecord, pid: u32, start_time: u64, now_nanos: i64) -> Option<u64> {
+    rec.state
+        .compare_exchange(FREE, RESERVED, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    // Exclusively ours: no other registrant can be here, and no reader trusts a
+    // non-LIVE slot.
+    rec.pid.store(pid, Ordering::Relaxed);
+    rec.start_time.store(start_time, Ordering::Relaxed);
+    rec.attached_at_nanos.store(now_nanos, Ordering::Relaxed);
+    rec.heartbeat.store(0, Ordering::Relaxed);
+    let incarnation = rec.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
+    // Release publishes every store above to anyone who sees LIVE, and folds the
+    // incarnation in so a release can prove the slot is still the same occupancy
+    // it registered.
+    rec.state.store(live_word(incarnation), Ordering::Release);
+    Some(incarnation)
 }
 
 /// A borrowed view over the participant table.
@@ -159,27 +220,60 @@ impl<'a> ParticipantTable<'a> {
         now_nanos: i64,
     ) -> Result<(u32, u64), ParticipantError> {
         for (i, rec) in self.slots.iter().enumerate() {
-            if rec
-                .state
-                .compare_exchange(FREE, RESERVED, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
+            if let Some(incarnation) = fill_slot(rec, pid, start_time, now_nanos) {
+                return Ok((i as u32, incarnation));
             }
-            // Exclusively ours: no other registrant can be here, and no reader
-            // trusts a non-LIVE slot.
-            rec.pid.store(pid, Ordering::Relaxed);
-            rec.start_time.store(start_time, Ordering::Relaxed);
-            rec.attached_at_nanos.store(now_nanos, Ordering::Relaxed);
-            rec.heartbeat.store(0, Ordering::Relaxed);
-            let incarnation = rec.incarnation.fetch_add(1, Ordering::AcqRel) + 1;
-            // Release publishes every store above to anyone who sees LIVE, and
-            // folds the incarnation in so a release can prove the slot is still
-            // the same occupancy it registered.
-            rec.state.store(live_word(incarnation), Ordering::Release);
-            return Ok((i as u32, incarnation));
         }
         Err(ParticipantError::TableFull)
+    }
+
+    /// Register this process into **one named slot**, returning its incarnation.
+    ///
+    /// [`ParticipantTable::register`] takes whichever slot it wins; this takes
+    /// the one it is told to and fails if it cannot.
+    ///
+    /// # Why the caller does not get to choose
+    ///
+    /// `docs/PHASE2.md` §3.7's `HelloResponse.participant_slot` "matches the
+    /// lock-file byte the client must take". That correspondence is the whole
+    /// point: the arena record and the `F_OFD_SETLK` byte have to be the *same
+    /// integer*, because §5.1's liveness predicate asks the kernel about the
+    /// byte and then reads the record it indexes. If the two were allocated
+    /// independently — as they are today, by `register` here and by
+    /// `LockFile::take_any_participant` there — a process would hold byte 3
+    /// while occupying record 7, and every liveness answer would be about
+    /// somebody else.
+    ///
+    /// So a *joiner* uses this, with the slot the owner assigned. A creator or
+    /// a process taking ownership has no owner to ask and uses `register`.
+    ///
+    /// Crash consistency is identical to `register` — the same
+    /// `FREE -> RESERVED -> fields -> Release(LIVE)` publication, sharing one
+    /// implementation deliberately, because two copies of a crash-consistency
+    /// protocol is two chances to amend only one of them.
+    ///
+    /// # Errors
+    ///
+    /// [`ParticipantError::SlotOutOfRange`] if `slot >= capacity()`;
+    /// [`ParticipantError::SlotTaken`] if the slot is not [`FREE`].
+    pub fn register_at(
+        &self,
+        slot: u32,
+        pid: u32,
+        start_time: u64,
+        now_nanos: i64,
+    ) -> Result<u64, ParticipantError> {
+        let rec = self.get(slot).ok_or(ParticipantError::SlotOutOfRange {
+            slot,
+            // Saturate rather than `as u32`. In an arena the length is bounded
+            // by the header's `max_participants`, which is a u32 — but
+            // `ParticipantTable::new` accepts any slice, so that is a property
+            // of the caller and not of this type. A silent truncation here
+            // would report a *smaller* capacity than the table has and make the
+            // error read as though the slot were out of range when it was not.
+            capacity: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
+        })?;
+        fill_slot(rec, pid, start_time, now_nanos).ok_or(ParticipantError::SlotTaken { slot })
     }
 
     /// Release a slot on clean detach.
