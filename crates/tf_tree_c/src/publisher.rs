@@ -89,6 +89,13 @@ fn thread_token() -> u64 {
 ///
 /// `#[repr(C)]` for the same reason as `tft_tree`: the magic check reads a named
 /// field, and `repr(Rust)` promises nothing about where that field lands.
+///
+/// **The generated header declares this as an incomplete type.** §3.2 says these
+/// are opaque handles, and a C caller who can see the fields can dereference
+/// them. `cbindgen`'s `cbindgen:opaque` annotation does not take effect on this
+/// shape, so `xtask headers` excludes the type and emits the forward
+/// declaration itself — which also satisfies §3.1's requirement that the stable
+/// header be reviewed by hand rather than merely generated.
 #[repr(C)]
 pub struct tft_publisher {
     magic: u64,

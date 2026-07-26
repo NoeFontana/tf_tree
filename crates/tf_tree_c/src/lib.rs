@@ -180,6 +180,12 @@ const MAGIC_PLAN: u64 = 0x7446_5F50_4C41_4E31;
 /// compiler is free to reorder fields — so "the magic is first" would be an
 /// assumption that happens to hold today and could stop holding on a compiler
 /// upgrade, silently turning every handle check into a read of an `Arc` pointer.
+/// **The generated header declares this as an incomplete type.** §3.2 says these
+/// are opaque handles, and a C caller who can see the fields can dereference
+/// them. `cbindgen`'s `cbindgen:opaque` annotation does not take effect on this
+/// shape, so `xtask headers` excludes the type and emits the forward
+/// declaration itself — which also satisfies §3.1's requirement that the stable
+/// header be reviewed by hand rather than merely generated.
 #[repr(C)]
 pub struct tft_tree {
     magic: u64,
@@ -189,6 +195,12 @@ pub struct tft_tree {
 /// An opaque handle to a compiled plan. `Send + Sync`, immutable.
 ///
 /// `#[repr(C)]` for the same reason as [`tft_tree`].
+/// **The generated header declares this as an incomplete type.** §3.2 says these
+/// are opaque handles, and a C caller who can see the fields can dereference
+/// them. `cbindgen`'s `cbindgen:opaque` annotation does not take effect on this
+/// shape, so `xtask headers` excludes the type and emits the forward
+/// declaration itself — which also satisfies §3.1's requirement that the stable
+/// header be reviewed by hand rather than merely generated.
 #[repr(C)]
 pub struct tft_plan {
     magic: u64,

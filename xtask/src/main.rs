@@ -3,7 +3,10 @@
 //!
 //! `loom` and `bench-gate` are wired up (steps 5 and 9 of `docs/PHASE1.md`'s
 //! implementation order; §10.2 and §11.3); `miri`
-//! is wired up by its own Phase 1 PR.
+//! is wired up by its own Phase 1 PR. `headers` generates and drift-checks the
+//! C ABI's committed headers (`docs/PHASE4.md` §3.1, `docs/decisions/0007`).
+
+mod headers;
 
 use std::process::{Command, ExitCode};
 
@@ -12,12 +15,14 @@ fn main() -> ExitCode {
     match task.as_deref() {
         Some("loom") => run_loom(),
         Some("bench-gate") => run_bench_gate(),
+        // `--check` fails on drift instead of rewriting; that is the form CI runs.
+        Some("headers") => headers::run(std::env::args().any(|a| a == "--check")),
         Some("miri") => {
             eprintln!("xtask: 'miri' is wired up by its Phase 1 PR");
             ExitCode::SUCCESS
         }
         _ => {
-            eprintln!("usage: cargo xtask <loom|miri|bench-gate>");
+            eprintln!("usage: cargo xtask <loom|miri|bench-gate|headers [--check]>");
             ExitCode::FAILURE
         }
     }

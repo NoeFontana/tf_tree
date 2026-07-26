@@ -59,6 +59,48 @@ c-abi-check:
     RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
         --features test-hooks --target x86_64-unknown-linux-gnu -Zbuild-std
 
+# **The committed C headers: drift check, then compile and run them.**
+#
+# Two things, and the second is what makes the first mean anything:
+#
+# 1. `cargo xtask headers --check` fails if `crates/tf_tree_c/include/*.h` and
+#    `crates/tf_tree_c/src/` have drifted. The headers are committed on purpose
+#    (`docs/decisions/0007`) so an ABI change is a diff somebody approves rather
+#    than something that materialises during a build.
+# 2. `tests/c/abi_smoke.c` is built and run against **gcc and clang, as C11 and
+#    as C++17**, with `-Wall -Wextra -Wpedantic -Werror`. This is `docs/PHASE4.md`
+#    §6.2's two-compiler matrix, and it is the only test that sees the *header*
+#    rather than the crate. It is not a formality: an earlier revision of
+#    `xtask headers` produced a header with an unbalanced `#endif`, and every
+#    Rust test still passed.
+#
+# `cbindgen` is needed only for step 1's regeneration and is deliberately not a
+# workspace dependency (MPL-2.0 against `deny.toml`'s allowlist). Install it with
+# `cargo install cbindgen`.
+c-header-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo xtask headers --check
+    cargo build --release -q -p tf_tree_c --features test-hooks
+    inc=crates/tf_tree_c/include
+    lib=target/release/libtf_tree_c.a
+    src=crates/tf_tree_c/tests/c/abi_smoke.c
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    # A `.cpp` copy for the C++ rows. The obvious alternative, `-x c++`, is a
+    # trap: it applies to every input that FOLLOWS it, so the 40 MB static
+    # archive gets handed to the C++ front end as source. It does not fail —
+    # it spins, at 100 % of a core, indefinitely.
+    cp "$src" "$out/smoke.cpp"
+    for cc in "gcc -std=c11" "clang -std=c11" "g++ -std=c++17" "clang++ -std=c++17"; do
+        in="$src"
+        case "$cc" in g++*|clang++*) in="$out/smoke.cpp";; esac
+        printf '%-22s ' "$cc"
+        $cc -Wall -Wextra -Wpedantic -Werror -I "$inc" -o "$out/smoke" "$in" "$lib" \
+            -lpthread -ldl -lm
+        "$out/smoke"
+    done
+
 # Lint everything. Pure checks; does not mutate files.
 lint: py-compile
     cargo fmt --all -- --check
