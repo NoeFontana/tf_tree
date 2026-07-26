@@ -48,10 +48,12 @@ Sections marked **NORMATIVE** are requirements.
 
 - Python 3.13 shipped the free-threaded build as experimental; **Python 3.14 (October 2025) promoted it to officially supported** under PEP 779 — phase II: supported, still opt-in, shipped as a separate `python3.14t` binary. The single-threaded penalty is now roughly 5–10%.
 - **`abi3` does not work on free-threaded builds.** PyO3 prints a warning and ignores the setting; an `abi3` wheel is rejected by a free-threaded interpreter outright.
-- **PEP 803 ("abi3t") was approved by the Steering Council in 2026**, defining a stable ABI valid on both GIL-enabled and free-threaded builds from **Python 3.15 onward**. PyO3 supports activating `abi3` and `abi3t` simultaneously. maturin support for the combined `abi3.abi3t` wheel tag was still in progress as of early 2026.
+- **PEP 803 ("abi3t") was approved by the Steering Council in 2026**, defining a stable ABI valid on both GIL-enabled and free-threaded builds from **Python 3.15 onward**. As of 2026-07 the toolchain has caught up with the PEP: **PyO3 0.29.0** ships the `abi3t` and `abi3t-py315` features (plus a new `abi3-py315`; `abi3-py37` is gone), and **maturin 1.14.0** builds them, with 1.14.1 fixing the abi3/abi3t interaction. The only thing still missing is CPython 3.15 itself.
+- **maturin emits at most one stable-ABI family per invocation** (PyO3/maturin#3226). Selection happens *after* interpreter resolution: `abi3t` when a CPython ≥ 3.15 interpreter is present, otherwise `abi3`; an interpreter that does not support the chosen family falls back to a version-specific wheel. `abi3` and `abi3.abi3t` therefore cannot come out of the same build. §10 needs **two maturin invocations per platform**, not one job with an extra flag — and building the `abi3.abi3t` wheel is structurally impossible before 3.15, so there is no way to get it wrong quietly.
+- **PyO3 0.29 refuses to build for `3.13t`**, manylinux has dropped 3.13t from its images, and maturin's `--find-interpreters` deliberately picks up 3.14t and newer only (PyO3/maturin#3206). A `cp313t` wheel is not buildable on the toolchain this phase pins. That is the right outcome and not a loss: 3.13t was PEP 703's experimental phase, and free-threading only became *supported* in 3.14 under PEP 779.
 - Phase III (free-threaded as the *default*) has no PEP and no timeline.
 
-**Consequence for the build matrix (§10):** ship `abi3` for GIL builds *plus* version-specific `cp313t` / `cp314t` wheels, and add the `abi3t` job as soon as 3.15 and maturin allow. Do not plan around a single wheel per platform.
+**Consequence for the build matrix (§10):** ship `abi3` for GIL builds *plus* version-specific `cp314t` wheels, from **two separate maturin invocations**, and add the third invocation the week 3.15 ships — everything below CPython is already ready for it. Do not plan around a single wheel, or a single build, per platform.
 
 ### 1.2 The declaration that matters more — NORMATIVE
 
@@ -380,6 +382,7 @@ Then state the reassuring part plainly, because it is a genuine payoff from Phas
 ## 9. Typing, docs, ergonomics
 
 - `py.typed` marker plus **hand-written `.pyi` stubs**. Generated stubs cannot express the scalar-vs-array return overloads, which are the most important thing for users to see.
+- **But generate them too, and diff.** maturin 1.14 generates stubs for mixed PyO3 projects (PyO3/maturin#3211), which this is. The standing hazard with hand-written stubs is not that they are wrong on day one — it is that a method added in Rust never reaches them. So make CI generate the stubs and assert that every public symbol in the generated set appears in the hand-written `.pyi`. Signatures are ours; *existence* is checkable, and that is the half that rots.
 - `@overload` for `at(int) -> NDArray[(4,4)]` versus `at(NDArray[int64]) -> NDArray[(N,4,4)]`, and `Literal["mat4","quat","affine32"]` for `layout`.
 - `mypy --strict` and `pyright --strict` in CI over the stubs *and* over the example code — examples that do not typecheck are a documentation bug.
 - Docstrings carry the measured numbers where they explain a design (the float-seconds ULP, the GIL threshold). Users argue with rules and accept measurements.
@@ -392,20 +395,38 @@ Then state the reassuring part plainly, because it is a genuine payoff from Phas
 
 | Platform | Shared memory | ABI targets |
 |---|---|---|
-| `manylinux_2_28` x86-64 | yes | `abi3-py39`, `cp313t`, `cp314t` |
+| `manylinux_2_28` x86-64 | yes | `abi3-py39`, `cp314t` |
 | `manylinux_2_28` aarch64 (Jetson) | yes | same |
 | `musllinux_1_2` x86-64, aarch64 | yes | same |
 | macOS arm64 / x86-64 | **no** — in-process only | same |
 | Windows x86-64 | **no** — in-process only | same |
+
+Each row is **two maturin invocations**, for the reason in §1.1: one against a GIL interpreter ≤ 3.14 (`--features pyo3/abi3-py39`) producing the `abi3` wheel, one against `python3.14t` producing `cp314-cp314t`. A third — `abi3.abi3t`, against a 3.15+ interpreter — is added when 3.15 ships and then *replaces* both on interpreters that can use it. `cp313t` is absent deliberately (§1.1), not by omission.
 
 Shipping macOS and Windows wheels without the IPC layer is deliberate: developer laptops are where adoption starts, and a library that cannot be imported on a Mac will not be evaluated. `tf_tree.has_shared_memory()` reports the truth at runtime, and `open()` on those platforms transparently gives an in-process `HeapArena` tree with a documented one-process limitation.
 
 Additional requirements:
 
 - **maturin** with `cibuildwheel` or `maturin-action`. Cross-compile aarch64; do not require a Jetson in CI.
-- **Add the `abi3t` job now, skipped**, with a comment referencing PEP 803 and the maturin tracking issue. It becomes the primary target once 3.15 ships and maturin emits `abi3.abi3t` tags, and having the job already written is the difference between a same-week and a same-quarter response.
-- PEP 740 attestations, an SBOM, and reproducible builds. These are table stakes for an industrial integrator's supply-chain review and are cheap to set up before the first release, expensive after.
+- **Add the `abi3.abi3t` job now, skipped**, with a comment referencing PEP 803. Its only unmet precondition is a 3.15 interpreter — PyO3 0.29 and maturin 1.14.1 already do their halves — so having the job written is the difference between a same-week and a same-quarter response.
+- **Let `--find-interpreters` discover `3.14t`** rather than hand-listing interpreter paths; before maturin 1.14 it missed free-threaded interpreters on Windows (PyO3/maturin#3206), which is exactly the row where a hand-written path is most likely to be wrong.
+- PEP 740 attestations, an SBOM, and reproducible builds. These are table stakes for an industrial integrator's supply-chain review and are cheap to set up before the first release, expensive after. Attestations are produced by the *upload* step under Trusted Publishing, not by `maturin build` — maturin 1.14.1 adopting them for its own releases is precedent for the workflow shape, not a feature we inherit.
 - The Rust `shm` feature gates the entire IPC layer so the macOS and Windows builds compile it out rather than stubbing it at runtime.
+
+### 10.1 Toolchain floors — NORMATIVE
+
+| Tool | Floor | Why this floor and not an earlier one |
+|---|---|---|
+| PyO3 | `0.29` | `abi3t` / `abi3t-py315` features; the free-threaded ABI story (§1.1) does not exist below it |
+| maturin | `1.14.1` | builds abi3t (PyO3/maturin#3113) and gets the abi3/abi3t interaction right (PyO3/maturin#3226); 1.14.0 also fixed `maturin develop` truncating the editable ELF via stale hardlinks (PyO3/maturin#3199), a dev-loop footgun rather than a release one |
+| pytest | `9.1` | see the doctest interaction below |
+| ruff | `0.16` | see the Markdown interaction below |
+| pyright | `1.1.411` | current; `--strict` behaviour is what §9 is written against |
+
+Two upgrades in this set change *default* behaviour, and both intersect something this spec already asks for:
+
+- **ruff 0.16 formats Python code blocks inside Markdown, by default.** `docs/` is this project's contract, and its fenced blocks are written to be read — line-broken to make an argument, sometimes elided with `...`. Set `[tool.ruff.format] exclude` over `**/*.md` before running the formatter for the first time. The same release raised the default rule set from 59 rules to 413; that one is a non-event *provided* `[tool.ruff.lint] select` stays explicit, which it must.
+- **pytest 9.1 changed `--doctest-modules` fixture visibility**: a module-, package-, or session-scoped autouse fixture defined inline in a test module can now run twice, because the `Module` and the `DoctestModule` register fixtures independently. §9 requires doctests in CI, so put every autouse fixture in `conftest.py` from the start. Also: `parametrize` `argvalues` must be a `Collection` — a generator is deprecated and silently yields skipped tests on a second collection, which the Hypothesis and sweep tests in §11 are otherwise well-placed to hit.
 
 ---
 
@@ -490,7 +511,10 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 - [ ] No hand-written DLPack capsule parsing anywhere in the codebase
 - [ ] `os.register_at_fork` poisoning tested under all three start methods
 - [ ] Hand-written stubs; `mypy --strict` and `pyright --strict` clean over stubs and examples
-- [ ] Wheels for every row of §10, with the `abi3t` job present and skipped
+- [ ] CI asserts no public symbol exists in the generated stubs but not the hand-written ones (§9)
+- [ ] Wheels for every row of §10 — two invocations each — with the `abi3.abi3t` job present and skipped
+- [ ] Toolchain floors of §10.1 pinned in `pyproject.toml`; `[tool.ruff.format] exclude` covers `**/*.md`
+- [ ] `.github/dependabot.yml` regains its `uv` entry when `pyproject.toml` lands (the Phase 1 scaffold removed both)
 - [ ] PEP 740 attestations and SBOM published with the first release
 - [ ] §12.2 gate met, or a written explanation of which criterion failed and by how much
 - [ ] `docs/PHASE4.md` written, carrying §13 forward with the measured numbers
