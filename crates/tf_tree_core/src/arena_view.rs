@@ -32,6 +32,7 @@
 use tf_tree_arena::{Arena, ArenaHeader};
 
 use crate::buffer::{pose_slots, stamp_slots, SampleRing};
+use crate::counters::{EdgeCounters, ParticipantCounters};
 use crate::edge::{ClaimRecord, EdgeRecord};
 use crate::error::{EdgeId, FrameError, FrameId, TopologyError};
 use crate::frame::{blake3_64, find_core, intern_core, FrameRecord, InternTable, CLAIM_UNRECORDED};
@@ -82,6 +83,20 @@ pub struct ArenaView<'a> {
     /// A8's injected liveness predicate; `None` means "assume alive", which
     /// disables takeover of a claimant whose participant slot still reads `LIVE`.
     is_alive: Option<&'a LivenessFn>,
+    /// Whether the mapping behind `base` is writable.
+    ///
+    /// **Default `false`, and that default is load-bearing.** A consumer
+    /// attaches read-only (D18) — the MMU is what stops it corrupting a robot's
+    /// transform tree — so *any* write through this view faults with `SIGSEGV`.
+    /// The diagnostic counters (`docs/PHASE5.md` §5) are the first thing that
+    /// wants to write from a *read* path, and they found this the hard way: the
+    /// `Guard` flush killed a read-only child process with signal 11.
+    ///
+    /// §5 does not discuss it. The resolution is that a read-only participant
+    /// silently keeps no counters — it cannot, and refusing to run would be far
+    /// worse than losing a diagnostic — and `doctor` reports what the writable
+    /// participants recorded.
+    writable: bool,
 }
 
 impl<'a> ArenaView<'a> {
@@ -102,7 +117,28 @@ impl<'a> ArenaView<'a> {
             header,
             me: CLAIM_UNRECORDED,
             is_alive: None,
+            // Conservative by default: a caller that has not said the mapping is
+            // writable gets a view that never writes. Opting *in* is safe to
+            // forget; opting out is not.
+            writable: false,
         }
+    }
+
+    /// Declare that the mapping behind this view is writable.
+    ///
+    /// Only a caller that mapped it `PROT_WRITE` may say so. Saying it falsely
+    /// does not corrupt anything — the write simply faults, which is what this
+    /// flag exists to prevent.
+    #[must_use]
+    pub fn writable(mut self, yes: bool) -> ArenaView<'a> {
+        self.writable = yes;
+        self
+    }
+
+    /// Whether writes through this view are permitted by the mapping.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.writable
     }
 
     /// Identify this view as participant `slot` (`docs/PHASE2.md` §1 A6/A8).
@@ -424,6 +460,40 @@ impl<'a> ArenaView<'a> {
         // the record is in bounds and 64-aligned. All its mutation is atomic, so
         // sharing it across threads is sound.
         Some(unsafe { &*self.base.add(off).cast::<ClaimRecord>() })
+    }
+
+    /// The per-edge diagnostic counters for edge `id` (`docs/PHASE5.md` §5.2),
+    /// or `None` if `id` is out of range.
+    ///
+    /// The region exists in every `FORMAT_VERSION` 3 arena whether or not the
+    /// `counters` feature is compiled in — D34, so that disabling the feature
+    /// does not fork the layout hash. What the feature removes is the *writes*,
+    /// not the space.
+    #[must_use]
+    pub fn edge_counters(&self, id: EdgeId) -> Option<&'a EdgeCounters> {
+        let off = self.edge_slot_off(id, self.header.edge_counters_off, 128)?;
+        // SAFETY: module invariant — the counter region reserves `max_edges`
+        // 128-byte records at `edge_counters_off` (sized by `ArenaLayout`,
+        // validated on attach by `MappedArena::attach`), and `id < max_edges`
+        // was just checked. Every field is atomic, so sharing the reference
+        // across processes is sound.
+        Some(unsafe { &*self.base.add(off).cast::<EdgeCounters>() })
+    }
+
+    /// The per-participant diagnostic counters for `slot`, or `None` if the
+    /// slot is out of range.
+    ///
+    /// This is what makes a diagnostic actionable: the edge counters say
+    /// failures exist, and these say *which consumer* is failing.
+    #[must_use]
+    pub fn participant_counters(&self, slot: u32) -> Option<&'a ParticipantCounters> {
+        if slot >= self.header.max_participants {
+            return None;
+        }
+        let off = self.header.participant_counters_off as usize + slot as usize * 128;
+        // SAFETY: as above, against `max_participants` and
+        // `participant_counters_off`, both validated on attach.
+        Some(unsafe { &*self.base.add(off).cast::<ParticipantCounters>() })
     }
 
     /// The edge record for edge `id`, or `None` if `id` is out of range.

@@ -19,6 +19,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
+default = ["counters"]
+# Passthrough to `tf_tree_core` (`docs/PHASE5.md` §5.5). Default-on; turning it
+# off removes the counter code from the engine, and the arena regions stay
+# (D34) so the layout hash does not fork.
+counters = ["tf_tree_core/counters"]
 # Phase 2 shared memory: `TreeBuilder::build_shared` / `Tree::attach_shared`.
 # Linux-only and off by default — the single-process build must not grow a
 # syscall dependency it never uses.

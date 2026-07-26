@@ -21,7 +21,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §2 Frozen arena (`.tft`) | Not implemented |
 | §3 Bag ingestion | Not implemented |
 | §4 Offline Python API | Not implemented |
-| §5 Diagnostic counters | **Partial** — `EdgeCounters`/`ParticipantCounters` and their arena regions exist (they are part of §1's one-time break, so they had to land with it). The `Guard` accumulation of §5.4 and the increments themselves are not wired yet. |
+| §5 Diagnostic counters | **Done**, except §5.6's freeze-side capture, which needs §2. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | Not implemented |
 | §7 `tf_tree top` | Not implemented |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
@@ -414,6 +414,20 @@ counters = []
 
 Disabling it removes the fields, the increments, and the arena regions' *use* (the regions remain, per D34, so the layout hash does not fork). What executes is then provably nothing, which is what that audience actually needs.
 
+> **A read-only participant keeps no counters, and this section does not say
+> so.** D18 makes a consumer's attachment read-only — the MMU is what stops it
+> corrupting a robot's transform tree — so *any* write from a read path faults.
+> The `Guard` flush is a write from a read path, and it killed a read-only child
+> in the multiprocess suite with `SIGSEGV` before the check existed.
+>
+> The resolution: a read-only participant silently records nothing. It cannot,
+> and refusing to run would be far worse than losing a diagnostic. `doctor`
+> reports what the *writable* participants recorded, which on a real robot is
+> the bridge and every publisher — the processes whose failures the counters are
+> mostly about. `ArenaView` carries a `writable` flag, default `false`, so
+> forgetting to opt in loses a counter and forgetting to opt out cannot crash
+> anything.
+
 ### 5.6 Counters are captured in snapshots
 
 Arena counters die with the arena. On a robot, the interesting question is usually "what did the counters say just before this went wrong", so:
@@ -423,6 +437,46 @@ Arena counters die with the arena. On a robot, the interesting question is usual
 ### 5.7 What must still be measured
 
 Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen concurrent readers that the flush-on-drop pattern shows no measurable contention. If it somehow does, shard by participant slot (`counters[edge][slot & 7]`) and sum on read — but measure before adding that complexity.
+
+> **Measured.** `cargo run --release -p tf_tree_bench --bin counter_cost`, on
+> this host (4 physical cores + SMT). Three runs each, `ns/lookup/thread`:
+>
+> | threads | 1 | 2 | 4 | 8 |
+> |---|---|---|---|---|
+> | counters on | 21.1–21.5 | 21.4–22.6 | 22.0–22.8 | 38.0–40.2 |
+> | counters off | 18.5–18.9 | 18.5–20.1 | 19.1–19.6 | 34.1–36.8 |
+> | ratio | 1.13× | 1.14× | 1.16× | 1.11× |
+>
+> **The counters cost about 2.6 ns per lookup, and the ratio is flat.** Those
+> are two separate findings and only the second answers §5.7's question. A
+> constant overhead that does not grow from one thread to eight is not
+> contention: the flush is one relaxed atomic per *batch*, so eight threads make
+> eight of them rather than eight thousand. **§5.7's sharding fallback is
+> therefore not justified** — it would address a cost that is not there.
+>
+> The 2.6 ns is the `Cell` increment, the `first_dynamic_edge` walk over the
+> plan's steps, and the branch on `is_writable`, on a ~19 ns lookup. It is a real
+> 14 % and it is what §5.5's compile-time switch exists to remove for a build
+> that cannot pay it.
+>
+> **An earlier revision of this section reported "no measurable contention" and
+> an overlap at every row. That measurement was invalid**, and the reason is
+> worth recording because nothing in the output showed it: the workspace's
+> `tf_tree_core` dependency did not set `default-features = false`, so a
+> downstream `--no-default-features` still enabled `counters` and the "control"
+> build was the counters-on engine measured twice. The banner printed `OFF` — it
+> reads the *bench crate's* features — while the engine counted. Both the
+> dependency declaration and the banner are fixed; the numbers above are from
+> builds verified with `cargo tree -e features`.
+>
+> The 16-thread row is still not quoted: it is 2× oversubscribed here, and a
+> scheduling artifact answering §5.7's question would be the wrong number.
+>
+> Batched against per-lookup flushing is **+5.8 ns** *within* the counters-on
+> build — an upper bound on the atomic §5.4 removes, since it includes the
+> guard's own construction.
+
+---
 
 ## 6. The diagnostics catalogue
 
