@@ -125,7 +125,15 @@ pub struct FrameRecord {
     pub name_len: u8,
     /// Frame flags (reserved).
     pub flags: u8,
-    _pad: [u8; 6],
+    /// What kind of thing this frame denotes (`docs/PHASE5.md` §1.2).
+    ///
+    /// `0` = unspecified, which is what this build writes; 1 = link, 2 = sensor,
+    /// 3 = map, 4 = virtual. It exists so a renderer or `tf_tree top` can group
+    /// a hundred-frame tree by something more useful than name prefixes, which
+    /// is what everybody does instead and which breaks the first time somebody
+    /// renames a link.
+    pub frame_kind: u8,
+    _pad: [u8; 5],
 }
 
 #[cfg(not(loom))]
@@ -148,7 +156,8 @@ impl FrameRecord {
             name: buf,
             name_len: n as u8,
             flags: 0,
-            _pad: [0; 6],
+            frame_kind: 0,
+            _pad: [0; 5],
         }
     }
 

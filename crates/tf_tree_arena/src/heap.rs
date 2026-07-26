@@ -229,6 +229,15 @@ pub(crate) unsafe fn write_header_at(
     h.edge_table_off = layout.edge_table().offset as u32;
     h.stamp_arena_off = layout.stamp_arena().offset as u32;
     h.pose_arena_off = layout.pose_arena().offset as u32;
+    // v3 (`docs/PHASE5.md` §1.2). The counter regions always exist; the Phase 6
+    // regions are declared absent with offset 0, which is what lets Phase 6 fill
+    // them without another format break.
+    h.edge_counters_off = layout.edge_counters().offset as u32;
+    h.participant_counters_off = layout.participant_counters().offset as u32;
+    h.covariance_region_off = 0;
+    h.covariance_stride = 0;
+    h.spline_region_off = 0;
+    h.spline_degree = 0;
     h.creator_pid = creator_pid;
     h.owner_start_time = owner_start_time;
     h.boot_id = boot_id;
@@ -279,6 +288,19 @@ mod tests {
         assert_eq!(h.edge_table_off as usize, layout.edge_table().offset);
         assert_eq!(h.stamp_arena_off as usize, layout.stamp_arena().offset);
         assert_eq!(h.pose_arena_off as usize, layout.pose_arena().offset);
+        // v3: the counter regions are recorded, and the Phase 6 ones are
+        // explicitly absent rather than uninitialised.
+        assert_eq!(h.edge_counters_off as usize, layout.edge_counters().offset);
+        assert_eq!(
+            h.participant_counters_off as usize,
+            layout.participant_counters().offset
+        );
+        assert_ne!(
+            h.edge_counters_off, 0,
+            "the region must exist in a v3 arena"
+        );
+        assert_eq!(h.covariance_region_off, 0, "Phase 6, absent");
+        assert_eq!(h.spline_region_off, 0, "Phase 6, absent");
 
         assert_eq!(h.creator_pid, 4321);
         assert_eq!(h.boot_id, [7u8; 16]);

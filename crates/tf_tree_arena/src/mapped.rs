@@ -351,6 +351,13 @@ impl MappedArena {
             && implied.edge_table().offset as u32 == h.edge_table_off
             && implied.stamp_arena().offset as u32 == h.stamp_arena_off
             && implied.pose_arena().offset as u32 == h.pose_arena_off
+            // v3: the counter regions are part of the geometry a foreign header
+            // must agree about. Without these two, a header claiming a v3
+            // layout hash could still point them anywhere, and §5.2's readers
+            // would build slices from the numbers — the same failure the
+            // participant-table check above exists to prevent.
+            && implied.edge_counters().offset as u32 == h.edge_counters_off
+            && implied.participant_counters().offset as u32 == h.participant_counters_off
             && h.stamp_slots == h.pose_slots;
         if !matches {
             return Err(ShmError::HeaderInconsistent);

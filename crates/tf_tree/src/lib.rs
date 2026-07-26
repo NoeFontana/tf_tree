@@ -54,6 +54,24 @@ pub use tree::CLAIM_WINDOW_HOOK;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use tf_tree_arena::{AttachMode, ShmError};
 
+/// This build's arena format version (`docs/PHASE5.md` §1).
+///
+/// Re-exported as a function rather than the constant so the facade keeps its
+/// `#![forbid(unsafe_code)]` promise of exposing no arena internals: a caller
+/// gets the number it needs for a diagnostic without a path into
+/// `tf_tree_arena`.
+#[must_use]
+pub fn arena_format_version() -> u32 {
+    tf_tree_arena::FORMAT_VERSION
+}
+
+/// This build's arena layout hash — the *geometry*, as distinct from the
+/// *format version*'s set of fields. Both are checked on attach.
+#[must_use]
+pub fn arena_layout_hash() -> u32 {
+    tf_tree_arena::layout_hash()
+}
+
 /// Zero-config rendezvous (`docs/PHASE2.md` §3.2, `docs/decisions/0005`).
 #[cfg(all(feature = "shm", target_os = "linux"))]
 mod open;

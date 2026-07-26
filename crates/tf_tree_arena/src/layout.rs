@@ -85,8 +85,12 @@ const R_PARTICIPANT: usize = 5;
 const R_EDGE: usize = 6;
 const R_STAMP: usize = 7;
 const R_POSE: usize = 8;
+/// Per-edge diagnostic counters (`docs/PHASE5.md` §5.2). v3.
+const R_EDGE_COUNTERS: usize = 9;
+/// Per-participant diagnostic counters (§5.2). v3.
+const R_PARTICIPANT_COUNTERS: usize = 10;
 /// Number of regions in header order.
-const N_REGIONS: usize = 9;
+const N_REGIONS: usize = 11;
 
 /// Default participant-table capacity (`docs/PHASE2.md` §1 A6).
 pub const DEFAULT_MAX_PARTICIPANTS: u32 = 64;
@@ -146,7 +150,7 @@ fn compute(
     let topo_stride = align64(mf * 12);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
-        256usize,                                       // header
+        320usize,                                       // header (v3: 256 -> 320)
         align64(mf * 64),                               // frame table (64 B / frame)
         align64(next_pow2(2 * mf) * FRAME_HASH_STRIDE), // frame hash (A8)
         TOPO_BLOCKS * topo_stride,                      // topology blocks (A1: four)
@@ -155,6 +159,8 @@ fn compute(
         align64(me * 128),                              // edge table (128 B / edge)
         align64(slots * 8),                             // stamp arena (i64 / slot)
         align64(slots * 64),                            // pose arena (PoseSlot / slot)
+        align64(me * 128),                              // edge counters (v3, §5.2)
+        align64(mp * 128),                              // participant counters (v3)
     ];
 
     let mut regions = [Region { offset: 0, size: 0 }; N_REGIONS];
@@ -206,10 +212,15 @@ impl ArenaLayout {
         let max_participants = DEFAULT_MAX_PARTICIPANTS;
         let computed = compute(max_frames, max_edges, max_participants, &edge_capacities);
         // Every region offset and the slot counts are stored as `u32` in the
-        // header. The pose arena is the last region, so its end is `total_size`;
-        // if that fits `u32`, every offset (<= total_size) and every slot count
-        // (slots * 64 <= total_size) fits too. Reject rather than truncate.
-        let total_size = computed.regions[R_POSE].offset + computed.regions[R_POSE].size;
+        // header. The **last** region's end is `total_size`; if that fits `u32`,
+        // every offset (<= total_size) and every slot count (slots * 64 <=
+        // total_size) fits too. Reject rather than truncate.
+        //
+        // This used to read `regions[R_POSE]` because the pose arena *was* last.
+        // v3 appended two counter regions after it, so the constant is now the
+        // one that means "last" rather than the one that happened to be.
+        let last = computed.regions[N_REGIONS - 1];
+        let total_size = last.offset + last.size;
         if total_size > u32::MAX as usize {
             return Err(LayoutError::ArenaTooLarge {
                 total_size: total_size as u64,
@@ -272,7 +283,8 @@ impl ArenaLayout {
     ) -> Result<ArenaLayout, LayoutError> {
         let max_participants = DEFAULT_MAX_PARTICIPANTS;
         let computed = compute(max_frames, max_edges, max_participants, &[total_slots]);
-        let total_size = computed.regions[R_POSE].offset + computed.regions[R_POSE].size;
+        let last = computed.regions[N_REGIONS - 1];
+        let total_size = last.offset + last.size;
         if total_size > u32::MAX as usize {
             return Err(LayoutError::ArenaTooLarge {
                 total_size: total_size as u64,
@@ -370,9 +382,26 @@ impl ArenaLayout {
         self.computed.slots as u32
     }
 
+    /// The per-edge counter region (`docs/PHASE5.md` §5.2). v3.
+    ///
+    /// Present in every v3 arena, whether or not the `counters` feature is
+    /// compiled in: D34 says a disabled feature must not fork the layout hash,
+    /// so the region exists and only its *use* is conditional.
+    pub fn edge_counters(&self) -> Region {
+        self.computed.regions[R_EDGE_COUNTERS]
+    }
+
+    /// The per-participant counter region (§5.2). Same contract.
+    pub fn participant_counters(&self) -> Region {
+        self.computed.regions[R_PARTICIPANT_COUNTERS]
+    }
+
     /// Total arena size in bytes, 64-byte aligned. Guaranteed `<= u32::MAX`.
     pub fn total_size(&self) -> usize {
-        let last = self.computed.regions[R_POSE];
+        // The **last** region, not the pose arena: v3 appended two counter
+        // regions after it. Reading `R_POSE` here would under-report the size
+        // by both counter regions, and the arena would be mapped short.
+        let last = self.computed.regions[N_REGIONS - 1];
         last.offset + last.size
     }
 }
@@ -409,8 +438,17 @@ pub const fn layout_hash() -> u32 {
     // A8 added the `claiming` array), topology per-frame width (12 = parent
     // AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16 + pad), topology
     // block count, stamp width.
-    let strides: [u32; 10] = [
-        256,
+    //
+    // **The two counter-region strides are appended** (`docs/PHASE5.md` §1.2's
+    // amendment). Note the tension that resolves: the amendment warns that a v3
+    // arena "built with counters and one built without would hash identically
+    // and attach to each other", while §5.5 and D34 say the regions exist
+    // regardless of the feature — so those two builds have identical layouts
+    // and *should* attach. The strides are appended because the hash should
+    // describe the layout that exists, not because that scenario is live; if
+    // the regions ever become conditional, this is already correct.
+    let strides: [u32; 12] = [
+        320,
         64,
         FRAME_HASH_STRIDE as u32,
         12,
@@ -420,6 +458,8 @@ pub const fn layout_hash() -> u32 {
         128,
         8,
         64,
+        128, // edge counters (v3)
+        128, // participant counters (v3)
     ];
     let mut i = 0;
     while i < strides.len() {
@@ -477,6 +517,8 @@ mod tests {
             l.edge_table(),
             l.stamp_arena(),
             l.pose_arena(),
+            l.edge_counters(),
+            l.participant_counters(),
         ]
     }
 
@@ -539,7 +581,7 @@ mod tests {
             l.header_region(),
             Region {
                 offset: 0,
-                size: 256
+                size: 320 // v3: was 256
             }
         );
         assert_eq!(l.frame_table().size, 64_000); // 1000 * 64
@@ -551,10 +593,12 @@ mod tests {
         assert_eq!(l.edge_table().size, 128_000); // 1000 * 128
         assert_eq!(l.stamp_arena().size, 32_768_000); // 4_096_000 * 8
         assert_eq!(l.pose_arena().size, 262_144_000); // 4_096_000 * 64
+        assert_eq!(l.edge_counters().size, 128_000); // v3: 1000 * 128
+        assert_eq!(l.participant_counters().size, 8_192); // v3: 64 * 128
 
         // Pose arena is ~260 MB.
         assert!((260_000_000..=263_000_000).contains(&l.pose_arena().size));
-        assert_eq!(l.total_size(), 295_257_344);
+        assert_eq!(l.total_size(), 295_393_600); // v3: +64 header, +2 counter regions
 
         // Every region offset is 64-byte aligned and regions are contiguous.
         let regions = all_regions(&l);
@@ -582,7 +626,9 @@ mod tests {
         assert_eq!(l.stamp_slots(), 84);
         assert_eq!(l.stamp_arena().size, 704); // align64(84 * 8 = 672)
         assert_eq!(l.pose_arena().size, 5_376); // 84 * 64 (already aligned)
-        assert_eq!(l.total_size(), 16_576);
+        assert_eq!(l.edge_counters().size, 512); // v3: 4 * 128
+        assert_eq!(l.participant_counters().size, 8_192); // v3: 64 * 128
+        assert_eq!(l.total_size(), 25_344); // v3: +64 header, +8_704 counters
 
         let regions = all_regions(&l);
         for w in regions.windows(2) {
@@ -597,12 +643,21 @@ mod tests {
         // Snapshot: any change to the header layout or region strides changes
         // this value, which is exactly what Phase 2's attach check relies on.
         //
-        // Last changed by A8 (`claiming` widened the frame-hash stride from 12 to
-        // 16 bytes): 0x1F32_7F69 -> 0x9075_90F5. `FORMAT_VERSION` stays 2 — it was
-        // already bumped for A6's participant table and has not shipped.
+        // History, because a changed hash is a fleet-wide restart and the diff
+        // should say which change bought it:
+        //
+        //   0x1F32_7F69 -> 0x9075_90F5   A8 widened the frame-hash stride 12->16
+        //   0x9075_90F5 -> 0x3D10_4195   FORMAT_VERSION 3 (`docs/PHASE5.md` §1):
+        //                                header 256->320, plus the two counter
+        //                                region strides appended
+        //
+        // **`tf_tree_ipc`'s wire tests hold this literal too** (§1.2's amendment
+        // says so, and it is right). Change it here and there in one commit, or
+        // the rendezvous rejects every client with a layout mismatch that is
+        // really a stale constant.
         assert_eq!(layout_hash(), layout_hash());
         assert_ne!(layout_hash(), 0);
-        assert_eq!(layout_hash(), 0x9075_90F5);
+        assert_eq!(layout_hash(), 0x3D10_4195);
     }
 
     #[test]
@@ -637,7 +692,7 @@ mod tests {
 
                 let regions = all_regions(&l);
                 prop_assert_eq!(regions[0].offset, 0);
-                prop_assert_eq!(regions[0].size, 256);
+                prop_assert_eq!(regions[0].size, 320); // v3 header
                 for w in regions.windows(2) {
                     prop_assert_eq!(w[0].offset % 64, 0);
                     prop_assert_eq!(w[0].size % 64, 0);

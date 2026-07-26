@@ -58,7 +58,18 @@ enum Command {
         rate: bool,
     },
     /// Diagnose cycles, unclaimed edges, contention, stale buffers, and more.
-    Doctor,
+    Doctor {
+        /// Explain this build's arena format version and what a mismatch means.
+        ///
+        /// `docs/PHASE5.md` §1.2 asks for this by name, because a format
+        /// mismatch is **the error operators will meet during the v2 -> v3
+        /// upgrade** and the message they get from the attach path is
+        /// necessarily terse — it comes from a library that has just refused to
+        /// map a segment. This prints both versions, the layout hash, and the
+        /// action, and it needs no arena to do it.
+        #[arg(long)]
+        explain_version: bool,
+    },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
         /// Fail the process if the runnable gate checks do not pass.
@@ -93,7 +104,14 @@ pub fn run() -> Result<()> {
             source,
             rate,
         } => cmd_echo(live, &target, &source, rate),
-        Command::Doctor => cmd_doctor(live),
+        Command::Doctor { explain_version } => {
+            if explain_version {
+                explain_format_version();
+                Ok(())
+            } else {
+                cmd_doctor(live)
+            }
+        }
         Command::Bench { gate } => cmd_bench(gate),
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Participants => cmd_participants(live),
@@ -481,5 +499,53 @@ fn observed_rate_hz(obs: &Observations, edge: u32) -> Option<f64> {
         None
     } else {
         Some(1e9 / median as f64)
+    }
+}
+
+/// Print this build's arena format version and what a mismatch means.
+///
+/// `docs/PHASE5.md` §1.2 requires this alongside the `FORMAT_VERSION = 3` bump,
+/// and the reason is operational rather than tidy: a version mismatch is the
+/// one error an operator is *guaranteed* to hit during the upgrade, and the
+/// message the attach path can give them is necessarily terse — it comes from a
+/// library that has just declined to map a segment and has no vocabulary for
+/// "restart your fleet together".
+///
+/// It reads no arena and takes no lock, so it answers on a machine where
+/// nothing is running and on one where everything is wedged.
+fn explain_format_version() {
+    let v = tf_tree::arena_format_version();
+    let h = tf_tree::arena_layout_hash();
+    println!("tf_tree arena format");
+    println!("  format_version  {v}");
+    println!("  layout_hash     0x{h:08X}");
+    println!();
+    println!("Both are checked when a process attaches to a shared arena, and a");
+    println!("mismatch on either is refused. They mean different things:");
+    println!();
+    println!("  format_version  the *set of fields* in the arena header changed.");
+    println!("                  A different version is never compatible.");
+    println!("  layout_hash     the *geometry* changed — a record grew, a region");
+    println!("                  was added, an alignment moved. Two builds with");
+    println!("                  the same version and different hashes disagree");
+    println!("                  about where things are, which is worse than");
+    println!("                  disagreeing about what they are.");
+    println!();
+    println!("If you are seeing a mismatch:");
+    println!();
+    println!("  1. Every participant must be rebuilt from the same commit and");
+    println!("     restarted TOGETHER. There is no compatibility layer, and a");
+    println!("     rolling restart leaves half the fleet unable to attach.");
+    println!("  2. The arena does not survive the restart. Kill every attached");
+    println!("     process (`tf_tree participants` lists them, and works without");
+    println!("     mapping the arena), then start the publisher first.");
+    println!("  3. A stale segment from a previous boot is a different fault and");
+    println!("     reports differently; `tf_tree doctor` names that one.");
+    println!();
+    if v >= 3 {
+        println!("Version 3 (docs/PHASE5.md §1) is a deliberate one-time break. It");
+        println!("added the diagnostic counter regions and reserved header space");
+        println!("for Phase 6's covariance and spline regions, so that those land");
+        println!("without a second break. A version-2 arena cannot be attached.");
     }
 }

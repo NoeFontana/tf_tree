@@ -71,12 +71,32 @@ pub struct EdgeRecord {
     pub stamp_off: u32,
     /// Element index of this edge's poses within the pose arena.
     pub pose_off: u32,
-    _pad1: u32,
+    /// Declared publication rate, in **milli-hertz** (`docs/PHASE5.md` §1.2).
+    ///
+    /// `0` means "not declared", which is the only value this build writes.
+    /// It exists so `TFT004` (rate deviation) has a *declared* rate to compare
+    /// the observed one against; without one, a diagnostic can only report what
+    /// the rate is, never that it is wrong.
+    ///
+    /// Milli-hertz rather than hertz because the rates that matter span
+    /// 0.1 Hz (a map update) to 1 kHz (an IMU), and an integer hertz cannot
+    /// express the low end.
+    pub nominal_rate_mhz: u32,
     /// Monotone total samples published (invariant 5).
     pub head: AtomicU64,
     /// Inline pose for static edges (`f64` bit patterns; see [`Iso3::to_bits`]).
     pub static_pose: [u64; 7],
-    _pad2: [u8; 32],
+    /// The participant slot that **declared** this edge (§1.2).
+    ///
+    /// Distinct from the *claim*, which lives in the claim table and moves as
+    /// writers come and go. This one does not move, so a diagnostic can say
+    /// "this edge was declared by the node that is now gone" — which is a
+    /// different fault from "this edge is unclaimed".
+    ///
+    /// `u32::MAX` means unknown, which is what a v3 arena built by this version
+    /// writes; the builder has no participant identity at declaration time.
+    pub declared_by_slot: u32,
+    _pad2: [u8; 28],
 }
 
 #[cfg(not(loom))]
@@ -109,10 +129,11 @@ impl EdgeRecord {
             capacity,
             stamp_off,
             pose_off,
-            _pad1: 0,
+            nominal_rate_mhz: 0,
             head: AtomicU64::new(0),
             static_pose: [0; 7],
-            _pad2: [0; 32],
+            declared_by_slot: u32::MAX,
+            _pad2: [0; 28],
         }
     }
 
@@ -129,10 +150,11 @@ impl EdgeRecord {
             capacity: 0,
             stamp_off: 0,
             pose_off: 0,
-            _pad1: 0,
+            nominal_rate_mhz: 0,
             head: AtomicU64::new(0),
             static_pose: pose,
-            _pad2: [0; 32],
+            declared_by_slot: u32::MAX,
+            _pad2: [0; 28],
         }
     }
 }
