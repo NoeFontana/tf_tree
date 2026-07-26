@@ -556,11 +556,32 @@ Each step lands as one PR, in order.
     The last of those exists because the fallback's *effect* is not observable from
     inside `tf_tree_arena` — a test of it cannot tell "touched every page" from
     "stopped one page short" — so the bound is a pure function and is tested as one.
-11. **CLI adoption** — `--attach`/`--domain`/`--name`/`--rw`/`--create`/`--timeout`; new
-    `tf_tree participants` reading `LockFile::read_identity`, which **must work without
-    the arena** (§3.3). Verified by an integration test that starts a publisher and
-    asserts a specific `doctor` finding; mutant: point it at another domain ⇒ must
-    report "no arena", not a stale snapshot.
+11. **CLI adoption** — `--attach`/`--domain`/`--name`/`--rw`/`--create`/`--timeout` as
+    global flags on `tree`, `echo` and `doctor`; new `tf_tree participants` reading
+    `LockFile::read_identity`, which **must work without the arena** (§3.3).
+
+    `--rw` is opt-in and `--create` defaults to *never*. A diagnostic tool attached
+    read-write to a robot's tree can corrupt it with any bug it happens to have, and
+    the MMU is the only thing that stops it (D18); defaulting to *create* would be
+    worse still, because a `doctor` run against a mistyped domain would conjure an
+    empty arena and then pronounce it healthy.
+
+    **`doctor` on a live arena loses two of its seven checks, and says so.** A live
+    arena has no recorded push stream, so `Observations::from_arena` reconstructs
+    what the rings retain — every stamp, in order — and *cannot* reconstruct two
+    things: a ring remembers the current claim owner rather than the sequence of
+    processes that wrote into it (so **multi-writer** can never fire), and
+    `arrival_delay_ns` is a fact about the publisher's clock at push time that
+    nothing in the arena records (so **short-buffer** can never fire). Printing "all
+    seven pass" would be a clean bill of health that was never earned, and those two
+    are exactly the checks an operator wants after a mystery outage.
+
+    Verified by `crates/tf_tree_cli/tests/attach.rs`, which drives the **shipped
+    binary** against a live publisher — through `clap`, through `open()`, over the
+    socket. Mutants: `--attach` falls back to the fixture ⇒ two tests fail on the
+    fixture's frame names; `doctor` drops the disclosure line ⇒ fails; either
+    `--domain` path ignored ⇒ `a_different_domain_is_a_different_arena` fails, which
+    is the mistake an operator actually makes and whose dangerous form is silent.
 12. **Docs close-out** — PHASE2 §0.0 status table, the D16 amendment note, RUNBOOK rows,
     `README.md` gaining §3.10's "shared memory IPC is not a sandbox", and this document
     to `implemented` with PR numbers.

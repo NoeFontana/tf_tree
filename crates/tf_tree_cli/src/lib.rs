@@ -22,6 +22,10 @@ use tf_tree_bench::fixture;
 
 pub mod doctor;
 
+/// Live-arena attach (`--attach`) and `tf_tree participants`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod attach;
+
 use doctor::{Observations, Severity, Snapshot};
 
 /// `tf_tree` — inspect and debug a transform tree.
@@ -33,6 +37,10 @@ use doctor::{Observations, Severity, Snapshot};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Live-arena flags, shared by `tree`, `echo` and `doctor`.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[command(flatten)]
+    attach: attach::AttachArgs,
 }
 
 #[derive(Subcommand)]
@@ -57,6 +65,14 @@ enum Command {
         #[arg(long)]
         gate: bool,
     },
+    /// List the processes attached to an arena, from the lock file alone.
+    ///
+    /// Reads `<runtime_dir>/<domain>/<name>.lock` and **never maps the arena**
+    /// (`docs/PHASE2.md` §3.3). That is the point: when the segment is gone, or
+    /// this build cannot read its layout, or the owner is wedged, this is the
+    /// command that still answers.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Participants,
 }
 
 /// Parse arguments and dispatch. Entry point shared by both binaries.
@@ -66,15 +82,95 @@ enum Command {
 /// Surfaces any failure building or inspecting the in-process fixture tree.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    let live = &cli.attach;
+    #[cfg(not(all(feature = "shm", target_os = "linux")))]
+    let live = &();
     match cli.command {
-        Command::Tree => cmd_tree(),
+        Command::Tree => cmd_tree(live),
         Command::Echo {
             target,
             source,
             rate,
-        } => cmd_echo(&target, &source, rate),
-        Command::Doctor => cmd_doctor(),
+        } => cmd_echo(live, &target, &source, rate),
+        Command::Doctor => cmd_doctor(live),
         Command::Bench { gate } => cmd_bench(gate),
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        Command::Participants => cmd_participants(live),
+    }
+}
+
+/// The live-arena flags, or `()` on a build without `shm`.
+///
+/// A type alias rather than `#[cfg]` at every call site: the three inspection
+/// commands differ between builds only in where their tree comes from, and
+/// duplicating each of them to say so would be three chances to let the two
+/// copies drift.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+type Live<'a> = &'a attach::AttachArgs;
+#[cfg(not(all(feature = "shm", target_os = "linux")))]
+type Live<'a> = &'a ();
+
+/// Where a command's tree came from, which is the one thing the output has to be
+/// honest about.
+enum Source {
+    /// The in-process benchmark fixture, with its recorded push stream.
+    Fixture(Observations),
+    /// A live arena somebody else is publishing into.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Live,
+}
+
+impl Source {
+    fn banner(&self) -> &'static str {
+        match self {
+            Source::Fixture(_) => "in-process fixture",
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Live => "live arena",
+        }
+    }
+}
+
+/// Build the fixture, or attach — and keep whatever has to stay alive alive.
+///
+/// The fixture's trees are `Box::leak`ed because its [`tf_tree::EdgeWriter`]s
+/// borrow the tree and are held for the duration of the inspection. The process
+/// inspects once and exits, so one intentional leak is cheaper than a
+/// self-referential owner, and it needs no `unsafe`.
+///
+/// An attached tree is leaked for the same reason and one more: its `Drop`
+/// releases the participant slot and stops the owner thread, and there is
+/// nothing useful to do with either between the last `println!` and `exit`.
+fn source(live: Live<'_>) -> Result<(&'static Tree, Source)> {
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    if live.attach {
+        let tree: &'static Tree = Box::leak(Box::new(live.open()?));
+        return Ok((tree, Source::Live));
+    }
+    let _ = live;
+    let tree: &'static Tree = Box::leak(Box::new(fixture::build_tree()?));
+    let (writers, samples) = fixture::spin_up(tree)?;
+    // Leaked for the same reason as the tree: the claims must stay held while
+    // the snapshot is taken, or every dynamic edge reports UNCLAIMED.
+    core::mem::forget(writers);
+    Ok((tree, Source::Fixture(Observations::from_samples(samples))))
+}
+
+/// The push stream a command's checks run against.
+///
+/// A live arena has no recorded push stream — nobody was watching when those
+/// samples arrived — so it is reconstructed from what the rings retain. That is
+/// strictly less than the fixture knows: the ring holds the newest `capacity`
+/// stamps and the *current* claim owner, so rate, ordering and buffer-depth
+/// checks all work, and the multi-writer check cannot fire because a ring cannot
+/// remember a writer that has been replaced.
+fn observations(tree: &Tree, src: &Source) -> Observations {
+    // Used only by the live arm, which does not exist without `shm`.
+    let _ = tree;
+    match src {
+        Source::Fixture(obs) => obs.clone(),
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        Source::Live => Observations::from_arena(tree, &Snapshot::capture(tree)),
     }
 }
 
@@ -85,13 +181,12 @@ pub fn run() -> Result<()> {
 /// a self-referential owner. The process inspects once and exits, so the single
 /// intentional leak is harmless and keeps the borrow checker satisfied with no
 /// `unsafe`.
-fn cmd_tree() -> Result<()> {
-    let tree: &Tree = Box::leak(Box::new(fixture::build_tree()?));
-    let (writers, samples) = fixture::spin_up(tree)?;
-    let obs = Observations::from_samples(samples);
+fn cmd_tree(live: Live<'_>) -> Result<()> {
+    let (tree, src) = source(live)?;
+    let obs = observations(tree, &src);
     let snap = Snapshot::capture(tree);
 
-    println!("tf_tree topology (in-process fixture; live external attach is Phase 2)");
+    println!("tf_tree topology ({})", src.banner());
     println!(
         "  {} frames, {} edges, arena {} KiB\n",
         snap.frames.len(),
@@ -155,29 +250,45 @@ fn cmd_tree() -> Result<()> {
             writer
         );
     }
-    drop(writers);
     Ok(())
 }
 
 /// `tf_tree echo target source [--rate]`.
-fn cmd_echo(target: &str, source: &str, rate: bool) -> Result<()> {
-    let tree = Box::leak(Box::new(fixture::build_tree()?));
-    let (writers, _samples) = fixture::spin_up(tree)?;
+fn cmd_echo(live: Live<'_>, target: &str, source_frame: &str, rate: bool) -> Result<()> {
+    let (tree, src) = source(live)?;
+    // The fixture's history is anchored to its own synthetic `NOW_NS`; a live
+    // arena's is anchored to whatever its publishers last stamped. Echoing a
+    // live tree at the fixture's clock would report `Extrapolation` for every
+    // sample and look like a broken arena.
+    let now = newest_stamp(tree).unwrap_or(fixture::NOW_NS);
 
     if rate {
-        // Simulate a live stream: sample across the last 100 ms of history.
-        println!("echo {target} <- {source} (streaming recent history; Phase 2 attaches live)");
-        let lo = fixture::NOW_NS - 100_000_000;
+        println!(
+            "echo {target} <- {source_frame} ({}, recent history)",
+            src.banner()
+        );
+        let lo = now - 100_000_000;
         for i in 0..10 {
-            let stamp: Stamp = Stamp::from_nanos(lo + (fixture::NOW_NS - lo) * i / 10);
-            print_lookup(tree, target, source, stamp);
+            let stamp: Stamp = Stamp::from_nanos(lo + (now - lo) * i / 10);
+            print_lookup(tree, target, source_frame, stamp);
         }
     } else {
-        let stamp: Stamp = Stamp::from_nanos(fixture::NOW_NS);
-        print_lookup(tree, target, source, stamp);
+        print_lookup(tree, target, source_frame, Stamp::from_nanos(now));
     }
-    drop(writers);
     Ok(())
+}
+
+/// The newest stamp on any edge, which is "now" as far as this arena is
+/// concerned.
+///
+/// `None` for an arena with no samples at all, which is a real state — an arena
+/// that was just created, or whose publishers have not started.
+fn newest_stamp(tree: &Tree) -> Option<i64> {
+    Snapshot::capture(tree)
+        .edges
+        .iter()
+        .filter_map(|e| e.newest_stamp)
+        .max()
 }
 
 /// Evaluate and print one `target <- source` lookup at `stamp`.
@@ -197,14 +308,30 @@ fn fmt_iso(iso: &Iso3) -> String {
 }
 
 /// `tf_tree doctor`.
-fn cmd_doctor() -> Result<()> {
-    let tree = Box::leak(Box::new(fixture::build_tree()?));
-    let (writers, samples) = fixture::spin_up(tree)?;
-    let obs = Observations::from_samples(samples);
+fn cmd_doctor(live: Live<'_>) -> Result<()> {
+    let (tree, src) = source(live)?;
+    let obs = observations(tree, &src);
     let snap = Snapshot::capture(tree);
     let report = doctor::run(&snap, &obs);
 
-    println!("tf_tree doctor (in-process fixture; live external attach is Phase 2)");
+    println!("tf_tree doctor ({})", src.banner());
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    if matches!(src, Source::Live) {
+        println!("  instance {}", hex16(tree.instance_uuid()));
+        // Say what is *not* being checked. A live arena has no recorded push
+        // stream, so two of the seven checks have no evidence to work from and
+        // can only ever come back clean — printing "all seven pass" would be a
+        // clean bill of health that was never earned.
+        let blind: Vec<&str> = doctor::Observations::LOST_ON_A_LIVE_ARENA
+            .iter()
+            .map(|c| c.label())
+            .collect();
+        println!(
+            "  {} of 7 checks need a recorded push stream and are not run: {}",
+            blind.len(),
+            blind.join(", ")
+        );
+    }
     if report.is_healthy() {
         println!(
             "  OK — all seven checks pass ({} frames)",
@@ -219,7 +346,6 @@ fn cmd_doctor() -> Result<()> {
             println!("  [{sev}] {}: {}", f.check.label(), f.message);
         }
     }
-    drop(writers);
 
     if report.has_error() {
         std::process::exit(1);
@@ -247,6 +373,92 @@ fn cmd_bench(gate: bool) -> Result<()> {
 
     if gate && !report.passed() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Sixteen bytes as 32 lowercase hex characters.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn hex16(bytes: [u8; 16]) -> String {
+    use core::fmt::Write;
+    bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// `tf_tree participants` — who is attached, from the lock file alone.
+///
+/// **Never maps the arena** (`docs/PHASE2.md` §3.3), and that is the entire
+/// value of it. Every other command needs a segment this build can read; this
+/// one answers when the segment is gone, when its layout hash does not match, or
+/// when the owner is wedged and nobody can complete a handshake. Those are
+/// exactly the situations in which somebody runs a diagnostic tool.
+///
+/// Liveness is the kernel's answer — `F_OFD_GETLK` on the participant's byte —
+/// not an inference from the identity record, which is why a `SIGSTOP`ped
+/// process correctly reads as alive (§5.1).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn cmd_participants(live: Live<'_>) -> Result<()> {
+    let rv = live.rendezvous()?;
+    let path = rv.lock_path();
+    println!("tf_tree participants — {}", path.display());
+
+    if !path.exists() {
+        // Not an error. "Nothing is running" is a legitimate and common answer,
+        // and exiting non-zero would make it indistinguishable from a failure to
+        // look.
+        println!("  no lock file: nothing has ever attached to this domain/name");
+        return Ok(());
+    }
+
+    // `IpcError` is `Copy` and `String`-free by design (`docs/PROJECT.md` §5),
+    // so it is not `std::error::Error` and cannot be `?`-ed into `anyhow`
+    // directly. Formatting it here is the seam where a `no_std` error becomes a
+    // human-facing one.
+    let lock = tf_tree_ipc::LockFile::open(path)
+        .map_err(|e| anyhow::anyhow!("opening {}: {e:?}", path.display()))?;
+
+    println!("  slot       pid  mode    state    comm");
+    let mut live_count = 0;
+    for slot in 0..tf_tree_ipc::MAX_PARTICIPANTS {
+        let held = lock
+            .probe_participant(slot)
+            .map(|p| p.held)
+            .unwrap_or(false);
+        let id = lock.read_identity(slot).ok().flatten();
+        // A byte held with no identity record is a participant caught between
+        // taking its byte and writing its record — a real, momentary state, and
+        // worth showing rather than skipping.
+        if !held && id.is_none() {
+            continue;
+        }
+        if held {
+            live_count += 1;
+        }
+        let (pid, mode, comm) = match &id {
+            None => (0, "-", String::from("<no record>")),
+            Some(i) => (
+                i.pid,
+                match i.mode {
+                    tf_tree_ipc::AccessMode::ReadOnly => "ro",
+                    tf_tree_ipc::AccessMode::ReadWrite => "rw",
+                },
+                {
+                    let n = i.name.iter().position(|b| *b == 0).unwrap_or(i.name.len());
+                    String::from_utf8_lossy(&i.name[..n]).into_owned()
+                },
+            ),
+        };
+        // "stale" is the interesting one: a record whose byte the kernel has
+        // already released, i.e. the process is gone and left its record behind.
+        // That is what a reaper collects, and seeing it here is how an operator
+        // knows one is owed.
+        let state = if held { "live" } else { "stale" };
+        println!("  {slot:>4}  {pid:>8}  {mode:<6}  {state:<7}  {comm}");
+    }
+    if live_count == 0 {
+        println!("  (no live participants)");
     }
     Ok(())
 }

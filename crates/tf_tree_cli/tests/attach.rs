@@ -1,0 +1,223 @@
+//! The CLI against a **live** arena — `docs/decisions/0005` step 11.
+//!
+//! This is the milestone's acceptance test in the plainest sense available: a
+//! publisher runs, and the shipped binary is asked to describe it. Everything
+//! upstream of here is tested by code that arranges its own processes and knows
+//! where the seams are. This does not — it goes through `clap`, through
+//! `tf_tree::open()`, and through whatever the arena actually says.
+//!
+//! `tf_tree participants` gets its own test because its contract is the
+//! opposite of the others': §3.3 requires it to work **without the arena**, and
+//! the only way to show that is to ask it about a lock file whose segment never
+//! existed.
+#![cfg(all(feature = "shm", target_os = "linux"))]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::path::PathBuf;
+use std::process::Command;
+
+use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, Tree, TreeBuilder};
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let p = std::env::temp_dir().join(format!("tf_tree_cli-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        std::env::set_var("TF_TREE_RUNTIME_DIR", &p);
+        Scratch(p)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// **The test process is the publisher.**
+///
+/// A helper binary would be more ceremony for less fidelity: `CARGO_BIN_EXE_*`
+/// only names bins of the *same* package, and the thing under test is the CLI
+/// joining somebody else's arena — which this is, exactly. The test owns the
+/// arena and serves it from its owner thread; the CLI runs as a real subprocess
+/// and comes in over the socket like any other consumer.
+///
+/// Returned by value and held by the caller: dropping it releases the ownership
+/// byte and stops the server, so it has to outlive the CLI invocations.
+fn publish(_scratch: &Scratch) -> Tree {
+    let tree = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+                .dynamic_edge("base", "cam", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .open()
+        .expect("create the arena");
+
+    let child = tree.frame("base").unwrap();
+    let parent = tree.frame("map").unwrap();
+    let w = tree.claim(child, parent).expect("claim");
+    // A short run of history, so `echo` has something to interpolate between
+    // and the rate check has intervals to look at.
+    for i in 0..16i64 {
+        w.push(
+            1_000_000_000 + i * 10_000_000,
+            &tf_tree_math::exp_se3([0.0, 0.0, 0.01 * i as f64, i as f64, 0.0, 0.0]),
+        )
+        .expect("push");
+    }
+    // The writer is leaked so the claim stays held for the duration: an edge
+    // that reports UNCLAIMED would change what `tree` and `doctor` print.
+    core::mem::forget(w);
+    tree
+}
+
+fn cli(dir: &PathBuf, args: &[&str]) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_tf_tree"))
+        .args(args)
+        .env("TF_TREE_RUNTIME_DIR", dir)
+        .output()
+        .expect("run tf_tree");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// **`--attach` reads the publisher's tree, not a fixture.**
+///
+/// The frame names are the tell. The publisher's topology is `map -> base ->
+/// cam`; the in-process fixture is a mobile-robot rig with `odom`, `base_link`
+/// and a laser. If `--attach` were quietly falling back to the
+/// fixture — the failure mode that matters, because it prints a perfectly
+/// plausible tree — the fixture's frames would be here instead.
+#[test]
+fn attach_shows_the_live_publishers_topology() {
+    let scratch = Scratch::new("tree");
+    let _pubr = publish(&scratch);
+
+    let (ok, out) = cli(&scratch.0, &["tree", "--attach"]);
+    assert!(ok, "tf_tree tree --attach failed:\n{out}");
+    assert!(
+        out.contains("live arena"),
+        "banner still says fixture:\n{out}"
+    );
+    assert!(out.contains("map"), "no `map` frame:\n{out}");
+    assert!(out.contains("base"), "no `base` frame:\n{out}");
+    assert!(
+        !out.contains("base_link"),
+        "this is the in-process fixture, not the live arena:\n{out}"
+    );
+}
+
+/// A lookup through the shipped binary must return the publisher's transform.
+#[test]
+fn echo_attaches_and_resolves() {
+    let scratch = Scratch::new("echo");
+    let _pubr = publish(&scratch);
+
+    let (ok, out) = cli(&scratch.0, &["echo", "map", "base", "--attach"]);
+    assert!(ok, "tf_tree echo --attach failed:\n{out}");
+    assert!(
+        out.contains("q=[") && !out.contains("error:"),
+        "echo did not resolve against the live arena:\n{out}"
+    );
+}
+
+/// **`doctor` must not claim a clean bill of health it did not earn.**
+///
+/// A live arena has no recorded push stream, so the multi-writer and
+/// short-buffer checks have no evidence and can only ever come back clean.
+/// Printing "all seven pass" would be a lie by omission — the two checks an
+/// operator most wants after a mystery outage are exactly the two that went
+/// blind.
+///
+/// Mutant: drop the "not run" line ⇒ this fails, and `doctor` goes back to
+/// implying seven checks ran when five did.
+#[test]
+fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
+    let scratch = Scratch::new("doctor");
+    let _pubr = publish(&scratch);
+
+    let (_ok, out) = cli(&scratch.0, &["doctor", "--attach"]);
+    assert!(
+        out.contains("live arena"),
+        "banner still says fixture:\n{out}"
+    );
+    assert!(
+        out.contains("are not run"),
+        "doctor did not disclose its blind checks:\n{out}"
+    );
+    assert!(
+        out.contains("multi-writer") && out.contains("short-buffer"),
+        "doctor did not name which checks:\n{out}"
+    );
+    assert!(
+        out.contains("instance "),
+        "doctor did not report which arena instance it looked at:\n{out}"
+    );
+}
+
+/// **`participants` must work with no arena at all** (§3.3).
+///
+/// The lock file is the source of truth about who is attached, and it is a
+/// separate file precisely so that it survives a segment this build cannot map:
+/// a format-version mismatch, a layout-hash mismatch, a wedged owner. Those are
+/// the moments somebody reaches for a diagnostic tool, so this is the command
+/// that must not need the thing that is broken.
+#[test]
+fn participants_lists_a_live_publisher() {
+    let scratch = Scratch::new("participants");
+    let _pubr = publish(&scratch);
+
+    let (ok, out) = cli(&scratch.0, &["participants"]);
+    assert!(ok, "tf_tree participants failed:\n{out}");
+    assert!(out.contains("live"), "no live participant listed:\n{out}");
+    assert!(
+        out.contains("rw"),
+        "the publisher attached read-write; that is not shown:\n{out}"
+    );
+}
+
+/// Nothing running is an *answer*, not a failure.
+///
+/// Exiting non-zero here would make "no publisher" indistinguishable from "the
+/// tool could not look", which is the distinction an operator is running it to
+/// find out.
+#[test]
+fn participants_on_an_empty_machine_says_so_and_succeeds() {
+    let scratch = Scratch::new("empty");
+    let (ok, out) = cli(&scratch.0, &["participants"]);
+    assert!(ok, "an empty machine must not be an error:\n{out}");
+    assert!(
+        out.contains("no lock file"),
+        "did not say the machine is empty:\n{out}"
+    );
+}
+
+/// A wrong `--domain` must report *nothing there*, not a stale snapshot of
+/// something else.
+///
+/// This is the mistake an operator actually makes, and the dangerous version of
+/// it is silent: attaching to domain 7 and being shown domain 0's tree looks
+/// exactly like a working system.
+#[test]
+fn a_different_domain_is_a_different_arena() {
+    let scratch = Scratch::new("domain");
+    let _pubr = publish(&scratch);
+
+    let (ok, out) = cli(&scratch.0, &["participants", "--domain", "7"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("no lock file"),
+        "domain 7 reported something; the domains are not isolated:\n{out}"
+    );
+
+    let (ok, out) = cli(&scratch.0, &["tree", "--attach", "--domain", "7"]);
+    assert!(!ok, "attaching to an empty domain must fail:\n{out}");
+}

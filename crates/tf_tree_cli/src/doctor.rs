@@ -318,6 +318,51 @@ impl Observations {
         Observations { events }
     }
 
+    /// Reconstruct what can be reconstructed from a **live** arena's rings.
+    ///
+    /// Nobody was watching when those samples arrived, so this is strictly less
+    /// than the fixture knows, and the difference is not cosmetic. Two of the
+    /// seven checks are **structurally unable to fire** on the result, and
+    /// [`Self::LOST_ON_A_LIVE_ARENA`] names them so `doctor` can say so instead
+    /// of printing a clean bill of health it did not earn:
+    ///
+    /// * **multi-writer** — a ring remembers the *current* claim owner, not the
+    ///   sequence of processes that wrote into it. Every sample therefore
+    ///   carries the same pid and the distinct-pid count is always one.
+    /// * **short-buffer** — `arrival_delay_ns` is how late a sample arrived
+    ///   relative to its own stamp, which is a fact about the *publisher's*
+    ///   clock at push time. Nothing in the arena records it; it is set to zero
+    ///   here, and zero latency never exceeds any buffer span.
+    ///
+    /// What does survive is every stamp the rings still retain, in order, which
+    /// is what the rate, ordering and reachability checks run on.
+    #[must_use]
+    pub fn from_arena(tree: &Tree, snap: &Snapshot) -> Observations {
+        let view = tree.arena_view();
+        let mut events = Vec::new();
+        for e in &snap.edges {
+            let Some(ring) = view.ring(EdgeId(e.id)) else {
+                continue;
+            };
+            let head = ring.head.load(Ordering::Acquire);
+            // The oldest logical index a reader may touch — `head - capacity`
+            // is the slot currently being overwritten, not a retained sample.
+            let retained = ring.retained().min(head);
+            for i in (head - retained)..head {
+                events.push(PushSample {
+                    edge: e.id,
+                    writer_pid: e.owner_pid,
+                    stamp_ns: ring.stamps[(i & ring.mask) as usize].load(Ordering::Relaxed),
+                    arrival_delay_ns: 0,
+                });
+            }
+        }
+        Observations { events }
+    }
+
+    /// The checks [`Self::from_arena`] cannot supply evidence for.
+    pub const LOST_ON_A_LIVE_ARENA: &'static [Check] = &[Check::MultiWriter, Check::ShortBuffer];
+
     /// Record one observed push.
     pub fn record(&mut self, sample: PushSample) {
         self.events.push(sample);
