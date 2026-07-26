@@ -40,6 +40,14 @@ use crate::wire::{HelloRequest, HelloResponse, HelloStatus, SegmentDescriptor, H
 /// the expected case (§11.2 scenario 7), not an anomaly to shed.
 const BACKLOG: i32 = 64;
 
+/// How long the owner will wait on one client's half of the handshake.
+///
+/// Two messages over a connected local socket; a client that cannot manage that
+/// in two seconds is not going to. Deliberately much shorter than the §3.4
+/// open deadline, because this budget is per-client and that one is per-attempt
+/// — a stalled peer must not consume the deadline of everybody queued behind it.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `epoll` token for the listening socket.
 const TOKEN_LISTENER: u64 = 0;
 /// `epoll` token for the shutdown `eventfd`.
@@ -224,12 +232,22 @@ impl OwnerServer {
             for ev in ready.iter() {
                 match ev.data.u64() {
                     TOKEN_SHUTDOWN => {
-                        let _ = std::fs::remove_file(&self.sock_path);
+                        self.unlink_if_still_ours();
                         return Ok(());
                     }
                     TOKEN_LISTENER => {
                         if let Ok((sock, slot)) = self.accept_one(segment, &mut assign) {
-                            let token = TOKEN_CLIENT_BASE + clients.len() as u64;
+                            // Reuse a departed client's index rather than always
+                            // appending. An owner runs for the life of the robot
+                            // and §11.2 cycles attach/detach 10^4 times; an
+                            // append-only table would grow without bound and
+                            // hand out ever-larger tokens for a fleet whose size
+                            // never changes.
+                            let idx = clients
+                                .iter()
+                                .position(Option::is_none)
+                                .unwrap_or(clients.len());
+                            let token = TOKEN_CLIENT_BASE + idx as u64;
                             // Watch for the peer going away. RDHUP catches a
                             // clean shutdown, HUP an abrupt death; both mean the
                             // participant is gone.
@@ -241,7 +259,11 @@ impl OwnerServer {
                             )
                             .is_ok()
                             {
-                                clients.push(Some((sock, slot)));
+                                if idx == clients.len() {
+                                    clients.push(Some((sock, slot)));
+                                } else {
+                                    clients[idx] = Some((sock, slot));
+                                }
                             }
                         }
                     }
@@ -273,6 +295,22 @@ impl OwnerServer {
         A: FnMut(&HelloRequest) -> Result<u32, HelloStatus>,
     {
         let sock = accept_with(&self.listener, SocketFlags::CLOEXEC).map_err(io)?;
+
+        // **Bound the handshake, or one peer wedges the owner.** `recvmsg`
+        // below is blocking and this loop is single-threaded, so a client that
+        // connects and then never sends — hung, stopped, or hostile — would
+        // otherwise stall every other participant's attach *and* the shutdown
+        // path, indefinitely. §3.7 specifies no timeout on either side; the
+        // client half sets one for the mirror-image reason.
+        //
+        // A slow client costs one timeout. An unbounded wait costs the arena.
+        for dir in [
+            rustix::net::sockopt::Timeout::Recv,
+            rustix::net::sockopt::Timeout::Send,
+        ] {
+            rustix::net::sockopt::set_socket_timeout(&sock, dir, Some(HANDSHAKE_TIMEOUT))
+                .map_err(io)?;
+        }
 
         let mut buf = [0u8; HELLO_REQUEST_LEN];
         let recv = recvmsg(
@@ -354,11 +392,37 @@ impl OwnerServer {
 
 impl Drop for OwnerServer {
     fn drop(&mut self) {
-        // Best effort: if this server never ran, or returned by error rather
-        // than by `stop`, the path would otherwise be left behind for the next
-        // owner to find and unlink. Harmless either way — §3.9 makes a stale
-        // socket path an expected state.
-        let _ = std::fs::remove_file(&self.sock_path);
+        self.unlink_if_still_ours();
+    }
+}
+
+impl OwnerServer {
+    /// Remove the socket path **only if it is still this server's socket**.
+    ///
+    /// A plain `remove_file` here is a real hazard rather than a tidy-up. §3.5
+    /// lets a successor take over, and a successor publishes by `rename`ing its
+    /// own socket over this path — so by the time this server winds down, the
+    /// path may name *somebody else's* live listener, and unlinking it would
+    /// silently make the new owner unreachable while it happily keeps serving a
+    /// socket no client can find.
+    ///
+    /// Comparing `(st_dev, st_ino)` of the listener against what the path names
+    /// today closes it: after a successor's `rename` the inodes differ, so this
+    /// leaves the path alone. Not perfectly atomic — the successor could rename
+    /// between the `stat` and the `unlink` — but that window is a single
+    /// syscall wide, against a window that is otherwise the entire lifetime of
+    /// the process, and §3.9 already makes a stale socket path a state every
+    /// client tolerates.
+    fn unlink_if_still_ours(&self) {
+        let Ok(mine) = rustix::fs::fstat(&self.listener) else {
+            return;
+        };
+        let Ok(theirs) = rustix::fs::stat(&self.sock_path) else {
+            return;
+        };
+        if (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino) {
+            let _ = std::fs::remove_file(&self.sock_path);
+        }
     }
 }
 

@@ -562,3 +562,40 @@ fn an_overlong_socket_path_is_refused_with_its_length() {
         other => panic!("expected SocketPathTooLong, got {other:?}"),
     }
 }
+
+/// A client that connects and never speaks must not wedge the owner.
+///
+/// The handshake `recvmsg` is blocking and the server loop is single-threaded,
+/// so without a receive timeout one silent peer — hung, `SIGSTOP`ped, or simply
+/// hostile — stalls every other participant's attach *and* the shutdown path,
+/// for as long as it cares to hold the connection. §3.7 specifies no timeout on
+/// either side.
+///
+/// The assertion is that a *second, well-behaved* client still gets through.
+/// Removing the server's `SO_RCVTIMEO` makes this hang rather than fail, which
+/// is exactly the production symptom: an arena that stops accepting nodes and
+/// says nothing.
+#[test]
+fn a_silent_client_cannot_wedge_the_owner() {
+    let scratch = Scratch::new("silent-client");
+    let sock = scratch.0.join("a.sock");
+    let _server = serve(&sock, 4096);
+
+    // Connect, send nothing, and hold the connection open for the whole test.
+    let addr = rustix::net::SocketAddrUnix::new(&sock).unwrap();
+    let mute = rustix::net::socket_with(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .unwrap();
+    rustix::net::connect(&mute, &addr).unwrap();
+
+    // The owner spends its per-client budget on the mute peer, then carries on.
+    let attached = tf_tree_ipc::attach(&sock, &good_request(), Duration::from_secs(10))
+        .expect("a well-behaved client must still be served");
+    assert_eq!(attached.response.arena_size, 4096);
+
+    drop(mute);
+}
