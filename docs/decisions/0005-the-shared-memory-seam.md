@@ -489,7 +489,21 @@ from the other side. Two consequences:
    and after a takeover the new owner would name that slot again and the joiner
    would loop.
 
-Neither is reachable as a *correctness* failure today, which is why this is
+**Half of it is now fixed** (consequence 2): the owner's assigner consults
+`probe_participant` as well as the arena table, so it will not name a slot whose
+byte is held. The guard is forward-looking rather than currently load-bearing —
+the granted-slot bitmask already prevents a re-grant for the life of one owner,
+so removing the check leaves every test passing. It becomes load-bearing the
+moment §3.5 takeover lands and a *new* owner inherits an arena whose read-only
+peers it never granted: the bitmask is empty, the arena table reports those
+slots free, and the owner names one forever while the joiner loops.
+
+Consequence 1 — `participant_alive` reporting a read-only peer dead — is left
+as it is, and is arguably correct: there is no participant *record*, so there is
+nothing for a reaper to act on. Revisit it with step 8, where "what is a slot's
+true occupancy" has to be answered anyway.
+
+Neither is reachable as a *correctness* failure today, which is why the rest is
 recorded rather than hot-fixed. The fix belongs with step 8 (reaping), which is
 the first code that must decide what a slot's true occupancy is: either the
 owner consults `held_participants()` as well as the arena table, or a read-only

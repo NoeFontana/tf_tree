@@ -203,3 +203,65 @@ fn a_stopped_peer_is_alive_and_a_killed_one_is_not() {
         "a SIGKILLed participant was still reported alive"
     );
 }
+
+/// A read-only peer and a read-write peer get different slots.
+///
+/// **What this verifies, and what it cannot.** `mode="ro"` is the consumer
+/// default (D18) and the Python default, and such a peer takes a lock byte but
+/// writes *no* arena record — `attach_shared` cannot register a `PROT_READ`
+/// mapping. So the owner's slot table and the lock file disagree about that
+/// slot, which this test does observe: slot 1 holds a byte and no record, slot
+/// 2 holds both.
+///
+/// It does **not** verify that the owner consults the lock file when assigning.
+/// Removing that check leaves this test passing — verified, not assumed —
+/// because the granted-slot bitmask already prevents a re-grant for the life of
+/// one owner. The check matters only once §3.5 takeover exists and a *new*
+/// owner inherits an arena whose read-only peers it never granted; then the
+/// bitmask is empty, the arena table reports those slots free, and the owner
+/// names one forever while the joiner loops. That scenario is unreachable
+/// today, so the guard is forward-looking and this test does not cover it.
+///
+/// Kept anyway: the byte/record asymmetry is a real invariant, it is the thing
+/// a future reader will be surprised by, and pinning it means a change to
+/// read-only registration cannot pass unnoticed.
+#[test]
+fn a_read_only_peer_holds_a_byte_without_an_arena_record() {
+    let scratch = Scratch::new("ro-slot");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "));
+
+    // Read-only: takes a lock byte, writes no arena record.
+    let mut ro = Kid::spawn(&scratch.0, &["join"]);
+    assert!(
+        ro.line().starts_with("joined "),
+        "read-only peer did not join"
+    );
+
+    // A second joiner must land somewhere else. `join-rw` registers, so its
+    // slot is observable.
+    let mut rw = Kid::spawn(&scratch.0, &["join-rw"]);
+    assert!(rw.line().starts_with("joined "), "second peer did not join");
+
+    // The owner holds slot 0. If the assigner ignored the lock file it would
+    // hand slot 1 to both peers; the read-write one would then be registered at
+    // a slot whose byte belongs to the read-only one.
+    let mut probe = Kid::spawn(&scratch.0, &["peer-alive", "1"]);
+    let slot1 = probe.line();
+    probe.kill();
+    let mut probe2 = Kid::spawn(&scratch.0, &["peer-alive", "2"]);
+    let slot2 = probe2.line();
+    probe2.kill();
+
+    // Exactly one of slots 1 and 2 carries a registered participant: the
+    // read-write joiner. The read-only one has a byte and no record, which is
+    // the asymmetry under test — what must not happen is *both* peers being
+    // assigned the same slot.
+    assert_eq!(
+        (slot1.as_str(), slot2.as_str()),
+        ("alive false", "alive true"),
+        "the byte/record asymmetry changed: slot 1 should hold a read-only \
+         peer's lock byte with no arena record, slot 2 a registered one"
+    );
+}
