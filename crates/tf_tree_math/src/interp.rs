@@ -10,9 +10,10 @@
 //!   SLERP. Left-invariant but **not** right-invariant; that asymmetry is why
 //!   `ScLerp` is the default (`docs/PHASE1.md` §3.4; `docs/PROJECT.md` §5 D5).
 
-use crate::dualquat::screw_pow;
+use crate::dualquat::{screw_pow, screw_pow_with_twist};
 use crate::iso3::Iso3;
 use crate::quat::Quat;
+use crate::twist::Twist;
 
 /// Below this half-angle between the two quaternions, `slerp` falls back to a
 /// normalized LERP to avoid dividing by `sin(angle) → 0`.
@@ -71,6 +72,38 @@ impl Interp for ScLerp {
         // a · (a⁻¹·b)ˢ — the fast screw power of the relative transform.
         let rel = a.inv_mul(b);
         *a * screw_pow(&rel, s)
+    }
+}
+
+impl ScLerp {
+    /// [`Interp::eval`], plus the segment's body twist **per unit `s`** —
+    /// `docs/PHASE4.md` §2.3.
+    ///
+    /// The twist is `ξ = log_se3(a⁻¹b)` and is *constant across the segment*,
+    /// which is the property that makes it exact rather than a finite
+    /// difference. Divide by the segment's duration to get velocity: for stamps
+    /// `t_i, t_j` in nanoseconds, `V^b = ξ · 1e9/(t_j − t_i)`.
+    ///
+    /// The pose is bit-identical to [`Interp::eval`], endpoint shortcuts
+    /// included — pinned by `eval_with_twist_pose_matches_eval`. There is
+    /// deliberately **no equivalent on [`LerpSlerp`]**: it has a body twist, but
+    /// one that rotates through the segment as an artifact of the interpolant
+    /// rather than of the motion (§2.4), so `tf_tree_core` refuses the query
+    /// instead of returning it.
+    #[inline]
+    #[must_use]
+    pub fn eval_with_twist(a: &Iso3, b: &Iso3, s: f64) -> (Iso3, Twist) {
+        let (rel_pow, xi) = screw_pow_with_twist(&a.inv_mul(b), s);
+        // Mirror `eval`'s exact endpoints rather than trusting `a · rel^0` to
+        // round back to `a`. It does, but "does today" is not the contract.
+        let pose = if s == 0.0 {
+            *a
+        } else if s == 1.0 {
+            *b
+        } else {
+            *a * rel_pow
+        };
+        (pose, xi)
     }
 }
 
@@ -445,6 +478,44 @@ mod tests {
             // At s = 1 the weights are (0, 1) exactly on both branches.
             for (g, e) in [(one.w, qb.w), (one.x, qb.x), (one.y, qb.y), (one.z, qb.z)] {
                 assert!((g - e).abs() < 1e-15, "s=1 @ {theta}: {g} vs {e}");
+            }
+        }
+    }
+
+    /// **`eval_with_twist`'s pose must be bit-identical to `eval`'s.**
+    ///
+    /// A caller gets the pose and its derivative from one call and is entitled
+    /// to assume they describe the same instant. If the pose drifted by even an
+    /// ulp from the `at()` path, two lookups at the same stamp through different
+    /// entry points would disagree — the kind of discrepancy that costs a day.
+    ///
+    /// Mutant: drop the `s == 1.0` shortcut from `eval_with_twist` ⇒ fails at
+    /// `s = 1`, where `a · rel^1` is `b` only to rounding.
+    #[test]
+    fn eval_with_twist_pose_matches_eval() {
+        for k in 0..50 {
+            let f = k as f64;
+            let a = crate::exp_se3([
+                0.4 * (f * 0.31).sin(),
+                -0.9 * (f * 0.17).cos(),
+                0.6 * (f * 0.53).sin(),
+                2.0 * (f * 0.11).cos(),
+                -((f * 0.29).sin()),
+                1.5 * (f * 0.43).cos(),
+            ]);
+            let b = crate::exp_se3([
+                0.4 * (f * 0.37).cos(),
+                -0.9 * (f * 0.19).sin(),
+                0.6 * (f * 0.59).cos(),
+                2.0 * (f * 0.13).sin(),
+                -((f * 0.23).cos()),
+                1.5 * (f * 0.47).sin(),
+            ]);
+            for j in 0..=8 {
+                let s = j as f64 / 8.0;
+                let want = <ScLerp as Interp>::eval(&a, &b, s);
+                let (got, _) = ScLerp::eval_with_twist(&a, &b, s);
+                assert_eq!(want.to_bits(), got.to_bits(), "pose differs at s={s}");
             }
         }
     }

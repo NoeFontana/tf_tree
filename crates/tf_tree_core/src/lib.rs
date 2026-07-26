@@ -81,7 +81,7 @@ pub use participant::{ParticipantError, ParticipantRecord, ParticipantTable};
 
 #[cfg(not(loom))]
 pub use plan::{
-    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query,
+    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
     SensorDomain, Stamp, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
 };
 

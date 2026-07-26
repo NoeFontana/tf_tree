@@ -18,7 +18,10 @@
 //! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
 //! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
 
-use tf_tree_math::{exp_se3, log_se3, Interp, Iso3};
+use tf_tree_math::{exp_se3, log_se3, Interp, Iso3, ScLerp, Twist};
+
+/// Nanoseconds per second, as the `f64` the twist scaling needs.
+const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
 use crate::buffer::SampleRing;
 use crate::error::LookupError;
@@ -294,6 +297,140 @@ impl SampleRing<'_> {
             len -= half;
         }
         base
+    }
+
+    /// Sample at `t` **and** the body twist there, in units of 1/second —
+    /// `docs/PHASE4.md` §2.3.
+    ///
+    /// ScLerp only. The caller (`Guard::sample_with_twist`) refuses `LerpSlerp`
+    /// before reaching here, so this is not generic over [`Interp`]: there is
+    /// exactly one policy with a derivative worth reporting, and making the
+    /// signature pretend otherwise would invite someone to add the wrong one.
+    ///
+    /// # The four bracket-less outcomes, which the spec does not cover
+    ///
+    /// `Plan::at` has cases that produce a pose without a segment, and each
+    /// needs an answer here rather than a plausible-looking zero:
+    ///
+    /// | case | pose | twist |
+    /// |---|---|---|
+    /// | `t > t_new`, [`ExtrapPolicy::Hold`] | newest, held | **zero** — held *is* stationary |
+    /// | `t > t_new`, [`ExtrapPolicy::ConstantTwist`] | extrapolated | the extended segment's twist |
+    /// | `t == t_new`, ≥ 2 samples | newest | the *preceding* segment's twist |
+    /// | one sample, or a zero-length segment | fine | [`LookupError::NoSegment`] |
+    ///
+    /// The last row is why [`LookupError::NoSegment`] exists rather than reusing
+    /// [`LookupError::NoData`]: the pose is well defined and only the derivative
+    /// is missing, and telling a caller "no data" when there is data sends them
+    /// to the wrong problem.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::sample`], plus [`LookupError::NoSegment`].
+    pub fn sample_with_twist(
+        &self,
+        t: i64,
+        policy: ExtrapPolicy,
+    ) -> Result<(Iso3, Twist), LookupError> {
+        let h = self.head.load(Ordering::Acquire);
+        if h == 0 {
+            return Err(LookupError::NoData { edge: self.edge });
+        }
+        let retained = self.retained();
+        let n = h.min(retained);
+        let lo_logical = h - n;
+        let newest = h - 1;
+
+        let t_old = self.stamp_at(lo_logical);
+        let t_new = self.stamp_at(newest);
+
+        if t < t_old {
+            return Err(LookupError::Extrapolation {
+                edge: self.edge,
+                requested: t,
+                oldest: t_old,
+                newest: t_new,
+            });
+        }
+        if t > t_new {
+            match policy {
+                ExtrapPolicy::Error => {
+                    return Err(LookupError::Extrapolation {
+                        edge: self.edge,
+                        requested: t,
+                        oldest: t_old,
+                        newest: t_new,
+                    })
+                }
+                ExtrapPolicy::Hold => {
+                    // The pose is pinned, so the velocity really is zero. This is
+                    // not a fallback — it is the derivative of what Hold does.
+                    return Ok((self.read_slot((newest & self.mask) as usize)?, Twist::ZERO));
+                }
+                ExtrapPolicy::ConstantTwist => {
+                    let pose = self.constant_twist(lo_logical, newest, t, t_new)?;
+                    if newest == lo_logical {
+                        // ConstantTwist degraded to Hold: one sample, no twist.
+                        return Err(LookupError::NoSegment { edge: self.edge });
+                    }
+                    let tw = self.segment_twist(newest - 1)?;
+                    return Ok((pose, tw));
+                }
+            }
+        }
+
+        // `t` is inside `[t_old, t_new]`, so a segment exists unless the ring
+        // retains a single sample.
+        if newest == lo_logical {
+            return Err(LookupError::NoSegment { edge: self.edge });
+        }
+        // At the newest stamp there is no forward segment; the body twist is
+        // piecewise-constant per segment, so the value there is the left limit —
+        // the segment that *ends* at that knot. Everywhere else `bracket`'s
+        // precondition (`stamp[lo] <= t < stamp[hi]`) holds and it returns
+        // `i < newest`, so `i + 1` is in range.
+        let i = if t == t_new {
+            newest - 1
+        } else {
+            self.bracket(lo_logical, newest, t)
+        };
+        let t_i = self.stamp_at(i);
+        let t_j = self.stamp_at(i + 1);
+        let dt = (t_j - t_i) as f64;
+        if dt == 0.0 {
+            // Equal stamps are legal (invariant 6) but span no time, so the
+            // velocity would be infinite rather than merely unknown.
+            return Err(LookupError::NoSegment { edge: self.edge });
+        }
+        let a = self.read_slot((i & self.mask) as usize)?;
+        let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+        let s = (t - t_i) as f64 / dt;
+        let (pose, xi) = ScLerp::eval_with_twist(&a, &b, s);
+
+        // Same revalidation and the same bound as `sample`: if the ring lapped
+        // past `i` while we read, both the pose and the twist are stale.
+        if self.head.load(Ordering::Acquire) - i > retained {
+            return Err(LookupError::SlotRecycled { edge: self.edge });
+        }
+        // ξ is per unit `s`; `s` spans `dt` nanoseconds.
+        Ok((pose, xi.scale(NANOS_PER_SEC / dt)))
+    }
+
+    /// The body twist of the segment `[i, i+1]`, in units of 1/second.
+    ///
+    /// Shared by the `ConstantTwist` arm, which needs the twist of a segment it
+    /// has already located.
+    fn segment_twist(&self, i: u64) -> Result<Twist, LookupError> {
+        let t_i = self.stamp_at(i);
+        let t_j = self.stamp_at(i + 1);
+        let dt = (t_j - t_i) as f64;
+        if dt == 0.0 {
+            return Err(LookupError::NoSegment { edge: self.edge });
+        }
+        let a = self.read_slot((i & self.mask) as usize)?;
+        let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+        let (_, xi) = ScLerp::eval_with_twist(&a, &b, 0.0);
+        Ok(xi.scale(NANOS_PER_SEC / dt))
     }
 
     /// [`ExtrapPolicy::ConstantTwist`] extrapolation past the newest sample.
