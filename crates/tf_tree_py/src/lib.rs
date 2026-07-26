@@ -91,6 +91,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree::open_arena, m)?)?;
     m.add_class::<PyTree>()?;
     m.add_class::<PyPlan>()?;
+    m.add_class::<PyPublisher>()?;
     errors::register(m)?;
     Ok(())
 }

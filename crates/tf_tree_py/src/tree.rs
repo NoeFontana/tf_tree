@@ -4,6 +4,7 @@ use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, PyUntypedArrayMethods}
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
+use std::sync::Mutex;
 
 use tf_tree::{AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, Stamp, SystemDomain, Tree};
 
@@ -69,6 +70,50 @@ impl PyTree {
             plan: Box::new(plan),
             // The refcount that makes the borrow real.
             tree: slf.clone().unbind(),
+        })
+    }
+
+    /// Claim `child`'s edge and return a publisher for it (§4.3).
+    ///
+    /// Argument order is **(child, parent)**, matching `Tree::claim`. An edge
+    /// names the frame it moves, and reversing it silently would make a
+    /// reversed transform a runtime mystery rather than an import-time error.
+    ///
+    /// Use it as a context manager; the claim is released on exit.
+    #[pyo3(signature = (child, parent, /))]
+    fn publisher(slf: &Bound<'_, PyTree>, child: &str, parent: &str) -> PyResult<PyPublisher> {
+        let this = slf.get();
+        let c = this
+            .inner
+            .frame(child)
+            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {child:?}")))?;
+        let p = this
+            .inner
+            .frame(parent)
+            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {parent:?}")))?;
+        let publisher = this
+            .inner
+            .claim(c, p)
+            .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+
+        // SAFETY: the only `unsafe` in this binding that is not a numpy slice.
+        //
+        // `Publisher<'a>` borrows the `Tree`, and a `#[pyclass]` cannot carry a
+        // lifetime, so the borrow is extended to `'static` and its validity
+        // moved to a runtime guarantee: the `Py<PyTree>` stored alongside is a
+        // strong reference, so the `Tree` — and the arena the claim points into
+        // — outlives this `Publisher` for certain.
+        //
+        // That is the same guarantee `Plan` relies on, and it is spelled with a
+        // refcount rather than a comment *because* the comment version was a
+        // use-after-free (see `PyPlan::tree`). The `Publisher` is never handed
+        // out, only borrowed under the mutex, so no caller can outlive it
+        // either.
+        let publisher: tf_tree::Publisher<'static> = unsafe { core::mem::transmute(publisher) };
+
+        Ok(PyPublisher {
+            inner: Mutex::new(Some(publisher)),
+            _tree: slf.clone().unbind(),
         })
     }
 
@@ -343,6 +388,143 @@ impl PyPlan {
         };
         res.map_err(lookup_err)
     }
+}
+
+/// A claimed edge, and the only way to publish from Python.
+///
+/// # Why this is the shape it is
+///
+/// `tf_tree::Publisher` is **`Send + !Sync` by design** — Phase 1 makes
+/// single-writer-per-edge a type-level property, so it cannot be a `#[pyclass]`
+/// directly. `docs/PHASE3.md` §7.1 says to wrap it in a mutex, and the
+/// semantics are exactly right: two Python threads pushing to one edge
+/// serialize, which is the same guarantee the Rust type system gives, enforced
+/// at a different level. An uncontended lock is ~15 ns against a `push` that
+/// already costs more.
+///
+/// It also borrows the `Tree`. The `Py<PyTree>` below is what makes that sound
+/// — the same refcount `Plan` uses, for the same reason and after the same bug.
+#[pyclass(name = "Publisher", module = "tf_tree")]
+pub struct PyPublisher {
+    /// `None` after `__exit__` or `release()`, so a use-after-release is a
+    /// clear Python error rather than a claim held past its scope.
+    inner: Mutex<Option<tf_tree::Publisher<'static>>>,
+    /// Keeps the arena alive for at least as long as the claim points into it.
+    _tree: Py<PyTree>,
+}
+
+#[pymethods]
+impl PyPublisher {
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Release the claim on scope exit.
+    ///
+    /// The context manager is the documented form (§4.3). `Drop` would release
+    /// it too, but Python's finalization order is not guaranteed and an edge
+    /// held until the interpreter feels like collecting is an edge no other
+    /// process can claim.
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, _args: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.release()?;
+        Ok(false)
+    }
+
+    /// Drop the claim now.
+    fn release(&self) -> PyResult<()> {
+        let mut g = self.lock()?;
+        *g = None;
+        Ok(())
+    }
+
+    /// Publish `[qw, qx, qy, qz, tx, ty, tz]` at `stamp_ns`.
+    #[pyo3(signature = (stamp_ns, quat7, /))]
+    fn push(&self, stamp_ns: i64, quat7: Vec<f64>) -> PyResult<()> {
+        let iso = iso_from_quat7(&quat7)?;
+        let g = self.lock()?;
+        let p = g.as_ref().ok_or_else(released)?;
+        p.push(stamp_ns, &iso)
+            .map_err(|e| TfTreeError::new_err(format!("{e:?}")))
+    }
+
+    /// Publish a whole batch: `(N,)` stamps and `(N, 7)` poses.
+    ///
+    /// The loop is in Rust rather than in Python. There is no batched write in
+    /// the engine — `SampleRing::push` is one sample at a time by design, since
+    /// each publication is an independent release-store that a reader may
+    /// observe — so this does not avoid the per-sample work. What it avoids is
+    /// N crossings of the FFI boundary, which at ~30 ns each is the entire
+    /// difference for a replayed log.
+    #[pyo3(signature = (stamps, poses, /))]
+    fn push_many(
+        &self,
+        stamps: &Bound<'_, PyArray1<i64>>,
+        poses: &Bound<'_, PyArray2<f64>>,
+    ) -> PyResult<()> {
+        let n = stamps.len();
+        if !stamps.is_c_contiguous() || !poses.is_c_contiguous() {
+            return Err(BufferError::new_err(
+                "stamps and poses must be C-contiguous",
+            ));
+        }
+        if poses.shape() != [n, 7] {
+            return Err(BufferError::new_err(format!(
+                "poses must have shape ({n}, 7) as [qw qx qy qz tx ty tz], got {:?}",
+                poses.shape()
+            )));
+        }
+        // SAFETY: both arrays were just checked contiguous and are borrowed
+        // only for the duration of this call.
+        let (st, po) = unsafe { (stamps.as_slice()?, poses.as_slice()?) };
+
+        let g = self.lock()?;
+        let p = g.as_ref().ok_or_else(released)?;
+        for (i, stamp) in st.iter().enumerate() {
+            let iso = iso_from_quat7(&po[i * 7..(i + 1) * 7])?;
+            p.push(*stamp, &iso).map_err(|e| {
+                // Name the index: a rejected sample partway through a batch is
+                // otherwise indistinguishable from a rejected batch, and the
+                // samples before it *were* published.
+                TfTreeError::new_err(format!("sample {i} (stamp {stamp}): {e:?}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        let held = self.inner.lock().map(|g| g.is_some()).unwrap_or(false);
+        format!("<tf_tree.Publisher held={held}>")
+    }
+}
+
+impl PyPublisher {
+    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Option<tf_tree::Publisher<'static>>>> {
+        self.inner
+            .lock()
+            .map_err(|_| TfTreeError::new_err("publisher mutex was poisoned by a panic"))
+    }
+}
+
+fn released() -> PyErr {
+    TfTreeError::new_err("this publisher's claim was already released")
+}
+
+fn iso_from_quat7(q: &[f64]) -> PyResult<tf_tree::Iso3> {
+    if q.len() != 7 {
+        return Err(PyValueError::new_err(
+            "expected [qw, qx, qy, qz, tx, ty, tz]",
+        ));
+    }
+    Ok(tf_tree::Iso3::new(
+        tf_tree::Quat {
+            w: q[0],
+            x: q[1],
+            y: q[2],
+            z: q[3],
+        },
+        tf_tree::Vec3::new(q[4], q[5], q[6]),
+    ))
 }
 
 /// Build an in-process tree from a simple edge list.

@@ -238,3 +238,79 @@ def test_a_plan_keeps_its_tree_alive():
 
     np.testing.assert_array_equal(plan.at(1_500), before)
     np.testing.assert_allclose(plan.at(1_500)[:3, 3], [2.0, 3.0, 4.0])
+
+
+def test_publisher_round_trips_through_the_context_manager():
+    tree = tf_tree.build([("map", "base")])
+    with tree.publisher("base", "map") as pub:
+        pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+        pub.push(2_000, [1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0])
+    p = tree.plan("map", "base")
+    np.testing.assert_allclose(p.at(1_500)[:3, 3], [2.0, 3.0, 4.0])
+
+
+def test_a_released_publisher_refuses_to_publish():
+    """§4.3: the context manager is the documented form, so leaving it must
+    actually release — not merely stop being convenient.
+
+    A claim held past its scope is a claim no other process can take, and the
+    symptom is a peer that cannot publish for a reason nothing reports.
+    """
+    tree = tf_tree.build([("map", "base")])
+    with tree.publisher("base", "map") as pub:
+        pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+    with pytest.raises(tf_tree.TfTreeError, match="already released"):
+        pub.push(2_000, [1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0])
+
+    # And the edge is genuinely free again: a second claim succeeds.
+    with tree.publisher("base", "map") as second:
+        second.push(2_000, [1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0])
+
+
+def test_push_many_matches_a_loop_of_push():
+    tree_a = tf_tree.build([("map", "base")])
+    tree_b = tf_tree.build([("map", "base")])
+    stamps = np.arange(1_000, 1_000 + 32 * 100, 100, dtype=np.int64)
+    poses = np.zeros((32, 7))
+    poses[:, 0] = 1.0
+    poses[:, 4] = np.arange(32, dtype=np.float64)
+
+    with tree_a.publisher("base", "map") as pub:
+        pub.push_many(stamps, poses)
+    with tree_b.publisher("base", "map") as pub:
+        for i, s in enumerate(stamps):
+            pub.push(int(s), list(poses[i]))
+
+    pa = tree_a.plan("map", "base")
+    pb = tree_b.plan("map", "base")
+    np.testing.assert_array_equal(pa.at(stamps), pb.at(stamps))
+
+
+def test_push_many_names_the_sample_it_rejected():
+    """A batch that fails partway is not a batch that failed.
+
+    The samples before the bad one *were* published, so an error naming only
+    the batch would leave the caller unable to tell how far it got.
+    """
+    tree = tf_tree.build([("map", "base")])
+    stamps = np.array([3_000, 2_000], dtype=np.int64)  # non-monotonic
+    poses = np.zeros((2, 7))
+    poses[:, 0] = 1.0
+    with (
+        tree.publisher("base", "map") as pub,
+        pytest.raises(tf_tree.TfTreeError, match="sample 1"),
+    ):
+        pub.push_many(stamps, poses)
+
+
+def test_a_publisher_keeps_its_tree_alive():
+    """The same lifetime guarantee `Plan` needed, for the same reason."""
+    import gc
+
+    tree = tf_tree.build([("map", "base")])
+    pub = tree.publisher("base", "map")
+    plan = tree.plan("map", "base")
+    del tree
+    gc.collect()
+    pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0])
+    np.testing.assert_allclose(plan.latest()[:3, 3], [7.0, 8.0, 9.0])
