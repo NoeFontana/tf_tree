@@ -78,6 +78,8 @@
 //! for the primitive the entire rendezvous rests on: `libc` maintains those
 //! definitions for every target, and it introduces no C build step, which is
 //! what §2's rule was actually protecting against.
+// `unsafe` boundary: the OS (one `pthread_atfork` shim). See `docs/decisions/0007`.
+#![deny(unsafe_op_in_unsafe_fn)]
 #![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 

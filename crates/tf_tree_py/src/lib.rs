@@ -43,6 +43,9 @@
 //! *intermediate* allocation: results are computed by interpolation and written
 //! exactly once, into their final home.
 #![allow(unsafe_code, clippy::needless_pass_by_value)]
+// `unsafe` boundary: a foreign runtime that owns its own objects.
+// See `docs/decisions/0007`.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;

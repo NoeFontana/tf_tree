@@ -1,5 +1,8 @@
 #![no_std]
 #![deny(unsafe_code)]
+// `unsafe` boundary: raw arena memory, in `buffer` and `arena_view` only.
+// See `docs/decisions/0007`.
+#![deny(unsafe_op_in_unsafe_fn)]
 //! `no_std + alloc` single-process transform tree engine.
 //!
 //! This is the source of truth: frame interning, topology, edge records, the

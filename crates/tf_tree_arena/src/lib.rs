@@ -1,4 +1,6 @@
 #![no_std]
+// `unsafe` boundary: raw arena memory. See `docs/decisions/0007`.
+#![deny(unsafe_op_in_unsafe_fn)]
 //! `no_std + alloc` pointer-free arena abstraction and layout math for `tf_tree`.
 //!
 //! The arena is a single flat allocation holding every record and ring buffer.
