@@ -15,17 +15,25 @@ touching code. When these documents do not answer a question, **stop and ask** �
 do not invent an answer, especially in the concurrency or arena-layout sections.
 
 [`docs/PHASE2.md`](./docs/PHASE2.md) is the Phase 2 spec (shared memory). Its §1
-holds **Phase 1 amendments A1–A8**, which are **NOT yet applied** to this
-codebase. Do not implement them as part of Phase 1 work unless explicitly asked;
-do read them before changing a concurrency protocol, so a Phase 1 change does not
-contradict an amendment already agreed for Phase 2.
+holds **Phase 1 amendments A1–A8, which are now all applied** (`FORMAT_VERSION =
+2`) — read them before changing any concurrency protocol, because they are the
+reason several orderings look the way they do. §0.0 is the live status table for
+what remains.
+
+What remains is the **lifecycle**, scoped by decision
+[`0005`](./docs/decisions/0005-the-shared-memory-seam.md): §3.7 fd passing, so
+`tf_tree::open()` does not exist yet and only a child can attach; `F_OFD_GETLK`
+liveness; and reaping. `0005` is `ready`, so its *Implementation plan* is the
+work breakdown — implement it as stated, and if you find an open question, stop
+and ask rather than inventing an answer.
 
 | Document | Role |
 | --- | --- |
 | [`docs/PROJECT.md`](./docs/PROJECT.md) | Overview, architecture, roadmap, decision log D1–D20 (§5). Supersedes `docs/decisions/0002`. |
 | [`docs/PHASE1.md`](./docs/PHASE1.md) | Normative Phase 1 spec: layouts, atomic orderings, test plan (§10), benchmark gate (§11). Supersedes `docs/decisions/0003`. |
-| [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 contains the unapplied Phase 1 amendments A1–A8. |
-| [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md) is still authoritative for the builder-time edge declaration API. |
+| [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 holds Phase 1 amendments A1–A8 (all applied), §0.0 is the status table. |
+| [`docs/PHASE3.md`](./docs/PHASE3.md) | Normative Phase 3 spec (Python bindings). Blocked on `0005`; not started. |
+| [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md) (builder-time edge declaration) and [`0005`](./docs/decisions/0005-the-shared-memory-seam.md) (the shared-memory seam) are authoritative. |
 
 ## Project shape (Phase 1 — pure Rust)
 

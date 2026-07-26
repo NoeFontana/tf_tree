@@ -602,15 +602,30 @@ peer attached are visible to it. The reader in that child is the unmodified
 Phase 1 reader — [`PHASE2.md`](../PHASE2.md) §4's "zero lines in the read path",
 tested rather than asserted.
 
-What is **not** implemented, and what each would protect against, is listed in
-[`PHASE2.md`](../PHASE2.md) §1 and §5-6. The short version: this is the mapping,
-not yet the lifecycle. Segments are handed over by fd inheritance rather than the
-`SOCK_SEQPACKET` + `SCM_RIGHTS` handshake, and there is no participant registry,
-no liveness detection and no reaping — so a participant that **dies while holding
-a claim** leaks that edge, and one that dies mid-topology-mutation could wedge
-readers (amendments A1-A4). Those are crash-consistency properties, not
-correctness-under-normal-operation properties, and the numbers above do not
-depend on them. They must be in place before this is production-safe.
+**Crash consistency: amendments A1–A8 are applied** (`FORMAT_VERSION = 2`). The
+arena has a participant table (A6), claims name a participant *slot* rather than
+a PID so a writer killed mid-claim leaves no unreclaimable edge (A3), `push`
+re-checks the claim epoch so a revoked writer cannot resurrect (A4), the
+topology generation and active block publish in a single atomic word (A1) under
+an in-arena reapable lock (A2), the sample writer forces slot parity rather than
+incrementing it (A5), the header carries a full 16-byte boot id (A7), and the
+interning spin is bounded with takeover of a provably-dead claimant (A8).
+
+What is **still** missing is the *lifecycle*, listed in
+[`PHASE2.md`](../PHASE2.md) §0.0 and scoped by decision
+[`0005`](../decisions/0005-the-shared-memory-seam.md):
+
+- Segments are handed over by **fd inheritance**; the §3.7 `SOCK_SEQPACKET` +
+  `SCM_RIGHTS` handshake is not implemented, so a process that is not a child
+  cannot attach at all and `tf_tree::open()` does not exist yet.
+- **Liveness** comes from a `/proc` heuristic that fails safe (unknown ⇒ alive),
+  not from `F_OFD_GETLK` (§5.1).
+- **Nothing reaps** (§6.3): `edge::reap` exists and is called only by tests, so a
+  participant that dies holding a claim leaks that edge until the arena does.
+
+Those are crash-*recovery* properties rather than
+correctness-under-normal-operation properties, and none of the numbers above
+depend on them — but they must be in place before this is production-safe.
 
 ## A real difference: maximum chain depth
 

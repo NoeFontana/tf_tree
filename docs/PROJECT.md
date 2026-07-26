@@ -117,6 +117,8 @@ In one process, a crash takes down every reader with it, so a torn write is unob
 **D16 — Ownership is configured, not negotiated.**
 One process owns the arena; others attach. No leader election, no consensus, no takeover. On a real robot there is always a natural owner, and negotiation would add a distributed-consensus problem to a project whose value is a fast local lookup — it would also be the least-tested code in the system. `tf_treed` exists so that "configure an owner" is a trivial ask.
 
+> **Amended by [`0005`](./decisions/0005-the-shared-memory-seam.md) §8 — "no takeover" does not survive; the rest does.** `PHASE2.md` §3.5 makes ownership a role the kernel reassigns on owner death, and `OpenOutcome::TookOver` ships. That is not negotiation: the heir is whichever process wins an uncontended `F_OFD_SETLK` on one byte, with no message exchanged between candidates and no quorum. What D16 rejects — election, consensus, a distributed-agreement protocol — stays rejected. D17 already assumes an owner can die without leaking every claim.
+
 **D17 — The attach socket is the liveness signal.**
 Participants hold their Unix socket open for the lifetime of the attachment. Process death of any kind closes it, and the owner sees `EPOLLHUP` in microseconds — exact, immediate, with no timeout to tune. Consequently **heartbeat staleness never triggers reaping** (a legitimately slow publisher is indistinguishable from a hung one), and reaping is cooperative rather than owner-only so that an owner's death does not leak every claim. *Do not* add heartbeat-based reaping by default, and *do not* close the socket after the handshake.
 

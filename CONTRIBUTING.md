@@ -26,8 +26,11 @@ docs/decisions/            architectural decision records (process, kept for new
 
 `docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that
 order before proposing a change. `docs/PHASE2.md` §1 lists amendments A1–A8 to
-Phase 1 that are agreed but **not yet applied**; check them before altering a
-concurrency protocol so a Phase 1 change does not contradict one.
+Phase 1, **all of which are now applied**; read them before altering a
+concurrency protocol, because they are why several orderings look the way they
+do. §0.0 is the live status table, and
+[`docs/decisions/0005`](./docs/decisions/0005-the-shared-memory-seam.md) scopes
+what is left (fd passing, liveness, reaping).
 
 `tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
 separately publishable and separately testable — keeping the math crate free of
