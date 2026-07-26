@@ -47,6 +47,12 @@ pub use tree::{
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use tf_tree_arena::{AttachMode, ShmError};
 
+/// Zero-config rendezvous (`docs/PHASE2.md` §3.2, `docs/decisions/0005`).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+mod open;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use open::{open, Open, OpenError};
+
 // Re-export the core engine surface so downstream code depends only on `tf_tree`.
 pub use tf_tree_core::arena_view::ArenaView;
 pub use tf_tree_core::edge::{EdgeKind, Publisher};

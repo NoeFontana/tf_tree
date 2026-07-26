@@ -139,7 +139,9 @@ jobs:
       - name: cargo fmt --check (shm sources)
         run: cargo fmt --all -- --check
       - name: just shm-check
-        run: just shm-check
+        run: |
+          just shm-check
+          just shm-rendezvous
 
   loom:
     name: loom

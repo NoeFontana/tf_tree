@@ -22,7 +22,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Phase 2 shared memory: `TreeBuilder::build_shared` / `Tree::attach_shared`.
 # Linux-only and off by default — the single-process build must not grow a
 # syscall dependency it never uses.
-shm = ["tf_tree_arena/shm"]
+shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
 
 [dependencies]
 tf_tree_core.workspace = true
@@ -30,5 +30,22 @@ tf_tree_math.workspace = true
 tf_tree_arena.workspace = true
 thiserror.workspace = true
 
+# The rendezvous half of Phase 2 (`docs/decisions/0005`). This crate owns the
+# composition because `open()` must return a `Tree`, whose constructor surface
+# is private — every alternative pays for the seam by widening that API. Gated
+# on `shm` *and* Linux, like the mapping it pairs with.
+[target.'cfg(target_os = "linux")'.dependencies]
+tf_tree_ipc = { workspace = true, optional = true }
+
 [dev-dependencies]
 proptest.workspace = true
+
+# The rendezvous is a between-processes claim, so `tests/rendezvous.rs` needs a
+# real second process rather than a thread.
+[[bin]]
+name = "rendezvous_child"
+required-features = ["shm"]
+
+[[test]]
+name = "rendezvous"
+required-features = ["shm"]

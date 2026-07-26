@@ -60,6 +60,7 @@ tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.1.0" }
 libc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "std"] }
 tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0" }
+tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.1.0" }
 tf_tree = { path = "crates/tf_tree", version = "0.1.0" }
 # publish = false crates, wired by path only (no version requirement published).
 tf_tree_bench = { path = "crates/tf_tree_bench" }
