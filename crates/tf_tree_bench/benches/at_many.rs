@@ -5,7 +5,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use tf_tree::{Iso3, Stamp};
+use tf_tree::{Iso3, Layout, Stamp};
 use tf_tree_bench::fixture;
 
 const N: usize = 1024;
@@ -36,6 +36,75 @@ fn at_many(c: &mut Criterion) {
             black_box(&out);
         });
     });
+
+    // The layout kernels (`docs/decisions/0005` Milestone B). The comparison
+    // that matters is not kernel-vs-kernel but **kernel vs. the two-pass
+    // alternative** a consumer is otherwise forced into: evaluate into an
+    // `Iso3` buffer, then convert. `Iso3` is 64 B with 8 of padding and no
+    // layout below shares its stride, so that second pass is not avoidable by
+    // any amount of care on the caller's side.
+    let mut mat = vec![0.0f64; N * Layout::Mat4.elems()];
+    group.bench_function("into_mat4_1024", |b| {
+        b.iter(|| {
+            plan.at_many_into(&guard, black_box(&stamps), Layout::Mat4, &mut mat)
+                .expect("at_many_into");
+            black_box(&mat);
+        });
+    });
+
+    let mut quat = vec![0.0f64; N * Layout::Quat.elems()];
+    group.bench_function("into_quat_1024", |b| {
+        b.iter(|| {
+            plan.at_many_into(&guard, black_box(&stamps), Layout::Quat, &mut quat)
+                .expect("at_many_into");
+            black_box(&quat);
+        });
+    });
+
+    let mut aff = vec![0.0f32; N * Layout::Affine32.elems()];
+    group.bench_function("into_affine32_1024", |b| {
+        b.iter(|| {
+            plan.at_many_into_f32(&guard, black_box(&stamps), Layout::Affine32, &mut aff)
+                .expect("at_many_into_f32");
+            black_box(&aff);
+        });
+    });
+
+    // The alternative, measured rather than asserted: `at_many` into an `Iso3`
+    // buffer followed by a conversion pass. This is what every consumer that
+    // wants a matrix pays today.
+    group.bench_function("two_pass_mat4_1024", |b| {
+        b.iter(|| {
+            plan.at_many(&guard, black_box(&stamps), &mut out)
+                .expect("at_many");
+            for (i, iso) in out.iter().enumerate() {
+                let q = iso.q;
+                let (w, x, y, z) = (q.w, q.x, q.y, q.z);
+                let (xx, yy, zz) = (x * x, y * y, z * z);
+                let (xy, xz, yz) = (x * y, x * z, y * z);
+                let (wx, wy, wz) = (w * x, w * y, w * z);
+                let m = &mut mat[i * 16..(i + 1) * 16];
+                m[0] = 1.0 - 2.0 * (yy + zz);
+                m[1] = 2.0 * (xy - wz);
+                m[2] = 2.0 * (xz + wy);
+                m[3] = iso.t.x;
+                m[4] = 2.0 * (xy + wz);
+                m[5] = 1.0 - 2.0 * (xx + zz);
+                m[6] = 2.0 * (yz - wx);
+                m[7] = iso.t.y;
+                m[8] = 2.0 * (xz - wy);
+                m[9] = 2.0 * (yz + wx);
+                m[10] = 1.0 - 2.0 * (xx + yy);
+                m[11] = iso.t.z;
+                m[12] = 0.0;
+                m[13] = 0.0;
+                m[14] = 0.0;
+                m[15] = 1.0;
+            }
+            black_box(&mat);
+        });
+    });
+
     group.finish();
 }
 

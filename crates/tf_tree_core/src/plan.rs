@@ -29,6 +29,7 @@ use tf_tree_math::{log_so3, Interp, Iso3, LerpSlerp, ScLerp};
 use crate::arena_view::ArenaView;
 use crate::edge::EdgeKind;
 use crate::error::{EdgeId, FrameId, LookupError};
+use crate::layout::{write_affine32, write_mat4, write_quat, Layout};
 use crate::sample::ExtrapPolicy;
 use crate::sync::spin;
 use crate::topology::TopologyView;
@@ -461,6 +462,125 @@ impl Plan {
         } else {
             for (s, o) in stamps.iter().zip(out.iter_mut()) {
                 *o = self.fold_at(g, s.nanos())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate a batch **directly into a caller's buffer**, in `layout`.
+    ///
+    /// The point of this over [`Self::at_many`] is that `Iso3` is
+    /// `repr(C, align(64))` and so cannot alias any layout a consumer wants
+    /// (see [`crate::layout`]). Writing through it costs an intermediate buffer
+    /// and a second pass; this writes once, in place, and allocates nothing.
+    ///
+    /// `out` is a flat `f64` slice of at least `stamps.len() * layout.elems()`.
+    /// Use [`Self::at_many_into_f32`] for [`Layout::Affine32`].
+    ///
+    /// # Errors
+    ///
+    /// [`LookupError::BufferTooSmall`] if `out` cannot hold the batch, or
+    /// [`LookupError::WrongElementType`] for an `f32` layout. Both are checked
+    /// **before a single element is written**, so a rejected call leaves the
+    /// caller's buffer untouched — `docs/PHASE3.md` §5.3 requires that, because
+    /// a half-written output is worse than none: it looks like data.
+    ///
+    /// Otherwise as [`Self::at`].
+    pub fn at_many_into<D: Domain>(
+        &self,
+        g: &Guard,
+        stamps: &[Stamp<D>],
+        layout: Layout,
+        out: &mut [f64],
+    ) -> Result<(), LookupError> {
+        if layout.is_f32() {
+            return Err(LookupError::WrongElementType);
+        }
+        let need = stamps.len().saturating_mul(layout.elems());
+        if out.len() < need {
+            return Err(LookupError::BufferTooSmall {
+                need,
+                got: out.len(),
+            });
+        }
+        self.check_generation(g)?;
+        self.check_domain::<D>()?;
+
+        let n = layout.elems();
+        // The layout is matched once, here. Putting it inside the loop would
+        // add an unpredictable branch between every element and the next, in
+        // the one API whose whole purpose is a per-element cost of nanoseconds.
+        match layout {
+            Layout::Mat4 => self.fold_batch(g, stamps, write_mat4, n, out),
+            Layout::Quat => self.fold_batch(g, stamps, write_quat, n, out),
+            // Unreachable: rejected by the `is_f32` check above. Returning the
+            // same error rather than panicking keeps this crate free of a
+            // panic path the workspace lints forbid, and a future f32 layout
+            // added without updating the check gets a clear error rather than
+            // a silently wrong `f64` write.
+            Layout::Affine32 => Err(LookupError::WrongElementType),
+        }
+    }
+
+    /// [`Self::at_many_into`] for `f32` layouts ([`Layout::Affine32`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at_many_into`], with [`LookupError::WrongElementType`] for a
+    /// layout that is not `f32`.
+    pub fn at_many_into_f32<D: Domain>(
+        &self,
+        g: &Guard,
+        stamps: &[Stamp<D>],
+        layout: Layout,
+        out: &mut [f32],
+    ) -> Result<(), LookupError> {
+        if !layout.is_f32() {
+            return Err(LookupError::WrongElementType);
+        }
+        let need = stamps.len().saturating_mul(layout.elems());
+        if out.len() < need {
+            return Err(LookupError::BufferTooSmall {
+                need,
+                got: out.len(),
+            });
+        }
+        self.check_generation(g)?;
+        self.check_domain::<D>()?;
+
+        let n = layout.elems();
+        self.fold_batch(g, stamps, write_affine32, n, out)
+    }
+
+    /// The shared batch loop: monotone stamps ride resumable cursors, and each
+    /// result is emitted straight into its slot.
+    ///
+    /// Generic over the element type so the `f64` and `f32` paths share one
+    /// copy of the cursor logic — which is the part that must not be duplicated,
+    /// because it is where the galloping search and the seqlock retry live.
+    #[inline]
+    fn fold_batch<D: Domain, T, W>(
+        &self,
+        g: &Guard,
+        stamps: &[Stamp<D>],
+        write: W,
+        elems: usize,
+        out: &mut [T],
+    ) -> Result<(), LookupError>
+    where
+        W: Fn(&Iso3, &mut [T]),
+    {
+        let monotone = stamps.windows(2).all(|w| w[0].nanos() <= w[1].nanos());
+        if monotone {
+            let mut cursors = [0u64; MAX_DEPTH];
+            for (i, s) in stamps.iter().enumerate() {
+                let iso = self.fold_at_cursors(g, s.nanos(), &mut cursors)?;
+                write(&iso, &mut out[i * elems..(i + 1) * elems]);
+            }
+        } else {
+            for (i, s) in stamps.iter().enumerate() {
+                let iso = self.fold_at(g, s.nanos())?;
+                write(&iso, &mut out[i * elems..(i + 1) * elems]);
             }
         }
         Ok(())

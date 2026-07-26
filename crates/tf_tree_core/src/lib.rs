@@ -52,6 +52,8 @@ pub mod buffer;
 pub mod edge;
 pub mod error;
 pub mod frame;
+/// Output layouts for folding results straight into a caller's buffer.
+pub mod layout;
 pub mod sample;
 
 pub(crate) mod sync;
