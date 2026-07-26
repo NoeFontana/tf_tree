@@ -217,7 +217,12 @@ shm-check:
     cargo clippy -p tf_tree_ipc --all-targets -- -D warnings
     cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
     cargo build --features shm -p tf_tree_bench --bin shm_child
+    cargo build --features shm -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
+    # Fork poisoning (`docs/decisions/0005` step 9). Separate from
+    # `shm-rendezvous` because it needs no second executable and no scratch
+    # rendezvous beyond its own: the second process is a `fork` of the first.
+    cargo nextest run -p tf_tree_bench --features shm --test fork
     cargo nextest run -p tf_tree_ipc
 
 # The zero-config rendezvous end to end: a foreign process calls

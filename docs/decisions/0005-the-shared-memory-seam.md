@@ -282,11 +282,70 @@ fn alive(&self) -> Result<(), OpenError>     // one Relaxed load
 ```
 
 Checked at `Tree::guard()`, every mutating entry point (`claim`, `reparent`, `intern`),
-the writer facade's `push`, and — decisively — **`Drop`**, which must skip both
-`participants().release()` and joining the owner/watch threads.
+the writer facade's `push`, and — decisively — **the destructors**.
 
-The single `unsafe { libc::pthread_atfork(..) }` lives in `tf_tree_ipc`, which already
+The single `unsafe { pthread_atfork(..) }` lives in `tf_tree_ipc`, which already
 budgets `unsafe` in `ofd.rs`, exposed as a safe `tf_tree_ipc::fork::generation()`.
+`libc` 0.2 does not declare `pthread_atfork` for `linux_like`, so the crate declares
+it. `ofd.rs`'s case against hand-maintaining an ABI does not carry over: what made
+`fcntl(F_OFD_*)` the wrong thing to hand-roll was `struct flock`, and `pthread_atfork`
+has no struct in its signature — three nullable function pointers and an `int`, fixed
+by POSIX.1-2001.
+
+**"Checked at `Tree::guard()`" is not implementable as written, and the fix is more
+useful than the check.** `guard()` returns a `Guard`, not a `Result`, and it is the
+`let g = tree.guard();` idiom at 53 call sites; `Guard::new` reads the topology
+generation *immediately*, so a detached tree cannot build one even to discard. The
+resolution is two-sided:
+
+* `Tree::view()` — which every accessor funnels through — returns a view over a
+  process-wide **poison arena** (one frame, no edges, `ArenaLayout::minimal()`) when
+  detached. Nothing can reach the vanished mapping through a safe method, which
+  matters because `tf_tree` is `forbid(unsafe_code)` and a `&`-reference into an
+  unmapped page is a soundness hole, not merely a crash.
+* `tf_tree_core::Guard::poisoned(view, err)` builds a guard that reads nothing and
+  answers `err` to every evaluation, so the error is `ChildDetached` rather than a
+  misleading `TopologyChanged { current: 0 }`.
+
+The poison arena is allocated when the *first shared tree is opened*, not lazily on
+the detached path: a `fork` child may have inherited a locked allocator from a thread
+that no longer exists, so the recovery path must not be the thing that first
+allocates.
+
+**Guarding `Tree::drop` is necessary but nowhere near sufficient, and in the end it
+was not even necessary.** A `Drop` impl's early return does not stop the struct's
+*fields* from being dropped afterwards, so every owned resource has to stand itself
+down independently. Five destructors reach across the fork, four of them at a
+distance, into a parent that is still running:
+
+| destructor | what it does in the child | guard |
+|---|---|---|
+| `Publisher::drop` (core) | `compare_exchange` into the unmapped arena ⇒ `SIGSEGV` | new `Publisher::abandon`, called by `EdgeWriter::drop` |
+| `ClaimLease::drop` | `F_OFD_SETLK` unlock on an **inherited description** ⇒ releases the *parent's* claim lease | `fork_gen` compare |
+| `OwnerThread::stop` | writes an inherited `eventfd` ⇒ stops the *parent's* owner server; then joins a thread this process never had | `fork_gen` compare, and clears the `JoinHandle` |
+| `OwnerServer::drop` | `unlink_if_still_ours` matches, because the listener fd is inherited ⇒ removes the *parent's* live socket path | `fork_gen` compare |
+| `MappedArena::drop` | `munmap` of a hole — a no-op until the child maps something into it | `getpid()` compare (a destructor can afford a syscall) |
+
+`Tree::drop`'s own check was written, tested against a mutant, found **unreachable**
+— the `view()` poison already sends the release into the throwaway arena — and
+deleted. Two mechanisms for one invariant, only one load-bearing, is how the
+load-bearing one eventually gets removed as redundant.
+
+**Measured cost.** `EdgeWriter::push` on a shared arena: **9.041 ns against
+8.846 ns** with the branch forced not-taken — `+0.195 ns`, one relaxed load of a
+process-local static plus a predictable branch (`benches/push.rs`,
+`--features shm`). A heap tree carries `None` and pays only the discriminant test,
+so the single-process path is unchanged at 8.71 ns. `Tree::view()`'s check is once
+per `guard()`, i.e. once per batch, and `benches/lookup.rs` is unchanged within
+noise (depth-3 64.60 ns vs 64.11 ns on `main`).
+
+Two of the five guards have **no failing mutant**, and the code says so at each
+site rather than implying coverage it does not have. `MappedArena`'s needs the child
+to have mapped something into the hole, which the harness cannot arrange without a
+public accessor for the arena base that would exist for no other reason;
+`OwnerServer`'s is unreachable in this workspace because the value only ever lives on
+the serving thread's stack, and `fork` does not copy threads — it is reachable only
+through the public API, which is exactly the case a library owes a guard for.
 
 ### 8. D16 is amended, not silently contradicted
 
@@ -451,8 +510,14 @@ Each step lands as one PR, in order.
    assertion).
 9. **Fork poisoning** — verified by `fork_child`: the child calls `tree.lookup(..)`,
    must get `ChildDetached`, and must exit 0. Assert `WIFEXITED`, not merely the status
-   code; mutant: remove the `Drop` guard ⇒ the child dies with `SIGSEGV` even though
-   the API check is present, which an exit-status-only assertion would miss.
+   code; mutant: remove the poison ⇒ the child dies with `SIGSEGV` even though the API
+   check is present, which an exit-status-only assertion would miss. The parent then
+   re-validates **itself** — lookup, push, its own liveness, a fresh `open()` through
+   the socket, and `probe_claim` from an *independent* open file description — because
+   the cross-fork damage is invisible in the child's exit status. The independent
+   description is not optional: OFD locks are self-blind, so the tree's own lock file
+   reports its byte free whether or not it still holds it, and without that vantage
+   point the `ClaimLease` guard has no test that can fail.
 10. **§7.1 per-region population** — drop `MapFlags::POPULATE` (`mapped.rs:375`); use
     `Advice::LinuxPopulateWrite` with a zeroing-write fallback on `EINVAL` for kernels
     < 5.14. Verified with `mincore` over an over-provisioned arena: declared edges
@@ -474,6 +539,12 @@ nightly). `shm-check` extends to `-p tf_tree --features shm`, `-p tf_tree_ipc` a
 `ubuntu-24.04-arm` rather than adding a job.
 
 ## Found while implementing
+
+**`the_acquire_window_backs_out` (step 7) still does not exist.** Step 8 landed the
+reaper that finally makes the epoch re-check reachable, and did not bring its test
+with it. This is recorded here rather than left implicit: the guard is present, is
+correct as far as reading it goes, and is unverified. It is the next thing owed.
+
 
 **The epoch re-check cannot be tested until step 8 exists.** Step 7's
 CAS-to-`SETLK` window is guarded by re-reading `ClaimRecord::epoch`, and

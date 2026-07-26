@@ -28,7 +28,9 @@ shm = ["dep:rustix"]
 bytemuck.workspace = true
 # `docs/PHASE2.md` §2 names rustix specifically: raw syscalls with no libc crate
 # and no C build step. `default-features = false` keeps it `no_std`.
-rustix = { workspace = true, optional = true, features = ["rand"] }
+# `process` is for `getpid` alone, in `MappedArena`'s destructor: a fork child
+# must not `munmap` a range it does not have (see `mapped.rs`).
+rustix = { workspace = true, optional = true, features = ["rand", "process"] }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -225,6 +225,31 @@ impl ArenaLayout {
         })
     }
 
+    /// The smallest valid layout: one frame, no edges, no sample slots.
+    ///
+    /// Infallible, and that is the whole point of it existing next to
+    /// [`Self::new`]. `new` can fail two ways — a capacity that is not a power
+    /// of two, and a capacity count that disagrees with `max_edges` — and
+    /// neither is representable here, because there are no capacities. That lets
+    /// this be called from a `static` initializer, where a `Result` has nowhere
+    /// to go and the crates that need one deny `unwrap`/`expect`/`panic`.
+    ///
+    /// Its consumer is `tf_tree`'s fork poison: a detached `Tree` must still
+    /// hand back an [`crate::ArenaView`] that is *safe to read*, and it cannot be
+    /// a view over the mapping that just went away. An arena with no frames and
+    /// no edges answers every query "not here", which is the truthful answer.
+    #[must_use]
+    pub fn minimal() -> ArenaLayout {
+        let max_participants = DEFAULT_MAX_PARTICIPANTS;
+        ArenaLayout {
+            max_frames: 1,
+            max_edges: 0,
+            max_participants,
+            edge_capacities: Vec::new(),
+            computed: compute(1, 0, max_participants, &[]),
+        }
+    }
+
     /// The layout implied by totals alone, for validating a header.
     ///
     /// `compute` uses only the **sum** of the per-edge capacities, never their
@@ -407,6 +432,34 @@ pub const fn layout_hash() -> u32 {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// [`ArenaLayout::minimal`] must be the layout `new(1, 0, [])` would have
+    /// produced — it exists to be infallible, not to be *different*.
+    ///
+    /// Without this the two could drift and the poison arena would have a
+    /// geometry nothing else in the codebase agrees with, which is the kind of
+    /// thing that only shows up as an out-of-range participant slot months
+    /// later.
+    #[test]
+    fn minimal_matches_the_fallible_constructor() {
+        let a = ArenaLayout::minimal();
+        let b = ArenaLayout::new(1, 0, Vec::new()).expect("1 frame, 0 edges is valid");
+        assert_eq!(a.total_size(), b.total_size());
+        assert_eq!(a.max_frames, b.max_frames);
+        assert_eq!(a.max_edges, b.max_edges);
+        assert_eq!(a.max_participants, b.max_participants);
+    }
+
+    /// The poison arena's participant table must be indexable by any slot a real
+    /// arena could hand out, because a detached `Tree` releases *its own* slot
+    /// into it.
+    #[test]
+    fn minimal_has_room_for_every_participant_slot() {
+        assert_eq!(
+            ArenaLayout::minimal().max_participants,
+            DEFAULT_MAX_PARTICIPANTS
+        );
+    }
 
     use super::*;
     use alloc::vec;

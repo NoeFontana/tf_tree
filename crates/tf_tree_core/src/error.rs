@@ -161,6 +161,19 @@ pub enum LookupError {
     },
     /// An `f32` layout was passed to the `f64` entry point, or the reverse.
     WrongElementType,
+    /// This handle belongs to a process that no longer exists: it was created
+    /// before a `fork()` and is being used in the child.
+    ///
+    /// A shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3), so the
+    /// child has **no mapping** where the arena was, and every reference into it
+    /// is dangling. This crate cannot detect that — it is `no_std` and knows
+    /// nothing about processes — so the variant exists here only so that the
+    /// `std` facade, which does detect it, has one error type to report through.
+    /// Nothing in `tf_tree_core` ever constructs it.
+    ///
+    /// Not retryable and not a transient: the correct response is to open a new
+    /// tree in the child, or to `exec`.
+    ChildDetached,
     /// The topology says this frame has a parent, but records no edge for the
     /// link (`edge_of_child == 0`, the "no edge" sentinel). The path cannot be
     /// evaluated; edge slot `0` is a real record and must not be sampled in its
@@ -195,6 +208,12 @@ pub enum PushError {
         /// The edge whose claim was revoked.
         edge: EdgeId,
     },
+    /// This handle belongs to a process that no longer exists: it was created
+    /// before a `fork()` and is being used in the child. See
+    /// [`LookupError::ChildDetached`], which carries the full explanation.
+    ///
+    /// Never constructed by this crate; the `std` facade is what detects it.
+    ChildDetached,
 }
 
 /// A failed attempt to claim exclusive write access to an edge.
@@ -234,6 +253,12 @@ pub enum FrameError {
     /// to prevent. Reporting it is the only remaining option, and it is
     /// actionable: identify the view.
     InternContended,
+    /// This handle belongs to a process that no longer exists: it was created
+    /// before a `fork()` and is being used in the child. See
+    /// [`LookupError::ChildDetached`], which carries the full explanation.
+    ///
+    /// Never constructed by this crate; the `std` facade is what detects it.
+    ChildDetached,
     /// The arena is mapped read-only, so a name that is not already interned
     /// cannot be added.
     ///

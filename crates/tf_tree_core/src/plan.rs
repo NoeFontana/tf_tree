@@ -269,6 +269,12 @@ impl Plan {
 
     #[inline]
     fn check_generation(&self, g: &Guard) -> Result<(), LookupError> {
+        // Ahead of the generation compare, because a poisoned guard's generation
+        // is meaningless and reporting `TopologyChanged { current: 0 }` would
+        // send the reader looking for a re-plan that cannot help.
+        if let Some(err) = g.poison() {
+            return Err(err);
+        }
         let cur = g.generation();
         if cur == self.generation {
             Ok(())
@@ -757,6 +763,9 @@ pub struct EdgeMeta {
 pub struct Guard<'a> {
     view: ArenaView<'a>,
     generation: u64,
+    /// Set by [`Guard::poisoned`]; returned by every evaluation against this
+    /// guard, ahead of the generation check.
+    poison: Option<LookupError>,
 }
 
 impl<'a> Guard<'a> {
@@ -770,7 +779,49 @@ impl<'a> Guard<'a> {
     #[must_use]
     pub fn new(view: ArenaView<'a>) -> Guard<'a> {
         let generation = view.topology().stable_generation();
-        Guard { view, generation }
+        Guard {
+            view,
+            generation,
+            poison: None,
+        }
+    }
+
+    /// A guard that fails every evaluation with `err`, without reading `view`.
+    ///
+    /// # Why this is not the same as returning an error from the constructor
+    ///
+    /// A facade may know the arena has become unreachable — the shared mapping
+    /// went away under a `fork()` is the case this was built for — at a point
+    /// where its own API cannot report it. `Tree::guard` is infallible and used
+    /// in a `let g = tree.guard();` idiom by dozens of callers; making it
+    /// fallible to carry a condition none of them will ever hit is the wrong
+    /// trade, and *not* reporting it means the next read dereferences memory
+    /// that is no longer mapped.
+    ///
+    /// This is the third option: hand back a guard that is safe to hold, safe to
+    /// pass to [`Plan::at`], and answers `err` to everything. Note that
+    /// [`Self::new`] reads the topology **immediately**, so a caller in this
+    /// position cannot use it even to build a guard it intends to discard —
+    /// which is exactly why this constructor exists rather than a `poison`
+    /// setter.
+    ///
+    /// `view` must still be a view over a *valid* arena, because [`Self::view`]
+    /// hands it out; supply a small throwaway arena rather than the unreachable
+    /// one.
+    #[must_use]
+    pub fn poisoned(view: ArenaView<'a>, err: LookupError) -> Guard<'a> {
+        Guard {
+            view,
+            generation: 0,
+            poison: Some(err),
+        }
+    }
+
+    /// The failure this guard was poisoned with, if any.
+    #[inline]
+    #[must_use]
+    pub fn poison(&self) -> Option<LookupError> {
+        self.poison
     }
 
     /// The pinned topology generation.

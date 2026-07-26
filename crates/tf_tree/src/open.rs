@@ -351,6 +351,16 @@ impl Open {
 pub(crate) struct OwnerThread {
     shutdown: ShutdownHandle,
     join: Option<std::thread::JoinHandle<()>>,
+    /// The fork generation the thread was spawned in.
+    ///
+    /// `fork` copies the address space but **not the threads**: the child gets
+    /// an `OwnerThread` value describing a thread that does not exist there. Its
+    /// `JoinHandle` names nothing, and — worse — `ShutdownHandle` is an
+    /// `eventfd` whose *description* the child inherited, so a write from the
+    /// child is delivered to the **parent's** serving loop. Dropping an
+    /// inherited `Tree` in a child would therefore shut down the parent's owner
+    /// server, and every subsequent joiner would find an unreachable arena.
+    fork_gen: u64,
     /// Set by the loop when it returns, so `Drop` can tell "still serving" from
     /// "already stopped" without blocking on a thread that has gone.
     running: Arc<AtomicBool>,
@@ -358,7 +368,17 @@ pub(crate) struct OwnerThread {
 
 impl OwnerThread {
     /// Stop the server and wait for the thread.
+    ///
+    /// A no-op in a `fork` child — see [`OwnerThread::fork_gen`]. Both callers
+    /// (this type's `Drop` and [`Attachment`]'s) route through here, so the
+    /// check lives here rather than at each of them.
     pub(crate) fn stop(&mut self) {
+        if self.fork_gen != tf_tree_ipc::fork::generation() {
+            // Do not join a thread that was never forked, and do not signal the
+            // parent's eventfd. Drop the handle so `Drop` does not try again.
+            self.join = None;
+            return;
+        }
         let _ = self.shutdown.stop();
         if let Some(h) = self.join.take() {
             let _ = h.join();
@@ -483,6 +503,7 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
         shutdown,
         join: Some(join),
         running,
+        fork_gen: tf_tree_ipc::fork::generation(),
     })
 }
 

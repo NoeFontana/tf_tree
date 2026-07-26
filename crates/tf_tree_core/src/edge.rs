@@ -372,6 +372,8 @@ pub struct Publisher<'a> {
     /// store, and therefore cannot free a claim that has since passed to
     /// somebody else. See [`release`].
     owner: u64,
+    /// Set by [`Publisher::abandon`]; makes `Drop` touch no arena memory.
+    abandoned: bool,
     // `Cell<()>` is `Send + !Sync`, which is exactly the auto-trait profile we
     // want to project onto `Publisher` regardless of what its other fields allow.
     _not_sync: PhantomData<core::cell::Cell<()>>,
@@ -394,8 +396,35 @@ impl<'a> Publisher<'a> {
             claim,
             epoch,
             owner,
+            abandoned: false,
             _not_sync: PhantomData,
         }
+    }
+
+    /// Give up this claim **without releasing it**, so that dropping this
+    /// writer performs no arena access whatsoever.
+    ///
+    /// # Why a `no_std` engine crate has this
+    ///
+    /// Releasing is a `compare_exchange` on the claim record — a *write* into
+    /// the arena — and there is one situation where that write is not merely
+    /// unnecessary but wrong: the memory is no longer there, or is no longer
+    /// ours. The `std` facade hits it after a `fork()`, where the shared mapping
+    /// is `MADV_DONTFORK` and the child holds a `Publisher` whose `claim`
+    /// reference points into a hole in its address space. Dropping it faults,
+    /// and the child dies in a destructor it never asked to run.
+    ///
+    /// This crate cannot detect that condition — it is `no_std` and has no
+    /// notion of a process. It only has to be *tellable*, which is what this is.
+    ///
+    /// The claim stays held in the arena. That is the correct outcome in the
+    /// case this exists for: the claim belongs to the process that forked, which
+    /// is still alive and still writing to it. In any other use it leaks the
+    /// claim until a reaper collects it, so **do not reach for this as a way to
+    /// avoid a release** — [`release`] is that.
+    #[inline]
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
     }
 
     /// The claim epoch observed when this writer was created.
@@ -443,6 +472,9 @@ impl<'a> Publisher<'a> {
 
 impl Drop for Publisher<'_> {
     fn drop(&mut self) {
+        if self.abandoned {
+            return;
+        }
         release(self.claim, self.owner);
     }
 }
