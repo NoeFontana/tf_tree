@@ -54,7 +54,7 @@
 //! | §3.7 handshake messages ([`HelloRequest`], [`HelloResponse`], [`HelloStatus`]) | implemented, offsets and status codes pinned |
 //! | §3.7 `SOCK_SEQPACKET` transport + `SCM_RIGHTS` ([`OwnerServer`], [`attach`]) | implemented |
 //! | §3.6 `memfd` creation, and wiring this into `tf_tree::open()` | **not yet** — `docs/decisions/0005` step 5 |
-//! | §6.1 claims as OFD locks | **not yet** — the byte range is reserved ([`CLAIM_BASE`]) |
+//! | §6.1 claim leases: [`LockFile::try_take_claim`] and friends | implemented; the arena-side two-phase acquire is `docs/decisions/0005` step 7 |
 //!
 //! Because §3.7 is absent, [`Open::open`] takes a [`ServerProbe`] that answers
 //! "is anyone serving?". That is not a placeholder for the interesting part: the
@@ -98,7 +98,7 @@ pub use error::{
     EnvVar, IpcError, LockRole, NameProblem, ProcError, ProcParseError, RuntimeDirSource,
 };
 pub use identity::{AccessMode, Identity, IDENTITY_RECORD_LEN};
-pub use lockfile::{LockFile, LockProbe, CLAIM_BASE, MAX_PARTICIPANTS};
+pub use lockfile::{LockFile, LockProbe, CLAIM_BASE, MAX_CLAIM_BYTES, MAX_PARTICIPANTS};
 pub use ofd::LockAttempt;
 pub use open::{
     CreatePolicy, NoServer, Open, OpenOutcome, Reach, ServerProbe, Session, DEFAULT_OPEN_TIMEOUT,
