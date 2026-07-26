@@ -100,6 +100,9 @@ impl PyTree {
 /// `frozen` and `Sync`: a `Plan` is `Copy` in Rust and holds no interior
 /// mutability, so several free-threaded Python threads may evaluate the same
 /// plan concurrently — which is the workload free-threading exists to serve.
+/// What [`PyPlan::adaptive`] returns: `(K,)` stamps and `(K, 4, 4)` poses.
+type Knots<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray3<f64>>);
+
 /// # A `#[pyclass]` may not contain an over-aligned type
 ///
 /// `Plan` is `align(64), size 2112` — it holds `[Step; MAX_DEPTH]` and `Step`
@@ -214,6 +217,67 @@ impl PyPlan {
         let slice = unsafe { out.as_slice_mut()? };
         tf_tree::write_mat4(&iso, slice);
         Ok(out)
+    }
+
+    /// The minimum set of knots whose linear interpolation stays within `tol`.
+    ///
+    /// Returns `(stamps, poses)` — an `(K,)` int64 array and a `(K, 4, 4)`
+    /// float64 array, strictly increasing in stamp. The consumer LERPs between
+    /// adjacent knots on whatever device they live on, with the reconstruction
+    /// error bounded by construction.
+    ///
+    /// This is what makes the device story small (§5.6). A 100 ms sweep at
+    /// 1 cm / 1e-4 rad is tens of knots — roughly a kilobyte — so the transfer
+    /// that a zero-copy-to-GPU pipeline would optimise is already negligible.
+    /// **If this returned enough data for that to matter, it would be evidence
+    /// the tolerance was wrong**, not that the transport needed work.
+    ///
+    /// `lin` is metres and `ang` is radians. Both default to the `docs/PHASE3.md`
+    /// §4.2 values.
+    #[pyo3(signature = (start_ns, end_ns, /, *, lin = 1e-3, ang = 1e-4))]
+    fn adaptive<'py>(
+        &self,
+        py: Python<'py>,
+        start_ns: i64,
+        end_ns: i64,
+        lin: f64,
+        ang: f64,
+    ) -> PyResult<Knots<'py>> {
+        if !(lin.is_finite() && ang.is_finite()) || lin <= 0.0 || ang <= 0.0 {
+            return Err(PyValueError::new_err(
+                "lin and ang must be finite and positive",
+            ));
+        }
+        let mut scratch = tf_tree::AdaptiveScratch::<SystemDomain>::new();
+        let tol = tf_tree::ErrBound {
+            rot_rad: ang,
+            trans: lin,
+        };
+        let g = self.tree().guard();
+        let (stamps, poses) = self
+            .plan
+            .at_adaptive(
+                &g,
+                (Stamp::from_nanos(start_ns), Stamp::from_nanos(end_ns)),
+                tol,
+                &mut scratch,
+            )
+            .map_err(lookup_err)?;
+
+        let k = stamps.len();
+        let out_s = PyArray1::<i64>::zeros(py, [k], false);
+        let out_p = PyArray3::<f64>::zeros(py, [k, 4, 4], false);
+        {
+            // SAFETY: both arrays were just allocated here, so nothing else
+            // holds a reference to them and both are contiguous by
+            // construction.
+            let (sd, pd) = unsafe { (out_s.as_slice_mut()?, out_p.as_slice_mut()?) };
+            for (i, (st, iso)) in stamps.iter().zip(poses.iter()).enumerate() {
+                sd[i] = st.nanos();
+                tf_tree::write_mat4(iso, &mut pd[i * 16..(i + 1) * 16]);
+            }
+        }
+        Ok((out_s, out_p))
     }
 
     /// Folded depth of this path, in edges.
