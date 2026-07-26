@@ -12,17 +12,31 @@
 //!    comparison — but more importantly, an edge whose kind is wrong should not
 //!    also be reported as a clock or authority problem. One fault, one
 //!    diagnostic.
-//! 3. **Authority** (§5.4). Whether this publisher may write the edge at all.
+//! 3. **Static value** (§5.7), *before* authority and **only on
+//!    `/tf_static`**. §5.7 says it in that order and it means it: on a
+//!    differing value, *"a diagnostic naming both publishers and both values,
+//!    **then** apply the authority policy"*.
+//!
+//!    An earlier version of this pipeline asked authority first, and the
+//!    consequence was that §5.7 became **inert for exactly the case it exists
+//!    for**. Two `robot_state_publisher`s with different URDFs is the canonical
+//!    misconfiguration; under `FirstWriterWins` the first one owns the edge, so
+//!    the second was rejected as `NotTheOwner` and the static store never saw
+//!    it. The conflict payload — both values, which is the only actionable half
+//!    — was unreachable through the pipeline. The converse broke too: a second
+//!    publisher offering an *identical* latched value got a loud authority
+//!    diagnostic where §5.7 requires silence.
+//! 4. **Authority** (§5.4). Whether this publisher may write the edge at all.
 //!    Before the clock, because a sample from the wrong publisher should not
 //!    move the clock's high-water mark — otherwise a rejected intruder
 //!    publishing from the future makes the *owner's* subsequent samples look
 //!    non-monotonic.
-//! 4. **Clock** (§5.5). Last, so only samples that are actually going to be
-//!    written are allowed to advance time.
+//! 5. **Clock** (§5.5). Last, and **dynamic only**, so that only samples which
+//!    are actually going to be written may advance time.
 //!
-//! Step 3 before step 4 is the one that is easy to get backwards and hard to
-//! notice: with the order reversed, one misconfigured node can silently stall
-//! the correct one, and the diagnostic blames the victim.
+//! Step 4 before step 5 is the other one that is easy to get backwards and hard
+//! to notice: with those reversed, one misconfigured node can silently stall the
+//! correct one, and the diagnostic blames the victim.
 
 use crate::authority::{Authority, AuthorityPolicy, Verdict};
 use crate::clock::{ClockGuard, ClockVerdict, OnClockReset};
@@ -63,6 +77,28 @@ pub enum Action {
         /// The constant.
         pose: [f64; 7],
     },
+    /// A `/tf_static` value that disagrees with the one on file (§5.7).
+    ///
+    /// **Not a `Drop`**, because §5.7 requires a diagnostic naming both
+    /// publishers *and both values* — and a `Drop { reason }` can carry
+    /// neither. The sample is not written either way; what this variant buys is
+    /// that the caller can print the sentence an operator can act on.
+    StaticConflict {
+        /// Normalized parent frame.
+        parent: String,
+        /// Normalized child frame.
+        child: String,
+        /// Who declared the value on file.
+        owner: Publisher,
+        /// Who is contradicting them.
+        intruder: Publisher,
+        /// The value on file.
+        existing: [f64; 7],
+        /// The value just offered.
+        offered: [f64; 7],
+        /// First occurrence, for rate limiting.
+        first_time: bool,
+    },
     /// Drop it. `reason` is for the log; the counters already moved.
     Drop {
         /// Why, in a form a human reads.
@@ -98,8 +134,6 @@ pub enum DropReason {
     /// The same static value again (§5.7). Silent, and counted as applied
     /// nowhere — it is not a failure, it is a latched re-delivery.
     StaticRepeat,
-    /// The static value disagrees with the one on file (§5.7).
-    StaticConflict,
     /// The edge is already declared with the other kind (§5.7).
     KindChange,
 }
@@ -182,7 +216,65 @@ impl Ingest {
             };
         }
 
-        // 3. Authority, before the clock — see the module docs.
+        // 3. Static value, before authority and only for `/tf_static` — §5.7
+        //    orders it this way, and the module docs record what putting it
+        //    after cost.
+        //
+        //    A static carries a stamp and it is meaningless: a latched
+        //    transform is constant, and `robot_state_publisher` commonly stamps
+        //    with zero. Running it past the clock guard would drag the
+        //    high-water mark to the epoch and make every dynamic sample
+        //    afterwards look like a bag loop, so statics never reach step 5.
+        if topic == Topic::TfStatic {
+            match self
+                .statics
+                .observe_static(&parent, &child, sample.pose, publisher)
+            {
+                StaticVerdict::Idempotent => {
+                    // Silent, per §5.7, **including from a different
+                    // publisher**: two robot_state_publishers with the same
+                    // URDF is a redundant launch file, not a misconfiguration,
+                    // and an authority diagnostic here would train operators to
+                    // ignore the message that matters. So this returns before
+                    // authority is consulted at all.
+                    self.stats.applied += 1;
+                    return Action::Drop {
+                        reason: DropReason::StaticRepeat,
+                    };
+                }
+                StaticVerdict::KindChanged { .. } => {
+                    self.stats.dropped_kind_change += 1;
+                    return Action::Drop {
+                        reason: DropReason::KindChange,
+                    };
+                }
+                StaticVerdict::Conflict {
+                    owner,
+                    intruder,
+                    existing,
+                    offered,
+                    first_time,
+                } => {
+                    // The diagnostic first — carrying **both values**, which is
+                    // the half that tells an operator which URDF is installed —
+                    // and then the authority policy decides the disposition.
+                    self.stats.static_conflicts += 1;
+                    self.stats.dropped_authority += 1;
+                    return Action::StaticConflict {
+                        parent,
+                        child,
+                        owner,
+                        intruder,
+                        existing,
+                        offered,
+                        first_time,
+                    };
+                }
+                StaticVerdict::Declare => {}
+            }
+        }
+
+        // 4. Authority, before the clock — see the module docs.
         match self.authority.admit(&parent, &child, publisher) {
             Verdict::Accept => {}
             Verdict::Reject { .. } => {
@@ -192,53 +284,31 @@ impl Ingest {
                 };
             }
             Verdict::Fatal { owner, intruder } => {
+                // **Count it before halting.** `stats.transforms` was already
+                // incremented, so returning without an outcome bucket leaves
+                // `balanced()` false forever — precisely the shape
+                // `BridgeStats::balanced`'s own doc names as the bug it exists
+                // to detect. The clock-reset halt below always counted; these
+                // two paths disagreeing is what review found.
+                self.stats.dropped_authority += 1;
                 return Action::Halt {
                     reason: HaltReason::AuthorityConflict { owner, intruder },
-                }
+                };
             }
         }
 
         if topic == Topic::TfStatic {
-            // Statics carry a stamp, and it is meaningless — a latched
-            // transform is constant. Running it past the clock guard would let
-            // a `robot_state_publisher` that stamps with zero drag the
-            // high-water mark to the epoch and make every dynamic sample
-            // afterwards look like a bag loop.
-            return match self
-                .statics
-                .observe_static(&parent, &child, sample.pose, publisher)
-            {
-                StaticVerdict::Declare => {
-                    self.stats.applied += 1;
-                    Action::DeclareStatic {
-                        parent,
-                        child,
-                        pose: sample.pose,
-                    }
-                }
-                StaticVerdict::Idempotent => {
-                    self.stats.applied += 1;
-                    Action::Drop {
-                        reason: DropReason::StaticRepeat,
-                    }
-                }
-                StaticVerdict::Conflict { .. } => {
-                    self.stats.static_conflicts += 1;
-                    self.stats.dropped_authority += 1;
-                    Action::Drop {
-                        reason: DropReason::StaticConflict,
-                    }
-                }
-                StaticVerdict::KindChanged { .. } => {
-                    self.stats.dropped_kind_change += 1;
-                    Action::Drop {
-                        reason: DropReason::KindChange,
-                    }
-                }
+            // Reached only for `StaticVerdict::Declare` — every other verdict
+            // returned in step 3, above authority.
+            self.stats.applied += 1;
+            return Action::DeclareStatic {
+                parent,
+                child,
+                pose: sample.pose,
             };
         }
 
-        // 4. Clock, last: only a sample that will be written may advance time.
+        // 5. Clock, last: only a sample that will be written may advance time.
         match self.clock.observe(sample.stamp_nanos) {
             ClockVerdict::Forward => {
                 self.stats.applied += 1;
@@ -291,6 +361,15 @@ impl Ingest {
     #[must_use]
     pub fn authority(&self) -> &Authority {
         &self.authority
+    }
+
+    /// The static-transform table, so `doctor` can surface §5.7's conflicts
+    /// alongside §5.4's. Without this the conflict payload would be visible
+    /// only on the one `Action` that reports it, and a caller that logged and
+    /// moved on could never answer "what disagreed, in total".
+    #[must_use]
+    pub fn statics(&self) -> &StaticStore {
+        &self.statics
     }
 
     /// The remap table, for the startup log (§5.6).
@@ -479,6 +558,116 @@ mod tests {
         );
         assert!(s.dropped_authority > 0 && s.dropped_bad_name == 1 && s.dropped_kind_change == 1);
         assert!(s.dropped_non_monotonic > 0);
+    }
+
+    /// **§5.7's whole feature: two `robot_state_publisher`s with different
+    /// URDFs, reported with both values.**
+    ///
+    /// This is the case §5.4 calls the sales pitch, and it was **inert**. The
+    /// pipeline asked authority before the static store, so under the default
+    /// `FirstWriterWins` the first publisher owned the edge and the second was
+    /// rejected as `NotTheOwner` — `observe_static` never ran, and the
+    /// `existing`/`offered` payload that tells an operator *which URDF is
+    /// installed* was unreachable through the pipeline. Every unit test in
+    /// `statics.rs` passed, because they call `StaticStore` directly.
+    ///
+    /// Mutant: move `observe_static` back below `authority.admit` ⇒ this
+    /// returns `Drop { NotTheOwner }` and `static_conflicts` stays 0.
+    #[test]
+    fn two_urdfs_disagreeing_is_reported_with_both_values() {
+        let mut i = Ingest::new();
+        let mut moved = Sample::identity("base", "lidar", 0);
+        assert!(matches!(
+            i.offer(Topic::TfStatic, &moved, &node("/rsp_a")),
+            Action::DeclareStatic { .. }
+        ));
+        moved.pose[4] = 0.25; // the second URDF puts the lidar 25 cm forward
+
+        match i.offer(Topic::TfStatic, &moved, &node("/rsp_b")) {
+            Action::StaticConflict {
+                parent,
+                child,
+                owner,
+                intruder,
+                existing,
+                offered,
+                first_time,
+            } => {
+                assert_eq!((parent.as_str(), child.as_str()), ("base", "lidar"));
+                assert_eq!(owner, node("/rsp_a"), "both publishers named");
+                assert_eq!(intruder, node("/rsp_b"));
+                assert_eq!(existing[4], 0.0, "and both values");
+                assert!((offered[4] - 0.25).abs() < 1e-12);
+                assert!(first_time);
+            }
+            other => panic!("§5.7's diagnostic must be reachable: {other:?}"),
+        }
+        assert_eq!(i.stats().static_conflicts, 1);
+        assert!(i.stats().balanced());
+    }
+
+    /// **An identical latched value from a second publisher is silent** — §5.7
+    /// says so, and it is the normal case for a redundant launch file.
+    ///
+    /// With authority first, this produced a *loud* `NotTheOwner` diagnostic
+    /// with `first_time: true`, training an operator to ignore the message that
+    /// matters.
+    #[test]
+    fn an_identical_static_from_a_second_publisher_is_silent() {
+        let mut i = Ingest::new();
+        let s = Sample::identity("base", "lidar", 0);
+        i.offer(Topic::TfStatic, &s, &node("/rsp_a"));
+        assert_eq!(
+            i.offer(Topic::TfStatic, &s, &node("/rsp_b")),
+            Action::Drop {
+                reason: DropReason::StaticRepeat
+            }
+        );
+        assert_eq!(i.stats().static_conflicts, 0);
+        assert_eq!(
+            i.stats().dropped_authority,
+            0,
+            "a redundant launch file is not an authority conflict"
+        );
+    }
+
+    /// **A `Strict` halt still balances the ledger.**
+    ///
+    /// `transforms` is incremented for every sample, so a path that returns
+    /// without an outcome bucket leaves `balanced()` false forever — the exact
+    /// shape `BridgeStats::balanced`'s own doc names as the bug it detects. The
+    /// clock-reset halt always counted; the authority halt did not, and the two
+    /// disagreeing is what review found.
+    ///
+    /// Mutant: drop the `dropped_authority += 1` from the `Fatal` arm ⇒ this
+    /// fails.
+    #[test]
+    fn a_strict_halt_leaves_the_ledger_balanced() {
+        let mut i = Ingest::with(AuthorityPolicy::Strict, OnClockReset::Halt, None);
+        let s = |t: i64| Sample::identity("odom", "base", t);
+        assert!(matches!(
+            i.offer(Topic::Tf, &s(1_000 * MS), &node("/a")),
+            Action::Publish { .. }
+        ));
+        assert!(matches!(
+            i.offer(Topic::Tf, &s(1_010 * MS), &node("/b")),
+            Action::Halt {
+                reason: HaltReason::AuthorityConflict { .. }
+            }
+        ));
+        assert!(i.stats().balanced(), "{:?}", i.stats());
+
+        // ...and so does the clock halt, which is the path that was already
+        // right and is what made the disagreement visible.
+        let mut j = Ingest::new();
+        j.offer(Topic::Tf, &s(10_000 * MS), &node("/a"));
+        assert!(matches!(
+            j.offer(Topic::Tf, &s(0), &node("/a")),
+            Action::Halt {
+                reason: HaltReason::ClockReset { .. }
+            }
+        ));
+        assert!(j.stats().balanced(), "{:?}", j.stats());
     }
 
     /// **The queue high-water mark only rises**, so a queue that fills between

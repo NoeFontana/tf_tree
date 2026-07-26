@@ -111,10 +111,18 @@ What that bought, concretely: **31 tests that run on `just test`**, over the
 sections where the judgments live. Three of them encode orderings that are easy
 to get backwards and hard to notice afterwards:
 
-- **Authority is decided before the clock.** Reversed, one node publishing from
-  the future is rejected on authority *after* its stamp has already moved the
-  high-water mark — so the legitimate publisher's next samples read as
-  non-monotonic, and the diagnostic blames the victim.
+- **The static-value check comes before authority, and authority before the
+  clock.** §5.7 orders the first pair explicitly — *"a diagnostic naming both
+  publishers and both values, **then** apply the authority policy"* — and the
+  first implementation got it backwards, which made §5.7 **inert for exactly the
+  case it exists for**: under `FirstWriterWins` the first
+  `robot_state_publisher` owns the edge, so the second was rejected as
+  `NotTheOwner` and the value comparison never ran. Every unit test passed,
+  because they call the store directly. Found by review.
+- **Authority before the clock.** Reversed, one node publishing from the future
+  is rejected on authority *after* its stamp has already moved the high-water
+  mark — so the legitimate publisher's next samples read as non-monotonic, and
+  the diagnostic blames the victim.
 - **A static's stamp never touches the clock.** `robot_state_publisher`
   commonly stamps statics with zero; feeding that to the reset detector drags
   the mark to the epoch and halts the bridge on a correctly configured robot.
