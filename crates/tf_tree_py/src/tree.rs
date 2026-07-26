@@ -358,15 +358,40 @@ impl PyPlan {
                     "a scalar stamp needs out of shape (4, 4), got {shape:?}"
                 )));
             }
+            // **Writability, before anything is evaluated.** `as_slice_mut` is
+            // `unsafe` because it checks neither `NPY_ARRAY_WRITEABLE` nor
+            // aliasing, and skipping the check does not merely produce a wrong
+            // answer: a read-only `np.memmap` is a `PROT_READ` page, and storing
+            // into it is `SIGSEGV`, not an error. §5.5's rule is refuse rather
+            // than fault, and it applies to host memory the caller cannot write
+            // exactly as much as to device memory.
+            //
+            // `try_readwrite` is the safe API and was tried first: it also
+            // consults rust-numpy's borrow registry, which costs a global
+            // lookup and measured **+50 ns on a 173 ns call** — enough to put
+            // `at_into` back above `at` and undo the reason it exists. The
+            // registry answers a question this code was not getting wrong;
+            // writability is the one it was. `is_writeable` reads the same
+            // `flags` field `is_c_contiguous` already reads, for about a
+            // nanosecond.
+            if !is_writeable(arr.as_untyped()) {
+                return Err(BufferError::new_err(
+                    "out is not writable (NumPy reports NPY_ARRAY_WRITEABLE clear); \
+                     a read-only mapping cannot receive a transform",
+                ));
+            }
             let g = self.tree().guard();
             let iso = self
                 .plan
                 .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
                 .map_err(lookup_err)?;
-            // SAFETY: checked C-contiguous and (4, 4) above, so the slice is
-            // exactly 16 f64, and `out` is exclusively borrowed for this call.
-            // Nothing is written before both checks pass — a half-written output
-            // is worse than none, because it looks like data.
+            // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
+            // slice is exactly 16 writable f64. Aliasing remains the caller's
+            // to avoid, as it was before — `as_slice_mut` documents that, and
+            // handing the same array to two threads is already a data race in
+            // NumPy's own terms. Nothing is written before every check passes:
+            // a half-written output is worse than none, because it looks like
+            // data.
             let slice = unsafe { arr.as_slice_mut()? };
             tf_tree::write_mat4(&iso, slice);
             return Ok(());
@@ -501,10 +526,23 @@ impl PyPlan {
             )));
         }
 
-        // SAFETY: both arrays were just checked C-contiguous, and `out` is
-        // exclusively borrowed for this call. Taken *before* `allow_threads` and
-        // held across it: NumPy refuses to resize an array while a buffer is
-        // exported, which is what keeps these pointers valid (§6.2).
+        // **Writability, before a single store.** `as_slice_mut` checks neither
+        // `NPY_ARRAY_WRITEABLE` nor aliasing; a read-only `np.memmap` is a
+        // `PROT_READ` page and storing into it is `SIGSEGV`, not an error.
+        // A single `flags` read — see the note in `at_into` on why not
+        // `try_readwrite`.
+        if !is_writeable(out.as_untyped()) {
+            return Err(BufferError::new_err(
+                "out is not writable (NumPy reports NPY_ARRAY_WRITEABLE clear); \
+                 a read-only mapping cannot receive a transform",
+            ));
+        }
+
+        // SAFETY: both arrays were just checked C-contiguous, `out` is writable,
+        // and aliasing is the caller's to avoid exactly as `as_slice_mut`
+        // documents. Taken *before* `allow_threads` and held across it: NumPy
+        // refuses to resize an array while a buffer is exported, which is what
+        // keeps these pointers valid (§6.2).
         let (src, dst) = unsafe { (stamps.as_slice()?, out.as_slice_mut()?) };
 
         let est = (n as u64)
@@ -719,6 +757,22 @@ fn reject_device_memory(obj: &Bound<'_, PyAny>) -> PyResult<()> {
          adaptive knot array is about a kilobyte, so that transfer is ~6 us and \
          is not what limits you."
     )))
+}
+
+/// Whether NumPy marks this array writable.
+///
+/// **This is the check whose absence made a read-only `np.memmap` a `SIGSEGV`
+/// rather than an error**, and made a `flags.writeable = False` array get
+/// silently overwritten. `as_slice_mut` is `unsafe` precisely because it checks
+/// neither this nor aliasing, and §5.5's rule — refuse rather than fault —
+/// applies to host memory the caller cannot write just as much as to device
+/// memory.
+///
+/// One field read, which is what `is_c_contiguous` also does.
+fn is_writeable(arr: &Bound<'_, numpy::PyUntypedArray>) -> bool {
+    // SAFETY: `as_array_ptr` returns this array's live `PyArrayObject` for the
+    // lifetime of the borrow; `flags` is a plain `c_int` field and is only read.
+    unsafe { (*arr.as_array_ptr()).flags & numpy::npyffi::NPY_ARRAY_WRITEABLE != 0 }
 }
 
 /// Render a bool the way Python spells it, for `__repr__`.
