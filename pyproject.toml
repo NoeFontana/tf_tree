@@ -54,6 +54,6 @@ addopts = ["-ra", "--strict-markers", "--strict-config"]
 testpaths = ["tests/python"]
 
 [tool.pyright]
-include = ["python", "tests/python"]
+include = ["python", "tests/python", "crates/tf_tree_bench/python"]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
