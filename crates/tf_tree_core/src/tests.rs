@@ -436,7 +436,7 @@ fn a_poisoned_guard_refuses_every_evaluation() {
     )
     .unwrap();
 
-    let g = Guard::poisoned(ArenaView::new(&arena), LookupError::ChildDetached);
+    let g = Guard::detached(ArenaView::new(&arena));
     assert_eq!(g.poison(), Some(LookupError::ChildDetached));
     let t = Stamp::<SystemDomain>::from_nanos(1);
     assert_eq!(plan.at(&g, t), Err(LookupError::ChildDetached));
@@ -464,6 +464,74 @@ fn a_poisoned_guard_refuses_every_evaluation() {
     // that a live guard and a poisoned one are distinguishable.
     let live = Guard::new(ArenaView::new(&arena));
     assert_ne!(plan.at(&live, t), Err(LookupError::ChildDetached));
+}
+
+/// **The detached sentinel must not collide with a real generation.**
+///
+/// `Guard` encodes "detached" as a `generation` of `u64::MAX` rather than
+/// carrying a 32-byte `Option<LookupError>` on a struct built once per `at()`
+/// call. That is only sound while no real topology can reach the sentinel
+/// value, and the cost of being wrong is a *live* guard reporting
+/// `ChildDetached` — an unrecoverable error, on a tree that is perfectly fine.
+///
+/// This builds the exact collision: a plan compiled against a generation the
+/// guard does not share, evaluated against an arena whose generation is `0`.
+/// Any sentinel a real topology can produce turns that into `ChildDetached`
+/// instead of the `TopologyChanged` it is. Mutant: `DETACHED = 0`.
+#[test]
+fn a_generation_mismatch_is_never_mistaken_for_a_detached_guard() {
+    // There is exactly one safe value, so it is pinned. Every other `u64` is a
+    // generation some tree can reach after enough mutations, and the collision
+    // test below can only demonstrate the small ones — a sentinel of `2` is
+    // just as wrong as `0` and no runnable test reaches it.
+    assert_eq!(
+        crate::plan::DETACHED_FOR_TEST,
+        u64::MAX,
+        "any sentinel below u64::MAX is a generation a real tree can reach"
+    );
+
+    let layout = ArenaLayout::new(4, 2, alloc::vec![4, 4]).unwrap();
+
+    // Arena A, mutated so its generation is non-zero, is where the plan comes
+    // from.
+    let a_arena = HeapArena::new(&layout, 1, 0, [0u8; 16]);
+    let a = ArenaView::new(&a_arena);
+    let x = a.intern("x").unwrap();
+    let y = a.intern("y").unwrap();
+    a.topology().set_parent(y, x.get(), 1).unwrap();
+    assert_ne!(a.topology().stable_generation(), 0, "arena A never mutated");
+    let plan = crate::plan::compile(
+        &a.topology(),
+        |eid| {
+            a.edge(eid).map(|e| crate::plan::EdgeMeta {
+                kind: crate::edge::EdgeKind::from_u8(e.kind),
+                domain: e.domain,
+                static_pose: Iso3::from_bits(&e.static_pose),
+            })
+        },
+        x,
+        y,
+    )
+    .unwrap();
+
+    // Arena B is untouched, so its generation is 0 — the value a careless
+    // sentinel would pick.
+    let b_arena = HeapArena::new(&layout, 2, 0, [0u8; 16]);
+    let b = Guard::new(ArenaView::new(&b_arena));
+    assert_eq!(b.generation(), 0);
+    assert_eq!(b.poison(), None, "a live guard must never read as detached");
+
+    let err = plan
+        .at(&b, Stamp::<SystemDomain>::from_nanos(1))
+        .expect_err("a plan from another arena's generation cannot evaluate here");
+    assert_eq!(
+        err,
+        LookupError::TopologyChanged {
+            plan: plan.generation(),
+            current: 0
+        },
+        "a generation mismatch was reported as a detached guard"
+    );
 }
 
 #[test]

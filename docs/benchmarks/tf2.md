@@ -692,9 +692,13 @@ than this; nothing here pays less.
 
 | | tf_tree | `tf2_ros` | ratio |
 |---|---:|---:|---:|
-| scalar lookup | **178.6 ns** | 11 708.8 ns | **65.6×** |
-| batch, n = 64 (per sample) | **37.9 ns** | 12 289.5 ns | **324.6×** |
-| batch, n = 4096 (per sample) | **35.7 ns** | 12 311.5 ns | **344.5×** |
+| scalar lookup | **188.7 ns** | 12 182.3 ns | **64.5×** |
+| batch, n = 64 (per sample) | **42.7 ns** | 12 477.5 ns | **292.0×** |
+| batch, n = 4096 (per sample) | **34.9 ns** | 12 607.5 ns | **361.7×** |
+
+Re-measured after Phase 2 completed. The earlier run read 178.6 ns scalar
+against 11 708.8 ns for tf2; **both** columns moved by about the same 4%, which
+is the container, not the code. What is *not* noise is recorded below.
 
 The batch rows deserve a word, because they are the easiest to misread. **tf2
 has no batch API**, so its per-sample figure is simply its scalar figure — the
@@ -721,6 +725,31 @@ Against `docs/PHASE3.md` §12.2's gate, measured on the *identical* fixture with
 Criterion 2's parity bench exists because `benches/at_many.rs` uses the deep
 mobile-robot fixture; dividing a Python figure by *its* ns/sample would have
 produced a meaningless ratio in either direction.
+
+#### A 32-byte struct field cost 4%, and the benchmark is how it was found
+
+Phase 2's fork poisoning needed a `Guard` that refuses every evaluation without
+reading the arena. The first version carried an `Option<LookupError>`:
+
+| | `Guard` | Python scalar | native depth-3 |
+|---|---:|---:|---:|
+| before | 48 B | 178.6 ns | 64.1 ns |
+| `Option<LookupError>` field | **80 B** | 196.3 ns | 64.6 ns |
+| generation sentinel | 48 B | **188.7 ns** | **62.0 ns** |
+
+`LookupError` is 32 bytes, and `Option` of it is niche-packed to the same 32 —
+so the field grew `Guard` by two thirds, on a struct built **once per `at()`
+call** on the Python path. Encoding "detached" as a `generation` of `u64::MAX`
+instead costs nothing at all: `check_generation` already loads `generation`, and
+the poison check folds into the comparison it was already making, on the cold
+side of it.
+
+The native row barely moved either way, which is why this needed the Python
+benchmark to see: the extension's per-call overhead is where a fatter `Guard`
+shows up. Sentinels earn their keep by being unreachable, so
+`a_generation_mismatch_is_never_mistaken_for_a_detached_guard` builds the exact
+collision — a plan from one arena's generation evaluated against another arena
+at generation 0 — and fails against `DETACHED = 0` or `1`.
 
 ### What is implemented, and what is not
 

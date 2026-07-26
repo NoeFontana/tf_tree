@@ -269,21 +269,20 @@ impl Plan {
 
     #[inline]
     fn check_generation(&self, g: &Guard) -> Result<(), LookupError> {
-        // Ahead of the generation compare, because a poisoned guard's generation
-        // is meaningless and reporting `TopologyChanged { current: 0 }` would
-        // send the reader looking for a re-plan that cannot help.
-        if let Some(err) = g.poison() {
-            return Err(err);
-        }
         let cur = g.generation();
         if cur == self.generation {
-            Ok(())
-        } else {
-            Err(LookupError::TopologyChanged {
-                plan: self.generation,
-                current: cur,
-            })
+            return Ok(());
         }
+        // Only now, on the cold side of a comparison that was already being
+        // made. A detached guard must not report `TopologyChanged`, which would
+        // send the reader looking for a re-plan that cannot help.
+        if cur == DETACHED {
+            return Err(LookupError::ChildDetached);
+        }
+        Err(LookupError::TopologyChanged {
+            plan: self.generation,
+            current: cur,
+        })
     }
 
     #[inline]
@@ -762,11 +761,29 @@ pub struct EdgeMeta {
 /// batch of lookups.
 pub struct Guard<'a> {
     view: ArenaView<'a>,
+    /// The pinned topology generation, or [`DETACHED`] for a guard built by
+    /// [`Guard::detached`].
     generation: u64,
-    /// Set by [`Guard::poisoned`]; returned by every evaluation against this
-    /// guard, ahead of the generation check.
-    poison: Option<LookupError>,
 }
+
+/// The generation a [`Guard::detached`] guard carries.
+///
+/// **Not a real generation, and unreachable as one.** The topology generation
+/// starts at 0 and is bumped once per mutation; reaching `u64::MAX` would take
+/// longer than the age of the universe at any rate a robot can mutate a tree, so
+/// there is no value here to collide with.
+///
+/// Encoding the poison in a field that already exists — rather than adding one —
+/// keeps `Guard` at 48 bytes and adds **no load at all** to the hot path:
+/// [`Plan::check_generation`] already reads `generation`, and the poison check
+/// is the comparison it was already making. An `Option<LookupError>` field cost
+/// 32 bytes on a struct built once per `at()` call.
+const DETACHED: u64 = u64::MAX;
+
+/// [`DETACHED`], for the test that pins it. Any other value is a generation some
+/// tree can reach.
+#[cfg(test)]
+pub(crate) const DETACHED_FOR_TEST: u64 = DETACHED;
 
 impl<'a> Guard<'a> {
     /// Pin the current topology generation and wrap the arena view for a batch of
@@ -779,14 +796,11 @@ impl<'a> Guard<'a> {
     #[must_use]
     pub fn new(view: ArenaView<'a>) -> Guard<'a> {
         let generation = view.topology().stable_generation();
-        Guard {
-            view,
-            generation,
-            poison: None,
-        }
+        Guard { view, generation }
     }
 
-    /// A guard that fails every evaluation with `err`, without reading `view`.
+    /// A guard that fails every evaluation with [`LookupError::ChildDetached`],
+    /// without reading `view`.
     ///
     /// # Why this is not the same as returning an error from the constructor
     ///
@@ -808,20 +822,24 @@ impl<'a> Guard<'a> {
     /// `view` must still be a view over a *valid* arena, because [`Self::view`]
     /// hands it out; supply a small throwaway arena rather than the unreachable
     /// one.
+    ///
+    /// There is deliberately no `poisoned(view, err)` taking an arbitrary error.
+    /// One was written and replaced: carrying the error meant a 32-byte
+    /// `Option<LookupError>` field on a struct that is built once per `at()`
+    /// call, to express a generality nothing needed. See [`DETACHED`].
     #[must_use]
-    pub fn poisoned(view: ArenaView<'a>, err: LookupError) -> Guard<'a> {
+    pub fn detached(view: ArenaView<'a>) -> Guard<'a> {
         Guard {
             view,
-            generation: 0,
-            poison: Some(err),
+            generation: DETACHED,
         }
     }
 
-    /// The failure this guard was poisoned with, if any.
+    /// The failure this guard refuses every evaluation with, if it does.
     #[inline]
     #[must_use]
     pub fn poison(&self) -> Option<LookupError> {
-        self.poison
+        (self.generation == DETACHED).then_some(LookupError::ChildDetached)
     }
 
     /// The pinned topology generation.
