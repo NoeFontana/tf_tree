@@ -141,11 +141,19 @@ cpp-bench:
     sophus=""
     [ -f target/thirdparty/Sophus/sophus/se3.hpp ] && \
         sophus="-isystem target/thirdparty/Sophus -DSOPHUS_USE_BASIC_LOGGING"
-    g++ -O2 -std=c++17 -Wall -Wextra -Werror -I crates/tf_tree_c/include \
-        -isystem /usr/include/eigen3 $sophus -o "$out/bench" \
-        crates/tf_tree_c/tests/cpp/bench.cpp target/release/libtf_tree_c.a \
-        -lpthread -ldl -lm
-    taskset -c 2 "$out/bench"
+    # **Both error modes.** The gate applies to the wrapper, and
+    # `-fno-exceptions` is a different wrapper: a first implementation of
+    # `expected<T>` made an FFI call per success and missed the gate at 1.064x
+    # while the exceptions build measured 1.002x. Measuring one mode and
+    # reporting "gate 2 passes" was wrong, and this is the fix.
+    for mode in "" "-fno-exceptions"; do
+        g++ -O2 -std=c++17 $mode -Wall -Wextra -Werror -I crates/tf_tree_c/include \
+            -isystem /usr/include/eigen3 $sophus -o "$out/bench" \
+            crates/tf_tree_c/tests/cpp/bench.cpp target/release/libtf_tree_c.a \
+            -lpthread -ldl -lm
+        taskset -c 2 "$out/bench"
+        echo
+    done
 
 # Fetch Sophus (header-only) into target/thirdparty so `cpp-check` can exercise
 # §4.3. Not vendored: it is a test dependency of one recipe, it is ~10 MB, and

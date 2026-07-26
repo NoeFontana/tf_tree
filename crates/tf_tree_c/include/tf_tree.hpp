@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -180,14 +181,35 @@ private:
 /// here. It is deliberately not a general-purpose type: it has exactly the
 /// operations the wrapper needs, so nobody is tempted to depend on it as a
 /// utility. When the project moves to C++23 this becomes an alias.
+/// The error is held in a `std::optional`, and **that is a performance
+/// requirement, not a style choice.**
+///
+/// The first version stored a plain `Error` and initialised it with
+/// `Error(TFT_OK)` on the *success* path. `Error`'s constructor calls
+/// `tft_last_error`, so every successful lookup made an extra FFI call and
+/// copied 320 bytes out of the thread-local slot. Measured with
+/// `-Wl,--wrap=tft_last_error`: exactly **one call per successful lookup**, and
+/// the wrapper came out at **1.064x** the raw C ABI against §7 gate 2's 1.02
+/// allowance. The exceptions build made zero such calls and measured 1.002x,
+/// which is why the benchmark — compiled only with exceptions — reported a pass.
+///
+/// An empty `std::optional` constructs no `Error` and calls nothing.
+/// Tag for constructing an `expected` whose payload is default-initialised
+/// **in place**. See `make_result`.
+struct in_place_value_t {
+    explicit in_place_value_t() = default;
+};
+inline constexpr in_place_value_t in_place_value{};
+
 template <typename T>
 class expected {
 public:
-    expected(T value) : has_(true), value_(std::move(value)), error_(TFT_OK) {}
-    expected(Error e) : has_(false), value_(), error_(std::move(e)) {}
+    explicit expected(in_place_value_t) : value_() {}
+    expected(T value) : value_(std::move(value)) {}
+    expected(Error e) : error_(std::move(e)) {}
 
-    explicit operator bool() const noexcept { return has_; }
-    bool has_value() const noexcept { return has_; }
+    explicit operator bool() const noexcept { return !error_.has_value(); }
+    bool has_value() const noexcept { return !error_.has_value(); }
 
     /// **Unchecked.** Reading the value of a failed `expected` is your bug, in
     /// the same way that dereferencing a null pointer is; there is no exception
@@ -197,31 +219,58 @@ public:
     const T* operator->() const noexcept { return &value_; }
     T* operator->() noexcept { return &value_; }
 
-    const Error& error() const noexcept { return error_; }
+    /// **Unchecked**, like `operator*`: only meaningful when `!*this`.
+    const Error& error() const noexcept { return *error_; }
 
 private:
-    bool has_;
-    T value_;
-    Error error_;
+    T value_{};
+    std::optional<Error> error_;
 };
 
 /// The void case: success or an `Error`, no payload.
 template <>
 class expected<void> {
 public:
-    expected() : has_(true), error_(TFT_OK) {}
-    expected(Error e) : has_(false), error_(std::move(e)) {}
-    explicit operator bool() const noexcept { return has_; }
-    bool has_value() const noexcept { return has_; }
-    const Error& error() const noexcept { return error_; }
+    expected() = default;
+    expected(Error e) : error_(std::move(e)) {}
+    explicit operator bool() const noexcept { return !error_.has_value(); }
+    bool has_value() const noexcept { return !error_.has_value(); }
+    /// **Unchecked**: only meaningful when `!*this`.
+    const Error& error() const noexcept { return *error_; }
 
 private:
-    bool has_;
-    Error error_;
+    std::optional<Error> error_;
 };
 
 template <typename T>
 using result = expected<T>;
+
+/// A pointer to the payload **inside the object that will be returned**.
+///
+/// The wrapper writes the C ABI's bytes straight into the return slot rather
+/// than into a local it then moves out. That is not micro-optimisation: with a
+/// local, `return out;` converts through `expected(T value)` and costs two
+/// moves of `T` — 128 bytes each for `Eigen::Isometry3d` — which NRVO elides in
+/// the exceptions mode and cannot elide here. Measured: 1.028x the C ABI with
+/// the moves, against §7 gate 2's 1.02.
+template <typename T>
+inline T* value_ptr(expected<T>& e) noexcept
+{
+    return &*e;
+}
+
+/// An empty result whose payload is default-initialised **in place**.
+///
+/// `expected<T> out{T{}}` looks equivalent and is not: it constructs a
+/// temporary and moves it into `value_`, which for `Eigen::Isometry3d` is a
+/// 128-byte copy the exceptions mode never pays. Interleaved measurement put
+/// that at a consistent 3-5 % over the C ABI — above §7 gate 2's 2 %, and only
+/// visible once the benchmark timed both paths in the same round.
+template <typename T>
+inline expected<T> make_result()
+{
+    return expected<T>(in_place_value);
+}
 
 #define TF_TREE_FAIL(status) return ::tf_tree::Error(status)
 #define TF_TREE_TRY(expr)                                                     \
@@ -236,6 +285,22 @@ using result = expected<T>;
 
 template <typename T>
 using result = T;
+
+/// See the no-exceptions overload: here `result<T>` *is* `T`, so this is the
+/// identity and NRVO does the rest.
+template <typename T>
+inline T* value_ptr(T& v) noexcept
+{
+    return &v;
+}
+
+/// Here `result<T>` *is* `T`, so this is a default-constructed `T` that the
+/// caller's NRVO turns into the return slot itself.
+template <typename T>
+inline T make_result()
+{
+    return T{};
+}
 
 #define TF_TREE_FAIL(status) throw ::tf_tree::Error(status)
 #define TF_TREE_TRY(expr)                                                     \
@@ -260,9 +325,17 @@ namespace detail {
 /// versions named. `tft_check_abi` puts both in the error detail and the
 /// message, so this only has to surface it.
 ///
-/// It runs before `main`, which is the point: a silently mismatched ABI is a
-/// debugging session nobody deserves, and finding out at the first lookup is
-/// finding out too late.
+/// Whether the ABI check has run. Declared before [`AbiCheck`] because its
+/// constructor sets it. Exists so a test can assert that the check happened at
+/// all — an assertion that is not a formality: it did not, for the whole of
+/// this header's first life.
+inline bool abi_check_ran = false;
+
+/// Constructed by a namespace-scope `inline` variable below, so it runs during
+/// this translation unit's dynamic initialization — before anything the user
+/// wrote in the same TU is odr-used, and in practice before `main`'s body. A
+/// silently mismatched ABI is a debugging session nobody deserves, and finding
+/// out at the first lookup is finding out too late.
 struct AbiCheck {
     AbiCheck()
     {
@@ -274,6 +347,7 @@ struct AbiCheck {
                                   : "tf_tree: ABI mismatch (detail unavailable)";
             fail(msg);
         }
+        abi_check_ran = true;
     }
 
     // `[[noreturn]]` in both modes: an ABI mismatch is not recoverable, and a
@@ -293,13 +367,19 @@ struct AbiCheck {
     }
 };
 
-/// One definition, `inline` so every translation unit shares it and the check
-/// runs once rather than once per TU.
-inline const AbiCheck& abi_check()
-{
-    static const AbiCheck instance;
-    return instance;
-}
+/// **A namespace-scope `inline` variable, not a function-local static, and not
+/// behind any `#ifdef`.**
+///
+/// The first version was a Meyers singleton called from `Tree::open()`, which is
+/// itself `#ifdef TFT_HAVE_SHM` — a macro nothing in the build defines. So the
+/// check was unreachable in every shipped configuration, and a comment above it
+/// claimed "it runs before `main`", which a function-local static does not do
+/// even when it is called. §3.6 asks for a static initializer; this is one.
+///
+/// C++17 `inline` gives exactly one object across all translation units, so the
+/// check runs once per program rather than once per TU, without a `.cpp` file
+/// to link — which a header-only library does not have.
+inline const AbiCheck abi_check_instance{};
 
 }  // namespace detail
 
@@ -530,7 +610,6 @@ public:
     /// `$TF_TREE_RUNTIME_DIR` select which arena.
     static result<Tree> open()
     {
-        detail::abi_check();
         Tree t;
         TF_TREE_TRY(tft_tree_open(t.h_.out()));
         return t;
@@ -586,8 +665,12 @@ public:
                       "if its storage really is a plain scalar array at offset 0");
         static_assert(sizeof(T) >= payload_bytes(layout_of<T>::value),
                       "T is smaller than the layout it selects, so the write would overrun it");
-        T out{};
-        const tft_status s = tft_plan_at(h_.get(), stamp, layout_of<T>::value, &out);
+        // `result<T>`, not `T`: this local IS the return slot under NRVO, in
+        // both error modes, so the C ABI writes once into the caller's storage.
+        // See `value_ptr`.
+        result<T> out = make_result<T>();
+        const tft_status s =
+            tft_plan_at(h_.get(), stamp, layout_of<T>::value, value_ptr(out));
         if (s != TFT_OK) {
             TF_TREE_FAIL(s);
         }

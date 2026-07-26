@@ -9,7 +9,11 @@ include(CMakeFindDependencyMacro)
 
 set_and_check(TF_TREE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
 
-find_library(TF_TREE_LIBRARY_SHARED NAMES tf_tree_c
+# **Exact filenames, both of them.** `NAMES tf_tree_c` walks
+# `CMAKE_FIND_LIBRARY_SUFFIXES` (`.so;.a` on Linux) and would happily match the
+# archive when no shared library is installed — declaring a `.a` a SHARED
+# IMPORTED target, which fails at link time with a message about the *consumer*.
+find_library(TF_TREE_LIBRARY_SHARED NAMES libtf_tree_c.so
              PATHS "@PACKAGE_CMAKE_INSTALL_LIBDIR@" NO_DEFAULT_PATH)
 find_library(TF_TREE_LIBRARY_STATIC NAMES libtf_tree_c.a
              PATHS "@PACKAGE_CMAKE_INSTALL_LIBDIR@" NO_DEFAULT_PATH)

@@ -54,7 +54,15 @@ WARN="-Wall -Wextra -Wpedantic -Werror"
 fail=0
 
 for cxx in g++ clang++; do
-    command -v "$cxx" >/dev/null || { echo "  skip: $cxx not installed"; continue; }
+    # **A missing compiler is a failure, not a skip.** §6.2 names GCC *and*
+    # Clang as the requirement; skipping one silently removed 4 of the 8 rows
+    # and left the script printing "cpp-check: OK". Eigen is already a hard
+    # failure a few lines up, and this is the same kind of thing.
+    if ! command -v "$cxx" >/dev/null; then
+        echo "  FAIL: $cxx is not installed; §6.2 requires both compilers." >&2
+        fail=1
+        continue
+    fi
     for std in c++17 c++20; do
         for mode in exceptions no-exceptions; do
             flags=""
@@ -100,7 +108,8 @@ if command -v clang++ >/dev/null; then
         fi
     fi
 else
-    echo "skipped (no clang++)"
+    echo "FAIL — §7 gate 4 needs clang++ for ASan/UBSan"
+    fail=1
 fi
 
 [ "$fail" -eq 0 ] && echo "  cpp-check: OK" || { echo "  cpp-check: FAILED" >&2; exit 1; }

@@ -35,16 +35,34 @@ set(TF_TREE_PREBUILT_DIR "" CACHE PATH
 
 # --- where the library comes from ------------------------------------------
 
-set(_tf_tree_static "")
-set(_tf_tree_shared "")
+# **Do not pre-set these**, and do not give both `find_library` calls the same
+# NAMES. Two separate defects lived in four lines here:
+#
+#  * `set(_tf_tree_static "")` before `find_library(_tf_tree_static ...)` makes
+#    the search a no-op — `find_library` skips entirely when a variable of that
+#    name is already defined. `TF_TREE_PREBUILT_DIR` was dead code.
+#  * both calls used `NAMES tf_tree_c`, and `CMAKE_FIND_LIBRARY_SUFFIXES` is
+#    `.so;.a`, so both resolved to the *same* `.so` — the "static" target was a
+#    shared library wearing a static label.
+#
+# Distinct cache variables, distinct NAMES, and `unset` rather than `set ""`.
+unset(_tf_tree_static)
+unset(_tf_tree_shared)
+set(_tf_tree_corrosion FALSE)
 
 if(TF_TREE_PREBUILT_DIR)
-  find_library(_tf_tree_static NAMES tf_tree_c PATHS "${TF_TREE_PREBUILT_DIR}"
-               NO_DEFAULT_PATH)
-  find_library(_tf_tree_shared NAMES tf_tree_c PATHS "${TF_TREE_PREBUILT_DIR}"
-               NO_DEFAULT_PATH)
-  if(_tf_tree_static)
-    message(STATUS "tf_tree: using prebuilt ${_tf_tree_static}")
+  find_library(TF_TREE_PREBUILT_STATIC NAMES libtf_tree_c.a
+               PATHS "${TF_TREE_PREBUILT_DIR}" NO_DEFAULT_PATH)
+  find_library(TF_TREE_PREBUILT_SHARED NAMES libtf_tree_c.so
+               PATHS "${TF_TREE_PREBUILT_DIR}" NO_DEFAULT_PATH)
+  if(TF_TREE_PREBUILT_STATIC OR TF_TREE_PREBUILT_SHARED)
+    set(_tf_tree_static "${TF_TREE_PREBUILT_STATIC}")
+    set(_tf_tree_shared "${TF_TREE_PREBUILT_SHARED}")
+    message(STATUS "tf_tree: using prebuilt from ${TF_TREE_PREBUILT_DIR}")
+  else()
+    message(WARNING
+        "tf_tree: TF_TREE_PREBUILT_DIR=${TF_TREE_PREBUILT_DIR} holds no "
+        "libtf_tree_c.a or libtf_tree_c.so; falling back to a source build")
   endif()
 endif()
 
@@ -55,6 +73,19 @@ if(NOT _tf_tree_static AND TF_TREE_BUILD_FROM_SOURCE)
     corrosion_import_crate(MANIFEST_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
                            PROFILE release)
     set(_tf_tree_corrosion TRUE)
+    # **Export the same target names corrosion does not.** Without this the
+    # corrosion branch imported the crate and then exported nothing: no
+    # `tf_tree::tf_tree`, no `tf_tree::tf_tree_static`, and no install rule for
+    # the library — so `find_package(tf_tree CONFIG)` found headers and a config
+    # file describing libraries that were never installed.
+    add_library(tf_tree::tf_tree ALIAS tf_tree_c-shared)
+    add_library(tf_tree::tf_tree_static ALIAS tf_tree_c-static)
+    foreach(_t tf_tree_c-shared tf_tree_c-static)
+      target_include_directories(${_t} INTERFACE "${TF_TREE_INCLUDE_DIR}")
+      target_compile_features(${_t} INTERFACE cxx_std_17)
+    endforeach()
+    install(IMPORTED_RUNTIME_ARTIFACTS tf_tree_c-shared
+            LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" OPTIONAL)
   else()
     message(STATUS "tf_tree: building from source via cargo (corrosion not found)")
     set(_cargo_out "${CMAKE_CURRENT_BINARY_DIR}/cargo")
@@ -62,7 +93,13 @@ if(NOT _tf_tree_static AND TF_TREE_BUILD_FROM_SOURCE)
     set(_tf_tree_shared "${_cargo_out}/release/libtf_tree_c.so")
     add_custom_command(
       OUTPUT "${_tf_tree_static}" "${_tf_tree_shared}"
-      COMMAND ${CMAKE_COMMAND} -E env cargo build --release
+      # `-Wl,-soname` is load-bearing for a relocatable install. A rustc cdylib
+      # carries no `DT_SONAME`, so a consumer linking `tf_tree::tf_tree` records
+      # the **absolute build-time path** in its `DT_NEEDED` and the installed
+      # prefix cannot be moved — or packaged.
+      COMMAND ${CMAKE_COMMAND} -E env
+              "RUSTFLAGS=-C link-arg=-Wl,-soname,libtf_tree_c.so"
+              cargo build --release
               --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
               --target-dir "${_cargo_out}"
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"

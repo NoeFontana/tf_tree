@@ -43,9 +43,36 @@ for f in include/tf_tree.h include/tf_tree.hpp include/tf_tree_unstable.h \
 done
 echo "  installed 6/6 expected artifacts"
 
+# The .so must carry a SONAME, or a consumer records the absolute build-time
+# path in DT_NEEDED and the prefix cannot be moved or packaged. A rustc cdylib
+# has none by default; the build passes `-Wl,-soname` for exactly this.
+if command -v readelf >/dev/null; then
+    if ! readelf -d "$WORK/prefix/lib/libtf_tree_c.so" | grep -q SONAME; then
+        echo "  FAIL: the installed .so has no SONAME; the prefix is not relocatable" >&2
+        exit 1
+    fi
+    echo "  .so carries a SONAME"
+fi
+
 echo "  downstream find_package(tf_tree CONFIG)"
 cmake -S "$ROOT/crates/tf_tree_c/tests/cmake_consumer" -B "$WORK/consumer" \
       -DCMAKE_PREFIX_PATH="$WORK/prefix" >>"$WORK/log" 2>&1
 cmake --build "$WORK/consumer" >>"$WORK/log" 2>&1
 "$WORK/consumer/consumer"
+# The consumer above links the STATIC target. Link the SHARED one too — they
+# are separate imported targets resolved by separate find_library calls, and
+# a config that gets one right can get the other wrong. It did: both calls
+# used `NAMES tf_tree_c`, which on Linux matches the .so first, so the
+# "static" target was a shared library wearing a static label.
+echo "  downstream, shared target"
+sed 's/tf_tree::tf_tree_static/tf_tree::tf_tree/' \
+    "$ROOT/crates/tf_tree_c/tests/cmake_consumer/CMakeLists.txt" >"$WORK/shared_CMakeLists.txt"
+mkdir -p "$WORK/shared_src"
+cp "$WORK/shared_CMakeLists.txt" "$WORK/shared_src/CMakeLists.txt"
+cp "$ROOT/crates/tf_tree_c/tests/cmake_consumer/main.cpp" "$WORK/shared_src/"
+cmake -S "$WORK/shared_src" -B "$WORK/shared_build" \
+      -DCMAKE_PREFIX_PATH="$WORK/prefix" >>"$WORK/log" 2>&1
+cmake --build "$WORK/shared_build" >>"$WORK/log" 2>&1
+LD_LIBRARY_PATH="$WORK/prefix/lib" "$WORK/shared_build/consumer"
+
 echo "  cmake-check: OK"

@@ -100,6 +100,67 @@ static_assert(tf_tree::layout_of<Sophus::SE3d>::value == TFT_LAYOUT_QVEC7_XYZW,
 ///
 /// Mutant: change any entry in the header's `payload_bytes` ⇒ fails here, at
 /// the first affected layout.
+/// **The §3.6 ABI check must actually have run, before `main`.**
+///
+/// It did not, for the whole of this file's first life: it lived in a
+/// function-local static called only from `Tree::open()`, which is
+/// `#ifdef TFT_HAVE_SHM` — a macro nothing in the build defines. So the check
+/// was unreachable in every configuration this suite compiles, and no test
+/// noticed, because no test asked.
+///
+/// Mutant: remove `inline const AbiCheck abi_check_instance{};` from the header
+/// ⇒ this fails. Mutant: put it back behind `#ifdef TFT_HAVE_SHM` ⇒ also fails.
+static void check_abi_guard_ran()
+{
+    CHECK(tf_tree::detail::abi_check_ran,
+          "the §3.6 ABI check did not run; a mismatched ABI would go undetected");
+}
+
+/// **The no-exceptions `expected` must not touch the error machinery on
+/// success.**
+///
+/// It did: `expected<T>` stored a plain `Error`, whose constructor calls
+/// `tft_last_error`, so every successful lookup made an extra FFI call and
+/// copied 320 bytes. That put the `-fno-exceptions` build at 1.064x the raw C
+/// ABI against §7 gate 2's 1.02 — while the exceptions build, which is the one
+/// the benchmark compiled, measured 1.002x and reported a pass.
+///
+/// Constructing an `expected` here and observing that the thread-local error
+/// slot is untouched is the cheap structural version of that measurement.
+///
+/// Mutant: give `expected<T>` a plain `Error error_` again ⇒ the slot is
+/// overwritten with TFT_OK and this fails.
+#ifdef TF_TREE_NO_EXCEPTIONS
+static void check_success_does_not_touch_the_error_slot()
+{
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_tree_create(&raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+
+    // Provoke a real failure, so the thread-local slot holds something specific.
+    auto bad = tree.plan("map", "no_such_frame");
+    CHECK(!bad, "the provoking call must fail");
+
+    tft_error before{};
+    before.struct_size = static_cast<std::uint32_t>(sizeof(tft_error));
+    CHECK(tft_last_error(&before) == TFT_OK, "read the slot");
+    CHECK(before.code == TFT_ERR_UNKNOWN_FRAME, "the slot holds the failure");
+
+    // A *successful* wrapper call must not disturb it. (`tft_plan_create`
+    // itself clears the slot on entry, so go through a path that succeeds
+    // without calling into the library again: construct the expected directly.)
+    {
+        const tf_tree::expected<tf_tree::Quat7> ok{tf_tree::Quat7{1, 0, 0, 0, 0, 0, 0}};
+        CHECK(static_cast<bool>(ok), "a value-constructed expected is a success");
+    }
+    tft_error after{};
+    after.struct_size = static_cast<std::uint32_t>(sizeof(tft_error));
+    CHECK(tft_last_error(&after) == TFT_OK, "read the slot again");
+    CHECK(after.code == before.code,
+          "constructing a successful expected must not call into the error machinery");
+}
+#endif
+
 static void check_payload_sizes_agree()
 {
     const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW, TFT_LAYOUT_MAT4_COL,
@@ -454,7 +515,11 @@ int main()
 #endif
     );
 
+    check_abi_guard_ran();
     check_payload_sizes_agree();
+#ifdef TF_TREE_NO_EXCEPTIONS
+    check_success_does_not_touch_the_error_slot();
+#endif
 #ifdef TF_TREE_HAS_EIGEN
     check_eigen_storage_premise();
 #endif
