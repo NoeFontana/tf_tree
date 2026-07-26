@@ -592,3 +592,139 @@ fn cross_thread_child() {
     // check — which is deliberate, and tested by that being true.
     drop(p);
 }
+
+// ---------------------------------------------------------------------------
+// Introspection against a tree with headroom — the case review found
+// ---------------------------------------------------------------------------
+
+/// **A frame id inside the arena's headroom is not a frame.**
+///
+/// `ArenaView::frame_record` bounds an id against `max_frames`, which is
+/// `frame_count + 1 + frame_headroom` — *not* against `frame_count`. The slots
+/// between are zeroed arena memory, and `tft_tree_frame_name` used to read one,
+/// find `name_len == 0`, write a lone NUL and return `TFT_OK`. A diagnostic
+/// iterating ids would have rendered blank frames that do not exist.
+///
+/// `live.rs`'s equivalent assertion passed the whole time, because both C
+/// fixtures were built with **zero headroom**, which makes the two bounds
+/// coincide. That is what makes this fixture's `frame_headroom(4)` the point of
+/// the test rather than a detail of it — and why the fixture carries it now.
+///
+/// Mutant: **remove both filters** — that is, restore the original
+/// `FrameId::new(id).and_then(|f| view.frame_record(f))` — ⇒ ids 4..=7 return
+/// `TFT_OK` with an empty name.
+///
+/// Removing *either* filter alone leaves this passing, and that was checked
+/// rather than assumed. The two are redundant for this case and not for others:
+/// `id <= count` is the range check, while `name_hash != 0` additionally covers
+/// an id *within* the count whose record `FrameTable::finish` has not written
+/// yet (it bumps `frame_count` before `write_record`). That second case cannot
+/// be provoked deterministically from a test, so it is guarded rather than
+/// pinned, and this docstring says so instead of claiming a mutant it does not
+/// kill.
+#[test]
+fn a_frame_id_in_the_headroom_is_refused_not_read() {
+    let f = Fixture::new();
+    // SAFETY: `f.0` is a live handle.
+    let count = unsafe { tft_tree_frame_count(f.0) };
+    assert_eq!(count, 3, "world/robot/tool");
+
+    let mut buf = [0i8; 64];
+    // The real frames answer.
+    for id in 1..=count {
+        // SAFETY: live handle; 64 writable bytes.
+        assert_eq!(
+            unsafe { tft_tree_frame_name(f.0, id, buf.as_mut_ptr(), buf.len()) },
+            TFT_OK,
+            "frame {id} is real and must have a name"
+        );
+        assert!(buf[0] != 0, "frame {id} must not report an empty name");
+    }
+
+    // Everything past the count is a hole in the arena, headroom included.
+    // Non-vacuity: at least one of these ids must be *inside* `max_frames`, or
+    // the loop is only re-testing the out-of-range path `live.rs` covers.
+    let mut in_range_holes = 0;
+    for id in count + 1..=count + 5 {
+        buf[0] = 0x7f;
+        // SAFETY: live handle; 64 writable bytes.
+        let rc = unsafe { tft_tree_frame_name(f.0, id, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(rc, TFT_ERR_UNKNOWN_FRAME, "id {id} is not a frame");
+        assert_eq!(buf[0], 0x7f, "nothing may be written for a non-frame");
+        if id <= count + 4 {
+            in_range_holes += 1;
+        }
+    }
+    assert!(
+        in_range_holes >= 4,
+        "the fixture must have headroom, or this test cannot fail"
+    );
+
+    // **And the guard must not over-reject.** A frame interned at runtime lands
+    // in what was headroom a moment ago, and its name must be readable the
+    // instant `frame_count` covers it. Without this the test would pass just as
+    // well against a `tft_tree_frame_name` that refused every id.
+    let _ = f.claim("late_arrival", "world"); // interns, then fails on NoEdge
+                                              // SAFETY: `f.0` is a live handle.
+    let after = unsafe { tft_tree_frame_count(f.0) };
+    assert_eq!(after, count + 1, "the claim must have interned the name");
+    // SAFETY: live handle; 64 writable bytes.
+    assert_eq!(
+        unsafe { tft_tree_frame_name(f.0, after, buf.as_mut_ptr(), buf.len()) },
+        TFT_OK
+    );
+    let name: String = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8 as char)
+        .collect();
+    assert_eq!(name, "late_arrival");
+}
+
+/// **A wrong parent is not a wrong frame name.**
+///
+/// `ParentMismatch` was reported as `TFT_ERR_UNKNOWN_FRAME`, whose frozen
+/// definition is "a frame name that this tree never interned" — false for
+/// *every* instance of this case, because `tft_tree_claim` resolves both names
+/// before the mismatch can arise. A C caller reading that code would go and
+/// check its spelling, which is the wrong fix. Reported by review.
+///
+/// Mutant: map `ParentMismatch` back onto `TFT_ERR_UNKNOWN_FRAME` ⇒ this fails,
+/// and the caller can no longer tell a typo from a topology error.
+#[test]
+fn claiming_the_wrong_parent_is_its_own_error() {
+    let f = Fixture::new();
+    // Both names exist; `robot` is attached to `world`, not to `tool`.
+    assert_eq!(
+        f.claim("robot", "tool").unwrap_err(),
+        TFT_ERR_PARENT_MISMATCH
+    );
+    let e = last_error();
+    assert_eq!(e.frame_a, 2, "the child frame");
+    assert_eq!(e.frame_b, 1, "its ACTUAL parent, world");
+
+    // **A name nobody has used before is *interned*, not rejected.**
+    //
+    // `Tree::frame` interns; it does not look up. So a typo'd child name becomes
+    // a real frame — which then has no incoming edge, and the claim fails with
+    // `TFT_ERR_NO_EDGE` rather than `TFT_ERR_UNKNOWN_FRAME`. This test asserted
+    // the latter and found out otherwise, which is worth pinning: it is the
+    // second reason `NoEdge` needed a code of its own, and it means a C caller
+    // that mistypes a frame name consumes a headroom slot permanently (ids are
+    // never recycled, D10). Documented on `tft_tree_claim` rather than changed
+    // here — `Tree::frame`'s semantics are Phase 2's and are shared with the
+    // Python binding and the CLI.
+    assert_eq!(f.claim("nonesuch", "world").unwrap_err(), TFT_ERR_NO_EDGE);
+
+    // With the headroom exhausted, interning fails and the name really is
+    // unknown — so the older code is still reachable, and still means what the
+    // header says it means.
+    for i in 0..8 {
+        let _ = f.claim(&format!("filler{i}"), "world");
+    }
+    assert_eq!(
+        f.claim("one_too_many", "world").unwrap_err(),
+        TFT_ERR_UNKNOWN_FRAME,
+        "once the frame table is full, an unseen name cannot be interned"
+    );
+}

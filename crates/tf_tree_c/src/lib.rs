@@ -77,10 +77,11 @@ pub use error::{
     TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL,
     TFT_ERR_CHILD_DETACHED, TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION,
     TFT_ERR_INTERNAL, TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION, TFT_ERR_NOT_DYNAMIC,
-    TFT_ERR_NOT_FINITE, TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_SEGMENT,
-    TFT_ERR_NULL_ARG, TFT_ERR_READ_ONLY, TFT_ERR_RELEASED, TFT_ERR_RETRY, TFT_ERR_SLOT_CONTENDED,
-    TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP,
-    TFT_ERR_UNKNOWN_FRAME, TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
+    TFT_ERR_NOT_FINITE, TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_EDGE,
+    TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG, TFT_ERR_PARENT_MISMATCH, TFT_ERR_READ_ONLY,
+    TFT_ERR_RELEASED, TFT_ERR_RETRY, TFT_ERR_SLOT_CONTENDED, TFT_ERR_SLOT_RECYCLED,
+    TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP, TFT_ERR_UNKNOWN_FRAME,
+    TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
@@ -716,6 +717,14 @@ pub unsafe extern "C" fn tft_test_publishable_tree_create(out: *mut *mut tft_tre
         let Ok(tree) = tf_tree::TreeBuilder::new()
             .dynamic_edge("world", "robot", cfg)
             .static_edge("robot", "tool", &mount)
+            // **Headroom is not decoration.** Without it `max_frames` equals
+            // `frame_count` and `tft_tree_frame_name`'s range check is
+            // untestable — which is exactly why a real hole there went
+            // unnoticed until review. Any publisher that interns frames at
+            // runtime needs headroom, so this fixture is also the more
+            // representative one.
+            .frame_headroom(4)
+            .edge_headroom(2)
             .build()
         else {
             return TFT_ERR_INTERNAL;

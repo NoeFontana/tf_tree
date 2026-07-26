@@ -29,6 +29,14 @@
 //! would be the wrong default for a surface that can never be withdrawn, and
 //! defaulting them into the unstable one would let the stable header silently
 //! stop describing the library. Neither is a decision a tool should make.
+//!
+//! **[`check_partition`] scans `extern "C" fn` declarations only**, so a new
+//! `pub const` is not caught by it. It is still not free-floating: both configs
+//! are built from these lists by *complement*, so a constant missing from
+//! [`STABLE`] lands in **both** headers rather than just the stable one — and
+//! `--check` then reports the unstable header as drifted. That is how the two
+//! codes added after review were caught. The list is therefore an inventory of
+//! the frozen surface, not merely documentation of one.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -77,6 +85,8 @@ const STABLE: &[&str] = &[
     "TFT_ERR_READ_ONLY",
     "TFT_ERR_RETRY",
     "TFT_ERR_RELEASED",
+    "TFT_ERR_PARENT_MISMATCH",
+    "TFT_ERR_NO_EDGE",
     "TFT_ERR_INTERNAL",
     // Layouts — §3.5.
     "tft_layout",

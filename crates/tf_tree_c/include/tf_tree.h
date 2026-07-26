@@ -279,6 +279,27 @@ typedef struct {
 #define TFT_ERR_RELEASED -37
 
 /**
+ * Both frame names are known, but the child is attached to a **different**
+ * parent than the one named.
+ *
+ * Distinct from [`TFT_ERR_UNKNOWN_FRAME`] on purpose: that one means "check
+ * your spelling", and this one means "check your topology". Reported as
+ * `UNKNOWN_FRAME` until review pointed out that its documented meaning — "a
+ * frame name that this tree never interned" — is false for *every* instance of
+ * this case, since `tft_tree_claim` resolves both names before it can arise.
+ *
+ * The detail carries `frame_a` = the child, `frame_b` = its actual parent.
+ */
+#define TFT_ERR_PARENT_MISMATCH -38
+
+/**
+ * The named child frame has no incoming edge at all — it is a root, or was
+ * never attached. Also formerly `TFT_ERR_UNKNOWN_FRAME`, and false for the
+ * same reason.
+ */
+#define TFT_ERR_NO_EDGE -39
+
+/**
  * Something the library did not anticipate — including a caught Rust panic.
  */
 #define TFT_ERR_INTERNAL -99
@@ -466,6 +487,18 @@ tft_status tft_last_error(tft_error *out);
  *
  * The thread that calls this **owns** the resulting publisher — see §3.2 and
  * this module's documentation.
+ *
+ * # A frame name you have not used before is *created*, not rejected
+ *
+ * `Tree::frame` interns; it does not look up. So mistyping `child` declares a
+ * new frame, which then has no incoming edge and the claim fails with
+ * [`TFT_ERR_NO_EDGE`] — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
+ * the frame table's headroom is exhausted and the name genuinely cannot be
+ * interned. Frame ids are never recycled (`docs/PROJECT.md` §5 D10), so a typo
+ * costs a headroom slot for the life of the arena.
+ *
+ * That is Phase 2's interning semantics, shared with the Python binding and the
+ * CLI, and it is documented here rather than special-cased at this boundary.
  *
  * # Safety
  *

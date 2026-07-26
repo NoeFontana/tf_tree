@@ -237,12 +237,39 @@ pub unsafe extern "C" fn tft_tree_frame_name(
         // SAFETY: `check_tree` confirmed the magic word.
         let h = unsafe { &*tree };
         let view = h.share.tree.arena_view();
-        // `FrameId::new` rejects 0 — the root sentinel — so an id of 0 lands
-        // here as "unknown frame", which is the honest answer.
-        let Some(rec) = tf_tree::FrameId::new(id).and_then(|f| view.frame_record(f)) else {
+        // **Three checks, and `frame_record` alone is none of them.**
+        //
+        // `ArenaView::frame_record` bounds `id` against `max_frames`, which is
+        // `frame_count + 1 + frame_headroom` — not against `frame_count`. With
+        // any headroom at all (and a publisher that wants runtime interning must
+        // have some) the slots in between are zeroed arena memory that
+        // `frame_record` happily returns: `name_len == 0`, so this used to write
+        // a lone NUL and report success for a frame that does not exist.
+        //
+        // Reported by review, and the existing test missed it because both C
+        // fixtures were built with zero headroom, which makes the two bounds
+        // coincide.
+        //
+        //  1. `FrameId::new` rejects 0 — the root sentinel, not the first frame.
+        //  2. `id <= frame_count` closes the headroom hole.
+        //  3. `name_hash != 0` closes a narrower one: `FrameTable::finish`
+        //     (`frame.rs`) does `frame_count.fetch_add` *before* `write_record`,
+        //     so a reader that loads the count and immediately reads that id can
+        //     see an all-zero record. `blake3_64` of any name — including the
+        //     empty string, which hashes to `0xa6a1f9f5b94913af` — is non-zero,
+        //     so a zero hash means the slot has not been written.
+        let count = view
+            .header()
+            .frame_count
+            .load(core::sync::atomic::Ordering::Acquire);
+        let rec = tf_tree::FrameId::new(id)
+            .filter(|_| id <= count)
+            .and_then(|f| view.frame_record(f))
+            .filter(|r| r.name_hash != 0);
+        let Some(rec) = rec else {
             set_error(
                 crate::TFT_ERR_UNKNOWN_FRAME,
-                "no such frame id in this tree",
+                "no such frame id in this tree (ids run 1..=tft_tree_frame_count)",
                 |d| d.frame_a = id,
             );
             return crate::TFT_ERR_UNKNOWN_FRAME;

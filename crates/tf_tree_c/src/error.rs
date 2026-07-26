@@ -90,6 +90,21 @@ pub const TFT_ERR_READ_ONLY: tft_status = -35;
 pub const TFT_ERR_RETRY: tft_status = -36;
 /// The publisher's claim was released; claim the edge again to publish.
 pub const TFT_ERR_RELEASED: tft_status = -37;
+/// Both frame names are known, but the child is attached to a **different**
+/// parent than the one named.
+///
+/// Distinct from [`TFT_ERR_UNKNOWN_FRAME`] on purpose: that one means "check
+/// your spelling", and this one means "check your topology". Reported as
+/// `UNKNOWN_FRAME` until review pointed out that its documented meaning — "a
+/// frame name that this tree never interned" — is false for *every* instance of
+/// this case, since `tft_tree_claim` resolves both names before it can arise.
+///
+/// The detail carries `frame_a` = the child, `frame_b` = its actual parent.
+pub const TFT_ERR_PARENT_MISMATCH: tft_status = -38;
+/// The named child frame has no incoming edge at all — it is a root, or was
+/// never attached. Also formerly `TFT_ERR_UNKNOWN_FRAME`, and false for the
+/// same reason.
+pub const TFT_ERR_NO_EDGE: tft_status = -39;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
 

@@ -203,6 +203,18 @@ fn writer_of(h: &tft_publisher) -> Result<&EdgeWriter<'static>, tft_status> {
 /// The thread that calls this **owns** the resulting publisher — see §3.2 and
 /// this module's documentation.
 ///
+/// # A frame name you have not used before is *created*, not rejected
+///
+/// `Tree::frame` interns; it does not look up. So mistyping `child` declares a
+/// new frame, which then has no incoming edge and the claim fails with
+/// [`TFT_ERR_NO_EDGE`] — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
+/// the frame table's headroom is exhausted and the name genuinely cannot be
+/// interned. Frame ids are never recycled (`docs/PROJECT.md` §5 D10), so a typo
+/// costs a headroom slot for the life of the arena.
+///
+/// That is Phase 2's interning semantics, shared with the Python binding and the
+/// CLI, and it is documented here rather than special-cased at this boundary.
+///
 /// # Safety
 ///
 /// `tree` must be a live handle. `child` and `parent` must be NUL-terminated
@@ -630,11 +642,11 @@ pub(crate) mod map {
             }
             C::NoEdge { child } => {
                 set_error(
-                    TFT_ERR_UNKNOWN_FRAME,
+                    TFT_ERR_NO_EDGE,
                     "no edge attaches this child frame to any parent",
                     |d| d.frame_a = child.get(),
                 );
-                TFT_ERR_UNKNOWN_FRAME
+                TFT_ERR_NO_EDGE
             }
             C::NotDynamic { child, edge } => {
                 set_error(
@@ -653,7 +665,7 @@ pub(crate) mod map {
                 actual,
             } => {
                 set_error(
-                    TFT_ERR_UNKNOWN_FRAME,
+                    TFT_ERR_PARENT_MISMATCH,
                     "that child frame is attached to a different parent",
                     |d| {
                         d.frame_a = child.get();
@@ -661,7 +673,7 @@ pub(crate) mod map {
                         d.plan_generation = u64::from(*expected);
                     },
                 );
-                TFT_ERR_UNKNOWN_FRAME
+                TFT_ERR_PARENT_MISMATCH
             }
             C::ReadOnly => {
                 set_error(
