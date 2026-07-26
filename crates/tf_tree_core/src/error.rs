@@ -182,6 +182,37 @@ pub enum LookupError {
         /// The child frame whose parent link carries no edge.
         child: FrameId,
     },
+    /// A derivative was requested from an edge whose interpolation policy does
+    /// not have one worth reporting — `docs/PHASE4.md` §2.4.
+    ///
+    /// This is a **refusal, not a limitation.** `LerpSlerp` does have a body
+    /// twist, and computing it would be easy. It is withheld because it is an
+    /// artifact of the interpolant rather than of the motion: LerpSlerp holds
+    /// the *world-frame* linear velocity constant, so the *body-frame* velocity
+    /// rotates through the segment. Measured on one segment, the body-frame `v`
+    /// vector swings by 5.29 while its magnitude varies by 5e-10 — so a caller
+    /// sanity-checking `‖v‖` sees nothing wrong. Handing that back as a velocity
+    /// would be worse than refusing, and the compatibility interpolator exists
+    /// to bit-match `tf2`, not to be differentiated.
+    ///
+    /// The fix is to declare the edge `ScLerp`, which is the default.
+    DerivativesUnavailable {
+        /// The edge whose policy has no reportable derivative.
+        edge: EdgeId,
+        /// The policy that edge declares, as its stored discriminant.
+        interp: u8,
+    },
+    /// A derivative was requested at a stamp with no segment to differentiate.
+    ///
+    /// Distinct from [`LookupError::NoData`], which means the edge is empty: here
+    /// the *pose* is perfectly well defined and only the derivative is not. Two
+    /// causes, both transient and both resolved by publishing another sample:
+    /// the ring retains exactly one sample, or the two samples bracketing `t`
+    /// carry equal stamps (permitted by invariant 6) and so span zero time.
+    NoSegment {
+        /// The edge with no differentiable segment at the requested stamp.
+        edge: EdgeId,
+    },
 }
 
 /// A failed `push` onto an edge's sample ring.

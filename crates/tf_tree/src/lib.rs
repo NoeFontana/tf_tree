@@ -65,13 +65,13 @@ pub use tf_tree_core::arena_view::ArenaView;
 pub use tf_tree_core::edge::{EdgeKind, Publisher};
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, Layout};
 pub use tf_tree_core::plan::{
-    AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, SensorDomain,
-    Stamp, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
+    AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
+    SensorDomain, Stamp, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
 };
 pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH,
 };
 
 pub use tf_tree_math::{
-    exp_se3, exp_so3, log_se3, log_so3, Interp, Iso3, LerpSlerp, Quat, ScLerp, Vec3,
+    exp_se3, exp_so3, log_se3, log_so3, Interp, Iso3, LerpSlerp, Quat, ScLerp, Twist, Vec3,
 };
