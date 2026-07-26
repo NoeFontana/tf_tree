@@ -209,3 +209,32 @@ def test_a_nonsense_tolerance_is_refused(tree):
     for bad in ({"lin": 0.0}, {"lin": -1.0}, {"ang": float("nan")}):
         with pytest.raises(ValueError):
             p.adaptive(1_000, 2_000, **bad)
+
+
+def test_a_plan_keeps_its_tree_alive():
+    """**A `Plan` outliving its `Tree` must not read freed memory.**
+
+    This was a real use-after-free: `PyPlan` held a raw `*const Tree` justified
+    by a doc comment claiming Python held a reference. It did not. Dropping the
+    tree freed the arena while the plan still pointed into it, and — worse than
+    a crash — the read *succeeded*, because the allocation was still mapped. It
+    surfaced as a nonsense `UnknownEdge` rather than as anything obviously
+    wrong.
+
+    So the assertion is not "it does not crash": it is that the lookup still
+    returns the *right numbers* after the tree is dropped, which is only
+    possible if the arena is genuinely still alive.
+    """
+    import gc
+
+    tree = tf_tree.build([("map", "base")])
+    tf_tree.push(tree, "base", "map", 1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+    tf_tree.push(tree, "base", "map", 2_000, [1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0])
+    plan = tree.plan("map", "base")
+    before = plan.at(1_500)
+
+    del tree
+    gc.collect()
+
+    np.testing.assert_array_equal(plan.at(1_500), before)
+    np.testing.assert_allclose(plan.at(1_500)[:3, 3], [2.0, 3.0, 4.0])
