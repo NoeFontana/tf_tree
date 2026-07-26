@@ -40,6 +40,11 @@ jobs:
   # `just lint` gained a `py-compile` dependency for this, but it skips when
   # there is no venv — correct for a clean checkout, useless as a gate. This job
   # is the gate: it needs only an interpreter, not maturin or a wheel.
+  #
+  # Demonstrated against the historical bug itself. Restoring the cross-type
+  # `transmute::<EdgeWriter, Publisher>` gives **4 errors here and 0 from
+  # `cargo clippy --workspace`**, because the workspace does not compile this
+  # crate at all — an error confined to it is invisible, however loud.
   bindings:
     name: python bindings compile
     runs-on: ubuntu-latest
