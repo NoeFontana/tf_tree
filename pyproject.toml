@@ -54,6 +54,13 @@ addopts = ["-ra", "--strict-markers", "--strict-config"]
 testpaths = ["tests/python"]
 
 [tool.pyright]
-include = ["python", "tests/python", "crates/tf_tree_bench/python"]
+include = ["python"]
 pythonVersion = "3.10"
-typeCheckingMode = "standard"
+typeCheckingMode = "strict"
+# Without these pyright resolves nothing from the venv and reports every numpy
+# type as unknown — 12 errors that look like stub bugs and are not.
+venvPath = "."
+venv = ".venv"
+# The extension is `.so` + `.pyi`; pyright must read the stub, not try to
+# introspect the binary.
+stubPath = "python"
