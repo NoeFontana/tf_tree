@@ -110,7 +110,7 @@ impl Open {
     pub fn name(self, name: &str) -> Open;
     pub fn mode(self, mode: AttachMode) -> Open;         // DEFAULT: ReadOnly  (D18)
     pub fn create(self, policy: CreatePolicy) -> Open;   // DEFAULT: IfAbsent
-    pub fn timeout(self, d: Duration) -> Open;           // DEFAULT: 5 s
+    pub fn timeout(self, d: Duration) -> Open;           // DEFAULT: tf_tree_ipc::DEFAULT_OPEN_TIMEOUT
     pub fn layout_if_creating(self, builder: TreeBuilder) -> Open;
     pub fn open(self) -> Result<Tree, OpenError>;
 }
@@ -125,6 +125,11 @@ reused as they stand.
 `OpenError` is `Copy`, `String`-free, `#[non_exhaustive]`, with `From<IpcError>`,
 `From<ShmError>`, `From<BuildError>` and `Rejected(HelloStatus)`. This closes the
 current state of three unrelated error families reaching the surface with no bridges.
+
+The default timeout **re-exports `tf_tree_ipc::DEFAULT_OPEN_TIMEOUT`** (`open.rs:159`,
+currently 5 s) rather than restating the number. Two constants that must agree and are
+written down twice will eventually disagree, and this one governs how long a failing
+`open()` blocks — the drift would present as a hang, not as a mismatch.
 
 The `AttachMode` ↔ `AccessMode` conversion cannot be a `From` impl anywhere — both
 types are foreign to `tf_tree` and neither dependency may depend on the other. It is a
@@ -222,10 +227,18 @@ by any claimer that gets `EdgeAlreadyClaimed`; and `Tree::reap_dead()` for
 `tf_tree doctor --repair` and for tests.
 
 ```text
+# PRECONDITION: self.participant != u32::MAX. A read-only tree never registers
+# (tree.rs:801) and cannot reap; assert it rather than assume it, because
+# `u32::MAX + 1` overflows — see Consequences.
+own_word = self.participant as u64 + 1
+
 for edge in 0..edge_count:
     owner = claim[edge].owner.load(Acquire)
-    if owner == 0                        { continue }
-    if owner == self.participant + 1     { continue }   # ADDED — see Consequences
+    if owner == 0                        { continue }   # cheap filter, no syscall
+    if owner == own_word                 { continue }   # ADDED — see Consequences
+    if let Some(dead) = only_slot        {              # see "one syscall per
+        if owner != dead + 1 { continue }               #  *dead* edge", below
+    }
     if lock.probe_claim(edge)?.held      { continue }   # alive: never reapable
     edge::reap(&claim[edge])                            # epoch++ then owner = 0
     normalize_slot_parity(edge, head & mask)            # A5 repair, §6.3
@@ -234,6 +247,20 @@ for slot in 0..MAX_PARTICIPANTS:
     if participants.identity(slot).is_some() && !lock.probe_participant(slot)?.held:
         participants.force_free(slot)                   # incarnation-guarded
 ```
+
+**One syscall per *dead* edge, not per edge — NORMATIVE.** `probe_claim` is an
+`fcntl`, so a naive sweep costs one syscall per claimed edge and an arena with
+thousands of edges would make reaping the most expensive operation in the system.
+Two things keep it cheap, and both must be implemented:
+
+- The `owner == 0` test is a relaxed load of a word already in the claim table.
+  Unclaimed edges cost no syscall, which is the common case.
+- **The owner-`EPOLLHUP` trigger knows *which* participant slot died**, so it
+  passes `only_slot = Some(slot)` and the loop degenerates to `O(edges)` atomic
+  loads plus one syscall per edge that slot actually held. The lazy trigger
+  probes exactly one edge. Only `Tree::reap_dead()` — `doctor --repair` and
+  tests — passes `None` and pays the full sweep, which is the one caller where
+  a whole-arena scan is the point.
 
 With OFD locks the kernel answers liveness authoritatively, so the `/proc`
 "unknown ⇒ alive" fail-safe is no longer the defence. The defence is that a
@@ -330,6 +357,13 @@ named test:
    spurious reap.
 4. **No self-skip in the liveness predicate** ⇒ the same blindness makes a `Tree`
    declare *itself* dead and steal the topology lock from itself.
+4b. **`self.participant + 1` on a read-only tree** ⇒ arithmetic overflow.
+   `u32::MAX` is the read-only sentinel (`tree.rs:801`), so the expression panics
+   in a debug build and wraps to `0` in release. The release behaviour is
+   *accidentally* harmless — `owner == 0` is filtered one line earlier — and
+   accidental correctness is exactly what this project does not accept. The
+   precondition is that only a read-write participant reaps; encode it as an
+   assertion at the top of the loop, not as a comment.
 5. **`CreatePolicy::Always`** creates a second arena against the *same* lock file, so
    arena A's edge 5 and arena B's edge 5 alias on byte `CLAIM_BASE + 5`, as do their
    participant bytes. Requires an instance-scoped lock path.
@@ -365,11 +399,17 @@ named test:
 
 Each step lands as one PR, in order.
 
-1. **`instance_uuid` + `SegmentDescriptor`** — field at header offset 136 in the
-   existing padding; `FORMAT_VERSION` stays 2; bytes from `rustix::rand::getrandom`.
-   Verified by `instance_uuid_lands_at_136` alongside the existing
-   `key_field_offsets_are_stable` (`header.rs:179`), plus
-   `two_creates_have_distinct_uuids` and `attach_preserves_the_creator_uuid`.
+1. **`instance_uuid` + `SegmentDescriptor`** — field at header offset 136, which is
+   implicit padding created by `TopoLock`'s `align(64)` (`header.rs:77`): `boot_id`
+   ends at 128, `_reserved` at 136, and the next 64-byte boundary is 192, so 136..192
+   is free and `topo_lock` stays at 192 with `size_of == 256`. `FORMAT_VERSION` stays
+   2. Bytes from `rustix::rand::getrandom` — **which must be retried on `EINTR` and
+   on a short read**; the kernel does not return partial reads for buffers this small
+   except when interrupted, and "except when interrupted" is the whole hazard, since a
+   partially-filled uuid would still look random. Verified by
+   `instance_uuid_lands_at_136` alongside the existing `key_field_offsets_are_stable`
+   (`header.rs:179`), plus `two_creates_have_distinct_uuids` and
+   `attach_preserves_the_creator_uuid`.
 2. **`ParticipantTable::register_at(slot, ..)`** — §3.7's `participant_slot` requires
    the arena slot and the lock byte to be the same integer; today they are independently
    allocated (`lockfile.rs:175` vs `participant.rs:155`). Verified by a loom test in
