@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 
 use tf_tree_arena::{ArenaLayout, HeapArena};
-use tf_tree_math::{exp_se3, Iso3, LerpSlerp};
+use tf_tree_math::{exp_se3, Iso3, LerpSlerp, ScLerp, Twist};
 
 use crate::arena_view::{ArenaBuilder, ArenaView};
 use crate::buffer::{PoseSlot, SampleRing};
@@ -1171,4 +1171,182 @@ fn an_anonymous_claimant_is_reported_contended_rather_than_spun_on() {
         FrameError::InternContended,
         "a reader must be told to retry, not told the frame does not exist"
     );
+}
+
+// ---- sample_with_twist: the extrapolation arms and the left limit ---------
+//
+// Found by review: the Hold arm, the ConstantTwist arm and the `t == t_new`
+// left-limit branch were all reachable through `tf_tree_core`'s public surface
+// and covered by no test at all. The plan fold always passes
+// `ExtrapPolicy::Error`, so none of it was exercised through the facade either.
+
+/// A ring with `n` samples at `i * 100` ns, moving along one screw.
+fn twist_ring(hr: &HeapRing, n: u64) {
+    for i in 0..n {
+        hr.ring().push(i as i64 * 100, &pose(i)).unwrap();
+    }
+}
+
+/// **`Hold` reports a zero twist, and that is the derivative of holding.**
+///
+/// Mutant: return the last segment's twist instead of `Twist::ZERO` ⇒ fails.
+/// The pose is pinned past `t_new`, so its derivative is zero by definition;
+/// reporting the incoming velocity would tell a controller the body is still
+/// moving after the data stopped.
+#[test]
+fn hold_extrapolation_reports_a_zero_twist() {
+    let hr = HeapRing::new(8);
+    twist_ring(&hr, 5);
+    let (pose_h, tw) = hr
+        .ring()
+        .sample_with_twist(10_000, ExtrapPolicy::Hold)
+        .expect("hold must succeed past the newest stamp");
+    assert_eq!(tw, Twist::ZERO, "a held pose is stationary");
+    // ...and the pose is the newest sample, unchanged.
+    assert_eq!(pose_h.to_bits(), pose(4).to_bits());
+}
+
+/// **`ConstantTwist` extends along the last segment, and reports that twist.**
+///
+/// Also pins that the pose agrees **bit-for-bit** with `sample`'s under the same
+/// policy — the two used to compute it by different routes (`log_se3`/`exp_se3`
+/// against the screw form), which is the sort of divergence nobody notices until
+/// two call sites disagree in the field.
+///
+/// Mutant: drop the `NANOS_PER_SEC / dt` scaling ⇒ the twist is per-100-ns
+/// rather than per-second and this fails by 1e7.
+#[test]
+fn constant_twist_extends_the_last_segment_and_agrees_with_sample() {
+    let hr = HeapRing::new(8);
+    twist_ring(&hr, 5);
+    let ring = hr.ring();
+
+    let (p_ct, tw) = ring
+        .sample_with_twist(650, ExtrapPolicy::ConstantTwist)
+        .expect("constant-twist extrapolation");
+    let p_plain = ring
+        .sample::<ScLerp>(650, ExtrapPolicy::ConstantTwist)
+        .expect("sample must take the same route");
+    assert_eq!(
+        p_ct.to_bits(),
+        p_plain.to_bits(),
+        "sample and sample_with_twist disagree on the extrapolated pose"
+    );
+
+    // The samples are 100 ns apart on one screw, so the twist is the segment's
+    // xi scaled to per-second. Cross-check against the in-window twist, which
+    // must be the same screw.
+    let (_, tw_inside) = ring
+        .sample_with_twist(350, ExtrapPolicy::Error)
+        .expect("in-window");
+    assert!(
+        tw.sub(tw_inside).amax() < 1e-9 * tw_inside.amax(),
+        "extrapolated twist {tw:?} differs from the in-window twist {tw_inside:?}"
+    );
+}
+
+/// **A single sample cannot be extended**, so `ConstantTwist` degrades to Hold
+/// for the pose while the derivative is simply absent.
+#[test]
+fn constant_twist_with_one_sample_is_no_segment() {
+    let hr = HeapRing::new(8);
+    twist_ring(&hr, 1);
+    assert!(matches!(
+        hr.ring()
+            .sample_with_twist(10_000, ExtrapPolicy::ConstantTwist),
+        Err(LookupError::NoSegment { .. })
+    ));
+    // But the plain sample still answers: the pose is available, only the
+    // derivative is not.
+    assert!(hr
+        .ring()
+        .sample::<ScLerp>(10_000, ExtrapPolicy::ConstantTwist)
+        .is_ok());
+}
+
+/// **At exactly the newest stamp the twist is the left limit** — the segment
+/// that *ends* at that knot, since no forward segment exists.
+///
+/// Mutant: use `bracket` unconditionally instead of special-casing `t == t_new`
+/// ⇒ `bracket`'s precondition (`stamp[lo] <= t < stamp[hi]`) is violated, it
+/// returns `newest`, and `i + 1` reads a slot outside the published window.
+#[test]
+fn at_the_newest_stamp_the_twist_is_the_left_limit() {
+    let hr = HeapRing::new(8);
+    twist_ring(&hr, 5);
+    let ring = hr.ring();
+    let (p, tw) = ring
+        .sample_with_twist(400, ExtrapPolicy::Error)
+        .expect("t == t_new is inside the window");
+    assert_eq!(
+        p.to_bits(),
+        pose(4).to_bits(),
+        "the pose is the newest sample"
+    );
+
+    // The left limit is the [3, 4] segment. Sample just inside it and compare.
+    let (_, tw_left) = ring.sample_with_twist(399, ExtrapPolicy::Error).unwrap();
+    assert!(
+        tw.sub(tw_left).amax() < 1e-9 * tw_left.amax().max(1e-12),
+        "twist at t_new is not the left limit: {tw:?} vs {tw_left:?}"
+    );
+}
+
+/// **Below the oldest retained stamp is an error, not a clamp** — with or
+/// without a derivative, and under every extrapolation policy, because the
+/// policies govern the *newer* end only.
+///
+/// Mutant: delete the `t < t_old` guard from `sample_with_twist` ⇒ `bracket`'s
+/// precondition is violated and it returns a bracket that does not contain `t`,
+/// so the caller gets a confidently extrapolated pose from the wrong segment.
+#[test]
+fn below_the_oldest_stamp_is_an_error_under_every_policy() {
+    let hr = HeapRing::new(8);
+    twist_ring(&hr, 5);
+    for policy in [
+        ExtrapPolicy::Error,
+        ExtrapPolicy::Hold,
+        ExtrapPolicy::ConstantTwist,
+    ] {
+        match hr.ring().sample_with_twist(-1, policy) {
+            Err(LookupError::Extrapolation {
+                requested, oldest, ..
+            }) => {
+                assert_eq!(requested, -1);
+                assert_eq!(oldest, 0);
+            }
+            other => panic!("policy {policy:?} did not refuse an old stamp: {other:?}"),
+        }
+    }
+}
+
+/// **Past the newest stamp under `Error` is refused**, and the error carries the
+/// window so the caller can see how far outside it was.
+#[test]
+fn past_the_newest_stamp_under_error_is_refused_with_the_window() {
+    let hr = HeapRing::new(8);
+    twist_ring(&hr, 5);
+    match hr.ring().sample_with_twist(10_000, ExtrapPolicy::Error) {
+        Err(LookupError::Extrapolation {
+            requested,
+            oldest,
+            newest,
+            ..
+        }) => {
+            assert_eq!((requested, oldest, newest), (10_000, 0, 400));
+        }
+        other => panic!("expected Extrapolation, got {other:?}"),
+    }
+}
+
+/// An empty ring has no pose and therefore no twist — `NoData`, not `NoSegment`.
+/// The two are different questions and the distinction is the whole reason
+/// `NoSegment` exists.
+#[test]
+fn an_empty_ring_is_no_data_not_no_segment() {
+    let hr = HeapRing::new(8);
+    assert!(matches!(
+        hr.ring().sample_with_twist(0, ExtrapPolicy::Error),
+        Err(LookupError::NoData { .. })
+    ));
 }

@@ -42,6 +42,25 @@ i.e. essentially all real traffic — `φ` comes from a `sqrt` of the
 added at all**. Calling `atan2` unconditionally would be correct and would show
 up as a step in this column at the top three rows.
 
+## 2a. The endpoints skip the power, and it is worth 60%
+
+`ScLerp::eval_with_twist` tests `s == 0.0` / `s == 1.0` **before** raising `rel`
+to a power, not after. `ScrewParts::pow` is the half of the decomposition that
+carries the transcendental on the large-arc branch, and at the endpoints its
+result is discarded; LLVM does not sink the call out of the untaken branch. The
+twist is still computed — it is a property of the segment, not of `s` — so only
+the power is skipped.
+
+| regime | interior ns | endpoint ns | saved |
+|---|---|---|---|
+| adjacent 1 kHz | 54.60 | 22.62 | **58.6%** |
+| large arc | 69.02 | 27.59 | **60.0%** |
+
+This is not a rare path. `sample_with_twist` produces `s == 0.0` exactly on an
+**exact hit on a published sample**, and `s == 1.0` exactly at **`t == t_new`** —
+which is where every `latest`-style query lands. Raised in review; the original
+code computed and threw away the power at both.
+
 ## 3. At plan level, the adjoint is the cost — not ξ
 
 | depth | `at` ns | `at_with_derivatives` ns | ratio | delta/step ns |

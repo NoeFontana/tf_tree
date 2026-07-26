@@ -378,4 +378,42 @@ mod tests {
         assert_eq!(core::mem::align_of::<Twist>(), 8);
         assert_eq!(core::mem::size_of::<Vec3>(), 24);
     }
+
+    /// `neg` must negate **both** parts, and the inverse identity is what pins it.
+    ///
+    /// Found by review: `neg` was public API with no test and no caller, so its
+    /// sign was constrained by nothing. It is load-bearing — `V_{T⁻¹} = −Ad(T)·V_T`
+    /// (`docs/PHASE4.md` §2.3) — and a `neg` that negated only `omega` would give
+    /// an inverse whose linear velocity points the wrong way while its angular
+    /// velocity is right, which reads as a plausible physical motion.
+    ///
+    /// Mutant: negate only `omega` (or only `v`) ⇒ fails.
+    #[test]
+    fn neg_negates_both_parts_and_satisfies_the_inverse_identity() {
+        for (t, x) in cases() {
+            let n = x.neg();
+            assert_eq!(n.omega, x.omega.scale(-1.0));
+            assert_eq!(n.v, x.v.scale(-1.0));
+            assert_eq!(n.neg(), x, "neg is not an involution");
+            // V_{T^-1} = -Ad(T) V_T, checked against the dense oracle.
+            let want = apply(&dense_adjoint(&t), &x).neg();
+            let got = t.adjoint(&x).neg();
+            assert!(got.sub(want).amax() < 1e-13 * want.amax());
+        }
+    }
+
+    /// `sub` is `add` of the negation, and `add`/`sub` are component-wise.
+    /// Cheap, and it stops a transposed field assignment in either one.
+    #[test]
+    fn add_and_sub_are_component_wise_and_mutually_consistent() {
+        let a = Twist::new(Vec3::new(1.0, 2.0, 3.0), Vec3::new(4.0, 5.0, 6.0));
+        let b = Twist::new(Vec3::new(0.5, -1.0, 2.0), Vec3::new(-3.0, 1.5, 0.25));
+        assert_eq!(a.add(b).omega, Vec3::new(1.5, 1.0, 5.0));
+        assert_eq!(a.add(b).v, Vec3::new(1.0, 6.5, 6.25));
+        assert_eq!(a.sub(b), a.add(b.neg()));
+        assert_eq!(a.scale(2.0), a.add(a));
+        assert_eq!(a.amax(), 6.0);
+        assert_eq!(Twist::ZERO.amax(), 0.0);
+        assert_eq!(a.add(Twist::ZERO), a);
+    }
 }

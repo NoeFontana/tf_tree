@@ -225,6 +225,47 @@ fn main() {
     let (p3, d3) = row(3);
     row(8);
 
+    // ---- endpoints: the two most-queried stamps on any edge ----
+    // s == 0.0 is an exact hit on a published sample; s == 1.0 is `t == t_new`,
+    // which is what every `latest` query lands on. Both discard the screw power,
+    // so `eval_with_twist` skips it -- this is the row that shows whether that
+    // shortcut is real.
+    println!("\nendpoints — eval_with_twist at s in {{0, 1}} vs interior");
+    println!(
+        "{:>16} {:>12} {:>12} {:>10}",
+        "regime", "interior ns", "endpoint ns", "saved"
+    );
+    for (label, theta) in [("adjacent 1 kHz", 3.0e-3), ("large arc", 1.5)] {
+        let d = pairs(theta);
+        let interior = bench(
+            || {
+                let mut acc = 0.0;
+                for (i, (a, b)) in d.iter().enumerate() {
+                    let (r, w) = ScLerp::eval_with_twist(a, b, black_box(s_at(i)));
+                    acc += r.t.x + w.omega.x;
+                }
+                acc
+            },
+            N,
+        );
+        let endpoint = bench(
+            || {
+                let mut acc = 0.0;
+                for (i, (a, b)) in d.iter().enumerate() {
+                    let s = if i % 2 == 0 { 0.0 } else { 1.0 };
+                    let (r, w) = ScLerp::eval_with_twist(a, b, black_box(s));
+                    acc += r.t.x + w.omega.x;
+                }
+                acc
+            },
+            N,
+        );
+        println!(
+            "{label:>16} {interior:>12.2} {endpoint:>12.2} {:>9.1}%",
+            100.0 * (interior - endpoint) / interior
+        );
+    }
+
     println!("\n§7 gate row — at_with_derivatives vs at, depth 3");
     println!("  measured ratio {:.2}x   (spec expects ~2x)", d3 / p3);
     println!(
