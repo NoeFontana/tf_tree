@@ -64,6 +64,8 @@
 
 pub mod error;
 pub mod layout;
+pub mod publisher;
+pub mod unstable;
 
 use core::ffi::{c_char, c_void};
 use std::sync::Arc;
@@ -71,16 +73,28 @@ use std::sync::Arc;
 use tf_tree::{Stamp, SystemDomain, Tree};
 
 pub use error::{
-    tft_error, tft_last_error, tft_status, TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE,
-    TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED,
-    TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION, TFT_ERR_INTERNAL, TFT_ERR_NO_DATA,
-    TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG, TFT_ERR_SLOT_CONTENDED,
+    tft_error, tft_last_error, tft_status, TFT_ERR_ABI_MISMATCH, TFT_ERR_ALREADY_CLAIMED,
+    TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL,
+    TFT_ERR_CHILD_DETACHED, TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION,
+    TFT_ERR_INTERNAL, TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION, TFT_ERR_NOT_DYNAMIC,
+    TFT_ERR_NOT_FINITE, TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_SEGMENT,
+    TFT_ERR_NULL_ARG, TFT_ERR_READ_ONLY, TFT_ERR_RELEASED, TFT_ERR_RETRY, TFT_ERR_SLOT_CONTENDED,
     TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP,
     TFT_ERR_UNKNOWN_FRAME, TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
     TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW,
+};
+#[cfg(feature = "test-hooks")]
+pub use publisher::tft_test_push_unguarded;
+pub use publisher::{
+    tft_publisher, tft_publisher_free, tft_publisher_push, tft_publisher_push_many,
+    tft_publisher_release, tft_tree_claim,
+};
+pub use unstable::{
+    tft_plan_at_with_derivatives, tft_tree_edge_count, tft_tree_frame_count, tft_tree_frame_name,
+    tft_tree_instance_uuid, TFT_TWIST_BYTES,
 };
 
 use error::{amend_error, guard, record_lookup, set_error};
@@ -105,6 +119,49 @@ pub extern "C" fn tft_abi_version_major() -> u32 {
 #[no_mangle]
 pub extern "C" fn tft_abi_version_minor() -> u32 {
     TFT_ABI_VERSION_MINOR
+}
+
+/// Check the header a caller compiled against against the library they linked.
+///
+/// §3.6 states the rule — **major must match exactly; the runtime minor may be
+/// ≥ the compiled-against minor** — and until this existed nothing enforced it.
+/// Two getters let a caller *implement* the rule; only one of them will, and the
+/// one who does not is the one who needs it.
+///
+/// Call it as `tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR)`
+/// using the constants **from the header**, so the arguments are baked in at the
+/// caller's compile time and the comparison is genuinely between two builds. The
+/// C++ wrapper does this in a static initializer (§3.6); a C caller should do it
+/// once at startup.
+///
+/// # Errors
+///
+/// [`TFT_ERR_ABI_MISMATCH`], with both version pairs in the error detail:
+/// `frame_a`/`frame_b` carry the caller's major/minor, `plan_generation` and
+/// `current_generation` the library's. The message names all four, because a
+/// silently mismatched ABI is a debugging session nobody deserves.
+#[no_mangle]
+pub extern "C" fn tft_check_abi(compiled_major: u32, compiled_minor: u32) -> tft_status {
+    guard(|| {
+        if compiled_major == TFT_ABI_VERSION_MAJOR && compiled_minor <= TFT_ABI_VERSION_MINOR {
+            return TFT_OK;
+        }
+        // The message is built from a fixed set of small integers, so this
+        // allocates only on the failure path — which ends the process anyway,
+        // in every caller that uses this correctly.
+        let msg = format!(
+            "ABI mismatch: compiled against {compiled_major}.{compiled_minor}, \
+             linked {TFT_ABI_VERSION_MAJOR}.{TFT_ABI_VERSION_MINOR} (major must \
+             match exactly; the library's minor must be at least the header's)"
+        );
+        set_error(TFT_ERR_ABI_MISMATCH, &msg, |d| {
+            d.frame_a = compiled_major;
+            d.frame_b = compiled_minor;
+            d.plan_generation = u64::from(TFT_ABI_VERSION_MAJOR);
+            d.current_generation = u64::from(TFT_ABI_VERSION_MINOR);
+        });
+        TFT_ERR_ABI_MISMATCH
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -147,8 +204,8 @@ pub struct tft_plan {
 }
 
 /// The tree, shared between its own handle and every plan compiled from it.
-struct TreeShare {
-    tree: Tree,
+pub(crate) struct TreeShare {
+    pub(crate) tree: Tree,
 }
 
 /// Generate a magic-word validator that reads the field **by name**.
@@ -183,7 +240,7 @@ macro_rules! magic_check {
         /// Passing a pointer to an unrelated, smaller object is Undefined
         /// Behaviour and no amount of checking here can change that.
         #[inline]
-        unsafe fn $name(p: *const $ty) -> bool {
+        pub(crate) unsafe fn $name(p: *const $ty) -> bool {
             if p.is_null() {
                 return false;
             }
@@ -622,11 +679,50 @@ pub unsafe extern "C" fn tft_test_tree_create(out: *mut *mut tft_tree) -> tft_st
     })
 }
 
+/// Build a fixture tree with a **claimable** dynamic edge: `world -> robot`
+/// (ScLerp, no samples, unclaimed) plus a static `robot -> tool`.
+///
+/// Separate from [`tft_test_tree_create`] on purpose. That fixture `forget`s its
+/// writers so both of its dynamic edges stay claimed for the life of the tree,
+/// which is exactly what the lookup tests want and exactly what a publisher test
+/// cannot use. Changing it to leave an edge free would also perturb the arena
+/// the §7 benchmark measures, and a benchmark that moves for a test's
+/// convenience is a benchmark nobody can compare across commits.
+///
+/// # Safety
+///
+/// `out` must be NULL or point to a writable `*mut tft_tree`.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub unsafe extern "C" fn tft_test_publishable_tree_create(out: *mut *mut tft_tree) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(64));
+        let mount = tf_tree::exp_se3([0.1, 0.2, -0.3, 0.4, -0.5, 0.6]);
+        let Ok(tree) = tf_tree::TreeBuilder::new()
+            .dynamic_edge("world", "robot", cfg)
+            .static_edge("robot", "tool", &mount)
+            .build()
+        else {
+            return TFT_ERR_INTERNAL;
+        };
+        let h = Box::new(tft_tree {
+            magic: MAGIC_TREE,
+            share: Arc::new(TreeShare { tree }),
+        });
+        // SAFETY: `out` is non-null and the caller contracts it writable.
+        unsafe { core::ptr::write(out, Box::into_raw(h)) };
+        TFT_OK
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers, so every entry point reports failures identically
 // ---------------------------------------------------------------------------
 
-fn bad_handle(what: &str) -> tft_status {
+pub(crate) fn bad_handle(what: &str) -> tft_status {
     set_error(
         TFT_ERR_BAD_HANDLE,
         "handle is NULL, freed, or not a tf_tree handle",
@@ -636,13 +732,13 @@ fn bad_handle(what: &str) -> tft_status {
     TFT_ERR_BAD_HANDLE
 }
 
-fn null_arg(what: &str) -> tft_status {
+pub(crate) fn null_arg(what: &str) -> tft_status {
     set_error(TFT_ERR_NULL_ARG, "a required argument was NULL", |_| {});
     let _ = what;
     TFT_ERR_NULL_ARG
 }
 
-fn bad_enum(what: &str) -> tft_status {
+pub(crate) fn bad_enum(what: &str) -> tft_status {
     set_error(
         TFT_ERR_BAD_ENUM,
         "an enum argument is outside the range this build defines",

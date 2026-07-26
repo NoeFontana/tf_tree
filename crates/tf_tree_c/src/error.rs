@@ -68,6 +68,28 @@ pub const TFT_ERR_NO_SEGMENT: tft_status = -20;
 pub const TFT_ERR_WRONG_THREAD: tft_status = -30;
 /// The path between the two frames is deeper than `TFT_MAX_DEPTH`.
 pub const TFT_ERR_TREE_TOO_DEEP: tft_status = -21;
+/// The compiled-against ABI version is incompatible with this library (§3.6).
+pub const TFT_ERR_ABI_MISMATCH: tft_status = -6;
+/// A published transform contained NaN or infinity.
+pub const TFT_ERR_NOT_FINITE: tft_status = -7;
+/// A published rotation is not one: a non-unit quaternion, or a matrix whose
+/// determinant is not `+1` (reflected, or carrying scale).
+pub const TFT_ERR_NOT_A_ROTATION: tft_status = -8;
+/// Another participant already holds this edge. One writer per edge (D7).
+pub const TFT_ERR_ALREADY_CLAIMED: tft_status = -31;
+/// A published stamp predates the edge's newest sample.
+pub const TFT_ERR_NON_MONOTONIC: tft_status = -32;
+/// A reaper judged this writer dead and took the edge away. Re-claim.
+pub const TFT_ERR_CLAIM_REVOKED: tft_status = -33;
+/// The edge is static or tombstoned; there is nothing to publish to it.
+pub const TFT_ERR_NOT_DYNAMIC: tft_status = -34;
+/// The arena is mapped read-only, so nothing can be claimed for writing.
+pub const TFT_ERR_READ_ONLY: tft_status = -35;
+/// The operation raced another participant's protocol. Retryable, and the
+/// caller's only correct response is to try again.
+pub const TFT_ERR_RETRY: tft_status = -36;
+/// The publisher's claim was released; claim the edge again to publish.
+pub const TFT_ERR_RELEASED: tft_status = -37;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
 

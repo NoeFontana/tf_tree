@@ -210,3 +210,60 @@ fn tft_error_layout_is_what_the_header_promises() {
         "struct_size must be first — every size check reads it before anything else"
     );
 }
+
+/// **§3.6's rule is enforced, not merely reportable.**
+///
+/// "Major must match exactly; the runtime minor may be ≥ the compiled-against
+/// minor." Until `tft_check_abi` existed the library shipped two getters and
+/// left every caller to implement that sentence — and the caller who does not
+/// is exactly the one who needs it.
+///
+/// Mutant: relax the comparison to `compiled_minor != TFT_ABI_VERSION_MINOR` ⇒
+/// the forwards-compatible case below starts failing, which is the whole point
+/// of a minor version.
+#[test]
+fn the_abi_check_implements_the_rule_rather_than_restating_it() {
+    // The honest case: a caller compiled against this exact header.
+    assert_eq!(
+        tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR),
+        TFT_OK
+    );
+    // Forwards compatible: an older header against this newer library.
+    if TFT_ABI_VERSION_MINOR > 0 {
+        assert_eq!(tft_check_abi(TFT_ABI_VERSION_MAJOR, 0), TFT_OK);
+    }
+    // A newer header than the library — the caller expects functions that are
+    // not here.
+    assert_eq!(
+        tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR + 1),
+        TFT_ERR_ABI_MISMATCH
+    );
+    // A different major is never compatible, in either direction.
+    assert_eq!(
+        tft_check_abi(TFT_ABI_VERSION_MAJOR + 1, 0),
+        TFT_ERR_ABI_MISMATCH
+    );
+    assert_eq!(
+        tft_check_abi(TFT_ABI_VERSION_MAJOR.wrapping_sub(1), 0),
+        TFT_ERR_ABI_MISMATCH
+    );
+}
+
+/// **The mismatch report names all four numbers.** A version error that says
+/// "incompatible" and stops is the debugging session §3.6 is trying to prevent.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_abi_mismatch_names_both_versions() {
+    assert_eq!(tft_check_abi(7, 3), TFT_ERR_ABI_MISMATCH);
+    let e = last_error().expect("detail must be available");
+    assert_eq!(e.frame_a, 7, "the caller's major");
+    assert_eq!(e.frame_b, 3, "the caller's minor");
+    assert_eq!(e.plan_generation, u64::from(TFT_ABI_VERSION_MAJOR));
+    assert_eq!(e.current_generation, u64::from(TFT_ABI_VERSION_MINOR));
+    let m = message(&e);
+    assert!(m.contains("7.3"), "the caller's version must appear: {m}");
+    assert!(
+        m.contains(&format!("{TFT_ABI_VERSION_MAJOR}.{TFT_ABI_VERSION_MINOR}")),
+        "the library's version must appear: {m}"
+    );
+}

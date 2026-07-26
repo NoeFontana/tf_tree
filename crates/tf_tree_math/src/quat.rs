@@ -274,3 +274,73 @@ pub fn log_so3(q: Quat) -> Vec3 {
         z: scale * z,
     }
 }
+
+/// The unit quaternion of a **row-major 3×3 rotation matrix**.
+///
+/// `r` is `[r00 r01 r02, r10 r11 r12, r20 r21 r22]`, the same order
+/// `tf_tree_c`'s `rot3` emits, so this is exactly its inverse.
+///
+/// # Why the four branches
+///
+/// The textbook one-liner `w = √(1 + tr R)/2` divides the vector part by `4w`,
+/// and `w → 0` as the angle approaches π — precisely the rotations a robot's
+/// `map → odom` yaw spends time near. At `θ = π` it is `0/0`. Shepperd's method
+/// instead builds the quaternion around whichever of `w, x, y, z` is largest in
+/// magnitude, so the divisor is never below `1/√2` of the largest component and
+/// the result is accurate to full precision for every rotation, including the
+/// half-turns.
+///
+/// # This does not validate `r`
+///
+/// A non-rotation input produces a quaternion rather than an error — a
+/// reflection (`det R = −1`) yields a *different, valid* rotation, silently.
+/// That check belongs where foreign input arrives, not in the kernel; see
+/// `tf_tree_c::layout::read`, which rejects `|det R − 1| > 1e-6` before calling
+/// this.
+///
+/// The result is not normalized either, for the same reason: a caller that
+/// validated the determinant knows the norm is 1 to rounding, and one that did
+/// not should not be silently rescued.
+#[inline]
+#[must_use]
+pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {
+    let (r00, r11, r22) = (r[0], r[4], r[8]);
+    let trace = r00 + r11 + r22;
+    if trace > 0.0 {
+        // s = 4w, and w ≥ 1/2 here, so s ≥ 2.
+        let s = libm::sqrt(trace + 1.0) * 2.0;
+        Quat::new(
+            0.25 * s,
+            (r[7] - r[5]) / s,
+            (r[2] - r[6]) / s,
+            (r[3] - r[1]) / s,
+        )
+    } else if r00 > r11 && r00 > r22 {
+        // s = 4x.
+        let s = libm::sqrt(1.0 + r00 - r11 - r22) * 2.0;
+        Quat::new(
+            (r[7] - r[5]) / s,
+            0.25 * s,
+            (r[1] + r[3]) / s,
+            (r[2] + r[6]) / s,
+        )
+    } else if r11 > r22 {
+        // s = 4y.
+        let s = libm::sqrt(1.0 + r11 - r00 - r22) * 2.0;
+        Quat::new(
+            (r[2] - r[6]) / s,
+            (r[1] + r[3]) / s,
+            0.25 * s,
+            (r[5] + r[7]) / s,
+        )
+    } else {
+        // s = 4z.
+        let s = libm::sqrt(1.0 + r22 - r00 - r11) * 2.0;
+        Quat::new(
+            (r[3] - r[1]) / s,
+            (r[2] + r[6]) / s,
+            (r[5] + r[7]) / s,
+            0.25 * s,
+        )
+    }
+}

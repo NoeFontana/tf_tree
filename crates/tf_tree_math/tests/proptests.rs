@@ -328,3 +328,130 @@ fn prop_lerpslerp_not_right_invariant() {
          this test is supposed to demonstrate it is NOT — do not 'fix' it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `quat_from_rot3` — the publish direction of the C ABI's matrix layouts
+// ---------------------------------------------------------------------------
+
+/// The rotation matrix of `q`, row-major. The forward direction, written out
+/// here rather than imported so the round-trip below is not `f(f⁻¹(x))` through
+/// one shared expression.
+fn rot3_of(q: Quat) -> [f64; 9] {
+    let (w, x, y, z) = (q.w, q.x, q.y, q.z);
+    let (xx, yy, zz) = (x * x, y * y, z * z);
+    let (xy, xz, yz) = (x * y, x * z, y * z);
+    let (wx, wy, wz) = (w * x, w * y, w * z);
+    [
+        1.0 - 2.0 * (yy + zz),
+        2.0 * (xy - wz),
+        2.0 * (xz + wy),
+        2.0 * (xy + wz),
+        1.0 - 2.0 * (xx + zz),
+        2.0 * (yz - wx),
+        2.0 * (xz - wy),
+        2.0 * (yz + wx),
+        1.0 - 2.0 * (xx + yy),
+    ]
+}
+
+/// `q` and `−q` are the same rotation, so compare on the canonical hemisphere.
+fn quat_err(a: Quat, b: Quat) -> f64 {
+    let b = if a.dot(b) < 0.0 {
+        Quat::new(-b.w, -b.x, -b.y, -b.z)
+    } else {
+        b
+    };
+    (a.w - b.w)
+        .abs()
+        .max((a.x - b.x).abs())
+        .max((a.y - b.y).abs())
+        .max((a.z - b.z).abs())
+}
+
+/// **`quat_from_rot3` inverts `rot3` over the whole rotation group.**
+///
+/// The twist strategy reaches ‖ω‖ ≈ 6.9, so the sample covers rotations past π
+/// as well as the near-identity ones — all four of Shepperd's branches are
+/// taken.
+#[test]
+fn prop_quat_from_rot3_inverts_rot3() {
+    // `Cell`, because proptest's closure is `Fn` and not `FnMut`.
+    let branches: [core::cell::Cell<usize>; 4] = Default::default();
+    runner(2048)
+        .run(&twist(), |xi| {
+            let q = exp_se3(xi).q;
+            let r = rot3_of(q);
+            let got = tf_tree_math::quat_from_rot3(&r);
+            // Record which branch ran, so the assertion below is not vacuous.
+            let (r00, r11, r22) = (r[0], r[4], r[8]);
+            let b = &branches[if r00 + r11 + r22 > 0.0 {
+                0
+            } else if r00 > r11 && r00 > r22 {
+                1
+            } else if r11 > r22 {
+                2
+            } else {
+                3
+            }];
+            b.set(b.get() + 1);
+            prop_assert!(
+                quat_err(q, got) < 1e-14,
+                "err {} for {q:?} -> {got:?}",
+                quat_err(q, got)
+            );
+            // The result is a unit quaternion without any normalization step.
+            prop_assert!((got.norm() - 1.0).abs() < 1e-14);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        branches.iter().all(|n| n.get() > 0),
+        "not every Shepperd branch was exercised: {branches:?} — the test is \
+         weaker than it looks"
+    );
+}
+
+/// **Near θ = π, which is the entire reason the four branches exist.**
+///
+/// The naive `w = √(1 + tr R)/2` form divides the vector part by `4w`, and
+/// `w → 0` as `θ → π`. A robot's `map → odom` yaw passes through π routinely, so
+/// this is not a corner case, it is Tuesday.
+///
+/// The oracle is **Rodrigues**, built from the axis-angle vector directly, so it
+/// shares no code with the quaternion algebra on either side.
+///
+/// Mutant: delete the three non-trace branches and always take the trace one ⇒
+/// the error at `θ = π − 1e−7` blows up from ~1e−16 to ~1e−9 and this fails,
+/// while `prop_quat_from_rot3_inverts_rot3` above still passes at its 1e−14
+/// tolerance for most cases.
+#[test]
+fn quat_from_rot3_is_accurate_at_a_half_turn() {
+    let axis = Vec3::new(0.6, -0.8, 0.0); // unit
+    for eps in [0.0f64, 1e-12, 1e-7, 1e-3] {
+        let theta = core::f64::consts::PI - eps;
+        let w = Vec3::new(axis.x * theta, axis.y * theta, axis.z * theta);
+
+        // Rodrigues, independent of any quaternion code.
+        let (s, c) = (theta.sin(), theta.cos());
+        let k = [
+            [0.0, -axis.z, axis.y],
+            [axis.z, 0.0, -axis.x],
+            [-axis.y, axis.x, 0.0],
+        ];
+        let mut r = [0.0f64; 9];
+        for i in 0..3 {
+            for j in 0..3 {
+                let kk: f64 = (0..3).map(|m| k[i][m] * k[m][j]).sum();
+                r[i * 3 + j] = f64::from(u8::from(i == j)) + s * k[i][j] + (1.0 - c) * kk;
+            }
+        }
+
+        let want = tf_tree_math::exp_so3(w);
+        let got = tf_tree_math::quat_from_rot3(&r);
+        let err = quat_err(want, got);
+        assert!(
+            err < 1e-14,
+            "θ = π − {eps}: error {err} (want {want:?}, got {got:?})"
+        );
+    }
+}

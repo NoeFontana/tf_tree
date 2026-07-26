@@ -73,5 +73,6 @@ pub use tf_tree_core::{
 };
 
 pub use tf_tree_math::{
-    exp_se3, exp_so3, log_se3, log_so3, Interp, Iso3, LerpSlerp, Quat, ScLerp, Twist, Vec3,
+    exp_se3, exp_so3, log_se3, log_so3, quat_from_rot3, Interp, Iso3, LerpSlerp, Quat, ScLerp,
+    Twist, Vec3,
 };

@@ -18,12 +18,41 @@
 | Area | Status |
 |---|---|
 | §2 `at_with_derivatives` | **Done** — `Twist`, `Sample`, the adjoint fold, `DerivativesUnavailable`/`NoSegment`. §2.3's cost model was **false** and is amended in place. |
-| §3 C ABI — `tf_tree.h`, `tf_tree_unstable.h` | **Partial** — `tf_tree_c` carries the handle model, error model, panic guard, ABI versioning, all five layouts and the hot path (§3.2–§3.7). The generated headers, `cbindgen`/xtask and the publisher surface are not written yet. |
+| §3 C ABI — `tf_tree.h`, `tf_tree_unstable.h` | **Partial** — `tf_tree_c` carries the handle model, error model, panic guard, ABI versioning *and its enforcement*, all five layouts in both directions, the hot path, the publisher surface with §3.2's thread affinity, and the unstable tier (derivatives + introspection). **The generated headers and the `cbindgen` xtask are not written yet**, so §3.1's two-tier split exists in the source but not yet as two files. |
 | §4 C++ wrapper, CMake package | Not implemented |
 | §5 ROS 2 ingest bridge | Not implemented — **not blocked**, see below |
 | §6 test plan | Follows its section; §6.3's QoS test is **amended** (as specified it cannot pass) |
-| §7 benchmarks and gate | Not implemented. Gate criteria 3 and 6 cannot be honestly produced here — see below. |
+| §7 benchmarks and gate | **Partial.** `examples/abi_cost.rs` covers rows 1 and 2: `tft_plan_at` is **1.020× native (gate: < 1.05, PASS)** and `catch_unwind` costs **+0.6 ns on a real, non-inlinable call**. Gate criterion 4 (Miri + ASan clean) passes via `just c-abi-check`. Criteria 3 and 6 cannot be honestly produced here — see below. |
 | §1 operational criteria | **Open, and not satisfiable by code.** Gates Phase 7. |
+
+### What §3 turned up that the spec did not anticipate
+
+- **`layout` needed a read direction, and reading is not writing.** §3.5 names
+  five output layouts; a publisher needs four of them as *inputs*. Matrix input
+  needs matrix→quaternion (Shepperd's four-branch method, added to
+  `tf_tree_math` — the one-branch textbook form loses nine digits near θ = π,
+  which is where a `map → odom` yaw spends real time). It also needs
+  **validation**: `det R = −1` is a reflection and `det R = s³` is an
+  `Affine3d` used where an `Isometry3d` was meant, and both convert silently
+  into a *valid, different* rotation. One determinant check catches both.
+  `AFFINE12_ROW_F32` is deliberately **write-only** — accepting an `f32`
+  publication would halve the precision of everything downstream of it.
+- **The two id spaces were documented wrongly.** `error.rs` said `EdgeId` 0 was
+  an ordinary slot; `TreeBuilder` reserves it and stores `declared + 1`, and
+  `doctor` skips it. The C ABI reconciles them so both report `1 ..= count`, and
+  the doc comment is corrected. Found by a test asserting 3 and getting 4.
+- **`instance_uuid` is zero for a private arena**, so returning it unconditionally
+  made two unrelated in-process trees compare *equal* — "are we on the same
+  arena?" answered `yes` for two processes that had never met. It now returns
+  `TFT_ERR_NO_DATA` and writes nothing.
+- **The publish path costs 2.5× native (22 ns against 8.8 ns), and that is not a
+  defect.** Three hypotheses about the gap were measured and all three refuted:
+  a redundant `sqrt` (noise), the pose decode (+0.3 ns), the un-inlinable call
+  (+0.3 ns). What remains is the checking — magic word, thread affinity,
+  finiteness, unit norm, determinant. **The C ABI pays at run time for what
+  Rust's type system settles at compile time**, and a C caller can construct
+  every one of those mistakes. §3.7's 5 % gate is about `tft_plan_at`, which
+  passes at 1.020×.
 
 ### What this development environment can and cannot gate
 

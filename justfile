@@ -49,6 +49,13 @@ c-abi-check:
     MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test live
+    # The publish surface. Separate because `--test` takes one target: this is
+    # where a foreign *write* into the arena is checked, which is the half where
+    # a mistake corrupts somebody else's transform tree rather than only
+    # returning this process a bad answer.
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+        -p tf_tree_c -p tf_tree_core \
+        --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test publish
     RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
         --features test-hooks --target x86_64-unknown-linux-gnu -Zbuild-std
 
