@@ -207,3 +207,6 @@ logs/
 
 # Subagent worktrees (git worktrees live here; never part of a commit).
 .claude/worktrees/
+
+# uv-managed venvs for the Python bindings (`just py-setup`).
+/.venv-t/

@@ -78,11 +78,15 @@ impl Layout {
 
 /// Write `iso` as a row-major 4x4 `f64` matrix.
 ///
+/// Public because a binding needs to emit a *single* transform without paying
+/// for a batch — the scalar path in `docs/PHASE3.md` §4.2, whose budget is
+/// ~200 ns end to end.
+///
 /// The rotation is expanded from the quaternion directly rather than through a
 /// `Mat3` type: the products below are shared between entries, so doing it in
 /// one place lets the compiler keep every one of them in a register.
 #[inline]
-pub(crate) fn write_mat4(iso: &Iso3, out: &mut [f64]) {
+pub fn write_mat4(iso: &Iso3, out: &mut [f64]) {
     let q = iso.q;
     let (w, x, y, z) = (q.w, q.x, q.y, q.z);
     let (xx, yy, zz) = (x * x, y * y, z * z);
@@ -116,7 +120,7 @@ pub(crate) fn write_mat4(iso: &Iso3, out: &mut [f64]) {
 
 /// Write `iso` as `[qw qx qy qz tx ty tz]`.
 #[inline]
-pub(crate) fn write_quat(iso: &Iso3, out: &mut [f64]) {
+pub fn write_quat(iso: &Iso3, out: &mut [f64]) {
     out[0] = iso.q.w;
     out[1] = iso.q.x;
     out[2] = iso.q.y;
@@ -129,7 +133,7 @@ pub(crate) fn write_quat(iso: &Iso3, out: &mut [f64]) {
 /// Write `iso` as a row-major 3x4 `f32` affine.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn write_affine32(iso: &Iso3, out: &mut [f32]) {
+pub fn write_affine32(iso: &Iso3, out: &mut [f32]) {
     let q = iso.q;
     let (w, x, y, z) = (q.w, q.x, q.y, q.z);
     let (xx, yy, zz) = (x * x, y * y, z * z);

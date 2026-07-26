@@ -31,12 +31,16 @@ use std::time::Duration;
 
 use tf_tree_arena::AttachMode;
 use tf_tree_ipc::{
-    boot_id, self_start_time, AccessMode, ArenaName, CreatePolicy, EnvVar, HelloRequest,
-    HelloStatus, IpcError, OpenOutcome, OwnerServer, Rendezvous, RuntimeDir, SegmentDescriptor,
-    ShutdownHandle, SocketProbe, SystemEnv, DEFAULT_OPEN_TIMEOUT,
+    boot_id, self_start_time, AccessMode, ArenaName, EnvVar, HelloRequest, HelloStatus, IpcError,
+    OpenOutcome, OwnerServer, Rendezvous, RuntimeDir, SegmentDescriptor, ShutdownHandle,
+    SocketProbe, SystemEnv, DEFAULT_OPEN_TIMEOUT,
 };
 
 use crate::tree::{BuildError, Tree, TreeBuilder};
+
+/// Re-exported so a caller does not have to depend on `tf_tree_ipc` directly
+/// just to name a policy `open()` already takes.
+pub use tf_tree_ipc::CreatePolicy;
 
 /// The rendezvous session a `Tree` from [`Open::open`] holds.
 pub(crate) type JoinedSession = tf_tree_ipc::Session<tf_tree_ipc::Attached>;

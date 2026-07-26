@@ -14,7 +14,11 @@ members = [
 # ROS 2 is installed. Excluding it keeps `cargo build --workspace` working on
 # every host; `tf_tree_bench --features tf2` pulls it in as a path dependency
 # when a ROS toolchain is actually present.
-exclude = ["crates/tf_tree_tf2_sys"]
+exclude = [
+    # Links libpython, which a plain `cargo build --workspace` cannot assume is
+    # present — same reasoning as `tf_tree_tf2_sys` and ROS below. Built and
+    # tested by `just py-*`, which point PyO3 at a uv-managed interpreter.
+    "crates/tf_tree_py","crates/tf_tree_tf2_sys"]
 
 [workspace.package]
 version = "0.1.0"
