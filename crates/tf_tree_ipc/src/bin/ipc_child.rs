@@ -21,6 +21,8 @@
 //! ipc_child hold-participant <lock> <slot>   -> "held <slot>" | "lost", then parks
 //! ipc_child probe            <lock> <slot>   -> "ownership <held> <pid> participants <mask>"
 //! ipc_child open             <lock-dir>      -> "<outcome> <slot>" | "error <display>"
+//! ipc_child serve            <sock> <size>   -> "serving", then serves until killed
+//! ipc_child attach           <sock>          -> "attached <slot> <size> <uuid>" | "error <display>"
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -37,9 +39,11 @@ fn main() {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use rustix::fd::AsFd;
     use tf_tree_ipc::{
-        current_uid, AccessMode, ArenaName, EnvVar, Identity, LockAttempt, LockFile, NoServer,
-        Open, OpenOutcome, Rendezvous, RuntimeDir,
+        current_uid, self_start_time, AccessMode, ArenaName, EnvVar, HelloRequest, Identity,
+        LockAttempt, LockFile, NoServer, Open, OpenOutcome, OwnerServer, Rendezvous, RuntimeDir,
+        SegmentDescriptor,
     };
 
     /// Print and flush, then block until killed.
@@ -111,6 +115,75 @@ fn main() {
                 "ownership {} {} participants {mask}",
                 own.held, own.holder_pid
             ));
+        }
+        // Serve a §3.7 handshake over `path`, backed by a bare memfd of
+        // `size` bytes. No arena: the wire is parameterised by a descriptor
+        // (`docs/decisions/0005`), so the transport is testable without one.
+        "serve" => {
+            use rustix::fs::{ftruncate, memfd_create, MemfdFlags};
+
+            let size: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4096);
+            let fd = memfd_create(c"tf_tree.serve_test", MemfdFlags::CLOEXEC).expect("memfd");
+            ftruncate(&fd, size).expect("ftruncate");
+
+            let desc = SegmentDescriptor {
+                format_version: 2,
+                layout_hash: 0xDEAD_BEEF,
+                arena_size: size,
+                instance_uuid: [0x5A; 16],
+                boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
+            };
+            let server = OwnerServer::bind_at(&path, desc, std::process::id()).expect("bind");
+            say("serving");
+            // Hand every client the next slot in sequence, which is all the
+            // policy a transport test needs.
+            let mut next = 0u32;
+            let outcome = server.serve(
+                fd.as_fd(),
+                |_req| {
+                    let s = next;
+                    next += 1;
+                    Ok(s)
+                },
+                |slot| {
+                    say(&format!("hangup {slot}"));
+                },
+            );
+            // Never silently: a server that returns is a bug the parent must
+            // see, not a child that quietly exits and leaves the parent
+            // reporting "nothing is listening".
+            say(&format!("server-stopped {outcome:?}"));
+        }
+        // Attach to a server at `path` and report what came back, including the
+        // *size the kernel reports for the received fd* — which is the only
+        // evidence that a real descriptor crossed the process boundary.
+        "attach" => {
+            let req = HelloRequest {
+                format_version: 2,
+                layout_hash: 0xDEAD_BEEF,
+                mode: AccessMode::ReadOnly,
+                client_pid: std::process::id(),
+                client_start_time: self_start_time().unwrap_or(0),
+                client_boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
+                client_name: [0; 32],
+            };
+            match tf_tree_ipc::attach(&path, &req, Duration::from_secs(5)) {
+                Ok(a) => {
+                    let st = rustix::fs::fstat(&a.segment).expect("fstat");
+                    let uuid: String = a
+                        .response
+                        .instance_uuid
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    say(&format!(
+                        "attached {} {} {uuid}",
+                        a.response.participant_slot, st.st_size
+                    ));
+                    park();
+                }
+                Err(e) => say(&format!("error {e}")),
+            }
         }
         // `path` is the runtime directory here, so the child resolves the same
         // rendezvous the parent did and runs the real §3.4 algorithm.

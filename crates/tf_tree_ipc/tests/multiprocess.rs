@@ -67,7 +67,7 @@ impl EnvLookup for Fixed {
 
 /// A spawned `ipc_child`, killed on drop so a failing assertion cannot leave a
 /// process holding a lock in `/tmp` forever.
-struct Kid(Child);
+struct Kid(Child, Option<BufReader<std::process::ChildStdout>>);
 
 impl Kid {
     fn spawn(args: &[&str]) -> Kid {
@@ -79,15 +79,21 @@ impl Kid {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn ipc_child");
-        Kid(child)
+        Kid(child, None)
     }
 
     /// The child's next line. The child flushes before it parks, so this
     /// returning is proof the lock has actually been taken — no sleeps, no
     /// polling, no "probably by now".
+    ///
+    /// The reader is kept across calls. Building a fresh `BufReader` each time
+    /// discards whatever it buffered beyond the newline, which is invisible
+    /// while a child emits exactly one line and silently drops the second when
+    /// one emits two.
     fn line(&mut self) -> String {
-        let out = self.0.stdout.as_mut().expect("piped stdout");
-        let mut reader = BufReader::new(out);
+        let reader = self
+            .1
+            .get_or_insert_with(|| BufReader::new(self.0.stdout.take().expect("piped stdout")));
         let mut line = String::new();
         reader.read_line(&mut line).expect("read child line");
         line.trim_end().to_string()
@@ -373,4 +379,223 @@ fn the_paths_on_disk_are_the_specified_ones() {
     assert_eq!(rv.lock_path(), expected.as_path());
     assert!(Path::new(&expected).is_file());
     assert_eq!(rv.sock_path(), scratch.0.join("0").join("default.sock"));
+}
+
+// ---------------------------------------------------------------------------
+// §3.7 attach handshake
+// ---------------------------------------------------------------------------
+
+/// A request that matches what `ipc_child serve` publishes.
+fn good_request() -> tf_tree_ipc::HelloRequest {
+    tf_tree_ipc::HelloRequest {
+        format_version: 2,
+        layout_hash: 0xDEAD_BEEF,
+        mode: tf_tree_ipc::AccessMode::ReadOnly,
+        client_pid: std::process::id(),
+        client_start_time: tf_tree_ipc::self_start_time().unwrap_or(0),
+        client_boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
+        client_name: [0; 32],
+    }
+}
+
+/// Start a server child and wait until it is actually listening.
+fn serve(sock: &Path, size: u64) -> Kid {
+    let mut kid = Kid::spawn(&["serve", sock.to_str().unwrap(), &size.to_string()]);
+    assert_eq!(kid.line(), "serving");
+    kid
+}
+
+/// **The whole point of §3.7: a real descriptor crosses a process boundary.**
+///
+/// The assertion is on `fstat(received_fd).st_size`, not on the response — the
+/// response is just bytes this process could have fabricated, whereas a size the
+/// kernel reports for a descriptor is only obtainable if a descriptor actually
+/// arrived. Omit the `ScmRights` push on the server and the client gets
+/// `NoFdReceived` rather than a plausible-looking success.
+#[test]
+fn a_segment_fd_crosses_the_process_boundary() {
+    let scratch = Scratch::new("scm-rights");
+    let sock = scratch.0.join("a.sock");
+    let _server = serve(&sock, 8192);
+
+    let attached = tf_tree_ipc::attach(&sock, &good_request(), Duration::from_secs(5))
+        .expect("attach should succeed");
+
+    assert_eq!(attached.response.status, tf_tree_ipc::HelloStatus::Ok);
+    assert_eq!(attached.response.arena_size, 8192);
+    assert_eq!(attached.response.instance_uuid, [0x5A; 16]);
+
+    // The kernel's view of the received fd. This is the evidence.
+    let st = rustix::fs::fstat(&attached.segment).expect("fstat the received fd");
+    assert_eq!(
+        st.st_size, 8192,
+        "the fd did not refer to the served segment"
+    );
+}
+
+/// Two clients get two slots, and both fds are independently valid.
+#[test]
+fn each_client_gets_its_own_slot() {
+    let scratch = Scratch::new("two-clients");
+    let sock = scratch.0.join("a.sock");
+    let _server = serve(&sock, 4096);
+
+    let a = tf_tree_ipc::attach(&sock, &good_request(), Duration::from_secs(5)).unwrap();
+    let b = tf_tree_ipc::attach(&sock, &good_request(), Duration::from_secs(5)).unwrap();
+
+    assert_ne!(a.response.participant_slot, b.response.participant_slot);
+    assert_eq!(rustix::fs::fstat(&a.segment).unwrap().st_size, 4096);
+    assert_eq!(rustix::fs::fstat(&b.segment).unwrap().st_size, 4096);
+}
+
+/// A rejection names both sides and carries no fd.
+///
+/// §3.7 singles out `LayoutMismatch` because its raw symptom is "attach fails on
+/// a machine where everything looks fine". The error must therefore carry the
+/// *owner's* hash — the client already knows its own — or the message is useless.
+#[test]
+fn a_layout_mismatch_names_the_owners_hash_and_sends_no_fd() {
+    let scratch = Scratch::new("layout-mismatch");
+    let sock = scratch.0.join("a.sock");
+    let _server = serve(&sock, 4096);
+
+    let mut req = good_request();
+    req.layout_hash = 0x0BAD_0BAD;
+
+    match tf_tree_ipc::attach(&sock, &req, Duration::from_secs(5)) {
+        Err(IpcError::HandshakeRejected {
+            status,
+            owner_layout_hash,
+            ..
+        }) => {
+            assert_eq!(status, tf_tree_ipc::HelloStatus::LayoutMismatch);
+            assert_eq!(owner_layout_hash, 0xDEAD_BEEF, "must name the owner's hash");
+        }
+        // Not merely "some error": a rejection that carried a segment is its
+        // own named failure, and collapsing the two would let the server hand
+        // over the arena to a peer it just refused while this test still passed.
+        Err(IpcError::RejectionCarriedFd { .. }) => {
+            panic!("the owner sent a segment fd with a rejection")
+        }
+        other => panic!("expected a LayoutMismatch rejection, got {other:?}"),
+    }
+}
+
+/// A version disagreement is reported as such, not as a layout complaint.
+#[test]
+fn a_version_mismatch_outranks_a_layout_mismatch() {
+    let scratch = Scratch::new("version-mismatch");
+    let sock = scratch.0.join("a.sock");
+    let _server = serve(&sock, 4096);
+
+    // Both wrong. A peer that lays its records out differently will also hash
+    // differently, so reporting the layout first would send the operator after
+    // the wrong problem.
+    let mut req = good_request();
+    req.format_version = 99;
+    req.layout_hash = 0x0BAD_0BAD;
+
+    match tf_tree_ipc::attach(&sock, &req, Duration::from_secs(5)) {
+        Err(IpcError::HandshakeRejected {
+            status,
+            owner_format_version,
+            ..
+        }) => {
+            assert_eq!(status, tf_tree_ipc::HelloStatus::VersionMismatch);
+            assert_eq!(owner_format_version, 2);
+        }
+        other => panic!("expected a VersionMismatch rejection, got {other:?}"),
+    }
+}
+
+/// **D17: the socket is the liveness signal.**
+///
+/// A participant that is `SIGKILL`ed — no unwinding, no destructor, no message —
+/// must be visible to the owner immediately, because the kernel closes its fd.
+/// This is what makes reaping prompt and timeout-free, and it is the property
+/// `docs/PROJECT.md` §5 D17 forbids replacing with a heartbeat.
+#[test]
+fn the_owner_sees_a_hangup_when_a_participant_is_killed() {
+    let scratch = Scratch::new("hangup");
+    let sock = scratch.0.join("a.sock");
+    let mut server = serve(&sock, 4096);
+
+    let mut client = Kid::spawn(&["attach", sock.to_str().unwrap()]);
+    let attached = client.line();
+    assert!(attached.starts_with("attached 0 4096"), "got {attached}");
+
+    // No cooperation from the client, and no timeout on either side.
+    client.kill();
+
+    assert_eq!(
+        server.line(),
+        "hangup 0",
+        "the owner did not observe the dead participant's socket close"
+    );
+}
+
+/// An absent server is distinguishable from a refusing one.
+///
+/// §3.9 makes a stale socket path an expected state, so "nothing is listening"
+/// has to be its own error — `open()` reads it as "no server" and lets the
+/// ownership byte decide, whereas a rejection is terminal.
+#[test]
+fn an_absent_server_is_not_a_rejection() {
+    let scratch = Scratch::new("absent");
+    let sock = scratch.0.join("nobody.sock");
+
+    match tf_tree_ipc::attach(&sock, &good_request(), Duration::from_millis(200)) {
+        Err(IpcError::ServerUnreachable { .. }) => {}
+        other => panic!("expected ServerUnreachable, got {other:?}"),
+    }
+}
+
+/// A socket path longer than `sun_path` fails at construction, naming the limit.
+#[test]
+fn an_overlong_socket_path_is_refused_with_its_length() {
+    let long = PathBuf::from(format!("/tmp/{}", "x".repeat(200)));
+    match tf_tree_ipc::attach(&long, &good_request(), Duration::from_millis(200)) {
+        Err(IpcError::SocketPathTooLong { len, limit }) => {
+            assert_eq!(limit, 108);
+            assert!(len > limit);
+        }
+        other => panic!("expected SocketPathTooLong, got {other:?}"),
+    }
+}
+
+/// A client that connects and never speaks must not wedge the owner.
+///
+/// The handshake `recvmsg` is blocking and the server loop is single-threaded,
+/// so without a receive timeout one silent peer — hung, `SIGSTOP`ped, or simply
+/// hostile — stalls every other participant's attach *and* the shutdown path,
+/// for as long as it cares to hold the connection. §3.7 specifies no timeout on
+/// either side.
+///
+/// The assertion is that a *second, well-behaved* client still gets through.
+/// Removing the server's `SO_RCVTIMEO` makes this hang rather than fail, which
+/// is exactly the production symptom: an arena that stops accepting nodes and
+/// says nothing.
+#[test]
+fn a_silent_client_cannot_wedge_the_owner() {
+    let scratch = Scratch::new("silent-client");
+    let sock = scratch.0.join("a.sock");
+    let _server = serve(&sock, 4096);
+
+    // Connect, send nothing, and hold the connection open for the whole test.
+    let addr = rustix::net::SocketAddrUnix::new(&sock).unwrap();
+    let mute = rustix::net::socket_with(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .unwrap();
+    rustix::net::connect(&mute, &addr).unwrap();
+
+    // The owner spends its per-client budget on the mute peer, then carries on.
+    let attached = tf_tree_ipc::attach(&sock, &good_request(), Duration::from_secs(10))
+        .expect("a well-behaved client must still be served");
+    assert_eq!(attached.response.arena_size, 4096);
+
+    drop(mute);
 }

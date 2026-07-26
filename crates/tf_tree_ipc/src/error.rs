@@ -237,6 +237,58 @@ pub enum IpcError {
     /// The intended failure for a supervised consumer that must not silently
     /// create an empty arena because the estimator has not started yet.
     ArenaAbsent,
+    /// The §3.7 socket path exceeds `sun_path`.
+    ///
+    /// `$TF_TREE_RUNTIME_DIR` is arbitrary, so this is reachable from
+    /// configuration rather than from a bug. Reported here, at construction,
+    /// rather than as a bare `EINVAL` from inside `bind`.
+    SocketPathTooLong {
+        /// Length of the path.
+        len: usize,
+        /// The kernel's limit.
+        limit: usize,
+    },
+    /// Nothing is listening on the §3.7 socket.
+    ///
+    /// **Not a failure by itself.** §3.9 makes a stale socket path an expected
+    /// state, so `open()` reads this as "no server" and lets the ownership byte
+    /// decide.
+    ServerUnreachable {
+        /// `connect` errno.
+        raw_os_error: i32,
+    },
+    /// A send or receive during the handshake failed, or timed out.
+    HandshakeIo {
+        /// The errno.
+        raw_os_error: i32,
+    },
+    /// The peer's datagram was not a well-formed handshake message.
+    HandshakeMalformed(crate::wire::WireError),
+    /// The owner refused this client, and named its own side of the comparison.
+    HandshakeRejected {
+        /// Why.
+        status: crate::wire::HelloStatus,
+        /// The **owner's** format version, so a caller can print both sides.
+        owner_format_version: u32,
+        /// The **owner's** layout hash, likewise.
+        owner_layout_hash: u32,
+    },
+    /// The owner *rejected* the attach but sent a segment fd anyway.
+    ///
+    /// A protocol violation (§3.7: a rejection carries no fd). Reported rather
+    /// than silently dropped, because the failure it guards against is a client
+    /// that ignores `status` and maps a segment it was refused — and a
+    /// violation nobody reports is one nobody fixes.
+    RejectionCarriedFd {
+        /// The status the owner sent alongside the fd.
+        status: crate::wire::HelloStatus,
+    },
+    /// The owner accepted but sent no `SCM_RIGHTS` fd.
+    ///
+    /// A protocol violation rather than an I/O failure: an acceptance with no
+    /// segment is not something a correct owner can produce, and silently
+    /// treating it as "no server" would hide an owner bug behind a retry.
+    NoFdReceived,
     /// A live arena exists — some participant still holds its lock byte — but
     /// nothing is serving it, and nobody took over before the deadline.
     ///
@@ -291,6 +343,42 @@ impl fmt::Display for IpcError {
                 f,
                 "runtime directory from {} is unusable (errno {raw_os_error})",
                 source.as_str()
+            ),
+            IpcError::SocketPathTooLong { len, limit } => write!(
+                f,
+                "attach socket path is {len} bytes; the kernel's sun_path limit is {limit}. \
+                 Set TF_TREE_RUNTIME_DIR to a shorter directory"
+            ),
+            IpcError::ServerUnreachable { raw_os_error } => write!(
+                f,
+                "nothing is listening on the attach socket (errno {raw_os_error})"
+            ),
+            IpcError::HandshakeIo { raw_os_error } => {
+                write!(f, "attach handshake failed (errno {raw_os_error})")
+            }
+            IpcError::HandshakeMalformed(e) => {
+                write!(f, "attach handshake reply was not well-formed: {e:?}")
+            }
+            IpcError::HandshakeRejected {
+                status,
+                owner_format_version,
+                owner_layout_hash,
+            } => write!(
+                f,
+                "the arena owner refused this attach: {status:?} \
+                 (owner format_version {owner_format_version}, \
+                 layout_hash 0x{owner_layout_hash:08X}). \
+                 A LayoutMismatch means this binary was built against a different \
+                 record layout than the running arena — rebuild both from the same source"
+            ),
+            IpcError::RejectionCarriedFd { status } => write!(
+                f,
+                "the arena owner refused this attach ({status:?}) but sent a segment fd anyway; \
+                 this is an owner bug and the segment was not mapped"
+            ),
+            IpcError::NoFdReceived => write!(
+                f,
+                "the arena owner accepted the attach but sent no segment fd; this is an owner bug"
             ),
             IpcError::RuntimeDirNotADirectory { source } => {
                 write!(f, "{} exists but is not a directory", source.as_str())

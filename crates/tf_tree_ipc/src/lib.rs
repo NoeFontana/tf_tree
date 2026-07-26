@@ -52,7 +52,8 @@
 //! | §3.4 `open()` decision algorithm, incl. the split-brain check | implemented, with the socket half injected as [`ServerProbe`] |
 //! | §5.1 `(pid, start_time, boot_id)` and the `/proc` parsing trap | implemented |
 //! | §3.7 handshake messages ([`HelloRequest`], [`HelloResponse`], [`HelloStatus`]) | implemented, offsets and status codes pinned |
-//! | §3.6 `memfd` creation, §3.7 `SOCK_SEQPACKET` transport + `SCM_RIGHTS` | **not yet** — `docs/decisions/0005` step 3b |
+//! | §3.7 `SOCK_SEQPACKET` transport + `SCM_RIGHTS` ([`OwnerServer`], [`attach`]) | implemented |
+//! | §3.6 `memfd` creation, and wiring the two halves into `tf_tree::open()` | **not yet** — `docs/decisions/0005` steps 4-5 |
 //! | §6.1 claims as OFD locks | **not yet** — the byte range is reserved ([`CLAIM_BASE`]) |
 //!
 //! Because §3.7 is absent, [`Open::open`] takes a [`ServerProbe`] that answers
@@ -80,6 +81,7 @@
 #![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 
+mod client;
 mod error;
 mod identity;
 mod lockfile;
@@ -88,8 +90,10 @@ mod open;
 mod procstat;
 mod rendezvous;
 mod runtime_dir;
+mod server;
 mod wire;
 
+pub use client::{attach, Attached};
 pub use error::{
     EnvVar, IpcError, LockRole, NameProblem, ProcError, ProcParseError, RuntimeDirSource,
 };
@@ -104,7 +108,8 @@ pub use rendezvous::{
     domain_from_env, name_from_env, ArenaName, Rendezvous, DEFAULT_NAME, MAX_NAME_LEN,
 };
 pub use runtime_dir::{current_uid, EnvLookup, RuntimeDir, SystemEnv};
+pub use server::{OwnerServer, ShutdownHandle};
 pub use wire::{
     HelloRequest, HelloResponse, HelloStatus, SegmentDescriptor, WireError, HELLO_REQUEST_LEN,
-    HELLO_RESPONSE_LEN, WIRE_MAGIC,
+    HELLO_RESPONSE_LEN, MAX_SOCKET_PATH, WIRE_MAGIC,
 };

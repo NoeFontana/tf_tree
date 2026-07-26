@@ -18,7 +18,7 @@ workspace = true
 # `docs/PHASE2.md` §2 names rustix: raw syscalls with no C build step.
 # `process` is on top of the workspace default set for `getuid` (the
 # `/tmp/tf_tree-<uid>` fallback and the same-user check).
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "net", "event"] }
 # A documented deviation from §2's "no libc crate", for exactly one call:
 # `fcntl(F_OFD_*)`. rustix has no OFD locking, and §3.3 rejects the classic
 # whole-file locks it does have. See `src/ofd.rs` for the full reasoning.
