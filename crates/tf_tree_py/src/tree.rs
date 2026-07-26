@@ -270,11 +270,24 @@ impl PyPlan {
     /// `PyArg_ParseTuple` for one argument — 20% of a depth-3 budget (§4.2).
     #[pyo3(signature = (stamps, /))]
     fn at<'py>(&self, py: Python<'py>, stamps: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        if let Ok(arr) = stamps.cast::<PyArray1<i64>>() {
-            let n = arr.len();
-            let out = PyArray3::<f64>::zeros(py, [n, 4, 4], false);
-            self.fill(py, arr, &out, n)?;
-            return Ok(out.into_any());
+        // **Scalar first, and it is not a style choice.** `cast::<PyArray1<i64>>`
+        // on an `int` *fails*, and a failed downcast builds a `DowncastError` —
+        // type-name lookups and a formatted message — that is then thrown away
+        // by the `if let Ok`. Measured on a depth-3 chain: probing the array
+        // first cost ~150 ns of the scalar call's ~313 ns, against 114 ns of
+        // actual engine work.
+        //
+        // `is_instance_of::<PyInt>` is a pointer comparison against the type
+        // object. The array path pays it too, but amortises it over N samples,
+        // where the scalar path pays the failed cast on every single tick — and
+        // a control loop is all scalar ticks.
+        if !stamps.is_instance_of::<pyo3::types::PyInt>() {
+            if let Ok(arr) = stamps.cast::<PyArray1<i64>>() {
+                let n = arr.len();
+                let out = PyArray3::<f64>::zeros(py, [n, 4, 4], false);
+                self.fill(py, arr, &out, n)?;
+                return Ok(out.into_any());
+            }
         }
         let stamp = stamp_from_any(stamps)?;
         let g = self.tree().guard();
@@ -302,18 +315,80 @@ impl PyPlan {
     fn at_into(
         &self,
         py: Python<'_>,
-        stamps: &Bound<'_, PyArray1<i64>>,
+        stamps: &Bound<'_, PyAny>,
         out: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        // Device placement first, and *before* any attempt to take a pointer:
-        // the whole point is to refuse rather than to fault (§5.5).
-        reject_device_memory(out)?;
-        let arr = out.cast::<PyArray3<f64>>().map_err(|_| {
-            BufferError::new_err(
-                "out must be a writable, C-contiguous (N, 4, 4) float64 array, or an \
-                 object exposing the buffer protocol with that layout",
-            )
-        })?;
+        // **`reject_device_memory` is not called on the numpy path, and that is
+        // a measurement, not an omission.** It does `getattr("__dlpack_device__")`
+        // and then *calls* it — a full Python method call and a tuple extract,
+        // measured at ~120 ns, on every invocation. NumPy has had
+        // `__dlpack_device__` since 1.22, so a plain `np.empty((4,4))` paid all
+        // of it.
+        //
+        // A successful `cast::<PyArrayN<f64>>` proves the object is a genuine
+        // `numpy.ndarray`, whose data pointer is host memory by construction —
+        // CuPy and torch arrays are *not* numpy subclasses, so they fail the
+        // cast and reach the probe below, where the cost is worth paying. The
+        // §5.5 guarantee is unchanged; only the objects that can trip it now pay
+        // for the check.
+
+        // The scalar form, which mirrors `at`'s scalar/array overload. A control
+        // loop does **one** lookup per tick and cannot batch, so the allocation
+        // `at` performs is paid once per tick forever — and it is the majority
+        // of the call. Measured on a depth-3 chain, in-process, release build:
+        //
+        //     np.empty((4, 4))          177 ns   <- object construction
+        //     plan.at(t)                330 ns
+        //     plan.at_into(t, buf)      ~146 ns
+        //
+        // The 177 ns is NumPy building the array *object*, not zeroing it —
+        // replacing `zeros` with an uninitialized `new` was measured at no
+        // change and reverted. The only way past it is not to allocate.
+        if let Ok(arr) = out.cast::<PyArray2<f64>>() {
+            let stamp = stamp_from_any(stamps)?;
+            if !arr.is_c_contiguous() {
+                return Err(BufferError::new_err(
+                    "out must be C-contiguous; pass np.ascontiguousarray(...) \
+                     explicitly if you meant to copy",
+                ));
+            }
+            let shape = arr.shape();
+            if shape != [4, 4] {
+                return Err(BufferError::new_err(format!(
+                    "a scalar stamp needs out of shape (4, 4), got {shape:?}"
+                )));
+            }
+            let g = self.tree().guard();
+            let iso = self
+                .plan
+                .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
+                .map_err(lookup_err)?;
+            // SAFETY: checked C-contiguous and (4, 4) above, so the slice is
+            // exactly 16 f64, and `out` is exclusively borrowed for this call.
+            // Nothing is written before both checks pass — a half-written output
+            // is worse than none, because it looks like data.
+            let slice = unsafe { arr.as_slice_mut()? };
+            tf_tree::write_mat4(&iso, slice);
+            return Ok(());
+        }
+
+        let arr = match out.cast::<PyArray3<f64>>() {
+            Ok(a) => a,
+            Err(_) => {
+                // Not a numpy array, so it may be device memory. Refuse rather
+                // than fault (§5.5): a CPU store to a `cudaMalloc` pointer is
+                // undefined, not slow.
+                reject_device_memory(out)?;
+                return Err(BufferError::new_err(
+                    "out must be a writable, C-contiguous (N, 4, 4) float64 array — or \
+                     (4, 4) for a scalar stamp — or an object exposing the buffer \
+                     protocol with that layout",
+                ));
+            }
+        };
+        let stamps = stamps
+            .cast::<PyArray1<i64>>()
+            .map_err(|_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?;
         let n = stamps.len();
         self.fill(py, stamps, arr, n)
     }
