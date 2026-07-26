@@ -451,3 +451,215 @@ fn fetch_error() -> tft_error {
     assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_OK);
     e
 }
+
+// ---------------------------------------------------------------------------
+// The unstable tier — `tf_tree_unstable.h`, §3.1
+// ---------------------------------------------------------------------------
+
+/// **Derivatives cross the boundary, and the twist is the one §2 defines.**
+///
+/// The fixture's two dynamic edges are ScLerp with a constant screw per edge, so
+/// the composed twist is checked against a **central difference of the pose**
+/// rather than against another `tf_tree` call — the same oracle the Rust-side
+/// tests use, and one that shares no code with the adjoint fold.
+///
+/// Asserted as a *convergence order*, not an absolute error: the stencil's own
+/// truncation is O(h²), so halving `h` must quarter the error. An absolute
+/// tolerance here would either be loose enough to pass a wrong answer or tight
+/// enough to fail on the stencil rather than on the code.
+#[test]
+fn derivatives_match_a_central_difference_of_the_pose() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+    let at = 300_000_000i64;
+
+    let mut pose = [0u8; 56];
+    let mut twist = [0.0f64; 6];
+    // SAFETY: live plan; both buffers are exactly the documented sizes.
+    let rc = unsafe {
+        tft_plan_at_with_derivatives(
+            p.0,
+            at,
+            TFT_LAYOUT_QVEC7_WXYZ,
+            pose.as_mut_ptr().cast(),
+            twist.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, TFT_OK);
+
+    // The oracle: (T(t)⁻¹ · T(t+h))'s log, over 2h. `log_se3` orders the result
+    // [ω, v], matching the twist buffer.
+    let err_at = |h_ns: i64| {
+        let sample = |s: i64| {
+            let mut b = [0u8; 56];
+            // SAFETY: live plan, correctly sized buffer.
+            assert_eq!(
+                unsafe { tft_plan_at(p.0, s, TFT_LAYOUT_QVEC7_WXYZ, b.as_mut_ptr().cast()) },
+                TFT_OK
+            );
+            tf_tree::Iso3::new(
+                tf_tree::Quat::new(
+                    read_f64(&b, 0),
+                    read_f64(&b, 1),
+                    read_f64(&b, 2),
+                    read_f64(&b, 3),
+                ),
+                tf_tree::Vec3::new(read_f64(&b, 4), read_f64(&b, 5), read_f64(&b, 6)),
+            )
+        };
+        let h = h_ns as f64 * 1e-9;
+        let d = tf_tree::log_se3(sample(at - h_ns).inverse() * sample(at + h_ns));
+        (0..6)
+            .map(|i| (d[i] / (2.0 * h) - twist[i]).abs())
+            .fold(0.0f64, f64::max)
+    };
+
+    let coarse = err_at(2_000_000);
+    let fine = err_at(1_000_000);
+    assert!(
+        fine < coarse / 3.0 || fine < 1e-9,
+        "halving h must roughly quarter the error: {coarse:e} -> {fine:e}"
+    );
+}
+
+/// **Either output may be NULL.** Asking for only the twist is a real request,
+/// and asking for neither is the caller's mistake, not a silent no-op.
+#[test]
+fn derivatives_write_only_what_was_asked_for() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+    let mut twist = [0.0f64; 6];
+    // SAFETY: live plan; `out_pose` NULL is the case under test.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_with_derivatives(
+                p.0,
+                300_000_000,
+                TFT_LAYOUT_QVEC7_WXYZ,
+                core::ptr::null_mut(),
+                twist.as_mut_ptr(),
+            )
+        },
+        TFT_OK
+    );
+    assert!(twist.iter().any(|v| v.abs() > 1e-12), "a twist was written");
+
+    let mut pose = [0u8; 56];
+    // SAFETY: live plan; `out_twist` NULL is the case under test.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_with_derivatives(
+                p.0,
+                300_000_000,
+                TFT_LAYOUT_QVEC7_WXYZ,
+                pose.as_mut_ptr().cast(),
+                core::ptr::null_mut(),
+            )
+        },
+        TFT_OK
+    );
+    // Both NULL is refused rather than treated as a very fast success.
+    // SAFETY: both output pointers NULL is the case under test.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_with_derivatives(
+                p.0,
+                300_000_000,
+                TFT_LAYOUT_QVEC7_WXYZ,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        },
+        TFT_ERR_NULL_ARG
+    );
+}
+
+/// **Introspection reports the fixture's actual shape**, and a frame name that
+/// does not fit is refused rather than truncated.
+///
+/// Mutant: write `buf_len` bytes and NUL-terminate at the end ⇒ `"sen"` comes
+/// back for `"sensor"`, which is a *different plausible frame name* — the exact
+/// failure mode this library exists to argue against.
+///
+/// This is also where both id conventions are pinned. They were established by
+/// probing a built tree, not by reading the docs, because the docs disagree:
+/// `error.rs` says edge index 0 is an ordinary slot while `TreeBuilder` reserves
+/// it and `doctor` skips it. What is true is that **ids of both kinds run
+/// `1 ..= count`**, and this is the test that keeps that true.
+#[test]
+fn introspection_reports_the_tree_and_refuses_to_truncate() {
+    let t = Tree::new();
+    // Four frames, three edges, both counted the same way.
+    // SAFETY: `t.0` is a live handle.
+    assert_eq!(
+        unsafe { tft_tree_frame_count(t.0) },
+        4,
+        "map/odom/base/sensor"
+    );
+    // SAFETY: as above. The arena header holds 4 here — `declared + 1` — and
+    // this asserting 3 is what caught the raw field leaking through.
+    assert_eq!(unsafe { tft_tree_edge_count(t.0) }, 3);
+
+    let mut buf = [0i8; 64];
+    let name_of = |id: u32, buf: &mut [i8; 64]| -> tft_status {
+        // SAFETY: live handle; `buf` has 64 writable bytes.
+        unsafe { tft_tree_frame_name(t.0, id, buf.as_mut_ptr(), buf.len()) }
+    };
+    // Frame 0 is the root sentinel, not the first frame.
+    assert_eq!(name_of(0, &mut buf), TFT_ERR_UNKNOWN_FRAME);
+
+    let read_name = |buf: &[i8; 64]| -> String {
+        buf.iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8 as char)
+            .collect()
+    };
+    assert_eq!(name_of(1, &mut buf), TFT_OK);
+    assert_eq!(read_name(&buf), "map", "ids start at 1");
+    assert_eq!(name_of(4, &mut buf), TFT_OK);
+    assert_eq!(read_name(&buf), "sensor", "...and run through the count");
+
+    // "sensor" needs 7 bytes with its NUL; 6 is one short.
+    let mut small = [0i8; 6];
+    // SAFETY: live handle; `small` has 6 writable bytes, which is the point.
+    let rc = unsafe { tft_tree_frame_name(t.0, 4, small.as_mut_ptr(), small.len()) };
+    assert_eq!(rc, TFT_ERR_BUFFER_TOO_SMALL);
+    assert!(
+        small.iter().all(|&c| c == 0),
+        "nothing may be written when it does not fit"
+    );
+    // ...and the caller is told how much it needed.
+    let mut e: tft_error = unsafe { core::mem::zeroed() };
+    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    // SAFETY: `e` is a live, aligned `tft_error` with `struct_size` set.
+    assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_OK);
+    assert_eq!(e.requested, 7, "the required length, NUL included");
+
+    // An id past the end is an error, not a read of whatever is there.
+    assert_eq!(name_of(9999, &mut buf), TFT_ERR_UNKNOWN_FRAME);
+}
+
+/// **A private arena reports that it has no instance UUID, rather than zeros.**
+///
+/// The UUID is written only when a *shared* arena is created (`docs/PHASE2.md`
+/// §1, A1); a heap arena leaves the field zero. This test was written to assert
+/// that two trees differ, and found that two unrelated heap trees both reported
+/// sixteen zero bytes and therefore compared **equal** — so a caller asking "are
+/// we on the same arena?" would have got `yes` for two processes that had never
+/// met.
+///
+/// Mutant: drop the `is_shared` check ⇒ `TFT_OK` and a zero buffer come back.
+#[test]
+fn a_private_arena_reports_no_instance_uuid_rather_than_zeros() {
+    let t = Tree::new();
+    let mut a = [0xAAu8; 16];
+    // SAFETY: live handle; a 16-byte buffer.
+    assert_eq!(
+        unsafe { tft_tree_instance_uuid(t.0, a.as_mut_ptr()) },
+        TFT_ERR_NO_DATA
+    );
+    assert_eq!(
+        a, [0xAA; 16],
+        "nothing may be written when there is no uuid"
+    );
+}

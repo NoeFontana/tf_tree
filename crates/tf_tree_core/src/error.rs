@@ -39,8 +39,19 @@ impl FrameId {
 /// Stable identity of an edge (index into the edge table).
 ///
 /// Like [`FrameId`], edge identity is append-only; removal is tombstoning, never
-/// recycling (invariant 1 / D10). Edge index `0` is a valid edge slot (edges are
-/// not sentinel-indexed the way frames are).
+/// recycling (invariant 1 / D10).
+///
+/// **`EdgeId` is a plain `u32` — index `0` is representable — but no builder
+/// hands one out.** `TreeBuilder::build` reserves index `0` and stores
+/// `declared + 1` in the header's `edge_count`, and `tf_tree doctor` iterates
+/// `1..edge_count` to skip it. So the id space a consumer sees is `1 ..=
+/// declared`, matching [`FrameId`]'s, and the difference is confined to the
+/// header field.
+///
+/// An earlier version of this comment said edge 0 was an ordinary slot, which
+/// contradicted the builder and cost `tf_tree_c::unstable` an off-by-one that
+/// its own test caught. The type still permits `EdgeId(0)`; nothing produces
+/// one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EdgeId(pub u32);
 
