@@ -787,7 +787,7 @@ impl Tree {
     /// Whether this tree belongs to a process that no longer exists — it was
     /// opened before a `fork()` and this is the child.
     ///
-    /// One relaxed load of a process-local counter; see [`tf_tree_ipc::fork`]
+    /// One relaxed load of a process-local counter; see `tf_tree_ipc::fork`
     /// for why it is not `getpid()`.
     ///
     /// A detached tree is not repairable. Open a new one in the child, or

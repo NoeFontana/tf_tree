@@ -8,23 +8,37 @@ This document is for whoever is on call when a robot's transform tree
 misbehaves. It is organised by **symptom**, because that is what you have when
 you arrive.
 
-**Implementation status.** `tf_tree` is mid-Phase-2. Rows marked
-**(Phase 2, not yet implemented)** describe errors the design specifies but the
-code does not yet produce — they are listed so the runbook is complete when the
-feature lands, and so nobody mistakes their absence for "cannot happen". The
-seven `doctor` checks that do exist are: `cycle`, `unclaimed-dynamic`,
-`multi-writer`, `short-buffer`, `inconsistent-rate`, `unreachable`,
-`out-of-order`.
+**Implementation status.** Phase 2's rendezvous and lifecycle are implemented
+(decision [`0005`](./decisions/0005-the-shared-memory-seam.md)); `tf_treed`, the
+recorder and `/tf` ingest are not. Rows marked **(needs `tf_treed`)** describe
+situations whose *fix* is a daemon that does not exist yet — the error itself is
+real and reachable today. The seven `doctor` checks are `cycle`,
+`unclaimed-dynamic`, `multi-writer`, `short-buffer`, `inconsistent-rate`,
+`unreachable`, `out-of-order`.
+
+**Two of those seven go blind when `doctor` is attached to a live arena**, and it
+says so on every run rather than implying a clean bill of health it did not earn:
+`multi-writer` and `short-buffer` both need a recorded push stream, and a ring
+retains stamps but not who wrote each one or how late it arrived. See
+[Attaching to a running robot](#attaching-to-a-running-robot).
 
 ---
 
 ## First moves
 
 ```bash
-tf_tree doctor          # every check, with the offending frame/edge named
-tf_tree tree            # live topology, per-edge rate, occupancy, writer PID
-tf_tree echo <target> <source> --rate    # is this specific lookup working?
+tf_tree doctor --attach      # every check against the running arena
+tf_tree tree --attach        # live topology, per-edge rate, occupancy, writer PID
+tf_tree echo <target> <source> --attach --rate
+tf_tree participants         # who is attached — works even with no arena
 ```
+
+Without `--attach` these commands operate on an in-process fixture, which is
+useful for seeing what healthy output looks like and useless for diagnosing a
+robot. **`tf_tree participants` is the one to reach for first when nothing else
+works**: it reads the lock file and never maps the arena, so it still answers
+when the segment is gone, when its layout does not match your build, or when the
+owner is wedged.
 
 Two habits worth forming:
 
@@ -204,7 +218,62 @@ recreating the arena, because capacity is fixed at construction by design
 **Structurally impossible with sealing.** If it ever happens, the segment was not
 sealed — file a bug rather than working around it.
 
-### `ArenaHeldButUnreachable` — *(Phase 2, not yet implemented)*
+### Attaching to a running robot
+
+`tf_tree <cmd> --attach` joins the arena that `$TF_TREE_RUNTIME_DIR`,
+`$TF_TREE_DOMAIN` and `$TF_TREE_NAME` resolve to — override any of them with
+`--domain` / `--name`. **The commonest mistake is a domain mismatch**, and its
+dangerous form is silent in other systems: you attach to the wrong domain and are
+shown a perfectly plausible tree. Here it fails, because a domain is a different
+directory and a different lock file. `tf_tree participants --domain N` confirms
+which one has anything in it.
+
+Attach is **read-only** and **will not create**. `--rw` and `--create` exist and
+are opt-in: a diagnostic tool that can write to a robot's tree can corrupt it
+with any bug it happens to have (D18), and a tool that creates on a typo will
+conjure an empty arena and then report it healthy.
+
+`doctor --attach` prints which checks it could not run. Two of the seven need a
+recorded push stream — `multi-writer` cannot see a writer that has already been
+replaced, and `short-buffer` needs each sample's arrival lateness, which nothing
+in the arena records. Neither can fire on a live arena, so neither is claimed.
+
+### Reading `tf_tree participants`
+
+| column | meaning |
+|---|---|
+| `state = live` | the kernel still holds this slot's lock byte. A `SIGSTOP`ped process reads **live**, correctly — it has not died, and reaping it would be wrong |
+| `state = stale` | the byte is released but the identity record remains: the process is gone and left a record behind. A reaper will collect it; `tf_tree doctor --attach --rw` forces one |
+| `comm = <no record>` | the byte is held but no record has been written — a participant caught between taking its slot and describing itself. Momentary; re-run |
+| `mode = ro` | attached read-only. It cannot publish and cannot corrupt anything |
+
+An empty machine prints "no lock file" and **exits zero**. That is an answer, not
+a failure, and the exit code says so.
+
+### A writer stopped publishing and `push` returns `ClaimRevoked`
+
+Its claim was reaped: something judged the process dead while it was stopped or
+stalled, and the edge is now free or owned by somebody else. The correct response
+is to stop publishing and re-claim — never to retry the push, which is the one
+thing that would put two writers on a single-writer ring.
+
+This is by design (A4). A process that was `SIGSTOP`ped long enough for its
+*kernel lock* to be released cannot have been merely slow — the lock is released
+by process death, not by a timeout — so if this fires, the process really did
+die and come back, or somebody reaped by hand.
+
+### The tree works in the parent and everything fails in a forked child
+
+Errors will be `ChildDetached` from every entry point. A shared arena is mapped
+`MADV_DONTFORK`, so the child has no mapping where the arena was; the handle it
+inherited names memory it does not have.
+
+Open a new tree in the child, or `exec`. There is no repair — this is not a
+transient. Python's `multiprocessing` defaults to `fork` on Linux, so this is the
+single most likely way to meet it; use the `spawn` start method, or open inside
+the worker.
+
+### `ArenaHeldButUnreachable`
 
 A participant holds a live arena but is stopped or wedged and cannot take over
 ownership. `doctor` will name the slot and PID; resume or kill it.
@@ -213,32 +282,32 @@ ownership. `doctor` will name the slot and PID; resume or kill it.
 confirmed unrecoverable — the reason `open()` blocks instead of creating a second
 arena is that two live arenas diverging silently is worse than failing to start.
 
-### Two processes see different data — *(Phase 2, not yet implemented)*
+### Two processes see different data
 
 Should be impossible; it means two `instance_uuid`s exist. `doctor` prints the
 uuid and the resolved runtime dir on both. Almost always a runtime-directory or
 domain mismatch — different container mounts, or different `ROS_DOMAIN_ID`.
 
-### `open()` created an arena when one was expected — *(Phase 2, not yet implemented)*
+### `open()` created an arena when one was expected
 
 A consumer used the default `CreatePolicy::IfAbsent` and started before the
 publisher. Set `CreatePolicy::Never` on consumers in any supervised deployment,
 so they fail loudly instead of creating an empty arena a later publisher then
 refuses to join.
 
-### Rendezvous misbehaving on a shared filesystem — *(Phase 2, not yet implemented)*
+### Rendezvous misbehaving on a shared filesystem
 
 The runtime directory is on NFS or CIFS. File locks there have subtly different
 semantics and the whole rendezvous depends on them being exact, so `open()`
 rejects those filesystems. Point `TF_TREE_RUNTIME_DIR` at local storage.
 
-### `FrameNotDeclared` — *(Phase 2, not yet implemented)*
+### `FrameNotDeclared` — *(needs `tf_treed`)*
 
 A read-only participant asked for a frame nobody has declared yet. This is a
 startup-ordering problem, not a typo: pre-declare the static structure in
 `tf_treed`'s config so consumers can attach and plan before any publisher runs.
 
-### `TopologyChurn` — *(Phase 2, not yet implemented)*
+### `TopologyChurn`
 
 The topology mutated `TOPO_BLOCKS` times during a single plan compilation.
 Almost certainly a bug — topology should be near-static after startup.
