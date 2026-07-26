@@ -52,6 +52,8 @@ extern crate alloc;
 extern crate std;
 
 pub mod buffer;
+/// Consumer-side diagnostic counters (`docs/PHASE5.md` §5).
+pub mod counters;
 pub mod edge;
 pub mod error;
 pub mod frame;

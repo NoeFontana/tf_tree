@@ -12,16 +12,16 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 
 ## 0.0 Implementation status
 
-**Not started.** This section is the live status table, in the style of
+**In progress.** This section is the live status table, in the style of
 `PHASE2.md` §0.0, and is updated as work lands.
 
 | Area | Status |
 |---|---|
-| §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | Not implemented |
+| §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
 | §2 Frozen arena (`.tft`) | Not implemented |
 | §3 Bag ingestion | Not implemented |
 | §4 Offline Python API | Not implemented |
-| §5 Diagnostic counters | Not implemented |
+| §5 Diagnostic counters | **Partial** — `EdgeCounters`/`ParticipantCounters` and their arena regions exist (they are part of §1's one-time break, so they had to land with it). The `Guard` accumulation of §5.4 and the increments themselves are not wired yet. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | Not implemented |
 | §7 `tf_tree top` | Not implemented |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
@@ -137,16 +137,31 @@ Regions whose Phase 6 content does not exist yet are declared in the header with
 >    there is still slack.
 > 2. The header region literal in `layout.rs` (`256usize, // header`) changes.
 > 3. `layout_hash` changes **automatically**, because `size_of::<ArenaHeader>()`
->    is its first input. That is correct and wanted here — but note the hash is
->    duplicated as the literal `0x9075_90F5` in `tf_tree_ipc`'s wire tests, so
->    those move with it.
+>    is its first input. That is correct and wanted here.
+>
+> **Correction, from implementing it.** This section previously added that the
+> hash "is duplicated as the literal `0x9075_90F5` in `tf_tree_ipc`'s wire
+> tests, so those move with it". It is not. Those literals are *fixture values*
+> in byte-position assertions — they pin that a `SegmentDescriptor`'s
+> `layout_hash` field encodes at offset 12, and any distinctive `u32` would do.
+> All 83 `tf_tree_ipc` tests pass unchanged across the bump. The one real
+> duplicate is the snapshot in `layout.rs`'s own test, which carries the change
+> history.
 >
 > Also note what `layout_hash` does **not** cover: region *offsets*, region
 > *count*, and `max_frames`/`max_edges`/`max_participants`. Its `strides` input
 > is a hardcoded `[u32; 10]`. **Adding the two counter regions therefore does not
-> change the hash unless their strides are explicitly appended** — and they must
-> be, or a v3 arena built with counters and one built without would hash
-> identically and attach to each other.
+> change the hash unless their strides are explicitly appended.** They are, and
+> the array is now `[u32; 12]`.
+>
+> **Correction, from implementing it.** The stated *reason* — "or a v3 arena
+> built with counters and one built without would hash identically and attach to
+> each other" — describes a scenario §5.5 and D34 rule out: the regions exist
+> whether or not the `counters` feature is compiled in, precisely so that
+> disabling it does not fork the layout hash. Those two builds have identical
+> layouts and *should* attach. The strides are appended because the hash should
+> describe the layout that exists, which is a good enough reason on its own, and
+> because it is already correct if the regions ever do become conditional.
 
 ### 1.3 Publish-side counters need no storage at all
 

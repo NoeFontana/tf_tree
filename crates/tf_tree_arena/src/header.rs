@@ -8,9 +8,11 @@
 //! implementation detail. All multi-byte fields are little-endian (load-bearing
 //! invariant 7); construction asserts a little-endian host.
 //!
-//! The header lives inside the 256-byte header *region* (see
-//! [`crate::layout`]); the struct itself is smaller (it rounds up to its 64-byte
-//! alignment) and the remainder of the region is reserved padding.
+//! The header lives inside the header *region* (see [`crate::layout`]), which is
+//! **320 bytes since `FORMAT_VERSION` 3** and was 256 before it. The struct is
+//! exactly that size — its reserved space is named fields (`_reserved`,
+//! `_reserved_v3`) plus the alignment padding in front of `topo_lock`, not slack
+//! at the end of the region.
 
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
 
@@ -37,8 +39,29 @@ pub const TF_TREE_MAGIC: [u8; 8] = *b"TF_TREE\0";
 ///   64 loses the property that makes it useful) and `owner_start_time` joins
 ///   it.
 ///
-/// A version-1 arena must not be attached: `MappedArena::attach` refuses it.
-pub const FORMAT_VERSION: u32 = 2;
+/// # Version 3 — `docs/PHASE5.md` §1
+///
+/// A **deliberate, one-time break**. Phase 5 needs new arena regions, and so do
+/// Phases 6 and 8; taking three breaks would cost three coordinated
+/// fleet-wide restarts. §1 takes one, now, while the user count is small, and
+/// reserves room for what is known to be coming:
+///
+/// * the two counter regions (§5.2), which exist whether or not the `counters`
+///   feature is compiled in, so that disabling it does not fork the layout hash
+///   (D34);
+/// * `covariance_region_off`/`_stride` and `spline_region_off`/`_degree`, which
+///   are **Phase 6's** and are `0` (absent) in every arena this build creates;
+/// * `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`'s reserved bytes,
+///   and `frame_kind` in `FrameRecord`'s.
+///
+/// The header grew from 256 to 320 bytes to hold them with §1.2's required 64
+/// reserved bytes still free. That moved `topo_lock` off its pinned offset and
+/// changed `layout_hash` — both intended, both pinned by tests.
+///
+/// **A version-2 arena must not be attached**, and neither must a version-1
+/// one: `MappedArena::attach` refuses both, and `tf_tree doctor
+/// --explain-version` is what tells an operator why and what to do about it.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Number of topology blocks the arena rotates through.
 ///
@@ -169,17 +192,61 @@ pub struct ArenaHeader {
     /// with and no randomness is drawn — which also keeps the no-`shm` build
     /// free of an RNG dependency.
     ///
-    /// Lands at offset 136, inside padding that already existed because
-    /// [`TopoLock`] is `align(64)`: `boot_id` ends at 128, `_reserved` at 136,
-    /// and the next 64-byte boundary is 192. So adding it moved no pinned
-    /// offset, did not grow the header past 256, and — because
-    /// [`crate::layout::layout_hash`] covers region sizes and strides rather
-    /// than header fields — did not change the layout hash either. That is why
-    /// [`FORMAT_VERSION`] is still 2.
+    /// Lands at offset 136. **When it was added, for `FORMAT_VERSION` 2**, that
+    /// was inside padding which already existed because [`TopoLock`] is
+    /// `align(64)`: `boot_id` ended at 128, `_reserved` at 136, and the next
+    /// 64-byte boundary was 192. So it moved no pinned offset, did not grow the
+    /// header, and did not change the layout hash — which is why version 2 did
+    /// not have to be version 3 for it.
+    ///
+    /// `FORMAT_VERSION` 3 then spent the rest of that padding on the fields
+    /// below, and the header grew to 320. The offset of this field is unchanged;
+    /// what changed is that there is no longer free space after it.
     pub instance_uuid: [u8; 16],
+    // -----------------------------------------------------------------------
+    // FORMAT_VERSION 3 additions — `docs/PHASE5.md` §1.2
+    // -----------------------------------------------------------------------
+    //
+    // These land at 152, in the 40 bytes of implicit padding that already
+    // existed between `instance_uuid`'s end and `topo_lock`'s 64-byte boundary.
+    // They do not fit *with* §1.2's required 64 reserved bytes, which is why the
+    // header grows to 320 — see the amendment in that section, and the tests
+    // below, which pin every offset it moved.
+    /// Byte offset of the per-edge counter region (§5.2). Never zero in a v3
+    /// arena: the region exists whether or not the `counters` feature is on, so
+    /// that disabling the feature does not fork the layout hash (D34).
+    pub edge_counters_off: u32,
+    /// Byte offset of the per-participant counter region (§5.2). Same contract.
+    pub participant_counters_off: u32,
+    /// Byte offset of the per-sample covariance region. **Phase 6.**
+    ///
+    /// `0` means absent, and it is 0 in every arena this build creates. The
+    /// field exists now so Phase 6 fills a region the header already accounts
+    /// for, rather than breaking the format a second time (§1's whole argument).
+    pub covariance_region_off: u32,
+    /// Bytes per covariance entry. **Phase 6.** `0` when absent.
+    pub covariance_stride: u32,
+    /// Byte offset of the cumulative-B-spline control region. **Phase 6.**
+    /// `0` when absent.
+    pub spline_region_off: u32,
+    /// Spline degree. **Phase 6.** `0` when absent.
+    pub spline_degree: u8,
+    _pad_v3: [u8; 3],
+    /// **≥ 64 bytes still reserved after everything above**, which §1.2 requires
+    /// explicitly.
+    ///
+    /// The point is not superstition. Phases 5, 6 and 8 each want header fields,
+    /// and a format break costs every participant a coordinated restart. This is
+    /// the room that makes the next two additions free — and it is the reason
+    /// the break is being taken *once*, now, rather than three times.
+    _reserved_v3: [u8; 64],
     /// The topology mutation lock (A2). Last so it lands on its own 64-byte
     /// line: it is contended only by mutators, and false-sharing it with the
     /// header fields every reader touches would be a needless cost.
+    ///
+    /// Moved from 192 to 256 by the v3 additions above. That offset was pinned
+    /// by a test on purpose; the test moved with it rather than being deleted,
+    /// because it is what stops the next person assuming there is still slack.
     pub topo_lock: TopoLock,
 }
 
@@ -192,8 +259,11 @@ mod tests {
 
     #[test]
     fn header_fits_within_region() {
-        // The struct must fit within the 256-byte header region reserved for it.
-        assert!(size_of::<ArenaHeader>() <= 256);
+        // The struct must fit within the header region reserved for it, which
+        // grew from 256 to 320 with FORMAT_VERSION 3 (`docs/PHASE5.md` §1.2).
+        // `crate::layout`'s region table holds the same number; a mismatch there
+        // would overlap the frame table with the header.
+        assert!(size_of::<ArenaHeader>() <= 320);
         assert_eq!(align_of::<ArenaHeader>(), 64);
     }
 
@@ -226,10 +296,40 @@ mod tests {
         assert_eq!(offset_of!(ArenaHeader, owner_start_time), 104);
         assert_eq!(offset_of!(ArenaHeader, boot_id), 112);
         assert_eq!(offset_of!(ArenaHeader, instance_uuid), 136);
+        // FORMAT_VERSION 3, in the padding that used to sit between
+        // `instance_uuid` and the lock's 64-byte boundary.
+        assert_eq!(offset_of!(ArenaHeader, edge_counters_off), 152);
+        assert_eq!(offset_of!(ArenaHeader, participant_counters_off), 156);
+        assert_eq!(offset_of!(ArenaHeader, covariance_region_off), 160);
+        assert_eq!(offset_of!(ArenaHeader, covariance_stride), 164);
+        assert_eq!(offset_of!(ArenaHeader, spline_region_off), 168);
+        assert_eq!(offset_of!(ArenaHeader, spline_degree), 172);
         // The lock sits on its own cacheline, so its offset is a multiple of 64
-        // and it is the last thing in the 256-byte header region.
-        assert_eq!(offset_of!(ArenaHeader, topo_lock), 192);
-        assert_eq!(size_of::<ArenaHeader>(), 256);
+        // and it is the last thing in the 320-byte header region.
+        assert_eq!(offset_of!(ArenaHeader, topo_lock), 256);
+        assert_eq!(size_of::<ArenaHeader>(), 320);
+    }
+
+    /// **§1.2 requires ≥ 64 bytes still reserved after the v3 additions**, and
+    /// this is what makes that a fact rather than an intention.
+    ///
+    /// The whole argument for breaking the format once is that the next two
+    /// phases' header fields land for free. That is only true while the room
+    /// exists, and the way it stops existing is somebody spending it without
+    /// noticing — so the check is here, next to the fields.
+    #[test]
+    fn at_least_64_reserved_bytes_remain_after_the_v3_fields() {
+        // Named reserved arrays, plus the implicit padding between the last
+        // named field and the lock's 64-byte boundary.
+        let named = 8usize /* _reserved */ + 3 /* _pad_v3 */ + 64 /* _reserved_v3 */;
+        let last_named_end = offset_of!(ArenaHeader, _reserved_v3) + 64;
+        let implicit = offset_of!(ArenaHeader, topo_lock) - last_named_end;
+        let free = named + implicit;
+        assert!(
+            free >= 64,
+            "only {free} reserved bytes remain; §1.2 requires at least 64, and \
+             spending them means the next phase pays for another format break"
+        );
     }
 
     /// `instance_uuid` had to fit without disturbing anything already published.
@@ -238,21 +338,42 @@ mod tests {
     /// records why 136 was available in the first place, so that a later field
     /// added in the same gap does not silently push the lock off its cacheline.
     #[test]
-    fn instance_uuid_occupies_pre_existing_alignment_padding() {
+    fn the_header_has_no_slack_left_between_its_last_field_and_the_lock() {
         let after_boot_id = offset_of!(ArenaHeader, boot_id) + 16;
         let uuid_at = offset_of!(ArenaHeader, instance_uuid);
         let lock_at = offset_of!(ArenaHeader, topo_lock);
 
-        // It sits after `boot_id` + `_reserved`, and entirely before the lock.
+        // `instance_uuid` still sits after `boot_id` + `_reserved` and entirely
+        // before the lock. That much is unchanged from version 2.
         assert!(uuid_at >= after_boot_id, "{uuid_at} < {after_boot_id}");
         assert!(
             uuid_at + 16 <= lock_at,
             "uuid overruns the lock at {lock_at}"
         );
-        // And the lock still lands exactly where its own alignment puts it,
-        // so the field consumed padding rather than adding any.
+
+        // **What changed, and why this test was rewritten rather than deleted.**
+        //
+        // In version 2 this asserted `lock_at == (uuid_at + 16).next_multiple_of(64)`
+        // — the lock landed exactly where its own alignment put it, which was
+        // the proof that `instance_uuid` had consumed *pre-existing* padding and
+        // cost nothing. FORMAT_VERSION 3 spent that padding on the fields
+        // `docs/PHASE5.md` §1.2 lists, so the lock moved from 192 to 256 and
+        // that assertion is now false.
+        //
+        // Deleting it would remove the only thing standing between the next
+        // person and the assumption that there is still slack there. So it
+        // asserts the *current* truth instead: the lock is where alignment puts
+        // it given everything now in front of it. Add a field without extending
+        // the header and this fails, which is the whole point.
         assert_eq!(align_of::<TopoLock>(), 64);
-        assert_eq!(lock_at, (uuid_at + 16).next_multiple_of(64));
+        let last_named_end = offset_of!(ArenaHeader, _reserved_v3) + 64;
+        assert_eq!(
+            lock_at,
+            last_named_end.next_multiple_of(64),
+            "the lock must sit at the first 64-byte boundary after the last \
+             named field; if this fails, a field was added without the header \
+             growing to hold it"
+        );
     }
 
     /// A1 packs the generation and the active-block index into one word so that
