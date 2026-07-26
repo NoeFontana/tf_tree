@@ -516,6 +516,14 @@ impl ArenaBacking {
     }
 }
 
+/// This process's answer to "is the participant in slot `n` still running?".
+///
+/// Boxed and owned by the [`Tree`] because it must outlive every [`ArenaView`]
+/// that borrows it, and because which implementation applies is decided once —
+/// `/proc` inference for a heap or fd-inherited tree, the kernel's `F_OFD_GETLK`
+/// answer for one that came through [`crate::open`] (`docs/PHASE2.md` §5.1).
+type BoxedLiveness = Box<dyn Fn(u32, &tf_tree_core::ParticipantRecord) -> bool + Send + Sync>;
+
 /// A transform tree: a fixed-capacity arena plus the ergonomic operations for
 /// publishing samples and looking up transforms. Build one with [`TreeBuilder`].
 ///
@@ -550,7 +558,7 @@ pub struct Tree {
     ///
     /// This is the seam `docs/PHASE2.md` §5.1 replaces with the OFD lock file,
     /// which is authoritative where `/proc` is inference.
-    liveness: Box<dyn Fn(&tf_tree_core::ParticipantRecord) -> bool + Send + Sync>,
+    liveness: BoxedLiveness,
     /// Serializes *this process's* threads through [`Self::reparent`].
     ///
     /// Not the real lock and never was — a `Mutex` is per-process, so it
@@ -937,6 +945,57 @@ impl Tree {
         });
     }
 
+    /// Replace the `/proc` liveness heuristic with the kernel's answer (§5.1).
+    ///
+    /// `/proc` parsing is an *inference* with a race in it: between reading a
+    /// pid and acting on it the process can exit and the number be reused, and
+    /// an unreadable `/proc` entry is indistinguishable from a permission
+    /// problem. So it fails safe — unknown means alive — which is right but
+    /// means a dead participant is never *proven* dead.
+    ///
+    /// `F_OFD_GETLK` on the participant's lock byte is authoritative instead.
+    /// A process that dies for any reason has its byte released by the kernel,
+    /// with no cooperation and no timeout; a process that is merely `SIGSTOP`ped
+    /// or GC-stalled still holds it, which is exactly the distinction
+    /// `docs/PROJECT.md` §5 D17 forbids a heartbeat from making.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn use_ofd_liveness(&mut self, probe: crate::open::LivenessProbe) {
+        let own_slot = self.participant;
+        self.liveness = Box::new(move |slot, rec| {
+            // **Never report ourselves dead.** `F_OFD_GETLK` answers about
+            // *conflicting* locks, so a description does not see its own — a
+            // property `tf_tree_ipc`'s `a_holder_does_not_see_its_own_lock`
+            // proves. This probe uses a second open file description, which
+            // happens to make our byte visible again, but relying on that would
+            // be relying on a detail a future refactor could remove by sharing
+            // one description. The guard is explicit so the correctness does
+            // not depend on which description asked.
+            if slot == own_slot {
+                return true;
+            }
+            probe.is_held(slot).unwrap_or_else(|| record_is_alive(rec))
+        });
+    }
+
+    /// Whether the participant in `slot` is still running.
+    ///
+    /// The kernel's answer for a tree obtained from [`crate::open`], a `/proc`
+    /// inference otherwise (`docs/PHASE2.md` §5.1). Exposed because `doctor`
+    /// and the reaper both need it, and because it is the one predicate whose
+    /// two implementations differ in a way a test can see: a `SIGSTOP`ped
+    /// holder still holds its lock byte.
+    #[must_use]
+    pub fn participant_alive(&self, slot: u32) -> bool {
+        match self.view().participants().get(slot) {
+            None => false,
+            Some(rec) => {
+                tf_tree_core::participant::state_of(rec.state.load(Ordering::Acquire))
+                    == tf_tree_core::participant::LIVE
+                    && (self.liveness)(slot, rec)
+            }
+        }
+    }
+
     /// Wrap a [`LookupError`] so its `Display` resolves ids to frame names.
     #[must_use]
     pub fn describe(&self, err: LookupError) -> Described<'_> {
@@ -1115,14 +1174,12 @@ fn record_is_alive(rec: &tf_tree_core::ParticipantRecord) -> bool {
 /// either id is unknown the comparison is skipped — treating "unknown" as
 /// "different" would declare every participant dead, the false negative this
 /// must never produce.
-fn liveness_for(
-    arena_boot: [u8; 16],
-) -> Box<dyn Fn(&tf_tree_core::ParticipantRecord) -> bool + Send + Sync> {
+fn liveness_for(arena_boot: [u8; 16]) -> BoxedLiveness {
     let host = *host_boot_id();
     if arena_boot != [0u8; 16] && host != [0u8; 16] && arena_boot != host {
-        return Box::new(|_| false);
+        return Box::new(|_, _| false);
     }
-    Box::new(record_is_alive)
+    Box::new(|_slot, rec| record_is_alive(rec))
 }
 
 fn participant_is_alive(

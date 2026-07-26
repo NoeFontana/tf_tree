@@ -42,6 +42,40 @@ use crate::tree::{BuildError, Tree, TreeBuilder};
 /// just to name a policy `open()` already takes.
 pub use tf_tree_ipc::CreatePolicy;
 
+/// A kernel-authoritative liveness probe over the lock file (§5.1).
+///
+/// Holds its **own** open file description, deliberately. The alternative —
+/// sharing the `Session`'s — would mean the probe could not see this process's
+/// own byte, because `F_OFD_GETLK` reports only *conflicting* locks. That is
+/// survivable (the caller guards its own slot anyway) but it makes a subtle
+/// property load-bearing; a separate description makes the probe answer the
+/// same way about every slot including ours.
+///
+/// The cost is one extra fd per attached tree, against a syscall that replaces
+/// parsing `/proc` — which is an inference with a race in it, where this is the
+/// kernel's own answer.
+pub(crate) struct LivenessProbe {
+    lock: tf_tree_ipc::LockFile,
+}
+
+impl LivenessProbe {
+    /// Open a second description of the rendezvous lock file.
+    fn open(rv: &Rendezvous) -> Result<LivenessProbe, IpcError> {
+        Ok(LivenessProbe {
+            lock: tf_tree_ipc::LockFile::open(rv.lock_path())?,
+        })
+    }
+
+    /// Whether `slot`'s byte is held, or `None` if the kernel could not say.
+    ///
+    /// `None` rather than a guess: §6.2 requires this to fail safe, and the
+    /// caller turns "cannot tell" back into the `/proc` inference rather than
+    /// into a "dead" verdict that would steal a working process's claim.
+    pub(crate) fn is_held(&self, slot: u32) -> Option<bool> {
+        self.lock.probe_participant(slot).ok().map(|p| p.held)
+    }
+}
+
 /// The rendezvous session a `Tree` from [`Open::open`] holds.
 pub(crate) type JoinedSession = tf_tree_ipc::Session<tf_tree_ipc::Attached>;
 
@@ -278,6 +312,7 @@ impl Open {
                     .ok_or(OpenError::Rendezvous(IpcError::ArenaAbsent))?;
                 let slot = attached.response.participant_slot;
                 let mut tree = Tree::attach_shared_at(attached.segment, self.mode, slot)?;
+                tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 // The socket and the lock file must outlive the handshake: the
                 // first is how the owner learns we died (D17), the second is
                 // what holds our participant byte. Parking them in the `Tree`
@@ -288,6 +323,7 @@ impl Open {
             OpenOutcome::Created | OpenOutcome::TookOver => {
                 let builder = self.layout.ok_or(OpenError::NoLayoutToCreate)?;
                 let mut tree = builder.build_shared(rv.name().as_str())?;
+                tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 let server = spawn_owner_server(&rv, &tree)?;
                 tree.hold_ownership(session, server);
                 Ok(tree)

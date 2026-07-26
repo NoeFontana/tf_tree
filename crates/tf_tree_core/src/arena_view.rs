@@ -53,7 +53,11 @@ use crate::topology::{Block, TopologyView};
 /// **It must fail safe** (§6.2): return `true` whenever it cannot tell. A false
 /// "dead" verdict steals an in-flight entry from a working process; a false
 /// "alive" verdict only postpones recovery.
-pub type LivenessFn = dyn Fn(&ParticipantRecord) -> bool;
+/// The first argument is the **participant slot**, which the `docs/PHASE2.md`
+/// §5.1 implementation needs: it asks the kernel about that slot's lock byte
+/// rather than parsing `/proc`. The record is passed too, because the `/proc`
+/// fallback and `doctor` still read the identity out of it.
+pub type LivenessFn = dyn Fn(u32, &ParticipantRecord) -> bool;
 
 /// Smallest power of two `>= n` (matching the arena layout's `next_pow2`).
 const fn next_pow2(n: usize) -> usize {
@@ -237,7 +241,7 @@ impl<'a> ArenaView<'a> {
                 None => true, // out of range for this arena: cannot judge
                 Some(rec) => {
                     state_of(rec.state.load(Ordering::Acquire)) == LIVE
-                        && self.is_alive.is_none_or(|f| f(rec))
+                        && self.is_alive.is_none_or(|f| f(owner - 1, rec))
                 }
             }
         }
