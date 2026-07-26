@@ -1,6 +1,6 @@
 # tf_tree — Phase 1 Implementation Specification
 
-> **Companion document:** `docs/PROJECT.md` holds the project overview, the full six-phase roadmap, and the decision log with rationale. When this spec does not answer a question, check the decision log there before choosing — several obvious-looking simplifications are deliberately excluded and the reasons are recorded.
+> **Companion document:** `docs/PROJECT.md` holds the project overview, the full eight-phase roadmap, and the decision log with rationale. When this spec does not answer a question, check the decision log there before choosing — several obvious-looking simplifications are deliberately excluded and the reasons are recorded.
 
 **Deliverable:** a single-process transform tree engine in Rust, benchmarked against ROS 2 `tf2`.
 

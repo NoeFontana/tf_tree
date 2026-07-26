@@ -10,7 +10,7 @@
 
 Every robot needs this. In ROS the answer is `tf2`, which is competent, ubiquitous, and around fifteen years old. `tf_tree` targets the workloads `tf2` was not designed for: kilohertz sensor edges, many concurrent readers in one process, multiple processes on one host, and multiple hosts on one robot — with a query path fast enough to sit inside a control loop and diagnostics good enough to debug at 3 a.m.
 
-**Non-goal, stated first because it constrains everything else:** this is a *tree*, not a pose graph. Each frame has exactly one parent. Uncertainty, when it arrives in Phase 5, will be a marginal — the structure cannot represent cross-correlation between sibling branches. If you need the joint distribution you need a factor graph, and `tf_tree` should say so loudly in its docs rather than hand out an optimistic covariance.
+**Non-goal, stated first because it constrains everything else:** this is a *tree*, not a pose graph. Each frame has exactly one parent. Uncertainty, when it arrives in Phase 6, will be a marginal — the structure cannot represent cross-correlation between sibling branches. If you need the joint distribution you need a factor graph, and `tf_tree` should say so loudly in its docs rather than hand out an optimistic covariance.
 
 ## 2. The problems being solved
 
@@ -27,7 +27,7 @@ These are the specific `tf2` behaviours that define the design targets. Each map
 | Opaque error strings | "Extrapolation into the future" — of *which* edge? | Typed errors that name the offending edge |
 | Anyone may publish any edge | Two nodes fighting over `map→odom` produces silent garbage | Exclusive claim per edge, enforced |
 | No batch API | Per-sample lookup loops for sweep deskewing | `at_many` and `at_adaptive` |
-| No derivatives, no continuous-time model | Cannot serve as a VIO/SLAM trajectory backbone | Pluggable interpolation incl. cumulative B-splines (Phase 5) |
+| No derivatives, no continuous-time model | Cannot serve as a VIO/SLAM trajectory backbone | Pluggable interpolation incl. cumulative B-splines (Phase 6); body-frame twists in Phase 4 |
 
 ## 3. Architecture in one page
 
@@ -59,11 +59,17 @@ Phases are ordered by *what constrains what*, not by user-visible value.
 
 **Phase 3 — Python bindings.** PyO3 binding the Rust core directly (not through the C ABI — that would cost error types and zero-copy ergonomics), abi3 wheels via maturin, GIL released on lookup, `at_many` returning zero-copy NumPy `(N, 4, 4)`, `__dlpack__` and `__cuda_array_interface__` export.
 
-**Phase 4 — C ABI and ROS 2.** `cbindgen` C ABI, C++ RAII header wrapper with Eigen conversions, `tf2_ros::Buffer`-compatible shim, bidirectional `/tf` bridge. By volume this is the largest phase and the first point at which an ABI is frozen. Budget accordingly.
+**Phase 4 — dogfooding integration.** `cbindgen` C ABI frozen in two tiers, C++ RAII header wrapper with Eigen and Sophus conversions, a **one-way** `/tf` → arena ingest bridge, and `sample_with_derivatives` pulled forward from Phase 6 because ScLerp already computes the twist. The first point at which an ABI is frozen. **Its exit criterion is operational, not a feature list** — a real node on real hardware for two weeks, and a written log of every surprise. Fully specified in `docs/PHASE4.md`.
 
-**Phase 5 — remaining engine features.** Covariance with adjoint transport, copy-on-write branches for loop-closure and multi-hypothesis evaluation, cumulative B-spline interpolation with analytic derivatives, MCAP record/replay, URDF parsing and typed-frame codegen, Rerun and Foxglove output.
+**Phase 5 — offline, observability, and the adoption wedge.** The frozen `.tft` arena (the arena bytes as a memory-mapped file, shared across sixteen dataloader workers for the price of one), bag ingestion, `FORMAT_VERSION = 3` with the Phase 6 regions reserved so the break happens once, diagnostic counters, a sixteen-check diagnostics catalogue, and `tf_tree top`. Every user of this phase changes nothing about their robot. Fully specified in `docs/PHASE5.md`.
 
-**Phase 6 — inter-host replication.** Interest-based subscription, delta-coded wire format, clock-domain alignment with reported uncertainty, pluggable transport (Zenoh default).
+**Phase 6 — remaining engine features.** Covariance with adjoint transport, copy-on-write branches for loop-closure and multi-hypothesis evaluation, cumulative B-spline interpolation with analytic derivatives, URDF parsing and typed-frame codegen.
+
+**Phase 7 — the compatibility layer, gated (D21).** `tf2_ros::Buffer`-compatible shim and arena → `/tf` egress. Does not begin until Phases 4 and 5 have produced the operating experience its hundred small semantic judgements require.
+
+**Phase 8 — inter-host replication.** Interest-based subscription, delta-coded wire format, clock-domain alignment with reported uncertainty, pluggable transport (Zenoh default).
+
+> **The roadmap was re-cut from six phases to eight** by [`0006`](./decisions/0006-the-eight-phase-roadmap.md), which is also where the decision-number alias table lives: `PHASE4.md`/`PHASE5.md` cite **D28/D29** for what is **D21** here, **D30** for what is **D20**, and **D34** for what is **D22**.
 
 **Pulled forward deliberately:** the `tf_tree doctor` diagnostics land at the end of Phase 1 (they are how Phase 2 gets debugged), and MCAP record/replay lands early in Phase 2 (deterministic replay is the correctness harness for the shared-memory layer).
 
@@ -96,7 +102,7 @@ A generic `T: RealField` doubles the test matrix and the monomorphized code size
 A LiDAR sweep needs one pose per distinct timestamp, not per point — and with adaptive knot placement bounded by a stated error tolerance, that is *tens* of poses for a 100 ms sweep, not thousands. So `at_adaptive` emits a small knot array, the consumer LERPs between knots on whatever device its points already live on, and the error is bounded by construction. This keeps CUDA out of the dependency tree entirely, which matters for Jetson/x86/ARM heterogeneity. *Do not* add a `deskew()` helper, a point-cloud type, or any GPU compute to the core.
 
 **D9 — Time domains are typed.**
-`Stamp<D>` with a phantom domain plus a runtime tag on each edge. Mixing sensor clock and host clock is the most common robotics bug and the compiler can prevent it. Cross-domain lookup is an error until Phase 6 supplies alignment. *Do not* add an implicit coercion.
+`Stamp<D>` with a phantom domain plus a runtime tag on each edge. Mixing sensor clock and host clock is the most common robotics bug and the compiler can prevent it. Cross-domain lookup is an error until Phase 8 supplies alignment. *Do not* add an implicit coercion.
 
 **D10 — Frame and edge identity is append-only.**
 Removal is tombstoning; indices are never reused. This is what makes a stale `Plan` safe: it may index a valid record and fail the generation check, but it can never go out of bounds. *Do not* add index recycling to save memory.
@@ -127,11 +133,19 @@ Participants hold their Unix socket open for the lifetime of the attachment. Pro
 **D18 — Read-only attach is the default for consumers.**
 A `PROT_READ` mapping means a buggy consumer *cannot* corrupt the transform tree, enforced by the MMU. For an industrial integrator this is a more compelling argument than any latency number, because it converts a class of whole-system failures into a single-process fault. It is also the only real security boundary the design has — a read-write peer is trusted completely, and the docs must say so plainly.
 
-**D19 — Interest-based replication, never broadcast (Phase 6).**
+**D19 — Interest-based replication, never broadcast (Phase 8).**
 A subscriber declares which `(target, source)` pairs it needs at what rate and precision; the daemon subscribes to exactly the union of required edges. This is the structural fix for the `/tf` firehose.
 
 **D20 — Apache-2.0 / MIT dual license.**
 The Rust ecosystem norm and the only choice compatible with industrial adoption. Not GPL, not BSL.
+
+> Cited as **D30** by `PHASE5.md` §10. Same decision; see [`0006`](./decisions/0006-the-eight-phase-roadmap.md).
+
+**D21 — The compatibility layer is Phase 7, and it is gated on evidence, not scheduled.**
+`tf2_ros::Buffer` API compatibility and arena → `/tf` egress wait until Phases 4 and 5 have produced operating experience: a real node on real hardware (`PHASE4.md` §1) and offline users who adopted nothing (`PHASE5.md` §0). The shim is a hundred small semantic judgements about what `tf2` does when asked something ambiguous, and each one made without that experience is a guess that ships as a compatibility promise. Phase 4's bridge is **ingress-only** for the same reason: one direction removes every loopback, echo and authority-cycle question from the phase. *Do not* schedule the shim; gate it. Cited as **D28**/**D29** by the Phase 4 and 5 specs.
+
+**D22 — A disabled feature never forks the layout hash.**
+When a cargo feature is compiled out, the arena *regions* it would use stay declared in the layout and keep being counted by `layout_hash`; only the code that touches them disappears. Sizing the arena per feature set would make `layout_hash` a function of the build configuration, so two correctly-built participants of the same version would refuse to attach to each other and report a layout mismatch naming no actionable cause. A wasted region in a build that does not use it is cheap; a version-skew diagnostic that lies is not. First consumers: `PHASE5.md` §5.5 (`counters`) and §1.2 (the Phase 6 covariance and spline regions, declared absent with offset `0`). Cited as **D34** by the Phase 5 spec.
 
 ## 6. Design smells — stop if you catch yourself doing these
 
