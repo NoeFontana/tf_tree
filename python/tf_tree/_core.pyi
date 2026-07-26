@@ -74,6 +74,22 @@ class Plan:
     def depth(self) -> int:
         """Folded depth of this path, in edges."""
 
+class Publisher:
+    """A claimed edge. Use as a context manager; the claim releases on exit."""
+
+    def __enter__(self) -> Publisher: ...
+    def __exit__(self, *args: object) -> bool: ...
+    def release(self) -> None:
+        """Drop the claim now, rather than at an unspecified finalization."""
+
+    def push(self, stamp_ns: int, quat7: list[float], /) -> None:
+        """Publish `[qw, qx, qy, qz, tx, ty, tz]` at `stamp_ns`."""
+
+    def push_many(
+        self, stamps: NDArray[np.int64], poses: NDArray[np.float64], /
+    ) -> None:
+        """Publish `(N,)` stamps and `(N, 7)` poses in one crossing."""
+
 class Tree:
     """A transform tree. Obtain with `tf_tree.open()` or `tf_tree.build()`."""
 
@@ -83,6 +99,9 @@ class Tree:
         Compile once and reuse: the path walk and per-edge metadata lookup
         happen here, not per sample.
         """
+
+    def publisher(self, child: str, parent: str, /) -> Publisher:
+        """Claim `child`'s edge. Argument order is **(child, parent)**."""
 
     def is_shared(self) -> bool:
         """Whether this tree's arena is shared with other processes."""
