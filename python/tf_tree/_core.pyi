@@ -40,7 +40,7 @@ class Plan:
         amortises to near-native.
         """
 
-    def at_into(self, stamps: NDArray[np.int64], out: NDArray[np.float64], /) -> None:
+    def at_into(self, stamps: NDArray[np.int64], out: object, /) -> None:
         """Evaluate into a caller-provided `(N, 4, 4)` float64 array.
 
         Allocates nothing. `out` must be C-contiguous and exactly the right
@@ -50,6 +50,11 @@ class Plan:
         Raises `BufferError` on a wrong shape, dtype or stride. Non-contiguous
         input is refused rather than silently copied — a silent copy would
         defeat the point of this method while appearing to work.
+
+        `out` is typed `object` rather than `NDArray` because any *host* buffer
+        is accepted — pinned allocations from torch, CuPy and Numba all
+        qualify. **Device memory is refused**, with a message naming the fix: a
+        CPU store to a `cudaMalloc` pointer is undefined, not slow.
         """
 
     def adaptive(

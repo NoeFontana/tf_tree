@@ -314,3 +314,65 @@ def test_a_publisher_keeps_its_tree_alive():
     gc.collect()
     pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0])
     np.testing.assert_allclose(plan.latest()[:3, 3], [7.0, 8.0, 9.0])
+
+
+class _FakeCudaArray:
+    """An object that claims to live on a CUDA device.
+
+    Stands in for `torch.empty(..., device="cuda")` without a GPU or a CUDA
+    runtime, both of which decision D8 forbids as dependencies. What is under
+    test is the *classification*, and that reads only `__dlpack_device__`.
+    """
+
+    def __dlpack_device__(self):
+        return (2, 0)  # kDLCUDA
+
+
+class _FakePinned:
+    """Pinned host memory, which reports `kDLCUDAHost` and *is* writable."""
+
+    def __dlpack_device__(self):
+        return (3, 0)
+
+
+def test_device_memory_is_refused_with_an_actionable_message(tree):
+    """§5.5: never attempt the write.
+
+    A CPU store to a `cudaMalloc` pointer is undefined — not slow, undefined —
+    so the only acceptable outcome is a refusal. And the message has to say
+    what to do instead, because "wrong device" tells a user nothing they did
+    not already suspect.
+    """
+    p = tree.plan("map", "base")
+    stamps = np.array([1_000, 1_500], dtype=np.int64)
+    with pytest.raises(tf_tree.BufferError) as e:
+        p.at_into(stamps, _FakeCudaArray())
+    msg = str(e.value)
+    assert "device type 2" in msg
+    assert "pin_memory" in msg, "the error must name the fix, not just the fault"
+
+
+def test_a_host_device_type_is_not_refused_for_being_dlpack(tree):
+    """Pinned host memory must pass the *device* check.
+
+    It then fails the layout check, which is the correct second failure — this
+    fake exposes no buffer. The point is that it is refused for the right
+    reason: a blanket rejection of anything with `__dlpack_device__` would lock
+    out every legitimate pinned buffer.
+    """
+    p = tree.plan("map", "base")
+    stamps = np.array([1_000, 1_500], dtype=np.int64)
+    with pytest.raises(tf_tree.BufferError) as e:
+        p.at_into(stamps, _FakePinned())
+    assert "device type" not in str(e.value), (
+        "pinned host memory was rejected as device memory"
+    )
+
+
+def test_a_plain_numpy_array_still_works(tree):
+    """The device check must not have broken the ordinary path."""
+    p = tree.plan("map", "base")
+    stamps = np.array([1_000, 1_500, 2_000], dtype=np.int64)
+    out = np.empty((3, 4, 4))
+    p.at_into(stamps, out)
+    np.testing.assert_array_equal(out, p.at(stamps))
