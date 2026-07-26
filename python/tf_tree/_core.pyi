@@ -52,6 +52,22 @@ class Plan:
         defeat the point of this method while appearing to work.
         """
 
+    def adaptive(
+        self,
+        start_ns: int,
+        end_ns: int,
+        /,
+        *,
+        lin: float = ...,
+        ang: float = ...,
+    ) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+        """Knots whose linear interpolation stays within `lin` m / `ang` rad.
+
+        Returns `(stamps, poses)` of shapes `(K,)` and `(K, 4, 4)`, strictly
+        increasing. LERP between adjacent knots on whatever device they live
+        on; the reconstruction error is bounded by construction.
+        """
+
     def latest(self) -> NDArray[np.float64]:
         """The most recent transform on this path, as `(4, 4)`."""
 

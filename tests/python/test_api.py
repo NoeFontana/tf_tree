@@ -120,3 +120,92 @@ def test_no_result_aliases_the_tree(tree):
     assert a.__array_interface__["data"][0] != b.__array_interface__["data"][0]
     a[0, 0] = 99.0
     assert b[0, 0] != 99.0
+
+
+@pytest.fixture
+def curved():
+    """A tree whose path actually curves.
+
+    The plain `tree` fixture rotates not at all and translates linearly, so
+    LERP between any two of its samples is **exact** — an adaptive subdivision
+    returns two knots and reconstructs perfectly at any tolerance whatsoever.
+    A tolerance test on that fixture passes even when the tolerance is ignored,
+    which is how this one was first written and how it was caught.
+
+    Here the rotation sweeps a radian about Z while the translation follows the
+    arc, so the geodesic genuinely departs from the chord.
+    """
+    t = tf_tree.build([("map", "base")])
+    for k in range(21):
+        u = k / 20.0
+        theta = u * 1.0
+        # Rotation about Z by `theta`, translation on the unit circle.
+        t_ = tf_tree.push(
+            t,
+            "base",
+            "map",
+            1_000 + k * 1_000,
+            [
+                float(np.cos(theta / 2)),
+                0.0,
+                0.0,
+                float(np.sin(theta / 2)),
+                float(np.cos(theta)),
+                float(np.sin(theta)),
+                0.0,
+            ],
+        )
+        assert t_ is None
+    return t
+
+
+def test_adaptive_reconstructs_within_tolerance(curved):
+    """The knots must actually bound the error they claim to (§4.2, §5.6).
+
+    Asserting only "some knots came back" would pass for any subdivision at
+    all. So this reconstructs by LERP *between* the knots and compares against
+    a dense exact evaluation — the property a consumer relies on.
+    """
+    p = curved.plan("map", "base")
+    lo, hi = 1_000, 21_000
+    stamps, poses = p.adaptive(lo, hi, lin=1e-4, ang=1e-4)
+
+    assert stamps.shape[0] == poses.shape[0]
+    assert poses.shape[1:] == (4, 4)
+    assert stamps[0] == lo and stamps[-1] == hi
+    assert np.all(np.diff(stamps) > 0), "knots must be strictly increasing"
+
+    probe = np.linspace(lo, hi, 200).astype(np.int64)
+    exact = p.at(probe)
+    for i, t in enumerate(probe):
+        j = int(np.searchsorted(stamps, t, side="right")) - 1
+        j = min(max(j, 0), len(stamps) - 2)
+        span = stamps[j + 1] - stamps[j]
+        u = 0.0 if span == 0 else (t - stamps[j]) / span
+        lerped = poses[j][:3, 3] * (1 - u) + poses[j + 1][:3, 3] * u
+        err = float(np.max(np.abs(lerped - exact[i][:3, 3])))
+        assert err < 1e-2, f"reconstruction at {t} was off by {err}"
+
+
+def test_a_tighter_tolerance_needs_more_knots(curved):
+    """**This is the test that catches an ignored tolerance.**
+
+    A subdivision that hard-codes its bound still returns increasing stamps and
+    still reconstructs, so the test above passes. Only the *response* to the
+    tolerance distinguishes it — and on a curved path a 1e-6 bound must cost
+    strictly more knots than a 1e-1 one.
+    """
+    p = curved.plan("map", "base")
+    tight, _ = p.adaptive(1_000, 21_000, lin=1e-6, ang=1e-6)
+    loose, _ = p.adaptive(1_000, 21_000, lin=1e-1, ang=1e-1)
+    assert len(loose) < len(tight), (
+        f"tolerance had no effect: {len(loose)} knots at 1e-1 vs "
+        f"{len(tight)} at 1e-6 — the subdivision is ignoring its bound"
+    )
+
+
+def test_a_nonsense_tolerance_is_refused(tree):
+    p = tree.plan("map", "base")
+    for bad in ({"lin": 0.0}, {"lin": -1.0}, {"ang": float("nan")}):
+        with pytest.raises(ValueError):
+            p.adaptive(1_000, 2_000, **bad)
