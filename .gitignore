@@ -213,3 +213,7 @@ logs/
 
 # Profiler output (`just profile-lookup`).
 /target/cg-annotated.txt
+
+# Test-only third-party headers, fetched by `just cpp-deps` rather than
+# vendored: Sophus is ~10 MB and is needed by exactly one recipe.
+/target/thirdparty/
