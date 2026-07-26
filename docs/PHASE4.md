@@ -12,40 +12,42 @@
 
 ## 0.0 Implementation status
 
-**Not started.** This section is the live status table, in the style of
+**In progress.** This section is the live status table, in the style of
 `PHASE2.md` §0.0, and is updated as work lands.
 
 | Area | Status |
 |---|---|
-| §2 `at_with_derivatives` | Not implemented |
+| §2 `at_with_derivatives` | **Done** — `Twist`, `Sample`, the adjoint fold, `DerivativesUnavailable`/`NoSegment`. §2.3's cost model was **false** and is amended in place. |
 | §3 C ABI — `tf_tree.h`, `tf_tree_unstable.h` | Not implemented |
 | §4 C++ wrapper, CMake package | Not implemented |
-| §5 ROS 2 ingest bridge | **Blocked — see below** |
-| §6 test plan | Follows its section |
-| §7 benchmarks and gate | Follows its section |
-| §1 operational criteria | **Blocked — see below** |
+| §5 ROS 2 ingest bridge | Not implemented — **not blocked**, see below |
+| §6 test plan | Follows its section; §6.3's QoS test is **amended** (as specified it cannot pass) |
+| §7 benchmarks and gate | Not implemented. Gate criteria 3 and 6 cannot be honestly produced here — see below. |
+| §1 operational criteria | **Open, and not satisfiable by code.** Gates Phase 7. |
 
 ### What this development environment can and cannot gate
 
-Stated plainly here rather than discovered later, because two of this phase's
-deliverables cannot be honestly claimed from this machine:
-
-- **No ROS 2 installation** (`/opt/ros` is absent; no `rclcpp`, no `rosbag2`,
-  no DDS). §5's bridge cannot be built, and its QoS regression test — the one
-  test in this phase most worth having, because it catches the single most
-  common ROS 2 tf integration bug — cannot run at all. A mock DDS proves
-  nothing about QoS negotiation, which is the entire subject.
+- **ROS 2 is available, in a container.** An earlier revision of this section
+  claimed it was not, on the strength of `/opt/ros` being absent from the host.
+  That was wrong: the project's existing `tf_tree/tf2-bench:latest` image is
+  `FROM ros:lyrical-ros-base` and carries `rclcpp`, `rclcpp_components`,
+  `rmw_fastrtps_cpp` (a real DDS), `tf2_ros`, `tf2_msgs` and `rosbag2_cpp` with
+  MCAP storage. §5's bridge is therefore buildable and testable by the same
+  mechanism `tf_tree_tf2_sys` already uses. **A mock DDS is not needed and would
+  prove nothing** — but a `TransformStamped`-shaped plain struct *is* legitimate
+  for §5.4, §5.5, §5.6 and §5.7, which are pure functions and belong in
+  host-testable code.
 - **No robot and no two-week window.** §1's operational criteria are not
   satisfiable by any amount of code. They gate Phase 7, and they stay open.
-
-The honest split is therefore: **§5 is designed and its ROS-independent half is
-implemented and tested; its ROS-coupled half is not written.** Concretely, the
-authority policy (§5.4), frame-name normalization (§5.6), static-transform
-semantics (§5.7), and clock-reset handling (§5.5) are pure functions of a
-`TransformStamped`-shaped input and are implemented and unit-tested against
-synthesised input. The subscription, QoS, executor, and `publisher_gid`
-attribution are not. Anything not implemented is marked as such in this table
-rather than being quietly counted as done.
+  Nothing in §5 may be counted as satisfying them.
+- **No Eigen, no Sophus, no clang on the host.** All three are installable;
+  until they are, §4's `static_assert` suite is vacuous and §6.2's "GCC *and*
+  Clang" matrix runs at half width. Say which half ran.
+- **The benchmark host is not a fair comparison machine.** 4 physical cores with
+  SMT and `perf_event_paranoid=4`, on which Phase 1's own read-scaling gate
+  already fails (measured 5.35–5.62× against a ≥ 6× requirement). §7's gate
+  criterion 3 must print `UNAVAILABLE` with a reason rather than a number,
+  following `xtask`'s existing convention.
 
 ---
 
@@ -208,7 +210,7 @@ This is the first ABI freeze in the project and the surface is permanent, so kee
 | Header | Contents | Guarantee |
 |---|---|---|
 | `tf_tree.h` | open/close, plan, at, at_many, publisher, declare, errors, version | **semver, frozen at 1.0** |
-| `tf_tree_unstable.h` | everything else — introspection, telemetry, adaptive, derivatives | none; requires `#define TFT_ENABLE_UNSTABLE` |
+| `tf_tree_unstable.h` | everything else — introspection, diagnostic counters, adaptive, derivatives | none; requires `#define TFT_ENABLE_UNSTABLE` |
 
 **Do not mirror the Rust API into C.** The stable header should be ~30 functions. Anything a C++ user does not need in the hot path belongs in the unstable header until Phase 7 has told us what is actually used.
 
@@ -445,6 +447,37 @@ Track and expose: messages received, transforms applied, dropped by authority, d
 ### 6.3 Bridge
 
 - **QoS regression test:** a static broadcaster that publishes once and exits, with the bridge starting afterwards. The bridge must receive the transform. This test exists specifically to catch a `volatile` regression on `/tf_static`.
+
+> **Amendment — as specified this test cannot pass, and the fix also makes it
+> stronger.**
+>
+> DDS `TRANSIENT_LOCAL` durability is **publisher-lifetime-scoped**: the sample
+> is retained by the *writer*, so once the broadcaster's participant is gone the
+> sample is gone with it. Measured directly in `tf_tree/tf2-bench` on
+> `rmw_fastrtps_cpp`:
+>
+> | publisher | subscriber | result |
+> |---|---|---|
+> | exited after publishing | `transient_local` | **nothing** |
+> | exited after publishing | `volatile` | nothing |
+> | alive, silent | `transient_local` | **received** |
+> | alive, silent | `volatile` | **nothing** |
+>
+> The first row is the specified test, and it fails against a *correct* bridge.
+> The real behaviour §5.2 is about is the last two rows, so the test must be:
+>
+> **A static broadcaster publishes once, stays alive, and never publishes again.
+> The bridge starts afterwards and must receive the transform — and a `volatile`
+> subscriber in the same run must not.**
+>
+> The `volatile` negative control is not decoration: it is the half that actually
+> catches the regression. Without it the test passes even if durability is
+> ignored, provided the broadcaster happens to still be publishing.
+>
+> This also corrects the mental model the original wording encodes. "Late joiners
+> re-receive latched messages" is true only while the latching publisher lives;
+> a `robot_state_publisher` that has exited takes its transforms with it, and no
+> QoS setting on the subscriber side recovers them.
 - Two publishers on one edge → `FirstWriterWins` applied, diagnostic names both nodes, counter increments.
 - Sim time: `/clock` driven, domains tagged, cross-domain query rejected.
 - Clock reset backwards → halt or recreate per policy, never non-monotonic pushes.

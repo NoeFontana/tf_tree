@@ -30,15 +30,25 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 
 ### What this development environment can and cannot gate
 
-- **No ROS 2 installation.** This constrains §3 less than it looks: MCAP is a
-  self-describing container with a Rust reader that has no ROS dependency, and
-  `tf2_msgs/msg/TFMessage` is decoded from the schema in the file. A `.mcap`
-  fixture can therefore be written and read here with no ROS present. What
-  cannot be gated is ingestion of a **real** recording produced by a real DDS
-  stack, and rosbag2's sqlite3 backend against a real rosbag2 writer.
+- **ROS 2 is available, in a container**, and an earlier revision of this
+  section wrongly said otherwise. `tf_tree/tf2-bench:latest` is
+  `FROM ros:lyrical-ros-base` and carries `rosbag2_cpp` with MCAP storage, so
+  §3's ingest path can be tested against **real recordings written by a real
+  rosbag2 through a real DDS**, not only against synthetic fixtures. Host-side,
+  MCAP is self-describing and its Rust reader needs no ROS at all, so fixtures
+  work either way.
+- **The `mcap` crate must be taken with `default-features = false`.** Its
+  defaults are `[zstd, lz4]`, which vendor C through `lz4-sys`/`zstd-sys` and
+  violate `PHASE2.md` §2's no-C-build-step rule.
 - **No GPU**, so anything touching device memory stays untested.
-- **CPython 3.12.3 only**, no free-threaded build, so §4's additions inherit
-  Phase 3's existing coverage gap on 3.14t.
+- **CPython 3.12.3 on the host**, no free-threaded build, so §4's additions
+  inherit Phase 3's existing coverage gap on 3.14t. `uv` is installed, so
+  `just py-setup` can fetch 3.14/3.14t.
+- **The benchmark host cannot fairly run §9's comparison.** 4 physical cores
+  with SMT and `perf_event_paranoid=4`; Phase 1's own read-scaling gate already
+  fails on it (5.35–5.62× against ≥ 6×). The `.tft` rows — 16-worker total Pss,
+  open time vs bag parse — *are* measurable here. §9.3 already prescribes the
+  right response: omit a row that cannot be measured fairly and say why.
 - **GitHub Actions has produced no run since 2026-07-23.** Every gate claimed
   in this document must be run locally through `just` and the arch stated,
   because a green check on a PR is not evidence.
@@ -56,7 +66,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | Bag ingestion | MCAP and rosbag2 → arena or `.tft`, two-pass, out-of-order tolerant (§3) |
 | Offline Python API | identical to the online API, plus dataset helpers (§4) |
 | Diagnostic counters | consumer-side failure counters, always on and free; publish-side derived (§5) |
-| Diagnostics catalogue | 14 checks, each with a detection rule and a severity (§6) |
+| Diagnostics catalogue | 16 checks (`TFT001`–`TFT016`), each with a detection rule and a severity (§6) |
 | `tf_tree top` | TUI plus an embedded static web view (§7) |
 | Stored-sample iteration | `iter_edge` / `iter_edges` / `frame_path` — audit and export, viewer-neutral (§8.3) |
 | Benchmark artifact | one command, reproducible, honest, CI-gated (§9) |
@@ -101,6 +111,42 @@ Phase 5 needs new arena regions. Phases 1–3 are implemented, so this is a real
 Regions whose Phase 6 content does not exist yet are declared in the header with offset `0`, meaning absent. Phase 6 then fills them **without another layout change**, because the region table already accounts for them.
 
 **NORMATIVE:** recompute `layout_hash` and bump `FORMAT_VERSION` to 3 in one commit. Ship a `tf_tree doctor --explain-version` that prints both versions and the required action when a mismatch is detected, since this is the error operators will meet during the upgrade.
+
+> **Amendment — this field set does not fit the current header, and the header
+> must grow. Plan it; do not discover it.**
+>
+> `ArenaHeader` is exactly 256 bytes with **48 free**: the named `_reserved: [u8; 8]`
+> at offset 128, plus 40 bytes of *implicit* alignment padding at 152..192
+> (`instance_uuid` ends at 152; `TopoLock` is `align(64)` so it lands at 192).
+> Both are pinned by tests — `header.rs` asserts `size_of == 256` and
+> `instance_uuid_occupies_pre_existing_alignment_padding` asserts
+> `lock_at == (uuid_at + 16).next_multiple_of(64)`, which exists precisely
+> because that padding is what let `instance_uuid` land without a version bump.
+>
+> The new header fields are `covariance_region_off` + `covariance_stride` +
+> `spline_region_off` + `spline_degree` = 13 bytes before alignment, and this
+> section then demands **≥ 64 bytes still reserved afterwards**. That is ≥ 77
+> against 48 available. It does not fit.
+>
+> So `ArenaHeader` grows to **320 bytes**, and three consequences follow that are
+> cheap now and expensive later:
+>
+> 1. `topo_lock` moves off its pinned offset 192, so
+>    `instance_uuid_occupies_pre_existing_alignment_padding` must be rewritten
+>    rather than deleted — it is the guard that stops the next person assuming
+>    there is still slack.
+> 2. The header region literal in `layout.rs` (`256usize, // header`) changes.
+> 3. `layout_hash` changes **automatically**, because `size_of::<ArenaHeader>()`
+>    is its first input. That is correct and wanted here — but note the hash is
+>    duplicated as the literal `0x9075_90F5` in `tf_tree_ipc`'s wire tests, so
+>    those move with it.
+>
+> Also note what `layout_hash` does **not** cover: region *offsets*, region
+> *count*, and `max_frames`/`max_edges`/`max_participants`. Its `strides` input
+> is a hardcoded `[u32; 10]`. **Adding the two counter regions therefore does not
+> change the hash unless their strides are explicitly appended** — and they must
+> be, or a v3 arena built with counters and one built without would hash
+> identically and attach to each other.
 
 ### 1.3 Publish-side counters need no storage at all
 
@@ -285,6 +331,19 @@ The lazy open matters: it must happen **after** fork, because Phase 3's `registe
 
 Rename it everywhere: **counters**, or **diagnostic counters**. Never "telemetry", in the code, the docs, the CLI, or the changelog.
 
+> **Amendment — there is nothing to rename; this is an enforcement item.**
+>
+> A case-insensitive grep for `telemetr` across the entire repository returns
+> **zero hits in code** — no Rust, no Python, no CLI string, no `Cargo.toml`.
+> The only occurrences are inside this document and `PHASE4.md` §3.1's
+> unstable-header table, i.e. in the specs that introduce the prohibition. The
+> `EdgeTelemetry` named in §1.3 above is a hypothetical design being rejected,
+> not an existing type.
+>
+> So the deliverable is **a CI check that keeps the word out**, not a rename
+> pass — and the two spec occurrences should be fixed as part of it, since a
+> NORMATIVE rule violated by its own document is not a rule anyone will enforce.
+
 In 2026 "telemetry" means the software phones home. A robotics team evaluating a library whose documentation says "telemetry" will assume network egress, and some will block it at procurement without reading further. Nothing here leaves the machine — these are counters in shared memory on the same host — and the name should say so.
 
 Pair the rename with a stronger, testable claim:
@@ -406,7 +465,7 @@ The general form, worth remembering because it will recur: **`tf_tree`'s value i
 | Information | Not in the bag | Surface |
 |---|---|---|
 | Clock skew between publishers | ✓ | `doctor` `TFT004` |
-| Extrapolation hotspots, with consumer attribution | ✓ | `doctor` `TFT010`, telemetry |
+| Extrapolation hotspots, with consumer attribution | ✓ | `doctor` `TFT010`, `EdgeCounters` |
 | Multi-publisher conflicts | ✓ | `doctor` `TFT001` (Phase 4 bridge) |
 | Rate deviation, jitter, gaps | ✓ | `doctor` `TFT007`–`TFT009` |
 | Buffer undersizing vs observed lag | ✓ | `doctor` `TFT011` |
