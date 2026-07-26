@@ -40,7 +40,8 @@ mod cache;
 mod tree;
 
 pub use tree::{
-    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, ReparentError, Tree, TreeBuilder,
+    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, ReparentError, Tree,
+    TreeBuilder,
 };
 
 /// Shared-memory attachment surface (Phase 2). Linux-only, behind `--features shm`.
