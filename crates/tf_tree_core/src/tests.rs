@@ -17,7 +17,9 @@ use crate::arena_view::{ArenaBuilder, ArenaView};
 use crate::buffer::{PoseSlot, SampleRing};
 use crate::edge::{claim, EdgeRecord, Publisher};
 use crate::error::{ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError};
+use crate::layout::Layout;
 use crate::participant::ParticipantRecord;
+use crate::plan::{Guard, Query, Stamp, SystemDomain};
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU64};
 
@@ -397,6 +399,71 @@ fn single_dyn_edge_arena() -> HeapArena {
     // 4 frame slots (root + 3), 1 dynamic edge, ring capacity 4.
     let layout = ArenaLayout::new(4, 1, alloc::vec![4]).unwrap();
     HeapArena::new(&layout, 4242, 0, [0u8; 16])
+}
+
+/// A poisoned [`Guard`] must fail **every** evaluation entry point, and must do
+/// so without reading the view it was handed.
+///
+/// The second half is the whole reason the constructor exists: `Guard::new`
+/// reads the topology generation immediately, so a facade whose arena has gone
+/// away (a `fork` child, `docs/decisions/0005` §7) cannot build a guard even to
+/// throw one away. If `poisoned` ever starts reading, that facade goes back to
+/// faulting and nothing here would notice — so this asserts the *error*, which
+/// only a non-reading construction can produce for an arena with no frames.
+#[test]
+fn a_poisoned_guard_refuses_every_evaluation() {
+    // Two edges, because edge index `0` is the "no edge" sentinel in a
+    // topology block (see `compile_rejects_the_no_edge_sentinel`), so a usable
+    // link needs index 1 to exist.
+    let layout = ArenaLayout::new(4, 2, alloc::vec![4, 4]).unwrap();
+    let arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
+    let view = ArenaView::new(&arena);
+    let a = view.intern("base_link").unwrap();
+    let b = view.intern("camera").unwrap();
+    view.topology().set_parent(b, a.get(), 1).unwrap();
+
+    let plan = crate::plan::compile(
+        &view.topology(),
+        |eid| {
+            view.edge(eid).map(|e| crate::plan::EdgeMeta {
+                kind: crate::edge::EdgeKind::from_u8(e.kind),
+                domain: e.domain,
+                static_pose: Iso3::from_bits(&e.static_pose),
+            })
+        },
+        a,
+        b,
+    )
+    .unwrap();
+
+    let g = Guard::poisoned(ArenaView::new(&arena), LookupError::ChildDetached);
+    assert_eq!(g.poison(), Some(LookupError::ChildDetached));
+    let t = Stamp::<SystemDomain>::from_nanos(1);
+    assert_eq!(plan.at(&g, t), Err(LookupError::ChildDetached));
+    assert_eq!(plan.latest(&g), Err(LookupError::ChildDetached));
+    assert_eq!(plan.latest_common(&g), Err(LookupError::ChildDetached));
+    assert_eq!(
+        plan.query(&g, Query::At(t)),
+        Err(LookupError::ChildDetached)
+    );
+    let mut out = [Iso3::IDENTITY; 1];
+    assert_eq!(
+        plan.at_many(&g, &[t], &mut out),
+        Err(LookupError::ChildDetached)
+    );
+    let mut raw = [0.0f64; 16];
+    assert_eq!(
+        plan.at_many_into::<SystemDomain>(&g, &[1], Layout::Mat4, &mut raw),
+        Err(LookupError::ChildDetached)
+    );
+
+    // An unpoisoned guard over the same arena still works — otherwise this test
+    // would pass just as well against a plan that was broken to begin with.
+    // Whatever it answers, it must not be the poison — that is the whole
+    // control. An unpublished dynamic edge gives `NoData`; the point is only
+    // that a live guard and a poisoned one are distinguishable.
+    let live = Guard::new(ArenaView::new(&arena));
+    assert_ne!(plan.at(&live, t), Err(LookupError::ChildDetached));
 }
 
 #[test]

@@ -28,6 +28,12 @@ tf_tree.workspace = true
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
 anyhow.workspace = true
+# `fork()` and `waitpid()` for `src/bin/fork_child.rs`; there is no other way to
+# produce a child that inherits an address space and its open file descriptions.
+libc.workspace = true
+# `fork_child` probes the claim lease from an *independent* open file
+# description, which is the only vantage point an OFD lock is visible from.
+tf_tree_ipc.workspace = true
 # Optional, and outside the workspace on purpose (see the root manifest): this
 # is the only edge that reaches ROS 2, and it is pulled in solely by `--features tf2`.
 tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
@@ -88,6 +94,13 @@ path = "src/bin/footprint.rs"
 [[bin]]
 name = "shm_child"
 path = "src/bin/shm_child.rs"
+required-features = ["shm"]
+
+# The workspace's only `fork()`. See the file header for why `unsafe` here is a
+# recorded exception (`docs/decisions/0005` step 9) rather than an oversight.
+[[bin]]
+name = "fork_child"
+path = "src/bin/fork_child.rs"
 required-features = ["shm"]
 
 # Multi-process benchmark driver: N reader processes on one shared arena.

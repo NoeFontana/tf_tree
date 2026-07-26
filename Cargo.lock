@@ -954,9 +954,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "libc",
  "tf_tree",
  "tf_tree_arena",
  "tf_tree_core",
+ "tf_tree_ipc",
  "tf_tree_math",
  "tf_tree_tf2_sys",
 ]

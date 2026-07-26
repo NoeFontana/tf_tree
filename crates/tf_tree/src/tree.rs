@@ -24,7 +24,9 @@ use tf_tree_core::edge::{claim, EdgeKind, EdgeRecord, Publisher};
 use tf_tree_core::frame::blake3_64;
 use tf_tree_core::plan::{compile, Domain, EdgeMeta, Guard, InterpPolicy, Stamp, SystemDomain};
 use tf_tree_core::topology::{TopoLockError, TopoLockView};
-use tf_tree_core::{EdgeId, FrameError, FrameId, LookupError, ParticipantError, TopologyError};
+use tf_tree_core::{
+    EdgeId, FrameError, FrameId, LookupError, ParticipantError, PushError, TopologyError,
+};
 use tf_tree_math::Iso3;
 
 use crate::cache;
@@ -285,6 +287,8 @@ impl TreeBuilder {
         let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
         let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let fork_gen = fork_gen_for(&backing);
         Ok(Tree {
             arena: backing,
             participant,
@@ -295,6 +299,8 @@ impl TreeBuilder {
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             claim_lock: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            fork_gen,
         })
     }
 
@@ -324,6 +330,8 @@ impl TreeBuilder {
         let (participant, incarnation) = register_participant(&ArenaView::new(backing.as_dyn()))
             .map_err(BuildError::Participant)?;
         let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let fork_gen = fork_gen_for(&backing);
         Ok(Tree {
             arena: backing,
             participant,
@@ -334,6 +342,8 @@ impl TreeBuilder {
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             claim_lock: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            fork_gen,
         })
     }
 
@@ -520,12 +530,6 @@ impl ArenaBacking {
     }
 }
 
-/// This process's answer to "is the participant in slot `n` still running?".
-///
-/// Boxed and owned by the [`Tree`] because it must outlive every [`ArenaView`]
-/// that borrows it, and because which implementation applies is decided once —
-/// `/proc` inference for a heap or fd-inherited tree, the kernel's `F_OFD_GETLK`
-/// answer for one that came through [`crate::open`] (`docs/PHASE2.md` §5.1).
 /// A claimed edge: the arena record, and the lease that makes its holder's
 /// death observable (`docs/PHASE2.md` §6.1, `docs/decisions/0005` §5).
 ///
@@ -547,10 +551,72 @@ impl ArenaBacking {
 /// this crate is `#![forbid(unsafe_code)]`. **Do not reorder these fields.**
 pub struct EdgeWriter<'a> {
     publisher: Publisher<'a>,
+    /// The fork generation this writer was claimed in.
+    ///
+    /// `Copy`, so it takes no part in the drop order above; it is declared here
+    /// only to keep the two drop-ordered fields adjacent.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fork_gen: Option<u64>,
     /// Held purely for its `Drop`, hence the underscore — nothing reads it, and
     /// the observable effect is releasing the byte when this value dies.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     _lease: Option<ClaimLease>,
+}
+
+impl EdgeWriter<'_> {
+    /// Whether this writer belongs to the pre-`fork` process. One relaxed load.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fn detached(&self) -> bool {
+        self.fork_gen
+            .is_some_and(|g| g != tf_tree_ipc::fork::generation())
+    }
+
+    /// Publish `iso` at `stamp` on the claimed edge.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::NonMonotonicStamp`] if `stamp` predates the edge's newest;
+    /// [`PushError::ClaimRevoked`] if a reaper judged this writer dead and took
+    /// the edge away (`docs/PHASE2.md` §1, A4);
+    /// [`PushError::ChildDetached`] if this writer was claimed before a `fork()`
+    /// and is being used in the child.
+    ///
+    /// # Why this shadows the `Deref` target
+    ///
+    /// An inherent method wins over a `Deref` one, so `writer.push(..)` lands
+    /// here and gets the fork check. Reaching the inner [`Publisher`] explicitly
+    /// — `(&*writer).push(..)` — skips it, and after a `fork` that is a write
+    /// through a dangling reference into an unmapped page. The `Deref` is kept
+    /// because it is what makes every pre-existing caller compile unchanged, but
+    /// **do not route `push` around it.**
+    pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        if self.detached() {
+            return Err(PushError::ChildDetached);
+        }
+        self.publisher.push(stamp, iso)
+    }
+}
+
+impl Drop for EdgeWriter<'_> {
+    fn drop(&mut self) {
+        // `Publisher`'s own `Drop` releases the claim with a `compare_exchange`
+        // *into the arena*. In a `fork` child that arena is a hole in the
+        // address space, so the destructor faults — and it does so whether or
+        // not the child ever called anything, which is what makes it the most
+        // dangerous of the four inherited destructors.
+        //
+        // Found by `a_forked_child_runs_its_destructors_without_touching_the_parent`,
+        // which failed with `child=signalled 11` while every API-level check in
+        // the same child passed. Guarding `Tree::drop` is not sufficient: a
+        // `Drop` impl's early return does not stop the struct's *fields* from
+        // being dropped afterwards, so every owned resource has to stand itself
+        // down.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        if self.detached() {
+            self.publisher.abandon();
+        }
+    }
 }
 
 impl<'a> core::ops::Deref for EdgeWriter<'a> {
@@ -566,11 +632,25 @@ impl<'a> core::ops::Deref for EdgeWriter<'a> {
 pub(crate) struct ClaimLease {
     lock: std::sync::Arc<tf_tree_ipc::LockFile>,
     edge: u32,
+    /// The fork generation this lease was taken in.
+    ///
+    /// An OFD lock belongs to the **open file description**, which a `fork`
+    /// child inherits — so an unlock issued by the child releases the *parent's*
+    /// byte. Dropping an inherited `EdgeWriter` in a child would therefore hand
+    /// the parent's live edge to the next reaper, from another process, with
+    /// nothing in the parent's logs to show for it.
+    fork_gen: u64,
 }
 
 #[cfg(all(feature = "shm", target_os = "linux"))]
 impl Drop for ClaimLease {
     fn drop(&mut self) {
+        // Never unlock from a `fork` child: the byte is the parent's (see
+        // `fork_gen`). Leaking it here leaks nothing — the description stays
+        // open in the parent, which still owns and will still release it.
+        if self.fork_gen != tf_tree_ipc::fork::generation() {
+            return;
+        }
         // Best effort: if the unlock fails the process is in no state to react,
         // and the kernel releases the byte at exit regardless — which is the
         // property the lease exists for.
@@ -578,6 +658,12 @@ impl Drop for ClaimLease {
     }
 }
 
+/// This process's answer to "is the participant in slot `n` still running?".
+///
+/// Boxed and owned by the [`Tree`] because it must outlive every [`ArenaView`]
+/// that borrows it, and because which implementation applies is decided once —
+/// `/proc` inference for a heap or fd-inherited tree, the kernel's `F_OFD_GETLK`
+/// answer for one that came through [`crate::open`] (`docs/PHASE2.md` §5.1).
 type BoxedLiveness = Box<dyn Fn(u32, &tf_tree_core::ParticipantRecord) -> bool + Send + Sync>;
 
 /// A transform tree: a fixed-capacity arena plus the ergonomic operations for
@@ -650,10 +736,47 @@ pub struct Tree {
     /// arena CAS alone is the claim exactly as it was before leases existed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     claim_lock: Option<std::sync::Arc<tf_tree_ipc::LockFile>>,
+    /// The fork generation this tree was opened in, or `None` for a backing that
+    /// survives a `fork` intact.
+    ///
+    /// See [`fork_gen_for`]. A mismatch means this value belongs to a process
+    /// that no longer exists, and every reference it holds into the arena is
+    /// dangling — the mapping is `MADV_DONTFORK`.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fork_gen: Option<u64>,
 }
 
 impl Tree {
+    /// Whether this tree belongs to a process that no longer exists — it was
+    /// opened before a `fork()` and this is the child.
+    ///
+    /// One relaxed load of a process-local counter; see [`tf_tree_ipc::fork`]
+    /// for why it is not `getpid()`.
+    ///
+    /// A detached tree is not repairable. Open a new one in the child, or
+    /// `exec`.
+    #[must_use]
+    pub fn detached(&self) -> bool {
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        {
+            self.fork_gen
+                .is_some_and(|g| g != tf_tree_ipc::fork::generation())
+        }
+        #[cfg(not(all(feature = "shm", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
     fn view(&self) -> ArenaView<'_> {
+        // The detached case first, and unconditionally: every accessor below
+        // funnels through here, so this is the one place that has to be right
+        // for a read of the vanished mapping to be impossible rather than
+        // merely unlikely.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        if self.detached() {
+            return ArenaView::new(poison_arena());
+        }
         // Both builders are load-bearing for A8, and neither is optional:
         //
         // * `as_participant` — a rescuer publishes *itself* into `claiming`, so
@@ -677,6 +800,12 @@ impl Tree {
     ///
     /// [`FrameError`] if the frame table is full or a name hash collides.
     pub fn frame(&self, name: &str) -> Result<FrameId, FrameError> {
+        // Explicitly, ahead of `view()`: the poison arena is a *writable* heap
+        // arena, so interning into it would succeed and hand back a `FrameId`
+        // that names nothing. A wrong answer is worse than an error.
+        if self.detached() {
+            return Err(FrameError::ChildDetached);
+        }
         if !self.arena.is_writable() {
             // Interning a *new* name publishes into the hash table with a
             // `compare_exchange`; through a `PROT_READ` mapping that is a
@@ -713,6 +842,9 @@ impl Tree {
     /// an out-of-range frame, or [`ReparentError::LockContended`] if a live peer
     /// holds the topology lock (retry).
     pub fn reparent(&self, child: FrameId, new_parent: FrameId) -> Result<(), ReparentError> {
+        if self.detached() {
+            return Err(ReparentError::ChildDetached);
+        }
         if !self.arena.is_writable() {
             return Err(ReparentError::ReadOnly);
         }
@@ -748,6 +880,9 @@ impl Tree {
     /// does not match, the edge carries no sample ring (it is static or
     /// tombstoned), or the edge is already claimed.
     pub fn claim(&self, child: FrameId, parent: FrameId) -> Result<EdgeWriter<'_>, ClaimApiError> {
+        if self.detached() {
+            return Err(ClaimApiError::ChildDetached);
+        }
         if !self.arena.is_writable() {
             return Err(ClaimApiError::ReadOnly);
         }
@@ -786,6 +921,8 @@ impl Tree {
 
         Ok(EdgeWriter {
             publisher: Publisher::new(ring, claim_rec, epoch, owner),
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            fork_gen: self.fork_gen,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             _lease: lease,
         })
@@ -850,6 +987,7 @@ impl Tree {
         Ok(Some(ClaimLease {
             lock: std::sync::Arc::clone(lock),
             edge: eid.0,
+            fork_gen: tf_tree_ipc::fork::generation(),
         }))
     }
 
@@ -864,6 +1002,9 @@ impl Tree {
         target: FrameId,
         source: FrameId,
     ) -> Result<tf_tree_core::Plan, LookupError> {
+        if self.detached() {
+            return Err(LookupError::ChildDetached);
+        }
         let view = self.view();
         let topo = view.topology();
         compile(&topo, |eid| edge_meta(&view, eid), target, source)
@@ -873,6 +1014,14 @@ impl Tree {
     /// lookups.
     #[must_use]
     pub fn guard(&self) -> Guard<'_> {
+        // `Guard::new` reads the topology generation *immediately*, so a
+        // detached tree cannot build one even to throw away. A poisoned guard
+        // answers `ChildDetached` to every evaluation instead — which is why
+        // this method can stay infallible for the several dozen call sites that
+        // will never fork.
+        if self.detached() {
+            return Guard::poisoned(self.view(), LookupError::ChildDetached);
+        }
         Guard::new(self.view())
     }
 
@@ -890,6 +1039,9 @@ impl Tree {
         source: &str,
         stamp: Stamp<D>,
     ) -> Result<Iso3, LookupError> {
+        if self.detached() {
+            return Err(LookupError::ChildDetached);
+        }
         let view = self.view();
         let t = find(&view, target)?;
         let s = find(&view, source)?;
@@ -1002,6 +1154,8 @@ impl Tree {
             (u32::MAX, 0)
         };
         let liveness = liveness_for(ArenaView::new(backing.as_dyn()).header().boot_id);
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let fork_gen = fork_gen_for(&backing);
         Ok(Tree {
             arena: backing,
             participant,
@@ -1012,6 +1166,8 @@ impl Tree {
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             claim_lock: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            fork_gen,
         })
     }
 
@@ -1225,6 +1381,20 @@ impl Tree {
         reaped
     }
 
+    /// This process's own participant slot in the arena's table.
+    ///
+    /// `u32::MAX` for a read-only attachment, which takes a lock-file byte but
+    /// writes no arena record — it cannot, the mapping is `PROT_READ`.
+    ///
+    /// The one number that indexes both tables (`docs/PHASE2.md` §3.7): the
+    /// arena record and the lock-file byte are deliberately the same integer, so
+    /// this is what a caller passes to [`Self::participant_alive`] to ask about
+    /// itself.
+    #[must_use]
+    pub fn participant_slot(&self) -> u32 {
+        self.participant
+    }
+
     /// Whether the participant in `slot` is still running.
     ///
     /// The kernel's answer for a tree obtained from [`crate::open`], a `/proc`
@@ -1331,12 +1501,85 @@ impl Drop for Tree {
         //
         // Read-only attachments never registered (they cannot write the table),
         // so they have nothing to release.
+        // **A `fork` child must not release the parent's slot** — and what stops
+        // it is `view()`, not a check here. A detached tree's `view()` returns
+        // the poison arena, so this releases a slot in a throwaway heap arena
+        // that names nothing. The parent's record is untouched, and the child
+        // never stores into the unmapped page.
+        //
+        // An explicit `if self.detached() { return }` was written here first and
+        // then deleted: with the poison in place it is unreachable in any way a
+        // test can demonstrate — removing it left
+        // `a_forked_child_runs_its_destructors_without_touching_the_parent`
+        // green, while removing the poison turns that test's child into
+        // `signalled 11`. Two mechanisms for one invariant, only one of them
+        // load-bearing, is how the load-bearing one eventually gets deleted as
+        // redundant. **Do not add the check back; keep the poison.**
         if self.participant != u32::MAX && self.arena.is_writable() {
             self.view()
                 .participants()
                 .release(self.participant, self.incarnation);
         }
     }
+}
+
+/// The fork generation to poison a tree against, or `None` for a backing that
+/// survives a `fork` intact.
+///
+/// A [`HeapArena`] is ordinary anonymous memory: `fork` gives the child a
+/// copy-on-write duplicate, every reference into it stays valid, and the child's
+/// tree keeps working — divergently from the parent's, which is what `fork`
+/// means. Poisoning that would break `multiprocessing` for single-process users
+/// to defend against a hazard they do not have.
+///
+/// A mapped arena is the opposite: `MADV_DONTFORK` means the child has **no
+/// mapping** there at all (`docs/PHASE2.md` §7.3).
+///
+/// Arming here rather than lazily is the load-bearing part. The handler must be
+/// installed before any `fork` can happen, and "a shared mapping now exists" is
+/// the earliest moment at which a `fork` could do damage. Arming on first *use*
+/// would install it after the fork that mattered, and both processes would then
+/// read generation 0 and agree they were the parent.
+///
+/// This also forces [`poison_arena`] to be built, in the parent, while
+/// allocating is still safe. A `fork` child may have inherited a locked
+/// allocator from a thread that no longer exists, so the detached path must not
+/// be the thing that first allocates.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn fork_gen_for(backing: &ArenaBacking) -> Option<u64> {
+    match backing {
+        ArenaBacking::Heap(_) => None,
+        ArenaBacking::Mapped(_) => {
+            tf_tree_ipc::fork::arm();
+            let _ = poison_arena();
+            Some(tf_tree_ipc::fork::generation())
+        }
+    }
+}
+
+/// The process-wide empty arena a detached [`Tree`] reads instead of the
+/// mapping that went away.
+///
+/// [`Tree::guard`] and [`Tree::arena_view`] cannot report an error — the first
+/// is the `let g = tree.guard();` idiom used by every reader, the second is a
+/// diagnostic accessor — so a detached tree has to hand back *something*, and
+/// that something must be memory this process actually has mapped. One frame, no
+/// edges: every query answers "not here".
+///
+/// Nothing is published into it and every tree shares the one instance, so the
+/// cost is a few kilobytes per process that ever opens a shared arena.
+///
+/// Reads that *can* report an error do not come here; they check
+/// [`Tree::detached`] first and return [`LookupError::ChildDetached`] and its
+/// siblings, which say what actually happened.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn poison_arena() -> &'static HeapArena {
+    static POISON: std::sync::OnceLock<HeapArena> = std::sync::OnceLock::new();
+    POISON.get_or_init(|| {
+        // `minimal()` is infallible precisely so this can be written without an
+        // `unwrap` in a crate that denies them.
+        HeapArena::new(&tf_tree_arena::ArenaLayout::minimal(), 0, 0, [0u8; 16])
+    })
 }
 
 /// Register this process in the arena's participant table.
@@ -1699,6 +1942,12 @@ impl From<LayoutError> for BuildError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReparentError {
+    /// This handle was created before a `fork()` and is being used in the child.
+    ///
+    /// The shared mapping is `MADV_DONTFORK`, so the child has none — see
+    /// [`Tree::detached`]. Not retryable: open a new tree, or `exec`.
+    #[error("this handle belongs to the pre-fork process; open a new tree in the child")]
+    ChildDetached,
     /// The child has no incoming edge to reuse; only frames declared with an edge
     /// can be re-parented (re-parenting allocates no new edge/capacity).
     #[error("frame {} has no edge to re-parent", child.get())]
@@ -1742,6 +1991,12 @@ impl From<TopoLockError> for ReparentError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClaimApiError {
+    /// This handle was created before a `fork()` and is being used in the child.
+    ///
+    /// The shared mapping is `MADV_DONTFORK`, so the child has none — see
+    /// [`Tree::detached`]. Not retryable: open a new tree, or `exec`.
+    #[error("this handle belongs to the pre-fork process; open a new tree in the child")]
+    ChildDetached,
     /// The arena record was free but a live process holds the edge's lease.
     ///
     /// Reachable only through a reaper bug or `CreatePolicy::Always` byte

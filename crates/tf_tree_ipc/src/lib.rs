@@ -83,6 +83,7 @@
 
 mod client;
 mod error;
+pub mod fork;
 mod identity;
 mod lockfile;
 mod ofd;

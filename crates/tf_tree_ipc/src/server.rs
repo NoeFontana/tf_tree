@@ -62,6 +62,8 @@ pub struct OwnerServer {
     sock_path: PathBuf,
     desc: SegmentDescriptor,
     owner_pid: u32,
+    /// The fork generation this server bound its socket in — see `Drop`.
+    fork_gen: u64,
 }
 
 /// Ask a running [`OwnerServer`] to stop.
@@ -152,6 +154,12 @@ impl OwnerServer {
             sock_path: sock_path.to_path_buf(),
             desc,
             owner_pid,
+            fork_gen: {
+                // Bound the socket, so from here on a `fork` matters. Arming is
+                // idempotent and the server is created once per arena.
+                crate::fork::arm();
+                crate::fork::generation()
+            },
         })
     }
 
@@ -392,6 +400,22 @@ impl OwnerServer {
 
 impl Drop for OwnerServer {
     fn drop(&mut self) {
+        // Never from a `fork` child. The listener fd is inherited, so it still
+        // `stat`s equal to the path — `unlink_if_still_ours` would conclude the
+        // socket is ours and remove the **parent's** live listening path, after
+        // which no client can find an owner that is still perfectly happy to
+        // serve one. The child's own fd closing is harmless: the description
+        // stays open in the parent.
+        //
+        // **Coverage, stated plainly: no test fails when this check is
+        // removed.** In this workspace an `OwnerServer` only ever lives on the
+        // serving thread's stack, and `fork` does not copy threads, so the
+        // child has no such value to drop. It is reachable only through the
+        // public API — bind on the main thread, then fork — which is exactly
+        // the case a library owes a guard for, and nothing else provides one.
+        if self.fork_gen != crate::fork::generation() {
+            return;
+        }
         self.unlink_if_still_ours();
     }
 }

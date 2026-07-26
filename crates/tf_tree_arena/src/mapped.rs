@@ -146,6 +146,32 @@ pub struct MappedArena {
     len: usize,
     fd: OwnedFd,
     writable: bool,
+    /// The process that established this mapping.
+    ///
+    /// The mapping is `MADV_DONTFORK` (§7.3), so a `fork` child does not have
+    /// it — the address range is a *hole* in the child's address space. An
+    /// unguarded `munmap` there is usually a harmless no-op, but "usually" is
+    /// doing real work in that sentence: nothing stops the kernel from placing a
+    /// later mapping of the child's own into that hole, and the destructor would
+    /// then unmap memory belonging to something else entirely, at a distance,
+    /// with no diagnostic.
+    ///
+    /// `getpid` is a syscall, and that is affordable *here* and nowhere else:
+    /// this runs once per arena teardown. The equivalent check on the hot path
+    /// is a `pthread_atfork` counter (`tf_tree_ipc::fork`), which this crate
+    /// deliberately does not depend on — the dependency would point the wrong
+    /// way, and a destructor can pay 50 ns.
+    ///
+    /// **Coverage, stated plainly: no test fails when this check is removed.**
+    /// `crates/tf_tree_bench/tests/fork.rs` was run against that mutant and
+    /// stayed green, because `munmap` on a hole succeeds and does nothing — the
+    /// damage needs the child to have placed a mapping of its own in that hole
+    /// first, which the harness does not arrange and cannot arrange without a
+    /// public accessor for the arena's base address that exists for no other
+    /// reason. Kept anyway: the state is reachable by any child that allocates
+    /// enough, the failure is silent and at a distance, and nothing else guards
+    /// it.
+    owner_pid: rustix::process::Pid,
 }
 
 impl MappedArena {
@@ -220,6 +246,7 @@ impl MappedArena {
         fcntl_add_seals(&fd, REQUIRED_SEALS | SealFlags::SEAL).map_err(ShmError::Seal)?;
 
         let arena = MappedArena {
+            owner_pid: rustix::process::getpid(),
             base,
             len,
             fd,
@@ -262,6 +289,7 @@ impl MappedArena {
         let base = unsafe_map(len, prot, &fd)?;
 
         let arena = MappedArena {
+            owner_pid: rustix::process::getpid(),
             base,
             len,
             fd,
@@ -426,8 +454,14 @@ fn unsafe_map(len: usize, prot: ProtFlags, fd: &OwnedFd) -> Result<NonNull<u8>, 
 
 impl Drop for MappedArena {
     fn drop(&mut self) {
+        // See `owner_pid`. In a `fork` child this range is not ours to unmap.
+        if rustix::process::getpid() != self.owner_pid {
+            return;
+        }
         // SAFETY: module invariant — `base`/`len` are exactly what `mmap`
-        // returned for this arena, unmapped here exactly once.
+        // returned for this arena, unmapped here exactly once. The `getpid`
+        // guard above additionally establishes that this is the process the
+        // mapping was made in, so the range is still ours.
         let _ = unsafe { munmap(self.base.as_ptr().cast(), self.len) };
     }
 }
