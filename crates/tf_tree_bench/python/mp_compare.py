@@ -198,6 +198,13 @@ def run_consumer(engine: str) -> None:
             time.sleep(0.02)
 
     period = 1.0 / HZ
+    # **CPU is measured by the consumer, over its own loop.** The coordinator
+    # used to sample `schedstat` between two sleeps, which for tf2 overlapped
+    # the consumer's exit — roughly half that window was a process that had
+    # already finished, understating exactly the column the O(1)-in-consumers
+    # claim rests on. A consumer knows when its loop starts and ends; nothing
+    # else does.
+    cpu_t0 = cpu_ns(os.getpid())
     t0 = time.perf_counter()
     service: list[float] = []
     cycle: list[float] = []
@@ -216,13 +223,14 @@ def run_consumer(engine: str) -> None:
         service.append((done - start) * 1e9)
         cycle.append((done - due) * 1e9)
 
+    busy = (cpu_ns(os.getpid()) - cpu_t0) / ((time.perf_counter() - t0) * 1e9)
     service.sort()
     cycle.sort()
     print(
         f"RESULT {os.getpid()} "
         f"{pct(service, 0.5):.0f} {pct(service, 0.99):.0f} {pct(service, 0.999):.0f} "
         f"{pct(cycle, 0.5):.0f} {pct(cycle, 0.99):.0f} {pct(cycle, 0.999):.0f} "
-        f"{fill_ms:.1f}",
+        f"{fill_ms:.1f} {busy:.6f}",
         flush=True,
     )
 
@@ -236,7 +244,6 @@ def run_publisher() -> None:
     print("READY", flush=True)
     period = 1.0 / PUB_HZ
     t0 = time.perf_counter()
-    i = 0
     while True:
         # **The tick index is derived from elapsed time, not incremented.**
         # A publisher that increments and then sleeps `due - now` does not
@@ -245,8 +252,12 @@ def run_publisher() -> None:
         # milliseconds instead of the 40 s the capacity implies. That is how
         # this first failed: every consumer got `ExtrapolationError` because the
         # publisher had run away from its own history.
+        # Derived from elapsed time and **not also incremented**. It was both,
+        # which advanced the index twice per iteration: the publisher ran at
+        # ~156 Hz where `PUB_HZ` says 100, the index stopped meaning "tick", and
+        # the header's claim that both engines see the same stream was false.
         now = time.perf_counter()
-        i = max(i + 1, int((now - t0) / period) + 1)
+        i = int((now - t0) / period) + 1
         due = t0 + i * period
         if now < due:
             time.sleep(due - now)
@@ -255,7 +266,6 @@ def run_publisher() -> None:
         stamp = time.time_ns()
         for w in writers:
             w.push(stamp, [1.0, 0.0, 0.0, 0.0, 0.001 * i, 0.0, 0.0])
-        i += 1
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +289,6 @@ def measure(engine: str, n: int, env: dict[str, str]) -> dict[str, float]:
     # steady-state CPU, and sampling then would understate tf2's cost.
     time.sleep(1.5 if engine == "tf_tree" else 3.0)
     pss = sum(pss_kib(k.pid) for k in kids)
-    cpu0 = [cpu_ns(k.pid) for k in kids]
-    t0 = time.perf_counter()
-    time.sleep(min(2.0, SECONDS / 2))
-    cpu1 = [cpu_ns(k.pid) for k in kids]
-    wall = time.perf_counter() - t0
 
     rows = []
     errs = []
@@ -299,14 +304,13 @@ def measure(engine: str, n: int, env: dict[str, str]) -> dict[str, float]:
             f"{engine}: no consumer reported a result\n" + "\n".join(errs[:1])
         )
 
-    busy = [(c1 - c0) / (wall * 1e9) for c0, c1 in zip(cpu0, cpu1, strict=True)]
     return {
         "svc_p50": max(r[0] for r in rows),
         "svc_p999": max(r[2] for r in rows),
         "cyc_p999": max(r[5] for r in rows),
         "fill_ms": max(r[6] for r in rows),
         "pss_mib": pss / 1024.0,
-        "cpu_pct": 100.0 * sum(busy) / max(1, len(busy)),
+        "cpu_pct": 100.0 * sum(r[7] for r in rows) / len(rows),
         "n_reported": len(rows),
     }
 

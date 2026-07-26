@@ -753,7 +753,14 @@ at generation 0 — and fails against `DETACHED = 0` or `1`.
 
 ### Python, multi-process: N nodes on one arena against N private buffers
 
-`just py-mp-bench`, 2026-07-26, 8 cpus, in the same container. Eight Python
+`just py-mp-bench`, 2026-07-26, 8 cpus, in the same container. Two corrections
+landed after the first publication of these numbers, both found in review: the
+publisher was running at **50 Hz where `PUB_HZ` says 100** (its tick index was
+both derived from elapsed time *and* incremented, so it slept two periods per
+push) while the tf2 consumer filled its buffer at the full 100 Hz — so the two
+engines were not seeing "the same stream" as claimed; and CPU was sampled by the
+coordinator over a window that overlapped tf2's startup. Both are fixed and the
+table is re-measured. Eight Python
 consumer nodes at 100 Hz over a depth-3 chain, open-loop, with a live publisher
 for tf_tree. **This is where the shared arena earns its keep, and it is the row
 the single-process comparison cannot show**: a Python `tf2_ros` node
@@ -767,10 +774,16 @@ by exactly the amount being claimed.
 
 | nodes | tf_tree svc p50 | `tf2_ros` svc p50 | ratio | tf_tree PSS | `tf2_ros` PSS |
 |---:|---:|---:|---:|---:|---:|
-| 1 | **1 112 ns** | 111 598 ns | 100× | 23.6 MiB | 55.1 MiB |
-| 2 | **1 192 ns** | 118 028 ns | 99× | 39.6 MiB | 92.2 MiB |
-| 4 | **1 342 ns** | 125 139 ns | 93× | 70.3 MiB | 168.5 MiB |
-| 8 | **1 321 ns** | 140 701 ns | **106×** | 128.3 MiB | 320.6 MiB |
+| 1 | **2.2–2.9 µs** | 167–260 µs | 76–89× | 23.6 MiB | 54.2 MiB |
+| 2 | **2.2–2.9 µs** | 155–226 µs | 69–78× | 40.1 MiB | 94.3 MiB |
+| 4 | **2.6–3.0 µs** | 188–233 µs | 74–77× | 70.4 MiB | 170.5 MiB |
+| 8 | **3.1–3.4 µs** | 233–374 µs | **75–110×** | 128.3 MiB | 320.9 MiB |
+
+Latency is given as the range across two runs because **this machine was not
+idle** — it had been running benchmarks for hours — and the absolute figures
+moved by up to 1.5× between them. The *ratios* and the memory columns did not,
+and those are what the claims rest on. On a dedicated machine, report point
+values; here, reporting one would be picking a number.
 
 **The slope is the claim, not the totals.** Both engines pay identically for the
 Python interpreter and numpy, which dominate the absolute figures. What the
@@ -778,14 +791,22 @@ shared arena changes is what each *additional* node costs:
 
 | marginal, per node | tf_tree | `tf2_ros` | ratio |
 |---|---:|---:|---:|
-| memory (PSS) | **15.0 MiB** | 37.9 MiB | 2.5× |
-| CPU | **0.10 %** | 6.44 % | **64×** |
-| time to first usable lookup | **0–1 ms** | 62–116 ms | ~70× |
+| memory (PSS) | **14.9 MiB** | 37.7–38.0 MiB | 2.5× |
+| CPU | **0.16–0.17 %** | 2.9–3.8 % | **18–22×** |
+| time to first usable lookup | **0–1 ms** | 64–121 ms | ~70× |
+
+**The CPU row previously read 64×, and that was an artifact.** The coordinator
+sampled `schedstat` between two of its own sleeps, a window that for tf2
+overlapped the consumer's import and fill rather than only its measured loop.
+Each consumer now measures its own CPU across its own loop and reports it —
+nothing else knows when that loop starts and ends. The corrected 18–22× is
+still the O(1)-versus-O(consumers × edges × rate) shape, and it is still the
+right column to look at; it is simply not 64×.
 
 The CPU row is `docs/PHASE2.md` §12.4's "O(1) in the number of consumers"
-measured rather than asserted, and 51× is what O(1) against
-O(consumers x edges x rate) looks like at eight nodes on one machine. It grows
-with the fleet.
+measured rather than asserted: tf_tree's per-node CPU is flat across the sweep
+and tf2's rises, which is the shape the claim predicts. The gap grows with the
+fleet.
 
 "time to first usable lookup" is the startup cost, and it is structural rather
 than incidental. tf_tree joins an arena somebody else is already publishing
@@ -842,9 +863,11 @@ leaves §5.5's guarantee intact — the objects that can actually trip it still 
 `at` *and* allocates nothing.
 
 Switching the consumer loop to it took the multi-process p50 from 1 923 ns to
-**1 321 ns** at eight nodes, and p99.9 from 29.3 us to 15.3 us. The ratio against
-tf2 went from 73x to **106x**. A node does one lookup per tick and cannot batch,
-so this is the number a real deployment sees.
+**1 321 ns** at eight nodes, and p99.9 from 29.3 us to 15.3 us — both measured
+with the same harness on both sides, so the **1.46x improvement stands** even
+though the absolute figures above were re-measured afterwards on a busier
+machine and against a corrected publisher rate. A node does one lookup per tick
+and cannot batch, so this is the path a real deployment takes.
 
 ### What is implemented, and what is not
 
