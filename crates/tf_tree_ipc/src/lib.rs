@@ -49,11 +49,11 @@
 //! | §3.1 runtime directory, incl. the NORMATIVE NFS/CIFS refusal | implemented |
 //! | §3.2 domain and name defaults | implemented |
 //! | §3.3 lock file: ownership byte, participant bytes, identity records | implemented |
-//! | §3.4 `open()` decision algorithm, incl. the split-brain check | implemented, with the socket half injected as [`ServerProbe`] |
+//! | §3.4 `open()` decision algorithm, incl. the split-brain check | implemented; [`SocketProbe`] is the real §3.7 half, [`NoServer`] the test one |
 //! | §5.1 `(pid, start_time, boot_id)` and the `/proc` parsing trap | implemented |
 //! | §3.7 handshake messages ([`HelloRequest`], [`HelloResponse`], [`HelloStatus`]) | implemented, offsets and status codes pinned |
 //! | §3.7 `SOCK_SEQPACKET` transport + `SCM_RIGHTS` ([`OwnerServer`], [`attach`]) | implemented |
-//! | §3.6 `memfd` creation, and wiring the two halves into `tf_tree::open()` | **not yet** — `docs/decisions/0005` steps 4-5 |
+//! | §3.6 `memfd` creation, and wiring this into `tf_tree::open()` | **not yet** — `docs/decisions/0005` step 5 |
 //! | §6.1 claims as OFD locks | **not yet** — the byte range is reserved ([`CLAIM_BASE`]) |
 //!
 //! Because §3.7 is absent, [`Open::open`] takes a [`ServerProbe`] that answers
@@ -93,7 +93,7 @@ mod runtime_dir;
 mod server;
 mod wire;
 
-pub use client::{attach, Attached};
+pub use client::{attach, Attached, SocketProbe};
 pub use error::{
     EnvVar, IpcError, LockRole, NameProblem, ProcError, ProcParseError, RuntimeDirSource,
 };

@@ -70,7 +70,7 @@ pub fn attach(
         SocketFlags::CLOEXEC,
         None,
     )
-    .map_err(|e| IpcError::HandshakeIo {
+    .map_err(|e| IpcError::ClientSocketSetup {
         raw_os_error: e.raw_os_error(),
     })?;
 
@@ -83,7 +83,7 @@ pub fn attach(
         rustix::net::sockopt::Timeout::Send,
     ] {
         rustix::net::sockopt::set_socket_timeout(&sock, dir, Some(timeout)).map_err(|e| {
-            IpcError::HandshakeIo {
+            IpcError::ClientSocketSetup {
                 raw_os_error: e.raw_os_error(),
             }
         })?;
@@ -178,4 +178,127 @@ pub(crate) fn socket_addr(path: &Path) -> Result<SocketAddrUnix, IpcError> {
         len,
         limit: MAX_SOCKET_PATH,
     })
+}
+
+/// The real [`crate::ServerProbe`]: connect and complete the §3.7 handshake.
+///
+/// Attaching *is* the probe. Answering "is anyone serving?" and then attaching
+/// as a second step would connect twice, and the owner could die or be replaced
+/// between the two — re-running the very race §3.4 exists to settle. So a
+/// successful probe comes back holding the segment.
+pub struct SocketProbe {
+    request: HelloRequest,
+    timeout: Duration,
+}
+
+impl SocketProbe {
+    /// A probe that will introduce itself as `request`.
+    #[must_use]
+    pub fn new(request: HelloRequest, timeout: Duration) -> SocketProbe {
+        SocketProbe { request, timeout }
+    }
+}
+
+impl crate::open::ServerProbe for SocketProbe {
+    type Attached = Attached;
+
+    fn probe(&mut self, sock: &Path) -> Result<crate::open::Reach<Attached>, IpcError> {
+        match attach(sock, &self.request, self.timeout) {
+            Ok(a) => {
+                let slot = a.response.participant_slot;
+                Ok(crate::open::Reach::Serving { attached: a, slot })
+            }
+            Err(e) => match verdict(&e) {
+                Verdict::Absent => Ok(crate::open::Reach::Absent),
+                Verdict::Rejected => Ok(crate::open::Reach::Rejected(e)),
+                Verdict::Fatal => Err(e),
+            },
+        }
+    }
+}
+
+/// What a failed [`attach`] means to the §3.4 loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Treat as "no server": carry on and let the ownership byte decide.
+    Absent,
+    /// The owner answered and refused. Stop; retrying cannot change the answer.
+    Rejected,
+    /// Neither. Propagate.
+    Fatal,
+}
+
+/// Classify an attach failure.
+///
+/// A pure function so the classification is testable without syscalls, and
+/// **because getting one arm wrong here is not a small bug**: anything mapped to
+/// [`Verdict::Absent`] tells `open()` there is no arena, and `open()` responds
+/// by creating one. A local failure misfiled as `Absent` therefore produces a
+/// *second arena beside a live one* — divergence, not an error message.
+fn verdict(e: &IpcError) -> Verdict {
+    match e {
+        // Nobody listening, or an owner that died mid-handshake. §3.9 makes a
+        // stale socket path expected, so both are simply "no server".
+        IpcError::ServerUnreachable { .. } | IpcError::HandshakeIo { .. } => Verdict::Absent,
+        // The owner answered. A version or layout disagreement cannot be fixed
+        // by waiting, and burning the §3.4 deadline on it would replace a
+        // precise message with a timeout.
+        IpcError::HandshakeRejected { .. }
+        | IpcError::HandshakeMalformed(_)
+        | IpcError::RejectionCarriedFd { .. }
+        | IpcError::NoFdReceived => Verdict::Rejected,
+        // Everything else — notably `ClientSocketSetup`, which is *this*
+        // process running out of descriptors. Calling that "no server" would
+        // make an `EMFILE` create a second arena.
+        _ => Verdict::Fatal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arm that must never move.
+    ///
+    /// `ClientSocketSetup` is a failure of this process, not evidence about the
+    /// arena. Classifying it as `Absent` would make descriptor exhaustion
+    /// indistinguishable from an empty machine, and `open()` would create a
+    /// second arena next to a live one it merely failed to reach — silent
+    /// divergence with no error anywhere.
+    #[test]
+    fn a_local_socket_failure_is_never_read_as_an_absent_arena() {
+        assert_eq!(
+            verdict(&IpcError::ClientSocketSetup { raw_os_error: 24 }),
+            Verdict::Fatal
+        );
+    }
+
+    #[test]
+    fn the_no_server_arms_are_exactly_the_two_that_mean_no_server() {
+        assert_eq!(
+            verdict(&IpcError::ServerUnreachable { raw_os_error: 2 }),
+            Verdict::Absent
+        );
+        assert_eq!(
+            verdict(&IpcError::HandshakeIo { raw_os_error: 110 }),
+            Verdict::Absent
+        );
+    }
+
+    #[test]
+    fn an_owner_that_answered_is_terminal() {
+        for e in [
+            IpcError::HandshakeRejected {
+                status: crate::wire::HelloStatus::LayoutMismatch,
+                owner_format_version: 2,
+                owner_layout_hash: 1,
+            },
+            IpcError::NoFdReceived,
+            IpcError::RejectionCarriedFd {
+                status: crate::wire::HelloStatus::VersionMismatch,
+            },
+        ] {
+            assert_eq!(verdict(&e), Verdict::Rejected, "{e:?}");
+        }
+    }
 }
