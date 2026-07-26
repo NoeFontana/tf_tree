@@ -246,10 +246,19 @@ impl PyPlan {
         &self,
         py: Python<'_>,
         stamps: &Bound<'_, PyArray1<i64>>,
-        out: &Bound<'_, PyArray3<f64>>,
+        out: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        // Device placement first, and *before* any attempt to take a pointer:
+        // the whole point is to refuse rather than to fault (§5.5).
+        reject_device_memory(out)?;
+        let arr = out.cast::<PyArray3<f64>>().map_err(|_| {
+            BufferError::new_err(
+                "out must be a writable, C-contiguous (N, 4, 4) float64 array, or an \
+                 object exposing the buffer protocol with that layout",
+            )
+        })?;
         let n = stamps.len();
-        self.fill(py, stamps, out, n)
+        self.fill(py, stamps, arr, n)
     }
 
     /// The most recent transform on this path.
@@ -504,6 +513,57 @@ impl PyPublisher {
             .lock()
             .map_err(|_| TfTreeError::new_err("publisher mutex was poisoned by a panic"))
     }
+}
+
+/// DLPack device types that a CPU kernel may write to (`docs/PHASE3.md` §5.5).
+///
+/// From the DLPack ABI: 1 = `kDLCPU`, 3 = `kDLCUDAHost` (pinned), 11 =
+/// `kDLROCMHost`, 13 = `kDLCUDAManaged`. Everything else is device memory, and
+/// **a CPU store to a `cudaMalloc` pointer is undefined** — not slow, undefined.
+const HOST_DEVICE_TYPES: [i32; 4] = [1, 3, 11, 13];
+
+/// Refuse an `out` buffer that does not live where a CPU can write it.
+///
+/// # Why DLPack for this and the buffer protocol for the rest
+///
+/// Device placement is the one property only DLPack reports portably.
+/// `__dlpack_device__()` returns `(device_type, device_id)` cheaply, without
+/// consuming the object and without a CUDA runtime — which decision D8 forbids
+/// us from taking as a dependency. `cudaPointerGetAttributes` would answer the
+/// same question and cost exactly that dependency.
+///
+/// Mutability and contiguity come from the buffer protocol instead, because it
+/// has conveyed writability since PEP 3118 and cannot get it wrong, whereas
+/// older DLPack has no read-only bit at all.
+///
+/// # What this check is actually for
+///
+/// Almost every host-accessible buffer reports `kDLCPU` — PyTorch calls pinned
+/// tensors `device='cpu'`, and `cupyx.empty_pinned` returns a NumPy array. So
+/// this does not enable an exotic path. **Its job is to produce a good error
+/// instead of a segfault**, and that is worth the twenty lines on its own.
+fn reject_device_memory(obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    let Ok(f) = obj.getattr("__dlpack_device__") else {
+        // No DLPack at all. The buffer protocol below still validates
+        // writability and contiguity, and an object with neither is refused
+        // there — naming both protocols.
+        return Ok(());
+    };
+    let Ok(dev) = f.call0() else { return Ok(()) };
+    let Ok((device_type, device_id)) = dev.extract::<(i32, i32)>() else {
+        return Ok(());
+    };
+    if HOST_DEVICE_TYPES.contains(&device_type) {
+        return Ok(());
+    }
+    Err(BufferError::new_err(format!(
+        "out lives on DLPack device type {device_type} (id {device_id}), which a \
+         CPU kernel cannot write to. Allocate pinned host memory instead — \
+         torch.empty(..., pin_memory=True), cupyx.empty_pinned(...) or \
+         numba.cuda.pinned_array(...) — and copy to the device yourself; the \
+         adaptive knot array is about a kilobyte, so that transfer is ~6 us and \
+         is not what limits you."
+    )))
 }
 
 fn released() -> PyErr {
