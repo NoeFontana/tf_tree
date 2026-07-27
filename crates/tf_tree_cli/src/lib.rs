@@ -47,6 +47,33 @@ struct Cli {
     attach: attach::AttachArgs,
 }
 
+/// `--color` for `tf_tree top`.
+///
+/// Three states rather than a `bool`, because the useful default is neither:
+/// colour belongs on a terminal and must be absent from the file an operator
+/// pipes into a bug report, and `--color true` is not a spelling anyone reaches
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ColorChoice {
+    /// Colour if and only if stdout is a terminal.
+    Auto,
+    /// Always emit colour, even into a pipe.
+    Always,
+    /// Never emit colour.
+    Never,
+}
+
+impl ColorChoice {
+    /// `None` means "decide from the terminal".
+    fn forced(self) -> Option<bool> {
+        match self {
+            ColorChoice::Auto => None,
+            ColorChoice::Always => Some(true),
+            ColorChoice::Never => Some(false),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Show topology, per-edge kind/rate/occupancy/staleness, and writer PID.
@@ -116,9 +143,9 @@ enum Command {
         /// without a `libc` dependency this crate does not have.
         #[arg(long, value_name = "ID|NAME")]
         edge: Option<String>,
-        /// Force colour on or off; the default follows whether stdout is a tty.
-        #[arg(long)]
-        color: Option<bool>,
+        /// `auto` (the default) follows whether stdout is a tty.
+        #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+        color: ColorChoice,
     },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
@@ -187,7 +214,7 @@ pub fn run() -> Result<()> {
             iterations,
             edge,
             color,
-        } => cmd_top(live, interval, iterations, edge, color),
+        } => cmd_top(live, interval, iterations, edge, color.forced()),
         Command::Bench { gate } => cmd_bench(gate),
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),

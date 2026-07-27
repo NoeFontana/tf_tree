@@ -50,6 +50,25 @@ fn iterations_are_exact_and_a_pipe_gets_plain_text() {
     assert!(out.contains("read-only observer"), "{out}");
 }
 
+/// **`--color always` overrides the tty detection, `never` is the default's
+/// answer for a pipe.**
+///
+/// The override exists because a pipe is not always a file: `tf_tree top |
+/// less -R` is a terminal at the far end, and auto-detection cannot know that.
+///
+/// Mutant: make `ColorChoice::forced` return `None` for `Always`. Applied: the
+/// piped output has no escape sequence and the first assertion fails.
+#[test]
+fn colour_can_be_forced_through_a_pipe() {
+    let (ok, out, err) = cli(&["top", "--iterations", "1", "--color", "always"]);
+    assert!(ok, "{err}");
+    assert!(out.contains('\x1b'), "--color always emitted no colour");
+
+    let (ok, out, err) = cli(&["top", "--iterations", "1", "--color", "never"]);
+    assert!(ok, "{err}");
+    assert!(!out.contains('\x1b'), "--color never emitted colour");
+}
+
 /// **A sub-50 ms interval is refused, not clamped.**
 ///
 /// The one way this tool can perturb what it observes is by spinning on the
