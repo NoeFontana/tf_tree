@@ -51,9 +51,10 @@ use rustix::fs::{
 };
 use rustix::mm::{madvise, mmap, munmap, Advice, MapFlags, ProtFlags};
 
-use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC, TOPO_BLOCKS};
+use crate::check::{validate_arena_header, ShmError};
+use crate::header::{ArenaHeader, TOPO_BLOCKS};
 use crate::heap::{write_header_at, Arena};
-use crate::layout::{layout_hash, ArenaLayout};
+use crate::layout::ArenaLayout;
 
 /// Seals every tf_tree segment carries. Checked, not assumed, on attach.
 const REQUIRED_SEALS: SealFlags = SealFlags::SHRINK.union(SealFlags::GROW);
@@ -66,73 +67,6 @@ pub enum AttachMode {
     ReadOnly,
     /// `PROT_READ | PROT_WRITE`. Required to publish samples or claim edges.
     ReadWrite,
-}
-
-/// Everything that can go wrong obtaining or validating a shared segment.
-///
-/// `Copy` and `String`-free, like every other error in this workspace
-/// (`docs/PROJECT.md` §5): an errno and what was being attempted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShmError {
-    /// `memfd_create` failed.
-    Create(rustix::io::Errno),
-    /// `ftruncate` to the arena size failed.
-    Truncate(rustix::io::Errno),
-    /// `mmap` failed.
-    Map(rustix::io::Errno),
-    /// `F_ADD_SEALS` failed. The segment is not safe to share.
-    Seal(rustix::io::Errno),
-    /// `F_GET_SEALS` failed, so the seals could not be verified.
-    SealQuery(rustix::io::Errno),
-    /// The segment is missing `F_SEAL_SHRINK`/`F_SEAL_GROW`, so it could be
-    /// truncated under a reader and fault it with `SIGBUS`.
-    Unsealed,
-    /// `fstat` on the segment failed.
-    Stat(rustix::io::Errno),
-    /// `getrandom` could not fill the arena's `instance_uuid`.
-    ///
-    /// Deliberately fatal rather than falling back to a counter or a timestamp:
-    /// a *guessable* instance id still compares equal to itself, so the
-    /// split-brain check it exists for would keep passing while no longer
-    /// meaning anything.
-    Random(rustix::io::Errno),
-    /// The fd's size disagrees with the header's `arena_size`.
-    SizeMismatch {
-        /// Bytes the segment actually has.
-        actual: u64,
-        /// Bytes the header claims.
-        expected: u64,
-    },
-    /// The first eight bytes are not `TF_TREE_MAGIC` — not a tf_tree arena.
-    BadMagic,
-    /// The segment was written by a different `FORMAT_VERSION`.
-    VersionMismatch {
-        /// Version found in the segment.
-        found: u32,
-        /// Version this build speaks.
-        expected: u32,
-    },
-    /// The segment's record layout differs from this build's. Attaching anyway
-    /// would reinterpret every offset.
-    LayoutMismatch {
-        /// Hash found in the segment.
-        found: u32,
-        /// Hash this build computes.
-        expected: u32,
-    },
-    /// The segment is smaller than an `ArenaHeader`, so it cannot even be
-    /// validated.
-    TooSmall,
-    /// Every participant slot is taken, so this process cannot join.
-    ParticipantTableFull,
-    /// The header's region offsets do not match the geometry its own capacities
-    /// imply, so the regions cannot be trusted to lie within the segment.
-    ///
-    /// Distinct from [`ShmError::LayoutMismatch`], which compares against a
-    /// *build* constant: this catches a header that is internally inconsistent,
-    /// whether from a peer bug, a scribbled byte, or a build that shares this
-    /// one's record sizes but not its capacities.
-    HeaderInconsistent,
 }
 
 /// An [`Arena`] backed by a sealed `memfd` mapped `MAP_SHARED`.
@@ -299,69 +233,11 @@ impl MappedArena {
 
         // Validate the header only now that it is mapped. On any failure the
         // `MappedArena` is dropped, unmapping cleanly.
-        let h = arena.header();
-        if h.magic != u64::from_le_bytes(TF_TREE_MAGIC) {
-            return Err(ShmError::BadMagic);
-        }
-        if h.format_version != FORMAT_VERSION {
-            return Err(ShmError::VersionMismatch {
-                found: h.format_version,
-                expected: FORMAT_VERSION,
-            });
-        }
-        // The layout hash is what makes a mismatched build fail loudly instead
-        // of reading every region at the wrong offset.
-        if h.layout_hash != layout_hash() {
-            return Err(ShmError::LayoutMismatch {
-                found: h.layout_hash,
-                expected: layout_hash(),
-            });
-        }
-        if h.arena_size != size {
-            return Err(ShmError::SizeMismatch {
-                actual: size,
-                expected: h.arena_size,
-            });
-        }
-
-        // `layout_hash()` is a *build* constant — it pins the record sizes this
-        // binary was compiled against, not this segment's capacities. Two builds
-        // can agree on it and disagree about `max_frames`. Since `ArenaView`
-        // forms slices straight off these offsets, an inconsistent header would
-        // produce out-of-bounds reads rather than an error, so recompute the
-        // geometry the header's own counts imply and require it to match.
         //
-        // `from_totals` is exact here: the region layout depends only on the
-        // *sum* of the per-edge capacities, which is `stamp_slots`.
-        let implied = ArenaLayout::from_totals(h.max_frames, h.max_edges, h.stamp_slots)
-            .map_err(|_| ShmError::HeaderInconsistent)?;
-        let matches = implied.total_size() as u64 == h.arena_size
-            && implied.frame_table().offset as u32 == h.frame_table_off
-            && implied.frame_hash().offset as u32 == h.frame_hash_off
-            && implied.topo_blocks().offset as u32 == h.topo_block_off
-            && implied.topo_block_stride() as u32 == h.topo_block_stride
-            && implied.claim_table().offset as u32 == h.claim_table_off
-            // A6's region. Omitting these was a real hole: `ArenaView::participants`
-            // builds a slice from `participant_table_off` and `max_participants`
-            // and its SAFETY comment cites *this* check as what bounds them, so a
-            // header carrying garbage there produced an out-of-bounds slice —
-            // exactly the failure this validation exists to prevent.
-            && implied.participant_table().offset as u32 == h.participant_table_off
-            && implied.max_participants() == h.max_participants
-            && implied.edge_table().offset as u32 == h.edge_table_off
-            && implied.stamp_arena().offset as u32 == h.stamp_arena_off
-            && implied.pose_arena().offset as u32 == h.pose_arena_off
-            // v3: the counter regions are part of the geometry a foreign header
-            // must agree about. Without these two, a header claiming a v3
-            // layout hash could still point them anywhere, and §5.2's readers
-            // would build slices from the numbers — the same failure the
-            // participant-table check above exists to prevent.
-            && implied.edge_counters().offset as u32 == h.edge_counters_off
-            && implied.participant_counters().offset as u32 == h.participant_counters_off
-            && h.stamp_slots == h.pose_slots;
-        if !matches {
-            return Err(ShmError::HeaderInconsistent);
-        }
+        // The checks themselves live in `crate::check` because the frozen-file
+        // backend must make exactly the same ones, and a check that exists on
+        // one path and not the other is a hole with a filename on it.
+        validate_arena_header(arena.header(), size)?;
         Ok(arena)
     }
 
@@ -710,6 +586,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::header::{FORMAT_VERSION, TF_TREE_MAGIC};
+    use crate::layout::layout_hash;
     use alloc::vec;
 
     fn fixture() -> ArenaLayout {

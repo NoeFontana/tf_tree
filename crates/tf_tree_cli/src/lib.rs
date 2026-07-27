@@ -99,6 +99,21 @@ enum Command {
         #[arg(long)]
         gate: bool,
     },
+    /// Write a live arena to a frozen `.tft` index (`docs/PHASE5.md` §2).
+    ///
+    /// **`--from-live` is the only source this phase has**, and the flag is
+    /// still required rather than implied: §3's `--from-bag` is the source most
+    /// users will want, and a `freeze` that silently meant "live" today would
+    /// have to change meaning when it lands.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Freeze {
+        /// Freeze the arena named by the global attach flags.
+        #[arg(long, required = true)]
+        from_live: bool,
+        /// Destination path. Overwritten if it exists.
+        #[arg(long, short)]
+        out: std::path::PathBuf,
+    },
     /// List the processes attached to an arena, from the lock file alone.
     ///
     /// Reads `<runtime_dir>/<domain>/<name>.lock` and **never maps the arena**
@@ -141,6 +156,8 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Bench { gate } => cmd_bench(gate),
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Participants => cmd_participants(live),
     }
@@ -524,6 +541,66 @@ fn hex16(bytes: [u8; 16]) -> String {
 /// when the owner is wedged and nobody can complete a handshake. Those are
 /// exactly the situations in which somebody runs a diagnostic tool.
 ///
+/// `tf_tree freeze --from-live` — `docs/PHASE5.md` §2, and §5.6's capture.
+///
+/// Attaches **read-only** (`AttachArgs` defaults, D18) and copies the arena.
+/// A diagnostic that had to map a robot's tree read-write in order to take a
+/// snapshot of it would be a strictly worse tool than one that could not take
+/// the snapshot at all.
+///
+/// # It is a snapshot, not a transaction
+///
+/// Publishers keep publishing while this runs, so the image is a smear rather
+/// than a point in time — see `tf_tree_arena::write_frozen`. The output says so,
+/// because an operator who reads "frozen 233 MB" and assumes a consistent
+/// instant will eventually be surprised by a `SlotContended` in an offline
+/// query and have nothing to attribute it to.
+///
+/// `source_digest` is all-zero: a live arena is not a recording and has no
+/// content hash to name. §3's `--from-bag` fills it.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn cmd_freeze(live: Live<'_>, from_live: bool, out: &std::path::Path) -> Result<()> {
+    // `required = true` on the flag makes this unreachable through `clap`; it is
+    // here so the invariant is stated where the code depends on it rather than
+    // in an attribute two hundred lines away.
+    anyhow::ensure!(from_live, "`freeze` needs a source; pass `--from-live`");
+    let tree = live.open()?;
+    // `as i64` would wrap silently once `as_nanos` passes 2^63 (2262-04-11) and
+    // hand the header a negative "created" stamp that reads as 1901. Saturating
+    // costs nothing on a once-per-freeze path, and the field is provenance only
+    // — a clamped far-future stamp is visibly wrong, a wrapped one is not.
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    // One message rather than an `anyhow` context chain: `FrozenFileError` is
+    // `Copy` and `String`-free by house rule, so all it can say is *what* went
+    // wrong — the path is the missing half, and it belongs in the same line an
+    // operator reads, not one frame above it.
+    let header = tree
+        .freeze_to(out, None, [0; 32], created)
+        .map_err(|e| anyhow::anyhow!("could not freeze to {}: {e}", out.display()))?;
+    println!(
+        "froze {} bytes of arena to {}",
+        header.arena_size,
+        out.display()
+    );
+    println!(
+        "  arena at file offset {} ({} MiB aligned), manifest {} bytes at {}",
+        header.arena_off,
+        tf_tree_arena_align_mib(),
+        header.manifest_len,
+        header.manifest_off
+    );
+    println!("  snapshot is not atomic: publishers were free to write during the copy");
+    Ok(())
+}
+
+/// The `.tft` arena alignment, in MiB, for the message above.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn tf_tree_arena_align_mib() -> u64 {
+    tf_tree::ARENA_FILE_ALIGN / (1024 * 1024)
+}
+
 /// Liveness is the kernel's answer — `F_OFD_GETLK` on the participant's byte —
 /// not an inference from the identity record, which is why a `SIGSTOP`ped
 /// process correctly reads as alive (§5.1).
