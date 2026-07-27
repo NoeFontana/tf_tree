@@ -7,6 +7,9 @@
 //! just bench-report --out dir/ --consumers 8
 //! ```
 //!
+//! There is no `cargo xtask bench-report`: `xtask` dispatches `loom | miri |
+//! bench-gate | headers` only.
+//!
 //! §9.1 spells the entry point `tf_tree bench compare --bag run.mcap ...`. That
 //! spelling is **not wired up**, and deliberately: its `--bag` argument is §3
 //! (bag ingestion), which `docs/PHASE5.md` §0.0 records as not implemented, so a
@@ -45,8 +48,30 @@ fn main() -> Result<()> {
         };
         match a.as_str() {
             "--out" => out = PathBuf::from(value("--out")?),
-            "--consumers" => opts.consumers = value("--consumers")?.parse()?,
-            "--duration" => opts.duration = parse_duration(&value("--duration")?)?,
+            "--consumers" => {
+                opts.consumers = value("--consumers")?.parse()?;
+                if opts.consumers == 0 {
+                    bail!(
+                        "--consumers 0 describes no comparison: the N-way rows would run \
+                         a publisher and nobody, and the `bridge_supervision` cost would \
+                         be stated about 0 consumers."
+                    );
+                }
+            }
+            // Rejected rather than accepted-and-ignored. §9.1 spells `--duration`
+            // as the steady-state window per point, and every point it would
+            // govern is an N-way comparison row that is UNAVAILABLE here (§0.0:
+            // no ROS 2, and the core budget). The one row this tool measures
+            // itself is bounded by lookup samples, not by wall clock. Taking the
+            // flag and producing a byte-identical report is exactly the quiet
+            // dishonesty §9.3 is written against.
+            "--duration" => bail!(
+                "--duration is `docs/PHASE5.md` §9.1's steady-state window for the N-way \
+                 comparison rows, every one of which this host reports as UNAVAILABLE, so \
+                 the flag would govern nothing here. Accepting it and emitting an \
+                 identical report would be a lie of omission. Use --warmup (which is \
+                 recorded as warmup_discarded_s) to change the discarded window."
+            ),
             "--warmup" => opts.warmup = parse_duration(&value("--warmup")?)?,
             "--bag" => bail!(
                 "--bag is `docs/PHASE5.md` §3 (bag ingestion), which is not implemented \
@@ -54,9 +79,11 @@ fn main() -> Result<()> {
                  with the bag-dependent rows marked UNAVAILABLE and the reason stated."
             ),
             "-h" | "--help" => {
+                println!("usage: bench_report [--out DIR] [--consumers N] [--warmup 2s]");
                 println!(
-                    "usage: bench_report [--out DIR] [--consumers N] [--duration 120s] \
-                     [--warmup 2s]"
+                    "  --duration and --bag are `docs/PHASE5.md` §9.1 spellings for work \
+                     that is not implemented; both are rejected with the reason rather \
+                     than accepted and ignored."
                 );
                 return Ok(());
             }

@@ -11,7 +11,14 @@ name = "tf_tree_tf2_sys"
 description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential and benchmark harnesses."
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+# Outside the workspace, so this cannot inherit `[workspace.package]
+# rust-version` and has to repeat it. It is not free to differ: this crate path-
+# depends on `tf_tree_math`, which declares 1.85, so a lower number here promised
+# a build that never existed. CI's `msrv` job compares every hand-written
+# `rust-version` in the repository against the workspace's, because a floor that
+# nothing checks is a floor that drifts — which is the defect that produced this
+# line's previous value of 1.83.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"

@@ -55,8 +55,14 @@ closed if none arrives.
 
 ## MSRV policy
 
-The minimum supported Rust version is **1.85**, declared once in the workspace
-manifest's `[workspace.package] rust-version` and inherited by every crate.
+The minimum supported Rust version is **1.85**, declared in the workspace
+manifest's `[workspace.package] rust-version` and inherited by every workspace
+member. Two crates are deliberately *outside* the workspace and therefore cannot
+inherit it — `tf_tree_py` (built by maturin) and `tf_tree_tf2_sys` (builds only
+where ROS 2 is installed) — so each repeats the number by hand. CI's `msrv` job
+compares every hand-written `rust-version` in the repository against the
+workspace's and fails on disagreement, because the number that nothing checks is
+the number that drifts.
 
 - **An MSRV bump is a minor-version bump** pre-1.0, and a breaking change after
   1.0. It is never a patch release.

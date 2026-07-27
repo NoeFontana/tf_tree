@@ -70,6 +70,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build on the MSRV toolchain
         run: cargo build --workspace --lib --bins --locked
+      # `cargo build --workspace` cannot see `crates/tf_tree_py` or
+      # `crates/tf_tree_tf2_sys`: both are excluded from the workspace, so both
+      # spell `rust-version` by hand, and neither was checked by anything. That
+      # is the same defect the job above exists for — a floor that looks
+      # authoritative, is never compiled against, and drifts. `tf_tree_py` is the
+      # one that matters most, because the wheel is what an end user installs.
+      #
+      # Compared rather than compiled: `tf_tree_tf2_sys` needs a ROS 2 install
+      # that no runner here has, so building it is not an option and agreeing
+      # with the workspace floor is the strongest check available.
+      - name: every hand-written rust-version agrees with the workspace
+        run: |
+          want='${{ steps.msrv.outputs.version }}'
+          rc=0
+          for m in crates/*/Cargo.toml xtask/Cargo.toml; do
+            got=$(grep -m1 '^rust-version *=' "$m" | cut -d'"' -f2)
+            [ -n "$got" ] || continue
+            if [ "$got" != "$want" ]; then
+              echo "::error file=$m::declares rust-version $got, workspace declares $want"
+              rc=1
+            fi
+          done
+          exit $rc
 
   # `crates/tf_tree_py` is excluded from the workspace, so `cargo clippy
   # --workspace` above never compiles it. That gap shipped a real bug: a

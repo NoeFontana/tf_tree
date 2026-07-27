@@ -58,6 +58,16 @@ use tf_tree::{InterpPolicy, Stamp};
 /// `results.json` schema identifier. Bump on any consumer-visible change.
 pub const SCHEMA: &str = "tf_tree.bench-report/1";
 
+/// The command that regenerates the whole report directory.
+///
+/// Named once, so the HTML's "Reproducing this" line and the test that checks it
+/// against the real `justfile` cannot disagree. It is **not**
+/// `cargo xtask bench-report`: `xtask` dispatches `loom | miri | bench-gate |
+/// headers` and nothing else, so that spelling exits non-zero. In an artifact
+/// whose whole thesis is that a benchmark nobody can reproduce persuades nobody,
+/// the reproduce line is the last place a wrong command can be afforded.
+pub const REPRODUCE_RECIPE: &str = "just bench-report";
+
 /// The row ids `docs/PHASE5.md` §9.2 requires the report to carry.
 ///
 /// A row may be [`Status::Unavailable`], but it may not be *missing*: a report
@@ -231,8 +241,12 @@ pub struct Fitness {
     pub consumers: usize,
     /// Measured busy fraction of the machine before the run.
     pub busy_fraction: f64,
-    /// Physical cores, from `/proc/cpuinfo` core ids.
+    /// Physical cores, from `/proc/cpuinfo` core ids — or the logical CPU count
+    /// when this host publishes no core ids. Read `physical_cores_known` before
+    /// quoting this at anyone.
     pub physical_cores: usize,
+    /// Whether `physical_cores` is a measurement or the logical-CPU fallback.
+    pub physical_cores_known: bool,
     /// Logical CPUs.
     pub logical_cpus: usize,
 }
@@ -246,12 +260,43 @@ impl Fitness {
     /// [`Status::Unavailable`], not that anything is estimated.
     #[must_use]
     pub fn probe(consumers: usize) -> Fitness {
+        // Every input this verdict rests on is read here and nowhere else, so
+        // that `assess` — which holds all of the judgement — can be handed a
+        // host it would take special hardware to stand in front of.
+        Fitness::assess(
+            consumers,
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            physical_cores(),
+            crate::mp::busy_fraction(Duration::from_millis(300)),
+            governors(),
+            // A debug build is not a slower release build; it is a different
+            // program. Checking it here means the CLI path (`cargo run` defaults
+            // to debug) cannot quietly publish debug latencies.
+            cfg!(debug_assertions),
+        )
+    }
+
+    /// The judgement half of [`Fitness::probe`], over measurements already taken.
+    ///
+    /// Split out because the interesting failures are hosts this one is not:
+    /// a machine that publishes no physical core count (every aarch64 host, and
+    /// many containers), and an absurd `--consumers`. Neither can be produced by
+    /// running the probe here, so neither would ever be tested through it.
+    ///
+    /// `detected_physical` is [`None`] when the host published no core ids, and
+    /// that is deliberately not the same value as `Some(logical)`.
+    #[must_use]
+    pub fn assess(
+        consumers: usize,
+        logical: usize,
+        detected_physical: Option<usize>,
+        busy: f64,
+        governors: Option<Vec<String>>,
+        debug_build: bool,
+    ) -> Fitness {
         let mut reasons = Vec::new();
 
-        // A debug build is not a slower release build; it is a different
-        // program. Checking it here means the CLI path (`cargo run` defaults to
-        // debug) cannot quietly publish debug latencies.
-        if cfg!(debug_assertions) {
+        if debug_build {
             reasons.push(
                 "built with debug assertions on; latency here measures the debug \
                  build, not the shipped one"
@@ -259,16 +304,43 @@ impl Fitness {
             );
         }
 
-        let logical = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let physical = physical_cores();
-        let needed = consumers + 1;
+        // Falling back to `logical` *silently* is the one thing this must not
+        // do. It makes `logical > physical` vacuously false, so the SMT reason
+        // never fires, and it checks the core budget against sibling threads —
+        // two PASSes about a host nothing was learned from. A refusal machine
+        // whose failure mode is a false PASS has the defect it cannot afford,
+        // so the fallback is stated and it fails both verdicts.
+        let physical = detected_physical.unwrap_or(logical);
+        let unknown_cores = detected_physical.is_none();
+        if unknown_cores {
+            reasons.push(format!(
+                "the physical core count is unknown on this host: /proc/cpuinfo publishes \
+                 no `physical id`/`core id` pairs (aarch64 never does, and many container \
+                 configurations do not), leaving {logical} logical CPUs as the only \
+                 denominator — and that one counts SMT siblings"
+            ));
+        }
+
+        // `saturating_add`, not `+`: `consumers` comes from `--consumers`, and
+        // `usize::MAX + 1` wraps to 0 in a release build, making `physical < 0`
+        // false and printing the core budget as PASS. `just bench-report` builds
+        // `--release`, so the wrap is the reachable half, not the debug panic.
+        let needed = consumers.saturating_add(1);
         // Not folded into `reasons`: this one governs the N-way rows only.
-        let core_reason = (physical < needed).then(|| {
-            format!(
+        let core_reason = if unknown_cores {
+            Some(format!(
+                "the physical core count is unknown on this host, so a {consumers}-consumer \
+                 budget cannot be checked against anything ({logical} logical CPUs counts \
+                 SMT siblings and would answer the wrong question)"
+            ))
+        } else if physical < needed {
+            Some(format!(
                 "{physical} physical cores for {consumers} consumers plus a publisher \
                  ({needed} needed); above the core count the rows measure the scheduler"
-            )
-        });
+            ))
+        } else {
+            None
+        };
         if logical > physical {
             reasons.push(format!(
                 "SMT is on ({logical} logical CPUs over {physical} physical cores); \
@@ -277,7 +349,6 @@ impl Fitness {
             ));
         }
 
-        let busy = crate::mp::busy_fraction(Duration::from_millis(300));
         if busy > crate::mp::QUIET_ENOUGH {
             reasons.push(format!(
                 "machine is {:.0}% busy before the run starts (threshold {:.0}%)",
@@ -286,7 +357,7 @@ impl Fitness {
             ));
         }
 
-        match governors() {
+        match governors {
             Some(g) if g.iter().all(|s| s == "performance") => {}
             Some(g) => reasons.push(format!(
                 "CPU frequency governor is {} on at least one CPU, not `performance`; \
@@ -309,6 +380,7 @@ impl Fitness {
             consumers,
             busy_fraction: busy,
             physical_cores: physical,
+            physical_cores_known: !unknown_cores,
             logical_cpus: logical,
         }
     }
@@ -406,7 +478,13 @@ impl Provenance {
         );
         push("interp_policy", "LerpSlerp (tf2's policy)".to_owned());
         push("cpu_model", cpu_model().unwrap_or_else(unknown));
-        push("physical_cores", physical_cores().to_string());
+        // Spelled `unknown` rather than backfilled from `available_parallelism`:
+        // this is the provenance block, and a number here is read as a measured
+        // fact about the host. See `physical_cores`.
+        push(
+            "physical_cores",
+            physical_cores().map_or_else(unknown, |n| n.to_string()),
+        );
         push(
             "logical_cpus",
             std::thread::available_parallelism()
@@ -812,13 +890,14 @@ impl Report {
             fmt_value(self.warmup_discarded_s)
         );
         s.push_str("</table>\n");
-        s.push_str(
-            "<h2>Reproducing this</h2>\n<p><code>cargo xtask bench-report</code> \
-             (or <code>just bench-report</code>) regenerates every file in this directory. \
+        let _ = write!(
+            s,
+            "<h2>Reproducing this</h2>\n<p><code>{REPRODUCE_RECIPE}</code> \
+             regenerates every file in this directory. \
              Rows marked unavailable name the command that measures them on a host that can; \
              the harness for all of them is in this repository \
              (<code>crates/tf_tree_bench/</code>), per PHASE5 §9.3's \
-             &ldquo;no private benchmark&rdquo;.</p>\n",
+             &ldquo;no private benchmark&rdquo;.</p>\n"
         );
         s
     }
@@ -829,8 +908,13 @@ impl Report {
 pub struct Options {
     /// Consumer count the comparison is scoped to (§9.1's `--consumers`).
     pub consumers: usize,
-    /// Steady-state window per point (§9.1's `--duration`).
-    pub duration: Duration,
+    // §9.1 also spells `--duration`, the steady-state window per point. There is
+    // deliberately no field for it: every row it would govern is an N-way
+    // comparison row, all of which are UNAVAILABLE here, and the one row this
+    // tool measures itself is bounded by `lookup_samples`, not by wall clock. A
+    // stored-and-never-read knob is the same quiet dishonesty the module exists
+    // to prevent, so the binary rejects the flag instead. It returns, with
+    // something to govern, when the N-way rows do.
     /// Warm-up discarded before any timing row is recorded (§9.3).
     pub warmup: Duration,
     /// Lookup samples for the latency row.
@@ -843,7 +927,6 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             consumers: 16,
-            duration: Duration::from_secs(120),
             warmup: Duration::from_secs(2),
             lookup_samples: 200_000,
             differential_queries: 50_000,
@@ -1219,7 +1302,7 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
     for _ in 0..samples {
         let t0 = Instant::now();
         let iso = plan.at(&guard, stamp).map_err(eval_failed)?;
-        hist.record(t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        hist.record(elapsed_ns(t0));
         sink += iso.t.x;
     }
 
@@ -1227,7 +1310,7 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
     let mut clock = crate::mp::Histogram::new();
     for _ in 0..samples.min(50_000) {
         let t0 = Instant::now();
-        clock.record(t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        clock.record(elapsed_ns(t0));
     }
 
     // Keep the loop from being optimised into nothing without pulling in
@@ -1245,6 +1328,20 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
     ])
 }
 
+/// Nanoseconds since `t0`, in 64-bit arithmetic.
+///
+/// `Duration::as_nanos` is `u128`, so the obvious spelling costs a 128-bit
+/// multiply-add and a 128-bit compare *per sample*. That sits after the clock
+/// read, so it never biased the recorded latency — it only widened the gap
+/// between samples. `u64` nanoseconds saturate after 584 years of uptime.
+#[inline]
+fn elapsed_ns(t0: Instant) -> u64 {
+    let d = t0.elapsed();
+    d.as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(d.subsec_nanos()))
+}
+
 /// Lift a `Copy`, non-`std::error::Error` [`tf_tree::LookupError`] into `anyhow`.
 ///
 /// Out of line so the hot loops keep a single non-inlined error path rather than
@@ -1254,13 +1351,24 @@ fn eval_failed(e: tf_tree::LookupError) -> anyhow::Error {
     anyhow!("plan evaluation failed: {e:?}")
 }
 
-/// Physical core count from `/proc/cpuinfo` `physical id` / `core id` pairs.
+/// Physical core count from `/proc/cpuinfo` `physical id` / `core id` pairs,
+/// or [`None`] when this host publishes none.
 ///
 /// `available_parallelism` counts SMT siblings, which is the wrong denominator
-/// for "can this host run N consumers without oversubscribing".
+/// for "can this host run N consumers without oversubscribing" — so this returns
+/// [`None`] rather than quietly substituting it. **aarch64 `/proc/cpuinfo`
+/// carries no `physical id` or `core id` lines at all**, and neither do many
+/// container configurations, which makes [`None`] the ordinary answer on a
+/// target this project supports rather than a corner case.
+/// [`Fitness::assess`] is what decides what to do about it.
 #[must_use]
-pub fn physical_cores() -> usize {
-    let text = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+pub fn physical_cores() -> Option<usize> {
+    physical_cores_from_cpuinfo(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default())
+}
+
+/// The parse, over text rather than over `/proc`, so it can be tested against a
+/// host this one is not.
+fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
     let mut ids = std::collections::HashSet::new();
     let (mut phys, mut core) = (None, None);
     for line in text.lines() {
@@ -1281,11 +1389,7 @@ pub fn physical_cores() -> usize {
             core = None;
         }
     }
-    if ids.is_empty() {
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
-    } else {
-        ids.len()
-    }
+    (!ids.is_empty()).then_some(ids.len())
 }
 
 fn cpu_model() -> Option<String> {
@@ -1479,8 +1583,11 @@ fn cell_html(m: &[Metric]) -> String {
 #[cfg(test)]
 mod tests {
     // A failed assertion in a unit test is the intended failure mode, and these
-    // helpers make the failure name the field it came from.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    // helpers make the failure name the field it came from. `panic!` is in the
+    // list because `expect` takes a `&str`: naming *which* metric went missing
+    // needs a formatted message, and "a metric is missing" without the key is a
+    // failure a reader has to reproduce before they can act on it.
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
 
@@ -1527,6 +1634,7 @@ mod tests {
                 consumers: 16,
                 busy_fraction: 0.01,
                 physical_cores: 4,
+                physical_cores_known: true,
                 logical_cpus: 8,
             },
             warmup_discarded_s: 1.0,
@@ -1670,6 +1778,105 @@ mod tests {
         assert_eq!(r.validate(), Ok(()));
     }
 
+    /// The four §9.3 "where we are worse" topics are as required as the rows,
+    /// and each must actually state the cost. A report that quietly shed them
+    /// reads as a clean sweep, which is the flattering-report failure mode
+    /// `validate` exists to make impossible.
+    ///
+    /// Mutants, each applied and confirmed to make this test fail: delete the
+    /// `REQUIRED_WORSE` presence loop from `validate` (the first half then
+    /// validates `Ok`); delete the empty-`statement` check (the second half
+    /// does).
+    #[test]
+    fn the_where_we_are_worse_entries_are_required_and_must_state_the_cost() {
+        let dropped = REQUIRED_WORSE[0];
+        let mut r = skeleton(false, false);
+        r.worse.retain(|w| w.id != dropped);
+        let errs = r.validate().expect_err("a dropped `worse` topic must fail");
+        assert!(errs.iter().any(|e| e.contains(dropped)), "{errs:?}");
+
+        // A *present but empty* entry is the more likely regression: the id is
+        // still there, so a presence-only check would pass it.
+        let mut r = skeleton(false, false);
+        r.worse[1].statement = "   ".to_owned();
+        let errs = r
+            .validate()
+            .expect_err("a `worse` entry that says nothing must fail");
+        assert!(
+            errs.iter().any(|e| e.contains("states nothing")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains(REQUIRED_WORSE[1])),
+            "the violation must name the offending entry: {errs:?}"
+        );
+    }
+
+    /// The remaining §9.3 row rules, each isolated so a failure names one cause:
+    /// a `measured` row must carry numbers, an `indicative` row must say why, an
+    /// `unavailable` row must carry none, and a required row may not be counted
+    /// twice (which would let a second, flattering copy sit beside the first).
+    ///
+    /// Each block picks the `skeleton` fitness that makes the *other* rules
+    /// inapplicable — otherwise the assertion would pass off the back of a rule
+    /// it is not testing.
+    ///
+    /// Mutants, each applied and confirmed to make this test fail: delete the
+    /// `r.tf_tree.is_empty() && r.tf2.is_empty()` check; delete the
+    /// `indicative`/`r.reason.trim().is_empty()` check; delete the
+    /// `!r.tf_tree.is_empty() || !r.tf2.is_empty()` check under `Unavailable`;
+    /// replace `validate`'s duplicate-count `n =>` arm with `_ => {}`.
+    #[test]
+    fn a_row_must_carry_exactly_the_evidence_its_status_claims() {
+        // `measured` with nothing to show. Fit host, so the timing rule is
+        // silent and only the missing-numbers rule can fire.
+        let mut r = skeleton(true, false);
+        r.rows[0].status = Status::Measured;
+        r.rows[0].reason = String::new();
+        let errs = r.validate().expect_err("measured with no numbers");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`measured` with no numbers")),
+            "{errs:?}"
+        );
+
+        // `indicative` with no reason. Unfit + forced is the one combination the
+        // other two indicative rules allow, so the reason rule is alone.
+        let mut r = skeleton(false, true);
+        r.rows[0].status = Status::Indicative;
+        r.rows[0].reason = "  ".to_owned();
+        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns")];
+        let errs = r.validate().expect_err("indicative with no reason");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`indicative` with no reason")),
+            "{errs:?}"
+        );
+
+        // `unavailable` and yet carrying a number. The number would render in
+        // the table beside the refusal, which is a claim wearing a disclaimer.
+        // Asserted on the `tf2` column specifically: the `tf_tree` column alone
+        // would leave the `||`'s right operand untested.
+        let mut r = skeleton(false, false);
+        r.rows[0].tf2 = vec![Metric::new("p50_ns", 42.0, "ns")];
+        let errs = r.validate().expect_err("unavailable carrying numbers");
+        assert!(
+            errs.iter().any(|e| e.contains("but carries numbers")),
+            "{errs:?}"
+        );
+
+        // A duplicated required row: present twice, so the presence check is
+        // satisfied and only the count arm can catch it.
+        let mut r = skeleton(false, false);
+        let dup = r.rows[3].clone();
+        r.rows.push(dup);
+        let errs = r.validate().expect_err("a duplicated row must fail");
+        assert!(
+            errs.iter().any(|e| e.contains("appears 2 times")),
+            "{errs:?}"
+        );
+    }
+
     /// §9.3 puts the "where we are worse" entries in the same table as the
     /// results, not in a footnote. Asserted structurally: the section header and
     /// every topic must fall between the results table's `<table>` and its
@@ -1738,6 +1945,330 @@ mod tests {
         // 2024-02-29: a leap day in a century-divisible-by-400 era.
         assert_eq!(at(1_709_164_800), "2024-02-29T00:00:00Z");
         assert_eq!(at(1_735_689_599), "2024-12-31T23:59:59Z");
+    }
+
+    /// Every command the artifact tells a stranger to run must be a command that
+    /// exists — the "Reproducing this" line at the top, and the `reproduce:`
+    /// field of every unavailable row. §9.3's "no private benchmark" is worth
+    /// nothing if the published incantation exits non-zero, and it is worse than
+    /// nothing: it teaches the reader that the rest of the page is decorative.
+    ///
+    /// Checked against the real `justfile`, the real `xtask` dispatch and the
+    /// real target files, so this fails on a renamed recipe as well as on an
+    /// invented one. `assemble` is called rather than `skeleton` because the
+    /// commands under test are the ones in the shipped rows.
+    ///
+    /// Mutant (applied, confirmed fatal): put `cargo xtask bench-report` back in
+    /// `to_html`'s "Reproducing this" block — `xtask` dispatches no such task and
+    /// this fails naming it.
+    ///
+    /// Mutant (applied, confirmed fatal): rename the `scaling_curve` row's
+    /// reproduce recipe to `just tf2-scaling-curve` — no such recipe, and this
+    /// fails.
+    #[test]
+    fn every_command_the_report_names_is_a_command_that_exists() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let justfile = std::fs::read_to_string(root.join("justfile")).expect("justfile");
+        let xtask = std::fs::read_to_string(root.join("xtask/src/main.rs")).expect("xtask main");
+
+        // `just <name>` where `<name>` is a recipe: a `justfile` recipe is a
+        // line at column 0 whose first token, up to a space or a colon, is the
+        // name. Comments start with `#`, so they cannot match a bare name.
+        let recipe_exists = |name: &str| {
+            justfile.lines().any(|l| {
+                !l.starts_with(char::is_whitespace)
+                    && l.split([' ', ':']).next().is_some_and(|r| r == name)
+            })
+        };
+
+        let mut checked = 0usize;
+        let mut check = |text: &str, whence: &str| {
+            // Strip HTML tags so `<code>just bench-report</code>` tokenises.
+            let plain: String = {
+                let mut out = String::with_capacity(text.len());
+                let mut in_tag = false;
+                for c in text.chars() {
+                    match c {
+                        '<' => in_tag = true,
+                        '>' => {
+                            in_tag = false;
+                            out.push(' ');
+                        }
+                        _ if !in_tag => out.push(c),
+                        _ => {}
+                    }
+                }
+                out
+            };
+            let word = |t: &str| {
+                t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                    .to_owned()
+            };
+            let tok: Vec<String> = plain.split_whitespace().map(String::from).collect();
+            for (i, t) in tok.iter().enumerate() {
+                match t.as_str() {
+                    "just" => {
+                        let name = word(tok.get(i + 1).map_or("", String::as_str));
+                        assert!(
+                            recipe_exists(&name),
+                            "{whence} says `just {name}`, which is not a justfile recipe"
+                        );
+                        checked += 1;
+                    }
+                    "cargo" if tok.get(i + 1).map(String::as_str) == Some("xtask") => {
+                        let name = word(tok.get(i + 2).map_or("", String::as_str));
+                        assert!(
+                            xtask.contains(&format!("Some(\"{name}\")")),
+                            "{whence} says `cargo xtask {name}`, which xtask does not dispatch"
+                        );
+                        checked += 1;
+                    }
+                    // `--bench X` / `--test X` name files cargo must be able to
+                    // find; a renamed harness is the same class of rot.
+                    "--bench" | "--test" => {
+                        let dir = if t == "--bench" { "benches" } else { "tests" };
+                        let name = word(tok.get(i + 1).map_or("", String::as_str));
+                        let path = root.join("crates/tf_tree_bench").join(dir);
+                        assert!(
+                            path.join(format!("{name}.rs")).exists(),
+                            "{whence} says `{t} {name}`, but {} has no {name}.rs",
+                            path.display()
+                        );
+                        checked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        let opts = Options {
+            lookup_samples: 1,
+            differential_queries: 64,
+            warmup: Duration::from_millis(1),
+            ..Options::default()
+        };
+        let r = assemble(&opts).expect("assemble");
+        for row in &r.rows {
+            check(row.reproduce, row.id);
+        }
+        let html = r.to_html();
+        let block = html
+            .split_once("<h2>Reproducing this</h2>")
+            .expect("the report must tell a reader how to reproduce it")
+            .1;
+        check(block, "the `Reproducing this` block");
+
+        // Guards the parser itself: if `check` silently matched nothing, every
+        // assertion above would be vacuous and this test would pass on a report
+        // naming only fictional commands.
+        assert!(
+            checked >= 8,
+            "only {checked} commands were checked — the scanner matched nothing"
+        );
+    }
+
+    /// A real x86-64 `/proc/cpuinfo` fragment (two SMT siblings per core, four
+    /// cores across two sockets) and a real aarch64 one, which carries no
+    /// `physical id` or `core id` lines at all.
+    ///
+    /// Non-degenerate on purpose: the x86 text repeats `core id: 0` on socket 0
+    /// and again on socket 1, so a parse that keyed on `core id` alone would
+    /// answer 2 instead of 4.
+    const X86_CPUINFO: &str = "\
+processor\t: 0
+physical id\t: 0
+core id\t\t: 0
+processor\t: 1
+physical id\t: 0
+core id\t\t: 1
+processor\t: 2
+physical id\t: 0
+core id\t\t: 0
+processor\t: 3
+physical id\t: 0
+core id\t\t: 1
+processor\t: 4
+physical id\t: 1
+core id\t\t: 0
+processor\t: 5
+physical id\t: 1
+core id\t\t: 1
+";
+    const AARCH64_CPUINFO: &str = "\
+processor\t: 0
+BogoMIPS\t: 50.00
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32
+CPU implementer\t: 0x41
+CPU part\t: 0xd0c
+processor\t: 1
+BogoMIPS\t: 50.00
+CPU implementer\t: 0x41
+CPU part\t: 0xd0c
+";
+
+    /// `/proc/cpuinfo` publishes no core ids on aarch64 — the target
+    /// `CLAUDE.md` requires CI to cover — nor in many containers. The parse must
+    /// say so rather than answer with the logical CPU count, which is the wrong
+    /// denominator by this function's own documentation.
+    ///
+    /// Mutant (applied, confirmed fatal): make the parse fall back to
+    /// `available_parallelism()` instead of returning `None` — the aarch64 half
+    /// then yields `Some(n)` and this fails.
+    #[test]
+    fn a_host_that_publishes_no_core_ids_is_unknown_not_guessed() {
+        assert_eq!(physical_cores_from_cpuinfo(X86_CPUINFO), Some(4));
+        assert_eq!(physical_cores_from_cpuinfo(AARCH64_CPUINFO), None);
+        assert_eq!(physical_cores_from_cpuinfo(""), None);
+    }
+
+    /// The verdicts must degrade honestly when the physical core count is
+    /// unknown. A silent fallback to logical CPUs makes `logical > physical`
+    /// vacuously false — so the SMT reason never fires — and checks the core
+    /// budget against sibling threads, and the visible result is
+    /// `clock fitness: PASS` / `core budget: PASS` on a host nothing was learned
+    /// from. A false PASS is the one failure a refusal machine cannot afford.
+    ///
+    /// `debug_build: false` throughout, so `fair_for_timing` is decided by the
+    /// host facts rather than by the fact that tests run in a debug build.
+    ///
+    /// Mutant (applied, confirmed fatal): in `assess`, drop both `unknown_cores`
+    /// branches and keep only `let physical = detected_physical
+    /// .unwrap_or(logical);` — the unknown host then reports
+    /// `fair_for_timing == true` and `core_reason == None`, and this fails.
+    #[test]
+    fn an_unknown_physical_core_count_fails_both_verdicts_and_says_why() {
+        // A known-good host: quiet, `performance`, no SMT, cores to spare.
+        // This is the control — without it the assertions below could be passing
+        // because `assess` refuses everything.
+        let ok = Fitness::assess(
+            4,
+            8,
+            Some(8),
+            0.01,
+            Some(vec!["performance".to_owned(); 8]),
+            false,
+        );
+        assert!(ok.fair_for_timing, "{:?}", ok.reasons);
+        assert!(ok.enough_cores, "{:?}", ok.core_reason);
+        assert!(ok.physical_cores_known);
+
+        // The same host, except that it published no core ids.
+        let blind = Fitness::assess(
+            4,
+            8,
+            None,
+            0.01,
+            Some(vec!["performance".to_owned(); 8]),
+            false,
+        );
+        assert!(!blind.physical_cores_known);
+        assert!(
+            !blind.fair_for_timing,
+            "an unmeasured host must not pass the clock verdict"
+        );
+        assert!(
+            blind
+                .reasons
+                .iter()
+                .any(|r| r.contains("physical core count is unknown")),
+            "{:?}",
+            blind.reasons
+        );
+        assert!(
+            !blind.enough_cores,
+            "a core budget checked against SMT siblings is not a budget check"
+        );
+
+        // The SMT reason is the one that goes quiet under a silent fallback, so
+        // it is pinned separately: a genuine SMT host must still name it.
+        let smt = Fitness::assess(
+            2,
+            8,
+            Some(4),
+            0.01,
+            Some(vec!["performance".to_owned(); 8]),
+            false,
+        );
+        assert!(
+            smt.reasons.iter().any(|r| r.contains("SMT is on")),
+            "{:?}",
+            smt.reasons
+        );
+    }
+
+    /// `--consumers` is operator input. `consumers + 1` wraps to 0 at
+    /// `usize::MAX` in a release build, making `physical < needed` false, so the
+    /// core budget prints PASS and the N-way rows become claimable — the refusal
+    /// inverted by an argument. `just bench-report` builds `--release`, so the
+    /// wrap is the reachable half; a debug build panics instead, and neither is
+    /// acceptable.
+    ///
+    /// Mutant (applied, confirmed fatal): restore `let needed = consumers + 1;`
+    /// — this test panics with `attempt to add with overflow` under `cargo
+    /// nextest` (debug), and reports `enough_cores == true` under `--release`.
+    #[test]
+    fn an_absurd_consumer_count_still_refuses_the_core_budget() {
+        let f = Fitness::assess(
+            usize::MAX,
+            8,
+            Some(8),
+            0.01,
+            Some(vec!["performance".to_owned(); 8]),
+            false,
+        );
+        assert!(
+            !f.enough_cores,
+            "8 physical cores cannot host usize::MAX consumers"
+        );
+        assert!(
+            f.core_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("physical cores for")),
+            "{:?}",
+            f.core_reason
+        );
+    }
+
+    /// `measure_lookup_latency` is the only real measurement in this module, and
+    /// `assemble` reaches it only when the clock-fitness probe passes — which
+    /// running the test suite actively prevents, since the suite is what makes
+    /// the machine busy. Left to `assemble`, the one code path whose numbers ever
+    /// get published as a claim would be the one path no test executes. So it is
+    /// called here directly, at a sample count that costs milliseconds.
+    ///
+    /// Mutant (applied, confirmed fatal): change the measured loop's bound to
+    /// `for _ in 0..samples.min(100)` — the `samples` metric then reports 100 and
+    /// the first assertion fails.
+    ///
+    /// Mutant (applied, confirmed fatal): swap the `p50_ns` and `p999_ns` rows of
+    /// the returned vector — the ordering assertion fails.
+    #[test]
+    fn the_lookup_measurement_reports_every_sample_and_ordered_percentiles() {
+        const SAMPLES: usize = 4_096;
+        let m = measure_lookup_latency(SAMPLES, Duration::from_millis(5))
+            .expect("the fixture must measure");
+        let get = |k: &str| {
+            m.iter()
+                .find(|x| x.key == k)
+                .unwrap_or_else(|| panic!("metric `{k}` is missing from {m:?}"))
+                .value
+        };
+
+        // Every sample must reach the histogram: a loop that silently recorded
+        // fewer would still produce plausible percentiles.
+        assert_eq!(get("samples"), SAMPLES as f64);
+
+        let (p50, p99, p999) = (get("p50_ns"), get("p99_ns"), get("p999_ns"));
+        assert!(p50 <= p99 && p99 <= p999, "p50={p50} p99={p99} p999={p999}");
+        // A p50 of 0 ns would mean the histogram recorded a constant, not a
+        // measurement — the degenerate fixture this repo has shipped before.
+        assert!(p50 > 0.0, "p50 of {p50} ns is not a measurement");
+        // A depth-3 in-process lookup taking a millisecond at the *median* means
+        // the unit is wrong or the fixture is not the fixture. Loose enough to
+        // survive a contended test runner, tight enough to catch a unit error.
+        assert!(p50 < 1_000_000.0, "p50 of {p50} ns is not a depth-3 lookup");
+        assert!(get("clock_overhead_p50_ns") >= 0.0);
+        assert!(m.iter().all(|x| x.value.is_finite()), "{m:?}");
     }
 
     /// End-to-end: the report this tool actually assembles on *this* host must
