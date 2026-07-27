@@ -82,6 +82,15 @@ impl Tree {
     /// last case is a hard error by §2.4 and the remedy is to re-freeze — a
     /// `.tft` is a cache, not an archive, and `tf_tree doctor --explain-version`
     /// prints the same reasoning.
+    /// # Why there is no `populate_hot` here
+    ///
+    /// A shared-memory attach prefaults its used extents, because a control loop
+    /// must not take a page-fault storm on its first iteration. A `.tft` is the
+    /// opposite case and §2.2 says so: a dataloader worker seeks to the
+    /// timestamps its batch needs and never touches the rest, and the win is
+    /// precisely that untouched pages cost nothing across sixteen workers.
+    /// Prefaulting a 233 MB index to serve a query that reads four pages of it
+    /// would throw that away.
     pub fn open_frozen(path: &Path) -> Result<Tree, FrozenFileError> {
         let file = std::fs::File::open(path).map_err(|e| path_err(&e))?;
         let arena = FrozenArena::open(file.into())?;

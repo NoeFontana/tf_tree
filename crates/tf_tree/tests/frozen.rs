@@ -269,7 +269,9 @@ fn freezing_carries_the_counter_regions() {
 /// `fetch_add` on a writable view, so a frozen tree that reported itself
 /// writable would kill the process on the *first lookup*, not on an attempted
 /// publish. Mutant: make `ArenaBacking::Frozen`'s `is_writable` return `true` ⇒
-/// verified, this test aborts with SIGSEGV on the `drop(g)` below.
+/// verified, this test aborts with SIGSEGV on the `drop(g)` below. Second
+/// mutant: bypass the `!self.arena.is_writable()` branch in `Tree::frame` ⇒
+/// verified, SIGSEGV on the unknown-name probe.
 #[test]
 fn a_frozen_tree_refuses_every_mutation() {
     let live = fixture();
@@ -283,6 +285,17 @@ fn a_frozen_tree_refuses_every_mutation() {
     assert!(frozen
         .lookup("map", "imu", Stamp::<SystemDomain>::from_nanos(1800 * MS))
         .is_ok());
+
+    // Resolving a name the file *does not* contain must be an error, not a
+    // fault. `Tree::frame` interns on demand, and interning publishes into the
+    // frame hash table with a `compare_exchange` — through a `PROT_READ`
+    // mapping that is a `SIGSEGV`, and it is reachable from the most ordinary
+    // possible typo. The read-only branch that catches it predates this
+    // backend; what is new is that a frozen tree takes it.
+    assert!(
+        frozen.frame("a_frame_that_was_never_declared").is_err(),
+        "interning through a read-only mapping must not be attempted"
+    );
 
     let p = frozen.frame("map").unwrap();
     let c = frozen.frame("odom").unwrap();
