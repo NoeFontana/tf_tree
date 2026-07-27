@@ -24,6 +24,7 @@ pub mod catalogue;
 pub mod checks;
 pub mod doctor;
 pub mod hostfacts;
+pub mod topology;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -114,6 +115,26 @@ enum Command {
         #[arg(long, short)]
         out: std::path::PathBuf,
     },
+    /// Obtain, validate or explain a bridge topology file (`docs/PHASE4.md` §5.8).
+    ///
+    /// The engine has no runtime edge declaration, so the ingest bridge is told
+    /// its topology up front. `--discover` is how an operator obtains that file
+    /// from a robot; `--config` is the pre-flight that fails on a laptop rather
+    /// than at bridge startup.
+    Topology {
+        /// Read a recorded `/tf` stream and print the config it implies.
+        #[arg(long, value_name = "FILE.tfstream", conflicts_with = "config")]
+        discover: Option<std::path::PathBuf>,
+        /// Parse a topology file, build the arena it describes, and print it.
+        #[arg(long, value_name = "FILE.toml")]
+        config: Option<std::path::PathBuf>,
+        /// Write the discovered config here instead of to stdout.
+        #[arg(long, short, requires = "discover")]
+        out: Option<std::path::PathBuf>,
+        /// Seconds of history the discovered rings should retain.
+        #[arg(long, default_value_t = 10.0, requires = "discover")]
+        history_secs: f64,
+    },
     /// List the processes attached to an arena, from the lock file alone.
     ///
     /// Reads `<runtime_dir>/<domain>/<name>.lock` and **never maps the arena**
@@ -156,6 +177,22 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Bench { gate } => cmd_bench(gate),
+        Command::Topology {
+            discover,
+            config,
+            out,
+            history_secs,
+        } => match (discover, config) {
+            (Some(src), _) => topology::cmd_discover(&src, out.as_deref(), history_secs),
+            (None, Some(cfg)) => topology::cmd_check(&cfg),
+            // clap cannot express "one of these two" without a group, and a
+            // group's error message names the flags without saying what the
+            // command is for. This one does.
+            (None, None) => Err(anyhow::anyhow!(
+                "give --discover <file.tfstream> to obtain a topology file, \
+                 or --config <file.toml> to check one"
+            )),
+        },
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
         #[cfg(all(feature = "shm", target_os = "linux"))]

@@ -37,6 +37,10 @@ tf_tree_math.workspace = true
 # The CLI operates on an in-process tree; Phase 1 has no cross-process attach
 # (that is Phase 2 shared memory), so it drives the shared benchmark fixture.
 tf_tree_bench.workspace = true
+# **`docs/PHASE4.md` §5.8's `--discover`.** The collector and the config format
+# live in the bridge because the `rclcpp` half needs them too; the CLI is the
+# host-side front end that feeds them a `.tfstream` instead of a subscription.
+tf_tree_bridge = { path = "../tf_tree_bridge" }
 anyhow.workspace = true
 clap.workspace = true
 # `tf_tree participants` reads the lock file **without the arena** (§3.3), which
