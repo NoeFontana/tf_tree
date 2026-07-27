@@ -48,7 +48,7 @@ mod frozen;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use frozen::FrozenFileError;
 #[cfg(all(feature = "shm", target_os = "linux"))]
-pub use tf_tree_arena::{FrozenError, FrozenHeader};
+pub use tf_tree_arena::{FrozenError, FrozenHeader, ARENA_FILE_ALIGN};
 
 pub use tree::{
     BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, ReparentError, Tree,
