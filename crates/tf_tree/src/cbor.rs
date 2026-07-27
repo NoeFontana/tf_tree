@@ -6,7 +6,8 @@
 //! variable-length, and worth being able to inspect with a generic tool.
 //! Everything hot is in the arena." The value of that choice is entirely
 //! *external* — `cbor2`, `cbor-diag`, `jq` after a conversion — and none of it
-//! requires a serialization framework on this side to encode nine fixed keys.
+//! requires a serialization framework on this side to encode a seven-key map of
+//! fixed keys and one array of eight-key ones.
 //!
 //! It lives in the facade rather than in `tf_tree_arena` for two reasons. The
 //! arena crate's dependency and *scope* budget is bytes and mappings; it takes
@@ -158,9 +159,15 @@ mod tests {
     ///
     /// `i64::MIN` is not a corner nobody hits: `created_unix_ns` and every stamp
     /// in the manifest are `i64`, and a sentinel of `i64::MIN` is exactly what an
-    /// uninitialised one looks like. Mutant: write `self.head(1, (-1 - v) as u64)`
-    /// ⇒ the `i64::MIN` case panics on overflow in a debug build, which is what
-    /// `cargo nextest` runs.
+    /// uninitialised one looks like. Mutant: write `self.head(1, (-v) as u64)`,
+    /// dropping the RFC's `-1 -` offset ⇒ verified, the first assertion fails
+    /// with `[0x21]` against `[0x20]`. (It would also panic on `-(i64::MIN)`
+    /// two lines further down, which is the overflow [`Writer::i64`]'s own
+    /// comment names; the run never gets that far.)
+    ///
+    /// `(-1 - v) as u64` is *not* a mutant that dies here, and it is worth
+    /// saying so, because it reads like one: `-1 - i64::MIN` is `i64::MAX`, so
+    /// it neither overflows nor differs from `!(v as u64)` for any negative `v`.
     #[test]
     fn negative_integers_match_the_rfc_vectors() {
         assert_eq!(enc(|w| w.i64(-1)), [0x20]);

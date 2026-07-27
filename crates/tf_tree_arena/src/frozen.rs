@@ -173,7 +173,7 @@ pub enum FrozenError {
     },
     /// The arena image mapped, but its [`ArenaHeader`] did not validate.
     ///
-    /// The *same* checks a `memfd` attach makes — see [`crate::check`].
+    /// The *same* checks a `memfd` attach makes — see the `check` module.
     Arena(ShmError),
 }
 
@@ -196,6 +196,27 @@ const SNAPSHOT_CHUNK: usize = 64 * 1024;
 /// unwritten, so on any filesystem that supports sparse files it costs no
 /// blocks.
 ///
+/// # The container header is written **last**, and that is the whole crash story
+///
+/// The file cannot be short: `ftruncate` sizes it up front so the gap is a hole,
+/// so "a crash leaves a short file that the `file_size` check catches" is not
+/// available and never was. A `SIGKILL`, a panic or an `ENOSPC` part-way through
+/// the arena copy leaves a **full-length** file whose header would validate and
+/// whose arena tail is zeros — an `ArenaHeader` in the first chunk, a valid
+/// `layout_hash`, and every edge past the copied prefix reading back as
+/// "published, stamp 0, zero quaternion". Silently wrong data, not a refusal.
+///
+/// So the order here is: discard any previous content, size the file, write the
+/// manifest, write the arena, flush, and only then `pwrite` the header at offset
+/// 0. Until that last write lands, offset 0 holds the zeros `ftruncate` left and
+/// [`FrozenArena::open`] refuses the file on [`FrozenError::BadMagic`]. The
+/// header is 128 bytes inside one block, so it lands or it does not.
+///
+/// The leading `ftruncate(fd, 0)` is load-bearing, not tidiness: `fd` may be
+/// re-freezing over a previous `.tft` of the same geometry, whose header is
+/// byte-identical to this one's. Without the discard, that stale header would
+/// certify a half-written body.
+///
 /// # The snapshot is not atomic, and `--from-live` cannot make it one
 ///
 /// A live arena has publishers storing into it while this runs. There is no
@@ -209,8 +230,13 @@ const SNAPSHOT_CHUNK: usize = 64 * 1024;
 /// one (§3), when a clean index matters.
 ///
 /// The copy goes through a chunk buffer rather than forming a `&[u8]` over the
-/// arena, because a shared reference over memory a peer is concurrently storing
-/// into is not something this crate is entitled to create.
+/// arena. That avoids fabricating a shared reference over memory a peer is
+/// concurrently storing into — but it does **not** make the read race-free:
+/// `copy_nonoverlapping` is a non-atomic bulk load of the same bytes and is a
+/// data race under the same model. The race is deliberate and unavoidable (there
+/// is no point-in-time snapshot of another process's memory to take); what the
+/// per-slot seqlock buys is that the *result* is interpretable — a slot caught
+/// mid-publish reads back as `SlotContended` rather than as a plausible pose.
 ///
 /// # Errors
 ///
@@ -224,9 +250,31 @@ pub fn write_frozen<A: Arena + ?Sized>(
     created_unix_ns: i64,
     tool_version: [u8; 32],
 ) -> Result<FrozenHeader, FrozenError> {
+    let header = plan_header(
+        arena.len() as u64,
+        manifest.len() as u64,
+        source_digest,
+        created_unix_ns,
+        tool_version,
+    )?;
+    write_body(fd, arena, manifest, &header)?;
+    commit_header(fd, &header)?;
+    Ok(header)
+}
+
+/// The [`FrozenHeader`] that describes a file with this arena and this manifest.
+///
+/// Pure arithmetic: it decides the geometry before a byte is written, so
+/// [`write_body`] knows where the arena goes and [`commit_header`] has something
+/// to publish at the end.
+fn plan_header(
+    arena_size: u64,
+    manifest_len: u64,
+    source_digest: [u8; 32],
+    created_unix_ns: i64,
+    tool_version: [u8; 32],
+) -> Result<FrozenHeader, FrozenError> {
     let manifest_off = FROZEN_HEADER_SIZE as u64;
-    let manifest_len = manifest.len() as u64;
-    let arena_size = arena.len() as u64;
     let arena_off = manifest_off
         .checked_add(manifest_len)
         .map(|end| end.div_ceil(ARENA_FILE_ALIGN) * ARENA_FILE_ALIGN)
@@ -235,14 +283,14 @@ pub fn write_frozen<A: Arena + ?Sized>(
         .checked_add(arena_size)
         .ok_or(FrozenError::HeaderInconsistent)?;
 
-    let header = FrozenHeader {
+    Ok(FrozenHeader {
         magic: FROZEN_MAGIC,
         format_version: FORMAT_VERSION,
         layout_hash: layout_hash(),
         file_size,
         // Both fit: `manifest_off` is a constant and `arena_off` bounds
-        // `manifest_len`, which the `u64::from` round-trip below re-checks
-        // rather than assuming.
+        // `manifest_len`. `try_from` rather than `as`, so a manifest that
+        // somehow exceeded `u32` is a refusal and not a truncated offset.
         manifest_off: u32::try_from(manifest_off).map_err(|_| FrozenError::HeaderInconsistent)?,
         manifest_len: u32::try_from(manifest_len).map_err(|_| FrozenError::HeaderInconsistent)?,
         arena_off,
@@ -251,15 +299,31 @@ pub fn write_frozen<A: Arena + ?Sized>(
         created_unix_ns,
         tool_version,
         _reserved: [0; 8],
-    };
+    })
+}
 
-    // Size the file first. Everything below is `pwrite` at an explicit offset,
+/// Everything except the container header: the manifest, and the arena image.
+///
+/// Separate from [`commit_header`] so the ordering this module depends on is a
+/// property of two calls in [`write_frozen`] rather than of a comment, and so a
+/// test can produce the exact file a crash would leave.
+fn write_body<A: Arena + ?Sized>(
+    fd: BorrowedFd<'_>,
+    arena: &A,
+    manifest: &[u8],
+    header: &FrozenHeader,
+) -> Result<(), FrozenError> {
+    // Discard first. See `write_frozen`'s docs: a previous `.tft` of the same
+    // geometry would otherwise leave a *valid* header at offset 0 certifying the
+    // body this call is only part-way through writing.
+    rustix::fs::ftruncate(fd, 0).map_err(FrozenError::Io)?;
+    // Then size the file up. Everything below is `pwrite` at an explicit offset,
     // so the file must already be long enough for the sparse gap to exist;
     // truncating afterwards would instead *discard* a short final write.
-    rustix::fs::ftruncate(fd, file_size).map_err(FrozenError::Io)?;
-    pwrite_all(fd, bytemuck::bytes_of(&header), 0)?;
-    pwrite_all(fd, manifest, manifest_off)?;
+    rustix::fs::ftruncate(fd, header.file_size).map_err(FrozenError::Io)?;
+    pwrite_all(fd, manifest, u64::from(header.manifest_off))?;
 
+    let arena_off = header.arena_off;
     let mut buf = vec![0u8; SNAPSHOT_CHUNK];
     let mut done = 0usize;
     while done < arena.len() {
@@ -268,15 +332,27 @@ pub fn write_frozen<A: Arena + ?Sized>(
         // bytes for as long as `arena` is borrowed, and `done + n <= len()`.
         // `buf` is a distinct owned allocation of at least `n` bytes, so the
         // ranges cannot overlap. A concurrent publisher may be storing into the
-        // source; see this function's docs for why that is a smear rather than
-        // unsoundness in the reader above.
+        // source; see `write_frozen`'s docs for why that race is deliberate and
+        // what makes its result interpretable.
         unsafe {
             core::ptr::copy_nonoverlapping(arena.base().add(done), buf.as_mut_ptr(), n);
         }
         pwrite_all(fd, &buf[..n], arena_off + done as u64)?;
         done += n;
     }
-    Ok(header)
+    Ok(())
+}
+
+/// Publish the container header at offset 0 — the file's commit point.
+///
+/// The `fdatasync` first is what extends the ordering guarantee from "this
+/// process died" to "the machine lost power": without it the header block may
+/// reach the platter before the arena blocks, and the file that comes back is
+/// exactly the one [`write_frozen`]'s ordering exists to prevent. It costs one
+/// flush per freeze, on a path that already wrote the whole arena.
+fn commit_header(fd: BorrowedFd<'_>, header: &FrozenHeader) -> Result<(), FrozenError> {
+    rustix::fs::fdatasync(fd).map_err(FrozenError::Io)?;
+    pwrite_all(fd, bytemuck::bytes_of(header), 0)
 }
 
 /// `pwrite` until every byte of `buf` has landed at `off`.
@@ -327,7 +403,16 @@ pub struct FrozenArena {
     /// whose manifest could only be read before the arena was mapped would be an
     /// awkward API for no gain.
     file: OwnedFd,
-    header: FrozenHeader,
+    /// **Boxed, and the indirection is the point.** `FrozenHeader` is 128 bytes
+    /// of cold provenance, and `FrozenArena` is a variant of the `ArenaBacking`
+    /// enum inside `tf_tree::Tree` — the hottest struct in the workspace, sized
+    /// by its largest variant. Stored inline it grew `size_of::<Tree>()` from
+    /// 224 to 344 bytes, pushing `Tree` from four cache lines to six and
+    /// charging that to the `Heap` and `Mapped` backings too, which never touch
+    /// a `FrozenHeader`. Nothing after `open` reads it on any path that runs
+    /// more than once per file. (`docs/PROJECT.md` §5 D4 forbids `Box` *inside
+    /// an arena structure* — this is a process-local handle, not arena bytes.)
+    header: alloc::boxed::Box<FrozenHeader>,
 }
 
 impl FrozenArena {
@@ -414,7 +499,7 @@ impl FrozenArena {
             base,
             len,
             file: fd,
-            header,
+            header: alloc::boxed::Box::new(header),
         };
         // Best effort, per §2.4: a kernel without transparent huge pages, or one
         // that declines to mark this mapping, is not a reason to fail an open.
@@ -577,9 +662,14 @@ mod tests {
     fn scratch() -> OwnedFd {
         use rustix::fs::{Mode, OFlags};
         let mut name = alloc::string::String::from("/tmp/tf_tree_frozen_test_");
-        // The pid is enough: nextest runs each test in its own process.
+        // Pid *and* a counter. The pid alone is enough under nextest (a process
+        // per test) but not under `cargo test`, which runs this module's tests
+        // as threads of one process — two of them would then race on the same
+        // path and the loser's `unlink` would fail.
+        static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let pid = rustix::process::getpid().as_raw_nonzero().get();
-        name.push_str(&alloc::format!("{pid}"));
+        let n = N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        name.push_str(&alloc::format!("{pid}_{n}"));
         let path = alloc::ffi::CString::new(name).unwrap();
         let fd = rustix::fs::open(
             &path,
@@ -607,6 +697,113 @@ mod tests {
     fn frozen_header_has_no_padding() {
         assert_eq!(core::mem::size_of::<FrozenHeader>(), FROZEN_HEADER_SIZE);
         assert_eq!(core::mem::align_of::<FrozenHeader>(), 8);
+    }
+
+    /// A `FrozenArena` is a variant of `tf_tree::Tree`'s backing enum, so its
+    /// size is charged to every tree in the workspace, including heap ones.
+    ///
+    /// Four pointer-ish words is base + len + fd + boxed header. Mutant: store
+    /// the `FrozenHeader` inline instead of boxing it ⇒ 152 bytes, and this
+    /// fails. (The bound is what keeps `size_of::<Tree>()` at its pre-Phase-5
+    /// 224; the `Tree`-side number is not asserted here because `tf_tree` is
+    /// three crates up.)
+    #[test]
+    fn the_frozen_handle_stays_pointer_sized() {
+        assert!(
+            core::mem::size_of::<FrozenArena>() <= 4 * core::mem::size_of::<usize>(),
+            "FrozenArena is {} bytes",
+            core::mem::size_of::<FrozenArena>()
+        );
+    }
+
+    /// A crash between the last arena byte and the container header must leave a
+    /// file that will not open — not one that opens and serves zeros.
+    ///
+    /// `ftruncate` sizes the file up front, so a crash never leaves a *short*
+    /// file: it leaves a full-length one with a zeroed tail. The only thing
+    /// standing between that and a silently-wrong offline dataset is that the
+    /// header is written last. This reproduces the exact bytes such a crash
+    /// leaves by calling the same `write_body` that `write_frozen` calls, and
+    /// then stopping.
+    ///
+    /// The scratch fd deliberately already holds a **complete, valid `.tft` of
+    /// identical geometry** — the re-freeze-over-yesterday's-file case — so its
+    /// header is byte-for-byte the header the interrupted write would have
+    /// published. Mutant: drop the leading `ftruncate(fd, 0)` in `write_body` ⇒
+    /// that stale header survives, the file opens, and the assertion fails; the
+    /// second half of the test then shows it would have served the *old* arena's
+    /// bytes under the new one's header.
+    #[test]
+    fn a_crash_before_the_header_lands_leaves_an_unopenable_file() {
+        let layout = fixture();
+        let mut first = HeapArena::new(&layout, 1, 1, [1; 16]);
+        let mut second = HeapArena::new(&layout, 1, 1, [1; 16]);
+        // Distinguishable bodies, or "it opened" could not be told from "it
+        // opened the wrong file".
+        scribble(&mut first, 0x11);
+        scribble(&mut second, 0x22);
+        assert_ne!(bytes(&first), bytes(&second), "fixture is degenerate");
+
+        let fd = scratch();
+        let manifest = b"\xa1\x64test\x01";
+        let complete = write_frozen(fd.as_fd(), &first, manifest, [0; 32], 1, [0; 32]).unwrap();
+        FrozenArena::open(dup(&fd)).expect("the complete file must open");
+
+        // Now the crash: the body of a *second* freeze lands, the header does
+        // not. Same geometry, so the bytes at offset 0 are the only difference
+        // between this file and a good one.
+        let planned = plan_header(
+            second.len() as u64,
+            manifest.len() as u64,
+            [0; 32],
+            1,
+            [0; 32],
+        )
+        .unwrap();
+        assert_eq!(planned.file_size, complete.file_size, "geometry differs");
+        write_body(fd.as_fd(), &second, manifest, &planned).unwrap();
+
+        assert_eq!(
+            FrozenArena::open(dup(&fd)).unwrap_err(),
+            FrozenError::BadMagic,
+            "a body with no header must not open"
+        );
+
+        // And once the header is committed the same file is good — so the
+        // refusal above is the ordering, not a file this test broke.
+        commit_header(fd.as_fd(), &planned).unwrap();
+        let opened = FrozenArena::open(fd).unwrap();
+        // SAFETY: both arenas are live and `len` bytes each.
+        let mapped =
+            unsafe { core::slice::from_raw_parts(opened.base().cast_const(), opened.len()) };
+        assert_eq!(mapped, bytes(&second));
+    }
+
+    /// Fill the pose region with a recognisable, non-zero pattern.
+    ///
+    /// `HeapArena::new` zeroes everything past the header, so two fresh arenas
+    /// of the same layout are byte-identical and any "did the body change"
+    /// assertion would hold vacuously.
+    fn scribble(arena: &mut HeapArena, tag: u8) {
+        let off = fixture().pose_arena().offset;
+        // SAFETY: the pose region is non-empty for this fixture and `off + 64`
+        // is inside it; the caller uniquely owns the allocation (`&mut`).
+        unsafe {
+            for i in 0..64u8 {
+                *arena.base().add(off + i as usize) = i ^ tag;
+            }
+        }
+    }
+
+    fn bytes(arena: &HeapArena) -> &[u8] {
+        // SAFETY: the arena is live and `len()` bytes long.
+        unsafe { core::slice::from_raw_parts(arena.base().cast_const(), arena.len()) }
+    }
+
+    /// A second handle on the same open file description, so a test can attempt
+    /// an `open` (which consumes the fd) and still keep writing to the file.
+    fn dup(fd: &OwnedFd) -> OwnedFd {
+        rustix::io::dup(fd).unwrap()
     }
 
     /// A `.tft` round-trips: the mapped image is byte-for-byte the arena that
@@ -653,12 +850,31 @@ mod tests {
     ///
     /// Mutant: round `arena_off` up to 4096 instead of `ARENA_FILE_ALIGN` ⇒
     /// fails, and the manifest here is far too short to reach 2 MiB by accident.
+    /// ...and the 2 MiB it skips is a **hole**, not two megabytes of zeros.
+    ///
+    /// §2.3 pays for huge-page eligibility with padding, and the padding is only
+    /// free because nothing writes it: `ftruncate` sizes the file and every
+    /// subsequent write is a `pwrite` at an explicit offset. A 25 KB arena in a
+    /// 2.1 MB file must therefore occupy well under 100 KB of blocks — the bound
+    /// below is loose enough for any block size up to 64 KiB and still an order
+    /// of magnitude under a filled gap. Mutant: in `write_body`, `pwrite_all` a
+    /// `vec![0u8; (arena_off - manifest_end) as usize]` into the gap ⇒ `st_blocks`
+    /// jumps to the full file size and this fails.
     #[test]
-    fn the_arena_image_is_two_megabyte_aligned() {
+    fn the_arena_image_is_two_megabyte_aligned_and_the_gap_is_a_hole() {
         let arena = HeapArena::new(&fixture(), 0, 0, [0; 16]);
-        let (_fd, h) = freeze(&arena, b"x");
+        let (fd, h) = freeze(&arena, b"x");
         assert_eq!(h.arena_off % ARENA_FILE_ALIGN, 0);
         assert!(h.arena_off > FROZEN_HEADER_SIZE as u64);
+
+        let st = rustix::fs::fstat(&fd).unwrap();
+        // `st_blocks` is in 512-byte units by POSIX, whatever the fs block size.
+        let allocated = st.st_blocks as u64 * 512;
+        assert!(
+            allocated < h.file_size / 8,
+            "{allocated} bytes allocated for a {} byte file: the gap is not sparse",
+            h.file_size
+        );
     }
 
     /// A `.tft` from a different build must be refused, not reinterpreted.

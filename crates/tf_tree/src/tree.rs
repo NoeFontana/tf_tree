@@ -1147,6 +1147,21 @@ impl Tree {
     /// are still only mutated through [`Self::claim`]/[`Self::reparent`]). It is
     /// the one accessor Phase 1 tooling needs to walk the tree without a running
     /// writer.
+    ///
+    /// # One method on the returned view is not read-only
+    ///
+    /// [`ArenaView::intern`] publishes into the arena's hash table with a
+    /// `compare_exchange`. Against a read-only backing — a `ReadOnly`
+    /// `attach_shared`, or a `.tft` opened with [`Tree::open_frozen`] — that
+    /// store reaches a `PROT_READ` page and the process takes `SIGSEGV`, which
+    /// no `Result` can catch. Use [`Tree::frame`], which checks
+    /// [`Tree::is_writable`] first and returns [`FrameError::ReadOnly`].
+    ///
+    /// `intern` does not make the check itself because `ArenaView`'s `writable`
+    /// flag defaults to `false` and this crate is not the only thing that builds
+    /// one; moving the guard down is a change to `tf_tree_core`'s contract (it
+    /// also gates the §5 counters) and belongs in its own commit with its own
+    /// `just loom` run.
     #[must_use]
     pub fn arena_view(&self) -> ArenaView<'_> {
         self.view()

@@ -274,6 +274,22 @@ The manifest is CBOR rather than a packed struct because it is cold, variable-le
 > Both are `null`, not `0`, for an edge that has never published: a reader cannot
 > tell a stamp of zero from "no samples", and epoch-zero stamps are real.
 
+> **Amendment — the per-edge "sample count" is two keys, because there are two
+> counts and they are not close.**
+>
+> §2.3 asks for a per-edge "sample count". `EdgeRecord::head` is the monotone
+> count of every sample ever pushed and keeps rising after the ring laps; the
+> number of samples the *file* holds is `min(head, retained)`. For a 512-slot
+> ring that took 2048 pushes those are 2048 and 511 — and the key sat one line
+> above `oldest_ns`, which is already, deliberately, the retained window. A
+> consumer computing `samples / (newest_ns - oldest_ns)` read 4 kHz off a 1 kHz
+> edge.
+>
+> So the manifest emits **`samples`** = what the file holds, and
+> **`pushes_total`** = what the source produced. Both, not one: their ratio is
+> how much the ring dropped during ingest, which is the first thing to check when
+> an offline query comes back short. The per-edge map is therefore eight keys.
+
 ### 2.4 Read path
 
 ```

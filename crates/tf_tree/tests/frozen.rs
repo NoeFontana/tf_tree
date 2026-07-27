@@ -362,10 +362,52 @@ fn freezing_twice_produces_the_same_bytes() {
     );
 }
 
+/// `samples` is what the **file** holds; `pushes_total` is what the source
+/// pushed. On a lapped ring those differ by 4x, and conflating them is a rate
+/// error, not a rounding one.
+///
+/// The fixture is load-bearing here in a way it is nowhere else: 2048 pushes
+/// into 512 slots. On a ring that had *not* lapped both keys would carry the
+/// same number and this test would pass no matter which one the encoder emitted
+/// — which is precisely how the original defect survived review. 511, not 512,
+/// because the slot at `head & mask` is the one being overwritten and is not
+/// retained (`SampleRing::retained`).
+///
+/// Mutant: emit `e.head` for `samples` (the pre-amendment encoding) ⇒ the
+/// `samples` value becomes `0x19 0x08 0x00` and both assertions below fail.
+#[test]
+fn the_manifest_separates_what_the_file_holds_from_what_was_pushed() {
+    let live = fixture();
+    let scratch = Scratch::new("counts");
+    let h = live.freeze_to(scratch.path(), None, [0; 32], 5).unwrap();
+    let bytes = std::fs::read(scratch.path()).unwrap();
+    let m = &bytes[h.manifest_off as usize..(h.manifest_off + h.manifest_len) as usize];
+
+    fn count(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    // text(7) "samples" then uint16 511; text(12) "pushes_total" then uint16 2048.
+    let retained = b"\x67samples\x19\x01\xff";
+    let pushed = b"\x6cpushes_total\x19\x08\x00";
+    assert_eq!(
+        count(m, retained),
+        3,
+        "expected 511 retained samples on each of the 3 lapped edges"
+    );
+    assert_eq!(
+        count(m, pushed),
+        3,
+        "expected 2048 total pushes on each of the 3 lapped edges"
+    );
+    // And the all-time count must never appear *as* `samples`.
+    assert_eq!(count(m, b"\x67samples\x19\x08\x00"), 0);
+}
+
 /// The manifest is real CBOR and carries the frames and edges §2.3 asks for.
 ///
 /// Decoded here by hand rather than with a CBOR crate, because adding one as a
-/// dev-dependency to check a nine-key map would be a bigger commitment than the
+/// dev-dependency to check a seven-key map would be a bigger commitment than the
 /// thing being checked. The assertions are on the *encoded* bytes, which is the
 /// strongest form: the frame name must appear as a length-prefixed text string
 /// with the right prefix byte, so a length that disagreed with the payload would

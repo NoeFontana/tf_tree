@@ -57,6 +57,31 @@ fn path_err(e: &std::io::Error) -> FrozenFileError {
     }
 }
 
+/// The path the freeze writes to before it is renamed over the real one.
+///
+/// A **sibling**, not `/tmp`: `rename` is only atomic within one filesystem, and
+/// a `.tft` written to a data volume with `TMPDIR` on the root filesystem is the
+/// common case, not the exotic one. Dot-prefixed so a directory listing during a
+/// long freeze does not show a half-written index next to the real ones, and
+/// suffixed with pid plus a counter so two freezes in one process cannot pick
+/// the same temporary.
+fn temp_sibling(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("out.tft"));
+    let mut name = std::ffi::OsString::from(".");
+    name.push(stem);
+    name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    dir.join(name)
+}
+
 /// This crate's version, NUL-padded into the header's `tool_version`.
 fn tool_version() -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -106,11 +131,23 @@ impl Tree {
     /// `ArenaView::edge_counters` accessor. There is no code path that can
     /// forget them, which is a stronger guarantee than remembering to copy them.
     ///
-    /// The file is created with `O_TRUNC`, so an existing `.tft` at `path` is
-    /// replaced. It is **not** written atomically — a crash mid-freeze leaves a
-    /// short file, which [`Tree::open_frozen`] refuses on the `file_size` check
-    /// rather than mapping past the end. Callers that need atomicity should
-    /// freeze to a temporary path and rename.
+    /// # Replacing `path` is atomic, and a failed freeze does not touch it
+    ///
+    /// The bytes go to a sibling temporary file and are `rename`d over `path`
+    /// only once the container header has landed, so `path` is at every instant
+    /// either the previous `.tft` or the new one. An `ENOSPC` half-way through a
+    /// 233 MB copy leaves the previous file intact and removes the partial.
+    ///
+    /// This is not belt-and-braces. `write_frozen` sizes the file with
+    /// `ftruncate` first, so an interrupted freeze leaves a **full-length** file
+    /// with a zeroed tail, not a short one — there is no `file_size` check that
+    /// could catch it. Two things stand between that and a silently-wrong
+    /// dataset: `write_frozen` publishes its header last (so a partial file
+    /// fails [`FrozenError::BadMagic`]), and the rename here means such a file
+    /// is never at `path` under a name anyone will open next week.
+    ///
+    /// The temporary is created in `path`'s own directory, because `rename` is
+    /// only atomic within a filesystem.
     ///
     /// `source_digest` is BLAKE3 of the recording this tree was built from, or
     /// all-zero when there is none — which is the `--from-live` case, since a
@@ -135,32 +172,69 @@ impl Tree {
         created_unix_ns: i64,
     ) -> Result<FrozenHeader, FrozenFileError> {
         let manifest = self.manifest(source, created_unix_ns);
-        let file = std::fs::File::create(path).map_err(|e| path_err(&e))?;
+        let tmp = temp_sibling(path);
+        let file = std::fs::File::create(&tmp).map_err(|e| path_err(&e))?;
         let arena: &dyn Arena = self.backing();
-        let header = tf_tree_arena::write_frozen(
-            std::os::fd::AsFd::as_fd(&file),
-            arena,
-            &manifest,
-            source_digest,
-            created_unix_ns,
-            tool_version(),
-        )?;
-        Ok(header)
+        // A closure so that *every* failure below reaches the cleanup arm; a `?`
+        // in the body of `freeze_to` would return past it and leave the
+        // temporary on disk.
+        let written = (|| -> Result<FrozenHeader, FrozenFileError> {
+            let header = tf_tree_arena::write_frozen(
+                std::os::fd::AsFd::as_fd(&file),
+                arena,
+                &manifest,
+                source_digest,
+                created_unix_ns,
+                tool_version(),
+            )?;
+            // The `rename` is the publish.
+            std::fs::rename(&tmp, path).map_err(|e| path_err(&e))?;
+            Ok(header)
+        })();
+        if written.is_err() {
+            // Best effort: a leftover temporary is litter, which is strictly
+            // better than a partial file sitting at `path` under the name
+            // somebody will open next week.
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// Build the CBOR manifest for this tree (§2.3).
     ///
     /// # Amendment to §2.3 — the per-edge span is one-sided, and says so
     ///
-    /// §2.3 asks for a "per-edge time span". The *newest* stamp is a public
-    /// accessor; the oldest **retained** one is computed here from the ring's
-    /// head and its retained window, and is emitted as `oldest_ns`. That is the
+    /// §2.3 asks for a "per-edge time span". Both ends are `SampleRing`
+    /// accessors — `newest_stamp` and `oldest_stamp` — and the lower one is
+    /// emitted as `oldest_ns`. It lives beside `retained()` in `tf_tree_core`
+    /// rather than being re-derived here, because the window's definition has
+    /// already changed once and a copy of that arithmetic in this crate would
+    /// not move with it. That is the
     /// oldest sample still in the file, which is not the same thing as the oldest
     /// sample the source recording contained — a ring that lapped during ingest
     /// has already dropped the earlier ones. §3's counting pass knows the real
     /// span and can widen this key when it lands; until then the key means what
     /// its name says and no more, because a `span` that silently meant
     /// "whatever survived" would be worse than a narrower one.
+    ///
+    /// # Amendment to §2.3 — `samples` counts what the file holds; `pushes_total`
+    /// counts what the source produced
+    ///
+    /// §2.3 asks for a "per-edge sample count". `EdgeRecord::head` is the
+    /// monotone count of *every* sample ever pushed and keeps rising after the
+    /// ring laps, so for a file that **is** the arena it answers a different
+    /// question than the file's own contents — and it sat one key above a span
+    /// that was already, deliberately, the retained window. A consumer dividing
+    /// `samples` by `newest_ns - oldest_ns` to recover a publish rate got 4 kHz
+    /// for a 1 kHz edge on a ring that had lapped four times, and one sizing an
+    /// offline index from it over-allocated by the same factor.
+    ///
+    /// So `samples` is `SampleRing::stored()` — `min(head, retained)`, the
+    /// number of samples actually in this file — and the all-time count keeps
+    /// its own key, `pushes_total`, whose name cannot be mistaken for a window.
+    /// Both are still worth emitting: their *ratio* is how much the ring dropped,
+    /// which is the first thing to look at when an offline query comes back
+    /// short.
     fn manifest(&self, source: Option<&str>, created_unix_ns: i64) -> Vec<u8> {
         let view = self.arena_view();
         let header = view.header();
@@ -212,31 +286,30 @@ impl Tree {
         w.array(edges.saturating_sub(1) as usize);
         for i in 1..edges {
             let id = tf_tree_core::EdgeId(i);
-            w.map(7);
+            // One observation of the record, not five. The five keys below must
+            // describe the same edge as each other; re-reading `view.edge(id)`
+            // per key would let a concurrent freeze interleave them, which is
+            // the exact smear this file is otherwise careful about.
+            let e = view.edge(id);
+            w.map(8);
             w.text("parent");
-            w.u64(u64::from(view.edge(id).map_or(0, |e| e.parent)));
+            w.u64(u64::from(e.map_or(0, |e| e.parent)));
             w.text("child");
-            w.u64(u64::from(view.edge(id).map_or(0, |e| e.child)));
+            w.u64(u64::from(e.map_or(0, |e| e.child)));
             w.text("kind");
-            w.u64(u64::from(view.edge(id).map_or(0, |e| e.kind)));
+            w.u64(u64::from(e.map_or(0, |e| e.kind)));
             w.text("capacity");
-            w.u64(u64::from(view.edge(id).map_or(0, |e| e.capacity)));
-            let head = view
-                .edge(id)
-                .map_or(0, |e| e.head.load(std::sync::atomic::Ordering::Acquire));
+            w.u64(u64::from(e.map_or(0, |e| e.capacity)));
+            let ring = view.ring(id);
+            // `samples` is how many the *file* holds; `pushes_total` is how many
+            // the source ever produced. See this function's amendment note.
             w.text("samples");
-            w.u64(head);
-            let span = view.ring(id).and_then(|ring| {
-                let newest = ring.newest_stamp()?;
-                // The readable window is `[head - retained, head - 1]`
-                // (`SampleRing::retained`), so this is the oldest logical index a
-                // reader may still touch — clamped at 0 for a ring that has not
-                // lapped yet.
-                let oldest_idx = head.saturating_sub(ring.retained());
-                let oldest = ring.stamps[(oldest_idx & ring.mask) as usize]
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                Some((oldest, newest))
-            });
+            w.u64(ring.as_ref().map_or(0, |r| r.stored()));
+            w.text("pushes_total");
+            w.u64(e.map_or(0, |e| e.head.load(std::sync::atomic::Ordering::Acquire)));
+            let span = ring
+                .as_ref()
+                .and_then(|r| Some((r.oldest_stamp()?, r.newest_stamp()?)));
             w.text("oldest_ns");
             match span {
                 Some((oldest, _)) => w.i64(oldest),

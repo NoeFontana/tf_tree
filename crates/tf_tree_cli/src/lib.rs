@@ -454,10 +454,13 @@ fn cmd_freeze(live: Live<'_>, from_live: bool, out: &std::path::Path) -> Result<
     // in an attribute two hundred lines away.
     anyhow::ensure!(from_live, "`freeze` needs a source; pass `--from-live`");
     let tree = live.open()?;
+    // `as i64` would wrap silently once `as_nanos` passes 2^63 (2262-04-11) and
+    // hand the header a negative "created" stamp that reads as 1901. Saturating
+    // costs nothing on a once-per-freeze path, and the field is provenance only
+    // — a clamped far-future stamp is visibly wrong, a wrapped one is not.
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     // One message rather than an `anyhow` context chain: `FrozenFileError` is
     // `Copy` and `String`-free by house rule, so all it can say is *what* went
     // wrong — the path is the missing half, and it belongs in the same line an

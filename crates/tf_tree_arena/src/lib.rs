@@ -24,8 +24,11 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// Private: it exports exactly one public item, and that item is re-exported at
+// the crate root. A `pub mod` here would render in rustdoc as a module whose
+// only content is a type readers already found as `tf_tree_arena::ShmError`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
-pub mod check;
+mod check;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod frozen;
 pub mod header;
