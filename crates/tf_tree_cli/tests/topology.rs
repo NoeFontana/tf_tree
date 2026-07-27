@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 
+use tf_tree::InterpPolicy;
 use tf_tree_bridge::{Action, Ingest, Publisher, Sample, Topic, TopologyConfig};
 use tf_tree_cli::topology::discover_from_tfstream;
 
@@ -263,5 +264,83 @@ fn an_edge_missing_from_the_config_is_counted_and_named_once() {
     assert_eq!(
         ingest.undeclared(),
         [("odom_combined", "base_footprint", 254)]
+    );
+}
+
+/// **`--tf-prefix` reaches the collector, and prefixes every frame.**
+///
+/// The flag existed on `Discovery` with no caller and no CLI surface, so §5.6's
+/// prefix was unreachable from every entry point that existed. It matters
+/// because a config discovered without the prefix, handed to a bridge running
+/// with one, declares every edge and matches none — the failure is total and
+/// silent.
+///
+/// Asserted against the *same* recording discovered without a prefix, so the
+/// property is "every name gained the prefix", not "some name starts with it".
+///
+/// Mutant: drop the `d = d.with_prefix(p)` line from `discover_from_tfstream`
+/// ⇒ the prefixed and bare edge lists are equal and this fails.
+#[test]
+fn a_tf_prefix_reaches_the_discovered_config() {
+    let bare = discover_from_tfstream(&stream_path(), 10.0, None, None)
+        .expect("discover")
+        .to_config();
+    let prefixed = discover_from_tfstream(&stream_path(), 10.0, Some("robot1"), None)
+        .expect("discover")
+        .to_config();
+
+    assert_eq!(bare.edges.len(), prefixed.edges.len());
+    assert_ne!(bare.edges, prefixed.edges, "the prefix changed something");
+    for (b, p) in bare.edges.iter().zip(&prefixed.edges) {
+        assert_eq!(p.parent, format!("robot1/{}", b.parent));
+        assert_eq!(p.child, format!("robot1/{}", b.child));
+    }
+    // And it still reparses — the prefix must not produce a name the file
+    // format cannot carry.
+    TopologyConfig::parse(&prefixed.to_toml()).expect("prefixed config reparses");
+}
+
+/// **`--interp` reaches the collector.** Same class of defect as `--tf-prefix`:
+/// the builder method existed with no caller.
+///
+/// Mutant: drop the `d = d.with_interp(i)` line ⇒ the discovered default stays
+/// `ScLerp` and this fails.
+#[test]
+fn an_interp_override_reaches_the_discovered_config() {
+    let d = discover_from_tfstream(&stream_path(), 10.0, None, Some(InterpPolicy::LerpSlerp))
+        .expect("discover");
+    let config = d.to_config();
+    assert_eq!(config.default_interp, InterpPolicy::LerpSlerp);
+    // Survives the round trip, which is the only reason the flag is useful.
+    let reparsed = TopologyConfig::parse(&config.to_toml()).expect("reparses");
+    assert_eq!(reparsed.default_interp, InterpPolicy::LerpSlerp);
+}
+
+/// **The real recording's own topology passes §5.5's domain check against the
+/// domain it declares, and fails against another one.**
+///
+/// `check_domain` shipped with unit tests and no caller, so the NORMATIVE
+/// startup refusal was enforced by nothing. Both directions are asserted: a
+/// check that only ever succeeds would pass with `check_domain` returning
+/// `Ok(())` unconditionally.
+///
+/// Mutant: make `TopologyConfig::check_domain` return `Ok(())` always ⇒ the
+/// mismatch assertion fails.
+#[test]
+fn the_discovered_config_passes_its_own_domain_and_fails_another() {
+    let config = discover_from_tfstream(&stream_path(), 10.0, None, None)
+        .expect("discover")
+        .to_config();
+    assert_eq!(config.default_domain, 0, "discovery declares domain 0");
+    assert_eq!(config.check_domain(0), Ok(()));
+
+    let e = config
+        .check_domain(1)
+        .expect_err("a domain-1 bridge must be refused");
+    assert_eq!(e.declared, 0);
+    assert_eq!(e.bridge, 1);
+    assert!(
+        !e.child.is_empty(),
+        "the refusal names the offending edge, not just the domains"
     );
 }
