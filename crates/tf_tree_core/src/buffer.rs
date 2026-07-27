@@ -194,6 +194,41 @@ impl SampleRing<'_> {
         Some(self.stamps[((h - 1) & self.mask) as usize].load(Ordering::Relaxed))
     }
 
+    /// The oldest stamp a reader may still touch, or `None` if the ring is
+    /// empty.
+    ///
+    /// The mirror of [`Self::newest_stamp`], and it lives here for the same
+    /// reason [`Self::retained`] does: the readable window's lower end is
+    /// `head - retained()` clamped at zero, and that arithmetic **changed once
+    /// already** (reading the lapped slot is what made an in-window query race a
+    /// `push`). A copy of it in another crate would not move when this one moves
+    /// next.
+    ///
+    /// Note the asymmetry with `newest_stamp`: this is the oldest sample still
+    /// *in the ring*, not the oldest ever pushed. A lapped ring dropped those.
+    #[inline]
+    #[must_use]
+    pub fn oldest_stamp(&self) -> Option<i64> {
+        let h = self.head.load(Ordering::Acquire);
+        if h == 0 {
+            return None;
+        }
+        let oldest = h.saturating_sub(self.retained());
+        Some(self.stamps[(oldest & self.mask) as usize].load(Ordering::Relaxed))
+    }
+
+    /// How many samples this ring currently holds — `min(head, retained())`.
+    ///
+    /// **Not** the number ever pushed: that is `head`, which keeps counting
+    /// after the ring laps. The two answer different questions ("how big is this
+    /// file" vs. "how many did the source produce") and a caller that wants a
+    /// rate wants this one over the span [`Self::oldest_stamp`] describes.
+    #[inline]
+    #[must_use]
+    pub fn stored(&self) -> u64 {
+        self.head.load(Ordering::Acquire).min(self.retained())
+    }
+
     /// Publish one sample. **Single writer only** — exclusivity is a type-level
     /// property of the `Publisher` that owns this ring, not a convention.
     ///

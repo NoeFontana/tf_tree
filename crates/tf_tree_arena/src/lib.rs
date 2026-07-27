@@ -24,12 +24,26 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// Private: it exports exactly one public item, and that item is re-exported at
+// the crate root. A `pub mod` here would render in rustdoc as a module whose
+// only content is a type readers already found as `tf_tree_arena::ShmError`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+mod check;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod frozen;
 pub mod header;
 pub mod heap;
 pub mod layout;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod mapped;
 
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use check::ShmError;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use frozen::{
+    write_frozen, FrozenArena, FrozenError, FrozenHeader, ARENA_FILE_ALIGN, FROZEN_HEADER_SIZE,
+    FROZEN_MAGIC,
+};
 pub use header::{
     pack_topo, unpack_topo, ArenaHeader, TopoLock, FORMAT_VERSION, TF_TREE_MAGIC, TOPO_BLOCKS,
 };
@@ -38,4 +52,4 @@ pub use layout::{
     layout_hash, ArenaLayout, LayoutError, Region, DEFAULT_MAX_PARTICIPANTS, FRAME_HASH_STRIDE,
 };
 #[cfg(all(feature = "shm", target_os = "linux"))]
-pub use mapped::{AttachMode, MappedArena, ShmError};
+pub use mapped::{AttachMode, MappedArena};
