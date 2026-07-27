@@ -4,6 +4,7 @@ use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, PyUntypedArrayMethods}
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tf_tree::{AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, Stamp, SystemDomain, Tree};
@@ -21,7 +22,7 @@ use crate::errors::{lookup_err, BufferError, FrameNotDeclaredError, TfTreeError}
 /// notices. Above it the worst case is a 4% overhead. **Both sides are cheap,
 /// which is why the exact constant does not need tuning**; what matters is that
 /// neither branch is ever badly wrong.
-const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
+pub(crate) const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
 /// Rough per-step cost used only to place the threshold above.
 const NS_PER_STEP_ESTIMATE: u64 = 55;
 
@@ -119,6 +120,35 @@ impl PyTree {
             inner: Mutex::new(Some(writer)),
             _tree: slf.clone().unbind(),
         })
+    }
+
+    /// Write this tree to `path` as a frozen `.tft` (`docs/PHASE5.md` §2.3).
+    ///
+    /// The replacement of `path` is atomic — the bytes go to a sibling
+    /// temporary and are renamed over it — so an interrupted freeze leaves the
+    /// previous index intact rather than a half-written one under the name
+    /// somebody will open next week.
+    ///
+    /// `source` is the recording these poses came from, and is recorded in the
+    /// manifest as `null` when there is none.
+    ///
+    /// `path` is any `os.PathLike`, and **the GIL is released for the copy** —
+    /// see [`freeze_impl`](crate::offline::freeze_impl) for why that is not
+    /// optional at the sizes a freeze is for.
+    #[pyo3(signature = (path, /, *, source = None))]
+    fn freeze(&self, py: Python<'_>, path: PathBuf, source: Option<&str>) -> PyResult<()> {
+        crate::offline::freeze_impl(py, &self.inner, &path, source)
+    }
+
+    /// The interval over which `tree.plan(target, source)` is answerable.
+    ///
+    /// `(t0, t1)` in nanoseconds, or `None` when every step on the path is
+    /// static and the plan therefore answers at any stamp. See
+    /// [`span_impl`](crate::offline::span_impl) for the three cases and why an
+    /// empty intersection is returned rather than raised.
+    #[pyo3(signature = (target, source, /))]
+    fn span(&self, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
+        crate::offline::span_impl(&self.inner, target, source)
     }
 
     /// Whether this tree's arena is shared with other processes.

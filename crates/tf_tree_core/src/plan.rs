@@ -585,6 +585,72 @@ impl Plan {
         self.fold_at(g, common)
     }
 
+    /// The interval over which this plan is answerable, or `None` when it is
+    /// unbounded (`docs/PHASE5.md` §4.2).
+    ///
+    /// [`Self::latest_common`] generalised from a point to a range: the
+    /// **intersection** of every dynamic step's retained window, so the lower end
+    /// is a `max` and the upper end a `min`. The upper end is `latest_common`'s
+    /// own stamp — both are `min` over [`SampleRing::newest_stamp`](crate::buffer::SampleRing::newest_stamp).
+    ///
+    /// The two do *not* share a helper, on purpose: `latest_common` is a lookup
+    /// path and folding it onto [`Guard::window`] would cost it a second atomic
+    /// load and a second mask per edge to compute a lower end it never uses.
+    /// `spans_agree_with_latest_common` in `tests.rs` pins the agreement instead.
+    ///
+    /// It lives here, next to that method and to
+    /// [`SampleRing::retained`](crate::buffer::SampleRing::retained), because the
+    /// definition of a ring's readable window **has already changed once** — a
+    /// copy of this arithmetic in a binding crate would not have moved with it,
+    /// and would be provable only through that binding's own test runner.
+    ///
+    /// Three answers, kept distinct on purpose:
+    ///
+    /// * `Some((t0, t1))` with `t0 <= t1` — the plan answers there, and nowhere
+    ///   else without extrapolating.
+    /// * `Some((t0, t1))` with `t0 > t1` — **an empty intersection is a real
+    ///   answer**, not an error: two edges on the path have disjoint histories
+    ///   and the caller's `t0 <= t <= t1` is correctly false everywhere.
+    ///   Collapsing it to `None` would make it indistinguishable from the
+    ///   unbounded case below.
+    /// * `None` — every step folded to a static transform (or the plan is the
+    ///   empty `lookup(x, x)`), so it is answerable at *any* stamp and there is
+    ///   no finite interval to report.
+    ///
+    /// # Staleness
+    ///
+    /// On a live arena the answer ages the moment it is returned, and the two
+    /// ends are not even one snapshot of one ring — see [`Guard::window`]. That
+    /// is the same contract [`Self::latest`] has, and refusing to answer would be
+    /// worse than answering the question that was asked. On a frozen `.tft`, the
+    /// case §4.2 is about, nothing pushes and the interval is exact.
+    ///
+    /// # Errors
+    ///
+    /// [`LookupError::TopologyChanged`] (or [`LookupError::ChildDetached`] on a
+    /// fork-poisoned guard), [`LookupError::UnknownEdge`], or
+    /// [`LookupError::NoData`] naming the first edge on the path that has never
+    /// published — which is a different fact from an empty intersection and is
+    /// reported differently.
+    pub fn span(&self, g: &Guard) -> Result<Option<(i64, i64)>, LookupError> {
+        self.check_generation(g)?;
+        let mut span: Option<(i64, i64)> = None;
+        for step in self.steps() {
+            let Step::Dyn { edge, .. } = step else {
+                // A static step carries its transform in the plan and constrains
+                // nothing in time. `inverted` does not matter either: inverting a
+                // pose does not move the stamp it was published at.
+                continue;
+            };
+            let (oldest, newest) = g.window(*edge)?;
+            span = Some(match span {
+                None => (oldest, newest),
+                Some((lo, hi)) => (lo.max(oldest), hi.min(newest)),
+            });
+        }
+        Ok(span)
+    }
+
     /// Fold an all-static plan (no `Guard` sampling needed).
     fn static_only(&self) -> Iso3 {
         let mut acc = Iso3::IDENTITY;
@@ -1421,6 +1487,31 @@ impl<'a> Guard<'a> {
             .ok_or(LookupError::UnknownEdge { edge })?
             .newest_stamp()
             .ok_or(LookupError::NoData { edge })
+    }
+
+    /// Both ends of a dynamic edge's retained window, `(oldest, newest)`.
+    ///
+    /// The two ends come from **one** [`SampleRing`](crate::buffer::SampleRing)
+    /// handle but from two
+    /// independent `head` loads (see [`SampleRing::oldest_stamp`](crate::buffer::SampleRing::oldest_stamp) and
+    /// [`SampleRing::newest_stamp`](crate::buffer::SampleRing::newest_stamp)), so on a live ring a concurrent `push`
+    /// between them can widen the pair past either real window. That is the same
+    /// staleness [`Plan::latest`] has and is not fixable here without a seqlock
+    /// over the whole ring; [`Plan::span`] documents what it means for a caller.
+    /// On a frozen arena — the case §4.2 is about — no push exists and the pair
+    /// is exact.
+    pub(crate) fn window(&self, edge: EdgeId) -> Result<(i64, i64), LookupError> {
+        let ring = self
+            .view
+            .ring(edge)
+            .ok_or(LookupError::UnknownEdge { edge })?;
+        match (ring.oldest_stamp(), ring.newest_stamp()) {
+            (Some(oldest), Some(newest)) => Ok((oldest, newest)),
+            // An empty ring is `NoData`, never an empty interval: the caller
+            // acts differently on "nobody has published this yet" than on "the
+            // windows do not overlap".
+            _ => Err(LookupError::NoData { edge }),
+        }
     }
 }
 

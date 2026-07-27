@@ -6,6 +6,15 @@
 #
 # Being outside the workspace also means it cannot use `field.workspace = true`
 # inheritance, so the metadata and lints below are spelled out.
+#
+# An empty table makes that exclusion structural. `exclude` in the root manifest
+# is a path *relative to that manifest*, so inside a git worktree —
+# `.claude/worktrees/<name>/crates/tf_tree_tf2_sys` — cargo walks up, finds the
+# main checkout's root manifest and refuses with "current package believes it's
+# in a workspace when it's not". That breaks `cargo fmt --all`, which formats
+# path dependencies too, so the whole `just lint` gate fails in any worktree.
+[workspace]
+
 [package]
 name = "tf_tree_tf2_sys"
 description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential and benchmark harnesses."

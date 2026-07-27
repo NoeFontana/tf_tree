@@ -30,6 +30,7 @@ from ._core import (
     from_sec,
     has_shared_memory,
     open_arena,
+    open_file,
     push,
 )
 
@@ -48,6 +49,7 @@ __all__ = [
     "has_shared_memory",
     "open",
     "open_arena",
+    "open_file",
     "push",
 ]
 

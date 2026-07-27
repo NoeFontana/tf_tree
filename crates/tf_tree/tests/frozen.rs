@@ -349,6 +349,74 @@ fn a_stale_tft_is_refused_and_names_both_hashes() {
 /// (`self.head`'s final branch) ⇒ still deterministic, so this test survives it
 /// — the property it pins is determinism, *not* shortest-form, and the RFC
 /// vectors in `cbor.rs` are what pin the latter.
+/// §2.3: the bytes go to a **sibling temporary** and are `rename`d over `path`.
+///
+/// **The inode is the assertion**, and it has to be: freezing twice and comparing
+/// the numbers read back passes just as well when `freeze_to` writes straight to
+/// `path`, so until this test existed the property was asserted nowhere in the
+/// repository — the whole suite passed with the `rename` deleted.
+///
+/// Why it matters is `write_frozen`'s `ftruncate`: an interrupted freeze leaves a
+/// **full-length** file with a zeroed tail, not a short one. At a temporary name
+/// that file is unlinked and forgotten. At `path` it is what next week's
+/// `open_frozen` finds, and it fails `BadMagic` only because the header is
+/// published last — a partial file that happened to keep a valid header would be
+/// silently wrong instead. `rename` is what keeps such a file from ever wearing
+/// the name somebody will open.
+///
+/// It is also what makes re-freezing over a *currently mapped* path safe, which
+/// the second half checks: the open tree keeps the old inode and its answers.
+///
+/// Mutant: `File::create(path)` instead of `File::create(&tmp)` with the
+/// `rename` removed ⇒ the inode is unchanged and the first assertion fails.
+#[test]
+fn freezing_replaces_the_target_by_rename_not_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let live = fixture();
+    let s = Scratch::new("rename");
+    live.freeze_to(s.path(), Some("src"), [7; 32], 99).unwrap();
+    let first_ino = std::fs::metadata(s.path()).unwrap().ino();
+
+    // Hold the first image open across the second freeze: this mapping is what
+    // the rename exists to protect.
+    let held = Tree::open_frozen(s.path()).unwrap();
+    let (target, source, at) = probes()[0];
+    let before = held
+        .lookup(target, source, at)
+        .expect("the held mapping must answer before the re-freeze");
+
+    live.freeze_to(s.path(), Some("src"), [7; 32], 99).unwrap();
+
+    assert_ne!(
+        std::fs::metadata(s.path()).unwrap().ino(),
+        first_ino,
+        "freeze rewrote the target in place: a partial write would be visible at \
+         `path`, and the mapping held open above would move under its reader"
+    );
+    let after = held.lookup(target, source, at).unwrap();
+    assert_eq!(
+        before.to_bits(),
+        after.to_bits(),
+        "the mapping held open across the freeze changed answers"
+    );
+
+    // The temporary is a sibling and is gone. A temporary in `/tmp` would make
+    // the `rename` non-atomic whenever `path` is on another filesystem.
+    let dir = s.path().parent().unwrap();
+    let stem = s.path().file_name().unwrap();
+    let litter: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| {
+            n != stem
+                && n.to_string_lossy()
+                    .contains(&format!("{}", std::process::id()))
+        })
+        .collect();
+    assert!(litter.is_empty(), "freeze left litter: {litter:?}");
+}
+
 #[test]
 fn freezing_twice_produces_the_same_bytes() {
     let live = fixture();
