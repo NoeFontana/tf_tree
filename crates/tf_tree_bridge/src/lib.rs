@@ -53,7 +53,9 @@ pub mod stats;
 
 pub use authority::{Authority, AuthorityPolicy, Verdict};
 pub use clock::{ClockGuard, ClockVerdict, OnClockReset};
-pub use config::{ConfigError, ConfigErrorKind, EdgeConfig, EdgeShape, RingSize, TopologyConfig};
+pub use config::{
+    ConfigError, ConfigErrorKind, DomainMismatch, EdgeConfig, EdgeShape, RingSize, TopologyConfig,
+};
 pub use discover::Discovery;
 pub use ingest::{Action, DropReason, HaltReason, Ingest, Topic};
 pub use names::{NameError, NameNormalizer, Normalized};

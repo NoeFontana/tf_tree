@@ -195,6 +195,56 @@ impl TopologyConfig {
             .find(|e| e.parent == parent && e.child == child)
     }
 
+    /// The time-domain tag `(parent, child)` will be declared with — its own
+    /// override, or the file default.
+    #[must_use]
+    pub fn domain_of(&self, edge: &EdgeConfig) -> u8 {
+        edge.domain.unwrap_or(self.default_domain)
+    }
+
+    /// Check every declared edge against the domain the bridge will stamp in.
+    ///
+    /// `docs/PHASE4.md` §5.5, **NORMATIVE**: *"the bridge refuses to write to
+    /// an edge whose declared domain differs from its own, and fails at startup
+    /// rather than at first message. Sim and real transforms in one arena is a
+    /// class of bug worth making impossible."*
+    ///
+    /// It could not be checked before §5.8's amendment, because before a config
+    /// file there was nothing that declared a domain for the bridge to disagree
+    /// with. It is a startup check and not a per-sample one on purpose: the
+    /// answer is the same for every message on an edge, and finding out at the
+    /// first message means finding out after the arena has been built and
+    /// twenty nodes have attached to it.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainMismatch`] naming the **first** offending edge in file order.
+    /// First rather than all of them: an operator who set `use_sim_time` on one
+    /// side of a launch file gets every edge listed, and the list is not more
+    /// actionable than the first line of it.
+    pub fn check_domain(&self, bridge_domain: u8) -> Result<(), DomainMismatch<'_>> {
+        for e in &self.edges {
+            // Static edges are exempt. Their pose is a constant folded into the
+            // plan with no stamp of its own, so there is no clock for a domain
+            // to be wrong about — and `robot_state_publisher` stamps them zero
+            // regardless of `use_sim_time`, which would make every sim
+            // deployment fail this check for no reason.
+            if matches!(e.shape, EdgeShape::Static { .. }) {
+                continue;
+            }
+            let declared = self.domain_of(e);
+            if declared != bridge_domain {
+                return Err(DomainMismatch {
+                    parent: e.parent.as_str(),
+                    child: e.child.as_str(),
+                    declared,
+                    bridge: bridge_domain,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// A [`TreeBuilder`] carrying exactly this topology.
     ///
     /// This is the operation §5.8's amendment says the engine was missing: the
@@ -447,6 +497,34 @@ impl fmt::Display for ConfigError<'_> {
 }
 
 impl std::error::Error for ConfigError<'_> {}
+
+/// A declared edge whose time domain is not the bridge's (§5.5).
+///
+/// `Copy` and borrowing the frame names from the config, like [`ConfigError`]
+/// and for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainMismatch<'a> {
+    /// Parent frame of the offending edge.
+    pub parent: &'a str,
+    /// Child frame of the offending edge.
+    pub child: &'a str,
+    /// The tag the config declares.
+    pub declared: u8,
+    /// The tag the bridge stamps in.
+    pub bridge: u8,
+}
+
+impl fmt::Display for DomainMismatch<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "edge {:?} -> {:?} is declared in time domain {} but the bridge stamps in domain {}",
+            self.parent, self.child, self.declared, self.bridge
+        )
+    }
+}
+
+impl std::error::Error for DomainMismatch<'_> {}
 
 /// How far a config quaternion may be from unit norm.
 ///
@@ -1282,6 +1360,38 @@ domain = 0
         let e = TopologyConfig::parse(text).unwrap_err();
         assert_eq!(e.kind, ConfigErrorKind::RedundantFrame);
         assert_eq!(e.at, "b");
+    }
+
+    /// **§5.5's NORMATIVE startup domain check**: a bridge stamping system time
+    /// refuses an edge declared in another domain, *before* the arena is built.
+    ///
+    /// Sim and real transforms in one arena is the bug §5.5 calls "worth making
+    /// impossible", and the engine's typed domains only reject the *query* —
+    /// by then the wrong stamps are already in the ring. Static edges are
+    /// exempt because their constant carries no stamp, and `robot_state_publisher`
+    /// stamps `/tf_static` at zero whatever `use_sim_time` says.
+    ///
+    /// Two mutants, both confirmed dead: drop the `declared != bridge_domain`
+    /// return ⇒ the check never fires and the second assertion fails; drop the
+    /// `matches!(.., Static)` continue ⇒ the statics-only file is refused and
+    /// the third fails.
+    #[test]
+    fn a_bridge_refuses_an_edge_declared_in_another_time_domain() {
+        // SAMPLE's file default is "sensor" (1); its one dynamic edge overrides
+        // to 0. A bridge in domain 0 is therefore fine…
+        let c = TopologyConfig::parse(SAMPLE).unwrap();
+        assert_eq!(c.check_domain(0), Ok(()));
+        // …and one in domain 1 is not, and is told which edge.
+        let e = c.check_domain(1).unwrap_err();
+        assert_eq!((e.parent, e.child), ("odom", "base_footprint"));
+        assert_eq!((e.declared, e.bridge), (0, 1));
+
+        // A static edge inheriting the mismatching default is exempt: its
+        // constant has no stamp. Without the exemption every sim deployment
+        // fails this check because of `/tf_static`.
+        let statics_only = "[topology]\ndomain = 1\n[[edge]]\nparent=\"a\"\nchild=\"b\"\nkind=\"static\"\npose=[1.0,0.0,0.0,0.0,0.0,0.0,0.0]\n";
+        let c = TopologyConfig::parse(statics_only).unwrap();
+        assert_eq!(c.check_domain(0), Ok(()), "a static edge has no clock");
     }
 
     /// **Ring sizing resolves the way `Capacity` documents**, so a file that
