@@ -20,6 +20,17 @@ pub struct BridgeStats {
     pub transforms: u64,
     /// Transforms written into the arena.
     pub applied: u64,
+    /// `/tf_static` transforms that **matched the config's declared constant**
+    /// and were therefore not written (§5.7 idempotent, §5.8 verification).
+    ///
+    /// Its own bucket rather than a share of `applied`, because it is not one:
+    /// the value was in the arena before the bridge started, put there by
+    /// `TopologyConfig::builder`, and the message only confirmed it. Counting
+    /// it as applied made `applied` grow every time a late joiner caused the
+    /// transient-local latched set to be re-delivered — an operator watching
+    /// `applied` on a robot with no dynamic edges would have seen a healthy
+    /// write rate for an arena nothing was writing to.
+    pub static_verified: u64,
     /// Dropped because another publisher owns the edge (§5.4).
     pub dropped_authority: u64,
     /// Dropped because the stamp went backwards by less than the reset
@@ -65,6 +76,7 @@ impl BridgeStats {
     #[must_use]
     pub fn balanced(&self) -> bool {
         self.applied
+            + self.static_verified
             + self.dropped_authority
             + self.dropped_non_monotonic
             + self.dropped_bad_name

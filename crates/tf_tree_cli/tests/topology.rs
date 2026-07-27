@@ -43,7 +43,7 @@ fn stream_path() -> PathBuf {
 /// a 47-second recording at 4.79 Hz, failing the capacity assertion below.
 #[test]
 fn a_real_recording_discovers_a_topology_that_builds_and_is_claimable() {
-    let d = discover_from_tfstream(&stream_path(), 10.0).expect("discover");
+    let d = discover_from_tfstream(&stream_path(), 10.0, None, None).expect("discover");
     assert!(
         d.multi_parent().is_empty(),
         "this recording has a single-parent tree: {:?}",
@@ -125,7 +125,7 @@ fn a_real_recording_discovers_a_topology_that_builds_and_is_claimable() {
 /// undeclared.
 #[test]
 fn the_discovered_config_accepts_the_stream_it_came_from() {
-    let d = discover_from_tfstream(&stream_path(), 10.0).expect("discover");
+    let d = discover_from_tfstream(&stream_path(), 10.0, None, None).expect("discover");
     let config = d.to_config();
 
     let stream = tf_tree_bench::replay::TfStream::load(&stream_path()).expect("load");
@@ -210,7 +210,7 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
 /// operator is told their frame names are wrong when their config is short.
 #[test]
 fn an_edge_missing_from_the_config_is_counted_and_named_once() {
-    let d = discover_from_tfstream(&stream_path(), 10.0).expect("discover");
+    let d = discover_from_tfstream(&stream_path(), 10.0, None, None).expect("discover");
     let mut config = d.to_config();
     // Remove the odometry edge — the single most consequential one to forget,
     // and the one whose absence a `map -> base_link` lookup reports as `NoPath`.

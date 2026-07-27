@@ -29,6 +29,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use tf_tree::InterpPolicy;
 use tf_tree_bench::replay::TfStream;
 use tf_tree_bridge::{Discovery, EdgeShape, Sample, Topic, TopologyConfig};
 
@@ -37,9 +38,23 @@ use tf_tree_bridge::{Discovery, EdgeShape, Sample, Topic, TopologyConfig};
 /// # Errors
 ///
 /// If the stream cannot be read or parsed.
-pub fn discover_from_tfstream(path: &Path, history_secs: f64) -> Result<Discovery> {
+pub fn discover_from_tfstream(
+    path: &Path,
+    history_secs: f64,
+    tf_prefix: Option<&str>,
+    interp: Option<InterpPolicy>,
+) -> Result<Discovery> {
     let stream = TfStream::load(path)?;
     let mut d = Discovery::new(history_secs);
+    // §5.6's `tf_prefix` belongs here and not only in the bridge: a discovered
+    // config keyed on `base_link` while the bridge that will read it keys on
+    // `robot1/base_link` declares every edge and matches none.
+    if let Some(p) = tf_prefix {
+        d = d.with_prefix(p);
+    }
+    if let Some(i) = interp {
+        d = d.with_interp(i);
+    }
     // Statics first, matching the wire: `/tf_static` is transient-local, so a
     // late-joining bridge receives the latched set before the first `/tf`
     // message it sees. Feeding them in the other order would let a static edge
@@ -86,10 +101,24 @@ fn pose_of(iso: &tf_tree::Iso3) -> [f64; 7] {
 /// # Errors
 ///
 /// If the stream cannot be read, or the config it produces cannot be written.
-pub fn cmd_discover(source: &Path, out: Option<&Path>, history_secs: f64) -> Result<()> {
-    let d = discover_from_tfstream(source, history_secs)?;
+pub fn cmd_discover(
+    source: &Path,
+    out: Option<&Path>,
+    history_secs: f64,
+    tf_prefix: Option<&str>,
+    interp: Option<InterpPolicy>,
+) -> Result<()> {
+    let d = discover_from_tfstream(source, history_secs, tf_prefix, interp)?;
     let config = d.to_config();
     let text = config.to_toml();
+
+    // Re-read what is about to be written. `Discovery` and the parser now share
+    // `frame_name_ok`, so this should never fire — which is exactly why it is
+    // here: the "a discovered config reparses" contract was asserted by three
+    // tests and enforced at no boundary, and the boundary is the one place an
+    // operator would otherwise meet the failure, on the robot.
+    TopologyConfig::parse(&text)
+        .map_err(|e| anyhow!("the discovered config does not reparse: {e}"))?;
 
     // The findings go to **stderr**, always, so `--discover > topology.toml`
     // produces a usable file and still tells the operator what it could not
@@ -100,6 +129,12 @@ pub fn cmd_discover(source: &Path, out: Option<&Path>, history_secs: f64) -> Res
             "warning: frame {child:?} has more than one parent in this recording; \
              {rejected:?} was dropped. tf_tree gives a frame exactly one parent \
              (docs/PROJECT.md §5 D4), so this is a defect in the observed system."
+        );
+    }
+    if d.dropped_multi_parent() > 0 {
+        eprintln!(
+            "warning: {} transforms discarded for a second parent",
+            d.dropped_multi_parent()
         );
     }
     for (parent, child) in d.kind_clashes() {
@@ -113,6 +148,13 @@ pub fn cmd_discover(source: &Path, out: Option<&Path>, history_secs: f64) -> Res
             "warning: {} transforms discarded for an unusable frame name (§5.6)",
             d.dropped_bad_name()
         );
+    }
+    // The per-edge sample count is what tells an operator whether a ring size
+    // is worth trusting: an edge sized from four samples got a rate measured
+    // over three intervals, and the number in the file looks exactly as
+    // confident as one measured over ten thousand.
+    for (parent, child, n) in d.sample_counts() {
+        eprintln!("  {parent} -> {child}: {n} samples");
     }
     eprintln!(
         "discovered {} edges from {}",
@@ -136,7 +178,7 @@ pub fn cmd_discover(source: &Path, out: Option<&Path>, history_secs: f64) -> Res
 ///
 /// If the file cannot be read, does not parse, or describes a topology the
 /// engine refuses (two edges on one child, a cycle, an arena that does not fit).
-pub fn cmd_check(path: &Path) -> Result<()> {
+pub fn cmd_check(path: &Path, domain: Option<u8>) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     // `ConfigError` borrows from `text`, so it is rendered here rather than
@@ -146,6 +188,25 @@ pub fn cmd_check(path: &Path) -> Result<()> {
         Ok(c) => c,
         Err(e) => bail!("{}: {e}", path.display()),
     };
+    // §5.5's NORMATIVE startup refusal, run here rather than only at bridge
+    // startup — the whole point of this command is that a file which fails on
+    // the robot should have failed on a laptop first.
+    if let Some(d) = domain {
+        if let Err(e) = config.check_domain(d) {
+            bail!("{}: {e}", path.display());
+        }
+    }
+    // Ask the config before asking the builder. The builder finds the same
+    // cycle and names it `FrameId(1)` — a number that indexes an arena which
+    // was never built, and which an operator holding a text file cannot map
+    // back to anything.
+    if let Some(child) = config.cycle_child() {
+        bail!(
+            "{}: the declared topology has a cycle through frame {child:?} — \
+             following its parent links returns to it",
+            path.display()
+        );
+    }
     let tree = config.builder().build().map_err(|e| {
         anyhow!(
             "{}: the declared topology does not build: {e}",

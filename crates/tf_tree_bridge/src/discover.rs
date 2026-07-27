@@ -33,11 +33,11 @@
 //! with fewer than two samples has no measurable rate at all and gets an
 //! explicit slot count instead of a fabricated one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tf_tree::InterpPolicy;
 
-use crate::config::{EdgeConfig, EdgeShape, RingSize, TopologyConfig};
+use crate::config::{frame_name_ok, EdgeConfig, EdgeShape, RingSize, TopologyConfig};
 use crate::ingest::Topic;
 use crate::names::NameNormalizer;
 use crate::statics::StaticKind;
@@ -66,7 +66,11 @@ pub struct Discovery {
     edges: BTreeMap<(String, String), Seen>,
     /// child -> the parent that owns it, so a second parent is detectable.
     parent_of: BTreeMap<String, String>,
-    rejected_parents: BTreeMap<String, String>,
+    /// child -> **every** parent rejected for it, not just the last one. A map
+    /// to a single `String` reported one parent for a child that had three,
+    /// which understates exactly the defect this collector exists to surface.
+    rejected_parents: BTreeMap<String, BTreeSet<String>>,
+    dropped_multi_parent: u64,
     dropped_bad_name: u64,
     history_secs: f64,
     default_interp: InterpPolicy,
@@ -89,6 +93,7 @@ impl Discovery {
             edges: BTreeMap::new(),
             parent_of: BTreeMap::new(),
             rejected_parents: BTreeMap::new(),
+            dropped_multi_parent: 0,
             dropped_bad_name: 0,
             history_secs,
             default_interp: InterpPolicy::ScLerp,
@@ -129,11 +134,27 @@ impl Discovery {
             self.dropped_bad_name += 1;
             return;
         }
+        // `NameNormalizer` refuses only the empty name and a bare `/` — it is
+        // §5.6's wire rule, not a file rule. This collector's output is a
+        // *config file*, so a name has to survive being written and read back,
+        // and only `frame_name_ok` decides that. Without this a robot
+        // publishing `odo"m` produced `parent = "odo"m"`, which this crate's
+        // own parser refuses — so `--discover > topology.toml` emitted a file
+        // that `--config` could not read, and the operator found out on the
+        // robot rather than on the laptop.
+        if !frame_name_ok(&parent) || !frame_name_ok(&child) {
+            self.dropped_bad_name += 1;
+            return;
+        }
         match self.parent_of.get(&child) {
             Some(p) if *p != parent => {
                 // A second parent for one child. Recorded, not encoded: see the
                 // module docs.
-                self.rejected_parents.insert(child, parent);
+                self.dropped_multi_parent += 1;
+                self.rejected_parents
+                    .entry(child)
+                    .or_default()
+                    .insert(parent);
                 return;
             }
             Some(_) => {}
@@ -205,8 +226,17 @@ impl Discovery {
     pub fn multi_parent(&self) -> Vec<(&str, &str)> {
         self.rejected_parents
             .iter()
-            .map(|(c, p)| (c.as_str(), p.as_str()))
+            .flat_map(|(c, ps)| ps.iter().map(move |p| (c.as_str(), p.as_str())))
             .collect()
+    }
+
+    /// Transforms discarded because their child already had a different parent.
+    ///
+    /// The module docs promise a second parent's samples are *"counted and
+    /// named"*; [`Discovery::multi_parent`] names them and this counts them.
+    #[must_use]
+    pub fn dropped_multi_parent(&self) -> u64 {
+        self.dropped_multi_parent
     }
 
     /// Edges that arrived on both `/tf` and `/tf_static` — §5.7's hard error,
@@ -220,8 +250,9 @@ impl Discovery {
             .collect()
     }
 
-    /// Transforms discarded because a frame name was unusable (§5.6), or
-    /// because parent and child were the same frame.
+    /// Transforms discarded because a frame name was unusable (§5.6), because
+    /// parent and child were the same frame, or because the name could not be
+    /// written to a config file and read back (`"`, `\`, a control character).
     #[must_use]
     pub fn dropped_bad_name(&self) -> u64 {
         self.dropped_bad_name
@@ -446,5 +477,83 @@ mod tests {
         d.observe(Topic::Tf, &dyn_sample("base", "base", 0));
         assert_eq!(d.dropped_bad_name(), 2);
         assert!(d.to_config().edges.is_empty());
+    }
+
+    /// **A frame name that cannot survive the config file is dropped here, not
+    /// discovered into an unparseable file.**
+    ///
+    /// `NameNormalizer` is §5.6's *wire* rule and refuses only the empty name
+    /// and a bare `/`. A robot publishing `odo"m` therefore used to be written
+    /// out as `parent = "odo"m"`, which this crate's own parser refuses — so
+    /// `--discover > topology.toml` produced a file `--config` could not read,
+    /// and the operator met the failure on the robot. A name holding a newline
+    /// was worse: it emitted a structurally broken block.
+    ///
+    /// The good edge in the fixture is non-degenerate on purpose: without it
+    /// the config would be empty and `parse` would trivially succeed, so this
+    /// would pass even if `observe` dropped *everything*.
+    ///
+    /// Mutant: delete the `frame_name_ok` guard from `Discovery::observe` ⇒ the
+    /// emitted text no longer reparses and the `unwrap` fails.
+    #[test]
+    fn a_name_that_cannot_be_written_to_a_config_is_not_discovered() {
+        let mut d = Discovery::new(10.0);
+        for (p, c) in [
+            ("base", "odo\"m"),
+            ("ba\\se", "wheel"),
+            ("base", "line\nbreak"),
+            ("base", "bell\u{7}"),
+        ] {
+            d.observe(Topic::Tf, &dyn_sample(p, c, 0));
+            d.observe(Topic::Tf, &dyn_sample(p, c, 50_000_000));
+        }
+        // …and one edge that is perfectly fine, so the config is not empty.
+        d.observe(Topic::Tf, &dyn_sample("base", "wheel", 0));
+        d.observe(Topic::Tf, &dyn_sample("base", "wheel", 50_000_000));
+
+        assert_eq!(d.dropped_bad_name(), 8, "two samples each, all refused");
+        let config = d.to_config();
+        assert_eq!(config.edges.len(), 1, "only the usable edge survives");
+        assert_eq!(config.edges[0].child, "wheel");
+
+        let text = config.to_toml();
+        assert!(
+            TopologyConfig::parse(&text).is_ok(),
+            "a discovered config must reparse; got {text}"
+        );
+    }
+
+    /// **Every rejected parent is counted and named**, which is what the module
+    /// docs promise and what a `BTreeMap<String, String>` could not deliver: it
+    /// overwrote, so a child with three parents reported only the last one, and
+    /// no counter moved at all.
+    ///
+    /// Three parents, not two: with two, "reports only the last" and "reports
+    /// all of them" are indistinguishable once the first is the incumbent.
+    ///
+    /// Mutant: change `rejected_parents` back to `insert(child, parent)` over a
+    /// `BTreeMap<String, String>` ⇒ `multi_parent()` has one entry, not two.
+    /// Mutant: drop `self.dropped_multi_parent += 1` ⇒ the count assertion
+    /// fails.
+    #[test]
+    fn every_rejected_parent_is_counted_and_named() {
+        let mut d = Discovery::new(10.0);
+        d.observe(Topic::Tf, &dyn_sample("odom", "base", 0));
+        d.observe(Topic::Tf, &dyn_sample("map", "base", 10_000_000));
+        d.observe(Topic::Tf, &dyn_sample("world", "base", 20_000_000));
+        d.observe(Topic::Tf, &dyn_sample("map", "base", 30_000_000));
+
+        let mut rejected: Vec<&str> = d.multi_parent().iter().map(|(_, p)| *p).collect();
+        rejected.sort_unstable();
+        assert_eq!(rejected, ["map", "world"], "both losers are named");
+        assert_eq!(
+            d.dropped_multi_parent(),
+            3,
+            "every sample for a second parent is counted, repeats included"
+        );
+        // The first parent seen still wins, per §5.4 / the module docs.
+        let config = d.to_config();
+        assert_eq!(config.edges.len(), 1);
+        assert_eq!(config.edges[0].parent, "odom");
     }
 }

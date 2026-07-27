@@ -74,7 +74,7 @@
 //! semantic checks live in [`TopologyConfig::parse`] rather than in a later
 //! pass over the owned struct.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Iso3, Quat, TreeBuilder, Vec3};
@@ -243,6 +243,43 @@ impl TopologyConfig {
             }
         }
         Ok(())
+    }
+
+    /// The child frame that closes a parent cycle, if the declared edges have
+    /// one.
+    ///
+    /// `build()` finds this too, and reports it as `WouldCreateCycle { child:
+    /// FrameId(1) }` — an index into an arena that was never constructed, which
+    /// is the one thing an operator holding a text file cannot resolve. The
+    /// config still has the names, so the preflight answers with one.
+    ///
+    /// It is deliberately *not* folded into [`TopologyConfig::parse`]:
+    /// [`ConfigError`] borrows its `at` from the input text, and a cycle is a
+    /// property of the assembled edge set whose frame names are owned `String`s
+    /// by the time it can be detected. Reporting it would mean giving
+    /// `ConfigError` an owned field, and `ConfigError` is `Copy` on purpose.
+    ///
+    /// Each child has at most one parent (`DuplicateChild` is refused at parse
+    /// time), so the edges form a functional graph and walking parent links
+    /// terminates at a root or repeats.
+    #[must_use]
+    pub fn cycle_child(&self) -> Option<&str> {
+        let parent_of: BTreeMap<&str, &str> = self
+            .edges
+            .iter()
+            .map(|e| (e.child.as_str(), e.parent.as_str()))
+            .collect();
+        for e in &self.edges {
+            let mut seen = BTreeSet::new();
+            let mut cur = e.child.as_str();
+            while let Some(p) = parent_of.get(cur) {
+                if !seen.insert(cur) {
+                    return Some(cur);
+                }
+                cur = p;
+            }
+        }
+        None
     }
 
     /// A [`TreeBuilder`] carrying exactly this topology.
@@ -572,16 +609,12 @@ impl TopologyConfig {
                 continue;
             }
             if let Some(rest) = s.strip_prefix("[[") {
-                let name = rest.strip_suffix("]]").ok_or(ConfigError {
-                    line,
-                    kind: ConfigErrorKind::UnknownTable,
-                    at: s,
-                })?;
-                if name.trim() != "edge" {
+                let name = header_name(rest, "]]", s, line)?;
+                if name != "edge" {
                     return Err(ConfigError {
                         line,
                         kind: ConfigErrorKind::UnknownTable,
-                        at: name.trim(),
+                        at: name,
                     });
                 }
                 edges.push(Table::new());
@@ -589,16 +622,12 @@ impl TopologyConfig {
                 continue;
             }
             if let Some(rest) = s.strip_prefix('[') {
-                let name = rest.strip_suffix(']').ok_or(ConfigError {
-                    line,
-                    kind: ConfigErrorKind::UnknownTable,
-                    at: s,
-                })?;
-                if name.trim() != "topology" {
+                let name = header_name(rest, "]", s, line)?;
+                if name != "topology" {
                     return Err(ConfigError {
                         line,
                         kind: ConfigErrorKind::UnknownTable,
-                        at: name.trim(),
+                        at: name,
                     });
                 }
                 if topology.is_some() {
@@ -633,6 +662,38 @@ impl TopologyConfig {
 
         build_config(&topology.unwrap_or_default(), &edges)
     }
+}
+
+/// The name inside a table header, given the text after its opening bracket.
+///
+/// `close` is `"]]"` for `[[edge]]` and `"]"` for `[topology]`. A **trailing
+/// comment is accepted**, for exactly the reason one is accepted after a value:
+/// `[[edge]] # left wheel` is an operator annotating the file this format
+/// exists to be hand-edited as. Refusing it produced the worst kind of
+/// diagnostic — `unknown table (expected [topology] or [[edge]])` pointing at a
+/// line that *does* say `[[edge]]` — which is why the check is a suffix match
+/// on the bracket rather than on the whole line.
+///
+/// Anything else after the bracket is still refused: this schema has no place
+/// for it, and `[topology] junk` silently ignored is how a typo'd second table
+/// header becomes a config that parses and means something else.
+fn header_name<'a>(
+    rest: &'a str,
+    close: &str,
+    whole: &'a str,
+    line: u32,
+) -> Result<&'a str, ConfigError<'a>> {
+    let bad = ConfigError {
+        line,
+        kind: ConfigErrorKind::UnknownTable,
+        at: whole,
+    };
+    let end = rest.find(close).ok_or(bad)?;
+    let tail = rest[end + close.len()..].trim();
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return Err(bad);
+    }
+    Ok(rest[..end].trim())
 }
 
 /// `key = value`, with the trailing comment (if any) already required to be all
@@ -712,6 +773,14 @@ fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>>
         '[' => {
             let mut items = Vec::new();
             let mut rest = s[1..].trim_start();
+            // The separator is **required**, not optional. `[1.0 0.0 0.0]` is
+            // not TOML, and a parser that accepted it would be the one piece of
+            // leniency in a module whose whole argument is that a construct it
+            // does not understand is an error rather than a silent skip. It
+            // also cannot round-trip: `to_toml` always emits commas, so
+            // accepting their absence means reading files this tool can never
+            // write. A trailing comma before `]` stays legal — TOML allows it.
+            let mut need_comma = false;
             loop {
                 if let Some(r) = rest.strip_prefix(']') {
                     return Ok((Value::Array(items), r));
@@ -721,12 +790,18 @@ fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>>
                     // line-oriented, so it says so instead of truncating.
                     return Err(err(ConfigErrorKind::Unsupported, s));
                 }
+                if need_comma {
+                    let Some(r) = rest.strip_prefix(',') else {
+                        return Err(err(ConfigErrorKind::BadValue, rest));
+                    };
+                    rest = r.trim_start();
+                    need_comma = false;
+                    continue;
+                }
                 let (v, r) = parse_value(rest, line)?;
                 items.push(v);
                 rest = r.trim_start();
-                if let Some(r) = rest.strip_prefix(',') {
-                    rest = r.trim_start();
-                }
+                need_comma = true;
             }
         }
         _ => {
@@ -866,11 +941,7 @@ fn parse_domain<'a>(v: &Value<'a>, line: u32) -> Result<u8, ConfigError<'a>> {
 /// to escape and the parser never has to unescape — see [`quote`]. ROS frame
 /// names are identifiers; none of the three has ever been one.
 fn check_frame_name<'a>(name: &'a str, line: u32) -> Result<&'a str, ConfigError<'a>> {
-    if name.is_empty()
-        || name
-            .chars()
-            .any(|c| c.is_control() || c == '"' || c == '\\')
-    {
+    if !frame_name_ok(name) {
         return Err(ConfigError {
             line,
             kind: ConfigErrorKind::BadFrameName,
@@ -878,6 +949,21 @@ fn check_frame_name<'a>(name: &'a str, line: u32) -> Result<&'a str, ConfigError
         });
     }
     Ok(name)
+}
+
+/// Whether a frame name can be written to a config file and read back.
+///
+/// The predicate behind [`check_frame_name`], separated so **every producer of
+/// a config uses the same one as the parser**. [`crate::Discovery`] is the
+/// other producer, and it takes names off the wire: a robot publishing a frame
+/// called `odo"m` used to yield `parent = "odo"m"` in a discovered file, which
+/// this crate's own parser then refused. The contract that a discovered config
+/// reparses is only real if the two halves share this function.
+pub(crate) fn frame_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
 }
 
 const TOPOLOGY_KEYS: &[&str] = &["interp", "domain", "frames", "frame_headroom"];
@@ -1015,7 +1101,18 @@ fn build_config<'a>(
                     (None, Some((rv, rl)), Some((sv, sl))) => {
                         let rate_hz = as_f64(rv, rl, child)?;
                         let secs = as_f64(sv, sl, child)?;
-                        if !(rate_hz.is_finite() && rate_hz > 0.0 && secs.is_finite() && secs > 0.0)
+                        // The **product** has to be finite too, not just the
+                        // factors. `rate_hz = 1e300` with `history_secs = 1e300`
+                        // passes both individual guards and overflows to `inf`
+                        // in `Capacity::history`, whose non-finite fallback is
+                        // the *minimum* — so the edge silently gets a one-slot
+                        // ring, the worst ring this sizing code can produce and
+                        // the only one it used to produce without a word.
+                        if !(rate_hz.is_finite()
+                            && rate_hz > 0.0
+                            && secs.is_finite()
+                            && secs > 0.0
+                            && (rate_hz * secs).is_finite())
                         {
                             return Err(ConfigError {
                                 line: rl,
@@ -1413,5 +1510,167 @@ domain = 0
             .get(),
             512
         );
+    }
+
+    /// **A trailing comment after a table header is a comment, not an unknown
+    /// table.** Comments are accepted at line start and after a value, so an
+    /// operator annotating `[[edge]] # left wheel` has every reason to expect
+    /// this to work — and the refusal it used to get named the wrong thing
+    /// entirely: `unknown table (expected [topology] or [[edge]])` pointing at
+    /// a line that says `[[edge]]`.
+    ///
+    /// Mutant: in `header_name`, go back to `rest.strip_suffix(close)` ⇒
+    /// neither header matches and this fails on the `unwrap`.
+    #[test]
+    fn a_table_header_may_carry_a_trailing_comment() {
+        let c = TopologyConfig::parse(
+            "[topology] # main\n\
+             domain = 1\n\
+             [[edge]]  # left wheel\n\
+             parent = \"base\"\n\
+             child = \"wheel\"\n\
+             kind = \"dynamic\"\n\
+             capacity = 8\n",
+        )
+        .unwrap();
+        assert_eq!(c.default_domain, 1);
+        assert_eq!(c.edges.len(), 1);
+        assert_eq!(c.edges[0].child, "wheel");
+    }
+
+    /// **Junk after a table header is still refused.** The comment rule must
+    /// not become "ignore whatever follows the bracket": `[[edge]] [[edge]]` on
+    /// one line would then parse as a single edge header and silently swallow
+    /// the second.
+    ///
+    /// Mutant: drop the `!tail.is_empty() && !tail.starts_with('#')` check from
+    /// `header_name` ⇒ both of these parse and this fails.
+    #[test]
+    fn junk_after_a_table_header_is_still_refused() {
+        for text in ["[topology] junk\n", "[[edge]] [[edge]]\n"] {
+            assert_eq!(
+                TopologyConfig::parse(text).unwrap_err().kind,
+                ConfigErrorKind::UnknownTable,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// **A ring whose `rate_hz * history_secs` overflows to infinity is
+    /// refused, naming the child.** Both factors pass `is_finite() && > 0`
+    /// individually; their product does not, and `Capacity::history`'s
+    /// non-finite fallback is the *minimum*. So such an edge used to be given a
+    /// **one-slot ring** — the worst ring this sizing code can produce — with
+    /// no message at all.
+    ///
+    /// The `1e10 * 1.0` half pins that the guard rejects overflow and not
+    /// merely large numbers, so this cannot pass by refusing everything big.
+    ///
+    /// Mutant: remove `&& (rate_hz * secs).is_finite()` ⇒ the first case parses
+    /// and yields a 1-slot ring, and this fails.
+    #[test]
+    fn a_ring_size_that_overflows_to_infinity_is_refused() {
+        let overflowing = "[[edge]]\n\
+                           parent = \"a\"\n\
+                           child = \"b\"\n\
+                           kind = \"dynamic\"\n\
+                           rate_hz = 1e300\n\
+                           history_secs = 1e300\n";
+        let e = TopologyConfig::parse(overflowing).unwrap_err();
+        assert_eq!(e.kind, ConfigErrorKind::BadValue);
+        assert_eq!(e.at, "b", "the error names the offending child");
+
+        let big = "[[edge]]\n\
+                   parent = \"a\"\n\
+                   child = \"b\"\n\
+                   kind = \"dynamic\"\n\
+                   rate_hz = 1e10\n\
+                   history_secs = 1.0\n";
+        let c = TopologyConfig::parse(big).unwrap();
+        assert!(
+            matches!(c.edges[0].shape, EdgeShape::Dynamic { ring }
+                     if ring.capacity().get() > 1),
+            "a finite product must not hit the 1-slot fallback"
+        );
+    }
+
+    /// **An array needs its separators.** `[1.0 0.0 …]` is not TOML, and
+    /// `to_toml` always emits commas — accepting their absence means reading
+    /// files this tool can never write, in the one module whose whole argument
+    /// is that it refuses what it does not understand.
+    ///
+    /// A trailing comma stays legal, because TOML says so; without that second
+    /// case the mutant below could be "fixed" by demanding a comma everywhere,
+    /// which would reject a legal file.
+    ///
+    /// Mutant: replace the `need_comma` branch with the old optional
+    /// `if let Some(r) = rest.strip_prefix(',') { rest = r.trim_start(); }` ⇒
+    /// the first assertion fails.
+    #[test]
+    fn an_array_requires_commas_between_its_items() {
+        let no_commas = "[[edge]]\n\
+                         parent = \"a\"\n\
+                         child = \"b\"\n\
+                         kind = \"static\"\n\
+                         pose = [1.0 0.0 0.0 0.0 0.0 0.0 0.0]\n";
+        assert_eq!(
+            TopologyConfig::parse(no_commas).unwrap_err().kind,
+            ConfigErrorKind::BadValue
+        );
+
+        let trailing_comma = "[topology]\n\
+                              frames = [\"map\", \"odom\",]\n";
+        assert_eq!(
+            TopologyConfig::parse(trailing_comma).unwrap().frames,
+            ["map", "odom"],
+            "TOML allows a trailing comma"
+        );
+    }
+
+    /// **A cycle is reported by frame name, not by `FrameId`.** `build()` finds
+    /// the same cycle and calls it `WouldCreateCycle { child: FrameId(1) }` — an
+    /// index into an arena that was never constructed. This preflight exists to
+    /// fail on a laptop with something an operator can act on.
+    ///
+    /// The acyclic half is a two-edge *chain*, not a single edge: a one-edge
+    /// fixture would pass even if `cycle_child` reported any child that merely
+    /// has a parent.
+    ///
+    /// Mutant: return `Some(cur)` unconditionally on the first loop iteration
+    /// instead of on `!seen.insert(cur)` ⇒ the chain reports a cycle and this
+    /// fails.
+    #[test]
+    fn a_cycle_is_named_by_frame_and_an_acyclic_chain_is_not() {
+        let chain = "[[edge]]\n\
+                     parent = \"map\"\n\
+                     child = \"odom\"\n\
+                     kind = \"dynamic\"\n\
+                     capacity = 8\n\
+                     [[edge]]\n\
+                     parent = \"odom\"\n\
+                     child = \"base\"\n\
+                     kind = \"dynamic\"\n\
+                     capacity = 8\n";
+        assert_eq!(TopologyConfig::parse(chain).unwrap().cycle_child(), None);
+
+        let cyclic = "[[edge]]\n\
+                      parent = \"base\"\n\
+                      child = \"odom\"\n\
+                      kind = \"dynamic\"\n\
+                      capacity = 8\n\
+                      [[edge]]\n\
+                      parent = \"odom\"\n\
+                      child = \"base\"\n\
+                      kind = \"dynamic\"\n\
+                      capacity = 8\n";
+        let c = TopologyConfig::parse(cyclic).unwrap();
+        let child = c.cycle_child().unwrap();
+        assert!(
+            child == "base" || child == "odom",
+            "names a frame on the cycle, got {child:?}"
+        );
+        // And the builder does refuse it, so the preflight is not inventing a
+        // rule the engine does not have.
+        assert!(c.builder().build().is_err());
     }
 }

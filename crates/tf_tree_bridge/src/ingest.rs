@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use crate::authority::{Authority, AuthorityPolicy, Verdict};
 use crate::clock::{ClockGuard, ClockVerdict, OnClockReset};
 use crate::config::TopologyConfig;
+use crate::edgemap::{insert, lookup_mut, ByEdge};
 use crate::names::NameNormalizer;
 use crate::statics::{StaticStore, StaticVerdict};
 use crate::stats::BridgeStats;
@@ -191,7 +192,14 @@ pub struct Ingest {
     /// Undeclared edges seen, and how many times — the rate limiter behind
     /// `Action::UndeclaredEdge`'s `first_time`, and `doctor`'s list of what the
     /// robot publishes that the config forgot.
-    undeclared: BTreeMap<(String, String), u64>,
+    ///
+    /// A [`ByEdge`] for the same reason [`StaticStore`]'s tables are: the
+    /// counter is bumped on **every** message from an undeclared edge, and a
+    /// `(String, String)` key cannot be probed by reference. `first_time`
+    /// silences the log for a 1 kHz undeclared edge; without this it left the
+    /// allocator running at 1 kHz anyway, which is the more expensive half of
+    /// what the rate limiter was there to stop.
+    undeclared: ByEdge<u64>,
 }
 
 impl Ingest {
@@ -255,12 +263,20 @@ impl Ingest {
         //    would send an operator looking at `/tf_static` for an edge nobody
         //    ever wrote down.
         if !self.statics.is_declared(&parent, &child) {
-            let seen = self
-                .undeclared
-                .entry((parent.clone(), child.clone()))
-                .or_insert(0);
-            let first_time = *seen == 0;
-            *seen += 1;
+            // Fast path first: a repeat must not allocate. `entry()` needs an
+            // owned key whether or not it inserts, so reaching for it
+            // unconditionally cloned both names on every message of an edge
+            // already known to be undeclared.
+            let first_time = match lookup_mut(&mut self.undeclared, &parent, &child) {
+                Some(n) => {
+                    *n += 1;
+                    false
+                }
+                None => {
+                    insert(&mut self.undeclared, &parent, &child, 1);
+                    true
+                }
+            };
             self.stats.dropped_undeclared += 1;
             return Action::UndeclaredEdge {
                 parent,
@@ -307,7 +323,7 @@ impl Ingest {
                     // and an authority diagnostic here would train operators to
                     // ignore the message that matters. So this returns before
                     // authority is consulted at all.
-                    self.stats.applied += 1;
+                    self.stats.static_verified += 1;
                     return Action::StaticVerified { parent, child };
                 }
                 StaticVerdict::KindChanged { .. } => {
@@ -436,9 +452,8 @@ impl Ingest {
     /// bridge that reports no drops the operator recognises.
     #[must_use]
     pub fn undeclared(&self) -> Vec<(&str, &str, u64)> {
-        self.undeclared
-            .iter()
-            .map(|((p, c), n)| (p.as_str(), c.as_str(), *n))
+        crate::edgemap::iter(&self.undeclared)
+            .map(|(p, c, n)| (p, c, *n))
             .collect()
     }
 
@@ -900,5 +915,54 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// **A verified static is not an applied transform.** `applied` is
+    /// documented as *"transforms written into the arena"*, and a `/tf_static`
+    /// message that matches the config's declared constant writes nothing — the
+    /// value was placed by `TopologyConfig::builder` before the bridge started.
+    ///
+    /// This is not a pedantic distinction. `/tf_static` is transient-local, so
+    /// every late joiner causes the whole latched set to be re-delivered; an
+    /// operator watching `applied` on a robot whose only edges are static used
+    /// to see a healthy write rate for an arena nothing was writing to.
+    ///
+    /// The fixture pushes a real dynamic sample too, so `applied` is non-zero
+    /// and the assertion cannot pass by everything being zero.
+    ///
+    /// Mutant: put `self.stats.applied += 1` back in the `StaticVerified` arm
+    /// (dropping `static_verified`) ⇒ `applied` reads 4 and the ledger stays
+    /// balanced, so the first assertion is the one that catches it.
+    #[test]
+    fn a_verified_static_is_counted_as_verified_not_applied() {
+        let mut i = ingest();
+        let stat = Sample {
+            pose: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..Sample::identity("base", "lidar", 0)
+        };
+        // Three deliveries of the latched set, as three late joiners produce.
+        for _ in 0..3 {
+            assert!(matches!(
+                i.offer(Topic::TfStatic, &stat, &node("/rsp")),
+                Action::StaticVerified { .. }
+            ));
+        }
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &Sample::identity("odom", "base", 1_000 * MS),
+                &node("/ekf")
+            ),
+            Action::Publish { .. }
+        ));
+
+        let s = i.stats();
+        assert_eq!(s.applied, 1, "only the dynamic sample was written");
+        assert_eq!(s.static_verified, 3);
+        assert_eq!(s.transforms, 4);
+        assert!(
+            s.balanced(),
+            "the ledger must still balance: {s:?}" // `static_verified` is a bucket
+        );
     }
 }
