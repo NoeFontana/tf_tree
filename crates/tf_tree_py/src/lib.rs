@@ -51,9 +51,11 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 mod errors;
+mod offline;
 mod tree;
 
 pub use errors::*;
+pub use offline::open_file;
 pub use tree::*;
 
 /// Nanoseconds from float seconds, and the exact reason it is lossy.
@@ -92,6 +94,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree::build, m)?)?;
     m.add_function(wrap_pyfunction!(tree::push, m)?)?;
     m.add_function(wrap_pyfunction!(tree::open_arena, m)?)?;
+    m.add_function(wrap_pyfunction!(offline::open_file, m)?)?;
     m.add_class::<PyTree>()?;
     m.add_class::<PyPlan>()?;
     m.add_class::<PyPublisher>()?;

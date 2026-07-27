@@ -139,6 +139,46 @@ class Tree:
         this pays a cache probe per call and a compiled plan pays nothing.
         """
 
+    def freeze(self, path: str, /, *, source: str | None = ...) -> None:
+        """Write this tree to `path` as a frozen `.tft` (`PHASE5.md` §2.3).
+
+        The file *is* the arena: `open_file` maps it back with no parse and no
+        fixups, and the lookups it answers are bit-identical to this tree's.
+
+        Replacing `path` is atomic — the bytes land in a sibling temporary and
+        are renamed over it — so an interrupted freeze leaves the previous index
+        intact instead of a half-written one under the name somebody will open
+        next week.
+
+        `source` is the recording these poses came from; it is recorded in the
+        manifest as `null` when there is none. Linux only.
+        """
+
+    def span(self, target: str, source: str, /) -> tuple[int, int] | None:
+        """The interval, in nanoseconds, over which `plan(target, source)` answers.
+
+        `LatestCommon` generalised to a range: the *intersection* of every
+        dynamic edge's retained window, so the lower end is a `max` and the
+        upper end a `min`. It is the query to reach for when a lookup fails at
+        a stamp, because the answer is nearly always "one edge on the path had
+        not started yet".
+
+        Three distinct answers:
+
+        * `(t0, t1)` with `t0 <= t1` — answerable there, nowhere else.
+        * `(t0, t1)` with `t0 > t1` — the windows do not overlap. That is a real
+          answer, not an error: `t0 <= t <= t1` is correctly false everywhere.
+        * `None` — every step on the path is static (or the path is empty), so
+          the plan answers at *any* stamp and there is no finite interval.
+
+        Raises `NoDataError`, naming the edge, when an edge on the path has no
+        samples at all — which is a different situation from a non-overlapping
+        window and calls for a different fix.
+
+        On a live tree the answer is a snapshot that ages immediately, exactly
+        as `Plan.latest` does.
+        """
+
     def instance_uuid(self) -> str:
         """Which arena instance this is, as 32 hex characters.
 
@@ -190,6 +230,55 @@ def open_arena(
     is why this is an edge list rather than a boolean. **It requires
     `mode="rw"`** and is refused otherwise, so a read-only consumer still
     cannot bring an arena into existence.
+    """
+
+def open_file(path: str, /) -> Tree:
+    """Open a frozen `.tft` and read it as an ordinary `Tree` (`PHASE5.md` §4.1).
+
+    Opening is an `mmap`, so it costs microseconds and no parse — and it hands
+    back the **same** `Tree` a live arena does. `plan`, `at`, `at_into`,
+    `adaptive`, `latest` and `span` are the objects that were already there,
+    with the same semantics and bit-identical results. There is no offline API
+    to learn.
+
+    The tree is permanently read-only: `is_writable()` is `False` and
+    `publisher()` refuses, because the mapping is `PROT_READ` and a store
+    through it would be a fault rather than an error.
+
+    Raises `FileNotFoundError` (and its `OSError` siblings) for a path problem,
+    and `TfTreeError` for a file that is not a readable `.tft` — a layout or
+    format mismatch names both values and says to re-freeze, since a `.tft` is a
+    cache and not an archive.
+
+    **Dataloader pattern (§4.3).** Documented, not shipped: a
+    `torch.utils.data.Dataset` subclass would bind this package to a framework
+    version for no benefit, and the pattern is four lines::
+
+        class Frames(Dataset):
+            def __init__(self, path):
+                self.path, self.ds = path, None
+
+            def __getitem__(self, i):
+                if self.ds is None:                    # per worker
+                    self.ds = tf_tree.open_file(self.path)
+                ...
+
+    Open it **in the worker, not in the parent**. A `Tree` cannot be pickled,
+    and a `DataLoader` with `num_workers > 0` sends the dataset object to its
+    workers — by pickle under `spawn` and `forkserver`, which is CPython 3.14's
+    default start method on Linux. The lazy `None` is what keeps the object
+    picklable.
+
+    Under a plain `fork` an inherited `.tft` mapping does keep working: it is
+    `MAP_PRIVATE | PROT_READ` and is deliberately *not* poisoned at fork, unlike
+    a shared-memory attach. So the rule is about picklability, not about the
+    arena going away — §4.3 gives the fork-poisoning reason and that reason does
+    not apply to a frozen file.
+
+    Sixteen workers that each open the same file share one set of clean
+    page-cache pages, so the marginal cost per worker is about zero. That is the
+    entire argument for `.tft` (§2.2), and opening once in the parent and
+    passing poses down instead gives it up.
     """
 
 def from_sec(seconds: float, /) -> int:

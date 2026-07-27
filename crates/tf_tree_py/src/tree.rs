@@ -121,6 +121,31 @@ impl PyTree {
         })
     }
 
+    /// Write this tree to `path` as a frozen `.tft` (`docs/PHASE5.md` §2.3).
+    ///
+    /// The replacement of `path` is atomic — the bytes go to a sibling
+    /// temporary and are renamed over it — so an interrupted freeze leaves the
+    /// previous index intact rather than a half-written one under the name
+    /// somebody will open next week.
+    ///
+    /// `source` is the recording these poses came from, and is recorded in the
+    /// manifest as `null` when there is none.
+    #[pyo3(signature = (path, /, *, source = None))]
+    fn freeze(&self, path: &str, source: Option<&str>) -> PyResult<()> {
+        crate::offline::freeze_impl(&self.inner, path, source)
+    }
+
+    /// The interval over which `tree.plan(target, source)` is answerable.
+    ///
+    /// `(t0, t1)` in nanoseconds, or `None` when every step on the path is
+    /// static and the plan therefore answers at any stamp. See
+    /// [`span_impl`](crate::offline::span_impl) for the three cases and why an
+    /// empty intersection is returned rather than raised.
+    #[pyo3(signature = (target, source, /))]
+    fn span(&self, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
+        crate::offline::span_impl(&self.inner, target, source)
+    }
+
     /// Whether this tree's arena is shared with other processes.
     fn is_shared(&self) -> bool {
         self.inner.is_shared()

@@ -20,7 +20,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
 | §2 Frozen arena (`.tft`) | **Done.** `tf_tree_arena::frozen` writes and maps the container; `Tree::open_frozen`/`Tree::freeze_to` and `tf_tree freeze --from-live` are wired. §2.1's bit-for-bit claim is **tested and holds** (`crates/tf_tree/tests/frozen.rs`). Two amendments below: the container header's size, and the one-sided per-edge span. |
 | §3 Bag ingestion | Not implemented |
-| §4 Offline Python API | Not implemented |
+| §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 50 passed) and `just py-test-freethreaded` (3.14t, 52 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
 | §7 `tf_tree top` | Not implemented |
@@ -379,6 +379,31 @@ ds.manifest                        # source path, digest, ingest options, versio
 
 `span` is `LatestCommon` generalized to a range: the interval over which *every* dynamic edge on the plan has data. It is the single most useful offline query, because "why did my lookup fail at t" is nearly always "one edge on the path had not started yet."
 
+> **Amendment — one of these five shipped, and the other four are decisions
+> rather than a backlog.**
+>
+> `span` is there, on `Tree`, so `ds.span("map", "lidar")` is spelled exactly as
+> above and works on a live tree too (it reads retained windows, which a live
+> arena also has). It returns three distinguishable things, because collapsing
+> them loses the answer the caller acts on: `(t0, t1)`; `(t0, t1)` with
+> `t0 > t1` when the windows do not overlap — an empty intersection is a real
+> answer, not an error; and `None` when every step is static and the plan
+> therefore answers at *any* stamp. An edge that has never published raises
+> `NoDataError` **naming that edge**, which is the case §4.2's own sentence is
+> about.
+>
+> `resample` is not a binding: it is `plan.at(np.arange(t0, t1, 10**9 // hz))`,
+> one line of NumPy over the vectorized call §4.1 insists is the same call. A
+> second spelling of an existing path is what §4.1 forbids.
+>
+> `edges()`, `gaps()` and `manifest` are **not implemented**, and shipping them
+> off what is available today would answer a different question than their names
+> promise. Per-edge rate and jitter need §3's counting pass: the ring knows what
+> it *retained*, not what the source produced, and dividing the one by the other
+> is precisely the 4-kHz-off-a-1-kHz-edge error that §2.3's
+> `samples`/`pushes_total` amendment already had to correct once. `manifest`
+> needs a CBOR *reader*, where the crate has only a writer.
+
 ### 4.3 The dataloader pattern
 
 Document it, do not ship a class. A `torch.utils.data.Dataset` subclass would bind us to a framework version for no benefit; the pattern is four lines:
@@ -392,6 +417,24 @@ class Frames(Dataset):
 ```
 
 The lazy open matters: it must happen **after** fork, because Phase 3's `register_at_fork` poisoning applies here too. Say so in the docstring with the reason, not just the rule.
+
+> **Amendment — the rule is right and the reason given for it is wrong.**
+>
+> Phase 3's fork poisoning does **not** apply to a `.tft`. `Tree::from_frozen`
+> goes through `fork_gen_for`, which returns `None` for `ArenaBacking::Frozen`
+> deliberately: the mapping is `MAP_PRIVATE | PROT_READ` and is not
+> `MADV_DONTFORK`, so a child inherits it intact and every offset into it stays
+> valid — poisoning it would break `multiprocessing` for offline users to defend
+> against a hazard they do not have. `tests/python/test_frozen.py` forks and
+> queries the inherited mapping to keep that honest.
+>
+> The lazy open survives for a different reason, and it is the one the docstring
+> now gives: **a `Tree` cannot be pickled**, and a `DataLoader` with
+> `num_workers > 0` sends the dataset object to its workers by pickle under
+> `spawn` *and* under `forkserver` — which is CPython 3.14's default start
+> method on Linux, so this is the common case and not the exotic one. The lazy
+> `None` is what keeps the object picklable. Opening per worker is also what
+> §2.2's page-sharing argument depends on.
 
 ---
 
