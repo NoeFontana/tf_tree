@@ -966,6 +966,9 @@ dependencies = [
 [[package]]
 name = "tf_tree_bridge"
 version = "0.1.0"
+dependencies = [
+ "tf_tree",
+]
 
 [[package]]
 name = "tf_tree_c"
@@ -982,6 +985,7 @@ dependencies = [
  "clap",
  "tf_tree",
  "tf_tree_bench",
+ "tf_tree_bridge",
  "tf_tree_core",
  "tf_tree_ipc",
  "tf_tree_math",
