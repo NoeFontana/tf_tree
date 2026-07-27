@@ -131,14 +131,17 @@ fn echo_attaches_and_resolves() {
 
 /// **`doctor` must not claim a clean bill of health it did not earn.**
 ///
-/// A live arena has no recorded push stream, so the multi-writer and
-/// short-buffer checks have no evidence and can only ever come back clean.
-/// Printing "all seven pass" would be a lie by omission — the two checks an
-/// operator most wants after a mystery outage are exactly the two that went
-/// blind.
+/// A live arena has no recorded push stream, and the two checks that depend on
+/// one degrade differently — which is why the report has two ways of saying so.
+/// `TFT001` loses its only evidence (a ring remembers the current claim owner,
+/// not the sequence of writers) and is reported *not run*. `TFT011` keeps its
+/// counter evidence and loses only the capacity-vs-latency half, so it runs and
+/// carries a note. A bare `pass` on either would be the lie by omission this
+/// asserts against.
 ///
-/// Mutant: drop the "not run" line ⇒ this fails, and `doctor` goes back to
-/// implying seven checks ran when five did.
+/// Mutant: return `Vec::new()` from `live_evidence_notes`. Applied: the
+/// `TFT011` note assertion fails while the rest still passes, which is the
+/// half-blind case going unreported.
 #[test]
 fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
     let scratch = Scratch::new("doctor");
@@ -150,16 +153,32 @@ fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
         "banner still says fixture:\n{out}"
     );
     assert!(
-        out.contains("are not run"),
+        out.contains("not run:"),
         "doctor did not disclose its blind checks:\n{out}"
     );
     assert!(
-        out.contains("multi-writer") && out.contains("short-buffer"),
-        "doctor did not name which checks:\n{out}"
+        out.contains("TFT001"),
+        "doctor did not name the check that lost all its evidence:\n{out}"
+    );
+    assert!(
+        out.contains("note: TFT011 ran on its counter evidence only"),
+        "doctor did not disclose the half-blind check:\n{out}"
     );
     assert!(
         out.contains("instance "),
         "doctor did not report which arena instance it looked at:\n{out}"
+    );
+    // `TFT014` resolves a claim through the *shared* arena's participant
+    // table, which is the case a single-process test cannot reach. A leaked
+    // claim would be a finding; the publisher is alive, so it must be silent.
+    let not_run = out.split("not run:").nth(1).unwrap_or("");
+    assert!(
+        !not_run.contains("TFT014"),
+        "TFT014 must run against a real participant table:\n{out}"
+    );
+    assert!(
+        !out.contains("TFT014  participant"),
+        "a live publisher's claim was reported as leaked:\n{out}"
     );
 }
 

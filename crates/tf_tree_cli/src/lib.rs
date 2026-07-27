@@ -20,13 +20,16 @@ use clap::{Parser, Subcommand};
 use tf_tree::{EdgeKind, Iso3, Stamp, Tree};
 use tf_tree_bench::fixture;
 
+pub mod catalogue;
+pub mod checks;
 pub mod doctor;
+pub mod hostfacts;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod attach;
 
-use doctor::{Observations, Severity, Snapshot};
+use doctor::{Observations, Snapshot};
 
 /// `tf_tree` — inspect and debug a transform tree.
 ///
@@ -69,12 +72,47 @@ enum Command {
         /// action, and it needs no arena to do it.
         #[arg(long)]
         explain_version: bool,
+        /// Emit the report as JSON on one stream (`docs/PHASE5.md` §6).
+        ///
+        /// The schema is documented on [`catalogue::render_json`] and is
+        /// stable: it always carries every catalogue id, so a consumer can tell
+        /// "this check did not fire" from "this build has no such check".
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero if any unsuppressed error-severity check fired.
+        ///
+        /// Opt-in rather than always-on because `doctor` is run by hand far more
+        /// often than by CI, and a diagnostic that returns 1 breaks `&&` in an
+        /// operator's shell for no benefit. A gate asks for one.
+        #[arg(long)]
+        exit_code: bool,
+        /// Remove a check from the `--exit-code` gate, by id (`--suppress TFT013`).
+        ///
+        /// Repeatable. A suppressed check still runs and still prints — the flag
+        /// changes the exit status, not the report.
+        #[arg(long, value_name = "TFTNNN")]
+        suppress: Vec<String>,
     },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
         /// Fail the process if the runnable gate checks do not pass.
         #[arg(long)]
         gate: bool,
+    },
+    /// Write a live arena to a frozen `.tft` index (`docs/PHASE5.md` §2).
+    ///
+    /// **`--from-live` is the only source this phase has**, and the flag is
+    /// still required rather than implied: §3's `--from-bag` is the source most
+    /// users will want, and a `freeze` that silently meant "live" today would
+    /// have to change meaning when it lands.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Freeze {
+        /// Freeze the arena named by the global attach flags.
+        #[arg(long, required = true)]
+        from_live: bool,
+        /// Destination path. Overwritten if it exists.
+        #[arg(long, short)]
+        out: std::path::PathBuf,
     },
     /// List the processes attached to an arena, from the lock file alone.
     ///
@@ -104,15 +142,22 @@ pub fn run() -> Result<()> {
             source,
             rate,
         } => cmd_echo(live, &target, &source, rate),
-        Command::Doctor { explain_version } => {
+        Command::Doctor {
+            explain_version,
+            json,
+            exit_code,
+            suppress,
+        } => {
             if explain_version {
                 explain_format_version();
                 Ok(())
             } else {
-                cmd_doctor(live)
+                cmd_doctor(live, json, exit_code, &suppress)
             }
         }
         Command::Bench { gate } => cmd_bench(gate),
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Participants => cmd_participants(live),
     }
@@ -145,6 +190,16 @@ impl Source {
             Source::Fixture(_) => "in-process fixture",
             #[cfg(all(feature = "shm", target_os = "linux"))]
             Source::Live => "live arena",
+        }
+    }
+
+    /// Whether the push stream was reconstructed from the rings rather than
+    /// recorded as it happened — which is what makes `TFT001` unanswerable.
+    fn is_live(&self) -> bool {
+        match self {
+            Source::Fixture(_) => false,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Live => true,
         }
     }
 }
@@ -325,50 +380,123 @@ fn fmt_iso(iso: &Iso3) -> String {
     )
 }
 
-/// `tf_tree doctor`.
-fn cmd_doctor(live: Live<'_>) -> Result<()> {
+/// `tf_tree doctor` — the `docs/PHASE5.md` §6 catalogue.
+///
+/// **`--exit-code` is opt-in, and the previous unconditional `exit(1)` on any
+/// error is gone.** `doctor` is run by hand far more often than by CI, and a
+/// diagnostic that returns non-zero by default breaks `&&` in an operator's
+/// shell and gets wrapped in `|| true`, at which point the gate is worthless
+/// where it was wanted. §6 asks for the flag; the flag is the whole mechanism.
+fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) -> Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    for s in suppress {
+        let id = catalogue::Tft::parse(s).ok_or_else(|| {
+            // Refused rather than ignored: a typo that silently suppresses
+            // nothing leaves a gate that looks configured and is not.
+            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT016")
+        })?;
+        ids.insert(id);
+    }
+
     let (tree, src) = source(live)?;
     let obs = observations(tree, &src);
     let snap = Snapshot::capture(tree);
-    let report = doctor::run(&snap, &obs);
+    let stats = checks::collect_edge_stats(tree, &snap);
+    let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
 
-    println!("tf_tree doctor ({})", src.banner());
-    #[cfg(all(feature = "shm", target_os = "linux"))]
-    if matches!(src, Source::Live) {
-        println!("  instance {}", hex16(tree.instance_uuid()));
-        // Say what is *not* being checked. A live arena has no recorded push
-        // stream, so two of the seven checks have no evidence to work from and
-        // can only ever come back clean — printing "all seven pass" would be a
-        // clean bill of health that was never earned.
-        let blind: Vec<&str> = doctor::Observations::LOST_ON_A_LIVE_ARENA
-            .iter()
-            .map(|c| c.label())
-            .collect();
-        println!(
-            "  {} of 7 checks need a recorded push stream and are not run: {}",
-            blind.len(),
-            blind.join(", ")
-        );
-    }
-    if report.is_healthy() {
-        println!(
-            "  OK — all seven checks pass ({} frames)",
-            snap.frames.len()
-        );
+    let inputs = checks::Inputs {
+        snap: &snap,
+        obs: &obs,
+        stats: &stats,
+        host: host_facts(),
+        clock,
+        arena_bytes: tree.arena_size_bytes() as u64,
+        occupancy: checks::occupancy_of(tree),
+        live: src.is_live(),
+        counters: tf_tree::counters_compiled_in(),
+    };
+    let report = checks::run(&inputs, &ids);
+
+    let meta = catalogue::Meta {
+        source: src.banner(),
+        format_version: tf_tree::arena_format_version(),
+        layout_hash: tf_tree::arena_layout_hash(),
+        instance: instance_uuid(tree, &src),
+        frames: snap.frames.len(),
+        edges: snap.edges.len(),
+        generated_unix_nanos: unix_nanos_now(),
+        now_nanos: clock.nanos(),
+        clock_source: clock.label(),
+        counters_compiled_in: tf_tree::counters_compiled_in(),
+        notes: evidence_notes(src.is_live()),
+    };
+
+    if json {
+        print!("{}", catalogue::render_json(&report, &meta));
     } else {
-        for f in &report.findings {
-            let sev = match f.severity {
-                Severity::Warn => "WARN ",
-                Severity::Error => "ERROR",
-            };
-            println!("  [{sev}] {}: {}", f.check.label(), f.message);
-        }
+        print!("{}", catalogue::render_human(&report, &meta));
     }
 
-    if report.has_error() {
+    if exit_code && report.has_error() {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Disclosures for a check that ran with one of its evidence sources missing.
+///
+/// `TFT011` has two: the counters, which a live arena has, and the Phase 1
+/// `capacity x period` against observed publish latency, which needs a recorded
+/// push stream. A live arena's stream is reconstructed from the rings, where
+/// `arrival_delay_ns` is unknown and set to zero — and zero latency never
+/// exceeds any buffer span, so that half of the check is structurally silent.
+/// Reporting `pass` without saying so would claim a result it did not earn.
+///
+/// `TFT015`'s disclosure is unconditional rather than live-only: the missing
+/// participants row is a gap in the engine, not in this run's evidence, so it
+/// applies to a fixture and a live arena alike.
+fn evidence_notes(live: bool) -> Vec<String> {
+    let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
+    if live {
+        notes.push(
+            "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
+             latency, so the capacity-vs-latency half of the check cannot fire"
+                .to_owned(),
+        );
+    }
+    notes
+}
+
+/// The system clock as nanoseconds since the Unix epoch.
+///
+/// Saturates rather than panicking on a clock before 1970: `doctor` reporting a
+/// bad clock is useful, `doctor` aborting because of one is not.
+fn unix_nanos_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Host facts for `TFT016`, or `None` where `/sys` and `/proc` do not exist.
+fn host_facts() -> Option<hostfacts::HostFacts> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(hostfacts::probe())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The arena's instance uuid, which only a shared arena has.
+fn instance_uuid(tree: &Tree, src: &Source) -> Option<String> {
+    let _ = (tree, src);
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    if matches!(src, Source::Live) {
+        return Some(hex16(tree.instance_uuid()));
+    }
+    None
 }
 
 /// `tf_tree bench [--gate]`.
@@ -413,6 +541,66 @@ fn hex16(bytes: [u8; 16]) -> String {
 /// when the owner is wedged and nobody can complete a handshake. Those are
 /// exactly the situations in which somebody runs a diagnostic tool.
 ///
+/// `tf_tree freeze --from-live` — `docs/PHASE5.md` §2, and §5.6's capture.
+///
+/// Attaches **read-only** (`AttachArgs` defaults, D18) and copies the arena.
+/// A diagnostic that had to map a robot's tree read-write in order to take a
+/// snapshot of it would be a strictly worse tool than one that could not take
+/// the snapshot at all.
+///
+/// # It is a snapshot, not a transaction
+///
+/// Publishers keep publishing while this runs, so the image is a smear rather
+/// than a point in time — see `tf_tree_arena::write_frozen`. The output says so,
+/// because an operator who reads "frozen 233 MB" and assumes a consistent
+/// instant will eventually be surprised by a `SlotContended` in an offline
+/// query and have nothing to attribute it to.
+///
+/// `source_digest` is all-zero: a live arena is not a recording and has no
+/// content hash to name. §3's `--from-bag` fills it.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn cmd_freeze(live: Live<'_>, from_live: bool, out: &std::path::Path) -> Result<()> {
+    // `required = true` on the flag makes this unreachable through `clap`; it is
+    // here so the invariant is stated where the code depends on it rather than
+    // in an attribute two hundred lines away.
+    anyhow::ensure!(from_live, "`freeze` needs a source; pass `--from-live`");
+    let tree = live.open()?;
+    // `as i64` would wrap silently once `as_nanos` passes 2^63 (2262-04-11) and
+    // hand the header a negative "created" stamp that reads as 1901. Saturating
+    // costs nothing on a once-per-freeze path, and the field is provenance only
+    // — a clamped far-future stamp is visibly wrong, a wrapped one is not.
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+    // One message rather than an `anyhow` context chain: `FrozenFileError` is
+    // `Copy` and `String`-free by house rule, so all it can say is *what* went
+    // wrong — the path is the missing half, and it belongs in the same line an
+    // operator reads, not one frame above it.
+    let header = tree
+        .freeze_to(out, None, [0; 32], created)
+        .map_err(|e| anyhow::anyhow!("could not freeze to {}: {e}", out.display()))?;
+    println!(
+        "froze {} bytes of arena to {}",
+        header.arena_size,
+        out.display()
+    );
+    println!(
+        "  arena at file offset {} ({} MiB aligned), manifest {} bytes at {}",
+        header.arena_off,
+        tf_tree_arena_align_mib(),
+        header.manifest_len,
+        header.manifest_off
+    );
+    println!("  snapshot is not atomic: publishers were free to write during the copy");
+    Ok(())
+}
+
+/// The `.tft` arena alignment, in MiB, for the message above.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn tf_tree_arena_align_mib() -> u64 {
+    tf_tree::ARENA_FILE_ALIGN / (1024 * 1024)
+}
+
 /// Liveness is the kernel's answer — `F_OFD_GETLK` on the participant's byte —
 /// not an inference from the identity record, which is why a `SIGSTOP`ped
 /// process correctly reads as alive (§5.1).

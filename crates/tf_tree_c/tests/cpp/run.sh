@@ -9,6 +9,10 @@
 # code, so a build that compiles and a build that computes the right transform
 # are different claims.
 #
+# Two groups follow the matrix and are not part of it: 4 `--wrap` builds that
+# add `check_at_writes_into_the_returned_object` (see the `WRAP` note below for
+# why they are kept separate), and 1 sanitizer build. 13 in total.
+#
 # Sophus is optional and its absence is reported rather than skipped silently —
 # §4.3's stride hazard only exists where Sophus does, and a run that did not
 # exercise it should not read like one that did. `just cpp-deps` fetches it.
@@ -51,6 +55,24 @@ fi
 cargo build --release -q -p tf_tree_c --features test-hooks
 
 WARN="-Wall -Wextra -Wpedantic -Werror"
+
+# **`--wrap` is what makes §7 gate 2 testable without a stopwatch.** It points
+# this file's calls to `tft_plan_at` at a shim that records the `out` pointer it
+# was handed, so `check_at_writes_into_the_returned_object` can assert that
+# `Plan::at<T>` gave the ABI the address of the object it returns rather than a
+# temporary it copies out of afterwards. The alternative — a `test-hooks` symbol
+# on the Rust side — would put that store inside the function `just cpp-bench`
+# times. The shim forwards to `__real_tft_plan_at`, so the rest of the file
+# behaves identically under it.
+#
+# **It is deliberately kept out of the §6.2 matrix below.** `--wrap` is a
+# GNU-ld/lld option and Mach-O's `ld64` has no equivalent, so putting it on the
+# portability rows would make the repo's C++ *portability* gate require a
+# specific linker family in order to test something that has nothing to do with
+# portability. The four rows below get it instead, and the eight matrix rows
+# stay linker-agnostic.
+WRAP="-DTF_TREE_WRAP_PLAN_AT -Wl,--wrap=tft_plan_at"
+
 fail=0
 
 for cxx in g++ clang++; do
@@ -85,6 +107,38 @@ for cxx in g++ clang++; do
             fi
             tail -n +2 "$OUT/log" | sed 's/^  /      /' | head -3
         done
+    done
+done
+
+# §7 gate 2, pinned structurally: `check_at_writes_into_the_returned_object`.
+#
+# Both compilers and both error modes, because that is exactly what the property
+# varies with — NRVO is a per-compiler decision, and the error mode is the whole
+# of the asymmetry §0.0 records. **Not** both standard revisions: copy elision
+# is unchanged between C++17 and C++20, so a second `std` would double the rows
+# and hold nothing new. These builds run the whole file, not just the one check,
+# which is also what shows that the forwarding shim perturbs nothing.
+for cxx in g++ clang++; do
+    command -v "$cxx" >/dev/null || continue   # already reported by the matrix
+    for mode in exceptions no-exceptions; do
+        flags=""
+        [ "$mode" = "no-exceptions" ] && flags="-fno-exceptions"
+        printf '  %-34s ' "$cxx --wrap $mode"
+        # shellcheck disable=SC2086
+        if ! $cxx -std=c++17 $flags $WARN $WRAP -I "$INC" $EIGEN $SOPHUS \
+                -o "$OUT/w" "$SRC" "$LIB" -lpthread -ldl -lm 2>"$OUT/err"; then
+            echo "COMPILE FAILED"
+            sed 's/^/      /' "$OUT/err" | head -20
+            fail=1
+            continue
+        fi
+        if ! "$OUT/w" >"$OUT/log" 2>&1; then
+            echo "RUN FAILED"
+            sed 's/^/      /' "$OUT/log" | head -20
+            fail=1
+            continue
+        fi
+        echo "ok"
     done
 done
 

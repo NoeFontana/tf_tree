@@ -18,11 +18,11 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | Area | Status |
 |---|---|
 | §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
-| §2 Frozen arena (`.tft`) | Not implemented |
+| §2 Frozen arena (`.tft`) | **Done.** `tf_tree_arena::frozen` writes and maps the container; `Tree::open_frozen`/`Tree::freeze_to` and `tf_tree freeze --from-live` are wired. §2.1's bit-for-bit claim is **tested and holds** (`crates/tf_tree/tests/frozen.rs`). Two amendments below: the container header's size, and the one-sided per-edge span. |
 | §3 Bag ingestion | Not implemented |
 | §4 Offline Python API | Not implemented |
-| §5 Diagnostic counters | **Done**, except §5.6's freeze-side capture, which needs §2. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
-| §6 Diagnostics catalogue `TFT001`–`TFT016` | Not implemented |
+| §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
+| §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
 | §7 `tf_tree top` | Not implemented |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
 | §9 Benchmark artifact | **Partial.** `just bench-report` emits `report/{results.json,index.html}` with the §9.3 provenance header, all eight §9.2 rows, and all four §9.3 "where we are worse" entries; `Report::validate` makes the honesty rules structural — the tool refuses to write a report that over-claims, rather than relying on whoever wrote it. On this host every comparison row is `UNAVAILABLE` with its own reason, which is §9.3's prescribed output, not a gap in the tool. **Not done:** §9.1's container image, the public sample recording, `tf_tree bench compare`'s CLI spelling (it takes `--bag`, which is §3), and §12 gate 7 (reproducing a committed `results.json` on a clean machine). |
@@ -235,6 +235,61 @@ The manifest is CBOR rather than a packed struct because it is cold, variable-le
 
 `source_digest` makes a `.tft` traceable to the recording it came from, which matters the first time a training result cannot be reproduced.
 
+> **Amendment — the container header is 128 bytes, and that has to be a
+> constant rather than a `size_of`.**
+>
+> The field list above gives no total size and no reserved tail. Laid out in the
+> stated order it comes to 120 bytes with no implicit padding, so
+> `tf_tree_arena::frozen::FROZEN_HEADER_SIZE` pins it at **128 with 8 reserved**,
+> asserted by a test. The alternative — letting the manifest start at whatever
+> `size_of::<FrozenHeader>()` happened to be — makes the file layout depend on a
+> compiler decision, which is exactly the class of accident `layout_hash` exists
+> to catch inside the arena and which nothing would have caught out here.
+>
+> The reserved tail is written zero and **not** checked on read, so a future
+> field placed there must be optional by construction: an older reader will
+> ignore it rather than refuse the file.
+
+> **Amendment — `arena_off` is 2 MiB aligned for a narrower reason than the
+> section gives, and the section's reason is not quite right.**
+>
+> §2.3 says the alignment makes the mapping "eligible for transparent huge pages".
+> More precisely: a huge page can back a mapping only where the virtual address
+> and the file offset are congruent modulo 2 MiB. Aligning the file offset is
+> *necessary* and is the only half this format controls; the address is the
+> kernel's choice. So `MADV_HUGEPAGE` is best-effort here and its failure is not
+> an error — which is what the implementation does, and why.
+
+> **Amendment — the manifest's per-edge span is one-sided, and is named
+> accordingly.**
+>
+> §2.3 asks for a "per-edge time span". `newest_ns` is exact. The other end is
+> emitted as **`oldest_ns`**, meaning the oldest sample *still retained in the
+> ring* — which is not the oldest sample the source contained, because a ring
+> that lapped during ingest has already dropped the earlier ones. §3's counting
+> pass knows the true span and can add a key for it. A single `span` that
+> silently meant "whatever survived" would be worse than a narrower key that
+> means what its name says.
+>
+> Both are `null`, not `0`, for an edge that has never published: a reader cannot
+> tell a stamp of zero from "no samples", and epoch-zero stamps are real.
+
+> **Amendment — the per-edge "sample count" is two keys, because there are two
+> counts and they are not close.**
+>
+> §2.3 asks for a per-edge "sample count". `EdgeRecord::head` is the monotone
+> count of every sample ever pushed and keeps rising after the ring laps; the
+> number of samples the *file* holds is `min(head, retained)`. For a 512-slot
+> ring that took 2048 pushes those are 2048 and 511 — and the key sat one line
+> above `oldest_ns`, which is already, deliberately, the retained window. A
+> consumer computing `samples / (newest_ns - oldest_ns)` read 4 kHz off a 1 kHz
+> edge.
+>
+> So the manifest emits **`samples`** = what the file holds, and
+> **`pushes_total`** = what the source produced. Both, not one: their ratio is
+> how much the ring dropped during ingest, which is the first thing to check when
+> an offline query comes back short. The per-edge map is therefore eight keys.
+
 ### 2.4 Read path
 
 ```
@@ -432,7 +487,24 @@ Disabling it removes the fields, the increments, and the arena regions' *use* (t
 
 Arena counters die with the arena. On a robot, the interesting question is usually "what did the counters say just before this went wrong", so:
 
-**NORMATIVE:** `tf_tree freeze --from-live` copies the counter regions into the `.tft` manifest, and `doctor --json` output is timestamped and appendable. A field snapshot then carries the diagnosis with it, rather than requiring the fault to be reproduced on a bench.
+**NORMATIVE:** `tf_tree freeze --from-live` copies the counter regions into the `.tft`, and `doctor --json` output is timestamped and appendable. A field snapshot then carries the diagnosis with it, rather than requiring the fault to be reproduced on a bench.
+
+> **Amendment — "into the manifest" was wrong, and §2.1 is why.**
+>
+> This section originally said the counters go into the `.tft` *manifest*. They
+> do not, and should not. §2.1 makes the frozen file an arena image, so freezing
+> copies the whole arena — `ArenaLayout::edge_counters()` and
+> `participant_counters()` land at their own offsets and are read back through
+> the identical `ArenaView::edge_counters` accessor a live arena uses.
+>
+> That is a stronger guarantee than the original wording asked for. There is no
+> code path that can *forget* to copy the counters, because there is no code that
+> copies them specifically. And it avoids a second source of truth: a manifest
+> copy would be a snapshot of a snapshot, and the first time the two disagreed
+> nobody would know which to believe.
+>
+> The manifest keeps what the arena cannot hold — the source path, the recording
+> digest, the ingest options.
 
 ### 5.7 What must still be measured
 

@@ -83,7 +83,13 @@ tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0", default-featur
 tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.1.0" }
 tf_tree = { path = "crates/tf_tree", version = "0.1.0", default-features = false }
 # publish = false crates, wired by path only (no version requirement published).
-tf_tree_bench = { path = "crates/tf_tree_bench" }
+# **`default-features = false` for the same load-bearing reason as `tf_tree`
+# above, and it is easy to miss here.** `tf_tree_bench` has its own
+# `default = ["counters"]` that forwards to `tf_tree/counters`, so without this
+# flag `tf_tree_cli --no-default-features` still linked a counting engine: the
+# CLI's own `counters` feature switched nothing, and `TFT010`'s "built without
+# counters" skip branch was unreachable in every buildable configuration.
+tf_tree_bench = { path = "crates/tf_tree_bench", default-features = false }
 # no_std numeric + POD casting (the entire core dependency budget, plus blake3).
 libm = "0.2"
 bytemuck = { version = "1", features = ["derive"] }

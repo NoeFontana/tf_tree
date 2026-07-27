@@ -39,6 +39,17 @@
 mod cache;
 mod tree;
 
+/// The `.tft` manifest's encoder (`docs/PHASE5.md` §2.3).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+mod cbor;
+/// The frozen `.tft` arena (`docs/PHASE5.md` §2).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+mod frozen;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use frozen::FrozenFileError;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use tf_tree_arena::{FrozenError, FrozenHeader, ARENA_FILE_ALIGN};
+
 pub use tree::{
     BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, ReparentError, Tree,
     TreeBuilder,
@@ -70,6 +81,19 @@ pub fn arena_format_version() -> u32 {
 #[must_use]
 pub fn arena_layout_hash() -> u32 {
     tf_tree_arena::layout_hash()
+}
+
+/// Whether this build compiled `docs/PHASE5.md` §5's diagnostic counters in.
+///
+/// A diagnostic that reads `EdgeCounters` cannot otherwise tell "nothing
+/// failed" from "nothing was counted", and those two answers call for opposite
+/// actions. It has to be evaluated *here*, inside the crate that owns the
+/// feature: cargo unifies features across a workspace, so a `cfg!` in a
+/// downstream crate reports what that crate asked for rather than what the
+/// engine was built with.
+#[must_use]
+pub fn counters_compiled_in() -> bool {
+    cfg!(feature = "counters")
 }
 
 /// Zero-config rendezvous (`docs/PHASE2.md` §3.2, `docs/decisions/0005`).
