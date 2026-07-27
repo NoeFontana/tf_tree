@@ -24,6 +24,7 @@ pub mod catalogue;
 pub mod checks;
 pub mod doctor;
 pub mod hostfacts;
+pub mod top;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -93,6 +94,32 @@ enum Command {
         #[arg(long, value_name = "TFTNNN")]
         suppress: Vec<String>,
     },
+    /// Live view of an arena: rates, staleness, claims, participants, feed.
+    ///
+    /// `docs/PHASE5.md` §7. Read-only, always — see [`top`] for why there is no
+    /// `ratatui` here and what that costs.
+    Top {
+        /// Redraw interval in milliseconds.
+        #[arg(long, default_value_t = 1000, value_name = "MS")]
+        interval: u64,
+        /// Stop after this many frames; `0` runs until interrupted.
+        ///
+        /// Not only a test affordance: `tf_tree top --iterations 1 > frame.txt`
+        /// is how an operator attaches a snapshot of a live arena to a bug
+        /// report, and it is why the non-tty path emits no escape sequences.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        iterations: u64,
+        /// Show the per-edge detail pane, with the inter-arrival histogram.
+        ///
+        /// Takes an edge id or a substring of its `parent->child` label. A flag
+        /// rather than a cursor because there is no raw-mode key handling
+        /// without a `libc` dependency this crate does not have.
+        #[arg(long, value_name = "ID|NAME")]
+        edge: Option<String>,
+        /// Force colour on or off; the default follows whether stdout is a tty.
+        #[arg(long)]
+        color: Option<bool>,
+    },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
         /// Fail the process if the runnable gate checks do not pass.
@@ -155,6 +182,12 @@ pub fn run() -> Result<()> {
                 cmd_doctor(live, json, exit_code, &suppress)
             }
         }
+        Command::Top {
+            interval,
+            iterations,
+            edge,
+            color,
+        } => cmd_top(live, interval, iterations, edge, color),
         Command::Bench { gate } => cmd_bench(gate),
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
@@ -497,6 +530,105 @@ fn instance_uuid(tree: &Tree, src: &Source) -> Option<String> {
         return Some(hex16(tree.instance_uuid()));
     }
     None
+}
+
+/// `tf_tree top` — `docs/PHASE5.md` §7's live view.
+///
+/// # `--rw` is refused, not ignored
+///
+/// The attach flags are global, so `tf_tree --rw top` parses. A read-write
+/// mapping is exactly what D18 exists to keep away from a diagnostic tool, and
+/// a live view is the tool most likely to be left running unattended on a
+/// robot. Silently downgrading would be friendlier and worse: the operator would
+/// believe they had asked for something and got it. Refusing states the rule
+/// once, where it is violated.
+fn cmd_top(
+    live: Live<'_>,
+    interval_ms: u64,
+    iterations: u64,
+    edge: Option<String>,
+    color: Option<bool>,
+) -> Result<()> {
+    // A floor rather than a clamp: `--interval 0` is a request to spin a core
+    // reading a robot's arena as fast as it can, which is the one way this tool
+    // *can* perturb what it observes (cache-line traffic on every ring head).
+    // Answering "no" is more useful than quietly doing something else.
+    anyhow::ensure!(
+        interval_ms >= 50,
+        "--interval {interval_ms} is below the 50 ms floor: a faster redraw perturbs the arena it \
+         is reading and cannot be read by a human anyway"
+    );
+
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    anyhow::ensure!(
+        !live.rw,
+        "`top` is a read-only observer (D18) and refuses --rw; drop the flag"
+    );
+
+    let (tree, src) = source(live)?;
+
+    // The lock file is what makes read-only participants visible at all: they
+    // hold a byte and write no arena record, so without this the participant
+    // pane would list only the writers — and `top` itself would be invisible in
+    // its own output.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    let merge: Box<dyn Fn(&mut top::Capture)> = if live.attach {
+        match live
+            .rendezvous()
+            .ok()
+            .filter(|rv| rv.lock_path().exists())
+            .and_then(|rv| tf_tree_ipc::LockFile::open(rv.lock_path()).ok())
+        {
+            // Not an error: the arena mapped, so there is something to watch.
+            // A missing or unreadable lock file costs the `mode`/`comm` columns
+            // and the read-only rows, and the pane's `record` column already
+            // says which rows came from where.
+            None => Box::new(|_: &mut top::Capture| {}),
+            Some(lock) => Box::new(move |cap: &mut top::Capture| {
+                let mut rows = Vec::new();
+                for slot in 0..tf_tree_ipc::MAX_PARTICIPANTS {
+                    let held = lock
+                        .probe_participant(slot)
+                        .map(|p| p.held)
+                        .unwrap_or(false);
+                    let id = lock.read_identity(slot).ok().flatten();
+                    if !held && id.is_none() {
+                        continue;
+                    }
+                    let (pid, mode, comm) = match id {
+                        None => (0, "?", String::new()),
+                        Some(i) => (
+                            i.pid,
+                            match i.mode {
+                                tf_tree_ipc::AccessMode::ReadOnly => "ro",
+                                tf_tree_ipc::AccessMode::ReadWrite => "rw",
+                            },
+                            {
+                                let n = i.name.iter().position(|b| *b == 0).unwrap_or(i.name.len());
+                                String::from_utf8_lossy(&i.name[..n]).into_owned()
+                            },
+                        ),
+                    };
+                    rows.push((slot, pid, mode, comm, held));
+                }
+                cap.merge_lock_rows(&rows);
+            }),
+        }
+    } else {
+        Box::new(|_: &mut top::Capture| {})
+    };
+    #[cfg(not(all(feature = "shm", target_os = "linux")))]
+    let merge: Box<dyn Fn(&mut top::Capture)> = Box::new(|_: &mut top::Capture| {});
+
+    top::run(
+        tree,
+        src.banner(),
+        core::time::Duration::from_millis(interval_ms),
+        iterations,
+        edge,
+        color,
+        &*merge,
+    )
 }
 
 /// `tf_tree bench [--gate]`.

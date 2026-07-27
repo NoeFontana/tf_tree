@@ -240,3 +240,91 @@ fn a_different_domain_is_a_different_arena() {
     let (ok, out) = cli(&scratch.0, &["tree", "--attach", "--domain", "7"]);
     assert!(!ok, "attaching to an empty domain must fail:\n{out}");
 }
+
+/// `tf_tree top` against a live arena, including the observer's own row.
+///
+/// Two properties that only a real attach can show:
+///
+/// 1. **The read-only observer is visible and is marked as one.** A read-only
+///    participant holds a lock-file byte and writes *no* arena participant
+///    record (`Tree::participant_slot` returns `u32::MAX`), so a participant
+///    pane built from the arena table alone would show only the publisher — and
+///    `top` would be invisible in its own output while sitting in the table's
+///    capacity.
+/// 2. **It says it is a read-only observer**, which is the claim the rest of
+///    the pane is asking to be believed.
+///
+/// Mutant: replace `cmd_top`'s lock-file `merge` closure with the no-op one
+/// used on the non-attach path. Applied: no `ro` row and no `record=no` row
+/// exist, so the `mode ro` assertion fails while the frame otherwise renders
+/// perfectly — exactly the silent half-picture this asserts against.
+#[test]
+fn top_shows_the_live_arena_and_its_own_read_only_row() {
+    let scratch = Scratch::new("top");
+    let _pubr = publish(&scratch);
+
+    let (ok, out) = cli(
+        &scratch.0,
+        &["top", "--attach", "--iterations", "2", "--interval", "50"],
+    );
+    assert!(ok, "tf_tree top --attach failed:\n{out}");
+    assert_eq!(
+        out.matches("tf_tree top").count(),
+        2,
+        "not two frames:\n{out}"
+    );
+    assert!(out.contains("live arena"), "banner says fixture:\n{out}");
+    assert!(out.contains("read-only observer"), "{out}");
+    assert!(
+        out.contains("no arena participant record"),
+        "the observer did not disclose how it is attached:\n{out}"
+    );
+    // The publisher's topology, not the in-process fixture's.
+    assert!(out.contains("map->base"), "no live edge:\n{out}");
+    assert!(
+        !out.contains("base_link"),
+        "this is the fixture, not the live arena:\n{out}"
+    );
+    // The observer's own lock-file row: read-only, and with no arena record.
+    let pane = out
+        .split("participants")
+        .nth(1)
+        .expect("no participants pane");
+    let ro_rows: Vec<&str> = pane
+        .lines()
+        .filter(|l| l.split_whitespace().nth(2) == Some("ro"))
+        .collect();
+    assert!(!ro_rows.is_empty(), "no read-only participant row:\n{pane}");
+    assert!(
+        ro_rows.iter().any(|l| l.contains(" no ")),
+        "the read-only row claims an arena record it cannot have:\n{ro_rows:?}"
+    );
+}
+
+/// **`top` refuses `--rw` rather than quietly downgrading it.**
+///
+/// D18 is why a diagnostic tool maps `PROT_READ`: the MMU is what stops a bug
+/// in this binary from corrupting a robot's transform tree. `--rw` is a global
+/// flag, so `tf_tree --rw top` parses; accepting it would put the longest-lived
+/// diagnostic process on the robot inside the blast radius the mapping exists
+/// to define.
+///
+/// Mutant: delete the `anyhow::ensure!(!live.rw, ...)` in `cmd_top`. Applied:
+/// the command exits 0 and both assertions fail.
+#[test]
+fn top_refuses_a_read_write_attach() {
+    let scratch = Scratch::new("top-rw");
+    let _pubr = publish(&scratch);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tf_tree"))
+        .args(["top", "--attach", "--rw", "--iterations", "1"])
+        .env("TF_TREE_RUNTIME_DIR", &scratch.0)
+        .output()
+        .expect("run tf_tree");
+    assert!(!out.status.success(), "--rw was accepted");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("read-only observer") && err.contains("--rw"),
+        "unhelpful refusal: {err}"
+    );
+}
