@@ -21,6 +21,8 @@ pub mod fixture;
 /// Multi-process evaluation harness: open-loop latency, CPU and PSS accounting.
 pub mod mp;
 pub mod replay;
+/// `docs/PHASE5.md` §9's benchmark artifact: the report and its honesty rules.
+pub mod report;
 /// Spawning child processes attached to a shared arena (Phase 2). Linux-only.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod shm_util;
