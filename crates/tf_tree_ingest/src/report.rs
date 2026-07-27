@@ -436,6 +436,48 @@ fn push_json_string(s: &mut String, v: &str) {
 mod tests {
     use super::*;
 
+    /// A rate that is not a number is emitted as `null`, because JSON has no
+    /// spelling for `NaN` and a document containing one is refused by every
+    /// parser — including `json.load`, which is what a user will reach for.
+    ///
+    /// The row is built by hand rather than through an ingest because no
+    /// recording this crate can read produces a non-finite rate; the guard
+    /// exists for the arithmetic, not for a fixture.
+    ///
+    /// Mutant: drop the `is_finite` guard from the `rate_hz` arm — applied, and
+    /// this test failed with `"rate_hz":NaN`.
+    #[test]
+    fn non_finite_rate_is_null() {
+        let row = EdgeRow {
+            parent: "a".into(),
+            child: "b".into(),
+            topic: "/tf".into(),
+            is_static: false,
+            samples: 2,
+            source_oldest_ns: Some(0),
+            source_newest_ns: Some(0),
+            rate_hz: Some(f64::NAN),
+        };
+        let report = IngestReport {
+            source: "x.mcap".into(),
+            tool_version: "0",
+            frames: 2,
+            static_edges: 0,
+            dynamic_edges: 1,
+            transforms_read: 2,
+            samples_pushed: 2,
+            span_ns: None,
+            fill: FillStats::default(),
+            edges: vec![row],
+            anomalies: crate::Anomalies::default(),
+            remaps: Vec::new(),
+            edges_without_samples: Vec::new(),
+        };
+        let json = report.to_json();
+        assert!(json.contains("\"rate_hz\":null"), "{json}");
+        assert!(!json.contains("NaN"), "{json}");
+    }
+
     /// The characters that actually break a hand-written encoder are escaped.
     ///
     /// Mutant: delete the `'\\' => s.push_str("\\\\")` arm — applied, and the

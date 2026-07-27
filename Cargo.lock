@@ -1141,6 +1141,7 @@ dependencies = [
  "tf_tree",
  "tf_tree_bench",
  "tf_tree_core",
+ "tf_tree_ingest",
  "tf_tree_ipc",
  "tf_tree_math",
 ]

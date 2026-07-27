@@ -423,6 +423,12 @@ shm-check:
     # that adds it.
     cargo nextest run -p tf_tree_arena --features shm
     cargo nextest run -p tf_tree --features shm --test frozen
+    # **`docs/PHASE5.md` §3 into §2's container.** `tests/frozen_bag.rs` carries
+    # `required-features = ["shm"]`, so `cargo nextest run --workspace` — which
+    # builds without features — skips the target entirely. The rest of
+    # `tf_tree_ingest`'s suite does run there; this is the half that cannot.
+    cargo clippy -p tf_tree_ingest --features shm --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_ingest --features shm
     cargo nextest run -p tf_tree_ipc
 
 # The zero-config rendezvous end to end: a foreign process calls

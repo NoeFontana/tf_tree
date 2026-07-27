@@ -55,3 +55,14 @@ blake3 = { workspace = true, optional = true }
 # without being part of what the crate ships. Cargo unifies the two views of the
 # package, so the lib is built once, with `fixture` on, for the test profile.
 tf_tree_ingest = { path = ".", features = ["fixture"] }
+# `tests/frozen_bag.rs` recomputes §2.3's `source_digest` independently of the
+# code that wrote it, so the assertion is not the implementation compared with
+# itself.
+blake3 = { workspace = true }
+
+# The `.tft` half needs the frozen backend, which is Linux-only and behind
+# `shm`. Declared so `cargo nextest run --workspace` (no features) does not try
+# to build it and `just shm-check` does.
+[[test]]
+name = "frozen_bag"
+required-features = ["shm"]

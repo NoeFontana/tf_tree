@@ -19,7 +19,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 |---|---|
 | §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
 | §2 Frozen arena (`.tft`) | **Done.** `tf_tree_arena::frozen` writes and maps the container; `Tree::open_frozen`/`Tree::freeze_to` and `tf_tree freeze --from-live` are wired. §2.1's bit-for-bit claim is **tested and holds** (`crates/tf_tree/tests/frozen.rs`). Two amendments below: the container header's size, and the one-sided per-edge span. |
-| §3 Bag ingestion | Not implemented |
+| §3 Bag ingestion | **Partly done — MCAP only.** `tf_tree_ingest` is a new workspace member; §3's opening note rules out `tf_tree_core`/`tf_tree_arena`, and it is not in `tf_tree_cli` because §4's offline Python API needs the same logic and cannot depend on a binary crate. §3.1's two passes, §3.3's MCAP source (schema-based discovery, so remapped topics are found) and every §3.2 row are implemented and gated by `cargo nextest run --workspace`. `tf_tree ingest --bag` needs no features; `tf_tree freeze --from-bag` needs `shm` (the frozen backend does) and is gated by `just shm-check`. **Four things are not done and are not silently approximated:** `--on-clock-reset=split` is refused with a reason rather than producing one file; §3.1's spill-to-run-file is replaced by re-reading the recording once per edge group, which bounds peak memory identically and is documented at `ingest::fill` (the one case it cannot serve — a single edge over the whole cap — is a named error); §3.3's rosbag2-sqlite3 source and `freeze_from_arrays` are absent. **§0.0's `default-features = false` on `mcap` has a visible cost:** a zstd- or lz4-compressed recording fails as `CompressedChunk`, and the CLI prints the `mcap compress --compression none` command that fixes it. **Two amendments below**: declaration order is canonical, and the reset threshold is not the bridge's question. |
 | §4 Offline Python API | Not implemented |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
@@ -343,6 +343,37 @@ Memory: buffer per edge, sort, drain. Peak is roughly the dataset size (~233 MB 
 | Edge kind changes mid-recording | Hard error naming the timestamp. |
 
 The ingest report is a first-class output, not log noise: emit it as JSON alongside the `.tft` and summarize it to the terminal. **For many users the ingest report will be the first thing `tf_tree` ever tells them about their data, and it should be worth reading.**
+
+> **Amendment — frames and edges are declared in canonical order, not
+> first-seen order, and §11 is the reason.**
+>
+> §11 requires that shuffling a recording's messages produce an identical
+> result. Declaring frames and edges as they are first encountered **cannot**
+> satisfy that: ids are assigned in declaration order, so two ingests of the same
+> transforms in a different order produce arenas whose `FrameId`s and `EdgeId`s —
+> and therefore whose ring offsets, topology block and
+> `LookupError::Extrapolation { edge }` — disagree. The values matched; the
+> identities did not, and the shuffle test found it on the first run.
+>
+> Declaration is therefore sorted by name. The arena becomes a pure function of
+> the recording's *content*, and the ingest report becomes diffable between runs,
+> which is worth having on its own.
+
+> **Amendment — the clock-reset threshold answers a different question offline
+> than online, and a shuffled file is not a recording.**
+>
+> `tf_tree_bridge`'s `ClockGuard` is reused so a recording and a live system draw
+> the same line, but one rule is inverted: a backward stamp is **dropped online
+> and kept offline**. Online the ring cannot accept it (invariant 6); offline
+> §3.1 sorts, so discarding it would throw away exactly what the sort exists to
+> recover. Backward jumps below the threshold are counted as `out_of_order` and
+> kept.
+>
+> The threshold itself is only meaningful because a recording is written in log
+> order, so its stamp inversions are milliseconds. §11's shuffle test destroys
+> that property by construction and must raise the threshold to run at all —
+> which is a fact about the test, not a workaround: a default that admitted a
+> whole-recording inversion would miss every real reset.
 
 ### 3.3 Sources
 

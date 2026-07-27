@@ -58,12 +58,15 @@ fn pose(k: f64) -> [f64; 7] {
 /// The ordinary path: a recording with statics and three dynamic edges at
 /// different rates ingests into a tree whose lookups answer.
 ///
-/// Mutant: in `ingest::fill`, drop the `if rec.is_static` early-return in the
-/// pass-two callback so static samples are buffered as dynamic ones — applied,
-/// and this test failed with `Claim(NotDeclaredDynamic)` on `base_link ->
-/// laser`. A second mutant, making `Capacity::slots(e.samples)` into
-/// `Capacity::slots(1)`, also failed: the 100-sample edge lapped and the
-/// `samples_pushed` assertion saw the ring, not the source.
+/// Mutant: in `ingest::fill`, size every ring with `Capacity::slots(1)` instead
+/// of the surveyed count — applied, and this test failed on the `map -> odom`
+/// rate, which came back as the ring's contents rather than the source's.
+///
+/// A second mutant was tried and **survived**, which is worth recording: dropping
+/// the `if rec.is_static` early-return in the pass-two callback is inert, because
+/// a static edge is never in any buffer group and the `buffers.get_mut` lookup
+/// misses. The early return is a short-circuit, not a guard, and nothing here
+/// depends on it.
 #[test]
 fn small_recording_ingests() {
     let dir = Scratch::new("small");
@@ -109,12 +112,17 @@ fn small_recording_ingests() {
 /// so a failure reproduces exactly.
 ///
 /// Mutant: change `buf.sort_by_key(|(s, _)| *s)` in `ingest::fill` to a no-op —
-/// applied, and this test failed with `Push(NonMonotonicStamp { .. })` before
-/// it ever reached the comparison. Mutant 2: change the stable `sort_by_key` to
-/// `sort_unstable_by_key` — applied, and the *duplicate* test below
-/// (`duplicates_resolve_last_wins`) failed instead; this one still passed,
-/// because it has no duplicates. Both are recorded because the second shows
-/// this test alone does not guard stability.
+/// applied, and this test failed with `Push(NonMonotonicStamp { .. })` before it
+/// ever reached the comparison. Mutant 2: revert `fill` to first-seen
+/// declaration order — applied, and this test failed on a `LookupError`
+/// comparison whose *values* matched and whose `EdgeId`s did not. That mutant is
+/// how the canonical-order requirement was found in the first place.
+///
+/// **The `sort_by_key` stability is not guarded by any test here** and is not
+/// claimed to be: swapping it for `sort_unstable_by_key` leaves every test in
+/// this file passing, because Rust's pattern-defeating quicksort happens to be
+/// order-preserving on the small runs these fixtures produce. What holds the
+/// property is the comment at the call site, not a test.
 #[test]
 fn out_of_order_ingest_matches_ordered() {
     let dir = Scratch::new("shuffle");
@@ -188,9 +196,9 @@ fn out_of_order_ingest_matches_ordered() {
 /// The two values differ in every component, so "last wins" and "first wins"
 /// give different answers.
 ///
-/// Mutant: change the last-wins skip to keep the first (`if i > 0 && buf[i-1].0
+/// Mutant: change the last-wins skip to keep the first (`if i > 0 && buf[i - 1].0
 /// == stamp { continue; }`) — applied, and the lookup assertion failed, reading
-/// back the 1.0 pose instead of the 2.0 one.
+/// back the earlier duplicate.
 #[test]
 fn duplicates_resolve_last_wins() {
     let dir = Scratch::new("dupes");
@@ -289,8 +297,12 @@ fn future_stamps_are_kept_and_reported() {
 /// §3.2: an edge that appears on both `/tf` and `/tf_static` is a hard error
 /// naming the timestamp — and, through [`tf_tree_ingest::describe`], the edge.
 ///
-/// Mutant: make the `StaticVerdict::KindChanged` arm a counted anomaly instead
-/// of an error — applied, and this test failed with `Ok`.
+/// Mutant: make the `observe_dynamic` conflict a counted anomaly instead of an
+/// error — applied, and this test failed with `Ok`. (The *other* branch, the
+/// `StaticVerdict::KindChanged` arm, is not what this fixture reaches: the
+/// static arrives first, so the contradiction is found on the dynamic side.
+/// Mutating that arm alone leaves the test passing, which is why the mutant
+/// named here is the one that runs.)
 #[test]
 fn edge_kind_change_is_a_hard_error() {
     let dir = Scratch::new("kind");
@@ -557,9 +569,10 @@ fn a_missing_file_reports_its_errno() {
 /// and no bare `NaN`/`Infinity`, which is what a hand-written encoder actually
 /// gets wrong.
 ///
-/// Mutant: emit `rate_hz` as `{r}` without the finite check and feed it a
-/// single-sample edge — applied by removing the `is_finite` guard and dividing
-/// by a zero span, and the `NaN` assertion failed.
+/// Mutant: delete the `s.push(']')` that closes the `edges` array — applied, and
+/// the balance assertion failed at depth 1. The `NaN` half of this test is
+/// guarded separately and directly by `report::tests::non_finite_rate_is_null`,
+/// because no fixture here produces a non-finite rate.
 #[test]
 fn report_json_is_well_formed() {
     let dir = Scratch::new("json");
