@@ -612,14 +612,35 @@ Bind to loopback by default. Serving robot state on `0.0.0.0` by default would b
 >
 > **Two things §7 does not say, which the implementation had to decide:**
 >
-> * **Ages are against the arena's newest stamp, never the host clock.** §0.0
->   already records that an arena's stamps need not share an epoch with the
->   system clock — it is why `TFT005` skips on the reference fixture — so a
->   staleness column computed against `SystemTime::now()` reads as decades on a
->   boot-relative arena. The same applies to a participant's
->   `attached_at_nanos`, which is the *arena's* clock and routinely disagrees
->   with the publishers' stamps; that column shows `epoch?` rather than a
->   negative age.
+> * **Ages are against the reference clock `doctor` uses, decided the same
+>   way.** §0.0 already records that an arena's stamps need not share an epoch
+>   with the system clock — it is why `TFT005` skips on the reference fixture —
+>   so a staleness column computed unconditionally against `SystemTime::now()`
+>   reads as decades on a boot-relative arena. The reference is therefore
+>   `checks::Clock::decide`: a majority vote of the per-edge newest stamps
+>   against the host clock, falling back to the **median** newest stamp when the
+>   arena's stamps are in some other domain. Not the *maximum* — that hands the
+>   definition of "now" to the single worst publisher, so one
+>   nanoseconds-into-a-seconds-field overshoot makes every healthy edge read ~54
+>   years stale and the broken one read `0.0`. That failure is the one
+>   `checks.rs` was already fixed for, and `top` prints `Clock::label()` in its
+>   header so an operator can see that the two tools agreed on a reference. The
+>   same applies to a participant's `attached_at_nanos`, which is the *arena's*
+>   clock and routinely disagrees with the publishers' stamps; that column shows
+>   `epoch?` rather than a negative age.
+> * **The "observes without perturbing" claim is a test, not a sentence.**
+>   `top::tests::capturing_the_arena_moves_no_counter` reads a populated arena
+>   five times and asserts no edge counter moved, with a real lookup afterwards
+>   to show the counters it is watching are ones that move. The claim was prose
+>   for one revision, and a `tree.lookup` added to `Capture::from_tree` left
+>   every other test passing.
+> * **Frame names and lock-file `comm` are sanitized before they reach the
+>   terminal.** Frame names are arbitrary UTF-8 (`intern_core` validates only
+>   the hash) and `comm` is bytes another process wrote; both are interpolated
+>   into a full-screen ANSI frame. `catalogue::json_escape` already guards the
+>   JSON path against the same input — `top::sanitize` is the ANSI path's half,
+>   and it is also what keeps `--color never` producing escape-free text and
+>   `{:<30}` producing aligned columns.
 > * **The participant pane is the arena table ∪ the lock file.** A read-only
 >   participant writes no arena participant record — it cannot, its mapping is
 >   `PROT_READ` (D18) — so a pane built from the arena alone shows only the

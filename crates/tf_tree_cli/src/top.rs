@@ -35,7 +35,22 @@
 //!   it *is* visible to `tf_tree participants` — the banner says both.
 //! * It performs **no lookups**, so it adds nothing to `lookups_ok` and cannot
 //!   invent an extrapolation failure. Even if it did, §5.6's amendment means a
-//!   read-only participant records nothing at all.
+//!   read-only participant records nothing at all. That is asserted, not
+//!   claimed: [`tests::capturing_the_arena_moves_no_counter`] reads a populated
+//!   arena repeatedly and requires every counter to stand still.
+//!
+//! # Its ages are against `doctor`'s reference clock
+//!
+//! [`Capture::decide_clock`] delegates to [`crate::checks::Clock::decide`]
+//! rather than reducing the arena's stamps itself. The reduction that looks
+//! obvious — the newest stamp on any edge — is the one this repository already
+//! removed from `doctor`, because it lets a single broken publisher define
+//! "now" and invert every staleness reading in the view.
+//!
+//! # Frame names are somebody else's bytes
+//!
+//! Everything this view did not author goes through [`sanitize`] before it is
+//! written into an ANSI frame. See that function for what is at stake.
 //!
 //! # Rates are observed, never a deviation from a nominal
 //!
@@ -62,6 +77,12 @@ use anyhow::Result;
 use tf_tree::{EdgeId, EdgeKind, Tree};
 
 use crate::catalogue::{Severity, Tft};
+// `OCCUPANCY_LIMIT` is imported rather than restated as a local `0.80`. A second
+// copy disagreed with `TFT015` at exactly 80.0 %: this pane compared with `>=`
+// and `checks::tft015` compares with `>`, so a table sitting on the line was
+// coloured yellow beside the words "TFT015 warns above 80%" while `doctor`
+// reported nothing at all. One constant, one comparator.
+use crate::checks::{Clock, OCCUPANCY_LIMIT};
 use crate::doctor::Snapshot;
 
 // ---------------------------------------------------------------------------
@@ -156,6 +177,13 @@ pub struct EdgeSample {
     pub oldest_stamp: Option<i64>,
     /// Newest stamp the ring holds — the last in push order.
     pub newest_stamp: Option<i64>,
+    /// How many stamps the ring currently retains.
+    ///
+    /// Carried rather than reconstructed from `intervals.len()`: the two differ
+    /// by one only while there *are* intervals, so `len + 1` reads `0` for a
+    /// ring holding exactly one sample — a publisher that has just started,
+    /// which is precisely when somebody is watching this pane.
+    pub retained: usize,
     /// Successive differences of the retained stamps, in push order.
     ///
     /// Kept rather than recomputed from a stamp vector because both the rate
@@ -233,6 +261,11 @@ pub struct Capture {
     pub shared: bool,
     /// Whether the engine was built with §5's `counters` feature.
     pub counters_compiled_in: bool,
+    /// The reference clock every age in this view is measured against, or
+    /// `None` when no ring holds a stamp.
+    ///
+    /// Decided by [`Clock::decide`] — see [`Capture::decide_clock`].
+    pub clock: Option<Clock>,
 }
 
 impl Capture {
@@ -264,11 +297,13 @@ impl Capture {
             let eid = EdgeId(e.id);
             let mut oldest = None;
             let mut intervals = Vec::new();
+            let mut retained_count = 0usize;
             if let Some(ring) = view.ring(eid) {
                 let head = ring.head.load(Ordering::Acquire);
                 // `head - capacity` is the slot being overwritten right now, not
                 // a retained sample — `retained()` is what excludes it.
                 let retained = ring.retained().min(head);
+                retained_count = usize::try_from(retained).unwrap_or(usize::MAX);
                 let mut prev: Option<i64> = None;
                 for i in (head - retained)..head {
                     let s = ring.stamps[(i & ring.mask) as usize].load(Ordering::Relaxed);
@@ -303,6 +338,7 @@ impl Capture {
                 owner_pid: e.owner_pid,
                 oldest_stamp: oldest,
                 newest_stamp: e.newest_stamp,
+                retained: retained_count,
                 intervals,
                 counters,
             });
@@ -353,6 +389,8 @@ impl Capture {
             s => Some(s),
         };
 
+        let clock = Capture::decide_clock(&edges, crate::unix_nanos_now());
+
         Capture {
             source,
             arena_bytes: tree.arena_size_bytes() as u64,
@@ -363,20 +401,47 @@ impl Capture {
             self_slot,
             shared: tree.is_shared(),
             counters_compiled_in: tf_tree::counters_compiled_in(),
+            clock,
         }
     }
 
-    /// The arena's own idea of "now": the newest stamp on any edge.
+    /// The reference instant every age in this view is measured against.
     ///
-    /// **Not the host clock.** `docs/PHASE5.md` §0.0 records that the arena's
-    /// stamps need not share an epoch with the system clock — that is why
-    /// `TFT005` skips on the reference fixture — so an age computed against
-    /// `SystemTime::now()` would read as decades of staleness on a
-    /// boot-relative arena. Every age in this view is relative to this, and the
-    /// header says so.
+    /// # Why this is [`Clock::decide`] and not `newest_stamp.max()`
+    ///
+    /// The obvious reduction — the arena's newest stamp on any edge — hands the
+    /// definition of "now" to the single worst publisher. One
+    /// nanoseconds-into-a-seconds-field overshoot (`now * 2`, the classic) is
+    /// the arena's maximum by decades, so every *healthy* edge's `age(ms)`
+    /// column reads ~54 years and the *broken* one reads `0.0`: the diagnostic
+    /// inverted, blaming the innocent majority and exonerating the fault. Every
+    /// participant's `attached(s)` degrades to `epoch?` at the same time.
+    ///
+    /// `checks::Clock::decide` is the estimator this repository already fixed
+    /// that bug with (`checks::a_single_units_error_cannot_capture_the_reference_clock`).
+    /// It votes: if a majority of edges agree with the host's wall clock the
+    /// arena is Unix-stamped and the wall clock is the reference; otherwise the
+    /// stamps are in some other domain and the **median** newest stamp is — a
+    /// centre one edge cannot drag. `top` gets a second property for free: with
+    /// a wall-clock reference an arena where *everything* froze five minutes ago
+    /// reads five minutes on every row, where `max()` always painted the newest
+    /// edge as `0.0` however long ago it stopped.
+    ///
+    /// `None` only when no ring holds a stamp at all, which is a real state —
+    /// an arena whose publishers have not started.
+    #[must_use]
+    pub fn decide_clock(edges: &[EdgeSample], system_unix_nanos: i64) -> Option<Clock> {
+        let stamps: Vec<i64> = edges.iter().filter_map(|e| e.newest_stamp).collect();
+        if stamps.is_empty() {
+            return None;
+        }
+        Some(Clock::decide(&stamps, system_unix_nanos))
+    }
+
+    /// The reference instant, or `None` when no ring holds a stamp.
     #[must_use]
     pub fn arena_now(&self) -> Option<i64> {
-        self.edges.iter().filter_map(|e| e.newest_stamp).max()
+        self.clock.map(Clock::nanos)
     }
 
     /// Merge lock-file facts (mode, `comm`, held-ness) into the participant
@@ -465,10 +530,15 @@ pub fn interval_stats(intervals: &[i64]) -> Option<IntervalStats> {
     let mut sorted = intervals.to_vec();
     sorted.sort_unstable();
     let n = sorted.len();
-    // `(n - 1) * 99 / 100` rather than `n * 99 / 100`: the latter indexes one
-    // past the end when `n` is a multiple of 100 (n=100 -> index 99 is fine,
-    // n=200 -> 198, but n*99/100 for n=100 is 99 and for n=1 is 0 — the failure
-    // is at n=100k). Nearest-rank on `n - 1` cannot leave the slice.
+    // `(n - 1) * 99 / 100` rather than `n * 99 / 100`. Neither can leave the
+    // slice (`n * 99 / 100 <= n - 1` for every n >= 1), so this is not a bounds
+    // argument — it is a rank argument. `n * 99 / 100` lands on `n - 1`, the
+    // *maximum*, for every n that is a multiple of 100: at n=100 it picks
+    // `sorted[99]`, the largest of 100, which is p100. `p99` and `max` are
+    // printed side by side in the detail pane, and a p99 that is defined to
+    // equal the max makes the pair useless exactly on the round sample counts a
+    // 100- or 1000-slot ring produces. Nearest-rank on `n - 1` gives
+    // `sorted[98]` — the 99th of 100.
     let p99 = sorted[(n - 1) * 99 / 100];
     Some(IntervalStats {
         n,
@@ -526,10 +596,19 @@ pub fn histogram(intervals: &[i64], buckets: usize) -> Vec<Bucket> {
         let idx = ((v.saturating_sub(min)) as i128 * n as i128 / span as i128) as usize;
         counts[idx.min(buckets - 1)] += 1;
     }
+    // The edges are computed in `i128` for the same reason the index above is:
+    // `span` can be up to `i64::MAX` (one wall-clock stamp landing in a
+    // boot-relative ring gives intervals of +-1.75e18, which `checks.rs` already
+    // catalogues as a real pathology), and `span * i` overflows `i64` for any
+    // span past `i64::MAX / buckets` — about 29 years of nanoseconds. In a debug
+    // build that is a panic *inside the redraw loop*, on exactly the dataset
+    // this pane exists to diagnose.
+    let span128 = i128::from(span);
+    let clamp = |v: i128| i64::try_from(v).unwrap_or(i64::MAX);
     (0..buckets)
         .map(|i| Bucket {
-            lo_ns: min + span * i as i64 / n,
-            hi_ns: min + span * (i as i64 + 1) / n,
+            lo_ns: clamp(i128::from(min) + span128 * i as i128 / i128::from(n)),
+            hi_ns: clamp(i128::from(min) + span128 * (i as i128 + 1) / i128::from(n)),
             count: counts[i],
         })
         .collect()
@@ -542,12 +621,19 @@ pub fn histogram(intervals: &[i64], buckets: usize) -> Vec<Bucket> {
 /// id means the id.
 #[must_use]
 pub fn select_edge<'a>(edges: &'a [EdgeSample], needle: &str) -> Option<&'a EdgeSample> {
+    select_edge_index(edges, needle).map(|i| &edges[i])
+}
+
+/// [`select_edge`] as a position, so a caller that also holds the parallel
+/// `Vec<EdgeRow>` can reach the row without a second search.
+#[must_use]
+pub fn select_edge_index(edges: &[EdgeSample], needle: &str) -> Option<usize> {
     if let Ok(id) = needle.parse::<u32>() {
-        if let Some(e) = edges.iter().find(|e| e.id == id) {
-            return Some(e);
+        if let Some(i) = edges.iter().position(|e| e.id == id) {
+            return Some(i);
         }
     }
-    edges.iter().find(|e| e.label.contains(needle))
+    edges.iter().position(|e| e.label.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -606,10 +692,17 @@ pub struct Sampler {
 }
 
 /// One edge's row in the rendered table.
+///
+/// **Positional, not self-contained:** `rows[i]` describes `capture.edges[i]`.
+/// It used to carry a `sample: EdgeSample` clone of that same element, which
+/// deep-copied the label and the whole interval vector once per tick, for no
+/// reader — `render` only ever read `row.sample`, which *is* `edges[i]`. The
+/// cost is `8 * sum(retained)` bytes per redraw and is linear in both edge count
+/// and ring capacity: the reference fixture retains 12 600 samples across its
+/// four dynamic edges, so it was copying ~100 KB a frame to hand the renderer
+/// what it was already holding. The renderer zips the two vectors instead.
 #[derive(Clone, Debug)]
 pub struct EdgeRow {
-    /// The sample this row was computed from.
-    pub sample: EdgeSample,
     /// Order statistics over the retained intervals.
     pub stats: Option<IntervalStats>,
     /// Samples published since the previous tick.
@@ -635,6 +728,13 @@ pub struct Tick {
     /// One row per edge, id order.
     pub rows: Vec<EdgeRow>,
     /// The whole retained feed, oldest first.
+    ///
+    /// A copy of the sampler's deque, and deliberately the *whole* one rather
+    /// than the `feed_lines` the renderer will show: bounded at
+    /// [`FEED_CAPACITY`] by construction, so unlike the per-edge interval
+    /// vectors it does not grow with the arena, and a tick that carried only
+    /// the visible tail could not answer "did this fire twice over fourteen
+    /// ticks", which is what the hysteresis tests ask it.
     pub feed: Vec<FeedEvent>,
 }
 
@@ -720,12 +820,17 @@ impl Sampler {
                 } else {
                     None
                 },
+                // Saturating: `n` and `s` can be in different time domains (a
+                // wall-clock stamp in a boot-relative arena, or the reverse),
+                // and `i64::MIN - anything` is a panic in the redraw loop. The
+                // detail pane two panes away already saturates the same
+                // quantity; this is the same subtraction and gets the same
+                // treatment.
                 age_ns: match (now, e.newest_stamp) {
-                    (Some(n), Some(s)) => Some(n - s),
+                    (Some(n), Some(s)) => Some(n.saturating_sub(s)),
                     _ => None,
                 },
                 delta_errors: delta_counters.errors(),
-                sample: e.clone(),
             });
         }
 
@@ -880,9 +985,6 @@ pub struct RenderOpts {
     pub interval: Duration,
 }
 
-/// The occupancy fraction above which `TFT015` fires.
-const OCCUPANCY_WARN: f64 = 0.80;
-
 /// Render one tick as a screenful of text.
 ///
 /// Returns a `String` rather than writing: it makes the whole view a pure
@@ -950,7 +1052,7 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         } else {
             f64::from(*used) / f64::from(*capacity)
         };
-        let colour = if frac >= OCCUPANCY_WARN { p.warn } else { "" };
+        let colour = if frac > OCCUPANCY_LIMIT { p.warn } else { "" };
         let _ = write!(
             occ,
             "  {colour}{what} {used}/{capacity} ({:.0}%){}",
@@ -960,11 +1062,16 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     }
     let _ = writeln!(
         s,
-        "  occupancy:{occ}   {}TFT015 warns at 80%{}",
-        p.dim, p.reset
+        "  occupancy:{occ}   {}TFT015 warns above {:.0}%{}",
+        p.dim,
+        OCCUPANCY_LIMIT * 100.0,
+        p.reset
     );
 
-    match cap.arena_now() {
+    // Which clock the ages are against is not a footnote: `doctor` prints the
+    // same `Clock::label` for the same reason, and an operator comparing the two
+    // tools has to be able to see that they agreed on the reference.
+    match cap.clock {
         None => {
             let _ = writeln!(
                 s,
@@ -972,12 +1079,17 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
                 p.dim, p.reset
             );
         }
-        Some(now) => {
+        Some(clock) => {
             let _ = writeln!(
                 s,
-                "  {}ages are against the arena's newest stamp ({now} ns); its stamps need not share \
-                 an epoch with this host's clock{}",
-                p.dim, p.reset
+                // `Clock::label` already says whether the epochs agree, so the
+                // sentence does not restate it — and for a `Wall` clock they
+                // *do* agree, which the old unconditional disclaimer denied.
+                "  {}ages are against the {} ({} ns){}",
+                p.dim,
+                clock.label(),
+                clock.nanos(),
+                p.reset
             );
         }
     }
@@ -991,8 +1103,9 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         "  {:<30} {:<9} {:>9} {:>8} {:>11} {:>10} {:>11} {:>10} {:>7}",
         "edge", "kind", "rate(Hz)", "d/s", "occupancy", "age(ms)", "writer", "ok", "err"
     );
-    for row in &tick.rows {
-        let e = &row.sample;
+    // `rows[i]` describes `edges[i]` — see [`EdgeRow`] for why the row does not
+    // carry its own copy.
+    for (row, e) in tick.rows.iter().zip(&cap.edges) {
         let kind = match e.kind {
             EdgeKind::Static => "static",
             EdgeKind::Dynamic => "dynamic",
@@ -1095,8 +1208,8 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     }
     let _ = writeln!(
         s,
-        "  {}attached(s) is against the arena's newest stamp; `epoch?` means the record's clock \
-         and the rings' stamps do not share one.\n  record=no is a read-only participant: it \
+        "  {}attached(s) is against the reference clock named above; `epoch?` means the record's \
+         clock and that reference do not share one.\n  record=no is a read-only participant: it \
          cannot write an arena record, so it keeps no counters (PHASE5 §5.6).{}",
         p.dim, p.reset
     );
@@ -1136,18 +1249,24 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
 /// histogram.
 fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
     use core::fmt::Write as _;
-    let Some(e) = select_edge(&tick.capture.edges, needle) else {
+    let Some(i) = select_edge_index(&tick.capture.edges, needle) else {
         let _ = writeln!(s, "  {}no edge matches {needle:?}{}", p.warn, p.reset);
         return;
     };
-    let _ = writeln!(s, "  {}edge detail{} — {}", p.bold, p.reset, e.label);
+    let e = &tick.capture.edges[i];
+    // Sanitized, not truncated: the detail pane is about one edge and its full
+    // name is the point, but it is still a name somebody else's robot chose.
+    let _ = writeln!(
+        s,
+        "  {}edge detail{} — {}",
+        p.bold,
+        p.reset,
+        sanitize(&e.label)
+    );
     let _ = writeln!(
         s,
         "  kind {:?}  capacity {}  head {}  retained {} samples",
-        e.kind,
-        e.capacity,
-        e.head,
-        e.intervals.len() + usize::from(!e.intervals.is_empty()),
+        e.kind, e.capacity, e.head, e.retained,
     );
     let c = &e.counters;
     let _ = writeln!(
@@ -1175,7 +1294,10 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
             let _ = writeln!(s, "  retained window: empty");
         }
     }
-    let Some(st) = interval_stats(&e.intervals) else {
+    // `tick.rows[i].stats` is `interval_stats(&e.intervals)`, already computed
+    // for this exact edge in `observe`. Recomputing it here sorted the interval
+    // vector a second time every frame for no new information.
+    let Some(st) = tick.rows[i].stats else {
         let _ = writeln!(
             s,
             "  {}fewer than two retained samples: no inter-arrival distribution{}",
@@ -1244,14 +1366,47 @@ pub fn fmt_ns(ns: i64) -> String {
     }
 }
 
-/// Truncate to `n` characters, with an ellipsis when it bites.
+/// Replace every control character with `?`.
+///
+/// **Not decorative.** The two strings this view interpolates that it did not
+/// author are frame names — arbitrary UTF-8, `intern_core` validates only the
+/// hash — and the lock file's `comm`, which is `from_utf8_lossy` of bytes
+/// *another process wrote*. Both land in a full-screen ANSI frame, so a frame
+/// named `"\x1b[2Jowned"` clears and repaints the operator's terminal on every
+/// redraw, and `--color never > bug_report.txt` stops producing escape-free
+/// text — which is the one thing that flag promises. `catalogue::json_escape`
+/// exists for the same exposure on the JSON path; this is the ANSI path's half.
+///
+/// It is also an alignment fix: `{:<30}` counts `char`s, and a control character
+/// occupies zero columns, so one of them shifts every column to its right.
+///
+/// C1 (`0x80..=0x9F`) is included because `ESC` is not the only introducer — a
+/// terminal in 8-bit mode reads `U+009B` as CSI directly.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || ('\u{80}'..='\u{9f}').contains(&c) {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Sanitize, then truncate to `n` characters with an ellipsis when it bites.
 ///
 /// Counts `char`s, not bytes: a frame name is UTF-8 and slicing it by byte
 /// index would panic on a multi-byte boundary — in a redraw loop, i.e. on
 /// whatever screen happened to be showing when the name appeared.
+///
+/// Sanitizing *before* truncating rather than after: truncation must not be able
+/// to cut a multi-character escape in half and leave a fragment whose meaning
+/// depends on what the next column happens to contain.
 fn truncate(s: &str, n: usize) -> String {
+    let s = sanitize(s);
     if s.chars().count() <= n {
-        return s.to_owned();
+        return s;
     }
     s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
 }
@@ -1365,6 +1520,9 @@ mod tests {
 
     use super::*;
 
+    /// A fixed "now" for the clock vote, so no test depends on when it runs.
+    const UNIX_NOW: i64 = 1_700_000_000_000_000_000;
+
     fn edge(id: u32, stamps: &[i64]) -> EdgeSample {
         EdgeSample {
             id,
@@ -1376,12 +1534,14 @@ mod tests {
             owner_pid: 4242,
             oldest_stamp: stamps.first().copied(),
             newest_stamp: stamps.last().copied(),
+            retained: stamps.len(),
             intervals: stamps.windows(2).map(|w| w[1] - w[0]).collect(),
             counters: CounterSample::default(),
         }
     }
 
     fn capture(edges: Vec<EdgeSample>) -> Capture {
+        let clock = Capture::decide_clock(&edges, UNIX_NOW);
         Capture {
             source: "test",
             arena_bytes: 65_536,
@@ -1392,6 +1552,7 @@ mod tests {
             self_slot: None,
             shared: true,
             counters_compiled_in: true,
+            clock,
         }
     }
 
@@ -1603,7 +1764,9 @@ mod tests {
         assert!(!out.contains('\x1b'), "escape sequence in a plain frame");
         assert!(out.contains("read-only observer"));
         assert!(out.contains("performs no lookups and records no counters"));
-        assert!(out.contains("need not share an epoch"));
+        // The fixture's stamps are boot-relative, so the clock vote falls
+        // through to the median and the header says which clock that is.
+        assert!(out.contains("do not share an epoch"), "{out}");
         assert!(out.contains("edge detail"));
         assert!(out.contains("inter-arrival"));
         // 100 Hz, from a stamp-derived median of 10 ms.
@@ -1721,5 +1884,330 @@ mod tests {
     fn truncation_is_char_wise() {
         assert_eq!(truncate("ééééé", 3), "éé…");
         assert_eq!(truncate("abc", 3), "abc");
+    }
+
+    /// **One publisher with a units error must not define "now" for the whole
+    /// view.**
+    ///
+    /// The reference clock decides the `age(ms)` column and every participant's
+    /// `attached(s)`. Reducing the arena's newest stamps with `max()` hands it
+    /// to the single largest one, so a nanoseconds-into-a-seconds-field
+    /// overshoot makes the five *healthy* edges read ~54 years stale and the
+    /// *broken* one read `0.0` — the diagnostic inverted. `checks.rs` fixed this
+    /// once already (`a_single_units_error_cannot_capture_the_reference_clock`,
+    /// commit `90561fc`); `top` must not be a third copy of the rejected
+    /// estimator.
+    ///
+    /// The fixture is `checks.rs`'s: five distinct Unix stamps within a second
+    /// of `UNIX_NOW`, plus one at `UNIX_NOW * 2`, which is the arena maximum by
+    /// decades. Non-degenerate on the axis that matters — the good stamps
+    /// differ from each other, so a median is not trivially the max.
+    ///
+    /// **Mutant:** `Capture::decide_clock` → `Some(Clock::NewestStamp(stamps
+    /// .into_iter().max().unwrap()))`. Applied: the rogue defines now, the five
+    /// healthy ages become 1.7e18 ns and the `< 1s` assertion fails with
+    /// `age 1700000000000000000`.
+    #[test]
+    fn one_broken_publisher_cannot_define_the_reference_clock() {
+        let mut edges: Vec<EdgeSample> = (0..5)
+            .map(|i| {
+                let s = UNIX_NOW - i * 200_000_000;
+                let mut e = edge(u32::try_from(i).unwrap() + 1, &[s - 10_000_000, s]);
+                e.label = format!("healthy{i}->child (edge#{})", i + 1);
+                e
+            })
+            .collect();
+        let rogue = UNIX_NOW * 2;
+        let mut bad = edge(6, &[rogue - 10_000_000, rogue]);
+        bad.label = "rogue->child (edge#6)".to_owned();
+        edges.push(bad);
+
+        let c = capture(edges);
+        assert_eq!(
+            c.clock,
+            Some(Clock::Wall(UNIX_NOW)),
+            "5 of 6 edges agree with the wall clock"
+        );
+
+        let mut s = Sampler::new();
+        let t = s.observe(c, Duration::from_secs(1));
+        for (i, row) in t.rows.iter().take(5).enumerate() {
+            let age = row.age_ns.unwrap();
+            assert!(
+                (0..1_000_000_000).contains(&age),
+                "healthy edge {i} reads age {age}"
+            );
+        }
+        // ...and the rogue is the one that stands out, as a stamp in the future.
+        assert!(
+            t.rows[5].age_ns.unwrap() < -1_000_000_000_000_000,
+            "the rogue edge must be the outlier, not the reference: {:?}",
+            t.rows[5].age_ns
+        );
+    }
+
+    /// A boot-relative arena falls back to the **median** newest stamp, and the
+    /// header names which clock it chose.
+    ///
+    /// **Mutant:** in `render`, print the literal `"the arena's newest stamp"`
+    /// instead of `clock.label()`. Applied: the `median arena stamp` assertion
+    /// fails — and with it the property that an operator can tell `top` and
+    /// `doctor` agreed on a reference.
+    #[test]
+    fn a_boot_relative_arena_names_the_median_stamp_as_its_clock() {
+        // Seconds-since-boot stamps: nowhere near the Unix epoch, so no edge
+        // agrees with the wall clock and the vote falls through. Three distinct
+        // newest stamps, so the median is neither the min nor the max.
+        let edges = vec![
+            edge(1, &[1_000_000_000, 1_100_000_000]),
+            edge(2, &[1_000_000_000, 1_500_000_000]),
+            edge(3, &[1_000_000_000, 9_000_000_000]),
+        ];
+        let c = capture(edges);
+        assert_eq!(c.clock, Some(Clock::NewestStamp(1_500_000_000)));
+        let mut s = Sampler::new();
+        let t = s.observe(c, Duration::from_secs(1));
+        let out = render(&t, &plain_opts(None));
+        assert!(out.contains("median arena stamp"), "{out}");
+        assert!(out.contains("1500000000 ns"), "{out}");
+    }
+
+    /// A stamp near `i64::MIN` must not panic the age column.
+    ///
+    /// Reachable when one publisher writes a wall-clock stamp into a
+    /// boot-relative arena or the reverse — the domain mix `checks.rs` already
+    /// catalogues — and `now - stamp` then leaves `i64`.
+    ///
+    /// **Mutant:** `age_ns: Some(n - s)` instead of `n.saturating_sub(s)`.
+    /// Applied: "attempt to subtract with overflow" at the `observe` call.
+    #[test]
+    fn an_extreme_stamp_saturates_rather_than_panicking() {
+        let mut extreme = edge(2, &[i64::MIN, i64::MIN]);
+        extreme.label = "sunk->child (edge#2)".to_owned();
+        let c = capture(vec![edge(1, &[UNIX_NOW - 10_000_000, UNIX_NOW]), extreme]);
+        // Non-vacuity: the reference really is the wall clock, so the
+        // subtraction really does span the whole i64 range.
+        assert_eq!(c.clock, Some(Clock::Wall(UNIX_NOW)));
+        let mut s = Sampler::new();
+        let t = s.observe(c, Duration::from_secs(1));
+        assert_eq!(t.rows[1].age_ns, Some(i64::MAX));
+    }
+
+    /// Bucket **edges**, not just the bucket index, must survive a span wider
+    /// than `i64::MAX / buckets`.
+    ///
+    /// A single wall-clock stamp landing in a boot-relative ring — a node
+    /// toggling `use_sim_time`, or one zero stamp in a Unix-domain ring — gives
+    /// intervals of +-1.75e18 and a span of ~3.5e18. That is the exact
+    /// pathology `tf_tree top --edge <it>` exists to draw.
+    ///
+    /// **Mutant:** compute the edges in `i64` again (`lo_ns: min + span * i as
+    /// i64 / n`). Applied: "attempt to multiply with overflow" at the bucket
+    /// construction — a panic inside the redraw loop.
+    #[test]
+    fn histogram_bucket_edges_survive_a_full_range_span() {
+        let intervals = [
+            10_000_000i64,
+            1_500_000_000_000_000_000,
+            -1_500_000_000_000_000_000,
+            10_000_000,
+        ];
+        let h = histogram(&intervals, 10);
+        assert_eq!(h.len(), 10);
+        assert_eq!(h.iter().map(|b| b.count).sum::<usize>(), intervals.len());
+        // Monotone, non-degenerate edges: the axis is still readable, not
+        // wrapped through negative.
+        assert_eq!(h[0].lo_ns, -1_500_000_000_000_000_000);
+        for w in h.windows(2) {
+            assert!(w[1].lo_ns > w[0].lo_ns, "axis is not monotone: {h:?}");
+        }
+    }
+
+    /// `p99` is the 99th of 100, not the maximum.
+    ///
+    /// The detail pane prints `p99` and `max` side by side; a `p99` defined to
+    /// equal `max` makes that pair carry one number instead of two, on exactly
+    /// the round sample counts a 100- or 1000-slot ring produces.
+    ///
+    /// **Mutant:** index with `sorted[n * 99 / 100]`. Applied: `p99` becomes
+    /// 500 ms, equal to `max`, and both assertions fail.
+    #[test]
+    fn p99_is_not_the_maximum_on_a_round_sample_count() {
+        let mut intervals = vec![10_000_000i64; 99];
+        intervals.push(500_000_000);
+        let st = interval_stats(&intervals).unwrap();
+        assert_eq!(st.n, 100);
+        assert_eq!(st.max_ns, 500_000_000);
+        assert_eq!(st.p99_ns, 10_000_000, "p99 must not be the max");
+    }
+
+    /// A ring holding exactly one sample says so.
+    ///
+    /// Reconstructing the retained count from `intervals.len()` is right for
+    /// `n >= 2` and reads `0` at `n == 1` — while the line below it prints a
+    /// non-empty retained window. Two adjacent lines contradicting each other,
+    /// on a publisher that has just started, which is when somebody is watching.
+    ///
+    /// **Mutant:** print `e.intervals.len() + usize::from(!e.intervals
+    /// .is_empty())` again. Applied: "retained 0 samples" and the assertion
+    /// fails.
+    #[test]
+    fn a_ring_holding_one_sample_reports_one_retained() {
+        let one = edge(1, &[12_345]);
+        assert_eq!(one.retained, 1);
+        assert!(one.intervals.is_empty());
+        let mut s = Sampler::new();
+        let t = s.observe(capture(vec![one]), Duration::from_secs(1));
+        let out = render(&t, &plain_opts(Some("1")));
+        assert!(out.contains("retained 1 samples"), "{out}");
+        // Non-vacuity: the window line it must agree with is present.
+        assert!(out.contains("retained window 12345 .. 12345"), "{out}");
+    }
+
+    /// **A frame name is somebody else's UTF-8 and must not reach the terminal
+    /// as an escape sequence.**
+    ///
+    /// Frame names are validated only by their hash, and the lock file's `comm`
+    /// is `from_utf8_lossy` of bytes another process wrote. Both are
+    /// interpolated into a full-screen ANSI frame, so `"\x1b[2J..."` repaints
+    /// the operator's terminal every redraw — and `--color never > report.txt`
+    /// stops producing the escape-free text that flag promises.
+    /// `catalogue::json_escape` guards the JSON path against the same input.
+    ///
+    /// **Mutant:** drop the `sanitize` call from `truncate` (and from
+    /// `render_detail`'s label). Applied: the frame contains `\x1b[2J` and the
+    /// no-escapes assertion fails.
+    #[test]
+    fn a_hostile_frame_name_cannot_reach_the_terminal() {
+        let mut e = edge(1, &[0, 10_000_000]);
+        e.label = "\u{1b}[2J\u{1b}[31mPWNED\u{7}\u{9b}5m".to_owned();
+        let mut c = capture(vec![e]);
+        c.merge_lock_rows(&[(3, 9, "ro", "\u{1b}[5mblink".to_owned(), true)]);
+        let mut s = Sampler::new();
+        let t = s.observe(c, Duration::from_secs(1));
+        // The detail pane prints the label untruncated, so it is covered too.
+        let out = render(&t, &plain_opts(Some("1")));
+        assert!(!out.contains('\u{1b}'), "escape reached the frame: {out:?}");
+        assert!(!out.contains('\u{7}'), "bell reached the frame: {out:?}");
+        assert!(!out.contains('\u{9b}'), "8-bit CSI reached the frame");
+        // Non-vacuity: the rows really are there, sanitized rather than dropped.
+        assert!(out.contains("PWNED"), "{out}");
+        assert!(out.contains("blink"), "{out}");
+    }
+
+    /// `top`'s occupancy colour fires on exactly the rule `TFT015` fires on.
+    ///
+    /// A local `0.80` with a `>=` comparator coloured a table sitting on the
+    /// line yellow, beside the words "TFT015 warns above 80%", while `doctor`
+    /// reported nothing about it.
+    ///
+    /// **Mutant:** compare with `frac >= OCCUPANCY_LIMIT`. Applied: the 80/100
+    /// row is coloured and the first assertion fails.
+    #[test]
+    fn occupancy_colours_on_the_same_rule_tft015_fires_on() {
+        let render_with = |used: u32| {
+            let mut c = capture(vec![edge(1, &[0, 10_000_000])]);
+            c.occupancy = vec![("frames", used, 100)];
+            let mut s = Sampler::new();
+            let t = s.observe(c, Duration::from_secs(1));
+            let mut o = plain_opts(None);
+            o.palette = Palette::colour();
+            render(&t, &o)
+                .lines()
+                .find(|l| l.contains("occupancy:"))
+                .expect("occupancy line")
+                .to_owned()
+        };
+        assert!(
+            !render_with(80).contains("\u{1b}[33m"),
+            "exactly 80% is not above 80%, and TFT015 does not fire on it"
+        );
+        assert!(
+            render_with(81).contains("\u{1b}[33m"),
+            "81% is above the limit and must be coloured"
+        );
+    }
+
+    fn plain_opts(detail: Option<&str>) -> RenderOpts {
+        RenderOpts {
+            palette: Palette::plain(),
+            detail: detail.map(ToOwned::to_owned),
+            feed_lines: 8,
+            interval: Duration::from_secs(1),
+        }
+    }
+
+    /// **`top` reads the arena and performs no lookup.**
+    ///
+    /// The banner claims it "performs no lookups, so it adds nothing to
+    /// `lookups_ok` and cannot invent an extrapolation failure", and
+    /// `docs/PHASE5.md` §7's amendment repeats it — but until this test the
+    /// claim was prose only: a real `tree.lookup(..)` added to
+    /// `Capture::from_tree` left every existing test passing. It matters because
+    /// `top` is the longest-lived process an operator points at a robot, and an
+    /// observer that moves the counters it is displaying makes `doctor`'s
+    /// extrapolation-rate findings unreadable.
+    ///
+    /// Counter activity in total rather than `lookups_ok` alone: a lookup that
+    /// *fails* moves an error counter instead, and inventing a failure is the
+    /// worse half of the claim.
+    ///
+    /// **An in-process writable tree, deliberately, and not the live `--attach`
+    /// path.** On a read-only attachment `Guard::drop` returns early on
+    /// `!view.is_writable()`, so no counter can move whatever the code does —
+    /// the property is structurally guaranteed there and a live assertion
+    /// would be vacuous. This is the one configuration in which `from_tree`
+    /// *could* move a counter, which makes it the only one where the property
+    /// has any content. It is also a reachable configuration: `run` takes a
+    /// `&Tree`, and a library caller can hand it a writable one.
+    ///
+    /// **Mutant:** add a `tree.lookup("map", "odom", newest)` to
+    /// `Capture::from_tree`, evaluated once per capture. Applied: "reading the
+    /// arena moved a counter it is meant to be observing, left: 1, right: 0".
+    #[cfg(feature = "counters")]
+    #[test]
+    fn capturing_the_arena_moves_no_counter() {
+        fn activity(c: &Capture) -> u64 {
+            c.edges
+                .iter()
+                .map(|e| e.counters.lookups_ok + e.counters.errors())
+                .sum()
+        }
+
+        let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
+        let (writers, _samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
+
+        let before = activity(&Capture::from_tree(&tree, "test"));
+        for _ in 0..4 {
+            let c = Capture::from_tree(&tree, "test");
+            assert_eq!(
+                activity(&c),
+                before,
+                "reading the arena moved a counter it is meant to be observing"
+            );
+        }
+
+        // Non-vacuity: the counters this asserts are still are ones that move.
+        // Without this the test would pass just as well against an engine built
+        // with no counters at all.
+        //
+        // `map <- odom` and not a longer chain on purpose: `Guard::drop` credits
+        // `lookups_ok` to an edge only when the whole batch went through exactly
+        // one, so a two-edge lookup would move nothing and the non-vacuity
+        // check would be the vacuous one.
+        let one_edge = Capture::from_tree(&tree, "test")
+            .edges
+            .into_iter()
+            .find(|e| e.label.starts_with("map->odom"))
+            .expect("the fixture publishes map->odom");
+        let stamp: tf_tree::Stamp =
+            tf_tree::Stamp::from_nanos(one_edge.newest_stamp.expect("map->odom has stamps"));
+        let _ = tree.lookup("map", "odom", stamp);
+        assert!(
+            activity(&Capture::from_tree(&tree, "test")) > before,
+            "a real lookup did not move any counter, so the assertions above \
+             were vacuous"
+        );
+        drop(writers);
     }
 }

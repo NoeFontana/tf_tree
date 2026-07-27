@@ -531,7 +531,10 @@ fn evidence_notes(live: bool) -> Vec<String> {
 ///
 /// Saturates rather than panicking on a clock before 1970: `doctor` reporting a
 /// bad clock is useful, `doctor` aborting because of one is not.
-fn unix_nanos_now() -> i64 {
+///
+/// `pub(crate)` because `top` needs the same value for the same reason:
+/// `checks::Clock::decide` votes the arena's stamps against it.
+pub(crate) fn unix_nanos_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
