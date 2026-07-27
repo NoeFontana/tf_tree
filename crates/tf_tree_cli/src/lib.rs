@@ -24,6 +24,7 @@ pub mod catalogue;
 pub mod checks;
 pub mod doctor;
 pub mod hostfacts;
+pub mod topology;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -44,6 +45,29 @@ struct Cli {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[command(flatten)]
     attach: attach::AttachArgs,
+}
+
+/// `--interp` as a flag value.
+///
+/// A separate enum rather than deriving on `tf_tree::InterpPolicy`: the facade
+/// is `#![forbid(unsafe_code)]` and dependency-disciplined, and giving it a
+/// `clap` derive would put a CLI argument parser in the dependency tree of
+/// every library that links the engine.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum InterpArg {
+    /// Screw-linear interpolation — the default.
+    Sclerp,
+    /// Separate lerp of translation and slerp of rotation.
+    Lerpslerp,
+}
+
+impl InterpArg {
+    fn policy(self) -> tf_tree::InterpPolicy {
+        match self {
+            InterpArg::Sclerp => tf_tree::InterpPolicy::ScLerp,
+            InterpArg::Lerpslerp => tf_tree::InterpPolicy::LerpSlerp,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -114,6 +138,41 @@ enum Command {
         #[arg(long, short)]
         out: std::path::PathBuf,
     },
+    /// Obtain, validate or explain a bridge topology file (`docs/PHASE4.md` §5.8).
+    ///
+    /// The engine has no runtime edge declaration, so the ingest bridge is told
+    /// its topology up front. `--discover` is how an operator obtains that file
+    /// from a robot; `--config` is the pre-flight that fails on a laptop rather
+    /// than at bridge startup.
+    Topology {
+        /// Read a recorded `/tf` stream and print the config it implies.
+        #[arg(long, value_name = "FILE.tfstream", conflicts_with = "config")]
+        discover: Option<std::path::PathBuf>,
+        /// Parse a topology file, build the arena it describes, and print it.
+        #[arg(long, value_name = "FILE.toml")]
+        config: Option<std::path::PathBuf>,
+        /// Write the discovered config here instead of to stdout.
+        #[arg(long, short, requires = "discover")]
+        out: Option<std::path::PathBuf>,
+        /// Seconds of history the discovered rings should retain.
+        #[arg(long, default_value_t = 10.0, requires = "discover")]
+        history_secs: f64,
+        /// Prefix every discovered frame with this `tf_prefix` (§5.6).
+        ///
+        /// Use it when the bridge that will read this file runs with the same
+        /// prefix: a config keyed on the unprefixed names declares every edge
+        /// and matches none.
+        #[arg(long, value_name = "PREFIX", requires = "discover")]
+        tf_prefix: Option<String>,
+        /// Interpolation policy the discovered file should default to.
+        #[arg(long, value_enum, requires = "discover")]
+        interp: Option<InterpArg>,
+        /// Check the file's per-edge time domains against the bridge's (§5.5).
+        ///
+        /// The startup refusal a bridge would perform, performed on a laptop.
+        #[arg(long, value_name = "N", requires = "config")]
+        domain: Option<u8>,
+    },
     /// List the processes attached to an arena, from the lock file alone.
     ///
     /// Reads `<runtime_dir>/<domain>/<name>.lock` and **never maps the arena**
@@ -156,6 +215,31 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Bench { gate } => cmd_bench(gate),
+        Command::Topology {
+            discover,
+            config,
+            out,
+            history_secs,
+            tf_prefix,
+            interp,
+            domain,
+        } => match (discover, config) {
+            (Some(src), _) => topology::cmd_discover(
+                &src,
+                out.as_deref(),
+                history_secs,
+                tf_prefix.as_deref(),
+                interp.map(InterpArg::policy),
+            ),
+            (None, Some(cfg)) => topology::cmd_check(&cfg, domain),
+            // clap cannot express "one of these two" without a group, and a
+            // group's error message names the flags without saying what the
+            // command is for. This one does.
+            (None, None) => Err(anyhow::anyhow!(
+                "give --discover <file.tfstream> to obtain a topology file, \
+                 or --config <file.toml> to check one"
+            )),
+        },
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
         #[cfg(all(feature = "shm", target_os = "linux"))]
