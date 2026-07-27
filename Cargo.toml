@@ -9,6 +9,7 @@ members = [
     "crates/tf_tree_bench",
     "crates/tf_tree_cli",
     "crates/tf_tree_bridge",
+    "crates/tf_tree_ingest",
     "crates/tf_tree_c",
     "xtask",
 ]
@@ -90,6 +91,10 @@ tf_tree = { path = "crates/tf_tree", version = "0.1.0", default-features = false
 # CLI's own `counters` feature switched nothing, and `TFT010`'s "built without
 # counters" skip branch was unreachable in every buildable configuration.
 tf_tree_bench = { path = "crates/tf_tree_bench", default-features = false }
+tf_tree_bridge = { path = "crates/tf_tree_bridge" }
+# `docs/PHASE5.md` §3. `default-features = false` for the same reason as
+# `tf_tree` above: the CLI decides whether the engine counts, not this crate.
+tf_tree_ingest = { path = "crates/tf_tree_ingest", default-features = false }
 # no_std numeric + POD casting (the entire core dependency budget, plus blake3).
 libm = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
