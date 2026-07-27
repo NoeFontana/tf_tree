@@ -39,6 +39,17 @@
 mod cache;
 mod tree;
 
+/// The `.tft` manifest's encoder (`docs/PHASE5.md` §2.3).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+mod cbor;
+/// The frozen `.tft` arena (`docs/PHASE5.md` §2).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+mod frozen;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use frozen::FrozenFileError;
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use tf_tree_arena::{FrozenError, FrozenHeader};
+
 pub use tree::{
     BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, ReparentError, Tree,
     TreeBuilder,

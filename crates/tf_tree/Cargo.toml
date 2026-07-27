@@ -63,3 +63,9 @@ required-features = ["shm"]
 [[test]]
 name = "rendezvous"
 required-features = ["shm"]
+
+# `docs/PHASE5.md` §2. The frozen backend is Linux-only and behind `shm`, like
+# the mapping it reuses.
+[[test]]
+name = "frozen"
+required-features = ["shm"]

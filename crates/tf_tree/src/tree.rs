@@ -501,6 +501,10 @@ enum ArenaBacking {
     /// Multi-process: a sealed `memfd` mapped `MAP_SHARED` (Phase 2).
     #[cfg(all(feature = "shm", target_os = "linux"))]
     Mapped(MappedArena),
+    /// Offline: the arena image inside a `.tft`, mapped `PROT_READ`
+    /// (`docs/PHASE5.md` §2).
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Frozen(tf_tree_arena::FrozenArena),
 }
 
 impl ArenaBacking {
@@ -509,6 +513,8 @@ impl ArenaBacking {
             ArenaBacking::Heap(a) => a,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ArenaBacking::Mapped(a) => a,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Frozen(a) => a,
         }
     }
 
@@ -524,6 +530,12 @@ impl ArenaBacking {
             ArenaBacking::Heap(_) => true,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ArenaBacking::Mapped(a) => a.is_writable(),
+            // `docs/PHASE5.md` §2.4: a frozen arena's `AttachMode` is implicitly
+            // and permanently `ReadOnly`. There is no mode in which this can be
+            // true — the mapping is `PROT_READ`, so a store through it is a
+            // `SIGSEGV` and not an error anything can catch.
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Frozen(_) => false,
         }
     }
 
@@ -532,6 +544,13 @@ impl ArenaBacking {
         match self {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ArenaBacking::Mapped(_) => true,
+            // Other *processes* may map the same `.tft`, but "shared" here asks
+            // whether a peer can mutate it — the participant table, the claim
+            // protocol and reaping all hang off this answer. A frozen arena has
+            // no writers at all (§2.4), so it is `false` for the same reason a
+            // heap arena is.
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Frozen(_) => false,
             ArenaBacking::Heap(_) => false,
         }
     }
@@ -1251,7 +1270,10 @@ impl Tree {
     pub fn shared_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         match &self.arena {
             ArenaBacking::Mapped(a) => Some(a.as_raw_fd()),
-            ArenaBacking::Heap(_) => None,
+            // A `.tft` is not shareable *as a segment*: handing its fd to a peer
+            // and letting it `attach` would map the container header, not the
+            // arena. Peers open the path.
+            ArenaBacking::Frozen(_) | ArenaBacking::Heap(_) => None,
         }
     }
 
@@ -1259,6 +1281,42 @@ impl Tree {
     #[must_use]
     pub fn is_shared(&self) -> bool {
         self.arena.is_shared()
+    }
+
+    /// Construct a permanently read-only [`Tree`] over a frozen `.tft` image.
+    ///
+    /// `pub(crate)`: [`crate::frozen`] owns the file half of `docs/PHASE5.md`
+    /// §2, but `Tree`'s fields are private to this module, so the constructor
+    /// has to live here.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn from_frozen(arena: tf_tree_arena::FrozenArena) -> Tree {
+        let backing = ArenaBacking::Frozen(arena);
+        let fork_gen = fork_gen_for(&backing);
+        Tree {
+            arena: backing,
+            // The read-only sentinel, exactly as a `PROT_READ` `attach_shared`
+            // takes: registering would write to the participant table, which is
+            // inside the mapping.
+            participant: u32::MAX,
+            incarnation: 0,
+            // **Nobody is alive in a frozen arena.** Its participant and claim
+            // records name processes of whatever run produced the file, and the
+            // usual `/proc` inference would answer about *this* host's current
+            // pids — so a recycled pid would resurrect a participant that has
+            // been dead since before the file existed. `false` is not a
+            // conservative guess here, it is the fact.
+            liveness: Box::new(|_, _| false),
+            decl: Mutex::new(()),
+            attachment: None,
+            claim_lock: None,
+            fork_gen,
+        }
+    }
+
+    /// The arena bytes behind this tree, for [`crate::frozen`]'s freeze path.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn backing(&self) -> &dyn Arena {
+        self.arena.as_dyn()
     }
 
     /// The boot id of the host that created this arena, all 16 bytes.
@@ -1619,6 +1677,13 @@ impl Drop for Tree {
 fn fork_gen_for(backing: &ArenaBacking) -> Option<u64> {
     match backing {
         ArenaBacking::Heap(_) => None,
+        // A frozen mapping is `MAP_PRIVATE | PROT_READ` and deliberately *not*
+        // `MADV_DONTFORK`, so a `fork` child inherits it intact and every
+        // reference into it stays valid — the same situation as a heap arena,
+        // and the one §2.2's sixteen dataloader workers depend on. Poisoning it
+        // would break `multiprocessing` for offline users to defend against a
+        // hazard they do not have.
+        ArenaBacking::Frozen(_) => None,
         ArenaBacking::Mapped(_) => {
             tf_tree_ipc::fork::arm();
             let _ = poison_arena();
