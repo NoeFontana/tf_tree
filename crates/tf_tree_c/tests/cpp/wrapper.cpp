@@ -314,12 +314,17 @@ static void check_read_path()
 /// exceptions build fails by `throw`, which is not a `return` — which is the
 /// whole of the asymmetry §0.0 had recorded as unexplained.
 ///
+/// This check is compiled only into the four `--wrap` rows of `just cpp-check`
+/// — g++ and clang++ × both error modes — because `-Wl,--wrap` is a GNU-ld/lld
+/// option and the eight §6.2 matrix rows are a *portability* gate that should
+/// not require a linker family. `run.sh`'s `WRAP` note has the argument.
+///
 /// Mutant (applied, and the results below are measured, not predicted): put
-/// `TF_TREE_FAIL(s)` back in `Plan::at`. **All four `-fno-exceptions` rows of
-/// `just cpp-check` fail** — g++ and clang++, C++17 and C++20 — and the four
-/// exceptions rows keep passing, which is the asymmetry itself reproduced as a
-/// test result rather than as a timing. `just cpp-bench` moves from an
-/// interleaved 1.003x to 1.035x against a 1.02 gate over the same 11-round A/B.
+/// `TF_TREE_FAIL(s)` back in `Plan::at`. **Both `--wrap no-exceptions` rows
+/// fail** — g++ and clang++ — and both `--wrap exceptions` rows keep passing,
+/// which is the asymmetry itself reproduced as a test result rather than as a
+/// timing. `just cpp-bench` moves from an interleaved 1.003x to 1.035x against
+/// a 1.02 gate over the same 11-round A/B.
 static void check_at_writes_into_the_returned_object()
 {
     tft_tree* raw = nullptr;
@@ -347,6 +352,72 @@ static void check_at_writes_into_the_returned_object()
           "see TF_TREE_FAIL_INTO in tf_tree.hpp");
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// TF_TREE_FAIL_INTO behaves the same way in both error modes
+// ---------------------------------------------------------------------------
+
+static bool fail_into_fell_through = false;
+
+/// Shaped exactly like `Plan::at`: fail through the macro, then `return out;`.
+/// The assignment in between stands for whatever a future `Plan::at` might grow
+/// there — a release, an unlock, a counter — and must never run.
+///
+/// `out` is a bare identifier because `TF_TREE_FAIL_INTO`'s contract 2 requires
+/// one; a probe that passed an expression would be testing a use the macro does
+/// not support.
+static tf_tree::result<double> fail_into_probe()
+{
+    tf_tree::result<double> out = tf_tree::make_result<double>();
+    TF_TREE_FAIL_INTO(out, TFT_ERR_BAD_HANDLE);
+    fail_into_fell_through = true;
+    return out;
+}
+
+/// **`TF_TREE_FAIL_INTO` must leave the function immediately, in both error
+/// modes** — contract 1 in `tf_tree.hpp`.
+///
+/// The macro's two expansions do visibly different things: one assigns an
+/// `Error` into the return object, the other throws. Only the observable
+/// control flow has to match, and nothing else in the build enforces that. A
+/// version that assigned and *fell through* compiles clean in both modes, so
+/// `TF_TREE_FAIL_INTO(out, s); unlock(); return out;` would run `unlock()`
+/// under exceptions and skip it under `-fno-exceptions`. Silently, in a header
+/// shipped to callers who compile it either way.
+///
+/// Mutant (applied): drop the `return out;` from the `-fno-exceptions`
+/// expansion, leaving the bare assignment. **The six `-fno-exceptions` rows of
+/// `just cpp-check` fail** on "fell through", g++ and clang++, C++17, C++20 and
+/// `--wrap`; the seven exceptions rows pass. That split is the defect itself: a
+/// bug that exists in one error mode only is exactly what this file is here to
+/// surface.
+///
+/// `check_at_writes_into_the_returned_object` does **not** catch it. `Plan::at`
+/// has nothing between the macro and its `return`, so falling through there is
+/// harmless today and the payload still lands in the return slot. This test
+/// guards the macro; that one guards its one current caller.
+static void check_fail_into_leaves_the_function()
+{
+    fail_into_fell_through = false;
+#ifdef TF_TREE_NO_EXCEPTIONS
+    const tf_tree::result<double> r = fail_into_probe();
+    CHECK(!r, "the probe must report failure");
+    CHECK(r.error().code() == TFT_ERR_BAD_HANDLE, "carrying the status it was handed");
+#else
+    bool threw = false;
+    try {
+        const tf_tree::result<double> r = fail_into_probe();
+        (void)r;
+    } catch (const tf_tree::Error& e) {
+        threw = true;
+        CHECK(e.code() == TFT_ERR_BAD_HANDLE, "carrying the status it was handed");
+    }
+    CHECK(threw, "the probe must report failure");
+#endif
+    CHECK(!fail_into_fell_through,
+          "TF_TREE_FAIL_INTO fell through to the next statement; the two error "
+          "modes no longer agree on control flow");
+}
 
 // ---------------------------------------------------------------------------
 // Batch writes go straight into the caller's array
@@ -500,10 +571,11 @@ static const char* clobber_the_error_slot()
 /// Mutant (applied): give `Error::message()` the body
 /// `{ static tft_error live{}; live.struct_size = sizeof(live);
 /// tft_last_error(&live); return live.message; }` — the "view, not a copy"
-/// implementation. **All eight `just cpp-check` rows fail** on the
-/// "must be a copy, not a view" line. The previous version of this test used
-/// `tft_layout_size` as the intervening call and checked `code()`; it survived
-/// that mutant in all eight, because neither half of it could discriminate.
+/// implementation. **Every row of `just cpp-check` fails** — all thirteen — on
+/// the "must be a copy, not a view" line. The previous version of this test
+/// used `tft_layout_size` as the intervening call and checked `code()`; it
+/// survived that mutant in every row, because neither half of it could
+/// discriminate.
 static void check_errors()
 {
     tft_tree* raw = nullptr;
@@ -666,6 +738,7 @@ int main()
 #if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
     check_at_writes_into_the_returned_object();
 #endif
+    check_fail_into_leaves_the_function();
     check_batch();
     check_errors();
     check_publish();

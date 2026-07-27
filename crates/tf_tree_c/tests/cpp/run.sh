@@ -9,6 +9,10 @@
 # code, so a build that compiles and a build that computes the right transform
 # are different claims.
 #
+# Two groups follow the matrix and are not part of it: 4 `--wrap` builds that
+# add `check_at_writes_into_the_returned_object` (see the `WRAP` note below for
+# why they are kept separate), and 1 sanitizer build. 13 in total.
+#
 # Sophus is optional and its absence is reported rather than skipped silently —
 # §4.3's stride hazard only exists where Sophus does, and a run that did not
 # exercise it should not read like one that did. `just cpp-deps` fetches it.
@@ -58,10 +62,15 @@ WARN="-Wall -Wextra -Wpedantic -Werror"
 # `Plan::at<T>` gave the ABI the address of the object it returns rather than a
 # temporary it copies out of afterwards. The alternative — a `test-hooks` symbol
 # on the Rust side — would put that store inside the function `just cpp-bench`
-# times. The shim forwards to `__real_tft_plan_at`, so every other test in the
-# file is unaffected.
+# times. The shim forwards to `__real_tft_plan_at`, so the rest of the file
+# behaves identically under it.
 #
-# GNU ld and lld both implement `--wrap`; the matrix below covers both linkers.
+# **It is deliberately kept out of the §6.2 matrix below.** `--wrap` is a
+# GNU-ld/lld option and Mach-O's `ld64` has no equivalent, so putting it on the
+# portability rows would make the repo's C++ *portability* gate require a
+# specific linker family in order to test something that has nothing to do with
+# portability. The four rows below get it instead, and the eight matrix rows
+# stay linker-agnostic.
 WRAP="-DTF_TREE_WRAP_PLAN_AT -Wl,--wrap=tft_plan_at"
 
 fail=0
@@ -83,7 +92,7 @@ for cxx in g++ clang++; do
             label="$cxx -std=$std $mode"
             printf '  %-34s ' "$label"
             # shellcheck disable=SC2086
-            if ! $cxx -std=$std $flags $WARN $WRAP -I "$INC" $EIGEN $SOPHUS \
+            if ! $cxx -std=$std $flags $WARN -I "$INC" $EIGEN $SOPHUS \
                     -o "$OUT/w" "$SRC" "$LIB" -lpthread -ldl -lm 2>"$OUT/err"; then
                 echo "COMPILE FAILED"
                 sed 's/^/      /' "$OUT/err" | head -20
@@ -101,6 +110,38 @@ for cxx in g++ clang++; do
     done
 done
 
+# §7 gate 2, pinned structurally: `check_at_writes_into_the_returned_object`.
+#
+# Both compilers and both error modes, because that is exactly what the property
+# varies with — NRVO is a per-compiler decision, and the error mode is the whole
+# of the asymmetry §0.0 records. **Not** both standard revisions: copy elision
+# is unchanged between C++17 and C++20, so a second `std` would double the rows
+# and hold nothing new. These builds run the whole file, not just the one check,
+# which is also what shows that the forwarding shim perturbs nothing.
+for cxx in g++ clang++; do
+    command -v "$cxx" >/dev/null || continue   # already reported by the matrix
+    for mode in exceptions no-exceptions; do
+        flags=""
+        [ "$mode" = "no-exceptions" ] && flags="-fno-exceptions"
+        printf '  %-34s ' "$cxx --wrap $mode"
+        # shellcheck disable=SC2086
+        if ! $cxx -std=c++17 $flags $WARN $WRAP -I "$INC" $EIGEN $SOPHUS \
+                -o "$OUT/w" "$SRC" "$LIB" -lpthread -ldl -lm 2>"$OUT/err"; then
+            echo "COMPILE FAILED"
+            sed 's/^/      /' "$OUT/err" | head -20
+            fail=1
+            continue
+        fi
+        if ! "$OUT/w" >"$OUT/log" 2>&1; then
+            echo "RUN FAILED"
+            sed 's/^/      /' "$OUT/log" | head -20
+            fail=1
+            continue
+        fi
+        echo "ok"
+    done
+done
+
 # §7 gate 4: zero ASan/UBSan findings across the C++ suite. One configuration is
 # enough — the sanitizers find memory and UB errors, which do not depend on the
 # standard revision or the error mode.
@@ -108,7 +149,7 @@ printf '  %-34s ' "clang++ asan+ubsan"
 if command -v clang++ >/dev/null; then
     # shellcheck disable=SC2086
     clang++ -std=c++17 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-        $WARN $WRAP -I "$INC" $EIGEN $SOPHUS -o "$OUT/wsan" "$SRC" "$LIB" \
+        $WARN -I "$INC" $EIGEN $SOPHUS -o "$OUT/wsan" "$SRC" "$LIB" \
         -lpthread -ldl -lm 2>"$OUT/err" || { echo "COMPILE FAILED"; head -20 "$OUT/err"; fail=1; }
     if [ -x "$OUT/wsan" ]; then
         if ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \

@@ -175,6 +175,13 @@ private:
 
 #ifdef TF_TREE_NO_EXCEPTIONS
 
+/// Tag for constructing an `expected` whose payload is default-initialised
+/// **in place**. See `make_result`.
+struct in_place_value_t {
+    explicit in_place_value_t() = default;
+};
+inline constexpr in_place_value_t in_place_value{};
+
 /// A minimal `expected`, used only when exceptions are off.
 ///
 /// `std::expected` is C++23 and this header is C++17, so a small one lives
@@ -210,14 +217,6 @@ private:
 /// It is also not *needed*: the width was never what §7 gate 2 was measuring.
 /// See `TF_TREE_FAIL_INTO` — the cost was the whole object being copied at all,
 /// which is a question of NRVO and not of size.
-
-/// Tag for constructing an `expected` whose payload is default-initialised
-/// **in place**. See `make_result`.
-struct in_place_value_t {
-    explicit in_place_value_t() = default;
-};
-inline constexpr in_place_value_t in_place_value{};
-
 template <typename T>
 class expected {
 public:
@@ -317,11 +316,38 @@ inline expected<T> make_result()
 /// return object's size, the `optional` discriminant, or the FFI boundary —
 /// those were measured and refuted (§0.0).
 ///
-/// Assigning keeps the function at one `return`, so both modes elide.
+/// Assigning into `out` — rather than returning a *different* object — is what
+/// keeps the elision, so both modes elide.
 /// `check_at_writes_into_the_returned_object` pins it without a stopwatch.
+///
+/// **Contract 1 — this macro never returns to the statement after it, and that
+/// is the same in both error modes.** The `-fno-exceptions` expansion returns,
+/// the exceptions expansion throws. It is the reason `return out;` lives inside
+/// the expansion rather than being left to the caller: a version that assigned
+/// and *fell through* compiles clean in both modes while running the statements
+/// between the failure and the next `return` in only one of them — so
+/// `TF_TREE_FAIL_INTO(out, s); unlock(); return out;` would leak the lock under
+/// exceptions and not under `-fno-exceptions`, with no diagnostic in either
+/// build. `check_fail_into_leaves_the_function` pins it.
+///
+/// That second `return` costs nothing: NRVO wants every `return` to name the
+/// *same* automatic object, not to be unique. Both name `out`, and the emitted
+/// assembly for `Plan::at<Eigen::Isometry3d>` at `-O2` is byte-identical to the
+/// fall-through form on g++ 13 and clang++ 18, in both error modes.
+///
+/// **Contract 2 — `out` must be a bare identifier naming the function's return
+/// object.** Not an expression: the `-fno-exceptions` expansion substitutes it
+/// twice (the assignment, then the `return`) and the exceptions expansion once,
+/// so anything with a side effect would behave differently per mode. This is
+/// not a restriction the macro adds — `return out;` only elides when `out` is a
+/// plain id-expression naming an automatic object, so NRVO demands the same
+/// thing the macro does, and a caller who violates it loses the elision this
+/// macro exists to protect. `check_at_writes_into_the_returned_object` is what
+/// notices, which is why contract 2 gets no separate test.
 #define TF_TREE_FAIL_INTO(out, status)                                        \
     do {                                                                      \
         (out) = ::tf_tree::Error(status);                                     \
+        return out;                                                           \
     } while (0)
 
 #else  // exceptions
@@ -356,12 +382,17 @@ inline T make_result()
 
 /// See the `-fno-exceptions` overload. Here `result<T>` *is* `T`, there is
 /// nothing to fail into, and a `throw` was never a `return` — so this mode's
-/// NRVO was always intact and the macro is the plain `throw`. `out` is named
-/// so the two definitions take the same arguments; `sizeof` consumes it
-/// without evaluating it, which keeps `-Wunused` quiet.
+/// NRVO was always intact and the failure path is the plain `throw`.
+///
+/// `out` is still named — and still *evaluated*, as a discarded-value
+/// expression rather than inside an unevaluated `sizeof`, so that a caller who
+/// misspells it fails to compile in this mode too rather than only in the
+/// other. Contract 2 over there makes the differing substitution count
+/// unobservable; contract 1 is what this expansion has to honour, and it does,
+/// because a `throw` leaves the function exactly as that `return` does.
 #define TF_TREE_FAIL_INTO(out, status)                                        \
     do {                                                                      \
-        (void)sizeof(out);                                                    \
+        (void)(out);                                                          \
         TF_TREE_FAIL(status);                                                 \
     } while (0)
 
@@ -723,11 +754,13 @@ public:
         // both error modes, so the C ABI writes once into the caller's storage.
         // See `value_ptr`.
         //
-        // **One `return`, and it is load-bearing** — `TF_TREE_FAIL_INTO`, never
-        // `TF_TREE_FAIL`. A second `return` of anything but `out` turns NRVO
-        // off for the whole function, and the payload `tft_plan_at` just wrote
-        // is then copied a second time into the caller. The failure path pays
-        // an assignment instead, which is cold.
+        // **Every `return` here names `out`, and that is load-bearing** —
+        // `TF_TREE_FAIL_INTO`, never `TF_TREE_FAIL`. A `return` of anything
+        // *but* `out` turns NRVO off for the whole function, and the payload
+        // `tft_plan_at` just wrote is then copied a second time into the
+        // caller. The failure path pays an assignment instead, which is cold.
+        // The macro itself leaves the function, so nothing may be added
+        // between it and the `return out;` below expecting to run on failure.
         result<T> out = make_result<T>();
         const tft_status s =
             tft_plan_at(h_.get(), stamp, layout_of<T>::value, value_ptr(out));
