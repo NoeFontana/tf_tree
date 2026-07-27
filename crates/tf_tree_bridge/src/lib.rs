@@ -21,6 +21,18 @@
 //! struct *is* legitimate for these sections. So they live here, under `just
 //! test` and `just lint`, on every host.
 //!
+//! # Topology comes from a file, not from the wire (§5.8's amendment)
+//!
+//! The engine has **no runtime edge declaration**: `declare_edge` is build-time
+//! only and `edge_headroom` reserves zero-capacity slots no API can fill
+//! (`docs/decisions/0004`, D4). So [`Ingest`] takes a [`TopologyConfig`] up
+//! front and everything else follows from it — a transform for an undeclared
+//! edge is dropped, counted and diagnosed once naming both frames
+//! ([`Action::UndeclaredEdge`]), and `/tf_static` is *verified against the
+//! declared constant* ([`Action::StaticVerified`]) rather than declaring
+//! anything. [`Discovery`] is how an operator obtains the file in the first
+//! place.
+//!
 //! # What this deliberately does not do
 //!
 //! **It does not publish.** §5.1 is NORMATIVE: the bridge is ingress only. One
@@ -113,6 +125,14 @@ pub enum Publisher {
     /// something we could not use, and only the second is a graph-cache bug
     /// worth chasing.
     Unattributed,
+    /// **The topology config file**, which is not a publisher at all.
+    ///
+    /// It is here because `docs/PHASE4.md` §5.8's amendment makes the config
+    /// the incumbent owner of every static edge's value: `/tf_static` is
+    /// verified against it, and a disagreement is §5.7's conflict with the file
+    /// on one side. A diagnostic that named `<unattributed>` there would send
+    /// an operator looking for a node.
+    Declared,
 }
 
 impl core::fmt::Display for Publisher {
@@ -121,6 +141,7 @@ impl core::fmt::Display for Publisher {
             Publisher::Node(n) => write!(f, "{n}"),
             Publisher::UnknownGid => write!(f, "<unknown publisher>"),
             Publisher::Unattributed => write!(f, "<unattributed>"),
+            Publisher::Declared => write!(f, "<topology config>"),
         }
     }
 }

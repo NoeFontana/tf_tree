@@ -26,6 +26,7 @@
 //! could observe. The tolerance is what makes the diagnostic mean "your two
 //! URDFs disagree" rather than "your two URDFs were serialized differently".
 
+use crate::config::{EdgeShape, TopologyConfig};
 use crate::Publisher;
 use std::collections::BTreeMap;
 
@@ -84,6 +85,45 @@ impl StaticStore {
     #[must_use]
     pub fn new() -> StaticStore {
         StaticStore::default()
+    }
+
+    /// A store pre-loaded with a topology config's declarations.
+    ///
+    /// This is what `docs/PHASE4.md` §5.8's amendment means by *"reinterpreted
+    /// as verify against the declared constant"*. Every static edge's value is
+    /// on file **before** any message arrives, owned by
+    /// [`Publisher::Declared`], so an arriving `/tf_static` runs the same
+    /// [`Self::observe_static`] it always did and lands in the same three
+    /// buckets — with the config as the incumbent. `/tf_static` handling
+    /// becomes §5.7's conflict machinery and nothing else, which is what that
+    /// machinery was for.
+    #[must_use]
+    pub fn seeded(config: &TopologyConfig) -> StaticStore {
+        let mut s = StaticStore::new();
+        for e in &config.edges {
+            let key = (e.parent.clone(), e.child.clone());
+            match e.shape {
+                EdgeShape::Static { pose } => {
+                    s.kinds.insert(key.clone(), StaticKind::Static);
+                    s.values.insert(key, (pose, Publisher::Declared));
+                }
+                EdgeShape::Dynamic { .. } => {
+                    s.kinds.insert(key, StaticKind::Dynamic);
+                }
+            }
+        }
+        s
+    }
+
+    /// Whether the topology declares this edge at all.
+    ///
+    /// A seeded store answers `false` for everything the config did not name,
+    /// which is what makes §5.8's *"a transform arriving for an undeclared edge
+    /// is dropped, counted and diagnosed"* a lookup rather than a second table.
+    #[must_use]
+    pub fn is_declared(&self, parent: &str, child: &str) -> bool {
+        self.kinds
+            .contains_key(&(parent.to_string(), child.to_string()))
     }
 
     /// Record that `(parent, child)` arrived on `/tf` — a dynamic edge.
