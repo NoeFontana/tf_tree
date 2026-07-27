@@ -38,8 +38,12 @@
 //! to notice: with those reversed, one misconfigured node can silently stall the
 //! correct one, and the diagnostic blames the victim.
 
+use std::collections::BTreeMap;
+
 use crate::authority::{Authority, AuthorityPolicy, Verdict};
 use crate::clock::{ClockGuard, ClockVerdict, OnClockReset};
+use crate::config::TopologyConfig;
+use crate::edgemap::{insert, lookup_mut, ByEdge};
 use crate::names::NameNormalizer;
 use crate::statics::{StaticStore, StaticVerdict};
 use crate::stats::BridgeStats;
@@ -68,14 +72,38 @@ pub enum Action {
         /// `[qw qx qy qz tx ty tz]`.
         pose: [f64; 7],
     },
-    /// Declare a static edge with this constant value.
-    DeclareStatic {
+    /// A `/tf_static` value that **matches the declared constant**. Nothing to
+    /// write; the arena already holds it.
+    ///
+    /// This is what `docs/PHASE4.md` §5.8's amendment turned `DeclareStatic`
+    /// into. That variant asked the caller to perform an operation the engine
+    /// does not have — a static edge's pose is inline in
+    /// `EdgeRecord::static_pose`, written at build time, and `Tree::claim`
+    /// refuses it with `NotDynamic` because its capacity is 0. Nothing outside
+    /// this crate consumed it, because nothing could. What is left once the
+    /// config declares the constant is *verification*, and that is a report,
+    /// not a write.
+    StaticVerified {
         /// Normalized parent frame.
         parent: String,
         /// Normalized child frame.
         child: String,
-        /// The constant.
-        pose: [f64; 7],
+    },
+    /// A transform for an edge the topology config does not declare (§5.8).
+    ///
+    /// **Not a `Drop`**, for the same reason as [`Action::StaticConflict`]: the
+    /// amendment requires the diagnostic to name *both frames*, and a
+    /// `Drop { reason }` carries neither. `first_time` is what keeps it to one
+    /// line per edge rather than one per message — an undeclared 1 kHz edge
+    /// would otherwise emit a thousand identical lines a second, the same
+    /// failure §5.6 avoids for frame names.
+    UndeclaredEdge {
+        /// Normalized parent frame.
+        parent: String,
+        /// Normalized child frame.
+        child: String,
+        /// First sighting of this edge, for rate limiting.
+        first_time: bool,
     },
     /// A `/tf_static` value that disagrees with the one on file (§5.7).
     ///
@@ -131,9 +159,6 @@ pub enum DropReason {
         /// By how much.
         by_nanos: i64,
     },
-    /// The same static value again (§5.7). Silent, and counted as applied
-    /// nowhere — it is not a failure, it is a latched re-delivery.
-    StaticRepeat,
     /// The edge is already declared with the other kind (§5.7).
     KindChange,
 }
@@ -155,7 +180,8 @@ pub enum HaltReason {
     },
 }
 
-/// The four tables, plus the counters, applied in order.
+/// The four tables, plus the declared topology and the counters, applied in
+/// order.
 #[derive(Debug)]
 pub struct Ingest {
     names: NameNormalizer,
@@ -163,32 +189,56 @@ pub struct Ingest {
     authority: Authority,
     clock: ClockGuard,
     stats: BridgeStats,
+    /// Undeclared edges seen, and how many times — the rate limiter behind
+    /// `Action::UndeclaredEdge`'s `first_time`, and `doctor`'s list of what the
+    /// robot publishes that the config forgot.
+    ///
+    /// A [`ByEdge`] for the same reason [`StaticStore`]'s tables are: the
+    /// counter is bumped on **every** message from an undeclared edge, and a
+    /// `(String, String)` key cannot be probed by reference. `first_time`
+    /// silences the log for a 1 kHz undeclared edge; without this it left the
+    /// allocator running at 1 kHz anyway, which is the more expensive half of
+    /// what the rate limiter was there to stop.
+    undeclared: ByEdge<u64>,
 }
 
 impl Ingest {
-    /// A pipeline with the default policies: `FirstWriterWins`, `Halt`, no
-    /// `tf_prefix`.
+    /// A pipeline over `config` with the default policies: `FirstWriterWins`,
+    /// `Halt`, no `tf_prefix`.
+    ///
+    /// **The topology is not optional**, and that is the whole of
+    /// `docs/PHASE4.md` §5.8's amendment: the engine cannot declare an edge
+    /// after `build()`, so a bridge that learned topology from the wire would
+    /// be collecting names it can never turn into arena slots. Everything the
+    /// bridge will ever write has to be in this file.
     #[must_use]
-    pub fn new() -> Ingest {
-        Ingest::with(AuthorityPolicy::default(), OnClockReset::default(), None)
+    pub fn new(config: &TopologyConfig) -> Ingest {
+        Ingest::with(
+            config,
+            AuthorityPolicy::default(),
+            OnClockReset::default(),
+            None,
+        )
     }
 
     /// A pipeline with explicit policies.
     #[must_use]
     pub fn with(
+        config: &TopologyConfig,
         authority: AuthorityPolicy,
         on_clock_reset: OnClockReset,
         tf_prefix: Option<&str>,
     ) -> Ingest {
         Ingest {
             names: tf_prefix.map_or_else(NameNormalizer::new, NameNormalizer::with_prefix),
-            statics: StaticStore::new(),
+            statics: StaticStore::seeded(config),
             authority: Authority::new(authority),
             clock: ClockGuard::new(on_clock_reset),
             stats: BridgeStats {
                 queue_capacity: 100, // §5.2's KeepLast(100)
                 ..BridgeStats::default()
             },
+            undeclared: BTreeMap::new(),
         }
     }
 
@@ -208,7 +258,34 @@ impl Ingest {
         };
         let (parent, child) = (parent.name, child.name);
 
-        // 2. Kind. A hard error, and one fault gets one diagnostic.
+        // 2. Declared? Before the kind check, because an undeclared edge has no
+        //    declared kind to clash with, and reporting `KindChange` for it
+        //    would send an operator looking at `/tf_static` for an edge nobody
+        //    ever wrote down.
+        if !self.statics.is_declared(&parent, &child) {
+            // Fast path first: a repeat must not allocate. `entry()` needs an
+            // owned key whether or not it inserts, so reaching for it
+            // unconditionally cloned both names on every message of an edge
+            // already known to be undeclared.
+            let first_time = match lookup_mut(&mut self.undeclared, &parent, &child) {
+                Some(n) => {
+                    *n += 1;
+                    false
+                }
+                None => {
+                    insert(&mut self.undeclared, &parent, &child, 1);
+                    true
+                }
+            };
+            self.stats.dropped_undeclared += 1;
+            return Action::UndeclaredEdge {
+                parent,
+                child,
+                first_time,
+            };
+        }
+
+        // 3. Kind. A hard error, and one fault gets one diagnostic.
         if topic == Topic::Tf && self.statics.observe_dynamic(&parent, &child).is_err() {
             self.stats.dropped_kind_change += 1;
             return Action::Drop {
@@ -216,7 +293,7 @@ impl Ingest {
             };
         }
 
-        // 3. Static value, before authority and only for `/tf_static` — §5.7
+        // 4. Static value, before authority and only for `/tf_static` — §5.7
         //    orders it this way, and the module docs record what putting it
         //    after cost.
         //
@@ -230,17 +307,24 @@ impl Ingest {
                 .statics
                 .observe_static(&parent, &child, sample.pose, publisher)
             {
-                StaticVerdict::Idempotent => {
+                // `Declare` is unreachable through this pipeline, and is
+                // folded in here rather than given its own arm: an edge is
+                // either undeclared (returned at step 2) or seeded by
+                // `StaticStore::seeded` with the config's constant, so
+                // `observe_static` always finds a value on file. Folding it
+                // into "verified" is the safe direction if seeding is ever
+                // skipped — the alternatives would either write a wire value
+                // the arena has no slot for, or report a conflict against
+                // nothing.
+                StaticVerdict::Idempotent | StaticVerdict::Declare => {
                     // Silent, per §5.7, **including from a different
                     // publisher**: two robot_state_publishers with the same
                     // URDF is a redundant launch file, not a misconfiguration,
                     // and an authority diagnostic here would train operators to
                     // ignore the message that matters. So this returns before
                     // authority is consulted at all.
-                    self.stats.applied += 1;
-                    return Action::Drop {
-                        reason: DropReason::StaticRepeat,
-                    };
+                    self.stats.static_verified += 1;
+                    return Action::StaticVerified { parent, child };
                 }
                 StaticVerdict::KindChanged { .. } => {
                     self.stats.dropped_kind_change += 1;
@@ -270,11 +354,10 @@ impl Ingest {
                         first_time,
                     };
                 }
-                StaticVerdict::Declare => {}
             }
         }
 
-        // 4. Authority, before the clock — see the module docs.
+        // 5. Authority, before the clock — see the module docs.
         match self.authority.admit(&parent, &child, publisher) {
             Verdict::Accept => {}
             Verdict::Reject { .. } => {
@@ -297,18 +380,7 @@ impl Ingest {
             }
         }
 
-        if topic == Topic::TfStatic {
-            // Reached only for `StaticVerdict::Declare` — every other verdict
-            // returned in step 3, above authority.
-            self.stats.applied += 1;
-            return Action::DeclareStatic {
-                parent,
-                child,
-                pose: sample.pose,
-            };
-        }
-
-        // 5. Clock, last: only a sample that will be written may advance time.
+        // 6. Clock, last: only a sample that will be written may advance time.
         match self.clock.observe(sample.stamp_nanos) {
             ClockVerdict::Forward => {
                 self.stats.applied += 1;
@@ -372,16 +444,23 @@ impl Ingest {
         &self.statics
     }
 
+    /// Edges the robot publishes that the topology config does not declare,
+    /// with how many transforms each swallowed.
+    ///
+    /// §5.8 requires the diagnostic once per edge; this is the list behind it,
+    /// and it is the first thing to look at when a lookup returns `NoPath` on a
+    /// bridge that reports no drops the operator recognises.
+    #[must_use]
+    pub fn undeclared(&self) -> Vec<(&str, &str, u64)> {
+        crate::edgemap::iter(&self.undeclared)
+            .map(|(p, c, n)| (p, c, *n))
+            .collect()
+    }
+
     /// The remap table, for the startup log (§5.6).
     #[must_use]
     pub fn names(&self) -> &NameNormalizer {
         &self.names
-    }
-}
-
-impl Default for Ingest {
-    fn default() -> Ingest {
-        Ingest::new()
     }
 }
 
@@ -394,6 +473,32 @@ mod tests {
         Publisher::Node(n.to_string())
     }
     const MS: i64 = 1_000_000;
+
+    /// The topology every test below runs against: one dynamic edge and one
+    /// static one, written in the real config format so these tests exercise
+    /// the parser the operator will use rather than a struct literal that could
+    /// drift from it.
+    const TOPO: &str = r#"
+[[edge]]
+parent = "odom"
+child = "base"
+kind = "dynamic"
+capacity = 256
+
+[[edge]]
+parent = "base"
+child = "lidar"
+kind = "static"
+pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+"#;
+
+    fn topo() -> TopologyConfig {
+        TopologyConfig::parse(TOPO).unwrap()
+    }
+
+    fn ingest() -> Ingest {
+        Ingest::new(&topo())
+    }
 
     /// **Authority is decided before the clock**, and this is what goes wrong
     /// if it is not.
@@ -409,7 +514,7 @@ mod tests {
     /// fails.
     #[test]
     fn a_rejected_publisher_cannot_move_the_clock() {
-        let mut i = Ingest::new();
+        let mut i = ingest();
         let s = |t: i64| Sample::identity("odom", "base", t);
 
         assert!(matches!(
@@ -431,13 +536,16 @@ mod tests {
         assert_eq!(i.stats().dropped_non_monotonic, 0);
     }
 
-    /// **Names are normalized before anything keys on them.**
+    /// **Names are normalized before anything keys on them** — including the
+    /// declared-topology lookup, which is now the first table.
     ///
-    /// Mutant: normalize after the authority lookup ⇒ `/odom` and `odom` become
-    /// two edges with two owners, and the same publisher conflicts with itself.
+    /// Mutant: normalize after the declared check ⇒ `/odom` -> `/base` does not
+    /// match the config's `odom` -> `base`, every slash-prefixed transform on a
+    /// correctly configured robot is reported undeclared, and this fails on the
+    /// first offer.
     #[test]
     fn a_slash_prefixed_name_is_the_same_edge() {
-        let mut i = Ingest::new();
+        let mut i = ingest();
         assert!(matches!(
             i.offer(
                 Topic::Tf,
@@ -457,6 +565,7 @@ mod tests {
             other => panic!("the same edge under both spellings: {other:?}"),
         }
         assert_eq!(i.stats().dropped_authority, 0);
+        assert_eq!(i.stats().dropped_undeclared, 0);
     }
 
     /// **A static's stamp must not touch the clock.**
@@ -470,20 +579,20 @@ mod tests {
     /// the zero-stamped static is a `Halt`.
     #[test]
     fn a_zero_stamped_static_does_not_reset_the_clock() {
-        let mut i = Ingest::new();
+        let mut i = ingest();
         i.offer(
             Topic::Tf,
             &Sample::identity("odom", "base", 1_000_000 * MS),
             &node("/ekf"),
         );
-        // A latched static, stamped at the epoch.
+        // A latched static, stamped at the epoch, matching the declared value.
         assert!(matches!(
             i.offer(
                 Topic::TfStatic,
                 &Sample::identity("base", "lidar", 0),
                 &node("/rsp")
             ),
-            Action::DeclareStatic { .. }
+            Action::StaticVerified { .. }
         ));
         // The dynamic stream is unaffected.
         assert!(matches!(
@@ -501,11 +610,12 @@ mod tests {
     /// makes `BridgeStats::balanced` worth having: every path either applies or
     /// drops for exactly one reason.
     ///
-    /// Mutant: return early from any arm without touching a counter ⇒ this
-    /// fails, naming the totals.
+    /// Mutant: return early from any arm without touching a counter — e.g. drop
+    /// `dropped_undeclared += 1` from the undeclared arm ⇒ this fails, naming
+    /// the totals.
     #[test]
     fn every_transform_is_accounted_for() {
-        let mut i = Ingest::new();
+        let mut i = ingest();
         // **`/ekf` publishes first, deliberately.** An earlier version of this
         // fixture used `k % 5 == 0`, which is true at `k == 0` — so `/rogue`
         // took the edge, every `/ekf` sample was dropped on authority, and the
@@ -533,7 +643,7 @@ mod tests {
             &Sample::identity("/", "base", 1_300 * MS),
             &node("/ekf"),
         );
-        // A static, then a kind clash.
+        // A declared static, then the same edge on `/tf` — a kind clash.
         i.offer(
             Topic::TfStatic,
             &Sample::identity("base", "lidar", 0),
@@ -544,43 +654,54 @@ mod tests {
             &Sample::identity("base", "lidar", 1_400 * MS),
             &node("/rsp"),
         );
+        // An edge the config never declared.
+        i.offer(
+            Topic::Tf,
+            &Sample::identity("base", "camera", 1_500 * MS),
+            &node("/rsp"),
+        );
 
         let s = i.stats();
         assert!(
             s.balanced(),
-            "unbalanced: {} transforms vs applied {} + auth {} + mono {} + name {} + kind {}",
+            "unbalanced: {} transforms vs applied {} + auth {} + mono {} + name {} + kind {} + undeclared {}",
             s.transforms,
             s.applied,
             s.dropped_authority,
             s.dropped_non_monotonic,
             s.dropped_bad_name,
-            s.dropped_kind_change
+            s.dropped_kind_change,
+            s.dropped_undeclared
         );
         assert!(s.dropped_authority > 0 && s.dropped_bad_name == 1 && s.dropped_kind_change == 1);
         assert!(s.dropped_non_monotonic > 0);
+        assert_eq!(s.dropped_undeclared, 1);
     }
 
-    /// **§5.7's whole feature: two `robot_state_publisher`s with different
-    /// URDFs, reported with both values.**
+    /// **§5.7's whole feature, re-aimed by §5.8's amendment: a URDF that
+    /// disagrees with the declared constant, reported with both values.**
     ///
-    /// This is the case §5.4 calls the sales pitch, and it was **inert**. The
-    /// pipeline asked authority before the static store, so under the default
-    /// `FirstWriterWins` the first publisher owned the edge and the second was
-    /// rejected as `NotTheOwner` — `observe_static` never ran, and the
-    /// `existing`/`offered` payload that tells an operator *which URDF is
-    /// installed* was unreachable through the pipeline. Every unit test in
-    /// `statics.rs` passed, because they call `StaticStore` directly.
+    /// The incumbent is now the config file rather than whichever publisher
+    /// arrived first, and that is the point of the reinterpretation: the
+    /// operator is told *"your file says the lidar is at x = 0, `/rsp_b` says
+    /// 0.25"*, which names the installed URDF against the intended one. Before,
+    /// the answer depended on launch order.
     ///
-    /// Mutant: move `observe_static` back below `authority.admit` ⇒ this
-    /// returns `Drop { NotTheOwner }` and `static_conflicts` stays 0.
+    /// Mutant: seed only the kinds and not the values in `StaticStore::seeded`
+    /// ⇒ the first publisher declares and the config is no longer a party to
+    /// the conflict, so `owner` is `/rsp_a` and this fails.
     #[test]
-    fn two_urdfs_disagreeing_is_reported_with_both_values() {
-        let mut i = Ingest::new();
+    fn a_urdf_that_disagrees_with_the_declared_constant_is_reported_with_both_values() {
+        let mut i = ingest();
         let mut moved = Sample::identity("base", "lidar", 0);
-        assert!(matches!(
+        // The first publisher agrees with the file: silent verification.
+        assert_eq!(
             i.offer(Topic::TfStatic, &moved, &node("/rsp_a")),
-            Action::DeclareStatic { .. }
-        ));
+            Action::StaticVerified {
+                parent: "base".to_string(),
+                child: "lidar".to_string()
+            }
+        );
         moved.pose[4] = 0.25; // the second URDF puts the lidar 25 cm forward
 
         match i.offer(Topic::TfStatic, &moved, &node("/rsp_b")) {
@@ -594,9 +715,9 @@ mod tests {
                 first_time,
             } => {
                 assert_eq!((parent.as_str(), child.as_str()), ("base", "lidar"));
-                assert_eq!(owner, node("/rsp_a"), "both publishers named");
+                assert_eq!(owner, Publisher::Declared, "the config is the incumbent");
                 assert_eq!(intruder, node("/rsp_b"));
-                assert_eq!(existing[4], 0.0, "and both values");
+                assert_eq!(existing[4], 0.0, "and both values are reported");
                 assert!((offered[4] - 0.25).abs() < 1e-12);
                 assert!(first_time);
             }
@@ -609,18 +730,19 @@ mod tests {
     /// **An identical latched value from a second publisher is silent** — §5.7
     /// says so, and it is the normal case for a redundant launch file.
     ///
-    /// With authority first, this produced a *loud* `NotTheOwner` diagnostic
-    /// with `first_time: true`, training an operator to ignore the message that
-    /// matters.
+    /// Mutant: consult authority before the static store ⇒ `/rsp_b` is rejected
+    /// as `NotTheOwner`, `dropped_authority` becomes 1, and an operator gets a
+    /// loud diagnostic about a correct system.
     #[test]
     fn an_identical_static_from_a_second_publisher_is_silent() {
-        let mut i = Ingest::new();
+        let mut i = ingest();
         let s = Sample::identity("base", "lidar", 0);
         i.offer(Topic::TfStatic, &s, &node("/rsp_a"));
         assert_eq!(
             i.offer(Topic::TfStatic, &s, &node("/rsp_b")),
-            Action::Drop {
-                reason: DropReason::StaticRepeat
+            Action::StaticVerified {
+                parent: "base".to_string(),
+                child: "lidar".to_string()
             }
         );
         assert_eq!(i.stats().static_conflicts, 0);
@@ -629,6 +751,78 @@ mod tests {
             0,
             "a redundant launch file is not an authority conflict"
         );
+    }
+
+    /// **An undeclared edge is dropped, counted, and diagnosed once — naming
+    /// both frames.**
+    ///
+    /// This is §5.8's amendment's fifth requirement and the failure mode it
+    /// exists to make visible: with no runtime edge declaration, a transform
+    /// for an edge the config forgot has nowhere to go, and the only downstream
+    /// symptom is a lookup returning `NoPath` with nothing anywhere saying why.
+    ///
+    /// Mutant: return `first_time: true` unconditionally ⇒ a 1 kHz undeclared
+    /// edge emits a thousand identical lines a second, and this fails on the
+    /// second offer.
+    #[test]
+    fn an_undeclared_edge_is_dropped_and_diagnosed_once() {
+        let mut i = ingest();
+        let s = |t: i64| Sample::identity("base", "camera", t);
+        match i.offer(Topic::Tf, &s(1_000 * MS), &node("/cam")) {
+            Action::UndeclaredEdge {
+                parent,
+                child,
+                first_time,
+            } => {
+                assert_eq!((parent.as_str(), child.as_str()), ("base", "camera"));
+                assert!(first_time, "the first sighting is the loud one");
+            }
+            other => panic!("{other:?}"),
+        }
+        for k in 1..50i64 {
+            match i.offer(Topic::Tf, &s(1_000 * MS + k * MS), &node("/cam")) {
+                Action::UndeclaredEdge { first_time, .. } => {
+                    assert!(!first_time, "rate-limited after the first");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(i.stats().dropped_undeclared, 50);
+        assert_eq!(i.stats().applied, 0);
+        assert!(i.stats().balanced());
+        assert_eq!(i.undeclared(), [("base", "camera", 50)]);
+
+        // …and it never reached the authority or clock tables, so it cannot
+        // have taken ownership of an edge or moved the high-water mark.
+        assert_eq!(i.stats().dropped_authority, 0);
+        assert_eq!(i.stats().dropped_non_monotonic, 0);
+    }
+
+    /// **An undeclared edge on `/tf_static` is undeclared, not a kind change.**
+    ///
+    /// The two diagnostics send an operator to different places: one says "add
+    /// this edge to your config", the other says "you have a publisher on the
+    /// wrong topic". Reporting the second for the first is a wrong answer with
+    /// a confident tone.
+    ///
+    /// Mutant: move the declared check *below* the static-value step ⇒
+    /// `observe_static` declares the unknown edge itself, this returns
+    /// `StaticVerified`, and the bridge silently accepts a static edge the
+    /// arena has no slot for. (Moving it below the *kind* check alone does
+    /// nothing: that check is `/tf`-only, so a `/tf_static` sample skips it.)
+    #[test]
+    fn an_undeclared_static_is_reported_as_undeclared() {
+        let mut i = ingest();
+        assert!(matches!(
+            i.offer(
+                Topic::TfStatic,
+                &Sample::identity("base", "imu", 0),
+                &node("/rsp")
+            ),
+            Action::UndeclaredEdge { .. }
+        ));
+        assert_eq!(i.stats().dropped_undeclared, 1);
+        assert_eq!(i.stats().dropped_kind_change, 0);
     }
 
     /// **A `Strict` halt still balances the ledger.**
@@ -643,7 +837,8 @@ mod tests {
     /// fails.
     #[test]
     fn a_strict_halt_leaves_the_ledger_balanced() {
-        let mut i = Ingest::with(AuthorityPolicy::Strict, OnClockReset::Halt, None);
+        let c = topo();
+        let mut i = Ingest::with(&c, AuthorityPolicy::Strict, OnClockReset::Halt, None);
         let s = |t: i64| Sample::identity("odom", "base", t);
         assert!(matches!(
             i.offer(Topic::Tf, &s(1_000 * MS), &node("/a")),
@@ -659,7 +854,7 @@ mod tests {
 
         // ...and so does the clock halt, which is the path that was already
         // right and is what made the disagreement visible.
-        let mut j = Ingest::new();
+        let mut j = ingest();
         j.offer(Topic::Tf, &s(10_000 * MS), &node("/a"));
         assert!(matches!(
             j.offer(Topic::Tf, &s(0), &node("/a")),
@@ -672,9 +867,12 @@ mod tests {
 
     /// **The queue high-water mark only rises**, so a queue that fills between
     /// two polls is still visible.
+    ///
+    /// Mutant: assign rather than `max` in `note_queue_depth` ⇒ the final `0`
+    /// wins and a saturated queue reports as idle.
     #[test]
     fn the_queue_high_water_mark_is_a_maximum_not_a_reading() {
-        let mut i = Ingest::new();
+        let mut i = ingest();
         i.note_queue_depth(3);
         i.note_queue_depth(100);
         i.note_queue_depth(0);
@@ -682,6 +880,89 @@ mod tests {
         assert!(
             i.stats().queue_saturated(),
             "a queue that hit its KeepLast(100) depth must report saturated"
+        );
+    }
+
+    /// **Every edge in the config is writable through the pipeline and through
+    /// the arena the same config builds** — the two halves of §5.8's
+    /// resolution, checked against each other.
+    ///
+    /// Without this, `TopologyConfig::builder` and `Ingest` could disagree
+    /// about which edges exist and each would still pass its own tests: the
+    /// pipeline would emit `Publish` for an edge `Tree::claim` refuses, which
+    /// is the exact failure the amendment describes (`NoEdge` on a slot no API
+    /// can fill), only moved one layer up.
+    ///
+    /// Mutant: seed the store from `config.frames` instead of `config.edges` ⇒
+    /// no edge is declared, the first offer is `UndeclaredEdge`, and this fails.
+    #[test]
+    fn the_pipeline_and_the_arena_agree_about_which_edges_exist() {
+        let c = topo();
+        let tree = c.builder().build().unwrap();
+        let mut i = Ingest::new(&c);
+        match i.offer(
+            Topic::Tf,
+            &Sample::identity("odom", "base", 1_000 * MS),
+            &node("/ekf"),
+        ) {
+            Action::Publish { parent, child, .. } => {
+                let p = tree.frame(&parent).unwrap();
+                let ch = tree.frame(&child).unwrap();
+                let w = tree
+                    .claim(ch, p)
+                    .unwrap_or_else(|e| panic!("pipeline said Publish, arena said {e:?}"));
+                w.push(1_000 * MS, &tf_tree::Iso3::IDENTITY).unwrap();
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A verified static is not an applied transform.** `applied` is
+    /// documented as *"transforms written into the arena"*, and a `/tf_static`
+    /// message that matches the config's declared constant writes nothing — the
+    /// value was placed by `TopologyConfig::builder` before the bridge started.
+    ///
+    /// This is not a pedantic distinction. `/tf_static` is transient-local, so
+    /// every late joiner causes the whole latched set to be re-delivered; an
+    /// operator watching `applied` on a robot whose only edges are static used
+    /// to see a healthy write rate for an arena nothing was writing to.
+    ///
+    /// The fixture pushes a real dynamic sample too, so `applied` is non-zero
+    /// and the assertion cannot pass by everything being zero.
+    ///
+    /// Mutant: put `self.stats.applied += 1` back in the `StaticVerified` arm
+    /// (dropping `static_verified`) ⇒ `applied` reads 4 and the ledger stays
+    /// balanced, so the first assertion is the one that catches it.
+    #[test]
+    fn a_verified_static_is_counted_as_verified_not_applied() {
+        let mut i = ingest();
+        let stat = Sample {
+            pose: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..Sample::identity("base", "lidar", 0)
+        };
+        // Three deliveries of the latched set, as three late joiners produce.
+        for _ in 0..3 {
+            assert!(matches!(
+                i.offer(Topic::TfStatic, &stat, &node("/rsp")),
+                Action::StaticVerified { .. }
+            ));
+        }
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &Sample::identity("odom", "base", 1_000 * MS),
+                &node("/ekf")
+            ),
+            Action::Publish { .. }
+        ));
+
+        let s = i.stats();
+        assert_eq!(s.applied, 1, "only the dynamic sample was written");
+        assert_eq!(s.static_verified, 3);
+        assert_eq!(s.transforms, 4);
+        assert!(
+            s.balanced(),
+            "the ledger must still balance: {s:?}" // `static_verified` is a bucket
         );
     }
 }

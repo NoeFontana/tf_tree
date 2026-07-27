@@ -9,10 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 # **Not published while the subcommand surface is still being specified.**
-# `docs/PHASE5.md` §6 (`TFT001`-`TFT016`) and §7 (`tf_tree top`) both add to this
-# binary and are recorded as not implemented in §0.0, so `cargo install` today
-# would hand someone a CLI whose documented commands are mostly absent. Publish
-# once §6 and §7 land, not before.
+# `docs/PHASE5.md` §6 (`TFT001`-`TFT016`) has landed and §7 (`tf_tree top`) has
+# landed except for its `--web` view, which is still recorded as not implemented
+# in §0.0. `cargo install` today would hand someone a CLI whose documented
+# `--web` flag does not exist. Publish once §7 is whole, not before.
 publish = false
 
 [lints]
@@ -37,6 +37,10 @@ tf_tree_math.workspace = true
 # The CLI operates on an in-process tree; Phase 1 has no cross-process attach
 # (that is Phase 2 shared memory), so it drives the shared benchmark fixture.
 tf_tree_bench.workspace = true
+# **`docs/PHASE4.md` §5.8's `--discover`.** The collector and the config format
+# live in the bridge because the `rclcpp` half needs them too; the CLI is the
+# host-side front end that feeds them a `.tfstream` instead of a subscription.
+tf_tree_bridge.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 # `docs/PHASE5.md` §3. Not optional: `tf_tree ingest` is the one subcommand a

@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::edgemap::{insert, lookup, ByEdge};
 use crate::Publisher;
 
 /// How to resolve two publishers on one edge.
@@ -78,7 +79,7 @@ pub enum Verdict {
 pub struct Authority {
     policy: AuthorityPolicy,
     /// `(parent, child)` -> owner.
-    owners: BTreeMap<(String, String), Publisher>,
+    owners: ByEdge<Publisher>,
     /// Conflicts already reported, so the diagnostic is rate-limited by
     /// *identity* rather than by a timer. A timer would report the same pair
     /// again every interval forever; this reports each distinct
@@ -109,9 +110,13 @@ impl Authority {
     /// which on a correctly configured system is true and on a misconfigured
     /// one loses only the diagnostic — never the data.
     pub fn admit(&mut self, parent: &str, child: &str, publisher: &Publisher) -> Verdict {
-        let key = (parent.to_string(), child.to_string());
-        let Some(owner) = self.owners.get(&key) else {
-            self.owners.insert(key, publisher.clone());
+        // Probed by reference: this runs on every accepted transform, and the
+        // overwhelmingly common outcome is the `owner == publisher` return two
+        // lines down. Building a `(String, String)` key to reach it cost two
+        // allocations per message on a correctly configured robot. See
+        // `crate::edgemap`.
+        let Some(owner) = lookup(&self.owners, parent, child) else {
+            insert(&mut self.owners, parent, child, publisher.clone());
             return Verdict::Accept;
         };
         if owner == publisher {
@@ -121,7 +126,7 @@ impl Authority {
         let owner = owner.clone();
         match self.policy {
             AuthorityPolicy::LastWriterWins => {
-                self.owners.insert(key, publisher.clone());
+                insert(&mut self.owners, parent, child, publisher.clone());
                 Verdict::Accept
             }
             AuthorityPolicy::Strict => Verdict::Fatal {
@@ -169,7 +174,7 @@ impl Authority {
     /// The owner of an edge, if one has been established.
     #[must_use]
     pub fn owner_of(&self, parent: &str, child: &str) -> Option<&Publisher> {
-        self.owners.get(&(parent.to_string(), child.to_string()))
+        lookup(&self.owners, parent, child)
     }
 }
 
