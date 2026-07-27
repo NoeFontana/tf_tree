@@ -11,7 +11,7 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — three unconditionally, and four more depending on what the arena,
+//! reason — three unconditionally, and three more depending on what the arena,
 //! the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
@@ -43,8 +43,6 @@
 //!   Against the fixture's recorded push stream it runs.
 //! * **`TFT005`** (stamps in the future) is skipped when the arena's stamps do
 //!   not share an epoch with the system clock — see [`Clock`].
-//! * **`TFT014`** (claim slot leak) is skipped when no participant slot
-//!   resolves to a live identity, which is every in-process tree.
 //! * **`TFT010`**/**`TFT016`** are skipped when the engine has no counters and
 //!   when the host is not Linux, respectively.
 //!
@@ -276,9 +274,6 @@ pub struct Inputs<'a> {
     pub live: bool,
     /// Whether the engine compiled `docs/PHASE5.md` §5's counters in.
     pub counters: bool,
-    /// How many participant slots resolve to a live identity — `TFT014` is
-    /// unanswerable at 0.
-    pub participants: u32,
 }
 
 /// Run every catalogue entry plus the two id-less Phase 1 checks.
@@ -678,20 +673,17 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 /// leaked claim: the writer is gone and nothing released its edge, so no other
 /// process can take it.
 ///
-/// **The check is meaningless without a populated participant table, and an
-/// in-process tree never populates one** — nothing registers, so every claim's
-/// slot fails to resolve and every claimed edge looks leaked. That is not a
-/// hypothetical: it fired on all four of the benchmark fixture's claimed edges,
-/// with their writers alive and holding them, before this guard existed.
+/// A record caught mid-claim (`CLAIMING`) resolves to no slot either, and is
+/// reported the same way on purpose: a claimer killed between winning the
+/// record and publishing its identity leaves a word no participant holds, which
+/// is the same thing a reaper collects.
+///
+/// **This rests entirely on the owner word being decoded correctly.** It is
+/// `(epoch << 16) | (slot + 1)`, so a hand-rolled `word - 1` resolves every
+/// live claim to nothing and reports every claimed edge as leaked;
+/// `Snapshot::capture` uses `tf_tree_core::edge::slot_of`, and
+/// `doctor::tests::a_held_claim_resolves_to_the_writers_pid` pins it.
 fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
-    if inp.participants == 0 {
-        return CheckOutcome::skipped(
-            Tft::Tft014,
-            "no slot in the participant table resolves to a live identity, so an unresolvable \
-             claim owner is not evidence of a leak — an in-process tree claims edges without \
-             registering a participant at all",
-        );
-    }
     let mut out = Vec::new();
     for e in &inp.snap.edges {
         if e.claimed && e.owner_pid == 0 {
@@ -869,7 +861,6 @@ mod tests {
             occupancy: Vec::new(),
             live: false,
             counters: true,
-            participants: 4,
         }
     }
 

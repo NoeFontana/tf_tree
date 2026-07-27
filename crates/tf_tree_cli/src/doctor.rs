@@ -234,14 +234,20 @@ impl Snapshot {
             };
             let kind = EdgeKind::from_u8(rec.kind);
             let owner_word = claim.owner.load(Ordering::Relaxed);
-            // `owner_word == 0` means *unclaimed*. Without this guard the
-            // `saturating_sub(1)` below yields slot 0 and the edge is reported as
-            // owned by whichever process happens to hold participant slot 0 — a
-            // plausible-looking wrong pid, which is worse than none.
+            // **The owner word is `(epoch << 16) | (slot + 1)`, not `slot + 1`**
+            // (`tf_tree_core::edge::pack_owner`, A3 plus decision 0005 §6's
+            // "one acquisition, not just one slot"). `claim` starts the epoch at
+            // 1, so `word - 1` is never a slot for any real claim — it is
+            // `epoch << 16` and resolves to no participant at all. Decoding it
+            // by hand is what produced `pid 0` for every live writer.
+            //
+            // `slot_of` returns `u32::MAX` for an unclaimed record and for one
+            // caught mid-claim, and `identity` rejects that, so both read as
+            // "no owner" rather than as a plausible wrong pid.
             let owner_slot = if owner_word == 0 {
                 None
             } else {
-                u32::try_from(owner_word - 1).ok()
+                Some(tf_tree_core::edge::slot_of(owner_word))
             };
             // `ring` is `None` for a static/tombstoned edge (capacity 0), so this
             // needs no separate power-of-two guard.
@@ -906,6 +912,38 @@ mod tests {
     }
 
     // --- healthy live fixture -------------------------------------------
+
+    /// **A live writer's claim must resolve to that writer's pid.**
+    ///
+    /// The owner word packs the acquisition epoch above the slot
+    /// (`(epoch << 16) | (slot + 1)`), and `claim` starts the epoch at 1, so a
+    /// hand-rolled `word - 1` never names a slot. It produced `pid 0` for every
+    /// claimed edge — which reads as "the writer is gone", is what the `tree`
+    /// command printed in its writer column, and is the exact condition
+    /// `TFT014` reports as a leaked claim.
+    ///
+    /// Mutant: decode with `u32::try_from(owner_word - 1).ok()` instead of
+    /// `slot_of`. Applied: `owner_pid` is 0 for all four claimed edges and the
+    /// assertion fails.
+    #[test]
+    fn a_held_claim_resolves_to_the_writers_pid() {
+        let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
+        let (writers, _samples) = tf_tree_bench::fixture::spin_up(&tree).expect("claim and push");
+        let snap = Snapshot::capture(&tree);
+
+        let claimed: Vec<&EdgeInfo> = snap.edges.iter().filter(|e| e.claimed).collect();
+        // Non-vacuity: the fixture holds four dynamic claims for the whole test.
+        assert_eq!(claimed.len(), 4, "the fixture must hold its claims");
+        let me = std::process::id();
+        for e in claimed {
+            assert_eq!(
+                e.owner_pid, me,
+                "edge#{} is claimed by this process but resolved to pid {}",
+                e.id, e.owner_pid
+            );
+        }
+        drop(writers);
+    }
 
     #[test]
     fn healthy_fixture_reports_clean() {

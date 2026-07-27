@@ -397,7 +397,6 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         occupancy: checks::occupancy_of(tree),
         live: src.is_live(),
         counters: tf_tree::counters_compiled_in(),
-        participants: live_participants(tree),
     };
     let report = checks::run(&inputs, &ids);
 
@@ -444,24 +443,6 @@ fn live_evidence_notes(live: bool) -> Vec<String> {
          latency, so the capacity-vs-latency half of the check cannot fire"
             .to_owned(),
     ]
-}
-
-/// How many participant slots currently resolve to a live identity.
-///
-/// **Counted by walking the table, not read from `ArenaHeader::participant_count`.**
-/// That field exists and nothing in the workspace ever increments it, so gating
-/// `TFT014` on it would have made the check permanently unreachable — a
-/// diagnostic that can never run, disguised as one that is merely skipped. The
-/// participant table is the authority the reaper and `tf_tree participants`
-/// already use.
-fn live_participants(tree: &Tree) -> u32 {
-    let view = tree.arena_view();
-    let table = view.participants();
-    (0..view.header().max_participants)
-        .filter(|&slot| table.identity(slot).is_some())
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX)
 }
 
 /// The system clock as nanoseconds since the Unix epoch.

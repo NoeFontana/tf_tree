@@ -43,7 +43,6 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
         occupancy: checks::occupancy_of(&tree),
         live: false,
         counters: tf_tree::counters_compiled_in(),
-        participants: 0,
     };
     let report = checks::run(&inputs, &BTreeSet::new());
     let out = f(&report, &snap);
@@ -60,11 +59,13 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
 /// gets piped to `/dev/null` inside a week, and this is the assertion that
 /// makes each new check earn its place.
 ///
-/// Mutant: delete the `inp.participants == 0` early return from `tft014`.
-/// Applied: `TFT014` fires on all four claimed edges (the fixture is an
-/// in-process tree, so no claim's owner slot resolves to a registered
-/// participant) and this test fails with them listed. That is the exact false
-/// positive this test caught before the guard existed.
+/// Mutant: in `Snapshot::capture`, decode the claim owner word by hand as
+/// `u32::try_from(owner_word - 1).ok()` instead of calling
+/// `tf_tree_core::edge::slot_of`. Applied: every live writer resolves to pid 0
+/// and `TFT014` fires on all four claimed edges, which this test fails with
+/// listed. That is the false positive this test exists for — the word is
+/// `(epoch << 16) | (slot + 1)`, and no unit test on a hand-built `Snapshot`
+/// can see a decode bug, because a hand-built one never encodes anything.
 #[test]
 fn the_healthy_fixture_fires_only_the_check_that_is_true_of_it() {
     run_on_fixture(|report, snap| {

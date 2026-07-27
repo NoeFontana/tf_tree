@@ -168,15 +168,17 @@ fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
         out.contains("instance "),
         "doctor did not report which arena instance it looked at:\n{out}"
     );
-    // A check that is skipped everywhere is a check that does not exist.
-    // `TFT014` reads the participant table, which only a shared arena has, so
-    // this is the only place its reachability can be pinned. It is also the
-    // guard against gating it on `ArenaHeader::participant_count`, a field
-    // nothing in the workspace increments.
+    // `TFT014` resolves a claim through the *shared* arena's participant
+    // table, which is the case a single-process test cannot reach. A leaked
+    // claim would be a finding; the publisher is alive, so it must be silent.
     let not_run = out.split("not run:").nth(1).unwrap_or("");
     assert!(
         !not_run.contains("TFT014"),
-        "TFT014 must be able to run against a real participant table:\n{out}"
+        "TFT014 must run against a real participant table:\n{out}"
+    );
+    assert!(
+        !out.contains("TFT014  participant"),
+        "a live publisher's claim was reported as leaked:\n{out}"
     );
 }
 
