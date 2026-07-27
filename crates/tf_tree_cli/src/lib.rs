@@ -971,3 +971,55 @@ fn explain_format_version() {
         println!("without a second break. A version-2 arena cannot be attached.");
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// **The `CompressedChunk` remedy is this crate's headline mitigation for
+    /// `default-features = false` on `mcap`, and it is a bare string.**
+    ///
+    /// A zstd-compressed recording is what Foxglove writes by default and what
+    /// `rosbag2` writes with `compression_mode` set, so it is the first thing
+    /// many users will meet. It cannot be reached from an end-to-end test — this
+    /// build has no codecs, so it cannot *write* a compressed fixture to feed
+    /// itself — which is exactly why deleting the whole message was invisible.
+    /// Asserting on `ingest_err` is the only level at which it is reachable.
+    ///
+    /// Mutant: delete the `CompressedChunk` arm, leaving the `_` fallthrough —
+    /// applied, and this failed with only the generic "uses compressed chunks"
+    /// line and no command.
+    #[test]
+    fn the_compressed_chunk_error_carries_the_command_that_fixes_it() {
+        let frames = tf_tree_ingest::Frames::default();
+        let text = ingest_err(tf_tree_ingest::IngestError::CompressedChunk, &frames).to_string();
+        assert!(
+            text.contains("mcap compress --compression none"),
+            "the remedy must be a literal command a user can paste: {text}"
+        );
+        assert!(
+            text.contains("PHASE2"),
+            "and it must say why this build cannot simply decompress: {text}"
+        );
+    }
+
+    /// The `split` refusal cites the section that records it as unbuilt, so a
+    /// user can tell a missing feature from a typo.
+    ///
+    /// Mutant: replace the `ClockResetSplitUnsupported` arm with the bare
+    /// `{text}` — applied, and the `PHASE5` assertion failed.
+    #[test]
+    fn the_split_refusal_cites_the_section_that_records_it() {
+        let frames = tf_tree_ingest::Frames::default();
+        let text = ingest_err(
+            tf_tree_ingest::IngestError::ClockResetSplitUnsupported,
+            &frames,
+        )
+        .to_string();
+        assert!(
+            text.contains("not implemented") && text.contains("PHASE5"),
+            "{text}"
+        );
+    }
+}

@@ -18,6 +18,24 @@
 //! the way into a `.tft` and out into somebody's training set. It is
 //! transposed once, in [`Reader::transform`], and tested against bytes captured
 //! from the wire order rather than against this module's own encoder.
+//!
+//! # It allocates per transform, and that is a known, measured, accepted cost
+//!
+//! [`TransformStamped`] owns two `String`s and `NameNormalizer::normalize`
+//! returns two more, so a transform costs four heap allocations plus one `Vec`
+//! per message — and the whole decode runs `1 + G` times, once for the survey
+//! and once per `--max-memory` group. `Reader::string` could yield a `&'a str`
+//! borrowed from the payload, with owning deferred to `Frames::intern`, which
+//! already deduplicates; that is worth an estimated 2–5× on this path.
+//!
+//! It is **not** done, and the reason is a number rather than an opinion.
+//! Measured on this host, release build, a 90 000-transform synthetic recording:
+//! **54.8 ms, 609 µs per 1 000 transforms**, against a §12 gate 5 that asks for
+//! 10× real time. This is an offline batch path that runs once per recording,
+//! not an engine hot path — **nothing in this crate touches a lookup or a push**
+//! — and the borrow refactor would change `TransformStamped`'s shape, which the
+//! fixture encoder also uses. Recorded here so the next person to open this file
+//! finds the measurement instead of rediscovering the allocations.
 
 /// Why a `TFMessage` payload could not be decoded.
 ///
