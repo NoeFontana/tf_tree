@@ -146,9 +146,15 @@ pub struct EdgeSample {
     pub claimed: bool,
     /// The claim owner's pid (`0` when unclaimed or unresolvable).
     pub owner_pid: u32,
-    /// Oldest stamp the ring still retains.
+    /// The **first retained stamp in push order** — the oldest one, for a
+    /// publisher whose stamps advance.
+    ///
+    /// Deliberately not `min(stamps)`: paired with `newest_stamp` it is the
+    /// window's two ends *as the ring holds them*, and a `min` would quietly
+    /// repair a publisher that stamps out of order into a plausible-looking
+    /// window. [`IntervalStats::non_monotonic`] is where that shows up instead.
     pub oldest_stamp: Option<i64>,
-    /// Newest stamp the ring holds.
+    /// Newest stamp the ring holds — the last in push order.
     pub newest_stamp: Option<i64>,
     /// Successive differences of the retained stamps, in push order.
     ///
@@ -235,6 +241,17 @@ impl Capture {
     /// Read-only throughout: [`Tree::arena_view`] on a read-only attachment is
     /// a `PROT_READ` mapping, and every load here is `Relaxed`/`Acquire` on a
     /// value somebody else owns.
+    ///
+    /// # It is a smear, not an instant
+    ///
+    /// Publishers keep publishing while this walks the tables, exactly as
+    /// `tf_tree freeze --from-live` warns about its copy. So an edge's `head`
+    /// (read by [`Snapshot::capture`]) can be a few samples behind the stamps
+    /// read from its ring a moment later. That is why `head` is only ever used
+    /// for *differences between ticks* and never to index the stamp array: a
+    /// tick-to-tick delta of a monotone counter is right whichever side of the
+    /// skew each read landed on, and at a 1 Hz redraw the skew is invisible
+    /// beside the interval it is divided by.
     #[must_use]
     pub fn from_tree(tree: &Tree, source: &'static str) -> Capture {
         use core::sync::atomic::Ordering;
