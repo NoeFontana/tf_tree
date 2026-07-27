@@ -30,9 +30,14 @@ fn run(args: &[&str]) -> Output {
 /// `--help` is asserted first as a control: without it, every assertion below
 /// would also pass on a binary that failed to start at all.
 ///
-/// Mutant (applied, confirmed fatal): restore
-/// `"--duration" => opts.duration = parse_duration(&value("--duration")?)?` and
-/// the `Options::duration` field — the run then exits 0 and this fails.
+/// `--help` trails each rejected flag so that a build which *accepted* it stops
+/// at the help text instead of running a full benchmark and writing `report/`.
+/// Arguments are processed in order, so the rejection still happens first.
+///
+/// Mutant (applied, confirmed fatal): make the arm
+/// `"--duration" => { let _ = value("--duration")?; }` — accepted, ignored,
+/// exactly the shipped defect. The run then reaches `--help`, exits 0, and this
+/// fails.
 #[test]
 fn a_flag_that_would_govern_nothing_is_rejected_not_ignored() {
     let help = run(&["--help"]);
@@ -46,7 +51,7 @@ fn a_flag_that_would_govern_nothing_is_rejected_not_ignored() {
         ("--duration", "300s", "steady-state window"),
         ("--bag", "run.mcap", "bag ingestion"),
     ] {
-        let out = run(&[flag, value]);
+        let out = run(&[flag, value, "--help"]);
         assert!(
             !out.status.success(),
             "`{flag} {value}` was accepted; it governs nothing here"
