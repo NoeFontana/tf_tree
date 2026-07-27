@@ -315,3 +315,307 @@ fn a_tree_can_rescue_a_wedged_intern() {
          takeover can never fire"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `Plan::span` — `docs/PHASE5.md` §4.2
+// ---------------------------------------------------------------------------
+
+/// Three dynamic edges whose retained windows are staggered *and* whose
+/// intersection is bounded by two **different** edges, neither of them the first.
+///
+/// `map->odom` is deliberately the widest window, so a `span` that returned the
+/// first step's own window (or stopped after it) reports `(0, 30_000)` and every
+/// assertion below fails. `odom->base`'s ring is smaller than its push count, so
+/// its lower end is a genuinely *lapped* window rather than "the first stamp ever
+/// pushed" — a fixture where every ring still held its whole history could not
+/// tell `oldest_stamp` from `stamps[0]`.
+///
+/// Windows: `map->odom = [0, 30_000]`, `odom->base = [19_000, 25_000]`,
+/// `base->lidar = [0, 22_000]`. Intersection `[19_000, 22_000]`: the low end
+/// comes from the second edge, the high end from the third.
+fn staggered_tree() -> tf_tree::Tree {
+    let big = EdgeCfg::new(Capacity::slots(64));
+    let small = EdgeCfg::new(Capacity::slots(8));
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "odom", big)
+        .dynamic_edge("odom", "base", small)
+        .dynamic_edge("base", "lidar", big)
+        .build()
+        .unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let map = tree.frame("map").unwrap();
+    let base = tree.frame("base").unwrap();
+    let lidar = tree.frame("lidar").unwrap();
+    {
+        let w = tree.claim(odom, map).unwrap();
+        for i in 0..=30i64 {
+            w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
+        }
+        // 25 pushes into an 8-slot ring: `retained() == 7`, so the readable
+        // window is the last seven stamps, `[19_000, 25_000]`.
+        let w = tree.claim(base, odom).unwrap();
+        for i in 0..25i64 {
+            w.push(1000 + i * 1000, &pose(i as u64 + 100)).unwrap();
+        }
+        let w = tree.claim(lidar, base).unwrap();
+        for i in 0..=22i64 {
+            w.push(i * 1000, &pose(i as u64 + 200)).unwrap();
+        }
+    }
+    tree
+}
+
+/// The intersection is a `max` of lower ends and a `min` of upper ends.
+///
+/// Mutant: `lo.max(oldest)` -> `lo.min(oldest)` in `Plan::span` yields
+/// `(0, 22_000)`. Mutant: `hi.min(newest)` -> `hi.max(newest)` yields
+/// `(19_000, 30_000)`. Mutant: `break` after the first step yields
+/// `(0, 30_000)`.
+#[test]
+fn span_is_the_intersection_of_every_dynamic_window() {
+    let tree = staggered_tree();
+    let map = tree.frame("map").unwrap();
+    let lidar = tree.frame("lidar").unwrap();
+    let plan = tree.plan(lidar, map).unwrap();
+
+    assert_eq!(plan.span(&tree.guard()).unwrap(), Some((19_000, 22_000)));
+}
+
+/// The interval means what it says: answerable inside it, refused outside it.
+///
+/// This is what makes the numbers above more than arithmetic — it is the same
+/// claim `docs/PHASE5.md` §4.2 makes for the query, checked against the sampler
+/// rather than against a second copy of `span`'s own `max`/`min`.
+///
+/// Mutant: widen either end by one nanosecond (`hi.min(newest) + 1`, or
+/// `lo.max(oldest) - 1`) and the matching `at` past that end stops raising.
+#[test]
+fn span_answers_exactly_at_the_ends_it_reports() {
+    let tree = staggered_tree();
+    let map = tree.frame("map").unwrap();
+    let lidar = tree.frame("lidar").unwrap();
+    let plan = tree.plan(lidar, map).unwrap();
+    let g = tree.guard();
+    let (t0, t1) = plan.span(&g).unwrap().unwrap();
+
+    assert!(plan.at(&g, ns(t0)).is_ok(), "span's lower end must answer");
+    assert!(plan.at(&g, ns(t1)).is_ok(), "span's upper end must answer");
+    assert!(matches!(
+        plan.at(&g, ns(t0 - 1)),
+        Err(LookupError::Extrapolation { .. })
+    ));
+    assert!(matches!(
+        plan.at(&g, ns(t1 + 1)),
+        Err(LookupError::Extrapolation { .. })
+    ));
+
+    // The upper end *is* `latest_common`'s stamp, which is the agreement
+    // `Plan::span`'s doc comment claims the two keep without sharing a helper.
+    assert_close(
+        plan.at(&g, ns(t1)).unwrap(),
+        plan.latest_common(&g).unwrap(),
+        TOL,
+        "span's upper end is latest_common",
+    );
+}
+
+/// A static step constrains nothing in time and must be skipped, not folded in.
+///
+/// **This is the branch no Python-reachable plan can contain** — `tf_tree.build`
+/// declares only dynamic edges — which is why the coverage lives here, in a crate
+/// `just test` runs.
+///
+/// Mutant: replace the `continue` in `Plan::span`'s `else` arm with
+/// `return Ok(None)`. The path then reports itself answerable at every stamp
+/// while its one dynamic edge bounds it to `[0, 3_000]`.
+#[test]
+fn span_skips_static_steps_and_is_bounded_by_the_dynamic_one() {
+    let tree = TreeBuilder::new()
+        .static_edge("map", "odom", &pose(7))
+        .dynamic_edge("odom", "base", EdgeCfg::new(Capacity::slots(64)))
+        .static_edge("base", "lidar", &pose(9))
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let base = tree.frame("base").unwrap();
+    let lidar = tree.frame("lidar").unwrap();
+    {
+        let w = tree.claim(base, odom).unwrap();
+        for i in 0..=3i64 {
+            w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
+        }
+    }
+
+    let plan = tree.plan(lidar, map).unwrap();
+    // Without these the test would still pass if constant folding ever stopped
+    // emitting a `Step::Static` here, and would then assert nothing about the
+    // branch it is named for.
+    assert!(
+        plan.steps()
+            .iter()
+            .any(|s| matches!(s, tf_tree::Step::Static(_))),
+        "fixture must contain a static step: {:?}",
+        plan.steps()
+    );
+    assert!(
+        plan.steps()
+            .iter()
+            .any(|s| matches!(s, tf_tree::Step::Dyn { .. })),
+        "fixture must contain a dynamic step too, or the assertion below is the \
+         all-static case in disguise"
+    );
+
+    assert_eq!(plan.span(&tree.guard()).unwrap(), Some((0, 3_000)));
+}
+
+/// `None` means *unbounded*, and an all-static path is the case it is for.
+///
+/// Distinguished from the empty `lookup(x, x)` plan below on purpose: a test that
+/// queries `span(x, x)` takes the `len == 0` path and never reaches the
+/// `Step::Static` arm at all.
+///
+/// Mutant: return `Some((0, 0))` for a plan with no dynamic step. A caller's
+/// `t0 <= t <= t1` is then false everywhere for a path that answers everywhere.
+#[test]
+fn span_of_an_all_static_path_is_none() {
+    let tree = TreeBuilder::new()
+        .static_edge("map", "odom", &pose(3))
+        .static_edge("odom", "base", &pose(4))
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let base = tree.frame("base").unwrap();
+    let plan = tree.plan(base, map).unwrap();
+    assert!(!plan.is_empty(), "an all-static path is not the empty plan");
+    assert_eq!(plan.span(&tree.guard()).unwrap(), None);
+}
+
+/// The empty `lookup(x, x)` plan is unbounded for the same reason but by a
+/// different code path: `steps()` is empty, so the loop body never runs.
+#[test]
+fn span_of_an_empty_plan_is_none() {
+    let tree = staggered_tree();
+    let map = tree.frame("map").unwrap();
+    let plan = tree.plan(map, map).unwrap();
+    assert!(plan.is_empty());
+    assert_eq!(plan.span(&tree.guard()).unwrap(), None);
+}
+
+/// An empty intersection is a real answer — not an error, and not `None`.
+///
+/// Two edges with genuinely disjoint histories: the caller's `t0 <= t <= t1` is
+/// correctly false everywhere, which is a different fact from "this path is
+/// answerable at any stamp".
+///
+/// Mutant: collapse `t0 > t1` to `None` in `Plan::span`. The `Some` assertion
+/// fails — and the two cases become indistinguishable to a caller.
+#[test]
+fn span_reports_a_disjoint_intersection_rather_than_none() {
+    let cfg = EdgeCfg::new(Capacity::slots(64));
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "odom", cfg)
+        .dynamic_edge("odom", "base", cfg)
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let base = tree.frame("base").unwrap();
+    {
+        let w = tree.claim(odom, map).unwrap();
+        for i in 0..=5i64 {
+            w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
+        }
+        // Starts long after the first edge stopped: no overlap at all.
+        let w = tree.claim(base, odom).unwrap();
+        for i in 0..=5i64 {
+            w.push(100_000 + i * 1000, &pose(i as u64 + 50)).unwrap();
+        }
+    }
+
+    let plan = tree.plan(base, map).unwrap();
+    let (t0, t1) = plan.span(&tree.guard()).unwrap().unwrap();
+    assert!(t0 > t1, "expected an empty interval, got [{t0}, {t1}]");
+    assert_eq!((t0, t1), (100_000, 5_000));
+}
+
+/// An edge that has never published is `NoData` naming that edge — not an empty
+/// interval, because the caller acts differently on the two.
+///
+/// Mutant: `continue` past an empty ring in `Plan::span` instead of propagating
+/// `Guard::window`'s error. `span` then reports the *other* edges' intersection,
+/// a window over which the path is not answerable at all, and this gets `Ok`.
+#[test]
+fn span_names_the_edge_that_has_never_published() {
+    let cfg = EdgeCfg::new(Capacity::slots(64));
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "odom", cfg)
+        .dynamic_edge("odom", "base", cfg)
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let base = tree.frame("base").unwrap();
+    {
+        let w = tree.claim(odom, map).unwrap();
+        for i in 0..=5i64 {
+            w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
+        }
+    }
+    // `odom->base` was declared and never pushed to.
+    let plan = tree.plan(base, map).unwrap();
+    let err = plan.span(&tree.guard()).unwrap_err();
+    // It must name the *silent* edge, not merely fail: a `span` that reported
+    // whichever edge it looked at first would satisfy a bare `matches!`.
+    let view = tree.arena_view();
+    let named = match err {
+        LookupError::NoData { edge } => view.edge(edge).map(|r| (r.parent, r.child)),
+        _ => None,
+    };
+    assert_eq!(
+        named,
+        Some((odom.get(), base.get())),
+        "expected NoData naming odom -> base, got {err:?}"
+    );
+}
+
+/// A plan compiled against an older topology must not be answered from, and
+/// `span` is not an exception.
+///
+/// This is the property the binding-side implementation could not have: it read
+/// `ArenaView` directly and never consulted a `Guard`, so it answered where
+/// `Plan::at` refuses — including from a fork-poisoned child, whose guard reports
+/// `ChildDetached` through the same `check_generation`.
+///
+/// Mutant: drop the `check_generation(g)?` from `Plan::span`. The stale plan then
+/// returns `Ok` and this fails.
+#[test]
+fn span_refuses_a_plan_from_an_older_topology() {
+    let cfg = EdgeCfg::new(Capacity::slots(64));
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "odom", cfg)
+        .dynamic_edge("odom", "base", cfg)
+        .dynamic_edge("odom", "extra", cfg)
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let base = tree.frame("base").unwrap();
+    let extra = tree.frame("extra").unwrap();
+    {
+        let w = tree.claim(odom, map).unwrap();
+        w.push(0, &pose(1)).unwrap();
+        let w = tree.claim(base, odom).unwrap();
+        w.push(0, &pose(2)).unwrap();
+    }
+
+    let plan = tree.plan(base, map).unwrap();
+    assert!(plan.span(&tree.guard()).unwrap().is_some());
+
+    tree.reparent(extra, base).unwrap();
+    let err = plan.span(&tree.guard()).unwrap_err();
+    assert!(
+        matches!(err, LookupError::TopologyChanged { .. }),
+        "{err:?}"
+    );
+}

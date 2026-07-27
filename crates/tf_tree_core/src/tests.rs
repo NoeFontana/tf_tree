@@ -442,6 +442,11 @@ fn a_poisoned_guard_refuses_every_evaluation() {
     assert_eq!(plan.at(&g, t), Err(LookupError::ChildDetached));
     assert_eq!(plan.latest(&g), Err(LookupError::ChildDetached));
     assert_eq!(plan.latest_common(&g), Err(LookupError::ChildDetached));
+    // `span` reads the same rings the sampler does, so a detached guard has to
+    // silence it too. Mutant: drop `check_generation` from `Plan::span` and this
+    // returns `Ok(None)` — a fork-poisoned child would be told the path is
+    // answerable everywhere.
+    assert_eq!(plan.span(&g), Err(LookupError::ChildDetached));
     assert_eq!(
         plan.query(&g, Query::At(t)),
         Err(LookupError::ChildDetached)

@@ -12,6 +12,7 @@ appears here. Signatures are ours; *existence* is checkable, and that is the
 half that rots.
 """
 
+import os
 from typing import Literal, overload
 
 import numpy as np
@@ -139,7 +140,9 @@ class Tree:
         this pays a cache probe per call and a compiled plan pays nothing.
         """
 
-    def freeze(self, path: str, /, *, source: str | None = ...) -> None:
+    def freeze(
+        self, path: str | os.PathLike[str], /, *, source: str | None = ...
+    ) -> None:
         """Write this tree to `path` as a frozen `.tft` (`PHASE5.md` §2.3).
 
         The file *is* the arena: `open_file` maps it back with no parse and no
@@ -152,6 +155,9 @@ class Tree:
 
         `source` is the recording these poses came from; it is recorded in the
         manifest as `null` when there is none. Linux only.
+
+        The GIL is released for the copy, so a background freeze does not stall
+        the threads servicing your progress bar or socket.
         """
 
     def span(self, target: str, source: str, /) -> tuple[int, int] | None:
@@ -171,9 +177,10 @@ class Tree:
         * `None` — every step on the path is static (or the path is empty), so
           the plan answers at *any* stamp and there is no finite interval.
 
-        Raises `NoDataError`, naming the edge, when an edge on the path has no
-        samples at all — which is a different situation from a non-overlapping
-        window and calls for a different fix.
+        Raises `NoDataError`, naming the edge's two **frames**, when an edge on
+        the path has no samples at all — which is a different situation from a
+        non-overlapping window and calls for a different fix. Raises
+        `TopologyChangedError` if the tree was re-parented under the call.
 
         On a live tree the answer is a snapshot that ages immediately, exactly
         as `Plan.latest` does.
@@ -232,7 +239,7 @@ def open_arena(
     cannot bring an arena into existence.
     """
 
-def open_file(path: str, /) -> Tree:
+def open_file(path: str | os.PathLike[str], /) -> Tree:
     """Open a frozen `.tft` and read it as an ordinary `Tree` (`PHASE5.md` §4.1).
 
     Opening is an `mmap`, so it costs microseconds and no parse — and it hands

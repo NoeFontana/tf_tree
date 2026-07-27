@@ -20,7 +20,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
 | §2 Frozen arena (`.tft`) | **Done.** `tf_tree_arena::frozen` writes and maps the container; `Tree::open_frozen`/`Tree::freeze_to` and `tf_tree freeze --from-live` are wired. §2.1's bit-for-bit claim is **tested and holds** (`crates/tf_tree/tests/frozen.rs`). Two amendments below: the container header's size, and the one-sided per-edge span. |
 | §3 Bag ingestion | Not implemented |
-| §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 50 passed) and `just py-test-freethreaded` (3.14t, 52 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
+| §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 52 passed) and `just py-test-freethreaded` (3.14t, 54 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
 | §7 `tf_tree top` | Not implemented |
@@ -389,8 +389,24 @@ ds.manifest                        # source path, digest, ingest options, versio
 > `t0 > t1` when the windows do not overlap — an empty intersection is a real
 > answer, not an error; and `None` when every step is static and the plan
 > therefore answers at *any* stamp. An edge that has never published raises
-> `NoDataError` **naming that edge**, which is the case §4.2's own sentence is
-> about.
+> `NoDataError` **naming the edge's two frames**, which is the case §4.2's own
+> sentence is about — an `EdgeId` would not be, because the Python surface has no
+> way to turn one back into the names the caller typed.
+>
+> **The arithmetic is `tf_tree_core::Plan::span`, not the binding.** It was
+> written in `tf_tree_py` first, and that was wrong twice over. It put a copy of
+> the retained-window intersection in the one crate `just test`, `just miri` and
+> `just loom` never build — the same mistake §2.3's `manifest` amendment argues
+> against in this repository's own words, since the definition of a ring's
+> readable window has already changed once. And it walked `ArenaView` directly
+> instead of a `Guard`, so it answered where `Plan::at` refuses: from a stale plan
+> after a re-parent, and from a fork-poisoned child. `Plan::span` takes a `Guard`
+> and calls `check_generation`, so `TopologyChanged` and `ChildDetached` now reach
+> the caller; the binding is a forwarder that only re-labels `NoData`. `span` is
+> consequently available to the Rust facade, the CLI and the C ABI as well, and
+> the branch it could not previously reach — a path with a folded `Step::Static`,
+> which no `tf_tree.build` tree can contain — is covered in
+> `crates/tf_tree/tests/behavior.rs`.
 >
 > `resample` is not a binding: it is `plan.at(np.arange(t0, t1, 10**9 // hz))`,
 > one line of NumPy over the vectorized call §4.1 insists is the same call. A

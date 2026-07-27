@@ -8,10 +8,25 @@ quietly acquired its own interpolation, so the comparison here is bit-for-bit.
 
 import os
 import pathlib
+import threading
+import time
 
 import numpy as np
 import pytest
 import tf_tree
+
+# Every test in this module goes through the frozen `.tft` path, which is
+# `#[cfg(all(feature = "shm", target_os = "linux"))]` in the facade. The binding
+# keeps `open_file` and `Tree.freeze` *present* elsewhere so a portable script
+# gets an explanation instead of an `AttributeError`, but "it refuses with a
+# message" is a different assertion from every one below — so skip, the way
+# `test_shared.py` already does off the same predicate (`has_shared_memory()` is
+# `cfg!(target_os = "linux")`). Without this the suite reports eleven failures on
+# macOS and the real signal is buried.
+pytestmark = pytest.mark.skipif(
+    not tf_tree.has_shared_memory(),
+    reason="frozen .tft files need the mmap-backed arena (Linux only)",
+)
 
 MS = 1_000_000
 
@@ -175,30 +190,55 @@ def test_span_answers_at_the_ends_it_reports(frozen):
         plan.at(t1 + 1)
 
 
-def test_span_of_an_all_static_path_is_none(frozen):
+def test_span_of_an_empty_plan_is_none(frozen):
     """`None` means unbounded, and is not the same as an empty interval.
 
-    Mutant: return ``Some((0, 0))`` for the stepless plan in ``span_impl``. A
+    This is the **empty** ``lookup(x, x)`` plan — ``len == 0``, so `span`'s loop
+    body never runs. It is *not* the all-static path, which reaches a different
+    branch (`Step::Static`) that no plan built through ``tf_tree.build`` can
+    contain, because the Python builder declares only dynamic edges. That branch
+    is covered where it is reachable, by
+    ``span_skips_static_steps_and_is_bounded_by_the_dynamic_one`` in
+    ``crates/tf_tree/tests/behavior.rs``. An earlier version of this test claimed
+    the static case and asserted the empty one.
+
+    Mutant: return ``Some((0, 0))`` for the stepless plan in ``Plan::span``. A
     caller's ``t0 <= t <= t1`` would then be false everywhere for a path that
     answers everywhere.
     """
     assert frozen.span("map", "map") is None
 
 
-def test_span_names_the_edge_that_has_never_published():
+def test_span_names_the_frames_of_the_edge_that_has_never_published():
     """The answer to "why did my lookup fail at t" is nearly always this (§4.2).
 
-    Mutant: in ``span_impl``, ``continue`` past an empty ring instead of
-    raising. `span` would then report the *other* edges' intersection — a window
-    over which the path is not answerable at all — and this test would get a
-    tuple instead of an exception.
+    And the answer has to be *actionable*: an ``EdgeId(2)`` is not, because the
+    Python surface exposes no way to turn an edge id back into the names the
+    caller typed. So `span_impl` resolves the two frame names on this error path.
+
+    Mutant: drop the ``LookupError::NoData`` arm in ``span_impl`` and let it fall
+    through to ``lookup_err``. The exception type is unchanged and the first
+    assertion still passes — the name assertions are what fail. Mutant:
+    ``continue`` past an empty ring in ``Plan::span`` instead of propagating;
+    this then gets a tuple instead of an exception.
     """
     t = tf_tree.build(EDGES, capacity=64)
     stamps = np.arange(N, dtype=np.int64) * STEP
-    with t.publisher("odom", "map") as p:
-        p.push_many(stamps, _poses(1.0))
-    with pytest.raises(tf_tree.NoDataError):
+    # Publish on the first two edges so exactly one edge — `base_link -> lidar` —
+    # is silent. Leaving two silent would make the assertion below pass on
+    # whichever the walk happened to reach first, which is not a property.
+    for j, (parent, child) in enumerate(EDGES[:2]):
+        with t.publisher(child, parent) as p:
+            p.push_many(stamps, _poses(1.0 + j))
+    with pytest.raises(tf_tree.NoDataError) as e:
         t.span("map", "lidar")
+    msg = str(e.value)
+    # The *pair*, in edge order. `map` and `lidar` are the query's own endpoints
+    # and the message echoes them, so asserting either name alone would be
+    # satisfied by a message that named no edge at all; `"base_link" -> "lidar"`
+    # can only come from the edge record.
+    assert '"base_link" -> "lidar"' in msg, msg
+    assert "EdgeId" not in msg, msg
 
 
 def test_open_file_of_a_missing_path_raises_filenotfound(tmp_path):
@@ -220,11 +260,18 @@ def test_open_file_of_a_missing_path_raises_filenotfound(tmp_path):
 
 
 def test_open_file_of_a_file_that_is_not_a_tft_says_so(tmp_path):
-    """Mutant: return ``Ok`` for a bad magic in ``FrozenArena::open``.
+    """A foreign file is refused, in our exception hierarchy, naming the path.
 
-    Then a directory of PNGs would map as an arena. Also killed by mapping
-    ``FrozenFileError::Frozen`` to ``PyValueError`` instead of ``TfTreeError``,
-    which is the mistake this arm's ordering invites.
+    Mutant: map ``FrozenFileError::Frozen`` to ``PyValueError`` instead of
+    ``TfTreeError`` — the mistake this arm's ordering invites, since
+    ``TfTreeError`` is not a ``ValueError``. That is the mutant this test kills.
+
+    It does **not** kill "return ``Ok`` for a bad magic in ``FrozenArena::open``":
+    the junk below still fails a later container check and the fall-through arm's
+    message still contains ``.tft``, so both assertions hold. That mutant is
+    caught by ``frozen::tests::a_foreign_file_is_not_a_tft`` under
+    ``just shm-check``, which is the right place for it — it is a property of the
+    arena, not of the binding.
     """
     junk = tmp_path / "not.tft"
     junk.write_bytes(b"PK\x03\x04" + os.urandom(8192))
@@ -237,20 +284,55 @@ def test_open_file_of_a_file_that_is_not_a_tft_says_so(tmp_path):
 def test_freeze_replaces_the_path_atomically_and_leaves_no_litter(live, tmp_path):
     """The temporary is a *sibling* and is renamed over the target (§2.3).
 
-    Mutant: in ``Tree::freeze_to``, write straight to ``path`` instead of to
-    ``temp_sibling`` and renaming. The directory listing below then still has
-    one entry, so what kills this is the second assertion — freezing twice over
-    a live target and reopening it — plus the absence of any dotfile.
+    **The inode is the assertion.** An earlier version of this test froze twice
+    and compared the numbers it read back, which passes just as well when
+    ``freeze_to`` writes straight to ``path`` — so it asserted nothing about the
+    property it is named for, and the whole Rust suite passed with the rename
+    deleted. `rename` replaces the directory entry, so a re-freeze *must* leave a
+    different inode at the same path; an in-place rewrite keeps it.
+
+    That is the difference that matters in practice. ``write_frozen`` sizes the
+    file with ``ftruncate`` first, so a freeze that dies at 60 % of a 233 MB copy
+    leaves a **full-length** zero-tailed file — harmless at a temporary name that
+    is then unlinked, fatal at ``path``, where next week's ``open_file`` gets
+    ``BadMagic`` instead of last week's good index. It is also what lets the third
+    assertion below hold: re-freezing over a path that is *currently mapped* by a
+    live tree cannot corrupt that mapping, because the mapping keeps the old
+    inode.
+
+    Mutant: in ``Tree::freeze_to``, ``File::create(path)`` instead of
+    ``File::create(&tmp)`` with the ``rename`` deleted. The inode assertion fails.
     """
     path = tmp_path / "run.tft"
-    live.freeze(str(path))
-    first = tf_tree.open_file(str(path)).plan("map", "lidar").at(int(COMMON[0]))
-    live.freeze(str(path))
-    again = tf_tree.open_file(str(path)).plan("map", "lidar").at(int(COMMON[0]))
+    live.freeze(path)
+    first_ino = os.stat(path).st_ino
+    # Hold the first image open across the second freeze: this is the mapping the
+    # rename exists to protect.
+    held = tf_tree.open_file(path)
+    first = held.plan("map", "lidar").at(int(COMMON[0]))
+
+    live.freeze(path)
+
+    assert os.stat(path).st_ino != first_ino, (
+        "freeze rewrote the target in place: a partial write would have been "
+        "visible at `path`, and the mapping held open above would have moved "
+        "under its reader"
+    )
+    np.testing.assert_array_equal(
+        held.plan("map", "lidar").at(int(COMMON[0])),
+        first,
+        err_msg="the mapping open across the freeze changed answers",
+    )
+    again = tf_tree.open_file(path).plan("map", "lidar").at(int(COMMON[0]))
     np.testing.assert_array_equal(again, first)
+    # No litter: the temporary is gone, and it was a sibling rather than a file
+    # in `/tmp` (a rename across filesystems is not atomic).
     assert [p.name for p in tmp_path.iterdir()] == ["run.tft"]
 
 
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
 def test_a_forked_child_can_query_a_tree_opened_before_the_fork(frozen):
     """§4.3's rule is right; §4.3's *reason* does not apply to a `.tft`.
 
@@ -266,6 +348,17 @@ def test_a_forked_child_can_query_a_tree_opened_before_the_fork(frozen):
     Mutant: give ``ArenaBacking::Frozen`` the ``Mapped`` arm's body in
     ``fork_gen_for`` (`crates/tf_tree/src/tree.rs`). The child's guard is then
     poisoned and answers ``ChildDetached``, so it reports failure here.
+
+    The ``filterwarnings`` mark is not cosmetic. CPython 3.12+ raises
+    ``DeprecationWarning`` from ``os.fork()`` in a multi-threaded process, and
+    whether this process has a thread by now depends on which modules pytest has
+    imported — so the warning appears in some runs and not others. Under
+    ``-W error`` that is the difference between a pass and a failure for a reason
+    that has nothing to do with the property. The child does allocate (numpy) and
+    take locks between the fork and ``os._exit``, which is exactly what the
+    warning is about; the fork is kept because §4.3's claim *is* about ``fork``,
+    and the parent waits on a pipe so a wedged child fails the suite rather than
+    hanging it forever.
     """
     stamps = _query_stamps()
     want = frozen.plan("map", "lidar").at(stamps)
@@ -286,3 +379,100 @@ def test_a_forked_child_can_query_a_tree_opened_before_the_fork(frozen):
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     assert verdict == b"1", "the inherited .tft mapping stopped answering in the child"
+
+
+def test_the_path_arguments_accept_os_pathlike(live, tmp_path):
+    """`freeze` and `open_file` take a `pathlib.Path`, not only a `str`.
+
+    A dataloader is precisely where paths arrive as `Path`, and these are the
+    binding's first filesystem-path arguments, so there was no earlier spelling
+    to stay consistent with.
+
+    Mutant: change either signature back to `&str`. `open_file(pathlib.Path(...))`
+    then raises ``TypeError: 'PosixPath' object cannot be converted to 'PyString'``
+    and this fails.
+    """
+    path = tmp_path / "pathlike.tft"
+    live.freeze(path)
+    assert path.exists()
+    tree = tf_tree.open_file(path)
+    assert tree.plan("map", "lidar").at(int(COMMON[0])).shape == (4, 4)
+
+    # `OSError.filename` stays a `str`, as CPython's own does for a `str`
+    # argument — PyO3 would have made it a `PosixPath` had `frozen_err` handed
+    # back a `PathBuf` instead of an `OsString`.
+    with pytest.raises(FileNotFoundError) as e:
+        tf_tree.open_file(tmp_path / "absent.tft")
+    assert e.value.filename == str(tmp_path / "absent.tft")
+    assert isinstance(e.value.filename, str)
+
+
+def test_freeze_releases_the_gil_for_the_copy(tmp_path):
+    """A freeze must not stop every other thread in the process for its duration.
+
+    `PyPlan.at_into` releases the GIL above 1 µs of estimated work; a freeze is
+    four orders of magnitude past that and was holding it. Measured on the host
+    that wrote this test, over a 39.9 MB arena: with the GIL held the heartbeat
+    thread's worst gap was **89–124 ms against an 89–124 ms freeze** — it did not
+    run at all — and with the GIL released it was **1.2–5.8 ms against a 52–68 ms
+    freeze**. The threshold below sits between those two populations with roughly
+    a five-fold margin on each side.
+
+    A *sleeping* thread is the probe rather than a spinning one on purpose: a spin
+    loop's own allocation makes its idle gaps noisy enough (up to 4.9 ms here) to
+    swamp the signal, and "the thread servicing the progress bar or the socket" is
+    the case that actually matters.
+
+    Mutant: drop the ``py.detach`` in ``freeze_impl`` and call ``freeze_to``
+    directly. The stall becomes the whole freeze and this fails.
+
+    On a free-threaded build there is no GIL to hold, so this passes for a reason
+    unrelated to the fix — it is a real assertion only under `just py-test`, not
+    under `just py-test-freethreaded`.
+    """
+    # 32 edges x 16384 slots: big enough that the freeze dominates scheduler
+    # noise, small enough (~40 MB) to be polite about disk.
+    edges = [(f"f{i}", f"f{i + 1}") for i in range(32)]
+    t = tf_tree.build(edges, capacity=16384)
+    stamps = np.arange(4, dtype=np.int64) * MS
+    poses = np.zeros((4, 7), dtype=np.float64)
+    poses[:, 0] = 1.0
+    with t.publisher("f1", "f0") as p:
+        p.push_many(stamps, poses)
+
+    gaps: list[float] = []
+    stop = threading.Event()
+
+    def heartbeat() -> None:
+        prev = time.perf_counter()
+        while not stop.is_set():
+            time.sleep(0.001)
+            now = time.perf_counter()
+            gaps.append(now - prev)
+            prev = now
+
+    path = tmp_path / "gil.tft"
+    th = threading.Thread(target=heartbeat)
+    th.start()
+    try:
+        time.sleep(0.05)  # let the thread reach steady state
+        gaps.clear()
+        t0 = time.perf_counter()
+        t.freeze(path)
+        wall = time.perf_counter() - t0
+        stall = max(gaps)
+    finally:
+        stop.set()
+        th.join()
+        path.unlink(missing_ok=True)
+
+    # If a future host freezes 40 MB so fast that the GIL-held case would stall
+    # less than the scheduler noise, this test can no longer tell the two apart —
+    # say so instead of passing vacuously.
+    if wall < 0.020:
+        pytest.skip(f"freeze took {wall * 1e3:.1f} ms: too fast to discriminate")
+
+    assert stall < 0.5 * wall, (
+        f"a concurrent thread stalled {stall * 1e3:.1f} ms across a "
+        f"{wall * 1e3:.1f} ms freeze: the GIL was held for the copy"
+    )
