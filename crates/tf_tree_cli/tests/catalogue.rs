@@ -29,7 +29,7 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
     let snap = Snapshot::capture(&tree);
     let obs = Observations::from_samples(samples);
     let stats = checks::collect_edge_stats(&tree, &snap);
-    let clock = Clock::decide(checks::newest_stamp(&snap), 1_700_000_000_000_000_000);
+    let clock = Clock::decide(&checks::newest_stamps(&snap), 1_700_000_000_000_000_000);
     let inputs = Inputs {
         snap: &snap,
         obs: &obs,
@@ -185,5 +185,40 @@ fn the_json_summary_agrees_with_the_exit_status() {
     assert!(
         json.contains("\"error\": 1"),
         "the summary must count id-less findings: {json}"
+    );
+}
+
+/// **The CLI's `counters` feature must actually control the engine's.**
+///
+/// `TFT010`'s "built without counters" skip and `render_human`'s banner both
+/// key off `tf_tree::counters_compiled_in`, which reports what the *engine* was
+/// built with. The CLI's own `counters` feature is supposed to be what sets
+/// that. Cargo will silently break the link: any workspace dependency declared
+/// without `default-features = false` re-enables `tf_tree/counters` through its
+/// own defaults, independently of what the CLI asked for. That is what
+/// happened — `tf_tree_bench` (a dependency of this crate, carrying
+/// `default = ["counters"]`) pinned the engine's counters on, so
+/// `--no-default-features` produced a byte-identical report and the skip branch
+/// was unreachable in every buildable configuration. Nothing warned, because
+/// each half was individually truthful.
+///
+/// This assertion is the only place the two answers are compared, so it is the
+/// only thing that can see them disagree.
+///
+/// Mutant: drop `default-features = false` from the `tf_tree_bench` line in the
+/// workspace `Cargo.toml`. Applied, under
+/// `cargo nextest run -p tf_tree_cli --no-default-features`: `left = false`,
+/// `right = true`, and this fails. It passes on the default build with or
+/// without the mutant, which is exactly why the mutant must be run with the
+/// feature off — and why the defect survived the default gate.
+#[test]
+fn the_cli_counters_feature_switches_the_engine() {
+    assert_eq!(
+        cfg!(feature = "counters"),
+        tf_tree::counters_compiled_in(),
+        "the CLI asked for counters={} but the engine was built with counters={}; \
+         some dependency is re-enabling tf_tree/counters through its own defaults",
+        cfg!(feature = "counters"),
+        tf_tree::counters_compiled_in()
     );
 }

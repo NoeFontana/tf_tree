@@ -385,7 +385,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
     let obs = observations(tree, &src);
     let snap = Snapshot::capture(tree);
     let stats = checks::collect_edge_stats(tree, &snap);
-    let clock = checks::Clock::decide(checks::newest_stamp(&snap), unix_nanos_now());
+    let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
 
     let inputs = checks::Inputs {
         snap: &snap,

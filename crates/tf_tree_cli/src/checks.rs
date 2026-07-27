@@ -11,8 +11,8 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — three unconditionally, and three more depending on what the arena,
-//! the engine build and the host can supply. A check that silently returns
+//! reason — **four** unconditionally, and **four** more depending on what the
+//! arena, the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
 //!
@@ -96,8 +96,9 @@ pub enum Clock {
     /// clock, so the two share an epoch and wall-clock comparisons mean
     /// something.
     Wall(i64),
-    /// They do not. The newest stamp in the arena is used as "now", which still
-    /// supports `TFT006`'s *distance* rule but cannot support `TFT005` at all.
+    /// They do not. The **median** of the per-edge newest stamps is used as
+    /// "now", which still supports `TFT006`'s *distance* rule but cannot
+    /// support `TFT005` at all.
     NewestStamp(i64),
 }
 
@@ -116,25 +117,58 @@ impl Clock {
         match self {
             Clock::Wall(_) => "system wall clock",
             Clock::NewestStamp(_) => {
-                "newest arena stamp (its stamps do not share an epoch with the system clock)"
+                "median arena stamp (its stamps do not share an epoch with the system clock)"
             }
         }
     }
 
-    /// Decide which clock applies, given the arena's newest stamp and the
-    /// system clock. `None` for an arena with no samples at all.
+    /// Decide which clock applies, given **every** edge's newest stamp and the
+    /// system clock.
+    ///
+    /// # Why this is a vote and not a single stamp
+    ///
+    /// [`ABSURD_HORIZON_NS`] does double duty: it is the domain-agreement
+    /// threshold here *and* `TFT006`'s absurdity radius. So whatever this
+    /// function picks as the reference is, by construction, the one value
+    /// `TFT006` can never call absurd. Deriving it from an extremum — the
+    /// arena's maximum stamp, say — hands that immunity to the single worst
+    /// edge: one publisher with the classic nanoseconds-into-a-seconds-field
+    /// overshoot *defines* the clock, `TFT005` skips itself because the arena
+    /// now looks non-Unix, and `TFT006` fires on every **correct** edge for
+    /// being far from the broken one. The check written for that exact fault
+    /// exonerates it and blames the healthy majority.
+    ///
+    /// The estimator therefore has to have a breakdown point. Two parts:
+    ///
+    /// * **The domain is decided by majority.** Count the edges whose newest
+    ///   stamp sits within the horizon of the system clock. A *minority* of bad
+    ///   stamps can then never flip the arena out of `Wall`, which is what keeps
+    ///   `TFT005` and `TFT006` pointed at the outlier instead of at everyone
+    ///   else.
+    /// * **Ties go to the wall clock.** At 50% contamination no estimator drawn
+    ///   from the arena can tell the good half from the bad half, so the
+    ///   tiebreak uses the one piece of evidence no edge can corrupt: the
+    ///   external clock.
+    ///
+    /// When the vote says the stamps genuinely are not Unix time, the fallback
+    /// reference is the **median** of the per-edge newest stamps, not the
+    /// maximum, for the same reason: `TFT006` still measures distance against
+    /// it, and a centre one edge can drag is a centre that check cannot use.
     #[must_use]
-    pub fn decide(newest_stamp: Option<i64>, system_unix_nanos: i64) -> Clock {
-        match newest_stamp {
-            Some(n) if (n - system_unix_nanos).abs() <= ABSURD_HORIZON_NS => {
-                Clock::Wall(system_unix_nanos)
-            }
-            Some(n) => Clock::NewestStamp(n),
-            // An arena with no samples has nothing to disagree with the system
-            // clock about, so the system clock is as good a reference as any and
-            // the checks that use it have nothing to look at either way.
-            None => Clock::Wall(system_unix_nanos),
+    pub fn decide(newest_stamps: &[i64], system_unix_nanos: i64) -> Clock {
+        let agree = newest_stamps
+            .iter()
+            .filter(|&&n| (n - system_unix_nanos).abs() <= ABSURD_HORIZON_NS)
+            .count();
+        // `>=` rather than `>`, and it also covers the empty arena: nothing has
+        // disagreed with the system clock, so the system clock stands.
+        if agree * 2 >= newest_stamps.len() {
+            return Clock::Wall(system_unix_nanos);
         }
+        let mut sorted = newest_stamps.to_vec();
+        sorted.sort_unstable();
+        // Non-empty: `agree * 2 >= 0` would have returned above otherwise.
+        Clock::NewestStamp(sorted[sorted.len() / 2])
     }
 }
 
@@ -797,10 +831,15 @@ pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
     ]
 }
 
-/// The newest stamp on any edge — used to decide the reference [`Clock`].
+/// Every edge's newest stamp — the sample [`Clock::decide`] votes over.
+///
+/// Deliberately the whole population and not an aggregate: the aggregation is
+/// `decide`'s job, and it needs the individual values to be robust to an
+/// outlier. Handing it a single pre-reduced stamp is what let one broken
+/// publisher define the reference clock.
 #[must_use]
-pub fn newest_stamp(snap: &Snapshot) -> Option<i64> {
-    snap.edges.iter().filter_map(|e| e.newest_stamp).max()
+pub fn newest_stamps(snap: &Snapshot) -> Vec<i64> {
+    snap.edges.iter().filter_map(|e| e.newest_stamp).collect()
 }
 
 #[cfg(test)]
@@ -1113,15 +1152,78 @@ mod tests {
         let unix_now = 1_700_000_000_000_000_000;
         // A boot-relative arena: 9.9 s since boot, as the benchmark fixture is.
         assert_eq!(
-            Clock::decide(Some(9_900_000_000), unix_now),
+            Clock::decide(&[9_900_000_000, 9_800_000_000], unix_now),
             Clock::NewestStamp(9_900_000_000)
         );
         // A Unix-stamped arena a minute behind the clock is still Unix.
         assert_eq!(
-            Clock::decide(Some(unix_now - 60_000_000_000), unix_now),
+            Clock::decide(&[unix_now - 60_000_000_000], unix_now),
             Clock::Wall(unix_now)
         );
         // An empty arena has nothing to disagree about.
-        assert_eq!(Clock::decide(None, unix_now), Clock::Wall(unix_now));
+        assert_eq!(Clock::decide(&[], unix_now), Clock::Wall(unix_now));
+    }
+
+    /// **One broken publisher must not be able to define the reference clock.**
+    ///
+    /// [`ABSURD_HORIZON_NS`] is both the domain-agreement threshold and
+    /// `TFT006`'s absurdity radius, so the reference is the one stamp `TFT006`
+    /// structurally cannot call absurd. If an extremum picks it, the single
+    /// worst edge becomes immune and the healthy majority becomes the outlier:
+    /// `TFT005` skips itself (the arena now looks non-Unix) and `TFT006` fires
+    /// on every correct edge while exonerating the broken one. That is the
+    /// diagnostic inverted — it blames five innocent publishers and clears the
+    /// guilty one.
+    ///
+    /// The fixture is non-degenerate on the axis that matters: the five good
+    /// edges carry *distinct* Unix stamps, and the bad edge's stamp is
+    /// `now * 2`, the classic nanoseconds-into-a-seconds-field overshoot, which
+    /// is the arena's maximum by a wide margin.
+    ///
+    /// Mutant: `Clock::decide` → `Clock::Wall`/`NewestStamp` chosen from
+    /// `newest_stamps.iter().max()` as the old single-stamp estimator did.
+    /// Applied: the arena is declared `NewestStamp(3_400_000_000_000_000_000)`,
+    /// `TFT005` skips, and `TFT006` fires on edges 1-5 — the first assertion
+    /// fails.
+    #[test]
+    fn a_single_units_error_cannot_capture_the_reference_clock() {
+        let unix_now = 1_700_000_000_000_000_000;
+        // Five healthy edges, each with its own stamp within a second of now,
+        // plus one publisher that multiplied instead of dividing.
+        let mut stamps: Vec<i64> = (0..5).map(|i| unix_now - i * 200_000_000).collect();
+        let rogue = unix_now * 2;
+        stamps.push(rogue);
+
+        assert_eq!(
+            Clock::decide(&stamps, unix_now),
+            Clock::Wall(unix_now),
+            "5 of 6 edges agree with the wall clock; the 6th must not be able to \
+             redefine the domain"
+        );
+
+        // ...and with that reference, TFT006 blames exactly the rogue edge.
+        let snap = Snapshot {
+            frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
+            edges: (0..6).map(|i| edge(i + 1, 1, 2, 100)).collect(),
+        };
+        let stats: Vec<EdgeStats> = stamps
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| EdgeStats {
+                edge: u32::try_from(i).unwrap() + 1,
+                oldest_stamp: Some(s),
+                newest_stamp: Some(s),
+                ..EdgeStats::default()
+            })
+            .collect();
+        let obs = Observations::new();
+        let o = tft006(&inputs(
+            &snap,
+            &obs,
+            &stats,
+            Clock::decide(&stamps, unix_now),
+        ));
+        let blamed: Vec<u32> = o.findings.iter().filter_map(|f| f.edge).collect();
+        assert_eq!(blamed, vec![6], "only the rogue edge is absurd: {o:?}");
     }
 }
