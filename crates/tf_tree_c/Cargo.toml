@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# **Not published, and the reason is the artifact shape, not maturity alone.**
+# What a C or C++ consumer needs is the generated headers plus a built
+# `staticlib`/`cdylib` — none of which arrives through `cargo add`. Publishing
+# would put a crate on crates.io whose only Rust-visible surface (`rlib`) exists
+# for this repository's own integration tests. It also carries an ABI version
+# (`docs/PHASE4.md` §3.1) that is pre-1.0 and still moving; an ABI on crates.io
+# is a promise, and this one is not ready to make. Distribution is release
+# artifacts plus the CMake package, per `docs/PHASE5.md` §10.
 publish = false
 
 [lib]

@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# **Not published because half the bridge does not exist.** This crate is the
+# ROS-independent decision half; the `rclcpp` half is recorded as **BLOCKED** in
+# `docs/PHASE4.md` §0.0 and §5.8 (the spec assumes a runtime edge declaration the
+# engine does not have). A crate named `tf_tree_bridge` on crates.io would
+# advertise a bridge that cannot currently bridge.
 publish = false
 
 # **A workspace member with no ROS dependency, and that is the design.**

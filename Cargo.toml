@@ -25,7 +25,13 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+# **1.85, and it was 1.83 until it was measured.** `cargo +1.83 build --workspace`
+# fails to *parse* a manifest: `blake3 1.8.5` pulls `constant_time_eq 0.4.2`,
+# which is `edition = "2024"` and declares `rust-version = "1.85.0"`. So 1.83 was
+# a promise nothing kept and nothing checked. The `msrv` job in
+# `.github/workflows/ci.yml` reads this field and builds on exactly it, so the
+# next silent drift fails the build instead of shipping. Policy: `SUPPORT.md`.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"

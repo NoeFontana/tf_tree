@@ -210,6 +210,22 @@ audit:
 bench:
     cargo xtask bench-gate
 
+# **`docs/PHASE5.md` §9's benchmark artifact.** One command, one `report/`
+# directory: `results.json` (stable schema, CI-diffable), `index.html`, and the
+# provenance header §9.3 requires.
+#
+# `--release` is not optional and not a speed convenience: the tool refuses to
+# call any timing row a claim in a debug build, so a debug run produces a report
+# with every timing row marked UNAVAILABLE for a reason that is about the build
+# rather than about the engine.
+#
+# On a host that cannot measure a row fairly the row is printed UNAVAILABLE with
+# the reason and the command that produces it elsewhere — never estimated, never
+# dropped. `TF_TREE_BENCH_FORCE=1` downgrades those rows to `indicative` (labelled
+# in both outputs as not a claim) rather than upgrading them to measured.
+bench-report *ARGS:
+    cargo run --release -p tf_tree_bench --bin bench_report -- {{ARGS}}
+
 # `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
 # where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
 # `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one

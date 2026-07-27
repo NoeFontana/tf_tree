@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# Harness, not a library: fixtures, the tf2 differential, and the `docs/PHASE5.md`
+# §9 report. §9.3 requires the harness to live in this repository ("no private
+# benchmark"), which it does — but nobody `cargo add`s a benchmark harness, and
+# publishing one would drag `libc` and the ROS-adjacent optional dependency onto
+# crates.io for no consumer.
 publish = false
 
 [lints]
@@ -43,11 +48,13 @@ tf_tree_ipc.workspace = true
 # is the only edge that reaches ROS 2, and it is pulled in solely by `--features tf2`.
 tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
 
+# `report::worse_entries` states the arena memory floor as arithmetic on the
+# layout rather than a measurement, so the layout math has to be reachable from
+# the library, not only from the relocation gate's dev-dependency.
+tf_tree_arena.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
-# Only the relocation gate needs this: it implements `Arena` over a byte copy of
-# a live arena, standing in for Phase 2's `MappedArena`.
-tf_tree_arena.workspace = true
 
 # Criterion benches (harness = false, driven by `criterion_group!`/`main!`). These
 # compile and run on any machine, but they are *not* the official go/no-go gate,
@@ -140,3 +147,10 @@ harness = false
 # and criterion's per-iteration setup would sit inside the thing being measured.
 [[bin]]
 name = "counter_cost"
+
+# **PHASE5 §9's artifact.** One command, one `report/` directory. It orchestrates
+# measurements that live elsewhere rather than reimplementing them, and refuses
+# to write a report that breaks §9.3 (see `src/report.rs`).
+[[bin]]
+name = "bench_report"
+path = "src/bin/bench_report.rs"
