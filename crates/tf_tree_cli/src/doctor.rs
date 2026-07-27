@@ -62,6 +62,13 @@ impl Check {
 }
 
 /// How serious a finding is.
+///
+/// Distinct from [`crate::catalogue::Severity`], which is the *reporting*
+/// vocabulary and carries an `Info` level this layer has no use for. The two
+/// meet in one place — `From<Severity> for crate::catalogue::Severity` — so
+/// that a check's severity is declared once, here, next to the code that knows
+/// why the condition is serious, instead of being restated by whatever maps the
+/// finding into the catalogue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     /// Worth attention but not necessarily broken.
@@ -99,24 +106,12 @@ impl Finding {
     }
 }
 
-/// The result of running all seven checks.
-#[derive(Clone, Debug, Default)]
-pub struct Report {
-    /// All findings, in check order.
-    pub findings: Vec<Finding>,
-}
-
-impl Report {
-    /// Whether the tree is clean (no findings).
-    #[must_use]
-    pub fn is_healthy(&self) -> bool {
-        self.findings.is_empty()
-    }
-
-    /// Whether any finding is an [`Severity::Error`].
-    #[must_use]
-    pub fn has_error(&self) -> bool {
-        self.findings.iter().any(|f| f.severity == Severity::Error)
+impl From<Severity> for crate::catalogue::Severity {
+    fn from(s: Severity) -> crate::catalogue::Severity {
+        match s {
+            Severity::Warn => crate::catalogue::Severity::Warn,
+            Severity::Error => crate::catalogue::Severity::Error,
+        }
     }
 }
 
@@ -160,6 +155,14 @@ pub struct EdgeInfo {
     pub head: u64,
     /// Whether a live writer currently holds the claim.
     pub claimed: bool,
+    /// Whether the claim record was caught **mid-handoff** (the `CLAIMING`
+    /// sentinel) rather than actually held.
+    ///
+    /// Separate from `claimed`/`owner_pid` because both of those collapse it
+    /// into "claimed by nobody", which is also what a genuinely leaked claim
+    /// looks like. Distinguishing them needs a liveness source a snapshot does
+    /// not have, so `TFT014` uses this to stay silent instead of guessing.
+    pub claiming: bool,
     /// The current claim owner's PID (`0` if unclaimed).
     pub owner_pid: u32,
     /// Newest published stamp, if any samples exist.
@@ -234,14 +237,20 @@ impl Snapshot {
             };
             let kind = EdgeKind::from_u8(rec.kind);
             let owner_word = claim.owner.load(Ordering::Relaxed);
-            // `owner_word == 0` means *unclaimed*. Without this guard the
-            // `saturating_sub(1)` below yields slot 0 and the edge is reported as
-            // owned by whichever process happens to hold participant slot 0 — a
-            // plausible-looking wrong pid, which is worse than none.
+            // **The owner word is `(epoch << 16) | (slot + 1)`, not `slot + 1`**
+            // (`tf_tree_core::edge::pack_owner`, A3 plus decision 0005 §6's
+            // "one acquisition, not just one slot"). `claim` starts the epoch at
+            // 1, so `word - 1` is never a slot for any real claim — it is
+            // `epoch << 16` and resolves to no participant at all. Decoding it
+            // by hand is what produced `pid 0` for every live writer.
+            //
+            // `slot_of` returns `u32::MAX` for an unclaimed record and for one
+            // caught mid-claim, and `identity` rejects that, so both read as
+            // "no owner" rather than as a plausible wrong pid.
             let owner_slot = if owner_word == 0 {
                 None
             } else {
-                u32::try_from(owner_word - 1).ok()
+                Some(tf_tree_core::edge::slot_of(owner_word))
             };
             // `ring` is `None` for a static/tombstoned edge (capacity 0), so this
             // needs no separate power-of-two guard.
@@ -256,6 +265,7 @@ impl Snapshot {
                 domain: rec.domain,
                 head: rec.head.load(Ordering::Relaxed),
                 claimed: owner_word != 0,
+                claiming: tf_tree_core::edge::is_claiming(owner_word),
                 // A3: the claim names a *participant slot*, not a PID, so the
                 // owning process is resolved through the participant table. A
                 // slot that no longer resolves means the owner detached or died
@@ -272,7 +282,8 @@ impl Snapshot {
     }
 
     /// The display name of frame `id`, or `#id` if it is not in the snapshot.
-    fn frame_label(&self, id: u32) -> String {
+    #[must_use]
+    pub fn frame_label(&self, id: u32) -> String {
         self.frames
             .iter()
             .find(|f| f.id == id)
@@ -280,8 +291,25 @@ impl Snapshot {
             .unwrap_or_else(|| format!("frame#{id}"))
     }
 
+    /// An `id -> edge` map for the checks that walk [`crate::checks::EdgeStats`]
+    /// and need the corresponding [`EdgeInfo`].
+    ///
+    /// Built once per check rather than re-scanning `edges` per entry: the
+    /// naive `edges.iter().find(...)` inside a loop over `stats` is O(E^2), and
+    /// on a 5 000-edge arena that is tens of millions of comparisons to answer
+    /// a question a single pass already knows. Not a `zip` against `stats`,
+    /// even though `collect_edge_stats` happens to build them in the same
+    /// order: a caller assembling `Inputs` by hand can supply stats for a
+    /// subset, and a silently misaligned zip would put the wrong frame names on
+    /// a finding — trading a correctness risk for speed on a cold path.
+    #[must_use]
+    pub fn edge_index(&self) -> BTreeMap<u32, &EdgeInfo> {
+        self.edges.iter().map(|e| (e.id, e)).collect()
+    }
+
     /// A `"parent->child"` label for edge `id`.
-    fn edge_label(&self, e: &EdgeInfo) -> String {
+    #[must_use]
+    pub fn edge_label(&self, e: &EdgeInfo) -> String {
         format!(
             "{}->{} (edge#{})",
             self.frame_label(e.parent),
@@ -323,8 +351,8 @@ impl Observations {
     /// Nobody was watching when those samples arrived, so this is strictly less
     /// than the fixture knows, and the difference is not cosmetic. Two of the
     /// seven checks are **structurally unable to fire** on the result, and
-    /// [`Self::LOST_ON_A_LIVE_ARENA`] names them so `doctor` can say so instead
-    /// of printing a clean bill of health it did not earn:
+    /// `doctor` discloses both rather than printing a clean bill of health it
+    /// did not earn — `TFT001` skips outright, and `TFT011` carries a note:
     ///
     /// * **multi-writer** — a ring remembers the *current* claim owner, not the
     ///   sequence of processes that wrote into it. Every sample therefore
@@ -360,16 +388,14 @@ impl Observations {
         Observations { events }
     }
 
-    /// The checks [`Self::from_arena`] cannot supply evidence for.
-    pub const LOST_ON_A_LIVE_ARENA: &'static [Check] = &[Check::MultiWriter, Check::ShortBuffer];
-
     /// Record one observed push.
     pub fn record(&mut self, sample: PushSample) {
         self.events.push(sample);
     }
 
     /// Group event indices by edge, preserving arrival order within each edge.
-    fn by_edge(&self) -> BTreeMap<u32, Vec<&PushSample>> {
+    #[must_use]
+    pub fn by_edge(&self) -> BTreeMap<u32, Vec<&PushSample>> {
         let mut map: BTreeMap<u32, Vec<&PushSample>> = BTreeMap::new();
         for s in &self.events {
             map.entry(s.edge).or_default().push(s);
@@ -639,9 +665,16 @@ fn median_period(samples: &[&PushSample]) -> Option<i64> {
     Some(median)
 }
 
-/// Run all seven checks over a captured snapshot and observed history.
+/// Every Phase 1 finding over a captured snapshot and observed history.
+///
+/// There is deliberately no `Report`/`is_healthy`/`has_error` wrapper here.
+/// `crate::catalogue::Report` is the one the `--exit-code` gate consults, and a
+/// second type with the same name and near-identical methods one module away is
+/// a trap: a reader landing on `has_error` has no way to tell which gate it
+/// feeds. The catalogue routes each of these findings to a `TFT` id (or to
+/// `Uncatalogued`), so this returns the raw list and lets that layer decide.
 #[must_use]
-pub fn run(snap: &Snapshot, obs: &Observations) -> Report {
+pub fn all_findings(snap: &Snapshot, obs: &Observations) -> Vec<Finding> {
     let mut findings = Vec::new();
     findings.extend(check_cycles(snap));
     findings.extend(check_unclaimed_dynamic(snap));
@@ -650,7 +683,7 @@ pub fn run(snap: &Snapshot, obs: &Observations) -> Report {
     findings.extend(check_inconsistent_rates(obs));
     findings.extend(check_unreachable(snap));
     findings.extend(check_out_of_order(obs));
-    Report { findings }
+    findings
 }
 
 #[cfg(test)]
@@ -680,6 +713,7 @@ mod tests {
             domain: 0,
             head: 0,
             claimed,
+            claiming: false,
             owner_pid: if claimed { 1234 } else { 0 },
             newest_stamp: None,
         }
@@ -904,6 +938,38 @@ mod tests {
 
     // --- healthy live fixture -------------------------------------------
 
+    /// **A live writer's claim must resolve to that writer's pid.**
+    ///
+    /// The owner word packs the acquisition epoch above the slot
+    /// (`(epoch << 16) | (slot + 1)`), and `claim` starts the epoch at 1, so a
+    /// hand-rolled `word - 1` never names a slot. It produced `pid 0` for every
+    /// claimed edge — which reads as "the writer is gone", is what the `tree`
+    /// command printed in its writer column, and is the exact condition
+    /// `TFT014` reports as a leaked claim.
+    ///
+    /// Mutant: decode with `u32::try_from(owner_word - 1).ok()` instead of
+    /// `slot_of`. Applied: `owner_pid` is 0 for all four claimed edges and the
+    /// assertion fails.
+    #[test]
+    fn a_held_claim_resolves_to_the_writers_pid() {
+        let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
+        let (writers, _samples) = tf_tree_bench::fixture::spin_up(&tree).expect("claim and push");
+        let snap = Snapshot::capture(&tree);
+
+        let claimed: Vec<&EdgeInfo> = snap.edges.iter().filter(|e| e.claimed).collect();
+        // Non-vacuity: the fixture holds four dynamic claims for the whole test.
+        assert_eq!(claimed.len(), 4, "the fixture must hold its claims");
+        let me = std::process::id();
+        for e in claimed {
+            assert_eq!(
+                e.owner_pid, me,
+                "edge#{} is claimed by this process but resolved to pid {}",
+                e.id, e.owner_pid
+            );
+        }
+        drop(writers);
+    }
+
     #[test]
     fn healthy_fixture_reports_clean() {
         let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
@@ -911,11 +977,10 @@ mod tests {
         let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
         let snap = Snapshot::capture(&tree);
         let obs = Observations::from_samples(samples);
-        let report = run(&snap, &obs);
+        let findings = all_findings(&snap, &obs);
         assert!(
-            report.is_healthy(),
-            "healthy fixture produced findings: {:?}",
-            report.findings
+            findings.is_empty(),
+            "healthy fixture produced findings: {findings:?}"
         );
         assert_eq!(snap.frames.len(), 24, "fixture should have 24 frames");
         assert_eq!(snap.edges.len(), 23, "fixture should have 23 edges");

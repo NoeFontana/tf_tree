@@ -330,6 +330,27 @@ pub fn slot_of(word: u64) -> u32 {
     u32::try_from((word & 0xFFFF).saturating_sub(1)).unwrap_or(u32::MAX)
 }
 
+/// Whether an owner word is a claim still in flight rather than a held one.
+///
+/// **Public because [`slot_of`] deliberately erases the difference and some
+/// callers need it back.** `slot_of` maps both "free" and "mid-claim" to
+/// `u32::MAX`, which is right for anything that only wants to resolve an owner.
+/// It is wrong for anything that draws a *conclusion* from failing to resolve
+/// one: a record holding `CLAIMING` for a few instructions during a normal
+/// handoff is indistinguishable, through `slot_of` alone, from one whose owner
+/// slot has genuinely gone dead.
+///
+/// [`reap`] gets away without this because it consults an independent liveness
+/// source — a claimer caught in that window is protected by `probe_claim`
+/// reporting the lock still held. A caller with no such second source (a
+/// snapshot-based diagnostic, say) must not treat `CLAIMING` as evidence of
+/// anything, and needs this predicate to tell the two cases apart.
+#[inline]
+#[must_use]
+pub fn is_claiming(word: u64) -> bool {
+    word == CLAIMING
+}
+
 /// Release a held claim. Idempotent at the memory level but should be called
 /// exactly once, by the owner, via `Publisher::drop`.
 pub fn release(rec: &ClaimRecord, owner: u64) {

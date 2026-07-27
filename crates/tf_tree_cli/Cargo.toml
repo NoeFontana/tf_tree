@@ -39,6 +39,13 @@ clap.workspace = true
 tf_tree_ipc = { workspace = true, optional = true }
 
 [features]
+default = ["counters"]
+# `docs/PHASE5.md` §5's diagnostic counters, which `TFT010`/`TFT011` read.
+# Needed explicitly because the workspace declares `tf_tree` with
+# `default-features = false` (see the comment on that declaration): without
+# this line the CLI would link an engine that counts nothing and `doctor` would
+# report "no extrapolation failures" on an arena that has never counted one.
+counters = ["tf_tree/counters"]
 # Attach to a live arena (`--attach`) and `tf_tree participants`. Linux-only,
 # and off by default so the single-process CLI does not grow a syscall
 # dependency it never uses.
