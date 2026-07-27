@@ -43,6 +43,10 @@ tf_tree_bench.workspace = true
 tf_tree_bridge.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+# `docs/PHASE5.md` §3. Not optional: `tf_tree ingest` is the one subcommand a
+# user with no `tf_tree` deployment can run, so gating it behind a feature would
+# put the adoption wedge behind a rebuild.
+tf_tree_ingest.workspace = true
 # `tf_tree participants` reads the lock file **without the arena** (§3.3), which
 # is the whole point of that subcommand: it must work when the segment is gone.
 tf_tree_ipc = { workspace = true, optional = true }
@@ -58,4 +62,10 @@ counters = ["tf_tree/counters"]
 # Attach to a live arena (`--attach`) and `tf_tree participants`. Linux-only,
 # and off by default so the single-process CLI does not grow a syscall
 # dependency it never uses.
-shm = ["tf_tree/shm", "dep:tf_tree_ipc"]
+shm = ["tf_tree/shm", "dep:tf_tree_ipc", "tf_tree_ingest/shm"]
+
+[dev-dependencies]
+# The `fixture` feature writes the synthetic recordings `tests/ingest.rs` runs
+# the binary against. Off in the normal build (it fabricates recordings), on
+# here, which is the only place a fabricated recording belongs.
+tf_tree_ingest = { workspace = true, features = ["fixture"] }

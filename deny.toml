@@ -4,7 +4,27 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# **One ignore, and it is narrow on purpose.** An empty list is the right default
+# and this is the only entry that has ever been needed; anything added here has
+# to carry the same three facts: what the advisory says, why it cannot be fixed,
+# and what would make it removable.
+ignore = [
+    # RUSTSEC-2024-0436 — `paste` is unmaintained. **Not a vulnerability**: the
+    # advisory records that the author archived the repository, and says outright
+    # "No safe upgrade is available".
+    #
+    # It arrives through `mcap` (`docs/PHASE5.md` §3.3's primary bag source) and
+    # nowhere else. `paste` is a `proc-macro` crate: it runs in the compiler,
+    # produces no code of its own in the binary, and is not reachable at runtime,
+    # so an unmaintained *macro* expander is a supply-chain concern rather than an
+    # exploitable one — and the supply-chain half is already covered by
+    # `[sources]` and the committed `Cargo.lock`.
+    #
+    # Removable the moment `mcap` moves to `pastey` or drops the dependency;
+    # nothing on our side can accelerate that, and vendoring an MCAP reader to
+    # avoid a proc-macro would be a far larger risk than the one it avoids.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2

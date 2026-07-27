@@ -177,20 +177,52 @@ enum Command {
         #[arg(long)]
         gate: bool,
     },
-    /// Write a live arena to a frozen `.tft` index (`docs/PHASE5.md` §2).
+    /// Read an MCAP recording and report what is in its `/tf` traffic
+    /// (`docs/PHASE5.md` §3).
     ///
-    /// **`--from-live` is the only source this phase has**, and the flag is
-    /// still required rather than implied: §3's `--from-bag` is the source most
-    /// users will want, and a `freeze` that silently meant "live" today would
-    /// have to change meaning when it lands.
+    /// **This is the subcommand that needs nothing installed.** It changes
+    /// nothing about anybody's robot, reads a file they already have, and
+    /// prints the §3.2 ingest report — which is D28's whole wedge. It is
+    /// deliberately *not* behind `--features shm`: writing a `.tft` needs the
+    /// frozen backend and therefore the mapping code, but running the two
+    /// passes and printing what they found needs neither.
+    ///
+    /// Use `tf_tree freeze --from-bag` to keep the result.
+    Ingest {
+        /// The `.mcap` recording to read.
+        #[arg(long, value_name = "PATH")]
+        bag: std::path::PathBuf,
+        /// Also write the report as JSON to this path.
+        #[arg(long, value_name = "PATH")]
+        report: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        opts: IngestArgs,
+    },
+    /// Write a frozen `.tft` index (`docs/PHASE5.md` §2), from a live arena or
+    /// from a recording.
+    ///
+    /// Exactly one source is required. Neither is implied: a `freeze` that
+    /// silently meant "live" would have had to change meaning when `--from-bag`
+    /// landed, which is why `--from-live` was a required flag before there was
+    /// anything to disambiguate it from.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     Freeze {
         /// Freeze the arena named by the global attach flags.
-        #[arg(long, required = true)]
+        #[arg(long, conflicts_with = "from_bag")]
         from_live: bool,
+        /// Ingest this `.mcap` recording and freeze the result (§3).
+        #[arg(long, value_name = "PATH", conflicts_with = "from_live")]
+        from_bag: Option<std::path::PathBuf>,
         /// Destination path. Overwritten if it exists.
         #[arg(long, short)]
         out: std::path::PathBuf,
+        /// Where to write the ingest report. Defaults to `<out>.ingest.json`
+        /// for `--from-bag`; ignored for `--from-live`, which has no recording
+        /// to report on.
+        #[arg(long, value_name = "PATH")]
+        report: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        ingest: IngestArgs,
     },
     /// Obtain, validate or explain a bridge topology file (`docs/PHASE4.md` §5.8).
     ///
@@ -275,6 +307,7 @@ pub fn run() -> Result<()> {
             color,
         } => cmd_top(live, interval, iterations, edge, color.forced()),
         Command::Bench { gate } => cmd_bench(gate),
+        Command::Ingest { bag, report, opts } => cmd_ingest(&bag, report.as_deref(), &opts),
         Command::Topology {
             discover,
             config,
@@ -301,9 +334,145 @@ pub fn run() -> Result<()> {
             )),
         },
         #[cfg(all(feature = "shm", target_os = "linux"))]
-        Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
+        Command::Freeze {
+            from_live,
+            from_bag,
+            out,
+            report,
+            ingest,
+        } => cmd_freeze(
+            live,
+            from_live,
+            from_bag.as_deref(),
+            &out,
+            report.as_deref(),
+            &ingest,
+        ),
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Participants => cmd_participants(live),
+    }
+}
+
+/// The knobs `docs/PHASE5.md` §3 puts on an ingest.
+///
+/// Shared by `ingest` and `freeze --from-bag` through `#[command(flatten)]`
+/// rather than duplicated: the two commands run the identical two passes, and
+/// two copies of seven flags is two chances for a default to drift between the
+/// command that previews a recording and the command that keeps it.
+#[derive(clap::Args, Clone, Debug)]
+pub struct IngestArgs {
+    /// Peak buffered-sample memory for pass two, in MiB (§3.1).
+    #[arg(long, value_name = "MIB", default_value_t = 4096)]
+    pub max_memory: u64,
+    /// What to do when the recording's clock jumps backwards (§3.2).
+    #[arg(long, value_enum, default_value_t = ClockResetArg::Halt)]
+    pub on_clock_reset: ClockResetArg,
+    /// Treat this topic as carrying static transforms. Repeatable.
+    ///
+    /// Without it the rule is "the last path segment is `tf_static`", which
+    /// covers `/tf_static` and `/robot1/tf_static`. Passing this **replaces**
+    /// that classification rule rather than adding to it, and does **not**
+    /// narrow which topics are read — `--tf-topic` is the flag that does that.
+    #[arg(long, value_name = "TOPIC")]
+    pub static_topic: Vec<String>,
+    /// Read only this topic's dynamic transforms. Repeatable.
+    ///
+    /// This is the only flag that narrows the read; without it every channel
+    /// carrying the TF schema is ingested, remapped ones included (§3.3).
+    #[arg(long, value_name = "TOPIC")]
+    pub tf_topic: Vec<String>,
+    /// Prefix every frame name, as a `tf_prefix` would (`docs/PHASE4.md` §5.6).
+    #[arg(long, value_name = "PREFIX")]
+    pub tf_prefix: Option<String>,
+    /// How far ahead of its own recorded time a stamp may be before it is
+    /// reported, in seconds (§3.2).
+    #[arg(long, value_name = "SECONDS", default_value_t = 10.0)]
+    pub future_horizon: f64,
+    /// How far backwards a stamp must jump to count as a clock reset rather
+    /// than ordinary interleaving, in milliseconds.
+    #[arg(long, value_name = "MILLIS", default_value_t = 100)]
+    pub clock_reset_threshold: u64,
+}
+
+/// `--on-clock-reset`, as §3.2 spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ClockResetArg {
+    /// Stop and name the timestamp.
+    Halt,
+    /// §3.2's multi-file split, which is **not implemented** — the value exists
+    /// so the tool can say so with a reason. Rejecting the spelling outright
+    /// would leave a user reading §3.2 unable to tell whether they had the name
+    /// wrong or the feature missing.
+    Split,
+}
+
+impl IngestArgs {
+    /// Convert to the library's options, failing on a value that cannot be
+    /// represented.
+    fn to_options(&self) -> Result<tf_tree_ingest::IngestOptions> {
+        let horizon = self.future_horizon * 1e9;
+        anyhow::ensure!(
+            horizon.is_finite() && (0.0..=9.2e18).contains(&horizon),
+            "--future-horizon {} is not a usable number of seconds",
+            self.future_horizon
+        );
+        Ok(tf_tree_ingest::IngestOptions {
+            roles: tf_tree_ingest::TopicRoles {
+                static_topics: self.static_topic.clone(),
+                dynamic_topics: self.tf_topic.clone(),
+            },
+            max_memory_bytes: self.max_memory.saturating_mul(1024 * 1024),
+            on_clock_reset: match self.on_clock_reset {
+                ClockResetArg::Halt => tf_tree_ingest::ClockResetPolicy::Halt,
+                ClockResetArg::Split => tf_tree_ingest::ClockResetPolicy::Split,
+            },
+            clock_reset_threshold_ns: i64::try_from(self.clock_reset_threshold)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000),
+            future_horizon_ns: horizon as i64,
+            tf_prefix: self.tf_prefix.clone(),
+        })
+    }
+}
+
+/// `tf_tree ingest --bag` — the two passes, and the §3.2 report.
+fn cmd_ingest(
+    bag: &std::path::Path,
+    report: Option<&std::path::Path>,
+    args: &IngestArgs,
+) -> Result<()> {
+    let opts = args.to_options()?;
+    let mut frames = tf_tree_ingest::Frames::default();
+    let out = tf_tree_ingest::run(bag, &opts, &mut frames).map_err(|e| ingest_err(e, &frames))?;
+    print!("{}", out.report.summary());
+    if let Some(path) = report {
+        std::fs::write(path, out.report.to_json())
+            .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+        println!("  report written to {}", path.display());
+    }
+    Ok(())
+}
+
+/// Render an ingest failure with the frame names it names by index, and attach
+/// the one remedy that is not obvious from the message.
+///
+/// `IngestError` is `Copy` and `String`-free by house rule, so it cannot carry a
+/// frame name or a suggested command; both are joined on here, at the only layer
+/// that has a terminal to print to.
+fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -> anyhow::Error {
+    let text = tf_tree_ingest::describe(e, frames).to_string();
+    match e {
+        tf_tree_ingest::IngestError::CompressedChunk => anyhow::anyhow!(
+            "{text}\n\
+             \x20 this build has no zstd or lz4 (they vendor a C build step, which\n\
+             \x20 docs/PHASE2.md §2 forbids). Rewrite the recording uncompressed:\n\
+             \x20   mcap compress --compression none <in.mcap> -o <out.mcap>"
+        ),
+        tf_tree_ingest::IngestError::ClockResetSplitUnsupported => anyhow::anyhow!(
+            "{text}\n\
+             \x20 docs/PHASE5.md §0.0 records --on-clock-reset=split as not implemented."
+        ),
+        _ => anyhow::anyhow!("{text}"),
     }
 }
 
@@ -802,14 +971,28 @@ fn hex16(bytes: [u8; 16]) -> String {
 /// instant will eventually be surprised by a `SlotContended` in an offline
 /// query and have nothing to attribute it to.
 ///
-/// `source_digest` is all-zero: a live arena is not a recording and has no
-/// content hash to name. §3's `--from-bag` fills it.
+/// `source_digest` is all-zero for `--from-live`: a live arena is not a
+/// recording and has no content hash to name. `--from-bag` fills it with BLAKE3
+/// of the recording (§2.3).
 #[cfg(all(feature = "shm", target_os = "linux"))]
-fn cmd_freeze(live: Live<'_>, from_live: bool, out: &std::path::Path) -> Result<()> {
-    // `required = true` on the flag makes this unreachable through `clap`; it is
-    // here so the invariant is stated where the code depends on it rather than
-    // in an attribute two hundred lines away.
-    anyhow::ensure!(from_live, "`freeze` needs a source; pass `--from-live`");
+fn cmd_freeze(
+    live: Live<'_>,
+    from_live: bool,
+    from_bag: Option<&std::path::Path>,
+    out: &std::path::Path,
+    report: Option<&std::path::Path>,
+    ingest: &IngestArgs,
+) -> Result<()> {
+    if let Some(bag) = from_bag {
+        return cmd_freeze_bag(bag, out, report, ingest);
+    }
+    // `conflicts_with` makes the two flags mutually exclusive but not mutually
+    // *required*, so "neither" reaches here and is stated where the code depends
+    // on it rather than in an attribute two hundred lines away.
+    anyhow::ensure!(
+        from_live,
+        "`freeze` needs a source; pass `--from-live` or `--from-bag <PATH>`"
+    );
     let tree = live.open()?;
     // `as i64` would wrap silently once `as_nanos` passes 2^63 (2262-04-11) and
     // hand the header a negative "created" stamp that reads as 1901. Saturating
@@ -838,6 +1021,57 @@ fn cmd_freeze(live: Live<'_>, from_live: bool, out: &std::path::Path) -> Result<
         header.manifest_off
     );
     println!("  snapshot is not atomic: publishers were free to write during the copy");
+    Ok(())
+}
+
+/// `tf_tree freeze --from-bag` — `docs/PHASE5.md` §3 into §2's container.
+///
+/// # Why this one *is* an atomic snapshot and `--from-live` is not
+///
+/// The tree is built in this process from a file nobody else is writing, so
+/// there is no publisher to race and no smear. That is the difference worth
+/// stating: a `.tft` frozen from a recording is exactly the recording, and a
+/// `.tft` frozen from a live arena is a best effort.
+///
+/// The report is written **alongside** the `.tft` by default, because §3.2 says
+/// it is a first-class output and a report that has to be asked for is a report
+/// nobody has when they need it. Its default name is derived rather than fixed
+/// so two `.tft` files in one directory do not overwrite each other's.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn cmd_freeze_bag(
+    bag: &std::path::Path,
+    out: &std::path::Path,
+    report: Option<&std::path::Path>,
+    args: &IngestArgs,
+) -> Result<()> {
+    let opts = args.to_options()?;
+    let mut frames = tf_tree_ingest::Frames::default();
+    let (ingested, header) = tf_tree_ingest::tft::freeze_bag(bag, out, &opts, &mut frames)
+        .map_err(|e| ingest_err(e, &frames))?;
+    print!("{}", ingested.report.summary());
+    println!(
+        "froze {} bytes of arena to {}",
+        header.arena_size,
+        out.display()
+    );
+    println!(
+        "  arena at file offset {} ({} MiB aligned), manifest {} bytes at {}",
+        header.arena_off,
+        tf_tree_arena_align_mib(),
+        header.manifest_len,
+        header.manifest_off
+    );
+    let report_path = match report {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let mut name = out.as_os_str().to_os_string();
+            name.push(".ingest.json");
+            std::path::PathBuf::from(name)
+        }
+    };
+    std::fs::write(&report_path, ingested.report.to_json())
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", report_path.display()))?;
+    println!("  ingest report written to {}", report_path.display());
     Ok(())
 }
 
@@ -981,5 +1215,57 @@ fn explain_format_version() {
         println!("added the diagnostic counter regions and reserved header space");
         println!("for Phase 6's covariance and spline regions, so that those land");
         println!("without a second break. A version-2 arena cannot be attached.");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// **The `CompressedChunk` remedy is this crate's headline mitigation for
+    /// `default-features = false` on `mcap`, and it is a bare string.**
+    ///
+    /// A zstd-compressed recording is what Foxglove writes by default and what
+    /// `rosbag2` writes with `compression_mode` set, so it is the first thing
+    /// many users will meet. It cannot be reached from an end-to-end test — this
+    /// build has no codecs, so it cannot *write* a compressed fixture to feed
+    /// itself — which is exactly why deleting the whole message was invisible.
+    /// Asserting on `ingest_err` is the only level at which it is reachable.
+    ///
+    /// Mutant: delete the `CompressedChunk` arm, leaving the `_` fallthrough —
+    /// applied, and this failed with only the generic "uses compressed chunks"
+    /// line and no command.
+    #[test]
+    fn the_compressed_chunk_error_carries_the_command_that_fixes_it() {
+        let frames = tf_tree_ingest::Frames::default();
+        let text = ingest_err(tf_tree_ingest::IngestError::CompressedChunk, &frames).to_string();
+        assert!(
+            text.contains("mcap compress --compression none"),
+            "the remedy must be a literal command a user can paste: {text}"
+        );
+        assert!(
+            text.contains("PHASE2"),
+            "and it must say why this build cannot simply decompress: {text}"
+        );
+    }
+
+    /// The `split` refusal cites the section that records it as unbuilt, so a
+    /// user can tell a missing feature from a typo.
+    ///
+    /// Mutant: replace the `ClockResetSplitUnsupported` arm with the bare
+    /// `{text}` — applied, and the `PHASE5` assertion failed.
+    #[test]
+    fn the_split_refusal_cites_the_section_that_records_it() {
+        let frames = tf_tree_ingest::Frames::default();
+        let text = ingest_err(
+            tf_tree_ingest::IngestError::ClockResetSplitUnsupported,
+            &frames,
+        )
+        .to_string();
+        assert!(
+            text.contains("not implemented") && text.contains("PHASE5"),
+            "{text}"
+        );
     }
 }

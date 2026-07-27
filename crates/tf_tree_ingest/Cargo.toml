@@ -1,0 +1,68 @@
+[package]
+name = "tf_tree_ingest"
+description = "Bag ingestion for tf_tree: MCAP recordings to a live arena or a frozen .tft (docs/PHASE5.md §3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# **Not published while §3 is partial.** `docs/PHASE5.md` §3.3 names four
+# sources; this crate reads one of them (MCAP). A crate called
+# `tf_tree_ingest` on crates.io would advertise rosbag2-sqlite3 and
+# `freeze_from_arrays` that are not here. Publish when §3.3 is complete.
+publish = false
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Writing a `.tft` (`docs/PHASE5.md` §2) needs `tf_tree`'s frozen backend, which
+# is Linux-only and behind `shm` because it reuses the same mapping code. Ingest
+# into an in-process `Tree` needs none of that and is always available, which is
+# what keeps the two-pass logic under plain `cargo nextest run --workspace`.
+shm = ["tf_tree/shm", "dep:blake3"]
+# The synthetic MCAP fixture writer. **Off by default**: it is test scaffolding,
+# not a product surface, and it fabricates recordings — a name a user could
+# reach for by accident is a name they will eventually mistake for real data.
+fixture = []
+
+[dependencies]
+tf_tree.workspace = true
+tf_tree_bridge.workspace = true
+# **`default-features = false` is load-bearing and is `docs/PHASE5.md` §0.0's
+# decisive constraint.** The crate's defaults are `[zstd, lz4]`, which vendor C
+# through `zstd-sys`/`lz4-sys` and violate `docs/PHASE2.md` §2's no-C-build-step
+# rule. The cost is real and is surfaced rather than hidden: a chunk compressed
+# with either codec fails as `IngestError::CompressedChunk`, which names the
+# `mcap` CLI command that rewrites the file uncompressed.
+mcap = { version = "0.25", default-features = false }
+thiserror.workspace = true
+# `docs/PHASE5.md` §2.3's `source_digest`, which is specified as BLAKE3 of the
+# source recording. Already in the lock file via `tf_tree_core`, so it costs
+# nothing new; `default-features = false` keeps it consistent with that use.
+blake3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Self-reference so the fixture writer is compiled for this crate's own tests
+# without being part of what the crate ships. Cargo unifies the two views of the
+# package, so the lib is built once, with `fixture` on, for the test profile.
+tf_tree_ingest = { path = ".", features = ["fixture"] }
+# `tests/frozen_bag.rs` recomputes §2.3's `source_digest` independently of the
+# code that wrote it, so the assertion is not the implementation compared with
+# itself.
+blake3 = { workspace = true }
+
+# The `.tft` half needs the frozen backend, which is Linux-only and behind
+# `shm`. Declared so `cargo nextest run --workspace` (no features) does not try
+# to build it and `just shm-check` does.
+[[test]]
+name = "frozen_bag"
+required-features = ["shm"]

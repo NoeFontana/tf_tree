@@ -19,7 +19,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 |---|---|
 | §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
 | §2 Frozen arena (`.tft`) | **Done.** `tf_tree_arena::frozen` writes and maps the container; `Tree::open_frozen`/`Tree::freeze_to` and `tf_tree freeze --from-live` are wired. §2.1's bit-for-bit claim is **tested and holds** (`crates/tf_tree/tests/frozen.rs`). Two amendments below: the container header's size, and the one-sided per-edge span. |
-| §3 Bag ingestion | Not implemented |
+| §3 Bag ingestion | **Partly done — MCAP only.** `tf_tree_ingest` is a new workspace member; §3's opening note rules out `tf_tree_core`/`tf_tree_arena`, and it is not in `tf_tree_cli` because §4's offline Python API needs the same logic and cannot depend on a binary crate. §3.1's two passes, §3.3's MCAP source (schema-based discovery, so remapped topics are found) and every §3.2 row are implemented and gated by `cargo nextest run --workspace`. `tf_tree ingest --bag` needs no features; `tf_tree freeze --from-bag` needs `shm` (the frozen backend does) and is gated by `just shm-check`. **Four things are not done and are not silently approximated:** `--on-clock-reset=split` is refused with a reason rather than producing one file; §3.1's spill-to-run-file is replaced by re-reading the recording once per edge group (the one case it cannot serve — a single edge over the whole cap — is a named error); §3.3's rosbag2-sqlite3 source and `freeze_from_arrays` are absent. **`--max-memory` bounds pass two's sort buffers and *not* the arena**, which is the larger of the two at a measured 78 B/sample against the buffers' 64 — the arena is the output and cannot be capped. `ingest::fill` carries the table and `tests/memory.rs` asserts it; an earlier revision claimed "peak memory is the cap either way", which was false. **§0.0's `default-features = false` on `mcap` has a visible cost:** a zstd- or lz4-compressed recording fails as `CompressedChunk`, and the CLI prints the `mcap compress --compression none` command that fixes it. **A truncated recording is read up to the cut** and reported as truncated rather than refused — a SIGKILLed recorder is how bags in the field end. **Three amendments below**: declaration order is canonical, the reset threshold is not the bridge's question, and the reset *guard* is per edge. |
 | §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 52 passed) and `just py-test-freethreaded` (3.14t, 54 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
@@ -343,6 +343,61 @@ Memory: buffer per edge, sort, drain. Peak is roughly the dataset size (~233 MB 
 | Edge kind changes mid-recording | Hard error naming the timestamp. |
 
 The ingest report is a first-class output, not log noise: emit it as JSON alongside the `.tft` and summarize it to the terminal. **For many users the ingest report will be the first thing `tf_tree` ever tells them about their data, and it should be worth reading.**
+
+> **Amendment — frames and edges are declared in canonical order, not
+> first-seen order, and §11 is the reason.**
+>
+> §11 requires that shuffling a recording's messages produce an identical
+> result. Declaring frames and edges as they are first encountered **cannot**
+> satisfy that: ids are assigned in declaration order, so two ingests of the same
+> transforms in a different order produce arenas whose `FrameId`s and `EdgeId`s —
+> and therefore whose ring offsets, topology block and
+> `LookupError::Extrapolation { edge }` — disagree. The values matched; the
+> identities did not, and the shuffle test found it on the first run.
+>
+> Declaration is therefore sorted by name. The arena becomes a pure function of
+> the recording's *content*, and the ingest report becomes diffable between runs,
+> which is worth having on its own.
+
+> **Amendment — the clock-reset threshold answers a different question offline
+> than online, and a shuffled file is not a recording.**
+>
+> `tf_tree_bridge`'s `ClockGuard` is reused so a recording and a live system draw
+> the same line, but one rule is inverted: a backward stamp is **dropped online
+> and kept offline**. Online the ring cannot accept it (invariant 6); offline
+> §3.1 sorts, so discarding it would throw away exactly what the sort exists to
+> recover. Backward jumps below the threshold are counted as `out_of_order` and
+> kept.
+>
+> The threshold itself is only meaningful because a recording is written in log
+> order, so its stamp inversions are milliseconds. §11's shuffle test destroys
+> that property by construction and must raise the threshold to run at all —
+> which is a fact about the test, not a workaround: a default that admitted a
+> whole-recording inversion would miss every real reset.
+
+> **Amendment — the guard is per edge, and a merged `/tf` stream is not a
+> clock.**
+>
+> The paragraph above is right that the *threshold* is shared with the bridge and
+> wrong about the *scope*, and the first revision implemented the wrong one: one
+> `ClockGuard` over every edge on every topic. That halts at the defaults on the
+> most ordinary `/tf` topology there is. A localization node stamps `map -> odom`
+> at the scan it processed and publishes hundreds of milliseconds later, while
+> `odom -> base_link` is stamped as it is published; both are correct, and their
+> stamps interleave by the slower pipeline's latency, which is above the 100 ms
+> threshold. A recording of two robots on `/robot1/tf` and `/robot2/tf` — which
+> §3.3 explicitly asks be read — fails the same way, by however far their clocks
+> differ.
+>
+> There is no threshold that fixes this, because the quantity being measured is
+> not a clock jump: it is the difference between two publishers' latencies, and
+> it is unbounded. So the guard is **one per edge**. That is also the only
+> monotonicity with a meaning here — §3.1 sorts per edge, and Phase 1 invariant 6
+> is a per-edge rule — and it does not weaken the check it exists for: a bag loop
+> or a sim reset moves `/clock` itself, so every edge regresses at once.
+>
+> The error consequently **names the edge**. The old one could not, and said
+> "clock reset" about something that was not one.
 
 ### 3.3 Sources
 
