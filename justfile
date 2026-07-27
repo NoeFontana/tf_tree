@@ -395,6 +395,18 @@ shm-check:
     # This is the milestone's acceptance test: the shipped binary, through clap,
     # joining somebody else's tree.
     cargo nextest run -p tf_tree_cli --features shm --test attach
+    # **The frozen `.tft` arena (`docs/PHASE5.md` §2), which needs a real
+    # mapping and therefore `--features shm`.** Without these two lines the
+    # branch that introduced it had its centrepiece — §2.1's bit-for-bit proof
+    # that a frozen file is read by the identical `Plan::at` code as a live
+    # arena — running in **no gate at all**: `--workspace` builds without `shm`,
+    # and this recipe named every other shm target but not these.
+    #
+    # That is the same gap that let a real bug live in `tf_tree_py` across six
+    # PRs, and it is why a new shm-only target belongs here in the same commit
+    # that adds it.
+    cargo nextest run -p tf_tree_arena --features shm
+    cargo nextest run -p tf_tree --features shm --test frozen
     cargo nextest run -p tf_tree_ipc
 
 # The zero-config rendezvous end to end: a foreign process calls
