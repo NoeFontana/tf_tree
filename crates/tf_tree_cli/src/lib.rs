@@ -24,6 +24,8 @@ pub mod catalogue;
 pub mod checks;
 pub mod doctor;
 pub mod hostfacts;
+pub mod top;
+pub mod topology;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -44,6 +46,56 @@ struct Cli {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[command(flatten)]
     attach: attach::AttachArgs,
+}
+
+/// `--color` for `tf_tree top`.
+///
+/// Three states rather than a `bool`, because the useful default is neither:
+/// colour belongs on a terminal and must be absent from the file an operator
+/// pipes into a bug report, and `--color true` is not a spelling anyone reaches
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ColorChoice {
+    /// Colour if and only if stdout is a terminal.
+    Auto,
+    /// Always emit colour, even into a pipe.
+    Always,
+    /// Never emit colour.
+    Never,
+}
+
+impl ColorChoice {
+    /// `None` means "decide from the terminal".
+    fn forced(self) -> Option<bool> {
+        match self {
+            ColorChoice::Auto => None,
+            ColorChoice::Always => Some(true),
+            ColorChoice::Never => Some(false),
+        }
+    }
+}
+
+/// `--interp` as a flag value.
+///
+/// A separate enum rather than deriving on `tf_tree::InterpPolicy`: the facade
+/// is `#![forbid(unsafe_code)]` and dependency-disciplined, and giving it a
+/// `clap` derive would put a CLI argument parser in the dependency tree of
+/// every library that links the engine.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum InterpArg {
+    /// Screw-linear interpolation — the default.
+    Sclerp,
+    /// Separate lerp of translation and slerp of rotation.
+    Lerpslerp,
+}
+
+impl InterpArg {
+    fn policy(self) -> tf_tree::InterpPolicy {
+        match self {
+            InterpArg::Sclerp => tf_tree::InterpPolicy::ScLerp,
+            InterpArg::Lerpslerp => tf_tree::InterpPolicy::LerpSlerp,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -93,6 +145,32 @@ enum Command {
         #[arg(long, value_name = "TFTNNN")]
         suppress: Vec<String>,
     },
+    /// Live view of an arena: rates, staleness, claims, participants, feed.
+    ///
+    /// `docs/PHASE5.md` §7. Read-only, always — see [`top`] for why there is no
+    /// `ratatui` here and what that costs.
+    Top {
+        /// Redraw interval in milliseconds.
+        #[arg(long, default_value_t = 1000, value_name = "MS")]
+        interval: u64,
+        /// Stop after this many frames; `0` runs until interrupted.
+        ///
+        /// Not only a test affordance: `tf_tree top --iterations 1 > frame.txt`
+        /// is how an operator attaches a snapshot of a live arena to a bug
+        /// report, and it is why the non-tty path emits no escape sequences.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        iterations: u64,
+        /// Show the per-edge detail pane, with the inter-arrival histogram.
+        ///
+        /// Takes an edge id or a substring of its `parent->child` label. A flag
+        /// rather than a cursor because there is no raw-mode key handling
+        /// without a `libc` dependency this crate does not have.
+        #[arg(long, value_name = "ID|NAME")]
+        edge: Option<String>,
+        /// `auto` (the default) follows whether stdout is a tty.
+        #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+        color: ColorChoice,
+    },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
         /// Fail the process if the runnable gate checks do not pass.
@@ -113,6 +191,41 @@ enum Command {
         /// Destination path. Overwritten if it exists.
         #[arg(long, short)]
         out: std::path::PathBuf,
+    },
+    /// Obtain, validate or explain a bridge topology file (`docs/PHASE4.md` §5.8).
+    ///
+    /// The engine has no runtime edge declaration, so the ingest bridge is told
+    /// its topology up front. `--discover` is how an operator obtains that file
+    /// from a robot; `--config` is the pre-flight that fails on a laptop rather
+    /// than at bridge startup.
+    Topology {
+        /// Read a recorded `/tf` stream and print the config it implies.
+        #[arg(long, value_name = "FILE.tfstream", conflicts_with = "config")]
+        discover: Option<std::path::PathBuf>,
+        /// Parse a topology file, build the arena it describes, and print it.
+        #[arg(long, value_name = "FILE.toml")]
+        config: Option<std::path::PathBuf>,
+        /// Write the discovered config here instead of to stdout.
+        #[arg(long, short, requires = "discover")]
+        out: Option<std::path::PathBuf>,
+        /// Seconds of history the discovered rings should retain.
+        #[arg(long, default_value_t = 10.0, requires = "discover")]
+        history_secs: f64,
+        /// Prefix every discovered frame with this `tf_prefix` (§5.6).
+        ///
+        /// Use it when the bridge that will read this file runs with the same
+        /// prefix: a config keyed on the unprefixed names declares every edge
+        /// and matches none.
+        #[arg(long, value_name = "PREFIX", requires = "discover")]
+        tf_prefix: Option<String>,
+        /// Interpolation policy the discovered file should default to.
+        #[arg(long, value_enum, requires = "discover")]
+        interp: Option<InterpArg>,
+        /// Check the file's per-edge time domains against the bridge's (§5.5).
+        ///
+        /// The startup refusal a bridge would perform, performed on a laptop.
+        #[arg(long, value_name = "N", requires = "config")]
+        domain: Option<u8>,
     },
     /// List the processes attached to an arena, from the lock file alone.
     ///
@@ -155,7 +268,38 @@ pub fn run() -> Result<()> {
                 cmd_doctor(live, json, exit_code, &suppress)
             }
         }
+        Command::Top {
+            interval,
+            iterations,
+            edge,
+            color,
+        } => cmd_top(live, interval, iterations, edge, color.forced()),
         Command::Bench { gate } => cmd_bench(gate),
+        Command::Topology {
+            discover,
+            config,
+            out,
+            history_secs,
+            tf_prefix,
+            interp,
+            domain,
+        } => match (discover, config) {
+            (Some(src), _) => topology::cmd_discover(
+                &src,
+                out.as_deref(),
+                history_secs,
+                tf_prefix.as_deref(),
+                interp.map(InterpArg::policy),
+            ),
+            (None, Some(cfg)) => topology::cmd_check(&cfg, domain),
+            // clap cannot express "one of these two" without a group, and a
+            // group's error message names the flags without saying what the
+            // command is for. This one does.
+            (None, None) => Err(anyhow::anyhow!(
+                "give --discover <file.tfstream> to obtain a topology file, \
+                 or --config <file.toml> to check one"
+            )),
+        },
         #[cfg(all(feature = "shm", target_os = "linux"))]
         Command::Freeze { from_live, out } => cmd_freeze(live, from_live, &out),
         #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -471,7 +615,10 @@ fn evidence_notes(live: bool) -> Vec<String> {
 ///
 /// Saturates rather than panicking on a clock before 1970: `doctor` reporting a
 /// bad clock is useful, `doctor` aborting because of one is not.
-fn unix_nanos_now() -> i64 {
+///
+/// `pub(crate)` because `top` needs the same value for the same reason:
+/// `checks::Clock::decide` votes the arena's stamps against it.
+pub(crate) fn unix_nanos_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
@@ -497,6 +644,105 @@ fn instance_uuid(tree: &Tree, src: &Source) -> Option<String> {
         return Some(hex16(tree.instance_uuid()));
     }
     None
+}
+
+/// `tf_tree top` — `docs/PHASE5.md` §7's live view.
+///
+/// # `--rw` is refused, not ignored
+///
+/// The attach flags are global, so `tf_tree --rw top` parses. A read-write
+/// mapping is exactly what D18 exists to keep away from a diagnostic tool, and
+/// a live view is the tool most likely to be left running unattended on a
+/// robot. Silently downgrading would be friendlier and worse: the operator would
+/// believe they had asked for something and got it. Refusing states the rule
+/// once, where it is violated.
+fn cmd_top(
+    live: Live<'_>,
+    interval_ms: u64,
+    iterations: u64,
+    edge: Option<String>,
+    color: Option<bool>,
+) -> Result<()> {
+    // A floor rather than a clamp: `--interval 0` is a request to spin a core
+    // reading a robot's arena as fast as it can, which is the one way this tool
+    // *can* perturb what it observes (cache-line traffic on every ring head).
+    // Answering "no" is more useful than quietly doing something else.
+    anyhow::ensure!(
+        interval_ms >= 50,
+        "--interval {interval_ms} is below the 50 ms floor: a faster redraw perturbs the arena it \
+         is reading and cannot be read by a human anyway"
+    );
+
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    anyhow::ensure!(
+        !live.rw,
+        "`top` is a read-only observer (D18) and refuses --rw; drop the flag"
+    );
+
+    let (tree, src) = source(live)?;
+
+    // The lock file is what makes read-only participants visible at all: they
+    // hold a byte and write no arena record, so without this the participant
+    // pane would list only the writers — and `top` itself would be invisible in
+    // its own output.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    let merge: Box<dyn Fn(&mut top::Capture)> = if live.attach {
+        match live
+            .rendezvous()
+            .ok()
+            .filter(|rv| rv.lock_path().exists())
+            .and_then(|rv| tf_tree_ipc::LockFile::open(rv.lock_path()).ok())
+        {
+            // Not an error: the arena mapped, so there is something to watch.
+            // A missing or unreadable lock file costs the `mode`/`comm` columns
+            // and the read-only rows, and the pane's `record` column already
+            // says which rows came from where.
+            None => Box::new(|_: &mut top::Capture| {}),
+            Some(lock) => Box::new(move |cap: &mut top::Capture| {
+                let mut rows = Vec::new();
+                for slot in 0..tf_tree_ipc::MAX_PARTICIPANTS {
+                    let held = lock
+                        .probe_participant(slot)
+                        .map(|p| p.held)
+                        .unwrap_or(false);
+                    let id = lock.read_identity(slot).ok().flatten();
+                    if !held && id.is_none() {
+                        continue;
+                    }
+                    let (pid, mode, comm) = match id {
+                        None => (0, "?", String::new()),
+                        Some(i) => (
+                            i.pid,
+                            match i.mode {
+                                tf_tree_ipc::AccessMode::ReadOnly => "ro",
+                                tf_tree_ipc::AccessMode::ReadWrite => "rw",
+                            },
+                            {
+                                let n = i.name.iter().position(|b| *b == 0).unwrap_or(i.name.len());
+                                String::from_utf8_lossy(&i.name[..n]).into_owned()
+                            },
+                        ),
+                    };
+                    rows.push((slot, pid, mode, comm, held));
+                }
+                cap.merge_lock_rows(&rows);
+            }),
+        }
+    } else {
+        Box::new(|_: &mut top::Capture| {})
+    };
+    #[cfg(not(all(feature = "shm", target_os = "linux")))]
+    let merge: Box<dyn Fn(&mut top::Capture)> = Box::new(|_: &mut top::Capture| {});
+
+    top::run(
+        tree,
+        src.banner(),
+        core::time::Duration::from_millis(interval_ms),
+        iterations,
+        edge,
+        color,
+        &*merge,
+    )
 }
 
 /// `tf_tree bench [--gate]`.

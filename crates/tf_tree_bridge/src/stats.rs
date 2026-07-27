@@ -20,6 +20,17 @@ pub struct BridgeStats {
     pub transforms: u64,
     /// Transforms written into the arena.
     pub applied: u64,
+    /// `/tf_static` transforms that **matched the config's declared constant**
+    /// and were therefore not written (§5.7 idempotent, §5.8 verification).
+    ///
+    /// Its own bucket rather than a share of `applied`, because it is not one:
+    /// the value was in the arena before the bridge started, put there by
+    /// `TopologyConfig::builder`, and the message only confirmed it. Counting
+    /// it as applied made `applied` grow every time a late joiner caused the
+    /// transient-local latched set to be re-delivered — an operator watching
+    /// `applied` on a robot with no dynamic edges would have seen a healthy
+    /// write rate for an arena nothing was writing to.
+    pub static_verified: u64,
     /// Dropped because another publisher owns the edge (§5.4).
     pub dropped_authority: u64,
     /// Dropped because the stamp went backwards by less than the reset
@@ -29,6 +40,16 @@ pub struct BridgeStats {
     pub dropped_bad_name: u64,
     /// Dropped because the edge kind would have changed (§5.7).
     pub dropped_kind_change: u64,
+    /// Dropped because the topology config does not declare the edge (§5.8).
+    ///
+    /// **The counter an operator looks at first after a config change.** The
+    /// engine has no runtime edge declaration (§5.8's amendment), so a
+    /// transform for an edge the file forgot has nowhere to go: it is dropped
+    /// silently as far as ROS is concerned, and the only symptom downstream is
+    /// a lookup that returns `NoPath`. A non-zero value here turns that into
+    /// "the robot publishes three edges your config does not list", which is a
+    /// question with an answer.
+    pub dropped_undeclared: u64,
     /// Clock resets detected (§5.5).
     pub clock_resets: u64,
     /// Static-transform value conflicts (§5.7).
@@ -55,10 +76,12 @@ impl BridgeStats {
     #[must_use]
     pub fn balanced(&self) -> bool {
         self.applied
+            + self.static_verified
             + self.dropped_authority
             + self.dropped_non_monotonic
             + self.dropped_bad_name
             + self.dropped_kind_change
+            + self.dropped_undeclared
             == self.transforms
     }
 
@@ -84,6 +107,20 @@ mod tests {
             dropped_authority: 2,
             dropped_non_monotonic: 1,
             dropped_bad_name: 1,
+            ..BridgeStats::default()
+        };
+        assert!(s.balanced());
+
+        // …and an undeclared edge is one of the buckets, not a leak. Dropping
+        // `dropped_undeclared` from `balanced()` makes this pass while the
+        // ledger is short by one, which is the shape the check exists to catch.
+        let s = BridgeStats {
+            transforms: 11,
+            applied: 6,
+            dropped_authority: 2,
+            dropped_non_monotonic: 1,
+            dropped_bad_name: 1,
+            dropped_undeclared: 1,
             ..BridgeStats::default()
         };
         assert!(s.balanced());

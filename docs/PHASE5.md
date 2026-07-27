@@ -23,7 +23,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 52 passed) and `just py-test-freethreaded` (3.14t, 54 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
-| §7 `tf_tree top` | Not implemented |
+| §7 `tf_tree top` | **Partly done.** `tf_tree top` exists, attaches read-only and *refuses* `--rw`, and renders all four panes §7 names: per-edge kind/rate/staleness/occupancy/writer, the participant list (arena record ∪ lock-file byte, so read-only participants appear at all), a rolling feed derived from counter deltas, and a per-edge detail view with an inter-arrival histogram. **Built with plain ANSI, not `ratatui` — see the amendment below.** **Not done:** the `--web` view, which is §7's other half. |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
 | §9 Benchmark artifact | **Partial.** `just bench-report` emits `report/{results.json,index.html}` with the §9.3 provenance header, all eight §9.2 rows, and all four §9.3 "where we are worse" entries; `Report::validate` makes the honesty rules structural — the tool refuses to write a report that over-claims, rather than relying on whoever wrote it. On this host every comparison row is `UNAVAILABLE` with its own reason, which is §9.3's prescribed output, not a gap in the tool. **Not done:** §9.1's container image, the public sample recording, `tf_tree bench compare`'s CLI spelling (it takes `--bag`, which is §3), and §12 gate 7 (reproducing a committed `results.json` on a clean machine). |
 | §10 Open-source readiness | **Partial.** Name decision made, measured and recorded ([`0008`](./decisions/0008-the-name-tf-tree.md)): `tf_tree` is free on the crates.io sparse index and on PyPI, and is kept. `LICENSE-MIT`/`LICENSE-APACHE`, `NOTICE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` (real address, and an explicit in-scope/out-of-scope boundary around §3.10's trust model) and `SUPPORT.md` (response expectations, platform support, MSRV policy) are in place; `README.md` is rebuilt against the §0.0 tables. **The MSRV was measured and was wrong:** `rust-version = "1.83"` could not build — `blake3` pulls `constant_time_eq 0.4.2`, edition 2024 — so the floor is now **1.85**, with a CI job that reads it from the manifest and builds `--locked` on exactly it. Every `publish = false` crate now states its reason in its own manifest. **Not done:** the mdBook site, SBOM per release, release automation (`cargo-dist`, PEP 740 attestations, signed tags), the ASan/UBSan/TSan and nightly-`shm_torture` CI jobs, and the benchmark artifact as a regression gate. |
@@ -647,6 +647,69 @@ TUI panes: topology with per-edge rate/staleness/occupancy and writer identity; 
 **NORMATIVE constraints on the web view:** a single embedded HTML file plus one JSON endpoint, no build step, no npm, no CDN. Charts in hand-written SVG. The moment this needs a frontend toolchain it becomes a maintenance liability that outlives its usefulness, and a small-team infrastructure project cannot afford that.
 
 Bind to loopback by default. Serving robot state on `0.0.0.0` by default would be a security bug in someone's deployment.
+
+> **Amendment — `ratatui` is not used, and the reason is the same one §7 gives
+> for the web view.**
+>
+> This section forbids a frontend toolchain for the web half on the grounds that
+> a dependency which outlives its usefulness is a maintenance liability a small
+> team cannot afford. That argument does not stop at the browser. `ratatui`
+> plus `crossterm` is a transitive tail inside a workspace whose dependency
+> budget is a stated hard rule, carried so that four panes of fixed-width text
+> can be drawn — and the implementation draws them in about thirty lines of
+> `ESC[H` / `ESC[K` / `ESC[J`, in `crates/tf_tree_cli/src/top.rs`.
+>
+> **What that costs is real.** There is no key handling, because raw mode means
+> `termios`, which means `libc`, which is both a dependency and an `unsafe`
+> boundary `tf_tree_cli` does not have (`#![forbid(unsafe_code)]`). So the
+> per-edge detail view is selected with `--edge <id|name>` rather than by moving
+> a cursor, and there is no alternate screen — restoring one on `SIGINT` needs a
+> signal handler, and a `top` that wedges an operator's terminal on Ctrl-C is
+> worse than one that leaves its last frame in the scrollback. If interactive
+> selection is later judged worth a `libc` dependency, that is a decision
+> record, not a drive-by `cargo add`.
+>
+> **Two things §7 does not say, which the implementation had to decide:**
+>
+> * **Ages are against the reference clock `doctor` uses, decided the same
+>   way.** §0.0 already records that an arena's stamps need not share an epoch
+>   with the system clock — it is why `TFT005` skips on the reference fixture —
+>   so a staleness column computed unconditionally against `SystemTime::now()`
+>   reads as decades on a boot-relative arena. The reference is therefore
+>   `checks::Clock::decide`: a majority vote of the per-edge newest stamps
+>   against the host clock, falling back to the **median** newest stamp when the
+>   arena's stamps are in some other domain. Not the *maximum* — that hands the
+>   definition of "now" to the single worst publisher, so one
+>   nanoseconds-into-a-seconds-field overshoot makes every healthy edge read ~54
+>   years stale and the broken one read `0.0`. That failure is the one
+>   `checks.rs` was already fixed for, and `top` prints `Clock::label()` in its
+>   header so an operator can see that the two tools agreed on a reference. The
+>   same applies to a participant's `attached_at_nanos`, which is the *arena's*
+>   clock and routinely disagrees with the publishers' stamps; that column shows
+>   `epoch?` rather than a negative age.
+> * **The "observes without perturbing" claim is a test, not a sentence.**
+>   `top::tests::capturing_the_arena_moves_no_counter` reads a populated arena
+>   five times and asserts no edge counter moved, with a real lookup afterwards
+>   to show the counters it is watching are ones that move. The claim was prose
+>   for one revision, and a `tree.lookup` added to `Capture::from_tree` left
+>   every other test passing.
+> * **Frame names and lock-file `comm` are sanitized before they reach the
+>   terminal.** Frame names are arbitrary UTF-8 (`intern_core` validates only
+>   the hash) and `comm` is bytes another process wrote; both are interpolated
+>   into a full-screen ANSI frame. `catalogue::json_escape` already guards the
+>   JSON path against the same input — `top::sanitize` is the ANSI path's half,
+>   and it is also what keeps `--color never` producing escape-free text and
+>   `{:<30}` producing aligned columns.
+> * **The participant pane is the arena table ∪ the lock file.** A read-only
+>   participant writes no arena participant record — it cannot, its mapping is
+>   `PROT_READ` (D18) — so a pane built from the arena alone shows only the
+>   writers, and `top` would be missing from its own output. §5.6's amendment
+>   is the same fact from the counters' side.
+>
+> **Rates are observed and are never presented as a deviation.**
+> `nominal_rate_mhz` is always 0 (§0.0, `TFT007`), so `top` shows a
+> stamp-derived median rate and a wall-clock-derived head-advance rate side by
+> side and compares neither against a declared one.
 
 ---
 

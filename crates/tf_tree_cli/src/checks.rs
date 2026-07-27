@@ -80,7 +80,10 @@ const EXTRAP_HOTSPOT_RATE: f64 = 0.01;
 const GAP_FACTOR: i64 = 3;
 
 /// Occupancy above this fraction of a table's capacity fires `TFT015`.
-const OCCUPANCY_LIMIT: f64 = 0.80;
+///
+/// `pub(crate)` because `tf_tree top` colours the same row on the same rule; a
+/// second copy of the literal there disagreed with this one at exactly 80.0 %.
+pub(crate) const OCCUPANCY_LIMIT: f64 = 0.80;
 
 /// Where the reference clock for the time-based checks came from.
 ///
@@ -156,9 +159,16 @@ impl Clock {
     /// it, and a centre one edge can drag is a centre that check cannot use.
     #[must_use]
     pub fn decide(newest_stamps: &[i64], system_unix_nanos: i64) -> Clock {
+        // The distance is taken in `i128`. A stamp is arbitrary data an arbitrary
+        // publisher wrote — one near `i64::MIN` against a Unix `now` overflows
+        // `i64` on the subtraction, and `.abs()` overflows again on `i64::MIN`
+        // itself. Either is a panic inside `doctor` and inside `top`'s redraw
+        // loop, on exactly the corrupt stamp both tools exist to report.
+        let horizon = i128::from(ABSURD_HORIZON_NS);
+        let now = i128::from(system_unix_nanos);
         let agree = newest_stamps
             .iter()
-            .filter(|&&n| (n - system_unix_nanos).abs() <= ABSURD_HORIZON_NS)
+            .filter(|&&n| (i128::from(n) - now).abs() <= horizon)
             .count();
         // `>=` rather than `>`, and it also covers the empty arena: nothing has
         // disagreed with the system clock, so the system clock stands.
@@ -484,10 +494,14 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
         }
         for (what, stamp) in ends {
             let Some(s) = stamp else { continue };
-            if (s - now).abs() > ABSURD_HORIZON_NS {
+            // `i128`, like `Clock::decide`: the stamp is whatever a publisher
+            // wrote, and `s - now` for `s` near `i64::MIN` is a panic in the
+            // check written to report exactly that stamp.
+            let dist = (i128::from(s) - i128::from(now)).abs();
+            if dist > i128::from(ABSURD_HORIZON_NS) {
                 reasons.push(format!(
                     "{what} retained stamp {s} is {} days from the reference clock",
-                    (s - now).abs() / (24 * 3600 * 1_000_000_000)
+                    dist / i128::from(24 * 3600 * 1_000_000_000i64)
                 ));
             }
         }

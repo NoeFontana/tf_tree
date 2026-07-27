@@ -119,7 +119,7 @@ crates/
 ├── tf_tree_bridge/  the ROS-independent half of the /tf ingest bridge
 ├── tf_tree_py/      PyO3 bindings — binds the Rust core directly, not the C ABI
 ├── tf_tree_bench/   criterion benches, tf2 differential harness, the §9 report
-└── tf_tree_cli/     binary `tf_tree` (alias `tft`): tree / echo / doctor / participants / bench
+└── tf_tree_cli/     binary `tf_tree` (alias `tft`): tree / echo / doctor / top / participants / bench
 xtask/               loom, miri, and bench-gate runners
 docs/                PROJECT.md, PHASE1–5.md, benchmarks/, decisions/
 ```

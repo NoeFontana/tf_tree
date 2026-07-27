@@ -26,6 +26,8 @@
 //! could observe. The tolerance is what makes the diagnostic mean "your two
 //! URDFs disagree" rather than "your two URDFs were serialized differently".
 
+use crate::config::{EdgeShape, TopologyConfig};
+use crate::edgemap::{insert, lookup, ByEdge};
 use crate::Publisher;
 use std::collections::BTreeMap;
 
@@ -68,10 +70,17 @@ pub enum StaticVerdict {
 }
 
 /// Tracks declared edges and their static values.
+///
+/// The `(parent, child)` tables are [`ByEdge`] — nested, so the per-transform
+/// probes in [`Self::is_declared`] and [`Self::observe_dynamic`] allocate
+/// nothing. See `crate::edgemap` for the full argument.
 #[derive(Debug, Default)]
 pub struct StaticStore {
-    kinds: BTreeMap<(String, String), StaticKind>,
-    values: BTreeMap<(String, String), ([f64; 7], Publisher)>,
+    kinds: ByEdge<StaticKind>,
+    values: ByEdge<([f64; 7], Publisher)>,
+    /// Conflicts already reported per edge. Left flat: it is touched only when
+    /// two publishers actually disagree about a static, which is a fault
+    /// condition and not a rate.
     reported: BTreeMap<(String, String), u64>,
     conflicts: u64,
 }
@@ -86,6 +95,44 @@ impl StaticStore {
         StaticStore::default()
     }
 
+    /// A store pre-loaded with a topology config's declarations.
+    ///
+    /// This is what `docs/PHASE4.md` §5.8's amendment means by *"reinterpreted
+    /// as verify against the declared constant"*. Every static edge's value is
+    /// on file **before** any message arrives, owned by
+    /// [`Publisher::Declared`], so an arriving `/tf_static` runs the same
+    /// [`Self::observe_static`] it always did and lands in the same three
+    /// buckets — with the config as the incumbent. `/tf_static` handling
+    /// becomes §5.7's conflict machinery and nothing else, which is what that
+    /// machinery was for.
+    #[must_use]
+    pub fn seeded(config: &TopologyConfig) -> StaticStore {
+        let mut s = StaticStore::new();
+        for e in &config.edges {
+            let (parent, child) = e.key();
+            match e.shape {
+                EdgeShape::Static { pose } => {
+                    insert(&mut s.kinds, parent, child, StaticKind::Static);
+                    insert(&mut s.values, parent, child, (pose, Publisher::Declared));
+                }
+                EdgeShape::Dynamic { .. } => {
+                    insert(&mut s.kinds, parent, child, StaticKind::Dynamic);
+                }
+            }
+        }
+        s
+    }
+
+    /// Whether the topology declares this edge at all.
+    ///
+    /// A seeded store answers `false` for everything the config did not name,
+    /// which is what makes §5.8's *"a transform arriving for an undeclared edge
+    /// is dropped, counted and diagnosed"* a lookup rather than a second table.
+    #[must_use]
+    pub fn is_declared(&self, parent: &str, child: &str) -> bool {
+        lookup(&self.kinds, parent, child).is_some()
+    }
+
     /// Record that `(parent, child)` arrived on `/tf` — a dynamic edge.
     ///
     /// Returns `Err` with the declared kind if it was already static.
@@ -94,12 +141,12 @@ impl StaticStore {
     ///
     /// [`StaticKind::Static`] if the edge is already a static one.
     pub fn observe_dynamic(&mut self, parent: &str, child: &str) -> Result<(), StaticKind> {
-        let key = (parent.to_string(), child.to_string());
-        match self.kinds.get(&key) {
+        match lookup(&self.kinds, parent, child) {
             Some(StaticKind::Static) => Err(StaticKind::Static),
             Some(StaticKind::Dynamic) => Ok(()),
+            // The only allocating arm, and it runs once per edge ever.
             None => {
-                self.kinds.insert(key, StaticKind::Dynamic);
+                insert(&mut self.kinds, parent, child, StaticKind::Dynamic);
                 Ok(())
             }
         }
@@ -113,22 +160,25 @@ impl StaticStore {
         pose: [f64; 7],
         publisher: &Publisher,
     ) -> StaticVerdict {
-        let key = (parent.to_string(), child.to_string());
-        if let Some(StaticKind::Dynamic) = self.kinds.get(&key) {
+        if let Some(StaticKind::Dynamic) = lookup(&self.kinds, parent, child) {
             return StaticVerdict::KindChanged {
                 declared: StaticKind::Dynamic,
             };
         }
-        let Some((existing, owner)) = self.values.get(&key) else {
-            self.kinds.insert(key.clone(), StaticKind::Static);
-            self.values.insert(key, (pose, publisher.clone()));
+        let Some((existing, owner)) = lookup(&self.values, parent, child) else {
+            insert(&mut self.kinds, parent, child, StaticKind::Static);
+            insert(&mut self.values, parent, child, (pose, publisher.clone()));
             return StaticVerdict::Declare;
         };
         if same_pose(existing, &pose) {
             return StaticVerdict::Idempotent;
         }
         let (existing, owner) = (*existing, owner.clone());
-        let seen = self.reported.entry(key).or_insert(0);
+        // Only here does a key get built: this is the conflict path.
+        let seen = self
+            .reported
+            .entry((parent.to_string(), child.to_string()))
+            .or_insert(0);
         let first_time = *seen == 0;
         *seen += 1;
         self.conflicts += 1;
@@ -150,9 +200,7 @@ impl StaticStore {
     /// The declared kind of an edge, if any.
     #[must_use]
     pub fn kind_of(&self, parent: &str, child: &str) -> Option<StaticKind> {
-        self.kinds
-            .get(&(parent.to_string(), child.to_string()))
-            .copied()
+        lookup(&self.kinds, parent, child).copied()
     }
 }
 
