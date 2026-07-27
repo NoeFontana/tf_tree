@@ -15,11 +15,18 @@ name = "tf_tree_py"
 description = "PyO3 bindings for tf_tree (docs/PHASE3.md)"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+# Tracks the workspace floor by hand: this crate is outside the workspace (it
+# links libpython), so it cannot inherit `[workspace.package]`. See the note on
+# `rust-version` in the root `Cargo.toml` for why the number is 1.85.
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
 authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
+# The Rust crate is never published: it is the `_core` extension module, and the
+# artifact users install is the PyPI wheel built by maturin (`docs/PHASE3.md`
+# §10), not a crates.io entry. Publishing it would put a crate on crates.io that
+# fails to build anywhere libpython is not where PyO3 expects it.
 publish = false
 
 [lib]

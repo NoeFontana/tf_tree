@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# Workspace automation (`cargo xtask loom|miri|bench-gate|headers`). It exists to
+# be run from this checkout and has no meaning outside it.
 publish = false
 
 [lints]

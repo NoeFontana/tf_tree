@@ -1,0 +1,30 @@
+tf_tree
+Copyright 2025-2026 Noé Fontana
+
+This product is licensed under either of
+
+  * Apache License, Version 2.0 (see LICENSE-APACHE)
+  * MIT license (see LICENSE-MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+
+--------------------------------------------------------------------------------
+
+This file exists to satisfy Apache-2.0 section 4(d) for redistributors. It
+carries no third-party attributions of its own: `tf_tree` vendors no source and
+statically links no code it did not write. Its Rust dependencies are ordinary
+crates.io dependencies, each under its own licence, resolved at build time and
+enumerated in `Cargo.lock`; the set is constrained by `deny.toml` and checked by
+`cargo deny check`, which `just lint` runs.
+
+`tf_tree` is not affiliated with, endorsed by, or derived from the Open Source
+Robotics Foundation, ROS, or the `tf` / `tf2` packages. It is an independent
+implementation that solves the same problem; no ROS source is copied or linked
+into it. The optional `tf2` comparison harness (`crates/tf_tree_tf2_sys`, and
+`crates/tf_tree_bench` behind `--features tf2`) links against a ROS 2 install
+that the person running it provides, is excluded from the workspace, is not
+published, and is not part of any release artifact.

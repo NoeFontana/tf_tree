@@ -16,6 +16,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
 authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
+# The only edge in the repository that reaches ROS 2, and it links `libtf2`.
+# Excluded from the workspace for the same reason it is unpublishable: it builds
+# only where a ROS 2 install is present, so on crates.io it would fail for almost
+# everyone who tried it.
 publish = false
 # Declares the native library this crate links, which is what lets `build.rs`
 # publish metadata (`cargo:rpath=...`) to the build scripts of crates that

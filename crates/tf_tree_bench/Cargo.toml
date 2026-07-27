@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# Harness, not a library: fixtures, the tf2 differential, and the `docs/PHASE5.md`
+# §9 report. §9.3 requires the harness to live in this repository ("no private
+# benchmark"), which it does — but nobody `cargo add`s a benchmark harness, and
+# publishing one would drag `libc` and the ROS-adjacent optional dependency onto
+# crates.io for no consumer.
 publish = false
 
 [lints]

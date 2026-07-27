@@ -31,6 +31,46 @@ jobs:
         with:
           command: check
 
+  # **The MSRV floor, enforced rather than intended** (`SUPPORT.md`, and
+  # `docs/PHASE5.md` §10's "MSRV policy and a CI matrix pinning it").
+  #
+  # `rust-version = "1.83"` in the workspace manifest is a promise to every
+  # downstream that this builds on 1.83. Nothing in the other jobs checks it:
+  # they all run `stable`, where a 1.85-only method compiles perfectly and the
+  # breakage is discovered by a user on an older toolchain.
+  #
+  # `--lib --bins` and not `test`: the promise is that what a downstream *links*
+  # builds on the floor. Dev-dependencies (criterion, proptest, nextest) set
+  # their own, higher MSRVs, and chasing theirs would raise ours for no benefit
+  # to anyone depending on this.
+  #
+  # The committed `Cargo.lock` is used as-is, deliberately. The floor is a
+  # property of the dependency versions we actually ship, and a transitive crate
+  # that needs a newer toolchain is exactly the drift this job exists to catch —
+  # re-resolving here would hide it behind whatever the resolver felt like
+  # picking that morning. That is not hypothetical: this job was written at
+  # `rust-version = "1.83"` and `constant_time_eq 0.4.2` (via `blake3`) failed to
+  # parse on 1.83, which is how the floor became 1.85.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: read rust-version from the workspace manifest
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          test -n "$v" || { echo "no rust-version in Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      # Pinned from the manifest, not written twice: a hardcoded version here
+      # would drift from `rust-version` and pass while the promise was broken.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build on the MSRV toolchain
+        run: cargo build --workspace --lib --bins --locked
+
   # `crates/tf_tree_py` is excluded from the workspace, so `cargo clippy
   # --workspace` above never compiles it. That gap shipped a real bug: a
   # `transmute::<EdgeWriter, Publisher>` that compiled only while the two types

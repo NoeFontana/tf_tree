@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# **Not published while the subcommand surface is still being specified.**
+# `docs/PHASE5.md` §6 (`TFT001`-`TFT016`) and §7 (`tf_tree top`) both add to this
+# binary and are recorded as not implemented in §0.0, so `cargo install` today
+# would hand someone a CLI whose documented commands are mostly absent. Publish
+# once §6 and §7 land, not before.
 publish = false
 
 [lints]
