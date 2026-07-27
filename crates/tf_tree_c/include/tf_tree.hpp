@@ -194,6 +194,23 @@ private:
 /// which is why the benchmark — compiled only with exceptions — reported a pass.
 ///
 /// An empty `std::optional` constructs no `Error` and calls nothing.
+///
+/// **The 456-byte width was reconsidered and kept.** The obvious way to shrink
+/// this is to hold the payload plus a bare `tft_status` and build the `Error`
+/// inside `error()` from `tft_last_error` at that moment —
+/// `sizeof(expected<Eigen::Isometry3d>)` would go from 456 to 136. It would
+/// also move the detail fetch to a point in time the *caller* chooses, and the
+/// thread-local slot is overwritten by the next `tf_tree` call on this thread,
+/// so `if (!r) { do_work(); log(r.error()); }` would report somebody else's
+/// failure — §3.3's most common C-API misuse, reintroduced by the wrapper whose
+/// job is to prevent it. Copying at the point of failure is what makes an
+/// `Error` safe to store and log later; `check_errors` asserts it against a
+/// deliberately clobbered slot.
+///
+/// It is also not *needed*: the width was never what §7 gate 2 was measuring.
+/// See `TF_TREE_FAIL_INTO` — the cost was the whole object being copied at all,
+/// which is a question of NRVO and not of size.
+
 /// Tag for constructing an `expected` whose payload is default-initialised
 /// **in place**. See `make_result`.
 struct in_place_value_t {
@@ -281,6 +298,32 @@ inline expected<T> make_result()
         }                                                                     \
     } while (0)
 
+/// Fail *into an existing result object* rather than returning a second one.
+///
+/// This is worth ~3.5 % on §7 gate 2 and it is the whole of the asymmetry §0.0
+/// recorded as unexplained. **NRVO is all-or-nothing per function**: GCC and
+/// Clang look for one automatic variable that *every* `return` names, and turn
+/// the optimisation off for the function entirely when some other `return`
+/// exists. `Plan::at` had two — `return out;` and `TF_TREE_FAIL(s)`, which
+/// expands to `return Error(s);` — so `out` was a stack local, `tft_plan_at`
+/// wrote 128 bytes into it, and the success path then copied the **whole
+/// 456-byte `expected`** into the caller's slot: eight `movdqa`/`movaps` pairs
+/// for the payload plus a `rep movsq $41` for the disengaged `optional<Error>`
+/// storage, which is trivially copyable and so gets copied whether engaged or
+/// not. Per lookup. On the hot path.
+///
+/// The exceptions build never had it: its failure path is a `throw`, which is
+/// not a `return`, so its single `return out;` kept NRVO. It was never the
+/// return object's size, the `optional` discriminant, or the FFI boundary —
+/// those were measured and refuted (§0.0).
+///
+/// Assigning keeps the function at one `return`, so both modes elide.
+/// `check_at_writes_into_the_returned_object` pins it without a stopwatch.
+#define TF_TREE_FAIL_INTO(out, status)                                        \
+    do {                                                                      \
+        (out) = ::tf_tree::Error(status);                                     \
+    } while (0)
+
 #else  // exceptions
 
 template <typename T>
@@ -309,6 +352,17 @@ inline T make_result()
         if (s_ != TFT_OK) {                                                   \
             TF_TREE_FAIL(s_);                                                 \
         }                                                                     \
+    } while (0)
+
+/// See the `-fno-exceptions` overload. Here `result<T>` *is* `T`, there is
+/// nothing to fail into, and a `throw` was never a `return` — so this mode's
+/// NRVO was always intact and the macro is the plain `throw`. `out` is named
+/// so the two definitions take the same arguments; `sizeof` consumes it
+/// without evaluating it, which keeps `-Wunused` quiet.
+#define TF_TREE_FAIL_INTO(out, status)                                        \
+    do {                                                                      \
+        (void)sizeof(out);                                                    \
+        TF_TREE_FAIL(status);                                                 \
     } while (0)
 
 #endif  // TF_TREE_NO_EXCEPTIONS
@@ -668,11 +722,17 @@ public:
         // `result<T>`, not `T`: this local IS the return slot under NRVO, in
         // both error modes, so the C ABI writes once into the caller's storage.
         // See `value_ptr`.
+        //
+        // **One `return`, and it is load-bearing** — `TF_TREE_FAIL_INTO`, never
+        // `TF_TREE_FAIL`. A second `return` of anything but `out` turns NRVO
+        // off for the whole function, and the payload `tft_plan_at` just wrote
+        // is then copied a second time into the caller. The failure path pays
+        // an assignment instead, which is cold.
         result<T> out = make_result<T>();
         const tft_status s =
             tft_plan_at(h_.get(), stamp, layout_of<T>::value, value_ptr(out));
         if (s != TFT_OK) {
-            TF_TREE_FAIL(s);
+            TF_TREE_FAIL_INTO(out, s);
         }
         return out;
     }

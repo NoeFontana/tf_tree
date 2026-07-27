@@ -51,6 +51,19 @@ fi
 cargo build --release -q -p tf_tree_c --features test-hooks
 
 WARN="-Wall -Wextra -Wpedantic -Werror"
+
+# **`--wrap` is what makes §7 gate 2 testable without a stopwatch.** It points
+# this file's calls to `tft_plan_at` at a shim that records the `out` pointer it
+# was handed, so `check_at_writes_into_the_returned_object` can assert that
+# `Plan::at<T>` gave the ABI the address of the object it returns rather than a
+# temporary it copies out of afterwards. The alternative — a `test-hooks` symbol
+# on the Rust side — would put that store inside the function `just cpp-bench`
+# times. The shim forwards to `__real_tft_plan_at`, so every other test in the
+# file is unaffected.
+#
+# GNU ld and lld both implement `--wrap`; the matrix below covers both linkers.
+WRAP="-DTF_TREE_WRAP_PLAN_AT -Wl,--wrap=tft_plan_at"
+
 fail=0
 
 for cxx in g++ clang++; do
@@ -70,7 +83,7 @@ for cxx in g++ clang++; do
             label="$cxx -std=$std $mode"
             printf '  %-34s ' "$label"
             # shellcheck disable=SC2086
-            if ! $cxx -std=$std $flags $WARN -I "$INC" $EIGEN $SOPHUS \
+            if ! $cxx -std=$std $flags $WARN $WRAP -I "$INC" $EIGEN $SOPHUS \
                     -o "$OUT/w" "$SRC" "$LIB" -lpthread -ldl -lm 2>"$OUT/err"; then
                 echo "COMPILE FAILED"
                 sed 's/^/      /' "$OUT/err" | head -20
@@ -95,7 +108,7 @@ printf '  %-34s ' "clang++ asan+ubsan"
 if command -v clang++ >/dev/null; then
     # shellcheck disable=SC2086
     clang++ -std=c++17 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-        $WARN -I "$INC" $EIGEN $SOPHUS -o "$OUT/wsan" "$SRC" "$LIB" \
+        $WARN $WRAP -I "$INC" $EIGEN $SOPHUS -o "$OUT/wsan" "$SRC" "$LIB" \
         -lpthread -ldl -lm 2>"$OUT/err" || { echo "COMPILE FAILED"; head -20 "$OUT/err"; fail=1; }
     if [ -x "$OUT/wsan" ]; then
         if ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \

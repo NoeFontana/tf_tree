@@ -23,6 +23,37 @@ tft_status tft_test_publishable_tree_create(tft_tree** out);
 tft_status tft_test_tree_create(tft_tree** out);
 }
 
+// **A linker-level shim that records where the C ABI was told to write.**
+//
+// `run.sh` links this file with `-Wl,--wrap=tft_plan_at`, which redirects the
+// call sites in this translation unit to `__wrap_tft_plan_at` and leaves the
+// real function reachable as `__real_tft_plan_at`. It exists for one assertion
+// — `check_at_writes_into_the_returned_object` — and that assertion cannot be
+// made any other way: the property is that `Plan::at<T>` hands the ABI the
+// address of the object it is about to *return*, and only the callee can see
+// the pointer it was given.
+//
+// **Deliberately not a `--features test-hooks` symbol on the Rust side.** The
+// §7 gate-2 benchmark links the same archive, so recording the pointer inside
+// `tft_plan_at` would put a store into the hot path that the gate measures. A
+// linker wrap is confined to this binary.
+//
+// The shim forwards unconditionally, so every other test in this file calls
+// through it and sees the real function's behaviour.
+#ifdef TF_TREE_WRAP_PLAN_AT
+extern "C" {
+tft_status __real_tft_plan_at(const tft_plan* plan, std::int64_t stamp, tft_layout layout,
+                              void* out);
+static const void* probe_last_out = nullptr;
+tft_status __wrap_tft_plan_at(const tft_plan* plan, std::int64_t stamp, tft_layout layout,
+                              void* out)
+{
+    probe_last_out = out;
+    return __real_tft_plan_at(plan, stamp, layout, out);
+}
+}
+#endif
+
 static int failures = 0;
 
 #define CHECK(cond, msg)                                                      \
@@ -262,6 +293,62 @@ static void check_read_path()
 }
 
 // ---------------------------------------------------------------------------
+// The C ABI writes into the object `at<T>` returns — no second copy
+// ---------------------------------------------------------------------------
+
+#if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
+/// **`Plan::at<T>` must hand `tft_plan_at` the address of the object it
+/// returns**, in both error modes.
+///
+/// This is §7 gate criterion 2 pinned without a stopwatch. When it does not
+/// hold, `out` is an ordinary local: the ABI writes the payload into it and the
+/// compiler copies the whole `expected<T>` into the caller afterwards — 128
+/// bytes of `Eigen::Isometry3d` in eight `movaps` pairs, plus a 328-byte
+/// `memcpy` of the `optional<Error>` storage, which is trivially copyable and
+/// so gets copied whether it is engaged or not. Per successful lookup.
+///
+/// The cause is that NRVO is **all-or-nothing per function**: the compiler
+/// wants one automatic variable that every `return` names, and gives up for the
+/// whole function when another `return` exists. `at` used to have a second one
+/// on the failure path (`TF_TREE_FAIL(s)`, i.e. `return Error(s);`). The
+/// exceptions build fails by `throw`, which is not a `return` — which is the
+/// whole of the asymmetry §0.0 had recorded as unexplained.
+///
+/// Mutant (applied, and the results below are measured, not predicted): put
+/// `TF_TREE_FAIL(s)` back in `Plan::at`. **All four `-fno-exceptions` rows of
+/// `just cpp-check` fail** — g++ and clang++, C++17 and C++20 — and the four
+/// exceptions rows keep passing, which is the asymmetry itself reproduced as a
+/// test result rather than as a timing. `just cpp-bench` moves from an
+/// interleaved 1.003x to 1.035x against a 1.02 gate over the same 11-round A/B.
+static void check_at_writes_into_the_returned_object()
+{
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_tree_create(&raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+    auto plan_r = tree.plan("map", "sensor");
+    CHECK_R(plan_r, "plan map <- sensor");
+    tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
+
+    probe_last_out = nullptr;
+    // The declaration below *is* the result object of the call — not a copy of
+    // one. Routing it through a helper that takes the result by value would
+    // introduce exactly the copy under test and make the check vacuous.
+#ifdef TF_TREE_NO_EXCEPTIONS
+    const auto r = plan.at<Eigen::Isometry3d>(300000000);
+    CHECK(static_cast<bool>(r), "the lookup must succeed, or there is nothing to check");
+    const void* returned = static_cast<const void*>(&*r);
+#else
+    const Eigen::Isometry3d r = plan.at<Eigen::Isometry3d>(300000000);
+    const void* returned = static_cast<const void*>(&r);
+#endif
+    CHECK(probe_last_out != nullptr, "the shim did not fire; -Wl,--wrap=tft_plan_at is missing");
+    CHECK(probe_last_out == returned,
+          "at<T> wrote into a temporary and the payload was copied out of it; "
+          "see TF_TREE_FAIL_INTO in tf_tree.hpp");
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Batch writes go straight into the caller's array
 // ---------------------------------------------------------------------------
 
@@ -376,6 +463,47 @@ static void check_sophus()
 // Errors, in whichever mode this build uses
 // ---------------------------------------------------------------------------
 
+/// Overwrite the thread-local error slot with a failure that is *not* the one
+/// under test, and return the message it wrote there.
+///
+/// It has to be a real failure. `tft_last_error` reads a slot only a *failing*
+/// call writes, so a successful call — or a pure one like `tft_layout_size`,
+/// which reads no state and writes none — leaves the slot byte-for-byte as it
+/// was and cannot tell a copy from a view. `TFT_ERR_BAD_HANDLE` from a null
+/// plan is the cheapest real one.
+static const char* clobber_the_error_slot()
+{
+    double scratch[16] = {};
+    const tft_status s = tft_plan_at(nullptr, 0, TFT_LAYOUT_MAT4_COL, scratch);
+    CHECK(s == TFT_ERR_BAD_HANDLE, "the clobbering call must itself fail");
+    static tft_error e{};
+    e.struct_size = static_cast<std::uint32_t>(sizeof(tft_error));
+    CHECK(tft_last_error(&e) == TFT_OK, "read the slot back");
+    CHECK(e.code == TFT_ERR_BAD_HANDLE, "the slot now holds the clobbering failure");
+    return e.message;
+}
+
+/// **An `Error` keeps the detail of the failure that produced it**, in both
+/// error modes, even after a later `tf_tree` call has overwritten the
+/// thread-local slot it came from.
+///
+/// This is what pays for `expected<T>` carrying a whole `tft_error` — see the
+/// note on `expected` in `tf_tree.hpp` — so it is the assertion that has to be
+/// load-bearing rather than decorative.
+///
+/// The probe is `message()`, **not** `code()`. `Error::fetch` overwrites `code`
+/// with the status the failing call actually returned, precisely so a stale
+/// slot cannot misreport it; that makes `code()` correct whether or not
+/// anything was copied, and therefore useless here. The message comes from the
+/// slot and nowhere else.
+///
+/// Mutant (applied): give `Error::message()` the body
+/// `{ static tft_error live{}; live.struct_size = sizeof(live);
+/// tft_last_error(&live); return live.message; }` — the "view, not a copy"
+/// implementation. **All eight `just cpp-check` rows fail** on the
+/// "must be a copy, not a view" line. The previous version of this test used
+/// `tft_layout_size` as the intervening call and checked `code()`; it survived
+/// that mutant in all eight, because neither half of it could discriminate.
 static void check_errors()
 {
     tft_tree* raw = nullptr;
@@ -387,6 +515,14 @@ static void check_errors()
     CHECK(!bad, "an unknown frame must fail");
     CHECK(bad.error().code() == TFT_ERR_UNKNOWN_FRAME, "and say why");
     CHECK(std::strlen(bad.error().message()) > 0, "with a message");
+    char first[TFT_MESSAGE_LEN];
+    std::strncpy(first, bad.error().message(), sizeof(first) - 1);
+    first[sizeof(first) - 1] = '\0';
+
+    const char* clobber = clobber_the_error_slot();
+    CHECK(std::strcmp(first, clobber) != 0,
+          "the two failures must have different messages, or this proves nothing");
+    CHECK(std::strcmp(bad.error().message(), first) == 0, "the detail must be a copy, not a view");
 #else
     bool threw = false;
     try {
@@ -396,11 +532,14 @@ static void check_errors()
         CHECK(e.code() == TFT_ERR_UNKNOWN_FRAME, "the right code");
         CHECK(std::strlen(e.what()) > 0, "what() is populated");
         CHECK(std::strlen(e.message()) > 0, "message() is populated");
-        // The detail must survive a later call, because it was copied out of
-        // the thread-local rather than referenced. A caller that logs an error
-        // after doing more work is the normal case, not an exotic one.
-        (void)tft_layout_size(TFT_LAYOUT_MAT4_ROW);
-        CHECK(e.code() == TFT_ERR_UNKNOWN_FRAME, "the detail must be a copy, not a view");
+        char first[TFT_MESSAGE_LEN];
+        std::strncpy(first, e.message(), sizeof(first) - 1);
+        first[sizeof(first) - 1] = '\0';
+
+        const char* clobber = clobber_the_error_slot();
+        CHECK(std::strcmp(first, clobber) != 0,
+              "the two failures must have different messages, or this proves nothing");
+        CHECK(std::strcmp(e.message(), first) == 0, "the detail must be a copy, not a view");
     }
     CHECK(threw, "an unknown frame must throw");
 #endif
@@ -524,6 +663,9 @@ int main()
     check_eigen_storage_premise();
 #endif
     check_read_path();
+#if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
+    check_at_writes_into_the_returned_object();
+#endif
     check_batch();
     check_errors();
     check_publish();
