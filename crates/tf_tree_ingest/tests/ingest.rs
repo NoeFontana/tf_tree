@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tf_tree::{Stamp, SystemDomain};
 use tf_tree_ingest::cdr::TransformStamped;
 use tf_tree_ingest::fixture::{
-    small_recording, two_publishers_with_latency, write_mcap, FixtureMessage,
+    small_recording, two_publishers_with_latency, write_mcap, write_mcap_as, FixtureMessage,
 };
 use tf_tree_ingest::{ClockResetPolicy, Frames, IngestError, IngestOptions};
 
@@ -582,6 +582,80 @@ fn remapped_topics_are_found_by_schema() {
     assert_eq!(out.report.static_edges, 1);
     assert_eq!(out.report.dynamic_edges, 1);
     assert_eq!(out.report.samples_pushed, 4);
+}
+
+/// §3.3: the **ROS 1 schema spelling** `tf2_msgs/TFMessage` is read too.
+///
+/// `rosbags-convert` keeps it when it converts a ROS 1 bag, and the payload is
+/// CDR either way once `rosbag2` has written it. `TF_SCHEMAS` carries both names
+/// with a comment saying so, and until now nothing exercised the second entry.
+///
+/// Mutant: drop `"tf2_msgs/TFMessage"` from `source::TF_SCHEMAS` — applied, and
+/// this test failed with `IngestError::NoTransforms`.
+#[test]
+fn the_ros1_schema_spelling_is_read() {
+    let dir = Scratch::new("ros1");
+    let p = dir.path("ros1.mcap");
+    let msgs: Vec<FixtureMessage> = (1..5)
+        .map(|i| FixtureMessage::dynamic("odom", "base_link", i * 1_000_000_000, pose(i as f64)))
+        .collect();
+    write_mcap_as(&p, &msgs, "tf2_msgs/TFMessage", &[]).unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&p, &IngestOptions::default(), &mut frames).unwrap();
+    assert_eq!(out.report.samples_pushed, 4);
+    assert_eq!(out.report.dynamic_edges, 1);
+}
+
+/// A TF-schema channel whose encoding is not `cdr` is **counted and skipped**,
+/// not fed to a decoder that would fail on it.
+///
+/// A `json` or `protobuf` channel carrying the TF schema name is possible and is
+/// not this crate's to decode. The count reaching the report is the other half:
+/// `filtered_channels` is `skips.filtered_channels + skips.non_cdr`, and the
+/// `+ non_cdr` term had nothing exercising it.
+///
+/// Mutant: set `filtered_channels = skips.filtered_channels` in `survey`,
+/// dropping the `+ non_cdr` — applied, and the count assertion failed at 0 and
+/// the summary line vanished.
+#[test]
+fn a_non_cdr_tf_channel_is_counted_not_decoded() {
+    let dir = Scratch::new("noncdr");
+    let p = dir.path("mixed.mcap");
+
+    // A **mixed** recording: one decodable topic and one JSON-encoded TF
+    // channel. A file where nothing decodes could only show that the ingest
+    // failed, not that the skip was counted.
+    let mut msgs: Vec<FixtureMessage> = (1..5)
+        .map(|i| FixtureMessage::dynamic("odom", "base_link", i * 1_000_000_000, pose(i as f64)))
+        .collect();
+    for i in 1..5 {
+        msgs.push(FixtureMessage {
+            topic: "/tf_json".into(),
+            log_time_ns: i * 1_000_000_000,
+            transforms: vec![TransformStamped {
+                stamp_ns: i * 1_000_000_000,
+                frame_id: "map".into(),
+                child_frame_id: "odom".into(),
+                pose: pose(i as f64),
+            }],
+        });
+    }
+    write_mcap_as(&p, &msgs, "tf2_msgs/msg/TFMessage", &[("/tf_json", "json")]).unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&p, &IngestOptions::default(), &mut frames).unwrap();
+
+    // The `cdr` half is ingested…
+    assert_eq!(out.report.samples_pushed, 4);
+    assert_eq!(out.report.dynamic_edges, 1);
+    // …and the JSON channel is counted, not silently ignored and not decoded.
+    assert_eq!(out.report.anomalies.filtered_channels, 1);
+    assert!(
+        out.report.summary().contains("TF channels were skipped"),
+        "the skip must reach the report:\n{}",
+        out.report.summary()
+    );
 }
 
 /// §5.6: a leading `/` is stripped, once, and counted — so `/odom` and `odom`

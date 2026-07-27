@@ -98,6 +98,29 @@ pub fn write_mcap(
     path: &Path,
     messages: &[FixtureMessage],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_mcap_as(path, messages, TF_SCHEMA, &[])
+}
+
+/// Write `messages` with an explicit schema name, and a per-topic message
+/// encoding for the topics named in `encodings` (everything else is `cdr`).
+///
+/// Both are things the reader keys on and neither is reachable through
+/// [`write_mcap`]: the ROS 1 schema spelling `tf2_msgs/TFMessage`, which a bag
+/// converted by `rosbags-convert` keeps, and a non-`cdr` encoding on a TF-schema
+/// channel, which is counted and skipped rather than decoded. The encoding is
+/// **per topic** rather than per file because the interesting recording is the
+/// *mixed* one — a file where nothing decodes cannot show that the skip was
+/// counted, only that the ingest failed.
+///
+/// # Errors
+///
+/// Any I/O or `mcap` failure, as a boxed error — see [`write_mcap`].
+pub fn write_mcap_as(
+    path: &Path,
+    messages: &[FixtureMessage],
+    schema_name: &str,
+    encodings: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
     let out = BufWriter::new(File::create(path)?);
     let mut w = mcap::WriteOptions::new()
         .compression(None)
@@ -107,13 +130,17 @@ pub fn write_mcap(
     // An empty schema payload: MCAP requires the schema *record* to exist so
     // discovery works, and nothing in this crate parses the IDL text. A real
     // rosbag2 puts the `.msg` definition here.
-    let schema = w.add_schema(TF_SCHEMA, "ros2msg", b"")?;
+    let schema = w.add_schema(schema_name, "ros2msg", b"")?;
     let mut channels: BTreeMap<String, u16> = BTreeMap::new();
     for (sequence, m) in messages.iter().enumerate() {
         let id = match channels.get(&m.topic) {
             Some(&id) => id,
             None => {
-                let id = w.add_channel(schema, &m.topic, "cdr", &BTreeMap::new())?;
+                let encoding = encodings
+                    .iter()
+                    .find(|(t, _)| *t == m.topic)
+                    .map_or("cdr", |(_, e)| *e);
+                let id = w.add_channel(schema, &m.topic, encoding, &BTreeMap::new())?;
                 channels.insert(m.topic.clone(), id);
                 id
             }

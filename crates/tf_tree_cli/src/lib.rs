@@ -227,10 +227,14 @@ pub struct IngestArgs {
     ///
     /// Without it the rule is "the last path segment is `tf_static`", which
     /// covers `/tf_static` and `/robot1/tf_static`. Passing this **replaces**
-    /// that rule rather than adding to it.
+    /// that classification rule rather than adding to it, and does **not**
+    /// narrow which topics are read — `--tf-topic` is the flag that does that.
     #[arg(long, value_name = "TOPIC")]
     pub static_topic: Vec<String>,
     /// Read only this topic's dynamic transforms. Repeatable.
+    ///
+    /// This is the only flag that narrows the read; without it every channel
+    /// carrying the TF schema is ingested, remapped ones included (§3.3).
     #[arg(long, value_name = "TOPIC")]
     pub tf_topic: Vec<String>,
     /// Prefix every frame name, as a `tf_prefix` would (`docs/PHASE4.md` §5.6).

@@ -21,7 +21,7 @@
 //! Streaming also makes §3.1's *two* passes cheap to express: [`read_tf`] is
 //! called twice on the same path, and nothing has to be retained between them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -79,12 +79,20 @@ impl TopicRoles {
 
     /// Whether a TF-schema channel on `topic` should be read at all.
     ///
-    /// An explicit `--dynamic-topic` list narrows the read; without one, every
-    /// TF-schema channel is read, which is what §3.3's "and remapped
-    /// equivalents" asks for.
+    /// **Only [`dynamic_topics`](TopicRoles::dynamic_topics) narrows the read.**
+    /// `--static-topic` answers "which topics are static", not "which topics
+    /// exist": naming a renamed static topic must not silently stop `/tf` from
+    /// being read, which is what an earlier revision did — it keyed the narrowing
+    /// on *either* list being non-empty, so `--static-topic /fixed_frames` alone
+    /// ingested the statics and zero dynamic samples, and said nothing about it.
+    ///
+    /// With no `--tf-topic`, every TF-schema channel is read, which is what
+    /// §3.3's "and remapped equivalents" asks for. With one, the read is the
+    /// named dynamic topics plus any named static ones — a user who narrows to
+    /// `/robot1/tf` still wants `/robot1/tf_static` if they named it.
     #[must_use]
     pub fn selects(&self, topic: &str) -> bool {
-        if self.static_topics.is_empty() && self.dynamic_topics.is_empty() {
+        if self.dynamic_topics.is_empty() {
             return true;
         }
         self.static_topics.iter().any(|t| t == topic)
@@ -186,6 +194,7 @@ where
     // two fields out of each and never the schema payload.
     let mut tf_schema_ids: HashMap<u16, ()> = HashMap::new();
     let mut channels: HashMap<u16, ChannelRole> = HashMap::new();
+    let mut seen_channels: HashSet<u16> = HashSet::new();
     let mut skips = SkipCounts::default();
 
     while let Some(event) = reader.next_event() {
@@ -231,6 +240,16 @@ where
                     }
                     mcap::records::Record::Channel(ch) => {
                         if !tf_schema_ids.contains_key(&ch.schema_id) {
+                            continue;
+                        }
+                        // **A channel is counted once, not once per record.**
+                        // MCAP repeats every Schema and Channel record in the
+                        // summary section at the end of the file, so a linear
+                        // read sees each of them twice. Without this, the
+                        // report's "TF channels were skipped" line says two for
+                        // one channel — a number a user cannot reconcile with
+                        // their recording.
+                        if !seen_channels.insert(ch.id) {
                             continue;
                         }
                         if !roles.selects(&ch.topic) {
@@ -341,5 +360,43 @@ mod tests {
         assert!(!r.is_static("/tf_static"));
         assert!(r.selects("/tf"));
         assert!(!r.selects("/tf_static"));
+    }
+
+    /// **`--static-topic` alone does not narrow the read.** It answers "which
+    /// topics are static", and an earlier revision let it silently exclude every
+    /// dynamic channel — a user who renamed their static topic got the statics
+    /// and none of the motion, with no error and no anomaly line.
+    ///
+    /// Mutant: restore `if self.static_topics.is_empty() && ...` as the early
+    /// return in `selects` — applied, and the `/tf` assertion failed.
+    #[test]
+    fn a_renamed_static_topic_does_not_exclude_the_dynamic_ones() {
+        let r = TopicRoles {
+            static_topics: vec!["/fixed_frames".into()],
+            dynamic_topics: Vec::new(),
+        };
+        assert!(r.selects("/fixed_frames"));
+        assert!(r.selects("/tf"), "naming a static topic hid /tf");
+        assert!(r.selects("/robot1/tf"));
+        // …and it is still the thing that classifies.
+        assert!(r.is_static("/fixed_frames"));
+        assert!(!r.is_static("/tf"));
+    }
+
+    /// `--tf-topic` **is** the flag that narrows, and a static topic named
+    /// alongside it survives the narrowing.
+    ///
+    /// Mutant: return `self.dynamic_topics.iter().any(...)` alone, dropping the
+    /// static term — applied, and the `/fixed_frames` assertion failed.
+    #[test]
+    fn dynamic_topics_narrow_the_read_and_keep_named_statics() {
+        let r = TopicRoles {
+            static_topics: vec!["/robot1/fixed".into()],
+            dynamic_topics: vec!["/robot1/tf".into()],
+        };
+        assert!(r.selects("/robot1/tf"));
+        assert!(r.selects("/robot1/fixed"));
+        assert!(!r.selects("/robot2/tf"));
+        assert!(!r.selects("/tf"));
     }
 }
