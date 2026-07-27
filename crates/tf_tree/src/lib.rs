@@ -72,6 +72,19 @@ pub fn arena_layout_hash() -> u32 {
     tf_tree_arena::layout_hash()
 }
 
+/// Whether this build compiled `docs/PHASE5.md` §5's diagnostic counters in.
+///
+/// A diagnostic that reads `EdgeCounters` cannot otherwise tell "nothing
+/// failed" from "nothing was counted", and those two answers call for opposite
+/// actions. It has to be evaluated *here*, inside the crate that owns the
+/// feature: cargo unifies features across a workspace, so a `cfg!` in a
+/// downstream crate reports what that crate asked for rather than what the
+/// engine was built with.
+#[must_use]
+pub fn counters_compiled_in() -> bool {
+    cfg!(feature = "counters")
+}
+
 /// Zero-config rendezvous (`docs/PHASE2.md` §3.2, `docs/decisions/0005`).
 #[cfg(all(feature = "shm", target_os = "linux"))]
 mod open;

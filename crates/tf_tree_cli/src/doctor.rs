@@ -272,7 +272,8 @@ impl Snapshot {
     }
 
     /// The display name of frame `id`, or `#id` if it is not in the snapshot.
-    fn frame_label(&self, id: u32) -> String {
+    #[must_use]
+    pub fn frame_label(&self, id: u32) -> String {
         self.frames
             .iter()
             .find(|f| f.id == id)
@@ -281,7 +282,8 @@ impl Snapshot {
     }
 
     /// A `"parent->child"` label for edge `id`.
-    fn edge_label(&self, e: &EdgeInfo) -> String {
+    #[must_use]
+    pub fn edge_label(&self, e: &EdgeInfo) -> String {
         format!(
             "{}->{} (edge#{})",
             self.frame_label(e.parent),
@@ -369,7 +371,8 @@ impl Observations {
     }
 
     /// Group event indices by edge, preserving arrival order within each edge.
-    fn by_edge(&self) -> BTreeMap<u32, Vec<&PushSample>> {
+    #[must_use]
+    pub fn by_edge(&self) -> BTreeMap<u32, Vec<&PushSample>> {
         let mut map: BTreeMap<u32, Vec<&PushSample>> = BTreeMap::new();
         for s in &self.events {
             map.entry(s.edge).or_default().push(s);

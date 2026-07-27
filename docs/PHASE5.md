@@ -22,7 +22,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §3 Bag ingestion | Not implemented |
 | §4 Offline Python API | Not implemented |
 | §5 Diagnostic counters | **Done**, except §5.6's freeze-side capture, which needs §2. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
-| §6 Diagnostics catalogue `TFT001`–`TFT016` | Not implemented |
+| §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. Nine detect: `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT013`, `TFT015`, `TFT016`. **Seven cannot and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded), `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding), and `TFT001`/`TFT005`/`TFT014` conditionally. **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
 | §7 `tf_tree top` | Not implemented |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
 | §9 Benchmark artifact | Not implemented |

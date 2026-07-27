@@ -20,13 +20,16 @@ use clap::{Parser, Subcommand};
 use tf_tree::{EdgeKind, Iso3, Stamp, Tree};
 use tf_tree_bench::fixture;
 
+pub mod catalogue;
+pub mod checks;
 pub mod doctor;
+pub mod hostfacts;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod attach;
 
-use doctor::{Observations, Severity, Snapshot};
+use doctor::{Observations, Snapshot};
 
 /// `tf_tree` — inspect and debug a transform tree.
 ///
@@ -69,6 +72,26 @@ enum Command {
         /// action, and it needs no arena to do it.
         #[arg(long)]
         explain_version: bool,
+        /// Emit the report as JSON on one stream (`docs/PHASE5.md` §6).
+        ///
+        /// The schema is documented on [`catalogue::render_json`] and is
+        /// stable: it always carries every catalogue id, so a consumer can tell
+        /// "this check did not fire" from "this build has no such check".
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero if any unsuppressed error-severity check fired.
+        ///
+        /// Opt-in rather than always-on because `doctor` is run by hand far more
+        /// often than by CI, and a diagnostic that returns 1 breaks `&&` in an
+        /// operator's shell for no benefit. A gate asks for one.
+        #[arg(long)]
+        exit_code: bool,
+        /// Remove a check from the `--exit-code` gate, by id (`--suppress TFT013`).
+        ///
+        /// Repeatable. A suppressed check still runs and still prints — the flag
+        /// changes the exit status, not the report.
+        #[arg(long, value_name = "TFTNNN")]
+        suppress: Vec<String>,
     },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
@@ -104,12 +127,17 @@ pub fn run() -> Result<()> {
             source,
             rate,
         } => cmd_echo(live, &target, &source, rate),
-        Command::Doctor { explain_version } => {
+        Command::Doctor {
+            explain_version,
+            json,
+            exit_code,
+            suppress,
+        } => {
             if explain_version {
                 explain_format_version();
                 Ok(())
             } else {
-                cmd_doctor(live)
+                cmd_doctor(live, json, exit_code, &suppress)
             }
         }
         Command::Bench { gate } => cmd_bench(gate),
@@ -145,6 +173,16 @@ impl Source {
             Source::Fixture(_) => "in-process fixture",
             #[cfg(all(feature = "shm", target_os = "linux"))]
             Source::Live => "live arena",
+        }
+    }
+
+    /// Whether the push stream was reconstructed from the rings rather than
+    /// recorded as it happened — which is what makes `TFT001` unanswerable.
+    fn is_live(&self) -> bool {
+        match self {
+            Source::Fixture(_) => false,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Live => true,
         }
     }
 }
@@ -325,50 +363,137 @@ fn fmt_iso(iso: &Iso3) -> String {
     )
 }
 
-/// `tf_tree doctor`.
-fn cmd_doctor(live: Live<'_>) -> Result<()> {
+/// `tf_tree doctor` — the `docs/PHASE5.md` §6 catalogue.
+///
+/// **`--exit-code` is opt-in, and the previous unconditional `exit(1)` on any
+/// error is gone.** `doctor` is run by hand far more often than by CI, and a
+/// diagnostic that returns non-zero by default breaks `&&` in an operator's
+/// shell and gets wrapped in `|| true`, at which point the gate is worthless
+/// where it was wanted. §6 asks for the flag; the flag is the whole mechanism.
+fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) -> Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    for s in suppress {
+        let id = catalogue::Tft::parse(s).ok_or_else(|| {
+            // Refused rather than ignored: a typo that silently suppresses
+            // nothing leaves a gate that looks configured and is not.
+            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT016")
+        })?;
+        ids.insert(id);
+    }
+
     let (tree, src) = source(live)?;
     let obs = observations(tree, &src);
     let snap = Snapshot::capture(tree);
-    let report = doctor::run(&snap, &obs);
+    let stats = checks::collect_edge_stats(tree, &snap);
+    let clock = checks::Clock::decide(checks::newest_stamp(&snap), unix_nanos_now());
 
-    println!("tf_tree doctor ({})", src.banner());
-    #[cfg(all(feature = "shm", target_os = "linux"))]
-    if matches!(src, Source::Live) {
-        println!("  instance {}", hex16(tree.instance_uuid()));
-        // Say what is *not* being checked. A live arena has no recorded push
-        // stream, so two of the seven checks have no evidence to work from and
-        // can only ever come back clean — printing "all seven pass" would be a
-        // clean bill of health that was never earned.
-        let blind: Vec<&str> = doctor::Observations::LOST_ON_A_LIVE_ARENA
-            .iter()
-            .map(|c| c.label())
-            .collect();
-        println!(
-            "  {} of 7 checks need a recorded push stream and are not run: {}",
-            blind.len(),
-            blind.join(", ")
-        );
-    }
-    if report.is_healthy() {
-        println!(
-            "  OK — all seven checks pass ({} frames)",
-            snap.frames.len()
-        );
+    let inputs = checks::Inputs {
+        snap: &snap,
+        obs: &obs,
+        stats: &stats,
+        host: host_facts(),
+        clock,
+        arena_bytes: tree.arena_size_bytes() as u64,
+        occupancy: checks::occupancy_of(tree),
+        live: src.is_live(),
+        counters: tf_tree::counters_compiled_in(),
+        participants: live_participants(tree),
+    };
+    let report = checks::run(&inputs, &ids);
+
+    let meta = catalogue::Meta {
+        source: src.banner(),
+        format_version: tf_tree::arena_format_version(),
+        layout_hash: tf_tree::arena_layout_hash(),
+        instance: instance_uuid(tree, &src),
+        frames: snap.frames.len(),
+        edges: snap.edges.len(),
+        generated_unix_nanos: unix_nanos_now(),
+        now_nanos: clock.nanos(),
+        clock_source: clock.label(),
+        counters_compiled_in: tf_tree::counters_compiled_in(),
+        notes: live_evidence_notes(src.is_live()),
+    };
+
+    if json {
+        print!("{}", catalogue::render_json(&report, &meta));
     } else {
-        for f in &report.findings {
-            let sev = match f.severity {
-                Severity::Warn => "WARN ",
-                Severity::Error => "ERROR",
-            };
-            println!("  [{sev}] {}: {}", f.check.label(), f.message);
-        }
+        print!("{}", catalogue::render_human(&report, &meta));
     }
 
-    if report.has_error() {
+    if exit_code && report.has_error() {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Disclosures for a check that ran with one of its evidence sources missing.
+///
+/// `TFT011` has two: the counters, which a live arena has, and the Phase 1
+/// `capacity x period` against observed publish latency, which needs a recorded
+/// push stream. A live arena's stream is reconstructed from the rings, where
+/// `arrival_delay_ns` is unknown and set to zero — and zero latency never
+/// exceeds any buffer span, so that half of the check is structurally silent.
+/// Reporting `pass` without saying so would claim a result it did not earn.
+fn live_evidence_notes(live: bool) -> Vec<String> {
+    if !live {
+        return Vec::new();
+    }
+    vec![
+        "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
+         latency, so the capacity-vs-latency half of the check cannot fire"
+            .to_owned(),
+    ]
+}
+
+/// How many participant slots currently resolve to a live identity.
+///
+/// **Counted by walking the table, not read from `ArenaHeader::participant_count`.**
+/// That field exists and nothing in the workspace ever increments it, so gating
+/// `TFT014` on it would have made the check permanently unreachable — a
+/// diagnostic that can never run, disguised as one that is merely skipped. The
+/// participant table is the authority the reaper and `tf_tree participants`
+/// already use.
+fn live_participants(tree: &Tree) -> u32 {
+    let view = tree.arena_view();
+    let table = view.participants();
+    (0..view.header().max_participants)
+        .filter(|&slot| table.identity(slot).is_some())
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// The system clock as nanoseconds since the Unix epoch.
+///
+/// Saturates rather than panicking on a clock before 1970: `doctor` reporting a
+/// bad clock is useful, `doctor` aborting because of one is not.
+fn unix_nanos_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Host facts for `TFT016`, or `None` where `/sys` and `/proc` do not exist.
+fn host_facts() -> Option<hostfacts::HostFacts> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(hostfacts::probe())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The arena's instance uuid, which only a shared arena has.
+fn instance_uuid(tree: &Tree, src: &Source) -> Option<String> {
+    let _ = (tree, src);
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    if matches!(src, Source::Live) {
+        return Some(hex16(tree.instance_uuid()));
+    }
+    None
 }
 
 /// `tf_tree bench [--gate]`.
