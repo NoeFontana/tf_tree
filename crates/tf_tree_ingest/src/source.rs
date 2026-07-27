@@ -38,6 +38,12 @@ use crate::IngestError;
 /// `rosbag2` has written it.
 const TF_SCHEMAS: [&str; 2] = ["tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"];
 
+/// Largest single MCAP record this reader will allocate for: **256 MiB**.
+///
+/// See the option's comment in [`read_tf`]. This is a bound on a corrupt length
+/// field, not a format limit.
+const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
+
 /// How a topic name decides whether its edges are static.
 ///
 /// **This is the one thing that cannot come from the schema**, and it is worth
@@ -122,6 +128,9 @@ pub struct SkipCounts {
     pub non_cdr: u64,
     /// Channels carrying the TF schema that the topic filter excluded.
     pub filtered_channels: u64,
+    /// The recording ended mid-record or without its end magic: everything up to
+    /// that point was read and the rest does not exist. See [`read_tf`].
+    pub truncated: bool,
 }
 
 /// Read every TF transform in `path`, calling `f` once per transform.
@@ -144,7 +153,33 @@ where
         raw_os_error: e.raw_os_error().unwrap_or(0),
     })?;
     let mut input = BufReader::new(file);
-    let mut reader = LinearReader::new();
+    let mut reader = LinearReader::new_with_options(
+        mcap::sans_io::LinearReaderOptions::default()
+            // **A truncated recording is read up to the truncation point.**
+            //
+            // The default requires the end magic, so a file whose recorder was
+            // SIGKILLed, whose disk filled, or whose copy was interrupted fails
+            // wholesale with `Mcap` — zero transforms out of a recording that is
+            // 90 % intact, and a message ("not a well-formed MCAP recording")
+            // that is wrong: the file is well-formed, it is incomplete. MCAP is
+            // designed to be readable up to the point it stops, and an *offline
+            // forensic* tool that discards a whole recording because the tail is
+            // missing inverts its own use case — §3.3's `freeze --from-live`
+            // exists to "capture a fault in the field", and a fault in the field
+            // is how recordings get truncated.
+            //
+            // The cost is that genuine tail corruption is no longer detected
+            // here. It was never detected *well*: the end magic says nothing
+            // about the records before it.
+            .with_skip_end_magic(true)
+            // A record header is a caller-supplied `u64` length. Without a limit
+            // a corrupt one asks for a multi-gigabyte allocation before anything
+            // validates it — the same failure `cdr::ImplausibleCount` exists to
+            // stop one layer down, and the guard was available here and switched
+            // off. 256 MiB is far above any real MCAP record (a chunk is
+            // typically 1–8 MiB) and far below a length that can exhaust memory.
+            .with_record_length_limit(MAX_RECORD_BYTES),
+    );
 
     // Our own accumulators. The `sans_io` reader emits raw records and leaves
     // schema/channel bookkeeping to the caller, which suits us: we only need
@@ -154,7 +189,31 @@ where
     let mut skips = SkipCounts::default();
 
     while let Some(event) = reader.next_event() {
-        match event.map_err(|e| map_mcap(&e))? {
+        // **A truncated recording is a short recording, not a broken one.**
+        //
+        // `UnexpectedEof` is what the reader returns when the file stops in the
+        // middle of a record — a recorder that was SIGKILLed, a disk that
+        // filled, an interrupted copy. Every record before the cut is intact and
+        // has already been handed to `f`. Propagating the error would throw all
+        // of it away, which for an *offline forensic* tool is the wrong trade:
+        // §3.3's `freeze --from-live` exists to "capture a fault in the field",
+        // and a fault in the field is how recordings get truncated.
+        //
+        // The prefix is kept and the fact is recorded, so the report can say so
+        // loudly rather than the tool pretending the file was whole. What this
+        // costs is that tail corruption now reads as truncation; it was never
+        // distinguished well anyway, because the end magic says nothing about
+        // the records before it. A file that is not an MCAP at all still fails,
+        // on the *start* magic, before any of this.
+        let event = match event {
+            Ok(e) => e,
+            Err(mcap::McapError::UnexpectedEof) => {
+                skips.truncated = true;
+                break;
+            }
+            Err(e) => return Err(map_mcap(&e)),
+        };
+        match event {
             LinearReadEvent::ReadRequest(want) => {
                 let n = input
                     .read(reader.insert(want))

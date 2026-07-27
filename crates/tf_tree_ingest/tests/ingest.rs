@@ -232,13 +232,24 @@ fn out_of_order_ingest_matches_ordered() {
 /// Mutant: change the last-wins skip to keep the first (`if i > 0 && buf[i - 1].0
 /// == stamp { continue; }`) — applied, and the lookup assertion failed, reading
 /// back the earlier duplicate.
+///
+/// **A run of three** is here on purpose, not for symmetry. The single lookahead
+/// at the push site is the whole rule, and a run longer than two is what shows
+/// it collapses the entire run rather than a pair at a time — a second check
+/// against the previously-pushed stamp is unreachable, because every element of
+/// a run except the last `continue`s without pushing. Mutant: restore that
+/// second check (`if prev == Some(stamp) { duplicates += 1; continue; }`) —
+/// applied, and every assertion here still passed, which is the evidence that
+/// the branch was dead rather than a claim that it was.
 #[test]
 fn duplicates_resolve_last_wins() {
     let dir = Scratch::new("dupes");
     let msgs = vec![
         FixtureMessage::dynamic("odom", "base_link", 1_000_000_000, pose(0.5)),
         FixtureMessage::dynamic("odom", "base_link", 2_000_000_000, pose(1.0)),
-        // Same edge, same stamp, different value, later in the recording.
+        // Same edge, same stamp, different value, later in the recording —
+        // three deep, so the run is longer than one lookahead.
+        FixtureMessage::dynamic("odom", "base_link", 2_000_000_000, pose(1.5)),
         FixtureMessage::dynamic("odom", "base_link", 2_000_000_000, pose(2.0)),
         FixtureMessage::dynamic("odom", "base_link", 3_000_000_000, pose(3.0)),
     ];
@@ -246,7 +257,7 @@ fn duplicates_resolve_last_wins() {
     let mut frames = Frames::default();
     let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames).unwrap();
 
-    assert_eq!(out.report.anomalies.duplicate_stamps, 1);
+    assert_eq!(out.report.anomalies.duplicate_stamps, 2);
     assert_eq!(out.report.samples_pushed, 3);
     let got = out
         .tree
@@ -649,6 +660,79 @@ fn a_non_mcap_file_is_refused() {
     assert_eq!(
         tf_tree_ingest::survey(&p, &IngestOptions::default(), &mut frames).unwrap_err(),
         IngestError::Mcap
+    );
+}
+
+/// **A truncated recording is read up to the truncation point**, not discarded.
+///
+/// A recorder that was SIGKILLed, a disk that filled, an interrupted copy: all
+/// three produce a file with no end magic and otherwise-intact records. Refusing
+/// it loses everything, and the message an earlier revision gave ("the file is
+/// not a well-formed MCAP recording") was wrong as well as unhelpful — the file
+/// is well-formed, it is incomplete.
+///
+/// The fixture is truncated at three fractions so the test is about the
+/// *property* rather than about one lucky cut point. Every cut must ingest, must
+/// recover something, and must be **reported as truncated** — silently returning
+/// a prefix as though it were the whole recording would be worse than refusing
+/// it, because every count in the report would then describe a run the user did
+/// not make. The deepest cut is additionally required to lose samples, so a set
+/// of cuts that all landed in the trailing summary section cannot make this pass
+/// vacuously.
+///
+/// Mutant: propagate `McapError::UnexpectedEof` from `read_tf` instead of
+/// breaking on it — applied, and all three cuts failed with `IngestError::Mcap`
+/// and zero samples recovered. Mutant 2: set `truncated` to `false`
+/// unconditionally — applied, and the `anomalies.truncated` assertion failed.
+#[test]
+fn a_truncated_recording_yields_what_it_contains() {
+    let dir = Scratch::new("trunc");
+    let path = write(&dir, "full.mcap", &small_recording());
+    let whole = std::fs::read(&path).unwrap();
+
+    let mut frames = Frames::default();
+    let full = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames).unwrap();
+    assert_eq!(full.report.samples_pushed, 160);
+    assert!(
+        !full.report.anomalies.truncated,
+        "the intact recording must not be reported as truncated"
+    );
+
+    let mut recovered = Vec::new();
+    for pct in [90usize, 70, 50] {
+        let cut = whole.len() * pct / 100;
+        let p = dir.path(&format!("cut{pct}.mcap"));
+        std::fs::write(&p, &whole[..cut]).unwrap();
+
+        let mut f = Frames::default();
+        let out = tf_tree_ingest::run(&p, &IngestOptions::default(), &mut f).unwrap_or_else(|e| {
+            panic!(
+                "{pct}% of the recording should still ingest: {}",
+                tf_tree_ingest::describe(e, &f)
+            )
+        });
+        assert!(
+            out.report.samples_pushed > 0,
+            "{pct}% recovered nothing at all"
+        );
+        assert!(
+            out.report.anomalies.truncated,
+            "{pct}% was read as though the recording were whole"
+        );
+        assert!(
+            out.report.summary().contains("ends mid-record"),
+            "the summary must say the recording is incomplete:\n{}",
+            out.report.summary()
+        );
+        recovered.push(out.report.samples_pushed);
+    }
+    assert!(
+        recovered
+            .last()
+            .is_some_and(|&n| n < full.report.samples_pushed),
+        "every cut recovered the whole recording ({recovered:?} of {}); the cuts \
+         all landed past the last message and this test proves nothing",
+        full.report.samples_pushed
     );
 }
 

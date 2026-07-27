@@ -150,6 +150,16 @@ impl Frames {
         FrameId(i)
     }
 
+    /// The index of an already-interned name, or `None`.
+    ///
+    /// The read-only half of [`intern`](Frames::intern), for pass two: pass one
+    /// interned every name the recording contains, so a miss here means the
+    /// transform was dropped in pass one and has no buffer to go in.
+    #[must_use]
+    pub fn id(&self, name: &str) -> Option<FrameId> {
+        self.index.get(name).copied().map(FrameId)
+    }
+
     /// The name behind an index, or `"?"` if it is out of range.
     #[must_use]
     pub fn name(&self, id: FrameId) -> &str {
@@ -234,6 +244,14 @@ pub struct Anomalies {
     pub empty_names: u64,
     /// Messages on a TF channel this build could not decode.
     pub filtered_channels: u64,
+    /// The recording stopped mid-record: everything before the cut was read.
+    ///
+    /// Not a count, because it is not a quantity — the recording either ends
+    /// where it says it does or it does not. It is in `Anomalies` rather than
+    /// beside it because §3.2's report is where a user finds out, and finding
+    /// out matters: every number in this report is then a number about a
+    /// *prefix* of the run they recorded.
+    pub truncated: bool,
 }
 
 /// The output of pass one: an exact topology and the counts that size it.
@@ -424,7 +442,12 @@ pub fn survey(
         Ok(())
     })?;
 
+    // Both terms, and the `+ non_cdr` is not decoration: a TF-schema channel
+    // this build cannot decode is skipped for a *different* reason than one the
+    // topic filter excluded, and the report's single "channels were skipped"
+    // line has to account for either or it under-reports silently.
     out.anomalies.filtered_channels = skips.filtered_channels + skips.non_cdr;
+    out.anomalies.truncated = skips.truncated;
     out.anomalies.stripped_slash_names = normalizer.stripped_count();
     out.remaps = normalizer.remaps().to_vec();
     if out.edges.is_empty() {
@@ -463,16 +486,35 @@ pub struct FillStats {
 ///
 /// Groups by edge, sorts by stamp within each edge, then pushes in order.
 ///
-/// # How `--max-memory` is honoured, and why there is no spill file
+/// # What `--max-memory` bounds, and what it does not
 ///
-/// §3.1 asks for a cap with a spill to a temporary run-file and a k-way merge
-/// beyond it. What is implemented is the same bound reached differently: edges
-/// are partitioned into groups that each fit the cap, and the recording is
-/// re-read once per group. Peak memory is the cap either way; the cost is extra
-/// sequential reads instead of extra sequential writes plus reads, and there is
-/// no temporary file to leak, to fill a different filesystem, or to leave behind
-/// when the process is killed. A recording large enough to need this is being
-/// read from storage that streams faster than it round-trips.
+/// **It bounds the sort buffers, not the process.** Saying otherwise would be
+/// the more flattering claim and it is false, so it is worth being exact about
+/// which half is capped:
+///
+/// | Allocation | Size | Bounded by `--max-memory`? |
+/// |---|---|---|
+/// | The arena, from `builder.build()` | 78 B per sample, measured | **No** |
+/// | Pass two's sort buffers | [`SAMPLE_BYTES`] = 64 B per sample | Yes |
+///
+/// The arena is not capped because it *cannot* be: it is the output. Every
+/// sample the recording contains has to be resident in it for the index to
+/// answer, the arena has fixed capacity and does not grow
+/// (`docs/PROJECT.md` §5 D4), and `Capacity::slots` rounds each ring up to a
+/// power of two on top of that. A user sizing a machine for a large recording
+/// must budget for the arena separately, and there is no flag that changes it —
+/// only fewer samples would.
+///
+/// What the cap removes is the *second* copy. Buffering the whole recording
+/// before sorting costs another 64 B per sample on top of the arena; splitting
+/// into groups replaces that with the cap. Measured here on a 90 000-sample,
+/// three-edge fixture (`tests/memory.rs`): 7 096 704 B of arena either way, and
+/// a peak of 142 B/sample in one pass against 121 B/sample at a 4 MiB cap. The
+/// saving is bounded by how finely the edges divide — three equal edges split
+/// 2–1, so this is close to the worst case — and it is paid for with one extra
+/// sequential re-read. That is the trade §3.1 asks for, reached without a
+/// temporary run-file to leak, to fill a different filesystem, or to leave
+/// behind when the process is killed.
 ///
 /// The one case this cannot serve is a **single** edge whose samples exceed the
 /// cap on their own — a true k-way merge would spill within the edge. That is
@@ -526,6 +568,17 @@ pub fn fill(
     let tree = builder.build().map_err(IngestError::Build)?;
 
     let groups = plan_groups(survey, &order, opts.max_memory_bytes)?;
+    // Re-derive the edge index the same way pass one did, **once**: it is a
+    // function of the survey alone and the survey does not change between
+    // groups. Building it from the survey rather than re-interning keeps the two
+    // passes agreeing about which edge is which even if a name normalizes
+    // differently.
+    let index: BTreeMap<EdgeKey, usize> = survey
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| ((e.parent.0, e.child.0), i))
+        .collect();
     let mut stats = FillStats {
         passes: 0,
         peak_buffer_bytes: 0,
@@ -541,20 +594,13 @@ pub fn fill(
                 Vec::with_capacity(survey.edges[slot].samples as usize),
             );
         }
-        // Re-derive the edge index the same way pass one did. Building it from
-        // the survey rather than re-interning keeps the two passes agreeing
-        // about which edge is which even if a name normalizes differently.
-        let index: BTreeMap<EdgeKey, usize> = survey
-            .edges
-            .iter()
-            .enumerate()
-            .map(|(i, e)| ((e.parent.0, e.child.0), i))
-            .collect();
+        // The normalizer, by contrast, is *not* hoisted: it accumulates the
+        // remap and stripped-slash counts, and reusing one across groups would
+        // multiply them by the number of passes.
         let mut normalizer = match &opts.tf_prefix {
             Some(p) => NameNormalizer::with_prefix(p),
             None => NameNormalizer::new(),
         };
-        let mut lookup = FrameLookup::new(frames);
 
         read_tf(path, &opts.roles, |rec| {
             if rec.is_static || rec.stamp_ns == 0 {
@@ -566,10 +612,10 @@ pub fn fill(
             ) else {
                 return Ok(());
             };
-            let (Some(pi), Some(ci)) = (lookup.get(&p.name), lookup.get(&c.name)) else {
+            let (Some(pi), Some(ci)) = (frames.id(&p.name), frames.id(&c.name)) else {
                 return Ok(());
             };
-            if let Some(buf) = index.get(&(pi, ci)).and_then(|s| buffers.get_mut(s)) {
+            if let Some(buf) = index.get(&(pi.0, ci.0)).and_then(|s| buffers.get_mut(s)) {
                 buf.push((rec.stamp_ns, rec.pose));
             }
             Ok(())
@@ -595,7 +641,6 @@ pub fn fill(
                 .frame(frames.name(e.child))
                 .map_err(|_| IngestError::FrameLost { frame: e.child })?;
             let writer = tree.claim(child, parent).map_err(IngestError::Claim)?;
-            let mut prev: Option<i64> = None;
             for i in 0..buf.len() {
                 let (stamp, pose) = buf[i];
                 // Last wins: skip every duplicate but the final one, rather
@@ -603,37 +648,25 @@ pub fn fill(
                 // them all is *correct* — equal stamps are accepted and the
                 // newer value wins — but it burns ring slots the counting pass
                 // did not budget for and inflates the manifest's `samples`.
+                //
+                // **One lookahead is the whole rule**, and a trailing check
+                // against the previously pushed stamp would be dead code: `buf`
+                // is sorted, so a run of equal stamps is contiguous, and every
+                // element of that run except the last takes this `continue`
+                // *without* pushing. The stamp that does get pushed is therefore
+                // strictly greater than the one before it.
                 if buf.get(i + 1).is_some_and(|(next, _)| *next == stamp) {
-                    stats.duplicates += 1;
-                    continue;
-                }
-                if prev == Some(stamp) {
                     stats.duplicates += 1;
                     continue;
                 }
                 writer
                     .push(stamp, &iso_from_canonical(pose))
                     .map_err(IngestError::Push)?;
-                prev = Some(stamp);
                 stats.pushed += 1;
             }
         }
     }
     Ok((tree, stats))
-}
-
-/// Frame-name to survey-index lookup for pass two.
-struct FrameLookup<'a> {
-    frames: &'a Frames,
-}
-
-impl<'a> FrameLookup<'a> {
-    fn new(frames: &'a Frames) -> FrameLookup<'a> {
-        FrameLookup { frames }
-    }
-    fn get(&mut self, name: &str) -> Option<u32> {
-        self.frames.index.get(name).copied()
-    }
 }
 
 /// Partition edges into groups whose buffered samples each fit `cap`.
@@ -675,7 +708,11 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Result<Vec<Vec<usi
 ///
 /// The one ordering that does not depend on when a message happened to arrive.
 /// See [`fill`]'s comment for why that matters.
-fn canonical_order(survey: &Survey, frames: &Frames) -> Vec<usize> {
+///
+/// `pub(crate)` so [`crate::report`] calls *this* rather than keeping its own
+/// copy of the comparator. Two copies is how the report's row order and the
+/// arena's `EdgeId` order drift apart, and nothing would report the drift.
+pub(crate) fn canonical_order(survey: &Survey, frames: &Frames) -> Vec<usize> {
     let mut order: Vec<usize> = (0..survey.edges.len()).collect();
     order.sort_by(|&a, &b| {
         let (ea, eb) = (&survey.edges[a], &survey.edges[b]);

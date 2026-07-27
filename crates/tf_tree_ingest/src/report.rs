@@ -89,15 +89,13 @@ impl IngestReport {
     /// Build a report from a completed survey and fill.
     #[must_use]
     pub fn new(path: &Path, survey: &Survey, frames: &Frames, fill: FillStats) -> IngestReport {
-        // Canonical order, matching what `ingest::fill` declares into the arena
-        // — a report whose rows moved when the recording's message order moved
-        // would be undiffable between two ingests of the same data.
-        let mut order: Vec<usize> = (0..survey.edges.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (ea, eb) = (&survey.edges[a], &survey.edges[b]);
-            (frames.name(ea.parent), frames.name(ea.child))
-                .cmp(&(frames.name(eb.parent), frames.name(eb.child)))
-        });
+        // Canonical order, **by calling the same function `ingest::fill` calls**
+        // rather than by repeating its comparator here. A report whose rows moved
+        // when the recording's message order moved would be undiffable between
+        // two ingests of the same data; a report whose rows were sorted by a
+        // second, separately-maintained copy of the rule would agree with the
+        // arena until someone edited one of them.
+        let order = crate::ingest::canonical_order(survey, frames);
         let edges: Vec<EdgeRow> = order
             .iter()
             .map(|&i| &survey.edges[i])
@@ -206,6 +204,7 @@ impl IngestReport {
             a.empty_names,
             a.filtered_channels,
         );
+        let _ = write!(s, ",\"truncated\":{}", a.truncated);
         s.push_str(",\"first_reset_at_ns\":");
         match a.first_reset_at_ns {
             Some(v) => {
@@ -315,6 +314,15 @@ impl IngestReport {
                 let _ = writeln!(s, "  ! {text}");
             }
         };
+        // First among the anomaly rows, because it changes what every other
+        // number in this report means: they describe a prefix of the recording,
+        // not the recording.
+        row(
+            a.truncated,
+            "the recording ends mid-record and was read up to that point; \
+             every count below covers only the part that exists"
+                .to_owned(),
+        );
         row(
             a.zero_stamp_drops > 0,
             format!(
