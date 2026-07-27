@@ -188,6 +188,42 @@ fn the_json_summary_agrees_with_the_exit_status() {
     );
 }
 
+/// **Every occupancy row TFT015 reports must be capable of being non-zero.**
+///
+/// `TFT015` is a threshold check, so a row whose numerator is stuck at 0 does
+/// not merely fail to fire — it reports `pass`, which is an active claim that
+/// the table has room. `ArenaHeader::participant_count` is never incremented
+/// anywhere in the workspace, so a `participants` row would read `0 / max` on
+/// every arena that has ever existed and would report `pass` on a fleet that
+/// had exhausted every slot and could not attach another node. The catalogue's
+/// premise is that a check without evidence says so; the row is therefore
+/// omitted and disclosed in `Meta.notes` instead.
+///
+/// The fixture is non-degenerate: it is a fully built tree with live
+/// publishers, so `frames` and `edges` are both genuinely non-zero and the
+/// assertion is about the *absent* row rather than about an empty arena.
+///
+/// Mutant: restore the `("participants", h.participant_count, h.max_participants)`
+/// row in `occupancy_of`. Applied: `used = 0` for it and this fails with
+/// "occupancy row \"participants\" reads 0 used".
+#[test]
+fn no_occupancy_row_is_permanently_zero() {
+    let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
+    let (writers, _samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
+
+    let rows = checks::occupancy_of(&tree);
+    assert!(!rows.is_empty(), "TFT015 must measure something");
+    for (what, used, cap) in rows {
+        assert!(
+            used > 0,
+            "occupancy row {what:?} reads 0 used of {cap} on a fully populated arena, so \
+             TFT015 can only ever report `pass` for it — omit the row and disclose the gap \
+             in Meta.notes instead of passing silently"
+        );
+    }
+    drop(writers);
+}
+
 /// **The CLI's `counters` feature must actually control the engine's.**
 ///
 /// `TFT010`'s "built without counters" skip and `render_human`'s banner both

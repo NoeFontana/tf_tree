@@ -62,6 +62,13 @@ impl Check {
 }
 
 /// How serious a finding is.
+///
+/// Distinct from [`crate::catalogue::Severity`], which is the *reporting*
+/// vocabulary and carries an `Info` level this layer has no use for. The two
+/// meet in one place — `From<Severity> for crate::catalogue::Severity` — so
+/// that a check's severity is declared once, here, next to the code that knows
+/// why the condition is serious, instead of being restated by whatever maps the
+/// finding into the catalogue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     /// Worth attention but not necessarily broken.
@@ -99,24 +106,12 @@ impl Finding {
     }
 }
 
-/// The result of running all seven checks.
-#[derive(Clone, Debug, Default)]
-pub struct Report {
-    /// All findings, in check order.
-    pub findings: Vec<Finding>,
-}
-
-impl Report {
-    /// Whether the tree is clean (no findings).
-    #[must_use]
-    pub fn is_healthy(&self) -> bool {
-        self.findings.is_empty()
-    }
-
-    /// Whether any finding is an [`Severity::Error`].
-    #[must_use]
-    pub fn has_error(&self) -> bool {
-        self.findings.iter().any(|f| f.severity == Severity::Error)
+impl From<Severity> for crate::catalogue::Severity {
+    fn from(s: Severity) -> crate::catalogue::Severity {
+        match s {
+            Severity::Warn => crate::catalogue::Severity::Warn,
+            Severity::Error => crate::catalogue::Severity::Error,
+        }
     }
 }
 
@@ -160,6 +155,14 @@ pub struct EdgeInfo {
     pub head: u64,
     /// Whether a live writer currently holds the claim.
     pub claimed: bool,
+    /// Whether the claim record was caught **mid-handoff** (the `CLAIMING`
+    /// sentinel) rather than actually held.
+    ///
+    /// Separate from `claimed`/`owner_pid` because both of those collapse it
+    /// into "claimed by nobody", which is also what a genuinely leaked claim
+    /// looks like. Distinguishing them needs a liveness source a snapshot does
+    /// not have, so `TFT014` uses this to stay silent instead of guessing.
+    pub claiming: bool,
     /// The current claim owner's PID (`0` if unclaimed).
     pub owner_pid: u32,
     /// Newest published stamp, if any samples exist.
@@ -262,6 +265,7 @@ impl Snapshot {
                 domain: rec.domain,
                 head: rec.head.load(Ordering::Relaxed),
                 claimed: owner_word != 0,
+                claiming: tf_tree_core::edge::is_claiming(owner_word),
                 // A3: the claim names a *participant slot*, not a PID, so the
                 // owning process is resolved through the participant table. A
                 // slot that no longer resolves means the owner detached or died
@@ -285,6 +289,22 @@ impl Snapshot {
             .find(|f| f.id == id)
             .map(|f| f.name.clone())
             .unwrap_or_else(|| format!("frame#{id}"))
+    }
+
+    /// An `id -> edge` map for the checks that walk [`crate::checks::EdgeStats`]
+    /// and need the corresponding [`EdgeInfo`].
+    ///
+    /// Built once per check rather than re-scanning `edges` per entry: the
+    /// naive `edges.iter().find(...)` inside a loop over `stats` is O(E^2), and
+    /// on a 5 000-edge arena that is tens of millions of comparisons to answer
+    /// a question a single pass already knows. Not a `zip` against `stats`,
+    /// even though `collect_edge_stats` happens to build them in the same
+    /// order: a caller assembling `Inputs` by hand can supply stats for a
+    /// subset, and a silently misaligned zip would put the wrong frame names on
+    /// a finding — trading a correctness risk for speed on a cold path.
+    #[must_use]
+    pub fn edge_index(&self) -> BTreeMap<u32, &EdgeInfo> {
+        self.edges.iter().map(|e| (e.id, e)).collect()
     }
 
     /// A `"parent->child"` label for edge `id`.
@@ -331,8 +351,8 @@ impl Observations {
     /// Nobody was watching when those samples arrived, so this is strictly less
     /// than the fixture knows, and the difference is not cosmetic. Two of the
     /// seven checks are **structurally unable to fire** on the result, and
-    /// [`Self::LOST_ON_A_LIVE_ARENA`] names them so `doctor` can say so instead
-    /// of printing a clean bill of health it did not earn:
+    /// `doctor` discloses both rather than printing a clean bill of health it
+    /// did not earn — `TFT001` skips outright, and `TFT011` carries a note:
     ///
     /// * **multi-writer** — a ring remembers the *current* claim owner, not the
     ///   sequence of processes that wrote into it. Every sample therefore
@@ -367,9 +387,6 @@ impl Observations {
         }
         Observations { events }
     }
-
-    /// The checks [`Self::from_arena`] cannot supply evidence for.
-    pub const LOST_ON_A_LIVE_ARENA: &'static [Check] = &[Check::MultiWriter, Check::ShortBuffer];
 
     /// Record one observed push.
     pub fn record(&mut self, sample: PushSample) {
@@ -648,9 +665,16 @@ fn median_period(samples: &[&PushSample]) -> Option<i64> {
     Some(median)
 }
 
-/// Run all seven checks over a captured snapshot and observed history.
+/// Every Phase 1 finding over a captured snapshot and observed history.
+///
+/// There is deliberately no `Report`/`is_healthy`/`has_error` wrapper here.
+/// `crate::catalogue::Report` is the one the `--exit-code` gate consults, and a
+/// second type with the same name and near-identical methods one module away is
+/// a trap: a reader landing on `has_error` has no way to tell which gate it
+/// feeds. The catalogue routes each of these findings to a `TFT` id (or to
+/// `Uncatalogued`), so this returns the raw list and lets that layer decide.
 #[must_use]
-pub fn run(snap: &Snapshot, obs: &Observations) -> Report {
+pub fn all_findings(snap: &Snapshot, obs: &Observations) -> Vec<Finding> {
     let mut findings = Vec::new();
     findings.extend(check_cycles(snap));
     findings.extend(check_unclaimed_dynamic(snap));
@@ -659,7 +683,7 @@ pub fn run(snap: &Snapshot, obs: &Observations) -> Report {
     findings.extend(check_inconsistent_rates(obs));
     findings.extend(check_unreachable(snap));
     findings.extend(check_out_of_order(obs));
-    Report { findings }
+    findings
 }
 
 #[cfg(test)]
@@ -689,6 +713,7 @@ mod tests {
             domain: 0,
             head: 0,
             claimed,
+            claiming: false,
             owner_pid: if claimed { 1234 } else { 0 },
             newest_stamp: None,
         }
@@ -952,11 +977,10 @@ mod tests {
         let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
         let snap = Snapshot::capture(&tree);
         let obs = Observations::from_samples(samples);
-        let report = run(&snap, &obs);
+        let findings = all_findings(&snap, &obs);
         assert!(
-            report.is_healthy(),
-            "healthy fixture produced findings: {:?}",
-            report.findings
+            findings.is_empty(),
+            "healthy fixture produced findings: {findings:?}"
         );
         assert_eq!(snap.frames.len(), 24, "fixture should have 24 frames");
         assert_eq!(snap.edges.len(), 23, "fixture should have 23 edges");

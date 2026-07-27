@@ -358,11 +358,15 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
 
     // The two Phase 1 checks §6 assigns no identifier to. See the
     // `crate::catalogue` module docs for why they are not forced into one.
+    // Severity comes from the finding, not from a literal here: `doctor` sets
+    // it next to the code that knows why the condition is serious, and
+    // restating it at this seam is how the two answers drift apart. `--exit-code`
+    // keys on it, so a drift is a gate that silently changes meaning.
     let mut uncatalogued = Vec::new();
     for f in doctor::check_unclaimed_dynamic(inp.snap) {
         uncatalogued.push(Uncatalogued {
             check: "unclaimed-dynamic",
-            severity: Severity::Warn,
+            severity: Severity::from(f.severity),
             subject: "tree".to_owned(),
             message: f.message,
         });
@@ -371,7 +375,7 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
         for f in doctor::check_out_of_order(inp.obs) {
             uncatalogued.push(Uncatalogued {
                 check: "out-of-order",
-                severity: Severity::Error,
+                severity: Severity::from(f.severity),
                 subject: "tree".to_owned(),
                 message: f.message,
             });
@@ -444,33 +448,27 @@ fn tft005(inp: &Inputs<'_>) -> CheckOutcome {
 fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
     let now = inp.clock.nanos();
     let wall = matches!(inp.clock, Clock::Wall(_));
+    let index = inp.snap.edge_index();
     let mut out = Vec::new();
     for st in inp.stats {
-        let Some(e) = inp.snap.edges.iter().find(|e| e.id == st.edge) else {
+        let Some(e) = index.get(&st.edge) else {
             continue;
         };
-        let label = inp.snap.edge_label(e);
+        // Reasons first, label second. `edge_label` formats two linear scans of
+        // `snap.frames` into a fresh `String`, and computing it before any
+        // predicate paid that on every edge of a completely clean arena.
+        let mut reasons: Vec<String> = Vec::new();
         if st.negative_stamps > 0 {
-            out.push(Finding::on_edge(
-                Tft::Tft006,
-                st.edge,
-                label.clone(),
-                format!(
-                    "{} retained stamp(s) are negative, which is invalid in every time domain",
-                    st.negative_stamps
-                ),
+            reasons.push(format!(
+                "{} retained stamp(s) are negative, which is invalid in every time domain",
+                st.negative_stamps
             ));
         }
         if wall && st.zero_stamps > 0 {
-            out.push(Finding::on_edge(
-                Tft::Tft006,
-                st.edge,
-                label.clone(),
-                format!(
-                    "{} retained stamp(s) are exactly 0; this arena's stamps are Unix time, \
-                     so that is 1970 and means the field was never set",
-                    st.zero_stamps
-                ),
+            reasons.push(format!(
+                "{} retained stamp(s) are exactly 0; this arena's stamps are Unix time, \
+                 so that is 1970 and means the field was never set",
+                st.zero_stamps
             ));
         }
         // The distance rule catches the units error a range check cannot: a
@@ -487,16 +485,23 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
         for (what, stamp) in ends {
             let Some(s) = stamp else { continue };
             if (s - now).abs() > ABSURD_HORIZON_NS {
-                out.push(Finding::on_edge(
-                    Tft::Tft006,
-                    st.edge,
-                    label.clone(),
-                    format!(
-                        "{what} retained stamp {s} is {} days from the reference clock",
-                        (s - now).abs() / (24 * 3600 * 1_000_000_000)
-                    ),
+                reasons.push(format!(
+                    "{what} retained stamp {s} is {} days from the reference clock",
+                    (s - now).abs() / (24 * 3600 * 1_000_000_000)
                 ));
             }
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+        let label = inp.snap.edge_label(e);
+        for reason in reasons {
+            out.push(Finding::on_edge(
+                Tft::Tft006,
+                st.edge,
+                label.clone(),
+                reason,
+            ));
         }
     }
     CheckOutcome::ran(Tft::Tft006, out)
@@ -531,12 +536,25 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
         if intervals.len() < 4 {
             continue;
         }
+        // **Any** negative interval disqualifies the edge, not just a
+        // non-positive median. A stream with a handful of inverted pairs keeps
+        // a healthy positive median, but the jump back to the true timeline
+        // after an inversion becomes `worst` — so TFT009 reports a dropout of
+        // N x the median that never happened. The real fault is the id-less
+        // `out-of-order` check, which fires on the same stream at error
+        // severity; adding a warn about a phantom gap next to it sends the
+        // operator looking for a lost publisher instead of a reordered one.
+        //
+        // Skipping loses nothing: an interval sequence that is not monotone has
+        // no meaningful inter-arrival distribution to measure a gap against.
+        if intervals.iter().any(|&d| d < 0) {
+            continue;
+        }
         let worst = intervals.iter().copied().max().unwrap_or(0);
         intervals.sort_unstable();
         let median = intervals[intervals.len() / 2];
-        // A non-positive median means the stream is not monotone; that is the
-        // id-less `out-of-order` check's finding, and multiplying by it here
-        // would turn one bad stream into a dropout report on every edge.
+        // A zero median (every retained stamp identical) would divide by zero
+        // in the ratio and make every non-zero interval an infinite gap.
         if median <= 0 {
             continue;
         }
@@ -566,6 +584,7 @@ fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
              reads zero and \"no failures\" cannot be told from \"nothing counted\"",
         );
     }
+    let index = inp.snap.edge_index();
     let mut out = Vec::new();
     for st in inp.stats {
         let errs = st.extrap_before + st.extrap_after;
@@ -590,11 +609,8 @@ fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
                 .collect();
             format!("last failed by {}", list.join(", "))
         };
-        let subject = inp
-            .snap
-            .edges
-            .iter()
-            .find(|e| e.id == st.edge)
+        let subject = index
+            .get(&st.edge)
             .map_or_else(|| format!("edge#{}", st.edge), |e| inp.snap.edge_label(e));
         out.push(Finding::on_edge(
             Tft::Tft010,
@@ -630,6 +646,7 @@ fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
 fn tft011(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     if inp.counters {
+        let index = inp.snap.edge_index();
         for st in inp.stats {
             if st.extrap_before == 0 || st.worst_extrap_gap_ns <= 0 {
                 continue;
@@ -640,11 +657,8 @@ fn tft011(inp: &Inputs<'_>) -> CheckOutcome {
             if st.worst_extrap_gap_ns <= span {
                 continue;
             }
-            let subject = inp
-                .snap
-                .edges
-                .iter()
-                .find(|e| e.id == st.edge)
+            let subject = index
+                .get(&st.edge)
                 .map_or_else(|| format!("edge#{}", st.edge), |e| inp.snap.edge_label(e));
             out.push(Finding::on_edge(
                 Tft::Tft011,
@@ -707,10 +721,19 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 /// leaked claim: the writer is gone and nothing released its edge, so no other
 /// process can take it.
 ///
-/// A record caught mid-claim (`CLAIMING`) resolves to no slot either, and is
-/// reported the same way on purpose: a claimer killed between winning the
-/// record and publishing its identity leaves a word no participant holds, which
-/// is the same thing a reaper collects.
+/// A record caught mid-claim (`CLAIMING`) also resolves to no slot, and is
+/// **excluded**, because from a snapshot the two are not the same thing. A
+/// normal handoff parks `CLAIMING` in the record for the few instructions
+/// between winning it and publishing an identity, so a `doctor` run that lands
+/// in that window on a *healthy* arena would report a leak on an edge whose
+/// publisher is restarting. `Tree::reap` may act on `CLAIMING` only because it
+/// first consults an independent liveness source — `probe_claim` on the lock
+/// file — and a live claimer in that window is protected by the lock still
+/// being held. This check takes no such probe, so it has no evidence with which
+/// to tell a dead mid-claim from a live one, and reports neither. The cost is a
+/// claimer killed inside that window going unreported; the alternative is a
+/// warn-severity false positive on every publisher restart, which is what
+/// teaches operators to ignore the check.
 ///
 /// **This rests entirely on the owner word being decoded correctly.** It is
 /// `(epoch << 16) | (slot + 1)`, so a hand-rolled `word - 1` resolves every
@@ -720,7 +743,7 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     for e in &inp.snap.edges {
-        if e.claimed && e.owner_pid == 0 {
+        if e.claimed && !e.claiming && e.owner_pid == 0 {
             out.push(Finding::on_edge(
                 Tft::Tft014,
                 e.id,
@@ -809,6 +832,21 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// The occupancy triples for [`Inputs::occupancy`], read from the header.
+///
+/// **`participants` is deliberately absent, and [`PARTICIPANT_OCCUPANCY_NOTE`]
+/// says so in the report.** §6 names frames, edges *and* participants, but
+/// `ArenaHeader::participant_count` is never incremented anywhere in the
+/// workspace — the only writes to it are the zero it is initialised with. A row
+/// fed from it would read `0 / max_participants` on every arena, so `TFT015`
+/// would report `pass` for participants on a fleet that had exhausted every
+/// slot and could not attach another node.
+///
+/// Emitting the row anyway would be worse than omitting it: this catalogue's
+/// whole premise is that a check without evidence says so rather than passing,
+/// and a permanently-`0%` row passes silently and looks like a real result. So
+/// the row is dropped and the gap is disclosed in `Meta.notes`, which exists
+/// for exactly this "ran, but half blind" case. Restore the row in the same
+/// commit that makes the engine maintain the counter.
 #[must_use]
 pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
     let view = tree.arena_view();
@@ -823,13 +861,14 @@ pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
         // (declared + 1) and `max_edges` is the table size, so the ratio is
         // exact rather than off by one slot.
         ("edges", h.edge_count.load(Ordering::Relaxed), h.max_edges),
-        (
-            "participants",
-            h.participant_count.load(Ordering::Relaxed),
-            h.max_participants,
-        ),
     ]
 }
+
+/// The disclosure that pairs with [`occupancy_of`]'s missing `participants` row.
+pub const PARTICIPANT_OCCUPANCY_NOTE: &str =
+    "TFT015 covers frames and edges only: ArenaHeader::participant_count is never \
+     incremented by the engine, so a participants row would read 0% on every arena \
+     and pass even with the slot table full";
 
 /// Every edge's newest stamp — the sample [`Clock::decide`] votes over.
 ///
@@ -872,6 +911,7 @@ mod tests {
             domain: 0,
             head,
             claimed: true,
+            claiming: false,
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
         }
@@ -1225,5 +1265,125 @@ mod tests {
         ));
         let blamed: Vec<u32> = o.findings.iter().filter_map(|f| f.edge).collect();
         assert_eq!(blamed, vec![6], "only the rogue edge is absurd: {o:?}");
+    }
+
+    /// **A claim caught mid-handoff is not a leaked claim.**
+    ///
+    /// `claim` parks the `CLAIMING` sentinel in the record for the few
+    /// instructions between winning it and publishing an identity. `slot_of`
+    /// maps that to no slot, exactly as it maps a dead owner's slot to no slot,
+    /// so `owner_pid` is 0 in both cases. Firing on `owner_pid == 0` alone
+    /// therefore reports a leak on a healthy arena every time `doctor` lands in
+    /// that window — a publisher restart, at warn severity, on an edge that is
+    /// fine. `Tree::reap` may act on `CLAIMING` only because it first probes
+    /// the lock file for liveness; this check takes no such probe and so must
+    /// not draw the conclusion.
+    ///
+    /// The fixture is non-degenerate: the two edges are identical except for
+    /// `claiming`, so the assertion cannot pass by accident of some other
+    /// field, and the genuinely-leaked edge proves the check still fires.
+    ///
+    /// Mutant: drop the `!e.claiming` term from `tft014`'s guard. Applied: both
+    /// edges are reported and the first assertion fails.
+    #[test]
+    fn a_claim_caught_mid_handoff_is_not_reported_as_a_leak() {
+        let obs = Observations::new();
+        let mut mid = edge(1, 1, 2, 100);
+        mid.claimed = true;
+        mid.claiming = true;
+        mid.owner_pid = 0;
+
+        let snap = two_frame_snapshot(mid.clone());
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(
+            o.status,
+            Status::Pass,
+            "a record in CLAIMING is a handoff in flight, not a leak: {o:?}"
+        );
+
+        // The same edge with the sentinel cleared *is* a leak, and must fire —
+        // otherwise the assertion above would hold for a check that never
+        // reports anything.
+        let mut leaked = mid;
+        leaked.claiming = false;
+        let snap = two_frame_snapshot(leaked);
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(
+            o.findings.len(),
+            1,
+            "a claim held by a slot with no live identity is still a leak: {o:?}"
+        );
+    }
+
+    /// **An out-of-order stream is not a dropout.**
+    ///
+    /// The `median <= 0` guard only catches a *wholly* non-monotone stream. A
+    /// few inverted pairs leave a healthy positive median, but the jump back to
+    /// the true timeline after an inversion becomes `worst` — so `TFT009`
+    /// reports a gap of several times the median that never happened. The real
+    /// fault fires too, as the id-less `out-of-order` check at error severity,
+    /// and the operator then also gets a warn sending them to look for a lost
+    /// publisher instead of a reordered one.
+    ///
+    /// The stream below is non-degenerate on both axes: its median interval is
+    /// a healthy 100 ms (so the old guard does not catch it) and its recovery
+    /// jump is 350 ms, comfortably past `GAP_FACTOR` x median (so the old code
+    /// really did fire).
+    ///
+    /// Mutant: replace the `intervals.iter().any(|&d| d < 0)` guard with the
+    /// old `median <= 0` test alone. Applied: `TFT009` fires with
+    /// "largest gap 350.0 ms is 3.5x the median period 100.0 ms" and the first
+    /// assertion fails.
+    #[test]
+    fn an_out_of_order_stream_is_not_reported_as_a_dropout() {
+        const MS: i64 = 1_000_000;
+        // Monotone 100 ms cadence except for one sample that arrives late and
+        // is stamped 250 ms in the past; the next sample jumps 350 ms forward.
+        let stamps = [0, 100, 200, 300, 50, 400, 500, 600];
+        let obs = Observations::from_samples(
+            stamps
+                .iter()
+                .map(|&ms| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: ms * MS,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let o = tft009(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(
+            o.status,
+            Status::Pass,
+            "a reordered stream has no inter-arrival distribution to measure a gap \
+             against; the fault is out-of-order, not a dropout: {o:?}"
+        );
+
+        // Non-vacuity, twice over. The stream really is out of order...
+        assert!(
+            !doctor::check_out_of_order(&obs).is_empty(),
+            "the fixture must actually be non-monotone, or this asserts nothing"
+        );
+        // ...and TFT009 is not simply mute: the same cadence with the inversion
+        // removed, and one genuine 400 ms hole, still reports the dropout.
+        let clean = [0, 100, 200, 300, 400, 800, 900, 1000];
+        let obs = Observations::from_samples(
+            clean
+                .iter()
+                .map(|&ms| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: ms * MS,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let o = tft009(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(
+            o.findings.len(),
+            1,
+            "a real gap in a monotone stream must still fire: {o:?}"
+        );
     }
 }

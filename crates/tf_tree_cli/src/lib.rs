@@ -411,7 +411,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         now_nanos: clock.nanos(),
         clock_source: clock.label(),
         counters_compiled_in: tf_tree::counters_compiled_in(),
-        notes: live_evidence_notes(src.is_live()),
+        notes: evidence_notes(src.is_live()),
     };
 
     if json {
@@ -434,15 +434,20 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 /// `arrival_delay_ns` is unknown and set to zero — and zero latency never
 /// exceeds any buffer span, so that half of the check is structurally silent.
 /// Reporting `pass` without saying so would claim a result it did not earn.
-fn live_evidence_notes(live: bool) -> Vec<String> {
-    if !live {
-        return Vec::new();
+///
+/// `TFT015`'s disclosure is unconditional rather than live-only: the missing
+/// participants row is a gap in the engine, not in this run's evidence, so it
+/// applies to a fixture and a live arena alike.
+fn evidence_notes(live: bool) -> Vec<String> {
+    let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
+    if live {
+        notes.push(
+            "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
+             latency, so the capacity-vs-latency half of the check cannot fire"
+                .to_owned(),
+        );
     }
-    vec![
-        "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
-         latency, so the capacity-vs-latency half of the check cannot fire"
-            .to_owned(),
-    ]
+    notes
 }
 
 /// The system clock as nanoseconds since the Unix epoch.
