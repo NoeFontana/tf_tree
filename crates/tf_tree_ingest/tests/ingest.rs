@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use tf_tree::{Stamp, SystemDomain};
 use tf_tree_ingest::cdr::TransformStamped;
-use tf_tree_ingest::fixture::{small_recording, write_mcap, FixtureMessage};
+use tf_tree_ingest::fixture::{
+    small_recording, two_publishers_with_latency, write_mcap, FixtureMessage,
+};
 use tf_tree_ingest::{ClockResetPolicy, Frames, IngestError, IngestOptions};
 
 /// A scratch directory that removes itself, so a failing test does not leave a
@@ -164,6 +166,37 @@ fn out_of_order_ingest_matches_ordered() {
     let b = tf_tree_ingest::run(&p2, &opts, &mut f2).unwrap();
 
     assert_eq!(a.report.samples_pushed, b.report.samples_pushed);
+
+    // **Identity, not just value.** The amendment at `ingest::fill` has two
+    // halves — canonical *edge* order and canonical *frame* order — and only the
+    // edge half is observable through a `LookupError`. `FrameId`s are assigned in
+    // declaration order, so if declaration followed first-seen order the two runs
+    // would agree about every pose and disagree about every id, and every byte of
+    // the topology block with them. That is precisely what §11's byte-identity
+    // requirement is about, so it is asserted directly rather than inferred.
+    //
+    // The fixture is non-degenerate for this: the two files declare frames in
+    // wholly different first-seen orders (`base_link, laser, imu_link, odom, map,
+    // arm_link` against `odom, base_link, map, arm_link, imu_link, laser`), so an
+    // ingest that used first-seen order could not pass by accident.
+    let mut names: Vec<&str> = f1.all().iter().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names.len(), 6, "frames: {names:?}");
+    let mut order_a: Vec<&str> = f1.all().iter().map(String::as_str).collect();
+    let mut order_b: Vec<&str> = f2.all().iter().map(String::as_str).collect();
+    assert_ne!(
+        order_a, order_b,
+        "the two files interned frames in the same first-seen order; \
+         the shuffle is degenerate and this assertion proves nothing"
+    );
+    order_a.sort_unstable();
+    order_b.sort_unstable();
+    assert_eq!(order_a, order_b, "the two runs saw different frame names");
+    for name in &names {
+        let ia = a.tree.frame(name).unwrap();
+        let ib = b.tree.frame(name).unwrap();
+        assert_eq!(ia, ib, "frame {name:?} got a different FrameId");
+    }
     // Out-of-order arrivals are *counted* in the shuffled run and absent in the
     // ordered one — if they were zero in both, the shuffle did nothing and this
     // test would be vacuous.
@@ -353,12 +386,83 @@ fn clock_reset_halts_but_jitter_does_not() {
     let path = write(&dir, "clock.mcap", &msgs);
     let mut frames = Frames::default();
     let err = tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames).unwrap_err();
-    assert_eq!(
-        err,
-        IngestError::ClockReset {
-            at_ns: 11_000_000_000,
-            by_ns: 30_000_000_000,
-        }
+    assert!(
+        matches!(
+            err,
+            IngestError::ClockReset {
+                at_ns: 11_000_000_000,
+                by_ns: 30_000_000_000,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// **Two publishers with different latencies are not a clock reset.** The most
+/// common real `/tf` topology — a 100 Hz `odom -> base_link` stamped at publish
+/// time interleaved with a 10 Hz `map -> odom` stamped 200 ms in the past by a
+/// localization node — ingests at the defaults.
+///
+/// 200 ms is chosen to be *above* the 100 ms reset threshold: that is what makes
+/// this test about the guard's scope rather than about its constant. Nothing in
+/// this recording is anomalous, and the assertion that `clock_resets == 0` is the
+/// one that matters.
+///
+/// Mutant: replace the per-edge `clocks[slot]` in `survey` with a single guard
+/// over the whole stream — applied, and this test failed with
+/// `ClockReset { at_ns: 9_800_000_000, by_ns: 200_000_000 }` on message 21 of
+/// 110, exactly as the finding predicted.
+#[test]
+fn two_publishers_with_different_latencies_ingest_at_the_defaults() {
+    let dir = Scratch::new("latency");
+    let path = write(
+        &dir,
+        "latency.mcap",
+        &two_publishers_with_latency(200_000_000),
+    );
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    assert_eq!(out.report.anomalies.clock_resets, 0);
+    // Each edge is internally monotone, so the skew is not "out of order"
+    // either — it is simply not this check's business.
+    assert_eq!(out.report.anomalies.out_of_order, 0);
+    assert_eq!(out.report.samples_pushed, 110);
+    assert_eq!(out.report.dynamic_edges, 2);
+}
+
+/// A **bag loop still halts** with the guard scoped per edge, because a loop
+/// moves `/clock` itself and therefore regresses every edge at once.
+///
+/// This is the other half of the per-edge change: without it, narrowing the
+/// guard's scope could have been a silent removal of the check.
+///
+/// Mutant: delete the `ClockVerdict::Reset` arm's `ClockResetPolicy::Halt`
+/// return, leaving the reset merely counted — applied, and this test failed with
+/// `Ok`.
+#[test]
+fn a_bag_loop_still_halts_with_a_per_edge_guard() {
+    let dir = Scratch::new("loop");
+    let mut msgs = two_publishers_with_latency(200_000_000);
+    // The recording restarts: every edge's stamps go back to the beginning.
+    msgs.extend(two_publishers_with_latency(200_000_000));
+    let path = write(&dir, "loop.mcap", &msgs);
+
+    let mut frames = Frames::default();
+    let err = tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames).unwrap_err();
+    let (parent, child) = match err {
+        IngestError::ClockReset { parent, child, .. } => (parent, child),
+        other => panic!("expected a clock reset, got {other:?}"),
+    };
+    // **The message names the edge**, which is what an earlier revision could
+    // not do: with one guard over the merged stream there was no edge to name.
+    let text = tf_tree_ingest::describe(err, &frames).to_string();
+    assert!(
+        text.contains(frames.name(parent)) && text.contains(frames.name(child)),
+        "the message must name the regressing edge: {text}"
     );
 }
 

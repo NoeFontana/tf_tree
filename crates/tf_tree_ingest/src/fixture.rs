@@ -210,3 +210,49 @@ pub fn small_recording() -> Vec<FixtureMessage> {
     }
     out
 }
+
+/// The shape of a **real** `/tf`: several publishers, each stamping at a
+/// different point in its own pipeline, interleaved into one topic.
+///
+/// [`small_recording`] gives every edge the identical stamp at each tick, which
+/// makes the merged stamp stream monotone and hides an entire class of bug — the
+/// merged stream of a real recording is *not* monotone, and never was. Here
+/// `odom -> base_link` is stamped as it is published (100 Hz, zero latency),
+/// while `map -> odom` comes from a localization node that stamps at the scan it
+/// processed and publishes `latency_ns` later (10 Hz). Nothing about this
+/// recording is anomalous; it is what a navigation stack writes.
+///
+/// `latency_ns` is a parameter because the interesting values straddle the
+/// reset threshold: at 200 ms the skew is above the 100 ms default and a
+/// per-stream clock guard halts on it.
+#[must_use]
+pub fn two_publishers_with_latency(latency_ns: i64) -> Vec<FixtureMessage> {
+    let mut out = Vec::new();
+    for i in 0..100i64 {
+        let t = 10_000_000_000 + i * 10_000_000;
+        let a = i as f64 * 0.01;
+        // Published now, stamped now.
+        out.push(
+            FixtureMessage::dynamic(
+                "odom",
+                "base_link",
+                t,
+                [a.cos(), 0.0, 0.0, a.sin(), a, a * 2.0, 0.5],
+            )
+            .logged_at(t),
+        );
+        if i % 10 == 0 {
+            // Published now, stamped `latency_ns` ago.
+            out.push(
+                FixtureMessage::dynamic(
+                    "map",
+                    "odom",
+                    t - latency_ns,
+                    [1.0, 0.0, 0.0, 0.0, 0.25 + a, -0.5, 1.5],
+                )
+                .logged_at(t),
+            );
+        }
+    }
+    out
+}

@@ -24,6 +24,24 @@
 //! same sample lands in the right place. Treating out-of-order as a drop here
 //! would discard exactly the samples §3.1's sort exists to recover, and a
 //! recording routinely has thousands of them.
+//!
+//! # And the guard is per **edge**, not per stream
+//!
+//! The online bridge watches one clock, because it *is* one publisher. A
+//! recording is not: `/tf` carries every publisher on the robot interleaved into
+//! one file, and they do not stamp at the same instant. A localization node
+//! stamps `map -> odom` at the scan it processed and publishes 200 ms later,
+//! while `odom -> base_link` is stamped as it is published. Both are correct;
+//! their stamps interleave by whatever the slower pipeline's latency is, which is
+//! hundreds of milliseconds and not the tens the 100 ms threshold assumes.
+//!
+//! A single guard over the merged stream therefore reports a *reset* — the whole
+//! ingest halting, at the default, on an ordinary recording — for something that
+//! is not a clock reset at all but two publishers. One guard per edge is the only
+//! monotonicity that means anything here anyway, because §3.1 sorts per edge and
+//! Phase 1 invariant 6 is a per-edge rule. It still catches what the check is
+//! for: a bag loop or a sim reset moves `/clock` itself, so **every** edge
+//! regresses at once and the first one to be observed halts.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -276,13 +294,9 @@ pub fn survey(
         None => NameNormalizer::new(),
     };
     let mut statics = StaticStore::new();
-    let mut clock = ClockGuard::with_threshold(
-        // The guard's own policy is not consulted: this crate applies
-        // `ClockResetPolicy` itself, because `split` has no online counterpart
-        // to borrow a meaning from.
-        OnClockReset::Halt,
-        opts.clock_reset_threshold_ns,
-    );
+    // One guard per edge — see the module docs. `clocks[i]` belongs to
+    // `out.edges[i]`; the two vectors are grown together and never separately.
+    let mut clocks: Vec<ClockGuard> = Vec::new();
     let mut index: BTreeMap<EdgeKey, usize> = BTreeMap::new();
     let mut out = Survey {
         edges: Vec::new(),
@@ -298,18 +312,30 @@ pub fn survey(
             return Ok(());
         };
         let key = (parent.0, child.0);
-        let slot = *index.entry(key).or_insert_with(|| {
-            out.edges.push(EdgeSurvey {
-                parent,
-                child,
-                topic: rec.topic.to_owned(),
-                static_pose: None,
-                samples: 0,
-                source_oldest_ns: None,
-                source_newest_ns: None,
-            });
-            out.edges.len() - 1
-        });
+        let slot = match index.get(&key) {
+            Some(&s) => s,
+            None => {
+                out.edges.push(EdgeSurvey {
+                    parent,
+                    child,
+                    topic: rec.topic.to_owned(),
+                    static_pose: None,
+                    samples: 0,
+                    source_oldest_ns: None,
+                    source_newest_ns: None,
+                });
+                clocks.push(ClockGuard::with_threshold(
+                    // The guard's own policy is not consulted: this crate applies
+                    // `ClockResetPolicy` itself, because `split` has no online
+                    // counterpart to borrow a meaning from.
+                    OnClockReset::Halt,
+                    opts.clock_reset_threshold_ns,
+                ));
+                let s = out.edges.len() - 1;
+                index.insert(key, s);
+                s
+            }
+        };
 
         if rec.is_static {
             // §5.7's order, which `docs/PHASE4.md` §0.0 records getting wrong
@@ -362,7 +388,7 @@ pub fn survey(
             out.anomalies.future_stamps += 1;
             out.anomalies.worst_future_offset_ns = out.anomalies.worst_future_offset_ns.max(ahead);
         }
-        match clock.observe(rec.stamp_ns) {
+        match clocks[slot].observe(rec.stamp_ns) {
             ClockVerdict::Forward => {}
             // Kept, unlike online. See the module docs.
             ClockVerdict::Jitter { .. } => out.anomalies.out_of_order += 1,
@@ -374,6 +400,8 @@ pub fn survey(
                 match opts.on_clock_reset {
                     ClockResetPolicy::Halt => {
                         return Err(IngestError::ClockReset {
+                            parent,
+                            child,
                             at_ns: rec.stamp_ns,
                             by_ns: by_nanos,
                         })

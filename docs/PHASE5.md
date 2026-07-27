@@ -375,6 +375,30 @@ The ingest report is a first-class output, not log noise: emit it as JSON alongs
 > which is a fact about the test, not a workaround: a default that admitted a
 > whole-recording inversion would miss every real reset.
 
+> **Amendment — the guard is per edge, and a merged `/tf` stream is not a
+> clock.**
+>
+> The paragraph above is right that the *threshold* is shared with the bridge and
+> wrong about the *scope*, and the first revision implemented the wrong one: one
+> `ClockGuard` over every edge on every topic. That halts at the defaults on the
+> most ordinary `/tf` topology there is. A localization node stamps `map -> odom`
+> at the scan it processed and publishes hundreds of milliseconds later, while
+> `odom -> base_link` is stamped as it is published; both are correct, and their
+> stamps interleave by the slower pipeline's latency, which is above the 100 ms
+> threshold. A recording of two robots on `/robot1/tf` and `/robot2/tf` — which
+> §3.3 explicitly asks be read — fails the same way, by however far their clocks
+> differ.
+>
+> There is no threshold that fixes this, because the quantity being measured is
+> not a clock jump: it is the difference between two publishers' latencies, and
+> it is unbounded. So the guard is **one per edge**. That is also the only
+> monotonicity with a meaning here — §3.1 sorts per edge, and Phase 1 invariant 6
+> is a per-edge rule — and it does not weaken the check it exists for: a bag loop
+> or a sim reset moves `/clock` itself, so every edge regresses at once.
+>
+> The error consequently **names the edge**. The old one could not, and said
+> "clock reset" about something that was not one.
+
 ### 3.3 Sources
 
 - **MCAP** — primary. Read `tf2_msgs/msg/TFMessage` via the schema, not by assuming a topic name; support `/tf`, `/tf_static`, and remapped equivalents.

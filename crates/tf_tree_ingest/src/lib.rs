@@ -116,10 +116,22 @@ pub enum IngestError {
         /// The stamp at which the contradiction was found.
         stamp_ns: i64,
     },
-    /// The clock jumped backwards past the reset threshold, under
+    /// One edge's stamps jumped backwards past the reset threshold, under
     /// [`ClockResetPolicy::Halt`].
-    #[error("clock reset at stamp {at_ns} (backwards by {by_ns} ns)")]
+    ///
+    /// **It names the edge**, and that is not decoration. The guard is per edge
+    /// (`ingest`'s module docs say why), so the only honest thing this error can
+    /// report is *which* edge regressed — an earlier revision watched the merged
+    /// stream and said "clock reset" when the truth was two publishers with
+    /// different latencies, which is a diagnosis a user cannot act on.
+    #[error(
+        "clock reset on edge {parent:?} -> {child:?} at stamp {at_ns} (backwards by {by_ns} ns)"
+    )]
     ClockReset {
+        /// Parent frame of the regressing edge.
+        parent: FrameId,
+        /// Child frame of the regressing edge.
+        child: FrameId,
         /// The stamp that regressed.
         at_ns: i64,
         /// How far back it went.
@@ -199,6 +211,19 @@ impl core::fmt::Display for Described<'_> {
                 f,
                 "edge {} -> {} alone needs {needed_bytes} B of buffer, over the \
                  {cap_bytes} B --max-memory cap; raise the cap",
+                n(parent),
+                n(child)
+            ),
+            IngestError::ClockReset {
+                parent,
+                child,
+                at_ns,
+                by_ns,
+            } => write!(
+                f,
+                "edge {} -> {} jumped {by_ns} ns backwards at stamp {at_ns}, past the \
+                 reset threshold; raise --clock-reset-threshold if this publisher is \
+                 merely late rather than replayed",
                 n(parent),
                 n(child)
             ),
