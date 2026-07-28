@@ -68,7 +68,7 @@ thread_local! {
 
 /// This thread's token, stable for the thread's lifetime and never reused.
 #[inline]
-fn thread_token() -> u64 {
+pub(crate) fn thread_token() -> u64 {
     TOKEN.with(|t| {
         let v = t.get();
         if v != 0 {
@@ -137,7 +137,19 @@ unsafe fn check_publisher(p: *const tft_publisher) -> bool {
 ///   useful than proceeding and is why that code is not dead.
 #[inline]
 fn check_thread(h: &tft_publisher) -> tft_status {
-    if h.owner == thread_token() {
+    check_thread_token(h.owner, "tft_publisher")
+}
+
+/// [`check_thread`]'s body, over a bare token.
+///
+/// Split out so the bridge handle — which owns one `EdgeWriter` per declared
+/// edge and is `!Sync` for exactly the same reason — enforces the rule through
+/// *this* code rather than a second copy of it. `what` names the handle type in
+/// the abort message, because "which handle did I move between threads" is the
+/// first question the message has to answer.
+#[inline]
+pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
+    if owner == thread_token() {
         return TFT_OK;
     }
     #[cfg(debug_assertions)]
@@ -152,9 +164,9 @@ fn check_thread(h: &tft_publisher) -> tft_status {
         #[allow(clippy::print_stderr)]
         {
             eprintln!(
-                "tf_tree: FATAL — a tft_publisher created on one thread was used on \
-             another. tft_publisher is Send but not Sync (docs/PHASE4.md §3.2): \
-             exactly one thread may use it at a time. Claim a separate publisher \
+                "tf_tree: FATAL — a {what} created on one thread was used on \
+             another. It is Send but not Sync (docs/PHASE4.md §3.2): \
+             exactly one thread may use it at a time. Claim a separate handle \
              per thread, or hand this one over with a handoff the ABI cannot see."
             );
         }
@@ -162,9 +174,10 @@ fn check_thread(h: &tft_publisher) -> tft_status {
     }
     #[cfg(not(debug_assertions))]
     {
+        let _ = what;
         set_error(
             crate::TFT_ERR_WRONG_THREAD,
-            "tft_publisher is Send but not Sync: it was created on another thread",
+            "this handle is Send but not Sync: it was created on another thread",
             |_| {},
         );
         crate::TFT_ERR_WRONG_THREAD
@@ -288,7 +301,7 @@ pub unsafe extern "C" fn tft_tree_claim(
 ///
 /// The caller must keep the borrowed `Tree` alive for as long as the returned
 /// writer exists.
-unsafe fn extend_to_static(w: EdgeWriter<'_>) -> EdgeWriter<'static> {
+pub(crate) unsafe fn extend_to_static(w: EdgeWriter<'_>) -> EdgeWriter<'static> {
     // SAFETY: the caller's obligation above is exactly what the lifetime
     // parameter encodes; nothing else about the type changes.
     unsafe { core::mem::transmute::<EdgeWriter<'_>, EdgeWriter<'static>>(w) }

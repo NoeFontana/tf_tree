@@ -105,6 +105,10 @@ pub const TFT_ERR_PARENT_MISMATCH: tft_status = -38;
 /// never attached. Also formerly `TFT_ERR_UNKNOWN_FRAME`, and false for the
 /// same reason.
 pub const TFT_ERR_NO_EDGE: tft_status = -39;
+/// A configuration text could not be turned into a topology: it does not parse,
+/// declares a cycle, or describes a tree the engine will not build. The
+/// message names the line or the frame.
+pub const TFT_ERR_BAD_CONFIG: tft_status = -40;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
 
@@ -215,6 +219,33 @@ pub(crate) fn amend_error(fill: impl FnOnce(&mut tft_error)) {
             fill(&mut e);
         }
     });
+}
+
+/// This thread's most recent error message, as a Rust `String`.
+///
+/// Exists so a caller *inside* this crate can quote what the engine just said
+/// rather than inventing a second wording for the same failure — the bridge's
+/// `TFT_BRIDGE_REJECTED` outcome does exactly that. Allocates, and is therefore
+/// only ever called on a failure path.
+#[cfg(feature = "bridge")]
+pub(crate) fn last_message() -> String {
+    LAST_ERROR.with(|slot| {
+        slot.try_borrow().map_or_else(
+            |_| String::new(),
+            |e| {
+                let bytes: Vec<u8> = e
+                    .message
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                // `set_message` substitutes non-ASCII, so this cannot fail; the
+                // fallback is here because a panic in an error path is the worst
+                // possible place for one.
+                String::from_utf8(bytes).unwrap_or_default()
+            },
+        )
+    })
 }
 
 /// Clear this thread's error slot. Called on every successful entry point so a
