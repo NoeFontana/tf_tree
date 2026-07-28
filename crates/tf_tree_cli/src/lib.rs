@@ -26,6 +26,7 @@ pub mod doctor;
 pub mod hostfacts;
 pub mod top;
 pub mod topology;
+pub mod web;
 
 /// Live-arena attach (`--attach`) and `tf_tree participants`.
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -158,6 +159,9 @@ enum Command {
         /// Not only a test affordance: `tf_tree top --iterations 1 > frame.txt`
         /// is how an operator attaches a snapshot of a live arena to a bug
         /// report, and it is why the non-tty path emits no escape sequences.
+        ///
+        /// **With `--web` it bounds connections, not frames** — the browser
+        /// decides when a frame happens, so "frame" has no meaning on that side.
         #[arg(long, default_value_t = 0, value_name = "N")]
         iterations: u64,
         /// Show the per-edge detail pane, with the inter-arrival histogram.
@@ -168,8 +172,21 @@ enum Command {
         #[arg(long, value_name = "ID|NAME")]
         edge: Option<String>,
         /// `auto` (the default) follows whether stdout is a tty.
+        ///
+        /// Ignored under `--web`: that view's colours come from the page's own
+        /// stylesheet, which follows the browser's light/dark preference.
         #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
         color: ColorChoice,
+        /// Serve §7's embedded web view instead of drawing to the terminal.
+        ///
+        /// `--web` alone binds `127.0.0.1:8787`; `--web ADDR` binds what you
+        /// name, and `--web 127.0.0.1:0` lets the kernel pick a free port. The
+        /// chosen URL is printed. Loopback is the default because serving a
+        /// robot's live transform state on `0.0.0.0` is a security bug in
+        /// somebody's deployment (§7); a non-loopback bind is accepted and
+        /// warned about, not refused.
+        #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = web::DEFAULT_ADDR)]
+        web: Option<std::net::SocketAddr>,
     },
     /// Run the runnable benchmark checks; `--gate` exits non-zero on failure.
     Bench {
@@ -305,7 +322,8 @@ pub fn run() -> Result<()> {
             iterations,
             edge,
             color,
-        } => cmd_top(live, interval, iterations, edge, color.forced()),
+            web,
+        } => cmd_top(live, interval, iterations, edge, color.forced(), web),
         Command::Bench { gate } => cmd_bench(gate),
         Command::Ingest { bag, report, opts } => cmd_ingest(&bag, report.as_deref(), &opts),
         Command::Topology {
@@ -831,6 +849,7 @@ fn cmd_top(
     iterations: u64,
     edge: Option<String>,
     color: Option<bool>,
+    web: Option<std::net::SocketAddr>,
 ) -> Result<()> {
     // A floor rather than a clamp: `--interval 0` is a request to spin a core
     // reading a robot's arena as fast as it can, which is the one way this tool
@@ -903,15 +922,70 @@ fn cmd_top(
     #[cfg(not(all(feature = "shm", target_os = "linux")))]
     let merge: Box<dyn Fn(&mut top::Capture)> = Box::new(|_: &mut top::Capture| {});
 
-    top::run(
-        tree,
-        src.banner(),
-        core::time::Duration::from_millis(interval_ms),
-        iterations,
-        edge,
-        color,
-        &*merge,
-    )
+    let interval = core::time::Duration::from_millis(interval_ms);
+    if let Some(addr) = web {
+        return cmd_top_web(tree, src.banner(), interval, iterations, edge, addr, &*merge);
+    }
+
+    top::run(tree, src.banner(), interval, iterations, edge, color, &*merge)
+}
+
+/// `tf_tree top --web` — the same sampler, served instead of drawn.
+///
+/// # The rate limit is not politeness, it is correctness
+///
+/// One [`top::Sampler`] holds the only per-tick state there is, and every delta
+/// in the document (`delta_head`, `delta_errors`, `observed_hz`) is a difference
+/// between two of its observations. Two browser tabs polling at 1 Hz would take
+/// alternate observations, so each would see half the samples over a full
+/// interval and every rate on both pages would read half of what the arena is
+/// doing — a wrong number, silently, with no error anywhere.
+///
+/// So a poll arriving sooner than `interval` after the last one is answered from
+/// the previous document. That makes the endpoint idempotent within a tick,
+/// which is also what lets a reload not perturb the view.
+///
+/// A refresh younger than the interval is *not* an error: it is what a second
+/// tab, an F5, or a `watch curl` does, and all three should show the current
+/// tick rather than a 429.
+fn cmd_top_web(
+    tree: &Tree,
+    source: &'static str,
+    interval: core::time::Duration,
+    iterations: u64,
+    edge: Option<String>,
+    addr: std::net::SocketAddr,
+    merge: &dyn Fn(&mut top::Capture),
+) -> Result<()> {
+    let (listener, bound) = web::bind(addr)?;
+    let mut sampler = top::Sampler::new();
+    let mut last = std::time::Instant::now();
+    let mut cached: Option<(std::time::Instant, String)> = None;
+    let selected_at_start = edge;
+
+    let mut tick = move || {
+        let now = std::time::Instant::now();
+        if let Some((at, doc)) = &cached {
+            if now.duration_since(*at) < interval {
+                return doc.clone();
+            }
+        }
+        let mut capture = top::Capture::from_tree(tree, source);
+        merge(&mut capture);
+        // `--edge` seeds the page's selection; after that the browser owns it,
+        // because there is no key handling to take it back with.
+        let selected = selected_at_start
+            .as_deref()
+            .and_then(|needle| top::select_edge(&capture.edges, needle))
+            .map(|e| e.id);
+        let t = sampler.observe(capture, now.duration_since(last));
+        last = now;
+        let doc = web::tick_json(&t, interval, selected);
+        cached = Some((now, doc.clone()));
+        doc
+    };
+
+    web::serve(&listener, bound, iterations, &mut tick)
 }
 
 /// `tf_tree bench [--gate]`.
