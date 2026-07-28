@@ -568,7 +568,8 @@ fn a_halted_bridge_refuses_every_later_offer() {
 /// Mutant: delete `inner.stopped = Some(…)` from the `RecreateArena` arm ⇒ the
 /// next offer is `TFT_BRIDGE_APPLIED` and this fails. Mutant: latch it with
 /// `action: TFT_BRIDGE_HALT` ⇒ the caller is told a worse fault than the one
-/// that happened, and the second `TFT_BRIDGE_RECREATE` assertion fails.
+/// that happened, and both the second `TFT_BRIDGE_RECREATE` assertion and the
+/// `"re-plan"` one fail.
 #[test]
 fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     let b = Bridge::new(
@@ -589,6 +590,11 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     );
     assert_eq!(o.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
     assert_eq!(o.by_nanos, 5_000 * MS);
+    assert!(
+        text(o.detail).contains("re-plan"),
+        "and the sentence keeps saying what to do, not \"halted\": {:?}",
+        text(o.detail)
+    );
     assert_balanced(&b.stats());
 }
 

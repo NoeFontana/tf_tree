@@ -853,9 +853,17 @@ pub unsafe extern "C" fn tft_bridge_offer(
             o.action = st.action;
             o.reason = TFT_BRIDGE_REASON_ALREADY_HALTED;
             o.by_nanos = st.by_nanos;
+            // The wording follows the *latched* action, not the word "halt": a
+            // caller told to recreate and then told it halted would read the
+            // second as a different, worse fault than the first.
             set(
                 &mut inner.strings.detail,
-                "the bridge halted; free it and build a new one",
+                if st.action == TFT_BRIDGE_RECREATE {
+                    "the clock went backwards past the reset threshold; free this bridge, \
+                     build a new one, and re-plan"
+                } else {
+                    "the bridge halted; free it and build a new one"
+                },
             );
             o.detail = ptr(&inner.strings.detail);
             // SAFETY: as the first write above.
