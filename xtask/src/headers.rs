@@ -87,6 +87,13 @@ const STABLE: &[&str] = &[
     "TFT_ERR_RELEASED",
     "TFT_ERR_PARENT_MISMATCH",
     "TFT_ERR_NO_EDGE",
+    // Returned only by `tft_bridge_create` today, and still stable: §3.3 defines
+    // one status space, the constant is not feature-gated, and the frozen header
+    // is where a C programmer looks up a negative number they were handed. A
+    // code that lived in the unstable header would be un-nameable by a caller
+    // that never opted into `TFT_ENABLE_UNSTABLE` but can still receive it once
+    // any stable entry point starts parsing config.
+    "TFT_ERR_BAD_CONFIG",
     "TFT_ERR_INTERNAL",
     // Layouts — §3.5.
     "tft_layout",
@@ -119,6 +126,88 @@ const UNSTABLE: &[&str] = &[
     "tft_tree_edge_count",
     "tft_tree_frame_name",
     "tft_tree_instance_uuid",
+    // The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, compiled only under
+    // `--features bridge` and therefore emitted inside `#if
+    // defined(TFT_HAVE_BRIDGE)`. **Unstable on purpose**: §5 is the half of
+    // Phase 4 that a year of dogfooding is expected to argue with, and freezing
+    // a ROS-shaped surface before the argument has happened is how a
+    // compatibility promise becomes a liability.
+    "tft_bridge_create",
+    "tft_bridge_tree",
+    "tft_bridge_free",
+    "tft_bridge_offer",
+    "tft_bridge_attribute",
+    "tft_bridge_note_message",
+    "tft_bridge_note_queue_depth",
+    "tft_bridge_get_stats",
+    "tft_bridge_topic",
+    "tft_bridge_authority",
+    "tft_bridge_on_clock_reset",
+    "tft_bridge_action",
+    "tft_bridge_reason",
+    "tft_bridge_sample",
+    "tft_bridge_outcome",
+    "tft_bridge_options",
+    "tft_bridge_stats",
+    "TFT_BRIDGE_TOPIC_TF",
+    "TFT_BRIDGE_TOPIC_TF_STATIC",
+    "TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS",
+    "TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS",
+    "TFT_BRIDGE_AUTHORITY_STRICT",
+    "TFT_BRIDGE_ON_CLOCK_RESET_HALT",
+    "TFT_BRIDGE_ON_CLOCK_RESET_RECREATE",
+    "TFT_BRIDGE_APPLIED",
+    "TFT_BRIDGE_STATIC_VERIFIED",
+    "TFT_BRIDGE_DROPPED",
+    "TFT_BRIDGE_UNDECLARED",
+    "TFT_BRIDGE_STATIC_CONFLICT",
+    "TFT_BRIDGE_HALT",
+    "TFT_BRIDGE_RECREATE",
+    "TFT_BRIDGE_REJECTED",
+    "TFT_BRIDGE_REASON_NONE",
+    "TFT_BRIDGE_REASON_BAD_NAME",
+    "TFT_BRIDGE_REASON_NOT_THE_OWNER",
+    "TFT_BRIDGE_REASON_NON_MONOTONIC",
+    "TFT_BRIDGE_REASON_KIND_CHANGE",
+    "TFT_BRIDGE_REASON_AUTHORITY_CONFLICT",
+    "TFT_BRIDGE_REASON_CLOCK_RESET",
+    "TFT_BRIDGE_REASON_BAD_POSE",
+    "TFT_BRIDGE_REASON_ALREADY_HALTED",
+];
+
+/// Tier entries that name a **type**, not an `extern "C" fn`.
+///
+/// They are in the lists to steer `cbindgen`'s exclude-by-complement, so
+/// [`check_partition`]'s reverse direction — "this entry names no exported
+/// function" — must skip them. Constants are skipped by the `is_lowercase`
+/// filter; these are not, because C type names here are lowercase by
+/// convention.
+const TIER_TYPES: &[&str] = &[
+    "tft_status",
+    "tft_error",
+    "tft_layout",
+    "tft_bridge_topic",
+    "tft_bridge_authority",
+    "tft_bridge_on_clock_reset",
+    "tft_bridge_action",
+    "tft_bridge_reason",
+    "tft_bridge_sample",
+    "tft_bridge_outcome",
+    "tft_bridge_options",
+    "tft_bridge_stats",
+];
+
+/// Rust types `cbindgen` must never emit: the opaque handles (§3.2) and the
+/// private types it would otherwise forward-declare in order to spell their
+/// fields.
+const OPAQUE: &[&str] = &[
+    "tft_tree",
+    "tft_plan",
+    "tft_publisher",
+    "tft_bridge",
+    "Arc_TreeShare",
+    "Option_EdgeWriter",
+    "Box_BridgeInner",
 ];
 
 /// Compiled only under `--features test-hooks`; never in a shipped header.
@@ -153,6 +242,32 @@ const HANDLE_DECLS: &str = "\
 typedef struct tft_tree tft_tree;
 typedef struct tft_plan tft_plan;
 typedef struct tft_publisher tft_publisher;
+";
+
+/// The bridge handle, declared by hand for the same reason as [`HANDLE_DECLS`]
+/// and guarded because the symbol only exists under `--features bridge`.
+///
+/// It lives in the *unstable* header: §5's shape is what a year of dogfooding is
+/// meant to argue with, so nothing about it belongs in the frozen one.
+const BRIDGE_DECLS: &str = "\
+#if defined(TFT_HAVE_BRIDGE)
+/*
+ * The ingest bridge — docs/PHASE4.md §5.
+ *
+ *   tft_bridge  Send + !Sync   ONE THREAD AT A TIME
+ *
+ * Same affinity rule, and for a sharper reason than tft_publisher's: the handle
+ * holds one claim per declared dynamic edge, so using it from a second thread
+ * would write the arena from a thread that does not own those claims. §5.9 asks
+ * for a dedicated SingleThreadedExecutor on its own thread, which is exactly the
+ * shape this allows.
+ *
+ * Every const char * in tft_bridge_outcome is borrowed from the handle and
+ * valid only until the next call on it. None is ever NULL; a field that does not
+ * apply to an outcome is the empty string.
+ */
+typedef struct tft_bridge tft_bridge;
+#endif  /* TFT_HAVE_BRIDGE */
 ";
 
 const GENERATED_BANNER: &str = "\
@@ -343,6 +458,10 @@ fn config_for(tier: Tier) -> String {
          # the caller would find out at link time.\n\
          [defines]\n\
          \"feature = shm\" = \"TFT_HAVE_SHM\"\n\
+         # Likewise for the ingest bridge (§5), which is default-off. Without\n\
+         # this the unstable header would declare eight symbols an ordinary\n\
+         # build does not export.\n\
+         \"feature = bridge\" = \"TFT_HAVE_BRIDGE\"\n\
          \n",
     );
     match tier {
@@ -355,8 +474,7 @@ fn config_for(tier: Tier) -> String {
                 .iter()
                 .chain(TEST_ONLY)
                 .copied()
-                .chain(["tft_tree", "tft_plan", "tft_publisher"])
-                .chain(["Arc_TreeShare", "Option_EdgeWriter"])
+                .chain(OPAQUE.iter().copied())
                 .collect();
             push_list(&mut s, &excluded);
         }
@@ -371,8 +489,7 @@ fn config_for(tier: Tier) -> String {
                 .iter()
                 .chain(TEST_ONLY)
                 .copied()
-                .chain(["tft_tree", "tft_plan", "tft_publisher"])
-                .chain(["Arc_TreeShare", "Option_EdgeWriter"])
+                .chain(OPAQUE.iter().copied())
                 .collect();
             push_list(&mut s, &excluded);
         }
@@ -421,6 +538,8 @@ fn assemble(tier: Tier, body: &str) -> String {
             out.push_str(UNSTABLE_PREAMBLE);
             out.push_str("\n#ifndef TF_TREE_UNSTABLE_H\n#define TF_TREE_UNSTABLE_H\n\n");
             out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+            out.push_str(BRIDGE_DECLS);
+            out.push('\n');
             out.push_str(body.trim_start_matches('\n'));
             out.push_str("\n#ifdef __cplusplus\n}  /* extern \"C\" */\n#endif\n\n");
             out.push_str("#endif  /* TF_TREE_UNSTABLE_H */\n");
@@ -493,7 +612,7 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
         .filter(|n| !found.contains(**n))
         // Types, not functions: they are in the lists to steer `cbindgen`'s
         // include/exclude and have no `extern "C" fn` to find.
-        .filter(|n| !matches!(**n, "tft_status" | "tft_error" | "tft_layout"))
+        .filter(|n| !TIER_TYPES.contains(*n))
         .collect();
     if !stale.is_empty() {
         return Err(format!(

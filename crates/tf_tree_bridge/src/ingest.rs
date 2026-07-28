@@ -105,6 +105,31 @@ pub enum Action {
         /// First sighting of this edge, for rate limiting.
         first_time: bool,
     },
+    /// A sample from a publisher that does not own the edge (§5.4).
+    ///
+    /// **Not a `Drop`**, and this is the variant §5.4's headline requirement
+    /// needs: *"Later publishers' samples are dropped and counted, with a
+    /// diagnostic naming **both** nodes and the edge"*, and the diagnostic must
+    /// be *"loud, rate-limited"*. A `Drop { reason: NotTheOwner }` carries none
+    /// of the three, so the sentence §5.4 calls the better sales pitch —
+    /// *"your `/ekf` and `/odom_node` have both been publishing
+    /// `odom -> base_link` for eight months"* — could not be written by any
+    /// caller, even though [`Verdict::Reject`] had all of it in hand one line
+    /// earlier.
+    ///
+    /// The sample is dropped either way; `stats.dropped_authority` counts it.
+    AuthorityConflict {
+        /// Normalized parent frame.
+        parent: String,
+        /// Normalized child frame.
+        child: String,
+        /// Who owns the edge.
+        owner: Publisher,
+        /// Who tried to write it.
+        intruder: Publisher,
+        /// First collision between these two on this edge, for rate limiting.
+        first_time: bool,
+    },
     /// A `/tf_static` value that disagrees with the one on file (§5.7).
     ///
     /// **Not a `Drop`**, because §5.7 requires a diagnostic naming both
@@ -152,8 +177,6 @@ pub enum Action {
 pub enum DropReason {
     /// The frame name was empty or only a slash (§5.6).
     BadName,
-    /// Another publisher owns the edge (§5.4).
-    NotTheOwner,
     /// The stamp went backwards, but not far enough to be a reset (§5.5).
     NonMonotonic {
         /// By how much.
@@ -360,10 +383,18 @@ impl Ingest {
         // 5. Authority, before the clock — see the module docs.
         match self.authority.admit(&parent, &child, publisher) {
             Verdict::Accept => {}
-            Verdict::Reject { .. } => {
+            Verdict::Reject {
+                owner,
+                intruder,
+                first_time,
+            } => {
                 self.stats.dropped_authority += 1;
-                return Action::Drop {
-                    reason: DropReason::NotTheOwner,
+                return Action::AuthorityConflict {
+                    parent,
+                    child,
+                    owner,
+                    intruder,
+                    first_time,
                 };
             }
             Verdict::Fatal { owner, intruder } => {
@@ -524,8 +555,12 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         // An intruder, from an hour in the future.
         assert_eq!(
             i.offer(Topic::Tf, &s(3_600_000 * MS), &node("/rogue")),
-            Action::Drop {
-                reason: DropReason::NotTheOwner
+            Action::AuthorityConflict {
+                parent: "odom".to_string(),
+                child: "base".to_string(),
+                owner: node("/ekf"),
+                intruder: node("/rogue"),
+                first_time: true,
             }
         );
         // The owner keeps working.
@@ -725,6 +760,55 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         }
         assert_eq!(i.stats().static_conflicts, 1);
         assert!(i.stats().balanced());
+    }
+
+    /// **§5.4's headline diagnostic is reachable: both nodes, the edge, and a
+    /// rate-limit flag.**
+    ///
+    /// §5.4 requires *"a diagnostic naming **both** nodes and the edge"* and
+    /// that it be *"loud, rate-limited"*. `Verdict::Reject` has carried all
+    /// three since it was written; the pipeline used to collapse it into
+    /// `Action::Drop { reason: NotTheOwner }`, which carries none of them — so
+    /// the sentence §5.4 calls the better sales pitch was unprintable by any
+    /// caller of `offer`, and a 1 kHz intruder could only be logged once per
+    /// message or not at all.
+    ///
+    /// Mutant: return `Action::Drop { reason: … }` from the `Reject` arm again
+    /// ⇒ this fails to match. Mutant: return `first_time: true` unconditionally
+    /// ⇒ the second offer's assertion fails.
+    #[test]
+    fn an_authority_conflict_names_both_publishers_the_edge_and_is_rate_limited() {
+        let mut i = ingest();
+        let s = |t: i64| Sample::identity("odom", "base", t);
+        assert!(matches!(
+            i.offer(Topic::Tf, &s(1_000 * MS), &node("/ekf")),
+            Action::Publish { .. }
+        ));
+        match i.offer(Topic::Tf, &s(1_001 * MS), &node("/odom_node")) {
+            Action::AuthorityConflict {
+                parent,
+                child,
+                owner,
+                intruder,
+                first_time,
+            } => {
+                assert_eq!((parent.as_str(), child.as_str()), ("odom", "base"));
+                assert_eq!(owner, node("/ekf"));
+                assert_eq!(intruder, node("/odom_node"));
+                assert!(first_time, "the first collision is the loud one");
+            }
+            other => panic!("§5.4's diagnostic must be reachable: {other:?}"),
+        }
+        for k in 2..40i64 {
+            match i.offer(Topic::Tf, &s(1_000 * MS + k * MS), &node("/odom_node")) {
+                Action::AuthorityConflict { first_time, .. } => {
+                    assert!(!first_time, "rate-limited after the first");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(i.stats().dropped_authority, 39);
+        assert!(i.stats().balanced(), "{:?}", i.stats());
     }
 
     /// **An identical latched value from a second publisher is silent** — §5.7

@@ -300,6 +300,13 @@ typedef struct {
 #define TFT_ERR_NO_EDGE -39
 
 /**
+ * A configuration text could not be turned into a topology: it does not parse,
+ * declares a cycle, or describes a tree the engine will not build. The
+ * message names the line or the frame.
+ */
+#define TFT_ERR_BAD_CONFIG -40
+
+/**
  * Something the library did not anticipate — including a caught Rust panic.
  */
 #define TFT_ERR_INTERNAL -99

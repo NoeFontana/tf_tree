@@ -56,8 +56,16 @@ c-abi-check:
     MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test publish
+    # The ingest-bridge seam (§5), behind the default-off `bridge` feature. It
+    # is the only entry point that both *decides* and *writes*, and its outcome
+    # POD hands C a fistful of `const char *` borrowed from the handle — a
+    # lifetime rule no compiler on either side enforces. Miri is what checks it.
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+        -p tf_tree_c -p tf_tree_core \
+        --features tf_tree_c/test-hooks,tf_tree_c/bridge,tf_tree_core/miri-soft-float \
+        --test bridge
     RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
-        --features test-hooks --target x86_64-unknown-linux-gnu -Zbuild-std
+        --features test-hooks,bridge --target x86_64-unknown-linux-gnu -Zbuild-std
 
 # **The committed C headers: drift check, then compile and run them.**
 #
@@ -81,7 +89,14 @@ c-header-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo xtask headers --check
-    cargo build --release -q -p tf_tree_c --features test-hooks
+    # **`bridge` is in this build, and the smoke test is compiled with
+    # `-DTFT_HAVE_BRIDGE`.** The bridge declarations are emitted inside
+    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the eight §5 entry
+    # points would be in the committed header and compiled by nothing — which is
+    # exactly the state that let a function and a typedef share the name
+    # `tft_bridge_stats` through a whole revision. A header nobody compiles is
+    # not a checked header.
+    cargo build --release -q -p tf_tree_c --features test-hooks,bridge
     inc=crates/tf_tree_c/include
     lib=target/release/libtf_tree_c.a
     src=crates/tf_tree_c/tests/c/abi_smoke.c
@@ -96,8 +111,8 @@ c-header-check:
         in="$src"
         case "$cc" in g++*|clang++*) in="$out/smoke.cpp";; esac
         printf '%-22s ' "$cc"
-        $cc -Wall -Wextra -Wpedantic -Werror -I "$inc" -o "$out/smoke" "$in" "$lib" \
-            -lpthread -ldl -lm
+        $cc -Wall -Wextra -Wpedantic -Werror -DTFT_HAVE_BRIDGE -I "$inc" \
+            -o "$out/smoke" "$in" "$lib" -lpthread -ldl -lm
         "$out/smoke"
     done
 

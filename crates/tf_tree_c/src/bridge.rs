@@ -125,7 +125,10 @@ pub type tft_bridge_reason = i32;
 pub const TFT_BRIDGE_REASON_NONE: tft_bridge_reason = 0;
 /// The frame name was empty or only a slash (§5.6).
 pub const TFT_BRIDGE_REASON_BAD_NAME: tft_bridge_reason = 1;
-/// Another publisher owns the edge (§5.4).
+/// Another publisher owns the edge (§5.4). `parent`, `child`, `owner`,
+/// `intruder` and `first_time` are **all** set — that is §5.4's diagnostic, and
+/// `first_time` is what keeps it to one line per pair of colliding publishers
+/// rather than one per message.
 pub const TFT_BRIDGE_REASON_NOT_THE_OWNER: tft_bridge_reason = 2;
 /// The stamp went backwards, but not far enough to be a reset (§5.5).
 pub const TFT_BRIDGE_REASON_NON_MONOTONIC: tft_bridge_reason = 3;
@@ -194,9 +197,14 @@ pub struct tft_bridge_outcome {
     /// How far time went backwards, for
     /// [`TFT_BRIDGE_REASON_NON_MONOTONIC`] and [`TFT_BRIDGE_RECREATE`].
     pub by_nanos: i64,
-    /// Normalized parent frame.
+    /// The parent frame. Normalized (§5.6) for every outcome the pipeline
+    /// named an edge in; **as it arrived** for `TFT_BRIDGE_DROPPED`,
+    /// `TFT_BRIDGE_HALT` and `TFT_BRIDGE_RECREATE`, whose actions carry only a
+    /// reason. The difference is one leading `/` and any `tf_prefix`, so the
+    /// pair identifies the same edge either way — and for
+    /// [`TFT_BRIDGE_REASON_BAD_NAME`] the raw name is the only useful one.
     pub parent: *const c_char,
-    /// Normalized child frame.
+    /// The child frame, on the same terms as `parent`.
     pub child: *const c_char,
     /// Who owns the edge, for an authority or static conflict.
     pub owner: *const c_char,
@@ -239,11 +247,17 @@ pub struct tft_bridge_options {
 /// applied + rejected_by_arena + static_verified
 ///         + dropped_authority + dropped_non_monotonic + dropped_bad_name
 ///         + dropped_kind_change + dropped_undeclared + dropped_bad_pose
+///         + refused_after_halt
 ///     == transforms
 /// ```
 ///
 /// A mismatch means some path returns without counting, which is how "we are
 /// not dropping anything" becomes false with no test failing.
+///
+/// `refused_after_halt` is a term because `transforms` counts those offers:
+/// the first revision of this comment omitted it, so the documented ledger
+/// stopped balancing the moment a bridge halted — which is precisely the moment
+/// an operator starts reading the counters.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct tft_bridge_stats {
@@ -276,7 +290,8 @@ pub struct tft_bridge_stats {
     /// The pipeline approved the write and the arena refused it — a revoked
     /// claim, or a per-edge stamp the global clock guard could not see.
     pub rejected_by_arena: u64,
-    /// Offers refused because the bridge had already halted.
+    /// Offers refused because the bridge had already stopped — after a
+    /// [`TFT_BRIDGE_HALT`] *or* a [`TFT_BRIDGE_RECREATE`], both of which latch.
     pub refused_after_halt: u64,
     /// Clock resets detected (§5.5).
     pub clock_resets: u64,
@@ -301,6 +316,16 @@ pub struct tft_bridge_stats {
 /// One `Vec<u8>` per field, rewritten in place on every offer, so a warm bridge
 /// allocates nothing for its diagnostics and the pointers stay valid for exactly
 /// as long as the documented contract says: until the next call.
+///
+/// **Nothing resets these between calls, and nothing needs to.** A field left
+/// over from the previous outcome would still point at valid memory — so no
+/// sanitizer would complain — and would name the wrong publisher, which is the
+/// failure mode a bridge diagnostic can least afford. What prevents it is that
+/// [`blank_outcome`] starts every pointer at a *static* empty string, so a
+/// pointer into one of these buffers appears in the outcome only where the same
+/// arm just wrote it. Clearing them as well would make a forgotten
+/// `o.field = ptr(...)` show `""` instead of the wrong name either way, at the
+/// cost of five writes per transform on the hot path.
 #[derive(Default)]
 struct Strings {
     parent: Vec<u8>,
@@ -308,27 +333,6 @@ struct Strings {
     owner: Vec<u8>,
     intruder: Vec<u8>,
     detail: Vec<u8>,
-}
-
-impl Strings {
-    /// Reset every field to `""`.
-    ///
-    /// **All five, every time.** A field left over from the previous outcome
-    /// would still point at valid memory — so no sanitizer would complain —
-    /// and would name the wrong publisher, which is the failure mode a bridge
-    /// diagnostic can least afford.
-    fn clear(&mut self) {
-        for v in [
-            &mut self.parent,
-            &mut self.child,
-            &mut self.owner,
-            &mut self.intruder,
-            &mut self.detail,
-        ] {
-            v.clear();
-            v.push(0);
-        }
-    }
 }
 
 fn set(v: &mut Vec<u8>, s: &str) {
@@ -340,6 +344,15 @@ fn set(v: &mut Vec<u8>, s: &str) {
 fn ptr(v: &[u8]) -> *const c_char {
     v.as_ptr().cast::<c_char>()
 }
+
+/// The `""` every outcome field starts at.
+///
+/// `static`, not a field of [`Strings`], so [`blank_outcome`] needs no handle:
+/// `*out` can then be filled **before** the handle is validated, which is what
+/// makes [`tft_bridge_offer`]'s promise — that a caller who ignores the status
+/// reads a well-formed "nothing happened" rather than its own stack — true for
+/// a bad handle too, and not only for a well-formed call that went badly.
+static EMPTY: [c_char; 1] = [0];
 
 /// An ingest bridge: the decision pipeline, the arena it writes to, one claim
 /// per declared dynamic edge, and §5.3's GID cache.
@@ -386,15 +399,25 @@ struct BridgeInner {
     scratch: Sample,
     /// The outcome's borrowed strings.
     strings: Strings,
-    /// Latched once the pipeline says halt.
+    /// Latched once the pipeline says stop.
     ///
     /// §5.5: *"the bridge stops and reports"*. A C caller that logs the halt and
     /// keeps offering would push exactly the non-monotonic stamps §5.5 exists to
     /// prevent, one at a time, and under `STRICT` it would keep writing an edge
     /// two nodes are fighting over. Latching is how the ABI enforces "stops"
-    /// without exiting somebody else's process. A halted bridge is freed and
+    /// without exiting somebody else's process. A stopped bridge is freed and
     /// rebuilt; there is deliberately no resume.
-    halted: Option<i64>,
+    ///
+    /// **[`TFT_BRIDGE_RECREATE`] latches too.** It is the `recreate` half of
+    /// §5.5's `--on-clock-reset`, and this ABI cannot recreate the arena for the
+    /// reasons in [`tft_bridge_offer`]'s docs — so the *only* correct
+    /// continuation is that the caller tears this bridge down. Left unlatched,
+    /// the pipeline's clock guard has already accepted the rewound stamp
+    /// (`ClockGuard::accept_reset`), so every subsequent offer would be approved
+    /// and the arena would refuse it per edge as non-monotonic: a bag loop would
+    /// turn into a silent, permanent stall reported one `rejected_by_arena` at a
+    /// time rather than the one loud outcome §5.5 asks for.
+    stopped: Option<Stopped>,
     dropped_bad_pose: u64,
     rejected_by_arena: u64,
     refused_after_halt: u64,
@@ -404,6 +427,19 @@ struct BridgeInner {
     /// [`EdgeWriter`] is dropped — releasing its claim and its lease — before
     /// the last reference to the `Tree` it borrows from goes away.
     share: Arc<TreeShare>,
+}
+
+/// Why the bridge stopped, replayed on every later offer.
+///
+/// The *action* is kept, not just the fact of stopping: a caller told
+/// `TFT_BRIDGE_RECREATE` once and `TFT_BRIDGE_HALT` forever afterwards would
+/// read the second as a different, worse fault than the first.
+#[derive(Clone, Copy)]
+struct Stopped {
+    /// [`TFT_BRIDGE_HALT`] or [`TFT_BRIDGE_RECREATE`].
+    action: tft_bridge_action,
+    /// How far time went backwards, or `0` for an authority conflict.
+    by_nanos: i64,
 }
 
 /// # Safety
@@ -600,7 +636,7 @@ pub unsafe extern "C" fn tft_bridge_create(
             gids: BTreeMap::new(),
             scratch: Sample::identity("", "", 0),
             strings: Strings::default(),
-            halted: None,
+            stopped: None,
             dropped_bad_pose: 0,
             rejected_by_arena: 0,
             refused_after_halt: 0,
@@ -755,21 +791,23 @@ pub unsafe extern "C" fn tft_bridge_offer(
         if declared as usize != core::mem::size_of::<tft_bridge_outcome>() {
             return bad_struct_size("tft_bridge_outcome");
         }
+        // A blank outcome first — **before the handle is validated**, so a
+        // caller that ignores the status reads "dropped, no reason" with live
+        // empty strings rather than whatever was on its stack, even when the
+        // handle is the thing that was wrong. Written through `write` because
+        // the caller's struct may be uninitialised apart from `struct_size`.
+        //
+        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
+        // invariants, so a bitwise write is a complete initialisation.
+        let mut o = blank_outcome();
+        unsafe { core::ptr::write(out, o) };
+
         // SAFETY: the caller contracts a live handle.
         let h = match unsafe { bridge_of(b) } {
             Ok(h) => h,
             Err(rc) => return rc,
         };
         let inner = &mut *h.inner;
-        inner.strings.clear();
-        // A blank outcome first, so a caller that ignores the status reads
-        // "dropped, no reason" rather than whatever was on its stack. Written
-        // through `write` because the caller's struct may be uninitialised apart
-        // from `struct_size`.
-        let mut o = blank_outcome(&inner.strings);
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
-        unsafe { core::ptr::write(out, o) };
 
         if s.is_null() {
             return null_arg("s");
@@ -809,12 +847,12 @@ pub unsafe extern "C" fn tft_bridge_offer(
             return TFT_ERR_UNKNOWN_FRAME;
         };
 
-        // A halted bridge stops. See the doc comment.
-        if let Some(by_nanos) = inner.halted {
+        // A stopped bridge stops. See the doc comment.
+        if let Some(st) = inner.stopped {
             inner.refused_after_halt += 1;
-            o.action = TFT_BRIDGE_HALT;
+            o.action = st.action;
             o.reason = TFT_BRIDGE_REASON_ALREADY_HALTED;
-            o.by_nanos = by_nanos;
+            o.by_nanos = st.by_nanos;
             set(
                 &mut inner.strings.detail,
                 "the bridge halted; free it and build a new one",
@@ -943,6 +981,36 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             o.child = ptr(&inner.strings.child);
             o.detail = ptr(&inner.strings.detail);
         }
+        Action::AuthorityConflict {
+            parent,
+            child,
+            owner,
+            intruder,
+            first_time,
+        } => {
+            // A `DROPPED`, not an action of its own: the sample really is just
+            // dropped, and what §5.4 needs is not a new code but the *fields* —
+            // both nodes, the edge, and `first_time` so a 1 kHz intruder is one
+            // log line rather than a thousand a second. `TFT_BRIDGE_STATIC_
+            // CONFLICT` is separate only because it also has to carry two
+            // 7-vectors.
+            o.action = TFT_BRIDGE_DROPPED;
+            o.reason = TFT_BRIDGE_REASON_NOT_THE_OWNER;
+            o.first_time = u8::from(*first_time);
+            set(&mut inner.strings.parent, parent);
+            set(&mut inner.strings.child, child);
+            set(&mut inner.strings.owner, &owner.to_string());
+            set(&mut inner.strings.intruder, &intruder.to_string());
+            set(
+                &mut inner.strings.detail,
+                "two publishers are writing one edge; tf2 would have interleaved them silently",
+            );
+            o.parent = ptr(&inner.strings.parent);
+            o.child = ptr(&inner.strings.child);
+            o.owner = ptr(&inner.strings.owner);
+            o.intruder = ptr(&inner.strings.intruder);
+            o.detail = ptr(&inner.strings.detail);
+        }
         Action::StaticConflict {
             parent,
             child,
@@ -974,13 +1042,13 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             o.action = TFT_BRIDGE_DROPPED;
             o.reason = match reason {
                 DropReason::BadName => TFT_BRIDGE_REASON_BAD_NAME,
-                DropReason::NotTheOwner => TFT_BRIDGE_REASON_NOT_THE_OWNER,
                 DropReason::KindChange => TFT_BRIDGE_REASON_KIND_CHANGE,
                 DropReason::NonMonotonic { by_nanos } => {
                     o.by_nanos = *by_nanos;
                     TFT_BRIDGE_REASON_NON_MONOTONIC
                 }
             };
+            name_the_edge(inner, o);
         }
         Action::Halt { reason } => {
             o.action = TFT_BRIDGE_HALT;
@@ -997,7 +1065,11 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                     o.by_nanos = *by_nanos;
                 }
             }
-            inner.halted = Some(o.by_nanos);
+            name_the_edge(inner, o);
+            inner.stopped = Some(Stopped {
+                action: TFT_BRIDGE_HALT,
+                by_nanos: o.by_nanos,
+            });
             set(
                 &mut inner.strings.detail,
                 "the bridge halted; free it and build a new one",
@@ -1008,6 +1080,11 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             o.action = TFT_BRIDGE_RECREATE;
             o.reason = TFT_BRIDGE_REASON_CLOCK_RESET;
             o.by_nanos = *by_nanos;
+            name_the_edge(inner, o);
+            inner.stopped = Some(Stopped {
+                action: TFT_BRIDGE_RECREATE,
+                by_nanos: *by_nanos,
+            });
             set(
                 &mut inner.strings.detail,
                 "the clock went backwards past the reset threshold; free this bridge, \
@@ -1016,6 +1093,29 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             o.detail = ptr(&inner.strings.detail);
         }
     }
+}
+
+/// Fill `parent`/`child` from the sample as it arrived, for the outcomes whose
+/// [`Action`] does not carry the normalized pair.
+///
+/// §5.4 requires the authority diagnostic to name *"both nodes **and the
+/// edge**"*, and §5.5's non-monotonic drop is useless without knowing which edge
+/// stalled — but `Action::Drop` and `Action::Halt` carry only a reason, so
+/// without this a C caller gets a code and nothing to print. Asking
+/// `tf_tree_bridge` to attach the names instead would put two `String`s on the
+/// hot path of every dropped 1 kHz sample; these are already in `scratch`.
+///
+/// **They are the raw names, not the normalized ones**, and that is why this is
+/// separate from the arms that set `o.parent` themselves rather than folded into
+/// [`blank_outcome`]. §5.6's normalization strips one leading `/` and applies
+/// `tf_prefix`, so the pair still identifies the same edge — and for
+/// `TFT_BRIDGE_REASON_BAD_NAME` the raw name is the *only* useful one, because
+/// the whole outcome is that it did not normalize.
+fn name_the_edge(inner: &mut BridgeInner, o: &mut tft_bridge_outcome) {
+    set(&mut inner.strings.parent, &inner.scratch.frame_id);
+    set(&mut inner.strings.child, &inner.scratch.child_frame_id);
+    o.parent = ptr(&inner.strings.parent);
+    o.child = ptr(&inner.strings.child);
 }
 
 /// Write one approved sample into the arena.
@@ -1153,12 +1253,19 @@ pub unsafe extern "C" fn tft_bridge_note_queue_depth(b: *mut tft_bridge, depth: 
 
 /// Copy §5.9's counters into `out`.
 ///
+/// **Named `get_stats` and not `stats`** because `cbindgen` emits the struct as
+/// `typedef struct { … } tft_bridge_stats;`, and in C a typedef name and a
+/// function name share one namespace — `tft_status tft_bridge_stats(…)` next to
+/// that typedef does not compile, in any of the four compiler/standard rows
+/// `just c-header-check` runs. Rust has no such collision, so nothing here would
+/// have caught it.
+///
 /// # Safety
 ///
 /// `b` must be a live handle used from the thread that created it. `out` must
 /// point to a writable `tft_bridge_stats` whose `struct_size` is set.
 #[no_mangle]
-pub unsafe extern "C" fn tft_bridge_stats(
+pub unsafe extern "C" fn tft_bridge_get_stats(
     b: *mut tft_bridge,
     out: *mut tft_bridge_stats,
 ) -> tft_status {
@@ -1188,8 +1295,13 @@ pub unsafe extern "C" fn tft_bridge_stats(
             transforms: s.transforms + inner.dropped_bad_pose + inner.refused_after_halt,
             // `applied` means "the arena took it". The pipeline's `applied`
             // means "the pipeline approved it", and those differ by exactly the
-            // writes the engine refused.
-            applied: s.applied - inner.rejected_by_arena,
+            // writes the engine refused: `rejected_by_arena` is only ever
+            // incremented on the `Action::Publish` arm, which is the same arm
+            // that already bumped the pipeline's counter, so the difference
+            // cannot go negative. `saturating_sub` anyway — a counter that
+            // wrapped to 18 exatransforms would be read as a catastrophe by the
+            // one person looking at it during an actual incident.
+            applied: s.applied.saturating_sub(inner.rejected_by_arena),
             static_verified: s.static_verified,
             dropped_authority: s.dropped_authority,
             dropped_non_monotonic: s.dropped_non_monotonic,
@@ -1215,9 +1327,10 @@ pub unsafe extern "C" fn tft_bridge_stats(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A well-formed "nothing happened" outcome, with every string pointing at an
-/// empty, live buffer.
-fn blank_outcome(s: &Strings) -> tft_bridge_outcome {
+/// A well-formed "nothing happened" outcome, with every string pointing at the
+/// static empty string.
+fn blank_outcome() -> tft_bridge_outcome {
+    let empty: *const c_char = EMPTY.as_ptr();
     tft_bridge_outcome {
         struct_size: core::mem::size_of::<tft_bridge_outcome>() as u32,
         action: TFT_BRIDGE_DROPPED,
@@ -1225,13 +1338,13 @@ fn blank_outcome(s: &Strings) -> tft_bridge_outcome {
         status: TFT_OK,
         first_time: 0,
         by_nanos: 0,
-        parent: ptr(&s.parent),
-        child: ptr(&s.child),
-        owner: ptr(&s.owner),
-        intruder: ptr(&s.intruder),
+        parent: empty,
+        child: empty,
+        owner: empty,
+        intruder: empty,
         existing: [0.0; 7],
         offered: [0.0; 7],
-        detail: ptr(&s.detail),
+        detail: empty,
     }
 }
 

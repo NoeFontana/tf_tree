@@ -169,12 +169,115 @@ static void check_round_trip(void)
     tft_tree_free(tree);
 }
 
+#if defined(TFT_HAVE_BRIDGE)
+/*
+ * The ingest-bridge seam, from C — docs/PHASE4.md §5.
+ *
+ * The Rust test `tests/bridge.rs` covers the behaviour far more thoroughly.
+ * What it cannot cover is anything about the *header*, and the bridge surface
+ * is where that matters most: `tft_bridge_stats` is both a typedef and (before
+ * review) the name of a function, which is legal in Rust and does not compile
+ * in C. Nothing on the Rust side could have found that.
+ *
+ * So this checks the shape a C caller depends on and nothing else: that the
+ * declarations compile, that the POD outcome is filled with strings that are
+ * printable rather than NULL, and that Rust — not the C++ node — is what
+ * decides and what writes.
+ */
+static const char *const BRIDGE_TOPOLOGY =
+    "[[edge]]\n"
+    "parent = \"odom\"\n"
+    "child = \"base\"\n"
+    "kind = \"dynamic\"\n"
+    "capacity = 64\n";
+
+static void check_bridge(void)
+{
+    tft_bridge *b = NULL;
+    tft_bridge_options opts;
+    tft_bridge_sample s;
+    tft_bridge_outcome o;
+    tft_bridge_stats stats;
+    tft_tree *tree = NULL;
+    tft_plan *plan = NULL;
+    double out[7];
+    unsigned char gid[16];
+    int i;
+
+    memset(&opts, 0, sizeof opts);
+    opts.struct_size = (uint32_t)sizeof opts;
+    opts.authority = TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS;
+    opts.on_clock_reset = TFT_BRIDGE_ON_CLOCK_RESET_HALT;
+    CHECK(tft_bridge_create(BRIDGE_TOPOLOGY, &opts, &b) == TFT_OK, why());
+    if (b == NULL) {
+        return;
+    }
+
+    for (i = 0; i < 16; i++) {
+        gid[i] = (unsigned char)(i + 1);
+    }
+    CHECK(tft_bridge_attribute(b, gid, "/ekf") == TFT_OK, why());
+
+    memset(&s, 0, sizeof s);
+    s.struct_size = (uint32_t)sizeof s;
+    s.frame_id = "odom";
+    s.child_frame_id = "base";
+    s.stamp_nanos = 1000000000;
+    s.pose[0] = 1.0; /* qw qx qy qz tx ty tz — NOT geometry_msgs' x y z w */
+    s.pose[4] = 3.25;
+
+    /* 0xAA everywhere, so "the ABI wrote a well-formed outcome" cannot pass by
+     * the struct happening to be zeroed: TFT_BRIDGE_APPLIED is 0. */
+    memset(&o, 0xAA, sizeof o);
+    o.struct_size = (uint32_t)sizeof o;
+    CHECK(tft_bridge_offer(b, TFT_BRIDGE_TOPIC_TF, &s, gid, &o) == TFT_OK, why());
+    CHECK(o.action == TFT_BRIDGE_APPLIED, "a declared edge must be written");
+    CHECK(o.parent != NULL && strcmp(o.parent, "odom") == 0, "outcome parent");
+    CHECK(o.child != NULL && strcmp(o.child, "base") == 0, "outcome child");
+    /* Never NULL, per the header — a C caller printf's these. */
+    CHECK(o.owner != NULL && o.intruder != NULL && o.detail != NULL,
+          "an unset outcome string is empty, never NULL");
+    CHECK(o.owner[0] == '\0', "…and empty means empty");
+
+    /* An edge the config does not declare: dropped, named, diagnosed once. */
+    s.child_frame_id = "camera";
+    memset(&o, 0xAA, sizeof o);
+    o.struct_size = (uint32_t)sizeof o;
+    CHECK(tft_bridge_offer(b, TFT_BRIDGE_TOPIC_TF, &s, gid, &o) == TFT_OK, why());
+    CHECK(o.action == TFT_BRIDGE_UNDECLARED, "an undeclared edge has nowhere to go");
+    CHECK(o.first_time == 1, "the first sighting is the loud one");
+    CHECK(o.detail[0] != '\0', "and it says why");
+
+    memset(&stats, 0, sizeof stats);
+    stats.struct_size = (uint32_t)sizeof stats;
+    CHECK(tft_bridge_get_stats(b, &stats) == TFT_OK, why());
+    CHECK(stats.transforms == 2, "two offers");
+    CHECK(stats.applied == 1, "one written");
+    CHECK(stats.dropped_undeclared == 1, "one with nowhere to go");
+    CHECK(stats.queue_capacity == 100, "§5.2's KeepLast(100)");
+
+    /* The arena the bridge built, read back through the ordinary stable API. */
+    CHECK(tft_bridge_tree(b, &tree) == TFT_OK, why());
+    CHECK(tft_plan_create(tree, "odom", "base", &plan) == TFT_OK, why());
+    CHECK(tft_plan_at(plan, 1000000000, TFT_LAYOUT_QVEC7_WXYZ, out) == TFT_OK, why());
+    CHECK(out[4] > 3.24 && out[4] < 3.26, "the bridge's write is readable");
+
+    tft_plan_free(plan);
+    tft_tree_free(tree);
+    tft_bridge_free(b);
+    tft_bridge_free(NULL); /* documented no-op */
+}
+#endif /* TFT_HAVE_BRIDGE */
+
 int main(void)
 {
     check_version_and_constants();
     check_null_is_never_dereferenced();
     check_struct_size_gate();
     check_round_trip();
+#if defined(TFT_HAVE_BRIDGE)
+    check_bridge();
+#endif
 
     if (failures == 0) {
         printf("tf_tree C ABI smoke: OK (abi %u.%u)\n",
