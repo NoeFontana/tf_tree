@@ -934,6 +934,48 @@ impl Default for Options {
     }
 }
 
+/// Why the two `.tft` rows are unavailable, for a given `attempt`.
+///
+/// # The reason is derived from a `cfg`, not written as prose, and that is the
+/// point
+///
+/// Both rows previously carried a hand-written reason saying `docs/PHASE5.md`
+/// §2 and §3 "are not implemented". **Both are, and §0.0's status table — which
+/// those very strings cited as the source of truth — says so.** So the tool was
+/// printing a false statement, under a section (§9.3) whose whole subject is
+/// that an unmeasurable row must say *why*. A reason nobody can trust is worse
+/// than a missing row, which is exactly the argument §9.3 makes about numbers.
+///
+/// The fix is to stop asserting anything about the roadmap. The frozen backend
+/// is `#[cfg(all(feature = "shm", target_os = "linux"))]`, and `just
+/// bench-report` builds without `--features shm`, so on the shipped recipe
+/// `Tree::open_frozen` is *not compiled into this binary* — that is the real
+/// blocker, it is checkable by the compiler, and it cannot go stale the way a
+/// sentence about a phase can.
+///
+/// With `shm` on, the remaining blocker is data rather than code: this harness
+/// builds synthetic fixtures, and both rows are about a *representative* index
+/// (§12 gate 2 names 233 MB). Timing `open_frozen` on a fixture and reporting it
+/// against a gate written about a 233 MB file would be the thumb on the scale
+/// §9.3 opens by naming.
+fn frozen_row_reason(attempt: &str) -> String {
+    if cfg!(all(feature = "shm", target_os = "linux")) {
+        format!(
+            "{attempt} needs a representative .tft, and this harness builds only synthetic \
+             fixtures. `docs/PHASE5.md` §12 gate 2 is written about a 233 MB index; a number \
+             taken from a fixture a thousand times smaller would answer a different question \
+             while appearing to answer that one"
+        )
+    } else {
+        format!(
+            "{attempt} needs `tf_tree`'s frozen backend, which is \
+             `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]` and is therefore not \
+             compiled into this binary — `just bench-report` builds without `--features shm`. \
+             There is no `Tree::open_frozen` here to call"
+        )
+    }
+}
+
 /// Build the whole §9 artifact for this host.
 ///
 /// Every row is either measured here or [`Status::Unavailable`] with the reason
@@ -1100,11 +1142,9 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "Frozen .tft: 16 dataloader workers, total RSS vs 16 bag parses (MB)",
             "The wedge's central claim (§12 gate 4: total Pss within 1.2x of one worker).",
             false,
-            "`docs/PHASE5.md` §2 (the frozen .tft arena) is not implemented — §0.0's status \
-         table is the source of truth. There is no file to map, so there is nothing to \
-         measure"
-                .to_owned(),
-            "not yet reproducible: implement PHASE5 §2 first",
+            frozen_row_reason("mapping one .tft from sixteen worker processes"),
+            "just bench-report-shm on >= 16 physical cores, with a .tft built by \
+             `tf_tree freeze --from-bag` from a representative recording",
         )
         .n_way(),
     );
@@ -1114,8 +1154,9 @@ pub fn assemble(opts: &Options) -> Result<Report> {
         ".tft open time vs bag parse time (ms)",
         "§12 gate 2 wants open under 10 ms for a 233 MB index.",
         true,
-        "`docs/PHASE5.md` §2 and §3 (frozen arena, bag ingestion) are not implemented".to_owned(),
-        "not yet reproducible: implement PHASE5 §2 and §3 first",
+        frozen_row_reason("timing `Tree::open_frozen` against a 233 MB index"),
+        "just bench-report-shm against a .tft built by `tf_tree freeze --from-bag` from a \
+         recording large enough to produce §12 gate 2's 233 MB index",
     ));
 
     // Correctness, and the one row that is hardware-independent by construction:
@@ -1930,6 +1971,66 @@ mod tests {
         let opens = json.matches('{').count();
         let closes = json.matches('}').count();
         assert_eq!(opens, closes, "unbalanced JSON braces");
+    }
+
+    /// **No row may explain itself by claiming a phase is unimplemented.**
+    ///
+    /// Two rows did, and both statements had become false: `tft_16_workers_rss`
+    /// and `tft_open_vs_bag_parse` said `docs/PHASE5.md` §2 and §3 "are not
+    /// implemented", citing §0.0's status table as the source of truth — while
+    /// §0.0 recorded §2 as **Done** and §3 as partly done for MCAP. §9.3 is
+    /// NORMATIVE that an unmeasurable row must say *why*, and a report that
+    /// misstates the reason costs exactly the credibility §9.3 opens by naming.
+    ///
+    /// The rule this pins is the general form: **an unavailable row's reason is
+    /// about this host or this build, never about the roadmap.** A `cfg` or a
+    /// core count is checkable and cannot rot; a sentence about what phase has
+    /// landed is neither, and §0.0 is the one place that tracks it.
+    ///
+    /// Mutant: restore either row's old reason (`"`docs/PHASE5.md` §2 (the
+    /// frozen .tft arena) is not implemented ..."`). Applied: the assertion
+    /// fails naming that row and quoting the phrase.
+    #[test]
+    fn no_unavailable_reason_claims_a_phase_is_unimplemented() {
+        let opts = Options {
+            lookup_samples: 1,
+            differential_queries: 64,
+            warmup: Duration::from_millis(1),
+            ..Options::default()
+        };
+        let report = assemble(&opts).expect("assemble");
+
+        // Non-degenerate: if nothing were unavailable this would pass vacuously,
+        // and on a host that can measure everything it still must not.
+        let unavailable: Vec<&Row> = report
+            .rows
+            .iter()
+            .filter(|r| r.status == Status::Unavailable)
+            .collect();
+        assert!(
+            unavailable.len() >= 2,
+            "this host reports {} unavailable rows; the two .tft rows are unconditionally \
+             unavailable, so fewer than two means the fixture stopped exercising the rule",
+            unavailable.len()
+        );
+
+        for r in &unavailable {
+            for phrase in ["is not implemented", "are not implemented", "unimplemented"] {
+                assert!(
+                    !r.reason.contains(phrase),
+                    "row `{}` explains itself with `{phrase}`, which is a claim about the \
+                     roadmap rather than about this host or this build, and is the exact \
+                     statement that had gone stale. Reason was: {}",
+                    r.id,
+                    r.reason
+                );
+            }
+            assert!(
+                !r.reason.is_empty(),
+                "row `{}` is unavailable with no reason at all (PHASE5 §9.3)",
+                r.id
+            );
+        }
     }
 
     /// The timestamp routine is the one piece of the provenance header with no

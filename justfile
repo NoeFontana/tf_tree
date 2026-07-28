@@ -226,6 +226,29 @@ bench:
 bench-report *ARGS:
     cargo run --release -p tf_tree_bench --bin bench_report -- {{ARGS}}
 
+# **The same report, built with the frozen backend compiled in.**
+#
+# `bench-report` above does NOT pass `--features shm`, and that is not an
+# oversight — `shm` is off by default so the single-process build never grows a
+# syscall dependency it does not use, and it is Linux-only. The consequence is
+# concrete and shows up in the artifact: `tf_tree::Tree::open_frozen` is
+# `#[cfg(all(feature = "shm", target_os = "linux"))]`, so in the default build
+# the two `.tft` rows are UNAVAILABLE because *the function is not compiled in*.
+# The report says exactly that.
+#
+# This recipe exists so that reason is falsifiable rather than decorative: it is
+# the command those two rows name as the way to get past it, and a `reproduce:`
+# line naming a recipe that does not exist is checked by
+# `report::tests::every_command_the_report_names_is_a_command_that_exists`.
+#
+# The rows still need a representative `.tft` (§12 gate 2 is written about a
+# 233 MB index) and 16 physical cores, neither of which a cargo feature can
+# supply — so on this host they stay UNAVAILABLE, with the *second* reason
+# rather than the first. That is the point: each blocker is stated as it is
+# reached, and none of them is a claim about which phase has landed.
+bench-report-shm *ARGS:
+    cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
+
 # `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
 # where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
 # `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one

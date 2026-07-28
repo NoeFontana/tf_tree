@@ -17,8 +17,8 @@ fn run(args: &[&str]) -> Output {
         .expect("spawning bench_report")
 }
 
-/// §9.1 spells flags for work `docs/PHASE5.md` §0.0 records as unimplemented.
-/// Each is rejected, naming the reason — never accepted and ignored.
+/// §9.1 spells flags that would govern nothing on this host. Each is rejected,
+/// naming the reason — never accepted and ignored.
 ///
 /// `--duration` is the steady-state window per point. Every point it would
 /// govern is an N-way comparison row that comes out UNAVAILABLE on any host
@@ -26,6 +26,13 @@ fn run(args: &[&str]) -> Output {
 /// bounded by lookup samples. An operator who passes `--duration 300s`, waits,
 /// and receives a report identical in every measured field has been misled by
 /// the tool whose entire thesis is that it does not mislead.
+///
+/// **`--bag`'s needle is `not wired up`, and used to be `bag ingestion`.** The
+/// old refusal said §3 (bag ingestion) "is not implemented"; §3 has since landed
+/// for MCAP, so that sentence became false while this test kept passing on the
+/// two words it happened to match. The needle now names the part of the refusal
+/// that is actually load-bearing — that the flag is unwired here — rather than a
+/// phrase that survives the claim around it going stale.
 ///
 /// `--help` is asserted first as a control: without it, every assertion below
 /// would also pass on a binary that failed to start at all.
@@ -49,8 +56,11 @@ fn a_flag_that_would_govern_nothing_is_rejected_not_ignored() {
 
     for (flag, value, needle) in [
         ("--duration", "300s", "steady-state window"),
-        ("--bag", "run.mcap", "bag ingestion"),
+        ("--bag", "run.mcap", "not wired up"),
     ] {
+        // A refusal must not explain itself with a claim about the roadmap:
+        // `report::tests::no_unavailable_reason_claims_a_phase_is_unimplemented`
+        // is the same rule for the report's own rows, and this is the CLI half.
         let out = run(&[flag, value, "--help"]);
         assert!(
             !out.status.success(),
@@ -61,6 +71,13 @@ fn a_flag_that_would_govern_nothing_is_rejected_not_ignored() {
             err.contains(flag) && err.contains(needle),
             "the refusal for `{flag}` must say why, got: {err}"
         );
+        for stale in ["is not implemented", "are not implemented"] {
+            assert!(
+                !err.contains(stale),
+                "the refusal for `{flag}` explains itself with `{stale}`, a claim about the \
+                 roadmap that §0.0 owns and that has already gone stale once: {err}"
+            );
+        }
     }
 }
 
