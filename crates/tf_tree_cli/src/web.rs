@@ -551,6 +551,13 @@ pub fn serve(
         let (mut stream, _peer) = listener.accept().context("accepting a --web connection")?;
         served += 1;
         let handled = (|| -> std::io::Result<()> {
+            // Both directions, and the read half is the load-bearing one: this
+            // loop is single-threaded, so a peer that connects and never sends a
+            // request line would otherwise block `read_head` forever and the
+            // operator's view would stop updating for as long as that socket is
+            // held open. `read_head` turns the resulting `WouldBlock`/`TimedOut`
+            // into "drop the connection".
+            stream.set_read_timeout(Some(IO_TIMEOUT))?;
             stream.set_write_timeout(Some(IO_TIMEOUT))?;
             let Some(head) = read_head(&mut stream)? else {
                 return Ok(());
@@ -644,7 +651,10 @@ mod tests {
             route(&get("/api/tick/../../etc/passwd", "localhost"), b),
             Route::NotFound
         );
-        assert_eq!(route(&get("/../src/web.rs", "localhost"), b), Route::NotFound);
+        assert_eq!(
+            route(&get("/../src/web.rs", "localhost"), b),
+            Route::NotFound
+        );
         assert_eq!(
             route("POST /api/tick HTTP/1.1\r\nHost: localhost", b),
             Route::MethodNotAllowed
@@ -787,8 +797,16 @@ mod tests {
     /// **A response carries the CSP that makes "no CDN" the browser's rule.**
     ///
     /// Mutant: delete the `Content-Security-Policy` line from `respond`.
-    /// Applied: the header is absent from the captured response and the
+    /// Applied: the header is absent from the response *head* and the first
     /// assertion fails.
+    ///
+    /// **Every header assertion is made against `head`, never against the whole
+    /// response, and that is not tidiness.** An earlier revision searched the
+    /// full text, and the mutant above *survived* it: `web/index.html`'s own
+    /// file comment quotes the header it is documenting
+    /// (``Content-Security-Policy: default-src 'none'; connect-src 'self'``),
+    /// so the served body satisfied the assertion with the header gone. A
+    /// header test that a page's prose can pass is not a header test.
     ///
     /// This drives a real socket rather than formatting a string, so it also
     /// covers the parts `route` cannot: the read loop finding `\r\n\r\n`, the
@@ -813,23 +831,27 @@ mod tests {
                 .unwrap();
             let mut out = String::new();
             s.read_to_string(&mut out).unwrap();
-            out
+            let (head, body) = out.split_once("\r\n\r\n").expect("a header terminator");
+            (head.to_owned(), body.to_owned())
         };
 
-        let page = fetch("/");
-        assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
-        assert!(page.contains("Content-Security-Policy: default-src 'none';"));
-        assert!(page.contains("connect-src 'self'"));
-        assert!(page.contains("Connection: close"));
+        let (head, body) = fetch("/");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         assert!(
-            page.contains(&format!("Content-Length: {}", INDEX_HTML.len())),
-            "content length must be the page's byte length"
+            head.contains("Content-Security-Policy: default-src 'none';"),
+            "{head}"
         );
-        assert!(page.ends_with(INDEX_HTML), "the body is the embedded page");
+        assert!(head.contains("connect-src 'self'"), "{head}");
+        assert!(head.contains("Connection: close"), "{head}");
+        assert!(
+            head.contains(&format!("Content-Length: {}", INDEX_HTML.len())),
+            "content length must be the page's byte length: {head}"
+        );
+        assert_eq!(body, INDEX_HTML, "the body is the embedded page");
 
-        let api = fetch("/api/tick");
-        assert!(api.contains("Content-Type: application/json"));
-        assert!(api.ends_with("{\"schema\":\"tf_tree.top/1\",\"n\":1}"));
+        let (head, body) = fetch("/api/tick");
+        assert!(head.contains("Content-Type: application/json"), "{head}");
+        assert_eq!(body, "{\"schema\":\"tf_tree.top/1\",\"n\":1}");
         h.join().unwrap();
     }
 
@@ -888,7 +910,9 @@ mod tests {
         s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
         let mut line = String::new();
-        std::io::BufReader::new(&mut s).read_line(&mut line).unwrap();
+        std::io::BufReader::new(&mut s)
+            .read_line(&mut line)
+            .unwrap();
         assert_eq!(line, "HTTP/1.1 200 OK\r\n");
         drop(silent);
         h.join().unwrap().unwrap();
@@ -913,7 +937,8 @@ mod tests {
         let h = std::thread::spawn(move || serve(&listener, bound, 1, &mut || "{}".to_owned()));
         let mut s = TcpStream::connect(bound).unwrap();
         let started = std::time::Instant::now();
-        s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n").unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .unwrap();
         // Never a blank line: headers forever. Twice `MAX_HEAD`, so the cap is
         // crossed well before the client runs out of things to say.
         let junk = format!("X-Pad: {}\r\n", "a".repeat(1024));
@@ -936,13 +961,24 @@ mod tests {
         h.join().unwrap().unwrap();
     }
 
-    /// **The JSON is well formed for an empty arena and for a populated one,
-    /// and never contains a bare `NaN`.**
+    /// **A non-finite rate renders as `null` rather than as a bare `NaN`.**
     ///
-    /// Mutant: make [`num`] `format!("{x}")` unconditionally. Applied, an edge
-    /// whose median interval is zero yields `inf` in the document, `JSON.parse`
-    /// throws on the first poll, and the page shows "disconnected" forever
-    /// rather than one blank cell. The assertion below fails on the `inf`.
+    /// `NaN` and `±Infinity` are not JSON: `JSON.parse` throws on the whole
+    /// document, so one bad cell blanks the entire page and the browser shows
+    /// "disconnected" forever.
+    ///
+    /// **Today no caller can reach that branch, and the honest claim is
+    /// therefore about the guard and not about a live bug.** Both inputs are
+    /// already guarded upstream: [`IntervalStats::rate_hz`] returns `None`
+    /// unless `median_ns > 0` (so its quotient is at most `1e9`), and
+    /// `EdgeRow::observed_hz` is `None` unless `secs > 0.0`. What this test pins
+    /// is that adding a *third* rate — a mean interval, a ratio of two counters,
+    /// an error rate whose denominator is `lookups_ok` — cannot introduce a
+    /// division by zero into the document without going through [`num`].
+    ///
+    /// Mutant: make [`num`] `format!("{x}")` unconditionally. Applied: the
+    /// `NaN` and `INFINITY` assertions below fail. (No *integration* test dies,
+    /// which is exactly the point above.)
     #[test]
     fn non_finite_rates_render_as_null() {
         assert_eq!(num(None), "null");

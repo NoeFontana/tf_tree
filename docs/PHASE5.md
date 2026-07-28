@@ -23,7 +23,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 52 passed) and `just py-test-freethreaded` (3.14t, 54 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
-| §7 `tf_tree top` | **Partly done.** `tf_tree top` exists, attaches read-only and *refuses* `--rw`, and renders all four panes §7 names: per-edge kind/rate/staleness/occupancy/writer, the participant list (arena record ∪ lock-file byte, so read-only participants appear at all), a rolling feed derived from counter deltas, and a per-edge detail view with an inter-arrival histogram. **Built with plain ANSI, not `ratatui` — see the amendment below.** **Not done:** the `--web` view, which is §7's other half. |
+| §7 `tf_tree top` | **Done, both halves.** `tf_tree top` exists, attaches read-only and *refuses* `--rw`, and renders all four panes §7 names: per-edge kind/rate/staleness/occupancy/writer, the participant list (arena record ∪ lock-file byte, so read-only participants appear at all), a rolling feed derived from counter deltas, and a per-edge detail view with an inter-arrival histogram. **Built with plain ANSI, not `ratatui` — see the amendment below.** `--web` serves the same [`Sampler`] over a hand-rolled HTTP/1.1 loop on `std::net::TcpListener` (**no new dependency**; a server crate is the third instance of §7's own argument, and the web-view amendment below records it), binding `127.0.0.1:8787` by default. One embedded HTML file, one `/api/tick` JSON endpoint (schema `tf_tree.top/1`), hand-written SVG, **no CDN — enforced by a `default-src 'none'` CSP the server sends, not promised by a comment.** Gated by `cargo nextest run --workspace`: 12 unit tests in `src/web.rs` plus `crates/tf_tree_cli/tests/web.rs`, which runs the shipped binary and parses the document a browser would receive. **Three defects the amendment names were found by writing those tests and are fixed.** **Not done:** `--web` is single-threaded with no keep-alive and is not a general-purpose server; there is no key handling on either half (see the `ratatui` amendment). |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
 | §9 Benchmark artifact | **Partial.** `just bench-report` emits `report/{results.json,index.html}` with the §9.3 provenance header, all eight §9.2 rows, and all four §9.3 "where we are worse" entries; `Report::validate` makes the honesty rules structural — the tool refuses to write a report that over-claims, rather than relying on whoever wrote it. On this host every comparison row is `UNAVAILABLE` with its own reason, which is §9.3's prescribed output, not a gap in the tool. **Not done:** §9.1's container image, the public sample recording, `tf_tree bench compare`'s CLI spelling (it takes `--bag`, which is §3), and §12 gate 7 (reproducing a committed `results.json` on a clean machine). |
 | §10 Open-source readiness | **Partial.** Name decision made, measured and recorded ([`0008`](./decisions/0008-the-name-tf-tree.md)): `tf_tree` is free on the crates.io sparse index and on PyPI, and is kept. `LICENSE-MIT`/`LICENSE-APACHE`, `NOTICE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` (real address, and an explicit in-scope/out-of-scope boundary around §3.10's trust model) and `SUPPORT.md` (response expectations, platform support, MSRV policy) are in place; `README.md` is rebuilt against the §0.0 tables. **The MSRV was measured and was wrong:** `rust-version = "1.83"` could not build — `blake3` pulls `constant_time_eq 0.4.2`, edition 2024 — so the floor is now **1.85**, with a CI job that reads it from the manifest and builds `--locked` on exactly it. Every `publish = false` crate now states its reason in its own manifest. **Not done:** the mdBook site, SBOM per release, release automation (`cargo-dist`, PEP 740 attestations, signed tags), the ASan/UBSan/TSan and nightly-`shm_torture` CI jobs, and the benchmark artifact as a regression gate. |
@@ -766,6 +766,82 @@ Bind to loopback by default. Serving robot state on `0.0.0.0` by default would b
 > stamp-derived median rate and a wall-clock-derived head-advance rate side by
 > side and compares neither against a declared one.
 
+> **Amendment — the `--web` half: what it is, and the four things §7 does not
+> say that the implementation had to decide.**
+>
+> **No HTTP crate, for the reason this section already gives twice.** §7 forbids
+> a frontend toolchain for the page and the `ratatui` amendment extends that to
+> the terminal; a server crate is the same argument a third time. `hyper`/`axum`
+> pull a `tokio` runtime into a workspace whose `CLAUDE.md` says "no
+> `async`/runtime", and `tiny_http` is still a dependency to keep current — to
+> answer two routes that serve one constant and one string. `--web` is
+> `std::net::TcpListener`, one connection at a time, no keep-alive, ~150 lines
+> in `crates/tf_tree_cli/src/web.rs`. **The dependency budget is unchanged: the
+> `--web` commit adds no crate to any manifest.** What that costs is stated in
+> `serve`'s own doc — it is not a general-purpose server and must never be
+> pointed at a network.
+>
+> * **This is the only network socket in the repository, and §11's "no network"
+>   test must be scoped to say so.** §5.1 is NORMATIVE that "`tf_tree` opens no
+>   network sockets. Ever." That sentence is about the *library* and stays
+>   literally true — nothing in `tf_tree`, `tf_tree_core`, `tf_tree_arena` or
+>   `tf_tree_ipc` can reach this code. The `AF_INET` socket lives in the CLI and
+>   exists only when an operator types `--web`. §11's proposed
+>   `socket(2)`-is-only-`AF_UNIX` assertion is therefore a claim about the
+>   library's suite; a version of it that ran over the CLI would have to encode
+>   this exception, and that is a worse test than a narrower one.
+> * **Loopback is not a boundary a browser respects, so there is a `Host`
+>   guard.** §7 asks for a loopback default and that is necessary but not
+>   sufficient: any page the operator visits can `fetch http://127.0.0.1:8787/`,
+>   and while CORS makes the response opaque, **DNS rebinding** makes
+>   `evil.example` resolve to `127.0.0.1` on its second lookup, at which point
+>   the page is same-origin and can read every frame name and pid in the arena.
+>   An `Origin` check does not help — a rebound page's origin *is*
+>   `evil.example`. The fix is that a loopback bind refuses any request whose
+>   `Host` is not a loopback name, missing `Host` included. The guard is scoped
+>   to a loopback bind: an operator who typed `--web 0.0.0.0:8787` asked for a
+>   reachable server, gets a stderr warning saying what it exposes, and would
+>   otherwise have every request refused.
+> * **"No CDN" is enforced by the browser, not promised by a comment.** Every
+>   response carries `Content-Security-Policy: default-src 'none'` with
+>   `connect-src 'self'` for the one `fetch`, so a `<script src>` added to the
+>   page in a year's time does not load. Two tests scan the page for the three
+>   ways it could acquire an external dependency without an absolute URL
+>   (protocol-relative `src`, `@import`, dynamic `import()`) and for the four
+>   string-to-DOM paths, because frame names are arbitrary UTF-8 and this page is
+>   the one place in the repository where they meet an HTML parser.
+> * **A poll arriving inside one interval is answered from the previous
+>   document, and that is correctness rather than politeness.** One `Sampler`
+>   holds all the per-tick state, and every delta in the document
+>   (`delta_head`, `delta_errors`, `observed_hz`) is a difference between two of
+>   its observations. Two browser tabs polling at 1 Hz would take alternate
+>   observations, so each would see half the samples and **every rate on both
+>   pages would read half of what the arena is doing** — wrong, silently, with
+>   no error anywhere. Caching within a tick also makes an F5 or a `watch curl`
+>   free rather than a perturbation.
+>
+> **Three defects were found by writing the tests, not by reading the code, and
+> two of them would have shipped.** They are recorded because each is a general
+> shape:
+>
+> 1. **No read timeout on the accepted socket.** A single-threaded loop plus a
+>    peer that connects and says nothing is an outage: the operator's view stops
+>    updating for as long as a port scanner holds the connection. The test for
+>    it does not *fail* against the unfixed code — it hangs — which is the honest
+>    description of the bug and is why the test opens a silent connection and
+>    holds it.
+> 2. **A header assertion that the page's own prose satisfied.** The CSP test
+>    searched the whole response for the header string, and `web/index.html`'s
+>    file comment quotes the header it documents. Deleting the
+>    `Content-Security-Policy` line from the server left the test passing. Header
+>    assertions are now made against the response head only.
+> 3. **A docstring naming a failure that could not happen.** The non-finite-rate
+>    test claimed a zero median interval would put `inf` in the document; it
+>    cannot, because `IntervalStats::rate_hz` returns `None` unless the median is
+>    positive and `observed_hz` returns `None` unless the elapsed time is. The
+>    guard is worth keeping and the test is worth keeping — as a claim about a
+>    guard, which is what it now says.
+
 ---
 
 ## 8. Visualization — deliberately not built
@@ -880,11 +956,11 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 - **Multi-process page sharing:** 16 processes mapping one `.tft`; assert total RSS is within 1.2× of a single process, measured from `/proc/*/smaps_rollup` `Pss`.
 - **Fork safety:** a `DataLoader` with `num_workers=16` under all three start methods.
 - **Counter contention:** 16 concurrent readers on one edge, each holding a long-lived `Guard`; assert no measurable throughput difference against a `counters`-disabled build.
-- **No network:** full suite under `strace`/seccomp, asserting `socket(2)` is only ever `AF_UNIX` (§5.1).
+- **No network:** full suite under `strace`/seccomp, asserting `socket(2)` is only ever `AF_UNIX` (§5.1). **Scoped to the library's suite** — `tf_tree top --web` is an `AF_INET` listener by construction, and §7's web-view amendment records why that exception belongs in this sentence rather than inside the assertion.
 - **Convenience-path guard reuse:** assert `tree.lookup` in a loop performs O(1) atomic flushes, not O(n).
 - **Diagnostics:** one test per check ID, each with a fixture that triggers exactly that check and no other.
 - **`doctor --json`:** schema-validated; adding a check must not break an existing consumer.
-- **Web view:** loopback binding asserted; no outbound network requests (assert on the served HTML).
+- **Web view:** loopback binding asserted; no outbound network requests (assert on the served HTML). **Both are implemented, and two more were needed**: the `Host` guard that makes the loopback bind mean something against DNS rebinding, and an end-to-end test that parses the document a browser receives — every unit test stubs the sampler, so the hand-formatted JSON was otherwise never once parsed.
 - **`iter_edge` returns stored samples:** push a known irregular sequence, iterate, and assert the exact stamps come back — no resampling, no interpolation, no reordering.
 
 ---
@@ -918,7 +994,7 @@ Criterion 4 is the wedge's central claim, and criterion 7 is what makes it belie
 - [ ] Offline Python API is the *same* API; no parallel surface introduced
 - [ ] Ingest report emitted as JSON and human summary; every §3.2 anomaly covered by a fixture
 - [ ] All 16 diagnostic checks implemented with stable IDs, `--json`, and `--exit-code`
-- [ ] `tf_tree top` TUI plus embedded web view with no build step, loopback-bound
+- [x] `tf_tree top` TUI plus embedded web view with no build step, loopback-bound
 - [ ] `iter_edge` / `iter_edges` / `frame_path` present on both live and frozen arenas, with `iter_edge` yielding stored samples
 - [ ] No viewer dependency, channel, schema, or plugin anywhere in the repository
 - [ ] Benchmark artifact reproducible from a published container by someone outside the team

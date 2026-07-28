@@ -924,10 +924,26 @@ fn cmd_top(
 
     let interval = core::time::Duration::from_millis(interval_ms);
     if let Some(addr) = web {
-        return cmd_top_web(tree, src.banner(), interval, iterations, edge, addr, &*merge);
+        return cmd_top_web(
+            tree,
+            src.banner(),
+            interval,
+            iterations,
+            edge,
+            addr,
+            &*merge,
+        );
     }
 
-    top::run(tree, src.banner(), interval, iterations, edge, color, &*merge)
+    top::run(
+        tree,
+        src.banner(),
+        interval,
+        iterations,
+        edge,
+        color,
+        &*merge,
+    )
 }
 
 /// `tf_tree top --web` — the same sampler, served instead of drawn.
