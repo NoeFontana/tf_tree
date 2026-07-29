@@ -1309,7 +1309,7 @@ fn explain_format_version() {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1358,4 +1358,54 @@ mod tests {
             "{text}"
         );
     }
+
+    /// **`--web` with no value binds loopback, and `--web ADDR` binds what the
+    /// operator named.**
+    ///
+    /// The bare spelling is the one the documentation leads with and the one an
+    /// operator types, and it is the *only* place the loopback default lives:
+    /// `bind` binds whatever it is handed, so if `default_missing_value` were
+    /// wrong or absent, §7's loopback-by-default rule would be gone with no
+    /// code change anywhere near `web.rs`. Every integration test passes
+    /// `127.0.0.1:0` explicitly and would not notice.
+    ///
+    /// Asserted through `clap` rather than by launching a server on port 8787:
+    /// a fixed port collides with whatever else is on this machine and with a
+    /// second copy of the test suite, and the property is about argument
+    /// parsing.
+    ///
+    /// Mutant: delete `default_missing_value = web::DEFAULT_ADDR` from the
+    /// `web` argument. Applied: `clap` rejects `--web` with "a value is
+    /// required" and `try_parse_from` returns `Err`, so the first assertion
+    /// fails. Second mutant: change the default to `0.0.0.0:8787` — the
+    /// `is_loopback` assertion fails, which is the security-relevant half.
+    #[test]
+    fn bare_web_binds_the_loopback_default() {
+        let parse = |args: &[&str]| -> Option<std::net::SocketAddr> {
+            match Cli::try_parse_from(args).expect("parse").command {
+                Command::Top { web, .. } => web,
+                _ => panic!("not `top`"),
+            }
+        };
+        let addr = parse(&["tf_tree", "top", "--web"]).expect("--web alone must bind a default");
+        assert_eq!(addr.to_string(), DEFAULT_WEB_ADDR_FOR_TEST);
+        assert!(addr.ip().is_loopback(), "§7: loopback by default");
+        // An explicit address still wins, including the `:0` spelling the
+        // integration tests rely on.
+        assert_eq!(
+            parse(&["tf_tree", "top", "--web", "127.0.0.1:0"])
+                .expect("an explicit address")
+                .port(),
+            0
+        );
+        assert_eq!(parse(&["tf_tree", "top"]), None, "no --web, no server");
+    }
+
+    /// [`web::DEFAULT_ADDR`] as the test above expects to see it printed.
+    ///
+    /// Spelled out rather than compared against the constant: comparing a
+    /// constant to itself would pass with the constant changed to `0.0.0.0`,
+    /// and the assertion above is about what `--web` binds, not about
+    /// `SocketAddr`'s `Display`.
+    const DEFAULT_WEB_ADDR_FOR_TEST: &str = "127.0.0.1:8787";
 }

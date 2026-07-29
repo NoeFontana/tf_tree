@@ -532,7 +532,9 @@ In 2026 "telemetry" means the software phones home. A robotics team evaluating a
 
 Pair the rename with a stronger, testable claim:
 
-**`tf_tree` opens no network sockets. Ever.** The only socket in the entire library is the Phase 2 `AF_UNIX` rendezvous socket, which is a filesystem path on the local host. Phase 8 replication will add network transport, and when it does it will be an explicitly enabled, separately named component.
+**The `tf_tree` *library* opens no network sockets. Ever.** The only socket in the entire library is the Phase 2 `AF_UNIX` rendezvous socket, which is a filesystem path on the local host. Phase 8 replication will add network transport, and when it does it will be an explicitly enabled, separately named component.
+
+**`tf_tree` is also the name of the shipped binary, and the binary has exactly one exception: `tf_tree top --web`.** It binds an `AF_INET` listener, only when an operator types the flag, loopback unless they name another address — see §7's amendment. Nothing a program links can reach it. The headline above is scoped to the library because that is the claim a team evaluating the crate is making a procurement decision about; stating it without the scope would leave the one exception to be discovered rather than read.
 
 **NORMATIVE CI test:** run the full test suite under `strace` (or a seccomp filter) and assert that `socket(2)` is called only with `AF_UNIX`. A promise in a README is worth less than an assertion in CI, and for a library that ships onto robots this is worth asserting.
 
@@ -775,8 +777,14 @@ Bind to loopback by default. Serving robot state on `0.0.0.0` by default would b
 > pull a `tokio` runtime into a workspace whose `CLAUDE.md` says "no
 > `async`/runtime", and `tiny_http` is still a dependency to keep current — to
 > answer two routes that serve one constant and one string. `--web` is
-> `std::net::TcpListener`, one connection at a time, no keep-alive, ~150 lines
-> in `crates/tf_tree_cli/src/web.rs`. **The dependency budget is unchanged: the
+> `std::net::TcpListener`, one connection at a time, no keep-alive. The socket
+> half of `crates/tf_tree_cli/src/web.rs` — `bind`, `read_head`, `respond`,
+> `serve` and their two classifiers — is **126 lines of code**, blank and
+> comment lines excluded; the file as a whole is 364, and the remaining 238 are
+> the JSON document, which a server crate would not have written either. Both
+> numbers are measured and each says what it counts, because "~150 lines" of an
+> unspecified region is the kind of claim that is off by two times without
+> anyone noticing. **The dependency budget is unchanged: the
 > `--web` commit adds no crate to any manifest.** What that costs is stated in
 > `serve`'s own doc — it is not a general-purpose server and must never be
 > pointed at a network.

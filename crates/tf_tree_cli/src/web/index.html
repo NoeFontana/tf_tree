@@ -106,7 +106,10 @@
 "use strict";
 // Selection lives in the page, not in the endpoint: the JSON carries every
 // edge's histogram already, so clicking a row is a repaint and never a request.
+// It starts from the server's `selected`, which is what `--edge` resolved to —
+// see `seed` below for why that is read exactly once.
 let selected = null;
+let seeded = false;
 let seenTick = -1;
 
 const $ = (id) => document.getElementById(id);
@@ -247,7 +250,18 @@ function renderHistogram(d) {
   mk("text", { x: PAD, y: PAD - 10, class: "lab" }, "peak " + peak);
 }
 
+// `--edge` seeds the selection, and only the first document is allowed to do it.
+// The flag says where the operator wants to *start*; the click handler owns the
+// selection from then on, and re-reading `d.selected` every poll would drag the
+// page back to the flag's edge one second after every click.
+function seed(d) {
+  if (seeded) return;
+  seeded = true;
+  if (d.selected !== null && d.selected !== undefined) selected = d.selected;
+}
+
 function paint(d) {
+  seed(d);
   $("banner").textContent =
     d.source + "  |  " + d.frames + " frames, " + d.edges.length + " edges, " +
     fmtBytes(d.arena_bytes) + "  |  clock: " + d.clock +

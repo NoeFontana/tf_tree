@@ -13,9 +13,12 @@
 //! that serve one constant and one string.
 //!
 //! So this is `std::net::TcpListener`, one connection at a time, no keep-alive.
-//! That is ~150 lines and it cannot rot. What it costs is stated in
-//! [`serve`]: it is not a general-purpose server and must never be pointed at a
-//! network.
+//! The socket half of it — [`bind`], `read_head`, `respond`, [`serve`] and the
+//! two classifiers they lean on — is **126 lines of code** (`wc` of this file
+//! from `bind` to the test module, blank and comment lines excluded), and it
+//! cannot rot. The rest of the module is the JSON document, which a server
+//! crate would not have written for us. What it costs is stated in [`serve`]:
+//! it is not a general-purpose server and must never be pointed at a network.
 //!
 //! # This is the only network socket in the repository, and it is opt-in
 //!
@@ -436,19 +439,33 @@ pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
     let listener =
         TcpListener::bind(addr).with_context(|| format!("binding the --web view to {addr}"))?;
     let local = listener.local_addr().unwrap_or(addr);
-    if !local.ip().is_loopback() {
-        // Not an error: an operator on a robot with no display may genuinely
-        // want this reachable. But §7 calls a non-loopback *default* a security
-        // bug, and an explicit choice deserves to be visible in the log the
-        // operator later reads.
-        eprintln!(
-            "warning: --web is bound to {local}, which is not loopback. This serves the arena's \
-             frame names, pids and rates to anyone who can reach that address, with no \
-             authentication. Bind {DEFAULT_ADDR} and use an SSH tunnel instead."
-        );
+    if let Some(warning) = exposure_warning(local) {
+        eprintln!("{warning}");
     }
     println!("tf_tree top --web: read-only view on http://{local}/ (Ctrl-C to stop)");
     Ok((listener, local))
+}
+
+/// The stderr line a non-loopback bind earns, or `None` for loopback.
+///
+/// Not an error: an operator on a robot with no display may genuinely want this
+/// reachable. But §7 calls a non-loopback *default* a security bug, and an
+/// explicit choice deserves to be visible in the log the operator later reads.
+///
+/// **This is a function and not three lines inside [`bind`] so that it is
+/// testable without a socket.** §7's amendment leans on this warning as the
+/// reason an explicit `0.0.0.0` is acceptable at all; a load-bearing part of a
+/// security argument that no test can reach is a claim, not a mitigation.
+#[must_use]
+pub fn exposure_warning(local: SocketAddr) -> Option<String> {
+    if local.ip().is_loopback() {
+        return None;
+    }
+    Some(format!(
+        "warning: --web is bound to {local}, which is not loopback. This serves the arena's \
+         frame names, pids and rates to anyone who can reach that address, with no \
+         authentication. Bind {DEFAULT_ADDR} and use an SSH tunnel instead."
+    ))
 }
 
 /// Read a request head (everything up to the blank line) from `stream`.
@@ -493,7 +510,13 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
 /// * `Content-Security-Policy` — this is what makes §7's "no CDN" enforced by
 ///   the browser instead of promised by a comment. `default-src 'none'` blocks
 ///   every external load; `connect-src 'self'` leaves exactly the one `fetch`
-///   the page makes; `img-src data:` is the empty favicon.
+///   the page makes; `img-src data:` is the empty favicon. `frame-ancestors
+///   'none'` is listed **separately and not left to `default-src`**: it is not a
+///   fetch directive, so it has no fallback, and without it any origin may
+///   `<iframe>` this view. Same-origin policy still stops that page reading the
+///   frame, so what it costs us is clickjacking on a page with no actions —
+///   cheap to close, and the threat model here is a hostile page in the
+///   operator's own browser.
 /// * `X-Content-Type-Options: nosniff` — the JSON must never be sniffed into
 ///   something a browser will execute.
 /// * `Cache-Control: no-store` — a cached poll is a frozen picture of a live
@@ -514,13 +537,46 @@ fn respond(stream: &mut TcpStream, route: Route, body: &[u8]) -> std::io::Result
          Referrer-Policy: no-referrer\r\n\
          Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
          script-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; \
-         form-action 'none'\r\n\
+         form-action 'none'; frame-ancestors 'none'\r\n\
          \r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// Whether an `accept(2)` failure is about one peer rather than the listener.
+///
+/// The distinction decides whether the operator keeps their view. `accept` can
+/// fail for reasons that leave the listening socket perfectly healthy:
+///
+/// * **`ECONNABORTED`** — the peer sent a RST between the `SYN` and our
+///   `accept`. A port scanner does this all day.
+/// * **`EINTR`** — a signal arrived while we were blocked.
+/// * **`EMFILE`/`ENFILE`** — this process, or the machine, is momentarily out
+///   of file descriptors. The next `accept` after something closes succeeds.
+///
+/// Treating any of those as fatal means a background scanner can kill
+/// `tf_tree top --web` on a robot mid-session. Anything else — a listener that
+/// has been closed, an `EBADF` — is not survivable and is propagated, because a
+/// loop that retried it would spin forever printing.
+#[must_use]
+pub fn accept_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
+    ) || is_descriptor_exhaustion(e)
+}
+
+/// `EMFILE`/`ENFILE`, which `std` maps to no [`ErrorKind`] of its own.
+///
+/// The raw numbers are Linux/POSIX `errno` values and are only consulted on
+/// unix, where this server is used; on any other target the `ErrorKind` arms of
+/// [`accept_is_transient`] are the whole classifier.
+#[must_use]
+fn is_descriptor_exhaustion(e: &std::io::Error) -> bool {
+    cfg!(unix) && matches!(e.raw_os_error(), Some(23 | 24))
 }
 
 /// Serve the view until `max_requests` connections have been handled.
@@ -537,7 +593,8 @@ fn respond(stream: &mut TcpStream, route: Route, body: &[u8]) -> std::io::Result
 ///
 /// # Errors
 ///
-/// Only a failure to accept. A failure on one connection is reported to stderr
+/// Only a failure to accept that says the *listener* is finished — see
+/// [`accept_is_transient`]. A failure on one connection is reported to stderr
 /// and the loop continues: a malformed request from one client must not take
 /// the view away from the operator.
 pub fn serve(
@@ -548,7 +605,23 @@ pub fn serve(
 ) -> Result<()> {
     let mut served = 0u64;
     loop {
-        let (mut stream, _peer) = listener.accept().context("accepting a --web connection")?;
+        let (mut stream, _peer) = match listener.accept() {
+            Ok(v) => v,
+            Err(e) if accept_is_transient(&e) => {
+                eprintln!("--web: accept failed, still listening: {e}");
+                // Out of descriptors is the one transient failure that repeats
+                // immediately, so it would otherwise be a hot loop printing a
+                // line per iteration. Everything else here is one peer's doing
+                // and the next `accept` blocks normally.
+                if is_descriptor_exhaustion(&e) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                // Deliberately *not* counted against `max_requests`: the bound
+                // is a number of connections handled, and no connection was.
+                continue;
+            }
+            Err(e) => return Err(e).context("accepting a --web connection"),
+        };
         served += 1;
         let handled = (|| -> std::io::Result<()> {
             // Both directions, and the read half is the load-bearing one: this
@@ -800,6 +873,11 @@ mod tests {
     /// Applied: the header is absent from the response *head* and the first
     /// assertion fails.
     ///
+    /// Second mutant: delete only the `; frame-ancestors 'none'` token,
+    /// leaving the rest of the policy. Applied: the `frame-ancestors`
+    /// assertion fails and no other does — which is the point of asserting it
+    /// separately, since `default-src 'none'` does **not** cover framing.
+    ///
     /// **Every header assertion is made against `head`, never against the whole
     /// response, and that is not tidiness.** An earlier revision searched the
     /// full text, and the mutant above *survived* it: `web/index.html`'s own
@@ -842,6 +920,9 @@ mod tests {
             "{head}"
         );
         assert!(head.contains("connect-src 'self'"), "{head}");
+        // `frame-ancestors` has no `default-src` fallback — it is not a fetch
+        // directive — so its absence is not covered by the assertion above.
+        assert!(head.contains("frame-ancestors 'none'"), "{head}");
         assert!(head.contains("Connection: close"), "{head}");
         assert!(
             head.contains(&format!("Content-Length: {}", INDEX_HTML.len())),
@@ -896,26 +977,45 @@ mod tests {
     /// port scanner opens a connection and never speaks, and the operator's
     /// view stops updating for as long as it holds it.
     ///
-    /// Mutant: delete the `stream.set_read_timeout(...)` line. Applied, the
-    /// test hangs on `h.join()` until nextest's timeout kills it rather than
-    /// failing — which is the honest description of what that mutant does, and
-    /// is why the connection is opened and *held* here rather than closed.
+    /// Mutant: delete the `stream.set_read_timeout(...)` line. Applied: the
+    /// client's own read deadline fires and `read_line` fails naming the wedge.
+    ///
+    /// **The deadlines on the client side are the finding, not decoration.** An
+    /// earlier revision of this test called `read_line` and `join` bare, and
+    /// under that mutant it did not fail — it *hung*, and there is no
+    /// `.config/nextest.toml` in this repository to convert a hang into a
+    /// failure, so `just test` would have wedged with no diagnostic instead of
+    /// reporting a regression. A gate that never returns is a gate that does
+    /// not run.
     #[test]
     fn a_client_that_never_speaks_does_not_wedge_the_server() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let bound = listener.local_addr().unwrap();
-        let h = std::thread::spawn(move || serve(&listener, bound, 2, &mut || "{}".to_owned()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let r = serve(&listener, bound, 2, &mut || "{}".to_owned());
+            tx.send(r.is_ok()).unwrap();
+        });
         let silent = TcpStream::connect(bound).unwrap();
         let mut s = TcpStream::connect(bound).unwrap();
+        // Well above the 2 s [`IO_TIMEOUT`] the server may legitimately spend
+        // on `silent` before it reaches us, and well below any patience a human
+        // has for a hung test.
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
         let mut line = String::new();
         std::io::BufReader::new(&mut s)
             .read_line(&mut line)
-            .unwrap();
+            .expect("a silent peer must not hold the loop past IO_TIMEOUT");
         assert_eq!(line, "HTTP/1.1 200 OK\r\n");
         drop(silent);
-        h.join().unwrap().unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(20))
+                .expect("serve must return once both connections are done"),
+            "serve returned an error"
+        );
+        h.join().unwrap();
     }
 
     /// **An over-long request head is dropped as soon as it passes the cap.**
@@ -1038,5 +1138,116 @@ mod tests {
         assert!(doc.contains("\"rate_hz\":null"), "{doc}");
         assert!(doc.contains("\"newest_stamp\":null"), "{doc}");
         assert!(doc.contains("\"histogram\":[]"), "{doc}");
+    }
+
+    /// **A non-loopback bind produces a warning that says what it exposed.**
+    ///
+    /// §7's amendment offers this warning as the reason an explicit `0.0.0.0`
+    /// is acceptable rather than refused, which makes it part of a security
+    /// argument — and nothing reached it while it was three lines inside
+    /// [`bind`], because `bind` needs a socket and `eprintln!` needs a captured
+    /// stderr.
+    ///
+    /// Mutant: delete the `if local.ip().is_loopback() { return None; }` guard
+    /// in [`exposure_warning`], so every bind warns. Applied: the two loopback
+    /// assertions fail. Inverse mutant: return `None` unconditionally — the
+    /// `0.0.0.0` assertion fails, which is the case that matters, since that is
+    /// the mutant a reviewer found surviving the whole suite.
+    #[test]
+    fn a_non_loopback_bind_warns_and_a_loopback_one_does_not() {
+        assert_eq!(exposure_warning(loopback()), None);
+        assert_eq!(
+            exposure_warning(SocketAddr::from(([127, 0, 0, 9], 1))),
+            None
+        );
+        let w = exposure_warning(SocketAddr::from(([0, 0, 0, 0], 8787)))
+            .expect("a wildcard bind must warn");
+        // The three things the operator needs from it: what was bound, what it
+        // gives away, and what to do instead.
+        assert!(w.contains("0.0.0.0:8787"), "{w}");
+        assert!(w.contains("no authentication"), "{w}");
+        assert!(w.contains(DEFAULT_ADDR), "{w}");
+        let w = exposure_warning(SocketAddr::from(([10, 0, 0, 5], 80)))
+            .expect("a routable bind must warn");
+        assert!(w.contains("10.0.0.5:80"), "{w}");
+    }
+
+    /// **An `accept(2)` failure that is about one peer does not end the view.**
+    ///
+    /// `ECONNABORTED` is what a port scanner that RSTs between `SYN` and
+    /// `accept` produces, and `EMFILE` is a transient descriptor shortage;
+    /// neither says the listening socket is broken, and treating either as
+    /// fatal lets a background scanner kill `tf_tree top --web` on a robot
+    /// mid-session.
+    ///
+    /// **What this pins is the classifier, not the loop.** `ECONNABORTED`
+    /// cannot be provoked deterministically from a test on Linux, so `serve`'s
+    /// use of [`accept_is_transient`] is by inspection; making the predicate a
+    /// named function is what puts the decision somewhere a test can reach at
+    /// all.
+    ///
+    /// Mutant: drop the `ConnectionAborted` arm. Applied: the first assertion
+    /// fails. Second mutant: make [`is_descriptor_exhaustion`] `false`.
+    /// Applied: the `EMFILE`/`ENFILE` assertions fail.
+    #[test]
+    fn a_transient_accept_error_is_not_fatal_but_a_broken_listener_is() {
+        use std::io::Error;
+        assert!(accept_is_transient(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(accept_is_transient(&Error::from(ErrorKind::Interrupted)));
+        assert!(accept_is_transient(&Error::from(
+            ErrorKind::ConnectionReset
+        )));
+        if cfg!(unix) {
+            assert!(accept_is_transient(&Error::from_raw_os_error(24)), "EMFILE");
+            assert!(accept_is_transient(&Error::from_raw_os_error(23)), "ENFILE");
+        }
+        // And the ones that mean the listener itself is finished. Retrying
+        // these would be an unkillable hot loop printing a line per iteration.
+        assert!(!accept_is_transient(&Error::from(ErrorKind::InvalidInput)));
+        assert!(!accept_is_transient(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!accept_is_transient(&Error::from(ErrorKind::Other)));
+    }
+
+    /// **The page reads the server's `selected`, so `--edge` reaches the
+    /// browser.**
+    ///
+    /// `tick_json` has served `"selected"` since the view landed and the page
+    /// ignored it: selection was initialised to `null` and pinned to
+    /// `d.edges[0]` by the first `renderHistogram`. `--edge 5` served
+    /// `"selected":5` and drew edge 1. Every server-side test passed, because
+    /// the whole defect lived in one JavaScript identifier that was never
+    /// mentioned.
+    ///
+    /// Mutant: delete the `seed(d);` call at the top of `paint`, or the
+    /// `if (d.selected !== null ...)` assignment inside `seed`. Applied: the
+    /// corresponding assertion below fails.
+    ///
+    /// Second mutant: make `seed` re-read `d.selected` on every document (drop
+    /// the `seeded` guard). Applied: the "read once" assertion fails — and in a
+    /// browser the page would drag the selection back to `--edge`'s row one
+    /// poll after every click.
+    #[test]
+    fn the_page_seeds_its_selection_from_the_served_selected() {
+        let page = page_without_html_comments();
+        assert!(
+            page.contains("d.selected"),
+            "the page must read the `selected` field `tick_json` serves"
+        );
+        assert!(
+            page.contains("seed(d);"),
+            "`paint` must seed the selection before it renders"
+        );
+        // Read once: the flag says where to *start*, and the click handler owns
+        // it afterwards.
+        assert!(page.contains("if (seeded) return;"), "seeding must be once");
+        assert!(page.contains("seeded = true;"));
+        // And the fallback that makes an unknown or absent id harmless is still
+        // there, since `--edge` naming a tombstoned edge must not blank the
+        // pane.
+        assert!(page.contains("|| d.edges[0]"), "the fallback must remain");
     }
 }

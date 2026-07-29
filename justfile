@@ -434,6 +434,11 @@ shm-check:
     # This is the milestone's acceptance test: the shipped binary, through clap,
     # joining somebody else's tree.
     cargo nextest run -p tf_tree_cli --features shm --test attach
+    # §7's `--web` view under the same feature. `--workspace` runs `tests/web.rs`
+    # without `shm`, and that is a different binary: `cmd_top_web` calls the
+    # `merge` closure that only exists under `shm`, so the build an operator
+    # actually attaches with was compiled by clippy here and executed nowhere.
+    cargo nextest run -p tf_tree_cli --features shm --test web
     # **The frozen `.tft` arena (`docs/PHASE5.md` §2), which needs a real
     # mapping and therefore `--features shm`.** Without these two lines the
     # branch that introduced it had its centrepiece — §2.1's bit-for-bit proof

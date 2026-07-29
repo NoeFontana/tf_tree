@@ -226,6 +226,11 @@ impl Drop for Server {
 /// would collide on any constant, and the whole point of printing the resolved
 /// address is that `:0` is a usable spelling.
 fn start(iterations: u32, interval_ms: u32) -> Server {
+    start_with(iterations, interval_ms, &[])
+}
+
+/// [`start`] plus whatever other flags the test is about.
+fn start_with(iterations: u32, interval_ms: u32, extra: &[&str]) -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tf_tree"))
         .args([
             "top",
@@ -236,6 +241,7 @@ fn start(iterations: u32, interval_ms: u32) -> Server {
             "--interval",
             &interval_ms.to_string(),
         ])
+        .args(extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -432,6 +438,51 @@ fn the_page_is_served_whole_and_matches_the_embedded_file() {
     );
     assert_eq!(body, tf_tree_cli::web::INDEX_HTML);
     assert_eq!(body.len(), tf_tree_cli::web::INDEX_HTML.len());
+    let out = s.child.wait().expect("wait");
+    assert!(out.success());
+}
+
+/// **`--edge` resolves against the arena and reaches the document.**
+///
+/// The flag is documented as seeding the page's selection, and until this test
+/// existed the whole path was untested from either end: `cmd_top_web` resolved
+/// the label and the page ignored the field. Replacing the resolution with
+/// `let selected: Option<u32> = None;` passed the entire suite.
+///
+/// `gps_link` is deliberately not the first edge — the fixture puts it at id 10
+/// of 23 — because the page's fallback when nothing is selected is `edges[0]`,
+/// so a fixture that selected edge 1 would pass with the seeding deleted.
+///
+/// Mutant: in `cmd_top_web`, replace the `selected_at_start.and_then(...)`
+/// block with `None`. Applied: the document carries `"selected":null` and the
+/// first assertion fails. Second mutant: `--edge` matched with `==` on the
+/// label instead of `contains` (`top::select_edge_index`) — applied, no edge
+/// matches `gps_link`, `"selected":null` again, same failure.
+///
+/// The page half of this — that `index.html` reads `d.selected` — is pinned by
+/// `web::tests::the_page_seeds_its_selection_from_the_served_selected`, since
+/// there is no JavaScript engine in this workspace to run the page in.
+#[test]
+fn the_edge_flag_seeds_the_documents_selection() {
+    let mut s = start_with(1, 50, &["--edge", "gps_link"]);
+    let resp = get(s.port, "/api/tick");
+    let (_, body) = split(&resp);
+    assert!(json(body), "{body}");
+    assert!(
+        body.contains("\"selected\":10"),
+        "--edge gps_link must resolve to the fixture's edge 10:\n{body}"
+    );
+    // Non-degenerate in the direction that matters: the edge it names is really
+    // in the document, and it is not the one the page would have fallen back to.
+    assert!(
+        body.contains("\"id\":10,\"label\":\"base_link->gps_link"),
+        "{body}"
+    );
+    assert!(
+        body.starts_with('{') && body.contains("\"id\":1,\"label\":"),
+        "{body}"
+    );
+
     let out = s.child.wait().expect("wait");
     assert!(out.success());
 }
