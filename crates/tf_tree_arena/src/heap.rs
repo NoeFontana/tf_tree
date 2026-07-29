@@ -230,13 +230,13 @@ pub(crate) unsafe fn write_header_at(
     h.edge_table_off = layout.edge_table().offset as u32;
     h.stamp_arena_off = layout.stamp_arena().offset as u32;
     h.pose_arena_off = layout.pose_arena().offset as u32;
-    // v3 (`docs/PHASE5.md` §1.2). The counter regions always exist; the Phase 6
-    // regions are declared absent with offset 0, which is what lets Phase 6 fill
-    // them without another format break.
+    // v3 (`docs/PHASE5.md` §1.2). The counter regions always exist; the spline
+    // region is declared absent with offset 0, which is what lets Phase 6 fill
+    // it without another format break. Covariance had two fields here until
+    // `docs/decisions/0009` descoped it; the header keeps their eight bytes
+    // reserved in place so the spline offsets do not move.
     h.edge_counters_off = layout.edge_counters().offset as u32;
     h.participant_counters_off = layout.participant_counters().offset as u32;
-    h.covariance_region_off = 0;
-    h.covariance_stride = 0;
     h.spline_region_off = 0;
     h.spline_degree = 0;
     h.creator_pid = creator_pid;
@@ -300,7 +300,6 @@ mod tests {
             h.edge_counters_off, 0,
             "the region must exist in a v3 arena"
         );
-        assert_eq!(h.covariance_region_off, 0, "Phase 6, absent");
         assert_eq!(h.spline_region_off, 0, "Phase 6, absent");
 
         assert_eq!(h.creator_pid, 4321);
