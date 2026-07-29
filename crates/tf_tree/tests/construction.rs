@@ -180,3 +180,79 @@ fn capacity_rounds_to_power_of_two() {
     assert_eq!(Capacity::slots(4096).get(), 4096);
     assert_eq!(Capacity::slots(4097).get(), 8192);
 }
+
+/// **A declared nominal rate reaches `EdgeRecord::nominal_rate_mhz`, and an
+/// undeclared edge leaves it 0.**
+///
+/// The field is the *only* evidence `tf_tree doctor`'s `TFT007` has that an
+/// observed rate is wrong rather than merely what it is (`docs/PHASE5.md` §1.2,
+/// §6). Declaration is also the only moment it can be written: after `build()`
+/// the arena may be shared, and no API mutates a record afterwards.
+///
+/// The values are chosen so the units cannot pass by accident. 19.79 Hz is what
+/// `tf_tree topology --discover` emits for a 20 Hz publisher (it measures and
+/// rounds up to two decimals), so hertz-rounding would store 20 000 mHz and
+/// milli-hertz truncation would store 19 790 either way; 0.1 Hz is a map update,
+/// which an integer-hertz field could not express at all.
+///
+/// Mutant: delete `record.nominal_rate_mhz = cfg.nominal_rate_mhz;` from
+/// `TreeBuilder::build_with`. Applied: the first assertion fails with
+/// `left: 0, right: 19790`.
+#[test]
+fn a_declared_nominal_rate_reaches_the_edge_record() {
+    let tree = TreeBuilder::new()
+        .dynamic_edge(
+            "map",
+            "odom",
+            EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(19.79),
+        )
+        .dynamic_edge(
+            "odom",
+            "base",
+            EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(0.1),
+        )
+        // Declares nothing: sized by slots, so there is no rate to record.
+        .dynamic_edge("base", "laser", EdgeCfg::new(Capacity::slots(64)))
+        // A rate no robot publishes at is dropped back to "undeclared" rather
+        // than clamped — a clamp would invent a nominal out of a typo and then
+        // report every real sample as deviating from it.
+        .dynamic_edge(
+            "base",
+            "imu",
+            EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(f64::INFINITY),
+        )
+        .dynamic_edge(
+            "base",
+            "gps",
+            EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(-5.0),
+        )
+        .build()
+        .unwrap();
+
+    let view = tree.arena_view();
+    let mhz = |id: u32| view.edge(tf_tree::EdgeId(id)).unwrap().nominal_rate_mhz;
+    assert_eq!(mhz(1), 19_790, "19.79 Hz in milli-hertz");
+    assert_eq!(
+        mhz(2),
+        100,
+        "0.1 Hz is 100 mHz, and is a real map-update rate"
+    );
+    assert_eq!(mhz(3), 0, "an edge sized by slots declares no rate");
+    assert_eq!(mhz(4), 0, "an infinite rate is not a declaration");
+    assert_eq!(mhz(5), 0, "a negative rate is not a declaration");
+
+    // A static edge never publishes, so it has no rate and the builder writes
+    // none — checked because `EdgeRecord::static_edge` and `::dynamic` are
+    // separate constructors and only one of them is on the path above.
+    let tree = TreeBuilder::new()
+        .static_edge("map", "odom", &Iso3::IDENTITY)
+        .build()
+        .unwrap();
+    assert_eq!(
+        tree.arena_view()
+            .edge(tf_tree::EdgeId(1))
+            .unwrap()
+            .nominal_rate_mhz,
+        0
+    );
+}

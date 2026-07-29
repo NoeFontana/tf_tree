@@ -41,9 +41,10 @@
 //! as having no id — which is also the form in which somebody deciding whether
 //! to amend §6 can see what is missing.
 //!
-//! Going the other way, five ids have no detection in this build. Each is
-//! reported [`Status::Skipped`] with the reason stated in [`crate::checks`],
-//! never silently passed.
+//! Going the other way, some ids have no detection *here*: three cannot detect
+//! anything in any configuration, and five more depend on what this arena, this
+//! engine build and this host can supply. Each is reported [`Status::Skipped`]
+//! with the reason stated in [`crate::checks`], never silently passed.
 //!
 //! # Severity is a property of the check, not of the finding
 //!

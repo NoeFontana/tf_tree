@@ -11,7 +11,7 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — **four** unconditionally, and **four** more depending on what the
+//! reason — **three** unconditionally, and **five** more depending on what the
 //! arena, the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
@@ -28,11 +28,6 @@
 //! * **`TFT004`** (clock skew) needs a per-publisher *arena receipt time* to
 //!   difference against the header stamp. Nothing records one: `SampleRing::push`
 //!   stores the stamp the publisher supplied and no second timestamp of its own.
-//! * **`TFT007`** (rate deviates from nominal) needs a declared rate.
-//!   `EdgeRecord::nominal_rate_mhz` exists and is **always 0** — its own doc
-//!   comment says `0` is the only value this build writes, because nothing
-//!   declares a rate yet. Comparing an observed rate against zero would report
-//!   every edge as deviating by infinity, which is a fabricated finding.
 //!
 //! And the conditional ones, which depend on what the arena, the engine build
 //! and the host can supply:
@@ -43,6 +38,12 @@
 //!   Against the fixture's recorded push stream it runs.
 //! * **`TFT005`** (stamps in the future) is skipped when the arena's stamps do
 //!   not share an epoch with the system clock — see [`Clock`].
+//! * **`TFT007`** (rate deviates from nominal) is skipped when **no** edge in
+//!   the arena declares a nominal rate. It is no longer structurally blind:
+//!   `EdgeRecord::nominal_rate_mhz` is written at declaration time from
+//!   `EdgeCfg::nominal_rate_hz`, and a topology file's `rate_hz` reaches it
+//!   through `TopologyConfig::builder`. An arena built without one still skips,
+//!   because a `0` means *undeclared* and not *0 Hz* — see [`tft007`].
 //! * **`TFT010`**/**`TFT016`** are skipped when the engine has no counters and
 //!   when the host is not Linux, respectively.
 //!
@@ -52,6 +53,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use tf_tree::{EdgeId, EdgeKind, Tree};
+use tf_tree_bench::fixture::PushSample;
 
 use crate::catalogue::{CheckOutcome, Finding, Report, Severity, Tft, Uncatalogued};
 use crate::doctor::{self, Observations, Snapshot};
@@ -347,11 +349,7 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
             ),
             Tft::Tft005 => tft005(inp),
             Tft::Tft006 => tft006(inp),
-            Tft::Tft007 => CheckOutcome::skipped(
-                check,
-                "EdgeRecord::nominal_rate_mhz is 0 on every edge (nothing declares a rate yet); \
-                 comparing an observed rate against zero would fabricate a deviation",
-            ),
+            Tft::Tft007 => tft007(inp),
             Tft::Tft008 => tft008(inp),
             Tft::Tft009 => tft009(inp),
             Tft::Tft010 => tft010(inp),
@@ -521,10 +519,180 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft006, out)
 }
 
+/// What evidence one edge offers `TFT007`.
+///
+/// Three-valued, and the three are not interchangeable: only the last supports
+/// a comparison, and the first two are the reasons [`rate_coverage_note`] can
+/// state what a `pass` did **not** cover. Both consumers match on this one
+/// enum so they cannot drift into disagreeing about which edges were checked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RateEvidence {
+    /// `EdgeRecord::nominal_rate_mhz` is 0 — nothing declared a rate for this
+    /// edge, so there is nothing to deviate from.
+    NotDeclared,
+    /// A rate is declared but too few intervals were observed to measure one
+    /// against it.
+    TooFewIntervals,
+    /// Both halves exist, in hertz.
+    Comparable {
+        /// What the topology declared.
+        declared_hz: f64,
+        /// What the retained stamps show, from their median interval.
+        observed_hz: f64,
+    },
+}
+
+/// Relative deviation from a declared rate before `TFT007` fires.
+///
+/// 20%, and both directions matter for different reasons. Slow is the obvious
+/// fault. Fast is the quiet one: a ring sized from `rate_hz * history_secs`
+/// holds proportionally less history than the operator asked for, so an edge
+/// declared at 50 Hz and running at 100 Hz retains half the window every
+/// consumer was tuned against.
+///
+/// Not tighter, because the observed side is a **median** interval over a
+/// finite window: scheduler jitter moves it far less than it moves a mean, but
+/// a partly-filled ring and a rate rounded to two decimals by
+/// `tf_tree topology --discover` both put a few percent in. A check that fires
+/// on a healthy robot is a check somebody adds to `--suppress` permanently,
+/// and then it detects nothing at all.
+const RATE_TOLERANCE: f64 = 0.20;
+
+/// Intervals needed before an observed rate is worth comparing to a declared
+/// one. Eight, so a single hiccup cannot carry the median.
+const RATE_MIN_INTERVALS: usize = 8;
+
+/// What one edge can tell `TFT007`.
+fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&Vec<&PushSample>>) -> RateEvidence {
+    let Some(mhz) = e.nominal_rate_mhz else {
+        return RateEvidence::NotDeclared;
+    };
+    let too_few = RateEvidence::TooFewIntervals;
+    let Some(samples) = samples else {
+        return too_few;
+    };
+    if samples.len() < RATE_MIN_INTERVALS + 1 {
+        return too_few;
+    }
+    // `None` for a non-positive median, which is what a stream of identical or
+    // backwards stamps produces — both would divide into an infinite or
+    // negative observed rate, and comparing either against a nominal produces a
+    // finding about arithmetic rather than about the robot.
+    let Some(observed_hz) = doctor::observed_rate_hz(samples) else {
+        return too_few;
+    };
+    RateEvidence::Comparable {
+        declared_hz: f64::from(mhz) / 1000.0,
+        observed_hz,
+    }
+}
+
+/// `TFT007` — the observed publish rate is far from the declared nominal.
+///
+/// # Where the declared rate comes from
+///
+/// `EdgeRecord::nominal_rate_mhz` (`docs/PHASE5.md` §1.2), written at
+/// declaration time from `EdgeCfg::nominal_rate_hz`. The path an operator
+/// actually uses is a topology file's `rate_hz` — `tf_tree topology --discover`
+/// writes one, `TopologyConfig::builder` carries it into the arena, and the
+/// ROS 2 bridge builds from exactly that. An edge sized by `capacity` declares
+/// nothing and is not compared.
+///
+/// # Why the whole check skips when nothing declares
+///
+/// A zero is "not declared", not "declared as 0 Hz". Comparing an observed rate
+/// against it makes every edge deviate by infinity, which is a fabricated
+/// finding on a correct arena — the failure this catalogue exists to avoid.
+/// When *some* edges declare, the check runs on those and
+/// [`rate_coverage_note`] states what it did not cover, because a bare `pass`
+/// would otherwise read as "every edge publishes at its intended rate".
+fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
+    let by_edge = inp.obs.by_edge();
+    let mut out = Vec::new();
+    let mut declared = 0usize;
+    for e in &inp.snap.edges {
+        match rate_evidence(e, by_edge.get(&e.id)) {
+            RateEvidence::NotDeclared => continue,
+            RateEvidence::TooFewIntervals => declared += 1,
+            RateEvidence::Comparable {
+                declared_hz,
+                observed_hz,
+            } => {
+                declared += 1;
+                let ratio = observed_hz / declared_hz;
+                if (ratio - 1.0).abs() <= RATE_TOLERANCE {
+                    continue;
+                }
+                let effect = if ratio > 1.0 {
+                    "the ring therefore retains proportionally less history than the \
+                     rate_hz x history_secs it was sized from"
+                } else {
+                    "consumers interpolating across the gap see a longer step than the \
+                     declared rate implies"
+                };
+                out.push(Finding::on_edge(
+                    Tft::Tft007,
+                    e.id,
+                    inp.snap.edge_label(e),
+                    format!(
+                        "publishes at {observed_hz:.2} Hz against a declared {declared_hz:.2} Hz \
+                         ({:+.0}%, tolerance {:.0}%); {effect}",
+                        (ratio - 1.0) * 100.0,
+                        RATE_TOLERANCE * 100.0
+                    ),
+                ));
+            }
+        }
+    }
+    if declared == 0 {
+        return CheckOutcome::skipped(
+            Tft::Tft007,
+            "no edge in this arena declares a nominal rate (EdgeRecord::nominal_rate_mhz is 0 \
+             on all of them); declare one with rate_hz in the topology file, or via \
+             EdgeCfg::nominal_rate_hz, and this check has something to compare against",
+        );
+    }
+    CheckOutcome::ran(Tft::Tft007, out)
+}
+
+/// The disclosure that pairs with [`tft007`]: which edges its result covers.
+///
+/// `None` when the answer is unambiguous — nothing declared a rate (the check
+/// skipped and says so itself), or every declared edge was measurable. A note
+/// is emitted only for the middle case, where `pass` is true of the edges that
+/// were compared and silent about the rest.
+#[must_use]
+pub fn rate_coverage_note(snap: &Snapshot, obs: &Observations) -> Option<String> {
+    let by_edge = obs.by_edge();
+    let (mut comparable, mut too_few, mut undeclared) = (0usize, 0usize, 0usize);
+    for e in &snap.edges {
+        if e.kind != EdgeKind::Dynamic {
+            continue;
+        }
+        match rate_evidence(e, by_edge.get(&e.id)) {
+            RateEvidence::NotDeclared => undeclared += 1,
+            RateEvidence::TooFewIntervals => too_few += 1,
+            RateEvidence::Comparable { .. } => comparable += 1,
+        }
+    }
+    if comparable == 0 || (undeclared == 0 && too_few == 0) {
+        return None;
+    }
+    Some(format!(
+        "TFT007 compared {comparable} of {} dynamic edge(s): {undeclared} declare no nominal \
+         rate (no rate_hz in the topology) and {too_few} have fewer than {RATE_MIN_INTERVALS} \
+         retained intervals to measure one from",
+        comparable + too_few + undeclared
+    ))
+}
+
 /// `TFT008` — inter-arrival spread. The Phase 1 `inconsistent-rate` check: a
 /// coefficient of variation *is* the jitter of the inter-arrival distribution
-/// about its own centre, which is what §6 asks for in the absence of a nominal
-/// rate to compare against (that is `TFT007`, and it is skipped).
+/// about its own centre. Distinct from [`tft007`] and not redundant with it: a
+/// publisher can hold a perfectly steady period at the wrong rate (`TFT007`
+/// fires, this passes) or average its declared rate while alternating 1 ms and
+/// 100 ms gaps (this fires, `TFT007` passes). This one needs no declaration and
+/// therefore runs on every arena.
 fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(
         Tft::Tft008,
@@ -537,9 +705,12 @@ fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
 
 /// `TFT009` — an inter-arrival interval far above the edge's own median.
 ///
-/// Relative to the median rather than to a fixed threshold because a 200 ms gap
-/// is a dropout at 100 Hz and normal at 5 Hz, and `doctor` has no declared rate
-/// to consult (`TFT007`).
+/// Relative to the edge's own median rather than to a fixed threshold because a
+/// 200 ms gap is a dropout at 100 Hz and normal at 5 Hz. Deliberately still not
+/// against the declared rate [`tft007`] now has: an edge running at half its
+/// nominal has no dropouts, and reporting one for every interval would bury the
+/// gaps this check exists to find under a rate deviation `TFT007` already
+/// reports once.
 fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     for (edge, samples) in inp.obs.by_edge() {
@@ -897,7 +1068,7 @@ pub fn newest_stamps(snap: &Snapshot) -> Vec<i64> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
     use crate::catalogue::Status;
@@ -928,7 +1099,20 @@ mod tests {
             claiming: false,
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
+            nominal_rate_mhz: None,
         }
+    }
+
+    /// `n` samples on `edge`, one every `period_ns`, from a single writer.
+    fn steady(edge: u32, n: usize, period_ns: i64) -> Vec<PushSample> {
+        (0..n as i64)
+            .map(|k| PushSample {
+                edge,
+                writer_pid: 4711,
+                stamp_ns: k * period_ns,
+                arrival_delay_ns: 0,
+            })
+            .collect()
     }
 
     fn two_frame_snapshot(e: EdgeInfo) -> Snapshot {
@@ -1399,5 +1583,171 @@ mod tests {
             1,
             "a real gap in a monotone stream must still fire: {o:?}"
         );
+    }
+
+    /// **`TFT007` compares only where a rate was declared, and an undeclared
+    /// edge is not compared against zero.**
+    ///
+    /// `EdgeRecord::nominal_rate_mhz == 0` means *not declared*, not *declared
+    /// as 0 Hz*. Treating it as a rate makes every undeclared edge deviate by
+    /// infinity, so a correct arena where nobody wrote a `rate_hz` would report
+    /// a warn on every edge — the fabricated finding this catalogue exists to
+    /// avoid, and the reason the field went unread until now.
+    ///
+    /// The fixture is non-degenerate on both axes: three edges, two declaring
+    /// and one not, and the two declaring differ in whether they hold their
+    /// rate. The declared value is not the observed one by accident — the slow
+    /// edge runs at exactly half.
+    ///
+    /// Mutant: read the declaration as `e.nominal_rate_mhz.unwrap_or(0)` in
+    /// `rate_evidence` and drop the `NotDeclared` arm. Applied: undeclared
+    /// edge#3 fires at `+inf%` and the assertion about which edges fired fails.
+    #[test]
+    fn tft007_compares_only_where_a_rate_was_declared() {
+        const MS: i64 = 1_000_000;
+        let mut on_rate = edge(1, 1, 2, 100);
+        on_rate.nominal_rate_mhz = Some(20_000); // 20 Hz
+        let mut too_slow = edge(2, 2, 3, 100);
+        too_slow.nominal_rate_mhz = Some(20_000);
+        let undeclared = edge(3, 3, 4, 100);
+
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+                frame(4, "laser", 3, 3),
+            ],
+            edges: vec![on_rate, too_slow, undeclared],
+        };
+        let mut events = steady(1, 12, 50 * MS); // 20 Hz: exactly nominal
+        events.extend(steady(2, 12, 100 * MS)); // 10 Hz: half of nominal
+        events.extend(steady(3, 12, 100 * MS)); // 10 Hz, but nothing declared
+        let obs = Observations::from_samples(events);
+
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(
+            o.findings.iter().map(|f| f.edge).collect::<Vec<_>>(),
+            vec![Some(2)],
+            "only the declared edge that missed its rate may be reported: {:?}",
+            o.findings
+        );
+        assert!(
+            o.findings[0].message.contains("10.00 Hz")
+                && o.findings[0].message.contains("20.00 Hz")
+                && o.findings[0].message.contains("-50%"),
+            "the finding must carry both rates and the deviation: {}",
+            o.findings[0].message
+        );
+
+        // Publishing *faster* than declared is a finding too: the ring was
+        // sized from rate_hz x history_secs, so it now retains proportionally
+        // less history than every consumer was tuned against.
+        let obs = Observations::from_samples(steady(1, 12, 20 * MS)); // 50 Hz
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.findings.len(), 1, "{o:?}");
+        assert!(
+            o.findings[0].message.contains("+150%"),
+            "{}",
+            o.findings[0].message
+        );
+
+        // And a rate inside the tolerance band is not a finding: 18 Hz against
+        // a declared 20 Hz is a 10% miss, which is jitter and load.
+        let obs = Observations::from_samples(steady(1, 12, 55_555_555));
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Pass, "{o:?}");
+    }
+
+    /// **An arena where nothing declares a rate skips `TFT007` with a reason
+    /// instead of passing.**
+    ///
+    /// A `pass` here would be an active claim that every edge publishes at its
+    /// intended rate, made by a check that had no intended rate to consult.
+    /// That is the difference `Status::Skipped` carries a mandatory reason for.
+    ///
+    /// Mutant: replace `if declared == 0` with `if false` in `tft007`. Applied:
+    /// the status is `Pass` and the `match` panics with "expected a skip".
+    #[test]
+    fn tft007_skips_when_no_edge_declares_a_rate() {
+        const MS: i64 = 1_000_000;
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        // A full, healthy, measurable stream — so the skip is about the missing
+        // declaration and not about missing samples.
+        let obs = Observations::from_samples(steady(1, 12, 50 * MS));
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("nominal rate") && why.contains("rate_hz"),
+                "the skip must name the missing evidence and how to supply it: {why}"
+            ),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+
+        // Non-vacuity: the same stream against a declared rate does run.
+        let mut declared = edge(1, 1, 2, 100);
+        declared.nominal_rate_mhz = Some(20_000);
+        let snap = two_frame_snapshot(declared);
+        assert_eq!(
+            tft007(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
+            Status::Pass
+        );
+    }
+
+    /// **A `TFT007` pass says which edges it covered, whenever it covered fewer
+    /// than all of them.**
+    ///
+    /// The report has three statuses and none of them is "ran, half blind", so
+    /// a partial run is disclosed through `Meta.notes` — the same mechanism
+    /// `TFT015`'s missing participants row uses. Without it, an arena where one
+    /// edge declares a rate and eleven do not reports a bare `pass` for
+    /// `TFT007`, which reads as a statement about all twelve.
+    ///
+    /// Mutant A: make `rate_coverage_note` return `None` unconditionally.
+    /// Applied: the `expect` fires. Mutant B: drop the `comparable == 0` term
+    /// from its guard. Applied: the last assertion fails — the report would
+    /// then carry a skip reason and a coverage note that contradict each other.
+    #[test]
+    fn the_rate_coverage_note_states_what_a_pass_did_not_cover() {
+        const MS: i64 = 1_000_000;
+        let mut declared = edge(1, 1, 2, 100);
+        declared.nominal_rate_mhz = Some(20_000);
+        let mut short = edge(2, 2, 3, 100);
+        short.nominal_rate_mhz = Some(20_000);
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+                frame(4, "laser", 3, 3),
+            ],
+            edges: vec![declared, short, edge(3, 3, 4, 100)],
+        };
+        let mut events = steady(1, 12, 50 * MS);
+        // Declared, but only three intervals: a rate measured from that is
+        // noise, so it counts as not compared rather than compared badly.
+        events.extend(steady(2, 4, 50 * MS));
+        let obs = Observations::from_samples(events);
+
+        let note = rate_coverage_note(&snap, &obs).expect("a partial run must disclose itself");
+        assert!(
+            note.contains("compared 1 of 3")
+                && note.contains("1 declare no nominal rate")
+                && note.contains("1 have fewer than 8"),
+            "{note}"
+        );
+
+        // Every edge declared and measurable: nothing to disclose.
+        let mut a = edge(1, 1, 2, 100);
+        a.nominal_rate_mhz = Some(20_000);
+        let full = two_frame_snapshot(a);
+        let obs = Observations::from_samples(steady(1, 12, 50 * MS));
+        assert_eq!(rate_coverage_note(&full, &obs), None);
+
+        // Nothing declared: the check skips and says so itself, so a note here
+        // would be a second, weaker statement of the same fact.
+        let none = two_frame_snapshot(edge(1, 1, 2, 100));
+        assert_eq!(rate_coverage_note(&none, &obs), None);
     }
 }

@@ -759,7 +759,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         now_nanos: clock.nanos(),
         clock_source: clock.label(),
         counters_compiled_in: tf_tree::counters_compiled_in(),
-        notes: evidence_notes(src.is_live()),
+        notes: evidence_notes(src.is_live(), &snap, &obs),
     };
 
     if json {
@@ -786,8 +786,13 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 /// `TFT015`'s disclosure is unconditional rather than live-only: the missing
 /// participants row is a gap in the engine, not in this run's evidence, so it
 /// applies to a fixture and a live arena alike.
-fn evidence_notes(live: bool) -> Vec<String> {
+///
+/// `TFT007`'s is per-arena and computed from the snapshot: it appears only when
+/// the check compared *some* edges and not others, which is the one case where
+/// its `pass` covers less than it looks like it does.
+fn evidence_notes(live: bool, snap: &Snapshot, obs: &Observations) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
+    notes.extend(checks::rate_coverage_note(snap, obs));
     if live {
         notes.push(
             "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
@@ -1259,25 +1264,12 @@ fn cmd_participants(live: Live<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Observed publish rate (Hz) for an edge, from the median inter-sample interval.
+/// Observed publish rate (Hz) for an edge, from the median inter-sample
+/// interval — [`doctor::observed_rate_hz`], which `TFT007` also measures with,
+/// so the column an operator reads and the check that judges it cannot differ.
 fn observed_rate_hz(obs: &Observations, edge: u32) -> Option<f64> {
-    let stamps: Vec<i64> = obs
-        .events
-        .iter()
-        .filter(|s| s.edge == edge)
-        .map(|s| s.stamp_ns)
-        .collect();
-    if stamps.len() < 2 {
-        return None;
-    }
-    let mut intervals: Vec<i64> = stamps.windows(2).map(|w| w[1] - w[0]).collect();
-    intervals.sort_unstable();
-    let median = intervals[intervals.len() / 2];
-    if median <= 0 {
-        None
-    } else {
-        Some(1e9 / median as f64)
-    }
+    let samples: Vec<&fixture::PushSample> = obs.events.iter().filter(|s| s.edge == edge).collect();
+    doctor::observed_rate_hz(&samples)
 }
 
 /// Print this build's arena format version and what a mismatch means.

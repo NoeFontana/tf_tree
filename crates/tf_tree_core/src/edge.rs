@@ -73,10 +73,15 @@ pub struct EdgeRecord {
     pub pose_off: u32,
     /// Declared publication rate, in **milli-hertz** (`docs/PHASE5.md` §1.2).
     ///
-    /// `0` means "not declared", which is the only value this build writes.
-    /// It exists so `TFT004` (rate deviation) has a *declared* rate to compare
-    /// the observed one against; without one, a diagnostic can only report what
-    /// the rate is, never that it is wrong.
+    /// `0` means "not declared" — **not** "declared as 0 Hz". The distinction is
+    /// load-bearing: `docs/PHASE5.md` §6's `TFT007` compares an observed rate
+    /// against this one, and reading the sentinel as a rate makes every
+    /// undeclared edge deviate from it by infinity.
+    ///
+    /// Written at declaration time from `tf_tree::EdgeCfg::nominal_rate_hz`,
+    /// which a topology file's `rate_hz` reaches through
+    /// `tf_tree_bridge::TopologyConfig::builder`. An edge whose ring was sized
+    /// by an explicit slot count declares no rate and leaves this 0.
     ///
     /// Milli-hertz rather than hertz because the rates that matter span
     /// 0.1 Hz (a map update) to 1 kHz (an IMU), and an integer hertz cannot
