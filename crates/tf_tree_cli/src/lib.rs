@@ -410,6 +410,14 @@ pub struct IngestArgs {
     /// than ordinary interleaving, in milliseconds.
     #[arg(long, value_name = "MILLIS", default_value_t = 100)]
     pub clock_reset_threshold: u64,
+    /// Where to put §3.1's temporary run file. Defaults to the system temporary
+    /// directory.
+    ///
+    /// Only used when a *single* edge exceeds `--max-memory`; every other
+    /// recording is handled by re-reading, with no file at all. Worth setting
+    /// when `/tmp` is a tmpfs, because a spill into RAM does not bound RAM.
+    #[arg(long, value_name = "DIR")]
+    pub spill_dir: Option<std::path::PathBuf>,
 }
 
 /// `--on-clock-reset`, as §3.2 spells it.
@@ -449,6 +457,7 @@ impl IngestArgs {
                 .saturating_mul(1_000_000),
             future_horizon_ns: horizon as i64,
             tf_prefix: self.tf_prefix.clone(),
+            spill_dir: self.spill_dir.clone(),
         })
     }
 }
@@ -488,7 +497,17 @@ fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -
         ),
         tf_tree_ingest::IngestError::ClockResetSplitUnsupported => anyhow::anyhow!(
             "{text}\n\
-             \x20 docs/PHASE5.md §0.0 records --on-clock-reset=split as not implemented."
+             \x20 docs/PHASE5.md §3.2 records --on-clock-reset=split as deliberately\n\
+             \x20 refused, with the argument. Cut the recording at the stamp `halt`\n\
+             \x20 reports and ingest each part."
+        ),
+        tf_tree_ingest::IngestError::Rosbag2Sqlite => anyhow::anyhow!(
+            "{text}\n\
+             \x20 rosbag2's sqlite3 storage is not read by this build (docs/PHASE5.md\n\
+             \x20 §3.3: every pure-Rust SQLite reader is either unlicensed or a header\n\
+             \x20 parser, and the C ones are ruled out by docs/PHASE2.md §2).\n\
+             \x20 Convert it once, with ROS 2's own tool:\n\
+             \x20   ros2 bag convert -i <bag.db3> -o <out.yaml>   # storage_id: mcap"
         ),
         _ => anyhow::anyhow!("{text}"),
     }
@@ -724,7 +743,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         let id = catalogue::Tft::parse(s).ok_or_else(|| {
             // Refused rather than ignored: a typo that silently suppresses
             // nothing leaves a gate that looks configured and is not.
-            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT016")
+            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT018")
         })?;
         ids.insert(id);
     }
@@ -759,7 +778,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         now_nanos: clock.nanos(),
         clock_source: clock.label(),
         counters_compiled_in: tf_tree::counters_compiled_in(),
-        notes: evidence_notes(src.is_live()),
+        notes: evidence_notes(src.is_live(), &snap, &obs),
     };
 
     if json {
@@ -786,8 +805,13 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 /// `TFT015`'s disclosure is unconditional rather than live-only: the missing
 /// participants row is a gap in the engine, not in this run's evidence, so it
 /// applies to a fixture and a live arena alike.
-fn evidence_notes(live: bool) -> Vec<String> {
+///
+/// `TFT007`'s is per-arena and computed from the snapshot: it appears only when
+/// the check compared *some* edges and not others, which is the one case where
+/// its `pass` covers less than it looks like it does.
+fn evidence_notes(live: bool, snap: &Snapshot, obs: &Observations) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
+    notes.extend(checks::rate_coverage_note(snap, obs));
     if live {
         notes.push(
             "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
@@ -1259,25 +1283,12 @@ fn cmd_participants(live: Live<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Observed publish rate (Hz) for an edge, from the median inter-sample interval.
+/// Observed publish rate (Hz) for an edge, from the median inter-sample
+/// interval — [`doctor::observed_rate_hz`], which `TFT007` also measures with,
+/// so the column an operator reads and the check that judges it cannot differ.
 fn observed_rate_hz(obs: &Observations, edge: u32) -> Option<f64> {
-    let stamps: Vec<i64> = obs
-        .events
-        .iter()
-        .filter(|s| s.edge == edge)
-        .map(|s| s.stamp_ns)
-        .collect();
-    if stamps.len() < 2 {
-        return None;
-    }
-    let mut intervals: Vec<i64> = stamps.windows(2).map(|w| w[1] - w[0]).collect();
-    intervals.sort_unstable();
-    let median = intervals[intervals.len() / 2];
-    if median <= 0 {
-        None
-    } else {
-        Some(1e9 / median as f64)
-    }
+    let samples: Vec<&fixture::PushSample> = obs.events.iter().filter(|s| s.edge == edge).collect();
+    doctor::observed_rate_hz(&samples)
 }
 
 /// Print this build's arena format version and what a mismatch means.
@@ -1332,6 +1343,83 @@ fn explain_format_version() {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// **The `TFT007` coverage note reaches `Meta.notes`, which is its only
+    /// route to an operator.**
+    ///
+    /// `Status` is three-valued and none of them is "ran, half blind", so the
+    /// design argument for a partial `TFT007` pass being honest rests entirely
+    /// on this disclosure being emitted. `checks::rate_coverage_note` is unit
+    /// tested; the line that *calls* it is not reachable from any of those
+    /// tests, and deleting it leaves every partial run reading as a full pass
+    /// with all 531 other tests green.
+    ///
+    /// The snapshot is the shape that produces one: two dynamic edges, one
+    /// declaring a rate and measurable, one declaring nothing — so the note is
+    /// about coverage and not about a skip.
+    ///
+    /// Mutant: delete `notes.extend(checks::rate_coverage_note(snap, obs));`
+    /// from `evidence_notes`. Applied: the `expect` fires with "no coverage
+    /// note".
+    #[test]
+    fn the_rate_coverage_note_reaches_the_report_metadata() {
+        use doctor::{EdgeInfo, FrameInfo};
+        use tf_tree::InterpPolicy;
+        use tf_tree_bench::fixture::PushSample;
+
+        let dyn_edge = |id: u32, parent: u32, child: u32, mhz: Option<u32>| EdgeInfo {
+            id,
+            parent,
+            child,
+            kind: EdgeKind::Dynamic,
+            capacity: 512,
+            interp: InterpPolicy::ScLerp,
+            domain: 0,
+            head: 100,
+            claimed: true,
+            claiming: false,
+            owner_pid: 4711,
+            newest_stamp: Some(1_000_000_000),
+            nominal_rate_mhz: mhz,
+        };
+        let frame = |id: u32, name: &str, parent: u32, depth: u16| FrameInfo {
+            id,
+            name: name.to_owned(),
+            parent,
+            depth,
+            edge_of_child: 0,
+        };
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base_link", 2, 2),
+            ],
+            edges: vec![dyn_edge(1, 1, 2, Some(20_000)), dyn_edge(2, 2, 3, None)],
+        };
+        // 20 Hz on edge 1, comfortably more than `RATE_MIN_INTERVALS`, so it is
+        // compared and passes; edge 2 declares nothing and is not.
+        let obs = Observations::from_samples(
+            (0..12i64)
+                .map(|k| PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: k * 50_000_000,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+
+        let notes = evidence_notes(false, &snap, &obs);
+        let note = notes.iter().find(|n| n.starts_with("TFT007")).expect(
+            "no coverage note in Meta.notes: a partial TFT007 pass would read as a full \
+                     one",
+        );
+        assert!(
+            note.contains("compared 1 of 2"),
+            "the note must state the coverage it reached the operator with: {note}"
+        );
+    }
 
     /// **The `CompressedChunk` remedy is this crate's headline mitigation for
     /// `default-features = false` on `mcap`, and it is a bare string.**

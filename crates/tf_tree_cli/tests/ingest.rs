@@ -42,9 +42,12 @@ fn tf_tree() -> Command {
 /// exit status, and get a JSON file holding the same numbers as the summary.
 ///
 /// Mutant: make `IngestArgs::to_options` pass `self.max_memory` as bytes rather
-/// than MiB — applied, and the run failed with `EdgeExceedsMemoryCap` (4 096 B
-/// against a 6 400 B edge), so the process exited non-zero and this test failed
-/// on the status assertion. That unit conversion is what this test exists for.
+/// than MiB — applied, and this failed on `"passes":1`, which came back as
+/// `"passes":2` with `"spilled_runs":2`: a 4 096 B cap turns a 160-sample
+/// recording into two re-reads and a spill file. That unit conversion is what
+/// this test exists for, and the two counters are how it is still visible —
+/// until §3.1's spill file landed the mutant produced a hard error and the
+/// status assertion caught it, which it no longer would.
 #[test]
 fn ingest_prints_a_report_and_writes_json() {
     let dir = Scratch::new("report");
@@ -79,6 +82,11 @@ fn ingest_prints_a_report_and_writes_json() {
     let text = std::fs::read_to_string(&json).unwrap();
     assert!(text.contains("\"schema\":\"tf_tree.ingest/1\""), "{text}");
     assert!(text.contains("\"samples_pushed\":160"), "{text}");
+    // The default cap is 4 096 **MiB**, so a 160-sample recording is one
+    // re-read with nothing spilled. These two are the observable consequence of
+    // the unit conversion in `IngestArgs::to_options`.
+    assert!(text.contains("\"passes\":1"), "{text}");
+    assert!(text.contains("\"spilled_runs\":0"), "{text}");
 }
 
 /// A recording this build cannot read fails non-zero and says what the file is
