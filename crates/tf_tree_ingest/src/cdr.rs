@@ -286,7 +286,7 @@ pub fn encode_tf_message(transforms: &[TransformStamped]) -> Vec<u8> {
     let mut out: Vec<u8> = vec![0x00, 0x01, 0x00, 0x00];
     // Alignment is counted from the body, so `out.len() - 4` is the origin.
     fn pad(out: &mut Vec<u8>, n: usize) {
-        while (out.len() - 4) % n != 0 {
+        while !(out.len() - 4).is_multiple_of(n) {
             out.push(0);
         }
     }
@@ -345,12 +345,12 @@ mod tests {
         // CDR aligns every primitive, so the next length prefix starts on a
         // 4-byte boundary counted from the body. Omitting this pad is exactly
         // the mistake the decoder must not mirror.
-        while (b.len() - 4) % 4 != 0 {
+        while !(b.len() - 4).is_multiple_of(4) {
             b.push(0);
         }
         b.extend_from_slice(&5u32.to_le_bytes()); // "base\0"
         b.extend_from_slice(b"base\0");
-        while (b.len() - 4) % 8 != 0 {
+        while !(b.len() - 4).is_multiple_of(8) {
             b.push(0);
         }
         for v in [1.0f64, 2.0, 3.0] {
@@ -420,12 +420,12 @@ mod tests {
         b.extend_from_slice(&0u32.to_be_bytes());
         b.extend_from_slice(&2u32.to_be_bytes());
         b.extend_from_slice(b"a\0");
-        while (b.len() - 4) % 4 != 0 {
+        while !(b.len() - 4).is_multiple_of(4) {
             b.push(0);
         }
         b.extend_from_slice(&2u32.to_be_bytes());
         b.extend_from_slice(b"b\0");
-        while (b.len() - 4) % 8 != 0 {
+        while !(b.len() - 4).is_multiple_of(8) {
             b.push(0);
         }
         for v in [0.0f64; 3] {

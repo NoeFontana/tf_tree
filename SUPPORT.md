@@ -55,7 +55,7 @@ closed if none arrives.
 
 ## MSRV policy
 
-The minimum supported Rust version is **1.85**, declared in the workspace
+The minimum supported Rust version is **1.87**, declared in the workspace
 manifest's `[workspace.package] rust-version` and inherited by every workspace
 member. Two crates are deliberately *outside* the workspace and therefore cannot
 inherit it — `tf_tree_py` (built by maturin) and `tf_tree_tf2_sys` (builds only
@@ -73,10 +73,17 @@ the number that drifts.
 - **The floor is enforced, not intended.** The `msrv` job in
   `.github/workflows/ci.yml` reads `rust-version` out of the manifest and builds
   `--locked` on exactly that toolchain, so a dependency that quietly needs a
-  newer compiler fails the build instead of shipping. It was 1.83 until it was
-  measured: `blake3` pulls `constant_time_eq 0.4.2`, which is edition 2024 and
-  will not even parse on 1.83. Verified locally with
-  `cargo +1.85 build --workspace --lib --bins --locked`.
+  newer compiler fails the build instead of shipping. **Both raises so far were
+  forced by a dependency, and both were measured rather than assumed:**
+  - 1.83 → 1.85: `blake3` pulls `constant_time_eq 0.4.2`, which is edition 2024
+    and will not even parse on 1.83.
+  - 1.85 → 1.87: `ruzstd 0.9.0` declares `rust-version = "1.87"`. It is how
+    `tf_tree_ingest` decompresses MCAP chunks without a C build step
+    (`docs/PHASE2.md` §2). `ruzstd 0.7.3` would have held 1.85 with the same
+    capability, so this one is a deliberate trade for a maintained release, and
+    it is the first raise that was not strictly unavoidable.
+
+  Verified locally with `cargo +1.87 build --workspace --lib --bins --locked`.
 - Development happens on `stable` (`rust-toolchain.toml`). Clippy and rustfmt are
   run on `stable`, not on the MSRV toolchain — lint output is not part of the
   compatibility promise.

@@ -557,7 +557,7 @@ impl FrozenArena {
 /// here is a way a hand-edited or truncated `.tft` could otherwise make this
 /// process map or read something that is not there.
 fn check_extents(h: &FrozenHeader) -> Result<(), FrozenError> {
-    if h.arena_off % ARENA_FILE_ALIGN != 0 {
+    if !h.arena_off.is_multiple_of(ARENA_FILE_ALIGN) {
         return Err(FrozenError::HeaderInconsistent);
     }
     // The manifest must live strictly between the container header and the
