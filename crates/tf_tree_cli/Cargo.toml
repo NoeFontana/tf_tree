@@ -8,11 +8,21 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-# **Not published while the subcommand surface is still being specified.**
-# `docs/PHASE5.md` §6 (`TFT001`-`TFT016`) has landed and §7 (`tf_tree top`) has
-# landed except for its `--web` view, which is still recorded as not implemented
-# in §0.0. `cargo install` today would hand someone a CLI whose documented
-# `--web` flag does not exist. Publish once §7 is whole, not before.
+# **Not published, and the reason is mechanical rather than a status claim.**
+# Three of this crate's `[dependencies]` are themselves `publish = false` —
+# `tf_tree_bench`, `tf_tree_bridge` and `tf_tree_ingest`, each for a reason
+# stated in its own manifest — so they are path-only, with no version to publish
+# against. Flip this line to `true` and `cargo publish --dry-run -p tf_tree_cli`
+# answers "all dependencies must have a version requirement specified when
+# publishing / dependency `tf_tree_bench` does not specify a version". That is a
+# fact cargo checks, not a policy this file has to keep current.
+#
+# It is deliberately not a sentence about which section has landed. A reason of
+# that shape rots the moment `docs/PHASE5.md` §0.0 moves, because §0.0 moves and
+# a string in this file does not — and a stale reason in a manifest is exactly
+# the defect class §9.3 spends a page on. The dependency edge above cannot go
+# stale silently. Publishing becomes possible when those three crates do;
+# `docs/PHASE5.md` §10 owns the distribution question, not this comment.
 publish = false
 
 [lints]

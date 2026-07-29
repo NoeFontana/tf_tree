@@ -1,0 +1,305 @@
+<!doctype html>
+<!--
+  tf_tree top --web  —  docs/PHASE5.md §7's embedded static view.
+
+  NORMATIVE constraints this file is written to satisfy: one embedded HTML file
+  plus one JSON endpoint, no build step, no npm, no CDN, charts in hand-written
+  SVG. So: no <script src>, no <link href> to anything but a data: URI, no
+  webfont, no import(). The single fetch target is the relative path "api/tick"
+  on the origin this page was served from. The server sends
+  `Content-Security-Policy: default-src 'none'; connect-src 'self'`, so a
+  browser *enforces* that rather than taking this comment's word for it.
+
+  Every value that came out of the arena is written with textContent or as an
+  SVG attribute built by createElementNS — never innerHTML. Frame names are
+  arbitrary UTF-8 that some other process chose (`intern_core` validates only
+  the hash), and this page is the one place they meet a HTML parser. That is the
+  same argument `top::sanitize` makes for the ANSI frame.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- An empty icon, so a browser does not issue a /favicon.ico request the
+     server would answer with a 404 and (under --iterations) charge to the
+     operator's request budget. `data:,` is an empty same-document URI, not a
+     network fetch. -->
+<link rel="icon" href="data:,">
+<title>tf_tree top</title>
+<style>
+  :root {
+    --bg: #12141a; --fg: #d8dee9; --dim: #7c869a; --line: #262a33;
+    --ok: #7bc96f; --warn: #e0c060; --err: #e06c75; --accent: #61afef;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #fbfbfd; --fg: #21242b; --dim: #6a7280; --line: #dfe2e8;
+      --ok: #2e7d32; --warn: #9a6b00; --err: #c0392b; --accent: #1d6fb8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1rem; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 15px; margin: 0 0 .2rem; }
+  h2 { font-size: 13px; margin: 1.2rem 0 .35rem; color: var(--dim);
+       text-transform: uppercase; letter-spacing: .06em; }
+  #banner { color: var(--dim); margin-bottom: .2rem; }
+  #status { margin-bottom: .6rem; }
+  .stale { color: var(--warn); }
+  .down { color: var(--err); }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 46rem; }
+  th, td { text-align: left; padding: .18rem .55rem .18rem 0;
+           border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; }
+  td.n, th.n { text-align: right; padding-right: 1.1rem; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--line); }
+  tr.sel { outline: 1px solid var(--accent); }
+  .err { color: var(--err); } .warn { color: var(--warn); } .info { color: var(--dim); }
+  .ok { color: var(--ok); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { border-bottom: 1px solid var(--line); padding: .18rem 0; }
+  svg { max-width: 100%; height: auto; display: block; }
+  .bar { fill: var(--accent); }
+  .axis { stroke: var(--line); }
+  .lab { fill: var(--dim); font-size: 10px; }
+  footer { color: var(--dim); margin-top: 1.4rem; }
+</style>
+</head>
+<body>
+<h1>tf_tree top</h1>
+<div id="banner"></div>
+<div id="status">connecting…</div>
+
+<h2>edges</h2>
+<div class="wrap"><table>
+  <thead><tr>
+    <th class="n">id</th><th>edge</th><th>kind</th>
+    <th class="n">rate Hz</th><th class="n">&Delta;/s</th><th class="n">age</th>
+    <th class="n">occupancy</th><th>writer</th><th class="n">errors</th>
+  </tr></thead>
+  <tbody id="edges"></tbody>
+</table></div>
+
+<h2 id="detail-title">detail</h2>
+<div id="detail-stats"></div>
+<svg id="hist" viewBox="0 0 720 200" role="img" aria-label="inter-arrival histogram"></svg>
+
+<h2>participants</h2>
+<div class="wrap"><table>
+  <thead><tr>
+    <th class="n">slot</th><th class="n">pid</th><th>mode</th><th>comm</th>
+    <th>record</th><th>alive</th><th class="n">errors</th>
+  </tr></thead>
+  <tbody id="parts"></tbody>
+</table></div>
+
+<h2>feed</h2>
+<ul id="feed"></ul>
+
+<footer id="foot"></footer>
+
+<script>
+"use strict";
+// Selection lives in the page, not in the endpoint: the JSON carries every
+// edge's histogram already, so clicking a row is a repaint and never a request.
+// It starts from the server's `selected`, which is what `--edge` resolved to —
+// see `seed` below for why that is read exactly once.
+let selected = null;
+let seeded = false;
+let seenTick = -1;
+
+const $ = (id) => document.getElementById(id);
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function cell(row, text, cls) {
+  const td = document.createElement("td");
+  td.textContent = text;              // text, never markup: see the file header.
+  if (cls) td.className = cls;
+  row.appendChild(td);
+  return td;
+}
+
+function fmtNs(ns) {
+  if (ns === null || ns === undefined) return "-";
+  const a = Math.abs(ns);
+  if (a < 1e3) return ns + "ns";
+  if (a < 1e6) return (ns / 1e3).toFixed(1) + "us";
+  if (a < 1e9) return (ns / 1e6).toFixed(1) + "ms";
+  return (ns / 1e9).toFixed(2) + "s";
+}
+function fmtNum(x, digits) {
+  return (x === null || x === undefined) ? "-" : x.toFixed(digits);
+}
+function fmtBytes(b) {
+  const u = ["B", "KiB", "MiB", "GiB"];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i += 1; }
+  return b.toFixed(i === 0 ? 0 : 1) + " " + u[i];
+}
+
+function renderEdges(d) {
+  const tb = $("edges");
+  tb.textContent = "";
+  for (const e of d.edges) {
+    const tr = document.createElement("tr");
+    if (e.id === selected) tr.className = "sel";
+    tr.addEventListener("click", () => { selected = e.id; paint(d); });
+    cell(tr, e.id, "n");
+    cell(tr, e.label);
+    cell(tr, e.kind);
+    cell(tr, fmtNum(e.rate_hz, 1), "n");
+    cell(tr, fmtNum(e.observed_hz, 1), "n");
+    // The age is against d.clock, which may be the median arena stamp rather
+    // than the wall clock — the banner says which. Colouring it against a fixed
+    // wall-clock threshold would be wrong in the other domain, so the only
+    // threshold used is "older than ten reported periods".
+    const period = e.rate_hz ? 1e9 / e.rate_hz : null;
+    const stale = period !== null && e.age_ns !== null && e.age_ns > 10 * period;
+    cell(tr, fmtNs(e.age_ns), stale ? "n stale" : "n");
+    cell(tr, e.capacity ? e.occupancy + "/" + e.capacity : "-", "n");
+    cell(tr, e.claimed ? "pid " + e.owner_pid : "unclaimed",
+         e.claimed ? "" : (e.kind === "dynamic" ? "warn" : ""));
+    cell(tr, e.errors_total + (e.delta_errors ? " (+" + e.delta_errors + ")" : ""),
+         e.errors_total ? "n err" : "n");
+    tb.appendChild(tr);
+  }
+}
+
+function renderParticipants(d) {
+  const tb = $("parts");
+  tb.textContent = "";
+  for (const p of d.participants) {
+    const tr = document.createElement("tr");
+    cell(tr, p.slot, "n");
+    cell(tr, p.pid || "-", "n");
+    cell(tr, p.mode === null ? "?" : p.mode);
+    cell(tr, p.comm);
+    cell(tr, p.in_arena ? "arena" : "lock-only");
+    cell(tr, p.alive ? "live" : "-", p.alive ? "ok" : "dim");
+    cell(tr, p.errors_total, "n");
+    tb.appendChild(tr);
+  }
+}
+
+function renderFeed(d) {
+  const ul = $("feed");
+  ul.textContent = "";
+  for (const ev of d.feed.slice().reverse()) {
+    const li = document.createElement("li");
+    li.className = ev.severity;
+    li.textContent = "#" + ev.tick + "  " + (ev.id ? ev.id + "  " : "") +
+                     ev.subject + "  " + ev.message;
+    ul.appendChild(li);
+  }
+  if (!d.feed.length) {
+    const li = document.createElement("li");
+    li.className = "info";
+    li.textContent = "nothing to report";
+    ul.appendChild(li);
+  }
+}
+
+// Hand-written SVG, per §7. No chart library, no build step: an axis, N bars,
+// and three labels is the whole requirement, and it is ~30 lines.
+function renderHistogram(d) {
+  const svg = $("hist");
+  svg.textContent = "";
+  const e = d.edges.find((x) => x.id === selected) || d.edges[0] || null;
+  if (!e) { $("detail-title").textContent = "detail — no edges"; return; }
+  selected = e.id;
+  $("detail-title").textContent = "detail — " + e.label;
+  const s = e.stats;
+  $("detail-stats").textContent = s
+    ? "n=" + s.n + "  min=" + fmtNs(s.min_ns) + "  median=" + fmtNs(s.median_ns) +
+      "  p99=" + fmtNs(s.p99_ns) + "  max=" + fmtNs(s.max_ns) +
+      "  non-monotonic=" + s.non_monotonic
+    : "no retained intervals";
+
+  const W = 720, H = 200, PAD = 26;
+  const bars = e.histogram;
+  if (!bars.length) return;
+  const peak = Math.max(...bars.map((b) => b.count), 1);
+  const bw = (W - 2 * PAD) / bars.length;
+  const mk = (name, attrs, text) => {
+    const n = document.createElementNS(SVG_NS, name);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    if (text !== undefined) n.textContent = text;
+    svg.appendChild(n);
+    return n;
+  };
+  mk("line", { x1: PAD, y1: H - PAD, x2: W - PAD, y2: H - PAD, class: "axis" });
+  bars.forEach((b, i) => {
+    const h = (b.count / peak) * (H - 2 * PAD);
+    const r = mk("rect", {
+      x: PAD + i * bw + 1, y: H - PAD - h,
+      width: Math.max(bw - 2, 1), height: h, class: "bar",
+    });
+    // The bucket range as a <title>, which is the SVG-native tooltip: no
+    // library, no positioning code, and it works on a touch screen.
+    const t = document.createElementNS(SVG_NS, "title");
+    t.textContent = fmtNs(b.lo_ns) + "…" + fmtNs(b.hi_ns) + ": " + b.count;
+    r.appendChild(t);
+  });
+  mk("text", { x: PAD, y: H - PAD + 14, class: "lab" }, fmtNs(bars[0].lo_ns));
+  mk("text", { x: W - PAD, y: H - PAD + 14, class: "lab", "text-anchor": "end" },
+     fmtNs(bars[bars.length - 1].hi_ns));
+  mk("text", { x: PAD, y: PAD - 10, class: "lab" }, "peak " + peak);
+}
+
+// `--edge` seeds the selection, and only the first document is allowed to do it.
+// The flag says where the operator wants to *start*; the click handler owns the
+// selection from then on, and re-reading `d.selected` every poll would drag the
+// page back to the flag's edge one second after every click.
+function seed(d) {
+  if (seeded) return;
+  seeded = true;
+  if (d.selected !== null && d.selected !== undefined) selected = d.selected;
+}
+
+function paint(d) {
+  seed(d);
+  $("banner").textContent =
+    d.source + "  |  " + d.frames + " frames, " + d.edges.length + " edges, " +
+    fmtBytes(d.arena_bytes) + "  |  clock: " + d.clock +
+    (d.counters_compiled_in ? "" : "  |  built without `counters`");
+  $("status").textContent =
+    "tick " + d.tick + "  every " + d.poll_ms + " ms  |  " +
+    d.occupancy.map((o) => o.what + " " + o.used + "/" + o.capacity).join("  ");
+  $("status").className = "";
+  renderEdges(d);
+  renderHistogram(d);
+  renderParticipants(d);
+  renderFeed(d);
+  $("foot").textContent =
+    "tf_tree " + d.tool_version + " — read-only observer; this view performs no " +
+    "lookups and takes no claim. Schema " + d.schema + ".";
+}
+
+async function poll() {
+  let delay = 1000;
+  try {
+    // Relative, so it follows whatever loopback port the server printed, and
+    // there is no origin to get wrong. `cache: no-store` because a poll served
+    // from the browser cache is a frozen view of a live robot.
+    const r = await fetch("api/tick", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    delay = d.poll_ms || 1000;
+    if (d.tick !== seenTick) { seenTick = d.tick; paint(d); }
+  } catch (err) {
+    const s = $("status");
+    s.textContent = "disconnected (" + err.message + ") — retrying";
+    s.className = "down";
+  }
+  // setTimeout and not setInterval: a slow or hung response must not queue a
+  // backlog of requests against a single-threaded server.
+  setTimeout(poll, delay);
+}
+poll();
+</script>
+</body>
+</html>
