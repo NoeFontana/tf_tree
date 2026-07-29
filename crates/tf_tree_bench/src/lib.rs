@@ -16,6 +16,9 @@
 //!   the feature-gated `tf2` module and `cargo xtask bench-gate`.
 //! * The zero-allocation gate (`tests/zero_alloc.rs`) is decisive and runs here.
 
+/// `docs/PHASE5.md` §10's "benchmark artifact as a regression gate": compare a
+/// fresh report against the committed baseline.
+pub mod baseline;
 pub mod differential;
 pub mod fixture;
 /// Multi-process evaluation harness: open-loop latency, CPU and PSS accounting.

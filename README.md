@@ -142,7 +142,9 @@ just lint           # fmt --check + clippy -D warnings + cargo-deny
 just loom           # concurrency model checking
 just miri           # UB checking (arena + core)
 just bench          # benchmark suite + go/no-go gate
-just bench-report    # the PHASE5 §9 artifact -> report/{results.json,index.html}
+just bench-report   # the PHASE5 §9 artifact -> report/{results.json,index.html}
+just bench-check    # the same artifact against the committed baseline
+just shm-torture    # PHASE2 §11.4's multi-process soak (30 min; nightly)
 ```
 
 `just --list` for everything.
@@ -157,6 +159,14 @@ can. On a 4-core development machine that means most rows are gaps — which is
 the correct output, not a broken tool. `docs/PHASE5.md` §9.3 is the rule it
 enforces, and it includes a "where `tf_tree` is worse" section, in the same
 table.
+
+`just bench-check` re-runs it and compares against the committed baseline in
+`crates/tf_tree_bench/baseline/results.json`, failing if a claim was withdrawn,
+a row was dropped, the arena layout changed, or a directional number moved past
+the slack the baseline itself records. It compares **claims, not hosts**: CPU
+model, core count, kernel, governor, load and every reason string are ignored,
+so the gate means the same thing on any machine. `just bench-baseline-update`
+regenerates the baseline; that diff belongs in the commit that causes it.
 
 Standing numbers and their caveats live in
 [`docs/benchmarks/`](./docs/benchmarks/).

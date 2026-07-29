@@ -1,0 +1,168 @@
+{
+  "schema": "tf_tree.bench-report/2",
+  "provenance": {
+    "generated_utc": "2026-07-29T05:01:26Z",
+    "schema": "tf_tree.bench-report/2",
+    "git_commit": "67cfa3ff4802565e8ad2f328d5ab4aa0a6685567",
+    "git_dirty": "false",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "build_profile": "release",
+    "target": "x86_64",
+    "counters_feature": "true",
+    "shm_feature": "false",
+    "tf2_feature": "false",
+    "format_version": "3",
+    "layout_hash": "0x3D104195",
+    "interp_policy": "LerpSlerp (tf2's policy)",
+    "cpu_model": "AMD EPYC-Milan Processor",
+    "physical_cores": "4",
+    "logical_cpus": "8",
+    "cpu_governor": "unknown",
+    "kernel": "6.8.0-136-generic",
+    "transparent_hugepage": "always [madvise] never",
+    "perf_event_paranoid": "4",
+    "load_average": "0.44 1.30 2.00 1/518 3625196",
+    "container": "no",
+    "ros_distro": "none (no ROS 2 in this run)",
+    "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
+    "rmw_implementation": "none — no middleware is in any measurement here; both engines are driven in-process from the same loop",
+    "dds_qos": "not applicable — no DDS in this configuration (see rmw_implementation)",
+    "executor_config": "not applicable — no rclcpp executor; the harness drives both engines directly"
+  },
+  "host_fitness": {
+    "fair_for_timing": false,
+    "enough_cores": false,
+    "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
+    "forced": false,
+    "consumers": 16,
+    "busy_fraction": 0.01673640167364021,
+    "physical_cores": 4,
+    "logical_cpus": 8,
+    "warmup_discarded_s": 2,
+    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out"]
+  },
+  "rows": [
+    {
+      "id": "cpu_per_consumer",
+      "title": "CPU per consumer at steady state (%CPU)",
+      "note": "Both stacks, N consumers plus one publisher, steady state.",
+      "timing_sensitive": true,
+      "needs_n_cores": true,
+      "status": "unavailable",
+      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reproduce": "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "total_rss_n_consumers",
+      "title": "Total RSS across N consumers (MB)",
+      "note": "Both stacks, summed Pss from /proc/*/smaps_rollup. Memory is exact even on a loaded machine, so this row's gap is the missing tf2 column, not the host.",
+      "timing_sensitive": false,
+      "needs_n_cores": true,
+      "status": "unavailable",
+      "reason": "the tf_tree column is measurable here, but the tf2 column needs a ROS 2 install this report cannot reach in-process; running both halves from one tool would mean linking tf2 into it. `just mp-bench-tf2` runs both in the container and prints Pss for each. A one-sided memory row is exactly the thumb on the scale §9.3 warns about, so it is a gap rather than a half-filled row",
+      "reproduce": "just mp-bench-tf2",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "lookup_latency",
+      "title": "Lookup latency, depth 3, hot path (p50, p99, p99.9)",
+      "note": "tf_tree column: `map <- imu_link`, LerpSlerp, in-process, one thread. Percentiles include two Instant::now() calls, whose own cost is reported alongside as clock_overhead_p50_ns. The tf2 column is a separate, cross-engine comparison and is not attempted here.",
+      "timing_sensitive": true,
+      "needs_n_cores": false,
+      "status": "unavailable",
+      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reproduce": "cargo bench -p tf_tree_bench --bench lookup (or this tool on a quiet, non-SMT, performance-governor host)",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "publish_to_visible",
+      "title": "Publish -> visible-to-consumer (p50, p99.9)",
+      "note": "Both stacks, publisher process to consumer process.",
+      "timing_sensitive": true,
+      "needs_n_cores": true,
+      "status": "unavailable",
+      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. This row also needs the `shm` feature and a second process per consumer, and its tf2 counterpart needs a DDS round trip that no configuration here provides",
+      "reproduce": "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "scaling_curve",
+      "title": "Scaling curve, N = 1..16 (throughput, CPU)",
+      "note": "Both stacks. The claim under test is that reads scale with threads.",
+      "timing_sensitive": true,
+      "needs_n_cores": true,
+      "status": "unavailable",
+      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
+      "reproduce": "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "tft_16_workers_rss",
+      "title": "Frozen .tft: 16 dataloader workers, total RSS vs 16 bag parses (MB)",
+      "note": "The wedge's central claim (§12 gate 4: total Pss within 1.2x of one worker).",
+      "timing_sensitive": false,
+      "needs_n_cores": true,
+      "status": "unavailable",
+      "reason": "mapping one .tft from sixteen worker processes needs `tf_tree`'s frozen backend, which is `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]` and is therefore not compiled into this binary — `just bench-report` builds without `--features shm`. There is no `Tree::open_frozen` here to call",
+      "reproduce": "just bench-report-shm on >= 16 physical cores, with a .tft built by `tf_tree freeze --from-bag` from a representative recording",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "tft_open_vs_bag_parse",
+      "title": ".tft open time vs bag parse time (ms)",
+      "note": "§12 gate 2 wants open under 10 ms for a 233 MB index.",
+      "timing_sensitive": true,
+      "needs_n_cores": false,
+      "status": "unavailable",
+      "reason": "timing `Tree::open_frozen` against a 233 MB index needs `tf_tree`'s frozen backend, which is `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]` and is therefore not compiled into this binary — `just bench-report` builds without `--features shm`. There is no `Tree::open_frozen` here to call",
+      "reproduce": "just bench-report-shm against a .tft built by `tf_tree freeze --from-bag` from a recording large enough to produce §12 gate 2's 233 MB index",
+      "tf_tree": {},
+      "tf2": {}
+    },
+    {
+      "id": "differential_agreement",
+      "title": "Differential agreement (LerpSlerp), max deviation",
+      "note": "tf_tree column: against the independent naive-Rust reference model. tf2 column: against tf2::BufferCore. Deviation is max(rotation-angle error in rad, translation error in m), so a quaternion sign flip cannot pass. Not timing sensitive: the same inputs give the same disagreement on any host.",
+      "timing_sensitive": false,
+      "needs_n_cores": false,
+      "status": "measured",
+      "reason": "",
+      "reproduce": "cargo test -p tf_tree_bench --release --test differential",
+      "tf_tree": {"max_deviation": {"value": 0.0000000000000002498001805406602, "unit": "rad or m", "drift": "lower_is_better", "tolerance": 9}, "compared": {"value": 47922, "unit": "queries", "drift": "informational", "tolerance": 0}, "tolerance": {"value": 0.000000000001, "unit": "rad or m", "drift": "informational", "tolerance": 0}},
+      "tf2": {}
+    }
+  ],
+  "where_we_are_worse": [
+    {
+      "id": "arena_memory_floor",
+      "topic": "Arena memory floor",
+      "statement": "A tf_tree arena is fixed-capacity and allocated up front, so an idle tree costs its full size from the first second. A tf2 BufferCore starts near empty and grows into whatever the stream actually contains, so on a robot that publishes far less than it declared, tf2 uses less memory and tf_tree is simply worse. The figure is for 64 frames, 64 edge slots and 32768 sample slots; it is arithmetic on the layout, not a measurement, and it does not depend on this host.",
+      "metrics": {"idle_arena_bytes": {"value": 2405696, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_mib": {"value": 2.29425048828125, "unit": "MiB", "drift": "informational", "tolerance": 0}}
+    },
+    {
+      "id": "attach_latency",
+      "topic": "Attach latency",
+      "statement": "Joining a live arena is a rendezvous: open the runtime directory, take the lock file, receive the segment fd over a unix socket, map it, and validate the header. A tf2 consumer constructs a buffer in-process and is ready immediately. The cost is paid once per process, but it is real, and it is a cost tf2 does not have.",
+      "metrics": {}
+    },
+    {
+      "id": "format_bump_cost",
+      "topic": "Operational cost of a format bump",
+      "statement": "Every participant shares one arena layout, so a FORMAT_VERSION change (this build: 3) is a fleet-wide, all-at-once restart: mixed versions do not attach, by design. `docs/PHASE5.md` §1 bumps v2 to v3 for exactly this reason — to break it once. tf2 has no shared binary layout and no equivalent event. `tf_tree doctor --explain-version` prints what an operator meeting the refusal needs.",
+      "metrics": {}
+    },
+    {
+      "id": "bridge_supervision",
+      "topic": "The bridge is another process to supervise",
+      "statement": "The 16 consumers in this comparison read one arena, which somebody has to fill: the ROS 2 ingest bridge is a process that must be started, supervised, restarted and monitored. With tf2 there is no such process — every node subscribes to /tf directly. That is one more thing to page somebody about at 3 a.m., and it is the honest cost of the shared arena.",
+      "metrics": {}
+    }
+  ]
+}

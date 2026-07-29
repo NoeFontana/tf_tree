@@ -42,10 +42,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use tf_tree_bench::baseline;
 use tf_tree_bench::report::{self, Options, Status};
 
 fn main() -> Result<()> {
     let mut out = PathBuf::from("report");
+    let mut check: Option<PathBuf> = None;
     let mut opts = Options::default();
 
     // Hand-rolled argument parsing: this is a benchmark binary in a
@@ -97,8 +99,16 @@ fn main() -> Result<()> {
                  §3 itself *is* implemented for MCAP — use `tf_tree ingest --bag` to read \
                  a recording, or `tf_tree freeze --from-bag` to keep the result."
             ),
+            // `docs/PHASE5.md` §10's "benchmark artifact as a regression gate".
+            // The comparison runs *after* the report is written, so a failing
+            // gate still leaves the artifact on disk to look at — a gate that
+            // deletes the evidence it failed on is unusable.
+            "--check-baseline" => check = Some(PathBuf::from(value("--check-baseline")?)),
             "-h" | "--help" => {
-                println!("usage: bench_report [--out DIR] [--consumers N] [--warmup 2s]");
+                println!(
+                    "usage: bench_report [--out DIR] [--consumers N] [--warmup 2s] \
+                     [--check-baseline results.json]"
+                );
                 println!(
                     "  --duration and --bag are `docs/PHASE5.md` §9.1 spellings that would \
                      govern nothing on this host; both are rejected with the reason rather \
@@ -177,6 +187,50 @@ fn main() -> Result<()> {
         println!("  - {}", w.topic);
     }
     println!("\nwrote {} and {}", json.display(), html.display());
+
+    if let Some(path) = check {
+        let cmp = baseline::check_file(&path, &report)?;
+        println!("\nregression gate against {} (PHASE5 §10):", path.display());
+        for n in &cmp.notes {
+            println!("  note: {n}");
+        }
+        // Checked before the verdict is printed, so "zero comparisons" never
+        // appears on screen as a PASS. "0 failures" is also what a gate that
+        // compared nothing prints, and a regression gate that has quietly
+        // stopped comparing is the exact failure this whole file is written
+        // against.
+        if cmp.compared_nothing() {
+            eprintln!(
+                "regression gate compared NOTHING against {}: the baseline carries no \
+                 directional metric this build also emits, so a green result here would \
+                 mean only that the comparison ran. Regenerate it with \
+                 `just bench-baseline-update`.",
+                path.display()
+            );
+            bail!("the regression gate compared nothing");
+        }
+        if cmp.passed() {
+            println!(
+                "  PASS — {} directional metric{} held.",
+                cmp.checked,
+                if cmp.checked == 1 { "" } else { "s" }
+            );
+        } else {
+            eprintln!("regression gate FAILED against {}:", path.display());
+            for f in &cmp.failures {
+                eprintln!("  - {f}");
+            }
+            eprintln!(
+                "\nIf the change is intended, regenerate the baseline with \
+                 `just bench-baseline-update` and put the diff in the commit that \
+                 causes it."
+            );
+            bail!(
+                "{} regression(s) against the committed baseline",
+                cmp.failures.len()
+            );
+        }
+    }
     Ok(())
 }
 

@@ -286,6 +286,41 @@ bench-report *ARGS:
 bench-report-shm *ARGS:
     cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
 
+# **`docs/PHASE5.md` §10's "benchmark artifact as a regression gate".**
+#
+# Regenerates the report and compares it against
+# `crates/tf_tree_bench/baseline/results.json`, exiting non-zero if this build
+# withdrew a claim, dropped a row, changed the arena layout, or moved a
+# directional number past the slack the baseline records.
+#
+# **What it does NOT do is compare the host.** CPU model, core count, kernel,
+# governor, load and every `reason` string are ignored, because they differ on
+# every machine and a gate that fails for the CPU model is a gate people learn
+# to ignore. `src/baseline.rs` carries the full split.
+#
+# On this host exactly one row is a claim — the LerpSlerp differential, which is
+# host-independent by construction — so this gate holds one number today. That
+# is not a placeholder: `Report::validate` refuses any row that prints numbers
+# without giving at least one of them a direction, so a row that starts being
+# measurable arrives already gated or not at all.
+#
+# `--out target/bench-report` and not `report/`: this is a check, and it should
+# not clobber a report somebody generated to look at.
+bench-check:
+    cargo run --release -p tf_tree_bench --bin bench_report -- \
+        --out target/bench-report \
+        --check-baseline crates/tf_tree_bench/baseline/results.json
+
+# Regenerate the committed baseline. **Run this deliberately, and put the diff
+# in the same commit as the change that causes it** — the diff is the record of
+# what moved and it is the only place a reviewer sees it.
+#
+# `index.html` is not committed: it is a rendering of `results.json` and a second
+# copy that can disagree with the first.
+bench-baseline-update:
+    cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report
+    cp target/bench-report/results.json crates/tf_tree_bench/baseline/results.json
+
 # `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
 # where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
 # `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one
@@ -520,6 +555,15 @@ shm-check:
     # that adds it.
     cargo nextest run -p tf_tree_arena --features shm
     cargo nextest run -p tf_tree --features shm --test frozen
+    # **`docs/PHASE2.md` §11.4's torture harness, gated on a branch.** The
+    # nightly is `just shm-torture` (30 minutes); this is the seconds-long
+    # self-test that proves the harness's detector still detects. A soak test
+    # whose checker has silently stopped checking prints exactly what a passing
+    # one does, so this is the difference between a gate and a decoration.
+    # Kept as the command rather than `just shm-torture-self-test` so this
+    # recipe stays a flat list somebody can read top to bottom; the standalone
+    # recipe exists for running it alone.
+    cargo nextest run -p tf_tree_bench --features shm --release --test torture
     # **`docs/PHASE5.md` §3 into §2's container.** `tests/frozen_bag.rs` carries
     # `required-features = ["shm"]`, so `cargo nextest run --workspace` — which
     # builds without features — skips the target entirely. The rest of
@@ -527,6 +571,70 @@ shm-check:
     cargo clippy -p tf_tree_ingest --features shm --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --features shm
     cargo nextest run -p tf_tree_ipc
+
+# **`docs/PHASE2.md` §11.4's `shm_torture`, which `docs/PHASE5.md` §10 wants
+# running nightly.** N processes on one arena doing random
+# attach/detach/claim/reap/push/lookup while the driver `SIGKILL`s one of them
+# several times a second and replaces it. Every reader validates every transform;
+# after the run a surviving participant checks that no claim and no participant
+# slot was leaked by a process that never got to clean up.
+#
+# **Thirty minutes and six children is `docs/PHASE2.md` §13's spelling**, and it
+# is what the nightly job runs. Override for a local smoke run:
+# `just shm-torture "--duration 60s --children 4"`.
+#
+# `--release`: the point is to interleave real processes at real speed. A debug
+# build spends its time in bounds checks and reaches a different, much narrower
+# set of interleavings.
+#
+# **What this does NOT cover** is §11.3's crash-point injection — there is no
+# `crash-points` feature to arm (§0.0 records it as not implemented), and the
+# binary *refuses* `--crash-points` rather than running the SIGKILL test and
+# calling it §11.3 coverage. §11.4's "under ASan" half is `just shm-torture-asan`.
+shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
+    cargo build --release --features shm -p tf_tree_bench --bin shm_torture
+    ./target/release/shm_torture {{ARGS}}
+
+# **The torture harness's own gate**, seconds rather than minutes, so it belongs
+# on a branch rather than in a nightly.
+#
+# It runs the binary twice and asserts the two runs disagree: once with a child
+# publishing a deliberately corrupt transform (which some *other* process must
+# catch) and once clean (which must pass having validated thousands of reads).
+# Without it, a harness that quietly stopped reading would print the same
+# "0 violations" forever — which is exactly what the first revision of this
+# harness did, and how the writer pacing in `work` came to exist.
+shm-torture-self-test:
+    cargo nextest run -p tf_tree_bench --features shm --release --test torture
+
+# **§11.4's "run it under ASan"**, on a short run.
+#
+# ASan works across `fork`/`exec`, so the children are instrumented too — which
+# is the whole reason to run a *multi-process* soak under it. Miri cannot reach
+# any of this: there is no `memfd`, no `mmap` and no second process under Miri,
+# so the arena's raw-memory `unsafe` has no other dynamic checker at all once it
+# crosses a process boundary.
+#
+# `-Zbuild-std` because the interceptors need an instrumented std; without it
+# ASan sees our allocations but not std's, and reports on its own internals.
+# It is also why this is minutes and not seconds, and why the duration is short.
+#
+# `detect_leaks=0`: a `SIGKILL`ed child is *defined* to leak — it is killed
+# holding a mapping and an allocation — so LeakSanitizer would report the thing
+# the test is deliberately doing. ASan's memory-error detection, which is what
+# this is for, is unaffected.
+#
+# The target is the **host's**, read from `rustc -vV`, not a hardcoded
+# `x86_64-unknown-linux-gnu`. `-Zsanitizer` needs an explicit `--target` (an
+# implicit one would build the proc-macros and build scripts instrumented too),
+# and spelling one architecture there made the recipe silently x86-only — on the
+# aarch64 job it would build a cross target that is not installed and fail for a
+# reason that says nothing about the arena. `baseline.rs`'s `PORTABLE_FACTS`
+# reasons explicitly about aarch64 running these gates.
+shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
+    RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
+    cargo +nightly run -Zbuild-std --target "$(rustc -vV | sed -n 's/^host: //p')" \
+        --release --features shm -p tf_tree_bench --bin shm_torture -- {{ARGS}}
 
 # The zero-config rendezvous end to end: a foreign process calls
 # `tf_tree::open()`, joins a served arena, and reads the same transform.
