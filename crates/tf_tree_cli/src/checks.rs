@@ -543,7 +543,15 @@ const RATE_TOLERANCE: f64 = 0.20;
 const RATE_MIN_INTERVALS: usize = 8;
 
 /// What one edge can tell `TFT007`.
-fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&Vec<&PushSample>>) -> RateEvidence {
+fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateEvidence {
+    // A static edge carries its pose inline and never publishes, so it has no
+    // rate to hold or miss. The builder writes no nominal for one; this guard is
+    // what keeps a hand-built or corrupt record with a stray non-zero rate from
+    // being counted as declared — which would suppress the whole-check skip and
+    // then compare a stream that does not exist.
+    if e.kind != EdgeKind::Dynamic {
+        return RateEvidence::NotDeclared;
+    }
     let Some(mhz) = e.nominal_rate_mhz else {
         return RateEvidence::NotDeclared;
     };
@@ -591,7 +599,7 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     let mut declared = 0usize;
     for e in &inp.snap.edges {
-        match rate_evidence(e, by_edge.get(&e.id)) {
+        match rate_evidence(e, by_edge.get(&e.id).map(Vec::as_slice)) {
             RateEvidence::NotDeclared => continue,
             RateEvidence::TooFewIntervals => declared += 1,
             RateEvidence::Comparable {
@@ -649,7 +657,7 @@ pub fn rate_coverage_note(snap: &Snapshot, obs: &Observations) -> Option<String>
         if e.kind != EdgeKind::Dynamic {
             continue;
         }
-        match rate_evidence(e, by_edge.get(&e.id)) {
+        match rate_evidence(e, by_edge.get(&e.id).map(Vec::as_slice)) {
             RateEvidence::NotDeclared => undeclared += 1,
             RateEvidence::TooFewIntervals => too_few += 1,
             RateEvidence::Comparable { .. } => comparable += 1,
@@ -1823,6 +1831,10 @@ mod tests {
     ///
     /// Mutant: replace `if declared == 0` with `if false` in `tft007`. Applied:
     /// the status is `Pass` and the `match` panics with "expected a skip".
+    /// Mutant B: drop the `e.kind != EdgeKind::Dynamic` guard from
+    /// `rate_evidence`. Applied: the static-edge case below counts as declared,
+    /// the check reports `Pass` instead of skipping, and its `match` panics —
+    /// a `pass` earned by an edge that cannot publish at all.
     #[test]
     fn tft007_skips_when_no_edge_declares_a_rate() {
         const MS: i64 = 1_000_000;
@@ -1837,6 +1849,22 @@ mod tests {
                 "the skip must name the missing evidence and how to supply it: {why}"
             ),
             other => panic!("expected a skip, got {other:?}"),
+        }
+
+        // A *static* edge carrying a rate is not a declaration either: it never
+        // publishes, so there is no stream to hold or miss one. Reachable only
+        // from a hand-built or corrupt record — the builder writes no nominal
+        // for a static edge — which is exactly why the guard is not obviously
+        // dead code.
+        let snap = two_frame_snapshot(EdgeInfo {
+            kind: EdgeKind::Static,
+            capacity: 0,
+            nominal_rate_mhz: Some(20_000),
+            ..edge(1, 1, 2, 0)
+        });
+        match &tft007(&inputs(&snap, &obs, &[], Clock::Wall(0))).status {
+            Status::Skipped(_) => {}
+            other => panic!("a static edge cannot declare a publish rate, got {other:?}"),
         }
 
         // Non-vacuity: the same stream against a declared rate does run.
