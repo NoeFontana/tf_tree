@@ -150,6 +150,24 @@ name = "shm_scaling"
 path = "src/bin/shm_scaling.rs"
 required-features = ["shm"]
 
+# **`docs/PHASE2.md` §11.4's `shm_torture`**, which `docs/PHASE5.md` §10 wants
+# running nightly. Deliberately **no** `required-features`: the binary compiles
+# everywhere and, without `shm`, exits non-zero saying there is no shared arena
+# to torture. `just shm-torture-self-test` runs it in `cargo nextest run
+# --workspace`'s build, and a target that vanished from the default build would
+# take that gate with it.
+[[bin]]
+name = "shm_torture"
+path = "src/bin/shm_torture.rs"
+
+# The torture harness's own gate. `required-features` keeps it out of
+# `cargo nextest run --workspace` (which builds without `shm`, where the binary
+# has nothing to torture); `just shm-torture-self-test` is where it runs, and
+# `just shm-check` calls that.
+[[test]]
+name = "torture"
+required-features = ["shm"]
+
 [[bench]]
 name = "py_parity"
 harness = false

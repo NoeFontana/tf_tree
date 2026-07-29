@@ -1,0 +1,94 @@
+name: nightly
+
+# `docs/PHASE5.md` §10's CI list asks for two things that do not belong on a
+# pull request: the `shm_torture` soak (`docs/PHASE2.md` §13 spells it "30
+# minutes nightly, clean, under ASan") and the sanitizer suites, which need a
+# nightly toolchain and `-Zbuild-std` and therefore take tens of minutes.
+#
+# **A green tick here is not evidence.** No run of any workflow has been produced
+# for this repository since 2026-07-23. Every job below is a thin wrapper around
+# a `just` recipe, and the recipe run locally — on a stated architecture — is the
+# gate. That is why the recipes came first and the jobs second.
+
+on:
+  schedule:
+    # 03:17 UTC. Off the hour on purpose: the hour is when every scheduled
+    # workflow on the platform starts, and a queued job that never runs is
+    # indistinguishable from a passing one.
+    - cron: "17 3 * * *"
+  # So a change to these recipes can be exercised without waiting a day.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  torture:
+    name: shm_torture (30 min)
+    runs-on: ubuntu-latest
+    # The recipe's own duration is 30 minutes; the margin covers the release
+    # build and the teardown. Left explicit so a hung run is killed by the job
+    # rather than by the 6-hour default.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      # The seconds-long self-test first. If the harness's detector is broken,
+      # thirty minutes of it would pass and mean nothing, and finding that out
+      # after thirty minutes is worse than finding it out after ten seconds.
+      - name: just shm-torture-self-test
+        run: just shm-torture-self-test
+      - name: just shm-torture
+        run: just shm-torture
+
+  sanitizers:
+    name: ${{ matrix.recipe }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # `tsan` is `docs/PHASE3.md` §7.3's concurrent read path;
+        # `shm-torture-asan` is `docs/PHASE2.md` §11.4's "run it under ASan".
+        #
+        # There is no Rust UBSan row, and its absence is deliberate rather than
+        # an omission: `rustc -Zsanitizer` accepts address, thread, leak, memory
+        # and the CFI variants, and no `undefined`. §10's "ASan/UBSan/TSan" is a
+        # C/C++ checklist; the UBSan half of it lives where there is C++ to
+        # check, in `just cpp-check`, which runs the header-only wrapper under
+        # `-fsanitize=undefined`.
+        recipe: [tsan, shm-torture-asan]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just ${{ matrix.recipe }}
+        run: just ${{ matrix.recipe }}
+
+  cpp-sanitizers:
+    name: cpp-check (ASan/UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      # Sophus is optional and its absence is *reported* by the recipe rather
+      # than skipped silently, so this job is honest either way — but fetch it,
+      # because the stride hazard §4.3 names only exists where Sophus does.
+      - name: just cpp-deps
+        run: just cpp-deps
+      - name: just cpp-check
+        run: just cpp-check
