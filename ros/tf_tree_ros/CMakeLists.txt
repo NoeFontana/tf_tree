@@ -35,7 +35,7 @@ find_package(tf2_msgs REQUIRED)
 # `tft_bridge_*` symbols. `just ros-build` builds it that way.
 find_package(tf_tree CONFIG REQUIRED)
 
-add_library(tf_tree_ros SHARED src/bridge_handle.cpp)
+add_library(tf_tree_ros SHARED src/bridge_handle.cpp src/bridge_node.cpp)
 target_include_directories(tf_tree_ros PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include>")
@@ -48,8 +48,21 @@ target_link_libraries(tf_tree_ros PUBLIC
   ${geometry_msgs_TARGETS}
   ${tf2_msgs_TARGETS})
 
+# §5.8 forms 2 and 1. **One `rclcpp_components_register_node` call produces
+# both**: the loadable plugin, and a standalone executable named `tf_tree_bridge`
+# that spins it. The component library is separate from `tf_tree_ros` so a
+# consumer using form 3 does not drag in `rclcpp_components` and the plugin
+# registration.
+add_library(tf_tree_ros_component SHARED src/bridge_component.cpp)
+target_link_libraries(tf_tree_ros_component PUBLIC
+  tf_tree_ros
+  rclcpp_components::component)
+rclcpp_components_register_node(tf_tree_ros_component
+  PLUGIN "tf_tree_ros::BridgeNode"
+  EXECUTABLE tf_tree_bridge)
+
 install(DIRECTORY include/ DESTINATION include)
-install(TARGETS tf_tree_ros EXPORT export_tf_tree_ros
+install(TARGETS tf_tree_ros tf_tree_ros_component EXPORT export_tf_tree_ros
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
@@ -81,6 +94,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_attribution test/test_attribution.cpp TIMEOUT 180)
   if(TARGET test_attribution)
     target_link_libraries(test_attribution tf_tree_ros)
+  endif()
+
+  # §5.8 forms 1 and 2: the parameter surface, which is all they add to form 3.
+  ament_add_gtest(test_node test/test_node.cpp TIMEOUT 120)
+  if(TARGET test_node)
+    target_link_libraries(test_node tf_tree_ros)
   endif()
 endif()
 

@@ -83,6 +83,23 @@ colcon --log-base "$OUT/log" build \
     --install-base "$OUT/install" \
     --cmake-args -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$PREFIX"
 
+# §5.8 forms 1 and 2 are *artifacts*, and a single `rclcpp_components_register_node`
+# call is supposed to produce both. Nothing in the ctests would notice if one of
+# them stopped being produced — a component that no longer registers still links,
+# still compiles, and still passes every test that constructs `BridgeNode`
+# directly. So they are checked here, where they are built.
+plugin_index=$OUT/install/tf_tree_ros/share/ament_index/resource_index/rclcpp_components/tf_tree_ros
+form1=$OUT/install/tf_tree_ros/lib/tf_tree_ros/tf_tree_bridge
+if [ ! -x "$form1" ]; then
+    echo "  FAIL: §5.8 form 1 (the standalone executable) was not installed at $form1" >&2
+    exit 1
+fi
+if ! grep -q '^tf_tree_ros::BridgeNode;' "$plugin_index" 2>/dev/null; then
+    echo "  FAIL: §5.8 form 2 (the component) is not registered in $plugin_index" >&2
+    exit 1
+fi
+echo "     §5.8 forms 1 and 2 present: tf_tree_bridge, tf_tree_ros::BridgeNode"
+
 if [ "$run_tests" -eq 1 ]; then
     echo "==> ctest"
     # `--event-handlers console_direct+` so gtest's own output reaches the
