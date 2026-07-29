@@ -24,15 +24,30 @@ exclude = [
     "crates/tf_tree_py","crates/tf_tree_tf2_sys"]
 
 [workspace.package]
-version = "0.1.0"
+# 0.2.0 because `SUPPORT.md` makes an MSRV bump a minor-version bump pre-1.0,
+# and the line below moved. Nothing has been released yet (`0008` measured the
+# name as free on crates.io), so this signals nothing to nobody — it is the
+# policy applied uniformly rather than skipped when it happens to be cheap.
+version = "0.2.0"
 edition = "2021"
-# **1.85, and it was 1.83 until it was measured.** `cargo +1.83 build --workspace`
-# fails to *parse* a manifest: `blake3 1.8.5` pulls `constant_time_eq 0.4.2`,
-# which is `edition = "2024"` and declares `rust-version = "1.85.0"`. So 1.83 was
-# a promise nothing kept and nothing checked. The `msrv` job in
-# `.github/workflows/ci.yml` reads this field and builds on exactly it, so the
-# next silent drift fails the build instead of shipping. Policy: `SUPPORT.md`.
-rust-version = "1.85"
+# **1.87, and each step was forced by a dependency rather than chosen.**
+#
+# 1.83 → 1.85: `cargo +1.83 build --workspace` failed to *parse* a manifest —
+# `blake3 1.8.5` pulls `constant_time_eq 0.4.2`, which is `edition = "2024"` and
+# declares `rust-version = "1.85.0"`. So 1.83 was a promise nothing kept.
+#
+# 1.85 → 1.87: `ruzstd 0.9.0` declares `rust-version = "1.87"`. It is the
+# pure-Rust zstd decoder `tf_tree_ingest` reads compressed MCAP chunks with, and
+# the reason it is pure Rust rather than `zstd-sys` is `docs/PHASE2.md` §2's
+# no-C-build-step rule. `ruzstd 0.7.3` would hold 1.85 and has the same two APIs
+# we need (`decode_all` into a slice, a 100 MiB window cap), so this buys
+# currency and a settable cap, not capability — a deliberate trade, not a
+# necessity.
+#
+# The `msrv` job in `.github/workflows/ci.yml` reads this field and builds on
+# exactly it, so the next silent drift fails the build instead of shipping.
+# Policy: `SUPPORT.md`.
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
@@ -64,8 +79,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.dependencies]
 # Intra-workspace crates (version pinned so publishable crates carry a real
 # requirement, not a path wildcard).
-tf_tree_math = { path = "crates/tf_tree_math", version = "0.1.0" }
-tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.1.0" }
+tf_tree_math = { path = "crates/tf_tree_math", version = "0.2.0" }
+tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.2.0" }
 # Phase 2 shared memory (see docs/PHASE2.md §2). Linux-only, opt-in via the
 # `shm` feature; `linux_raw` backend so there is no libc crate and no C build.
 # Only `tf_tree_ipc`, and only for `fcntl(F_OFD_*)`: rustix has no OFD locking
@@ -80,9 +95,9 @@ rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "s
 # measurement — the "counters off" row was measuring the counters-on engine.
 # Every crate that wants them re-enables them through its own `counters`
 # feature, which is what makes the switch actually switch.
-tf_tree_core = { path = "crates/tf_tree_core", version = "0.1.0", default-features = false }
-tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.1.0" }
-tf_tree = { path = "crates/tf_tree", version = "0.1.0", default-features = false }
+tf_tree_core = { path = "crates/tf_tree_core", version = "0.2.0", default-features = false }
+tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.2.0" }
+tf_tree = { path = "crates/tf_tree", version = "0.2.0", default-features = false }
 # publish = false crates, wired by path only (no version requirement published).
 # **`default-features = false` for the same load-bearing reason as `tf_tree`
 # above, and it is easy to miss here.** `tf_tree_bench` has its own
