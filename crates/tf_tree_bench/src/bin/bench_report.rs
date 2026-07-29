@@ -11,10 +11,20 @@
 //! bench-gate | headers` only.
 //!
 //! §9.1 spells the entry point `tf_tree bench compare --bag run.mcap ...`. That
-//! spelling is **not wired up**, and deliberately: its `--bag` argument is §3
-//! (bag ingestion), which `docs/PHASE5.md` §0.0 records as not implemented, so a
-//! CLI subcommand accepting it would advertise a capability that does not exist.
-//! When §3 lands, the CLI grows the subcommand and calls this same code.
+//! spelling is **not wired up.** The reason is no longer the one an earlier
+//! revision of this comment gave — it said §3 (bag ingestion) was unimplemented,
+//! and §3 has since landed for MCAP. Two reasons remain, and both are about this
+//! crate rather than about the roadmap:
+//!
+//! * `tf_tree_bench` is `publish = false` and carries `criterion`, `proptest`
+//!   and an optional ROS-adjacent dependency. Making the shipped `tf_tree`
+//!   binary depend on it to gain a subcommand would drag a benchmark harness
+//!   into every install.
+//! * Every row `--bag` would feed is UNAVAILABLE here for a reason the report
+//!   states, so the subcommand would accept a recording and use none of it.
+//!
+//! Wiring it is therefore a crate-boundary question, which `CLAUDE.md` routes to
+//! a decision record rather than to a PR.
 //!
 //! The interesting behaviour is in `tf_tree_bench::report`, in particular
 //! `Report::validate`: this binary **exits non-zero without writing anything**
@@ -73,17 +83,28 @@ fn main() -> Result<()> {
                  recorded as warmup_discarded_s) to change the discarded window."
             ),
             "--warmup" => opts.warmup = parse_duration(&value("--warmup")?)?,
+            // Still rejected, but **not** for the reason an earlier revision
+            // gave. That one said §3 "is not implemented"; §3 landed (MCAP), and
+            // `tf_tree ingest --bag` / `tf_tree freeze --from-bag` are how a
+            // recording is read today. What is missing is the wiring *here*:
+            // this harness never opens a `.tft`, so a recording handed to it
+            // would be parsed and then have nothing to feed.
             "--bag" => bail!(
-                "--bag is `docs/PHASE5.md` §3 (bag ingestion), which is not implemented \
-                 (see §0.0's status table). Run without --bag: the report is emitted \
-                 with the bag-dependent rows marked UNAVAILABLE and the reason stated."
+                "--bag is `docs/PHASE5.md` §9.1's spelling for feeding this harness a \
+                 recording, and it is not wired up: the two bag-dependent rows \
+                 (`tft_16_workers_rss`, `tft_open_vs_bag_parse`) are UNAVAILABLE for a \
+                 reason the report states, so a recording would be read and then unused. \
+                 §3 itself *is* implemented for MCAP — use `tf_tree ingest --bag` to read \
+                 a recording, or `tf_tree freeze --from-bag` to keep the result."
             ),
             "-h" | "--help" => {
                 println!("usage: bench_report [--out DIR] [--consumers N] [--warmup 2s]");
                 println!(
-                    "  --duration and --bag are `docs/PHASE5.md` §9.1 spellings for work \
-                     that is not implemented; both are rejected with the reason rather \
-                     than accepted and ignored."
+                    "  --duration and --bag are `docs/PHASE5.md` §9.1 spellings that would \
+                     govern nothing on this host; both are rejected with the reason rather \
+                     than accepted and ignored. Neither refusal is a claim about what phase \
+                     has landed — §0.0's status table owns that, and a copy of it here has \
+                     already gone stale once."
                 );
                 return Ok(());
             }
