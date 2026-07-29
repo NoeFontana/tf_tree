@@ -11,9 +11,11 @@
 #ifndef TF_TREE_ROS__BRIDGE_HANDLE_HPP_
 #define TF_TREE_ROS__BRIDGE_HANDLE_HPP_
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <future>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -89,6 +91,26 @@ struct BridgeOptions
 
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
+};
+
+/// The most recent §5.4 authority conflict, with both publishers named.
+///
+/// §5.4 calls this "the feature that finds pre-existing bugs in the host
+/// system" and the diagnostic goes to the log, where an operator reads it. This
+/// struct is the same information in a form a *program* can read — a health
+/// topic, a diagnostic aggregator, or a test asserting that §5.3's attribution
+/// actually resolved a GID to a node name rather than to
+/// `<unknown publisher>`.
+struct AuthorityConflict
+{
+  /// False until a conflict has been seen; the other fields are empty then.
+  bool observed = false;
+  /// The node that owns the edge, per §5.3's GID cache.
+  std::string owner;
+  /// The node whose samples are being dropped.
+  std::string intruder;
+  std::string parent;
+  std::string child;
 };
 
 /// A `tft_status` that a `tf_tree_ros` call could not proceed past.
@@ -177,9 +199,17 @@ public:
     return remap_;
   }
 
+  /// The most recent §5.4 authority conflict, or `{}` if there has been none.
+  /// A snapshot on the same terms as `stats()`, and for the same reason.
+  AuthorityConflict last_authority_conflict() const;
+
 private:
+  using Gid = std::array<uint8_t, 16>;
+
   void run(std::promise<tft_status> & ready);
   tft_status create_bridge();
+  void maybe_attribute(const uint8_t * gid);
+  bool attribute_from_graph(const Gid & wanted);
   void ingest(
     const tf2_msgs::msg::TFMessage & msg, const rclcpp::MessageInfo & info,
     tft_bridge_topic topic);
@@ -197,6 +227,10 @@ private:
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_static_;
 
+  /// §5.3's per-GID state, touched only from the ingest thread: how many graph
+  /// walks this GID has cost, or `kResolved` once one of them matched it.
+  std::map<Gid, uint32_t> gid_state_;
+
   /// Only ever touched from `thread_`.
   tft_bridge * bridge_ = nullptr;
   std::thread thread_;
@@ -206,8 +240,10 @@ private:
   /// `Send + Sync`, so it escapes the ingest thread. Freed by the destructor.
   tft_tree * tree_ = nullptr;
 
+  /// Guards both snapshots below. Held only for the copy.
   mutable std::mutex stats_mutex_;
   tft_bridge_stats stats_{};
+  AuthorityConflict conflict_;
 
   std::vector<std::pair<std::string, std::string>> remap_;
 

@@ -74,6 +74,14 @@ if(BUILD_TESTING)
   if(TARGET test_qos)
     target_link_libraries(test_qos tf_tree_ros)
   endif()
+
+  # §5.3 attribution and §5.4's diagnostic. The one thing here that cannot be
+  # checked anywhere else is that `MessageInfo::publisher_gid` and the graph's
+  # `endpoint_gid()` are the same 16 bytes on a real RMW.
+  ament_add_gtest(test_attribution test/test_attribution.cpp TIMEOUT 180)
+  if(TARGET test_attribution)
+    target_link_libraries(test_attribution tf_tree_ros)
+  endif()
 endif()
 
 ament_package()

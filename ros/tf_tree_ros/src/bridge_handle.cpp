@@ -131,9 +131,9 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
   const tft_status rc = done.get();
   if (rc != TFT_OK) {
     thread_.join();
-    // Drop the subscriptions so a caller that catches this is left with the
-    // node it handed us, not a node carrying two dead subscriptions on a group
-    // no executor drives.
+    // Drop the subscriptions and the timer so a caller that catches this is
+    // left with the node it handed us, not a node carrying dead entities on a
+    // group no executor drives.
     sub_tf_.reset();
     sub_static_.reset();
     throw BridgeError(rc, create_error_);
@@ -209,6 +209,86 @@ tft_status BridgeHandle::create_bridge()
   return TFT_OK;
 }
 
+namespace
+{
+/// A GID that a graph walk has matched. Distinct from any attempt count.
+constexpr uint32_t kResolved = UINT32_MAX;
+
+/// How many graph walks one unresolvable GID may cost before the bridge stops
+/// trying. §5.3 requires the bridge to keep running on an RMW that reports no
+/// usable GIDs at all, and without a cap that RMW would buy a graph walk per
+/// message forever.
+constexpr uint32_t kMaxAttempts = 20;
+}  // namespace
+
+void BridgeHandle::maybe_attribute(const uint8_t * gid)
+{
+  Gid key{};
+  std::memcpy(key.data(), gid, key.size());
+
+  // **The walk happens before the sample is offered, and that ordering is the
+  // whole point.** §5.3 says "refreshed on graph-change events"; a periodic
+  // refresh was tried first and is *wrong*, not merely late: under
+  // `FirstWriterWins` the very first sample from a publisher decides who owns
+  // the edge, and the owner's name is recorded then. A cache that catches up a
+  // second later leaves `<unknown publisher>` frozen in as the owner for the
+  // life of the bridge, and §5.4's headline diagnostic reads "<unknown
+  // publisher> and /impostor_ekf have both been publishing …" — which was
+  // measured, in this file's history, before this was written this way.
+  //
+  // Doing it on a *new GID* rather than on a graph event also keeps every call
+  // on the ingest thread, which the ABI's affinity rule requires: a graph event
+  // fires on whichever executor holds the node, and `tft_bridge_attribute` from
+  // there is `TFT_ERR_WRONG_THREAD`.
+  const auto it = gid_state_.emplace(key, 0u).first;
+  if (it->second == kResolved || it->second >= kMaxAttempts) {
+    return;
+  }
+  it->second++;
+  if (attribute_from_graph(key)) {
+    it->second = kResolved;
+  }
+  // Otherwise the endpoint is not in the graph yet — a sample can outrun
+  // discovery — and the next message from this GID walks again.
+}
+
+bool BridgeHandle::attribute_from_graph(const Gid & wanted)
+{
+  bool found = false;
+  for (const std::string * topic : {&opts_.tf_topic, &opts_.tf_static_topic}) {
+    for (const auto & info : node_->get_publishers_info_by_topic(*topic)) {
+      const auto & gid = info.endpoint_gid();
+
+      // An all-zero GID is what an RMW leaves when it has nothing to report,
+      // and `tft_bridge_attribute` refuses it — caching a name under that
+      // pattern would attribute every unattributed sample to one node. Skipping
+      // here rather than eating the error keeps the log clean on such an RMW,
+      // which §5.3 requires the bridge to survive.
+      Gid seen{};
+      bool all_zero = true;
+      for (size_t i = 0; i < seen.size(); i++) {
+        seen[i] = gid[i];
+        all_zero = all_zero && gid[i] == 0;
+      }
+      if (all_zero) {
+        continue;
+      }
+
+      // `node_namespace()` is "/" for a node in the default namespace, so a
+      // plain concatenation would produce "//odom_node".
+      std::string name = info.node_namespace();
+      if (name.empty() || name.back() != '/') {
+        name += '/';
+      }
+      name += info.node_name();
+
+      tft_bridge_attribute(bridge_, seen.data(), name.c_str());
+      found = found || seen == wanted;
+    }
+  }
+  return found;
+}
+
 void BridgeHandle::run(std::promise<tft_status> & ready)
 {
   // Everything the ABI's affinity check cares about happens on this thread:
@@ -247,6 +327,7 @@ void BridgeHandle::ingest(
   // every sample. A GID that resolves to no cached node is not an error — the
   // Rust side degrades it to `<unknown publisher>` and keeps running.
   const uint8_t * gid = info.get_rmw_message_info().publisher_gid.data;
+  maybe_attribute(gid);
 
   for (const auto & t : msg.transforms) {
     offer_one(t, gid, topic);
@@ -327,6 +408,35 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
       return;
 
     case TFT_BRIDGE_DROPPED:
+      if (out.reason == TFT_BRIDGE_REASON_NOT_THE_OWNER) {
+        // §5.4, and the reason §5.3's attribution exists at all: the diagnostic
+        // must name **both** nodes and the edge. "tf2 interleaves competing
+        // publishers by timestamp and produces a transform that is a nonsensical
+        // blend of two authorities, silently"; being able to say which two nodes
+        // is the whole value. Logging only `out.detail` here would throw the
+        // names away — the ABI sets `owner` and `intruder` precisely so a C
+        // caller can write this sentence.
+        if (out.first_time != 0) {
+          RCLCPP_ERROR(
+            log_,
+            "%s and %s have both been publishing %s -> %s. %s owns it; %s's samples are dropped.",
+            out.owner, out.intruder, out.parent, out.child, out.owner, out.intruder);
+        }
+        // **The record is not rate-limited and the log is.** `first_time` fires
+        // once per edge, and §5.3's GID cache refreshes on a 1 Hz timer, so a
+        // conflict seen in the first second names `<unknown publisher>` — which
+        // would then be frozen into the record for the life of the bridge if it
+        // were written under the same condition. The comparison keeps the cost
+        // to one uncontended lock and no allocation on the steady-state path.
+        const std::lock_guard<std::mutex> guard(stats_mutex_);
+        if (!conflict_.observed || conflict_.owner != out.owner ||
+          conflict_.intruder != out.intruder || conflict_.parent != out.parent ||
+          conflict_.child != out.child)
+        {
+          conflict_ = AuthorityConflict{true, out.owner, out.intruder, out.parent, out.child};
+        }
+        return;
+      }
       if (out.first_time != 0) {
         RCLCPP_WARN(
           log_, "%s -> %s dropped from %s: %s", out.parent, out.child, topic_name(topic),
@@ -378,6 +488,12 @@ tft_bridge_stats BridgeHandle::stats() const
 {
   const std::lock_guard<std::mutex> guard(stats_mutex_);
   return stats_;
+}
+
+AuthorityConflict BridgeHandle::last_authority_conflict() const
+{
+  const std::lock_guard<std::mutex> guard(stats_mutex_);
+  return conflict_;
 }
 
 }  // namespace tf_tree_ros
