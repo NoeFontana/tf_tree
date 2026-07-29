@@ -12,6 +12,19 @@ test: test-rust test-doc
 
 test-rust:
     cargo nextest run --workspace --no-tests=pass
+    # **`tf_tree_c`'s `bridge` feature is default-off, so `--workspace` compiles
+    # none of it.** `crates/tf_tree_c/src/bridge.rs` — nine `extern "C"` entry
+    # points, the only ones that both decide and write — could be replaced with
+    # literal garbage and `cargo build --workspace --all-targets`, this
+    # `nextest` line above and `cargo clippy --workspace --all-targets` all
+    # still passed; only `cargo fmt --check` noticed. Its 21 tests ran nowhere
+    # but the two `+nightly` rows of `just c-abi-check`, so on a machine without
+    # a nightly toolchain the §5 seam had no gate at all.
+    #
+    # This is the same shape `shm-check` exists for, one crate over: a
+    # default-off feature is invisible to `--workspace`, and a file nobody
+    # compiles is not a checked file.
+    cargo nextest run -p tf_tree_c --features bridge
 
 test-doc:
     cargo test --doc --workspace
@@ -56,8 +69,16 @@ c-abi-check:
     MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test publish
+    # The ingest-bridge seam (§5), behind the default-off `bridge` feature. It
+    # is the only entry point that both *decides* and *writes*, and its outcome
+    # POD hands C a fistful of `const char *` borrowed from the handle — a
+    # lifetime rule no compiler on either side enforces. Miri is what checks it.
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+        -p tf_tree_c -p tf_tree_core \
+        --features tf_tree_c/test-hooks,tf_tree_c/bridge,tf_tree_core/miri-soft-float \
+        --test bridge
     RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
-        --features test-hooks --target x86_64-unknown-linux-gnu -Zbuild-std
+        --features test-hooks,bridge --target x86_64-unknown-linux-gnu -Zbuild-std
 
 # **The committed C headers: drift check, then compile and run them.**
 #
@@ -81,7 +102,14 @@ c-header-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo xtask headers --check
-    cargo build --release -q -p tf_tree_c --features test-hooks
+    # **`bridge` is in this build, and the smoke test is compiled with
+    # `-DTFT_HAVE_BRIDGE`.** The bridge declarations are emitted inside
+    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the nine §5 entry
+    # points would be in the committed header and compiled by nothing — which is
+    # exactly the state that let a function and a typedef share the name
+    # `tft_bridge_stats` through a whole revision. A header nobody compiles is
+    # not a checked header.
+    cargo build --release -q -p tf_tree_c --features test-hooks,bridge
     inc=crates/tf_tree_c/include
     lib=target/release/libtf_tree_c.a
     src=crates/tf_tree_c/tests/c/abi_smoke.c
@@ -96,8 +124,8 @@ c-header-check:
         in="$src"
         case "$cc" in g++*|clang++*) in="$out/smoke.cpp";; esac
         printf '%-22s ' "$cc"
-        $cc -Wall -Wextra -Wpedantic -Werror -I "$inc" -o "$out/smoke" "$in" "$lib" \
-            -lpthread -ldl -lm
+        $cc -Wall -Wextra -Wpedantic -Werror -DTFT_HAVE_BRIDGE -I "$inc" \
+            -o "$out/smoke" "$in" "$lib" -lpthread -ldl -lm
         "$out/smoke"
     done
 
@@ -174,6 +202,15 @@ cpp-deps:
 lint: py-compile
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
+    # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
+    # above compiles none of it — two real warnings injected into `bridge.rs`
+    # left `clippy --workspace --all-targets` exiting 0. See `test-rust`.
+    cargo clippy -p tf_tree_c --features bridge --all-targets -- -D warnings
+    # `test-hooks` has the same hole: `tests/publish.rs` and `examples/abi_cost.rs`
+    # are `#![cfg(feature = "test-hooks")]`, so the workspace pass compiles them
+    # to nothing and `just c-abi-check` only ever runs `cargo test` over them.
+    # One real warning had been sitting in `publish.rs` unseen.
+    cargo clippy -p tf_tree_c --features test-hooks --all-targets -- -D warnings
 
 # **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
 #

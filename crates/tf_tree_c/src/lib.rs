@@ -62,6 +62,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(non_camel_case_types)]
 
+#[cfg(feature = "bridge")]
+pub mod bridge;
 pub mod error;
 pub mod layout;
 pub mod publisher;
@@ -74,14 +76,14 @@ use tf_tree::{Stamp, SystemDomain, Tree};
 
 pub use error::{
     tft_error, tft_last_error, tft_status, TFT_ERR_ABI_MISMATCH, TFT_ERR_ALREADY_CLAIMED,
-    TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL,
-    TFT_ERR_CHILD_DETACHED, TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION,
-    TFT_ERR_INTERNAL, TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION, TFT_ERR_NOT_DYNAMIC,
-    TFT_ERR_NOT_FINITE, TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_EDGE,
-    TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG, TFT_ERR_PARENT_MISMATCH, TFT_ERR_READ_ONLY,
-    TFT_ERR_RELEASED, TFT_ERR_RETRY, TFT_ERR_SLOT_CONTENDED, TFT_ERR_SLOT_RECYCLED,
-    TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP, TFT_ERR_UNKNOWN_FRAME,
-    TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
+    TFT_ERR_BAD_CONFIG, TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STRUCT_SIZE,
+    TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED, TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED,
+    TFT_ERR_EXTRAPOLATION, TFT_ERR_INTERNAL, TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION,
+    TFT_ERR_NOT_DYNAMIC, TFT_ERR_NOT_FINITE, TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES,
+    TFT_ERR_NO_EDGE, TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG, TFT_ERR_PARENT_MISMATCH,
+    TFT_ERR_READ_ONLY, TFT_ERR_RELEASED, TFT_ERR_RETRY, TFT_ERR_SLOT_CONTENDED,
+    TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP,
+    TFT_ERR_UNKNOWN_FRAME, TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
@@ -268,6 +270,21 @@ macro_rules! magic_check {
 
 magic_check!(check_tree, tft_tree, MAGIC_TREE);
 magic_check!(check_plan, tft_plan, MAGIC_PLAN);
+
+/// Wrap a share of an already-built tree in a fresh, independently owned handle.
+///
+/// The bridge builds the arena and then has to hand the node something it can
+/// read through. Handing out a *pointer into* the bridge would make the reader's
+/// lifetime the writer's problem in a language with no borrow checker; handing
+/// out another refcounted handle makes free order irrelevant, which is the same
+/// trade [`tft_plan::share`] already makes.
+#[cfg(feature = "bridge")]
+pub(crate) fn tree_handle(share: Arc<TreeShare>) -> Box<tft_tree> {
+    Box::new(tft_tree {
+        magic: MAGIC_TREE,
+        share,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle — §3.2

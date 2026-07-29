@@ -116,6 +116,10 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
 /// flat map ⇒ the undeclared budget is exceeded by 2.
 /// Mutant: give `Authority::owners` a `(String, String)` key and build one at
 /// the top of `admit` ⇒ the declared budget is exceeded by 2.
+/// Mutant: restore `NameNormalizer::normalize`'s
+/// `let first_sight = self.seen.insert(raw.to_string());` ⇒ both budgets are
+/// exceeded by 2, one owned key per frame allocated and dropped again on every
+/// message of a frame already seen.
 #[test]
 fn offer_does_not_allocate_for_its_table_lookups() {
     let publisher = Publisher::Node("/ekf".to_string());
@@ -123,13 +127,20 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     let declared = allocs_per_offer(&Sample::identity("odom", "base", 0), &publisher);
     let undeclared = allocs_per_offer(&Sample::identity("base", "lidar", 0), &publisher);
 
-    // Four: `NameNormalizer::normalize` is called once per frame and allocates
-    // twice — the owned normalized name it returns, and the raw spelling it
-    // interns to drive §5.6's "warn once per distinct frame". Nothing else on
-    // either path allocates in steady state. The budgets are equalities in
-    // spirit; `<=` so that removing an allocation is never a test failure.
-    const DECLARED_BUDGET: usize = 4;
-    const UNDECLARED_BUDGET: usize = 4;
+    // Two, one per frame: the owned normalized name `NameNormalizer::normalize`
+    // returns, which the caller keeps. Nothing else on either path allocates in
+    // steady state.
+    //
+    // It was four. The other two were `self.seen.insert(raw.to_string())`,
+    // driving §5.6's "warn once per distinct frame": `BTreeSet::insert` needs an
+    // owned key whether or not it stores one, so every message of an
+    // already-known frame built a `String` purely to discover it was already
+    // there. Probing with `contains` first borrows and allocates nothing.
+    //
+    // The budgets are equalities in spirit; `<=` so that removing an allocation
+    // is never a test failure.
+    const DECLARED_BUDGET: usize = 2;
+    const UNDECLARED_BUDGET: usize = 2;
 
     assert!(
         declared <= DECLARED_BUDGET,

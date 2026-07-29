@@ -26,6 +26,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 tf_tree = { workspace = true }
+# Optional, behind `bridge`. `tf_tree_bridge` depends only on `tf_tree`, so this
+# adds no third-party code to the C ABI's dependency graph — but it is still
+# weight a C caller who only reads transforms should not link, which is why the
+# feature is off by default.
+tf_tree_bridge = { workspace = true, optional = true }
 
 [features]
 # Test-only hook that forces a panic inside an `extern "C"` body, so §6.1's
@@ -33,6 +38,10 @@ tf_tree = { workspace = true }
 test-hooks = []
 # Pass through to tf_tree: tft_tree_open needs the shared-memory rendezvous.
 shm = ["tf_tree/shm"]
+# The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, the half that is not
+# `rclcpp`. Default-off: it is `docs/PHASE4.md` §3.1's *unstable* tier, and a
+# consumer that only reads transforms should not link the decision pipeline.
+bridge = ["dep:tf_tree_bridge"]
 
 [lints]
 workspace = true
@@ -43,3 +52,8 @@ workspace = true
 [[example]]
 name = "abi_cost"
 required-features = ["test-hooks"]
+
+# Same reason, one feature over: it drives the §5 seam, which is default-off.
+[[example]]
+name = "bridge_cost"
+required-features = ["bridge"]

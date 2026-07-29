@@ -266,7 +266,35 @@ pub(crate) fn read(layout: tft_layout, src: &[u8]) -> Option<Result<Iso3, ReadEr
 /// `[w, x, y, z]` slot indices, so the two quaternion orders share one body and
 /// cannot drift apart.
 fn read_quat7(src: &[u8], wxyz: [usize; 4]) -> Result<Iso3, ReadError> {
-    let v = get_f64s::<7>(src);
+    quat7(get_f64s::<7>(src), wxyz)
+}
+
+/// Validate and convert `[qw qx qy qz tx ty tz]` that is **already** seven
+/// `f64`s rather than caller bytes.
+///
+/// The bridge's samples arrive as an array in the ABI's own struct, not as an
+/// opaque buffer in a caller-chosen layout, so there is nothing to decode — but
+/// there is everything to check. Routing them through the same body as
+/// [`read`] is what makes "a NaN from `/tf` is refused exactly as a NaN from
+/// `tft_publisher_push` is" true by construction instead of by a second copy of
+/// the tolerances.
+#[cfg(feature = "bridge")]
+pub(crate) fn from_wxyz_pose(v: [f64; 7]) -> Result<Iso3, ReadError> {
+    quat7(v, [0, 1, 2, 3])
+}
+
+/// A one-line description of a rejected transform, for a diagnostic that is not
+/// a `tft_error`.
+#[cfg(feature = "bridge")]
+pub(crate) fn read_error_text(e: ReadError) -> &'static str {
+    match e {
+        ReadError::NotFinite => "the transform contains NaN or infinity",
+        ReadError::NotAUnitQuaternion => "the rotation is not a unit quaternion",
+        ReadError::NotARotationMatrix => "the rotation matrix is reflected or scaled",
+    }
+}
+
+fn quat7(v: [f64; 7], wxyz: [usize; 4]) -> Result<Iso3, ReadError> {
     if !v.iter().all(|x| x.is_finite()) {
         return Err(ReadError::NotFinite);
     }

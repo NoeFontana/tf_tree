@@ -1133,6 +1133,7 @@ name = "tf_tree_c"
 version = "0.1.0"
 dependencies = [
  "tf_tree",
+ "tf_tree_bridge",
 ]
 
 [[package]]

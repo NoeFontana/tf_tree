@@ -79,6 +79,8 @@ use std::fmt;
 
 use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Iso3, Quat, TreeBuilder, Vec3};
 
+use crate::names::NameNormalizer;
+
 // ---------------------------------------------------------------------------
 // The parsed config
 // ---------------------------------------------------------------------------
@@ -280,6 +282,59 @@ impl TopologyConfig {
             }
         }
         None
+    }
+
+    /// This topology with every declared frame name put through `names` —
+    /// §5.6's normalization, `tf_prefix` included.
+    ///
+    /// # Why the config is normalized and not only the wire
+    ///
+    /// §5.6's `tf_prefix` rewrites the names arriving on `/tf`. Everything
+    /// downstream keys on `(parent, child)`, and §5.8's amendment makes the
+    /// *config* the sole source of declared edges — so if only the wire side is
+    /// rewritten, a bridge with a prefix looks up `robot1/odom -> robot1/base`
+    /// in a table seeded with `odom -> base`, misses every time, and reports
+    /// every transform on the robot as an undeclared edge. The arena is built
+    /// from this same rewritten config, so the frame names a consumer looks up
+    /// are the prefixed ones too — there is no second set of names anywhere.
+    ///
+    /// The operator workflow is what settles the direction: `tf_tree topology
+    /// --discover` writes the names as they appear on the wire, and adding
+    /// `tf_prefix` for a second robot must not require hand-editing every name
+    /// in the file it just produced.
+    ///
+    /// **The same [`NameNormalizer`] instance the wire will use**, not a second
+    /// one configured the same way: passing it in is what makes the two sides
+    /// provably identical rather than merely similar, and it leaves the
+    /// normalizer's remap table populated with the declared frames before the
+    /// first message arrives — which is what §5.6 means by *"log the resulting
+    /// mapping table at startup"*.
+    ///
+    /// A name that does not normalize is kept verbatim. The only such name is a
+    /// bare `"/"`, which the parser accepts and which no wire name can ever
+    /// match afterwards, so the edge is simply one nothing can write — the same
+    /// outcome as dropping the declaration, without inventing a second failure
+    /// mode at create time.
+    #[must_use]
+    pub fn rewritten(&self, names: &mut NameNormalizer) -> TopologyConfig {
+        let mut rename = |s: &String| names.normalize(s).map_or_else(|_| s.clone(), |n| n.name);
+        TopologyConfig {
+            frames: self.frames.iter().map(&mut rename).collect(),
+            frame_headroom: self.frame_headroom,
+            default_interp: self.default_interp,
+            default_domain: self.default_domain,
+            edges: self
+                .edges
+                .iter()
+                .map(|e| EdgeConfig {
+                    parent: rename(&e.parent),
+                    child: rename(&e.child),
+                    shape: e.shape,
+                    interp: e.interp,
+                    domain: e.domain,
+                })
+                .collect(),
+        }
     }
 
     /// A [`TreeBuilder`] carrying exactly this topology.
