@@ -688,7 +688,7 @@ mod imp {
         }
         let (map, tool) = (ids[0].0, ids[ids.len() - 1].1);
 
-        let mut held: Option<(usize, tf_tree::EdgeWriter<'_>)> = None;
+        let mut held: Option<tf_tree::EdgeWriter<'_>> = None;
         let mut aim = now_nanos();
         // A bounded number of operations per attachment, so every child
         // re-attaches regularly instead of one lucky survivor holding the arena
@@ -713,7 +713,7 @@ mod imp {
                         // A refused claim is the correct answer when somebody
                         // else holds it. Only a *granted* one is interesting.
                         if let Ok(w) = tree.claim(c, p) {
-                            held = Some((i, w));
+                            held = Some(w);
                         }
                     }
                 }
@@ -729,7 +729,7 @@ mod imp {
                 18..=19 => return Ok(()),
                 // Publish.
                 20..=59 => {
-                    if let Some((_, w)) = &held {
+                    if let Some(w) = &held {
                         let iso = sample(rng, inject);
                         // `ClaimRevoked` is A4 working: this writer was judged
                         // dead, reaped, and is being fenced. Drop the claim and
