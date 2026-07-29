@@ -210,6 +210,14 @@ impl IngestReport {
             a.filtered_channels,
         );
         let _ = write!(s, ",\"truncated\":{}", a.truncated);
+        let _ = write!(s, ",\"bad_chunks\":{}", a.bad_chunks);
+        s.push_str(",\"bad_chunk_span_ns\":");
+        match a.bad_chunk_span_ns {
+            Some((lo, hi)) => {
+                let _ = write!(s, "[{lo},{hi}]");
+            }
+            None => s.push_str("null"),
+        }
         s.push_str(",\"first_reset_at_ns\":");
         match a.first_reset_at_ns {
             Some(v) => {
@@ -341,6 +349,28 @@ impl IngestReport {
             "the recording ends mid-record and was read up to that point; \
              every count below covers only the part that exists"
                 .to_owned(),
+        );
+        // Beside `truncated` and for the same reason: a skipped chunk means the
+        // counts below cover only part of the recording. The span is what makes it
+        // actionable — a bare count tells an operator nothing they can do.
+        row(
+            a.bad_chunks > 0,
+            match a.bad_chunk_span_ns {
+                Some((lo, hi)) => format!(
+                    "{} chunk(s) were unreadable and were skipped, losing the \
+                     transforms between {lo} and {hi} ns; every count below covers \
+                     only the part that could be read. Use --on-bad-chunk=halt to \
+                     refuse a recording that is not whole",
+                    a.bad_chunks
+                ),
+                None => format!(
+                    "{} chunk(s) were unreadable and were skipped, and their \
+                     headers named no message times, so what was lost cannot be \
+                     placed in time; every count below covers only the part that \
+                     could be read",
+                    a.bad_chunks
+                ),
+            },
         );
         row(
             a.zero_stamp_drops > 0,

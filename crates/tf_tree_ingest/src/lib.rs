@@ -71,6 +71,8 @@ mod spill;
 /// recording either works or reports why.
 mod decompress;
 
+pub use decompress::{BadChunkKind, ChunkCodec};
+
 #[cfg(feature = "fixture")]
 pub mod fixture;
 
@@ -83,7 +85,7 @@ pub use ingest::{
     Survey, DEFAULT_FUTURE_HORIZON_NS, DEFAULT_MAX_MEMORY_BYTES,
 };
 pub use report::IngestReport;
-pub use source::TopicRoles;
+pub use source::{OnBadChunk, TopicRoles};
 
 /// An index into [`Frames`], which is how a `Copy` error names a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,27 +134,48 @@ pub enum IngestError {
     Rosbag2Sqlite,
     /// A chunk uses zstd or lz4, which this build cannot decompress. See the
     /// crate docs for why, and for the one command that fixes it.
-    #[error("the recording uses compressed chunks, which this build cannot read")]
-    CompressedChunk,
+    ///
+    /// **Never skippable, unlike [`IngestError::BadChunk`].** Every chunk in a
+    /// recording uses the same codec, so skipping them all would yield
+    /// [`IngestError::NoTransforms`] — an answer that explains nothing about a
+    /// file which is perfectly intact.
+    #[error("the recording uses {codec}-compressed chunks, which this build cannot read")]
+    CompressedChunk {
+        /// Which codec, as far as it could be identified.
+        codec: decompress::ChunkCodec,
+    },
+    /// A chunk was unreadable and the policy was
+    /// [`OnBadChunk::Halt`](ingest::OnBadChunk::Halt).
+    ///
+    /// It names the chunk, and that is not decoration — the same reason
+    /// [`cdr::CdrError`] carries a byte offset. "Chunk 3 of 812 failed its CRC" is
+    /// a damaged recording; "chunk 0 failed", and then 811 more, is a file that is
+    /// not what it claims to be, and the two want different responses.
+    #[error("chunk {chunk} is unreadable: {kind}")]
+    BadChunk {
+        /// Zero-based index of the chunk in read order.
+        ///
+        /// An ordinal rather than a byte offset because it is what `mcap info`
+        /// numbers chunks by, and so is directly comparable against it.
+        chunk: u64,
+        /// What was wrong with it.
+        kind: decompress::BadChunkKind,
+    },
     /// A `TFMessage` payload could not be decoded.
     #[error("bad TFMessage payload: {0}")]
     Cdr(cdr::CdrError),
     /// No TF channel in the recording carried a decodable transform.
     #[error("the recording contains no tf2_msgs/msg/TFMessage transforms")]
     NoTransforms,
-    /// The recording was cut before any complete chunk, so nothing could be read
-    /// — distinct from [`IngestError::NoTransforms`], which means the recording
-    /// is whole and simply has no TF in it.
+    /// The recording is truncated and its surviving prefix held no transform —
+    /// distinct from [`IngestError::NoTransforms`], which means the recording is
+    /// whole and simply has no TF in it.
     ///
-    /// **Why this needs its own variant.** Reading takes chunks whole (see
-    /// `source::read_tf`), so recovery from truncation is *chunk*-granular: a
-    /// recording cut mid-chunk loses that chunk entirely. On a real recording,
-    /// chunked at 1–4 MiB, that costs the final chunk and no more. On a small one
-    /// that fits in a single chunk it costs everything — and reporting that as
-    /// "this recording contains no transforms" sends the user looking for a
-    /// publisher that was never running, when the truth is their file is
-    /// incomplete.
-    #[error("the recording is truncated before the end of its first chunk, so no transforms could be read")]
+    /// **Why this needs its own variant.** The two are indistinguishable from the
+    /// outside and have opposite remedies. Reporting an incomplete file as "this
+    /// recording contains no transforms" sends the user looking for a publisher
+    /// that was never running, when what they have is a recorder that was killed.
+    #[error("the recording is truncated, and the part that survived holds no transforms")]
     TruncatedBeforeAnyChunk,
     /// An edge appeared on both a static and a dynamic topic (§3.2 — a hard
     /// error naming the timestamp).

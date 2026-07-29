@@ -26,8 +26,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-use mcap::sans_io::{LinearReadEvent, LinearReader};
-
 use crate::cdr::{decode_tf_message, CdrError};
 use crate::decompress;
 use crate::IngestError;
@@ -44,6 +42,17 @@ const TF_SCHEMAS: [&str; 2] = ["tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"];
 /// See the option's comment in [`read_tf`]. This is a bound on a corrupt length
 /// field, not a format limit.
 const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Length of MCAP's file magic, at both ends of a complete recording.
+const MAGIC_LEN: usize = 8;
+
+/// A record's framing: `opcode: u8` then `len: u64` little-endian.
+///
+/// This module owns the framing and `mcap::parse_record` owns every record
+/// *body*, which is the split that matters: nine bytes of length prefix are
+/// trivial and we already walk them inside chunks, whereas a `Schema`,
+/// `Channel` or `Message` body is not ours to re-derive.
+const RECORD_HEADER_LEN: usize = 1 + 8;
 
 /// How a topic name decides whether its edges are static.
 ///
@@ -130,6 +139,38 @@ struct ChannelRole {
     is_static: bool,
 }
 
+/// What to do about a chunk that does not decompress or does not check out.
+///
+/// # Why the default is to skip
+///
+/// One bad chunk in four hundred thousand must not lose the recording, and here
+/// the skip is **exact rather than heuristic**: the framing gave us the chunk's
+/// declared length, so we resume on the next record boundary with no
+/// resynchronisation guess. That is a stronger position than the general
+/// "truncated bags are how the field works" argument, and it is why this is a
+/// default rather than an opt-in.
+///
+/// # What a skip costs, which the report must say
+///
+/// Chunks carry `Schema` and `Channel` records as well as messages. If the
+/// skipped chunk held the only `Channel` record for `/tf`, every later message on
+/// that channel is dropped as belonging to an unknown channel — and that drop has
+/// no counter of its own. So the report puts the skip beside `truncated`, with the
+/// same "the counts below cover only part of the recording" framing, and carries
+/// the *time span* that was lost.
+///
+/// Both passes read the same file, so a deterministic bad chunk is skipped
+/// identically in the survey and the fill, and the two stay consistent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnBadChunk {
+    /// Skip it, count it, and report the span it covered. **The default.**
+    #[default]
+    Skip,
+    /// Fail, naming the chunk — for a user who must know the recording is whole
+    /// before trusting a number derived from it.
+    Halt,
+}
+
 /// Counts of what the reader declined to decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SkipCounts {
@@ -137,17 +178,30 @@ pub struct SkipCounts {
     pub non_cdr: u64,
     /// Channels carrying the TF schema that the topic filter excluded.
     pub filtered_channels: u64,
-    /// The recording ended mid-record or without its end magic: everything up to
-    /// that point was read and the rest does not exist. See [`read_tf`].
+    /// The recording ended mid-record: everything up to that point was read and
+    /// the rest does not exist. See [`read_tf`].
     ///
-    /// **Recovery is chunk-granular, not record-granular.** Chunks are taken
-    /// whole (`crate::decompress` says why), so the reader needs a complete chunk
-    /// record before it emits anything from inside it: a recording cut mid-chunk
-    /// loses that entire chunk, not merely the records past the cut. Chunked at a
-    /// real 1–4 MiB that costs the final chunk; on a recording small enough to
-    /// fit in one chunk it costs all of it, which is what
-    /// [`IngestError::TruncatedBeforeAnyChunk`] exists to say out loud.
+    /// **Recovery is record-granular, including inside a chunk.** A recording cut
+    /// mid-chunk still yields every whole record in that chunk's prefix, which is
+    /// why this module owns the record framing rather than asking a reader for
+    /// complete records only — see [`RECORD_HEADER_LEN`].
+    ///
+    /// The one case that cannot be recovered is a truncated *compressed* chunk: a
+    /// partial codec frame is not decodable by a one-shot decoder, so that chunk's
+    /// records are lost even though its prefix is on disk. The bound is one chunk,
+    /// and [`bad_chunks`](SkipCounts::bad_chunks) does not count it — nothing is
+    /// wrong with the chunk, the file simply stops inside it.
     pub truncated: bool,
+    /// Chunks that did not decompress or did not check out, and were skipped
+    /// under [`OnBadChunk::Skip`](crate::ingest::OnBadChunk::Skip).
+    pub bad_chunks: u64,
+    /// The span the skipped chunks covered, from their own declared message
+    /// times.
+    ///
+    /// A count alone is not actionable. "Three chunks were unreadable" tells an
+    /// operator nothing they can do; "the transforms between 14:22:07 and
+    /// 14:22:19 are missing" tells them which part of the run to distrust.
+    pub bad_chunk_span_ns: Option<(u64, u64)>,
 }
 
 /// The first sixteen bytes of every SQLite database file, including a rosbag2
@@ -185,7 +239,12 @@ fn is_sqlite(input: &mut BufReader<File>) -> Result<bool, IngestError> {
 /// cannot decompress (see the crate docs), [`IngestError::Mcap`] for a malformed
 /// file, [`IngestError::Cdr`] for a payload that is not a decodable `TFMessage`,
 /// or whatever the callback returned.
-pub fn read_tf<F>(path: &Path, roles: &TopicRoles, mut f: F) -> Result<SkipCounts, IngestError>
+pub fn read_tf<F>(
+    path: &Path,
+    roles: &TopicRoles,
+    on_bad_chunk: OnBadChunk,
+    mut f: F,
+) -> Result<SkipCounts, IngestError>
 where
     F: FnMut(RawRecord<'_>) -> Result<(), IngestError>,
 {
@@ -196,121 +255,241 @@ where
     if is_sqlite(&mut input)? {
         return Err(IngestError::Rosbag2Sqlite);
     }
-    let mut reader = LinearReader::new_with_options(
-        mcap::sans_io::LinearReaderOptions::default()
-            // **A truncated recording is read up to the truncation point.**
-            //
-            // The default requires the end magic, so a file whose recorder was
-            // SIGKILLed, whose disk filled, or whose copy was interrupted fails
-            // wholesale with `Mcap` — zero transforms out of a recording that is
-            // 90 % intact, and a message ("not a well-formed MCAP recording")
-            // that is wrong: the file is well-formed, it is incomplete. MCAP is
-            // designed to be readable up to the point it stops, and an *offline
-            // forensic* tool that discards a whole recording because the tail is
-            // missing inverts its own use case — §3.3's `freeze --from-live`
-            // exists to "capture a fault in the field", and a fault in the field
-            // is how recordings get truncated.
-            //
-            // The cost is that genuine tail corruption is no longer detected
-            // here. It was never detected *well*: the end magic says nothing
-            // about the records before it.
-            .with_skip_end_magic(true)
-            // A record header is a caller-supplied `u64` length. Without a limit
-            // a corrupt one asks for a multi-gigabyte allocation before anything
-            // validates it — the same failure `cdr::ImplausibleCount` exists to
-            // stop one layer down, and the guard was available here and switched
-            // off. 256 MiB is far above any real MCAP record (a chunk is
-            // typically 1–8 MiB) and far below a length that can exhaust memory.
-            //
-            // **With `emit_chunks` below, this now bounds whole chunk records**,
-            // i.e. compressed size, rather than the records inside them. That is
-            // a larger unit than before and the limit still comfortably clears a
-            // real chunk; the *decompressed* bound is a separate question and
-            // belongs to `crate::decompress`.
-            .with_record_length_limit(MAX_RECORD_BYTES)
-            // **Chunks are handed to us whole and this crate reads inside them.**
-            //
-            // `mcap` is taken `default-features = false` (`docs/PHASE2.md` §2
-            // forbids the C build step its `zstd`/`lz4` features vendor), so the
-            // crate's own `get_decompressor` can only ever return
-            // `UnsupportedCompression` — which is why a compressed recording was
-            // refused outright. `emit_chunks` routes around it: the reader's
-            // `opcode == op::CHUNK && !emit_chunks` guard stops applying, the
-            // chunk falls through to the generic record path, and the
-            // decompressor factory is never reached. See `crate::decompress`.
-            //
-            // The crate's own buffer-based reader ships this same setting, so it
-            // is an exercised configuration rather than a clever one.
-            .with_emit_chunks(true),
-    );
+    // **The start magic is the one thing that separates "incomplete" from "not an
+    // MCAP at all".** Everything below tolerates a short file; this does not, so a
+    // JPEG handed to `tf_tree ingest` fails here with a clear reason rather than
+    // being read as a recording containing nothing.
+    let mut magic = [0u8; MAGIC_LEN];
+    read_exact_or_eof(&mut input, &mut magic)?;
+    if magic != *mcap::MAGIC {
+        return Err(IngestError::Mcap);
+    }
 
-    // Our own accumulators. The `sans_io` reader emits raw records and leaves
-    // schema/channel bookkeeping to the caller, which suits us: we only need
-    // two fields out of each and never the schema payload.
+    // Our own accumulators. Records are parsed by `mcap::parse_record`; what this
+    // module owns is which bytes are a record, and the bookkeeping across them.
     let mut book = Bookkeeping::default();
     let mut skips = SkipCounts::default();
-    // One buffer for the whole file, not one per chunk. Unused while no codec is
-    // compiled in — an uncompressed chunk is read by borrow — but the caller is
-    // where it has to live, because that is what makes the reuse possible at all.
+    // One buffer for the whole file, reused for every record body, and a second
+    // for decompression. Neither grows past `MAX_RECORD_BYTES`.
+    let mut body: Vec<u8> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
+    let mut chunk_ordinal: u64 = 0;
 
-    while let Some(event) = reader.next_event() {
-        // **A truncated recording is a short recording, not a broken one.**
+    loop {
+        // **A truncated recording is a short recording, not a broken one, and
+        // the cut is honoured at *record* granularity — including inside a
+        // chunk.**
         //
-        // `UnexpectedEof` is what the reader returns when the file stops in the
-        // middle of a record — a recorder that was SIGKILLed, a disk that
-        // filled, an interrupted copy. Every record before the cut is intact and
-        // has already been handed to `f`. Propagating the error would throw all
-        // of it away, which for an *offline forensic* tool is the wrong trade:
-        // §3.3's `freeze --from-live` exists to "capture a fault in the field",
-        // and a fault in the field is how recordings get truncated.
+        // A recorder that was SIGKILLed, a disk that filled, an interrupted copy:
+        // every record before the cut is intact and belongs to the caller.
+        // Discarding them would invert this tool's own use case, since §3.3's
+        // `freeze --from-live` exists to "capture a fault in the field" and a
+        // fault in the field is how recordings get truncated.
         //
-        // The prefix is kept and the fact is recorded, so the report can say so
-        // loudly rather than the tool pretending the file was whole. What this
-        // costs is that tail corruption now reads as truncation; it was never
-        // distinguished well anyway, because the end magic says nothing about
-        // the records before it. A file that is not an MCAP at all still fails,
-        // on the *start* magic, before any of this.
-        let event = match event {
-            Ok(e) => e,
-            Err(mcap::McapError::UnexpectedEof) => {
+        // The prefix is kept and the fact recorded, so the report says so loudly
+        // rather than pretending the file was whole. What this costs is that
+        // genuine tail corruption reads as truncation — it was never distinguished
+        // well anyway, because the end magic says nothing about the records before
+        // it.
+        let mut header = [0u8; RECORD_HEADER_LEN];
+        match read_full(&mut input, &mut header)? {
+            // A clean end: either the footer's magic was consumed as a record
+            // above, or the file simply stops on a record boundary.
+            0 => break,
+            // **The end magic, which is eight bytes and therefore one short of a
+            // record header.** A complete recording ends `Footer` then MAGIC, so
+            // without this a healthy file reports itself truncated on its very
+            // last eight bytes.
+            MAGIC_LEN if header[..MAGIC_LEN] == *mcap::MAGIC => break,
+            n if n < RECORD_HEADER_LEN => {
                 skips.truncated = true;
                 break;
             }
-            Err(e) => return Err(map_mcap(&e)),
+            _ => {}
+        }
+        let opcode = header[0];
+        // Infallible: `header[1..9]` is exactly eight bytes.
+        let len_bytes: [u8; 8] = match header[1..RECORD_HEADER_LEN].try_into() {
+            Ok(b) => b,
+            Err(_) => return Err(IngestError::Mcap),
         };
-        match event {
-            LinearReadEvent::ReadRequest(want) => {
-                let n = input
-                    .read(reader.insert(want))
-                    .map_err(|e| IngestError::Io {
-                        raw_os_error: e.raw_os_error().unwrap_or(0),
-                    })?;
-                reader.notify_read(n);
-            }
-            LinearReadEvent::Record { data, opcode } => {
-                let rec = mcap::parse_record(opcode, data).map_err(|e| map_mcap(&e))?;
-                // **A chunk is the one record that contains other records.**
-                //
-                // Everything the recording says about schemas, channels and
-                // messages can appear either at the top level or inside a chunk
-                // — a file written with a summary section has its schemas and
-                // channels in both places, and one written without has them only
-                // inside. So the same handler serves both, and the only thing
-                // this arm adds is unwrapping the container.
-                if let mcap::records::Record::Chunk { header, data } = rec {
-                    let records = decompress::chunk_records(&header, &data, &mut scratch)?;
-                    decompress::for_each_inner_record(records, |op, body| {
-                        let inner = mcap::parse_record(op, body).map_err(|e| map_mcap(&e))?;
-                        handle_record(inner, &mut book, roles, &mut skips, &mut f)
-                    })?;
-                } else {
-                    handle_record(rec, &mut book, roles, &mut skips, &mut f)?;
-                }
-            }
+        let declared = u64::from_le_bytes(len_bytes);
+        // A record header is a length straight off disk. Without this bound a
+        // corrupt one asks for a multi-gigabyte allocation before anything
+        // validates it — the same failure `cdr::ImplausibleCount` stops one layer
+        // down. 256 MiB is far above any real record (a chunk is typically
+        // 1–8 MiB) and far below a length that can exhaust memory.
+        let Ok(want) = usize::try_from(declared) else {
+            return Err(IngestError::Mcap);
+        };
+        if want > MAX_RECORD_BYTES {
+            return Err(IngestError::Mcap);
+        }
+        body.clear();
+        body.resize(want, 0);
+        let got = read_full(&mut input, &mut body)?;
+        // **This is the branch the whole rewrite exists for.** A record cut short
+        // by the end of the file is not simply dropped: if it is a chunk, its
+        // prefix still holds complete records, and those are recovered. Asking a
+        // reader for whole records only would lose every transform in the final
+        // chunk — up to a few megabytes of a real recording, and all of a small
+        // one.
+        let complete = got == want;
+        if !complete {
+            skips.truncated = true;
+            body.truncate(got);
+        }
+
+        if opcode == mcap::records::op::CHUNK {
+            chunk_ordinal += 1;
+            read_chunk(
+                &body,
+                complete,
+                chunk_ordinal - 1,
+                on_bad_chunk,
+                &mut scratch,
+                &mut book,
+                roles,
+                &mut skips,
+                &mut f,
+            )?;
+        } else if complete {
+            // A truncated non-chunk record has no recoverable interior — a
+            // partial `Message` body is a partial CDR payload, and decoding one
+            // would invent a transform.
+            let rec = mcap::parse_record(opcode, &body).map_err(|e| map_mcap(&e))?;
+            handle_record(rec, &mut book, roles, &mut skips, &mut f)?;
+        }
+        if !complete {
+            break;
         }
     }
     Ok(skips)
+}
+
+/// Read exactly `buf.len()` bytes, or as many as the file has left.
+///
+/// Returns how many were read. `Read::read` is allowed to return short without
+/// being at EOF, so a single call cannot distinguish "the file ends here" from
+/// "the pipe had less ready" — which is exactly the distinction truncation
+/// handling turns on.
+fn read_full(input: &mut BufReader<File>, buf: &mut [u8]) -> Result<usize, IngestError> {
+    let mut at = 0;
+    while at < buf.len() {
+        let n = input.read(&mut buf[at..]).map_err(|e| IngestError::Io {
+            raw_os_error: e.raw_os_error().unwrap_or(0),
+        })?;
+        if n == 0 {
+            break;
+        }
+        at += n;
+    }
+    Ok(at)
+}
+
+/// [`read_full`], but a short read is an error rather than a count. For the magic,
+/// where a short file is not a recording at all.
+fn read_exact_or_eof(input: &mut BufReader<File>, buf: &mut [u8]) -> Result<(), IngestError> {
+    if read_full(input, buf)? == buf.len() {
+        Ok(())
+    } else {
+        Err(IngestError::Mcap)
+    }
+}
+
+/// Read the records inside one chunk record's body.
+///
+/// `complete` is false when the file ended inside this chunk. A truncated
+/// *uncompressed* chunk still yields every whole record in its prefix; the
+/// trailing fragment is expected in that case and is not reported as corruption.
+#[allow(clippy::too_many_arguments)]
+fn read_chunk<F>(
+    body: &[u8],
+    complete: bool,
+    ordinal: u64,
+    on_bad_chunk: OnBadChunk,
+    scratch: &mut Vec<u8>,
+    book: &mut Bookkeeping,
+    roles: &TopicRoles,
+    skips: &mut SkipCounts,
+    f: &mut F,
+) -> Result<(), IngestError>
+where
+    F: FnMut(RawRecord<'_>) -> Result<(), IngestError>,
+{
+    // **A chunk is the one record that contains other records.**
+    //
+    // Everything a recording says about schemas, channels and messages can appear
+    // either at the top level or inside a chunk: a file written with a summary
+    // section has its schemas and channels in both places, one written without has
+    // them only inside. So the same handler serves both.
+    // The chunk header's message times, kept before the body is consumed so a
+    // skipped chunk can report the span it took with it.
+    let span = decompress::chunk_span(body);
+    let records = match decompress::chunk_records(body, complete, scratch) {
+        Ok(r) => r,
+        Err(fault) => return note_or_fail(fault, ordinal, on_bad_chunk, span, skips),
+    };
+    // A truncated chunk's records field ends mid-record by construction, so the
+    // fragment the walk would otherwise report is the truncation we already know
+    // about.
+    let tolerate_tail = !complete;
+    match decompress::for_each_record(records, tolerate_tail, |op, inner| {
+        let rec = mcap::parse_record(op, inner).map_err(|e| map_mcap(&e))?;
+        handle_record(rec, book, roles, skips, f)
+    }) {
+        Ok(()) => Ok(()),
+        Err(fault) => note_or_fail(fault, ordinal, on_bad_chunk, span, skips),
+    }
+}
+
+/// Skip a bad chunk and count it, or fail naming it, per the policy.
+///
+/// Two faults are **never** skippable, and both for the same reason: skipping
+/// them would answer a question the user did not ask.
+///
+/// * [`ChunkFault::Unsupported`] — every chunk in a recording uses the same codec,
+///   so skipping them all yields "no transforms" about a file that is perfectly
+///   intact.
+/// * [`ChunkFault::Callback`] — the caller's own verdict on a transform (an
+///   edge-kind change, a clock reset under `halt`). Swallowing it would convert a
+///   hard error into silent data loss, which is the exact inversion this policy
+///   exists to avoid.
+fn note_or_fail(
+    fault: decompress::ChunkFault,
+    ordinal: u64,
+    on_bad_chunk: OnBadChunk,
+    span: Option<(u64, u64)>,
+    skips: &mut SkipCounts,
+) -> Result<(), IngestError> {
+    let skippable = matches!(fault, decompress::ChunkFault::Bad(_));
+    if !skippable || on_bad_chunk == OnBadChunk::Halt {
+        return Err(chunk_error(fault, ordinal));
+    }
+    skips.bad_chunks += 1;
+    if let Some((lo, hi)) = span {
+        skips.bad_chunk_span_ns = Some(match skips.bad_chunk_span_ns {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
+    }
+    Ok(())
+}
+
+/// Join a chunk fault to the ordinal of the chunk it came from.
+///
+/// A callback failure passes straight through: it is the caller's own verdict on
+/// a transform, not a fact about the chunk, and dressing it as one would let a
+/// skip policy swallow a hard error.
+fn chunk_error(fault: decompress::ChunkFault, ordinal: u64) -> IngestError {
+    match fault {
+        decompress::ChunkFault::Unsupported(codec) => IngestError::CompressedChunk { codec },
+        decompress::ChunkFault::Bad(kind) => IngestError::BadChunk {
+            chunk: ordinal,
+            kind,
+        },
+        decompress::ChunkFault::Callback(e) => e,
+    }
 }
 
 /// Schema and channel state accumulated as the recording is read.
@@ -417,7 +596,13 @@ where
 /// reachable on ordinary recordings.
 fn map_mcap(e: &mcap::McapError) -> IngestError {
     match e {
-        mcap::McapError::UnsupportedCompression(_) => IngestError::CompressedChunk,
+        // Unreachable in practice now that this crate decides about codecs
+        // itself — `crate::decompress` classifies the chunk before `mcap` ever
+        // sees a compression field. Mapped rather than dropped so the arm cannot
+        // rot into a wrong one if that ever changes.
+        mcap::McapError::UnsupportedCompression(_) => IngestError::CompressedChunk {
+            codec: decompress::ChunkCodec::Other,
+        },
         _ => IngestError::Mcap,
     }
 }
