@@ -29,6 +29,7 @@ use std::path::Path;
 use mcap::sans_io::{LinearReadEvent, LinearReader};
 
 use crate::cdr::{decode_tf_message, CdrError};
+use crate::decompress;
 use crate::IngestError;
 
 /// The schema names this reader accepts, newest first.
@@ -138,6 +139,14 @@ pub struct SkipCounts {
     pub filtered_channels: u64,
     /// The recording ended mid-record or without its end magic: everything up to
     /// that point was read and the rest does not exist. See [`read_tf`].
+    ///
+    /// **Recovery is chunk-granular, not record-granular.** Chunks are taken
+    /// whole (`crate::decompress` says why), so the reader needs a complete chunk
+    /// record before it emits anything from inside it: a recording cut mid-chunk
+    /// loses that entire chunk, not merely the records past the cut. Chunked at a
+    /// real 1–4 MiB that costs the final chunk; on a recording small enough to
+    /// fit in one chunk it costs all of it, which is what
+    /// [`IngestError::TruncatedBeforeAnyChunk`] exists to say out loud.
     pub truncated: bool,
 }
 
@@ -212,16 +221,38 @@ where
             // stop one layer down, and the guard was available here and switched
             // off. 256 MiB is far above any real MCAP record (a chunk is
             // typically 1–8 MiB) and far below a length that can exhaust memory.
-            .with_record_length_limit(MAX_RECORD_BYTES),
+            //
+            // **With `emit_chunks` below, this now bounds whole chunk records**,
+            // i.e. compressed size, rather than the records inside them. That is
+            // a larger unit than before and the limit still comfortably clears a
+            // real chunk; the *decompressed* bound is a separate question and
+            // belongs to `crate::decompress`.
+            .with_record_length_limit(MAX_RECORD_BYTES)
+            // **Chunks are handed to us whole and this crate reads inside them.**
+            //
+            // `mcap` is taken `default-features = false` (`docs/PHASE2.md` §2
+            // forbids the C build step its `zstd`/`lz4` features vendor), so the
+            // crate's own `get_decompressor` can only ever return
+            // `UnsupportedCompression` — which is why a compressed recording was
+            // refused outright. `emit_chunks` routes around it: the reader's
+            // `opcode == op::CHUNK && !emit_chunks` guard stops applying, the
+            // chunk falls through to the generic record path, and the
+            // decompressor factory is never reached. See `crate::decompress`.
+            //
+            // The crate's own buffer-based reader ships this same setting, so it
+            // is an exercised configuration rather than a clever one.
+            .with_emit_chunks(true),
     );
 
     // Our own accumulators. The `sans_io` reader emits raw records and leaves
     // schema/channel bookkeeping to the caller, which suits us: we only need
     // two fields out of each and never the schema payload.
-    let mut tf_schema_ids: HashMap<u16, ()> = HashMap::new();
-    let mut channels: HashMap<u16, ChannelRole> = HashMap::new();
-    let mut seen_channels: HashSet<u16> = HashSet::new();
+    let mut book = Bookkeeping::default();
     let mut skips = SkipCounts::default();
+    // One buffer for the whole file, not one per chunk. Unused while no codec is
+    // compiled in — an uncompressed chunk is read by borrow — but the caller is
+    // where it has to live, because that is what makes the reuse possible at all.
+    let mut scratch: Vec<u8> = Vec::new();
 
     while let Some(event) = reader.next_event() {
         // **A truncated recording is a short recording, not a broken one.**
@@ -258,74 +289,125 @@ where
                 reader.notify_read(n);
             }
             LinearReadEvent::Record { data, opcode } => {
-                match mcap::parse_record(opcode, data).map_err(|e| map_mcap(&e))? {
-                    mcap::records::Record::Schema { header, .. }
-                        if TF_SCHEMAS.contains(&header.name.as_str()) =>
-                    {
-                        tf_schema_ids.insert(header.id, ());
-                    }
-                    mcap::records::Record::Channel(ch) => {
-                        if !tf_schema_ids.contains_key(&ch.schema_id) {
-                            continue;
-                        }
-                        // **A channel is counted once, not once per record.**
-                        // MCAP repeats every Schema and Channel record in the
-                        // summary section at the end of the file, so a linear
-                        // read sees each of them twice. Without this, the
-                        // report's "TF channels were skipped" line says two for
-                        // one channel — a number a user cannot reconcile with
-                        // their recording.
-                        if !seen_channels.insert(ch.id) {
-                            continue;
-                        }
-                        if !roles.selects(&ch.topic) {
-                            skips.filtered_channels += 1;
-                            continue;
-                        }
-                        // ROS 2 writes `cdr`; a `json`/`protobuf` channel with
-                        // the TF schema name is possible and is not ours to
-                        // decode. Counted, not silently dropped.
-                        if ch.message_encoding != "cdr" {
-                            skips.non_cdr += 1;
-                            continue;
-                        }
-                        let is_static = roles.is_static(&ch.topic);
-                        channels.insert(
-                            ch.id,
-                            ChannelRole {
-                                topic: ch.topic,
-                                is_static,
-                            },
-                        );
-                    }
-                    mcap::records::Record::Message { header, data } => {
-                        let Some(role) = channels.get(&header.channel_id) else {
-                            continue;
-                        };
-                        // `log_time` is a `u64` of nanoseconds since the epoch;
-                        // a value past `i64::MAX` is 2262 and is corrupt, so it
-                        // saturates rather than wrapping into the past — which
-                        // would make the future-stamp check fire on every
-                        // message instead of none.
-                        let log_time_ns = i64::try_from(header.log_time).unwrap_or(i64::MAX);
-                        for t in decode_tf_message(&data).map_err(IngestError::Cdr)? {
-                            f(RawRecord {
-                                topic: &role.topic,
-                                is_static: role.is_static,
-                                log_time_ns,
-                                stamp_ns: t.stamp_ns,
-                                parent: &t.frame_id,
-                                child: &t.child_frame_id,
-                                pose: t.pose,
-                            })?;
-                        }
-                    }
-                    _ => {}
+                let rec = mcap::parse_record(opcode, data).map_err(|e| map_mcap(&e))?;
+                // **A chunk is the one record that contains other records.**
+                //
+                // Everything the recording says about schemas, channels and
+                // messages can appear either at the top level or inside a chunk
+                // — a file written with a summary section has its schemas and
+                // channels in both places, and one written without has them only
+                // inside. So the same handler serves both, and the only thing
+                // this arm adds is unwrapping the container.
+                if let mcap::records::Record::Chunk { header, data } = rec {
+                    let records = decompress::chunk_records(&header, &data, &mut scratch)?;
+                    decompress::for_each_inner_record(records, |op, body| {
+                        let inner = mcap::parse_record(op, body).map_err(|e| map_mcap(&e))?;
+                        handle_record(inner, &mut book, roles, &mut skips, &mut f)
+                    })?;
+                } else {
+                    handle_record(rec, &mut book, roles, &mut skips, &mut f)?;
                 }
             }
         }
     }
     Ok(skips)
+}
+
+/// Schema and channel state accumulated as the recording is read.
+///
+/// Extracted so [`handle_record`] can serve both the top-level record stream and
+/// the records inside a chunk. Before `emit_chunks` these lived as three locals
+/// in the event loop; a chunk's contents would now need a second copy of every
+/// rule, and two copies of "is this channel one of ours" is exactly the drift
+/// worth preventing.
+#[derive(Default)]
+struct Bookkeeping {
+    /// Ids of schemas whose name is one of [`TF_SCHEMAS`].
+    tf_schema_ids: HashMap<u16, ()>,
+    /// Channels carrying such a schema with a `cdr` encoding, and their role.
+    channels: HashMap<u16, ChannelRole>,
+    /// Channel ids already classified, so the summary section's repeat of every
+    /// Schema and Channel record is not counted twice.
+    seen_channels: HashSet<u16>,
+}
+
+/// Fold one record into the bookkeeping, emitting transforms for a TF message.
+///
+/// Records other than Schema, Channel and Message are ignored, which includes
+/// the `MessageIndex` records that follow every chunk and become visible under
+/// `emit_chunks`.
+fn handle_record<F>(
+    rec: mcap::records::Record<'_>,
+    book: &mut Bookkeeping,
+    roles: &TopicRoles,
+    skips: &mut SkipCounts,
+    f: &mut F,
+) -> Result<(), IngestError>
+where
+    F: FnMut(RawRecord<'_>) -> Result<(), IngestError>,
+{
+    match rec {
+        mcap::records::Record::Schema { header, .. }
+            if TF_SCHEMAS.contains(&header.name.as_str()) =>
+        {
+            book.tf_schema_ids.insert(header.id, ());
+        }
+        mcap::records::Record::Channel(ch) => {
+            if !book.tf_schema_ids.contains_key(&ch.schema_id) {
+                return Ok(());
+            }
+            // **A channel is counted once, not once per record.** MCAP repeats
+            // every Schema and Channel record in the summary section at the end
+            // of the file, so a linear read sees each of them twice. Without
+            // this, the report's "TF channels were skipped" line says two for one
+            // channel — a number a user cannot reconcile with their recording.
+            if !book.seen_channels.insert(ch.id) {
+                return Ok(());
+            }
+            if !roles.selects(&ch.topic) {
+                skips.filtered_channels += 1;
+                return Ok(());
+            }
+            // ROS 2 writes `cdr`; a `json`/`protobuf` channel with the TF schema
+            // name is possible and is not ours to decode. Counted, not silently
+            // dropped.
+            if ch.message_encoding != "cdr" {
+                skips.non_cdr += 1;
+                return Ok(());
+            }
+            let is_static = roles.is_static(&ch.topic);
+            book.channels.insert(
+                ch.id,
+                ChannelRole {
+                    topic: ch.topic,
+                    is_static,
+                },
+            );
+        }
+        mcap::records::Record::Message { header, data } => {
+            let Some(role) = book.channels.get(&header.channel_id) else {
+                return Ok(());
+            };
+            // `log_time` is a `u64` of nanoseconds since the epoch; a value past
+            // `i64::MAX` is 2262 and is corrupt, so it saturates rather than
+            // wrapping into the past — which would make the future-stamp check
+            // fire on every message instead of none.
+            let log_time_ns = i64::try_from(header.log_time).unwrap_or(i64::MAX);
+            for t in decode_tf_message(&data).map_err(IngestError::Cdr)? {
+                f(RawRecord {
+                    topic: &role.topic,
+                    is_static: role.is_static,
+                    log_time_ns,
+                    stamp_ns: t.stamp_ns,
+                    parent: &t.frame_id,
+                    child: &t.child_frame_id,
+                    pose: t.pose,
+                })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Classify an `mcap` failure into this crate's `Copy` error type.

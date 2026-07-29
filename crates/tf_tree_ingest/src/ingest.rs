@@ -462,7 +462,16 @@ pub fn survey(
     out.anomalies.stripped_slash_names = normalizer.stripped_count();
     out.remaps = normalizer.remaps().to_vec();
     if out.edges.is_empty() {
-        return Err(IngestError::NoTransforms);
+        // **Which of the two "nothing here" cases this is, is the whole value of
+        // the message.** Reading is chunk-granular, so a recording cut before its
+        // first complete chunk yields zero transforms for a reason that has
+        // nothing to do with what was published — and `NoTransforms` would send
+        // the user looking for a publisher instead of at their file.
+        return Err(if out.anomalies.truncated {
+            IngestError::TruncatedBeforeAnyChunk
+        } else {
+            IngestError::NoTransforms
+        });
     }
     Ok(out)
 }

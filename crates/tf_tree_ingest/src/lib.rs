@@ -64,6 +64,13 @@ pub mod source;
 /// [`IngestOptions::spill_dir`](ingest::IngestOptions::spill_dir).
 mod spill;
 
+/// Chunk handling: taking MCAP chunks whole and reading inside them.
+///
+/// Private for the same reason as [`spill`] — it is how `source` reads a file,
+/// not a choice a caller makes. What a caller sees is that a compressed
+/// recording either works or reports why.
+mod decompress;
+
 #[cfg(feature = "fixture")]
 pub mod fixture;
 
@@ -133,6 +140,20 @@ pub enum IngestError {
     /// No TF channel in the recording carried a decodable transform.
     #[error("the recording contains no tf2_msgs/msg/TFMessage transforms")]
     NoTransforms,
+    /// The recording was cut before any complete chunk, so nothing could be read
+    /// — distinct from [`IngestError::NoTransforms`], which means the recording
+    /// is whole and simply has no TF in it.
+    ///
+    /// **Why this needs its own variant.** Reading takes chunks whole (see
+    /// `source::read_tf`), so recovery from truncation is *chunk*-granular: a
+    /// recording cut mid-chunk loses that chunk entirely. On a real recording,
+    /// chunked at 1–4 MiB, that costs the final chunk and no more. On a small one
+    /// that fits in a single chunk it costs everything — and reporting that as
+    /// "this recording contains no transforms" sends the user looking for a
+    /// publisher that was never running, when the truth is their file is
+    /// incomplete.
+    #[error("the recording is truncated before the end of its first chunk, so no transforms could be read")]
+    TruncatedBeforeAnyChunk,
     /// An edge appeared on both a static and a dynamic topic (§3.2 — a hard
     /// error naming the timestamp).
     #[error("edge {parent:?} -> {child:?} changed kind at stamp {stamp_ns}")]

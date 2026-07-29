@@ -821,6 +821,49 @@ fn a_truncated_recording_yields_what_it_contains() {
     );
 }
 
+/// A recording cut before its first complete chunk says so, rather than claiming
+/// the recording has no transforms in it.
+///
+/// This is the boundary of the previous test's guarantee, and it is worth pinning
+/// because the two failures look identical from the outside and have completely
+/// different remedies. Chunks are taken whole, so recovery is chunk-granular; a
+/// file cut inside its first chunk yields nothing at all. "This recording
+/// contains no transforms" would send the user hunting for a publisher that never
+/// ran, when their file is simply incomplete.
+///
+/// The cut is 400 bytes: past the start magic and the header record, so the file
+/// is recognisably an MCAP, and far short of the first 4 KiB chunk.
+///
+/// Mutant: return `NoTransforms` unconditionally in `survey`'s empty-edges branch
+/// (i.e. drop the `out.anomalies.truncated` test) ⇒ this fails on the variant.
+#[test]
+fn a_recording_cut_before_its_first_chunk_says_so() {
+    let dir = Scratch::new("trunc_first");
+    let path = write(&dir, "full.mcap", &small_recording());
+    let whole = std::fs::read(&path).unwrap();
+    assert!(
+        whole.len() > 4096,
+        "the fixture must be larger than one chunk for this cut to be inside the first one"
+    );
+
+    let p = dir.path("cut_early.mcap");
+    std::fs::write(&p, &whole[..400]).unwrap();
+
+    let mut frames = Frames::default();
+    let err = tf_tree_ingest::survey(&p, &IngestOptions::default(), &mut frames).unwrap_err();
+    assert_eq!(
+        err,
+        tf_tree_ingest::IngestError::TruncatedBeforeAnyChunk,
+        "a cut inside the first chunk must be reported as truncation, not as an \
+         absence of transforms"
+    );
+    let text = tf_tree_ingest::describe(err, &frames).to_string();
+    assert!(
+        text.contains("truncated"),
+        "the message must name truncation: {text}"
+    );
+}
+
 /// A missing file is an `Io` error carrying the errno, not a panic.
 #[test]
 fn a_missing_file_reports_its_errno() {
