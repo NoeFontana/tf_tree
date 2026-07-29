@@ -107,6 +107,10 @@ clap = { version = "4", features = ["derive"] }
 proptest = "1"
 loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
+# `tf_tree_bench`'s regression gate reads the committed `results.json` baseline.
+# Already in the lockfile via `criterion`; see that crate's manifest for why the
+# *writer* stays hand-rolled.
+serde_json = "1"
 
 [profile.release]
 lto = "thin"

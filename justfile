@@ -286,6 +286,41 @@ bench-report *ARGS:
 bench-report-shm *ARGS:
     cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
 
+# **`docs/PHASE5.md` §10's "benchmark artifact as a regression gate".**
+#
+# Regenerates the report and compares it against
+# `crates/tf_tree_bench/baseline/results.json`, exiting non-zero if this build
+# withdrew a claim, dropped a row, changed the arena layout, or moved a
+# directional number past the slack the baseline records.
+#
+# **What it does NOT do is compare the host.** CPU model, core count, kernel,
+# governor, load and every `reason` string are ignored, because they differ on
+# every machine and a gate that fails for the CPU model is a gate people learn
+# to ignore. `src/baseline.rs` carries the full split.
+#
+# On this host exactly one row is a claim — the LerpSlerp differential, which is
+# host-independent by construction — so this gate holds one number today. That
+# is not a placeholder: `Report::validate` refuses any row that prints numbers
+# without giving at least one of them a direction, so a row that starts being
+# measurable arrives already gated or not at all.
+#
+# `--out target/bench-report` and not `report/`: this is a check, and it should
+# not clobber a report somebody generated to look at.
+bench-check:
+    cargo run --release -p tf_tree_bench --bin bench_report -- \
+        --out target/bench-report \
+        --check-baseline crates/tf_tree_bench/baseline/results.json
+
+# Regenerate the committed baseline. **Run this deliberately, and put the diff
+# in the same commit as the change that causes it** — the diff is the record of
+# what moved and it is the only place a reviewer sees it.
+#
+# `index.html` is not committed: it is a rendering of `results.json` and a second
+# copy that can disagree with the first.
+bench-baseline-update:
+    cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report
+    cp target/bench-report/results.json crates/tf_tree_bench/baseline/results.json
+
 # `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
 # where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
 # `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one

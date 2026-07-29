@@ -260,3 +260,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo xtask loom
         run: cargo xtask loom
+
+  # `docs/PHASE5.md` §10: "the benchmark artifact as a regression gate".
+  #
+  # Runs `just bench-check`, which regenerates the §9 artifact and compares it
+  # against `crates/tf_tree_bench/baseline/results.json`. Deliberately
+  # single-runner and `ubuntu-latest` only: the comparison ignores host facts by
+  # construction (`crates/tf_tree_bench/src/baseline.rs`), so an extra
+  # architecture would re-run the same one host-independent claim.
+  #
+  # **A green tick here is not evidence and must not be read as one.** No run of
+  # this workflow has been produced for this repository since 2026-07-23; the
+  # gate is `just bench-check`, run locally on the arch stated in the PR.
+  bench-gate:
+    name: benchmark regression gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just bench-check
+        run: just bench-check
+      # The artifact itself, so a failing gate can be inspected rather than
+      # re-derived. `bench_report` writes it before comparing, precisely so it
+      # survives the failure.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-report
+          path: target/bench-report/

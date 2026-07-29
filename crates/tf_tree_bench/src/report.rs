@@ -56,7 +56,15 @@ use anyhow::{anyhow, bail, Result};
 use tf_tree::{InterpPolicy, Stamp};
 
 /// `results.json` schema identifier. Bump on any consumer-visible change.
-pub const SCHEMA: &str = "tf_tree.bench-report/1";
+///
+/// `/2` added `drift` and `tolerance` to every metric. `/1` emitted a bare
+/// `{"value", "unit"}`, which meant a consumer — including
+/// [`crate::baseline`], the regression gate §10 asks for — could not tell
+/// whether `compared: 47922` growing was an improvement, a regression, or
+/// nothing at all. A regression gate over untyped numbers is a coin flip with
+/// extra steps, so the direction is now part of the artifact rather than
+/// knowledge held by whoever wrote the checker.
+pub const SCHEMA: &str = "tf_tree.bench-report/2";
 
 /// The command that regenerates the whole report directory.
 ///
@@ -84,6 +92,36 @@ pub const REQUIRED_ROWS: &[&str] = &[
     "differential_agreement",
 ];
 
+/// Relative slack the regression gate allows on the differential row's
+/// `max_deviation`, as a multiple of the committed baseline.
+///
+/// **10x, which reads loose and is not.** The measured deviation on this host is
+/// ~2.5e-16 rad/m — a handful of f64 ULPs — against the row's own pass tolerance
+/// of 1e-12. A tight relative bound on a quantity that close to machine epsilon
+/// gates the *compiler*: a rustc upgrade that reassociates one FMA moves it by a
+/// factor of two while the engine is unchanged, and a gate that cries wolf on
+/// toolchain bumps is a gate that gets its baseline regenerated without anyone
+/// reading the diff.
+///
+/// What this bound is for is the failure that matters: a real disagreement — a
+/// dropped normalization, a wrong interpolation branch, a quaternion sign flip —
+/// lands at 1e-3 or worse, thirteen orders above the ceiling this sets. It also
+/// still leaves ~2.5e-15, three orders *below* the pass tolerance, so the gate
+/// fires long before the differential itself would.
+pub const DEVIATION_SLACK: f64 = 9.0;
+
+/// Relative slack the regression gate allows on a latency percentile.
+///
+/// 25%. These rows are only ever [`Status::Measured`] on a host that passed
+/// [`Fitness::probe`] — quiet, no SMT, a readable governor — and the gate only
+/// compares a baseline taken on that same host to a run on it. Even there a
+/// p99.9 moves several percent run to run from page placement and interrupt
+/// timing alone, so a 10% bound would flap. 25% is above that noise and well
+/// under the size of any regression worth a bisect: the changes this is written
+/// against — an extra atomic in the read path, a lost inline, a bounds check
+/// back in the bracket search — cost tens of percent or more.
+pub const LATENCY_SLACK: f64 = 0.25;
+
 /// The "where `tf_tree` is worse" topics `docs/PHASE5.md` §9.3 names, verbatim.
 pub const REQUIRED_WORSE: &[&str] = &[
     "arena_memory_floor",
@@ -91,6 +129,37 @@ pub const REQUIRED_WORSE: &[&str] = &[
     "format_bump_cost",
     "bridge_supervision",
 ];
+
+/// Which way a metric is allowed to move before it is a regression.
+///
+/// This exists for [`crate::baseline`]. Without it the regression gate would
+/// have to infer intent from key names — `p99_ns` down, `samples` neither,
+/// `throughput` up — and a checker that guesses is a checker that will one day
+/// pass a doubled latency because somebody named a field `ops_ns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drift {
+    /// Context, not a claim: sample counts, the tolerance a comparison was run
+    /// against, a clock-overhead control. The gate checks that the key is still
+    /// *present* (its disappearance would silently shrink the artifact) and
+    /// never compares the value.
+    Informational,
+    /// Smaller is better — latency, memory, deviation from a reference.
+    LowerIsBetter,
+    /// Larger is better — throughput, a scaling factor.
+    HigherIsBetter,
+}
+
+impl Drift {
+    /// The JSON/HTML spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Drift::Informational => "informational",
+            Drift::LowerIsBetter => "lower_is_better",
+            Drift::HigherIsBetter => "higher_is_better",
+        }
+    }
+}
 
 /// One named scalar inside a report cell.
 #[derive(Debug, Clone)]
@@ -101,13 +170,50 @@ pub struct Metric {
     pub value: f64,
     /// Unit, for the HTML column and for a reader of the JSON.
     pub unit: &'static str,
+    /// Which way this number may move before [`crate::baseline`] calls it a
+    /// regression.
+    pub drift: Drift,
+    /// Relative slack the regression gate allows, e.g. `0.10` for 10%. Only
+    /// read when `drift` is directional.
+    pub tolerance: f64,
 }
 
 impl Metric {
-    /// A metric with the given key, value and unit.
+    /// A metric with the given key, value and unit, **informational**.
+    ///
+    /// Informational is the default because most report numbers are context,
+    /// and because a wrong direction is worse than none: a metric silently
+    /// typed `LowerIsBetter` when it is really a count would fail the gate on
+    /// every run that scored more queries. The omission is not silent —
+    /// [`Report::validate`] refuses a row that claims to be `measured` while
+    /// carrying nothing directional, so a new claim cannot arrive ungated.
     #[must_use]
     pub fn new(key: &'static str, value: f64, unit: &'static str) -> Metric {
-        Metric { key, value, unit }
+        Metric {
+            key,
+            value,
+            unit,
+            drift: Drift::Informational,
+            tolerance: 0.0,
+        }
+    }
+
+    /// Mark this metric as one where growth is a regression, with `tolerance`
+    /// relative slack (`0.10` = 10%).
+    #[must_use]
+    pub fn lower_is_better(mut self, tolerance: f64) -> Metric {
+        self.drift = Drift::LowerIsBetter;
+        self.tolerance = tolerance;
+        self
+    }
+
+    /// Mark this metric as one where shrinkage is a regression, with
+    /// `tolerance` relative slack (`0.10` = 10%).
+    #[must_use]
+    pub fn higher_is_better(mut self, tolerance: f64) -> Metric {
+        self.drift = Drift::HigherIsBetter;
+        self.tolerance = tolerance;
+        self
     }
 }
 
@@ -603,6 +709,37 @@ impl Report {
         }
 
         for r in &self.rows {
+            // Applies to `measured` and `indicative` alike: both print numbers,
+            // so both can carry a regression past the gate. `unavailable` rows
+            // carry no numbers at all (checked below), so there is nothing to
+            // type.
+            if r.status != Status::Unavailable
+                && !r
+                    .tf_tree
+                    .iter()
+                    .chain(&r.tf2)
+                    .any(|m| m.drift != Drift::Informational)
+            {
+                bad.push(format!(
+                    "row `{}` prints numbers but every one of them is informational, so \
+                     `just bench-check` would compare nothing in it. Give at least one \
+                     metric a direction with `Metric::lower_is_better`/`higher_is_better`, \
+                     or say plainly why this row is context rather than a claim",
+                    r.id
+                ));
+            }
+            for m in r.tf_tree.iter().chain(&r.tf2) {
+                if m.drift != Drift::Informational
+                    && !(m.tolerance.is_finite() && m.tolerance >= 0.0)
+                {
+                    bad.push(format!(
+                        "row `{}` metric `{}` is directional with tolerance {} — a \
+                         negative or non-finite tolerance makes the gate either always \
+                         or never fire",
+                        r.id, m.key, m.tolerance
+                    ));
+                }
+            }
             match r.status {
                 Status::Measured => {
                     if r.tf_tree.is_empty() && r.tf2.is_empty() {
@@ -1185,7 +1322,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             );
         }
         vec![
-            Metric::new("max_deviation", t.max_error, "rad or m"),
+            Metric::new("max_deviation", t.max_error, "rad or m").lower_is_better(DEVIATION_SLACK),
             Metric::new("compared", t.compared as f64, "queries"),
             Metric::new("tolerance", t.tolerance, "rad or m"),
         ]
@@ -1207,7 +1344,10 @@ pub fn assemble(opts: &Options) -> Result<Report> {
         reason: String::new(),
         reproduce: "cargo test -p tf_tree_bench --release --test differential",
         tf_tree: vec![
-            Metric::new("max_deviation", diff.max_error, "rad or m"),
+            // The one number in this report that is a claim on any host, so it
+            // is also the one the regression gate can actually hold.
+            Metric::new("max_deviation", diff.max_error, "rad or m")
+                .lower_is_better(DEVIATION_SLACK),
             Metric::new("compared", diff.compared as f64, "queries"),
             Metric::new("tolerance", diff.tolerance, "rad or m"),
         ],
@@ -1360,10 +1500,17 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
         bail!("lookup sink went NaN — the measured loop did not run as written");
     }
 
+    // `LATENCY_SLACK` is per-percentile and generous because these can only be
+    // `Measured` on a host that passed the fitness probe, and even a quiet,
+    // non-SMT, fixed-frequency machine moves a p99.9 by more than a few percent
+    // between runs. `samples` and `clock_overhead_p50_ns` stay informational:
+    // the first is a run parameter, and the second describes the host's clock
+    // rather than the engine — gating it would fail this repository's own
+    // artifact on a kernel that made `clock_gettime` slower.
     Ok(vec![
-        Metric::new("p50_ns", hist.quantile(0.50) as f64, "ns"),
-        Metric::new("p99_ns", hist.quantile(0.99) as f64, "ns"),
-        Metric::new("p999_ns", hist.quantile(0.999) as f64, "ns"),
+        Metric::new("p50_ns", hist.quantile(0.50) as f64, "ns").lower_is_better(LATENCY_SLACK),
+        Metric::new("p99_ns", hist.quantile(0.99) as f64, "ns").lower_is_better(LATENCY_SLACK),
+        Metric::new("p999_ns", hist.quantile(0.999) as f64, "ns").lower_is_better(LATENCY_SLACK),
         Metric::new("samples", hist.count() as f64, "lookups"),
         Metric::new("clock_overhead_p50_ns", clock.quantile(0.50) as f64, "ns"),
     ])
@@ -1564,10 +1711,12 @@ fn jmetrics(m: &[Metric]) -> String {
         }
         let _ = write!(
             s,
-            "{}: {{\"value\": {}, \"unit\": {}}}",
+            "{}: {{\"value\": {}, \"unit\": {}, \"drift\": {}, \"tolerance\": {}}}",
             jstr(x.key),
             jnum(x.value),
-            jstr(x.unit)
+            jstr(x.unit),
+            jstr(x.drift.as_str()),
+            jnum(x.tolerance)
         );
     }
     s.push('}');
@@ -1693,6 +1842,86 @@ mod tests {
         assert_eq!(skeleton(false, false).validate(), Ok(()));
     }
 
+    /// **A row that prints numbers must print at least one the regression gate
+    /// can hold.**
+    ///
+    /// [`crate::baseline`] compares only metrics with a direction, so a row
+    /// whose numbers are all [`Drift::Informational`] passes `just bench-check`
+    /// no matter what it says. That is the way a regression gate rots: not by
+    /// being deleted, but by a new claim arriving next to it, ungated, and
+    /// nobody noticing that the green tick covers less than it used to. The rule
+    /// lives in `validate` rather than in the gate because the gate would have
+    /// to *guess* that a row it skipped was meant to be checked.
+    ///
+    /// It binds `indicative` as well as `measured`: an indicative row is not a
+    /// claim, but it still prints numbers a reader will compare, and the two
+    /// statuses differ only in the host they were taken on.
+    ///
+    /// Mutant (applied, confirmed fatal): restrict the new arm to
+    /// `r.status == Status::Measured` — the `indicative` half of this test then
+    /// returns `Ok(())` and the `expect_err` panics.
+    #[test]
+    fn a_row_that_prints_numbers_must_print_one_the_gate_can_hold() {
+        for (fair, forced, status) in [
+            (true, false, Status::Measured),
+            (false, true, Status::Indicative),
+        ] {
+            let mut r = skeleton(fair, forced);
+            let row = &mut r.rows[0];
+            row.status = status;
+            row.reason = if status == Status::Indicative {
+                "forced on an unfit host".to_owned()
+            } else {
+                String::new()
+            };
+            row.tf_tree = vec![Metric::new("samples", 1024.0, "lookups")];
+            let errs = r
+                .validate()
+                .expect_err("a row of pure context claimed to be a result");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("every one of them is informational")),
+                "{status:?}: {errs:?}"
+            );
+
+            // The same row with one directional metric is fine: the rule is
+            // about being gateable, not about the metric count.
+            r.rows[0]
+                .tf_tree
+                .push(Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK));
+            assert_eq!(r.validate(), Ok(()), "{status:?}");
+        }
+    }
+
+    /// A directional metric with a negative or non-finite tolerance is refused.
+    ///
+    /// `slack = |baseline| * tolerance` in the gate, so a negative tolerance
+    /// makes the bound tighter than exact equality and fires on every run, and a
+    /// NaN one makes every comparison `false` and fires on none. Both are worse
+    /// than an ungated metric, because both look like a working gate.
+    ///
+    /// Mutant (applied, confirmed fatal): drop the `m.tolerance >= 0.0`
+    /// conjunct — the `-0.5` case then validates and the loop's `expect_err`
+    /// panics.
+    #[test]
+    fn a_directional_metric_needs_a_usable_tolerance() {
+        for bad in [-0.5, f64::NAN, f64::INFINITY] {
+            let mut r = skeleton(true, false);
+            let row = &mut r.rows[0];
+            row.status = Status::Measured;
+            row.reason = String::new();
+            row.tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(bad)];
+            let errs = r
+                .validate()
+                .expect_err("an unusable tolerance was accepted");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("makes the gate either always")),
+                "tolerance {bad}: {errs:?}"
+            );
+        }
+    }
+
     /// §9.3's central rule: a timing row may not claim `measured` on a host that
     /// failed the fitness probe. This is the check the whole module exists for.
     ///
@@ -1704,7 +1933,7 @@ mod tests {
         let row = &mut r.rows[0];
         row.status = Status::Measured;
         row.reason = String::new();
-        row.tf_tree = vec![Metric::new("p50_ns", 42.0, "ns")];
+        row.tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         let errs = r.validate().expect_err("unfit host must reject the claim");
         assert!(
             errs.iter().any(|e| e.contains("failed the fitness probe")),
@@ -1717,7 +1946,7 @@ mod tests {
         let row = &mut ok.rows[0];
         row.status = Status::Measured;
         row.reason = String::new();
-        row.tf_tree = vec![Metric::new("p50_ns", 42.0, "ns")];
+        row.tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         assert_eq!(ok.validate(), Ok(()));
     }
 
@@ -1741,7 +1970,7 @@ mod tests {
         row.timing_sensitive = false;
         row.status = Status::Measured;
         row.reason = String::new();
-        row.tf_tree = vec![Metric::new("cpu_pct", 3.0, "%")];
+        row.tf_tree = vec![Metric::new("cpu_pct", 3.0, "%").lower_is_better(0.20)];
         let errs = r
             .validate()
             .expect_err("short core budget must reject the claim");
@@ -1797,7 +2026,7 @@ mod tests {
     fn indicative_requires_the_force_override_and_an_unfit_host() {
         let mut r = skeleton(false, false);
         r.rows[0].status = Status::Indicative;
-        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns")];
+        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         let errs = r.validate().expect_err("indicative without force");
         assert!(
             errs.iter().any(|e| e.contains("TF_TREE_BENCH_FORCE")),
@@ -1815,7 +2044,7 @@ mod tests {
         // Unfit + forced is the one combination that is allowed.
         let mut r = skeleton(false, true);
         r.rows[0].status = Status::Indicative;
-        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns")];
+        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         assert_eq!(r.validate(), Ok(()));
     }
 
@@ -1886,7 +2115,7 @@ mod tests {
         let mut r = skeleton(false, true);
         r.rows[0].status = Status::Indicative;
         r.rows[0].reason = "  ".to_owned();
-        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns")];
+        r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         let errs = r.validate().expect_err("indicative with no reason");
         assert!(
             errs.iter()
@@ -1899,7 +2128,7 @@ mod tests {
         // Asserted on the `tf2` column specifically: the `tf_tree` column alone
         // would leave the `||`'s right operand untested.
         let mut r = skeleton(false, false);
-        r.rows[0].tf2 = vec![Metric::new("p50_ns", 42.0, "ns")];
+        r.rows[0].tf2 = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         let errs = r.validate().expect_err("unavailable carrying numbers");
         assert!(
             errs.iter().any(|e| e.contains("but carries numbers")),
@@ -1967,7 +2196,10 @@ mod tests {
         assert!(!json.contains("NaN"), "{json}");
         assert!(json.contains("\"value\": null"), "{json}");
         // Cheap structural check: braces balance and the schema key is first.
-        assert!(json.starts_with("{\n  \"schema\": \"tf_tree.bench-report/1\""));
+        // The version is spelled out rather than read from `SCHEMA` on purpose —
+        // it is a compatibility surface, so bumping it should cost an edit here
+        // that somebody reads, not pass silently because both sides moved.
+        assert!(json.starts_with("{\n  \"schema\": \"tf_tree.bench-report/2\""));
         let opens = json.matches('{').count();
         let closes = json.matches('}').count();
         assert_eq!(opens, closes, "unbalanced JSON braces");

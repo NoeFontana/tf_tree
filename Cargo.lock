@@ -1113,6 +1113,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "libc",
+ "serde_json",
  "tf_tree",
  "tf_tree_arena",
  "tf_tree_core",
