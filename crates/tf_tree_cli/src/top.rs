@@ -52,11 +52,15 @@
 //! Everything this view did not author goes through [`sanitize`] before it is
 //! written into an ANSI frame. See that function for what is at stake.
 //!
-//! # Rates are observed, never a deviation from a nominal
+//! # Rates here are observed, never a deviation from a nominal
 //!
-//! `EdgeRecord::nominal_rate_mhz` is always 0 — nothing in the system declares a
-//! rate (which is exactly why `TFT007` cannot detect anything, per §0.0). So
-//! every rate here is derived from evidence and labelled as such:
+//! An edge *may* now carry a declared `EdgeRecord::nominal_rate_mhz` (that is
+//! what `TFT007` compares against), but this view does not show a deviation and
+//! deliberately so: it redraws every few hundred milliseconds, and a column
+//! that flickers between "on rate" and "8% slow" as the window slides teaches
+//! an operator to ignore it. Judging an observed rate against a declared one is
+//! `doctor`'s job, once, with a stated tolerance. So every rate here is derived
+//! from evidence and labelled as such:
 //!
 //! * `rate(Hz)` comes from the **median inter-arrival** of the stamps the ring
 //!   still retains. It is in the publisher's stamp domain.
@@ -65,8 +69,7 @@
 //!   is the honest answer to "is this edge moving *now*".
 //!
 //! They disagree when a publisher back-dates or replays, and seeing them
-//! disagree is the diagnosis. Neither is compared against a declared rate,
-//! because there is no declared rate to compare against.
+//! disagree is the diagnosis.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{IsTerminal, Write};
@@ -1217,7 +1220,7 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     s.push('\n');
     let _ = writeln!(
         s,
-        "  {}feed{} {}(newest last; run `tf_tree doctor` for the full TFT001-TFT016 catalogue){}",
+        "  {}feed{} {}(newest last; run `tf_tree doctor` for the full TFT001-TFT018 catalogue){}",
         p.bold, p.reset, p.dim, p.reset
     );
     if tick.feed.is_empty() {

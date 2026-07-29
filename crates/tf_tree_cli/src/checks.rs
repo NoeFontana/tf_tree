@@ -11,7 +11,7 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — **four** unconditionally, and **four** more depending on what the
+//! reason — **three** unconditionally, and **five** more depending on what the
 //! arena, the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
@@ -28,11 +28,6 @@
 //! * **`TFT004`** (clock skew) needs a per-publisher *arena receipt time* to
 //!   difference against the header stamp. Nothing records one: `SampleRing::push`
 //!   stores the stamp the publisher supplied and no second timestamp of its own.
-//! * **`TFT007`** (rate deviates from nominal) needs a declared rate.
-//!   `EdgeRecord::nominal_rate_mhz` exists and is **always 0** — its own doc
-//!   comment says `0` is the only value this build writes, because nothing
-//!   declares a rate yet. Comparing an observed rate against zero would report
-//!   every edge as deviating by infinity, which is a fabricated finding.
 //!
 //! And the conditional ones, which depend on what the arena, the engine build
 //! and the host can supply:
@@ -43,6 +38,12 @@
 //!   Against the fixture's recorded push stream it runs.
 //! * **`TFT005`** (stamps in the future) is skipped when the arena's stamps do
 //!   not share an epoch with the system clock — see [`Clock`].
+//! * **`TFT007`** (rate deviates from nominal) is skipped when **no** edge in
+//!   the arena declares a nominal rate. It is no longer structurally blind:
+//!   `EdgeRecord::nominal_rate_mhz` is written at declaration time from
+//!   `EdgeCfg::nominal_rate_hz`, and a topology file's `rate_hz` reaches it
+//!   through `TopologyConfig::builder`. An arena built without one still skips,
+//!   because a `0` means *undeclared* and not *0 Hz* — see [`tft007`].
 //! * **`TFT010`**/**`TFT016`** are skipped when the engine has no counters and
 //!   when the host is not Linux, respectively.
 //!
@@ -52,8 +53,9 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use tf_tree::{EdgeId, EdgeKind, Tree};
+use tf_tree_bench::fixture::PushSample;
 
-use crate::catalogue::{CheckOutcome, Finding, Report, Severity, Tft, Uncatalogued};
+use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
 use crate::doctor::{self, Observations, Snapshot};
 use crate::hostfacts::{HostFacts, MemLock, Thp};
 
@@ -347,11 +349,7 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
             ),
             Tft::Tft005 => tft005(inp),
             Tft::Tft006 => tft006(inp),
-            Tft::Tft007 => CheckOutcome::skipped(
-                check,
-                "EdgeRecord::nominal_rate_mhz is 0 on every edge (nothing declares a rate yet); \
-                 comparing an observed rate against zero would fabricate a deviation",
-            ),
+            Tft::Tft007 => tft007(inp),
             Tft::Tft008 => tft008(inp),
             Tft::Tft009 => tft009(inp),
             Tft::Tft010 => tft010(inp),
@@ -361,40 +359,20 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
             Tft::Tft014 => tft014(inp),
             Tft::Tft015 => tft015(inp),
             Tft::Tft016 => tft016(inp),
+            Tft::Tft017 => tft017(inp),
+            Tft::Tft018 => tft018(inp),
         };
         o.suppressed = suppress.contains(&check);
         outcomes.push(o);
     }
 
-    // The two Phase 1 checks §6 assigns no identifier to. See the
-    // `crate::catalogue` module docs for why they are not forced into one.
-    // Severity comes from the finding, not from a literal here: `doctor` sets
-    // it next to the code that knows why the condition is serious, and
-    // restating it at this seam is how the two answers drift apart. `--exit-code`
-    // keys on it, so a drift is a gate that silently changes meaning.
-    let mut uncatalogued = Vec::new();
-    for f in doctor::check_unclaimed_dynamic(inp.snap) {
-        uncatalogued.push(Uncatalogued {
-            check: "unclaimed-dynamic",
-            severity: Severity::from(f.severity),
-            subject: "tree".to_owned(),
-            message: f.message,
-        });
-    }
-    if !inp.live {
-        for f in doctor::check_out_of_order(inp.obs) {
-            uncatalogued.push(Uncatalogued {
-                check: "out-of-order",
-                severity: Severity::from(f.severity),
-                subject: "tree".to_owned(),
-                message: f.message,
-            });
-        }
-    }
-
     Report {
         outcomes,
-        uncatalogued,
+        // Empty, and the field stays: `uncatalogued` is part of the stable
+        // `--json` schema, and it is the shape a future check with no id would
+        // take. `docs/PHASE5.md` §6's amendment gave the last two occupants
+        // `TFT017`/`TFT018`.
+        uncatalogued: Vec::new(),
     }
 }
 
@@ -521,10 +499,216 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft006, out)
 }
 
+/// What evidence one edge offers `TFT007`.
+///
+/// Three-valued, and the three are not interchangeable: only the last supports
+/// a comparison, and the first two are the reasons [`rate_coverage_note`] can
+/// state what a `pass` did **not** cover. Both consumers match on this one
+/// enum so they cannot drift into disagreeing about which edges were checked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RateEvidence {
+    /// Nothing declared a rate for this edge — `EdgeRecord::nominal_rate_mhz`
+    /// is 0, or the edge is static and cannot have one — so there is nothing to
+    /// deviate from.
+    NotDeclared,
+    /// A rate is declared but too few intervals were observed to measure one
+    /// against it.
+    TooFewIntervals,
+    /// Both halves exist, in hertz.
+    Comparable {
+        /// What the topology declared.
+        declared_hz: f64,
+        /// What the retained stamps show, from their median interval.
+        observed_hz: f64,
+    },
+}
+
+/// Relative deviation from a declared rate before `TFT007` fires.
+///
+/// 20%, and both directions matter for different reasons. Slow is the obvious
+/// fault. Fast is the quiet one: a ring sized from `rate_hz * history_secs`
+/// holds proportionally less history than the operator asked for, so an edge
+/// declared at 50 Hz and running at 100 Hz retains half the window every
+/// consumer was tuned against.
+///
+/// Not tighter, because the observed side is a **median** interval over a
+/// finite window: scheduler jitter moves it far less than it moves a mean, but
+/// a partly-filled ring and a rate rounded to two decimals by
+/// `tf_tree topology --discover` both put a few percent in. A check that fires
+/// on a healthy robot is a check somebody adds to `--suppress` permanently,
+/// and then it detects nothing at all.
+const RATE_TOLERANCE: f64 = 0.20;
+
+/// Intervals needed before an observed rate is worth comparing to a declared
+/// one. Eight, so a single hiccup cannot carry the median.
+const RATE_MIN_INTERVALS: usize = 8;
+
+/// What one edge can tell `TFT007`.
+fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateEvidence {
+    // A static edge carries its pose inline and never publishes, so it has no
+    // rate to hold or miss. The builder writes no nominal for one; this guard is
+    // what keeps a hand-built or corrupt record with a stray non-zero rate from
+    // being counted as declared — which would suppress the whole-check skip and
+    // then compare a stream that does not exist.
+    if e.kind != EdgeKind::Dynamic {
+        return RateEvidence::NotDeclared;
+    }
+    let Some(mhz) = e.nominal_rate_mhz else {
+        return RateEvidence::NotDeclared;
+    };
+    let too_few = RateEvidence::TooFewIntervals;
+    let Some(samples) = samples else {
+        return too_few;
+    };
+    if samples.len() < RATE_MIN_INTERVALS + 1 {
+        return too_few;
+    }
+    // `None` for a non-positive median, which is what a stream of identical or
+    // backwards stamps produces — both would divide into an infinite or
+    // negative observed rate, and comparing either against a nominal produces a
+    // finding about arithmetic rather than about the robot.
+    let Some(observed_hz) = doctor::observed_rate_hz(samples) else {
+        return too_few;
+    };
+    RateEvidence::Comparable {
+        declared_hz: f64::from(mhz) / 1000.0,
+        observed_hz,
+    }
+}
+
+/// `TFT007` — the observed publish rate is far from the declared nominal.
+///
+/// # Where the declared rate comes from
+///
+/// `EdgeRecord::nominal_rate_mhz` (`docs/PHASE5.md` §1.2), written at
+/// declaration time from `EdgeCfg::nominal_rate_hz`. The path an operator
+/// actually uses is a topology file's `rate_hz` — `tf_tree topology --discover`
+/// writes one, `TopologyConfig::builder` carries it into the arena, and the
+/// ROS 2 bridge builds from exactly that. An edge sized by `capacity` declares
+/// nothing and is not compared.
+///
+/// # Why the whole check skips when it compared nothing
+///
+/// A `Pass` from this check is an active claim: *every edge that declared a
+/// rate is publishing at it*. That claim needs at least one compared edge, and
+/// there are two ways to have none. Nothing declared — a zero is "not
+/// declared", not "declared as 0 Hz", and comparing an observed rate against it
+/// makes every edge deviate by infinity, which is a fabricated finding on a
+/// correct arena. Or edges declared and none of them retained enough intervals
+/// to measure: `doctor` run seconds after bringup, during a publisher restart,
+/// or on an edge whose publisher has stopped entirely (no samples at all).
+/// **Both skip**, with a reason naming which one it was, because a `Pass`
+/// earned by the second is exactly the fabricated assurance the first case is
+/// guarded against.
+///
+/// When *some* edges are comparable and others are not, the check runs on those
+/// and [`rate_coverage_note`] states what it did not cover, because a bare
+/// `pass` would otherwise read as "every edge publishes at its intended rate".
+fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
+    let by_edge = inp.obs.by_edge();
+    let mut out = Vec::new();
+    let mut declared = 0usize;
+    let mut comparable = 0usize;
+    for e in &inp.snap.edges {
+        match rate_evidence(e, by_edge.get(&e.id).map(Vec::as_slice)) {
+            RateEvidence::NotDeclared => continue,
+            RateEvidence::TooFewIntervals => declared += 1,
+            RateEvidence::Comparable {
+                declared_hz,
+                observed_hz,
+            } => {
+                declared += 1;
+                comparable += 1;
+                let ratio = observed_hz / declared_hz;
+                if (ratio - 1.0).abs() <= RATE_TOLERANCE {
+                    continue;
+                }
+                let effect = if ratio > 1.0 {
+                    "the ring therefore retains proportionally less history than the \
+                     rate_hz x history_secs it was sized from"
+                } else {
+                    "consumers interpolating across the gap see a longer step than the \
+                     declared rate implies"
+                };
+                out.push(Finding::on_edge(
+                    Tft::Tft007,
+                    e.id,
+                    inp.snap.edge_label(e),
+                    format!(
+                        "publishes at {observed_hz:.2} Hz against a declared {declared_hz:.2} Hz \
+                         ({:+.0}%, tolerance {:.0}%); {effect}",
+                        (ratio - 1.0) * 100.0,
+                        RATE_TOLERANCE * 100.0
+                    ),
+                ));
+            }
+        }
+    }
+    // Not `declared == 0`: that guard leaves a hole between itself and
+    // `rate_coverage_note`, which also says nothing when it compared nothing.
+    // An arena whose declaring edges all fell short of `RATE_MIN_INTERVALS`
+    // would satisfy both and report a bare `pass` having compared no edge at
+    // all — no finding, no skip reason, and no note in `--json` either.
+    if comparable == 0 {
+        return CheckOutcome::skipped(
+            Tft::Tft007,
+            if declared == 0 {
+                "no edge in this arena declares a nominal rate (EdgeRecord::nominal_rate_mhz is \
+                 0 on all of them); declare one with rate_hz in the topology file, or via \
+                 EdgeCfg::nominal_rate_hz, and this check has something to compare against"
+                    .to_owned()
+            } else {
+                format!(
+                    "{declared} edge(s) declare a nominal rate, but none has the \
+                     {RATE_MIN_INTERVALS} retained intervals needed to measure an observed one \
+                     against it; the publishers may not have started, may have stopped, or the \
+                     arena was read too soon after bringup"
+                )
+            },
+        );
+    }
+    CheckOutcome::ran(Tft::Tft007, out)
+}
+
+/// The disclosure that pairs with [`tft007`]: which edges its result covers.
+///
+/// `None` when the answer is unambiguous — nothing was compared (the check
+/// skipped and says so itself, naming which of its two gaps it hit), or every
+/// dynamic edge was declared and measurable. A note is emitted only for the
+/// middle case, where `pass` is true of the edges that were compared and silent
+/// about the rest.
+#[must_use]
+pub fn rate_coverage_note(snap: &Snapshot, obs: &Observations) -> Option<String> {
+    let by_edge = obs.by_edge();
+    let (mut comparable, mut too_few, mut undeclared) = (0usize, 0usize, 0usize);
+    for e in &snap.edges {
+        if e.kind != EdgeKind::Dynamic {
+            continue;
+        }
+        match rate_evidence(e, by_edge.get(&e.id).map(Vec::as_slice)) {
+            RateEvidence::NotDeclared => undeclared += 1,
+            RateEvidence::TooFewIntervals => too_few += 1,
+            RateEvidence::Comparable { .. } => comparable += 1,
+        }
+    }
+    if comparable == 0 || (undeclared == 0 && too_few == 0) {
+        return None;
+    }
+    Some(format!(
+        "TFT007 compared {comparable} of {} dynamic edge(s): {undeclared} declare no nominal \
+         rate (no rate_hz in the topology) and {too_few} have fewer than {RATE_MIN_INTERVALS} \
+         retained intervals to measure one from",
+        comparable + too_few + undeclared
+    ))
+}
+
 /// `TFT008` — inter-arrival spread. The Phase 1 `inconsistent-rate` check: a
 /// coefficient of variation *is* the jitter of the inter-arrival distribution
-/// about its own centre, which is what §6 asks for in the absence of a nominal
-/// rate to compare against (that is `TFT007`, and it is skipped).
+/// about its own centre. Distinct from [`tft007`] and not redundant with it: a
+/// publisher can hold a perfectly steady period at the wrong rate (`TFT007`
+/// fires, this passes) or average its declared rate while alternating 1 ms and
+/// 100 ms gaps (this fires, `TFT007` passes). This one needs no declaration and
+/// therefore runs on every arena.
 fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(
         Tft::Tft008,
@@ -537,9 +721,12 @@ fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
 
 /// `TFT009` — an inter-arrival interval far above the edge's own median.
 ///
-/// Relative to the median rather than to a fixed threshold because a 200 ms gap
-/// is a dropout at 100 Hz and normal at 5 Hz, and `doctor` has no declared rate
-/// to consult (`TFT007`).
+/// Relative to the edge's own median rather than to a fixed threshold because a
+/// 200 ms gap is a dropout at 100 Hz and normal at 5 Hz. Deliberately still not
+/// against the declared rate [`tft007`] now has: an edge running at half its
+/// nominal has no dropouts, and reporting one for every interval would bury the
+/// gaps this check exists to find under a rate deviation `TFT007` already
+/// reports once.
 fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     for (edge, samples) in inp.obs.by_edge() {
@@ -845,6 +1032,56 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft016, out)
 }
 
+/// `TFT017` — a dynamic edge nobody is writing to.
+///
+/// The Phase 1 `unclaimed-dynamic` check, given an id by `docs/PHASE5.md` §6's
+/// amendment. Distinct from `TFT013` (declared and *never* published to) and
+/// from `TFT014` (a claim held by a slot whose owner is gone): this is an edge
+/// with no claim at all, which may have a full ring of history that is now
+/// going stale.
+fn tft017(inp: &Inputs<'_>) -> CheckOutcome {
+    CheckOutcome::ran(
+        Tft::Tft017,
+        doctor::check_unclaimed_dynamic(inp.snap)
+            .into_iter()
+            .map(|f| Finding::about(Tft::Tft017, "tree", f.message))
+            .collect(),
+    )
+}
+
+/// `TFT018` — a later arrival carried an older stamp than an earlier one.
+///
+/// The Phase 1 `out-of-order` check, given an id by `docs/PHASE5.md` §6's
+/// amendment. Distinct from `TFT006`, which judges a stamp's *value*: a stream
+/// of perfectly plausible stamps can still arrive backwards, and that is what
+/// breaks a consumer's interpolation.
+///
+/// **Skipped on a live arena, and this is the one that would otherwise report a
+/// fault that never happened.** [`Observations::from_arena`] reconstructs the
+/// stream by walking the ring's retained window with relaxed loads and no
+/// re-check, while a publisher is writing into it. The oldest slot is the one
+/// being overwritten, so a sample from the *next* lap can appear at the old end
+/// of the window: the reconstructed stream jumps forward and then back, which is
+/// exactly the shape of this finding, on a perfectly monotone publisher. Before
+/// the id, this condition was silently not run on a live arena; now it says so.
+fn tft018(inp: &Inputs<'_>) -> CheckOutcome {
+    if inp.live {
+        return CheckOutcome::skipped(
+            Tft::Tft018,
+            "a live arena's push stream is reconstructed from a ring that is being written \
+             while it is read, so a slot at the old end can already hold the next lap's \
+             sample — which reads as an inversion on a correctly ordered publisher",
+        );
+    }
+    CheckOutcome::ran(
+        Tft::Tft018,
+        doctor::check_out_of_order(inp.obs)
+            .into_iter()
+            .map(|f| Finding::about(Tft::Tft018, "tree", f.message))
+            .collect(),
+    )
+}
+
 /// The occupancy triples for [`Inputs::occupancy`], read from the header.
 ///
 /// **`participants` is deliberately absent, and [`PARTICIPANT_OCCUPANCY_NOTE`]
@@ -897,7 +1134,7 @@ pub fn newest_stamps(snap: &Snapshot) -> Vec<i64> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
     use crate::catalogue::Status;
@@ -928,7 +1165,20 @@ mod tests {
             claiming: false,
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
+            nominal_rate_mhz: None,
         }
+    }
+
+    /// `n` samples on `edge`, one every `period_ns`, from a single writer.
+    fn steady(edge: u32, n: usize, period_ns: i64) -> Vec<PushSample> {
+        (0..n as i64)
+            .map(|k| PushSample {
+                edge,
+                writer_pid: 4711,
+                stamp_ns: k * period_ns,
+                arrival_delay_ns: 0,
+            })
+            .collect()
     }
 
     fn two_frame_snapshot(e: EdgeInfo) -> Snapshot {
@@ -1399,5 +1649,451 @@ mod tests {
             1,
             "a real gap in a monotone stream must still fire: {o:?}"
         );
+    }
+
+    /// **`TFT017` and `TFT018` report at the severity their Phase 1 checks
+    /// assign, and the two answers are compared here because nothing else
+    /// compares them.**
+    ///
+    /// Before they had ids, `checks::run` took each finding's severity from
+    /// [`doctor::Finding`], next to the code that knows why the condition is
+    /// serious. An id owns its severity instead (`--exit-code` is only a usable
+    /// gate if the set of ids that can fail it is knowable from the
+    /// documentation), so the value is now stated twice — and `TFT018` is an
+    /// *error*, so a drift would silently change what `doctor --exit-code`
+    /// fails on.
+    ///
+    /// Mutant: give `Tft::Tft018` `Severity::Warn` in `catalogue::severity`.
+    /// Applied: the out-of-order comparison fails with `left: Warn, right:
+    /// Error`. Mutant B: make `doctor::check_unclaimed_dynamic` return
+    /// `Finding::error`. Applied: the unclaimed comparison fails.
+    #[test]
+    fn the_two_new_ids_keep_their_phase_1_severities() {
+        let unclaimed = Snapshot {
+            frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
+            edges: vec![EdgeInfo {
+                claimed: false,
+                owner_pid: 0,
+                ..edge(1, 1, 2, 100)
+            }],
+        };
+        let f = doctor::check_unclaimed_dynamic(&unclaimed);
+        assert_eq!(f.len(), 1, "the fixture must fire the check it is about");
+        assert_eq!(
+            crate::catalogue::Severity::from(f[0].severity),
+            Tft::Tft017.severity(),
+            "TFT017's severity must be the one `unclaimed-dynamic` assigns"
+        );
+
+        let obs = Observations::from_samples(vec![
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 100,
+                arrival_delay_ns: 0,
+            },
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 50,
+                arrival_delay_ns: 0,
+            },
+        ]);
+        let f = doctor::check_out_of_order(&obs);
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            crate::catalogue::Severity::from(f[0].severity),
+            Tft::Tft018.severity(),
+            "TFT018's severity must be the one `out-of-order` assigns"
+        );
+
+        // And both really do reach the report through their ids, rather than
+        // through the id-less path they used to take.
+        let snap = two_frame_snapshot(EdgeInfo {
+            claimed: false,
+            owner_pid: 0,
+            ..edge(1, 1, 2, 100)
+        });
+        let report = run(&inputs(&snap, &obs, &[], Clock::Wall(0)), &BTreeSet::new());
+        assert!(
+            report.uncatalogued.is_empty(),
+            "neither check is id-less any more: {:?}",
+            report.uncatalogued
+        );
+        let fired: Vec<&str> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.status == Status::Fired)
+            .map(|o| o.check.id())
+            .collect();
+        assert!(
+            fired.contains(&"TFT017") && fired.contains(&"TFT018"),
+            "{fired:?}"
+        );
+        assert!(report.has_error(), "an out-of-order stream must still gate");
+    }
+
+    /// **`TFT018` skips on a live arena instead of reporting an inversion the
+    /// publisher never made.**
+    ///
+    /// A live push stream is reconstructed from a ring that is being written
+    /// while it is read, so a slot at the old end of the window can already hold
+    /// the next lap's sample — a forward jump followed by a step back, which is
+    /// this check's exact signature. Before the id, the live case was silently
+    /// not run and the report said nothing about it.
+    ///
+    /// Mutant: drop the `if inp.live` guard from `tft018`. Applied: the status
+    /// is `Fired` and the `Skipped` match panics.
+    #[test]
+    fn tft018_skips_on_a_live_arena_and_says_so() {
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let obs = Observations::from_samples(vec![
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 100,
+                arrival_delay_ns: 0,
+            },
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 50,
+                arrival_delay_ns: 0,
+            },
+        ]);
+        let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
+        inp.live = true;
+        match &tft018(&inp).status {
+            Status::Skipped(why) => assert!(
+                why.contains("next lap"),
+                "the skip must name what would have been misread: {why}"
+            ),
+            other => panic!("expected a skip on a live arena, got {other:?}"),
+        }
+        // Non-vacuity: the same stream off a live arena does fire.
+        inp.live = false;
+        assert_eq!(tft018(&inp).status, Status::Fired);
+    }
+
+    /// **`TFT007` compares only where a rate was declared, and an undeclared
+    /// edge is not compared against zero.**
+    ///
+    /// `EdgeRecord::nominal_rate_mhz == 0` means *not declared*, not *declared
+    /// as 0 Hz*. Treating it as a rate makes every undeclared edge deviate by
+    /// infinity, so a correct arena where nobody wrote a `rate_hz` would report
+    /// a warn on every edge — the fabricated finding this catalogue exists to
+    /// avoid, and the reason the field went unread until now.
+    ///
+    /// The fixture is non-degenerate on both axes: three edges, two declaring
+    /// and one not, and the two declaring differ in whether they hold their
+    /// rate. The declared value is not the observed one by accident — the slow
+    /// edge runs at exactly half.
+    ///
+    /// Mutant: read the declaration as `e.nominal_rate_mhz.unwrap_or(0)` in
+    /// `rate_evidence` and drop the `NotDeclared` arm. Applied: undeclared
+    /// edge#3 fires at `+inf%` and the assertion about which edges fired fails.
+    /// Mutant B: invert the `effect` selection to `if ratio < 1.0`. Applied: the
+    /// slow edge is told its ring "retains proportionally less history" — the
+    /// opposite diagnosis — and the assertion on the explanation fails. The
+    /// numbers alone do not catch it; the sentence is what an operator acts on.
+    #[test]
+    fn tft007_compares_only_where_a_rate_was_declared() {
+        const MS: i64 = 1_000_000;
+        let mut on_rate = edge(1, 1, 2, 100);
+        on_rate.nominal_rate_mhz = Some(20_000); // 20 Hz
+        let mut too_slow = edge(2, 2, 3, 100);
+        too_slow.nominal_rate_mhz = Some(20_000);
+        let undeclared = edge(3, 3, 4, 100);
+
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+                frame(4, "laser", 3, 3),
+            ],
+            edges: vec![on_rate, too_slow, undeclared],
+        };
+        let mut events = steady(1, 12, 50 * MS); // 20 Hz: exactly nominal
+        events.extend(steady(2, 12, 100 * MS)); // 10 Hz: half of nominal
+        events.extend(steady(3, 12, 100 * MS)); // 10 Hz, but nothing declared
+        let obs = Observations::from_samples(events);
+
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(
+            o.findings.iter().map(|f| f.edge).collect::<Vec<_>>(),
+            vec![Some(2)],
+            "only the declared edge that missed its rate may be reported: {:?}",
+            o.findings
+        );
+        assert!(
+            o.findings[0].message.contains("10.00 Hz")
+                && o.findings[0].message.contains("20.00 Hz")
+                && o.findings[0].message.contains("-50%"),
+            "the finding must carry both rates and the deviation: {}",
+            o.findings[0].message
+        );
+        assert!(
+            o.findings[0].message.contains("see a longer step"),
+            "a slow publisher must be told the consequence of *slow*: {}",
+            o.findings[0].message
+        );
+
+        // Publishing *faster* than declared is a finding too: the ring was
+        // sized from rate_hz x history_secs, so it now retains proportionally
+        // less history than every consumer was tuned against.
+        let obs = Observations::from_samples(steady(1, 12, 20 * MS)); // 50 Hz
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.findings.len(), 1, "{o:?}");
+        assert!(
+            o.findings[0].message.contains("+150%")
+                && o.findings[0]
+                    .message
+                    .contains("retains proportionally less history"),
+            "and a fast one the consequence of *fast*: {}",
+            o.findings[0].message
+        );
+
+        // And a rate inside the tolerance band is not a finding: 18 Hz against
+        // a declared 20 Hz is a 10% miss, which is jitter and load.
+        let obs = Observations::from_samples(steady(1, 12, 55_555_555));
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Pass, "{o:?}");
+    }
+
+    /// **An arena where nothing declares a rate skips `TFT007` with a reason
+    /// instead of passing.**
+    ///
+    /// A `pass` here would be an active claim that every edge publishes at its
+    /// intended rate, made by a check that had no intended rate to consult.
+    /// That is the difference `Status::Skipped` carries a mandatory reason for.
+    ///
+    /// Mutant: replace `if declared == 0` with `if false` in `tft007`. Applied:
+    /// the status is `Pass` and the `match` panics with "expected a skip".
+    /// Mutant B: drop the `e.kind != EdgeKind::Dynamic` guard from
+    /// `rate_evidence`. Applied: the static-edge case below counts as declared,
+    /// the check reports `Pass` instead of skipping, and its `match` panics —
+    /// a `pass` earned by an edge that cannot publish at all.
+    #[test]
+    fn tft007_skips_when_no_edge_declares_a_rate() {
+        const MS: i64 = 1_000_000;
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        // A full, healthy, measurable stream — so the skip is about the missing
+        // declaration and not about missing samples.
+        let obs = Observations::from_samples(steady(1, 12, 50 * MS));
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("nominal rate") && why.contains("rate_hz"),
+                "the skip must name the missing evidence and how to supply it: {why}"
+            ),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+
+        // A *static* edge carrying a rate is not a declaration either: it never
+        // publishes, so there is no stream to hold or miss one. Reachable only
+        // from a hand-built or corrupt record — the builder writes no nominal
+        // for a static edge — which is exactly why the guard is not obviously
+        // dead code.
+        let snap = two_frame_snapshot(EdgeInfo {
+            kind: EdgeKind::Static,
+            capacity: 0,
+            nominal_rate_mhz: Some(20_000),
+            ..edge(1, 1, 2, 0)
+        });
+        match &tft007(&inputs(&snap, &obs, &[], Clock::Wall(0))).status {
+            Status::Skipped(_) => {}
+            other => panic!("a static edge cannot declare a publish rate, got {other:?}"),
+        }
+
+        // Non-vacuity: the same stream against a declared rate does run.
+        let mut declared = edge(1, 1, 2, 100);
+        declared.nominal_rate_mhz = Some(20_000);
+        let snap = two_frame_snapshot(declared);
+        assert_eq!(
+            tft007(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
+            Status::Pass
+        );
+    }
+
+    /// **`TFT007` skips rather than passing when every declaring edge is
+    /// unmeasurable — a `pass` that compared nothing is a fabricated
+    /// assurance.**
+    ///
+    /// This is the state an operator is in seconds after bringup, during a
+    /// publisher restart, and — worst — on an edge whose publisher has stopped
+    /// dead, which reaches `rate_evidence` with no samples at all. A declaration
+    /// exists, so the "nothing declares" skip does not fire; nothing is
+    /// comparable, so no finding is produced and [`rate_coverage_note`] stays
+    /// silent too. Reporting `pass` there would tell a fleet operator that a
+    /// stopped publisher is publishing at its intended rate.
+    ///
+    /// Mutant: restore the guard to `if declared == 0`. Applied: the status is
+    /// `Pass` and the first `match` panics with "expected a skip".
+    /// Mutant B: make the `TooFewIntervals` arm `continue` instead of counting.
+    /// Applied: `declared` stays 0, the skip reason becomes the "no edge
+    /// declares a nominal rate" one — false, two of them do — and the assertion
+    /// on "retained intervals" fails.
+    #[test]
+    fn tft007_skips_rather_than_passing_when_it_compared_nothing() {
+        const MS: i64 = 1_000_000;
+        let mut short = edge(1, 1, 2, 100);
+        short.nominal_rate_mhz = Some(20_000);
+        let mut stopped = edge(2, 2, 3, 100);
+        stopped.nominal_rate_mhz = Some(20_000);
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+            ],
+            // Edge 2 appears in no sample at all: `by_edge` has no entry, which
+            // is the `samples: None` path and not the short-slice one.
+            edges: vec![short, stopped],
+        };
+        let obs = Observations::from_samples(steady(1, 4, 50 * MS));
+
+        let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("2 edge(s) declare") && why.contains("retained intervals"),
+                "the skip must say a declaration exists and that the *stream* is what is \
+                 missing, not the declaration: {why}"
+            ),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        assert_eq!(
+            rate_coverage_note(&snap, &obs),
+            None,
+            "the note stays silent here, which is why the skip has to carry the disclosure"
+        );
+
+        // Non-vacuity: one measurable edge is enough to make the check run, and
+        // then the note — not the skip — carries what it did not cover.
+        let obs = Observations::from_samples(
+            steady(1, 12, 50 * MS)
+                .into_iter()
+                .chain(steady(2, 4, 50 * MS))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            tft007(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
+            Status::Pass
+        );
+        assert!(rate_coverage_note(&snap, &obs)
+            .expect("a partial run discloses itself")
+            .contains("compared 1 of 2"));
+    }
+
+    /// **`RATE_TOLERANCE` is the band, and one milli-hertz either side of it
+    /// decides fired from passed.**
+    ///
+    /// The constant is offered as the spec owner's dial, so a change to it must
+    /// be visible in a test rather than silently widening what `doctor`
+    /// certifies as healthy. Both cases run the *same* 25 Hz stream and differ
+    /// only in the declared rate by 1 mHz — 25 Hz is 20.0019% above 20.833 Hz
+    /// and 19.9962% above 20.834 Hz — so nothing but the threshold can explain
+    /// the difference in outcome.
+    ///
+    /// Mutant: `RATE_TOLERANCE: f64 = 0.35`. Applied: the first case reports
+    /// `Pass` and its assertion fails. Mutant B: `0.10`. Applied: the second
+    /// case fires and its assertion fails. A test pinned only to `(0.10, 0.50)`
+    /// deviations survives both.
+    #[test]
+    fn the_rate_tolerance_band_is_pinned_at_its_edge() {
+        // 25 Hz exactly: 40 ms is representable, so the observed side carries
+        // no rounding of its own into the comparison.
+        let obs = Observations::from_samples(steady(1, 12, 40_000_000));
+        let outcome = |mhz: u32| {
+            let mut e = edge(1, 1, 2, 100);
+            e.nominal_rate_mhz = Some(mhz);
+            tft007(&inputs(&two_frame_snapshot(e), &obs, &[], Clock::Wall(0))).status
+        };
+        assert_eq!(
+            outcome(20_833),
+            Status::Fired,
+            "25 Hz against 20.833 Hz is +20.0019%, outside a 20% band"
+        );
+        assert_eq!(
+            outcome(20_834),
+            Status::Pass,
+            "25 Hz against 20.834 Hz is +19.9962%, inside it"
+        );
+    }
+
+    /// **A `TFT007` pass says which edges it covered, whenever it covered fewer
+    /// than all of them.**
+    ///
+    /// The report has three statuses and none of them is "ran, half blind", so
+    /// a partial run is disclosed through `Meta.notes` — the same mechanism
+    /// `TFT015`'s missing participants row uses. Without it, an arena where one
+    /// edge declares a rate and eleven do not reports a bare `pass` for
+    /// `TFT007`, which reads as a statement about all twelve.
+    ///
+    /// Mutant A: make `rate_coverage_note` return `None` unconditionally.
+    /// Applied: the `expect` fires. Mutant B: drop the `comparable == 0` term
+    /// from its guard. Applied: the last assertion fails — the report would
+    /// then carry a skip reason and a coverage note that contradict each other.
+    /// Mutant C: drop the `e.kind != EdgeKind::Dynamic` guard from the note's
+    /// own loop. Applied: the static edge below lands in the `undeclared`
+    /// bucket and the note reads "compared 1 of 4 dynamic edge(s)" — a sentence
+    /// whose noun contradicts its arithmetic, and the reason the note counts
+    /// its denominator itself instead of using `snap.edges.len()`.
+    #[test]
+    fn the_rate_coverage_note_states_what_a_pass_did_not_cover() {
+        const MS: i64 = 1_000_000;
+        let mut declared = edge(1, 1, 2, 100);
+        declared.nominal_rate_mhz = Some(20_000);
+        let mut short = edge(2, 2, 3, 100);
+        short.nominal_rate_mhz = Some(20_000);
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+                frame(4, "laser", 3, 3),
+                frame(5, "imu", 4, 4),
+            ],
+            edges: vec![
+                declared,
+                short,
+                edge(3, 3, 4, 100),
+                // A static edge cannot declare a rate and cannot publish one,
+                // so it belongs in neither the numerator nor the denominator:
+                // a real arena is mostly static edges, and counting them would
+                // make the note read as near-total blindness on a healthy tree.
+                EdgeInfo {
+                    kind: EdgeKind::Static,
+                    capacity: 0,
+                    ..edge(4, 4, 5, 0)
+                },
+            ],
+        };
+        let mut events = steady(1, 12, 50 * MS);
+        // Declared, but only three intervals: a rate measured from that is
+        // noise, so it counts as not compared rather than compared badly.
+        events.extend(steady(2, 4, 50 * MS));
+        let obs = Observations::from_samples(events);
+
+        let note = rate_coverage_note(&snap, &obs).expect("a partial run must disclose itself");
+        assert!(
+            note.contains("compared 1 of 3")
+                && note.contains("1 declare no nominal rate")
+                && note.contains("1 have fewer than 8"),
+            "{note}"
+        );
+
+        // Every edge declared and measurable: nothing to disclose.
+        let mut a = edge(1, 1, 2, 100);
+        a.nominal_rate_mhz = Some(20_000);
+        let full = two_frame_snapshot(a);
+        let obs = Observations::from_samples(steady(1, 12, 50 * MS));
+        assert_eq!(rate_coverage_note(&full, &obs), None);
+
+        // Nothing declared: the check skips and says so itself, so a note here
+        // would be a second, weaker statement of the same fact.
+        let none = two_frame_snapshot(edge(1, 1, 2, 100));
+        assert_eq!(rate_coverage_note(&none, &obs), None);
     }
 }

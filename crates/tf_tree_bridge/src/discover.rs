@@ -273,6 +273,15 @@ impl Discovery {
 /// `None` when fewer than two samples arrived or they all carried the same
 /// stamp: there is no rate to measure, and inventing one puts a number in the
 /// operator's file that no observation supports.
+///
+/// **This is an observation, and `rate_hz` in the emitted file is read back as
+/// an intention.** Since `docs/PHASE5.md` §6's amendment, `rate_hz` is also the
+/// arena's declared nominal, which `tf_tree doctor`'s `TFT007` judges the robot
+/// against — so a recording captured while a publisher was degraded discovers
+/// the fault as the declaration, and `doctor` would then certify the fault and
+/// fire once the publisher is repaired. Nothing here can tell the two apart;
+/// the mitigation is that `--discover` prints each edge's sample count and the
+/// amendment states that a discovered rate is a starting point to review.
 fn measured_rate(s: &Seen) -> Option<f64> {
     let span_ns = s.last_ns.checked_sub(s.first_ns)?;
     if s.count < 2 || span_ns <= 0 {

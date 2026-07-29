@@ -167,6 +167,17 @@ pub struct EdgeInfo {
     pub owner_pid: u32,
     /// Newest published stamp, if any samples exist.
     pub newest_stamp: Option<i64>,
+    /// The rate this edge was **declared** to publish at, in milli-hertz, or
+    /// `None` when nothing declared one (`EdgeRecord::nominal_rate_mhz == 0`).
+    ///
+    /// `Option` rather than the raw `0` sentinel because the two answers send
+    /// `TFT007` in opposite directions: a declared rate is something to compare
+    /// against, and an absent one is a reason to say nothing at all. A `u32`
+    /// here invites `rate != 0` to be forgotten at one call site, and the
+    /// failure that produces — every undeclared edge reported as deviating from
+    /// 0 Hz by infinity — is a fabricated finding on every edge of a correct
+    /// arena.
+    pub nominal_rate_mhz: Option<u32>,
 }
 
 impl EdgeInfo {
@@ -275,6 +286,10 @@ impl Snapshot {
                     .and_then(|slot| view.participants().identity(slot))
                     .map_or(0, |(pid, _start, _inc)| pid),
                 newest_stamp,
+                nominal_rate_mhz: match rec.nominal_rate_mhz {
+                    0 => None,
+                    mhz => Some(mhz),
+                },
             });
         }
 
@@ -642,6 +657,18 @@ pub fn check_out_of_order(obs: &Observations) -> Vec<Finding> {
     out
 }
 
+/// The observed publish rate (Hz) of a per-edge event slice, from its median
+/// interval. `None` exactly where [`median_period`] is `None`.
+///
+/// One definition, two consumers — `TFT007`'s comparison against the declared
+/// nominal and the `edges` command's rate column — because "the rate this edge
+/// publishes at" must be one number. A second copy is free to lose the
+/// non-positive-median guard, and a backwards stream then reports a *negative*
+/// rate: printed in one place, and compared against a nominal in the other.
+pub(crate) fn observed_rate_hz(samples: &[&PushSample]) -> Option<f64> {
+    median_period(samples).map(|ns| 1e9 / ns as f64)
+}
+
 /// The median inter-sample interval (nanoseconds) of a per-edge event slice.
 ///
 /// `None` when the median is not a usable period. Intervals are raw stamp
@@ -649,7 +676,7 @@ pub fn check_out_of_order(obs: &Observations) -> Vec<Finding> {
 /// can have a **negative** median; letting that through made `capacity × period`
 /// negative and flagged every dynamic edge as a short buffer, burying the real
 /// finding under noise.
-fn median_period(samples: &[&PushSample]) -> Option<i64> {
+pub(crate) fn median_period(samples: &[&PushSample]) -> Option<i64> {
     if samples.len() < 2 {
         return None;
     }
@@ -716,6 +743,7 @@ mod tests {
             claiming: false,
             owner_pid: if claimed { 1234 } else { 0 },
             newest_stamp: None,
+            nominal_rate_mhz: None,
         }
     }
 

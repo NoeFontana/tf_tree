@@ -64,6 +64,15 @@
 //! domain = 1
 //! ```
 //!
+//! `rate_hz` does **two** things, and the second is why writing `capacity`
+//! instead is not a free simplification: it sizes the ring, and it is recorded
+//! in the arena as the edge's *declared nominal rate*
+//! (`EdgeRecord::nominal_rate_mhz`), which is the only evidence `tf_tree
+//! doctor`'s `TFT007` has that an observed rate is wrong rather than merely
+//! what it is. An edge sized by `capacity` declares no rate and `TFT007` says
+//! so for it, rather than comparing against a zero it would have to invent a
+//! meaning for.
+//!
 //! # Errors name the offending frame, and cost nothing to carry
 //!
 //! [`ConfigError`] is `Copy` and holds a `&str` **borrowed from the config
@@ -359,6 +368,15 @@ impl TopologyConfig {
                     let mut cfg = EdgeCfg::new(ring.capacity());
                     cfg.interp = e.interp;
                     cfg.domain = e.domain;
+                    // `rate_hz` is carried into the arena as well as consumed by
+                    // `ring.capacity()`. It is the operator's statement of what
+                    // this edge *should* publish at, so it is exactly the
+                    // nominal `TFT007` needs; an edge written as `capacity = N`
+                    // states no rate and leaves the field 0 (undeclared), which
+                    // is why this is a `match` and not an `unwrap_or(0.0)`.
+                    if let RingSize::History { rate_hz, .. } = ring {
+                        cfg = cfg.nominal_rate_hz(rate_hz);
+                    }
                     b.dynamic_edge(&e.parent, &e.child, cfg)
                 }
             };
@@ -1474,6 +1492,58 @@ domain = 0
         // The static edge has no ring, so claiming it is refused — that is what
         // "static" means in the arena, and it is why the file has to say which.
         assert!(tree.claim(base, foot).is_err());
+    }
+
+    /// **`rate_hz` is carried into the arena as the edge's declared nominal
+    /// rate, and an edge sized by `capacity` declares nothing.**
+    ///
+    /// This is the whole evidence path for `docs/PHASE5.md` §6's `TFT007`: the
+    /// operator writes a rate in the topology file, the bridge builds the arena
+    /// from that file, and `doctor` — a different process, attaching later —
+    /// finds the declaration in `EdgeRecord::nominal_rate_mhz`. Break this link
+    /// and `TFT007` goes back to having nothing to compare against, silently,
+    /// because a `0` there means "not declared" and is a legal state.
+    ///
+    /// 5.4 Hz is deliberately not a whole number: an integer-hertz field would
+    /// store 5, and the check would then report a correct publisher as 8% fast
+    /// forever.
+    ///
+    /// Mutant: drop the `if let RingSize::History { rate_hz, .. }` arm from
+    /// `TopologyConfig::builder`. Applied: the first assertion fails with
+    /// `left: 0, right: 5400`.
+    #[test]
+    fn a_declared_rate_hz_reaches_the_arena_and_capacity_declares_nothing() {
+        let text = "\
+[[edge]]
+parent = \"odom\"
+child = \"base_footprint\"
+kind = \"dynamic\"
+rate_hz = 5.4
+history_secs = 10.0
+
+[[edge]]
+parent = \"base_footprint\"
+child = \"base_link\"
+kind = \"dynamic\"
+capacity = 512
+";
+        let c = TopologyConfig::parse(text).unwrap();
+        let tree = c.builder().build().unwrap();
+        let view = tree.arena_view();
+        assert_eq!(
+            view.edge(tf_tree::EdgeId(1)).unwrap().nominal_rate_mhz,
+            5400,
+            "rate_hz = 5.4 must reach the arena as 5400 mHz"
+        );
+        assert_eq!(
+            view.edge(tf_tree::EdgeId(2)).unwrap().nominal_rate_mhz,
+            0,
+            "an edge sized by `capacity` states no rate, and 0 means undeclared"
+        );
+        // Non-vacuity: both edges really were built as dynamic rings, so the
+        // difference above is the declaration and not the edge kind.
+        assert_eq!(view.edge(tf_tree::EdgeId(1)).unwrap().capacity, 64);
+        assert_eq!(view.edge(tf_tree::EdgeId(2)).unwrap().capacity, 512);
     }
 
     /// **A quaternion a few ulps off unit is a correct file, not a bad one.**

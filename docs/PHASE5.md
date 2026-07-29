@@ -22,7 +22,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §3 Bag ingestion | **Partly done — MCAP only.** `tf_tree_ingest` is a new workspace member; §3's opening note rules out `tf_tree_core`/`tf_tree_arena`, and it is not in `tf_tree_cli` because §4's offline Python API needs the same logic and cannot depend on a binary crate. §3.1's two passes **including the spill-to-run-file**, §3.3's MCAP source (schema-based discovery, so remapped topics are found) and every §3.2 row are implemented and gated by `cargo nextest run --workspace`. `tf_tree ingest --bag` needs no features; `tf_tree freeze --from-bag` needs `shm` (the frozen backend does) and is gated by `just shm-check`. **Of the four things that were not done, two are closed and two are now decisions with arguments rather than gaps:** §3.1's run file is built — grouping still handles every recording whose largest single edge fits the cap, and one edge over the cap on its own is spilled, *reduced* in bounded passes and merged, so `IngestError::EdgeExceedsMemoryCap` is gone (see §3.1's amendment, including why the reduce pass is not optional); `--on-clock-reset=split` **stays refused with the argument recorded in §3.2's amendment** — it would turn one ingest into N arenas and change every downstream contract, to do worse what cutting the recording already does; §3.3's rosbag2-sqlite3 source **stays absent on a measured dependency finding** (§3.3's amendment: `rusqlite` vendors C, `prsqlite` has no licence and `cargo deny` refuses it, `sqlite-rs`/`sq3_parser` are header parsers) but a `.db3` is now *diagnosed* as one, with the `ros2 bag convert` remedy, instead of being reported as a corrupt MCAP. **`freeze_from_arrays` is still absent**, and it is the one of the four that is a schedule rather than a decision: it needs no dependency and no format change, only a `tf_tree_py` entry point that builds a `Tree` from NumPy arrays, and its gate is `just py-test` / `just py-lint` on two interpreters rather than `cargo nextest`. `Tree.freeze()` — the way *out* — already exists (§4 row). **`--max-memory` bounds pass two's sort buffers and *not* the arena**, which is the larger of the two at a measured 78 B/sample against the buffers' 64 — the arena is the output and cannot be capped. `ingest::fill` carries the table and `tests/memory.rs` asserts it; an earlier revision claimed "peak memory is the cap either way", which was false. **§0.0's `default-features = false` on `mcap` has a visible cost:** a zstd- or lz4-compressed recording fails as `CompressedChunk`, and the CLI prints the `mcap compress --compression none` command that fixes it. **A truncated recording is read up to the cut** and reported as truncated rather than refused — a SIGKILLed recorder is how bags in the field end. **A review of the spill path found two real defects and they are fixed:** the temporary file's name was derived from the *edge slot*, so two concurrent `fill` calls in one process picked the same path and `truncate(true)` let the second empty the first's inode — silently interleaved samples, no error, and a deterministic collision rather than a race wherever the unlink-at-create cannot run; it is now a process-wide `AtomicU64`. And **the reduce pass's cross-run tie order was asserted by nothing** — two order-inverting edits left the whole workspace green while resolving a duplicate to the wrong pose — so `a_reduce_pass_keeps_the_last_occurrence` now gates it. Two accounting corrections came with them: a reduce pass holds **two** staging buffers and counted one, and the run index (16 B per run) is real memory the cap does not bound and is now reported as `peak_run_index_bytes` rather than omitted. **What is still not gated, and is said rather than papered over:** the *per-run* sort's stability. Swapping it for `sort_unstable_by_key` survives the whole suite, because a run at the caps these tests use is short enough that `sort_unstable` insertion-sorts and is stable in fact; the in-memory sort it mirrors *is* gated, by the two tests that compare the paths. **Five amendments below**: declaration order is canonical, the reset threshold is not the bridge's question, the reset *guard* is per edge, the cap is enforced by two mechanisms and not one, and `split` is a decision. |
 | §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 52 passed) and `just py-test-freethreaded` (3.14t, 54 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
-| §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
+| §6 Diagnostics catalogue `TFT001`–`TFT018` | **Partly done.** All eighteen ids exist and are reported (§6's second amendment appends `TFT017` *unclaimed dynamic edge* and `TFT018` *out-of-order stamps*, so **nothing is reported id-less any more**; the ids are appended and never renumbered, which is what keeps `--suppress` and `--json` compatible); `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Fifteen detect** — `TFT001`, `TFT005`–`TFT018` — of which **thirteen run on the reference fixture**: `tf_tree doctor` reports `12 passed, 1 fired, 5 not run` of eighteen. **Three cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local) and `TFT004` (no arena receipt time is recorded). **Six more skip conditionally**, on evidence rather than on capability: `TFT001` and `TFT018` (live arena — the rings remember the current claim owner and not the sequence of writers, and the window slides while it is read), `TFT005` (the arena's stamps do not share an epoch with the system clock), **`TFT007` (nothing in *this* arena was comparable — either no edge declares a nominal rate, or the declaring edges have not retained enough intervals to measure one; the skip reason says which)**, `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **`TFT007` was in the first group and is now in the second** — the amendment in §6 records how: a topology file's `rate_hz` is carried into `EdgeRecord::nominal_rate_mhz`, with no arena field added and no format bump. The reference fixture sizes its rings by slot count, so it still skips *there*, with a reason about that arena rather than about the system. **A `TFT007` `pass` therefore always means at least one edge was compared** — the second skip condition closes a review finding where a declared-but-unmeasurable arena (`doctor` at bringup, or a publisher that has stopped) reported `pass` having compared nothing, with no note either. **What §6's amendment states and does not solve:** `--discover` writes a *measured* rate into the same `rate_hz` the arena reads as an *intended* one, so a recording of a degraded publisher declares the fault as nominal — a discovered rate is a starting point to review. **`TFT018` also skips on a live arena** — the reconstructed push stream can show an inversion the publisher never made — which is a condition that was previously silently not run and reported as nothing at all. |
 | §7 `tf_tree top` | **Done, both halves.** `tf_tree top` exists, attaches read-only and *refuses* `--rw`, and renders all four panes §7 names: per-edge kind/rate/staleness/occupancy/writer, the participant list (arena record ∪ lock-file byte, so read-only participants appear at all), a rolling feed derived from counter deltas, and a per-edge detail view with an inter-arrival histogram. **Built with plain ANSI, not `ratatui` — see the amendment below.** `--web` serves the same [`Sampler`] over a hand-rolled HTTP/1.1 loop on `std::net::TcpListener` (**no new dependency**; a server crate is the third instance of §7's own argument, and the web-view amendment below records it), binding `127.0.0.1:8787` by default. One embedded HTML file, one `/api/tick` JSON endpoint (schema `tf_tree.top/1`), hand-written SVG, **no CDN — enforced by a `default-src 'none'` CSP the server sends, not promised by a comment.** Gated by `cargo nextest run --workspace`: the unit tests in `src/web.rs` plus `crates/tf_tree_cli/tests/web.rs`, which runs the shipped binary and parses the document a browser would receive; `just shm-check` runs the latter again under `--features shm`, which is the build an operator attaches with. **Three defects the amendment names were found by writing those tests and are fixed.** **Not done:** `--web` has no keep-alive, caps itself at 64 concurrent connections and is not a general-purpose server; there is no key handling on either half (see the `ratatui` amendment). |
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
 | §9 Benchmark artifact | **Partial.** `just bench-report` emits `report/{results.json,index.html}` with the §9.3 provenance header, all eight §9.2 rows, and all four §9.3 "where we are worse" entries; `Report::validate` makes the honesty rules structural — the tool refuses to write a report that over-claims, rather than relying on whoever wrote it. On this host every comparison row is `UNAVAILABLE` with its own reason, which is §9.3's prescribed output, not a gap in the tool. **Two of those reasons had gone stale and were corrected:** the `.tft` rows said §2 and §3 "are not implemented", citing *this table* as the source of truth, while this table records §2 as Done and §3 as done for MCAP — so the tool was printing a false statement under the one section (§9.3) that is about stating a true one. Both reasons are now derived from `cfg!(all(feature = "shm", target_os = "linux"))` — the frozen backend genuinely is not compiled into `just bench-report`'s build — and **two tests pin the general rule: an unavailable row's reason is about this host or this build, never about the roadmap.** **Not done:** §9.1's container image, the public sample recording, `tf_tree bench compare`'s CLI spelling, and §12 gate 7 (reproducing a committed `results.json` on a clean machine). The CLI spelling's blocker is no longer §3 (which landed) but the crate boundary: `tf_tree_bench` is `publish = false` and carries `criterion`, so a shipped `tf_tree` subcommand reaching it would drag a benchmark harness into every install — `CLAUDE.md` routes that to a decision record, not a PR. |
@@ -806,10 +806,119 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 | `TFT014` | Participant or claim slot leak | warn | Phase 2 lock file vs arena records |
 | `TFT015` | Arena occupancy > 80% (frames, edges, participants) | warn | header counters |
 | `TFT016` | THP disabled, or `RLIMIT_MEMLOCK` below arena size | info | `/sys`, `getrlimit` |
+| `TFT017` | Dynamic edge with no live writer | warn | claim table (added by the amendment below) |
+| `TFT018` | Stamps arriving out of monotonic order | error | observed push stream (added by the amendment below) |
 
 Output modes: human (default, coloured, grouped by severity), `--json` (stable schema, for CI), and `--exit-code` (non-zero if any error-severity check fires) so `doctor` can gate a robot's startup or a CI job.
 
 **`TFT004` deserves special care** — it is the check most likely to find something nobody knew. Compute per-publisher offset between header stamp and arena receipt time, track a rolling median, and report publishers whose median differs from the fleet median by more than a threshold. On a multi-machine robot with imperfect PTP this finds real problems that present as intermittent extrapolation errors.
+
+> **Amendment — `TFT007` is no longer structurally blind. The declared rate
+> comes from the topology file, and no arena field was added to get it there.**
+>
+> §0.0 recorded `TFT007` among the four ids that "cannot detect anything in any
+> configuration", because §1.2's `EdgeRecord::nominal_rate_mhz` was reserved and
+> never written: every edge read 0, and comparing an observed rate against zero
+> fabricates a finding on every edge of a correct arena.
+>
+> The missing piece was a *declaration*, and Phase 4 had already shipped one.
+> `TopologyConfig`'s `rate_hz` — which an operator writes, or
+> `tf_tree topology --discover` measures and writes for them — was consumed only
+> to size the ring. It is now also carried into the arena:
+>
+> ```text
+> topology.toml rate_hz -> TopologyConfig::builder -> EdgeCfg::nominal_rate_hz
+>                       -> TreeBuilder::build -> EdgeRecord::nominal_rate_mhz
+> ```
+>
+> **`FORMAT_VERSION` stays 3 and `layout_hash` does not move**: the field already
+> existed, at the offset §1.2 gave it, and this fills it. That is the whole
+> reason this was cheap — the expensive half was paid by §1's one deliberate
+> break, and §1.2's instruction not to add arena fields opportunistically is
+> honoured by adding none.
+>
+> Four properties of the detection are worth stating, because each is a way it
+> could have been wrong:
+>
+> * **`0` means undeclared, not 0 Hz.** An edge sized by `capacity = N` states no
+>   rate and is not compared. When *no* edge declares one, the whole check skips
+>   and says which knob supplies the evidence.
+> * **The observed rate is the median inter-arrival**, the same statistic the
+>   `edges` column prints, so the number an operator sees and the number the
+>   check judges cannot differ.
+> * **Both directions fire.** Slow is the obvious fault; fast is the quiet one —
+>   a ring sized from `rate_hz * history_secs` retains proportionally less
+>   history than every consumer was tuned against.
+> * **A partial run says so.** `Status` is three-valued and none of them is
+>   "ran, half blind", so when some edges declare and others do not, the coverage
+>   is disclosed in `Meta.notes` — the same mechanism `TFT015`'s missing
+>   participants row uses. **A run that compared *nothing* does not say `pass`**:
+>   an arena where edges declare a rate but none has retained enough intervals
+>   to measure one — `doctor` seconds after bringup, mid publisher restart, or
+>   on an edge whose publisher has stopped dead — **skips**, with a reason
+>   naming the missing stream rather than the missing declaration. A `pass`
+>   there is the same fabricated assurance as comparing against zero, arrived at
+>   from the other side.
+>
+> **A measured rate is not a declared rate, and `--discover` produces the first
+> while the arena reads it as the second.** Before this amendment `rate_hz` was
+> a sizing hint and the distinction cost nothing; it is now the statement
+> `TFT007` judges the robot against, and the two sources mean opposite things —
+> one is intent, one is observation. An integrator who records `/tf` while a
+> node is degraded at 12 Hz, runs `tf_tree topology --discover`, and ships the
+> result has declared 12 Hz: `doctor` will certify the fault as nominal and fire
+> `TFT007` when the publisher is *repaired*. Nothing in the tool can tell the
+> two apart, so this is stated rather than solved: **a discovered `rate_hz` is a
+> starting point to review, not a declaration.** `--discover` prints each edge's
+> sample count to stderr for exactly this review, and an edge whose rate could
+> not be measured is emitted as `capacity = N` — declaring nothing — rather than
+> as an invented rate.
+>
+> What this does **not** do: the reference fixture (`tf_tree_bench::fixture`)
+> sizes its rings by slot count and declares no rate, so `tf_tree doctor` on the
+> fixture still reports `TFT007` as not run. The reason it prints is now about
+> *that arena* rather than about the system, which is the whole difference
+> between an evidence skip and a capability skip. An arena built from a topology
+> file with `rate_hz` — which is what the ROS 2 bridge builds — runs it.
+
+> **Amendment — the catalogue runs to `TFT018`. The two Phase 1 checks that had
+> no id have one, and the decision is made rather than deferred.**
+>
+> §6's table listed sixteen ids and the seven Phase 1 checks mapped onto only
+> five of them. `unclaimed-dynamic` and `out-of-order` were reported *id-less*:
+> visible, still gating, and explicitly marked as having no identifier, because
+> forcing them into `TFT013` or `TFT006` would give an existing id a second
+> meaning and inventing new ones was an amendment nobody had made. This is that
+> amendment.
+>
+> **They are appended, not folded in.** The three candidates are each a different
+> condition: `TFT013` is *declared and never published to*, which is not
+> *published and then abandoned*; `TFT014` is a claim held by a slot whose owner
+> is gone, which is not *no claim at all*; `TFT006` judges a stamp's **value**,
+> and a stream of entirely plausible stamps can still arrive backwards.
+>
+> **Appending is additive; renumbering would be a break.** The ids are a public
+> contract — `--suppress` takes them, `--json` emits them, a runbook cites them.
+> `TFT017`/`TFT018` add two spellings to `--suppress` and two entries to an array
+> `--json` consumers already iterate. No existing id changes meaning, and none is
+> ever recycled.
+>
+> **What it buys, concretely.** `unclaimed-dynamic` fires on every dynamic edge
+> of an arena whose writers are not attached — a bag-ingested arena, or any
+> moment during a publisher restart — and until now there was no way to silence
+> it, because `--suppress` had nothing to name. And `out-of-order` was *silently
+> not run* on a live arena; it is now a stated skip, with the reason: the live
+> push stream is reconstructed from a ring that is being written while it is
+> read, so a slot at the old end of the window can already hold the next lap's
+> sample, which reads as an inversion on a correctly ordered publisher.
+>
+> **Severity is preserved exactly** — `TFT017` warn, `TFT018` error — so
+> `doctor --exit-code` fails on exactly what it failed on before. That value is
+> now stated in two places (the check and the id), so a test compares them:
+> `checks::tests::the_two_new_ids_keep_their_phase_1_severities`.
+>
+> The `uncatalogued` array stays in the `--json` schema with no producer. It is a
+> stable key, and it is the shape any future check without an id would take.
 
 ---
 

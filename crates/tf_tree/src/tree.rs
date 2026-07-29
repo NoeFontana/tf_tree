@@ -100,7 +100,15 @@ impl Capacity {
 /// `capacity` is required; `interp` and `domain` fall back to the builder
 /// defaults ([`TreeBuilder::default_interp`] / [`TreeBuilder::default_domain`])
 /// when left `None`.
+///
+/// `#[non_exhaustive]` because this struct is *designed* to grow — `interp`,
+/// `domain` and `nominal_rate_mhz` all arrived after `capacity`, and each would
+/// have been a breaking change for any out-of-repo `EdgeCfg { .. }` literal.
+/// Construction goes through [`EdgeCfg::new`] and the builder methods, which
+/// stay source-compatible across every such addition. Reading the fields is
+/// unaffected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EdgeCfg {
     /// Ring capacity (a power of two; see [`Capacity`]).
     pub capacity: Capacity,
@@ -108,17 +116,57 @@ pub struct EdgeCfg {
     pub interp: Option<InterpPolicy>,
     /// Time-domain tag (see [`Domain`]); `None` uses the builder default.
     pub domain: Option<u8>,
+    /// The rate this edge is *expected* to publish at, in milli-hertz;
+    /// `0` means "not declared". Set it through [`EdgeCfg::nominal_rate_hz`]
+    /// rather than by hand.
+    ///
+    /// Stored in `EdgeRecord::nominal_rate_mhz`, where `tf_tree doctor`'s
+    /// `TFT007` reads it. Nothing on the read path consults it: an edge that
+    /// publishes at half its declared rate still resolves normally, and saying
+    /// so is a diagnostic's job, not the lookup's.
+    pub nominal_rate_mhz: u32,
 }
 
 impl EdgeCfg {
-    /// A config with the given `capacity` and builder-default interp/domain.
+    /// A config with the given `capacity`, builder-default interp/domain and no
+    /// declared nominal rate.
     #[must_use]
     pub fn new(capacity: Capacity) -> EdgeCfg {
         EdgeCfg {
             capacity,
             interp: None,
             domain: None,
+            nominal_rate_mhz: 0,
         }
+    }
+
+    /// Declare the rate this edge is expected to publish at, in hertz.
+    ///
+    /// This is the *nominal* rate — what the publisher was configured to do —
+    /// and is the only thing that makes "the observed rate is wrong" a
+    /// statement anybody can check. Without it a diagnostic can report what a
+    /// rate *is* and never that it should have been something else
+    /// (`docs/PHASE5.md` §6, `TFT007`).
+    ///
+    /// Stored as milli-hertz because the rates that matter span 0.1 Hz (a map
+    /// update) to 1 kHz (an IMU), which integer hertz cannot express at the low
+    /// end. A rate that is not finite, not positive, or beyond `u32::MAX` mHz
+    /// (~4.29 MHz) is **not** a rate any robot publishes at, so it is dropped
+    /// back to "not declared" rather than clamped: a clamp would invent a
+    /// 4.29 MHz nominal out of an `f64::INFINITY` typo and then report every
+    /// real sample as a deviation from it.
+    #[must_use]
+    pub fn nominal_rate_hz(mut self, rate_hz: f64) -> EdgeCfg {
+        let mhz = rate_hz * 1000.0;
+        self.nominal_rate_mhz = if mhz.is_finite() && mhz >= 1.0 && mhz <= f64::from(u32::MAX) {
+            // `round`, not `as`: `as` truncates, so a rate that arrived as
+            // 19.9999 Hz through a text round-trip would declare 19_999 mHz for
+            // an edge the operator wrote `20.0` for.
+            mhz.round() as u32
+        } else {
+            0
+        };
+        self
     }
 
     /// Override the interpolation policy for this edge.
@@ -461,7 +509,7 @@ impl TreeBuilder {
                         let capacity = cfg.capacity.get();
                         let interp = cfg.interp.unwrap_or(self.default_interp);
                         let domain = cfg.domain.unwrap_or(self.default_domain);
-                        let record = EdgeRecord::dynamic(
+                        let mut record = EdgeRecord::dynamic(
                             parent.get(),
                             child.get(),
                             capacity,
@@ -470,6 +518,14 @@ impl TreeBuilder {
                             interp.as_u8(),
                             domain,
                         );
+                        // Assigned rather than passed to `dynamic()`: that
+                        // constructor is already at clippy's seven-argument
+                        // limit, and the field is plain data with no invariant
+                        // tying it to the ring layout the constructor computes.
+                        // Declaration time is the only moment it can be written
+                        // — `ArenaBuilder`'s `&mut` borrow ends with this scope,
+                        // and after that the arena may be shared.
+                        record.nominal_rate_mhz = cfg.nominal_rate_mhz;
                         running_off += capacity;
                         record
                     }
