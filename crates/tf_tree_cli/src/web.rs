@@ -12,13 +12,14 @@
 //! crate the workspace would still have to keep current — to answer two routes
 //! that serve one constant and one string.
 //!
-//! So this is `std::net::TcpListener`, one connection at a time, no keep-alive.
-//! The socket half of it — [`bind`], `read_head`, `respond`, [`serve`] and the
-//! two classifiers they lean on — is **126 lines of code** (`wc` of this file
-//! from `bind` to the test module, blank and comment lines excluded), and it
-//! cannot rot. The rest of the module is the JSON document, which a server
-//! crate would not have written for us. What it costs is stated in [`serve`]:
-//! it is not a general-purpose server and must never be pointed at a network.
+//! So this is `std::net::TcpListener`, a scoped thread per connection, no
+//! keep-alive. The socket half of it — [`bind`], `read_head`, `respond`,
+//! `handle`, [`serve`] and the classifiers they lean on — is **152 lines of
+//! code** (this file from `bind` to the test module, blank and comment lines
+//! excluded), and it cannot rot. The rest of the module is the JSON document,
+//! which a server crate would not have written for us. What it costs is stated
+//! in [`serve`]: it is not a general-purpose server and must never be pointed at
+//! a network.
 //!
 //! # This is the only network socket in the repository, and it is opt-in
 //!
@@ -84,10 +85,16 @@ pub const SCHEMA: &str = "tf_tree.top/1";
 
 /// How long a client gets to send its request head, and to accept the response.
 ///
-/// The server is single-threaded, so a client that connects and says nothing
-/// would otherwise stall the view for every other client — including the
-/// operator's own browser. Two seconds is far beyond a loopback round trip and
-/// far below an operator's patience.
+/// A peer that connects and says nothing holds a thread and one of
+/// [`MAX_CONNECTIONS`] slots until this fires, so it is what bounds the cost of
+/// a silent socket. Two seconds is far beyond a loopback round trip — and beyond
+/// a round trip through the SSH tunnel §7 recommends — and far below an
+/// operator's patience.
+///
+/// It is *not* what keeps the view answering: that is the thread per connection
+/// in [`serve`]. Before those existed this timeout was the only bound, and it
+/// bounded the outage per peer rather than in aggregate — five silent sockets
+/// still cost ten seconds.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The largest request head accepted, in bytes.
@@ -105,6 +112,16 @@ const MAX_HEAD: usize = 8 * 1024;
 /// costs ~1500 small objects a poll, which is nothing beside the per-edge
 /// interval vectors it is derived from.
 const HIST_BUCKETS: usize = 24;
+
+/// How many connections may be in flight at once.
+///
+/// Each one costs a thread and at most [`IO_TIMEOUT`], so this is the bound on
+/// what an unauthenticated local peer can make this process hold. Sixty-four is
+/// far above what a browser polling once a second and a `curl` or two need, and
+/// far below a thread count that matters on a robot's compute box. Past it a
+/// connection is dropped without being read, which is the honest answer: the
+/// alternative is queueing, and a queued poll is a stale poll.
+const MAX_CONNECTIONS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Routing
@@ -504,9 +521,10 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
 ///
 /// The header set is short and every line of it is load-bearing:
 ///
-/// * `Connection: close` — there is no keep-alive, because a single-threaded
-///   server that holds a connection open serves nobody else. One poll is one
-///   connection, which at the default interval is one per second.
+/// * `Connection: close` — there is no keep-alive. A held-open connection is a
+///   thread and one of [`MAX_CONNECTIONS`] slots for as long as the browser
+///   feels like keeping it, in exchange for saving a loopback handshake. One
+///   poll is one connection, which at the default interval is one per second.
 /// * `Content-Security-Policy` — this is what makes §7's "no CDN" enforced by
 ///   the browser instead of promised by a comment. `default-src 'none'` blocks
 ///   every external load; `connect-src 'self'` leaves exactly the one `fetch`
@@ -579,17 +597,75 @@ fn is_descriptor_exhaustion(e: &std::io::Error) -> bool {
     cfg!(unix) && matches!(e.raw_os_error(), Some(23 | 24))
 }
 
-/// Serve the view until `max_requests` connections have been handled.
+/// One connection, start to finish: deadlines, head, route, response.
+///
+/// The deadlines are set here and not on the listener because they are
+/// per-socket. The read half is the load-bearing one: a peer that connects and
+/// never sends a request line holds this thread until [`IO_TIMEOUT`], and
+/// [`read_head`] turns the resulting `WouldBlock`/`TimedOut` into "drop the
+/// connection".
+fn handle(
+    stream: &mut TcpStream,
+    bound: SocketAddr,
+    tick: &dyn Fn() -> String,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let Some(head) = read_head(stream)? else {
+        return Ok(());
+    };
+    let r = route(&head, bound);
+    match r {
+        Route::Index => respond(stream, r, INDEX_HTML.as_bytes()),
+        Route::Tick => respond(stream, r, tick().as_bytes()),
+        Route::NotFound => respond(stream, r, b"not found\n"),
+        Route::BadRequest => respond(stream, r, b"bad request\n"),
+        Route::MethodNotAllowed => respond(stream, r, b"only GET\n"),
+        // The refusal explains itself, because the operator who trips it will be
+        // looking at this string and not at this source file.
+        Route::ForbiddenHost => respond(
+            stream,
+            r,
+            b"forbidden: this view is bound to loopback and only answers requests whose \
+              Host is a loopback name. A page on another origin reaching this address is \
+              DNS rebinding, not you.\n",
+        ),
+    }
+}
+
+/// Serve the view until `max_requests` connections have been accepted.
 ///
 /// `max_requests == 0` runs until interrupted. The bound counts **accepted
 /// connections**, not successful requests, so a bounded run terminates even
 /// when a client connects and says nothing — which is also what makes it
-/// testable.
+/// testable. It returns once every connection it accepted has finished.
 ///
-/// `tick` is called only for `GET /api/tick`, and the caller is expected to rate
-/// limit it (see `cmd_top_web`): two open browser tabs polling one sampler would
-/// otherwise split every per-tick delta between them, and the rates in both
-/// would read half of what the arena is doing.
+/// # One thread per connection, capped at [`MAX_CONNECTIONS`]
+///
+/// The accept loop hands each socket to a scoped thread and goes straight back
+/// to `accept`. **This is not throughput, it is availability.** Handling
+/// connections inline costs a full [`IO_TIMEOUT`] per peer that connects and
+/// says nothing, and those costs add: five silent sockets blanked the operator's
+/// view for ten seconds, linear in the number of peers and bounded by nothing.
+/// A local port scanner or a stuck `curl` loop is enough, and it lands at
+/// exactly the moment somebody is watching a fault. With a thread per
+/// connection, a silent peer costs one thread for two seconds and delays nobody.
+///
+/// `std::thread::scope` and not `spawn`: the threads borrow `tick` and the
+/// listener, so the compiler is what guarantees none of them outlives this call.
+/// That is also why `serve` returning means every handler has finished — a
+/// bounded run cannot leave a response half-written.
+///
+/// Past [`MAX_CONNECTIONS`] in flight a connection is closed unread rather than
+/// queued, and the first time that happens is reported once. A cap is not
+/// optional: threads are the resource an unauthenticated peer would otherwise
+/// allocate without limit.
+///
+/// `tick` is `&dyn Fn` rather than `&mut dyn FnMut` because handlers share it,
+/// and it is called only for `GET /api/tick`. The caller is expected to rate
+/// limit it *and* to serialise it (see `cmd_top_web`): two browser tabs polling
+/// one sampler would otherwise split every per-tick delta between them, and the
+/// rates in both would read half of what the arena is doing.
 ///
 /// # Errors
 ///
@@ -601,69 +677,72 @@ pub fn serve(
     listener: &TcpListener,
     bound: SocketAddr,
     max_requests: u64,
-    tick: &mut dyn FnMut() -> String,
+    tick: &(dyn Fn() -> String + Sync),
 ) -> Result<()> {
-    let mut served = 0u64;
-    loop {
-        let (mut stream, _peer) = match listener.accept() {
-            Ok(v) => v,
-            Err(e) if accept_is_transient(&e) => {
-                eprintln!("--web: accept failed, still listening: {e}");
-                // Out of descriptors is the one transient failure that repeats
-                // immediately, so it would otherwise be a hot loop printing a
-                // line per iteration. Everything else here is one peer's doing
-                // and the next `accept` blocks normally.
-                if is_descriptor_exhaustion(&e) {
-                    std::thread::sleep(Duration::from_millis(50));
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let live = AtomicUsize::new(0);
+    let warned = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let mut served = 0u64;
+        loop {
+            let (mut stream, _peer) = match listener.accept() {
+                Ok(v) => v,
+                Err(e) if accept_is_transient(&e) => {
+                    eprintln!("--web: accept failed, still listening: {e}");
+                    // Out of descriptors is the one transient failure that
+                    // repeats immediately, so it would otherwise be a hot loop
+                    // printing a line per iteration. Everything else here is one
+                    // peer's doing and the next `accept` blocks normally.
+                    if is_descriptor_exhaustion(&e) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    // Deliberately *not* counted against `max_requests`: the
+                    // bound is a number of connections handled, and no
+                    // connection was.
+                    continue;
                 }
-                // Deliberately *not* counted against `max_requests`: the bound
-                // is a number of connections handled, and no connection was.
-                continue;
-            }
-            Err(e) => return Err(e).context("accepting a --web connection"),
-        };
-        served += 1;
-        let handled = (|| -> std::io::Result<()> {
-            // Both directions, and the read half is the load-bearing one: this
-            // loop is single-threaded, so a peer that connects and never sends a
-            // request line would otherwise block `read_head` forever and the
-            // operator's view would stop updating for as long as that socket is
-            // held open. `read_head` turns the resulting `WouldBlock`/`TimedOut`
-            // into "drop the connection".
-            stream.set_read_timeout(Some(IO_TIMEOUT))?;
-            stream.set_write_timeout(Some(IO_TIMEOUT))?;
-            let Some(head) = read_head(&mut stream)? else {
-                return Ok(());
+                Err(e) => return Err(e).context("accepting a --web connection"),
             };
-            let r = route(&head, bound);
-            match r {
-                Route::Index => respond(&mut stream, r, INDEX_HTML.as_bytes()),
-                Route::Tick => respond(&mut stream, r, tick().as_bytes()),
-                Route::NotFound => respond(&mut stream, r, b"not found\n"),
-                Route::BadRequest => respond(&mut stream, r, b"bad request\n"),
-                Route::MethodNotAllowed => respond(&mut stream, r, b"only GET\n"),
-                // The refusal explains itself, because the operator who trips it
-                // will be looking at this string and not at this source file.
-                Route::ForbiddenHost => respond(
-                    &mut stream,
-                    r,
-                    b"forbidden: this view is bound to loopback and only answers requests whose \
-                      Host is a loopback name. A page on another origin reaching this address is \
-                      DNS rebinding, not you.\n",
-                ),
+            served += 1;
+
+            // `fetch_add` and not load-then-add: the handlers decrement from
+            // their own threads, so a check that is not part of the increment
+            // can be overtaken between the two.
+            if live.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                live.fetch_sub(1, Ordering::AcqRel);
+                // Once, not per refusal: whatever is opening sockets faster than
+                // this can retire them would otherwise own the operator's
+                // terminal as thoroughly as it owns the port.
+                if !warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "--web: more than {MAX_CONNECTIONS} connections in flight; dropping the \
+                         excess unread. Something is opening sockets to this port faster than a \
+                         browser does."
+                    );
+                }
+                drop(stream);
+            } else {
+                let live = &live;
+                scope.spawn(move || {
+                    let handled = handle(&mut stream, bound, tick);
+                    live.fetch_sub(1, Ordering::AcqRel);
+                    if let Err(e) = handled {
+                        // A broken pipe is a browser navigating away mid-poll,
+                        // which is normal and is not worth a line in the
+                        // operator's terminal.
+                        if e.kind() != ErrorKind::BrokenPipe {
+                            eprintln!("--web: dropping a connection: {e}");
+                        }
+                    }
+                });
             }
-        })();
-        if let Err(e) = handled {
-            // A broken pipe is a browser navigating away mid-poll, which is
-            // normal and is not worth a line in the operator's terminal.
-            if e.kind() != ErrorKind::BrokenPipe {
-                eprintln!("--web: dropping a connection: {e}");
+
+            if max_requests != 0 && served >= max_requests {
+                return Ok(());
             }
         }
-        if max_requests != 0 && served >= max_requests {
-            return Ok(());
-        }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -895,10 +974,12 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let bound = listener.local_addr().unwrap();
         let h = std::thread::spawn(move || {
-            let mut n = 0u32;
-            serve(&listener, bound, 2, &mut || {
-                n += 1;
-                format!("{{\"schema\":\"{SCHEMA}\",\"n\":{n}}}")
+            // An atomic and not a `mut` capture: handlers share `tick`, so it is
+            // `&dyn Fn` and the count has to live behind interior mutability.
+            let n = std::sync::atomic::AtomicU32::new(0);
+            serve(&listener, bound, 2, &|| {
+                let seq = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                format!("{{\"schema\":\"{SCHEMA}\",\"n\":{seq}}}")
             })
             .unwrap();
         });
@@ -951,13 +1032,16 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let h = std::thread::spawn(move || {
-            let mut n = 0u32;
-            serve(&listener, bound, 3, &mut || {
-                n += 1;
+            let n = std::sync::atomic::AtomicU32::new(0);
+            serve(&listener, bound, 3, &|| {
+                n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 "{}".to_owned()
             })
             .unwrap();
-            tx.send(n).unwrap();
+            // `serve` returns only once every handler it spawned has finished,
+            // so this load cannot race a still-running `fetch_add`.
+            tx.send(n.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap();
         });
         for path in ["/", "/favicon.ico", "/api/tick"] {
             let mut s = TcpStream::connect(bound).unwrap();
@@ -970,21 +1054,25 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// **A silent client is dropped rather than wedging the single-threaded
-    /// loop, and the run is still bounded.**
+    /// **A silent client is dropped rather than held forever, and a bounded run
+    /// still returns.**
     ///
     /// This is the failure mode that turns a two-route server into an outage: a
-    /// port scanner opens a connection and never speaks, and the operator's
-    /// view stops updating for as long as it holds it.
+    /// port scanner opens a connection and never speaks. The thread per
+    /// connection is what keeps the *view* answering (see
+    /// `silent_peers_do_not_delay_the_operators_poll`); what this pins is that
+    /// [`IO_TIMEOUT`] eventually retires the socket, so a silent peer does not
+    /// hold a thread and a [`MAX_CONNECTIONS`] slot for the life of the process.
     ///
-    /// Mutant: delete the `stream.set_read_timeout(...)` line. Applied: the
-    /// client's own read deadline fires and `read_line` fails naming the wedge.
+    /// Mutant: delete the `stream.set_read_timeout(...)` line in `handle`.
+    /// Applied: the silent handler never finishes, `std::thread::scope` cannot
+    /// join it, `serve` never returns and the `recv_timeout` below fails naming
+    /// it.
     ///
-    /// **The deadlines on the client side are the finding, not decoration.** An
-    /// earlier revision of this test called `read_line` and `join` bare, and
-    /// under that mutant it did not fail — it *hung*, and there is no
-    /// `.config/nextest.toml` in this repository to convert a hang into a
-    /// failure, so `just test` would have wedged with no diagnostic instead of
+    /// **The deadlines on the client side are the finding, not decoration.**
+    /// Called bare, `read_line` and `join` turn that mutant into a *hang*, and
+    /// there is no `.config/nextest.toml` in this repository to convert a hang
+    /// into a failure — `just test` would wedge with no diagnostic instead of
     /// reporting a regression. A gate that never returns is a gate that does
     /// not run.
     #[test]
@@ -993,26 +1081,157 @@ mod tests {
         let bound = listener.local_addr().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let h = std::thread::spawn(move || {
-            let r = serve(&listener, bound, 2, &mut || "{}".to_owned());
+            let r = serve(&listener, bound, 2, &|| "{}".to_owned());
             tx.send(r.is_ok()).unwrap();
         });
         let silent = TcpStream::connect(bound).unwrap();
         let mut s = TcpStream::connect(bound).unwrap();
-        // Well above the 2 s [`IO_TIMEOUT`] the server may legitimately spend
-        // on `silent` before it reaches us, and well below any patience a human
-        // has for a hung test.
+        // Well above the 2 s [`IO_TIMEOUT`], and well below any patience a
+        // human has for a hung test.
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
         let mut line = String::new();
         std::io::BufReader::new(&mut s)
             .read_line(&mut line)
-            .expect("a silent peer must not hold the loop past IO_TIMEOUT");
+            .expect("a real request must be answered while a silent peer is held");
         assert_eq!(line, "HTTP/1.1 200 OK\r\n");
-        drop(silent);
+        // **`silent` is deliberately still open here.** Closing it first would
+        // end its handler by EOF, and the read timeout — the thing under test —
+        // would never have to fire.
         assert!(
             rx.recv_timeout(Duration::from_secs(20))
-                .expect("serve must return once both connections are done"),
+                .expect("IO_TIMEOUT must retire a silent connection so `serve` can return"),
+            "serve returned an error"
+        );
+        drop(silent);
+        h.join().unwrap();
+    }
+
+    /// **Silent peers cost the operator's poll nothing, however many there
+    /// are.**
+    ///
+    /// Handling connections inline made every silent socket cost a full
+    /// [`IO_TIMEOUT`] *in series*: measured on this host, one `/api/tick` took
+    /// 0.008 s alone and 10.047 s behind five sockets that connected and said
+    /// nothing — linear in the number of peers and bounded by nothing. A local
+    /// port scanner or a stuck `curl` loop blanks the view at the moment
+    /// somebody is watching a fault, and a per-connection deadline does not fix
+    /// it, it only sets the slope.
+    ///
+    /// Mutant: in `serve`, call `handle(&mut stream, bound, tick)` inline where
+    /// the `scope.spawn` is. Applied: the poll below takes ~10 s and the
+    /// deadline assertion fails, naming the elapsed time.
+    ///
+    /// The threshold is 2 s — one whole [`IO_TIMEOUT`] — rather than something
+    /// tight: what is being asserted is that the cost does not accumulate, and
+    /// a loaded CI box must not be able to fail this by being slow.
+    #[test]
+    fn silent_peers_do_not_delay_the_operators_poll() {
+        const SILENT: usize = 5;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let bound = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let r = serve(&listener, bound, (SILENT + 1) as u64, &|| "{}".to_owned());
+            tx.send(r.is_ok()).unwrap();
+        });
+
+        // Held open for the whole test: these are the peers that say nothing.
+        let held: Vec<TcpStream> = (0..SILENT)
+            .map(|_| TcpStream::connect(bound).unwrap())
+            .collect();
+        // Every one of them must have been accepted before the real request is
+        // sent, or the measurement is of an empty server. `accept` is what the
+        // loop does with no thread involved, so this settles in microseconds.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = std::time::Instant::now();
+        let mut s = TcpStream::connect(bound).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s.write_all(b"GET /api/tick HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&mut s)
+            .read_line(&mut line)
+            .expect("the poll must be answered");
+        let waited = started.elapsed();
+        assert_eq!(line, "HTTP/1.1 200 OK\r\n");
+        assert!(
+            waited < IO_TIMEOUT,
+            "{SILENT} silent peers must not delay a poll; it waited {waited:?}, and the failure \
+             mode this pins is that the cost is {SILENT} x {IO_TIMEOUT:?}"
+        );
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("serve must return once the silent peers time out"),
+            "serve returned an error"
+        );
+        drop(held);
+        h.join().unwrap();
+    }
+
+    /// **Past [`MAX_CONNECTIONS`] a connection is dropped, and the loop keeps
+    /// answering.**
+    ///
+    /// A thread per connection is a resource an unauthenticated local peer
+    /// allocates, so it has to be capped; what the cap must not do is take the
+    /// view away from the operator, which is the outage it exists to prevent.
+    ///
+    /// Mutant: delete the `live.fetch_add(...) >= MAX_CONNECTIONS` branch, so
+    /// every connection is spawned. Applied: the assertion that the excess peer
+    /// gets no response fails — it is answered like any other. Second mutant:
+    /// drop the `live.fetch_sub` in the handler, so the count only ever rises.
+    /// Applied: the final request is refused too and the last assertion fails.
+    #[test]
+    fn the_connection_cap_drops_the_excess_and_keeps_serving() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let bound = listener.local_addr().unwrap();
+        let total = (MAX_CONNECTIONS + 2) as u64;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let r = serve(&listener, bound, total, &|| "{}".to_owned());
+            tx.send(r.is_ok()).unwrap();
+        });
+
+        // Exactly the cap, all silent, all held.
+        let held: Vec<TcpStream> = (0..MAX_CONNECTIONS)
+            .map(|_| TcpStream::connect(bound).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+
+        // The one past the cap: accepted by the kernel, then closed unread.
+        let mut over = TcpStream::connect(bound).unwrap();
+        over.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        over.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut sink = Vec::new();
+        // Closing a socket with unread bytes still in its receive queue sends a
+        // RST, so the peer sees `ECONNRESET` rather than a clean EOF. Either is
+        // "no response"; the assertion is on the bytes, which is the property.
+        let _ = over.read_to_end(&mut sink);
+        assert!(
+            sink.is_empty(),
+            "a connection past the cap must be closed unread, not answered"
+        );
+
+        // And once the silent ones retire, the next request is served normally.
+        drop(held);
+        let mut s = TcpStream::connect(bound).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&mut s)
+            .read_line(&mut line)
+            .expect("the loop must still be answering after the cap was hit");
+        assert_eq!(line, "HTTP/1.1 200 OK\r\n");
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("serve must return"),
             "serve returned an error"
         );
         h.join().unwrap();
@@ -1034,7 +1253,7 @@ mod tests {
     fn an_oversized_request_head_is_refused_promptly() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let bound = listener.local_addr().unwrap();
-        let h = std::thread::spawn(move || serve(&listener, bound, 1, &mut || "{}".to_owned()));
+        let h = std::thread::spawn(move || serve(&listener, bound, 1, &|| "{}".to_owned()));
         let mut s = TcpStream::connect(bound).unwrap();
         let started = std::time::Instant::now();
         s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")

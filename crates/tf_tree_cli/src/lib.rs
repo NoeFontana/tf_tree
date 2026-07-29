@@ -874,7 +874,7 @@ fn cmd_top(
     // pane would list only the writers — and `top` itself would be invisible in
     // its own output.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    let merge: Box<dyn Fn(&mut top::Capture)> = if live.attach {
+    let merge: Box<dyn Fn(&mut top::Capture) + Sync> = if live.attach {
         match live
             .rendezvous()
             .ok()
@@ -920,7 +920,7 @@ fn cmd_top(
         Box::new(|_: &mut top::Capture| {})
     };
     #[cfg(not(all(feature = "shm", target_os = "linux")))]
-    let merge: Box<dyn Fn(&mut top::Capture)> = Box::new(|_: &mut top::Capture| {});
+    let merge: Box<dyn Fn(&mut top::Capture) + Sync> = Box::new(|_: &mut top::Capture| {});
 
     let interval = core::time::Duration::from_millis(interval_ms);
     if let Some(addr) = web {
@@ -964,6 +964,19 @@ fn cmd_top(
 /// A refresh younger than the interval is *not* an error: it is what a second
 /// tab, an F5, or a `watch curl` does, and all three should show the current
 /// tick rather than a 429.
+///
+/// # The `Mutex` is the same argument, not a second one
+///
+/// `web::serve` runs a thread per connection, so the sampler is now reachable
+/// from several at once and the correctness above becomes a data race as well
+/// as a wrong number. Serialising the whole closure is exactly right and costs
+/// nothing worth measuring: everything inside it is either a cache hit or one
+/// arena capture, and the interval is 50 ms at its fastest. What must *not* be
+/// serialised is the socket I/O, and none of it is here.
+///
+/// A poisoned lock is recovered rather than propagated. The alternative is that
+/// one panicking handler ends the operator's view, which is the failure mode
+/// the threading exists to remove.
 fn cmd_top_web(
     tree: &Tree,
     source: &'static str,
@@ -971,7 +984,7 @@ fn cmd_top_web(
     iterations: u64,
     edge: Option<String>,
     addr: std::net::SocketAddr,
-    merge: &dyn Fn(&mut top::Capture),
+    merge: &(dyn Fn(&mut top::Capture) + Sync),
 ) -> Result<()> {
     let (listener, bound) = web::bind(addr)?;
     let mut sampler = top::Sampler::new();
@@ -979,7 +992,7 @@ fn cmd_top_web(
     let mut cached: Option<(std::time::Instant, String)> = None;
     let selected_at_start = edge;
 
-    let mut tick = move || {
+    let sample = std::sync::Mutex::new(move || {
         let now = std::time::Instant::now();
         if let Some((at, doc)) = &cached {
             if now.duration_since(*at) < interval {
@@ -989,7 +1002,8 @@ fn cmd_top_web(
         let mut capture = top::Capture::from_tree(tree, source);
         merge(&mut capture);
         // `--edge` seeds the page's selection; after that the browser owns it,
-        // because there is no key handling to take it back with.
+        // because there is no key handling to take it back with. `web/index.html`
+        // reads this field once, from the first document it paints.
         let selected = selected_at_start
             .as_deref()
             .and_then(|needle| top::select_edge(&capture.edges, needle))
@@ -999,9 +1013,15 @@ fn cmd_top_web(
         let doc = web::tick_json(&t, interval, selected);
         cached = Some((now, doc.clone()));
         doc
+    });
+    let tick = || {
+        let mut guard = sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard()
     };
 
-    web::serve(&listener, bound, iterations, &mut tick)
+    web::serve(&listener, bound, iterations, &tick)
 }
 
 /// `tf_tree bench [--gate]`.
