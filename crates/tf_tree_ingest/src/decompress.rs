@@ -1,36 +1,44 @@
-//! Chunk handling: this crate takes chunks whole and reads inside them itself.
+//! Chunk handling: this crate owns MCAP's record framing and reads inside chunks.
 //!
-//! # Why the reader is configured this way
+//! # Why the framing is ours
 //!
 //! `mcap` is taken `default-features = false` because its `zstd` and `lz4`
 //! features vendor C through `zstd-sys`/`lz4-sys`, and `docs/PHASE2.md` §2
-//! forbids a C build step. The consequence is that the crate's own
-//! `get_decompressor` (`sans_io/linear_reader.rs`) can only ever return
-//! `UnsupportedCompression`, so **every compressed recording was refused** — and
-//! rosbag2 and Foxglove both write zstd chunks by default.
+//! forbids a C build step. The consequence used to be that **every compressed
+//! recording was refused**, since the crate's own decompressor factory is the
+//! only thing that reads a chunk and it can only report an unsupported codec —
+//! and rosbag2 and Foxglove both write zstd chunks by default.
 //!
-//! `LinearReaderOptions::with_emit_chunks(true)` routes around that entirely.
-//! The reader's `opcode == op::CHUNK && !emit_chunks` guard stops applying, the
-//! chunk falls through to the generic record path, and `get_decompressor` is
-//! never reached. What arrives is a `Record { opcode: op::CHUNK }` that
-//! `mcap::parse_record` splits into a `ChunkHeader` and its still-compressed
-//! body — neither of which is feature-gated. This is not a trick: the crate's
-//! own buffer-based reader ships the same configuration.
+//! The first fix was `LinearReaderOptions::with_emit_chunks(true)`, which hands
+//! chunks over whole so the factory is never reached. It worked, and it cost
+//! something that only a test revealed: **the reader will not hand over an
+//! incomplete record**, so a recording cut mid-chunk lost that whole chunk. On a
+//! real 1–4 MiB-chunked file that is the final chunk; on a small one it is
+//! everything. Truncation is not an edge case here — §3.3's `freeze --from-live`
+//! exists to "capture a fault in the field", and a fault in the field is how
+//! recordings get truncated.
 //!
-//! Two jobs become ours as a result. **Reading the records inside a chunk** is
-//! [`for_each_inner_record`], below. **Decompressing** is [`chunk_records`],
-//! which today serves only the uncompressed case and refuses the rest — the
-//! pure-Rust codecs land behind a later `compression` feature, and the point of
-//! separating the two changes is that this one is behaviour-preserving.
+//! So the framing is ours instead. It is nine bytes — `opcode: u8`, `len: u64`
+//! little-endian, `body[len]` — plus an eight-byte magic at each end of the file,
+//! and it is the *same* framing inside a chunk, so [`for_each_record`] serves
+//! both. What stays with `mcap` is every record **body**: `parse_record`,
+//! `records::*`, the `ChunkHeader` layout. That is the line worth holding — the
+//! framing is trivial and we already walked it for chunk interiors, whereas a
+//! `Schema`, `Channel` or `Message` body is genuinely not ours to re-derive.
 //!
-//! # What this file does *not* yet do
+//! What that buys, beyond compressed chunks:
 //!
-//! A chunk carries an `uncompressed_crc`, and validating it is now ours as well
-//! — the crate's own check runs only under `validate_chunk_crcs`, which defaults
-//! off and was never enabled here. It is deliberately not done in this revision:
-//! a CRC failure needs an error variant that says so, `IngestError` does not yet
-//! have one, and reporting it as the existing catch-all would be worse than the
-//! silence it replaces. Both arrive together.
+//! * **Record-granular truncation recovery, including inside a chunk.** A cut
+//!   chunk's prefix still yields every whole record in it.
+//! * **Byte offsets**, for a diagnostic that can say where.
+//! * **Chunk CRC validation** — `mcap`'s own runs only under
+//!   `validate_chunk_crcs`, which its default leaves off, so chunk CRCs were
+//!   never checked here at all. Doing it ourselves is a net gain.
+//!
+//! The one case still unrecoverable is a truncated **compressed** chunk: a partial
+//! codec frame is not decodable by a one-shot decoder. The bound is one chunk, and
+//! it is reported as truncation rather than as corruption, because nothing is
+//! wrong with the file beyond where it stops.
 
 use crate::IngestError;
 
@@ -41,7 +49,8 @@ use crate::IngestError;
 /// was a fixed-capacity byte array in the variant, which is uglier and buys one
 /// better message in a case nobody has met.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChunkCodec {
+#[non_exhaustive]
+pub enum ChunkCodec {
     /// `""` — the chunk's records are stored uncompressed.
     None,
     /// `"zstd"`.
@@ -66,6 +75,104 @@ impl ChunkCodec {
             _ => Self::Other,
         }
     }
+
+    /// Whether this build carries a decoder for it.
+    ///
+    /// [`ChunkCodec::None`] always counts: an uncompressed chunk needs no
+    /// decoder. The rest depend on the `compression` feature, which is why this
+    /// is a method rather than a `match` written out at each call site.
+    pub(crate) fn is_built_in(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// The name as it appears in a chunk header, for a diagnostic.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zstd => "zstd",
+            Self::Lz4 => "lz4",
+            Self::Other => "an unrecognised codec",
+        }
+    }
+}
+
+impl core::fmt::Display for ChunkCodec {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why one chunk could not be read.
+///
+/// `Copy` and `String`-free (`docs/PROJECT.md` §5). Each variant carries the
+/// numbers that distinguish "this recording is damaged" from "this file is not
+/// what it claims to be", which is the same reason
+/// [`CdrError`](crate::cdr::CdrError) carries a byte offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BadChunkKind {
+    /// The codec's stream did not decode.
+    #[error("its {codec} stream did not decode")]
+    Decompress {
+        /// Which codec was in use.
+        codec: ChunkCodec,
+    },
+    /// Decompression produced a different number of bytes than the header
+    /// declared.
+    ///
+    /// A correctness guard as much as a safety one: a stream that stops early
+    /// would otherwise parse as a valid *short* record list, losing transforms
+    /// with no counter anywhere to say so.
+    #[error("it declared {declared} uncompressed bytes and produced {produced}")]
+    LengthMismatch {
+        /// `ChunkHeader::uncompressed_size`.
+        declared: u32,
+        /// What the decoder actually wrote.
+        produced: u32,
+    },
+    /// The CRC32 in the header disagrees with the data.
+    #[error("its CRC32 is {saved:#010x} but the data hashes to {calculated:#010x}")]
+    Crc {
+        /// `ChunkHeader::uncompressed_crc`.
+        saved: u32,
+        /// What the records actually hash to.
+        calculated: u32,
+    },
+    /// The header declares more uncompressed bytes than this reader will
+    /// allocate for.
+    #[error("it declares {declared} uncompressed bytes, past this reader's ceiling")]
+    ImplausibleSize {
+        /// `ChunkHeader::uncompressed_size`.
+        declared: u64,
+    },
+    /// A record inside the chunk runs past the chunk's end, or a fragment too
+    /// short to be a record header trails it.
+    #[error("a record inside it is malformed, at offset {at}")]
+    InnerFraming {
+        /// Offset within the chunk's decompressed records field.
+        at: u32,
+    },
+}
+
+/// What went wrong with a chunk, before it is joined to a chunk ordinal.
+///
+/// The split matters because the two halves have different policies:
+/// [`ChunkFault::Unsupported`] is never skippable (every chunk in the file will
+/// use the same codec, so skipping them all yields "no transforms" explaining
+/// nothing), while [`ChunkFault::Bad`] is skippable by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChunkFault {
+    /// The codec is one this build has no decoder for.
+    Unsupported(ChunkCodec),
+    /// The chunk is damaged.
+    Bad(BadChunkKind),
+    /// The caller's own callback failed — an edge-kind change, a clock reset
+    /// under `halt`, an undecodable CDR payload. Carried through rather than
+    /// reshaped, because it is not a fact about the chunk and must never be
+    /// treated as one: a skip policy that swallowed it would turn a hard error
+    /// into silent data loss.
+    Callback(IngestError),
 }
 
 /// Hand back a chunk's `records` field, decompressing if this build can.
@@ -75,24 +182,186 @@ impl ChunkCodec {
 /// through it, so the case that already worked gains no copy — the two
 /// lifetimes are unified because the return value is one or the other.
 ///
-/// In this revision every codec is refused with
-/// [`IngestError::CompressedChunk`], which is exactly what the reader used to do
-/// one layer down, so the observable behaviour is unchanged.
+/// In this revision no codec is compiled in, so every compressed chunk is
+/// [`ChunkFault::Unsupported`] — the same outcome the reader produced before this
+/// module existed.
+///
+/// # Why the header is parsed here rather than by `mcap::parse_record`
+///
+/// `parse_record` validates `compressed_size` against the bytes it was given and
+/// fails with `BadChunkLength` when it is short. That is right for a whole file
+/// and wrong for a **truncated** one: the final chunk of a SIGKILLed recording is
+/// exactly the case where `compressed_size` describes bytes that were never
+/// written, and refusing it there would throw away every complete record inside
+/// its prefix. Parsing the six fixed fields here is twenty lines and is what makes
+/// recovery record-granular rather than chunk-granular.
 pub(crate) fn chunk_records<'a>(
-    header: &mcap::records::ChunkHeader,
-    compressed: &'a [u8],
+    body: &'a [u8],
+    complete: bool,
     scratch: &'a mut Vec<u8>,
-) -> Result<&'a [u8], IngestError> {
-    match ChunkCodec::parse(&header.compression) {
-        ChunkCodec::None => {
-            // Untouched: `scratch` exists for the compressed path and is not
-            // even read here. Keeping the borrow in the signature rather than
-            // splitting the function is what lets the caller hold one buffer.
-            let _ = scratch;
-            Ok(compressed)
-        }
-        ChunkCodec::Zstd | ChunkCodec::Lz4 | ChunkCodec::Other => Err(IngestError::CompressedChunk),
+) -> Result<&'a [u8], ChunkFault> {
+    let head = ChunkHead::parse(body)?;
+    if !head.codec.is_built_in() {
+        return Err(ChunkFault::Unsupported(head.codec));
     }
+    // Clamp rather than trust: on a truncated chunk `compressed_size` names bytes
+    // past the end of the file.
+    let available = body.len() - head.records_at;
+    let take = if complete {
+        match usize::try_from(head.compressed_size) {
+            Ok(n) if n <= available => n,
+            // A complete chunk whose declared size does not fit is corrupt, not
+            // truncated — that is what `complete` distinguishes.
+            _ => {
+                return Err(ChunkFault::Bad(BadChunkKind::LengthMismatch {
+                    declared: clamp_u32(head.compressed_size),
+                    produced: clamp_u32(available as u64),
+                }))
+            }
+        }
+    } else {
+        available
+    };
+    let records = &body[head.records_at..head.records_at + take];
+
+    // Untouched on this path: `scratch` exists for the compressed one and is not
+    // read here, so an uncompressed chunk is still never copied. Keeping the
+    // borrow in the signature rather than splitting the function is what lets the
+    // caller hold exactly one buffer for the whole file.
+    let _ = scratch;
+
+    // **A truncated chunk's CRC cannot be checked, and pretending otherwise would
+    // turn every truncated recording into a corrupt one.** The saved hash covers
+    // the whole records field; we have a prefix of it, so a mismatch is
+    // guaranteed and means nothing.
+    if complete {
+        check_crc(records, head.uncompressed_crc)?;
+    }
+    Ok(records)
+}
+
+/// The fixed part of a chunk record's header.
+///
+/// Only the fields this module needs, parsed by hand so a truncated chunk is
+/// still readable — see [`chunk_records`].
+struct ChunkHead {
+    // `uncompressed_size` sits at offset 16 and is deliberately *not* kept: it is
+    // only meaningful once a codec exists, where it is the exact allocation size
+    // and the value the decompression-bomb guard bounds. Parsing a field nothing
+    // reads would be one more thing to keep true for no gain.
+    uncompressed_crc: u32,
+    codec: ChunkCodec,
+    compressed_size: u64,
+    /// Offset within the chunk record's body at which the records field starts.
+    records_at: usize,
+}
+
+impl ChunkHead {
+    /// `message_start_time: u64`, `message_end_time: u64`, `uncompressed_size:
+    /// u64`, `uncompressed_crc: u32`, `compression: u32-prefixed string`,
+    /// `compressed_size: u64` — all little-endian, per the MCAP specification.
+    fn parse(body: &[u8]) -> Result<Self, ChunkFault> {
+        /// Up to the `compression` length prefix: two times, size, crc, prefix.
+        const FIXED: usize = 8 + 8 + 8 + 4 + 4;
+        let framing = |at: usize| {
+            ChunkFault::Bad(BadChunkKind::InnerFraming {
+                at: clamp_u32(at as u64),
+            })
+        };
+        if body.len() < FIXED {
+            return Err(framing(body.len()));
+        }
+        let u64_at = |at: usize| -> u64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&body[at..at + 8]);
+            u64::from_le_bytes(b)
+        };
+        let u32_at = |at: usize| -> u32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&body[at..at + 4]);
+            u32::from_le_bytes(b)
+        };
+        let uncompressed_crc = u32_at(24);
+        let name_len = u32_at(28) as usize;
+        let name_at = FIXED;
+        let after_name = name_at
+            .checked_add(name_len)
+            .ok_or_else(|| framing(name_at))?;
+        // The name, then `compressed_size`.
+        let records_at = after_name
+            .checked_add(8)
+            .ok_or_else(|| framing(after_name))?;
+        if records_at > body.len() {
+            return Err(framing(body.len()));
+        }
+        // A codec name is ASCII in practice; a non-UTF-8 one is not a codec this
+        // build knows, which `ChunkCodec::Other` already says.
+        let codec = match core::str::from_utf8(&body[name_at..after_name]) {
+            Ok(s) => ChunkCodec::parse(s),
+            Err(_) => ChunkCodec::Other,
+        };
+        let compressed_size = u64_at(after_name);
+        Ok(Self {
+            uncompressed_crc,
+            codec,
+            compressed_size,
+            records_at,
+        })
+    }
+}
+
+/// The message times a chunk header declares, for reporting what a skip lost.
+///
+/// `None` when the header cannot be parsed at all, which is the one case where
+/// there is nothing to report.
+pub(crate) fn chunk_span(body: &[u8]) -> Option<(u64, u64)> {
+    if body.len() < 16 {
+        return None;
+    }
+    let at = |off: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&body[off..off + 8]);
+        u64::from_le_bytes(b)
+    };
+    let (start, end) = (at(0), at(8));
+    // A writer that does not track them leaves both zero; reporting
+    // "1970-01-01 to 1970-01-01" as the lost span would be worse than silence.
+    if start == 0 && end == 0 {
+        None
+    } else {
+        Some((start.min(end), start.max(end)))
+    }
+}
+
+/// Saturate a `u64` into the `u32` an error variant carries.
+///
+/// The variants are `u32` to keep `IngestError` small; every real value is far
+/// below the ceiling, and a corrupt one only needs to read as "absurdly large".
+fn clamp_u32(v: u64) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+/// Verify a chunk's records against the CRC32 in its header.
+///
+/// # This is a gain, not a cost, and the reason is easy to misread
+///
+/// `LinearReaderOptions` derives `Default`, so `validate_chunk_crcs` is `false`
+/// and the crate's own check has **never** run in this crate. Doing it here means
+/// chunk CRCs are validated for the first time — including on the uncompressed
+/// chunks that already worked.
+///
+/// A saved CRC of `0` means "not computed" per the MCAP specification, so it is
+/// skipped rather than compared. Treating it as a real hash would fail every
+/// recording from a writer that does not compute one.
+fn check_crc(records: &[u8], saved: u32) -> Result<(), ChunkFault> {
+    if saved == 0 {
+        return Ok(());
+    }
+    let calculated = crc32fast::hash(records);
+    if calculated != saved {
+        return Err(ChunkFault::Bad(BadChunkKind::Crc { saved, calculated }));
+    }
+    Ok(())
 }
 
 /// Walk the records inside a chunk's decompressed `records` field.
@@ -109,20 +378,35 @@ pub(crate) fn chunk_records<'a>(
 /// The loop below borrows the buffer directly, so `parse_record` gets a slice
 /// into it and no intermediate copy exists.
 ///
-/// A trailing fragment shorter than a header, or a body that runs past the end,
-/// is a corrupt chunk rather than a normal end, and is reported as such.
-pub(crate) fn for_each_inner_record<F>(records: &[u8], mut g: F) -> Result<(), IngestError>
+/// With `tolerate_tail`, a trailing fragment is a normal end rather than
+/// corruption — which is what a **truncated** chunk's records field always looks
+/// like, since the file stopped in the middle of one. Without it, a fragment or a
+/// body running past the end is corruption and says so, carrying the offset.
+pub(crate) fn for_each_record<F>(
+    records: &[u8],
+    tolerate_tail: bool,
+    mut g: F,
+) -> Result<(), ChunkFault>
 where
     F: FnMut(u8, &[u8]) -> Result<(), IngestError>,
 {
     /// `opcode: u8` + `len: u64`.
     const HEADER: usize = 1 + 8;
 
+    let framing = |at: usize| {
+        ChunkFault::Bad(BadChunkKind::InnerFraming {
+            at: clamp_u32(at as u64),
+        })
+    };
     let mut at = 0usize;
     while at < records.len() {
         let remaining = records.len() - at;
         if remaining < HEADER {
-            return Err(IngestError::Mcap);
+            return if tolerate_tail {
+                Ok(())
+            } else {
+                Err(framing(at))
+            };
         }
         let opcode = records[at];
         // `unwrap` is unavailable under this workspace's lints, and the slice is
@@ -130,7 +414,7 @@ where
         // written as a match rather than an assertion.
         let len_bytes: [u8; 8] = match records[at + 1..at + HEADER].try_into() {
             Ok(b) => b,
-            Err(_) => return Err(IngestError::Mcap),
+            Err(_) => return Err(framing(at)),
         };
         let len = u64::from_le_bytes(len_bytes);
         // Two checks, not one. `usize::try_from` catches a length past the
@@ -138,13 +422,21 @@ where
         // `at + HEADER + len` is the value that could wrap.
         let len = match usize::try_from(len) {
             Ok(n) => n,
-            Err(_) => return Err(IngestError::Mcap),
+            Err(_) => return Err(framing(at)),
         };
         let end = match at.checked_add(HEADER).and_then(|h| h.checked_add(len)) {
             Some(e) if e <= records.len() => e,
-            _ => return Err(IngestError::Mcap),
+            // A body running past the end is the *other* face of truncation: the
+            // last record in a cut chunk declares more than survived.
+            _ => {
+                return if tolerate_tail {
+                    Ok(())
+                } else {
+                    Err(framing(at))
+                }
+            }
         };
-        g(opcode, &records[at + HEADER..end])?;
+        g(opcode, &records[at + HEADER..end]).map_err(ChunkFault::Callback)?;
         at = end;
     }
     Ok(())
@@ -180,7 +472,7 @@ mod tests {
     #[test]
     fn an_empty_records_field_is_not_an_error() {
         let mut seen = 0;
-        for_each_inner_record(&[], |_, _| {
+        for_each_record(&[], false, |_, _| {
             seen += 1;
             Ok(())
         })
@@ -202,7 +494,7 @@ mod tests {
             buf.extend_from_slice(body);
         }
         let mut got: Vec<(u8, Vec<u8>)> = Vec::new();
-        for_each_inner_record(&buf, |op, body| {
+        for_each_record(&buf, false, |op, body| {
             got.push((op, body.to_vec()));
             Ok(())
         })
@@ -222,8 +514,11 @@ mod tests {
         let mut buf = vec![0x05u8];
         buf.extend_from_slice(&64u64.to_le_bytes());
         buf.extend_from_slice(b"only four");
-        let err = for_each_inner_record(&buf, |_, _| Ok(())).unwrap_err();
-        assert_eq!(err, IngestError::Mcap);
+        let err = for_each_record(&buf, false, |_, _| Ok(())).unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkFault::Bad(BadChunkKind::InnerFraming { .. })
+        ));
     }
 
     /// A trailing fragment too short to be a header is refused.
@@ -237,8 +532,11 @@ mod tests {
         buf.extend_from_slice(&2u64.to_le_bytes());
         buf.extend_from_slice(b"ab");
         buf.extend_from_slice(b"tail");
-        let err = for_each_inner_record(&buf, |_, _| Ok(())).unwrap_err();
-        assert_eq!(err, IngestError::Mcap);
+        let err = for_each_record(&buf, false, |_, _| Ok(())).unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkFault::Bad(BadChunkKind::InnerFraming { .. })
+        ));
     }
 
     /// A record of length zero is legal and advances the cursor.
@@ -254,12 +552,117 @@ mod tests {
         buf.extend_from_slice(&1u64.to_le_bytes());
         buf.push(b'z');
         let mut got: Vec<(u8, usize)> = Vec::new();
-        for_each_inner_record(&buf, |op, body| {
+        for_each_record(&buf, false, |op, body| {
             got.push((op, body.len()));
             Ok(())
         })
         .unwrap();
         assert_eq!(got, vec![(0x0f, 0), (0x10, 1)]);
+    }
+
+    /// A CRC that disagrees with the data is caught, and a saved `0` is skipped.
+    ///
+    /// Two properties in one test because they are the same decision made twice.
+    /// Mutant: delete the comparison ⇒ the wrong-hash case is accepted. Mutant:
+    /// drop the `saved == 0` early return ⇒ the not-computed case starts failing,
+    /// and every recording from a writer that does not compute a CRC breaks.
+    #[test]
+    fn a_wrong_crc_is_caught_and_a_zero_crc_is_skipped() {
+        let data = b"the records field of some chunk";
+        let right = crc32fast::hash(data);
+        assert!(check_crc(data, right).is_ok());
+        assert!(
+            check_crc(data, 0).is_ok(),
+            "0 means not computed, per the spec"
+        );
+        let err = check_crc(data, right ^ 0xFFFF_FFFF).unwrap_err();
+        match err {
+            ChunkFault::Bad(BadChunkKind::Crc { saved, calculated }) => {
+                assert_eq!(calculated, right);
+                assert_ne!(saved, right);
+            }
+            other => panic!("expected a Crc fault, got {other:?}"),
+        }
+    }
+
+    /// A chunk header shorter than its fixed fields is a framing fault, not a
+    /// panic.
+    ///
+    /// Mutant: drop the `body.len() < FIXED` guard ⇒ the `u64_at`/`u32_at` slices
+    /// go out of range and this panics instead of returning. The input is a
+    /// truncated chunk, i.e. the ordinary case this rewrite exists to serve, so
+    /// the guard is on a real path rather than a defensive one.
+    #[test]
+    fn a_chunk_header_too_short_to_parse_is_a_framing_fault() {
+        for len in [0usize, 1, 15, 27, 31] {
+            let body = vec![0u8; len];
+            let mut scratch = Vec::new();
+            let err = chunk_records(&body, false, &mut scratch).unwrap_err();
+            assert!(
+                matches!(err, ChunkFault::Bad(BadChunkKind::InnerFraming { .. })),
+                "len {len} gave {err:?}"
+            );
+        }
+    }
+
+    /// A truncated chunk's CRC is not checked, because it cannot be.
+    ///
+    /// The saved hash covers the whole records field and we hold a prefix, so a
+    /// mismatch is guaranteed and means nothing. Checking it anyway would turn
+    /// every truncated recording into a corrupt one.
+    ///
+    /// Mutant: make the `check_crc` call unconditional (drop `if complete`) ⇒ the
+    /// partial read below fails with a `Crc` fault.
+    #[test]
+    fn a_truncated_chunk_does_not_have_its_crc_checked() {
+        // A chunk whose header claims a CRC that the prefix cannot match.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1_000u64.to_le_bytes()); // message_start_time
+        body.extend_from_slice(&2_000u64.to_le_bytes()); // message_end_time
+        body.extend_from_slice(&64u64.to_le_bytes()); // uncompressed_size
+        body.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // uncompressed_crc
+        body.extend_from_slice(&0u32.to_le_bytes()); // compression name length
+        body.extend_from_slice(&64u64.to_le_bytes()); // compressed_size
+        body.extend_from_slice(b"only a few bytes of the records field");
+
+        // Two times, uncompressed_size, crc, the name's length prefix, an empty
+        // name, then compressed_size: 8+8+8+4+4+0+8.
+        const HEADER_BYTES: usize = 40;
+        let mut scratch = Vec::new();
+        let partial = chunk_records(&body, false, &mut scratch).expect("a prefix must be readable");
+        assert_eq!(
+            partial.len(),
+            body.len() - HEADER_BYTES,
+            "the whole surviving records prefix must be handed over"
+        );
+
+        // The same bytes declared complete: now the length disagreement is real.
+        let mut scratch2 = Vec::new();
+        let err = chunk_records(&body, true, &mut scratch2).unwrap_err();
+        assert!(
+            matches!(err, ChunkFault::Bad(BadChunkKind::LengthMismatch { .. })),
+            "got {err:?}"
+        );
+    }
+
+    /// The span a skipped chunk reports comes from its header, and an unset one is
+    /// reported as absent rather than as 1970.
+    ///
+    /// Mutant: drop the `start == 0 && end == 0` case ⇒ a writer that does not
+    /// track message times has its lost span reported as the epoch, which reads as
+    /// a real answer and is not one.
+    #[test]
+    fn a_chunk_span_is_absent_rather_than_epoch() {
+        let mut body = vec![0u8; 16];
+        assert_eq!(chunk_span(&body), None);
+        body[0..8].copy_from_slice(&7u64.to_le_bytes());
+        body[8..16].copy_from_slice(&3u64.to_le_bytes());
+        assert_eq!(chunk_span(&body), Some((3, 7)), "the span is ordered");
+        assert_eq!(
+            chunk_span(&body[..4]),
+            None,
+            "too short to hold either time"
+        );
     }
 
     /// An error from the callback stops the walk immediately.
@@ -276,12 +679,12 @@ mod tests {
             buf.push(b'x');
         }
         let mut seen = 0;
-        let err = for_each_inner_record(&buf, |_, _| {
+        let err = for_each_record(&buf, false, |_, _| {
             seen += 1;
             Err(IngestError::NoTransforms)
         })
         .unwrap_err();
         assert_eq!(seen, 1);
-        assert_eq!(err, IngestError::NoTransforms);
+        assert_eq!(err, ChunkFault::Callback(IngestError::NoTransforms));
     }
 }

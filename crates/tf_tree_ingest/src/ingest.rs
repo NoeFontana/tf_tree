@@ -52,7 +52,7 @@ use tf_tree_bridge::names::NameNormalizer;
 use tf_tree_bridge::statics::{StaticKind, StaticStore, StaticVerdict};
 use tf_tree_bridge::Publisher;
 
-use crate::source::{read_tf, RawRecord, TopicRoles};
+use crate::source::{read_tf, OnBadChunk, RawRecord, TopicRoles};
 use crate::spill;
 use crate::{FrameId, IngestError};
 
@@ -103,6 +103,8 @@ pub struct IngestOptions {
     pub max_memory_bytes: u64,
     /// What to do on a backward clock jump.
     pub on_clock_reset: ClockResetPolicy,
+    /// What to do about a chunk that does not decompress or does not check out.
+    pub on_bad_chunk: OnBadChunk,
     /// How far backwards a stamp must jump to count as a reset rather than
     /// ordinary interleaving. Defaults to the bridge's own threshold, so a
     /// recording and a live system draw the line in the same place.
@@ -128,6 +130,7 @@ impl Default for IngestOptions {
             roles: TopicRoles::default(),
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             on_clock_reset: ClockResetPolicy::default(),
+            on_bad_chunk: OnBadChunk::default(),
             clock_reset_threshold_ns: tf_tree_bridge::clock::DEFAULT_RESET_THRESHOLD_NANOS,
             future_horizon_ns: DEFAULT_FUTURE_HORIZON_NS,
             tf_prefix: None,
@@ -263,6 +266,23 @@ pub struct Anomalies {
     /// out matters: every number in this report is then a number about a
     /// *prefix* of the run they recorded.
     pub truncated: bool,
+    /// Chunks that were unreadable and skipped (`OnBadChunk::Skip`).
+    ///
+    /// Reported next to [`truncated`](Anomalies::truncated), and for the same
+    /// reason: both mean the counts below cover only part of the recording. A
+    /// skipped chunk also takes its `Schema` and `Channel` records with it, so a
+    /// later message on a channel that was only ever declared there is dropped
+    /// with no counter of its own — which is why this row is not merely a tally.
+    ///
+    /// **Truncation does not count here.** A cut chunk's last record necessarily
+    /// runs past the end of the file; calling that corruption would tell an
+    /// operator their recording is damaged when it is only incomplete.
+    pub bad_chunks: u64,
+    /// The span the skipped chunks covered, from their own declared message times.
+    ///
+    /// "Three chunks were unreadable" is not actionable; "the transforms between
+    /// 14:22:07 and 14:22:19 are missing" is.
+    pub bad_chunk_span_ns: Option<(u64, u64)>,
 }
 
 /// The output of pass one: an exact topology and the counts that size it.
@@ -334,7 +354,7 @@ pub fn survey(
         remaps: Vec::new(),
     };
 
-    let skips = read_tf(path, &opts.roles, |rec| {
+    let skips = read_tf(path, &opts.roles, opts.on_bad_chunk, |rec| {
         out.transforms_read += 1;
         let Some((parent, child)) = normalize_pair(&mut normalizer, &rec, frames) else {
             out.anomalies.empty_names += 1;
@@ -459,6 +479,8 @@ pub fn survey(
     // line has to account for either or it under-reports silently.
     out.anomalies.filtered_channels = skips.filtered_channels + skips.non_cdr;
     out.anomalies.truncated = skips.truncated;
+    out.anomalies.bad_chunks = skips.bad_chunks;
+    out.anomalies.bad_chunk_span_ns = skips.bad_chunk_span_ns;
     out.anomalies.stripped_slash_names = normalizer.stripped_count();
     out.remaps = normalizer.remaps().to_vec();
     if out.edges.is_empty() {
@@ -652,7 +674,7 @@ pub fn fill(
             None => NameNormalizer::new(),
         };
 
-        read_tf(path, &opts.roles, |rec| {
+        read_tf(path, &opts.roles, opts.on_bad_chunk, |rec| {
             if rec.is_static || rec.stamp_ns == 0 {
                 return Ok(());
             }
@@ -809,7 +831,7 @@ fn fill_spilled(
     };
     stats.passes += 1;
 
-    read_tf(path, &opts.roles, |rec| {
+    read_tf(path, &opts.roles, opts.on_bad_chunk, |rec| {
         if rec.is_static || rec.stamp_ns == 0 {
             return Ok(());
         }

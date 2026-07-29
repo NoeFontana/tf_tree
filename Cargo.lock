@@ -1170,6 +1170,7 @@ name = "tf_tree_ingest"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "crc32fast",
  "mcap",
  "tf_tree",
  "tf_tree_bridge",

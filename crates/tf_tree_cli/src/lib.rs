@@ -385,6 +385,18 @@ pub struct IngestArgs {
     /// What to do when the recording's clock jumps backwards (§3.2).
     #[arg(long, value_enum, default_value_t = ClockResetArg::Halt)]
     pub on_clock_reset: ClockResetArg,
+    /// What to do about a chunk that will not decompress or fails its CRC.
+    ///
+    /// `skip` (the default) drops that chunk, counts it, and reports the span of
+    /// time it took with it — one bad chunk in four hundred thousand must not cost
+    /// the recording. `halt` refuses instead, for when you have to know the
+    /// recording is whole before trusting a number derived from it.
+    ///
+    /// A codec this build cannot decompress is **never** skipped either way: every
+    /// chunk would use it, and the result would be "no transforms" about a file
+    /// that is perfectly intact.
+    #[arg(long, value_enum, default_value_t = BadChunkArg::Skip, value_name = "POLICY")]
+    pub on_bad_chunk: BadChunkArg,
     /// Treat this topic as carrying static transforms. Repeatable.
     ///
     /// Without it the rule is "the last path segment is `tf_static`", which
@@ -432,6 +444,15 @@ pub enum ClockResetArg {
     Split,
 }
 
+/// `--on-bad-chunk`, mapped 1:1 onto `tf_tree_ingest`'s policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum BadChunkArg {
+    /// Skip the chunk, count it, report the span it lost.
+    Skip,
+    /// Refuse the recording, naming the chunk.
+    Halt,
+}
+
 impl IngestArgs {
     /// Convert to the library's options, failing on a value that cannot be
     /// represented.
@@ -448,6 +469,10 @@ impl IngestArgs {
                 dynamic_topics: self.tf_topic.clone(),
             },
             max_memory_bytes: self.max_memory.saturating_mul(1024 * 1024),
+            on_bad_chunk: match self.on_bad_chunk {
+                BadChunkArg::Skip => tf_tree_ingest::OnBadChunk::Skip,
+                BadChunkArg::Halt => tf_tree_ingest::OnBadChunk::Halt,
+            },
             on_clock_reset: match self.on_clock_reset {
                 ClockResetArg::Halt => tf_tree_ingest::ClockResetPolicy::Halt,
                 ClockResetArg::Split => tf_tree_ingest::ClockResetPolicy::Split,
@@ -489,7 +514,13 @@ fn cmd_ingest(
 fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -> anyhow::Error {
     let text = tf_tree_ingest::describe(e, frames).to_string();
     match e {
-        tf_tree_ingest::IngestError::CompressedChunk => anyhow::anyhow!(
+        tf_tree_ingest::IngestError::BadChunk { .. } => anyhow::anyhow!(
+            "{text}\n\
+             \x20 --on-bad-chunk=skip (the default) would drop just this chunk and\n\
+             \x20 report the span of time it takes with it, instead of refusing the\n\
+             \x20 whole recording."
+        ),
+        tf_tree_ingest::IngestError::CompressedChunk { .. } => anyhow::anyhow!(
             "{text}\n\
              \x20 this build has no zstd or lz4 (they vendor a C build step, which\n\
              \x20 docs/PHASE2.md §2 forbids). Rewrite the recording uncompressed:\n\
@@ -1440,7 +1471,13 @@ mod tests {
     #[test]
     fn the_compressed_chunk_error_carries_the_command_that_fixes_it() {
         let frames = tf_tree_ingest::Frames::default();
-        let text = ingest_err(tf_tree_ingest::IngestError::CompressedChunk, &frames).to_string();
+        let text = ingest_err(
+            tf_tree_ingest::IngestError::CompressedChunk {
+                codec: tf_tree_ingest::ChunkCodec::Zstd,
+            },
+            &frames,
+        )
+        .to_string();
         assert!(
             text.contains("mcap compress --compression none"),
             "the remedy must be a literal command a user can paste: {text}"
@@ -1448,6 +1485,46 @@ mod tests {
         assert!(
             text.contains("PHASE2"),
             "and it must say why this build cannot simply decompress: {text}"
+        );
+        assert!(
+            text.contains("zstd"),
+            "and it must name the codec, so a user can tell which of the two \
+             they have: {text}"
+        );
+    }
+
+    /// A bad chunk's error points at the policy that would have kept the rest of
+    /// the recording.
+    ///
+    /// An operator who meets this under `--on-bad-chunk=halt` has already decided
+    /// they want strictness; one who meets it because they *set* halt without
+    /// meaning to needs to be told the other option exists. The error is the only
+    /// place that can say so.
+    ///
+    /// Mutant: delete the `BadChunk` arm, leaving the `_` fallthrough ⇒ the
+    /// `--on-bad-chunk` assertion fails and the user is told a chunk is unreadable
+    /// with no indication that the recording is still usable.
+    #[test]
+    fn a_bad_chunk_error_names_the_policy_that_would_recover() {
+        let frames = tf_tree_ingest::Frames::default();
+        let text = ingest_err(
+            tf_tree_ingest::IngestError::BadChunk {
+                chunk: 7,
+                kind: tf_tree_ingest::BadChunkKind::Crc {
+                    saved: 0xDEAD_BEEF,
+                    calculated: 0x0BAD_F00D,
+                },
+            },
+            &frames,
+        )
+        .to_string();
+        assert!(
+            text.contains("--on-bad-chunk=skip"),
+            "the alternative policy must be named: {text}"
+        );
+        assert!(
+            text.contains('7'),
+            "and the chunk must be identified: {text}"
         );
     }
 

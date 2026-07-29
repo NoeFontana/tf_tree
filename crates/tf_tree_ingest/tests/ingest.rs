@@ -821,46 +821,147 @@ fn a_truncated_recording_yields_what_it_contains() {
     );
 }
 
-/// A recording cut before its first complete chunk says so, rather than claiming
-/// the recording has no transforms in it.
+/// Truncation recovery is **record-granular, including inside a chunk**: the more
+/// of a recording survives, the more transforms come out of it.
 ///
-/// This is the boundary of the previous test's guarantee, and it is worth pinning
-/// because the two failures look identical from the outside and have completely
-/// different remedies. Chunks are taken whole, so recovery is chunk-granular; a
-/// file cut inside its first chunk yields nothing at all. "This recording
-/// contains no transforms" would send the user hunting for a publisher that never
-/// ran, when their file is simply incomplete.
+/// This is the property the hand-rolled framing exists for. Asking a reader for
+/// whole records only means a cut mid-chunk loses that entire chunk — the final
+/// one of a real recording, and *all* of a small one. Measured on this fixture
+/// (24 960 bytes, 4 KiB chunks): 400 bytes yields 1 transform, 800 yields 4,
+/// 1 600 yields 10, 3 000 yields 21. A chunk-granular reader yields zero for
+/// every one of those.
 ///
-/// The cut is 400 bytes: past the start magic and the header record, so the file
-/// is recognisably an MCAP, and far short of the first 4 KiB chunk.
-///
-/// Mutant: return `NoTransforms` unconditionally in `survey`'s empty-edges branch
-/// (i.e. drop the `out.anomalies.truncated` test) ⇒ this fails on the variant.
+/// Mutant: skip the chunk arm when `!complete` (i.e. only read whole chunks) ⇒
+/// every cut below 4 KiB recovers nothing and the strict-increase assertion
+/// fails. Mutant: pass `tolerate_tail = false` in `read_chunk` ⇒ the final partial
+/// record in each prefix is reported as `InnerFraming` corruption and the ingest
+/// errors instead of recovering.
 #[test]
-fn a_recording_cut_before_its_first_chunk_says_so() {
-    let dir = Scratch::new("trunc_first");
+fn truncation_recovery_is_record_granular() {
+    let dir = Scratch::new("trunc_gran");
     let path = write(&dir, "full.mcap", &small_recording());
     let whole = std::fs::read(&path).unwrap();
-    assert!(
-        whole.len() > 4096,
-        "the fixture must be larger than one chunk for this cut to be inside the first one"
-    );
 
+    let mut recovered = Vec::new();
+    for cut in [400usize, 800, 1600, 3000, 6000] {
+        assert!(cut < whole.len());
+        let p = dir.path(&format!("c{cut}.mcap"));
+        std::fs::write(&p, &whole[..cut]).unwrap();
+        let mut f = Frames::default();
+        let s = tf_tree_ingest::survey(&p, &IngestOptions::default(), &mut f).unwrap_or_else(|e| {
+            panic!(
+                "a {cut}-byte prefix must still yield its complete records: {}",
+                tf_tree_ingest::describe(e, &f)
+            )
+        });
+        assert!(
+            s.anomalies.truncated,
+            "{cut} bytes was read as though the recording were whole"
+        );
+        // **Truncation is not corruption, and the report must not conflate them.**
+        // The final record in a cut chunk's prefix necessarily runs past the end;
+        // treating that as a malformed chunk would tell an operator their
+        // recording is damaged when it is merely incomplete, and would inflate a
+        // counter they are meant to act on.
+        assert_eq!(
+            s.anomalies.bad_chunks, 0,
+            "a truncated recording reported {} corrupt chunk(s) at a {cut}-byte cut",
+            s.anomalies.bad_chunks
+        );
+        recovered.push(s.transforms_read);
+    }
+    // Strictly increasing: a chunk-granular reader would give a run of zeros and
+    // then a jump, so this is what distinguishes the two.
+    for w in recovered.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "more bytes must yield more transforms, got {recovered:?}"
+        );
+    }
+    assert!(
+        recovered[0] > 0,
+        "a 400-byte prefix lands inside the first 4 KiB chunk and must still \
+         recover the records before the cut, got {recovered:?}"
+    );
+}
+
+/// A recording cut before *any* complete record says it was truncated, rather than
+/// claiming the recording has no transforms in it.
+///
+/// The remaining floor of the guarantee above: a prefix can be too short to hold
+/// one whole record, and then there is genuinely nothing to recover. The two
+/// failures look identical from the outside and have opposite remedies — "no
+/// transforms" sends the user hunting for a publisher that never ran, when their
+/// file is simply incomplete.
+///
+/// Mutant: return `NoTransforms` unconditionally in `survey`'s empty-edges branch
+/// (drop the `out.anomalies.truncated` test) ⇒ this fails on the variant.
+#[test]
+fn a_recording_cut_before_any_record_says_it_was_truncated() {
+    let dir = Scratch::new("trunc_floor");
+    let path = write(&dir, "full.mcap", &small_recording());
+    let whole = std::fs::read(&path).unwrap();
+
+    // 200 bytes: past the 8-byte magic and the Header record, so the file is
+    // recognisably an MCAP, and short of the first complete message.
     let p = dir.path("cut_early.mcap");
-    std::fs::write(&p, &whole[..400]).unwrap();
+    std::fs::write(&p, &whole[..200]).unwrap();
 
     let mut frames = Frames::default();
     let err = tf_tree_ingest::survey(&p, &IngestOptions::default(), &mut frames).unwrap_err();
     assert_eq!(
         err,
         tf_tree_ingest::IngestError::TruncatedBeforeAnyChunk,
-        "a cut inside the first chunk must be reported as truncation, not as an \
-         absence of transforms"
+        "a cut before any complete record must be reported as truncation, not as \
+         an absence of transforms"
     );
     let text = tf_tree_ingest::describe(err, &frames).to_string();
     assert!(
         text.contains("truncated"),
         "the message must name truncation: {text}"
+    );
+}
+
+/// A file whose start magic is missing is refused, **even though its records would
+/// parse perfectly well**.
+///
+/// The junk-file test above cannot show this: arbitrary bytes produce an absurd
+/// record length and are refused by the size bound, so a build with no magic check
+/// returns the same error by accident. This one strips the eight-byte magic off a
+/// real recording and leaves everything else intact, so the magic is the only
+/// thing standing between "a recording" and "something else that happens to be
+/// shaped like one".
+///
+/// It matters because the magic is now the *only* structural check on the file as
+/// a whole — everything downstream tolerates a short or damaged tail by design.
+///
+/// **No mutant kills this, and the reason is worth stating rather than hiding.**
+/// Dropping the `magic != *mcap::MAGIC` comparison was applied and survived: the
+/// eight bytes are consumed either way, so a file that fails the comparison is
+/// also misaligned by eight bytes and fails downstream on a nonsense record length
+/// — the same `IngestError::Mcap`, reached by accident. The comparison's value is
+/// that the refusal is *immediate and unambiguous* instead of incidental, which is
+/// a diagnostic property this test cannot distinguish. What the test does pin is
+/// that a headless file is refused at all, which is not free: everything after the
+/// magic tolerates damage by design, so without a structural check somewhere this
+/// would read as a recording containing nothing.
+#[test]
+fn a_recording_without_its_start_magic_is_refused() {
+    let dir = Scratch::new("nomagic");
+    let path = write(&dir, "full.mcap", &small_recording());
+    let whole = std::fs::read(&path).unwrap();
+
+    // Sanity: the intact file ingests, so the only difference below is the magic.
+    let mut ok_frames = Frames::default();
+    tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut ok_frames).unwrap();
+
+    let p = dir.path("headless.mcap");
+    std::fs::write(&p, &whole[8..]).unwrap();
+    let mut frames = Frames::default();
+    assert_eq!(
+        tf_tree_ingest::survey(&p, &IngestOptions::default(), &mut frames).unwrap_err(),
+        IngestError::Mcap,
+        "a file without MCAP's magic must be refused, not read as a recording"
     );
 }
 

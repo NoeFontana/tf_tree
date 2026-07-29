@@ -45,6 +45,15 @@ tf_tree_bridge.workspace = true
 # `mcap` CLI command that rewrites the file uncompressed.
 mcap = { version = "0.25", default-features = false }
 thiserror.workspace = true
+# **Chunk CRC32 validation, which became this crate's job with `emit_chunks`.**
+#
+# `mcap`'s own check runs only under `validate_chunk_crcs`, which its
+# `LinearReaderOptions::default()` leaves off — so chunk CRCs were never verified
+# here at all. Doing it ourselves is a net gain, not a new cost.
+#
+# Already in `Cargo.lock` via `mcap` itself, so this adds no transitive
+# dependency and no build step; it is the same crate, named directly.
+crc32fast = { version = "1", default-features = false }
 # `docs/PHASE5.md` §2.3's `source_digest`, which is specified as BLAKE3 of the
 # source recording. Already in the lock file via `tf_tree_core`, so it costs
 # nothing new; `default-features = false` keeps it consistent with that use.

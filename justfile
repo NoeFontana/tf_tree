@@ -8,7 +8,7 @@ build:
     cargo build --workspace --all-targets
 
 # Run the full test suite (unit + integration + doctests).
-test: test-rust test-doc
+test: test-rust test-doc ingest-check
 
 test-rust:
     cargo nextest run --workspace --no-tests=pass
@@ -199,6 +199,25 @@ cpp-deps:
     echo "cpp-deps: fetched Sophus 1.22.10"
 
 # Lint everything. Pure checks; does not mutate files.
+# **`tf_tree_ingest`'s feature axes, which `--workspace` compiles exactly one of.**
+#
+# `fixture` is off by default and reachable only through the crate's
+# self-referential dev-dependency, so `cargo clippy --workspace --all-targets`
+# compiles its module to nothing. That is the same shape as the defects
+# `test-rust` and `shm-check` already carry comments about, one crate over.
+#
+# This recipe exists now rather than when the codecs land, because the codec-free
+# build is about to become the *non-default* configuration — the one
+# `IngestError::CompressedChunk` exists for, and the one nothing would compile.
+ingest-check:
+    cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_ingest --features fixture
+    # The CLI's `ingest_err` arms are the only place the remedy text for a
+    # compressed or bad chunk exists, and they are reachable only from a build
+    # that can produce those errors.
+    cargo clippy -p tf_tree_cli --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_cli
+
 lint: py-compile
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
@@ -211,6 +230,9 @@ lint: py-compile
     # to nothing and `just c-abi-check` only ever runs `cargo test` over them.
     # One real warning had been sitting in `publish.rs` unseen.
     cargo clippy -p tf_tree_c --features test-hooks --all-targets -- -D warnings
+    # `tf_tree_ingest`'s `fixture` module is default-off and so is invisible to the
+    # workspace pass above, for the same reason. See `ingest-check`.
+    cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
 
 # **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
 #
