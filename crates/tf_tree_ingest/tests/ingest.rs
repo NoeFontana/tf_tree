@@ -120,11 +120,16 @@ fn small_recording_ingests() {
 /// comparison whose *values* matched and whose `EdgeId`s did not. That mutant is
 /// how the canonical-order requirement was found in the first place.
 ///
-/// **The `sort_by_key` stability is not guarded by any test here** and is not
-/// claimed to be: swapping it for `sort_unstable_by_key` leaves every test in
-/// this file passing, because Rust's pattern-defeating quicksort happens to be
-/// order-preserving on the small runs these fixtures produce. What holds the
-/// property is the comment at the call site, not a test.
+/// **The `sort_by_key` stability is not guarded by *this* test**, and is not
+/// claimed to be: swapping it for `sort_unstable_by_key` leaves this one
+/// passing, because this fixture has no duplicate stamps for stability to decide
+/// between. It *is* guarded elsewhere in this file —
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` and
+/// `a_reduce_pass_keeps_the_last_occurrence` both fail under that swap, because
+/// both carry duplicates and compare the in-memory path against the spill path.
+/// An earlier revision of this paragraph said no test in the file caught it,
+/// which was true when it was written and stopped being true when those two
+/// landed.
 #[test]
 fn out_of_order_ingest_matches_ordered() {
     let dir = Scratch::new("shuffle");
@@ -478,7 +483,11 @@ fn a_bag_loop_still_halts_with_a_per_edge_guard() {
 }
 
 /// §3.2's `split` policy is refused with a reason rather than silently doing
-/// something else.
+/// something else. **That refusal is the decided behaviour**, argued in §3.2's
+/// amendment — an ingest that produced N arenas would change the output type of
+/// every consumer, and cutting the recording at the stamp `halt` reports does
+/// the same job with tools the user already has. So this test pins a decision,
+/// not a placeholder.
 ///
 /// Mutant: map `ClockResetPolicy::Split` to the same `ClockReset` error as
 /// `Halt` — applied, and this test failed on the variant.
@@ -501,9 +510,11 @@ fn split_policy_says_it_is_unimplemented() {
     );
 }
 
-/// §11's "spill path" row, in the form §3.1's cap is actually implemented:
-/// a `--max-memory` below the dataset size splits pass two into several
-/// re-reads, and the result is identical to the single-pass one.
+/// §11's "spill path" row for the **grouping** half of §3.1's cap: a
+/// `--max-memory` below the dataset size splits pass two into several re-reads,
+/// and the result is identical to the single-pass one. The run-file half is
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` below; grouping is
+/// preferred wherever it applies, so this is the path most recordings take.
 ///
 /// Mutant: in `plan_groups`, return one group containing everything (delete the
 /// flush) — applied, and the `passes > 1` assertion failed, which is the point:
@@ -865,4 +876,464 @@ fn report_json_is_well_formed() {
     }
     assert_eq!(depth, 0, "unbalanced: {json}");
     assert!(!in_str, "unterminated string: {json}");
+}
+
+/// §3.1's spill-to-run-file: an edge that alone exceeds `--max-memory` is sorted
+/// through a temporary run file and a k-way merge, and produces **the same
+/// answers** as the in-memory path.
+///
+/// That equality is the whole assertion. The spill path has its own sort, its
+/// own duplicate collapse and its own ordering rule across runs; the only way to
+/// know all three agree with the path they replace is to run both over one
+/// recording and compare the answers, not the counters.
+///
+/// The recording is permuted by a coprime stride rather than lightly perturbed,
+/// and that is load-bearing: a locally-out-of-order edge cuts into runs whose
+/// stamp ranges are disjoint, so the merge degenerates into concatenation and
+/// never compares across runs. A stride permutation spreads the whole range
+/// through every run, so the heap does the work. The same construction is why
+/// the reset threshold has to stand down here, for the reason
+/// `out_of_order_ingest_matches_ordered` states at length: a deliberately
+/// reordered file's stamp inversions are the length of the recording and are
+/// indistinguishable from a bag loop.
+///
+/// Mutant: in `fill_spilled`, drop the trailing `if !buf.is_empty()` flush —
+/// applied, and this failed on `spilled_bytes` at 35 840 B against the 38 400 B
+/// asserted: the recording's last partial run was never written, so 40 samples
+/// vanished. Mutant 2: build the merger's readers from
+/// `spans.iter().rev()`, so the run indices and therefore the cross-run tie
+/// break run backwards — applied, and this failed inside the lookup comparison
+/// loop, the two paths disagreeing about the pose at the duplicated stamp.
+/// Mutant 3: swap the runs' `sort_by_key`
+/// for `sort_unstable_by_key` — **survived**: the tie that matters here is
+/// *between* runs, and this fixture never puts two equal stamps in one run.
+/// `a_reduce_pass_keeps_the_last_occurrence` puts a pair in one run and it
+/// survives there too, so the per-run sort's stability is a property no test in
+/// this suite gates — see that test's docstring for why, and for what does hold
+/// it. Mutant 4: swap **`fill`'s** in-memory `sort_by_key` for the unstable one
+/// — applied, and this failed, because the in-memory path is this test's
+/// reference and last-wins is what the two paths are being compared on.
+///
+/// The peak assertions are two-sided on purpose. `peak <= cap` alone is passed
+/// by a spill path that reports nothing at all: deleting every
+/// `peak_buffer_bytes` update in `fill_spilled` was applied, and it failed here
+/// and in `a_tiny_cap_reduces_in_several_passes`.
+#[test]
+fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
+    const N: i64 = 600;
+    // Coprime with N, so the stride visits every index exactly once.
+    const STRIDE: i64 = 7;
+    let dir = Scratch::new("spill");
+    let spill = dir.0.join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+
+    let mut msgs = Vec::new();
+    for i in 0..N {
+        let k = (i * STRIDE) % N;
+        let t = 1_000_000_000 + k * 1_000_000;
+        msgs.push(FixtureMessage::dynamic("odom", "base_link", t, pose(k as f64)).logged_at(t));
+        // A second, small edge so the run also exercises the ordinary grouped
+        // path beside the spilled one — a recording with a single edge would not
+        // show that the two coexist.
+        if i % 30 == 0 {
+            msgs.push(
+                FixtureMessage::dynamic("base_link", "arm", t, pose(k as f64 * 0.5)).logged_at(t),
+            );
+        }
+    }
+    // Duplicates of an *early* stamp appended at the very end, so the original
+    // and the duplicates land in different runs and the cross-run tie break is
+    // what decides. Last wins (§3.2), so `pose(42.0)` must be the survivor.
+    let dup_stamp = 1_000_000_000 + 3 * 1_000_000;
+    msgs.push(FixtureMessage::dynamic("odom", "base_link", dup_stamp, pose(41.0)).logged_at(0));
+    msgs.push(FixtureMessage::dynamic("odom", "base_link", dup_stamp, pose(42.0)).logged_at(0));
+
+    let path = write(&dir, "spill.mcap", &msgs);
+    let cap = 8192;
+    let base = IngestOptions {
+        clock_reset_threshold_ns: i64::MAX,
+        ..IngestOptions::default()
+    };
+    let mut f_spill = Frames::default();
+    let spilled = tf_tree_ingest::run(
+        &path,
+        &IngestOptions {
+            max_memory_bytes: cap,
+            spill_dir: Some(spill.clone()),
+            ..base.clone()
+        },
+        &mut f_spill,
+    )
+    .unwrap();
+    let mut f_mem = Frames::default();
+    let in_memory = tf_tree_ingest::run(&path, &base, &mut f_mem).unwrap();
+
+    // The fixture is non-degenerate for what it claims to test.
+    assert!(
+        spilled.report.fill.spilled_runs >= 3,
+        "only {} run(s); the cap did not force a real merge",
+        spilled.report.fill.spilled_runs
+    );
+    assert_eq!(
+        in_memory.report.fill.spilled_runs, 0,
+        "the uncapped run must not spill, or the two paths are the same path"
+    );
+    assert!(
+        spilled.report.fill.spilled_bytes >= N as u64 * 64,
+        "spilled {} B for {N} samples",
+        spilled.report.fill.spilled_bytes
+    );
+    assert!(
+        spilled.report.fill.peak_buffer_bytes <= cap,
+        "peak {} B over the {cap} B cap",
+        spilled.report.fill.peak_buffer_bytes
+    );
+    // And a *lower* bound, which is the half that makes the peak a measurement
+    // rather than a ceiling: the spill phase alone holds `run_samples × 64`
+    // plus staging, and `WINDOW_SHARE_*` puts that at three quarters of the cap
+    // at the least. Without this, deleting every `peak_buffer_bytes` update in
+    // `fill_spilled` — reporting zero for the whole spill path — passes.
+    assert!(
+        spilled.report.fill.peak_buffer_bytes >= cap * 3 / 4,
+        "peak {} B is too small to be the spill path's; it was not measured",
+        spilled.report.fill.peak_buffer_bytes
+    );
+
+    // The two paths agree about how much survived, and about the duplicate.
+    assert_eq!(
+        spilled.report.samples_pushed,
+        in_memory.report.samples_pushed
+    );
+    // `N` distinct stamps on the spilled edge (the two appended duplicates
+    // collapse onto one that is already there) plus `N / 30` on the small one.
+    assert_eq!(spilled.report.samples_pushed, N as u64 + N as u64 / 30);
+    assert_eq!(spilled.report.anomalies.duplicate_stamps, 2);
+    assert_eq!(
+        spilled.report.anomalies.duplicate_stamps,
+        in_memory.report.anomalies.duplicate_stamps
+    );
+
+    // And they answer identically, across the whole span and past both ends.
+    for i in -5..=(N + 5) {
+        let t = 1_000_000_000 + i * 1_000_000 + 250_000;
+        let a = spilled
+            .tree
+            .lookup("odom", "arm", Stamp::<SystemDomain>::from_nanos(t));
+        let b = in_memory
+            .tree
+            .lookup("odom", "arm", Stamp::<SystemDomain>::from_nanos(t));
+        match (a, b) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "at {t}"),
+            (Err(a), Err(b)) => assert_eq!(a, b, "at {t}"),
+            (a, b) => panic!("at {t}: {a:?} vs {b:?}"),
+        }
+    }
+    let got = spilled
+        .tree
+        .lookup(
+            "odom",
+            "base_link",
+            Stamp::<SystemDomain>::from_nanos(dup_stamp),
+        )
+        .unwrap();
+    let want = pose(42.0);
+    assert!(
+        (got.t.x - want[4]).abs() < 1e-12,
+        "cross-run duplicate resolved to {:?}, wanted the last occurrence {want:?}",
+        got.t
+    );
+
+    // The run file does not outlive the ingest. On Linux it never had a name
+    // after `create`; this catches the fallback path failing anywhere else.
+    let left: Vec<_> = std::fs::read_dir(&spill)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "spill directory still holds {left:?}");
+}
+
+/// A rosbag2 sqlite3 bag is **diagnosed**, not reported as a corrupt MCAP.
+///
+/// §3.3 lists `rosbag2` sqlite3 as a source and this build does not read it (see
+/// that section's amendment for the dependency finding). The gap between "not
+/// implemented" and "not implemented, and the tool says so" is the whole value
+/// of the check: `.db3` is the most likely wrong file to be handed, and "the
+/// file is not a well-formed MCAP recording" sends a user hunting for corruption
+/// in a file that is perfectly intact.
+///
+/// The fixture is a **real** SQLite database with rosbag2's schema
+/// (`testdata/rosbag2/`), not sixteen bytes of magic.
+///
+/// Mutant: delete the `is_sqlite` call in `read_tf` — applied, and this failed
+/// with `Mcap` where it expects `Rosbag2Sqlite`, which is exactly the unhelpful
+/// message the check exists to replace.
+#[test]
+fn a_rosbag2_sqlite3_bag_is_named_as_one() {
+    let bag =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/rosbag2/synthetic_empty.db3");
+    let mut frames = Frames::default();
+    // `Ingested` holds a `Tree`, which is not `Debug`, so `unwrap_err` is not
+    // available here.
+    match tf_tree_ingest::run(&bag, &IngestOptions::default(), &mut frames) {
+        Err(e) => assert_eq!(e, IngestError::Rosbag2Sqlite, "got {e:?}"),
+        Ok(_) => panic!("a rosbag2 .db3 must not ingest as an MCAP"),
+    }
+}
+
+/// A cap so small that the runs outnumber what one merge can hold: the spill
+/// path **reduces in several passes** and still answers identically.
+///
+/// This is the case that makes `--max-memory` a bound rather than an
+/// aspiration. A k-way merge keeps at least one sample of every run resident, so
+/// a single-pass merge over enough runs exceeds the cap no matter how the read
+/// windows are sized. The reduce loop is what removes that floor, and the test
+/// above does not reach it: at its 8 KiB cap the spilled edge produces **six**
+/// runs against a fan-in of **95**, so its `while runs.runs() > fan_in` loop
+/// never executes.
+///
+/// The witness that reduction actually happened is `spilled_bytes`. Every pass
+/// rewrites every sample, so three times the edge's own size means the initial
+/// spill plus **two** reduce passes; one pass would be two times, and no
+/// reduction at all would be one.
+///
+/// Mutant: delete the `while runs.runs() > fan_in` loop, leaving the
+/// single-pass merge — applied, and this failed twice over. `spilled_bytes` came
+/// back at 140 800 B against the 422 400 B asserted; with that assertion
+/// relaxed so the run could continue, the peak assertion then failed at 10 176 B
+/// resident against the 1 024 B cap, which is the tenfold overrun the loop
+/// exists to prevent.
+///
+/// Mutant 2: neutralise the three `peak_run_index_bytes` updates in
+/// `fill_spilled` — applied, and this failed with `run index 0 B`. Mutant 3:
+/// neutralise the three `peak_buffer_bytes` updates instead, so the spill path
+/// reports no peak at all — applied, and the *lower* bound failed. Both halves
+/// of both numbers are asserted, because a one-sided bound on a measurement is
+/// satisfied by not measuring.
+#[test]
+fn a_tiny_cap_reduces_in_several_passes() {
+    // 2 200 samples at 14 per run is 158 runs against a fan-in of 11: one
+    // reduce pass leaves 15, still over the fan-in, so a second runs and leaves
+    // 2. `spilled_runs` is the sum over passes and comes back at 158 + 15 + 2 =
+    // 175 — measured, not derived.
+    const N: i64 = 2_200;
+    const STRIDE: i64 = 7;
+    const CAP: u64 = 1024;
+    let dir = Scratch::new("reduce");
+    let spill = dir.0.join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+
+    let mut msgs = Vec::new();
+    for i in 0..N {
+        let k = (i * STRIDE) % N;
+        let t = 1_000_000_000 + k * 1_000_000;
+        msgs.push(FixtureMessage::dynamic("odom", "base_link", t, pose(k as f64)).logged_at(t));
+    }
+    let path = write(&dir, "reduce.mcap", &msgs);
+    let base = IngestOptions {
+        clock_reset_threshold_ns: i64::MAX,
+        ..IngestOptions::default()
+    };
+    let mut f1 = Frames::default();
+    let reduced = tf_tree_ingest::run(
+        &path,
+        &IngestOptions {
+            max_memory_bytes: CAP,
+            spill_dir: Some(spill.clone()),
+            ..base.clone()
+        },
+        &mut f1,
+    )
+    .unwrap();
+    let mut f2 = Frames::default();
+    let in_memory = tf_tree_ingest::run(&path, &base, &mut f2).unwrap();
+
+    assert!(
+        reduced.report.fill.spilled_bytes >= 3 * N as u64 * 64,
+        "spilled {} B for {N} samples; fewer than two reduce passes ran",
+        reduced.report.fill.spilled_bytes
+    );
+    assert_eq!(
+        reduced.report.fill.spilled_runs, 175,
+        "158 runs, then 15, then 2 — a different split means the reduce loop \
+         changed shape and this test's arithmetic no longer describes it"
+    );
+    assert!(
+        reduced.report.fill.peak_buffer_bytes <= CAP,
+        "peak {} B over the {CAP} B cap",
+        reduced.report.fill.peak_buffer_bytes
+    );
+    // The other side of the bound: a spill path that reported nothing would
+    // pass the assertion above. See the sibling test for the same pair.
+    assert!(
+        reduced.report.fill.peak_buffer_bytes >= CAP * 3 / 4,
+        "peak {} B is too small to be the spill path's; it was not measured",
+        reduced.report.fill.peak_buffer_bytes
+    );
+    // **The one allocation the cap does not bound**, reported rather than
+    // hidden: sixteen bytes per run, and at this cap there are enough runs for
+    // it to exceed the cap several times over. Measured at 6 880 B — the two
+    // files' `Vec<RunSpan>` plus the snapshot the reduce pass merges from.
+    assert!(
+        reduced.report.fill.peak_run_index_bytes > CAP,
+        "run index {} B; this fixture is supposed to be in the regime where it \
+         exceeds the cap, which is the regime worth reporting",
+        reduced.report.fill.peak_run_index_bytes
+    );
+    assert_eq!(reduced.report.samples_pushed, N as u64);
+    assert_eq!(
+        reduced.report.samples_pushed,
+        in_memory.report.samples_pushed
+    );
+    for i in 0..N {
+        let t = 1_000_000_000 + i * 1_000_000;
+        let a = reduced
+            .tree
+            .lookup("odom", "base_link", Stamp::<SystemDomain>::from_nanos(t))
+            .unwrap();
+        let b = in_memory
+            .tree
+            .lookup("odom", "base_link", Stamp::<SystemDomain>::from_nanos(t))
+            .unwrap();
+        assert_eq!(a, b, "at {t}");
+    }
+    let left: Vec<_> = std::fs::read_dir(&spill)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "spill directory still holds {left:?}");
+}
+
+/// **A duplicate that is re-merged by a reduce pass still resolves to the last
+/// occurrence in the recording.**
+///
+/// This is the half of §3.2's "last wins" that nothing else gates. The claim in
+/// `spill`'s module docs is that the recording-order tie break survives *being
+/// re-merged across passes*, and neither sibling test reaches that:
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` is the only one
+/// with duplicate stamps and its six runs never trip the
+/// `while runs.runs() > fan_in` loop, while
+/// `a_tiny_cap_reduces_in_several_passes` is the only one that reduces and its
+/// fixture has no duplicates at all. The failure that fits in the gap is silent:
+/// a `.tft` whose pose at one stamp is the second-to-last value the recording
+/// carried, disagreeing with the in-memory path over the same bag.
+///
+/// The fixture is built for it. At a 1 KiB cap a run holds 14 samples and the
+/// fan-in is 11, so recording indices 3 and 17 land in **runs 0 and 1** — two
+/// runs inside the *same* reduce window, which is exactly where the ordering is
+/// decided and then frozen: after pass one both live in one output run, and no
+/// later merge can reorder them.
+///
+/// Mutant: `spans.reverse()` before `spans.chunks(fan_in)` in `fill_spilled`,
+/// which keeps every window contiguous but inverts the run order inside it.
+/// Mutant 2: `runs.merge_runs(&chunk.iter().rev().copied().collect::<Vec<_>>(),
+/// window)`, which inverts the tie break inside a reduce pass only and leaves
+/// the final merge correct, so `spill`'s own
+/// `runs_merge_ascending_with_ties_in_run_order` cannot see it. Both were
+/// applied, both failed here at `across runs: resolved to Vec3 { x: 41.0, .. },
+/// wanted the last occurrence 42`, and **both left every other test in the
+/// workspace passing** — which is the gap this test closes.
+///
+/// Mutant 3, for the second duplicate pair: swap `fill_spilled`'s two
+/// `sort_by_key`s for `sort_unstable_by_key` — **survived**. A run here is 14
+/// samples and `sort_unstable_by_key` insertion-sorts a slice that short, so it
+/// is stable in fact and the pair cannot be reordered. The per-run sort's
+/// stability is therefore gated by **no** test in this suite; what stands behind
+/// it is the comment at the call site. The in-memory sort it mirrors *is* gated
+/// — swapping `fill`'s `sort_by_key` for the unstable one fails this test and
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` together — so the
+/// within-run pair is kept for that, and for the day a larger run size makes the
+/// per-run half reachable.
+#[test]
+fn a_reduce_pass_keeps_the_last_occurrence() {
+    const N: i64 = 2_200;
+    const STRIDE: i64 = 7;
+    const CAP: u64 = 1024;
+    // `spill::spill_budget(1024)`'s samples-per-run. Spelled as a literal
+    // because the constant is crate-private, and a test that recomputed it from
+    // the same expression would be checking nothing.
+    const RUN: usize = 14;
+    let dir = Scratch::new("reduce_ties");
+    let spill = dir.0.join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+
+    let mut msgs = Vec::new();
+    for i in 0..N {
+        let k = (i * STRIDE) % N;
+        let t = 1_000_000_000 + k * 1_000_000;
+        msgs.push(FixtureMessage::dynamic("odom", "base_link", t, pose(k as f64)).logged_at(t));
+    }
+    // Off the 1 ms grid, so neither stamp collides with one the loop above
+    // already produced and each duplicate is a clean pair of two.
+    let across = 1_000_000_000 + 1_234_000_000 + 500_000;
+    let within = 1_000_000_000 + 1_300_000_000 + 500_000;
+    // Across two runs: index 3 is in run 0, index `3 + RUN` in run 1, and both
+    // runs fall inside the first reduce window.
+    msgs[3] = FixtureMessage::dynamic("odom", "base_link", across, pose(41.0)).logged_at(0);
+    msgs[3 + RUN] = FixtureMessage::dynamic("odom", "base_link", across, pose(42.0)).logged_at(0);
+    // Within one run, so the per-run sort decides rather than the heap.
+    msgs[5] = FixtureMessage::dynamic("odom", "base_link", within, pose(51.0)).logged_at(0);
+    msgs[9] = FixtureMessage::dynamic("odom", "base_link", within, pose(52.0)).logged_at(0);
+
+    let path = write(&dir, "reduce_ties.mcap", &msgs);
+    let base = IngestOptions {
+        clock_reset_threshold_ns: i64::MAX,
+        ..IngestOptions::default()
+    };
+    let mut f1 = Frames::default();
+    let reduced = tf_tree_ingest::run(
+        &path,
+        &IngestOptions {
+            max_memory_bytes: CAP,
+            spill_dir: Some(spill),
+            ..base.clone()
+        },
+        &mut f1,
+    )
+    .unwrap();
+    let mut f2 = Frames::default();
+    let in_memory = tf_tree_ingest::run(&path, &base, &mut f2).unwrap();
+
+    // Non-degenerate: the reduce loop has to have run, or this is the sibling
+    // test again under another name.
+    assert!(
+        reduced.report.fill.spilled_bytes >= 3 * N as u64 * 64,
+        "spilled {} B for {N} samples; fewer than two reduce passes ran",
+        reduced.report.fill.spilled_bytes
+    );
+    assert_eq!(reduced.report.anomalies.duplicate_stamps, 2);
+    assert_eq!(
+        reduced.report.anomalies.duplicate_stamps,
+        in_memory.report.anomalies.duplicate_stamps
+    );
+    assert_eq!(reduced.report.samples_pushed, N as u64 - 2);
+
+    for (stamp, want, which) in [
+        (across, 42.0, "across runs"),
+        (within, 52.0, "within one run"),
+    ] {
+        let got = reduced
+            .tree
+            .lookup(
+                "odom",
+                "base_link",
+                Stamp::<SystemDomain>::from_nanos(stamp),
+            )
+            .unwrap();
+        assert!(
+            (got.t.x - want).abs() < 1e-12,
+            "{which}: resolved to {:?}, wanted the last occurrence {want}",
+            got.t
+        );
+        let same = in_memory
+            .tree
+            .lookup(
+                "odom",
+                "base_link",
+                Stamp::<SystemDomain>::from_nanos(stamp),
+            )
+            .unwrap();
+        assert_eq!(got, same, "{which}: the two paths disagree");
+    }
 }

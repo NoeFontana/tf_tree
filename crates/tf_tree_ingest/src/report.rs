@@ -167,7 +167,9 @@ impl IngestReport {
             s,
             ",\"frames\":{},\"static_edges\":{},\"dynamic_edges\":{},\
              \"transforms_read\":{},\"samples_pushed\":{},\
-             \"passes\":{},\"peak_buffer_bytes\":{}",
+             \"passes\":{},\"peak_buffer_bytes\":{},\
+             \"peak_run_index_bytes\":{},\
+             \"spilled_runs\":{},\"spilled_bytes\":{}",
             self.frames,
             self.static_edges,
             self.dynamic_edges,
@@ -175,6 +177,9 @@ impl IngestReport {
             self.samples_pushed,
             self.fill.passes,
             self.fill.peak_buffer_bytes,
+            self.fill.peak_run_index_bytes,
+            self.fill.spilled_runs,
+            self.fill.spilled_bytes,
         );
         s.push_str(",\"span_ns\":");
         match self.span_ns {
@@ -306,6 +311,20 @@ impl IngestReport {
                 s,
                 "  re-read the recording {} times to stay under --max-memory (peak {} B)",
                 self.fill.passes, self.fill.peak_buffer_bytes
+            );
+        }
+        // Its own line, and not folded into the one above: a re-read costs time,
+        // a spill costs *disk*, and a user who has to find room for it needs the
+        // number rather than an inference from "passes > 1".
+        if self.fill.spilled_runs > 0 {
+            let _ = writeln!(
+                s,
+                "  spilled {} sorted run{} ({} B) to a temporary file, \
+                 {} B of run index; one edge exceeds --max-memory on its own",
+                self.fill.spilled_runs,
+                if self.fill.spilled_runs == 1 { "" } else { "s" },
+                self.fill.spilled_bytes,
+                self.fill.peak_run_index_bytes
             );
         }
         let a = &self.anomalies;
