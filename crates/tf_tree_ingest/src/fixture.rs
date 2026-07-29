@@ -32,6 +32,25 @@ use crate::cdr::{encode_tf_message, TransformStamped};
 /// The schema name a real `rosbag2` writes for `/tf`.
 pub const TF_SCHEMA: &str = "tf2_msgs/msg/TFMessage";
 
+/// Target uncompressed chunk size for every fixture in this module: **4 KiB**,
+/// against `mcap`'s 1 MiB default.
+///
+/// The corpora here are a few kilobytes, so at the default each fixture would be
+/// exactly one chunk — and one chunk is a degenerate fixture for two properties
+/// this crate now depends on.
+///
+/// **Truncation recovery is chunk-granular.** `read_tf` takes chunks whole (see
+/// `crate::decompress` for why), so the reader needs a complete chunk record
+/// before it emits anything from it. A recording cut mid-chunk therefore loses
+/// that chunk entirely, not just the records after the cut. With one chunk that
+/// means losing everything, which would make a truncation test either vacuous or
+/// impossible; with several it is the real behaviour, bounded and testable.
+///
+/// **The inner-record walk crosses boundaries.** A single chunk exercises
+/// `for_each_inner_record` once, from a clean start, which is the case least
+/// likely to be wrong.
+pub const FIXTURE_CHUNK_SIZE: u64 = 4 * 1024;
+
 /// One fabricated message: a topic, a log time, and the transforms in it.
 #[derive(Clone, Debug)]
 pub struct FixtureMessage {
@@ -125,6 +144,20 @@ pub fn write_mcap_as(
     let mut w = mcap::WriteOptions::new()
         .compression(None)
         .profile("ros2")
+        // **Deliberately far below `mcap`'s 1 MiB default, so a fixture spans
+        // many chunks rather than exactly one.**
+        //
+        // Every corpus in this module is a few kilobytes, so at the default a
+        // fixture is a single chunk — and a single chunk hides two things that
+        // matter. `crate::decompress::for_each_inner_record` is then walked once
+        // and never across a boundary; and truncation recovery, which is
+        // chunk-granular (see [`FIXTURE_CHUNK_SIZE`]), has nothing to recover
+        // because the one chunk is the one that was cut.
+        //
+        // A real recording is chunked at 1–4 MiB and holds far more per chunk,
+        // so this is not realism — it is the same number of chunks a real
+        // recording has, at this corpus's scale.
+        .chunk_size(Some(FIXTURE_CHUNK_SIZE))
         .library("tf_tree_ingest fixture (synthetic, not a recording)")
         .create(out)?;
     // An empty schema payload: MCAP requires the schema *record* to exist so
