@@ -478,7 +478,11 @@ fn a_bag_loop_still_halts_with_a_per_edge_guard() {
 }
 
 /// §3.2's `split` policy is refused with a reason rather than silently doing
-/// something else.
+/// something else. **That refusal is the decided behaviour**, argued in §3.2's
+/// amendment — an ingest that produced N arenas would change the output type of
+/// every consumer, and cutting the recording at the stamp `halt` reports does
+/// the same job with tools the user already has. So this test pins a decision,
+/// not a placeholder.
 ///
 /// Mutant: map `ClockResetPolicy::Split` to the same `ClockReset` error as
 /// `Halt` — applied, and this test failed on the variant.
@@ -501,9 +505,11 @@ fn split_policy_says_it_is_unimplemented() {
     );
 }
 
-/// §11's "spill path" row, in the form §3.1's cap is actually implemented:
-/// a `--max-memory` below the dataset size splits pass two into several
-/// re-reads, and the result is identical to the single-pass one.
+/// §11's "spill path" row for the **grouping** half of §3.1's cap: a
+/// `--max-memory` below the dataset size splits pass two into several re-reads,
+/// and the result is identical to the single-pass one. The run-file half is
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` below; grouping is
+/// preferred wherever it applies, so this is the path most recordings take.
 ///
 /// Mutant: in `plan_groups`, return one group containing everything (delete the
 /// flush) — applied, and the `passes > 1` assertion failed, which is the point:
@@ -1021,6 +1027,34 @@ fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
         .map(|e| e.file_name())
         .collect();
     assert!(left.is_empty(), "spill directory still holds {left:?}");
+}
+
+/// A rosbag2 sqlite3 bag is **diagnosed**, not reported as a corrupt MCAP.
+///
+/// §3.3 lists `rosbag2` sqlite3 as a source and this build does not read it (see
+/// that section's amendment for the dependency finding). The gap between "not
+/// implemented" and "not implemented, and the tool says so" is the whole value
+/// of the check: `.db3` is the most likely wrong file to be handed, and "the
+/// file is not a well-formed MCAP recording" sends a user hunting for corruption
+/// in a file that is perfectly intact.
+///
+/// The fixture is a **real** SQLite database with rosbag2's schema
+/// (`testdata/rosbag2/`), not sixteen bytes of magic.
+///
+/// Mutant: delete the `is_sqlite` call in `read_tf` — applied, and this failed
+/// with `Mcap` where it expects `Rosbag2Sqlite`, which is exactly the unhelpful
+/// message the check exists to replace.
+#[test]
+fn a_rosbag2_sqlite3_bag_is_named_as_one() {
+    let bag =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/rosbag2/synthetic_empty.db3");
+    let mut frames = Frames::default();
+    // `Ingested` holds a `Tree`, which is not `Debug`, so `unwrap_err` is not
+    // available here.
+    match tf_tree_ingest::run(&bag, &IngestOptions::default(), &mut frames) {
+        Err(e) => assert_eq!(e, IngestError::Rosbag2Sqlite, "got {e:?}"),
+        Ok(_) => panic!("a rosbag2 .db3 must not ingest as an MCAP"),
+    }
 }
 
 /// A cap so small that the runs outnumber what one merge can hold: the spill

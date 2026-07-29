@@ -497,7 +497,17 @@ fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -
         ),
         tf_tree_ingest::IngestError::ClockResetSplitUnsupported => anyhow::anyhow!(
             "{text}\n\
-             \x20 docs/PHASE5.md §0.0 records --on-clock-reset=split as not implemented."
+             \x20 docs/PHASE5.md §3.2 records --on-clock-reset=split as deliberately\n\
+             \x20 refused, with the argument. Cut the recording at the stamp `halt`\n\
+             \x20 reports and ingest each part."
+        ),
+        tf_tree_ingest::IngestError::Rosbag2Sqlite => anyhow::anyhow!(
+            "{text}\n\
+             \x20 rosbag2's sqlite3 storage is not read by this build (docs/PHASE5.md\n\
+             \x20 §3.3: every pure-Rust SQLite reader is either unlicensed or a header\n\
+             \x20 parser, and the C ones are ruled out by docs/PHASE2.md §2).\n\
+             \x20 Convert it once, with ROS 2's own tool:\n\
+             \x20   ros2 bag convert -i <bag.db3> -o <out.yaml>   # storage_id: mcap"
         ),
         _ => anyhow::anyhow!("{text}"),
     }

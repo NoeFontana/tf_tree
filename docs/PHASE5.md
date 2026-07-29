@@ -19,7 +19,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 |---|---|
 | §1 `FORMAT_VERSION = 3`, Phase 6 regions reserved | **Done.** Header 256 → 320 with ≥ 64 bytes still reserved (asserted, not intended); the two counter regions; Phase 6's four header fields, declared absent; `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`, `frame_kind` in `FrameRecord`; `layout_hash` `0x9075_90F5` → `0x3D10_4195`; `doctor --explain-version`. **Two of this section's own amendments were wrong and are corrected in place.** |
 | §2 Frozen arena (`.tft`) | **Done.** `tf_tree_arena::frozen` writes and maps the container; `Tree::open_frozen`/`Tree::freeze_to` and `tf_tree freeze --from-live` are wired. §2.1's bit-for-bit claim is **tested and holds** (`crates/tf_tree/tests/frozen.rs`). Two amendments below: the container header's size, and the one-sided per-edge span. |
-| §3 Bag ingestion | **Partly done — MCAP only.** `tf_tree_ingest` is a new workspace member; §3's opening note rules out `tf_tree_core`/`tf_tree_arena`, and it is not in `tf_tree_cli` because §4's offline Python API needs the same logic and cannot depend on a binary crate. §3.1's two passes, §3.3's MCAP source (schema-based discovery, so remapped topics are found) and every §3.2 row are implemented and gated by `cargo nextest run --workspace`. `tf_tree ingest --bag` needs no features; `tf_tree freeze --from-bag` needs `shm` (the frozen backend does) and is gated by `just shm-check`. **Four things are not done and are not silently approximated:** `--on-clock-reset=split` is refused with a reason rather than producing one file; §3.1's spill-to-run-file is replaced by re-reading the recording once per edge group (the one case it cannot serve — a single edge over the whole cap — is a named error); §3.3's rosbag2-sqlite3 source and `freeze_from_arrays` are absent. **`--max-memory` bounds pass two's sort buffers and *not* the arena**, which is the larger of the two at a measured 78 B/sample against the buffers' 64 — the arena is the output and cannot be capped. `ingest::fill` carries the table and `tests/memory.rs` asserts it; an earlier revision claimed "peak memory is the cap either way", which was false. **§0.0's `default-features = false` on `mcap` has a visible cost:** a zstd- or lz4-compressed recording fails as `CompressedChunk`, and the CLI prints the `mcap compress --compression none` command that fixes it. **A truncated recording is read up to the cut** and reported as truncated rather than refused — a SIGKILLed recorder is how bags in the field end. **Three amendments below**: declaration order is canonical, the reset threshold is not the bridge's question, and the reset *guard* is per edge. |
+| §3 Bag ingestion | **Partly done — MCAP only.** `tf_tree_ingest` is a new workspace member; §3's opening note rules out `tf_tree_core`/`tf_tree_arena`, and it is not in `tf_tree_cli` because §4's offline Python API needs the same logic and cannot depend on a binary crate. §3.1's two passes **including the spill-to-run-file**, §3.3's MCAP source (schema-based discovery, so remapped topics are found) and every §3.2 row are implemented and gated by `cargo nextest run --workspace`. `tf_tree ingest --bag` needs no features; `tf_tree freeze --from-bag` needs `shm` (the frozen backend does) and is gated by `just shm-check`. **Of the four things that were not done, two are closed and two are now decisions with arguments rather than gaps:** §3.1's run file is built — grouping still handles every recording whose largest single edge fits the cap, and one edge over the cap on its own is spilled, *reduced* in bounded passes and merged, so `IngestError::EdgeExceedsMemoryCap` is gone (see §3.1's amendment, including why the reduce pass is not optional); `--on-clock-reset=split` **stays refused with the argument recorded in §3.2's amendment** — it would turn one ingest into N arenas and change every downstream contract, to do worse what cutting the recording already does; §3.3's rosbag2-sqlite3 source **stays absent on a measured dependency finding** (§3.3's amendment: `rusqlite` vendors C, `prsqlite` has no licence and `cargo deny` refuses it, `sqlite-rs`/`sq3_parser` are header parsers) but a `.db3` is now *diagnosed* as one, with the `ros2 bag convert` remedy, instead of being reported as a corrupt MCAP. **`freeze_from_arrays` is still absent**, and it is the one of the four that is a schedule rather than a decision: it needs no dependency and no format change, only a `tf_tree_py` entry point that builds a `Tree` from NumPy arrays, and its gate is `just py-test` / `just py-lint` on two interpreters rather than `cargo nextest`. `Tree.freeze()` — the way *out* — already exists (§4 row). **`--max-memory` bounds pass two's sort buffers and *not* the arena**, which is the larger of the two at a measured 78 B/sample against the buffers' 64 — the arena is the output and cannot be capped. `ingest::fill` carries the table and `tests/memory.rs` asserts it; an earlier revision claimed "peak memory is the cap either way", which was false. **§0.0's `default-features = false` on `mcap` has a visible cost:** a zstd- or lz4-compressed recording fails as `CompressedChunk`, and the CLI prints the `mcap compress --compression none` command that fixes it. **A truncated recording is read up to the cut** and reported as truncated rather than refused — a SIGKILLed recorder is how bags in the field end. **Five amendments below**: declaration order is canonical, the reset threshold is not the bridge's question, the reset *guard* is per edge, the cap is enforced by two mechanisms and not one, and `split` is a decision. |
 | §4 Offline Python API | **Done**, with §4.2 trimmed and §4.3's *reason* corrected — see the two amendments in those sections. `tf_tree.open_file()` returns the ordinary `Tree`, so §4.1's "no parallel offline API" is structural rather than promised; `Tree.freeze()` is the Python way *out*, which is also what makes §4.1's claim testable from Python at all (`tests/python/test_frozen.py` compares live against frozen bit-for-bit through `plan.at`). Of §4.2's five helpers only `span` is API: `resample` is one line of NumPy over `at`, and `edges`/`gaps`/`manifest` need §3's counting pass and a CBOR reader, neither of which exists. **Gated by `just py-test` (CPython 3.14, 52 passed) and `just py-test-freethreaded` (3.14t, 54 passed) — so §4 does *not* inherit Phase 3's 3.14t gap; `uv` fetches the free-threaded build even though the host interpreter is 3.12.3.** |
 | §5 Diagnostic counters | **Done**, §5.6 included — see its amendment: the capture is structural, not a step. Structs and regions landed with §1; §5.4's `Guard` accumulation, the error-path increments and §5.5's default-on `counters` feature are wired. §5.7's measurement is `cargo run --release -p tf_tree_bench --bin counter_cost`: **no measurable contention at or below the CPU count**, so the sharding fallback is not justified. |
 | §6 Diagnostics catalogue `TFT001`–`TFT016` | **Partly done.** All sixteen ids exist and are reported; `--json` (schema `tf_tree.doctor/1`), `--exit-code` and `--suppress` are wired. **Twelve detect** — `TFT001`, `TFT005`, `TFT006`, `TFT008`–`TFT016` — of which **eleven run on the reference fixture** (`TFT005` skips there, because the fixture's stamps are boot-relative): `tf_tree doctor` reports `10 passed, 1 fired, 5 not run`. **Four cannot detect anything in any configuration and say so** rather than passing: `TFT002`/`TFT003` (owned by `tf_tree_bridge::StaticStore`, whose state is process-local), `TFT004` (no arena receipt time is recorded) and `TFT007` (`nominal_rate_mhz` is always 0 — comparing against zero would fabricate a finding). **Four more skip conditionally**, on evidence rather than on capability: `TFT001` (live arena — the rings remember the current claim owner, not the sequence of writers), `TFT005` (the arena's stamps do not share an epoch with the system clock), `TFT010` (engine built without `counters`) and `TFT016` (non-Linux host). **Two Phase 1 checks have no id here** — `unclaimed-dynamic` and `out-of-order` — and are reported as id-less rather than forced into `TFT013`/`TFT006`; assigning them ids is an amendment this section has not made. |
@@ -330,6 +330,37 @@ Sorting is required because Phase 1 invariant 6 mandates non-decreasing stamps p
 
 Memory: buffer per edge, sort, drain. Peak is roughly the dataset size (~233 MB above). **Cap it** at a configurable `--max-memory` (default 4 GiB) and spill to a temporary run-file with a k-way merge beyond that. Most users never hit it; the ones who do have a 4-hour recording and will not accept an OOM.
 
+> **Amendment — the cap is enforced in two mechanisms, not one, and the run file
+> is the second choice.**
+>
+> §3.1 names one mechanism. There are two, because they bound different things:
+>
+> 1. **Grouping.** Edges are partitioned into sets whose buffers fit the cap
+>    together, and the recording is re-read once per set. This handles every
+>    recording whose largest *single* edge fits, costs one sequential re-read
+>    per group, and leaves no temporary file to leak, to fill a different
+>    filesystem, or to leave behind when the process is killed. It is preferred
+>    for exactly those reasons.
+> 2. **The run file**, for the case grouping cannot subdivide: one edge over the
+>    cap on its own. Spill cap-sized sorted runs, then merge.
+>
+> The merge needed a third step that §3.1 does not mention and that is not
+> optional. **A k-way merge holds at least one sample of every run resident, so a
+> single-pass merge over more runs than `cap / 64` exceeds the cap by
+> construction** — the very promise the run file exists to keep. So runs are
+> *reduced* in passes, merging a bounded fan-in at a time into a fresh file,
+> until one merge can hold what is left. The regime is reachable at ordinary
+> sizes, not only in theory: 2 200 samples at a 1 KiB cap overran it tenfold
+> before the reduce pass existed, which is how the omission was found.
+>
+> Ties break by run index and runs are merged in contiguous windows, so §3.2's
+> "last occurrence in the recording wins" survives being cut into runs and
+> re-merged across passes.
+>
+> **`--max-memory` still bounds the sort buffers and not the arena.** Nothing
+> here changes that, and the row in `ingest::fill`'s doc comment and
+> `tests/memory.rs` still say so.
+
 ### 3.2 Anomalies, all of which occur in real recordings
 
 | Anomaly | Handling |
@@ -399,12 +430,87 @@ The ingest report is a first-class output, not log noise: emit it as JSON alongs
 > The error consequently **names the edge**. The old one could not, and said
 > "clock reset" about something that was not one.
 
+> **Amendment — `--on-clock-reset=split` stays refused, and this is the
+> decision, not the backlog.**
+>
+> The table above says `split` "produces multiple `.tft` files". Implementing it
+> was considered against implementing §3.1's spill file, and only the spill file
+> was built. The argument, so nobody has to have it twice:
+>
+> 1. **The output type changes, everywhere.** Everything downstream of an ingest
+>    takes *one* path and yields *one* arena: `--out` is a path, §2.3's container
+>    holds one arena, §4.1's `open_file()` returns one `Tree`, a `Plan`'s span is
+>    that file's span, `tf_tree top` attaches to one, and §2.3's `source_digest`
+>    identifies one recording. `split` makes an ingest produce *N* of those from
+>    one input, which turns `--out` into a filename template, the ingest report
+>    into a set, and "the index for this bag" into a concept every consumer has
+>    to learn. That is a large, permanent surface change.
+> 2. **Nothing downstream can be given a segment set to hold.** The natural
+>    answer — one `.tft` carrying N segments — is not available: an arena has one
+>    time axis per edge (Phase 1 invariant 6) and after a reset the segments'
+>    stamps *overlap*, which is precisely why splitting is needed at all. So the
+>    segments cannot share an arena, and there is no other container.
+> 3. **The user almost never wants N of them.** A backward jump in a recording is
+>    a bag loop, a sim reset, or two recordings concatenated. In every one of
+>    those the question is about a single stretch of time; the others are noise.
+>    `halt` already reports the edge, the stamp, and the magnitude, which is the
+>    one number needed to cut the recording — with `mcap filter`, `ros2 bag
+>    convert`, or the recorder's own tooling — and ingest the part that matters.
+>    The split we would build is a worse version of a cut the user can already
+>    make, with a filename convention they did not choose.
+> 4. **It is not a lot of code, and that is not the cost.** The counting pass
+>    already detects the reset per edge; segmenting it is mechanical. The cost is
+>    the API surface in (1) and a format concept in (2), both of which are
+>    permanent, against a workflow that is already expressible.
+>
+> So the variant remains spelled — `--on-clock-reset=split` is accepted by the
+> parser and refused with a reason, rather than rejected as an unknown value,
+> because a user reading this table must be able to tell "I typed the name wrong"
+> from "this is not built". `IngestError::ClockResetSplitUnsupported` and the
+> CLI's message both now point at *this* amendment rather than at §0.0's status
+> table: it is a decision with an argument, not a row that is waiting to flip.
+>
+> **What would reopen it:** a user with a recording whose segments they genuinely
+> all want indexed, and who cannot cut the source. Nothing in §3 or §9 needs that
+> today.
+
 ### 3.3 Sources
 
 - **MCAP** — primary. Read `tf2_msgs/msg/TFMessage` via the schema, not by assuming a topic name; support `/tf`, `/tf_static`, and remapped equivalents.
 - **rosbag2 sqlite3** — supported, lower priority; convert to MCAP where practical.
 - **A running arena** — `tf_tree freeze --from-live --duration 60s` snapshots a live system. Useful for capturing a fault in the field.
 - **Python** — `tf_tree.freeze_from_arrays(...)` for users whose poses are not in a bag at all. This is how a non-ROS user gets in the door, and it should exist from day one.
+
+> **Amendment — the rosbag2 sqlite3 source is blocked on the dependency budget,
+> and the blocker was measured rather than assumed.**
+>
+> This is a finding, not a schedule. Reading a `.db3` needs a SQLite reader, and
+> every option was checked against the rules this repository already has:
+>
+> | Candidate | Verdict |
+> |---|---|
+> | `rusqlite` / `libsqlite3-sys` | Vendors C. `docs/PHASE2.md` §2's no-C-build-step rule already forced `mcap` to `default-features = false` and cost this crate zstd and lz4 (§0.0). Taking C here would make that concession pointless. |
+> | `prsqlite` 0.1.0 | Pure Rust, and **the crates.io index records no licence at all**. `deny.toml`'s `[licenses] allow` list is an allow-list, so `cargo deny check` — part of `just lint` — refuses it outright. Not a judgement call. |
+> | `sqlite-rs` 0.3.7 / `sq3_parser` 0.3.3 | Pure Rust, MIT, same author. Both are file-*header* and pager-level parsers: `sqlite-rs`'s public surface is `header`/`io`/`pager` with one undocumented `SqliteConnection`, at 20 % documentation coverage, and `sq3_parser` ships a feature spelled `defaulft`. Neither demonstrates table-row or BLOB iteration, which is the entire job. |
+> | Write one here | A read-only b-tree walk plus varint records plus overflow-page chains for a `/tf` message larger than a page — a file format reverse-implemented against fixtures we generate ourselves, in a crate whose reason to exist is *not* reimplementing databases. |
+>
+> **So it stays absent**, and §3.3's own next clause is the remedy: "convert to
+> MCAP where practical". `ros2 bag convert` does it in one command, and the
+> container this repository already builds (§0.0) carries both
+> `librosbag2_storage_sqlite3.so` and `librosbag2_storage_mcap.so`, so the
+> conversion needs nothing new either.
+>
+> What *is* built is the diagnosis. `tf_tree_ingest::source::is_sqlite` looks at
+> the sixteen magic bytes and returns `IngestError::Rosbag2Sqlite`, and the CLI
+> prints the conversion command — because the failure this closes is not "we do
+> not read `.db3`", it is that handing one to `tf_tree ingest` used to report
+> "the file is not a well-formed MCAP recording", which is true and sends the
+> user looking for corruption in an intact file. The fixture is a real SQLite
+> database with rosbag2's schema (`testdata/rosbag2/`), so the day a reader lands
+> it already has the shape it needs.
+>
+> **What would reopen it:** a pure-Rust, permissively licensed SQLite reader that
+> can iterate a table's rows and read BLOBs, at a maturity worth depending on.
 
 ---
 

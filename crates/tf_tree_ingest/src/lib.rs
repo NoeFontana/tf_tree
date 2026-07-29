@@ -113,6 +113,16 @@ pub enum IngestError {
     /// The file is not a well-formed MCAP.
     #[error("the file is not a well-formed MCAP recording")]
     Mcap,
+    /// The file is a SQLite database — almost certainly a rosbag2 `.db3` bag,
+    /// which §3.3 lists as a source and which this crate does not read.
+    ///
+    /// A variant of its own rather than [`IngestError::Mcap`]: it is the most
+    /// likely wrong file to be handed, "not a well-formed MCAP recording" is a
+    /// true statement that sends the user hunting for corruption, and the remedy
+    /// (`ros2 bag convert`) is one command. See the amendment at
+    /// `docs/PHASE5.md` §3.3 for why the reader is absent.
+    #[error("the file is a SQLite database, not an MCAP recording")]
+    Rosbag2Sqlite,
     /// A chunk uses zstd or lz4, which this build cannot decompress. See the
     /// crate docs for why, and for the one command that fixes it.
     #[error("the recording uses compressed chunks, which this build cannot read")]

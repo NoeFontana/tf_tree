@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use mcap::sans_io::{LinearReadEvent, LinearReader};
@@ -141,6 +141,28 @@ pub struct SkipCounts {
     pub truncated: bool,
 }
 
+/// The first sixteen bytes of every SQLite database file, including a rosbag2
+/// `.db3` (<https://sqlite.org/fileformat2.html> §1.3).
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// Whether this file is a SQLite database rather than an MCAP.
+///
+/// **A detection, not a reader.** `docs/PHASE5.md` §3.3's rosbag2 sqlite3 source
+/// is not implemented — the amendment there records why, and it is a dependency
+/// finding rather than a schedule — so the whole value of looking is the error
+/// message: without this, the most likely wrong file to hand `tf_tree ingest` is
+/// reported as "not a well-formed MCAP recording", which is true, useless, and
+/// sends the user looking for corruption in a file that is fine.
+///
+/// The peek is a `fill_buf` on the same `BufReader` the MCAP reader then uses,
+/// so it consumes nothing and costs no second `open`.
+fn is_sqlite(input: &mut BufReader<File>) -> Result<bool, IngestError> {
+    let head = input.fill_buf().map_err(|e| IngestError::Io {
+        raw_os_error: e.raw_os_error().unwrap_or(0),
+    })?;
+    Ok(head.starts_with(SQLITE_MAGIC))
+}
+
 /// Read every TF transform in `path`, calling `f` once per transform.
 ///
 /// The callback returns a `Result` so a caller can stop on the first anomaly it
@@ -149,10 +171,11 @@ pub struct SkipCounts {
 ///
 /// # Errors
 ///
-/// [`IngestError::Io`] for a failing read, [`IngestError::CompressedChunk`] for
-/// a chunk this build cannot decompress (see the crate docs), [`IngestError::
-/// Mcap`] for a malformed file, [`IngestError::Cdr`] for a payload that is not
-/// a decodable `TFMessage`, or whatever the callback returned.
+/// [`IngestError::Io`] for a failing read, [`IngestError::Rosbag2Sqlite`] for a
+/// rosbag2 sqlite3 bag, [`IngestError::CompressedChunk`] for a chunk this build
+/// cannot decompress (see the crate docs), [`IngestError::Mcap`] for a malformed
+/// file, [`IngestError::Cdr`] for a payload that is not a decodable `TFMessage`,
+/// or whatever the callback returned.
 pub fn read_tf<F>(path: &Path, roles: &TopicRoles, mut f: F) -> Result<SkipCounts, IngestError>
 where
     F: FnMut(RawRecord<'_>) -> Result<(), IngestError>,
@@ -161,6 +184,9 @@ where
         raw_os_error: e.raw_os_error().unwrap_or(0),
     })?;
     let mut input = BufReader::new(file);
+    if is_sqlite(&mut input)? {
+        return Err(IngestError::Rosbag2Sqlite);
+    }
     let mut reader = LinearReader::new_with_options(
         mcap::sans_io::LinearReaderOptions::default()
             // **A truncated recording is read up to the truncation point.**
