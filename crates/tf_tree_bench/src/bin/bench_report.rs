@@ -199,7 +199,7 @@ fn main() -> Result<()> {
         // compared nothing prints, and a regression gate that has quietly
         // stopped comparing is the exact failure this whole file is written
         // against.
-        if cmp.passed() && cmp.checked == 0 {
+        if cmp.compared_nothing() {
             eprintln!(
                 "regression gate compared NOTHING against {}: the baseline carries no \
                  directional metric this build also emits, so a green result here would \

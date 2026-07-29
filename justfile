@@ -623,9 +623,17 @@ shm-torture-self-test:
 # holding a mapping and an allocation — so LeakSanitizer would report the thing
 # the test is deliberately doing. ASan's memory-error detection, which is what
 # this is for, is unaffected.
+#
+# The target is the **host's**, read from `rustc -vV`, not a hardcoded
+# `x86_64-unknown-linux-gnu`. `-Zsanitizer` needs an explicit `--target` (an
+# implicit one would build the proc-macros and build scripts instrumented too),
+# and spelling one architecture there made the recipe silently x86-only — on the
+# aarch64 job it would build a cross target that is not installed and fail for a
+# reason that says nothing about the arena. `baseline.rs`'s `PORTABLE_FACTS`
+# reasons explicitly about aarch64 running these gates.
 shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
     RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
-    cargo +nightly run -Zbuild-std --target x86_64-unknown-linux-gnu \
+    cargo +nightly run -Zbuild-std --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --release --features shm -p tf_tree_bench --bin shm_torture -- {{ARGS}}
 
 # The zero-config rendezvous end to end: a foreign process calls

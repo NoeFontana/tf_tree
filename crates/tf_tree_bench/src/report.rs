@@ -93,7 +93,8 @@ pub const REQUIRED_ROWS: &[&str] = &[
 ];
 
 /// Relative slack the regression gate allows on the differential row's
-/// `max_deviation`, as a multiple of the committed baseline.
+/// `max_deviation`, as a fraction of the committed baseline: `9.0` means the
+/// gate fires above `baseline * (1 + 9)`, i.e. **10x** the baseline.
 ///
 /// **10x, which reads loose and is not.** The measured deviation on this host is
 /// ~2.5e-16 rad/m — a handful of f64 ULPs — against the row's own pass tolerance
@@ -722,9 +723,10 @@ impl Report {
             {
                 bad.push(format!(
                     "row `{}` prints numbers but every one of them is informational, so \
-                     `just bench-check` would compare nothing in it. Give at least one \
-                     metric a direction with `Metric::lower_is_better`/`higher_is_better`, \
-                     or say plainly why this row is context rather than a claim",
+                     nothing in it can ever be gated — on the host that cuts the baseline \
+                     as much as on this one. Give at least one metric a direction with \
+                     `Metric::lower_is_better`/`higher_is_better`, or say plainly why this \
+                     row is context rather than a claim",
                     r.id
                 ));
             }
@@ -1853,9 +1855,15 @@ mod tests {
     /// lives in `validate` rather than in the gate because the gate would have
     /// to *guess* that a row it skipped was meant to be checked.
     ///
-    /// It binds `indicative` as well as `measured`: an indicative row is not a
-    /// claim, but it still prints numbers a reader will compare, and the two
-    /// statuses differ only in the host they were taken on.
+    /// It binds `indicative` as well as `measured`, and the reason is *not* the
+    /// one an earlier revision of this comment gave. `bench-check` skips every
+    /// row whose **baseline** status is not `measured` (`baseline::compare`
+    /// short-circuits on it), so an indicative row is compared neither with a
+    /// direction nor without one, and "the gate would compare nothing in it" is
+    /// false for that half. The rule binds it anyway because a row's status is a
+    /// property of the *host*: the same row is indicative here and measured on
+    /// the machine the baseline is cut from, and a direction it never acquired
+    /// while it was cheap to add is one nothing gates once it matters.
     ///
     /// Mutant (applied, confirmed fatal): restrict the new arm to
     /// `r.status == Status::Measured` — the `indicative` half of this test then

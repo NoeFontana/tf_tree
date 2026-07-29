@@ -120,6 +120,23 @@ impl Comparison {
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
     }
+
+    /// A clean result that compared **no** directional metric at all.
+    ///
+    /// The distinction `bench_report` refuses on: "0 failures" is also what a
+    /// gate that has quietly stopped comparing prints, and a regression gate
+    /// whose baseline no longer shares a single directional metric with this
+    /// build is green for the rest of its life.
+    ///
+    /// A predicate rather than an `if` inside the binary because reaching that
+    /// branch through the binary means assembling a whole benchmark report
+    /// first — minutes, in a suite that runs on every branch. Here it is one
+    /// unit test; `just bench-check` covers the wiring by running the binary
+    /// for real against the committed baseline.
+    #[must_use]
+    pub fn compared_nothing(&self) -> bool {
+        self.passed() && self.checked == 0
+    }
 }
 
 /// One metric as the baseline file records it.
@@ -425,11 +442,21 @@ mod tests {
     /// A one-row report whose row is `measured` with one directional metric —
     /// the shape the real `differential_agreement` row has.
     fn report_with(value: f64, drift_hi: bool) -> Report {
+        report_tuned(value, drift_hi, 0.10)
+    }
+
+    /// [`report_with`], with the metric's tolerance spelled out.
+    ///
+    /// Separate because the two sides of a comparison must be able to disagree
+    /// about the tolerance: which of them the gate reads is a property this
+    /// module claims in its docs, and a fixture that hard-codes 0.10 on both
+    /// sides cannot tell the two apart.
+    fn report_tuned(value: f64, drift_hi: bool, tolerance: f64) -> Report {
         let m = crate::report::Metric::new("max_deviation", value, "rad or m");
         let m = if drift_hi {
-            m.higher_is_better(0.10)
+            m.higher_is_better(tolerance)
         } else {
-            m.lower_is_better(0.10)
+            m.lower_is_better(tolerance)
         };
         Report {
             // **Spelled out, not derived from `PORTABLE_FACTS`.** An earlier
@@ -608,6 +635,180 @@ mod tests {
             c.failures[0].contains("layout_hash"),
             "got: {:?}",
             c.failures
+        );
+    }
+
+    /// The **set** of rows and of `where_we_are_worse` entries must match, in
+    /// both directions.
+    ///
+    /// Half of this is redundant with [`Report::validate`]'s `REQUIRED_ROWS`
+    /// rule and half is not, and the half that is not is the one that matters:
+    /// a row present *here* and absent from the baseline is a claim nothing
+    /// gates. Nobody notices, because the gate still prints PASS on the rows it
+    /// does compare.
+    ///
+    /// Mutant (applied, confirmed fatal): make `diff_ids` return immediately —
+    /// both halves of this test fail, and nothing else in the crate does.
+    #[test]
+    fn a_row_set_that_does_not_match_the_baseline_fails_in_both_directions() {
+        let base = baseline_of(&report_with(100.0, false));
+
+        let mut shrunk = report_with(100.0, false);
+        shrunk.rows.clear();
+        let c = compare(&base, &shrunk).expect("baseline");
+        assert!(!c.passed(), "a report with no rows at all passed");
+        assert!(
+            c.failures.iter().any(|f| f.contains("the artifact shrank")),
+            "got: {:?}",
+            c.failures
+        );
+
+        // The other direction: a row this build emits that the baseline has
+        // never seen. Not a regression in itself — and precisely for that
+        // reason the easiest one to leave ungated forever.
+        let mut grown = report_with(100.0, false);
+        let mut extra = grown.rows[0].clone();
+        extra.id = "lookup_latency";
+        grown.rows.push(extra);
+        let c = compare(&base, &grown).expect("baseline");
+        assert!(!c.passed(), "an ungated new row passed");
+        assert!(
+            c.failures
+                .iter()
+                .any(|f| f.contains("lookup_latency") && f.contains("regenerate the baseline")),
+            "got: {:?}",
+            c.failures
+        );
+
+        // The same rule for §9.3's list, which is checked by the same function
+        // and would otherwise be pinned by nothing at all.
+        let mut worse = report_with(100.0, false);
+        worse.worse.push(crate::report::Worse {
+            id: "attach_latency",
+            topic: "attach latency",
+            statement: String::from("we are slower to attach"),
+            metrics: Vec::new(),
+        });
+        let c = compare(&base, &worse).expect("baseline");
+        assert!(!c.passed(), "an ungated new `worse` entry passed");
+        assert!(
+            c.failures
+                .iter()
+                .any(|f| f.contains("where_we_are_worse") && f.contains("attach_latency")),
+            "got: {:?}",
+            c.failures
+        );
+    }
+
+    /// A directional metric the baseline does not carry fails; an informational
+    /// one does not.
+    ///
+    /// [`Report::validate`] only forces *at least one* directional metric per
+    /// row, so a second claim arriving next to an already-gated one is caught
+    /// only here. The failure it prevents: `p99_ns` is gated, a later commit
+    /// adds `p999_9_ns` with a direction, the baseline is never regenerated, and
+    /// the new number is compared against nothing while the gate reports "2
+    /// directional metrics held".
+    ///
+    /// Mutant (applied, confirmed fatal): `if false && !baseline.contains_key(…)`
+    /// in `compare_column`'s trailing loop — the first half passes and this
+    /// fails.
+    #[test]
+    fn a_directional_metric_the_baseline_does_not_gate_fails() {
+        let base = baseline_of(&report_with(100.0, false));
+
+        let mut ungated = report_with(100.0, false);
+        ungated.rows[0]
+            .tf_tree
+            .push(crate::report::Metric::new("p999_9_ns", 4200.0, "ns").lower_is_better(0.25));
+        let c = compare(&base, &ungated).expect("baseline");
+        assert!(!c.passed(), "a new directional metric passed ungated");
+        assert!(
+            c.failures
+                .iter()
+                .any(|f| f.contains("p999_9_ns") && f.contains("does not gate")),
+            "got: {:?}",
+            c.failures
+        );
+
+        // The control, and the reason the rule is written on `drift` rather
+        // than on the key set: most report numbers are context, and a report
+        // that could not add one without a baseline regeneration would have its
+        // baseline regenerated unread.
+        let mut context = report_with(100.0, false);
+        context.rows[0]
+            .tf_tree
+            .push(crate::report::Metric::new("compared", 47922.0, "lookups"));
+        let c = compare(&base, &context).expect("baseline");
+        assert!(
+            c.passed(),
+            "a new informational metric failed the gate: {:?}",
+            c.failures
+        );
+    }
+
+    /// The tolerance the comparison uses is the **baseline's**.
+    ///
+    /// This is the module's stated security property: reading the tolerance
+    /// from the running build would let one commit widen the gate and land the
+    /// regression it was widened for, with a green run.
+    ///
+    /// Mutant (applied, confirmed fatal): `let slack = b.value.abs() *
+    /// c.tolerance;` in `compare_column` — the widened build's 50% growth then
+    /// passes and the first assertion fails.
+    #[test]
+    fn the_tolerance_is_the_baselines_not_the_running_builds() {
+        // Baseline: 100, 10% allowed. This build: 150, and it says 100% is fine.
+        let base = baseline_of(&report_tuned(100.0, false, 0.10));
+        let widened = report_tuned(150.0, false, 1.00);
+        let c = compare(&base, &widened).expect("baseline");
+        assert!(
+            !c.passed(),
+            "the running build widened its own gate and passed"
+        );
+        assert!(
+            c.failures[0].contains("+50.0%") && c.failures[0].contains("10%"),
+            "the failure must quote the baseline's tolerance, got: {:?}",
+            c.failures
+        );
+
+        // The control: a *committed* 100% tolerance really does allow it, so
+        // the assertion above is about whose tolerance, not about 150 > 100.
+        let generous = baseline_of(&report_tuned(100.0, false, 1.00));
+        let c = compare(&generous, &report_tuned(150.0, false, 1.00)).expect("baseline");
+        assert!(
+            c.passed(),
+            "growth inside the baseline's own tolerance failed: {:?}",
+            c.failures
+        );
+    }
+
+    /// A comparison that matched nothing is not a pass.
+    ///
+    /// The predicate `bench_report` refuses on. It lives here, next to the
+    /// thing it is a statement about, because reaching it through the binary
+    /// costs a full benchmark assembly — see the note on
+    /// [`Comparison::compared_nothing`].
+    ///
+    /// Mutant (applied, confirmed fatal): make `compared_nothing` return
+    /// `false` — the second assertion fails.
+    #[test]
+    fn a_comparison_that_matched_nothing_is_not_a_pass() {
+        let r = report_with(2.5e-16, false);
+        let c = compare(&baseline_of(&r), &r).expect("baseline");
+        assert!(c.passed() && !c.compared_nothing(), "a real comparison");
+
+        // A baseline whose only directional metric became context: it parses,
+        // it compares cleanly, and it gates nothing.
+        let mut informational = baseline_of(&r);
+        informational["rows"][0]["tf_tree"]["max_deviation"]["drift"] =
+            Value::String(String::from("informational"));
+        let mut also_context = report_with(2.5e-16, false);
+        also_context.rows[0].tf_tree[0].drift = Drift::Informational;
+        let c = compare(&informational, &also_context).expect("baseline");
+        assert!(
+            c.passed() && c.compared_nothing(),
+            "a gate that compared nothing did not say so: {c:?}"
         );
     }
 
