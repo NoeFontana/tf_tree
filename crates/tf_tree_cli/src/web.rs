@@ -604,6 +604,15 @@ fn is_descriptor_exhaustion(e: &std::io::Error) -> bool {
 /// never sends a request line holds this thread until [`IO_TIMEOUT`], and
 /// [`read_head`] turns the resulting `WouldBlock`/`TimedOut` into "drop the
 /// connection".
+///
+/// **The write deadline is defence in depth and is deliberately untested.** Both
+/// bodies — the ~11 KB page and ~9 KB of JSON — fit in a default Linux send
+/// buffer, so `write_all` returns without waiting for a peer that never reads
+/// and there is no cheap way to drive the other case from a test. It is set
+/// because "fits today" is a property of two sizes that both grow, and a
+/// handler blocked in `write_all` forever would hold a [`MAX_CONNECTIONS`] slot
+/// for the life of the process. The asymmetry with the read half is stated here
+/// so that it reads as a decision and not as an oversight.
 fn handle(
     stream: &mut TcpStream,
     bound: SocketAddr,
