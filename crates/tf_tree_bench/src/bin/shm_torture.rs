@@ -16,6 +16,15 @@
 //!   held has to be recovered by somebody else with no cooperation from it.
 //! * Continuous invariant checking — yes, see [`Invariant`].
 //!
+//! …with one boundary on the second bullet that is worth stating before anyone
+//! quotes this as "we kill anything, anywhere": **the killed processes are the
+//! joiners, never the rendezvous owner.** The driver creates and serves the
+//! arena and is not a candidate victim, because `docs/PHASE2.md` §3.5's takeover
+//! is not wired into `tf_tree::open` yet and a run that kills the owner spends
+//! the rest of its life in `ArenaHeldButUnreachable` proving nothing.
+//! [`imp::attach_observer`] carries the measurement and the one-line change that
+//! reverses this when §3.5 lands.
+//!
 //! **One is not**, and is not faked: "a random crash point armed in 10% of
 //! children". Crash points are `docs/PHASE2.md` §11.3's `crash-points` feature,
 //! which `docs/PHASE2.md` §0.0 records as **not implemented** — there is no
@@ -67,16 +76,44 @@ fn main() -> anyhow::Result<()> {
 mod imp {
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use anyhow::{bail, Context, Result};
-    use tf_tree::{AttachMode, Capacity, EdgeCfg, InterpPolicy, Iso3, Stamp, Tree, TreeBuilder};
+    use tf_tree::{
+        AttachMode, Capacity, EdgeCfg, EdgeId, Guard, InterpPolicy, Iso3, Plan, Stamp, Tree,
+        TreeBuilder,
+    };
     use tf_tree_ipc::CreatePolicy;
 
     /// A child exits with this after printing a `VIOLATION` line. Distinct from
     /// 1 (an ordinary error, which is expected and retried) and from the
     /// signalled exit of a child the driver killed.
     const EXIT_VIOLATION: i32 = 3;
+
+    /// The fewest composed `map -> tool` reads an observation round must
+    /// validate for the run's verdict to mean anything.
+    ///
+    /// Each round *attempts* 256 (see [`observe`]), so this is a 6% success
+    /// rate, and it is set that low on purpose: the chain is readable only while
+    /// all four rings overlap, and a round that lands entirely inside the gap
+    /// left by a freshly killed writer legitimately reads nothing. What the
+    /// floor is written against is the *systematic* zero — a reader that stopped
+    /// finding the window at all — not one unlucky round.
+    ///
+    /// Measured over seven seeds in each of two configurations — 8 s with 4
+    /// children at 4 Hz, and 15 s with 6 children at 6 Hz — the worst of the
+    /// fourteen averaged **248** composed reads per round, 15x this floor. The
+    /// same fourteen against the reader this replaced: seed 999 at
+    /// `--children 6 --kill-hz 6` averaged exactly 0 and exited `PASS`.
+    const MIN_CHAIN_READS_PER_ROUND: u64 = 16;
+
+    /// The same floor for single-edge reads, of which each round attempts 64.
+    ///
+    /// A single edge needs only its own ring to be non-empty, which is true
+    /// unless every writer of that edge has been dead for longer than the ring
+    /// covers — so all fourteen runs above hit the full 64 per round, 8x this.
+    const MIN_EDGE_READS_PER_ROUND: u64 = 8;
 
     /// Frames in the torture topology.
     ///
@@ -198,6 +235,7 @@ mod imp {
         seed: u64,
         kill_hz: f64,
         inject: bool,
+        readers_only: bool,
     }
 
     /// `30m`, `120s`, `500ms`, `1h`, or a bare number of seconds.
@@ -232,6 +270,7 @@ mod imp {
             seed: 0x7085_1234_ABCD_0001,
             kill_hz: 4.0,
             inject: false,
+            readers_only: false,
         };
         let mut it = argv.into_iter();
         while let Some(arg) = it.next() {
@@ -249,6 +288,15 @@ mod imp {
                 // looked would print — which is how a soak test spends two years
                 // being green and worthless.
                 "--inject-violation" => a.inject = true,
+                // **The negative control for the read floor**, and the reason
+                // it is a flag rather than a mocked-out reader: children that
+                // attach and read but never claim or publish leave every ring
+                // empty, so the observer validates exactly nothing — and a run
+                // that validated nothing is the one state this harness used to
+                // report as `PASS`. `just shm-torture-self-test` runs it and
+                // asserts the run *fails*. It measures the harness, never the
+                // arena, so it has no place in a real soak.
+                "--readers-only" => a.readers_only = true,
                 "--crash-points" => bail!(
                     "--crash-points would arm `docs/PHASE2.md` §11.3's fault-injection sites, \
                      and there are none: the `crash-points` feature and `TF_TREE_CRASH_AT` are \
@@ -261,7 +309,7 @@ mod imp {
                 "-h" | "--help" => {
                     println!(
                         "usage: shm_torture [--duration 30s] [--children 6] [--seed N] \
-                         [--kill-hz 4] [--inject-violation]"
+                         [--kill-hz 4] [--inject-violation] [--readers-only]"
                     );
                     println!(
                         "  --crash-points is PHASE2 §11.3's fault injection and is refused: \
@@ -314,7 +362,13 @@ mod imp {
         }
     }
 
-    fn spawn(exe: &std::path::Path, dir: &PathBuf, seed: u64, inject: bool) -> Result<Kid> {
+    fn spawn(
+        exe: &std::path::Path,
+        dir: &PathBuf,
+        seed: u64,
+        inject: bool,
+        readers_only: bool,
+    ) -> Result<Kid> {
         let mut cmd = Command::new(exe);
         cmd.arg("child")
             .arg("--seed")
@@ -327,6 +381,9 @@ mod imp {
             .stderr(Stdio::inherit());
         if inject {
             cmd.arg("--inject-violation");
+        }
+        if readers_only {
+            cmd.arg("--readers-only");
         }
         let proc = cmd.spawn().context("spawning a torture child")?;
         Ok(Kid { proc, seed, inject })
@@ -356,6 +413,20 @@ mod imp {
             );
         }
 
+        // **The driver owns the rendezvous, and it comes up first.** Three
+        // roles, all load-bearing:
+        //
+        // 1. It serves the socket, so a child killed at any moment leaves a
+        //    rendezvous somebody still answers (see [`attach_observer`] for why
+        //    that cannot be a child).
+        // 2. It keeps the segment alive. Without it the last kill frees the
+        //    arena with its final mapping, and `check_recovery` has nothing to
+        //    check — which is exactly what an earlier revision did, printing a
+        //    green "PASS" whose recovery half had silently skipped every run.
+        // 3. It is a reader that is never killed, so §11.4's "invariants checked
+        //    continuously" does not depend on which child happened to survive.
+        let observer = attach_observer()?;
+
         // Kids are held in fixed slots, not a list, so "slot 0 injects" survives
         // slot 0 being killed and replaced.
         let mut kids: Vec<Option<Kid>> = Vec::with_capacity(a.children);
@@ -363,25 +434,19 @@ mod imp {
             // Only *one* slot injects, and only when asked: a corrupt sample
             // from every writer would let a child detect its own corruption,
             // which proves nothing about what crosses a process boundary.
-            kids.push(Some(spawn(&exe, &dir, rng.next_u64(), a.inject && i == 0)?));
+            kids.push(Some(spawn(
+                &exe,
+                &dir,
+                rng.next_u64(),
+                a.inject && i == 0,
+                a.readers_only,
+            )?));
         }
-
-        // **The driver attaches too, and stays.** Two reasons, both load-bearing:
-        //
-        // 1. It keeps the segment alive. Without it the last kill frees the
-        //    arena with its final mapping, and `check_recovery` has nothing to
-        //    check — which is exactly what an earlier revision did, printing a
-        //    green "PASS" whose recovery half had silently skipped every run.
-        // 2. It is a reader that is never killed, so §11.4's "invariants checked
-        //    continuously" does not depend on which child happened to survive.
-        //
-        // It retries: the first child has to win the create race before there is
-        // anything to join.
-        let observer = attach_observer()?;
 
         let deadline = Instant::now() + a.duration;
         let mut kills = 0usize;
-        let mut reads = 0u64;
+        let mut reads = Reads::default();
+        let mut rounds = 0u64;
         let mut violations = Vec::new();
         let interval = Duration::from_secs_f64(1.0 / a.kill_hz);
 
@@ -398,7 +463,8 @@ mod imp {
             let left = deadline.saturating_duration_since(Instant::now());
             std::thread::sleep(interval.mul_f64(jitter).min(left));
 
-            reads += observe(&observer, &mut rng, &mut violations);
+            reads.add(observe(&observer, &mut rng, &mut violations));
+            rounds += 1;
             reap_finished(&mut kids, &mut violations);
             if !violations.is_empty() {
                 break;
@@ -406,7 +472,13 @@ mod imp {
             for (slot, kid) in kids.iter_mut().enumerate() {
                 if kid.is_none() {
                     let seed = rng.next_u64();
-                    *kid = Some(spawn(&exe, &dir, seed, a.inject && slot == 0)?);
+                    *kid = Some(spawn(
+                        &exe,
+                        &dir,
+                        seed,
+                        a.inject && slot == 0,
+                        a.readers_only,
+                    )?);
                 }
             }
             let victim = rng.below(a.children as u64) as usize;
@@ -421,11 +493,26 @@ mod imp {
         // Give the survivors a moment to exit on their own so a violation
         // detected in the last instant is not lost to the teardown.
         std::thread::sleep(Duration::from_millis(200));
-        reads += observe(&observer, &mut rng, &mut violations);
+        reads.add(observe(&observer, &mut rng, &mut violations));
+        rounds += 1;
         reap_finished(&mut kids, &mut violations);
         // Kill every remaining child *before* the recovery check: "no claim is
         // held by a dead participant" is only a statement about a quiescent
         // arena, and a live writer would fail it correctly and uselessly.
+        //
+        // **Signal them all, then wait.** Dropping the vector kills and waits
+        // one child at a time, and the children reap on 3% of their operations
+        // — so the survivors clean up after the ones already dead and
+        // `check_recovery` inspects an arena somebody else already recovered,
+        // with nothing left for its own `reap_dead` to do. Killing the whole set
+        // first leaves the claim word of every writer that held one at that
+        // instant, which is the state §11.4's recovery clause is about.
+        for kid in kids.iter_mut().flatten() {
+            let _ = kid.proc.kill();
+        }
+        for kid in kids.iter_mut().flatten() {
+            let _ = kid.proc.wait();
+        }
         drop(kids);
         std::thread::sleep(Duration::from_millis(100));
 
@@ -433,7 +520,14 @@ mod imp {
         drop(observer);
         drop(scratch);
 
-        println!("shm_torture: {reads} checked reads from the observer");
+        println!(
+            "shm_torture: {} checked reads from the observer",
+            reads.total()
+        );
+        println!(
+            "shm_torture:   {} composed map->tool, {} single-edge, over {rounds} rounds",
+            reads.chain, reads.edge
+        );
 
         println!(
             "shm_torture: {kills} kills, {} violation(s)",
@@ -451,6 +545,52 @@ mod imp {
                 "{} invariant violation(s) — the arena is not crash-consistent \
                  (docs/PHASE2.md §12.3 gate 3)",
                 violations.len()
+            );
+        }
+        // **A run that validated nothing must not print PASS.** This is the
+        // guard the harness shipped without, and the reason is worth stating:
+        // every other outcome of this binary — a corrupt read, a leaked claim, a
+        // dead child — is a thing that *happened*, while "the observer never
+        // managed a single lookup" is a thing that did not, and the two printed
+        // the same verdict. A 30-minute nightly that quietly stops reading is
+        // strictly worse than no nightly, because it also occupies the slot
+        // where somebody would have noticed.
+        //
+        // The floor is per observation round, not absolute, so it scales with
+        // `--duration` and `--kill-hz` instead of being a number tuned to one
+        // recipe. `MIN_*_READS_PER_ROUND` says what the two shapes cost.
+        let want_chain = rounds * MIN_CHAIN_READS_PER_ROUND;
+        let want_edge = rounds * MIN_EDGE_READS_PER_ROUND;
+        let vacuous = reads.chain < want_chain || reads.edge < want_edge;
+        // The self-test's other half, checked **before** the floor because it is
+        // the more specific diagnosis: `--inject-violation` publishes a NaN for
+        // the whole run and the expected outcome is a failure, so reaching this
+        // line at all is a defect. Which defect it is depends on the counts, so
+        // the message carries them rather than making the reader go look.
+        if a.inject {
+            bail!(
+                "--inject-violation ran to completion with 0 violations: a child published \
+                 a NaN translation for the whole run and no reader — not the observer, not \
+                 a sibling — reported it. The observer validated {} composed and {} \
+                 single-edge transforms over {rounds} rounds, so {}",
+                reads.chain,
+                reads.edge,
+                if vacuous {
+                    "the run read too little to conclude anything: fix the reader first"
+                } else {
+                    "it read plenty and the detector is what failed"
+                }
+            );
+        }
+        if vacuous {
+            bail!(
+                "the observer validated {} composed and {} single-edge transforms over \
+                 {rounds} rounds, under the floor of {want_chain}/{want_edge}. This run \
+                 proves nothing: `0 violation(s)` is also what a harness that never read \
+                 anything prints. Something is wrong with the reader (see \
+                 `common_window`) or with the rendezvous, not necessarily with the arena.",
+                reads.chain,
+                reads.edge
             );
         }
         if !recovery.failures.is_empty() {
@@ -494,76 +634,211 @@ mod imp {
         }
     }
 
-    /// Join the arena the children create, retrying until one of them wins the
-    /// create race.
+    /// Create and serve the arena the children will join, and hold a reader on
+    /// it for the whole run.
     ///
-    /// `CreatePolicy::Never`: the driver must not be the one that creates the
-    /// arena. If it were, the very first thing the run tests — N processes
-    /// racing to create one arena, exactly one winning — would never happen.
+    /// # Why the *driver* owns it, and what that costs
+    ///
+    /// An earlier revision had the driver join with [`CreatePolicy::Never`] and
+    /// let the children race to create, on the argument that the create race is
+    /// worth exercising. It is — but it is exercised by
+    /// `crates/tf_tree/tests/rendezvous.rs` and `tf_tree_ipc`'s multiprocess
+    /// suite, and here it cost the entire rest of the run:
+    ///
+    /// **`docs/PHASE2.md` §3.5's takeover is not wired into `tf_tree::open`.**
+    /// `crates/tf_tree/src/open.rs`'s module documentation says so in as many
+    /// words: a participant noticing the owner died and promoting itself "is not
+    /// here", it needs a watcher on the client socket. So when the owner is a
+    /// child and the driver kills it, *nothing* takes over: no process is
+    /// serving, and every joiner that wins the ownership byte is then turned
+    /// away by §3.4's split-brain check, because the driver's own participant
+    /// byte is held. Measured, before this changed: children failing `open()`
+    /// with `ArenaHeldButUnreachable { holder_slots: 4, first_pid: <the driver> }`
+    /// after the full 2 s timeout, over and over, while the driver read an arena
+    /// nobody was left to publish to. The run then reported `0 violations` and
+    /// `PASS` having validated nothing at all — including with a child
+    /// publishing NaN throughout.
+    ///
+    /// So this harness kills **joiners, never the owner**, and says so rather
+    /// than quietly covering less than its name suggests. Killing the owner is
+    /// worth testing and is *not tested here*; it becomes testable when §3.5's
+    /// watcher lands, and the change at that point is one line — spawn a child
+    /// as the owner again and let the driver join with `Never`.
     fn attach_observer() -> Result<Tree> {
-        let start = Instant::now();
-        loop {
-            match tf_tree::Open::new()
-                .mode(AttachMode::ReadWrite)
-                .create(CreatePolicy::Never)
-                .timeout(Duration::from_millis(200))
-                .open()
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::IfAbsent)
+            .layout_if_creating(layout())
+            .timeout(Duration::from_secs(5))
+            .open()
+            .context("the driver could not create the torture arena")
+    }
+
+    /// How many transforms one observation round validated.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct Reads {
+        /// `map -> tool`, composed over all four edges at one stamp.
+        chain: u64,
+        /// Single edges, each read inside its own retained window.
+        edge: u64,
+    }
+
+    impl Reads {
+        fn total(self) -> u64 {
+            self.chain + self.edge
+        }
+        fn add(&mut self, other: Reads) {
+            self.chain += other.chain;
+            self.edge += other.edge;
+        }
+    }
+
+    /// One chain edge's compiled plan and the `[oldest, newest]` it retains.
+    struct EdgeWindow {
+        /// Index into [`CHAIN`], so a violation names the edge it came from.
+        which: usize,
+        plan: Plan,
+        oldest: i64,
+        newest: i64,
+    }
+
+    /// Probe every chain edge for the window it currently retains.
+    ///
+    /// **The probe is a deliberate `Extrapolation`.** `Plan::at` is the only
+    /// public way to learn what a ring holds, and it reports `oldest`/`newest`
+    /// exactly when it refuses. An hour past the shared clock is beyond anything
+    /// a writer paced at ~1 kHz can have published, so the probe never
+    /// accidentally succeeds and never disturbs what it measures.
+    ///
+    /// Returns **fewer** than `CHAIN.len()` entries when an edge is empty
+    /// ([`tf_tree::LookupError::NoData`], no writer has ever claimed it) or
+    /// unreadable; callers must treat that as "no common window" rather than
+    /// intersect what came back.
+    fn edge_windows(tree: &Tree, guard: &Guard<'_>) -> Vec<EdgeWindow> {
+        let probe = Stamp::from_nanos(now_nanos().saturating_add(3_600_000_000_000));
+        let mut out = Vec::with_capacity(CHAIN.len());
+        for (which, (parent, child)) in CHAIN.iter().enumerate() {
+            let (Ok(p), Ok(c)) = (tree.frame(parent), tree.frame(child)) else {
+                continue;
+            };
+            let Ok(plan) = tree.plan(p, c) else {
+                continue;
+            };
+            if let Err(tf_tree::LookupError::Extrapolation { oldest, newest, .. }) =
+                plan.at::<tf_tree::SystemDomain>(guard, probe)
             {
-                Ok(t) => return Ok(t),
-                Err(e) => {
-                    if start.elapsed() > Duration::from_secs(10) {
-                        bail!("no child created an arena within 10 s: {e}");
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                out.push(EdgeWindow {
+                    which,
+                    plan,
+                    oldest,
+                    newest,
+                });
             }
+        }
+        out
+    }
+
+    /// The stamps every chain edge can answer *at once*, if there are any.
+    ///
+    /// **An intersection, not a hill climb**, and the honest reason is narrower
+    /// than it looks. The reader this replaced asked at `now` and, on
+    /// `Extrapolation`, re-aimed at the window the failing edge reported. That
+    /// is a search, and `map -> tool` needs one stamp inside all four windows at
+    /// once, so it can oscillate between two disjoint ones; an intersection
+    /// cannot. But it is **not** what made this harness validate nothing — that
+    /// was the rendezvous (see [`attach_observer`]). Measured with the
+    /// rendezvous fixed and the hill climb restored: 12 967 composed reads over
+    /// 8 s at seed 999, against 12 800 for this code. So the property here is
+    /// structural — an intersection has no state to get stuck in — and no mutant
+    /// of it is fatal to the suite. What the per-edge probing buys that the hill
+    /// climb cannot is the single-edge reads in [`observe`], which keep
+    /// validating while the four windows are apart.
+    ///
+    /// `None` means the windows are disjoint *right now*, which is a normal
+    /// state a few hundred milliseconds after a writer was killed — not an
+    /// error. It is the run-level floor in [`drive`], not this function, that
+    /// refuses a run where they were disjoint the whole time.
+    fn common_window(windows: &[EdgeWindow]) -> Option<(i64, i64)> {
+        if windows.len() != CHAIN.len() {
+            return None;
+        }
+        let lo = windows.iter().map(|w| w.oldest).max()?;
+        let hi = windows.iter().map(|w| w.newest).min()?;
+        (lo <= hi).then_some((lo, hi))
+    }
+
+    /// A stamp inside `[lo, hi]`, so consecutive reads are different queries and
+    /// the interpolation *between* two slots is exercised rather than one exact
+    /// hit repeated.
+    fn pick(rng: &mut Rng, (lo, hi): (i64, i64)) -> i64 {
+        let span = hi.saturating_sub(lo);
+        if span <= 0 {
+            lo
+        } else {
+            lo.saturating_add(rng.below(span as u64 + 1) as i64)
         }
     }
 
     /// A burst of checked reads from the never-killed observer.
     ///
-    /// Returns how many transforms were validated, which the run prints. A count
-    /// is not decoration here: "0 violations" and "0 reads" print the same
-    /// verdict, and only one of them is a result.
-    fn observe(tree: &Tree, rng: &mut Rng, violations: &mut Vec<String>) -> u64 {
-        let (Ok(map), Ok(tool)) = (tree.frame(CHAIN[0].0), tree.frame(CHAIN[CHAIN.len() - 1].1))
-        else {
-            return 0;
-        };
-        let Ok(plan) = tree.plan(map, tool) else {
-            return 0;
-        };
+    /// Returns how many transforms were validated, which the run prints and
+    /// [`drive`] enforces a floor on. A count is not decoration here: "0
+    /// violations" and "0 reads" print the same verdict, and only one of them is
+    /// a result.
+    ///
+    /// Both shapes are read. The composed `map -> tool` is the one §11.4 is
+    /// about — a bad sample on any edge reaches it — but it needs all four
+    /// windows to overlap. The per-edge reads need only that edge's own ring, so
+    /// they keep validating across the moments when the chain cannot be read at
+    /// all, and they still see the injected corruption: the injector writes NaN
+    /// to whichever single edge it holds.
+    fn observe(tree: &Tree, rng: &mut Rng, violations: &mut Vec<String>) -> Reads {
+        let mut reads = Reads::default();
         let guard = tree.guard();
-        let mut n = 0;
-        let mut aim = now_nanos();
-        for _ in 0..256 {
-            // Jitter backwards, so consecutive reads are not the same query and
-            // the interpolation between two slots is exercised rather than one
-            // exact hit repeated 256 times.
-            let at = aim - rng.below(2_000_000) as i64;
-            match plan.at::<tf_tree::SystemDomain>(&guard, Stamp::from_nanos(at)) {
-                Ok(iso) => {
-                    n += 1;
+        let windows = edge_windows(tree, &guard);
+
+        for w in &windows {
+            let (parent, child) = CHAIN[w.which];
+            for _ in 0..16 {
+                let at = pick(rng, (w.oldest, w.newest));
+                if let Ok(iso) = w
+                    .plan
+                    .at::<tf_tree::SystemDomain>(&guard, Stamp::from_nanos(at))
+                {
+                    reads.edge += 1;
                     if let Err(why) = Invariant::check(&iso) {
                         violations.push(format!(
-                            "the observer read a bad transform: map->tool at {at}: {why}"
+                            "the observer read a bad transform: {parent}->{child} at {at}: {why}"
                         ));
-                        return n;
+                        return reads;
                     }
                 }
-                // **Aim from the arena, not from the clock.** Writers here are
-                // killed and replaced constantly, so the newest sample can be
-                // hundreds of milliseconds behind `now`; a reader that only ever
-                // asks for `now` reads nothing at all and then reports zero
-                // violations having validated nothing. The error carries the
-                // window it wanted, so the next query uses it.
-                Err(tf_tree::LookupError::Extrapolation { newest, oldest, .. }) => {
-                    aim = newest.max(oldest);
-                }
-                Err(_) => {}
             }
         }
-        n
+
+        let (Ok(map), Ok(tool)) = (tree.frame(CHAIN[0].0), tree.frame(CHAIN[CHAIN.len() - 1].1))
+        else {
+            return reads;
+        };
+        let Ok(plan) = tree.plan(map, tool) else {
+            return reads;
+        };
+        let Some(window) = common_window(&windows) else {
+            return reads;
+        };
+        for _ in 0..256 {
+            let at = pick(rng, window);
+            if let Ok(iso) = plan.at::<tf_tree::SystemDomain>(&guard, Stamp::from_nanos(at)) {
+                reads.chain += 1;
+                if let Err(why) = Invariant::check(&iso) {
+                    violations.push(format!(
+                        "the observer read a bad transform: map->tool at {at}: {why}"
+                    ));
+                    return reads;
+                }
+            }
+        }
+        reads
     }
 
     struct Recovery {
@@ -583,17 +858,40 @@ mod imp {
             notes: Vec::new(),
         };
 
-        // Reap first: a claim held by a process the kernel has already cleaned
-        // up is *reapable*, not leaked, and the distinction is the whole of A3.
-        // Leaving it un-reaped and calling it a leak would fail the property the
-        // design actually promises.
-        let reaped = tree.reap_dead();
-        out.notes.push(format!(
-            "recovery: reaped {reaped} slot(s) left by killed children"
-        ));
-
         let me = tree.participant_slot();
         let view = tree.arena_view();
+
+        // **Count what the dead left before reclaiming it.** `reap_dead` returns
+        // how many claims it reclaimed, and that number alone cannot distinguish
+        // "there was nothing to reclaim" from "this step did not run" — an
+        // earlier revision printed `reaped 0` on every run and read like a step
+        // that had worked. The owner word is the state reaping acts on, so it is
+        // what the note reports: `stale` is the arena's own record of claims held
+        // by participants that are all now dead, and `reaped` is how many of them
+        // came back.
+        //
+        // Anything non-zero here is a killed writer's claim, because every child
+        // has been waited for and this process holds none.
+        let mut stale = 0usize;
+        for edge in 0..view.header().max_edges {
+            let Some(rec) = view.claim(EdgeId(edge)) else {
+                continue;
+            };
+            if rec.owner.load(Ordering::Acquire) != 0 {
+                stale += 1;
+            }
+        }
+
+        // Reap *after* the count and *before* the claim probe below: a claim held
+        // by a process the kernel has already cleaned up is reapable, not leaked,
+        // and the distinction is the whole of A3. Leaving it un-reaped and calling
+        // it a leak would fail the property the design actually promises.
+        let reaped = tree.reap_dead();
+        out.notes.push(format!(
+            "recovery: {stale} edge(s) still carried a killed writer's claim word; \
+             reap_dead reclaimed {reaped}"
+        ));
+
         for (parent, child) in CHAIN {
             let (Ok(p), Ok(c)) = (tree.frame(parent), tree.frame(child)) else {
                 out.failures.push(format!(
@@ -633,6 +931,7 @@ mod imp {
     fn child(argv: &[String]) -> Result<()> {
         let mut seed = 1u64;
         let mut inject = false;
+        let mut readers_only = false;
         let mut it = argv.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -644,20 +943,22 @@ mod imp {
                         .context("--seed")?;
                 }
                 "--inject-violation" => inject = true,
+                "--readers-only" => readers_only = true,
                 other => bail!("child: unknown argument `{other}`"),
             }
         }
         let mut rng = Rng::new(seed);
 
         loop {
-            // `IfAbsent`, in every child: the driver kills the owner too, and
-            // the survivor that gets there first has to be able to bring the
-            // arena back. `Never` here would turn every owner kill into the end
-            // of the run.
+            // `Never`, in every child: the driver creates and serves the arena
+            // (see [`attach_observer`]), so there is always one to join, and a
+            // child that created a second one would silently split the run in
+            // two — half the participants publishing where the observer cannot
+            // see them, which is a *green* run that validates nothing. `Never`
+            // makes that state a failed `open()` this loop retries instead.
             let tree = match tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
-                .create(CreatePolicy::IfAbsent)
-                .layout_if_creating(layout())
+                .create(CreatePolicy::Never)
                 .timeout(Duration::from_secs(2))
                 .open()
             {
@@ -670,13 +971,13 @@ mod imp {
                     continue;
                 }
             };
-            work(&tree, &mut rng, inject)?;
+            work(&tree, &mut rng, inject, readers_only)?;
         }
     }
 
     /// The random-operation loop against one attachment. Returns when it decides
     /// to detach and re-join, which is §11.4's "attach/detach".
-    fn work(tree: &Tree, rng: &mut Rng, inject: bool) -> Result<()> {
+    fn work(tree: &Tree, rng: &mut Rng, inject: bool, readers_only: bool) -> Result<()> {
         // Interning can fail while another participant is mid-mutation; that is
         // not a violation, it is a retry.
         let mut ids = Vec::new();
@@ -689,25 +990,27 @@ mod imp {
         let (map, tool) = (ids[0].0, ids[ids.len() - 1].1);
 
         let mut held: Option<tf_tree::EdgeWriter<'_>> = None;
-        let mut aim = now_nanos();
         // A bounded number of operations per attachment, so every child
         // re-attaches regularly instead of one lucky survivor holding the arena
         // for the whole run.
         for _ in 0..2_000 {
             // **Pacing, and it is not politeness.** A 64-slot ring filled by an
-            // unthrottled loop covers about nine *microseconds* of history, so
-            // by the time any reader looks the whole window has rolled past and
-            // every lookup is `Extrapolation`: the run then reports zero
-            // violations having validated zero transforms, which reads exactly
-            // like a pass. At ~1 kHz the same ring covers ~64 ms, which is a
-            // window a reader in another process can actually land in — and it
-            // also spreads the driver's SIGKILLs across the protocol instead of
-            // landing them all inside one hot loop.
+            // unthrottled loop covers about nine *microseconds* of history, and
+            // six children spinning on `push` is a busy-wait on every core the
+            // scheduler will give them — so the kills all land inside one hot
+            // loop instead of spreading across the protocol, which is the only
+            // thing this harness is for. At ~1 kHz the same ring covers ~64 ms.
+            //
+            // It is **not** what keeps the reader fed: `observe` probes each
+            // ring for its window immediately before reading it, so removing
+            // this leaves the read counts unchanged (measured: 11 989 composed
+            // reads over 8 s, against 12 800 with it). That was not true of the
+            // reader this replaced, and `tests/torture.rs` records the change.
             std::thread::sleep(Duration::from_micros(200 + rng.below(1_600)));
             match rng.below(100) {
                 // Claim an edge, if we hold none.
                 0..=9 => {
-                    if held.is_none() {
+                    if held.is_none() && !readers_only {
                         let i = rng.below(CHAIN.len() as u64) as usize;
                         let (p, c) = ids[i];
                         // A refused claim is the correct answer when somebody
@@ -742,29 +1045,30 @@ mod imp {
                 // Read, and check.
                 _ => {
                     let guard = tree.guard();
+                    // The observer's window arithmetic, for the same reason: a
+                    // stamp that all four rings can answer is an intersection of
+                    // what they retain, and after a writer is killed that is
+                    // nowhere near `now`. Four extra probe lookups per read op
+                    // cost nothing against the ~1 ms pacing above.
+                    let windows = edge_windows(tree, &guard);
+                    let Some(window) = common_window(&windows) else {
+                        continue;
+                    };
                     let Ok(plan) = tree.plan(map, tool) else {
                         continue;
                     };
-                    // Same self-aiming read as the observer's, for the same
-                    // reason: `aim` tracks whatever window the arena actually
-                    // holds, which after a writer is killed is not `now`.
-                    let at = aim - rng.below(2_000_000) as i64;
-                    match plan.at::<tf_tree::SystemDomain>(&guard, Stamp::from_nanos(at)) {
-                        Err(tf_tree::LookupError::Extrapolation { newest, oldest, .. }) => {
-                            aim = newest.max(oldest);
-                        }
-                        Err(_) => {}
-                        Ok(iso) => {
-                            if let Err(why) = Invariant::check(&iso) {
-                                eprintln!(
-                                    "VIOLATION pid {} map->tool at {at}: {why} (iso = {iso:?})",
-                                    std::process::id()
-                                );
-                                // Exit immediately: the arena has already told this
-                                // process something impossible, and every further
-                                // read would report the same corruption again.
-                                std::process::exit(EXIT_VIOLATION);
-                            }
+                    let at = pick(rng, window);
+                    if let Ok(iso) = plan.at::<tf_tree::SystemDomain>(&guard, Stamp::from_nanos(at))
+                    {
+                        if let Err(why) = Invariant::check(&iso) {
+                            eprintln!(
+                                "VIOLATION pid {} map->tool at {at}: {why} (iso = {iso:?})",
+                                std::process::id()
+                            );
+                            // Exit immediately: the arena has already told this
+                            // process something impossible, and every further
+                            // read would report the same corruption again.
+                            std::process::exit(EXIT_VIOLATION);
                         }
                     }
                 }
