@@ -48,6 +48,12 @@
 //! pass: the merged stream is exactly the stream a single stable sort of the
 //! whole edge would have produced.
 //!
+//! The "across every pass" half is **gated**, by
+//! `tests/ingest.rs::a_reduce_pass_keeps_the_last_occurrence`, and it was not
+//! always: reversing the run order inside a reduce window used to leave every
+//! test in the workspace passing while resolving a duplicate to the wrong pose.
+//! Reasoning of this shape is exactly what a test is for.
+//!
 //! # The file is unlinked as soon as it exists, where the platform allows
 //!
 //! On Unix a file unlinked while open keeps its descriptor valid and its blocks
@@ -62,6 +68,7 @@ use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::IngestError;
 
@@ -89,6 +96,19 @@ pub(crate) const ENCODED: usize = 8 + 7 * 8;
 /// the cap is raised here — and the ingest report prints the *measured* peak, so
 /// a user who asked for 200 bytes is told what was really used rather than what
 /// they asked for.
+///
+/// # What the cap covers, and the one thing it does not
+///
+/// It covers every buffer that holds *samples*: the spill buffer, the merge
+/// windows, and the encode/decode staging. It does **not** cover the run index,
+/// [`RunFile::index_bytes`] — sixteen bytes per run, and the run count is
+/// `samples / (cap / 64)`, so the index crosses the cap itself at roughly
+/// `cap² / 2048` samples. At the 4 GiB default that is far past any recording;
+/// at a 1 KiB cap it is 512 samples, and a cap that small is a test, not a
+/// deployment. The number is measured and reported as
+/// [`crate::ingest::FillStats::peak_run_index_bytes`] rather than hidden inside
+/// the capped one, because a cap that quietly excludes an allocation is how a
+/// cap stops meaning anything.
 const MIN_CAP: u64 = 16 * ENCODED as u64;
 
 /// Ceiling on one encode/decode staging buffer.
@@ -106,7 +126,14 @@ const MAX_STAGING: u64 = 64 * 1024;
 const WINDOW_SHARE_NUM: u64 = 3;
 const WINDOW_SHARE_DEN: u64 = 4;
 
-fn cap_of(user: u64) -> u64 {
+/// The cap actually in force for a requested one.
+///
+/// Public to the crate so [`crate::ingest::plan_groups`] decides "does this edge
+/// fit?" against the same number the spill path will honour. Deciding against
+/// the raw request instead routes an edge that would have fit in memory — a
+/// 4-sample edge at `--max-memory 200` — to a run file that then runs on a
+/// 1 024 B budget anyway.
+pub(crate) fn cap_of(user: u64) -> u64 {
     user.max(MIN_CAP)
 }
 
@@ -157,12 +184,30 @@ fn io(e: &std::io::Error) -> IngestError {
     }
 }
 
-/// Decode one sample from exactly [`ENCODED`] bytes.
+/// Encode one sample into exactly [`ENCODED`] little-endian bytes.
+///
+/// Built on the stack and appended in **one** `extend_from_slice`, rather than
+/// eight of them straight into the staging buffer: eight appends are eight
+/// capacity checks and eight short memcpys per 64-byte sample, and the whole
+/// point of a staging buffer is that the per-sample path be cheap. The fixed
+/// indices below are what let the compiler turn this into plain stores.
+fn encode(s: Sample) -> [u8; ENCODED] {
+    let mut b = [0u8; ENCODED];
+    b[..8].copy_from_slice(&s.0.to_le_bytes());
+    for (i, v) in s.1.iter().enumerate() {
+        b[8 + i * 8..16 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+/// Decode one sample from exactly [`ENCODED`] bytes — the inverse of [`encode`].
 ///
 /// Every caller feeds it a `chunks_exact(ENCODED)` element, so the fixed-width
 /// `copy_from_slice`s below cannot mismatch. That is why this takes a slice and
 /// not an `Option`: an unreachable error variant is worse than a length
-/// invariant stated once and held at its one call site.
+/// invariant stated once and held at its one call site. It is also why it does
+/// not take a `&[u8; ENCODED]`, which would read better but would force a
+/// fallible `try_into` — and this crate has no panic budget to discharge it with.
 fn decode(b: &[u8]) -> Sample {
     let mut w = [0u8; 8];
     w.copy_from_slice(&b[..8]);
@@ -173,6 +218,35 @@ fn decode(b: &[u8]) -> Sample {
         *out = f64::from_le_bytes(w);
     }
     (stamp, pose)
+}
+
+/// Distinguishes one spill file from every other one this process opens.
+///
+/// **Process-wide, not derived from the edge slot.** A slot-derived tag is
+/// unique across the passes of a *single* [`crate::ingest::fill`] and collides
+/// across two concurrent ones: both would name their respective slot 0 the same
+/// thing, and [`RunFile::create`]'s `truncate(true)` means whoever opens second
+/// empties the first's inode while the first still holds its descriptor. The two
+/// then interleave writes at their own offsets, the merge seeks into the
+/// mixture, and `read_exact` and `decode` both succeed — wrong poses in the
+/// arena with no error anywhere. `tf_tree_ingest` is a library and §4's Python
+/// API is a plausible concurrent caller, so this is not a hypothetical.
+///
+/// It is not merely a race, either: on a platform where the unlink at creation
+/// cannot run (the [`TempPath`] fallback this module supports), a slot-derived
+/// tag collides *deterministically*, on the second ingest as much as on a
+/// simultaneous one.
+static NEXT_TAG: AtomicU64 = AtomicU64::new(0);
+
+/// The name for one spill file: this process, and a tag no other [`RunFile`]
+/// in it will take.
+///
+/// `Relaxed` is the whole requirement — nothing is published through this
+/// counter, only its uniqueness is used, and `fetch_add` is atomic under every
+/// ordering.
+fn spill_path(dir: &Path) -> PathBuf {
+    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("tf_tree_ingest_spill_{}_{tag}", std::process::id()))
 }
 
 /// A path that removes itself, holding `None` once the file has been unlinked.
@@ -215,11 +289,11 @@ impl RunFile {
     /// descriptor and every read fails `EBADF` — which is exactly how the first
     /// revision of this module failed its own round-trip test.
     ///
-    /// The name carries the process id and a caller-supplied tag so two ingests
-    /// in one process cannot collide during the window between `create` and the
-    /// unlink, short as it is.
-    pub(crate) fn create(dir: &Path, tag: usize, staging: usize) -> Result<RunFile, IngestError> {
-        let path = dir.join(format!("tf_tree_ingest_spill_{}_{tag}", std::process::id()));
+    /// The name comes from [`spill_path`], which is what keeps two run files in
+    /// one process — two passes of one ingest, or two concurrent ingests — off
+    /// each other's inode during the window between `create` and the unlink.
+    pub(crate) fn create(dir: &Path, staging: usize) -> Result<RunFile, IngestError> {
+        let path = spill_path(dir);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -262,10 +336,7 @@ impl RunFile {
         if self.staging.len() + ENCODED > self.staging.capacity() {
             self.flush()?;
         }
-        self.staging.extend_from_slice(&s.0.to_le_bytes());
-        for v in s.1 {
-            self.staging.extend_from_slice(&v.to_le_bytes());
-        }
+        self.staging.extend_from_slice(&encode(s));
         if let Some((_, n)) = &mut self.open_run {
             *n += 1;
         }
@@ -318,6 +389,20 @@ impl RunFile {
         self.written
     }
 
+    /// Bytes the *run index* holds resident — the `Vec<RunSpan>` and nothing
+    /// else.
+    ///
+    /// Reported separately from every sample buffer because it is the one
+    /// allocation on this path that `--max-memory` does **not** bound: it grows
+    /// with the run count, which grows as the cap shrinks, so at a small cap it
+    /// can exceed the cap several times over. Folding it into
+    /// `peak_buffer_bytes` would make that number a lie; leaving it out of the
+    /// report entirely would make the report one. `capacity`, not `len`, because
+    /// the allocation is what is resident.
+    pub(crate) fn index_bytes(&self) -> u64 {
+        self.runs.capacity() as u64 * core::mem::size_of::<RunSpan>() as u64
+    }
+
     /// A merged, ascending stream over `spans`, `window` samples resident per
     /// run.
     ///
@@ -367,6 +452,13 @@ impl RunReader {
         self.buf.get(self.pos).copied()
     }
 
+    /// The head sample's stamp, without copying the 56 bytes of pose beside it.
+    /// [`Merger::seed`] runs once per emitted sample and only ever needs the
+    /// stamp; `peek` there would double the per-sample copy.
+    fn peek_stamp(&self) -> Option<i64> {
+        self.buf.get(self.pos).map(|s| s.0)
+    }
+
     /// Refill the window if it is spent. Leaves `pos` at the first unread sample.
     fn refill(
         &mut self,
@@ -409,7 +501,7 @@ pub(crate) struct Merger<'a> {
 impl Merger<'_> {
     fn seed(&mut self, i: usize) -> Result<(), IngestError> {
         self.readers[i].refill(self.file, &mut self.staging, self.window)?;
-        if let Some((stamp, _)) = self.readers[i].peek() {
+        if let Some(stamp) = self.readers[i].peek_stamp() {
             self.heap.push(core::cmp::Reverse((stamp, i)));
         }
         Ok(())
@@ -481,7 +573,7 @@ mod tests {
     #[test]
     fn a_run_round_trips_exactly() {
         let dir = scratch("roundtrip");
-        let mut f = RunFile::create(&dir, 0, 128).unwrap();
+        let mut f = RunFile::create(&dir, 128).unwrap();
         let run = vec![
             (
                 -9_000_000_007i64,
@@ -509,7 +601,7 @@ mod tests {
     #[test]
     fn runs_merge_ascending_with_ties_in_run_order() {
         let dir = scratch("merge");
-        let mut f = RunFile::create(&dir, 1, 128).unwrap();
+        let mut f = RunFile::create(&dir, 128).unwrap();
         // Run 0 and run 1 both carry stamp 20, with different payloads.
         f.write_run(&[sample(10, 0.0), sample(20, 1.0), sample(40, 4.0)])
             .unwrap();
@@ -539,11 +631,81 @@ mod tests {
     #[test]
     fn an_empty_run_is_not_recorded() {
         let dir = scratch("empty");
-        let mut f = RunFile::create(&dir, 2, 128).unwrap();
+        let mut f = RunFile::create(&dir, 128).unwrap();
         f.begin_run();
         f.end_run().unwrap();
         f.write_run(&[sample(1, 1.0)]).unwrap();
         assert_eq!(f.runs(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two spill files in one process never share a name — across threads as
+    /// well as within one.
+    ///
+    /// This is the assertion that keeps two concurrent ingests off each other's
+    /// inode. `RunFile::create` opens with `truncate(true)`, so a shared name is
+    /// not a failed `create` but a silently emptied file that the other holder
+    /// keeps writing into at its own offsets; the merge then reads a mixture
+    /// that decodes perfectly into wrong poses.
+    ///
+    /// Mutant: derive the tag from a caller-supplied slot instead of
+    /// [`NEXT_TAG`] — modelled here by `fetch_add(0, …)`, which is what any
+    /// caller-derived tag reduces to for two callers on the same slot — applied,
+    /// and this failed at `1 unique path(s), wanted 256`.
+    #[test]
+    fn spill_paths_are_unique_within_the_process() {
+        use std::collections::BTreeSet;
+        const THREADS: usize = 8;
+        const EACH: usize = 32;
+        let dir = std::env::temp_dir();
+        let mut all: BTreeSet<PathBuf> = BTreeSet::new();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| s.spawn(|| (0..EACH).map(|_| spill_path(&dir)).collect::<Vec<_>>()))
+                .collect();
+            for h in handles {
+                all.extend(h.join().unwrap());
+            }
+        });
+        assert_eq!(
+            all.len(),
+            THREADS * EACH,
+            "{} unique path(s), wanted {}",
+            all.len(),
+            THREADS * EACH
+        );
+    }
+
+    /// A run opened while the staging buffer still holds unflushed bytes starts
+    /// *after* them, not on top of them.
+    ///
+    /// Reachable only through `begin_run` without an intervening `end_run`,
+    /// which no caller does today — so this pins the invariant rather than a
+    /// live bug, and it is the gate the accounting in `begin_run` did not have.
+    ///
+    /// Mutant: `self.open_run = Some((self.written, 0))` — applied, and the
+    /// span assertion failed with `left: [(0, 1)]`, `right: [(64, 1)]`. That
+    /// span points at the *discarded* sample, which is what the merge below
+    /// would then have handed back; the assertion fires first, so the drain is
+    /// there to name the consequence rather than to be the thing that catches
+    /// it.
+    #[test]
+    fn a_run_opened_over_unflushed_bytes_starts_after_them() {
+        let dir = scratch("unflushed");
+        // Staging wide enough that neither sample forces a flush.
+        let mut f = RunFile::create(&dir, 8 * ENCODED).unwrap();
+        f.begin_run();
+        f.append(sample(1, 1.0)).unwrap();
+        // Abandons the first run without closing it: its one sample is staged
+        // but unwritten, and the run below must not claim those bytes.
+        f.begin_run();
+        f.append(sample(2, 2.0)).unwrap();
+        f.end_run().unwrap();
+        let spans = f.spans();
+        assert_eq!(spans, vec![(ENCODED as u64, 1)]);
+        let mut m = f.merge_runs(&spans, 4).unwrap();
+        assert_eq!(drain(&mut m), vec![sample(2, 2.0)]);
+        drop(m);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -560,6 +722,12 @@ mod tests {
     /// 1 664 B resident against a 1 024 B cap. That mutant *was* the code for an
     /// hour, and `tests/ingest.rs::a_tiny_cap_reduces_in_several_passes` found
     /// it first, at 1 280 B against the same cap.
+    ///
+    /// Mutant 2, for the `2 ×` on the staging term specifically: `staging_of`
+    /// returning `cap / 4` — applied, and this failed at cap 1024, runs 1:
+    /// 1 280 B resident. With `1 × staging` the same mutant lands at exactly
+    /// 1 024 B and **survives**, which is how the missing second buffer went
+    /// unnoticed.
     #[test]
     fn budget_fits_the_cap() {
         for user_cap in [1u64, 200, 1024, 4096, 1 << 20, 4 << 30] {
@@ -576,8 +744,13 @@ mod tests {
                 let w = merge_window_samples(user_cap, runs);
                 assert!(w >= 1);
                 // `runs + 1` windows — one per run plus the decode staging —
-                // and, during a reduce pass, the write staging on top.
-                let resident = (runs as u64 + 1) * w as u64 * ENCODED as u64 + staging_of(cap);
+                // and **two** write-staging buffers, not one: a reduce pass has
+                // the file it is reading and the file it is writing open at the
+                // same instant, and `RunFile::staging` is allocated to capacity
+                // at `create` and never released. `WINDOW_SHARE_*`'s three
+                // quarters was always chosen against `2 × staging ≤ cap / 4`;
+                // this line is what checks the pair rather than half of it.
+                let resident = (runs as u64 + 1) * w as u64 * ENCODED as u64 + 2 * staging_of(cap);
                 assert!(
                     resident <= cap,
                     "cap {cap}, runs {runs}: {resident} B resident"

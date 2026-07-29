@@ -168,6 +168,7 @@ impl IngestReport {
             ",\"frames\":{},\"static_edges\":{},\"dynamic_edges\":{},\
              \"transforms_read\":{},\"samples_pushed\":{},\
              \"passes\":{},\"peak_buffer_bytes\":{},\
+             \"peak_run_index_bytes\":{},\
              \"spilled_runs\":{},\"spilled_bytes\":{}",
             self.frames,
             self.static_edges,
@@ -176,6 +177,7 @@ impl IngestReport {
             self.samples_pushed,
             self.fill.passes,
             self.fill.peak_buffer_bytes,
+            self.fill.peak_run_index_bytes,
             self.fill.spilled_runs,
             self.fill.spilled_bytes,
         );
@@ -317,9 +319,12 @@ impl IngestReport {
         if self.fill.spilled_runs > 0 {
             let _ = writeln!(
                 s,
-                "  spilled {} sorted runs ({} B) to a temporary file; \
-                 one edge exceeds --max-memory on its own",
-                self.fill.spilled_runs, self.fill.spilled_bytes
+                "  spilled {} sorted run{} ({} B) to a temporary file, \
+                 {} B of run index; one edge exceeds --max-memory on its own",
+                self.fill.spilled_runs,
+                if self.fill.spilled_runs == 1 { "" } else { "s" },
+                self.fill.spilled_bytes,
+                self.fill.peak_run_index_bytes
             );
         }
         let a = &self.anomalies;

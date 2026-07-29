@@ -65,15 +65,6 @@ use crate::{FrameId, IngestError};
 /// conversion happens at the push, one sample at a time.
 const SAMPLE_BYTES: u64 = 8 + 7 * 8;
 
-/// Spacing between one spilled edge's temporary-file names and the next one's.
-///
-/// A reduce pass creates a fresh file, so a spilled edge needs one name per
-/// pass. Each pass divides the run count by at least two, so no edge can need
-/// more than 64 of them — a `u64` count of runs is exhausted first. 1024 leaves
-/// that bound a wide margin and keeps two spilled edges from colliding on a
-/// platform where the unlink-at-create could not run.
-const SPILL_TAG_STRIDE: usize = 1024;
-
 /// Default `--max-memory` (§3.1): 4 GiB.
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -494,8 +485,22 @@ pub struct FillStats {
     /// How many times the recording had to be re-read to stay under
     /// `--max-memory`. `1` is the ordinary case.
     pub passes: u32,
-    /// Peak bytes of buffered samples across those passes.
+    /// Peak bytes of buffered **samples** across those passes — the sort
+    /// buffers, the spill path's merge windows and its encode/decode staging.
+    /// This is the number `--max-memory` bounds.
     pub peak_buffer_bytes: u64,
+    /// Peak bytes of the spill path's *run index* — sixteen bytes per sorted
+    /// run, live for as long as the file that holds them. `0` unless an edge
+    /// spilled.
+    ///
+    /// Its own field, and not folded into
+    /// [`peak_buffer_bytes`](FillStats::peak_buffer_bytes), because
+    /// `--max-memory` does **not** bound it: the run count is
+    /// `samples / (cap / 64)`, so the index crosses the cap itself at roughly
+    /// `cap² / 2048` samples — 512 samples at a 1 KiB cap, and past any real
+    /// recording at the 4 GiB default. Adding it to the capped number would make
+    /// that number a lie; leaving it unreported would make the report one.
+    pub peak_run_index_bytes: u64,
     /// Samples pushed into the arena.
     pub pushed: u64,
     /// Duplicate `(edge, stamp)` pairs collapsed, last-wins.
@@ -525,6 +530,7 @@ pub struct FillStats {
 /// |---|---|---|
 /// | The arena, from `builder.build()` | 78 B per sample, measured | **No** |
 /// | Pass two's sort buffers | [`SAMPLE_BYTES`] = 64 B per sample | Yes |
+/// | The spill path's run index | 16 B per sorted run | **No** — reported as [`FillStats::peak_run_index_bytes`] |
 ///
 /// The arena is not capped because it *cannot* be: it is the output. Every
 /// sample the recording contains has to be resident in it for the index to
@@ -722,7 +728,12 @@ enum Group {
 /// joining a group it would blow — grouping cannot subdivide an edge, which is
 /// the whole reason the spill path exists.
 fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
-    let cap = cap.max(SAMPLE_BYTES);
+    // The *effective* cap, not the requested one: the spill path raises anything
+    // below `spill::MIN_CAP` to it, so deciding "does this edge fit?" against
+    // the raw request routes an edge that would have fit — four samples at
+    // `--max-memory 200` — to a run file that then runs on a 1 024 B budget
+    // anyway. One number, asked once.
+    let cap = spill::cap_of(cap);
     let mut groups: Vec<Group> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_bytes = 0u64;
@@ -778,7 +789,7 @@ fn fill_spilled(
         Some(d) => d.clone(),
         None => std::env::temp_dir(),
     };
-    let mut runs = spill::RunFile::create(&dir, slot * SPILL_TAG_STRIDE, staging)?;
+    let mut runs = spill::RunFile::create(&dir, staging)?;
     // Allocated to its full capacity up front, so the peak recorded below is the
     // resident amount for the whole pass rather than a high-water mark that a
     // reallocation could briefly double.
@@ -824,6 +835,7 @@ fn fill_spilled(
     stats.peak_buffer_bytes = stats
         .peak_buffer_bytes
         .max(run_samples as u64 * SAMPLE_BYTES + staging as u64);
+    stats.peak_run_index_bytes = stats.peak_run_index_bytes.max(runs.index_bytes());
     stats.spilled_runs = stats.spilled_runs.saturating_add(runs.runs() as u32);
     stats.spilled_bytes += runs.bytes();
     // Released before the merge allocates its windows: holding both would double
@@ -836,16 +848,19 @@ fn fill_spilled(
     // pass merges a *contiguous* window of runs, which is what preserves the
     // recording-order tie break that "last wins" depends on.
     let fan_in = spill::fan_in(opts.max_memory_bytes);
-    let mut round = 1usize;
     while runs.runs() > fan_in {
-        let mut next = spill::RunFile::create(&dir, slot * SPILL_TAG_STRIDE + round, staging)?;
+        let mut next = spill::RunFile::create(&dir, staging)?;
         let spans = runs.spans();
         for chunk in spans.chunks(fan_in) {
             let window = spill::merge_window_samples(opts.max_memory_bytes, chunk.len());
             let mut m = runs.merge_runs(chunk, window)?;
+            // **Two** staging buffers, not one: `runs` and `next` are both open
+            // here, and `RunFile::staging` is allocated to capacity at `create`
+            // and never released. Counting one understates the pass by
+            // `staging` bytes, which at a small cap is an eighth of it.
             stats.peak_buffer_bytes = stats
                 .peak_buffer_bytes
-                .max(m.resident_bytes() + staging as u64);
+                .max(m.resident_bytes() + 2 * staging as u64);
             next.begin_run();
             while let Some(s) = m.next_sample()? {
                 next.append(s)?;
@@ -853,18 +868,33 @@ fn fill_spilled(
             drop(m);
             next.end_run()?;
         }
+        // Measured at the end of the pass, which is where it peaks: both files'
+        // run indices and the snapshot of the one being read are live at once,
+        // and `next`'s index is the only one of the three still growing.
+        stats.peak_run_index_bytes = stats.peak_run_index_bytes.max(
+            runs.index_bytes()
+                + next.index_bytes()
+                + spans.len() as u64 * core::mem::size_of::<spill::RunSpan>() as u64,
+        );
         stats.spilled_runs = stats.spilled_runs.saturating_add(next.runs() as u32);
         stats.spilled_bytes += next.bytes();
         // The previous file is dropped here, and with it the spill it held: disk
         // use is bounded by two consecutive passes, not by their number.
         runs = next;
-        round += 1;
     }
 
     let window = spill::merge_window_samples(opts.max_memory_bytes, runs.runs());
     let spans = runs.spans();
+    // Read before the merge borrows the file mutably.
+    let runs_index_bytes = runs.index_bytes();
     let mut merged = runs.merge_runs(&spans, window)?;
-    stats.peak_buffer_bytes = stats.peak_buffer_bytes.max(merged.resident_bytes());
+    // One staging buffer here, not two: only the file being read is open.
+    stats.peak_buffer_bytes = stats
+        .peak_buffer_bytes
+        .max(merged.resident_bytes() + staging as u64);
+    stats.peak_run_index_bytes = stats
+        .peak_run_index_bytes
+        .max(runs_index_bytes + spans.len() as u64 * core::mem::size_of::<spill::RunSpan>() as u64);
 
     let parent = tree
         .frame(frames.name(want_parent))
@@ -1009,6 +1039,27 @@ mod tests {
             groups,
             vec![Group::Spilled(0), Group::InMemory(vec![1])],
             "the oversized edge must not join a group it would blow"
+        );
+    }
+
+    /// A cap below what the spill path can honour is planned against the value
+    /// it *will* be raised to, so a small edge is not spilled for nothing.
+    ///
+    /// Four samples are 256 B. At `--max-memory 200` they fit in memory —
+    /// because the spill path would raise 200 to `spill::MIN_CAP` = 1 024 and
+    /// buffer them anyway — so routing them to a temporary file buys a file, a
+    /// merge and a `Drop` and saves not one byte.
+    ///
+    /// Mutant: plan against `cap.max(SAMPLE_BYTES)` instead of
+    /// `spill::cap_of(cap)` — applied, and this failed with `[Spilled(0)]`.
+    #[test]
+    fn a_cap_below_the_floor_is_planned_at_the_floor() {
+        let s = survey_with(&[4]);
+        let order: Vec<usize> = (0..s.edges.len()).collect();
+        assert_eq!(
+            plan_groups(&s, &order, 200),
+            vec![Group::InMemory(vec![0])],
+            "an edge that fits the *effective* cap must not take the spill path"
         );
     }
 

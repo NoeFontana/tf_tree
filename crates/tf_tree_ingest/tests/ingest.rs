@@ -120,11 +120,16 @@ fn small_recording_ingests() {
 /// comparison whose *values* matched and whose `EdgeId`s did not. That mutant is
 /// how the canonical-order requirement was found in the first place.
 ///
-/// **The `sort_by_key` stability is not guarded by any test here** and is not
-/// claimed to be: swapping it for `sort_unstable_by_key` leaves every test in
-/// this file passing, because Rust's pattern-defeating quicksort happens to be
-/// order-preserving on the small runs these fixtures produce. What holds the
-/// property is the comment at the call site, not a test.
+/// **The `sort_by_key` stability is not guarded by *this* test**, and is not
+/// claimed to be: swapping it for `sort_unstable_by_key` leaves this one
+/// passing, because this fixture has no duplicate stamps for stability to decide
+/// between. It *is* guarded elsewhere in this file —
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` and
+/// `a_reduce_pass_keeps_the_last_occurrence` both fail under that swap, because
+/// both carry duplicates and compare the in-memory path against the spill path.
+/// An earlier revision of this paragraph said no test in the file caught it,
+/// which was true when it was written and stopped being true when those two
+/// landed.
 #[test]
 fn out_of_order_ingest_matches_ordered() {
     let dir = Scratch::new("shuffle");
@@ -900,10 +905,19 @@ fn report_json_is_well_formed() {
 /// break run backwards — applied, and this failed inside the lookup comparison
 /// loop, the two paths disagreeing about the pose at the duplicated stamp.
 /// Mutant 3: swap the runs' `sort_by_key`
-/// for `sort_unstable_by_key` — **survived**, as it does on the in-memory path
-/// and for the same reason: the tie that matters here is *between* runs, and
-/// this fixture never puts two equal stamps in one run. The stability of the
-/// per-run sort is held by the comment at the call site, not by this test.
+/// for `sort_unstable_by_key` — **survived**: the tie that matters here is
+/// *between* runs, and this fixture never puts two equal stamps in one run.
+/// `a_reduce_pass_keeps_the_last_occurrence` puts a pair in one run and it
+/// survives there too, so the per-run sort's stability is a property no test in
+/// this suite gates — see that test's docstring for why, and for what does hold
+/// it. Mutant 4: swap **`fill`'s** in-memory `sort_by_key` for the unstable one
+/// — applied, and this failed, because the in-memory path is this test's
+/// reference and last-wins is what the two paths are being compared on.
+///
+/// The peak assertions are two-sided on purpose. `peak <= cap` alone is passed
+/// by a spill path that reports nothing at all: deleting every
+/// `peak_buffer_bytes` update in `fill_spilled` was applied, and it failed here
+/// and in `a_tiny_cap_reduces_in_several_passes`.
 #[test]
 fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
     const N: i64 = 600;
@@ -972,6 +986,16 @@ fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
     assert!(
         spilled.report.fill.peak_buffer_bytes <= cap,
         "peak {} B over the {cap} B cap",
+        spilled.report.fill.peak_buffer_bytes
+    );
+    // And a *lower* bound, which is the half that makes the peak a measurement
+    // rather than a ceiling: the spill phase alone holds `run_samples × 64`
+    // plus staging, and `WINDOW_SHARE_*` puts that at three quarters of the cap
+    // at the least. Without this, deleting every `peak_buffer_bytes` update in
+    // `fill_spilled` — reporting zero for the whole spill path — passes.
+    assert!(
+        spilled.report.fill.peak_buffer_bytes >= cap * 3 / 4,
+        "peak {} B is too small to be the spill path's; it was not measured",
         spilled.report.fill.peak_buffer_bytes
     );
 
@@ -1063,9 +1087,10 @@ fn a_rosbag2_sqlite3_bag_is_named_as_one() {
 /// This is the case that makes `--max-memory` a bound rather than an
 /// aspiration. A k-way merge keeps at least one sample of every run resident, so
 /// a single-pass merge over enough runs exceeds the cap no matter how the read
-/// windows are sized. The reduce loop is what removes that floor, and nothing
-/// else in the suite reaches it: at the 8 KiB cap of the test above there are
-/// ten runs against a fan-in of ninety-six.
+/// windows are sized. The reduce loop is what removes that floor, and the test
+/// above does not reach it: at its 8 KiB cap the spilled edge produces **six**
+/// runs against a fan-in of **95**, so its `while runs.runs() > fan_in` loop
+/// never executes.
 ///
 /// The witness that reduction actually happened is `spilled_bytes`. Every pass
 /// rewrites every sample, so three times the edge's own size means the initial
@@ -1078,10 +1103,19 @@ fn a_rosbag2_sqlite3_bag_is_named_as_one() {
 /// relaxed so the run could continue, the peak assertion then failed at 10 176 B
 /// resident against the 1 024 B cap, which is the tenfold overrun the loop
 /// exists to prevent.
+///
+/// Mutant 2: neutralise the three `peak_run_index_bytes` updates in
+/// `fill_spilled` — applied, and this failed with `run index 0 B`. Mutant 3:
+/// neutralise the three `peak_buffer_bytes` updates instead, so the spill path
+/// reports no peak at all — applied, and the *lower* bound failed. Both halves
+/// of both numbers are asserted, because a one-sided bound on a measurement is
+/// satisfied by not measuring.
 #[test]
 fn a_tiny_cap_reduces_in_several_passes() {
-    // 2 200 samples at 14 per run is 157 runs against a fan-in of 12: one
-    // reduce pass leaves 14, which is still over the fan-in, so a second runs.
+    // 2 200 samples at 14 per run is 158 runs against a fan-in of 11: one
+    // reduce pass leaves 15, still over the fan-in, so a second runs and leaves
+    // 2. `spilled_runs` is the sum over passes and comes back at 158 + 15 + 2 =
+    // 175 — measured, not derived.
     const N: i64 = 2_200;
     const STRIDE: i64 = 7;
     const CAP: u64 = 1024;
@@ -1119,10 +1153,32 @@ fn a_tiny_cap_reduces_in_several_passes() {
         "spilled {} B for {N} samples; fewer than two reduce passes ran",
         reduced.report.fill.spilled_bytes
     );
+    assert_eq!(
+        reduced.report.fill.spilled_runs, 175,
+        "158 runs, then 15, then 2 — a different split means the reduce loop \
+         changed shape and this test's arithmetic no longer describes it"
+    );
     assert!(
         reduced.report.fill.peak_buffer_bytes <= CAP,
         "peak {} B over the {CAP} B cap",
         reduced.report.fill.peak_buffer_bytes
+    );
+    // The other side of the bound: a spill path that reported nothing would
+    // pass the assertion above. See the sibling test for the same pair.
+    assert!(
+        reduced.report.fill.peak_buffer_bytes >= CAP * 3 / 4,
+        "peak {} B is too small to be the spill path's; it was not measured",
+        reduced.report.fill.peak_buffer_bytes
+    );
+    // **The one allocation the cap does not bound**, reported rather than
+    // hidden: sixteen bytes per run, and at this cap there are enough runs for
+    // it to exceed the cap several times over. Measured at 6 880 B — the two
+    // files' `Vec<RunSpan>` plus the snapshot the reduce pass merges from.
+    assert!(
+        reduced.report.fill.peak_run_index_bytes > CAP,
+        "run index {} B; this fixture is supposed to be in the regime where it \
+         exceeds the cap, which is the regime worth reporting",
+        reduced.report.fill.peak_run_index_bytes
     );
     assert_eq!(reduced.report.samples_pushed, N as u64);
     assert_eq!(
@@ -1147,4 +1203,137 @@ fn a_tiny_cap_reduces_in_several_passes() {
         .map(|e| e.file_name())
         .collect();
     assert!(left.is_empty(), "spill directory still holds {left:?}");
+}
+
+/// **A duplicate that is re-merged by a reduce pass still resolves to the last
+/// occurrence in the recording.**
+///
+/// This is the half of §3.2's "last wins" that nothing else gates. The claim in
+/// `spill`'s module docs is that the recording-order tie break survives *being
+/// re-merged across passes*, and neither sibling test reaches that:
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` is the only one
+/// with duplicate stamps and its six runs never trip the
+/// `while runs.runs() > fan_in` loop, while
+/// `a_tiny_cap_reduces_in_several_passes` is the only one that reduces and its
+/// fixture has no duplicates at all. The failure that fits in the gap is silent:
+/// a `.tft` whose pose at one stamp is the second-to-last value the recording
+/// carried, disagreeing with the in-memory path over the same bag.
+///
+/// The fixture is built for it. At a 1 KiB cap a run holds 14 samples and the
+/// fan-in is 11, so recording indices 3 and 17 land in **runs 0 and 1** — two
+/// runs inside the *same* reduce window, which is exactly where the ordering is
+/// decided and then frozen: after pass one both live in one output run, and no
+/// later merge can reorder them.
+///
+/// Mutant: `spans.reverse()` before `spans.chunks(fan_in)` in `fill_spilled`,
+/// which keeps every window contiguous but inverts the run order inside it.
+/// Mutant 2: `runs.merge_runs(&chunk.iter().rev().copied().collect::<Vec<_>>(),
+/// window)`, which inverts the tie break inside a reduce pass only and leaves
+/// the final merge correct, so `spill`'s own
+/// `runs_merge_ascending_with_ties_in_run_order` cannot see it. Both were
+/// applied, both failed here at `across runs: resolved to Vec3 { x: 41.0, .. },
+/// wanted the last occurrence 42`, and **both left every other test in the
+/// workspace passing** — which is the gap this test closes.
+///
+/// Mutant 3, for the second duplicate pair: swap `fill_spilled`'s two
+/// `sort_by_key`s for `sort_unstable_by_key` — **survived**. A run here is 14
+/// samples and `sort_unstable_by_key` insertion-sorts a slice that short, so it
+/// is stable in fact and the pair cannot be reordered. The per-run sort's
+/// stability is therefore gated by **no** test in this suite; what stands behind
+/// it is the comment at the call site. The in-memory sort it mirrors *is* gated
+/// — swapping `fill`'s `sort_by_key` for the unstable one fails this test and
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path` together — so the
+/// within-run pair is kept for that, and for the day a larger run size makes the
+/// per-run half reachable.
+#[test]
+fn a_reduce_pass_keeps_the_last_occurrence() {
+    const N: i64 = 2_200;
+    const STRIDE: i64 = 7;
+    const CAP: u64 = 1024;
+    // `spill::spill_budget(1024)`'s samples-per-run. Spelled as a literal
+    // because the constant is crate-private, and a test that recomputed it from
+    // the same expression would be checking nothing.
+    const RUN: usize = 14;
+    let dir = Scratch::new("reduce_ties");
+    let spill = dir.0.join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+
+    let mut msgs = Vec::new();
+    for i in 0..N {
+        let k = (i * STRIDE) % N;
+        let t = 1_000_000_000 + k * 1_000_000;
+        msgs.push(FixtureMessage::dynamic("odom", "base_link", t, pose(k as f64)).logged_at(t));
+    }
+    // Off the 1 ms grid, so neither stamp collides with one the loop above
+    // already produced and each duplicate is a clean pair of two.
+    let across = 1_000_000_000 + 1_234_000_000 + 500_000;
+    let within = 1_000_000_000 + 1_300_000_000 + 500_000;
+    // Across two runs: index 3 is in run 0, index `3 + RUN` in run 1, and both
+    // runs fall inside the first reduce window.
+    msgs[3] = FixtureMessage::dynamic("odom", "base_link", across, pose(41.0)).logged_at(0);
+    msgs[3 + RUN] = FixtureMessage::dynamic("odom", "base_link", across, pose(42.0)).logged_at(0);
+    // Within one run, so the per-run sort decides rather than the heap.
+    msgs[5] = FixtureMessage::dynamic("odom", "base_link", within, pose(51.0)).logged_at(0);
+    msgs[9] = FixtureMessage::dynamic("odom", "base_link", within, pose(52.0)).logged_at(0);
+
+    let path = write(&dir, "reduce_ties.mcap", &msgs);
+    let base = IngestOptions {
+        clock_reset_threshold_ns: i64::MAX,
+        ..IngestOptions::default()
+    };
+    let mut f1 = Frames::default();
+    let reduced = tf_tree_ingest::run(
+        &path,
+        &IngestOptions {
+            max_memory_bytes: CAP,
+            spill_dir: Some(spill),
+            ..base.clone()
+        },
+        &mut f1,
+    )
+    .unwrap();
+    let mut f2 = Frames::default();
+    let in_memory = tf_tree_ingest::run(&path, &base, &mut f2).unwrap();
+
+    // Non-degenerate: the reduce loop has to have run, or this is the sibling
+    // test again under another name.
+    assert!(
+        reduced.report.fill.spilled_bytes >= 3 * N as u64 * 64,
+        "spilled {} B for {N} samples; fewer than two reduce passes ran",
+        reduced.report.fill.spilled_bytes
+    );
+    assert_eq!(reduced.report.anomalies.duplicate_stamps, 2);
+    assert_eq!(
+        reduced.report.anomalies.duplicate_stamps,
+        in_memory.report.anomalies.duplicate_stamps
+    );
+    assert_eq!(reduced.report.samples_pushed, N as u64 - 2);
+
+    for (stamp, want, which) in [
+        (across, 42.0, "across runs"),
+        (within, 52.0, "within one run"),
+    ] {
+        let got = reduced
+            .tree
+            .lookup(
+                "odom",
+                "base_link",
+                Stamp::<SystemDomain>::from_nanos(stamp),
+            )
+            .unwrap();
+        assert!(
+            (got.t.x - want).abs() < 1e-12,
+            "{which}: resolved to {:?}, wanted the last occurrence {want}",
+            got.t
+        );
+        let same = in_memory
+            .tree
+            .lookup(
+                "odom",
+                "base_link",
+                Stamp::<SystemDomain>::from_nanos(stamp),
+            )
+            .unwrap();
+        assert_eq!(got, same, "{which}: the two paths disagree");
+    }
 }
