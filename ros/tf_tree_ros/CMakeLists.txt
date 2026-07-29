@@ -66,6 +66,14 @@ if(BUILD_TESTING)
   if(TARGET test_ingest)
     target_link_libraries(test_ingest tf_tree_ros)
   endif()
+
+  # §6.3's QoS regression, as amended. Separate from `test_ingest` because it
+  # deliberately waits out timeouts — one of its two assertions is that nothing
+  # arrives — and mixing that with the fast path makes the fast path look slow.
+  ament_add_gtest(test_qos test/test_qos.cpp TIMEOUT 120)
+  if(TARGET test_qos)
+    target_link_libraries(test_qos tf_tree_ros)
+  endif()
 endif()
 
 ament_package()
