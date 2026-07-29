@@ -193,11 +193,17 @@ fn capacity_rounds_to_power_of_two() {
 /// `tf_tree topology --discover` emits for a 20 Hz publisher (it measures and
 /// rounds up to two decimals), so hertz-rounding would store 20 000 mHz and
 /// milli-hertz truncation would store 19 790 either way; 0.1 Hz is a map update,
-/// which an integer-hertz field could not express at all.
+/// which an integer-hertz field could not express at all. **19.9999 Hz is the
+/// value that separates `round` from `as`** — the conversion's own comment calls
+/// the distinction load-bearing, and neither 19.79 nor 0.1 discriminates it,
+/// because `19.79 * 1000.0` and `0.1 * 1000.0` are both exact in `f64`.
 ///
 /// Mutant: delete `record.nominal_rate_mhz = cfg.nominal_rate_mhz;` from
 /// `TreeBuilder::build_with`. Applied: the first assertion fails with
 /// `left: 0, right: 19790`.
+/// Mutant B: `mhz.round() as u32` -> `mhz as u32` in `EdgeCfg::nominal_rate_hz`.
+/// Applied: the 19.9999 Hz assertion fails with `left: 19999, right: 20000` —
+/// an edge the operator declared at 20 Hz, off by a milli-hertz forever.
 #[test]
 fn a_declared_nominal_rate_reaches_the_edge_record() {
     let tree = TreeBuilder::new()
@@ -226,6 +232,12 @@ fn a_declared_nominal_rate_reaches_the_edge_record() {
             "gps",
             EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(-5.0),
         )
+        // A 20 Hz rate that came back from a text round-trip a whisker short.
+        .dynamic_edge(
+            "base",
+            "wheel",
+            EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(19.9999),
+        )
         .build()
         .unwrap();
 
@@ -240,6 +252,11 @@ fn a_declared_nominal_rate_reaches_the_edge_record() {
     assert_eq!(mhz(3), 0, "an edge sized by slots declares no rate");
     assert_eq!(mhz(4), 0, "an infinite rate is not a declaration");
     assert_eq!(mhz(5), 0, "a negative rate is not a declaration");
+    assert_eq!(
+        mhz(6),
+        20_000,
+        "19.9999 Hz rounds to 20 000 mHz; truncating would store 19 999"
+    );
 
     // A static edge never publishes, so it has no rate and the builder writes
     // none — checked because `EdgeRecord::static_edge` and `::dynamic` are

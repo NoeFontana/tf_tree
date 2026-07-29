@@ -100,7 +100,15 @@ impl Capacity {
 /// `capacity` is required; `interp` and `domain` fall back to the builder
 /// defaults ([`TreeBuilder::default_interp`] / [`TreeBuilder::default_domain`])
 /// when left `None`.
+///
+/// `#[non_exhaustive]` because this struct is *designed* to grow — `interp`,
+/// `domain` and `nominal_rate_mhz` all arrived after `capacity`, and each would
+/// have been a breaking change for any out-of-repo `EdgeCfg { .. }` literal.
+/// Construction goes through [`EdgeCfg::new`] and the builder methods, which
+/// stay source-compatible across every such addition. Reading the fields is
+/// unaffected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EdgeCfg {
     /// Ring capacity (a power of two; see [`Capacity`]).
     pub capacity: Capacity,
