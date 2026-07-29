@@ -21,9 +21,9 @@ use tf_tree_cli::doctor::{Observations, Snapshot};
 fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) -> R) -> R {
     let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
     // The writers are held for the whole run: dropping them releases every
-    // claim, and the tree would then be a *different* state — one where the
-    // id-less `unclaimed-dynamic` check legitimately fires on all four dynamic
-    // edges, which would make this test assert nothing about the healthy case.
+    // claim, and the tree would then be a *different* state — one where
+    // `TFT017` legitimately fires on all four dynamic edges, which would make
+    // this test assert nothing about the healthy case.
     let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
 
     let snap = Snapshot::capture(&tree);
@@ -87,7 +87,8 @@ fn the_healthy_fixture_fires_only_the_check_that_is_true_of_it() {
         );
         assert!(
             report.uncatalogued.is_empty(),
-            "id-less checks fired on a healthy tree: {:?}",
+            "nothing should reach the id-less path any more (PHASE5 §6's amendment gave \
+             the last two occupants TFT017/TFT018): {:?}",
             report.uncatalogued
         );
         assert!(
@@ -149,9 +150,14 @@ fn every_id_is_reported_and_every_skip_states_a_reason() {
 ///
 /// Mutant: make `Report::count_at` in the JSON summary use `at()` alone,
 /// dropping the `uncatalogued` term. Applied: the summary/gate agreement below
-/// still holds on the healthy fixture (nothing id-less fires), so the case is
-/// forced explicitly with an injected id-less error, and *that* assertion
-/// fails.
+/// still holds on the healthy fixture (nothing id-less fires — nothing produces
+/// an [`Uncatalogued`] at all since §6's amendment), so the case is forced
+/// explicitly with an injected id-less error, and *that* assertion fails. The
+/// injection is the point: the `uncatalogued` array is still part of the stable
+/// JSON schema, and this pins that a finding placed in it would still be counted
+/// by the summary a CI job reads.
+///
+/// [`Uncatalogued`]: tf_tree_cli::catalogue::Uncatalogued
 #[test]
 fn the_json_summary_agrees_with_the_exit_status() {
     run_on_fixture(|report, _| {

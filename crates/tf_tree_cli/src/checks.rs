@@ -55,7 +55,7 @@ use std::sync::atomic::Ordering;
 use tf_tree::{EdgeId, EdgeKind, Tree};
 use tf_tree_bench::fixture::PushSample;
 
-use crate::catalogue::{CheckOutcome, Finding, Report, Severity, Tft, Uncatalogued};
+use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
 use crate::doctor::{self, Observations, Snapshot};
 use crate::hostfacts::{HostFacts, MemLock, Thp};
 
@@ -359,40 +359,20 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
             Tft::Tft014 => tft014(inp),
             Tft::Tft015 => tft015(inp),
             Tft::Tft016 => tft016(inp),
+            Tft::Tft017 => tft017(inp),
+            Tft::Tft018 => tft018(inp),
         };
         o.suppressed = suppress.contains(&check);
         outcomes.push(o);
     }
 
-    // The two Phase 1 checks §6 assigns no identifier to. See the
-    // `crate::catalogue` module docs for why they are not forced into one.
-    // Severity comes from the finding, not from a literal here: `doctor` sets
-    // it next to the code that knows why the condition is serious, and
-    // restating it at this seam is how the two answers drift apart. `--exit-code`
-    // keys on it, so a drift is a gate that silently changes meaning.
-    let mut uncatalogued = Vec::new();
-    for f in doctor::check_unclaimed_dynamic(inp.snap) {
-        uncatalogued.push(Uncatalogued {
-            check: "unclaimed-dynamic",
-            severity: Severity::from(f.severity),
-            subject: "tree".to_owned(),
-            message: f.message,
-        });
-    }
-    if !inp.live {
-        for f in doctor::check_out_of_order(inp.obs) {
-            uncatalogued.push(Uncatalogued {
-                check: "out-of-order",
-                severity: Severity::from(f.severity),
-                subject: "tree".to_owned(),
-                message: f.message,
-            });
-        }
-    }
-
     Report {
         outcomes,
-        uncatalogued,
+        // Empty, and the field stays: `uncatalogued` is part of the stable
+        // `--json` schema, and it is the shape a future check with no id would
+        // take. `docs/PHASE5.md` §6's amendment gave the last two occupants
+        // `TFT017`/`TFT018`.
+        uncatalogued: Vec::new(),
     }
 }
 
@@ -1016,6 +996,56 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft016, out)
 }
 
+/// `TFT017` — a dynamic edge nobody is writing to.
+///
+/// The Phase 1 `unclaimed-dynamic` check, given an id by `docs/PHASE5.md` §6's
+/// amendment. Distinct from `TFT013` (declared and *never* published to) and
+/// from `TFT014` (a claim held by a slot whose owner is gone): this is an edge
+/// with no claim at all, which may have a full ring of history that is now
+/// going stale.
+fn tft017(inp: &Inputs<'_>) -> CheckOutcome {
+    CheckOutcome::ran(
+        Tft::Tft017,
+        doctor::check_unclaimed_dynamic(inp.snap)
+            .into_iter()
+            .map(|f| Finding::about(Tft::Tft017, "tree", f.message))
+            .collect(),
+    )
+}
+
+/// `TFT018` — a later arrival carried an older stamp than an earlier one.
+///
+/// The Phase 1 `out-of-order` check, given an id by `docs/PHASE5.md` §6's
+/// amendment. Distinct from `TFT006`, which judges a stamp's *value*: a stream
+/// of perfectly plausible stamps can still arrive backwards, and that is what
+/// breaks a consumer's interpolation.
+///
+/// **Skipped on a live arena, and this is the one that would otherwise report a
+/// fault that never happened.** [`Observations::from_arena`] reconstructs the
+/// stream by walking the ring's retained window with relaxed loads and no
+/// re-check, while a publisher is writing into it. The oldest slot is the one
+/// being overwritten, so a sample from the *next* lap can appear at the old end
+/// of the window: the reconstructed stream jumps forward and then back, which is
+/// exactly the shape of this finding, on a perfectly monotone publisher. Before
+/// the id, this condition was silently not run on a live arena; now it says so.
+fn tft018(inp: &Inputs<'_>) -> CheckOutcome {
+    if inp.live {
+        return CheckOutcome::skipped(
+            Tft::Tft018,
+            "a live arena's push stream is reconstructed from a ring that is being written \
+             while it is read, so a slot at the old end can already hold the next lap's \
+             sample — which reads as an inversion on a correctly ordered publisher",
+        );
+    }
+    CheckOutcome::ran(
+        Tft::Tft018,
+        doctor::check_out_of_order(inp.obs)
+            .into_iter()
+            .map(|f| Finding::about(Tft::Tft018, "tree", f.message))
+            .collect(),
+    )
+}
+
 /// The occupancy triples for [`Inputs::occupancy`], read from the header.
 ///
 /// **`participants` is deliberately absent, and [`PARTICIPANT_OCCUPANCY_NOTE`]
@@ -1583,6 +1613,130 @@ mod tests {
             1,
             "a real gap in a monotone stream must still fire: {o:?}"
         );
+    }
+
+    /// **`TFT017` and `TFT018` report at the severity their Phase 1 checks
+    /// assign, and the two answers are compared here because nothing else
+    /// compares them.**
+    ///
+    /// Before they had ids, `checks::run` took each finding's severity from
+    /// [`doctor::Finding`], next to the code that knows why the condition is
+    /// serious. An id owns its severity instead (`--exit-code` is only a usable
+    /// gate if the set of ids that can fail it is knowable from the
+    /// documentation), so the value is now stated twice — and `TFT018` is an
+    /// *error*, so a drift would silently change what `doctor --exit-code`
+    /// fails on.
+    ///
+    /// Mutant: give `Tft::Tft018` `Severity::Warn` in `catalogue::severity`.
+    /// Applied: the out-of-order comparison fails with `left: Warn, right:
+    /// Error`. Mutant B: make `doctor::check_unclaimed_dynamic` return
+    /// `Finding::error`. Applied: the unclaimed comparison fails.
+    #[test]
+    fn the_two_new_ids_keep_their_phase_1_severities() {
+        let unclaimed = Snapshot {
+            frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
+            edges: vec![EdgeInfo {
+                claimed: false,
+                owner_pid: 0,
+                ..edge(1, 1, 2, 100)
+            }],
+        };
+        let f = doctor::check_unclaimed_dynamic(&unclaimed);
+        assert_eq!(f.len(), 1, "the fixture must fire the check it is about");
+        assert_eq!(
+            crate::catalogue::Severity::from(f[0].severity),
+            Tft::Tft017.severity(),
+            "TFT017's severity must be the one `unclaimed-dynamic` assigns"
+        );
+
+        let obs = Observations::from_samples(vec![
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 100,
+                arrival_delay_ns: 0,
+            },
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 50,
+                arrival_delay_ns: 0,
+            },
+        ]);
+        let f = doctor::check_out_of_order(&obs);
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            crate::catalogue::Severity::from(f[0].severity),
+            Tft::Tft018.severity(),
+            "TFT018's severity must be the one `out-of-order` assigns"
+        );
+
+        // And both really do reach the report through their ids, rather than
+        // through the id-less path they used to take.
+        let snap = two_frame_snapshot(EdgeInfo {
+            claimed: false,
+            owner_pid: 0,
+            ..edge(1, 1, 2, 100)
+        });
+        let report = run(&inputs(&snap, &obs, &[], Clock::Wall(0)), &BTreeSet::new());
+        assert!(
+            report.uncatalogued.is_empty(),
+            "neither check is id-less any more: {:?}",
+            report.uncatalogued
+        );
+        let fired: Vec<&str> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.status == Status::Fired)
+            .map(|o| o.check.id())
+            .collect();
+        assert!(
+            fired.contains(&"TFT017") && fired.contains(&"TFT018"),
+            "{fired:?}"
+        );
+        assert!(report.has_error(), "an out-of-order stream must still gate");
+    }
+
+    /// **`TFT018` skips on a live arena instead of reporting an inversion the
+    /// publisher never made.**
+    ///
+    /// A live push stream is reconstructed from a ring that is being written
+    /// while it is read, so a slot at the old end of the window can already hold
+    /// the next lap's sample — a forward jump followed by a step back, which is
+    /// this check's exact signature. Before the id, the live case was silently
+    /// not run and the report said nothing about it.
+    ///
+    /// Mutant: drop the `if inp.live` guard from `tft018`. Applied: the status
+    /// is `Fired` and the `Skipped` match panics.
+    #[test]
+    fn tft018_skips_on_a_live_arena_and_says_so() {
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let obs = Observations::from_samples(vec![
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 100,
+                arrival_delay_ns: 0,
+            },
+            PushSample {
+                edge: 1,
+                writer_pid: 1,
+                stamp_ns: 50,
+                arrival_delay_ns: 0,
+            },
+        ]);
+        let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
+        inp.live = true;
+        match &tft018(&inp).status {
+            Status::Skipped(why) => assert!(
+                why.contains("next lap"),
+                "the skip must name what would have been misread: {why}"
+            ),
+            other => panic!("expected a skip on a live arena, got {other:?}"),
+        }
+        // Non-vacuity: the same stream off a live arena does fire.
+        inp.live = false;
+        assert_eq!(tft018(&inp).status, Status::Fired);
     }
 
     /// **`TFT007` compares only where a rate was declared, and an undeclared

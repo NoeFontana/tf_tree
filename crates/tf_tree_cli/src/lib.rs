@@ -724,7 +724,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         let id = catalogue::Tft::parse(s).ok_or_else(|| {
             // Refused rather than ignored: a typo that silently suppresses
             // nothing leaves a gate that looks configured and is not.
-            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT016")
+            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT018")
         })?;
         ids.insert(id);
     }

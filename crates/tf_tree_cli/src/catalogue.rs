@@ -17,10 +17,10 @@
 //! layout: an id never changes meaning, never gets recycled, and is what
 //! `--json`, `--suppress` and every document refer to.
 //!
-//! # The catalogue is exactly `TFT001`–`TFT016`
+//! # The catalogue is `TFT001`–`TFT018`
 //!
-//! §6's table lists sixteen. Mapping the seven Phase 1 checks
-//! ([`crate::doctor`]) onto it goes:
+//! §6's table lists sixteen; its amendment adds two. Mapping the seven Phase 1
+//! checks ([`crate::doctor`]) onto it goes:
 //!
 //! | Phase 1 check | Catalogue id |
 //! |---|---|
@@ -28,18 +28,24 @@
 //! | `inconsistent-rate` | `TFT008` (jitter — a coefficient of variation *is* the inter-arrival spread) |
 //! | `short-buffer` | `TFT011` |
 //! | `cycle`, `unreachable` | `TFT012` (both are "the topology walk does not reach everything") |
-//! | `unclaimed-dynamic` | **none** |
-//! | `out-of-order` | **none** |
+//! | `unclaimed-dynamic` | `TFT017` |
+//! | `out-of-order` | `TFT018` |
 //!
-//! **Two Phase 1 checks have no §6 identifier, and neither is forced into one.**
+//! **The last two got new ids rather than being folded into existing ones.**
 //! `TFT013` is *declared but never published*, which is not *published and then
-//! abandoned*; `TFT006` is a check on a stamp's *value*, not on the order stamps
-//! arrive in. Giving either id a second meaning would defeat the point of having
-//! stable ids at all, and inventing `TFT017`/`TFT018` here would be a unilateral
-//! amendment to a normative document. So they are reported through
-//! [`Report::uncatalogued`]: fully visible, still gating, and explicitly marked
-//! as having no id — which is also the form in which somebody deciding whether
-//! to amend §6 can see what is missing.
+//! abandoned*; `TFT014` is a claim held by a slot whose owner is gone, which is
+//! not *no claim at all*; `TFT006` is a check on a stamp's *value*, not on the
+//! order stamps arrive in. Giving any of those a second meaning would defeat the
+//! point of having stable ids. Appending two is additive — `--suppress` gains
+//! two spellings, `--json` gains two entries in an array consumers already
+//! iterate — whereas renumbering an existing id would break every runbook and CI
+//! job that names one. §6's amendment records the decision.
+//!
+//! [`Uncatalogued`] survives that change and has no producer today. It stays for
+//! two reasons: the `uncatalogued` key is part of the stable `--json` schema, so
+//! removing it would break a consumer that reads it; and it is the shape any
+//! future check without an id takes, which is the state this catalogue spent its
+//! first revision in.
 //!
 //! Going the other way, some ids have no detection *here*: three cannot detect
 //! anything in any configuration, and five more depend on what this arena, this
@@ -125,12 +131,16 @@ pub enum Tft {
     Tft015,
     /// Transparent huge pages disabled, or `RLIMIT_MEMLOCK` below the arena size.
     Tft016,
+    /// A dynamic edge with no live writer holding its claim.
+    Tft017,
+    /// Stamps arriving out of monotonic order on an edge.
+    Tft018,
 }
 
 impl Tft {
     /// Every check, in id order. [`crate::checks::run`] walks this, so a new
     /// variant cannot be added and then silently never executed.
-    pub const ALL: [Tft; 16] = [
+    pub const ALL: [Tft; 18] = [
         Tft::Tft001,
         Tft::Tft002,
         Tft::Tft003,
@@ -147,6 +157,8 @@ impl Tft {
         Tft::Tft014,
         Tft::Tft015,
         Tft::Tft016,
+        Tft::Tft017,
+        Tft::Tft018,
     ];
 
     /// The stable identifier, e.g. `"TFT010"`. **Never changes.**
@@ -169,6 +181,8 @@ impl Tft {
             Tft::Tft014 => "TFT014",
             Tft::Tft015 => "TFT015",
             Tft::Tft016 => "TFT016",
+            Tft::Tft017 => "TFT017",
+            Tft::Tft018 => "TFT018",
         }
     }
 
@@ -192,6 +206,8 @@ impl Tft {
             Tft::Tft014 => "participant or claim slot leak",
             Tft::Tft015 => "arena occupancy above 80%",
             Tft::Tft016 => "transparent huge pages off, or RLIMIT_MEMLOCK below the arena size",
+            Tft::Tft017 => "dynamic edge with no live writer",
+            Tft::Tft018 => "stamps arriving out of order",
         }
     }
 
@@ -203,7 +219,9 @@ impl Tft {
     #[must_use]
     pub fn severity(self) -> Severity {
         match self {
-            Tft::Tft001 | Tft::Tft002 | Tft::Tft003 | Tft::Tft006 | Tft::Tft012 => Severity::Error,
+            Tft::Tft001 | Tft::Tft002 | Tft::Tft003 | Tft::Tft006 | Tft::Tft012 | Tft::Tft018 => {
+                Severity::Error
+            }
             Tft::Tft004
             | Tft::Tft005
             | Tft::Tft007
@@ -212,7 +230,8 @@ impl Tft {
             | Tft::Tft010
             | Tft::Tft011
             | Tft::Tft014
-            | Tft::Tft015 => Severity::Warn,
+            | Tft::Tft015
+            | Tft::Tft017 => Severity::Warn,
             Tft::Tft013 | Tft::Tft016 => Severity::Info,
         }
     }
@@ -781,7 +800,7 @@ mod tests {
         // nothing is the failure mode worth refusing.
         assert_eq!(Tft::parse("TFT10"), None);
         assert_eq!(Tft::parse("10"), None);
-        assert_eq!(Tft::parse("TFT017"), None);
+        assert_eq!(Tft::parse("TFT019"), None);
     }
 
     /// **A hostile frame name must not be able to break the JSON document.**
