@@ -304,6 +304,14 @@ bench-report-shm *ARGS:
 # behind the feature actually runs; the tf2 *integration* tests keep their own
 # recipes, `tf2-differential` and `tf2-replay`.
 #
+# The `tf_tree_c --features bridge` clippy row is **deliberately the same command
+# `just lint` runs**, not a copy-paste slip. `ros/tf_tree_ros` links a
+# `libtf_tree_c.a` built by *this image's* rustup toolchain, which is installed
+# independently of the host's and is pinned only by the Dockerfile's
+# `RUST_TOOLCHAIN` argument. This is the recipe to run before `just ros-build`,
+# and it is where a container-side toolchain drift in the one crate the ROS
+# package links shows up.
+#
 # fmt + clippy + unit tests for the tf2 bridge, in the container. `lint` and `test` cannot see it.
 tf2-check:
     ./docker/tf2/run.sh 'set -euo pipefail; \
@@ -311,7 +319,31 @@ tf2-check:
         cargo clippy --manifest-path crates/tf_tree_tf2_sys/Cargo.toml --all-targets -- -D warnings; \
         cargo nextest run --manifest-path crates/tf_tree_tf2_sys/Cargo.toml --release; \
         cargo clippy -p tf_tree_bench --features tf2 --all-targets -- -D warnings; \
-        cargo nextest run -p tf_tree_bench --features tf2 --release --lib --no-tests=pass'
+        cargo nextest run -p tf_tree_bench --features tf2 --release --lib --no-tests=pass; \
+        cargo clippy -p tf_tree_c --features bridge --all-targets -- -D warnings'
+
+# **The ROS 2 ingest bridge (`docs/PHASE4.md` §5), built in the container.**
+#
+# `ros/tf_tree_ros` is an `ament_cmake` package, not a cargo crate: it needs
+# `rclcpp`, which exists only in `docker/tf2`. It therefore inherits
+# `tf_tree_tf2_sys`' problem — no `cargo fmt`, no `clippy`, no `nextest` — and
+# these two recipes are the whole of its gate. Run them after touching anything
+# under `ros/`.
+#
+# `ros/build.sh` says what the three steps are and which of them is easy to get
+# wrong; the short version is that the staticlib must carry `--features bridge`
+# and colcon must be told every output directory or it litters the repo root.
+#
+# Build ros/tf_tree_ros (PHASE4 §5) in the container. Nothing on the host can.
+ros-build:
+    ./docker/tf2/run.sh './ros/build.sh'
+
+# The same build, then its `ctest`s — §6.3's QoS regression among them, which
+# needs a real DDS and two participants and so can exist nowhere else.
+#
+# Build ros/tf_tree_ros and run its ctests. The only gate this package has.
+ros-test:
+    ./docker/tf2/run.sh './ros/build.sh --test'
 
 # The tf2::BufferCore differential — the migration-credibility test.
 #

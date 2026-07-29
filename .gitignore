@@ -201,6 +201,15 @@ logs/
 # Container build artifacts (docker/tf2/run.sh redirects CARGO_TARGET_DIR here).
 /target/tf2-docker/
 
+# colcon's build/install/log trees and the find_package(tf_tree) prefix, for
+# `ros/tf_tree_ros` (`just ros-build`). Already covered by the `/target/` rule
+# above; named because `ros/build.sh` has to pass all three paths to colcon
+# explicitly and this is where a reader looks for what they should be.
+/target/ros/
+# colcon's DEFAULT log directory, which is the one rule `/target/` does not
+# cover: any `colcon` invocation that forgets `--log-base` drops it here.
+/log/
+
 # Bags are large and license-encumbered to redistribute; only the derived
 # .tfstream files (see testdata/tfstream/ATTRIBUTION.md) are committed.
 /testdata/bags/
