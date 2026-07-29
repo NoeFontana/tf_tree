@@ -735,11 +735,19 @@ Consequences, which must be enforced by types where possible and by errors where
 The reference owner. Target ~400 lines. Deliberately boring: it holds no application logic, so it is the process least likely to crash.
 
 ```
-tf_treed --domain <n> --name <n> --config <file.toml|urdf> [--participants 64]
+tf_treed --domain <n> --name <n> --config <file.toml> [--participants 64]
          [--lock] [--socket-mode 0600] [--metrics-port <p>]
 ```
 
-Responsibilities: create and seal the segment; declare frames and static edges from config or URDF so the tree exists before any node starts; serve the attach socket; `epoll` participant sockets and reap on `HUP`; serve `doctor`/`top` queries; export Prometheus metrics; on `SIGTERM`, drain and exit, leaving the segment alive for existing participants.
+> **Amended by [`0009`](./decisions/0009-descoping-phase-6.md):** `--config` took
+> `<file.toml|urdf>` here. URDF parsing is no longer owed by any phase — it
+> leaves the engine and becomes an optional converter that emits the topology
+> config Phase 4 already ships, built on the existing `urdf-rs` crate. So this
+> daemon takes the config format and nothing else; a user with a URDF converts
+> it first. Costs no code, since §9 is unimplemented, but it does retract a
+> promise rather than leaving it to be discovered.
+
+Responsibilities: create and seal the segment; declare frames and static edges from the config so the tree exists before any node starts; serve the attach socket; `epoll` participant sockets and reap on `HUP`; serve `doctor`/`top` queries; export Prometheus metrics; on `SIGTERM`, drain and exit, leaving the segment alive for existing participants.
 
 It must **not** publish, claim any edge, or interpret transforms. It is a lifecycle daemon.
 

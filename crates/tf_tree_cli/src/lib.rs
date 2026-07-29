@@ -1334,8 +1334,11 @@ fn explain_format_version() {
     if v >= 3 {
         println!("Version 3 (docs/PHASE5.md §1) is a deliberate one-time break. It");
         println!("added the diagnostic counter regions and reserved header space");
-        println!("for Phase 6's covariance and spline regions, so that those land");
-        println!("without a second break. A version-2 arena cannot be attached.");
+        println!("for Phase 6's spline region, so that it lands without a second");
+        println!("break. A version-2 arena cannot be attached. The eight bytes");
+        println!("that were reserved for covariance stay reserved and unused:");
+        println!("docs/decisions/0009 descoped covariance, and tf_tree carries");
+        println!("no uncertainty.");
     }
 }
 

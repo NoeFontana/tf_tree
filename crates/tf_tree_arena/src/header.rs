@@ -49,8 +49,9 @@ pub const TF_TREE_MAGIC: [u8; 8] = *b"TF_TREE\0";
 /// * the two counter regions (§5.2), which exist whether or not the `counters`
 ///   feature is compiled in, so that disabling it does not fork the layout hash
 ///   (D34);
-/// * `covariance_region_off`/`_stride` and `spline_region_off`/`_degree`, which
-///   are **Phase 6's** and are `0` (absent) in every arena this build creates;
+/// * `spline_region_off`/`_degree`, which are **Phase 6's** and are `0`
+///   (absent) in every arena this build creates, and the eight reserved bytes
+///   in front of them that were covariance's before `0009` descoped it;
 /// * `nominal_rate_mhz` and `declared_by_slot` in `EdgeRecord`'s reserved bytes,
 ///   and `frame_kind` in `FrameRecord`'s.
 ///
@@ -218,14 +219,22 @@ pub struct ArenaHeader {
     pub edge_counters_off: u32,
     /// Byte offset of the per-participant counter region (§5.2). Same contract.
     pub participant_counters_off: u32,
-    /// Byte offset of the per-sample covariance region. **Phase 6.**
+    /// Eight bytes that were `covariance_region_off` + `covariance_stride`
+    /// until [`0009`] descoped covariance, reserved **in place** rather than
+    /// reclaimed.
     ///
-    /// `0` means absent, and it is 0 in every arena this build creates. The
-    /// field exists now so Phase 6 fills a region the header already accounts
-    /// for, rather than breaking the format a second time (§1's whole argument).
-    pub covariance_region_off: u32,
-    /// Bytes per covariance entry. **Phase 6.** `0` when absent.
-    pub covariance_stride: u32,
+    /// [`0009`]: ../../../docs/decisions/0009-descoping-phase-6.md
+    ///
+    /// Leaving them here is the point: `spline_region_off` and `spline_degree`
+    /// are published at 168 and 172, and closing this gap would move them. A
+    /// v3 arena written before the descope and one written after must stay
+    /// byte-compatible, because `layout_hash` hashes region strides and would
+    /// not notice the difference — two participants would attach to each other
+    /// and disagree about where the spline region begins.
+    ///
+    /// `tf_tree` does not carry uncertainty; see `0009` for why a tree cannot
+    /// compose a correct one.
+    _reserved_covariance: [u8; 8],
     /// Byte offset of the cumulative-B-spline control region. **Phase 6.**
     /// `0` when absent.
     pub spline_region_off: u32,
@@ -300,8 +309,14 @@ mod tests {
         // `instance_uuid` and the lock's 64-byte boundary.
         assert_eq!(offset_of!(ArenaHeader, edge_counters_off), 152);
         assert_eq!(offset_of!(ArenaHeader, participant_counters_off), 156);
-        assert_eq!(offset_of!(ArenaHeader, covariance_region_off), 160);
-        assert_eq!(offset_of!(ArenaHeader, covariance_stride), 164);
+        // 160..168 was `covariance_region_off` + `covariance_stride` until
+        // `docs/decisions/0009` descoped covariance. The bytes stay reserved
+        // rather than being reclaimed, so that the two assertions below keep
+        // their published values — a v3 arena written either side of the
+        // descope must agree on where the spline region begins, and
+        // `layout_hash` would not catch a disagreement because it hashes
+        // region strides and not header fields.
+        assert_eq!(offset_of!(ArenaHeader, _reserved_covariance), 160);
         assert_eq!(offset_of!(ArenaHeader, spline_region_off), 168);
         assert_eq!(offset_of!(ArenaHeader, spline_degree), 172);
         // The lock sits on its own cacheline, so its offset is a multiple of 64
@@ -321,7 +336,10 @@ mod tests {
     fn at_least_64_reserved_bytes_remain_after_the_v3_fields() {
         // Named reserved arrays, plus the implicit padding between the last
         // named field and the lock's 64-byte boundary.
-        let named = 8usize /* _reserved */ + 3 /* _pad_v3 */ + 64 /* _reserved_v3 */;
+        let named = 8usize /* _reserved */
+            + 8 /* _reserved_covariance, freed by `0009` */
+            + 3 /* _pad_v3 */
+            + 64 /* _reserved_v3 */;
         let last_named_end = offset_of!(ArenaHeader, _reserved_v3) + 64;
         let implicit = offset_of!(ArenaHeader, topo_lock) - last_named_end;
         let free = named + implicit;

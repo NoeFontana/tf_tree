@@ -591,7 +591,8 @@ because nothing set `tf_prefix`.
 | Publishing arena → `/tf` (egress) | Phase 7. Ingress-only removes all loopback questions from this phase. |
 | ROS 1 | EOL. A bridge only, if ever. |
 | Python changes | Phase 3 is done and the C ABI does not touch it (D: PyO3 binds Rust directly) |
-| Covariance, splines, CoW branches | Phase 6 |
+| Splines | Phase 6 |
+| Covariance, CoW branches | **Cut** by [`0009`](./decisions/0009-descoping-phase-6.md) — not deferred |
 | A C++ *implementation* of anything | The wrapper is a header over the C ABI. No logic in C++ — logic lives in Rust where it is tested. |
 
 ---

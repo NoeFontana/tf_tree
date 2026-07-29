@@ -78,7 +78,8 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 |---|---|
 | `tf2_ros::Buffer` shim | Phase 7, gated on this phase's evidence |
 | Arena → `/tf` egress | Phase 7 |
-| Covariance, splines, CoW branches | Phase 6 — but §1 reserves their layout space now |
+| Splines | Phase 6 — §1 reserves their layout space now |
+| Covariance, CoW branches | **Cut** by [`0009`](./decisions/0009-descoping-phase-6.md) — not deferred. A tree cannot compose a correct covariance; CoW serves the loop-closure use case D2 rejects. |
 | Inter-host replication | Phase 8 |
 | Compression in `.tft` | Breaks `mmap`, which is the entire point. Revisit only with a block-oriented design and measured demand. |
 | A web *framework* | §7. An embedded static page and one JSON endpoint. Nothing that needs npm. |
@@ -103,7 +104,7 @@ Phase 5 needs new arena regions. Phases 1–3 are implemented, so this is a real
 | `ParticipantCounters` array | 5 | `max_participants × 128 B` |
 | Per-edge `nominal_rate_mhz: u32` | 5 | in `EdgeRecord` reserved bytes |
 | Per-edge `declared_by_slot: u32` | 5 | in `EdgeRecord` reserved bytes |
-| `covariance_region_off: u32`, `covariance_stride: u32` | **6** | header, zero when absent |
+| ~~`covariance_region_off: u32`, `covariance_stride: u32`~~ | — | **Descoped by [`0009`](./decisions/0009-descoping-phase-6.md).** The eight bytes stay reserved *in place* as `_reserved_covariance`, because closing the gap would move the two spline offsets below. |
 | `spline_region_off: u32`, `spline_degree: u8` | **6** | header, zero when absent |
 | `frame_kind: u8` (link / sensor / map / virtual) | 5 | `FrameRecord` reserved |
 | Header `_reserved` | — | keep ≥ 64 bytes after all of the above |
@@ -127,6 +128,14 @@ Regions whose Phase 6 content does not exist yet are declared in the header with
 > `spline_region_off` + `spline_degree` = 13 bytes before alignment, and this
 > section then demands **≥ 64 bytes still reserved afterwards**. That is ≥ 77
 > against 48 available. It does not fit.
+>
+> *(The two covariance fields were later descoped by
+> [`0009`](./decisions/0009-descoping-phase-6.md). The arithmetic above is left
+> as it was, because it is the reason the header is 320 bytes and that decision
+> is already published; the freed eight bytes are reserved in place, so nothing
+> below it moved. Reclaiming them would move `spline_region_off` off 168 and
+> `layout_hash` — which hashes region strides, not header fields — would not
+> catch the resulting disagreement between two v3 participants.)*
 >
 > So `ArenaHeader` grows to **320 bytes**, and three consequences follow that are
 > cheap now and expensive later:
