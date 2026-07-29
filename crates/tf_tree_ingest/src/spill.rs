@@ -249,8 +249,12 @@ impl RunFile {
     ///
     /// [`end_run`]: RunFile::end_run
     pub(crate) fn begin_run(&mut self) {
-        self.staging.clear();
-        self.open_run = Some((self.written, 0));
+        // `written + staging.len()`, not `written`: the staging buffer may hold
+        // bytes that have not reached the file yet, and they precede this run.
+        // `written` alone is right only while every caller pairs `begin_run`
+        // with `end_run`, and a span that silently overlaps the previous run is
+        // not the failure to leave to a convention.
+        self.open_run = Some((self.written + self.staging.len() as u64, 0));
     }
 
     /// Append one sample to the open run.
