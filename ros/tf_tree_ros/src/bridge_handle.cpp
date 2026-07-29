@@ -125,9 +125,14 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
     },
     sub_opts);
 
-  std::promise<tft_status> ready;
-  auto done = ready.get_future();
-  thread_ = std::thread([this, &ready] {run(ready);});
+  // The promise is shared rather than a stack local captured by reference. The
+  // ingest thread outlives this constructor by design, and a reference into a
+  // frame that has returned is a dangling reference even when nothing touches
+  // it — one added line in `run` after `set_value` would make it a use-after-free
+  // that only shows up under load.
+  auto ready = std::make_shared<std::promise<tft_status>>();
+  auto done = ready->get_future();
+  thread_ = std::thread([this, ready] {run(*ready);});
   const tft_status rc = done.get();
   if (rc != TFT_OK) {
     thread_.join();
