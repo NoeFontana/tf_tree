@@ -230,6 +230,110 @@ fn no_occupancy_row_is_permanently_zero() {
     drop(writers);
 }
 
+/// **The whole `TFT007` evidence path, end to end: a topology file's `rate_hz`
+/// reaches the arena, is read back out of it, and judges a real publisher.**
+///
+/// The unit tests own the two halves — `config.rs` proves `rate_hz` lands in
+/// `EdgeRecord::nominal_rate_mhz`, and `checks.rs` proves the comparison — and
+/// neither can see the seam between them, which is `Snapshot::capture` mapping
+/// the record's `0` sentinel to `None`. A capture that mapped it to `Some(0)`
+/// passes every unit test in this repository (they build `EdgeInfo` directly)
+/// and turns every undeclared edge on a live robot into a warn about deviating
+/// from 0 Hz by infinity — the exact fabricated finding this id was blocked on
+/// for one revision.
+///
+/// The arena is non-degenerate: two dynamic edges, one declaring a rate and one
+/// not, both published into at the *same* wrong rate, so the difference between
+/// them is the declaration and nothing else.
+///
+/// Mutant: in `Snapshot::capture`, map the field as `Some(rec.nominal_rate_mhz)`
+/// unconditionally. Applied: `TFT007` fires on both edges and the "exactly the
+/// declared edge" assertion fails. Mutant B: map it to `None` unconditionally.
+/// Applied: the check skips instead of firing and the first assertion fails.
+#[test]
+fn a_topology_files_declared_rate_reaches_doctor_and_judges_the_publisher() {
+    use tf_tree_bridge::TopologyConfig;
+
+    // 20 Hz declared, 2 s of history -> a 64-slot ring; the sibling is sized by
+    // slots and declares nothing.
+    let text = "\
+[[edge]]
+parent = \"odom\"
+child = \"base_footprint\"
+kind = \"dynamic\"
+rate_hz = 20.0
+history_secs = 2.0
+
+[[edge]]
+parent = \"base_footprint\"
+child = \"base_link\"
+kind = \"dynamic\"
+capacity = 64
+";
+    let config = TopologyConfig::parse(text).expect("the fixture config must parse");
+    let tree = config.builder().build().expect("and must build");
+
+    let odom = tree.frame("odom").unwrap();
+    let foot = tree.frame("base_footprint").unwrap();
+    let base = tree.frame("base_link").unwrap();
+    let declared = tree.claim(foot, odom).expect("claim the declared edge");
+    let undeclared = tree.claim(base, foot).expect("claim the sibling");
+    // 10 Hz on both: half the declared rate on the one that declared.
+    for k in 0..12 {
+        let stamp = k * 100_000_000;
+        declared.push(stamp, &tf_tree::Iso3::IDENTITY).unwrap();
+        undeclared.push(stamp, &tf_tree::Iso3::IDENTITY).unwrap();
+    }
+
+    let snap = Snapshot::capture(&tree);
+    let obs = Observations::from_arena(&tree, &snap);
+    let stats = checks::collect_edge_stats(&tree, &snap);
+    let clock = Clock::decide(&checks::newest_stamps(&snap), 1_700_000_000_000_000_000);
+    let report = checks::run(
+        &Inputs {
+            snap: &snap,
+            obs: &obs,
+            stats: &stats,
+            host: None,
+            clock,
+            arena_bytes: tree.arena_size_bytes() as u64,
+            occupancy: checks::occupancy_of(&tree),
+            live: true,
+            counters: tf_tree::counters_compiled_in(),
+        },
+        &BTreeSet::new(),
+    );
+
+    let o = report
+        .outcomes
+        .iter()
+        .find(|o| o.check == Tft::Tft007)
+        .expect("TFT007 must be in the report");
+    assert_eq!(
+        o.status,
+        Status::Fired,
+        "a 10 Hz publisher on a 20 Hz declaration must be reported: {o:?}"
+    );
+    assert_eq!(o.findings.len(), 1, "{:?}", o.findings);
+    assert!(
+        o.findings[0].subject.contains("odom->base_footprint"),
+        "the finding must name the declared edge, not its sibling: {}",
+        o.findings[0].subject
+    );
+    assert!(
+        o.findings[0].message.contains("20.00 Hz"),
+        "the declared rate must survive the round trip through the arena: {}",
+        o.findings[0].message
+    );
+
+    // And the arena discloses that one of its two edges was never compared.
+    let note = checks::rate_coverage_note(&snap, &obs).expect("a partial run must say so");
+    assert!(note.contains("compared 1 of 2"), "{note}");
+
+    drop(declared);
+    drop(undeclared);
+}
+
 /// **The CLI's `counters` feature must actually control the engine's.**
 ///
 /// `TFT010`'s "built without counters" skip and `render_human`'s banner both
