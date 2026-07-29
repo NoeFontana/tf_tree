@@ -1075,7 +1075,7 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 - **Three-way bit-identity:** replay one recording into `HeapArena`, `MappedArena`, and `FrozenArena`; identical query set; assert bit-identical `f64`. This extends Phase 2 §10 and is the core correctness claim of the frozen format.
 - **Ingest anomalies:** a synthetic corpus containing every row of §3.2, asserting the exact ingest-report output.
 - **Out-of-order ingest:** shuffle a recording's messages; the resulting `.tft` must be byte-identical to one built from the ordered source.
-- **Spill path:** ingest with `--max-memory` set below the dataset size; result identical to the in-memory path.
+- **Spill path:** ingest with `--max-memory` set below the dataset size; result identical to the in-memory path. **Three tests, because §3.1's amendment splits this into three mechanisms:** grouping (`capped_memory_matches_the_uncapped_path`), one edge spilled to a run file and merged in a single pass (`an_oversized_edge_spills_and_matches_the_in_memory_path`), and a cap small enough that the runs must be *reduced* in several passes first (`a_tiny_cap_reduces_in_several_passes`). The last one is not redundant: a single-pass merge over that many runs exceeds the cap tenfold, and only that test observes it.
 - **Multi-process page sharing:** 16 processes mapping one `.tft`; assert total RSS is within 1.2× of a single process, measured from `/proc/*/smaps_rollup` `Pss`.
 - **Fork safety:** a `DataLoader` with `num_workers=16` under all three start methods.
 - **Counter contention:** 16 concurrent readers on one edge, each holding a long-lived `Guard`; assert no measurable throughput difference against a `counters`-disabled build.
