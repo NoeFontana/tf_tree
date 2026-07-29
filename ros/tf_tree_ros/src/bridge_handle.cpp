@@ -202,9 +202,12 @@ tft_status BridgeHandle::create_bridge()
     remap_.emplace_back(r.from, r.to);
   }
 
-  // Report the configured depth alongside the counters, so a high-water mark
-  // reads as a fraction rather than as a bare number.
-  tft_bridge_note_queue_depth(bridge_, 0);
+  // `tft_bridge_note_queue_depth` is deliberately never called, and
+  // `tft_bridge_stats::queue_high_water` therefore stays 0. §5.9 asks for
+  // "subscription queue depth"; **that is not an API that exists** — not in
+  // rclcpp, not in rcl, not in rmw. See §5.9's amendment. What the middleware
+  // does report is messages *lost*, and that is wired to
+  // `message_lost_callback` above.
   refresh_stats();
   return TFT_OK;
 }
