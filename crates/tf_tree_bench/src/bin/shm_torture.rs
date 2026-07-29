@@ -150,8 +150,8 @@ mod imp {
     /// has to know where to look. A private counter per process gives four
     /// unrelated timelines: pushes fail `NonMonotonicStamp` on every hand-over
     /// and every lookup lands outside the ring, so the run reports zero
-    /// violations having validated almost nothing. That is what the first
-    /// revision of this file did.
+    /// violations having validated almost nothing, which is
+    /// indistinguishable from a clean run.
     fn now_nanos() -> i64 {
         // `as i64` saturates in the year 2262; `unwrap_or_default` covers a
         // clock before the epoch, which would be a host problem, not ours.
@@ -200,12 +200,24 @@ mod imp {
         inject: bool,
     }
 
+    /// `30m`, `120s`, `500ms`, `1h`, or a bare number of seconds.
+    ///
+    /// **`m` and `h` are here because the nightly is spelled in minutes.**
+    /// `docs/PHASE2.md` §13 says "30 minutes" and `just shm-torture` defaults to
+    /// `--duration 30m`; a parser that knows only `s` and `ms` rejects that with
+    /// `invalid float literal` while every seconds-based test still passes, so
+    /// the one command this binary exists for is the only thing that breaks.
     fn parse_duration(s: &str) -> Result<Duration> {
-        if let Some(ms) = s.strip_suffix("ms") {
-            return Ok(Duration::from_millis(ms.parse()?));
+        // `ms` first: it ends in `s`, so the seconds arm would eat it.
+        if let Some(v) = s.strip_suffix("ms") {
+            return Ok(Duration::from_millis(v.parse()?));
         }
-        let secs = s.strip_suffix('s').unwrap_or(s);
-        Ok(Duration::from_secs_f64(secs.parse()?))
+        for (suffix, scale) in [("h", 3600.0), ("m", 60.0), ("s", 1.0)] {
+            if let Some(v) = s.strip_suffix(suffix) {
+                return Ok(Duration::from_secs_f64(v.parse::<f64>()? * scale));
+            }
+        }
+        Ok(Duration::from_secs_f64(s.parse()?))
     }
 
     pub(crate) fn main() -> Result<()> {
@@ -378,7 +390,13 @@ mod imp {
             // runs. An in-phase killer reaches one point in the protocol over
             // and over and calls the other points covered.
             let jitter = 0.5 + rng.unit();
-            std::thread::sleep(interval.mul_f64(jitter).min(deadline - Instant::now()));
+            // `saturating_duration_since`, not `deadline - Instant::now()`:
+            // `Instant`'s `Sub` panics when the operand is later, and the clock
+            // can cross the deadline between the `while` test and this line. A
+            // 30-minute soak that panics on its last iteration would report a
+            // crash in the harness as a failure of the arena.
+            let left = deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(interval.mul_f64(jitter).min(left));
 
             reads += observe(&observer, &mut rng, &mut violations);
             reap_finished(&mut kids, &mut violations);
@@ -593,7 +611,6 @@ mod imp {
                      reap_dead ran: {e:?}"
                 )),
             }
-            let _ = (p, c);
         }
 
         let table = view.participants();
@@ -680,9 +697,9 @@ mod imp {
             // **Pacing, and it is not politeness.** A 64-slot ring filled by an
             // unthrottled loop covers about nine *microseconds* of history, so
             // by the time any reader looks the whole window has rolled past and
-            // every lookup is `Extrapolation`. The first revision of this file
-            // ran exactly that way: it reported zero violations having validated
-            // zero transforms. At ~1 kHz the same ring covers ~64 ms, which is a
+            // every lookup is `Extrapolation`: the run then reports zero
+            // violations having validated zero transforms, which reads exactly
+            // like a pass. At ~1 kHz the same ring covers ~64 ms, which is a
             // window a reader in another process can actually land in — and it
             // also spreads the driver's SIGKILLs across the protocol instead of
             // landing them all inside one hot loop.

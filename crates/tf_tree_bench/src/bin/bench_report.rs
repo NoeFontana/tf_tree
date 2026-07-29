@@ -194,25 +194,27 @@ fn main() -> Result<()> {
         for n in &cmp.notes {
             println!("  note: {n}");
         }
+        // Checked before the verdict is printed, so "zero comparisons" never
+        // appears on screen as a PASS. "0 failures" is also what a gate that
+        // compared nothing prints, and a regression gate that has quietly
+        // stopped comparing is the exact failure this whole file is written
+        // against.
+        if cmp.passed() && cmp.checked == 0 {
+            eprintln!(
+                "regression gate compared NOTHING against {}: the baseline carries no \
+                 directional metric this build also emits, so a green result here would \
+                 mean only that the comparison ran. Regenerate it with \
+                 `just bench-baseline-update`.",
+                path.display()
+            );
+            bail!("the regression gate compared nothing");
+        }
         if cmp.passed() {
-            // The count is printed on the passing path deliberately. "0
-            // failures" is also what a gate that compared nothing prints, and a
-            // regression gate that has quietly stopped comparing is the exact
-            // failure this whole file is written against.
             println!(
                 "  PASS — {} directional metric{} held.",
                 cmp.checked,
                 if cmp.checked == 1 { "" } else { "s" }
             );
-            if cmp.checked == 0 {
-                eprintln!(
-                    "  ...but zero metrics were compared. The baseline carries no \
-                     directional metric this build also emits, so the gate is green \
-                     without having checked anything. Regenerate it with \
-                     `just bench-baseline-update`."
-                );
-                bail!("the regression gate compared nothing");
-            }
         } else {
             eprintln!("regression gate FAILED against {}:", path.display());
             for f in &cmp.failures {

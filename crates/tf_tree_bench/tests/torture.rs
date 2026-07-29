@@ -43,9 +43,9 @@ fn torture(args: &[&str]) -> Output {
 ///
 /// Mutant (applied, confirmed fatal): make `Invariant::check` return `Ok(())`
 /// unconditionally — the injected run then exits 0 and the first assertion
-/// fails. Also confirmed by the reverse: without the writer pacing in `work`,
-/// the observer manages 0 checked reads and the injected run passes, which is
-/// how the pacing came to be there.
+/// fails. Also confirmed by the reverse: with the writer pacing in `work`
+/// removed, the observer manages 0 checked reads and the injected run passes —
+/// which is what that pacing is for.
 #[test]
 fn a_corrupt_transform_is_caught_by_a_process_that_did_not_write_it() {
     let out = torture(&["--duration", "8s", "--children", "4", "--inject-violation"]);
@@ -120,6 +120,39 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
         kills > 5,
         "only {kills} children were killed, so no recovery path was exercised.\n{stdout}"
     );
+}
+
+/// **The arguments `just shm-torture` passes by default actually parse.**
+///
+/// This is not hypothetical. `docs/PHASE2.md` §13 spells the nightly as "30
+/// minutes" and the recipe's default is `--duration 30m`, while every test above
+/// passes a duration in *seconds*. A parser that handles only `s` and `ms`
+/// therefore passes the entire suite while making the one command this binary
+/// exists for exit instantly with `invalid float literal`.
+///
+/// `--help` trails the duration so the parse is all that runs: arguments are
+/// processed in order, so a value that fails to parse still fails first.
+///
+/// Mutant (applied, confirmed fatal): drop the `("m", 60.0)` row from
+/// `parse_duration`'s table — `--duration 30m` then exits non-zero and the
+/// `30m` case fails.
+#[test]
+fn the_nightly_recipes_default_duration_parses() {
+    // The spellings the justfile and the workflow actually use, plus the two
+    // the help text advertises.
+    for spelling in ["30m", "120s", "500ms", "1h", "45"] {
+        let out = torture(&["--duration", spelling, "--help"]);
+        assert!(
+            out.status.success(),
+            "`--duration {spelling}` was rejected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The control: a duration that is genuinely not a duration must still be
+    // refused, or the assertions above would pass on a parser that accepted
+    // everything.
+    let bad = torture(&["--duration", "soon", "--help"]);
+    assert!(!bad.status.success(), "`--duration soon` was accepted");
 }
 
 /// `--crash-points` is refused, naming the feature that does not exist.
