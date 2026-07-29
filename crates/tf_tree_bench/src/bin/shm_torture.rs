@@ -103,9 +103,11 @@ mod imp {
     ///
     /// Measured over seven seeds in each of two configurations — 8 s with 4
     /// children at 4 Hz, and 15 s with 6 children at 6 Hz — the worst of the
-    /// fourteen averaged **248** composed reads per round, 15x this floor. The
-    /// same fourteen against the reader this replaced: seed 999 at
-    /// `--children 6 --kill-hz 6` averaged exactly 0 and exited `PASS`.
+    /// fourteen averaged **248** composed reads per round, 15x this floor. Under
+    /// `just shm-torture-asan`, which is the slowest way this binary runs, 256.
+    /// Against the harness this replaced, where a *child* owned the rendezvous,
+    /// seed 999 in the second of those configurations averaged exactly 0 and
+    /// exited `PASS`.
     const MIN_CHAIN_READS_PER_ROUND: u64 = 16;
 
     /// The same floor for single-edge reads, of which each round attempts 64.
