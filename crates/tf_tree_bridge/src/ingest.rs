@@ -208,6 +208,15 @@ pub enum HaltReason {
 #[derive(Debug)]
 pub struct Ingest {
     names: NameNormalizer,
+    /// The declared topology **after** §5.6's normalization — the names this
+    /// pipeline actually keys on.
+    ///
+    /// Kept rather than recomputed because the arena has to be built from
+    /// exactly these names: `tft_bridge_create` asks for it instead of building
+    /// from the file, so there is one normalized topology in the process and the
+    /// store, the claims and the frame table cannot disagree about what an edge
+    /// is called.
+    declared: TopologyConfig,
     statics: StaticStore,
     authority: Authority,
     clock: ClockGuard,
@@ -252,9 +261,20 @@ impl Ingest {
         on_clock_reset: OnClockReset,
         tf_prefix: Option<&str>,
     ) -> Ingest {
+        // **`config` carries the names as the file writes them; everything this
+        // pipeline keys on is the rewritten form.** `tf_prefix` (§5.6) rewrites
+        // the wire, and the declared topology has to be rewritten with it or the
+        // two never meet: a prefixed bridge would look up `robot1/odom ->
+        // robot1/base` in a store seeded with `odom -> base` and report 100 % of
+        // a correctly configured robot's traffic as undeclared edges. The
+        // rewrite goes through *this* normalizer, the one the wire will use, so
+        // the two cannot drift — see `TopologyConfig::rewritten`.
+        let mut names = tf_prefix.map_or_else(NameNormalizer::new, NameNormalizer::with_prefix);
+        let declared = config.rewritten(&mut names);
         Ingest {
-            names: tf_prefix.map_or_else(NameNormalizer::new, NameNormalizer::with_prefix),
-            statics: StaticStore::seeded(config),
+            statics: StaticStore::seeded(&declared),
+            names,
+            declared,
             authority: Authority::new(authority),
             clock: ClockGuard::new(on_clock_reset),
             stats: BridgeStats {
@@ -444,6 +464,29 @@ impl Ingest {
         }
     }
 
+    /// The declared topology as this pipeline keys on it — §5.6's
+    /// normalization, `tf_prefix` included, already applied.
+    ///
+    /// **Build the arena from this, not from the parsed file.** The two differ
+    /// exactly when a `tf_prefix` is configured, and a bridge that built from
+    /// the file would hold an arena whose frames no approved sample can name.
+    #[must_use]
+    pub fn declared(&self) -> &TopologyConfig {
+        &self.declared
+    }
+
+    /// §5.6's remap table: `(name on the wire, name in the arena)`.
+    ///
+    /// *"A silent remap is worse than no remap"* — §5.6 requires this logged at
+    /// startup, and it is complete at startup because
+    /// [`TopologyConfig::rewritten`] runs every declared frame through the
+    /// normalizer before the first message arrives. Later rows can only be
+    /// frames the config never declared.
+    #[must_use]
+    pub fn remaps(&self) -> &[(String, String)] {
+        self.names.remaps()
+    }
+
     /// Note that a `TFMessage` arrived, whatever it contained.
     pub fn note_message(&mut self) {
         self.stats.messages += 1;
@@ -529,6 +572,101 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     fn ingest() -> Ingest {
         Ingest::new(&topo())
+    }
+
+    /// **A `tf_prefix` rewrites the declared topology as well as the wire.**
+    ///
+    /// §5.6 applies the prefix to incoming frame names, and §5.8's amendment
+    /// makes the config the sole source of declared edges. If only the wire side
+    /// is rewritten the two never meet: the pipeline looks up
+    /// `robot1/odom -> robot1/base` in a store seeded with `odom -> base`,
+    /// misses, and reports every transform on a correctly configured robot as an
+    /// undeclared edge — with the diagnostic blaming the config rather than the
+    /// prefix. Setting `tf_prefix` was therefore a switch that dropped 100 % of
+    /// the traffic and said nothing at startup.
+    ///
+    /// The direction is settled by the documented operator workflow: `tf_tree
+    /// topology --discover` writes the names as they appear on the wire, and
+    /// adding a prefix for a second robot must not require hand-editing the file
+    /// it just produced.
+    ///
+    /// Mutant: seed `StaticStore` from `config` rather than from
+    /// `config.rewritten(&mut names)` in `Ingest::with` ⇒ the offer comes back
+    /// `Action::UndeclaredEdge` and the `Action::Publish` assertion fails.
+    #[test]
+    fn a_tf_prefix_rewrites_the_declared_edges_not_only_the_wire() {
+        let mut i = Ingest::with(
+            &topo(),
+            AuthorityPolicy::FirstWriterWins,
+            OnClockReset::Halt,
+            Some("robot1"),
+        );
+        // The declared topology the arena must be built from.
+        let e: Vec<(&str, &str)> = i
+            .declared()
+            .edges
+            .iter()
+            .map(|e| (e.parent.as_str(), e.child.as_str()))
+            .collect();
+        assert_eq!(
+            e,
+            [
+                ("robot1/odom", "robot1/base"),
+                ("robot1/base", "robot1/lidar")
+            ]
+        );
+
+        // …and the wire's raw names land on it.
+        let a = i.offer(
+            Topic::Tf,
+            &Sample::identity("odom", "base", 1_000 * MS),
+            &node("/ekf"),
+        );
+        match a {
+            Action::Publish { parent, child, .. } => {
+                assert_eq!(
+                    (parent.as_str(), child.as_str()),
+                    ("robot1/odom", "robot1/base")
+                );
+            }
+            other => panic!("a declared edge must publish, got {other:?}"),
+        }
+
+        // §5.6's table is complete before the first message, which is what
+        // "log the resulting mapping table at startup" needs.
+        assert_eq!(
+            i.remaps(),
+            [
+                ("odom".to_string(), "robot1/odom".to_string()),
+                ("base".to_string(), "robot1/base".to_string()),
+                ("lidar".to_string(), "robot1/lidar".to_string()),
+            ]
+        );
+    }
+
+    /// **No prefix leaves the declared topology exactly as the file wrote it**,
+    /// and the remap table empty.
+    ///
+    /// The other half of the rewrite: it must be a no-op when nothing asked for
+    /// it, or every unprefixed bridge silently renames its own frames.
+    ///
+    /// Mutant: make `NameNormalizer::with_prefix("")` keep `Some("")` instead of
+    /// `None` ⇒ every frame becomes `/base`, the edge assertion fails, and the
+    /// remap table is three rows rather than none.
+    #[test]
+    fn no_prefix_leaves_the_declared_topology_alone() {
+        let i = Ingest::new(&topo());
+        assert_eq!(i.declared(), &topo());
+        assert!(i.remaps().is_empty());
+
+        let blank = Ingest::with(
+            &topo(),
+            AuthorityPolicy::FirstWriterWins,
+            OnClockReset::Halt,
+            Some("   "),
+        );
+        assert_eq!(blank.declared(), &topo(), "an unset launch argument");
+        assert!(blank.remaps().is_empty());
     }
 
     /// **Authority is decided before the clock**, and this is what goes wrong

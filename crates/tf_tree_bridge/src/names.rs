@@ -113,7 +113,20 @@ impl NameNormalizer {
             Some(p) => (format!("{p}/{body}"), true),
             None => (body.to_string(), false),
         };
-        let first_sight = self.seen.insert(raw.to_string());
+        // `contains` before `insert`, and the order is the whole point:
+        // `BTreeSet::insert` needs an owned key whether or not it stores one, so
+        // the obvious `self.seen.insert(raw.to_string())` allocates a `String`
+        // on **every** sample only to discover the name is already there and
+        // drop it again. This runs once per offered transform, which at 1 kHz
+        // across twenty edges is twenty thousand pointless allocations a second.
+        // The probe borrows (`BTreeSet<String>: Borrow<str>`) and allocates
+        // nothing; only a genuinely new name pays.
+        let first_sight = if self.seen.contains(raw) {
+            false
+        } else {
+            self.seen.insert(raw.to_string());
+            true
+        };
         if first_sight && (stripped_slash || prefixed) {
             self.remaps.push((raw.to_string(), name.clone()));
         }

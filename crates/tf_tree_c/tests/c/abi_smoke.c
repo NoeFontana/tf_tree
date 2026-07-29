@@ -267,6 +267,65 @@ static void check_bridge(void)
     tft_bridge_free(b);
     tft_bridge_free(NULL); /* documented no-op */
 }
+
+/*
+ * tf_prefix, and the remap table §5.6 requires to be logged at startup.
+ *
+ * Two things only this side can check: that tft_bridge_get_remap's declaration
+ * compiles and that the termination condition a C loop is told to use — the
+ * first index past the end returning TFT_ERR_NO_DATA — is really what it does.
+ * A prefixed bridge that recognised none of its own declared edges used to be
+ * the shipped behaviour, so the offer below is the regression that matters.
+ */
+static void check_bridge_prefix(void)
+{
+    tft_bridge *b = NULL;
+    tft_bridge_options opts;
+    tft_bridge_sample s;
+    tft_bridge_outcome o;
+    tft_bridge_remap r;
+    int rows = 0;
+    uint32_t i;
+
+    memset(&opts, 0, sizeof opts);
+    opts.struct_size = (uint32_t)sizeof opts;
+    opts.authority = TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS;
+    opts.on_clock_reset = TFT_BRIDGE_ON_CLOCK_RESET_HALT;
+    opts.tf_prefix = "robot1";
+    CHECK(tft_bridge_create(BRIDGE_TOPOLOGY, &opts, &b) == TFT_OK, why());
+    if (b == NULL) {
+        return;
+    }
+
+    /* The wire carries the robot's own names; the arena knows the prefixed
+     * ones. Setting tf_prefix must not turn every transform into a drop. */
+    memset(&s, 0, sizeof s);
+    s.struct_size = (uint32_t)sizeof s;
+    s.frame_id = "odom";
+    s.child_frame_id = "base";
+    s.stamp_nanos = 1000000000;
+    s.pose[0] = 1.0;
+    s.pose[4] = 3.25;
+    memset(&o, 0xAA, sizeof o);
+    o.struct_size = (uint32_t)sizeof o;
+    CHECK(tft_bridge_offer(b, TFT_BRIDGE_TOPIC_TF, &s, NULL, &o) == TFT_OK, why());
+    CHECK(o.action == TFT_BRIDGE_APPLIED, "a prefixed bridge still knows its own edge");
+    CHECK(strcmp(o.child, "robot1/base") == 0, "and reports the arena's name");
+
+    /* The startup log §5.6 asks for, walked exactly as the header says. */
+    for (i = 0; i < 64; i++) {
+        memset(&r, 0, sizeof r);
+        r.struct_size = (uint32_t)sizeof r;
+        if (tft_bridge_get_remap(b, i, &r) != TFT_OK) {
+            break;
+        }
+        CHECK(r.from != NULL && r.to != NULL, "a remap row is printable");
+        rows++;
+    }
+    CHECK(rows == 2, "one row per declared frame, before any traffic");
+
+    tft_bridge_free(b);
+}
 #endif /* TFT_HAVE_BRIDGE */
 
 int main(void)
@@ -277,6 +336,7 @@ int main(void)
     check_round_trip();
 #if defined(TFT_HAVE_BRIDGE)
     check_bridge();
+    check_bridge_prefix();
 #endif
 
     if (failures == 0) {

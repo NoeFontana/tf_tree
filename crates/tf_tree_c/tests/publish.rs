@@ -566,6 +566,11 @@ fn a_publisher_refuses_the_wrong_thread() {
 
 /// The child arm of [`a_publisher_refuses_the_wrong_thread`]. Inert unless
 /// `TFT_CROSS_THREAD_CHILD` is set, so a normal run does not abort itself.
+///
+/// stdout is the channel the parent reads, so `print_stdout` — a `warn` in the
+/// workspace lints — is what this arm is *for*. Allowed here rather than at the
+/// file level so an accidental `println!` in an ordinary test still warns.
+#[allow(clippy::print_stdout)]
 #[test]
 fn cross_thread_child() {
     if std::env::var_os("TFT_CROSS_THREAD_CHILD").is_none() {

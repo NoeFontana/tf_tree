@@ -164,24 +164,47 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
         #[allow(clippy::print_stderr)]
         {
             eprintln!(
-                "tf_tree: FATAL — a {what} created on one thread was used on \
-             another. It is Send but not Sync (docs/PHASE4.md §3.2): \
-             exactly one thread may use it at a time. Claim a separate handle \
-             per thread, or hand this one over with a handoff the ABI cannot see."
+                "tf_tree: FATAL — {}. Claim a separate handle per thread, or \
+                 hand this one over with a handoff the ABI cannot see.",
+                wrong_thread_message(what)
             );
         }
         std::process::abort();
     }
     #[cfg(not(debug_assertions))]
     {
-        let _ = what;
         set_error(
             crate::TFT_ERR_WRONG_THREAD,
-            "this handle is Send but not Sync: it was created on another thread",
+            &wrong_thread_message(what),
             |_| {},
         );
         crate::TFT_ERR_WRONG_THREAD
     }
+}
+
+/// The sentence both profiles print, built in one place.
+///
+/// **`what` is in it, and that is the whole reason this is a function.** The two
+/// profiles report the same mistake by different means — a debug build aborts
+/// with a message on stderr, a release build returns `TFT_ERR_WRONG_THREAD` and
+/// a `tft_error` — and only one of them is compiled at a time, so a name dropped
+/// from the arm you are not building is a regression nothing observes. It had
+/// been: the release arm discarded `what` and told a `tft_bridge` caller only
+/// that *"this handle"* had moved. An operator reading `TFT_ERR_WRONG_THREAD` in
+/// production has several handle types in hand and no other clue which one it
+/// was.
+///
+/// `format!` on a path that is either about to `abort()` or has already lost the
+/// call is not a hot-path allocation.
+///
+/// **ASCII only.** `tft_error::set_message` substitutes `?` for every non-ASCII
+/// byte rather than risk truncating a code point mid-sequence, so a `§` here
+/// would reach the operator as `??`.
+fn wrong_thread_message(what: &str) -> String {
+    format!(
+        "{what} is Send but not Sync (docs/PHASE4.md 3.2): it was created on \
+         another thread, and exactly one thread may use it at a time"
+    )
 }
 
 /// Borrow the live writer, or report why not.
@@ -767,6 +790,38 @@ pub(crate) mod map {
                 );
                 TFT_ERR_NOT_A_ROTATION
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrong_thread_message;
+
+    /// **The cross-thread diagnostic names the handle type**, in both profiles.
+    ///
+    /// Only one arm of `check_thread_token` is compiled at a time — debug
+    /// aborts, release returns a status — so a name dropped from the arm you are
+    /// not building is invisible. It was: the release arm discarded `what`, and
+    /// an operator reading `TFT_ERR_WRONG_THREAD` in production learned that
+    /// *"this handle"* had moved between threads without learning which of
+    /// `tft_publisher` and `tft_bridge` it was.
+    ///
+    /// Mutant: drop `{what}` from the format string (or restore the release
+    /// arm's `let _ = what;` and its fixed sentence) ⇒ neither name appears and
+    /// both assertions fail.
+    #[test]
+    fn the_wrong_thread_message_names_the_handle_that_moved() {
+        for what in ["tft_publisher", "tft_bridge"] {
+            let m = wrong_thread_message(what);
+            assert!(m.starts_with(what), "message was {m:?}");
+            assert!(
+                m.contains("Send but not Sync"),
+                "the phrase `publish.rs` asserts on stderr: {m:?}"
+            );
+            // `tft_error::set_message` substitutes `?` for non-ASCII, so a
+            // section sign here would reach the operator as `??`.
+            assert!(m.is_ascii(), "message was {m:?}");
         }
     }
 }

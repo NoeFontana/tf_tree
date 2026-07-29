@@ -140,6 +140,7 @@ const UNSTABLE: &[&str] = &[
     "tft_bridge_note_message",
     "tft_bridge_note_queue_depth",
     "tft_bridge_get_stats",
+    "tft_bridge_get_remap",
     "tft_bridge_topic",
     "tft_bridge_authority",
     "tft_bridge_on_clock_reset",
@@ -149,6 +150,7 @@ const UNSTABLE: &[&str] = &[
     "tft_bridge_outcome",
     "tft_bridge_options",
     "tft_bridge_stats",
+    "tft_bridge_remap",
     "TFT_BRIDGE_TOPIC_TF",
     "TFT_BRIDGE_TOPIC_TF_STATIC",
     "TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS",
@@ -195,6 +197,7 @@ const TIER_TYPES: &[&str] = &[
     "tft_bridge_outcome",
     "tft_bridge_options",
     "tft_bridge_stats",
+    "tft_bridge_remap",
 ];
 
 /// Rust types `cbindgen` must never emit: the opaque handles (§3.2) and the

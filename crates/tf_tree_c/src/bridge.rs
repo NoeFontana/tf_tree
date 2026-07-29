@@ -238,6 +238,26 @@ pub struct tft_bridge_options {
     pub tf_prefix: *const c_char,
 }
 
+/// One row of §5.6's remap table: a frame name as it arrives, and the name the
+/// arena knows it by.
+///
+/// Both strings are borrowed from the handle and valid until the next
+/// [`tft_bridge_get_remap`] call on it — the same rule as
+/// [`tft_bridge_outcome`], and deliberately *not* invalidated by
+/// [`tft_bridge_offer`], because the startup loop that reads this table logs as
+/// it walks.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct tft_bridge_remap {
+    /// `sizeof(tft_bridge_remap)` in the caller's build (§3.6).
+    pub struct_size: u32,
+    /// The name as it appears on `/tf` — and in every launch file and RViz
+    /// config on the robot.
+    pub from: *const c_char,
+    /// The name the arena declares, and the one a consumer must look up.
+    pub to: *const c_char,
+}
+
 /// §5.9's counters, plus the two the C layer alone can see.
 ///
 /// **The ledger balances**, and that is the point of exposing it rather than a
@@ -333,6 +353,16 @@ struct Strings {
     owner: Vec<u8>,
     intruder: Vec<u8>,
     detail: Vec<u8>,
+    /// The row [`tft_bridge_get_remap`] last returned.
+    ///
+    /// **Its own pair of buffers, not the outcome's.** §5.6's table is read in a
+    /// startup loop that logs as it goes, and a caller printing an outcome it is
+    /// still holding while walking the remap table would otherwise find the
+    /// outcome's strings rewritten underneath it by the very log statement.
+    /// Two extra `Vec`s per bridge is a cheaper answer than a lifetime rule with
+    /// an exception in it.
+    remap_from: Vec<u8>,
+    remap_to: Vec<u8>,
 }
 
 fn set(v: &mut Vec<u8>, s: &str) {
@@ -378,14 +408,29 @@ pub struct tft_bridge {
 /// happens to be a field.
 struct BridgeInner {
     ingest: Ingest,
-    /// One claim per declared dynamic edge, keyed by the child frame's id — a
-    /// child has exactly one parent, so the child alone identifies the edge.
+    /// One claim per declared dynamic edge, keyed by the **normalized** child
+    /// frame name — a child has exactly one parent, so the child alone
+    /// identifies the edge.
     ///
-    /// **Keyed on the id and not on the names** because the hot path already
-    /// has to ask the tree to resolve a name, and a second map keyed on
-    /// `(String, String)` would be a second thing to keep in step with the
-    /// arena as well as an allocation per probe.
-    writers: BTreeMap<u32, EdgeWriter<'static>>,
+    /// **Keyed on the name and not on the `FrameId`**, because the name is what
+    /// the hot path already holds. `Action::Publish` hands back the normalized
+    /// child; going from there to a `FrameId` means `Tree::frame`, which on a
+    /// *writable* arena is `view().intern(name)` — a blake3 hash of the name
+    /// plus a probe of the intern table — run once per sample to index a map
+    /// this process owns.
+    ///
+    /// Measured with `examples/bridge_cost.rs`, 20 dynamic edges, the two
+    /// variants alternated over 20 rounds so drift is common-mode: **418.6 ns**
+    /// per accepted transform keyed on the `FrameId` against **281.5 ns** keyed
+    /// on the name (best round of each; medians 435.6 and 293.7). The
+    /// re-derivation was **a third of the whole call**.
+    ///
+    /// `BTreeMap<String, _>::get(&str)` allocates nothing — the probe borrows
+    /// through `String: Borrow<str>` — so there is no per-sample allocation to
+    /// trade against, and the keys come from the same `ingest.declared()` the
+    /// arena was built from, so there is no second set of names to keep in step
+    /// with either.
+    writers: BTreeMap<String, EdgeWriter<'static>>,
     /// §5.3's GID → publisher cache, filled by [`tft_bridge_attribute`].
     ///
     /// Holds a whole [`Publisher`] rather than a `String` so the hot path can
@@ -594,7 +639,18 @@ pub unsafe extern "C" fn tft_bridge_create(
                 "topology config: the declared topology has a cycle through frame {child:?}"
             ));
         }
-        let Ok(tree) = config.builder().build() else {
+        // **The pipeline is built first, and the arena is built from what it
+        // says the topology is.** `Ingest::with` applies §5.6's `tf_prefix` to
+        // the declared names as well as to the wire, so with a prefix
+        // configured `ingest.declared()` and `config` name different frames.
+        // Building the arena from `config` would then produce a tree whose
+        // frames no approved sample can name — every transform on the robot
+        // reported as an undeclared edge, with the diagnostic blaming the
+        // config rather than the prefix. There is one normalized topology in
+        // this process and this is it.
+        let ingest = Ingest::with(&config, authority, on_reset, prefix);
+        let declared = ingest.declared();
+        let Ok(tree) = declared.builder().build() else {
             return bad_config("topology config: the declared topology does not build");
         };
 
@@ -605,7 +661,7 @@ pub unsafe extern "C" fn tft_bridge_create(
         // `odom -> base`" is a deployment fault, and a deployment fault should
         // be a refusal to start rather than a drop counter that climbs after the
         // robot is moving.
-        for e in &config.edges {
+        for e in &declared.edges {
             if !matches!(e.shape, tf_tree_bridge::EdgeShape::Dynamic { .. }) {
                 continue;
             }
@@ -627,11 +683,11 @@ pub unsafe extern "C" fn tft_bridge_create(
             // `Arc<TreeShare>` stored in the same struct is a strong reference
             // to that same `Tree` and is dropped *after* the writers (see
             // `BridgeInner::share`), so the borrow cannot outlive the arena.
-            writers.insert(c.get(), unsafe { extend_to_static(w) });
+            writers.insert(e.child.clone(), unsafe { extend_to_static(w) });
         }
 
         let inner = Box::new(BridgeInner {
-            ingest: Ingest::with(&config, authority, on_reset, prefix),
+            ingest,
             writers,
             gids: BTreeMap::new(),
             scratch: Sample::identity("", "", 0),
@@ -796,6 +852,16 @@ pub unsafe extern "C" fn tft_bridge_offer(
         // empty strings rather than whatever was on its stack, even when the
         // handle is the thing that was wrong. Written through `write` because
         // the caller's struct may be uninitialised apart from `struct_size`.
+        //
+        // **Yes, `*out` is written twice per successful offer**, and 112 of the
+        // struct's ~184 bytes are the two 7-vectors only `STATIC_CONFLICT` ever
+        // fills. That is not an oversight: it is the mechanism
+        // `a_bad_handle_still_leaves_a_printable_outcome` pins, and the blank
+        // has to precede `bridge_of` or the promise it makes is only true for
+        // calls that reached a live handle. Narrowing the first write to the
+        // fields a caller could misread would trade a rule stated in one line
+        // for a rule with an exception list. The cost is a couple of
+        // nanoseconds against a call measured in the hundreds.
         //
         // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
         // invariants, so a bitwise write is a complete initialisation.
@@ -962,6 +1028,31 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                 // that could drift from it.
                 set(&mut inner.strings.detail, &crate::error::last_message());
                 o.detail = ptr(&inner.strings.detail);
+                // **This arm has no test, and it is not for want of trying.**
+                // Reaching it needs the arena to refuse a write the pipeline
+                // approved, and on a private heap arena that cannot happen:
+                //
+                // * `PushError::NonMonotonicStamp` is dominated by the global
+                //   clock guard. `Action::Publish` requires `stamp >= newest`,
+                //   and `newest` is the maximum over every accepted sample, so
+                //   it is `>=` any one edge's own last stamp. The `Recreate`
+                //   path is the only thing that rewinds `newest`, and it
+                //   latches `stopped` before another offer can be processed.
+                // * `PushError::ClaimRevoked` needs a reaper, and
+                //   `PushError::ChildDetached` needs a `fork()`; both are
+                //   `--features shm` machinery (`docs/PHASE2.md` §1, A4) that a
+                //   bridge over its own arena never engages.
+                // * `TFT_ERR_NO_EDGE` from `write_sample` needs `writers` and
+                //   `ingest.declared()` to disagree about an edge, and they are
+                //   built from the same object in `tft_bridge_create`.
+                //
+                // Deliberately kept anyway: the third case is one refactor away
+                // from being reachable, and it is exactly the failure a
+                // deployment would present as "the bridge says applied and the
+                // lookups say no data". Breaking that invariant on purpose is
+                // how `a_tf_prefix_rewrites_the_declared_topology_and_the_arena
+                // _with_it`'s second mutant dies — through this arm, reporting
+                // status 7.
             }
         }
         Action::StaticVerified { parent, child } => {
@@ -1127,29 +1218,29 @@ fn name_the_edge(inner: &mut BridgeInner, o: &mut tft_bridge_outcome) {
 }
 
 /// Write one approved sample into the arena.
+///
+/// **There is no name → `FrameId` step here, and that is the point.** The
+/// claims are keyed by the normalized child name (see `BridgeInner::writers`),
+/// which is exactly what `Action::Publish` carries, so this is one `BTreeMap`
+/// probe over borrowed `str`s and then the ring push. Asking the tree to resolve
+/// the name instead put a blake3 hash and an intern probe on every sample, and
+/// cost a third of the whole call — see `BridgeInner::writers`.
 fn write_sample(
     inner: &mut BridgeInner,
     child: &str,
     stamp: i64,
     iso: tf_tree::Iso3,
 ) -> tft_status {
-    // The name → id step goes through the tree's own intern table rather than a
-    // second map in the bridge. `Action::Publish` is only reachable for an edge
-    // the config declared, so both frames were interned at build time and this
-    // is a lookup, never an insertion.
-    let Ok(c) = inner.share.tree.frame(child) else {
-        set_error(
-            TFT_ERR_UNKNOWN_FRAME,
-            "the approved child frame is not in the arena",
-            |_| {},
-        );
-        return TFT_ERR_UNKNOWN_FRAME;
-    };
-    let Some(w) = inner.writers.get(&c.get()) else {
+    let Some(w) = inner.writers.get(child) else {
+        // Cold, and unreachable through the pipeline: `Action::Publish` is only
+        // produced for an edge the declared topology holds as dynamic, and the
+        // claims were taken from that same `ingest.declared()`. Resolving the
+        // id for the diagnostic is therefore free of any hot-path cost, and a
+        // caller that somehow gets here should still be told which frame.
         set_error(
             crate::TFT_ERR_NO_EDGE,
             "no claim is held on this edge; it was declared static or not at all",
-            |d| d.frame_a = c.get(),
+            |d| d.frame_a = inner.share.tree.frame(child).map_or(0, |c| c.get()),
         );
         return crate::TFT_ERR_NO_EDGE;
     };
@@ -1213,6 +1304,79 @@ pub unsafe extern "C" fn tft_bridge_attribute(
             return TFT_ERR_UNKNOWN_FRAME;
         };
         h.inner.gids.insert(key, Publisher::Node(name.to_string()));
+        TFT_OK
+    })
+}
+
+/// Read row `index` of §5.6's remap table, or report that there is no such row.
+///
+/// §5.6 is normative and the sentence is short: *"Apply `tf_prefix` remapping if
+/// configured, and log the resulting mapping table at startup. **A silent remap
+/// is worse than no remap.**"* Without this a C caller has no way to obey it —
+/// the table lives in the pipeline's `NameNormalizer`, in Rust, and every name
+/// it holds is a `String`.
+///
+/// **The table is complete before the first message.** §5.8's amendment made the
+/// config the sole source of declared edges, so `tft_bridge_create` puts every
+/// declared frame through the same normalizer the wire will use; a row that
+/// appears later can only be a frame the config never declared. Walk it right
+/// after create:
+///
+/// ```c
+/// tft_bridge_remap r = { .struct_size = sizeof r };
+/// for (uint32_t i = 0; tft_bridge_get_remap(b, i, &r) == TFT_OK; i++)
+///     RCLCPP_INFO(log, "tf_tree: frame %s is declared as %s", r.from, r.to);
+/// ```
+///
+/// A bridge with no `tf_prefix` and no ROS 1 names has an empty table and the
+/// first call returns [`TFT_ERR_NO_DATA`](crate::TFT_ERR_NO_DATA), which is the
+/// loop's termination condition rather than a fault.
+///
+/// # Errors
+///
+/// * [`TFT_ERR_NO_DATA`](crate::TFT_ERR_NO_DATA) — `index` is past the last row.
+///
+/// # Safety
+///
+/// `b` must be a live handle used from the thread that created it. `out` must
+/// point to a writable `tft_bridge_remap` whose `struct_size` is set.
+#[no_mangle]
+pub unsafe extern "C" fn tft_bridge_get_remap(
+    b: *mut tft_bridge,
+    index: u32,
+    out: *mut tft_bridge_remap,
+) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        // SAFETY: `out` is non-null and the caller contracts `struct_size` set.
+        let declared = unsafe { core::ptr::addr_of!((*out).struct_size).read_unaligned() };
+        if declared as usize != core::mem::size_of::<tft_bridge_remap>() {
+            return bad_struct_size("tft_bridge_remap");
+        }
+        // SAFETY: the caller contracts a live handle.
+        let h = match unsafe { bridge_of(b) } {
+            Ok(h) => h,
+            Err(rc) => return rc,
+        };
+        let inner = &mut *h.inner;
+        let Some((from, to)) = inner.ingest.remaps().get(index as usize) else {
+            return crate::TFT_ERR_NO_DATA;
+        };
+        // Copied into the handle's own buffers rather than handed out directly:
+        // a Rust `String` is not NUL-terminated, so there is no pointer into the
+        // table that C could print.
+        set(&mut inner.strings.remap_from, from);
+        set(&mut inner.strings.remap_to, to);
+        let row = tft_bridge_remap {
+            struct_size: core::mem::size_of::<tft_bridge_remap>() as u32,
+            from: ptr(&inner.strings.remap_from),
+            to: ptr(&inner.strings.remap_to),
+        };
+        // SAFETY: `out` is non-null, writable, and `tft_bridge_remap` is `Copy`
+        // with no padding invariants, so a bitwise write initialises it fully.
+        unsafe { core::ptr::write(out, row) };
         TFT_OK
     })
 }

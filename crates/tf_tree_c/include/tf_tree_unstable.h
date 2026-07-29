@@ -244,6 +244,34 @@ typedef struct {
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
+ * One row of §5.6's remap table: a frame name as it arrives, and the name the
+ * arena knows it by.
+ *
+ * Both strings are borrowed from the handle and valid until the next
+ * [`tft_bridge_get_remap`] call on it — the same rule as
+ * [`tft_bridge_outcome`], and deliberately *not* invalidated by
+ * [`tft_bridge_offer`], because the startup loop that reads this table logs as
+ * it walks.
+ */
+typedef struct {
+  /**
+   * `sizeof(tft_bridge_remap)` in the caller's build (§3.6).
+   */
+  uint32_t struct_size;
+  /**
+   * The name as it appears on `/tf` — and in every launch file and RViz
+   * config on the robot.
+   */
+  const char *from;
+  /**
+   * The name the arena declares, and the one a consumer must look up.
+   */
+  const char *to;
+} tft_bridge_remap;
+#endif
+
+#if defined(TFT_HAVE_BRIDGE)
+/**
  * §5.9's counters, plus the two the C layer alone can see.
  *
  * **The ledger balances**, and that is the point of exposing it rather than a
@@ -685,6 +713,44 @@ tft_status tft_bridge_offer(tft_bridge *b,
  * point to 16 readable bytes and `node_name` be NUL-terminated UTF-8.
  */
 tft_status tft_bridge_attribute(tft_bridge *b, const uint8_t *gid, const char *node_name);
+#endif
+
+#if defined(TFT_HAVE_BRIDGE)
+/**
+ * Read row `index` of §5.6's remap table, or report that there is no such row.
+ *
+ * §5.6 is normative and the sentence is short: *"Apply `tf_prefix` remapping if
+ * configured, and log the resulting mapping table at startup. **A silent remap
+ * is worse than no remap.**"* Without this a C caller has no way to obey it —
+ * the table lives in the pipeline's `NameNormalizer`, in Rust, and every name
+ * it holds is a `String`.
+ *
+ * **The table is complete before the first message.** §5.8's amendment made the
+ * config the sole source of declared edges, so `tft_bridge_create` puts every
+ * declared frame through the same normalizer the wire will use; a row that
+ * appears later can only be a frame the config never declared. Walk it right
+ * after create:
+ *
+ * ```c
+ * tft_bridge_remap r = { .struct_size = sizeof r };
+ * for (uint32_t i = 0; tft_bridge_get_remap(b, i, &r) == TFT_OK; i++)
+ *     RCLCPP_INFO(log, "tf_tree: frame %s is declared as %s", r.from, r.to);
+ * ```
+ *
+ * A bridge with no `tf_prefix` and no ROS 1 names has an empty table and the
+ * first call returns [`TFT_ERR_NO_DATA`](crate::TFT_ERR_NO_DATA), which is the
+ * loop's termination condition rather than a fault.
+ *
+ * # Errors
+ *
+ * * [`TFT_ERR_NO_DATA`](crate::TFT_ERR_NO_DATA) — `index` is past the last row.
+ *
+ * # Safety
+ *
+ * `b` must be a live handle used from the thread that created it. `out` must
+ * point to a writable `tft_bridge_remap` whose `struct_size` is set.
+ */
+tft_status tft_bridge_get_remap(tft_bridge *b, uint32_t index, tft_bridge_remap *out);
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
