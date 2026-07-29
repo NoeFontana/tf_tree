@@ -507,8 +507,9 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
 /// enum so they cannot drift into disagreeing about which edges were checked.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RateEvidence {
-    /// `EdgeRecord::nominal_rate_mhz` is 0 — nothing declared a rate for this
-    /// edge, so there is nothing to deviate from.
+    /// Nothing declared a rate for this edge — `EdgeRecord::nominal_rate_mhz`
+    /// is 0, or the edge is static and cannot have one — so there is nothing to
+    /// deviate from.
     NotDeclared,
     /// A rate is declared but too few intervals were observed to measure one
     /// against it.
