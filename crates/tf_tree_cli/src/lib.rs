@@ -410,6 +410,14 @@ pub struct IngestArgs {
     /// than ordinary interleaving, in milliseconds.
     #[arg(long, value_name = "MILLIS", default_value_t = 100)]
     pub clock_reset_threshold: u64,
+    /// Where to put §3.1's temporary run file. Defaults to the system temporary
+    /// directory.
+    ///
+    /// Only used when a *single* edge exceeds `--max-memory`; every other
+    /// recording is handled by re-reading, with no file at all. Worth setting
+    /// when `/tmp` is a tmpfs, because a spill into RAM does not bound RAM.
+    #[arg(long, value_name = "DIR")]
+    pub spill_dir: Option<std::path::PathBuf>,
 }
 
 /// `--on-clock-reset`, as §3.2 spells it.
@@ -449,6 +457,7 @@ impl IngestArgs {
                 .saturating_mul(1_000_000),
             future_horizon_ns: horizon as i64,
             tf_prefix: self.tf_prefix.clone(),
+            spill_dir: self.spill_dir.clone(),
         })
     }
 }

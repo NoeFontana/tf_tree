@@ -44,11 +44,13 @@
 //!
 //! # Status against §3
 //!
-//! Implemented: §3.1's two passes, §3.3's MCAP source, and every row of §3.2
-//! except `--on-clock-reset=split`, which is refused with a reason
-//! ([`IngestError::ClockResetSplitUnsupported`]) rather than silently doing
-//! something else. `rosbag2` sqlite3 (§3.3, "lower priority") and
-//! `freeze_from_arrays` are not here.
+//! Implemented: §3.1's two passes **including the spill-to-run-file**, §3.3's
+//! MCAP source, and every row of §3.2 except `--on-clock-reset=split`, which is
+//! refused with a reason ([`IngestError::ClockResetSplitUnsupported`]) rather
+//! than silently doing something else. `docs/PHASE5.md` §3.2 carries the
+//! argument for leaving it refused; it is a decision, not a backlog entry.
+//! `rosbag2` sqlite3 (§3.3, "lower priority") and `freeze_from_arrays` are not
+//! here.
 
 use std::path::Path;
 
@@ -56,6 +58,11 @@ pub mod cdr;
 pub mod ingest;
 pub mod report;
 pub mod source;
+
+/// §3.1's spill-to-run-file. Private: it is a strategy `ingest::fill` chooses,
+/// not a surface a caller picks — the only knob is
+/// [`IngestOptions::spill_dir`](ingest::IngestOptions::spill_dir).
+mod spill;
 
 #[cfg(feature = "fixture")]
 pub mod fixture;
@@ -89,6 +96,17 @@ pub enum IngestError {
     /// The recording could not be opened or read.
     #[error("could not read the recording (errno {raw_os_error})")]
     Io {
+        /// `errno`, or `0` if the platform did not supply one.
+        raw_os_error: i32,
+    },
+    /// §3.1's temporary run file could not be created, written or read back.
+    ///
+    /// Distinct from [`IngestError::Io`] because the remedy is different and the
+    /// user cannot guess which file failed: this one is about the *spill*
+    /// directory — a full or read-only `/tmp` — not about the recording, which
+    /// was read fine.
+    #[error("could not use the spill file (errno {raw_os_error}); check --spill-dir")]
+    Spill {
         /// `errno`, or `0` if the platform did not supply one.
         raw_os_error: i32,
     },
@@ -140,18 +158,6 @@ pub enum IngestError {
     /// §3.2's `split` policy, which is not implemented.
     #[error("--on-clock-reset=split is not implemented; use halt and split the recording")]
     ClockResetSplitUnsupported,
-    /// A single edge's samples exceed `--max-memory` on their own.
-    #[error("edge {parent:?} -> {child:?} needs {needed_bytes} B, over the {cap_bytes} B cap")]
-    EdgeExceedsMemoryCap {
-        /// Parent frame.
-        parent: FrameId,
-        /// Child frame.
-        child: FrameId,
-        /// Bytes the edge's buffer would need.
-        needed_bytes: u64,
-        /// The configured cap.
-        cap_bytes: u64,
-    },
     /// The surveyed topology could not be allocated.
     #[error("could not build the tree: {0}")]
     Build(tf_tree::BuildError),
@@ -199,18 +205,6 @@ impl core::fmt::Display for Described<'_> {
                 f,
                 "edge {} -> {} is published on both /tf and /tf_static; \
                  the contradiction appears at stamp {stamp_ns}",
-                n(parent),
-                n(child)
-            ),
-            IngestError::EdgeExceedsMemoryCap {
-                parent,
-                child,
-                needed_bytes,
-                cap_bytes,
-            } => write!(
-                f,
-                "edge {} -> {} alone needs {needed_bytes} B of buffer, over the \
-                 {cap_bytes} B --max-memory cap; raise the cap",
                 n(parent),
                 n(child)
             ),

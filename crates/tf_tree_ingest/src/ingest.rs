@@ -44,7 +44,7 @@
 //! regresses at once and the first one to be observed halts.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tf_tree::{Capacity, EdgeCfg, Iso3, Quat, Tree, TreeBuilder, Vec3};
 use tf_tree_bridge::clock::{ClockGuard, ClockVerdict, OnClockReset};
@@ -53,6 +53,7 @@ use tf_tree_bridge::statics::{StaticKind, StaticStore, StaticVerdict};
 use tf_tree_bridge::Publisher;
 
 use crate::source::{read_tf, RawRecord, TopicRoles};
+use crate::spill;
 use crate::{FrameId, IngestError};
 
 /// Bytes one buffered sample costs during pass two: an `i64` stamp beside the
@@ -63,6 +64,15 @@ use crate::{FrameId, IngestError};
 /// bytes and would double the memory this module is trying to bound. The
 /// conversion happens at the push, one sample at a time.
 const SAMPLE_BYTES: u64 = 8 + 7 * 8;
+
+/// Spacing between one spilled edge's temporary-file names and the next one's.
+///
+/// A reduce pass creates a fresh file, so a spilled edge needs one name per
+/// pass. Each pass divides the run count by at least two, so no edge can need
+/// more than 64 of them — a `u64` count of runs is exhausted first. 1024 leaves
+/// that bound a wide margin and keeps two spilled edges from colliding on a
+/// platform where the unlink-at-create could not run.
+const SPILL_TAG_STRIDE: usize = 1024;
 
 /// Default `--max-memory` (§3.1): 4 GiB.
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -110,6 +120,15 @@ pub struct IngestOptions {
     pub future_horizon_ns: i64,
     /// A `tf_prefix` to apply to every frame name (§5.6).
     pub tf_prefix: Option<String>,
+    /// Where §3.1's spill file goes when one edge alone exceeds
+    /// [`max_memory_bytes`](IngestOptions::max_memory_bytes). `None` means
+    /// `std::env::temp_dir()`.
+    ///
+    /// A knob rather than a hardcoded `/tmp` because the user this exists for —
+    /// §3.1's "4-hour recording", tens of gigabytes on one edge — is exactly the
+    /// user whose `/tmp` is a small tmpfs *in RAM*, where spilling would defeat
+    /// the cap it is enforcing.
+    pub spill_dir: Option<PathBuf>,
 }
 
 impl Default for IngestOptions {
@@ -121,6 +140,7 @@ impl Default for IngestOptions {
             clock_reset_threshold_ns: tf_tree_bridge::clock::DEFAULT_RESET_THRESHOLD_NANOS,
             future_horizon_ns: DEFAULT_FUTURE_HORIZON_NS,
             tf_prefix: None,
+            spill_dir: None,
         }
     }
 }
@@ -480,6 +500,15 @@ pub struct FillStats {
     pub pushed: u64,
     /// Duplicate `(edge, stamp)` pairs collapsed, last-wins.
     pub duplicates: u64,
+    /// Sorted runs written to a temporary spill file (§3.1), summed over every
+    /// edge that needed one **and every reduce pass** — so it can exceed the
+    /// number of runs that existed at any one instant. `0` is the ordinary case.
+    pub spilled_runs: u32,
+    /// Bytes written to those files. Disk, not memory — it is reported separately
+    /// from [`peak_buffer_bytes`](FillStats::peak_buffer_bytes) because
+    /// `--max-memory` does not bound it and conflating the two is how a cap
+    /// starts meaning nothing.
+    pub spilled_bytes: u64,
 }
 
 /// Pass two — fill (§3.1).
@@ -516,16 +545,20 @@ pub struct FillStats {
 /// temporary run-file to leak, to fill a different filesystem, or to leave
 /// behind when the process is killed.
 ///
-/// The one case this cannot serve is a **single** edge whose samples exceed the
-/// cap on their own — a true k-way merge would spill within the edge. That is
-/// [`IngestError::EdgeExceedsMemoryCap`], which names the edge and both numbers.
-/// At the default 4 GiB it takes 67 million samples on one edge.
+/// Grouping's smallest unit is an edge, so it cannot serve a **single** edge
+/// whose samples exceed the cap on their own — at the default 4 GiB, 67 million
+/// samples on one edge. That case, and only that case, takes §3.1's other route:
+/// [`crate::spill`] sorts the edge in cap-sized runs, writes them to one
+/// temporary file, and k-way merges them back. It is second choice rather than
+/// the general mechanism because a run file is a thing that can leak, fill a
+/// different filesystem, or outlive the process; re-reading the recording is
+/// none of those.
 ///
 /// # Errors
 ///
 /// [`IngestError::Build`] if the surveyed topology cannot be allocated,
-/// [`IngestError::Push`] if a sample is rejected, or
-/// [`IngestError::EdgeExceedsMemoryCap`] as above.
+/// [`IngestError::Push`] if a sample is rejected, or [`IngestError::Spill`] if
+/// the run file could not be written or read back.
 pub fn fill(
     path: &Path,
     opts: &IngestOptions,
@@ -567,7 +600,7 @@ pub fn fill(
     }
     let tree = builder.build().map_err(IngestError::Build)?;
 
-    let groups = plan_groups(survey, &order, opts.max_memory_bytes)?;
+    let groups = plan_groups(survey, &order, opts.max_memory_bytes);
     // Re-derive the edge index the same way pass one did, **once**: it is a
     // function of the survey alone and the survey does not change between
     // groups. Building it from the survey rather than re-interning keeps the two
@@ -579,16 +612,18 @@ pub fn fill(
         .enumerate()
         .map(|(i, e)| ((e.parent.0, e.child.0), i))
         .collect();
-    let mut stats = FillStats {
-        passes: 0,
-        peak_buffer_bytes: 0,
-        pushed: 0,
-        duplicates: 0,
-    };
+    let mut stats = FillStats::default();
     for group in &groups {
+        let slots = match group {
+            Group::InMemory(slots) => slots,
+            Group::Spilled(slot) => {
+                fill_spilled(path, opts, survey, frames, &tree, *slot, &mut stats)?;
+                continue;
+            }
+        };
         stats.passes += 1;
         let mut buffers: BTreeMap<usize, Vec<(i64, [f64; 7])>> = BTreeMap::new();
-        for &slot in group {
+        for &slot in slots {
             buffers.insert(
                 slot,
                 Vec::with_capacity(survey.edges[slot].samples as usize),
@@ -669,14 +704,34 @@ pub fn fill(
     Ok((tree, stats))
 }
 
-/// Partition edges into groups whose buffered samples each fit `cap`.
+/// One re-read of the recording, and what pass two does with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Group {
+    /// Edges whose sort buffers fit the cap together: buffer, sort in memory,
+    /// drain. The ordinary case, and the one with no temporary file.
+    InMemory(Vec<usize>),
+    /// One edge that does not fit the cap on its own, so it takes §3.1's other
+    /// route through [`crate::spill`].
+    Spilled(usize),
+}
+
+/// Partition edges into re-reads whose buffered samples each fit `cap`.
 ///
-/// Static edges take no buffer and are left out entirely.
-fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Result<Vec<Vec<usize>>, IngestError> {
+/// Static edges take no buffer and are left out entirely. An edge too large for
+/// the cap on its own becomes a [`Group::Spilled`] of its own rather than
+/// joining a group it would blow — grouping cannot subdivide an edge, which is
+/// the whole reason the spill path exists.
+fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
     let cap = cap.max(SAMPLE_BYTES);
-    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_bytes = 0u64;
+    let flush = |cur: &mut Vec<usize>, cur_bytes: &mut u64, groups: &mut Vec<Group>| {
+        if !cur.is_empty() {
+            groups.push(Group::InMemory(core::mem::take(cur)));
+        }
+        *cur_bytes = 0;
+    };
     for &i in order {
         let e = &survey.edges[i];
         if e.is_static() || e.samples == 0 {
@@ -684,24 +739,164 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Result<Vec<Vec<usi
         }
         let need = e.samples.saturating_mul(SAMPLE_BYTES);
         if need > cap {
-            return Err(IngestError::EdgeExceedsMemoryCap {
-                parent: e.parent,
-                child: e.child,
-                needed_bytes: need,
-                cap_bytes: cap,
-            });
+            // Emitted in place, so the spilled edge keeps its position in the
+            // canonical order and the number of re-reads stays a function of the
+            // survey alone.
+            flush(&mut cur, &mut cur_bytes, &mut groups);
+            groups.push(Group::Spilled(i));
+            continue;
         }
-        if cur_bytes + need > cap && !cur.is_empty() {
-            groups.push(core::mem::take(&mut cur));
-            cur_bytes = 0;
+        if cur_bytes + need > cap {
+            flush(&mut cur, &mut cur_bytes, &mut groups);
         }
         cur.push(i);
         cur_bytes += need;
     }
-    if !cur.is_empty() {
-        groups.push(cur);
+    flush(&mut cur, &mut cur_bytes, &mut groups);
+    groups
+}
+
+/// Pass two for one edge that does not fit `--max-memory` on its own: §3.1's
+/// spill-to-run-file and k-way merge.
+///
+/// Reads the recording once, keeping only this edge, in cap-sized sorted runs;
+/// then merges the runs back and pushes. See [`crate::spill`] for the memory
+/// budget and for why ties break by run index.
+fn fill_spilled(
+    path: &Path,
+    opts: &IngestOptions,
+    survey: &Survey,
+    frames: &Frames,
+    tree: &Tree,
+    slot: usize,
+    stats: &mut FillStats,
+) -> Result<(), IngestError> {
+    let edge = &survey.edges[slot];
+    let (want_parent, want_child) = (edge.parent, edge.child);
+    let (run_samples, staging) = spill::spill_budget(opts.max_memory_bytes);
+    let dir = match &opts.spill_dir {
+        Some(d) => d.clone(),
+        None => std::env::temp_dir(),
+    };
+    let mut runs = spill::RunFile::create(&dir, slot * SPILL_TAG_STRIDE, staging)?;
+    // Allocated to its full capacity up front, so the peak recorded below is the
+    // resident amount for the whole pass rather than a high-water mark that a
+    // reallocation could briefly double.
+    let mut buf: Vec<spill::Sample> = Vec::with_capacity(run_samples);
+    let mut normalizer = match &opts.tf_prefix {
+        Some(p) => NameNormalizer::with_prefix(p),
+        None => NameNormalizer::new(),
+    };
+    stats.passes += 1;
+
+    read_tf(path, &opts.roles, |rec| {
+        if rec.is_static || rec.stamp_ns == 0 {
+            return Ok(());
+        }
+        let (Ok(p), Ok(c)) = (
+            normalizer.normalize(rec.parent),
+            normalizer.normalize(rec.child),
+        ) else {
+            return Ok(());
+        };
+        let (Some(pi), Some(ci)) = (frames.id(&p.name), frames.id(&c.name)) else {
+            return Ok(());
+        };
+        if (pi, ci) != (want_parent, want_child) {
+            return Ok(());
+        }
+        buf.push((rec.stamp_ns, rec.pose));
+        if buf.len() == run_samples {
+            // **Stable**, for the same reason the in-memory path is stable: it
+            // is what makes "last wins" mean the last occurrence in the
+            // recording. See `spill`'s module docs for the other half — the tie
+            // break across runs.
+            buf.sort_by_key(|(s, _)| *s);
+            runs.write_run(&buf)?;
+            buf.clear();
+        }
+        Ok(())
+    })?;
+    if !buf.is_empty() {
+        buf.sort_by_key(|(s, _)| *s);
+        runs.write_run(&buf)?;
     }
-    Ok(groups)
+    stats.peak_buffer_bytes = stats
+        .peak_buffer_bytes
+        .max(run_samples as u64 * SAMPLE_BYTES + staging as u64);
+    stats.spilled_runs = stats.spilled_runs.saturating_add(runs.runs() as u32);
+    stats.spilled_bytes += runs.bytes();
+    // Released before the merge allocates its windows: holding both would double
+    // the peak, which is the number `--max-memory` is supposed to be about.
+    drop(buf);
+
+    // **Reduce until one merge can hold every remaining run.** A merge keeps at
+    // least one sample of each run resident, so beyond `fan_in` runs it exceeds
+    // the cap however the window is chosen — see `spill`'s module docs. Each
+    // pass merges a *contiguous* window of runs, which is what preserves the
+    // recording-order tie break that "last wins" depends on.
+    let fan_in = spill::fan_in(opts.max_memory_bytes);
+    let mut round = 1usize;
+    while runs.runs() > fan_in {
+        let mut next = spill::RunFile::create(&dir, slot * SPILL_TAG_STRIDE + round, staging)?;
+        let spans = runs.spans();
+        for chunk in spans.chunks(fan_in) {
+            let window = spill::merge_window_samples(opts.max_memory_bytes, chunk.len());
+            let mut m = runs.merge_runs(chunk, window)?;
+            stats.peak_buffer_bytes = stats
+                .peak_buffer_bytes
+                .max(m.resident_bytes() + staging as u64);
+            next.begin_run();
+            while let Some(s) = m.next_sample()? {
+                next.append(s)?;
+            }
+            drop(m);
+            next.end_run()?;
+        }
+        stats.spilled_runs = stats.spilled_runs.saturating_add(next.runs() as u32);
+        stats.spilled_bytes += next.bytes();
+        // The previous file is dropped here, and with it the spill it held: disk
+        // use is bounded by two consecutive passes, not by their number.
+        runs = next;
+        round += 1;
+    }
+
+    let window = spill::merge_window_samples(opts.max_memory_bytes, runs.runs());
+    let spans = runs.spans();
+    let mut merged = runs.merge_runs(&spans, window)?;
+    stats.peak_buffer_bytes = stats.peak_buffer_bytes.max(merged.resident_bytes());
+
+    let parent = tree
+        .frame(frames.name(want_parent))
+        .map_err(|_| IngestError::FrameLost { frame: want_parent })?;
+    let child = tree
+        .frame(frames.name(want_child))
+        .map_err(|_| IngestError::FrameLost { frame: want_child })?;
+    let writer = tree.claim(child, parent).map_err(IngestError::Claim)?;
+    // The in-memory path's one-element lookahead, spelled as a one-element
+    // delay: a merged stream has no random access, so the sample is held back
+    // until the next one proves it is not a duplicate.
+    let mut pending: Option<spill::Sample> = None;
+    while let Some(next) = merged.next_sample()? {
+        if let Some(prev) = pending {
+            if prev.0 == next.0 {
+                stats.duplicates += 1;
+            } else {
+                writer
+                    .push(prev.0, &iso_from_canonical(prev.1))
+                    .map_err(IngestError::Push)?;
+                stats.pushed += 1;
+            }
+        }
+        pending = Some(next);
+    }
+    if let Some(last) = pending {
+        writer
+            .push(last.0, &iso_from_canonical(last.1))
+            .map_err(IngestError::Push)?;
+        stats.pushed += 1;
+    }
+    Ok(())
 }
 
 /// Survey indices sorted by `(parent name, child name)`.
@@ -772,43 +967,48 @@ mod tests {
     /// A cap smaller than the dataset splits the edges across several passes,
     /// and no group exceeds the cap.
     ///
-    /// Mutant: drop the `&& !cur.is_empty()` guard's companion — change the
-    /// flush condition to `cur_bytes + need > cap * 2` — applied, and the
-    /// per-group budget assertion failed at 2 × cap.
+    /// Mutant: change the flush condition to `cur_bytes + need > cap * 2` —
+    /// applied, and the per-group budget assertion failed at 2 × cap.
     #[test]
     fn groups_respect_the_cap() {
         let s = survey_with(&[10, 10, 10, 10]);
         let cap = 25 * SAMPLE_BYTES;
         let order: Vec<usize> = (0..s.edges.len()).collect();
-        let groups = plan_groups(&s, &order, cap).unwrap();
+        let groups = plan_groups(&s, &order, cap);
         assert!(groups.len() >= 2, "expected a split, got {groups:?}");
+        let mut seen: Vec<usize> = Vec::new();
         for g in &groups {
-            let bytes: u64 = g.iter().map(|&i| s.edges[i].samples * SAMPLE_BYTES).sum();
-            assert!(bytes <= cap, "group {g:?} needs {bytes} > {cap}");
+            let Group::InMemory(slots) = g else {
+                panic!("no edge here exceeds the cap alone: {g:?}")
+            };
+            let bytes: u64 = slots
+                .iter()
+                .map(|&i| s.edges[i].samples * SAMPLE_BYTES)
+                .sum();
+            assert!(bytes <= cap, "group {slots:?} needs {bytes} > {cap}");
+            seen.extend(slots);
         }
         // Every non-empty edge appears exactly once.
-        let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
         seen.sort_unstable();
         assert_eq!(seen, vec![0, 1, 2, 3]);
     }
 
-    /// One edge larger than the whole cap is an error naming that edge, not a
-    /// group that quietly exceeds the budget.
+    /// One edge larger than the whole cap becomes a spilled group of its own —
+    /// grouping cannot subdivide an edge, so this is the case §3.1's run file
+    /// exists for.
     ///
-    /// Mutant: delete the `if need > cap` arm — applied, and the test failed
-    /// with `Ok` where it expects `EdgeExceedsMemoryCap` (the edge went into a
-    /// group 4× over budget).
+    /// Mutant: delete the `if need > cap` arm — applied, and this failed with
+    /// `InMemory([0, 1])`, a group 3× over budget, instead of the two groups
+    /// asserted here.
     #[test]
-    fn one_oversized_edge_is_named() {
-        let s = survey_with(&[100]);
+    fn one_oversized_edge_spills_on_its_own() {
+        let s = survey_with(&[100, 5]);
         let order: Vec<usize> = (0..s.edges.len()).collect();
-        let err = plan_groups(&s, &order, 25 * SAMPLE_BYTES).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                IngestError::EdgeExceedsMemoryCap { child, .. } if child == FrameId(1)
-            ),
-            "got {err:?}"
+        let groups = plan_groups(&s, &order, 25 * SAMPLE_BYTES);
+        assert_eq!(
+            groups,
+            vec![Group::Spilled(0), Group::InMemory(vec![1])],
+            "the oversized edge must not join a group it would blow"
         );
     }
 
@@ -822,7 +1022,7 @@ mod tests {
         let mut s = survey_with(&[0, 0]);
         s.edges[0].static_pose = Some([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let order: Vec<usize> = (0..s.edges.len()).collect();
-        assert!(plan_groups(&s, &order, 1024).unwrap().is_empty());
+        assert!(plan_groups(&s, &order, 1024).is_empty());
     }
 
     /// A quaternion that is off-unit by more than `slerp` tolerates is
