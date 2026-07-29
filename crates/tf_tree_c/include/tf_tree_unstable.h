@@ -199,6 +199,17 @@ typedef struct {
    * rate limiter behind §5.6's "warn once" and §5.8's "once per edge". An
    * undeclared 1 kHz edge otherwise emits a thousand identical lines a
    * second.
+   *
+   * **Set on every outcome a caller is expected to log, including
+   * [`TFT_BRIDGE_HALT`] and [`TFT_BRIDGE_RECREATE`].** Those two are latched:
+   * the offer that stops the bridge carries `first_time = 1` and every offer
+   * after it replays the same action with `first_time = 0`, because the
+   * bridge answers `HALT` to every later transform forever. A caller that
+   * logged them unconditionally would emit one line per transform for the
+   * life of the process — at 20 edges and 100 Hz, 2000 `FATAL` lines a
+   * second, each taking the logging mutex on the ingest thread and burying
+   * the one actionable line. §5.4 requires the diagnostic be "loud,
+   * **rate-limited**"; this field is the whole of that mechanism.
    */
   uint8_t first_time;
   /**
@@ -578,9 +589,12 @@ typedef struct {
  *
  * # Errors
  *
- * * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, declares a cycle, or
- *   describes a topology the engine will not build. The message names the line
- *   or the frame.
+ * * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, **declares no edges**,
+ *   declares a cycle, or describes a topology the engine will not build. The
+ *   message names the line or the frame. An empty config parses fine and
+ *   describes a tree with no edges; it is refused because a bridge built from
+ *   one can only ever answer [`TFT_BRIDGE_UNDECLARED`], which is a switch that
+ *   drops 100 % of the traffic with nothing failing at startup.
  * * [`TFT_ERR_TIME_DOMAIN`] — a declared dynamic edge's domain is not
  *   `opts->domain` (§5.5, NORMATIVE, and at startup by design).
  * * [`TFT_ERR_ALREADY_CLAIMED`](crate::TFT_ERR_ALREADY_CLAIMED) and the rest of

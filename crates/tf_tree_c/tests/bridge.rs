@@ -622,6 +622,106 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     assert_balanced(&b.stats());
 }
 
+/// **A stop is `first_time = 1` exactly once, and the replay after it is
+/// rate-limited like every other repeated outcome.**
+///
+/// `HALT` and `RECREATE` are the only actions a caller *must* log, and they are
+/// the only ones that repeat forever: every offer after the stop replays the
+/// latched action. Without a rate limiter on them the rclcpp bridge emitted one
+/// `RCLCPP_FATAL` per transform for the life of the process — at 20 edges and
+/// 100 Hz, 2000 lines a second, each taking rcutils' logging mutex on the
+/// ingest thread and burying the one actionable line. §5.4 requires the
+/// diagnostic be "loud, **rate-limited**"; `first_time` is the whole of that
+/// mechanism and it was set on three arms out of five.
+///
+/// Mutant: delete `o.first_time = 1` from the `Action::Halt` arm ⇒ the halting
+/// offer reports 0 and a caller has no way to tell the transition from the
+/// replay; the first `assert_eq!(o.first_time, 1)` fails. Mutant: the same
+/// deletion in `Action::RecreateArena` ⇒ the second one fails. Mutant: set
+/// `o.first_time = 1` on the `Stopped` short-circuit path ⇒ every replayed
+/// offer claims to be the first and the `0` assertions fail.
+#[test]
+fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+    );
+    b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
+    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_000 * MS, POSE, None);
+    assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
+    assert_eq!(o.first_time, 1, "the transition is the loud one");
+    for k in 0..4i64 {
+        let o = b.offer(
+            TFT_BRIDGE_TOPIC_TF,
+            "odom",
+            "base",
+            5_010 * MS + k * MS,
+            POSE,
+            None,
+        );
+        assert_eq!(o.action, TFT_BRIDGE_HALT);
+        assert_eq!(
+            o.first_time, 0,
+            "and the halt a bag loop replays 100 times a second is not"
+        );
+    }
+
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_RECREATE,
+    );
+    b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
+    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_000 * MS, POSE, None);
+    assert_eq!(o.action, TFT_BRIDGE_RECREATE, "{}", text(o.detail));
+    assert_eq!(o.first_time, 1);
+    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_010 * MS, POSE, None);
+    assert_eq!(o.action, TFT_BRIDGE_RECREATE);
+    assert_eq!(o.first_time, 0);
+}
+
+/// **A topology that declares no edges is refused at `tft_bridge_create`.**
+///
+/// An empty config *parses* — it is a legal description of a tree with no edges
+/// — so nothing below this refused one, and a bridge built from it starts
+/// clean, reports "ingest bridge up" and answers `TFT_BRIDGE_UNDECLARED` to
+/// 100 % of the robot's traffic. That is the same shape as the `tf_prefix`
+/// defect §5.6's clarification records: a switch that drops every transform
+/// with nothing failing at startup. The engine has no runtime edge declaration
+/// (`docs/decisions/0004`, D4), so zero edges at create time means zero edges
+/// forever.
+///
+/// The check lives here rather than in one of §5.8's three deployment forms
+/// because it is a policy, and every other startup refusal — domain, cycle,
+/// claim — is already here. A form-3 `BridgeHandle` used to accept it.
+///
+/// Mutant: delete the `config.edges.is_empty()` refusal ⇒ both creates return
+/// `TFT_OK` and every `assert_eq!(…, Err(TFT_ERR_BAD_CONFIG))` fails.
+#[test]
+fn a_topology_declaring_no_edges_is_refused_rather_than_started() {
+    for toml in [
+        "",
+        // Not merely the empty string: a config with frames and headroom but no
+        // edge is equally unable to write anything, and it is what a truncated
+        // or half-written file looks like.
+        "[topology]\nframes = [\"odom\", \"base\"]\nframe_headroom = 8\n",
+    ] {
+        let rc = Bridge::try_new(
+            toml,
+            TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+            TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+            0,
+            None,
+        )
+        .err();
+        assert_eq!(rc, Some(TFT_ERR_BAD_CONFIG), "config was {toml:?}");
+        assert!(
+            last_message().contains("no edges are declared"),
+            "the message must say what is wrong, not just that something is: {:?}",
+            last_message()
+        );
+    }
+}
+
 /// **A `/tf_static` value that disagrees with the config is reported with both
 /// values and names the file as the incumbent** (§5.7, re-aimed by §5.8).
 ///

@@ -193,6 +193,17 @@ pub struct tft_bridge_outcome {
     /// rate limiter behind §5.6's "warn once" and §5.8's "once per edge". An
     /// undeclared 1 kHz edge otherwise emits a thousand identical lines a
     /// second.
+    ///
+    /// **Set on every outcome a caller is expected to log, including
+    /// [`TFT_BRIDGE_HALT`] and [`TFT_BRIDGE_RECREATE`].** Those two are latched:
+    /// the offer that stops the bridge carries `first_time = 1` and every offer
+    /// after it replays the same action with `first_time = 0`, because the
+    /// bridge answers `HALT` to every later transform forever. A caller that
+    /// logged them unconditionally would emit one line per transform for the
+    /// life of the process — at 20 edges and 100 Hz, 2000 `FATAL` lines a
+    /// second, each taking the logging mutex on the ingest thread and burying
+    /// the one actionable line. §5.4 requires the diagnostic be "loud,
+    /// **rate-limited**"; this field is the whole of that mechanism.
     pub first_time: u8,
     /// How far time went backwards, for
     /// [`TFT_BRIDGE_REASON_NON_MONOTONIC`] and [`TFT_BRIDGE_RECREATE`].
@@ -542,9 +553,12 @@ unsafe fn bridge_of<'a>(b: *mut tft_bridge) -> Result<&'a mut tft_bridge, tft_st
 ///
 /// # Errors
 ///
-/// * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, declares a cycle, or
-///   describes a topology the engine will not build. The message names the line
-///   or the frame.
+/// * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, **declares no edges**,
+///   declares a cycle, or describes a topology the engine will not build. The
+///   message names the line or the frame. An empty config parses fine and
+///   describes a tree with no edges; it is refused because a bridge built from
+///   one can only ever answer [`TFT_BRIDGE_UNDECLARED`], which is a switch that
+///   drops 100 % of the traffic with nothing failing at startup.
 /// * [`TFT_ERR_TIME_DOMAIN`] — a declared dynamic edge's domain is not
 ///   `opts->domain` (§5.5, NORMATIVE, and at startup by design).
 /// * [`TFT_ERR_ALREADY_CLAIMED`](crate::TFT_ERR_ALREADY_CLAIMED) and the rest of
@@ -620,6 +634,31 @@ pub unsafe extern "C" fn tft_bridge_create(
             // actionable.
             Err(e) => return bad_config(&format!("topology config: {e}")),
         };
+        // **A topology declaring no edges is refused here**, and here is the
+        // only place it can be. §5.8's amendment makes the config the sole
+        // source of declared edges and the engine has no runtime declaration
+        // (`docs/decisions/0004`, D4), so a bridge with zero edges cannot ever
+        // apply a transform: it starts clean, reports "ingest bridge up", and
+        // answers `TFT_BRIDGE_UNDECLARED` to 100 % of the robot's traffic with
+        // nothing failing at startup — the same shape as the `tf_prefix` defect
+        // §5.6's clarification records.
+        //
+        // This is a *policy*, and it belongs at the seam where every other
+        // startup refusal (domain, cycle, claim) already lives rather than in
+        // one of §5.8's three deployment forms — a form that did not repeat the
+        // check would accept `topology_toml = ""` and start clean, and form 3
+        // is a library handle a caller constructs directly, with no parameter
+        // layer above it to put a check in.
+        if config.edges.is_empty() {
+            // ASCII only: `tft_error::set_message` substitutes `?` for every
+            // non-ASCII byte so truncation cannot split a code point, which
+            // turns a `§` into `??` in the one string an operator reads.
+            return bad_config(
+                "topology config: no edges are declared, so this bridge could never write \
+                 anything. Produce a config with `tf_tree topology --discover`; the engine \
+                 has no runtime edge declaration (docs/PHASE4.md 5.8, docs/decisions/0004).",
+            );
+        }
         // §5.5's NORMATIVE startup refusal, before the arena is built: finding
         // out at the first message means finding out after twenty nodes have
         // attached.
@@ -1151,6 +1190,16 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
         }
         Action::Halt { reason } => {
             o.action = TFT_BRIDGE_HALT;
+            // The stop is announced once. This arm runs exactly once per bridge
+            // — `inner.stopped` is latched immediately below and every later
+            // offer short-circuits to the `Stopped` path, which leaves
+            // `first_time` at `blank_outcome`'s 0 — so the flag is definitional
+            // here rather than a counter. It is the only thing distinguishing
+            // the transition from the replay: without it a caller that logs a
+            // halt logs one line per transform for the life of the process,
+            // because a halted bridge answers `HALT` to every transform
+            // forever.
+            o.first_time = 1;
             match reason {
                 HaltReason::AuthorityConflict { owner, intruder } => {
                     o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
@@ -1177,6 +1226,8 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
         }
         Action::RecreateArena { by_nanos } => {
             o.action = TFT_BRIDGE_RECREATE;
+            // Latched on the same terms as `Action::Halt` above.
+            o.first_time = 1;
             o.reason = TFT_BRIDGE_REASON_CLOCK_RESET;
             o.by_nanos = *by_nanos;
             name_the_edge(inner, o);

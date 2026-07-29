@@ -210,6 +210,16 @@ jobs:
       - name: just tf2-check
         run: just tf2-check
 
+      # `ros/tf_tree_ros` is an `ament_cmake` package outside the cargo
+      # workspace, so `lint` and `test` above compile none of it: not the
+      # subscriptions, not the QoS §5.2 is NORMATIVE about, not the four ctest
+      # binaries. CLAUDE.md says "`just ros-build` and `just ros-test` are its
+      # entire gate" — this is where that gate runs. It reuses the image the
+      # step above already built, so the marginal cost is the colcon build and
+      # the ctests.
+      - name: just ros-test
+        run: just ros-test
+
   # The `shm` feature is off by default, so `lint` and `test` above compile none
   # of it: not `MappedArena`'s ~390 lines of syscall-facing `unsafe`, not the
   # multi-process gate, not the shm benchmarks. Without this job that code is

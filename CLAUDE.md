@@ -40,7 +40,7 @@ the reason several orderings look the way they do.
 | [`docs/PHASE1.md`](./docs/PHASE1.md) | Normative Phase 1 spec: layouts, atomic orderings, test plan (§10), benchmark gate (§11). Supersedes `docs/decisions/0003`. **Implemented.** |
 | [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 holds Phase 1 amendments A1–A8 (all applied), §0.0 is the status table. **Engine half implemented.** |
 | [`docs/PHASE3.md`](./docs/PHASE3.md) | Normative Phase 3 spec (Python bindings). **Implemented.** |
-| [`docs/PHASE4.md`](./docs/PHASE4.md) | Normative Phase 4 spec (C ABI, C++ wrapper, ROS 2 ingest bridge, `sample_with_derivatives`). §0.0 records what this environment cannot gate — **there is no ROS 2 here.** |
+| [`docs/PHASE4.md`](./docs/PHASE4.md) | Normative Phase 4 spec (C ABI, C++ wrapper, ROS 2 ingest bridge, `sample_with_derivatives`). §0.0 records what this environment cannot gate. **ROS 2 *is* available, in `docker/tf2`** — an earlier revision of this line said otherwise and was wrong. What is missing is a second RMW, clang in that image, and a robot. |
 | [`docs/PHASE5.md`](./docs/PHASE5.md) | Normative Phase 5 spec (frozen `.tft` arena, bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, `TFT001`–`TFT016`, `tf_tree top`). |
 | [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md), [`0005`](./docs/decisions/0005-the-shared-memory-seam.md) and [`0006`](./docs/decisions/0006-the-eight-phase-roadmap.md) are authoritative. |
 
@@ -56,8 +56,18 @@ crates/tf_tree_py/      PyO3 bindings; binds the Rust core directly, not the C A
 crates/tf_tree_bench/   criterion + tf2 differential harness
 crates/tf_tree_tf2_sys/ the tf2 side of the differential harness
 crates/tf_tree_cli/     binary `tf_tree` (alias `tft`)
+ros/tf_tree_ros/        ament_cmake package: the §5 ingest bridge. NOT a cargo crate.
 xtask/                  loom / miri / bench-gate runners
 ```
+
+`ros/tf_tree_ros/` needs `rclcpp`, which exists only inside `docker/tf2`, so it
+is outside the cargo workspace and outside every host recipe — `cargo fmt`,
+`clippy` and `nextest` cannot see it, exactly like `crates/tf_tree_tf2_sys`.
+**`just ros-build` and `just ros-test` are its entire gate**; run them after
+touching anything under `ros/`, and note that `just ros-test` also rebuilds
+`tf_tree_c --features bridge`, so a change on the Rust side of the seam is
+covered by it too. CI's `tf2` job runs `just ros-test` after `just tf2-check`. It reaches the engine only through
+`find_package(tf_tree CONFIG)` and `tf_tree_c`'s default-off `bridge` feature.
 
 Phase 4 adds a C ABI crate and a header-only C++ wrapper. **The Python binding
 does not go through it** — PyO3 binds Rust directly, and `docs/PHASE3.md` §0
@@ -104,6 +114,8 @@ Everything goes through `just`; CI mirrors it 1:1.
 | `just loom` | concurrency model checking (`cargo xtask loom`) |
 | `just miri` | UB checking on arena + core |
 | `just bench` | benchmark suite + go/no-go gate |
+| `just ros-build` / `just ros-test` | `ros/tf_tree_ros` in the container — nothing on the host can |
+| `just tf2-check` | the container-only crates: `tf_tree_tf2_sys`, and `tf_tree_c --features bridge` |
 
 Single test — Rust: `cargo nextest run -p tf_tree_math -- exp_log_roundtrip`.
 
