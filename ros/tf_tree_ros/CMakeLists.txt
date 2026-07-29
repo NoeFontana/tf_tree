@@ -75,7 +75,7 @@ if(BUILD_TESTING)
 
   # These need a real DDS and a second participant, so they are `ctest`s rather
   # than unit tests — and `just ros-test` is the only gate they run in.
-  ament_add_gtest(test_ingest test/test_ingest.cpp TIMEOUT 120)
+  ament_add_gtest(test_ingest test/test_ingest.cpp TIMEOUT 240)
   if(TARGET test_ingest)
     target_link_libraries(test_ingest tf_tree_ros)
   endif()
@@ -100,6 +100,16 @@ if(BUILD_TESTING)
   ament_add_gtest(test_node test/test_node.cpp TIMEOUT 120)
   if(TARGET test_node)
     target_link_libraries(test_node tf_tree_ros)
+  endif()
+
+  # §5.8's amendment: form 3 attached to a node the caller is already spinning.
+  # Its own binary because the mutant it exists for kills the *process* rather
+  # than failing an assertion — `add_callback_group` throws on the ingest
+  # thread, where nothing catches it — and a crash must not take the other
+  # tests' results with it.
+  ament_add_gtest(test_executor test/test_executor.cpp TIMEOUT 120)
+  if(TARGET test_executor)
+    target_link_libraries(test_executor tf_tree_ros)
   endif()
 endif()
 

@@ -64,17 +64,20 @@ BridgeNode::BridgeNode(const rclcpp::NodeOptions & options)
   const auto config_file = declare_parameter<std::string>("topology_config_file", "");
   const auto config_text = declare_parameter<std::string>("topology_config", "");
   if (config_file.empty() == config_text.empty()) {
-    // Both or neither, and **this check is the only thing that refuses an empty
-    // topology anywhere in the stack.** Measured: `tft_bridge_create("")`
-    // returns `TFT_OK` — an empty config is a legal config describing a tree
-    // with no edges — so without this a bridge with no `topology_config` starts
-    // clean, logs "ingest bridge up", and reports every transform on the robot
-    // as `TFT_BRIDGE_UNDECLARED`. That is the same shape as the `tf_prefix`
-    // defect §5.6's clarification records: a switch that drops 100 % of the
-    // traffic with nothing failing at startup.
+    // Both or neither. This used to be the **only** thing in the stack that
+    // refused an empty topology, which left §5.8's form 3 — a `BridgeHandle`
+    // constructed directly with `topology_toml = ""` — starting clean and
+    // answering `TFT_BRIDGE_UNDECLARED` to 100 % of the robot's traffic. The
+    // policy now lives in `tft_bridge_create`, where every other startup
+    // refusal (domain, cycle, claim) already lives and where all three
+    // deployment forms inherit it.
     //
-    // "Both" is refused too because no rule for which one wins is one an
-    // operator could predict.
+    // What is left here is the *parameter* surface, which the ABI cannot see:
+    // "neither parameter set" and "both set" are indistinguishable from an
+    // empty string by the time they reach C, and "both" has no rule for which
+    // one wins that an operator could predict. A caller that removes this still
+    // gets a `BridgeError` from below rather than a healthy-looking bridge —
+    // this one is the better message, not the safety net.
     throw std::invalid_argument(
             "set exactly one of topology_config_file and topology_config. Produce a config with "
             "`tf_tree topology --discover`; the engine cannot declare edges at run time "

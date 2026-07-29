@@ -64,7 +64,9 @@ xtask/                  loom / miri / bench-gate runners
 is outside the cargo workspace and outside every host recipe — `cargo fmt`,
 `clippy` and `nextest` cannot see it, exactly like `crates/tf_tree_tf2_sys`.
 **`just ros-build` and `just ros-test` are its entire gate**; run them after
-touching anything under `ros/`. It reaches the engine only through
+touching anything under `ros/`, and note that `just ros-test` also rebuilds
+`tf_tree_c --features bridge`, so a change on the Rust side of the seam is
+covered by it too. CI's `tf2` job runs `just ros-test` after `just tf2-check`. It reaches the engine only through
 `find_package(tf_tree CONFIG)` and `tf_tree_c`'s default-off `bridge` feature.
 
 Phase 4 adds a C ABI crate and a header-only C++ wrapper. **The Python binding

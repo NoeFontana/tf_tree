@@ -55,6 +55,31 @@ const char * topic_name(tft_bridge_topic t)
   return t == TFT_BRIDGE_TOPIC_TF_STATIC ? "/tf_static" : "/tf";
 }
 
+/// The negotiated reliability, as §5.2's own vocabulary.
+const char * reliability_name(rclcpp::ReliabilityPolicy p)
+{
+  switch (p) {
+    case rclcpp::ReliabilityPolicy::Reliable: return "reliable";
+    case rclcpp::ReliabilityPolicy::BestEffort: return "best_effort";
+    case rclcpp::ReliabilityPolicy::SystemDefault: return "system_default";
+    default: return "unknown";
+  }
+}
+
+/// The negotiated durability. This is the field §5.2 is really about: a
+/// `volatile` `/tf_static` subscription is "the single most common ROS 2 tf
+/// integration bug" and it presents with no error anywhere, so the startup line
+/// is the only place an operator can see it before the transforms go missing.
+const char * durability_name(rclcpp::DurabilityPolicy p)
+{
+  switch (p) {
+    case rclcpp::DurabilityPolicy::TransientLocal: return "transient_local";
+    case rclcpp::DurabilityPolicy::Volatile: return "volatile";
+    case rclcpp::DurabilityPolicy::SystemDefault: return "system_default";
+    default: return "unknown";
+  }
+}
+
 /// The message from `tft_last_error`, for the startup failures that throw.
 std::string last_error_message()
 {
@@ -97,6 +122,23 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
         s.total_count_change, s.total_count, opts_.queue_depth);
     };
 
+  // §5.2's second clause, "warn on any incompatibility event". rclcpp installs
+  // a default handler that logs — but on the *node's* logger rather than this
+  // child one, and in the middleware's vocabulary rather than naming the trap.
+  // A `/tf_static` publisher that is `volatile` is the exact configuration §5.2
+  // exists for, and this is the one moment the middleware volunteers the fact.
+  sub_opts.event_callbacks.incompatible_qos_callback =
+    [this](rclcpp::QOSRequestedIncompatibleQoSInfo & s) {
+      RCLCPP_WARN(
+        log_,
+        "a publisher's QoS is incompatible with this subscription's (policy %d, %d total, "
+        "%d new): its samples will never arrive. §5.2 requires reliable /tf and "
+        "reliable+transient_local /tf_static; a volatile or best_effort broadcaster "
+        "matches neither and reports nothing else anywhere.",
+        static_cast<int>(s.last_policy_kind), static_cast<int>(s.total_count),
+        static_cast<int>(s.total_count_change));
+    };
+
   // §5.2, NORMATIVE and the single most common ROS 2 tf integration bug: /tf is
   // volatile, /tf_static is transient_local. A volatile subscription to
   // /tf_static receives nothing from a broadcaster that published before this
@@ -125,6 +167,15 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
     },
     sub_opts);
 
+  // **Read back what the middleware actually gave us, once, here.** The startup
+  // line below reports these rather than the literals just requested, which is
+  // what §5.2's "log the *negotiated* QoS" asks for: a line that restates the
+  // request cannot report a regression in the request. Captured on this thread
+  // at construction so `actual_tf_qos()` is a copy rather than a live call into
+  // a subscription the ingest thread is driving.
+  actual_tf_qos_ = sub_tf_->get_actual_qos();
+  actual_tf_static_qos_ = sub_static_->get_actual_qos();
+
   // The promise is shared rather than a stack local captured by reference. The
   // ingest thread outlives this constructor by design, and a reference into a
   // frame that has returned is a dangling reference even when nothing touches
@@ -146,9 +197,13 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
 
   RCLCPP_INFO(
     log_,
-    "ingest bridge up: %s KeepLast(%zu) reliable volatile, %s KeepLast(%zu) reliable "
-    "transient_local, authority=%d, on_clock_reset=%d, domain=%u",
-    opts_.tf_topic.c_str(), opts_.queue_depth, opts_.tf_static_topic.c_str(), opts_.queue_depth,
+    "ingest bridge up: %s KeepLast(%zu) %s %s, %s KeepLast(%zu) %s %s, "
+    "authority=%d, on_clock_reset=%d, domain=%u",
+    opts_.tf_topic.c_str(), actual_tf_qos_.depth(),
+    reliability_name(actual_tf_qos_.reliability()), durability_name(actual_tf_qos_.durability()),
+    opts_.tf_static_topic.c_str(), actual_tf_static_qos_.depth(),
+    reliability_name(actual_tf_static_qos_.reliability()),
+    durability_name(actual_tf_static_qos_.durability()),
     static_cast<int>(opts_.authority), static_cast<int>(opts_.on_clock_reset),
     static_cast<unsigned>(opts_.time_domain));
 
@@ -431,11 +486,15 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
             out.owner, out.intruder, out.parent, out.child, out.owner, out.intruder);
         }
         // **The record is not rate-limited and the log is.** `first_time` fires
-        // once per edge, and §5.3's GID cache refreshes on a 1 Hz timer, so a
-        // conflict seen in the first second names `<unknown publisher>` — which
-        // would then be frozen into the record for the life of the bridge if it
-        // were written under the same condition. The comparison keeps the cost
-        // to one uncontended lock and no allocation on the steady-state path.
+        // once per edge, but a GID can still be unresolved when that edge's
+        // first conflict arrives: `maybe_attribute` walks the graph before
+        // offering, and an endpoint can lag its own first sample, so the walk
+        // is retried on later messages. A conflict caught in that window names
+        // `<unknown publisher>`, and writing the record under `first_time`
+        // would freeze that in for the life of the bridge — the exact sentence
+        // §5.4 calls the better sales pitch, with the name missing. Rewriting
+        // whenever the four strings change costs one uncontended lock and no
+        // allocation on the steady-state path.
         const std::lock_guard<std::mutex> guard(stats_mutex_);
         if (!conflict_.observed || conflict_.owner != out.owner ||
           conflict_.intruder != out.intruder || conflict_.parent != out.parent ||
@@ -458,21 +517,35 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
         out.detail);
       return;
 
+    // **Both stops are gated on `first_time` like every other arm**, and this
+    // is not belt-and-braces. A stop is *latched*: the ABI replays the same
+    // action for every later transform forever, so an ungated `RCLCPP_FATAL`
+    // here is one line per transform for the life of the process — on a robot
+    // whose `/tf` carries 20 transforms at 100 Hz, 2000 `FATAL` a second, each
+    // formatting and taking rcutils' logging mutex on the ingest thread, and
+    // each pushing the one actionable line further up the scrollback. §5.4
+    // requires the diagnostic be "loud, **rate-limited**"; this is the second
+    // half of that. `tft_bridge_outcome::first_time` is 1 on the offer that
+    // stops the bridge and 0 on every replay.
     case TFT_BRIDGE_HALT:
-      RCLCPP_FATAL(
-        log_, "ingest bridge HALTED on %s -> %s: %s. Every later transform is refused.",
-        out.parent, out.child, out.detail);
+      if (out.first_time != 0) {
+        RCLCPP_FATAL(
+          log_, "ingest bridge HALTED on %s -> %s: %s. Every later transform is refused.",
+          out.parent, out.child, out.detail);
+      }
       return;
 
     case TFT_BRIDGE_RECREATE:
       // §5.5's `recreate` is a *report* here: every `tft_plan` a consumer
       // compiled points into the current arena, so the ABI will not swap it.
       // The owner of this handle destroys it and builds a new one.
-      RCLCPP_FATAL(
-        log_,
-        "the clock went backwards by %" PRId64
-        " ns: this bridge is finished and must be replaced. %s",
-        out.by_nanos, out.detail);
+      if (out.first_time != 0) {
+        RCLCPP_FATAL(
+          log_,
+          "the clock went backwards by %" PRId64
+          " ns: this bridge is finished and must be replaced. %s",
+          out.by_nanos, out.detail);
+      }
       return;
 
     default:

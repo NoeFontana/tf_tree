@@ -102,6 +102,17 @@ echo "     §5.8 forms 1 and 2 present: tf_tree_bridge, tf_tree_ros::BridgeNode"
 
 if [ "$run_tests" -eq 1 ]; then
     echo "==> ctest"
+    # **Delete the previous run's result XML first.** `colcon test-result` is the
+    # line that decides this script's exit status, and it counts every
+    # `*.xml` under `--test-result-base` whether or not this run produced it.
+    # The build base is never cleaned, so a test binary that has been *removed*
+    # — its `ament_add_gtest` line deleted, its source gone — keeps reporting
+    # its last passing rows forever. Measured: after adding a fifth test and
+    # then deleting it, `just ros-test` printed "Summary: 15 tests, 0 errors, 0
+    # failures" from four binaries. Green, and counting a test that no longer
+    # exists. Given this repository's history of tests that ship in no recipe,
+    # that is precisely the failure mode this gate is here to prevent.
+    rm -rf "$OUT"/build/*/test_results
     # `--event-handlers console_direct+` so gtest's own output reaches the
     # terminal; colcon otherwise buries a failure in a log file nobody reads.
     # `colcon test` exits 0 even when tests fail, which is why `test-result`

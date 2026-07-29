@@ -92,17 +92,21 @@ TEST(BridgeNodeTest, the_topic_parameters_are_the_topics_the_bridge_subscribes_t
 /// A node with no topology declares nothing, so it can never write anything —
 /// §5.8's amendment, `docs/decisions/0004`, D4.
 ///
-/// **This check is the only thing in the stack that refuses an empty topology.**
-/// `tft_bridge_create("")` returns `TFT_OK`: an empty config is a legal config
-/// describing a tree with no edges. So the failure mode without it is not an
-/// error at all — the node starts, logs "ingest bridge up", and reports every
-/// transform on the robot as `TFT_BRIDGE_UNDECLARED`.
+/// What this asserts is the *parameter* surface: "neither parameter set" is
+/// indistinguishable from an empty string by the time it reaches C, and this is
+/// where an operator gets told which parameter to set. The empty topology
+/// itself is refused one layer down, in `tft_bridge_create`, so all three of
+/// §5.8's deployment forms inherit the refusal —
+/// `IngestTest.form_3_refuses_a_topology_that_declares_no_edges` is the same
+/// property asserted against form 3.
 ///
 /// **Mutant:** delete the `throw` in the both-or-neither check. Construction
-/// then succeeds and `EXPECT_THROW` reports "it throws nothing". Applied; it
-/// dies — and the docstring's first version, which predicted a `BridgeError`
-/// from a refusing `tft_bridge_create`, was wrong about *why*, which is how the
-/// paragraph above came to be measured.
+/// reaches `tft_bridge_create("")`, which now refuses it, so a `BridgeError`
+/// comes out instead — a different type from the `std::invalid_argument` this
+/// expects, and `EXPECT_THROW` reports the mismatch. Applied; it dies.
+/// (This test's first docstring predicted exactly that `BridgeError` and was
+/// wrong at the time, because `tft_bridge_create("")` then returned `TFT_OK`.
+/// It is true now because that was fixed, not because the prediction was.)
 TEST(BridgeNodeTest, a_node_given_no_topology_at_all_refuses_to_start)
 {
   EXPECT_THROW(
@@ -117,8 +121,10 @@ TEST(BridgeNodeTest, a_node_given_no_topology_at_all_refuses_to_start)
 /// a test that holds for a reason other than the one it is named for.
 ///
 /// **Mutant:** delete the `throw` in the both-or-neither check. `/dev/null`
-/// reads as an empty config, which `tft_bridge_create` accepts, so nothing
-/// throws and the test fails. Applied; it dies.
+/// reads as an empty config, `config_file` wins the ternary below it, and
+/// `tft_bridge_create` refuses that with a `BridgeError` — not the
+/// `std::invalid_argument` this expects, so `EXPECT_THROW` fails on the type.
+/// Applied; it dies.
 TEST(BridgeNodeTest, a_node_given_two_topologies_refuses_to_start)
 {
   EXPECT_THROW(

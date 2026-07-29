@@ -232,6 +232,52 @@ TEST(QosRegression, a_broadcaster_that_has_exited_takes_its_static_transforms_wi
        "unpassable form of this test would now pass.";
 }
 
+/// **§5.2's NORMATIVE table, asserted against what the middleware actually
+/// negotiated** — not against the constructor's literals.
+///
+/// The two tests above cover durability on `/tf_static`, because that one has
+/// an observable consequence a test can wait for. **Reliability has none**, and
+/// that is exactly why it needs this test: `best_effort` is *compatible* with a
+/// reliable publisher, so DDS still matches, nothing errors, and a test that
+/// republishes in a loop until a counter moves cannot tell the difference. The
+/// consequence appears only on a loaded robot, where the middleware silently
+/// discards `/tf` under congestion instead of retransmitting and lookups return
+/// stale poses at random. It is the same class of defect as the volatile
+/// `/tf_static` bug this file is written for — a QoS field whose regression
+/// produces no error — and it is the half the other two do not cover.
+///
+/// The values come from `get_actual_qos()`, which is also what the startup line
+/// now prints: §5.2 says log the **negotiated** QoS, and a line that restates
+/// the request cannot report a regression in the request.
+///
+/// `queue_depth` is asserted here too, on a non-default value, because nothing
+/// else sets it — an option that silently did nothing would look identical.
+///
+/// **Mutant:** `qos_tf` from `.reliable()` to `.best_effort()`. Every other test
+/// in the package still passes; this one fails on `/tf`'s reliability. Applied;
+/// it dies. **Mutant:** `qos_static` from `.transient_local()` to
+/// `.durability_volatile()` — this fails immediately, where the late-joiner test
+/// above takes a 15 s timeout to reach the same conclusion. Applied; it dies.
+/// **Mutant:** build `qos_tf`/`qos_static` with `rclcpp::KeepLast(100)` instead
+/// of `KeepLast(opts_.queue_depth)`; the depth expectations fail. Applied; it
+/// dies.
+TEST(QosRegression, the_negotiated_qos_is_the_one_5_2_is_normative_about)
+{
+  auto node = std::make_shared<rclcpp::Node>("qos_reader");
+  tf_tree_ros::BridgeOptions o = options_on("/tf_static_negotiated");
+  o.queue_depth = 37;
+  tf_tree_ros::BridgeHandle bridge(node.get(), o);
+
+  EXPECT_EQ(bridge.actual_tf_qos().reliability(), rclcpp::ReliabilityPolicy::Reliable);
+  EXPECT_EQ(bridge.actual_tf_qos().durability(), rclcpp::DurabilityPolicy::Volatile);
+  EXPECT_EQ(bridge.actual_tf_qos().depth(), 37u);
+
+  EXPECT_EQ(bridge.actual_tf_static_qos().reliability(), rclcpp::ReliabilityPolicy::Reliable);
+  EXPECT_EQ(
+    bridge.actual_tf_static_qos().durability(), rclcpp::DurabilityPolicy::TransientLocal);
+  EXPECT_EQ(bridge.actual_tf_static_qos().depth(), 37u);
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)

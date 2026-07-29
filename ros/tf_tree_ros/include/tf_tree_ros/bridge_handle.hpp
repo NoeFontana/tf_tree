@@ -191,6 +191,21 @@ public:
   /// to a second executor is an error rclcpp will report.
   rclcpp::CallbackGroup::SharedPtr callback_group() const noexcept {return group_;}
 
+  /// The QoS the middleware actually gave the `/tf` subscription, read back
+  /// from it at construction (§5.2's "log the **negotiated** QoS").
+  ///
+  /// This exists so §5.2's NORMATIVE table is *assertable*. Both of its fields
+  /// regress silently: `best_effort` is compatible with a reliable publisher,
+  /// so DDS still matches, nothing errors, and a test that republishes until a
+  /// counter moves cannot tell — while on a loaded robot the middleware
+  /// discards `/tf` under congestion instead of retransmitting.
+  const rclcpp::QoS & actual_tf_qos() const noexcept {return actual_tf_qos_;}
+
+  /// The QoS the middleware actually gave the `/tf_static` subscription. Its
+  /// durability is the field §5.2 calls the single most common ROS 2 tf
+  /// integration bug.
+  const rclcpp::QoS & actual_tf_static_qos() const noexcept {return actual_tf_static_qos_;}
+
   /// §5.6's remap table, `from` (the name on the wire) to `to` (the name the
   /// arena declares). Complete before the first message, and logged by the
   /// constructor.
@@ -226,6 +241,12 @@ private:
   rclcpp::CallbackGroup::SharedPtr group_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_tf_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr sub_static_;
+
+  /// Read back from the subscriptions in the constructor, on the constructing
+  /// thread, and never touched again. Initialised to a depth the code below
+  /// overwrites; `rclcpp::QoS` has no default constructor.
+  rclcpp::QoS actual_tf_qos_{rclcpp::KeepLast(1)};
+  rclcpp::QoS actual_tf_static_qos_{rclcpp::KeepLast(1)};
 
   /// §5.3's per-GID state, touched only from the ingest thread: how many graph
   /// walks this GID has cost, or `kResolved` once one of them matched it.
