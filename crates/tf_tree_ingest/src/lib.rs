@@ -47,8 +47,19 @@
 //! Decompression is bounded: `uncompressed_size` is a number off a disk, so
 //! [`IngestOptions::max_chunk_uncompressed_bytes`] and
 //! [`IngestOptions::max_chunk_expansion_ratio`] are checked before anything is
-//! allocated for it. Neither codec crate bounds its total output for us —
-//! `crate::decompress` says exactly what each of them does bound.
+//! allocated for it, and the zstd decoder's *window* — a separate number in the
+//! codec's own header that neither of those can see — is bounded too. Neither codec
+//! crate bounds its total output for us; `crate::decompress` says exactly what each
+//! of them does bound, and what the three guards here cost.
+//!
+//! **What the C-free codecs cost, measured.** On this host, `survey` over a
+//! 160 000-transform recording takes 0.027 s uncompressed, 0.035 s for lz4 and
+//! 0.048 s for zstd — so roughly **1.8× the per-pass wall time** of an uncompressed
+//! recording, and `ruzstd` decodes libzstd frames at about **a quarter of libzstd's
+//! own rate**. Multiplied by the pass count, which is `1 + groups + spilled edges`.
+//! An earlier revision of this section said the constraint had no visible cost; it
+//! has a modest and measurable one, and that is still the right trade against a C
+//! build step.
 //!
 //! # Status against §3
 //!
@@ -80,6 +91,23 @@ mod spill;
 mod decompress;
 
 pub use decompress::{BadChunkKind, ChunkCodec, ChunkLimits};
+
+/// Whether this build compiled the zstd and lz4 chunk decoders in.
+///
+/// **It has to be evaluated here, inside the crate that owns the feature.** Cargo
+/// unifies features across a workspace, so a `cfg!(feature = "compression")` in a
+/// consumer reports what *that* crate asked for rather than what this one was built
+/// with — and the two can differ silently, which is exactly how a `cargo install`
+/// ships a binary that refuses every zstd bag while `cargo build --workspace` stays
+/// green. `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`
+/// compares the two answers; it is the only thing that can see them disagree.
+///
+/// Mirrors [`tf_tree::counters_compiled_in`], for the same reason and after the same
+/// defect.
+#[must_use]
+pub fn compression_compiled_in() -> bool {
+    cfg!(feature = "compression")
+}
 
 #[cfg(feature = "fixture")]
 pub mod fixture;

@@ -2291,15 +2291,17 @@ fn a_compressed_recording_ingests_identically(codec: FixtureCodec, tag: &str) {
 /// **Mutant: in `decode_zstd`, replace `Ok(written) if written == want` with `Ok(_)`
 /// — applied, and this test still passed.** The reason is worth recording rather
 /// than papering over: this fixture carries an honest `uncompressed_crc`, and a
-/// short decode leaves zero padding that the CRC over the whole records field also
-/// rejects. So end to end the property is guarded **twice**, and no single mutant of
-/// either check kills this test.
+/// short decode leaves the output buffer's previous contents in the records field,
+/// which the CRC over the whole field also rejects. So end to end the property is
+/// guarded **twice**, and no single mutant of either check kills this test.
+/// Re-verified after `decode_zstd` stopped `clear()`ing that buffer, which changed
+/// the padding from zeros to stale bytes and changed nothing about the CRC.
 ///
 /// The length check is isolated one level down, by
 /// `decompress::tests::each_codec_round_trips_and_catches_both_length_disagreements`,
 /// whose CRC-0 rows remove the backstop — `uncompressed_crc == 0` means "not
 /// computed" per the specification and real writers emit it — and which that same
-/// mutant does kill, with the zero padding visible in the returned records.
+/// mutant does kill, with the padding visible in the returned records.
 ///
 /// What this test does catch, observed: swapping lz4's frame decoder for the block
 /// API (`samples_pushed` 9 against 6), and a fixture that writes the codec name
@@ -2476,4 +2478,27 @@ fn a_real_libzstd_recording_ingests() {
     );
     assert_eq!(real.report.samples_pushed, plain.report.samples_pushed);
     assert_eq!(edge_time_rows(&real.report), edge_time_rows(&plain.report));
+}
+
+/// **`compression_compiled_in` reports the truth about *this* build.**
+///
+/// The counterpart of `codec_free::the_predicate_reports_a_codec_free_build`, and both
+/// halves are needed: a predicate that answered a constant would be right in one
+/// configuration and wrong in the other, and the consumer that depends on it
+/// (`tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`) compares
+/// it against a `cfg!` it cannot see across the crate boundary.
+///
+/// Mutant: `compression_compiled_in` returning `false` unconditionally — applied, and
+/// this failed on `left: false, right: true` with "the default build compiles both
+/// codecs in", the only failure in the crate. **The codec-free configuration stayed
+/// green with that mutant — 85 of 85** — and the mirror-image mutant (`true`) is green
+/// in the default build and red in the codec-free one, which is why the property takes
+/// two tests in two configurations rather than one anywhere.
+#[test]
+fn the_predicate_reports_a_build_with_codecs() {
+    assert_eq!(
+        tf_tree_ingest::compression_compiled_in(),
+        cfg!(feature = "compression"),
+        "the default build compiles both codecs in"
+    );
 }

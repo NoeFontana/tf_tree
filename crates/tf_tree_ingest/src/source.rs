@@ -266,10 +266,12 @@ fn is_sqlite(input: &mut BufReader<File>) -> Result<bool, IngestError> {
 /// # Errors
 ///
 /// [`IngestError::Io`] for a failing read, [`IngestError::Rosbag2Sqlite`] for a
-/// rosbag2 sqlite3 bag, [`IngestError::CompressedChunk`] for a chunk this build
-/// cannot decompress (see the crate docs), [`IngestError::Mcap`] for a malformed
-/// file, [`IngestError::Cdr`] for a payload that is not a decodable `TFMessage`,
-/// or whatever the callback returned.
+/// rosbag2 sqlite3 bag, [`IngestError::CompressedChunk`] for a codec this build has
+/// no decoder for — which since the `compression` feature means an unrecognised
+/// name, or zstd/lz4 in a `--no-default-features` build, and not compression as such
+/// (see the crate docs) — [`IngestError::Mcap`] for a malformed file,
+/// [`IngestError::Cdr`] for a payload that is not a decodable `TFMessage`, or
+/// whatever the callback returned.
 pub fn read_tf<F>(
     path: &Path,
     roles: &TopicRoles,
@@ -630,15 +632,22 @@ where
 
 /// Classify an `mcap` failure into this crate's `Copy` error type.
 ///
-/// The distinction that matters to a user is compression: it is the one failure
-/// with an action attached, and §0.0's `default-features = false` makes it
-/// reachable on ordinary recordings.
+/// **Compression is no longer among the failures this function classifies**, and an
+/// earlier revision of this comment said the opposite — that it was "the one failure
+/// with an action attached", reachable on ordinary recordings because of §0.0's
+/// `default-features = false`. That was true when `mcap` owned the decompressor
+/// factory. It does not: `crate::decompress` classifies every chunk's codec before
+/// `mcap` sees a compression field at all, and
+/// [`IngestError::CompressedChunk`](crate::IngestError::CompressedChunk) is now
+/// produced by `chunk_records` via `note_or_fail`. What is left here is a malformed
+/// record body, which is [`IngestError::Mcap`].
 fn map_mcap(e: &mcap::McapError) -> IngestError {
     match e {
-        // Unreachable in practice now that this crate decides about codecs
-        // itself — `crate::decompress` classifies the chunk before `mcap` ever
-        // sees a compression field. Mapped rather than dropped so the arm cannot
-        // rot into a wrong one if that ever changes.
+        // Unreachable in practice, for the reason in the function's docs. Mapped
+        // rather than dropped so the arm cannot rot into a wrong one if `mcap` is
+        // ever handed a compression field again — `ChunkCodec::Other` is the honest
+        // answer for a name that reached the `mcap` crate rather than this module,
+        // because this module's classifier is what knows the three names.
         mcap::McapError::UnsupportedCompression(_) => IngestError::CompressedChunk {
             codec: decompress::ChunkCodec::Other,
         },

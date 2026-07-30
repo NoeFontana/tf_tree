@@ -20,11 +20,24 @@
 //!
 //! With the chunk in hand, the codec is then **ours** rather than `mcap`'s: the
 //! `compression` feature (on by default) compiles pure-Rust `ruzstd` and
-//! `lz4_flex`, so a zstd or lz4 recording ingests with no C build step and
-//! §0.0's `default-features = false` costs nothing a user can see. The no-C rule
-//! is untouched; what changed is who owns the decoder. A build with the feature
-//! off still refuses those chunks with [`ChunkFault::Unsupported`], unchanged,
-//! and `tests/codec_free.rs` is compiled in exactly that configuration.
+//! `lz4_flex`, so a zstd or lz4 recording ingests with no C build step. The no-C
+//! rule is untouched; what changed is who owns the decoder. A build with the
+//! feature off still refuses those chunks with [`ChunkFault::Unsupported`],
+//! unchanged, and `tests/codec_free.rs` is compiled in exactly that
+//! configuration.
+//!
+//! **What the C-free decoder costs, measured, because an earlier revision of this
+//! paragraph said §0.0's `default-features = false` "costs nothing a user can see"
+//! and that was false.** On this host (AMD EPYC-Milan, release, page cache warm),
+//! [`crate::survey`] over a 160 000-transform recording in 16 chunks: **0.027 s
+//! uncompressed, 0.035 s lz4 (1.33×), 0.048 s zstd (1.82×)**. Isolated, `ruzstd`
+//! decodes a libzstd `-3` frame at **674 MiB/s** against libzstd's own
+//! **2 480 MiB/s** on the same bytes (`zstd -b3`), i.e. **~3.7× slower**. Two
+//! things multiply that: decompression is repeated on **every pass**, and the pass
+//! count is `1 + groups + spilled edges` rather than a flat two, so `--max-memory`
+//! pressure buys extra decodes. It is a price worth paying for no C build step, and
+//! it is not the same as free — `docs/PHASE5.md` §12's throughput gate is still met
+//! with a wide margin.
 //!
 //! So the framing is ours instead. It is nine bytes — `opcode: u8`, `len: u64`
 //! little-endian, `body[len]` — plus an eight-byte magic at each end of the file,
@@ -51,7 +64,7 @@
 //! `SkipCounts::bad_chunks` never counts it, while `SkipCounts::truncated` (which
 //! `read_tf` has already set for any short record) says the recording is a prefix.
 //!
-//! # Why decompression is bounded twice over
+//! # Why decompression is bounded three times over
 //!
 //! A chunk header is two numbers off a disk that may be lying. `uncompressed_size`
 //! is both the allocation size and the only thing standing between this reader and
@@ -62,7 +75,18 @@
 //! allocation), not its total output, and a 100 MiB-window frame can still decode
 //! to terabytes; lz4_flex bounds only the *per-block* size (4 MiB for a standard
 //! frame) and offers no cumulative-output knob at all. The caller-sized output
-//! buffer is the actual guarantee in both cases.
+//! buffer is the actual guarantee for **output** in both cases.
+//!
+//! The third bound is `window_ceiling`, and it exists because those two bound
+//! output while the zstd decoder's own **working** allocation is a different number
+//! in a different header that neither of them can see. Measured before it existed:
+//! a **26-byte** payload of two concatenated zstd frames whose second declares a
+//! 64 MiB window, under an honest `uncompressed_size` of 8 and a correct CRC,
+//! decoded to the right eight bytes and drove the allocator to a **134 226 570-byte
+//! peak** — five million times the input, and unmoved by either [`ChunkLimits`]
+//! knob. `window_ceiling` closes it: the same payload now costs 8 841 bytes and is
+//! refused with [`BadChunkKind::ImplausibleWindow`]. Its own docs carry the
+//! mechanism and the trade.
 
 use crate::IngestError;
 
@@ -198,6 +222,39 @@ pub enum BadChunkKind {
         /// `ChunkHeader::uncompressed_size`.
         declared: u64,
     },
+    /// `compressed_size` names more bytes than the chunk record actually carries.
+    ///
+    /// **Separate from [`BadChunkKind::LengthMismatch`] because neither number is
+    /// an uncompressed byte count.** This fault is raised before any decoder runs —
+    /// it is the header's own `compressed_size` against the bytes on disk — so
+    /// reporting it as "it declared N uncompressed bytes and produced M" sent an
+    /// operator to `uncompressed_size` and to the decompressor, neither of which
+    /// had been consulted.
+    #[error("it declares {declared} compressed bytes but the record carries {present}")]
+    CompressedSizeMismatch {
+        /// `ChunkHeader::compressed_size`.
+        declared: u32,
+        /// How many bytes of the records field the chunk record actually holds.
+        present: u32,
+    },
+    /// A zstd frame asks for a decoding window larger than this reader will
+    /// allocate for a chunk of this size.
+    ///
+    /// A different fault from [`BadChunkKind::ImplausibleSize`] because it is a
+    /// different number in a different header: `uncompressed_size` is what the
+    /// *chunk* declares and is what [`ChunkLimits`] bounds, while the window is what
+    /// the *codec frame* declares and is bounded by nothing the caller can set. See
+    /// `window_ceiling` for why the second needs bounding at all, and for what the
+    /// ceiling is derived from.
+    #[error(
+        "its zstd frame asks for a {requested}-byte window, past this chunk's {ceiling}-byte ceiling"
+    )]
+    ImplausibleWindow {
+        /// The window size the frame header declared.
+        requested: u64,
+        /// What `window_ceiling` allowed for this chunk.
+        ceiling: u64,
+    },
     /// A record inside the chunk runs past the chunk's end, or a fragment too
     /// short to be a record header trails it.
     #[error("a record inside it is malformed, at offset {at}")]
@@ -234,9 +291,22 @@ pub(crate) enum ChunkFault {
 /// reason: the person who meets a limit is the person who cannot patch the crate.
 /// A recording whose writer used 128 MiB chunks is not corrupt, and a reader that
 /// refuses it with no knob to turn is a reader that has to be forked.
+///
+/// # What these numbers bound, and what they do not
+///
+/// They bound the **output buffer**, not peak resident memory: the decoder allocates
+/// its own working set beside it, and that set tracks the frame's declared window
+/// rather than anything here. Measured with a counting allocator on libzstd `-3`
+/// frames written by a streaming encoder, `ruzstd` adds **1.98 MiB of peak while
+/// decoding a 1 MiB chunk** and **6.48 MiB for a 4 MiB chunk** — so the transient
+/// peak is up to roughly 2.6× the declared size, bounded above by the output buffer
+/// plus about twice what `window_ceiling` allows. An operator sizing a container
+/// against `--max-chunk-size` should read that flag as "the buffer this reader will
+/// size", not as the process's high-water mark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkLimits {
-    /// Absolute ceiling on a chunk's declared `uncompressed_size`.
+    /// Absolute ceiling on a chunk's declared `uncompressed_size`, i.e. on the
+    /// output buffer. See the type's own docs for what it does **not** bound.
     pub max_uncompressed_bytes: u64,
     /// Ceiling on `uncompressed_size / compressed_size`.
     ///
@@ -261,17 +331,34 @@ pub struct ChunkLimits {
 /// 1. [`ChunkHead::parse`] — a header too short to hold its own fixed fields.
 /// 2. The codec: one this build has no decoder for is
 ///    [`ChunkFault::Unsupported`], which is never skippable.
+///
+/// The two paths then diverge, and the numbering below is the *code's* order rather
+/// than a tidier one — the compressed path's ordering is load-bearing, and the
+/// comment at its guards says which test depends on it.
+///
+/// The uncompressed path, which allocates nothing and hands back a borrow:
+///
 /// 3. `compressed_size` against the bytes actually present — a *complete* chunk
-///    that declares more than it carries is corrupt; a truncated one is clamped.
-/// 4. A truncated **compressed** chunk: no records at all, and no fault. A
-///    partial codec frame is not decodable, and the file is short rather than
-///    damaged.
-/// 5. The uncompressed path, which allocates nothing: `uncompressed_size` must
-///    equal `compressed_size` (the records are stored verbatim), then the CRC.
-/// 6. The compressed path's bomb guards — [`ChunkLimits`], both halves, on the
-///    header's own numbers.
-/// 7. Only now is `scratch` sized, and the codec run into it.
-/// 8. The produced length against the declared one, then the CRC.
+///    that declares more than it carries is [`BadChunkKind::CompressedSizeMismatch`];
+///    a truncated one is clamped.
+/// 4. `uncompressed_size == compressed_size`, the invariant that holds when records
+///    are stored verbatim, on a complete chunk only.
+/// 5. The CRC, on a complete chunk only.
+///
+/// The compressed path:
+///
+/// 6. A truncated chunk: no records at all, and no fault. A partial codec frame is
+///    not decodable, and the file is short rather than damaged.
+/// 7. Both bomb guards — [`ChunkLimits`], on the header's own raw `u64`s and
+///    **before** step 8, so the guard's own arithmetic is reachable.
+/// 8. `compressed_size` against the bytes present, as in step 3, and the payload
+///    slice is taken.
+/// 9. An empty payload: no codec frame is zero bytes.
+/// 10. Only now is `scratch` sized and the codec run into it — under one further
+///     bound that comes off the codec's own header rather than the chunk's,
+///     `window_ceiling`.
+/// 11. The produced length against the declared one, then the CRC over the
+///     decompressed bytes.
 ///
 /// # Why the header is parsed here rather than by `mcap::parse_record`
 ///
@@ -301,9 +388,15 @@ pub(crate) fn chunk_records<'a>(
     // not truncated — that is the distinction `complete` exists to make.
     let declared_fits = || match usize::try_from(head.compressed_size) {
         Ok(n) if n <= available => Ok(n),
-        _ => Err(ChunkFault::Bad(BadChunkKind::LengthMismatch {
+        // **`CompressedSizeMismatch` and not `LengthMismatch`**, because neither
+        // number here is an uncompressed byte count and no decoder has run: this is
+        // the header's `compressed_size` against the bytes on disk. Reported as a
+        // `LengthMismatch` it printed "it declared N uncompressed bytes and produced
+        // M" over two *compressed* figures, sending a reader to `uncompressed_size`
+        // and the decompressor — the two things this arm never consults.
+        _ => Err(ChunkFault::Bad(BadChunkKind::CompressedSizeMismatch {
             declared: clamp_u32(head.compressed_size),
-            produced: clamp_u32(available as u64),
+            present: clamp_u32(available as u64),
         })),
     };
 
@@ -428,6 +521,12 @@ pub(crate) fn chunk_records<'a>(
 /// [`ChunkLimits::max_uncompressed_bytes`], which is checked before this is
 /// called — so the worst case is one chunk's ceiling, not the largest chunk in
 /// any file the process has ever read.
+///
+/// **That argument is about the output buffer and extends to nothing else.** In
+/// particular it does not extend to the codec decoders, which are constructed per
+/// chunk on purpose: see the comment at `FrameDecoder::new` in `decode_zstd`, where
+/// reuse would turn a lazy allocation into an eager one sized by an
+/// attacker-chosen header field.
 // Both allows exist only in the codec-free build, where every arm that uses these
 // parameters is compiled out: `unused_variables` because nothing then reads
 // `payload`, `want` or `scratch`, and `ptr_arg` because clippy then sees a
@@ -455,6 +554,68 @@ fn decompress_into(
     }
 }
 
+/// The smallest window ceiling this reader will ever impose, 8 MiB.
+///
+/// The floor exists because an encoder declares the window it *might* use rather
+/// than the one the frame needs, and a streaming encoder cannot know the source size
+/// at all. Measured on this host, the largest window a `zstd` CLI invocation
+/// reachable without `--ultra`/`--long` declares is exactly this: piping four
+/// kilobytes through `zstd -19` declares **8 MiB**, `zstd -3` declares 2 MiB, and
+/// `ruzstd`'s own encoder declares 128 KiB. Every chunk of the committed
+/// `testdata/zstd_conformance.mcap` declares 8 MiB for ~660 uncompressed bytes, so a
+/// ceiling without this floor would reject the repository's own conformance fixture.
+#[cfg(feature = "compression")]
+const MIN_ZSTD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The largest zstd decoding window this reader will allocate for a chunk that
+/// declares `want` uncompressed bytes.
+///
+/// # Why a window bound is needed at all
+///
+/// `FrameDecoder::new` leaves `max_window_size` at ruzstd's
+/// `DEFAULT_MAX_WINDOW_SIZE` (100 MiB), and that number is reachable from a file.
+/// `decode_all` re-`init`s once per frame in the payload and accepts concatenated
+/// frames; the first frame takes `FrameDecoderState::new`, whose `DecodeBuffer` only
+/// *records* the window and lets the ring grow on demand, but every subsequent frame
+/// takes `reset`, which calls `RingBuffer::reserve(window_size)` **eagerly**.
+/// Measured: a 26-byte payload of two frames, the second declaring a 64 MiB window
+/// over four raw bytes, decoded correctly under an honest `uncompressed_size` of 8
+/// and drove the allocator to a 134 226 570-byte peak. Neither [`ChunkLimits`] knob
+/// could see it — they bound `uncompressed_size`, and the window is a different field
+/// in a different header — so lowering `--max-chunk-size` to harden against a hostile
+/// file changed nothing.
+///
+/// # Why the ceiling comes from the chunk and not from [`ChunkLimits`]
+///
+/// A match offset cannot reach further back than the bytes already decoded in the
+/// frame, and no dictionary is in play (ruzstd refuses a dictionary frame outright),
+/// so **a window larger than the frame's total output is unusable by any conformant
+/// decoder**. `want` is therefore the semantically exact bound, and it is already
+/// bounded by [`ChunkLimits::max_uncompressed_bytes`] two guards earlier. Using the
+/// limit instead — the other obvious choice — would leave a 26-byte chunk entitled to
+/// a 64 MiB window under the default 64 MiB ceiling, i.e. would not fix the case
+/// above at the defaults, only for a user who lowered the knob.
+///
+/// ruzstd evaluates the declared window against this **before** allocating, in both
+/// `FrameDecoderState::new` and `reset`, so a frame asking for more is refused rather
+/// than served: the 26-byte payload above now costs 8 841 bytes.
+///
+/// # The trade, stated
+///
+/// This refuses frames that would decode. Measured window declarations that exceed
+/// `max(want, 8 MiB)` for a 4 MiB chunk: `zstd --ultra -20` (32 MiB), `--ultra -21`
+/// (64 MiB) and `--long=27` (128 MiB — already past ruzstd's own 100 MiB default and
+/// refused today). No MCAP writer uses those: `mcap`'s Rust and C++ writers, rosbag2
+/// and Foxglove all encode at levels whose declared window is ≤ 8 MiB. The refusal is
+/// loud and names both numbers ([`BadChunkKind::ImplausibleWindow`]), so if such a
+/// recording ever turns up the fault says exactly what to raise
+/// [`MIN_ZSTD_WINDOW_BYTES`] to — which is why this is a constant and not a fourth
+/// knob nobody has yet had a reason to turn.
+#[cfg(feature = "compression")]
+fn window_ceiling(want: usize) -> u64 {
+    (want as u64).max(MIN_ZSTD_WINDOW_BYTES)
+}
+
 /// zstd, via `ruzstd`'s one-shot decode into a caller-sized slice.
 ///
 /// **`decode_all` into an exactly-`want` slice detects both a short frame and an
@@ -465,25 +626,58 @@ fn decompress_into(
 ///
 /// Two things it does not do, said here rather than implied. It accepts several
 /// concatenated frames and silently skips zstd *skippable* frames, so a chunk
-/// whose payload is more than one frame is not rejected — the declared length is
-/// what constrains it. And it does not verify zstd's own content checksum;
-/// `chunk_records` checks the chunk CRC32 over the same bytes, which is a
-/// stronger claim than either codec's internal hash because it is the one the
-/// MCAP writer actually committed to.
+/// whose payload is more than one frame is not rejected — the declared length and
+/// `window_ceiling` are what constrain it, and the multi-frame case is precisely the
+/// one that reaches ruzstd's eager window allocation. And it does not verify zstd's
+/// own content checksum — it no longer even computes one, `ruzstd` being taken
+/// without its `hash` feature (see this crate's manifest for why). `chunk_records`
+/// checks the chunk CRC32 over the same bytes, which is a stronger claim than either
+/// codec's internal hash because it is the one the MCAP writer actually committed to.
 #[cfg(feature = "compression")]
 fn decode_zstd(payload: &[u8], want: usize, scratch: &mut Vec<u8>) -> Result<(), ChunkFault> {
     use ruzstd::decoding::errors::FrameDecoderError;
     use ruzstd::decoding::FrameDecoder;
 
-    scratch.clear();
+    // **No `clear()` before this, deliberately.** `resize` alone zero-fills only
+    // the shortfall and merely truncates when the previous chunk was larger, which
+    // in a recording's steady state of near-uniform chunks writes nothing;
+    // `clear()` first made every chunk memset its whole output buffer — a second
+    // full-width pass over the recording's entire decompressed size, on every ingest
+    // pass, measured at 37 789 ns per 4 MiB chunk. Every one of those bytes was then
+    // overwritten by the decoder. What changes is that the bytes below `written`
+    // after a short decode are now stale rather than zero, which no caller can
+    // observe: that is exactly the arm returning `LengthMismatch`, which hands back
+    // nothing. The lz4 arm below *does* `clear()`, because `read_to_end` appends
+    // rather than overwriting — the asymmetry is real and neither side should be
+    // "tidied" into the other.
     scratch.resize(want, 0);
+    // **The decoder is constructed per chunk on purpose. Do not hoist it beside
+    // `scratch`.** ruzstd documents `new()` as designed for reuse, and its reuse
+    // path is `FrameDecoderState::reset`, which calls
+    // `RingBuffer::reserve(window_size)` **eagerly** where the fresh path lets the
+    // ring grow on demand. Measured with a counting allocator: a 13-byte frame
+    // declaring a 64 MiB window costs a fresh decoder 8 841 bytes and a reused one
+    // 134 226 570 — and since neither ruzstd nor this module shrinks a buffer, a
+    // hoisted decoder would hold the largest window any chunk in the file declared
+    // for the rest of the ingest. What hoisting would save is 44 small allocations
+    // per chunk, worth 0.6–1.8% of that chunk's decode time. `window_ceiling` bounds
+    // the damage either way; the lazy path is what keeps the bound from being paid at
+    // all.
     let mut decoder = FrameDecoder::new();
+    // Bound the decoder's *working* allocation, which is a different number in a
+    // different header from the one `ChunkLimits` bounds. See `window_ceiling`.
+    let ceiling = window_ceiling(want);
+    decoder.set_max_window_size(ceiling);
     match decoder.decode_all(payload, &mut scratch[..]) {
         Ok(written) if written == want => Ok(()),
         // A frame that stopped early. **This is a correctness guard, not merely a
         // safety one**: the short output would otherwise parse as a valid but
-        // shorter record list, losing transforms with no counter anywhere to say
-        // so, because the tail of `scratch` is zeros that frame as empty records.
+        // shorter record list, losing transforms with no counter anywhere to say so.
+        // The bytes past `written` are whatever the buffer held — zeros on a fresh
+        // `scratch`, the previous chunk's records once it has been reused, since the
+        // `clear()` above was removed. Either way the walk finds a plausible record
+        // list and nothing complains, which is why the comparison and not the shape
+        // of the tail is what this arm relies on.
         Ok(written) => Err(ChunkFault::Bad(BadChunkKind::LengthMismatch {
             declared: clamp_u32(want as u64),
             produced: clamp_u32(written as u64),
@@ -495,6 +689,16 @@ fn decode_zstd(payload: &[u8], want: usize, scratch: &mut Vec<u8>) -> Result<(),
             codec: ChunkCodec::Zstd,
             declared: clamp_u32(want as u64),
         })),
+        // Named rather than folded into `Decompress`, because "its zstd stream did
+        // not decode" would be true and useless: nothing is wrong with the stream,
+        // this reader declined to allocate what the frame header asked for. The two
+        // numbers are what tells the two apart.
+        Err(FrameDecoderError::WindowSizeTooBig { requested, .. }) => {
+            Err(ChunkFault::Bad(BadChunkKind::ImplausibleWindow {
+                requested,
+                ceiling,
+            }))
+        }
         Err(_) => Err(ChunkFault::Bad(BadChunkKind::Decompress {
             codec: ChunkCodec::Zstd,
         })),
@@ -735,25 +939,31 @@ where
             Err(_) => return Err(framing(at)),
         };
         let len = u64::from_le_bytes(len_bytes);
-        // Two checks, not one. `usize::try_from` catches a length past the
-        // address space on a 32-bit host; the addition is checked because
-        // `at + HEADER + len` is the value that could wrap.
+        // `usize::try_from` is load-bearing on a 32-bit host: `len` came off disk as
+        // a `u64` and need not fit an address space at all.
         let len = match usize::try_from(len) {
             Ok(n) => n,
             Err(_) => return Err(framing(at)),
         };
-        let end = match at.checked_add(HEADER).and_then(|h| h.checked_add(len)) {
-            Some(e) if e <= records.len() => e,
-            // A body running past the end is the *other* face of truncation: the
-            // last record in a cut chunk declares more than survived.
-            _ => {
-                return if tolerate_tail {
-                    Ok(())
-                } else {
-                    Err(framing(at))
-                }
-            }
-        };
+        // **One comparison, and no checked arithmetic, because the invariant just
+        // above makes both unnecessary.** `remaining >= HEADER` was checked, so
+        // `remaining - HEADER` cannot underflow; and the sum below is bounded by
+        // `at + remaining == records.len()`, so it cannot overflow either. An earlier
+        // revision wrote `at.checked_add(HEADER).and_then(|h| h.checked_add(len))`,
+        // whose first check could not fire — a dead branch in the loop that runs once
+        // per record in the recording, which a later reader has to reason their way
+        // out of before they can trust the walk.
+        //
+        // A body running past the end is the *other* face of truncation: the last
+        // record in a cut chunk declares more than survived.
+        if len > remaining - HEADER {
+            return if tolerate_tail {
+                Ok(())
+            } else {
+                Err(framing(at))
+            };
+        }
+        let end = at + HEADER + len;
         g(opcode, &records[at + HEADER..end]).map_err(ChunkFault::Callback)?;
         at = end;
     }
@@ -997,13 +1207,19 @@ mod tests {
             "the whole surviving records prefix must be handed over"
         );
 
-        // The same bytes declared complete: now the length disagreement is real.
+        // The same bytes declared complete: now the size disagreement is real, and
+        // it is a **compressed**-size one — `compressed_size` against the bytes the
+        // record carries, which is a different fact from a decoder producing the
+        // wrong number of bytes and now says so.
         let mut scratch2 = Vec::new();
         let err = chunk_records(&body, true, limits(), &mut scratch2).unwrap_err();
-        assert!(
-            matches!(err, ChunkFault::Bad(BadChunkKind::LengthMismatch { .. })),
-            "got {err:?}"
-        );
+        match err {
+            ChunkFault::Bad(BadChunkKind::CompressedSizeMismatch { declared, present }) => {
+                assert_eq!(declared, 64);
+                assert_eq!(u64::from(present), (body.len() - HEADER_BYTES) as u64);
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 
     /// The span a skipped chunk reports comes from its header, and an unset one is
@@ -1187,7 +1403,10 @@ mod tests {
     /// `saturating_mul` the product pins at `u64::MAX`, the guard declines to fire,
     /// and the chunk is then refused a line later for declaring more compressed
     /// bytes than the record contains — which is the truthful complaint about this
-    /// header.
+    /// header, and is why the assertion names `CompressedSizeMismatch`. Reported as a
+    /// `LengthMismatch`, as it was, the same fault printed "it declared 4294967295
+    /// uncompressed bytes and produced 38" over two *compressed* figures, while the
+    /// header's only uncompressed number (1 000) appeared nowhere.
     ///
     /// Mutant: `saturating_mul` → `*` — applied, and this test failed with
     /// `attempt to multiply with overflow` inside `chunk_records`. That is a panic
@@ -1211,7 +1430,10 @@ mod tests {
         let mut scratch = Vec::new();
         let err = chunk_records(&body, true, limits(), &mut scratch).unwrap_err();
         assert!(
-            matches!(err, ChunkFault::Bad(BadChunkKind::LengthMismatch { .. })),
+            matches!(
+                err,
+                ChunkFault::Bad(BadChunkKind::CompressedSizeMismatch { .. })
+            ),
             "got {err:?}"
         );
     }
@@ -1283,7 +1505,8 @@ mod tests {
     /// # The CRC-0 rows are the ones that isolate the length check
     ///
     /// A chunk with a **computed** CRC is protected twice over: a short decode leaves
-    /// zero padding in the records field and a truncated read drops bytes from it, so
+    /// the buffer's previous contents in the records field and a truncated read drops
+    /// bytes from it, so
     /// the CRC over the whole field disagrees either way. The MCAP specification
     /// defines `uncompressed_crc == 0` as "not computed", real writers produce it, and
     /// `check_crc` therefore returns `Ok` unconditionally for it — so the under-run
@@ -1294,9 +1517,12 @@ mod tests {
     ///
     /// Mutant (zstd): `Ok(written) if written == want` → `Ok(_)` — applied, and the
     /// CRC-0 under-run row failed on `unwrap_err`, holding `Ok` with the records
-    /// followed by 64 zero bytes. Those zeros frame as empty records, so the walk
-    /// finds nothing to complain about: the chunk is silently short and no counter
-    /// anywhere says so. Before the CRC-0 rows existed the same mutant surfaced as
+    /// followed by 64 bytes of whatever `scratch` held — zeros here, because each row
+    /// starts from a fresh `Vec`, and the previous chunk's records in a real ingest,
+    /// since `decode_zstd` no longer `clear()`s. Zeros frame as empty records and
+    /// stale bytes frame as garbage, so the walk complains about neither reliably:
+    /// the chunk is silently short and no counter anywhere says so. Re-verified after
+    /// the `clear()` removal — the mutant is still the only failure in the crate. Before the CRC-0 rows existed the same mutant surfaced as
     /// `Bad(Crc { saved: 440882894, calculated: 1134732146 })` instead — a kill, but
     /// of the CRC rather than of this check, which is why they were added.
     ///
@@ -1481,6 +1707,144 @@ mod tests {
             let err = chunk_records(&body, true, limits(), &mut scratch).unwrap_err();
             assert_eq!(err, ChunkFault::Unsupported(want), "{codec}");
         }
+    }
+
+    /// A hand-rolled zstd frame: one raw block, and a **chosen window descriptor**.
+    ///
+    /// Hand-built because no encoder will produce this. `ruzstd`'s declares 128 KiB
+    /// and the `zstd` CLI's largest default-reachable declaration is 8 MiB, so the
+    /// frame that reaches the allocation these tests are about has to be written by
+    /// hand. Per the zstd specification: the magic, a frame-header descriptor of
+    /// `0x00` (no content size, not single-segment, no checksum, no dictionary), then
+    /// a `Window_Descriptor` with `Exponent` in bits 7..3 and `Mantissa` in 2..0 — so
+    /// the window is `1 << (10 + exponent)` — then a three-byte block header (last
+    /// block, raw type, size in bits 3..23) and the body verbatim.
+    #[cfg(feature = "compression")]
+    fn zstd_frame_with_window(exponent: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, exponent << 3];
+        let header = 1u32 | ((body.len() as u32) << 3);
+        v.extend_from_slice(&header.to_le_bytes()[..3]);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// **A zstd frame demanding a decoding window larger than this chunk could
+    /// possibly need is refused, and the two-frame row is the one that matters.**
+    ///
+    /// A window is the furthest back a match may reach, so one larger than the
+    /// frame's whole output is unusable — but `ruzstd` allocates from the *declared*
+    /// number, and on the second and later frames of a payload it does so **eagerly**
+    /// (`FrameDecoderState::reset` → `DecodeBuffer::reset` →
+    /// `RingBuffer::reserve(window_size)`; the first frame's `new` path lets the ring
+    /// grow on demand). Neither [`ChunkLimits`] guard can see it: both bound
+    /// `uncompressed_size`, and the window is a different field in a different
+    /// header, so lowering `--max-chunk-size` did not help.
+    ///
+    /// **Measured, out of tree, before `window_ceiling` existed:** this exact 26-byte
+    /// payload under an honest `uncompressed_size` of 8 and a correct CRC decoded to
+    /// the right eight bytes and drove the allocator to a **134 226 570-byte peak** —
+    /// 5 162 560× the input, and identical with `max_uncompressed_bytes` set to
+    /// 1 MiB. With `set_max_window_size(8 MiB)` the same payload peaked at **8 841
+    /// bytes** and returned
+    /// `Err(WindowSizeTooBig { requested: 67108864, max: 8388608 })`.
+    ///
+    /// That measurement is out of tree and stays there: it needs a counting
+    /// `#[global_allocator]`, which is an `unsafe impl` this crate's
+    /// `#![forbid(unsafe_code)]` will not admit even under `cfg(test)`. What is
+    /// asserted here is the fault — and ruzstd evaluates `check_window_size` *before*
+    /// `DecoderScratch::new`/`reset` in both paths, so the fault firing is the
+    /// allocation not happening.
+    ///
+    /// Mutant: drop `decoder.set_max_window_size(ceiling)` — applied, and this failed
+    /// on the two-frame row with `left: Ok("bbbbaaaa")` against
+    /// `right: Err(Bad(ImplausibleWindow { requested: 67108864, ceiling: 8388608 }))`.
+    /// That `Ok` **is** the 134 226 570-byte allocation, served from twenty-six bytes
+    /// and handed back as a correct answer. It killed
+    /// `the_window_floor_admits_what_a_real_zstd_encoder_declares` with it (its 16 MiB
+    /// row) and nothing else: 96 tests run, 94 passed, 2 failed — which is why the
+    /// hazard needed a test written for it rather than an existing one to notice.
+    #[cfg(feature = "compression")]
+    #[test]
+    fn a_zstd_frame_demanding_an_oversized_window_is_refused() {
+        /// `1 << (10 + 16)`, i.e. 64 MiB — what `zstd --ultra -21` declares, and
+        /// eight times what any default-reachable encoder does.
+        const HOSTILE_EXPONENT: u8 = 16;
+        const HOSTILE_WINDOW: u64 = 1 << (10 + HOSTILE_EXPONENT as u64);
+
+        // Two concatenated frames: the second is the one that reaches the eager
+        // `reset` path, and `decode_all` accepts a multi-frame payload silently.
+        let mut two = zstd_frame_with_window(3, b"bbbb");
+        two.extend_from_slice(&zstd_frame_with_window(HOSTILE_EXPONENT, b"aaaa"));
+        assert_eq!(two.len(), 26, "the amplification is the point of this row");
+
+        for (label, payload, want) in [
+            ("two frames", two, 8u64),
+            (
+                "one frame",
+                zstd_frame_with_window(HOSTILE_EXPONENT, b"aaaa"),
+                4,
+            ),
+        ] {
+            // `uncompressed_crc == 0` is "not computed" per the specification, so the
+            // window bound is the only thing that can refuse these bytes: they decode,
+            // and they decode to exactly what the header declares.
+            let body = chunk_body("zstd", want, 0, payload.len() as u64, &payload);
+            let mut scratch = Vec::new();
+            let got = chunk_records(&body, true, limits(), &mut scratch)
+                .map(|r| String::from_utf8_lossy(r).into_owned());
+            assert_eq!(
+                got,
+                Err(ChunkFault::Bad(BadChunkKind::ImplausibleWindow {
+                    requested: HOSTILE_WINDOW,
+                    ceiling: MIN_ZSTD_WINDOW_BYTES,
+                })),
+                "{label}"
+            );
+        }
+    }
+
+    /// **The window floor admits the largest window a real encoder declares, and
+    /// nothing above it.**
+    ///
+    /// This is the other half of the bound, and the half that a bomb guard tuned by
+    /// feel gets wrong: too low a floor rejects ordinary recordings, because a
+    /// streaming encoder declares the window it *might* use and cannot know the source
+    /// size. Measured on this host, piping bytes through `zstd -19` declares exactly
+    /// 8 MiB whatever the input size, and every chunk of the committed
+    /// `testdata/zstd_conformance.mcap` declares it for ~660 uncompressed bytes.
+    ///
+    /// Mutant: `window_ceiling` returning `want` with no floor — applied, and the
+    /// first row failed with
+    /// `an 8 MiB window must be accepted: Bad(ImplausibleWindow { requested: 8388608, ceiling: 4 })`.
+    /// It took eight other tests with it, including
+    /// `ingest::a_real_libzstd_recording_ingests` (the same claim against bytes libzstd
+    /// actually produced), `fixture::tests::a_compressed_fixture_round_trips_through_the_reader`
+    /// and `ingest::a_zstd_recording_ingests_identically` — i.e. a floor chosen too low
+    /// refuses every compressed recording this crate can write or read.
+    #[cfg(feature = "compression")]
+    #[test]
+    fn the_window_floor_admits_what_a_real_zstd_encoder_declares() {
+        // `1 << (10 + 13)` is 8 MiB, exactly `MIN_ZSTD_WINDOW_BYTES`.
+        assert_eq!(MIN_ZSTD_WINDOW_BYTES, 1 << (10 + 13));
+        let payload = zstd_frame_with_window(13, b"aaaa");
+        let body = chunk_body("zstd", 4, 0, payload.len() as u64, &payload);
+        let mut scratch = Vec::new();
+        let got = chunk_records(&body, true, limits(), &mut scratch)
+            .unwrap_or_else(|e| panic!("an 8 MiB window must be accepted: {e:?}"));
+        assert_eq!(got, b"aaaa");
+
+        // One exponent higher is 16 MiB, and is refused — so the floor is a boundary
+        // rather than a number that merely happens to be large enough.
+        let payload = zstd_frame_with_window(14, b"aaaa");
+        let body = chunk_body("zstd", 4, 0, payload.len() as u64, &payload);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            chunk_records(&body, true, limits(), &mut scratch),
+            Err(ChunkFault::Bad(BadChunkKind::ImplausibleWindow {
+                requested: 16 * 1024 * 1024,
+                ceiling: MIN_ZSTD_WINDOW_BYTES,
+            }))
+        );
     }
 
     /// Compress with `ruzstd`'s own encoder, for a round-trip fixture.

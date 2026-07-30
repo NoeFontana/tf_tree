@@ -28,14 +28,23 @@ hash of the input is what checks libzstd's output.
 
 ### Exactly how it was generated
 
-```text
-$ zstd --version
-*** Zstandard CLI (64-bit) v1.5.5, by Yann Collet ***
+The generator reports the compressor's own version banner, so one command is the
+whole transcript. Verbatim, with only the absolute path elided:
 
+```text
 $ cargo run -p tf_tree_ingest --features fixture --example gen_zstd_conformance
-wrote crates/tf_tree_ingest/testdata/zstd_conformance.mcap
-  (1069 B, 3 chunks, from 1982 uncompressed B)
+wrote …/crates/tf_tree_ingest/testdata/zstd_conformance.mcap (1069 B, 3 chunks, from 1982 uncompressed B) using *** Zstandard CLI (64-bit) v1.5.5, by Yann Collet ***
 ```
+
+An earlier revision of this block showed a hand-written two-line output under the
+same heading, which is not what the program prints. In a section whose whole job is
+provenance, a transcript a reader cannot reproduce character for character costs
+exactly the trust the section exists to earn.
+
+**Regeneration is byte-reproducible on zstd 1.5.5**: re-running the command over the
+committed file leaves it identical (`cmp` clean), which is verified rather than
+assumed. So a diff on this file always means either the corpus or the compressor
+changed, and never that the generator is nondeterministic.
 
 The example pipes each chunk's records field through:
 

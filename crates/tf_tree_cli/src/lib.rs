@@ -430,6 +430,12 @@ pub struct IngestArgs {
     /// recording written with larger chunks is unusual rather than corrupt, and the
     /// person who meets the limit is the person who cannot patch the library.
     ///
+    /// **It bounds the output buffer, not this process's peak.** The decoder allocates
+    /// its own working set alongside it: measured, `ruzstd` adds about 2 MiB of peak
+    /// while decoding a 1 MiB chunk and 6.5 MiB for a 4 MiB one, tracking the frame's
+    /// declared window rather than this number. Sizing a container against this flag
+    /// should allow for roughly 2.6× it.
+    ///
     /// The default is derived from the library constant rather than written down, so
     /// the two cannot drift.
     #[arg(

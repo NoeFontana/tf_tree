@@ -239,6 +239,29 @@ ingest-check:
     # cannot read an ordinary bag.
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
     cargo nextest run -p tf_tree_cli --no-default-features
+    # **The shipped CLI links both codecs, asserted against the dependency graph
+    # because no test inside the crate can assert it.**
+    #
+    # `tf_tree_cli/tests/ingest.rs::the_cli_compression_feature_switches_the_reader`
+    # catches a feature edge that is *wired wrong* — a dependency re-enabling or
+    # failing to forward `tf_tree_ingest/compression` independently of what the CLI
+    # asked for, the way `tf_tree_bench` once did to `counters`. It cannot catch
+    # `compression` being **deleted** from `[features] default`, and this was
+    # verified rather than assumed: with the feature removed from the manifest,
+    # `cargo nextest run -p tf_tree_cli` ran 117 tests and all 117 passed. Every
+    # `cfg!` in the crate is relative to the configuration being deleted, so both
+    # sides of that assertion go `false` together and the end-to-end zstd test
+    # compiles to nothing.
+    #
+    # The workspace declares `tf_tree_ingest` with `default-features = false`, so
+    # the deletion ships a `cargo install tf_tree_cli` that refuses every zstd bag —
+    # the ordinary rosbag2/Foxglove case — while `cargo build --workspace`,
+    # `just lint` and `cargo nextest run --workspace` all stay green through feature
+    # unification. The graph is the only place the invariant is visible.
+    cargo tree -q -p tf_tree_cli -e normal | grep -q ruzstd || \
+        { echo "tf_tree_cli's default build has no zstd decoder: is 'compression' still in [features] default?"; exit 1; }
+    cargo tree -q -p tf_tree_cli -e normal | grep -q lz4_flex || \
+        { echo "tf_tree_cli's default build has no lz4 decoder: is 'compression' still in [features] default?"; exit 1; }
 
 lint: py-compile
     cargo fmt --all -- --check
@@ -255,6 +278,19 @@ lint: py-compile
     # `tf_tree_ingest`'s `fixture` module is default-off and so is invisible to the
     # workspace pass above, for the same reason. See `ingest-check`.
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
+    # **And its `compression` axis, which is the *other* direction: default-ON, so
+    # the workspace pass compiles the codec-free half nowhere.** This line belongs in
+    # `lint` and not only in `ingest-check`, because `lint` is the recipe CI's lint
+    # job mirrors and the recipe a contributor runs before pushing: without it, a
+    # clippy error under `--no-default-features` — `tests/codec_free.rs`, the
+    # `is_built_in` arm, `fixture`'s `CodecUnavailable` arm — was reachable only by
+    # someone who also ran `just test`.
+    #
+    # Verified to be a real gate: a `clippy::len_zero` injected into
+    # `tests/codec_free.rs` left `cargo clippy --workspace --all-targets -- -D warnings`
+    # finishing clean, and this line failed on it.
+    cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
+    cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
 
 # **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
 #

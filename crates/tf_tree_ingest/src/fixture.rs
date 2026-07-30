@@ -542,8 +542,27 @@ impl FixtureCodec {
 /// Compress one chunk's records field, as the codec MCAP names it does.
 ///
 /// The compression level is the cheapest one on purpose: these corpora are a few
-/// kilobytes and the property under test is the framing and the length
-/// bookkeeping, not the ratio.
+/// kilobytes and the property under test is the framing and the length bookkeeping,
+/// not the ratio.
+///
+/// # These frames are written by the decoder's own crate — never read a timing taken
+/// from them as a bag timing
+///
+/// `ruzstd`'s encoder, not libzstd, so every compressed fixture in this crate proves
+/// **round-trip** and not conformance, and its frames are not shaped like the ones a
+/// recorder writes. Measured on this host: `ruzstd` decodes its own `Fastest` output
+/// at 849 MiB/s and a libzstd `-3` frame at 674 MiB/s, and it declares a 128 KiB
+/// window where a streaming `zstd -19` declares 8 MiB. So a fixture understates the
+/// decode cost of a real recording by roughly **1.3×** and exercises a different
+/// window path. `testdata/zstd_conformance.mcap` is what closes the conformance half
+/// for zstd; nothing closes it for lz4, because this host has no `lz4` CLI, and
+/// `testdata/ATTRIBUTION.md` says so rather than implying the two are equal.
+///
+/// There is also **no ingest benchmark in `crates/tf_tree_bench`**, so
+/// `just bench-check` cannot see a throughput regression on this path and
+/// `docs/PHASE5.md` §12's ingest gate is asserted by no code. A benchmark whose
+/// corpus came from *this* function would understate it by the factor above, which is
+/// why one has not simply been added; §11 records what it would take.
 #[cfg_attr(not(feature = "compression"), allow(unused_variables))]
 fn compress_records(codec: FixtureCodec, bytes: &[u8]) -> Result<Vec<u8>, FixturePlanError> {
     match codec {
@@ -587,9 +606,14 @@ fn compress_records(codec: FixtureCodec, bytes: &[u8]) -> Result<Vec<u8>, Fixtur
 pub enum ChunkDamage {
     /// `compressed_size` declares more bytes than the chunk record contains.
     ///
-    /// Detected in every build, as `BadChunkKind::LengthMismatch`: the chunk is
-    /// complete, so its declared size is compared against what is present rather
-    /// than clamped the way a truncated chunk's is.
+    /// Detected in every build, as `BadChunkKind::CompressedSizeMismatch`: the
+    /// chunk is complete, so its declared size is compared against what is present
+    /// rather than clamped the way a truncated chunk's is.
+    ///
+    /// **Not `LengthMismatch`**, which it used to be. Neither number in this fault
+    /// is an uncompressed byte count and no decoder has run, so the message that
+    /// variant renders ("it declared N uncompressed bytes and produced M") named
+    /// the wrong field of the header.
     CompressedSizeTooLarge,
     /// `compressed_size` declares four bytes fewer than the records field holds.
     ///
@@ -1538,11 +1562,16 @@ mod tests {
     /// Every [`ChunkDamage`]'s documented fault, checked against
     /// `crate::decompress` rather than asserted in prose.
     ///
-    /// Two of these are not what a reader would guess, which is why the table is
-    /// worth pinning: a **short** `compressed_size` is caught by the CRC rather
-    /// than as a length fault, because a short declaration is satisfiable and the
-    /// saved hash covers the whole records field; and a lying `uncompressed_size`
-    /// is caught by **nothing at all** in this codec-free build.
+    /// Three of these are not what a reader would guess, which is why the table is
+    /// worth pinning. A **long** `compressed_size` is a `CompressedSizeMismatch`
+    /// and not a `LengthMismatch`, because no decoder has run and neither number is
+    /// an uncompressed byte count. A **short** one is caught by the
+    /// `uncompressed_size == compressed_size` invariant rather than by the CRC —
+    /// which is what closed the "no computed CRC" gap the variant's docs used to
+    /// record as live. And a lying `uncompressed_size` is caught in *every* build,
+    /// including the codec-free one, by that same invariant; an earlier revision of
+    /// this paragraph said it was caught by nothing, which the row at the bottom of
+    /// this test disproves.
     ///
     /// Mutant: `chunk_body` hashing the records *after* the flip for
     /// `FlippedBitInRecords` — applied, and the `FlippedBitInRecords` row failed
@@ -1569,7 +1598,7 @@ mod tests {
 
         assert!(matches!(
             fault_of(ChunkDamage::CompressedSizeTooLarge),
-            Some(ChunkFault::Bad(BadChunkKind::LengthMismatch { .. }))
+            Some(ChunkFault::Bad(BadChunkKind::CompressedSizeMismatch { .. }))
         ));
         // A short `compressed_size` is now caught by the size invariant rather than
         // by the CRC, which is what closes the "no computed CRC" gap the variant's

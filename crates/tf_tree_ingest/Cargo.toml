@@ -78,7 +78,35 @@ mcap = { version = "0.25", default-features = false }
 #
 # It also fixes the workspace MSRV at 1.87 (`rust-version = "1.87"`); the root
 # manifest's MSRV comment records that trade.
-ruzstd = { version = "0.9", optional = true }
+#
+# **`default-features = false` here, and it means the opposite of what it means for
+# `lz4_flex` below — the asymmetry is the point.** ruzstd's defaults are
+# `["hash", "std"]`, and `hash` gates a *computation*, not a `forbid(unsafe_code)`
+# attribute. With it on, `DecodeBuffer::drain_to`/`drain` xxhash64 every byte they
+# hand out — unconditionally, not only when the frame declares a content checksum —
+# and the sole consumer of the result is `get_calculated_checksum()`, which
+# `crate::decompress` deliberately never calls, because the chunk's own CRC32 over
+# the same bytes is the hash the MCAP writer actually committed to. So the hottest
+# loop in the ingest was making a full extra pass over every decompressed byte to
+# produce a number nothing reads. Measured on a 4 MiB libzstd `-3` frame the
+# saving is small — 673.9 against 665.1 MiB/s, about 1%, which is inside this
+# host's run-to-run spread — so the case for turning it off is that the work is
+# provably unused, not that the benchmark is decisive.
+#
+# Decoding is unaffected: `state.check_sum` is read from the stream outside the
+# `cfg` and `decode_all` compares nothing either way, so a frame carrying an XXH64
+# content checksum still decodes byte-identically.
+#
+# Two consequences worth stating rather than leaving to be discovered.
+# `twox-hash` stays in `Cargo.lock` regardless, pulled by `lz4_flex`'s `frame`
+# feature, so neither the lock file's crate list nor the licence position changes.
+# And `encoding::FrameCompressor` sets `content_checksum: cfg!(feature = "hash")`,
+# so the round-trip fixtures now carry frames without a zstd content checksum —
+# which matches `testdata/ATTRIBUTION.md`'s deliberate `--no-check` on the
+# conformance fixture, and matches the fact that nothing here would verify one.
+ruzstd = { version = "0.9", optional = true, default-features = false, features = [
+    "std",
+] }
 # **The lz4 decoder, pure Rust. MCAP's `"lz4"` is the LZ4 *frame* format**, so
 # `crate::decompress` drives `lz4_flex::frame::FrameDecoder` and never the
 # block-format helpers — the crate `#[deprecated]`s its crate-root block
@@ -96,10 +124,11 @@ ruzstd = { version = "0.9", optional = true }
 # in this file. `frame` is a default feature and implies `std`.
 lz4_flex = { version = "0.14", optional = true }
 # Not named here, but new in `Cargo.lock` and worth one line: **`twox-hash 2.x`
-# arrives through both crates above** — ruzstd's default `hash` feature wants
-# xxhash64 for the zstd content checksum, lz4_flex's `frame` feature wants
-# xxhash32 for the LZ4 frame checksum. Same major, so Cargo unifies them to one
-# version (`cargo tree -d` is the check). It carries 4 `unsafe` occurrences.
+# arrives through `lz4_flex`**, whose `frame` feature wants xxhash32 for the LZ4
+# frame checksum. It used to arrive through ruzstd's `hash` feature as well; that
+# is off now (see above) and `twox-hash` stays anyway, which is why turning it off
+# changed the lock file by one dependency edge and not by one crate. It carries 4
+# `unsafe` occurrences. `cargo tree -i twox-hash` is the check.
 thiserror.workspace = true
 # **Chunk CRC32 validation, which became this crate's job with `emit_chunks`.**
 #

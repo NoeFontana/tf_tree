@@ -147,3 +147,27 @@ fn an_uncompressed_recording_still_ingests_in_a_codec_free_build() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **`compression_compiled_in` reports the truth about *this* build.**
+///
+/// The predicate exists so a consumer can tell "the reader has no zstd decoder" from
+/// "the reader has one" across a crate boundary that `cfg!` cannot cross —
+/// `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` is the
+/// consumer, and it compares its own `cfg!` against this. That comparison is only
+/// worth anything if the predicate is not simply a constant, and **this is the only
+/// configuration in which a constant `true` is wrong**. Its counterpart in the default
+/// build is `ingest::the_predicate_reports_a_build_with_codecs`.
+///
+/// Mutant: `compression_compiled_in` returning `true` unconditionally — applied, and
+/// this failed with "a --no-default-features build must report no codecs", taking
+/// `ingest::the_predicate_reports_a_build_with_codecs` with it: 85 tests run, 83
+/// passed, 2 failed. **The default build stayed green with that mutant — 97 of 97 —
+/// which is exactly why the assertion has to live here**, in the configuration
+/// `cargo nextest run --workspace` does not compile.
+#[test]
+fn the_predicate_reports_a_codec_free_build() {
+    assert!(
+        !tf_tree_ingest::compression_compiled_in(),
+        "a --no-default-features build must report no codecs"
+    );
+}

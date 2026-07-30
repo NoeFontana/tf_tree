@@ -354,3 +354,102 @@ fn split_is_a_known_value_that_is_refused_with_a_reason() {
         "the refusal should carry its reason: {stderr}"
     );
 }
+
+/// **The CLI's `compression` feature must actually control the reader's**, and a
+/// compressed bag must survive the whole binary.
+///
+/// The manifest comment on `compression = ["tf_tree_ingest/compression"]` argues that
+/// the line is load-bearing, and it is right: the workspace declares `tf_tree_ingest`
+/// with `default-features = false`, so deleting it ships a `cargo install` that
+/// refuses every zstd bag — the ordinary rosbag2/Foxglove case — while
+/// `cargo build --workspace`, `just lint` and `cargo nextest run --workspace` all
+/// stay green, because building `tf_tree_ingest` as a workspace member turns its own
+/// defaults on and feature unification covers for the missing edge. Nothing asserted
+/// it. `counters` has had exactly this test since the same defect bit it once.
+///
+/// Mutant: replace the `tf_tree_ingest` dev-dependency's `workspace = true` (which
+/// carries the workspace's `default-features = false`) with a plain path dependency,
+/// so its defaults come back — applied, and under
+/// `cargo nextest run -p tf_tree_cli --no-default-features` this failed with
+/// `left: false, right: true`: "the CLI asked for compression=false but the reader was
+/// built with compression=true". It was the only failure in the crate. That is the
+/// counters defect exactly, one feature over.
+///
+/// **What this test cannot catch, stated because the reviewer's suggested fix assumed
+/// it could.** Deleting `compression` from `[features] default` *and* from
+/// `[features]` — the failure the manifest comment warns about — leaves this
+/// assertion passing: both sides go `false` together, and
+/// `a_zstd_bag_ingests_through_the_binary` below compiles to nothing. Applied and
+/// measured: 117 tests ran and 117 passed. Every `cfg!` in this crate is relative to
+/// the configuration being deleted, so no in-crate test can see it. That invariant is
+/// asserted against the dependency graph instead, in `just ingest-check`
+/// (`cargo tree -p tf_tree_cli -e normal | grep -q ruzstd`), which does fire.
+#[test]
+fn the_cli_compression_feature_switches_the_reader() {
+    assert_eq!(
+        cfg!(feature = "compression"),
+        tf_tree_ingest::compression_compiled_in(),
+        "the CLI asked for compression={} but the reader was built with \
+         compression={}; the tf_tree_ingest/compression feature edge is broken, or \
+         some dependency is re-enabling it through its own defaults",
+        cfg!(feature = "compression"),
+        tf_tree_ingest::compression_compiled_in()
+    );
+}
+
+/// A zstd-compressed bag ingests through the shipped binary.
+///
+/// Separate from the predicate above because it proves the other direction: that the
+/// feature being on means the *binary* reads a compressed recording, not merely that
+/// two `cfg!`s agree. No `tf_tree_cli` test did that before — `grep -rn FixtureCodec
+/// crates/tf_tree_cli/` returned nothing — so the CLI's headline capability was
+/// exercised only one crate down. Gated on `compression`, because the codec-free
+/// build refuses this bag by design and `fixture::chunked_mcap_bytes` will not even
+/// write it.
+///
+/// Mutant: `IngestArgs::to_options` hard-coding `max_chunk_expansion_ratio: 1` —
+/// applied, and this failed with `status Some(1)` and
+/// `the recording contains no tf2_msgs/msg/TFMessage transforms` on stderr: every
+/// chunk expands by more than 1×, so every chunk is refused and an intact recording
+/// reads as empty. It killed `tests::the_chunk_bounds_default_to_the_librarys_and_are_settable`
+/// with it — but that unit test only compares two numbers, while this one shows what
+/// the wrong number does to a real file through the real binary.
+#[cfg(feature = "compression")]
+#[test]
+fn a_zstd_bag_ingests_through_the_binary() {
+    use tf_tree_ingest::fixture::{write_mcap_chunked, ChunkedSpec, FixtureCodec};
+
+    let dir = Scratch::new("zstd");
+    let bag = dir.0.join("zstd.mcap");
+    write_mcap_chunked(
+        &bag,
+        &small_recording(),
+        ChunkedSpec::new(8).compressed(FixtureCodec::Zstd),
+    )
+    .unwrap();
+
+    let out = tf_tree()
+        .arg("ingest")
+        .arg("--bag")
+        .arg(&bag)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "status {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The same counts the uncompressed fixture of this corpus produces, so the
+    // decompression is transparent rather than merely non-fatal.
+    assert!(
+        stdout.contains("2 static edges, 3 dynamic edges"),
+        "summary:\n{stdout}"
+    );
+    assert!(stdout.contains("160 samples stored"), "summary:\n{stdout}");
+    assert!(
+        !stdout.contains(" ! "),
+        "a clean bag reports no anomalies:\n{stdout}"
+    );
+}
