@@ -621,9 +621,11 @@ pub enum ChunkDamage {
     CompressedSizeTooLarge,
     /// `compressed_size` declares four bytes fewer than the records field holds.
     ///
-    /// Detected in every build, as `BadChunkKind::LengthMismatch`, because on an
-    /// uncompressed chunk the two size fields must agree and this variant makes
-    /// them differ by four.
+    /// Detected in every build, as `BadChunkKind::StoredSizeMismatch`, because on
+    /// an uncompressed chunk the two size fields must agree and this variant makes
+    /// them differ by four. **Not `LengthMismatch`**, which it used to be: neither
+    /// number is a decoder's output, and the variant's own docs say why the
+    /// distinction is worth a variant.
     ///
     /// **It used to be caught by the CRC instead, and the change closed a real
     /// gap.** A short declaration is satisfiable, so the reader used to hand over a
@@ -689,19 +691,21 @@ pub enum ChunkDamage {
     InnerRecordRunsPastTheEnd,
     /// `uncompressed_size` declares 64 bytes more than the records field holds.
     ///
-    /// **Detected in every build, as `BadChunkKind::LengthMismatch` — but by a
-    /// different check on each path, which is why this is the one variant worth
-    /// writing both ways.**
+    /// **Detected in every build, but by a different check on each path and as a
+    /// different fault, which is why this is the one variant worth writing both
+    /// ways.**
     ///
-    /// * Uncompressed: the records are stored verbatim, so
-    ///   `uncompressed_size == compressed_size` is an invariant, checkable from two
-    ///   `u64`s nine bytes apart in a header `ChunkHead::parse` already walks past.
-    ///   `mcap`'s own writer and reader treat them as equal, and
+    /// * Uncompressed: `BadChunkKind::StoredSizeMismatch`. The records are stored
+    ///   verbatim, so `uncompressed_size == compressed_size` is an invariant,
+    ///   checkable from two `u64`s nine bytes apart in a header `ChunkHead::parse`
+    ///   already walks past. `mcap`'s own writer and reader treat them as equal, and
     ///   `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
-    ///   asserts it of every clean chunk here.
-    /// * Compressed: the field is the allocation size, so the decoder is handed a
-    ///   64-byte-too-large output buffer, produces less than it, and the produced
-    ///   length disagrees with the declared one.
+    ///   asserts it of every clean chunk here. No decoder is involved, which is
+    ///   exactly what makes the fault kind a different one.
+    /// * Compressed: `BadChunkKind::LengthMismatch`. The field is the allocation
+    ///   size, so the decoder is handed a 64-byte-too-large output buffer, produces
+    ///   less than it, and the produced length — a real count, from a decoder that
+    ///   really ran — disagrees with the declared one.
     ///
     /// An earlier revision of this variant was undetected in every build, and its
     /// docs said so at length. Both halves of that gap are closed;
@@ -1609,7 +1613,7 @@ mod tests {
         // docs used to record as a live one.
         assert!(matches!(
             fault_of(ChunkDamage::CompressedSizeTooSmall),
-            Some(ChunkFault::Bad(BadChunkKind::LengthMismatch { .. }))
+            Some(ChunkFault::Bad(BadChunkKind::StoredSizeMismatch { .. }))
         ));
         assert!(matches!(
             fault_of(ChunkDamage::UncompressedCrc),
@@ -1656,7 +1660,7 @@ mod tests {
         assert!(
             matches!(
                 fault_of(ChunkDamage::UncompressedSizeTooLarge),
-                Some(ChunkFault::Bad(BadChunkKind::LengthMismatch { .. }))
+                Some(ChunkFault::Bad(BadChunkKind::StoredSizeMismatch { .. }))
             ),
             "got {:?}",
             fault_of(ChunkDamage::UncompressedSizeTooLarge)

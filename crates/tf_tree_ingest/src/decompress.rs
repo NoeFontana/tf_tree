@@ -201,13 +201,22 @@ pub enum BadChunkKind {
     ///
     /// **Separate from [`BadChunkKind::LengthMismatch`] because the exact
     /// produced count is unknowable**, and inventing one would be a lie in an
-    /// error message. Both decoders detect the over-run by being handed an
-    /// output buffer one byte larger than the declared size and finding it
-    /// insufficient, so what is known is "more than `declared`", not how much
-    /// more — and finding out would mean decoding an unbounded amount, which is
-    /// precisely what [`ChunkLimits`] exists to refuse. It is not
-    /// [`BadChunkKind::Decompress`] either: the codec did nothing wrong, the
-    /// header disagrees with it about a length.
+    /// error message: what is known is "more than `declared`", not how much more,
+    /// and finding out would mean decoding an unbounded amount — precisely what
+    /// [`ChunkLimits`] exists to refuse. It is not [`BadChunkKind::Decompress`]
+    /// either: the codec did nothing wrong, the header disagrees with it about a
+    /// length.
+    ///
+    /// **The two decoders detect it differently, and neither mechanism should be
+    /// changed on the strength of the other.** `decode_lz4` is the one handed a
+    /// budget one byte larger than the declared size, because `lz4_flex` has no
+    /// one-shot frame API and the extra byte is also what drives its `EndMark`
+    /// checks — see that function. `decode_zstd` hands `ruzstd` a slice of exactly
+    /// `want` and reads the over-run off `FrameDecoderError::TargetTooSmall`; an
+    /// earlier revision of this paragraph said both used the `+ 1`, which would
+    /// invite "simplifying" the zstd slice to `want + 1` and losing the guard,
+    /// since `decode_all` would then return `Ok(want + 1)` and land in the
+    /// [`BadChunkKind::LengthMismatch`] arm with a fabricated produced count.
     #[error("its {codec} stream produced more than the {declared} uncompressed bytes it declared")]
     Overrun {
         /// Which codec was in use.
@@ -236,6 +245,29 @@ pub enum BadChunkKind {
         declared: u32,
         /// How many bytes of the records field the chunk record actually holds.
         present: u32,
+    },
+    /// An **uncompressed** chunk's two size fields disagree.
+    ///
+    /// Records stored verbatim make `uncompressed_size == compressed_size` an
+    /// invariant, checkable from two `u64`s nine bytes apart with no decoder
+    /// involved — which is exactly why it is not
+    /// [`BadChunkKind::LengthMismatch`], as it used to be. That variant's
+    /// `produced` field is documented as "what the decoder actually wrote", and on
+    /// this path no decoder has run: the message read "it declared 87 uncompressed
+    /// bytes and produced 23" over two *header* fields, sending an operator to a
+    /// decompressor that was never consulted. That is the same misdiagnosis
+    /// [`BadChunkKind::CompressedSizeMismatch`] was split out to end, left in place
+    /// one branch over.
+    ///
+    /// Raised only on a **complete** chunk: a truncated one's `compressed_size`
+    /// describes bytes that were never written, so the two disagree for a reason
+    /// that is not damage.
+    #[error("it is stored uncompressed but declares {uncompressed} bytes against {compressed}")]
+    StoredSizeMismatch {
+        /// `ChunkHeader::uncompressed_size`.
+        uncompressed: u32,
+        /// `ChunkHeader::compressed_size`.
+        compressed: u32,
     },
     /// A zstd frame asks for a decoding window larger than this reader will
     /// allocate for a chunk of this size.
@@ -422,9 +454,13 @@ pub(crate) fn chunk_records<'a>(
         // chunk — a truncated one's `compressed_size` describes bytes that were
         // never written, so the two disagree for a reason that is not damage.
         if complete && head.uncompressed_size != head.compressed_size {
-            return Err(ChunkFault::Bad(BadChunkKind::LengthMismatch {
-                declared: clamp_u32(head.uncompressed_size),
-                produced: clamp_u32(head.compressed_size),
+            // **`StoredSizeMismatch` and not `LengthMismatch`**, for the reason
+            // that variant records: both numbers here are header fields and no
+            // decoder has run, so "declared N uncompressed bytes and produced M"
+            // named a decompressor this arm never reaches.
+            return Err(ChunkFault::Bad(BadChunkKind::StoredSizeMismatch {
+                uncompressed: clamp_u32(head.uncompressed_size),
+                compressed: clamp_u32(head.compressed_size),
             }));
         }
         // **A truncated chunk's CRC cannot be checked, and pretending otherwise
@@ -1280,6 +1316,12 @@ mod tests {
     /// `CompressedSizeTooSmall` row) and
     /// `ingest::a_lying_uncompressed_size_is_refused` (`bad_chunks` 0 against 1).
     ///
+    /// Mutant 3: report the disagreement as `LengthMismatch` again — applied, and
+    /// this failed on `expected a StoredSizeMismatch`. That is the fault kind this
+    /// check raised until the message was read as prose: "declared 87 uncompressed
+    /// bytes and produced 23" over two header fields sends an operator to the
+    /// decompressor, which this arm never reaches.
+    ///
     /// Mutant 2: drop the `complete &&` term so the check also runs on a truncated
     /// chunk — applied, and the truncated case below failed ("a truncated chunk's
     /// size disagreement is truncation, not corruption"), which is a SIGKILLed
@@ -1295,11 +1337,27 @@ mod tests {
         let mut scratch = Vec::new();
         let err = chunk_records(&body, true, limits(), &mut scratch).unwrap_err();
         match err {
-            ChunkFault::Bad(BadChunkKind::LengthMismatch { declared, produced }) => {
-                assert_eq!(u64::from(declared), len + 64);
-                assert_eq!(u64::from(produced), len);
+            ChunkFault::Bad(kind) => {
+                let BadChunkKind::StoredSizeMismatch {
+                    uncompressed,
+                    compressed,
+                } = kind
+                else {
+                    panic!("expected a StoredSizeMismatch, got {kind:?}")
+                };
+                assert_eq!(u64::from(uncompressed), len + 64);
+                assert_eq!(u64::from(compressed), len);
+                // **And it names two header fields rather than a decoder's
+                // output.** The fault this used to raise rendered as "it declared N
+                // uncompressed bytes and produced M", a sentence about a
+                // decompressor; nothing on this path decompresses anything.
+                let text = kind.to_string();
+                assert!(
+                    text.contains("stored uncompressed") && !text.contains("produced"),
+                    "the message must not describe a decode that never happened: {text}"
+                );
             }
-            other => panic!("expected a LengthMismatch, got {other:?}"),
+            other => panic!("expected a StoredSizeMismatch, got {other:?}"),
         }
 
         // **The same bytes as a truncated chunk are not damage.** A recording cut
