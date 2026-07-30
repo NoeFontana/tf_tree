@@ -558,6 +558,13 @@ pub(crate) fn chunk_records<'a>(
 /// called — so the worst case is one chunk's ceiling, not the largest chunk in
 /// any file the process has ever read.
 ///
+/// **Both arms below grow it with `reserve_exact`, and that is what makes the
+/// sentence above true rather than approximately true.** `Vec`'s amortised growth
+/// is the right default when the final size is unknown; here it is `want`, so
+/// doubling only overshoots — measured at up to 2× before the change, and
+/// permanent, because nothing shrinks the buffer afterwards.
+/// `the_output_buffer_is_not_doubled_past_the_chunk` is the assertion.
+///
 /// **That argument is about the output buffer and extends to nothing else.** In
 /// particular it does not extend to the codec decoders, which are constructed per
 /// chunk on purpose: see the comment at `FrameDecoder::new` in `decode_zstd`, where
@@ -686,6 +693,19 @@ fn decode_zstd(payload: &[u8], want: usize, scratch: &mut Vec<u8>) -> Result<(),
     // nothing. The lz4 arm below *does* `clear()`, because `read_to_end` appends
     // rather than overwriting — the asymmetry is real and neither side should be
     // "tidied" into the other.
+    // **Grown exactly, before `resize` grows it amortised.** `resize` reserves the
+    // shortfall through `Vec`'s doubling path, so a chunk one kilobyte larger than
+    // the previous one doubles the buffer: measured, a 1 049 609-byte chunk
+    // following a 1 048 585-byte one took the capacity to 2 097 170 — 1 047 561
+    // bytes of overshoot that then stayed resident, since this buffer is
+    // deliberately never shrunk. Doubling is the right default when the final size
+    // is unknown; here it is `want`, checked against the ceiling two guards
+    // earlier, so the exact request is both cheaper and what makes
+    // `--max-chunk-size` mean what its help text says.
+    //
+    // `reserve_exact(0)` is a no-op, so the steady state of near-uniform chunks —
+    // where `scratch` is already long enough — costs nothing.
+    scratch.reserve_exact(want.saturating_sub(scratch.len()));
     scratch.resize(want, 0);
     // **The decoder is constructed per chunk on purpose. Do not hoist it beside
     // `scratch`.** ruzstd documents `new()` as designed for reuse, and its reuse
@@ -769,6 +789,22 @@ fn decode_lz4(payload: &[u8], want: usize, scratch: &mut Vec<u8>) -> Result<(), 
     use std::io::Read;
 
     scratch.clear();
+    // **Sized up front, because `read_to_end` would otherwise double its way there
+    // and overshoot by up to 2×.** Measured before this line existed: a 4 MiB chunk
+    // left `scratch` holding 8 388 608 bytes of capacity, a 1 MiB chunk 2 097 152 —
+    // and since the buffer is deliberately never shrunk, that peak stayed resident
+    // for the rest of the ingest. It contradicted the bound `decompress_into`
+    // states ("the worst case is one chunk's ceiling") and the arithmetic an
+    // operator does with `--max-chunk-size`, which is the number they size a
+    // container against.
+    //
+    // `want + 1` and not `want`, because that is exactly the budget below: a
+    // conforming frame fills `want`, and the one extra byte is what a *lying* one
+    // needs room for so the over-run is detected rather than silently truncated.
+    // Exact rather than amortised, since the size is known: this is one allocation
+    // for the whole recording instead of ~20 realloc-and-copy rounds on the first
+    // chunk of every pass.
+    scratch.reserve_exact(want + 1);
     let decoder = lz4_flex::frame::FrameDecoder::new(std::io::Cursor::new(payload));
     let budget = (want as u64).saturating_add(1);
     if let Err(_e) = decoder.take(budget).read_to_end(scratch) {
@@ -1874,6 +1910,69 @@ mod tests {
             0x05,
             b"lz4 from the spec:  lz4 from the spec:   no!!!!!!! liblz4-free.",
         )
+    }
+
+    /// **The output buffer is sized to the chunk, not doubled past it.**
+    ///
+    /// `scratch` is the caller's buffer for the whole recording and is deliberately
+    /// never shrunk, so any overshoot is not transient — it stays resident for the
+    /// rest of the ingest. That makes `Vec`'s amortised growth the wrong policy
+    /// here: the final size is *known* (`want`, already checked against
+    /// `ChunkLimits::max_uncompressed_bytes` two guards earlier), so doubling buys
+    /// nothing and costs up to 2×.
+    ///
+    /// It is also what `--max-chunk-size` promises. `decompress_into`'s docs say
+    /// "the worst case is one chunk's ceiling", and an operator sizing a container
+    /// against that flag is doing arithmetic this test keeps true.
+    ///
+    /// Both codecs, because they reached the same defect by different routes and a
+    /// fix to one is not a fix to the other: `read_to_end` doubles as it appends,
+    /// and `resize` reserves its shortfall through the same doubling path.
+    ///
+    /// # The growth case is the one that matters
+    ///
+    /// Decoding into a *fresh* buffer was already exact, because `Vec`'s growth
+    /// takes `max(2 * capacity, needed)` and `2 * 0` loses. The defect only appears
+    /// on reuse, which is the only thing that ever happens in a real ingest — and
+    /// measured before the fix, a 1 049 609-byte chunk following a 1 048 585-byte
+    /// one took zstd's buffer to 2 097 170 bytes, and every lz4 chunk overshot by
+    /// nearly 2× regardless of order (4 MiB of records leaving 8 388 608 bytes
+    /// resident).
+    ///
+    /// Mutant: drop either `reserve_exact` — applied, and this fails on the codec
+    /// whose line was removed, at the 1025 KiB step for zstd and at the first step
+    /// for lz4.
+    #[cfg(feature = "compression")]
+    #[test]
+    fn the_output_buffer_is_not_doubled_past_the_chunk() {
+        for codec in [ChunkCodec::Zstd, ChunkCodec::Lz4] {
+            // One buffer across four chunks, one of which is barely larger than the
+            // last: that step is what triggers a doubling, and a test whose sizes
+            // all doubled cleanly would pass either way.
+            let mut scratch = Vec::new();
+            for kib in [1024usize, 1025, 2048, 4096] {
+                let records = inner_record(0x05, &vec![0x41u8; kib * 1024]);
+                let want = records.len();
+                let payload = if codec == ChunkCodec::Zstd {
+                    encode_zstd(&records)
+                } else {
+                    encode_lz4(&records)
+                };
+                decompress_into(codec, &payload, want, &mut scratch)
+                    .unwrap_or_else(|e| panic!("{codec} at {kib} KiB: {e:?}"));
+                assert_eq!(scratch.len(), want, "{codec} at {kib} KiB");
+                // **One byte of slack, and it is lz4's read budget rather than
+                // rounding.** `decode_lz4` reserves `want + 1` so an over-long frame
+                // has somewhere to land and is caught instead of being truncated;
+                // `decode_zstd` needs no such byte and is asserted exact.
+                let slack = if codec == ChunkCodec::Lz4 { 1 } else { 0 };
+                assert_eq!(
+                    scratch.capacity(),
+                    want + slack,
+                    "{codec} at {kib} KiB overshot: a buffer this reader never shrinks                      must not be doubled past the chunk it was sized for"
+                );
+            }
+        }
     }
 
     /// A chunk labelled with a codec whose payload is not that codec fails to
