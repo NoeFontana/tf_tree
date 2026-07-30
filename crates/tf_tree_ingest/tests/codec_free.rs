@@ -55,8 +55,8 @@ fn corpus() -> Vec<FixtureMessage> {
 /// a `cfg` that covered only one of them would be invisible everywhere else.
 ///
 /// Mutant: make `ChunkCodec::is_built_in` return `true` for `Zstd`/`Lz4`
-/// unconditionally, i.e. drop its `#[cfg]` — applied, and **all 85 tests still
-/// passed**, this one included (97 of 97 in the default build).
+/// unconditionally, i.e. drop its `#[cfg]` — applied, and **the whole suite still
+/// passed**, this one included, in both feature configurations.
 /// `decompress_into`'s fallback arm returns `ChunkFault::Unsupported` for any codec
 /// it has no decoder for, so the answer is unchanged; the property is
 /// **structurally guarded** by that arm, which exists precisely so a `cfg` mistake
@@ -124,8 +124,8 @@ fn a_compressed_chunk_is_refused_by_name_in_a_codec_free_build() {
 ///
 /// Mutant: `ChunkCodec::parse("")` → `Self::Other` — applied, and this failed with
 /// `the recording uses an unrecognised codec-compressed chunks, which this build
-/// cannot read` (39 of this configuration's 85 tests died with it, and 42 of the
-/// default build's 97). That mutant is the reason this test is here rather than only
+/// cannot read` — **39 tests died with it** in this configuration (of 85) and 42 in
+/// the default build (of 99). That mutant is the reason this test is here rather than only
 /// in the default configuration: the uncompressed path is now one arm of a codec
 /// `match`, and this is the build where nothing else can reach the other arms at
 /// all.
@@ -163,7 +163,7 @@ fn an_uncompressed_recording_still_ingests_in_a_codec_free_build() {
 /// Mutant: `compression_compiled_in` returning `true` unconditionally — applied, and
 /// this failed with "a --no-default-features build must report no codecs", taking
 /// `ingest::the_predicate_reports_a_build_with_codecs` with it: 85 tests run, 83
-/// passed, 2 failed. **The default build stayed green with that mutant — 97 of 97 —
+/// passed, 2 failed. **The default build stayed entirely green with that mutant —
 /// which is exactly why the assertion has to live here**, in the configuration
 /// `cargo nextest run --workspace` does not compile.
 #[test]

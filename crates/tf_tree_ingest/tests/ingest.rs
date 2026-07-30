@@ -2175,9 +2175,12 @@ fn a_lying_uncompressed_size_is_refused() {
 //
 // Every fixture below is compressed by the same crates that read it back, which
 // proves round-trip and **not** conformance. `a_real_libzstd_recording_ingests`
-// closes that gap for zstd against the host's `zstd` CLI; there is no `lz4` CLI
-// here, so lz4 has round-trip coverage only, and this comment is the honest
-// statement of that asymmetry rather than a claim that both are equal.
+// closes that gap for zstd against the host's `zstd` CLI. There is no `lz4` CLI
+// here, so lz4 closes it the other way — `decompress::tests::
+// a_hand_authored_lz4_frame_decodes_per_the_specification` reads a frame written by
+// hand from the LZ4 format, which no encoder in this dependency tree produced. The
+// asymmetry that remains is one of *scope*: zstd's evidence is a whole recording and
+// lz4's is one frame. `testdata/ATTRIBUTION.md` states it exactly.
 // ---------------------------------------------------------------------------
 
 /// **A zstd recording ingests byte-for-byte identically to the uncompressed one.**

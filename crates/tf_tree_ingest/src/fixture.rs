@@ -34,8 +34,11 @@
 //! * A fixture this module compresses proves **round-trip**, not conformance with
 //!   what a real recorder writes. `testdata/zstd_conformance.mcap` is compressed
 //!   by the real `zstd` CLI (libzstd 1.5.5) for exactly that gap; see
-//!   `testdata/ATTRIBUTION.md`. There is no `lz4` CLI on this host, so **lz4 has
-//!   round-trip coverage only** — stated rather than implied.
+//!   `testdata/ATTRIBUTION.md`. There is no `lz4` CLI on this host, so lz4 closes
+//!   the same gap from the other end — a **hand-authored 82-byte frame** in
+//!   `crate::decompress`'s tests, written from the LZ4 specification rather than by
+//!   any encoder. What lz4 still lacks is a whole *recording* from an independent
+//!   writer; `testdata/ATTRIBUTION.md` states the remaining asymmetry exactly.
 //! * The codec is orthogonal to [`ChunkDamage`], and each damage variant's
 //!   documented fault is the one it produces on an **uncompressed** chunk unless
 //!   the variant says otherwise. `ChunkDamage::UncompressedSizeTooLarge` is the
@@ -555,8 +558,9 @@ impl FixtureCodec {
 /// window where a streaming `zstd -19` declares 8 MiB. So a fixture understates the
 /// decode cost of a real recording by roughly **1.3×** and exercises a different
 /// window path. `testdata/zstd_conformance.mcap` is what closes the conformance half
-/// for zstd; nothing closes it for lz4, because this host has no `lz4` CLI, and
-/// `testdata/ATTRIBUTION.md` says so rather than implying the two are equal.
+/// for zstd; for lz4, with no `lz4` CLI on this host, it is closed by a
+/// hand-authored spec frame instead of by an independently written file, and
+/// `testdata/ATTRIBUTION.md` states what that does and does not cover.
 ///
 /// There is also **no ingest benchmark in `crates/tf_tree_bench`**, so
 /// `just bench-check` cannot see a throughput regression on this path and
@@ -1736,7 +1740,7 @@ mod tests {
     /// while exercising the mislabelled-payload path instead.
     ///
     /// Mutant: delete `chunk_body`'s `codec.is_available()` guard — applied, and
-    /// **all 85 tests still passed** (97 of 97 in the default build):
+    /// **the whole suite still passed**, in both feature configurations:
     /// `compress_records`'s own `#[cfg(not(feature = "compression"))]` arm returns
     /// the same `CodecUnavailable`, with the same codec name. The property is therefore
     /// **structurally guarded** by that arm; the guard in `chunk_body` is a second,

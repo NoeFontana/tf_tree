@@ -1607,6 +1607,217 @@ mod tests {
         }
     }
 
+    /// **A conformance vector for lz4, authored from the specification rather than
+    /// produced by an encoder.**
+    ///
+    /// This is the lz4 half of the argument `testdata/ATTRIBUTION.md` makes for the
+    /// zstd fixture: an encoder and a decoder *from the same crate* can agree with
+    /// each other and both disagree with the liblz4 that rosbag2 and Foxglove link,
+    /// so `encode_lz4` round-tripping proves the two halves of `lz4_flex` consistent
+    /// and nothing more. zstd closes that with a frame from the real `zstd` CLI. There
+    /// is no `lz4` CLI on this host, and installing one is not available to a test, so
+    /// this closes it the other way: **the 82 bytes below were written by hand from
+    /// the LZ4 frame and block formats**, and `lz4_flex` has to agree with the
+    /// specification about what they mean.
+    ///
+    /// It is an independent vector rather than a round-trip in disguise, and the last
+    /// assertion proves it: `lz4_flex`'s own encoder does **not** produce these bytes
+    /// for this input. The sequences were chosen by hand, not searched for by a
+    /// compressor, so that one small frame exercises every decoding rule that could
+    /// plausibly be got wrong:
+    ///
+    /// * **A literal-length extension.** 29 literals, so the token's high nibble is
+    ///   15 and a `14` continuation byte follows — the `255`-continuation scheme.
+    /// * **A match-length extension.** A 20-byte match, so the low nibble is 15 and a
+    ///   `1` continuation byte follows (`20 - 4 - 15`). The `- 4` is the format's
+    ///   minimum match length and a decoder that forgets it is off by four.
+    /// * **An overlapping match**, offset 1 and length 6: a run of `!`. This is the
+    ///   rule a decoder breaks by copying the match with a wide `memcpy` instead of
+    ///   byte by byte, which is *correct* for the non-overlapping match above and
+    ///   wrong here.
+    /// * **The frame's own framing**: the `0x184D2204` magic, an `FLG` byte declaring
+    ///   block independence with both a content size and a content checksum, a `BD`
+    ///   byte, the header checksum (`xxh32(descriptor) >> 8`), a block-size word whose
+    ///   high bit is clear for "compressed", the `EndMark`, and the trailing xxh32 of
+    ///   the content. `decode_lz4`'s `+ 1` read budget is what makes `lz4_flex` reach
+    ///   the `EndMark` arm and check the last two of those at all, so this vector is
+    ///   also the only test in which that checksum is ever verified.
+    ///
+    /// The frame decodes to one MCAP inner record, so it is asserted twice: through
+    /// `decode_lz4` for the bytes, and through `chunk_records` — the real entry point,
+    /// with a real CRC — for the whole path.
+    ///
+    /// The `xxh32` values were computed from that algorithm's specification and
+    /// checked against its published vectors (`""` → `0x02cc5d05`, `"a"` →
+    /// `0x550d7456`, `"abc"` → `0x32d153ff`) before this frame was assembled, so a bug
+    /// in the checksum arithmetic could not have produced a frame that is
+    /// self-consistently wrong.
+    ///
+    /// Every byte of the frame is load-bearing, which
+    /// `a_single_flipped_bit_in_the_lz4_vector_is_caught` asserts exhaustively rather
+    /// than by spot check — see it for the one nibble that is *correctly* insensitive.
+    #[cfg(feature = "compression")]
+    #[test]
+    fn a_hand_authored_lz4_frame_decodes_per_the_specification() {
+        let want = lz4_vector_content();
+        assert_eq!(want.len(), 72, "the frame declares 72 content bytes");
+
+        let mut scratch = Vec::new();
+        decompress_into(ChunkCodec::Lz4, LZ4_SPEC_VECTOR, want.len(), &mut scratch)
+            .unwrap_or_else(|e| panic!("the hand-authored frame did not decode: {e:?}"));
+        assert_eq!(scratch, want, "lz4_flex disagrees with the specification");
+
+        // And through the real entry point, under a real CRC, so the vector covers
+        // the path a recording takes rather than only the decoder.
+        let chunk = chunk_body(
+            "lz4",
+            want.len() as u64,
+            crc32fast::hash(&want),
+            LZ4_SPEC_VECTOR.len() as u64,
+            LZ4_SPEC_VECTOR,
+        );
+        let mut scratch = Vec::new();
+        let got = chunk_records(&chunk, true, limits(), &mut scratch)
+            .unwrap_or_else(|e| panic!("the hand-authored chunk did not read: {e:?}"));
+        assert_eq!(got, &want[..]);
+        let mut seen = Vec::new();
+        for_each_record(got, false, |op, b| {
+            seen.push((op, b.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(0x05u8, want[9..].to_vec())]);
+
+        // **The vector is independent, asserted rather than claimed.** If
+        // `lz4_flex`'s encoder happened to emit exactly these bytes, this test would
+        // be `encode_lz4` round-tripping under another name and the conformance claim
+        // above would be false.
+        assert_ne!(
+            encode_lz4(&want),
+            LZ4_SPEC_VECTOR,
+            "the vector must not be what lz4_flex's own encoder produces"
+        );
+    }
+
+    /// **The vector's non-vacuity, exhaustively: of the 656 single-bit
+    /// perturbations of its 82 bytes, 651 are caught and the 5 that are not are
+    /// enumerated and explained.**
+    ///
+    /// A hand-authored fixture is worth exactly what its assertions are worth, and
+    /// "any byte flipped ⇒ the test fails" is a claim that can be *checked* instead of
+    /// asserted in a comment. Every bit of every byte is flipped in turn, and the
+    /// result must be a fault or content that differs from the expected 72 bytes —
+    /// never a clean decode of the right ones.
+    ///
+    /// The survivors are asserted as an exact **set** rather than a count, because
+    /// that is the form in which a change means something: a survivor appearing
+    /// elsewhere is a region of the frame this vector does not really cover, and one
+    /// of these two disappearing is `lz4_flex` becoming stricter. Either is worth a
+    /// failure that names the byte.
+    ///
+    /// # Why those five bits are don't-cares
+    ///
+    /// * **Byte 60, bits 0–3.** The final sequence's token is `0xd0`: 13 literals in
+    ///   the high nibble, `0` in the low one. The low nibble is the match length, and
+    ///   a block's last sequence has no match — the decoder stops after its literals
+    ///   and never reads an offset — so the format leaves those four bits unused.
+    ///   Measured, the split is exactly that: all four low bits inert, all four high
+    ///   bits (the literal count) lethal.
+    /// * **Byte 77, bit 7.** The high bit of the `EndMark`, which turns the
+    ///   all-zero word into `0x80000000` — the block-size field's "stored
+    ///   uncompressed" flag over a length of zero. `lz4_flex` ends the frame on
+    ///   `size & 0x7fff_ffff == 0`, so it reads that as the `EndMark`; the format
+    ///   spells the mark as exactly four zero bytes. A leniency in the decoder, not
+    ///   a hole in the vector, and it costs nothing here: the frame still ends where
+    ///   it should and the content checksum after it is still verified.
+    ///
+    /// # What the failure modes say, measured
+    ///
+    /// Almost every caught flip is `Decompress`; the interesting ones are not:
+    ///
+    /// * Byte 53 (`0x42`, the second sequence's token) `^ 1` is the lone `Overrun`:
+    ///   its match length goes from 6 to 7, so the frame produces 73 bytes for a
+    ///   declared 72 and is caught by the one-byte-over read budget rather than by any
+    ///   checksum.
+    /// * Byte 49 (the `0x14` match offset) `^ 1` still produces exactly 72 bytes, so
+    ///   no length check can see it. It is caught because `lz4_flex` verifies the
+    ///   frame's xxh32 content checksum — which happens only because `decode_lz4`
+    ///   reads one byte past `want` and so reaches the `EndMark` arm.
+    /// * Bytes 78–81 (that checksum) are caught for the same reason. So this test is
+    ///   a second, independent mutant for `decode_lz4`'s `take(budget)`: under
+    ///   `take(want)` the `EndMark` is never reached and all five of those flips
+    ///   decode clean.
+    #[cfg(feature = "compression")]
+    #[test]
+    fn a_single_flipped_bit_in_the_lz4_vector_is_caught() {
+        /// `(byte, bit)` pairs the format or the decoder treats as don't-care. See
+        /// this test's doc comment for why each is one.
+        const DONT_CARE: &[(usize, u32)] = &[(60, 0), (60, 1), (60, 2), (60, 3), (77, 7)];
+
+        let want = lz4_vector_content();
+        let mut survivors = Vec::new();
+        let mut checked = 0usize;
+        for at in 0..LZ4_SPEC_VECTOR.len() {
+            for bit in 0..8u32 {
+                let mut frame = LZ4_SPEC_VECTOR.to_vec();
+                frame[at] ^= 1u8 << bit;
+                let mut scratch = Vec::new();
+                checked += 1;
+                match decompress_into(ChunkCodec::Lz4, &frame, want.len(), &mut scratch) {
+                    Ok(()) if scratch == want => survivors.push((at, bit)),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(checked, 82 * 8);
+        assert_eq!(
+            survivors, DONT_CARE,
+            "the set of bits this vector does not cover has changed: a new entry is a \
+             region of the frame it only appears to exercise, and a missing one is \
+             lz4_flex having become stricter"
+        );
+    }
+
+    /// The 82 hand-authored bytes of
+    /// `a_hand_authored_lz4_frame_decodes_per_the_specification`.
+    ///
+    /// Written out from the LZ4 frame and block formats; see that test for what each
+    /// region is and why each was chosen. There is deliberately **no** recipe that
+    /// regenerates this — a vector regenerated by a tool is a round-trip again, and a
+    /// round-trip is what it exists to replace.
+    #[cfg(feature = "compression")]
+    const LZ4_SPEC_VECTOR: &[u8] = &[
+        // magic, FLG, BD, content size (72), header checksum
+        0x04, 0x22, 0x4d, 0x18, 0x6c, 0x40, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xd0, // block size: 55, high bit clear -> a compressed block
+        0x37, 0x00, 0x00, 0x00,
+        // sequence 1: token 0xff (literal nibble 15, match nibble 15), literal-length
+        // extension 14 -> 29 literals; then offset 20 and match-length extension 1 ->
+        // a 20-byte match, replaying the phrase.
+        0xff, 0x0e, 0x05, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6c, 0x7a, 0x34, 0x20,
+        0x66, 0x72, 0x6f, 0x6d, 0x20, 0x74, 0x68, 0x65, 0x20, 0x73, 0x70, 0x65, 0x63, 0x3a, 0x20,
+        0x20, 0x14, 0x00, 0x01,
+        // sequence 2: token 0x42 -> 4 literals, then a 6-byte match at offset 1: an
+        // overlapping run of `!`.
+        0x42, 0x20, 0x6e, 0x6f, 0x21, 0x01, 0x00,
+        // sequence 3: token 0xd0 -> 13 literals and no match, which is how a block's
+        // last sequence is spelled.
+        0xd0, 0x20, 0x6c, 0x69, 0x62, 0x6c, 0x7a, 0x34, 0x2d, 0x66, 0x72, 0x65, 0x65, 0x2e,
+        // EndMark, then xxh32 of the 72 uncompressed bytes
+        0x00, 0x00, 0x00, 0x00, 0x1a, 0x6c, 0xf9, 0x70,
+    ];
+
+    /// What [`LZ4_SPEC_VECTOR`] must decode to: one MCAP inner record whose body
+    /// repeats a phrase (the 20-byte match) and then a run of one byte (the
+    /// overlapping match).
+    #[cfg(feature = "compression")]
+    fn lz4_vector_content() -> Vec<u8> {
+        inner_record(
+            0x05,
+            b"lz4 from the spec:  lz4 from the spec:   no!!!!!!! liblz4-free.",
+        )
+    }
+
     /// A chunk labelled with a codec whose payload is not that codec fails to
     /// decode, and is a **skippable** bad chunk rather than an unsupported one.
     ///
@@ -1683,8 +1894,8 @@ mod tests {
     /// unsupported and nothing tries to decode.
     ///
     /// Mutant: make `is_built_in` return `true` for `Zstd`/`Lz4` unconditionally,
-    /// i.e. drop its `#[cfg]` — applied, and **all 85 tests still passed** (97 of 97
-    /// in the default build). That is not a gap being hidden: `decompress_into`'s
+    /// i.e. drop its `#[cfg]` — applied, and **the whole suite still passed**, in both
+    /// feature configurations. That is not a gap being hidden: `decompress_into`'s
     /// fallback arm returns `ChunkFault::Unsupported` for any codec it has no decoder
     /// for, so the answer is identical by construction. The property is **structurally guarded** by that
     /// arm, which exists precisely so that a `cfg` mistake cannot become a wrong
@@ -1861,8 +2072,12 @@ mod tests {
     /// Compress with `lz4_flex`'s **frame** encoder — the container MCAP's `"lz4"`
     /// names.
     ///
-    /// There is no `lz4` CLI on this host, so lz4 has round-trip coverage only.
-    /// That asymmetry with zstd is stated rather than papered over.
+    /// **Round-trip is not conformance here either**, for the same reason
+    /// `encode_zstd` says so. zstd answers it with a file from the real `zstd` CLI;
+    /// there is no `lz4` CLI on this host, so lz4 answers it from the other end, with
+    /// the hand-authored [`LZ4_SPEC_VECTOR`] that
+    /// `a_hand_authored_lz4_frame_decodes_per_the_specification` reads. This function
+    /// is what that test asserts it is *not*.
     #[cfg(feature = "compression")]
     fn encode_lz4(bytes: &[u8]) -> Vec<u8> {
         use std::io::Write;
