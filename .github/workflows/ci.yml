@@ -144,11 +144,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: just,cargo-nextest
       - name: cargo nextest
         run: cargo nextest run --workspace --no-tests=pass
       - name: cargo test --doc
         run: cargo test --doc --workspace
+      # **`tf_tree_ingest`'s feature axes, which the `--workspace` line above
+      # compiles exactly one of.** `compression` is default-ON, so
+      # `#[cfg(not(feature = "compression"))]` code — `tests/codec_free.rs`, the
+      # `is_built_in` arm that refuses a codec, `fixture`'s `CodecUnavailable` arm —
+      # is compiled by nothing here: `cargo nextest run --workspace` runs 612 tests
+      # and includes none of the five that exist only in that configuration.
+      # `fixture` is default-OFF and has the same hole in the other direction. The
+      # recipe also asserts, against the dependency graph, that the shipped CLI's
+      # default build still links both codecs, which no test in that crate can see.
+      #
+      # `just test` depends on `ingest-check`, but this job does not run `just test`
+      # — it runs the two commands above directly — so without this step CLAUDE.md's
+      # "CI mirrors these recipes 1:1" was false for exactly the configuration this
+      # PR created. Same shape as the `-p tf_tree_c --features bridge` gap that
+      # `test-rust` carries a comment about.
+      - name: just ingest-check
+        run: just ingest-check
 
   docs:
     name: docs

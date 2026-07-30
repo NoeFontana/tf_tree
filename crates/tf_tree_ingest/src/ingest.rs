@@ -52,7 +52,8 @@ use tf_tree_bridge::names::NameNormalizer;
 use tf_tree_bridge::statics::{StaticKind, StaticStore, StaticVerdict};
 use tf_tree_bridge::Publisher;
 
-use crate::source::{read_tf, OnBadChunk, RawRecord, TopicRoles};
+use crate::decompress::ChunkLimits;
+use crate::source::{read_tf, ChunkPolicy, OnBadChunk, RawRecord, TopicRoles};
 use crate::spill;
 use crate::{FrameId, IngestError};
 
@@ -77,6 +78,24 @@ pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// second this would fire on ordinary sensor pipelines that stamp at capture
 /// and publish after processing.
 pub const DEFAULT_FUTURE_HORIZON_NS: i64 = 10_000_000_000;
+
+/// Default ceiling on one chunk's declared `uncompressed_size`: **64 MiB**.
+///
+/// Chosen against what recorders write, not against what the format permits:
+/// rosbag2 and Foxglove chunk at 1–8 MiB, and `mcap`'s own writer defaults to
+/// 1 MiB. 64 MiB is an order of magnitude above any of them and two orders below
+/// a size that can exhaust a machine, which is the gap a bound wants to sit in.
+pub const DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default ceiling on one chunk's `uncompressed_size / compressed_size`: **1024**.
+///
+/// The absolute ceiling alone is not a bomb guard, because 64 MiB of output from
+/// 200 bytes of input fits under any ceiling generous enough for a real
+/// recording. Real MCAP chunks of CDR transforms compress at roughly 2–5×; zstd's
+/// theoretical maximum on a degenerate frame is far past this, so 1024 admits
+/// every plausible recording and refuses the shape whose only purpose is to
+/// allocate.
+pub const DEFAULT_MAX_CHUNK_EXPANSION_RATIO: u64 = 1024;
 
 /// How ingest should handle a backward clock jump (§3.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,6 +132,24 @@ pub struct IngestOptions {
     pub future_horizon_ns: i64,
     /// A `tf_prefix` to apply to every frame name (§5.6).
     pub tf_prefix: Option<String>,
+    /// Ceiling on one chunk's declared `uncompressed_size`, in bytes.
+    ///
+    /// **A knob and not a constant, because the person who meets a limit is the
+    /// person who cannot patch the crate.** A recording written with 128 MiB
+    /// chunks is unusual and is not corrupt; a reader that refuses it with no
+    /// number to raise is a reader that has to be forked. Defaults to
+    /// [`DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES`].
+    ///
+    /// It bounds the compressed path only. The uncompressed path returns the
+    /// records **by borrow** and allocates nothing, so there is no allocation for
+    /// a ceiling to bound — see `crate::decompress::chunk_records`.
+    pub max_chunk_uncompressed_bytes: u64,
+    /// Ceiling on one chunk's `uncompressed_size / compressed_size`. Defaults to
+    /// [`DEFAULT_MAX_CHUNK_EXPANSION_RATIO`].
+    ///
+    /// The second half of the decompression-bomb guard; the absolute ceiling
+    /// above cannot do this job on its own.
+    pub max_chunk_expansion_ratio: u64,
     /// Where §3.1's spill file goes when one edge alone exceeds
     /// [`max_memory_bytes`](IngestOptions::max_memory_bytes). `None` means
     /// `std::env::temp_dir()`.
@@ -134,7 +171,34 @@ impl Default for IngestOptions {
             clock_reset_threshold_ns: tf_tree_bridge::clock::DEFAULT_RESET_THRESHOLD_NANOS,
             future_horizon_ns: DEFAULT_FUTURE_HORIZON_NS,
             tf_prefix: None,
+            max_chunk_uncompressed_bytes: DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES,
+            max_chunk_expansion_ratio: DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
             spill_dir: None,
+        }
+    }
+}
+
+impl IngestOptions {
+    /// The two chunk bounds as the reader wants them.
+    ///
+    /// A method rather than a field holding a [`ChunkLimits`], because the options
+    /// are a flat struct every caller builds with `..Default::default()` and a
+    /// nested struct would make the two numbers reachable two ways. This is the
+    /// join, done once.
+    #[must_use]
+    pub fn chunk_limits(&self) -> ChunkLimits {
+        ChunkLimits {
+            max_uncompressed_bytes: self.max_chunk_uncompressed_bytes,
+            max_expansion_ratio: self.max_chunk_expansion_ratio,
+        }
+    }
+
+    /// Everything [`read_tf`] needs to know about how to treat a chunk.
+    #[must_use]
+    pub fn chunk_policy(&self) -> ChunkPolicy {
+        ChunkPolicy {
+            on_bad: self.on_bad_chunk,
+            limits: self.chunk_limits(),
         }
     }
 }
@@ -354,7 +418,7 @@ pub fn survey(
         remaps: Vec::new(),
     };
 
-    let skips = read_tf(path, &opts.roles, opts.on_bad_chunk, |rec| {
+    let skips = read_tf(path, &opts.roles, opts.chunk_policy(), |rec| {
         out.transforms_read += 1;
         let Some((parent, child)) = normalize_pair(&mut normalizer, &rec, frames) else {
             out.anomalies.empty_names += 1;
@@ -679,7 +743,7 @@ pub fn fill(
             None => NameNormalizer::new(),
         };
 
-        read_tf(path, &opts.roles, opts.on_bad_chunk, |rec| {
+        read_tf(path, &opts.roles, opts.chunk_policy(), |rec| {
             if rec.is_static || rec.stamp_ns == 0 {
                 return Ok(());
             }
@@ -836,7 +900,7 @@ fn fill_spilled(
     };
     stats.passes += 1;
 
-    read_tf(path, &opts.roles, opts.on_bad_chunk, |rec| {
+    read_tf(path, &opts.roles, opts.chunk_policy(), |rec| {
         if rec.is_static || rec.stamp_ns == 0 {
             return Ok(());
         }

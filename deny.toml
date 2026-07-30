@@ -46,7 +46,31 @@ confidence-threshold = 0.93
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
-deny = []
+# **`docs/PHASE2.md` §2's no-C-build-step rule, converted from prose into something
+# `just lint` can fail on.**
+#
+# The rule is argued in five places — the root `Cargo.toml`, `tf_tree_ingest`'s
+# `mcap`/`ruzstd`/`lz4_flex` dependency comments, `decompress.rs`'s module header and
+# `docs/PHASE5.md` §0.0 — and every one of them was a comment. The mistake they warn
+# about is concrete and one line long: writing
+# `mcap = { features = ["zstd"] }`, or reaching for `zstd = "0.13"` as a
+# dev-dependency to generate a fixture. Either pulls a `*-sys` crate whose build
+# script compiles C, and before this list `cargo build`, `just test`, `just lint` and
+# `cargo deny check` all passed while it happened.
+#
+# `[graph] all-features = true` above means this sees every feature combination of
+# every workspace member, so it cannot be evaded by hiding the dependency behind a
+# feature. It is a **ban and not an exception**: it makes the check stricter, and it
+# does not false-positive on the current graph — `cargo deny check` passes with it,
+# because the pure-Rust `ruzstd`/`lz4_flex` path deliberately reaches none of these.
+#
+# If a future zstd frame genuinely cannot be decoded by `ruzstd`, the answer is a
+# decision record about `docs/PHASE2.md` §2, not an entry removed from here.
+deny = [
+    { name = "zstd-sys" },
+    { name = "lz4-sys" },
+    { name = "libz-sys" },
+]
 
 [sources]
 unknown-registry = "deny"

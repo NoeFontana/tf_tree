@@ -70,10 +70,15 @@ the number that drifts.
   raises it — a language or standard-library feature that removes real
   complexity, or a dependency that has already moved. "The toolchain moved on" is
   not a reason.
-- **The floor is enforced, not intended.** The `msrv` job in
-  `.github/workflows/ci.yml` reads `rust-version` out of the manifest and builds
-  `--locked` on exactly that toolchain, so a dependency that quietly needs a
-  newer compiler fails the build instead of shipping. **Both raises so far were
+- **The floor is enforced, not intended, and enforced on a host as well as in
+  CI.** `just msrv` reads `rust-version` out of the manifest, builds `--locked` on
+  exactly that toolchain, and compares every hand-written `rust-version` in the
+  repository against the workspace's; the `msrv` job in
+  `.github/workflows/ci.yml` runs the same two steps. So a dependency that quietly
+  needs a newer compiler fails the build instead of shipping. The local recipe
+  exists because for one release the CI job was the *only* thing enforcing the
+  floor, and CI stopped running — a floor gated solely by a workflow nobody runs
+  is back to being intended. **Both raises so far were
   forced by a dependency, and both were measured rather than assumed:**
   - 1.83 → 1.85: `blake3` pulls `constant_time_eq 0.4.2`, which is edition 2024
     and will not even parse on 1.83.
@@ -83,7 +88,11 @@ the number that drifts.
     capability, so this one is a deliberate trade for a maintained release, and
     it is the first raise that was not strictly unavoidable.
 
-  Verified locally with `cargo +1.87 build --workspace --lib --bins --locked`.
+  Verified locally with `just msrv`, whose build step is
+  `cargo +1.87 build --workspace --lib --bins --locked`. Both of its arms were
+  checked against a deliberate mutant rather than assumed: `cargo +1.85` fails with
+  `ruzstd@0.9.0 requires rustc 1.87`, and a crate's hand-written `rust-version` set
+  to `1.86` is reported by name.
 - Development happens on `stable` (`rust-toolchain.toml`). Clippy and rustfmt are
   run on `stable`, not on the MSRV toolchain — lint output is not part of the
   compatibility promise.

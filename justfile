@@ -212,11 +212,56 @@ cpp-deps:
 ingest-check:
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --features fixture
+    # **The codec-free build, which `--workspace` compiles nowhere.**
+    #
+    # `tf_tree_ingest`'s `compression` feature is default-**on**, so every other
+    # recipe in this file compiles exactly one configuration and
+    # `#[cfg(not(feature = "compression"))]` code — `tests/codec_free.rs`, the
+    # `is_built_in` arm that refuses a codec, `fixture`'s refusal to write one —
+    # is compiled by nothing. That is the same shape as the four defects
+    # `test-rust` and `shm-check` exist for, one crate over: a configuration
+    # nobody builds is not a checked configuration, and here the unchecked one is
+    # what a `--no-default-features` consumer gets.
+    #
+    # Verified to be a real gate rather than a no-op: this line runs 85 tests,
+    # five of which exist only in this configuration.
+    cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_ingest --no-default-features
     # The CLI's `ingest_err` arms are the only place the remedy text for a
     # compressed or bad chunk exists, and they are reachable only from a build
     # that can produce those errors.
     cargo clippy -p tf_tree_cli --all-targets -- -D warnings
     cargo nextest run -p tf_tree_cli
+    # And the CLI without its defaults, which drops both `counters` and
+    # `compression` — the second forwards to `tf_tree_ingest/compression`, and the
+    # workspace declares that dependency `default-features = false`, so this is
+    # the configuration where a missing feature edge would show up as a CLI that
+    # cannot read an ordinary bag.
+    cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_cli --no-default-features
+    # **The shipped CLI links both codecs, asserted against the dependency graph
+    # because no test inside the crate can assert it.**
+    #
+    # `tf_tree_cli/tests/ingest.rs::the_cli_compression_feature_switches_the_reader`
+    # catches a feature edge that is *wired wrong* — a dependency re-enabling or
+    # failing to forward `tf_tree_ingest/compression` independently of what the CLI
+    # asked for, the way `tf_tree_bench` once did to `counters`. It cannot catch
+    # `compression` being **deleted** from `[features] default`, and this was
+    # verified rather than assumed: with the feature removed from the manifest,
+    # `cargo nextest run -p tf_tree_cli` ran 117 tests and all 117 passed. Every
+    # `cfg!` in the crate is relative to the configuration being deleted, so both
+    # sides of that assertion go `false` together and the end-to-end zstd test
+    # compiles to nothing.
+    #
+    # The workspace declares `tf_tree_ingest` with `default-features = false`, so
+    # the deletion ships a `cargo install tf_tree_cli` that refuses every zstd bag —
+    # the ordinary rosbag2/Foxglove case — while `cargo build --workspace`,
+    # `just lint` and `cargo nextest run --workspace` all stay green through feature
+    # unification. The graph is the only place the invariant is visible.
+    cargo tree -q -p tf_tree_cli -e normal | grep -q ruzstd || \
+        { echo "tf_tree_cli's default build has no zstd decoder: is 'compression' still in [features] default?"; exit 1; }
+    cargo tree -q -p tf_tree_cli -e normal | grep -q lz4_flex || \
+        { echo "tf_tree_cli's default build has no lz4 decoder: is 'compression' still in [features] default?"; exit 1; }
 
 lint: py-compile
     cargo fmt --all -- --check
@@ -233,6 +278,19 @@ lint: py-compile
     # `tf_tree_ingest`'s `fixture` module is default-off and so is invisible to the
     # workspace pass above, for the same reason. See `ingest-check`.
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
+    # **And its `compression` axis, which is the *other* direction: default-ON, so
+    # the workspace pass compiles the codec-free half nowhere.** This line belongs in
+    # `lint` and not only in `ingest-check`, because `lint` is the recipe CI's lint
+    # job mirrors and the recipe a contributor runs before pushing: without it, a
+    # clippy error under `--no-default-features` — `tests/codec_free.rs`, the
+    # `is_built_in` arm, `fixture`'s `CodecUnavailable` arm — was reachable only by
+    # someone who also ran `just test`.
+    #
+    # Verified to be a real gate: a `clippy::len_zero` injected into
+    # `tests/codec_free.rs` left `cargo clippy --workspace --all-targets -- -D warnings`
+    # finishing clean, and this line failed on it.
+    cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
+    cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
 
 # **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
 #
@@ -264,6 +322,51 @@ fmt:
 # cargo-deny: advisories, licenses, bans, sources.
 audit:
     cargo deny check
+
+# **The MSRV floor, on the host rather than only in CI.**
+#
+# `SUPPORT.md` calls the floor "enforced, not intended", and until this recipe
+# existed the only thing enforcing it was CI's `msrv` job — which has produced no
+# run since 2026-07-23. A floor whose only gate is a workflow nobody is running is
+# back to being intended, which is the exact failure that took `rust-version` from
+# 1.83 to 1.85: the number looked authoritative and nothing had ever compiled
+# against it.
+#
+# This mirrors that job step for step, and deliberately so — the version is read
+# out of the manifest rather than written here, the `--locked` build uses the
+# committed lockfile (a transitive crate that quietly needs a newer toolchain is
+# the drift being caught, so re-resolving would hide it), and `--lib --bins`
+# because the promise covers what a downstream *links*, not what our
+# dev-dependencies need.
+#
+# Requires the floor's toolchain to be installed; when it is not, the recipe stops
+# with the exact `rustup toolchain install` line to run rather than falling back to
+# `stable`, which would make it pass while checking nothing.
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    want=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+    test -n "$want" || { echo "no rust-version in Cargo.toml"; exit 1; }
+    rustup toolchain list | grep -q "^$want" \
+        || { echo "the floor is $want; install it: rustup toolchain install $want"; exit 1; }
+    echo "==> building the workspace on the declared floor, $want"
+    cargo "+$want" build --workspace --lib --bins --locked
+    # `cargo build --workspace` cannot see `crates/tf_tree_py` or
+    # `crates/tf_tree_tf2_sys`: both are excluded from the workspace (maturin builds
+    # one, the other needs a ROS 2 install), so both spell `rust-version` by hand and
+    # neither is compiled by the line above. Compared rather than compiled, which is
+    # the strongest check available for a crate this host cannot build.
+    echo "==> every hand-written rust-version agrees with the workspace"
+    rc=0
+    for m in crates/*/Cargo.toml xtask/Cargo.toml; do
+        got=$(grep -m1 '^rust-version *=' "$m" | cut -d'"' -f2 || true)
+        [ -n "$got" ] || continue
+        if [ "$got" != "$want" ]; then
+            echo "$m: declares rust-version $got, workspace declares $want"
+            rc=1
+        fi
+    done
+    exit $rc
 
 # Run the benchmark suite and the go/no-go gate.
 bench:

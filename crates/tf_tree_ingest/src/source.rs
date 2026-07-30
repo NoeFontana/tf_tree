@@ -184,6 +184,24 @@ pub enum OnBadChunk {
     Halt,
 }
 
+/// How this reader treats a chunk: the skip policy, and the bounds it will
+/// decompress one within.
+///
+/// **One argument rather than two, and the reason is a smell this type exists to
+/// stop growing.** [`read_chunk`] already carries
+/// `#[allow(clippy::too_many_arguments)]`; adding the decompression bounds beside
+/// [`OnBadChunk`] as a second scalar would have made that eight and nine, and
+/// would have re-indented every `read_tf` call site for a parameter that belongs
+/// with the one next to it. Both halves answer the same question — what this
+/// reader does when a chunk is not what its header says — so they travel together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkPolicy {
+    /// What to do about a chunk that does not decompress or does not check out.
+    pub on_bad: OnBadChunk,
+    /// What this reader will decompress a chunk into, before it believes a header.
+    pub limits: decompress::ChunkLimits,
+}
+
 /// Counts of what the reader declined to decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SkipCounts {
@@ -248,14 +266,16 @@ fn is_sqlite(input: &mut BufReader<File>) -> Result<bool, IngestError> {
 /// # Errors
 ///
 /// [`IngestError::Io`] for a failing read, [`IngestError::Rosbag2Sqlite`] for a
-/// rosbag2 sqlite3 bag, [`IngestError::CompressedChunk`] for a chunk this build
-/// cannot decompress (see the crate docs), [`IngestError::Mcap`] for a malformed
-/// file, [`IngestError::Cdr`] for a payload that is not a decodable `TFMessage`,
-/// or whatever the callback returned.
+/// rosbag2 sqlite3 bag, [`IngestError::CompressedChunk`] for a codec this build has
+/// no decoder for — which since the `compression` feature means an unrecognised
+/// name, or zstd/lz4 in a `--no-default-features` build, and not compression as such
+/// (see the crate docs) — [`IngestError::Mcap`] for a malformed file,
+/// [`IngestError::Cdr`] for a payload that is not a decodable `TFMessage`, or
+/// whatever the callback returned.
 pub fn read_tf<F>(
     path: &Path,
     roles: &TopicRoles,
-    on_bad_chunk: OnBadChunk,
+    policy: ChunkPolicy,
     mut f: F,
 ) -> Result<SkipCounts, IngestError>
 where
@@ -359,7 +379,7 @@ where
                 &body,
                 complete,
                 chunk_ordinal - 1,
-                on_bad_chunk,
+                policy,
                 &mut scratch,
                 &mut book,
                 roles,
@@ -415,12 +435,20 @@ fn read_exact_or_eof(input: &mut BufReader<File>, buf: &mut [u8]) -> Result<(), 
 /// `complete` is false when the file ended inside this chunk. A truncated
 /// *uncompressed* chunk still yields every whole record in its prefix; the
 /// trailing fragment is expected in that case and is not reported as corruption.
+///
+/// A truncated **compressed** chunk yields no records at all — a partial codec
+/// frame is not decodable — and `decompress::chunk_records` returns an empty
+/// records field rather than a fault for it, so it lands in
+/// [`SkipCounts::truncated`] (already set by [`read_tf`] for the short record) and
+/// never in [`SkipCounts::bad_chunks`]. The distinction is the difference between
+/// telling an operator their recording is incomplete and telling them it is
+/// damaged.
 #[allow(clippy::too_many_arguments)]
 fn read_chunk<F>(
     body: &[u8],
     complete: bool,
     ordinal: u64,
-    on_bad_chunk: OnBadChunk,
+    policy: ChunkPolicy,
     scratch: &mut Vec<u8>,
     book: &mut Bookkeeping,
     roles: &TopicRoles,
@@ -439,9 +467,9 @@ where
     // The chunk header's message times, kept before the body is consumed so a
     // skipped chunk can report the span it took with it.
     let span = decompress::chunk_span(body);
-    let records = match decompress::chunk_records(body, complete, scratch) {
+    let records = match decompress::chunk_records(body, complete, policy.limits, scratch) {
         Ok(r) => r,
-        Err(fault) => return note_or_fail(fault, ordinal, on_bad_chunk, span, skips),
+        Err(fault) => return note_or_fail(fault, ordinal, policy.on_bad, span, skips),
     };
     // A truncated chunk's records field ends mid-record by construction, so the
     // fragment the walk would otherwise report is the truncation we already know
@@ -452,7 +480,7 @@ where
         handle_record(rec, book, roles, skips, f)
     }) {
         Ok(()) => Ok(()),
-        Err(fault) => note_or_fail(fault, ordinal, on_bad_chunk, span, skips),
+        Err(fault) => note_or_fail(fault, ordinal, policy.on_bad, span, skips),
     }
 }
 
@@ -604,15 +632,22 @@ where
 
 /// Classify an `mcap` failure into this crate's `Copy` error type.
 ///
-/// The distinction that matters to a user is compression: it is the one failure
-/// with an action attached, and §0.0's `default-features = false` makes it
-/// reachable on ordinary recordings.
+/// **Compression is no longer among the failures this function classifies**, and an
+/// earlier revision of this comment said the opposite — that it was "the one failure
+/// with an action attached", reachable on ordinary recordings because of §0.0's
+/// `default-features = false`. That was true when `mcap` owned the decompressor
+/// factory. It does not: `crate::decompress` classifies every chunk's codec before
+/// `mcap` sees a compression field at all, and
+/// [`IngestError::CompressedChunk`](crate::IngestError::CompressedChunk) is now
+/// produced by `chunk_records` via `note_or_fail`. What is left here is a malformed
+/// record body, which is [`IngestError::Mcap`].
 fn map_mcap(e: &mcap::McapError) -> IngestError {
     match e {
-        // Unreachable in practice now that this crate decides about codecs
-        // itself — `crate::decompress` classifies the chunk before `mcap` ever
-        // sees a compression field. Mapped rather than dropped so the arm cannot
-        // rot into a wrong one if that ever changes.
+        // Unreachable in practice, for the reason in the function's docs. Mapped
+        // rather than dropped so the arm cannot rot into a wrong one if `mcap` is
+        // ever handed a compression field again — `ChunkCodec::Other` is the honest
+        // answer for a name that reached the `mcap` crate rather than this module,
+        // because this module's classifier is what knows the three names.
         mcap::McapError::UnsupportedCompression(_) => IngestError::CompressedChunk {
             codec: decompress::ChunkCodec::Other,
         },

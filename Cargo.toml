@@ -44,6 +44,13 @@ edition = "2021"
 # currency and a settable cap, not capability — a deliberate trade, not a
 # necessity.
 #
+# One clarification, because the sentence above invites the wrong reading and the
+# wrong reading is a decompression bomb: that 100 MiB caps the decoder's *window*,
+# i.e. its peak working allocation, and **not** its total output. A frame with a
+# 100 MiB window can still decode to terabytes. What bounds output is
+# `IngestOptions::max_chunk_uncompressed_bytes` and `max_chunk_expansion_ratio`,
+# enforced in `tf_tree_ingest::decompress` before anything is allocated.
+#
 # The `msrv` job in `.github/workflows/ci.yml` reads this field and builds on
 # exactly it, so the next silent drift fails the build instead of shipping.
 # Policy: `SUPPORT.md`.

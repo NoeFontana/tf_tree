@@ -24,23 +24,42 @@
 //! run --workspace` gates the two-pass logic on every host, with no feature
 //! flag and no container — the frozen-file half is what needs `shm`.
 //!
-//! # What this build cannot read
+//! # What this build can and cannot read
 //!
 //! `mcap` is taken with `default-features = false`, which `docs/PHASE5.md` §0.0
 //! requires: its defaults are `[zstd, lz4]` and both vendor a C build step that
-//! `docs/PHASE2.md` §2 forbids. The consequence is not hypothetical — a
-//! recording whose chunks are zstd-compressed (Foxglove's default, and
-//! `rosbag2`'s when `compression_mode` is set) fails with
-//! [`IngestError::CompressedChunk`]. The remedy is one command with the
-//! upstream tool:
+//! `docs/PHASE2.md` §2 forbids. **That rule still holds and the cost it used to
+//! carry is gone.** `crate::decompress` takes each chunk over whole and decodes
+//! it with pure-Rust codecs of our own — `ruzstd` and `lz4_flex`, behind the
+//! default-on `compression` feature — so a zstd- or lz4-compressed recording
+//! (Foxglove's default, and `rosbag2`'s when `compression_mode` is set) ingests
+//! transparently, with no `*-sys` crate in the graph and no C toolchain.
 //!
-//! ```text
-//! mcap compress --compression none in.mcap -o out.mcap
-//! ```
+//! An earlier revision of this section told the user to run
+//! `mcap compress --compression none` instead. That is no longer the ordinary
+//! path; it is the remedy for the two cases that remain:
 //!
-//! That is a worse story than transparently decompressing, and it is the story
-//! the no-C-build-step rule buys. It is surfaced as its own error variant, with
-//! that command in the CLI's message, rather than as a generic parse failure.
+//! * a codec neither we nor the MCAP specification names, which is
+//!   [`IngestError::CompressedChunk`] with [`ChunkCodec::Other`], and
+//! * a build with `--no-default-features`, where zstd and lz4 are compiled out
+//!   and report themselves as exactly that rather than as corruption.
+//!
+//! Decompression is bounded: `uncompressed_size` is a number off a disk, so
+//! [`IngestOptions::max_chunk_uncompressed_bytes`] and
+//! [`IngestOptions::max_chunk_expansion_ratio`] are checked before anything is
+//! allocated for it, and the zstd decoder's *window* — a separate number in the
+//! codec's own header that neither of those can see — is bounded too. Neither codec
+//! crate bounds its total output for us; `crate::decompress` says exactly what each
+//! of them does bound, and what the three guards here cost.
+//!
+//! **What the C-free codecs cost, measured.** On this host, `survey` over a
+//! 160 000-transform recording takes 0.027 s uncompressed, 0.035 s for lz4 and
+//! 0.048 s for zstd — so roughly **1.8× the per-pass wall time** of an uncompressed
+//! recording, and `ruzstd` decodes libzstd frames at about **a quarter of libzstd's
+//! own rate**. Multiplied by the pass count, which is `1 + groups + spilled edges`.
+//! An earlier revision of this section said the constraint had no visible cost; it
+//! has a modest and measurable one, and that is still the right trade against a C
+//! build step.
 //!
 //! # Status against §3
 //!
@@ -71,7 +90,24 @@ mod spill;
 /// recording either works or reports why.
 mod decompress;
 
-pub use decompress::{BadChunkKind, ChunkCodec};
+pub use decompress::{BadChunkKind, ChunkCodec, ChunkLimits};
+
+/// Whether this build compiled the zstd and lz4 chunk decoders in.
+///
+/// **It has to be evaluated here, inside the crate that owns the feature.** Cargo
+/// unifies features across a workspace, so a `cfg!(feature = "compression")` in a
+/// consumer reports what *that* crate asked for rather than what this one was built
+/// with — and the two can differ silently, which is exactly how a `cargo install`
+/// ships a binary that refuses every zstd bag while `cargo build --workspace` stays
+/// green. `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`
+/// compares the two answers; it is the only thing that can see them disagree.
+///
+/// Mirrors [`tf_tree::counters_compiled_in`], for the same reason and after the same
+/// defect.
+#[must_use]
+pub fn compression_compiled_in() -> bool {
+    cfg!(feature = "compression")
+}
 
 #[cfg(feature = "fixture")]
 pub mod fixture;
@@ -82,10 +118,11 @@ pub mod tft;
 
 pub use ingest::{
     fill, survey, Anomalies, ClockResetPolicy, EdgeSurvey, FillStats, Frames, IngestOptions,
-    Survey, DEFAULT_FUTURE_HORIZON_NS, DEFAULT_MAX_MEMORY_BYTES,
+    Survey, DEFAULT_FUTURE_HORIZON_NS, DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
+    DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES, DEFAULT_MAX_MEMORY_BYTES,
 };
 pub use report::IngestReport;
-pub use source::{OnBadChunk, TopicRoles};
+pub use source::{ChunkPolicy, OnBadChunk, TopicRoles};
 
 /// An index into [`Frames`], which is how a `Copy` error names a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,8 +169,15 @@ pub enum IngestError {
     /// `docs/PHASE5.md` §3.3 for why the reader is absent.
     #[error("the file is a SQLite database, not an MCAP recording")]
     Rosbag2Sqlite,
-    /// A chunk uses zstd or lz4, which this build cannot decompress. See the
-    /// crate docs for why, and for the one command that fixes it.
+    /// A chunk names a codec this build has no decoder for.
+    ///
+    /// **Not the ordinary compressed recording.** zstd and lz4 are decoded
+    /// transparently by the default-on `compression` feature, so reaching this
+    /// means either a codec name outside the MCAP specification
+    /// ([`ChunkCodec::Other`]) or a `--no-default-features` build. See the crate
+    /// docs, and note that a chunk which *claims* zstd and carries something else
+    /// is [`IngestError::BadChunk`] instead — that is damage, not a missing
+    /// decoder.
     ///
     /// **Never skippable, unlike [`IngestError::BadChunk`].** Every chunk in a
     /// recording uses the same codec, so skipping them all would yield
