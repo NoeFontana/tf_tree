@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use tf_tree::{Capacity, EdgeCfg, Iso3, Quat, Tree, TreeBuilder, Vec3};
 use tf_tree_bridge::clock::{ClockGuard, ClockVerdict, OnClockReset};
 use tf_tree_bridge::names::NameNormalizer;
-use tf_tree_bridge::statics::{StaticKind, StaticStore, StaticVerdict};
+use tf_tree_bridge::statics::{StaticStore, StaticVerdict};
 use tf_tree_bridge::Publisher;
 
 use crate::decompress::ChunkLimits;
@@ -417,6 +417,15 @@ pub fn survey(
     // One guard per edge — see the module docs. `clocks[i]` belongs to
     // `out.edges[i]`; the two vectors are grown together and never separately.
     let mut clocks: Vec<ClockGuard> = Vec::new();
+    // **The dynamic half of the edge-kind check, as one bit per slot.**
+    //
+    // `StaticStore` can answer "has this edge been seen as dynamic?", but only by
+    // name: `observe_dynamic` is two `BTreeMap<String, _>` descents, and asking it
+    // per transform costs ~ten `str` comparisons to re-derive something the slot
+    // lookup above already resolved. The static direction is read straight off
+    // `out.edges[slot].static_pose`; this vector is the other direction, and it is
+    // grown with `clocks` and `out.edges`, never separately.
+    let mut dynamic_seen: Vec<bool> = Vec::new();
     let mut index: BTreeMap<EdgeKey, usize> = BTreeMap::new();
     let mut out = Survey {
         edges: Vec::new(),
@@ -451,6 +460,7 @@ pub fn survey(
                     OnClockReset::Halt,
                     opts.clock_reset_threshold_ns,
                 ));
+                dynamic_seen.push(false);
                 let s = out.edges.len() - 1;
                 index.insert(key, s);
                 s
@@ -458,6 +468,20 @@ pub fn survey(
         };
 
         if rec.is_static {
+            // **The dynamic-then-static direction, checked here rather than by
+            // `StaticStore`.** It used to fall out of `observe_static`'s
+            // `KindChanged` arm, which fires on the `Dynamic` kind that
+            // `observe_dynamic` inserted — and that call is gone from the dynamic
+            // branch below, because it re-probed by name what the slot already
+            // knows. So the bit is kept here instead. The arm below stays as a
+            // match arm; it is simply no longer the thing that catches this.
+            if dynamic_seen[slot] {
+                return Err(IngestError::EdgeKindChanged {
+                    parent,
+                    child,
+                    stamp_ns: rec.stamp_ns,
+                });
+            }
             // §5.7's order, which `docs/PHASE4.md` §0.0 records getting wrong
             // once: compare values *first*, and report both, before any policy
             // decides which one survives.
@@ -489,15 +513,22 @@ pub fn survey(
             return Ok(());
         }
 
-        if statics.observe_dynamic(frames.name(parent), frames.name(child))
-            == Err(StaticKind::Static)
-        {
+        // **The edge kind is a property of the slot the lookup above already
+        // resolved**, so it is read from there rather than re-probed by name.
+        // `StaticStore::observe_dynamic` is two `BTreeMap<String, _>` descents —
+        // ~ten `str` comparisons — and it ran on *every* dynamic transform in the
+        // recording to answer a question an index answers in one load.
+        // `static_pose` is `Some` exactly when the store holds `Static` for this
+        // edge: `observe_static` inserts `Static` only on its `Declare` path, and
+        // `Declare` is the only arm that sets `static_pose`.
+        if out.edges[slot].static_pose.is_some() {
             return Err(IngestError::EdgeKindChanged {
                 parent,
                 child,
                 stamp_ns: rec.stamp_ns,
             });
         }
+        dynamic_seen[slot] = true;
 
         if rec.stamp_ns == 0 {
             out.anomalies.zero_stamp_drops += 1;
@@ -862,7 +893,27 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
         }
         *cur_bytes = 0;
     };
-    for &i in order {
+    // **First-fit *decreasing*, and the bin is the expensive thing.** Every
+    // `Group::InMemory` is one whole re-read of the recording — reopen, re-walk,
+    // re-decompress, re-CDR-decode — so a bin saved is the largest saving
+    // available on this path. Packing in canonical *name* order is plain first
+    // fit, whose worst case is 17/10 of the optimal bin count; largest-first
+    // needs 11/9.
+    //
+    // This does **not** touch the canonical order. `fill` has already declared
+    // every frame and edge from `order` before it calls here, so `FrameId`,
+    // `EdgeId` and §11's byte-identical `.tft` are unaffected; what changes is
+    // only which re-read buffers which edge, and `fill`'s `buffers` is keyed by
+    // slot, so the per-edge push order is unchanged too. `rank` — position in the
+    // canonical order — is the tie break, which keeps the plan a pure function of
+    // the survey rather than of a sort's stability.
+    let mut rank = vec![usize::MAX; survey.edges.len()];
+    for (pos, &i) in order.iter().enumerate() {
+        rank[i] = pos;
+    }
+    let mut packing: Vec<usize> = order.to_vec();
+    packing.sort_by_key(|&i| (core::cmp::Reverse(survey.edges[i].samples), rank[i]));
+    for &i in &packing {
         let e = &survey.edges[i];
         if e.is_static() || e.samples == 0 {
             continue;

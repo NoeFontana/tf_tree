@@ -39,8 +39,16 @@ const TF_SCHEMAS: [&str; 2] = ["tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"];
 
 /// Largest single MCAP record this reader will allocate for: **256 MiB**.
 ///
-/// See the option's comment in [`read_tf`]. This is a bound on a corrupt length
-/// field, not a format limit.
+/// A bound on a corrupt length field, not a format limit: a record header is a
+/// `u64` straight off disk, and without this a rewritten one asks for a
+/// multi-gigabyte allocation before anything validates it.
+///
+/// **A private constant and not an [`crate::IngestOptions`] knob**, unlike the two
+/// chunk ceilings — which is a gap rather than a decision. 256 MiB is an order of
+/// magnitude above any real record (a chunk is typically 1–8 MiB), so nobody has
+/// met it yet; the day somebody does, they get [`IngestError::Mcap`] and no number
+/// to raise. See the sibling argument at [`crate::ChunkLimits`], which is why those
+/// two became options.
 const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Length of MCAP's file magic, at both ends of a complete recording.
@@ -324,7 +332,14 @@ where
     let mut book = Bookkeeping::default();
     let mut skips = SkipCounts::default();
     // One buffer for the whole file, reused for every record body, and a second
-    // for decompression. Neither grows past `MAX_RECORD_BYTES`.
+    // for decompression. **They are bounded by different numbers.** `body` never
+    // grows past `MAX_RECORD_BYTES`, checked below. `scratch` is sized to a
+    // chunk's declared `uncompressed_size` and is bounded by
+    // `policy.limits.max_uncompressed_bytes` — a caller knob (`--max-chunk-size`,
+    // 64 MiB by default) that has no relation to `MAX_RECORD_BYTES` and that the
+    // CLI will saturate to `u64::MAX`. Neither buffer is ever shrunk, so the
+    // resident cost of this function is `MAX_RECORD_BYTES + that knob`, not twice
+    // the former.
     let mut body: Vec<u8> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
     let mut chunk_ordinal: u64 = 0;
@@ -379,7 +394,23 @@ where
         if want > MAX_RECORD_BYTES {
             return Err(IngestError::Mcap);
         }
-        body.clear();
+        // **No `clear()` before this, deliberately** — the argument
+        // `decompress::decode_zstd` records for its own buffer, one module over.
+        // `resize` alone zero-fills only the shortfall and merely truncates when
+        // the previous record was larger, which in a recording's steady state of
+        // near-uniform chunks writes nothing; `clear()` first memsets the whole
+        // body on every record, and `read_full` overwrites every one of those
+        // bytes. The bytes below `got` after a short read are then stale rather
+        // than zero, which no caller can observe: `body.truncate(got)` below
+        // removes them.
+        //
+        // **Grown exactly**, which is what makes the "never grows past
+        // `MAX_RECORD_BYTES`" above true rather than approximately true: `resize`
+        // reserves the shortfall through `Vec`'s doubling path, so a record one
+        // kilobyte larger than the previous one doubles the buffer — and this
+        // buffer is never shrunk. `reserve_exact(0)` is a no-op, so the steady
+        // state costs nothing.
+        body.reserve_exact(want.saturating_sub(body.len()));
         body.resize(want, 0);
         let got = read_full(&mut input, &mut body)?;
         // **This is the branch the whole rewrite exists for.** A record cut short
@@ -580,7 +611,7 @@ fn chunk_error(fault: decompress::ChunkFault, ordinal: u64) -> IngestError {
 #[derive(Default)]
 struct Bookkeeping {
     /// Ids of schemas whose name is one of [`TF_SCHEMAS`].
-    tf_schema_ids: HashMap<u16, ()>,
+    tf_schema_ids: HashSet<u16>,
     /// Channels carrying such a schema with a `cdr` encoding, and their role.
     channels: HashMap<u16, ChannelRole>,
     /// Channel ids already classified, so the summary section's repeat of every
@@ -607,10 +638,10 @@ where
         mcap::records::Record::Schema { header, .. }
             if TF_SCHEMAS.contains(&header.name.as_str()) =>
         {
-            book.tf_schema_ids.insert(header.id, ());
+            book.tf_schema_ids.insert(header.id);
         }
         mcap::records::Record::Channel(ch) => {
-            if !book.tf_schema_ids.contains_key(&ch.schema_id) {
+            if !book.tf_schema_ids.contains(&ch.schema_id) {
                 return Ok(());
             }
             // **A channel is counted once, not once per record.** MCAP repeats

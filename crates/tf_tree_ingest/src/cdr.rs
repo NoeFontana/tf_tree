@@ -485,4 +485,49 @@ mod tests {
             Err(CdrError::BadEncapsulation { id: 0x0007 })
         );
     }
+
+    /// **A malformed frame name is a named error at a named offset**, never a
+    /// panic and never a frame silently called `"\u{fffd}"`.
+    ///
+    /// The three ways a string prefix off a damaged sector can be wrong, two of
+    /// which had no test at all. `wire_one`'s first length prefix sits at payload
+    /// byte 16 — 4 encapsulation, 4 count, 4 `sec`, 4 `nanosec` — so body offset
+    /// 12, which is the `at` the first variant reports.
+    ///
+    /// * **Zero.** CDR strings include their NUL, so a length of `0` is malformed
+    ///   rather than empty; reading it as empty would intern a nameless frame.
+    /// * **Not UTF-8.** ROS frame ids are unconstrained bytes on the wire, which
+    ///   is why the variant exists; a lossy conversion here would put a frame in
+    ///   the arena that no launch file can name.
+    /// * **Past the payload**, which is the bound that keeps the two above from
+    ///   being reachable only through a slice panic.
+    ///
+    /// Mutant: drop the `if len == 0` arm in `Reader::string` — the first row
+    /// fails with `Ok`, holding a transform whose `frame_id` is `""`. Mutant 2:
+    /// `String::from_utf8_lossy` in place of `from_utf8` — the second row fails
+    /// the same way.
+    #[test]
+    fn a_malformed_frame_name_is_a_named_error_not_a_guess() {
+        let mut b = wire_one();
+        b[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            decode_tf_message(&b),
+            Err(CdrError::BadString { at: 12, len: 0 })
+        );
+
+        let mut b = wire_one();
+        b[20] = 0xFF;
+        assert_eq!(decode_tf_message(&b), Err(CdrError::NotUtf8 { at: 16 }));
+
+        let mut b = wire_one();
+        b[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        // `ImplausibleCount` does not catch this: it bounds the *element* count,
+        // not a string length inside an element. `take`'s bounds check is what
+        // refuses it, and it reports the offset the read started from.
+        assert_eq!(
+            decode_tf_message(&b),
+            Err(CdrError::Truncated { at: 16, want: 4096 }),
+            "a length past the payload must be refused, not sliced"
+        );
+    }
 }

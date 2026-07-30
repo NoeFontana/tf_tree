@@ -83,7 +83,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use crate::cdr::{encode_tf_message, TransformStamped};
@@ -262,6 +262,17 @@ pub fn write_mcap_as(
         )?;
     }
     w.finish()?;
+    // **`Writer::finish` does not flush the stream it wrote into.** It writes
+    // `DataEnd`, the summary section and the closing magic *through* the writer
+    // and returns; `mcap`'s own `into_inner` doc says to use it "if you wish to
+    // handle any errors returned when the underlying stream is closed". The
+    // stream here is a `BufWriter`, so without this the file's tail — footer and
+    // end magic included — reaches disk only when `Drop` runs, and `Drop for
+    // BufWriter` discards the flush error. A full or read-only filesystem
+    // therefore produced a truncated fixture while this function returned `Ok`,
+    // which would surface as the *ingest* under test failing rather than as the
+    // ENOSPC that actually happened.
+    w.into_inner().flush()?;
     Ok(())
 }
 
@@ -604,15 +615,22 @@ fn compress_records(codec: FixtureCodec, bytes: Vec<u8>) -> Result<Vec<u8>, Fixt
 
 /// A deliberate defect in the second chunk of a hand-rolled fixture.
 ///
-/// Each variant documents the fault it produces **in this build** — the codec-free
-/// one — because that is not always the fault a reader would guess. Five produce a
-/// [`BadChunkKind`](crate::BadChunkKind); [`ChunkDamage::Relabelled`] produces
-/// `ChunkFault::Unsupported`, which is deliberately *not* damage in the
-/// `BadChunkKind` sense and is never skippable; and
-/// [`ChunkDamage::UncompressedSizeTooLarge`] produces nothing at all today.
+/// Each variant documents the fault it produces, and
 /// `fixture::tests::each_damage_variant_produces_its_documented_fault` is where
 /// each of those claims is checked against `crate::decompress` rather than
 /// asserted in prose.
+///
+/// **Six of the seven produce a** [`BadChunkKind`](crate::BadChunkKind) on an
+/// uncompressed chunk — including [`ChunkDamage::UncompressedSizeTooLarge`], which
+/// this paragraph used to say produced nothing at all and which now produces
+/// `StoredSizeMismatch`. Two of those six name a *different* `BadChunkKind` when the
+/// chunk is compressed, and each says which.
+///
+/// [`ChunkDamage::Relabelled`] is the one whose fault depends on the **build**: a
+/// codec name no build has a decoder for is `ChunkFault::Unsupported`, which is
+/// deliberately not damage in the `BadChunkKind` sense and is never skippable, while
+/// `"zstd"`/`"lz4"` in a default build (`compression` is on by default) reach the
+/// decoder and come back as `BadChunkKind::Decompress`, which *is* skippable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkDamage {
     /// `compressed_size` declares more bytes than the chunk record contains.
@@ -668,12 +686,16 @@ pub enum ChunkDamage {
     /// The `compression` field relabelled to a codec name, with the records left
     /// uncompressed.
     ///
-    /// Produces `ChunkFault::Unsupported` and therefore
-    /// [`IngestError::CompressedChunk`](crate::IngestError::CompressedChunk) — **not**
-    /// a `BadChunkKind`, and never skippable even under
-    /// [`OnBadChunk::Skip`](crate::OnBadChunk::Skip). `"zstd"` and `"lz4"` classify
-    /// as those codecs; anything else classifies as
-    /// [`ChunkCodec::Other`](crate::ChunkCodec::Other).
+    /// **The fault depends on whether this build has a decoder for the name.**
+    /// A name no build knows ([`ChunkCodec::Other`](crate::ChunkCodec::Other), e.g.
+    /// `"brotli"`) is `ChunkFault::Unsupported` and therefore
+    /// [`IngestError::CompressedChunk`](crate::IngestError::CompressedChunk), which is
+    /// never skippable. `"zstd"` and `"lz4"` classify as those codecs, so in the
+    /// default build the decoder runs over uncompressed bytes and fails:
+    /// `BadChunkKind::Decompress`, which **is** skippable under
+    /// [`OnBadChunk::Skip`](crate::OnBadChunk::Skip) — see
+    /// `ingest::a_mislabelled_codec_is_damage_not_an_unsupported_codec`. Only under
+    /// `--no-default-features` is `"zstd"` itself `Unsupported`.
     Relabelled(&'static str),
     /// The last inner record's declared length inflated so its body runs past the
     /// end of the records field, with `uncompressed_crc` recomputed over the
