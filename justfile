@@ -223,7 +223,7 @@ ingest-check:
     # nobody builds is not a checked configuration, and here the unchecked one is
     # what a `--no-default-features` consumer gets.
     #
-    # Verified to be a real gate rather than a no-op: this line runs 85 tests,
+    # Verified to be a real gate rather than a no-op: this line runs 87 tests,
     # five of which exist only in this configuration.
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --no-default-features

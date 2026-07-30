@@ -221,6 +221,33 @@ pub enum IngestError {
     /// that was never running, when what they have is a recorder that was killed.
     #[error("the recording is truncated, and the part that survived holds no transforms")]
     TruncatedBeforeAnyChunk,
+    /// Every chunk that could have held a transform was refused by one of **this
+    /// reader's own limits**, so nothing was read from a file that is not damaged.
+    ///
+    /// # Why this needs its own variant, for the same reason as the one above
+    ///
+    /// A chunk over `--max-chunk-size`, over the expansion ratio, or whose zstd
+    /// frame declares more window than [`BadChunkKind::ImplausibleWindow`] allows,
+    /// is skipped like any other bad chunk — and those refusals are **uniform
+    /// across a recording**, because a writer's chunk size and compression level
+    /// are settings, not accidents. So the skips take every chunk, and
+    /// [`IngestError::NoTransforms`] then reports "this recording contains no
+    /// transforms" about a recording full of them, sending the operator to look for
+    /// a publisher that was running the whole time.
+    ///
+    /// The remedy is a flag, so this variant exists to name one. That is also why
+    /// the refusals stay skippable rather than being promoted to hard errors: a
+    /// corrupt `uncompressed_size` off a bad sector produces the identical fault,
+    /// and one bad sector must not cost a recording `--on-bad-chunk=skip` would
+    /// recover. Fixing the diagnosis costs that case nothing; changing the policy
+    /// would lose it.
+    #[error(
+        "every chunk was refused by this reader's limits ({skipped} of them), so nothing was read"
+    )]
+    AllChunksOverLimit {
+        /// How many chunks were refused that way.
+        skipped: u64,
+    },
     /// An edge appeared on both a static and a dynamic topic (§3.2 — a hard
     /// error naming the timestamp).
     #[error("edge {parent:?} -> {child:?} changed kind at stamp {stamp_ns}")]

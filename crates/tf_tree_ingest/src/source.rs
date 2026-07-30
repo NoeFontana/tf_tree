@@ -233,6 +233,27 @@ pub struct SkipCounts {
     /// operator nothing they can do; "the transforms between 14:22:07 and
     /// 14:22:19 are missing" tells them which part of the run to distrust.
     pub bad_chunk_span_ns: Option<(u64, u64)>,
+    /// Of [`bad_chunks`](SkipCounts::bad_chunks), how many were refused by one of
+    /// **this reader's own limits** rather than found damaged.
+    ///
+    /// A subset and not a separate tally, because from the skip policy's point of
+    /// view they are the same event. What differs is the remedy, and the remedy is
+    /// the whole reason to tell them apart: damage is a fact about the recording
+    /// and there is nothing to turn, while
+    /// [`BadChunkKind::ImplausibleSize`](crate::BadChunkKind::ImplausibleSize) and
+    /// [`BadChunkKind::ImplausibleWindow`](crate::BadChunkKind::ImplausibleWindow)
+    /// say a perfectly sound chunk was larger than `--max-chunk-size` (or its
+    /// zstd frame asked for more window than the chunk's ceiling allows), and a
+    /// flag fixes it.
+    ///
+    /// Both are still **skippable**, deliberately. Making them fatal would be the
+    /// obvious reading of "a policy refusal is uniform across the file", and it is
+    /// wrong in the case that matters: an `uncompressed_size` rewritten by a bad
+    /// sector lands here too, and one bad sector must not cost a recording that
+    /// `--on-bad-chunk=skip` would otherwise recover. So the fix is the
+    /// *diagnosis*, not the policy — see
+    /// [`IngestError::AllChunksOverLimit`](crate::IngestError::AllChunksOverLimit).
+    pub chunks_over_limit: u64,
 }
 
 /// The first sixteen bytes of every SQLite database file, including a rosbag2
@@ -496,6 +517,10 @@ where
 ///   edge-kind change, a clock reset under `halt`). Swallowing it would convert a
 ///   hard error into silent data loss, which is the exact inversion this policy
 ///   exists to avoid.
+///
+/// A third kind is skippable but is **counted twice**: a chunk refused by one of
+/// this reader's own limits. See [`SkipCounts::chunks_over_limit`] for why it stays
+/// skippable and what the second count is for.
 fn note_or_fail(
     fault: decompress::ChunkFault,
     ordinal: u64,
@@ -508,6 +533,18 @@ fn note_or_fail(
         return Err(chunk_error(fault, ordinal));
     }
     skips.bad_chunks += 1;
+    // Matched on the fault rather than derived from a flag set at the refusal site,
+    // so a `BadChunkKind` added later is a non-exhaustive-match error here and
+    // whoever adds it has to decide which of the two it is.
+    if matches!(
+        fault,
+        decompress::ChunkFault::Bad(
+            decompress::BadChunkKind::ImplausibleSize { .. }
+                | decompress::BadChunkKind::ImplausibleWindow { .. }
+        )
+    ) {
+        skips.chunks_over_limit += 1;
+    }
     if let Some((lo, hi)) = span {
         skips.bad_chunk_span_ns = Some(match skips.bad_chunk_span_ns {
             Some((a, b)) => (a.min(lo), b.max(hi)),
