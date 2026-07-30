@@ -245,10 +245,18 @@ pub(crate) fn chunk_records<'a>(
 /// Only the fields this module needs, parsed by hand so a truncated chunk is
 /// still readable — see [`chunk_records`].
 struct ChunkHead {
-    // `uncompressed_size` sits at offset 16 and is deliberately *not* kept: it is
-    // only meaningful once a codec exists, where it is the exact allocation size
-    // and the value the decompression-bomb guard bounds. Parsing a field nothing
-    // reads would be one more thing to keep true for no gain.
+    // `uncompressed_size` sits at offset 16 and is *not* kept: nothing in this
+    // revision reads it, and parsing a field nothing reads would be one more thing
+    // to keep true for no gain. Once a codec exists it becomes the exact allocation
+    // size and the value the decompression-bomb guard bounds.
+    //
+    // **A codec is not the only reason to retain it.** On the uncompressed path the
+    // records are stored verbatim, so `uncompressed_size == compressed_size` is an
+    // invariant checkable here today, from two `u64`s nine bytes apart, and a chunk
+    // header rewritten by a bad sector currently passes. That check is a `decompress`
+    // change with its own test, deliberately not smuggled into the commit that added
+    // the fixture for it; `ingest::a_lying_uncompressed_size_is_not_detected_by_this_build`
+    // pins today's behaviour so it cannot be closed silently either way.
     uncompressed_crc: u32,
     codec: ChunkCodec,
     compressed_size: u64,

@@ -13,9 +13,12 @@ use std::path::{Path, PathBuf};
 use tf_tree::{Stamp, SystemDomain};
 use tf_tree_ingest::cdr::TransformStamped;
 use tf_tree_ingest::fixture::{
-    small_recording, two_publishers_with_latency, write_mcap, write_mcap_as, FixtureMessage,
+    small_recording, two_publishers_with_latency, write_mcap, write_mcap_as, write_mcap_chunked,
+    ChunkDamage, ChunkedSpec, FixtureMessage, DAMAGED_CHUNK_ORDINAL,
 };
-use tf_tree_ingest::{ClockResetPolicy, Frames, IngestError, IngestOptions};
+use tf_tree_ingest::{
+    BadChunkKind, ClockResetPolicy, Frames, IngestError, IngestOptions, OnBadChunk,
+};
 
 /// A scratch directory that removes itself, so a failing test does not leave a
 /// recording behind. Disk is tight on the development host and `just test` runs
@@ -1480,4 +1483,615 @@ fn a_reduce_pass_keeps_the_last_occurrence() {
             .unwrap();
         assert_eq!(got, same, "{which}: the two paths disagree");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The hand-rolled, summary-free fixture and the corrupt-chunk skip policy.
+//
+// `fixture`'s module docs say why these cannot be written against a fixture from
+// `mcap::Writer`: it cannot produce a damaged chunk, and its summary section
+// repeats every Schema and Channel record, which makes a skipped definitions
+// chunk harmless and the caveat in `OnBadChunk`'s docs unreachable.
+// ---------------------------------------------------------------------------
+
+/// Nine messages, three per child frame, so a chunk of three makes "the second
+/// chunk's messages" exactly "the `sensor_b` edge".
+///
+/// A per-chunk *edge* rather than a per-chunk slice of one edge, because the
+/// assertion then has a shape a reader can check by eye: after the second chunk is
+/// skipped, `sensor_b` is not in the report at all and the other two are whole.
+fn three_sensors_nine_messages() -> Vec<FixtureMessage> {
+    let mut out = Vec::new();
+    for (chunk, child) in ["sensor_a", "sensor_b", "sensor_c"].iter().enumerate() {
+        for i in 0..3 {
+            let k = chunk * 3 + i;
+            out.push(FixtureMessage::dynamic(
+                "base_link",
+                child,
+                1_000_000_000 + k as i64 * 10_000_000,
+                pose(k as f64 + 1.0),
+            ));
+        }
+    }
+    out
+}
+
+/// `(parent, child, samples)` for every edge in a report, in a stable order.
+fn edge_rows(report: &tf_tree_ingest::IngestReport) -> Vec<(String, String, u64)> {
+    let mut rows: Vec<(String, String, u64)> = report
+        .edges
+        .iter()
+        .map(|e| (e.parent.clone(), e.child.clone(), e.samples))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// One row of [`edge_time_rows`]: parent, child, samples, and the source's oldest
+/// and newest stamp for that edge.
+type EdgeTimeRow = (String, String, u64, Option<i64>, Option<i64>);
+
+/// `(parent, child, samples, source_oldest_ns, source_newest_ns)` for every edge.
+///
+/// The time bounds are here and not in [`edge_rows`] because comparing two writers
+/// on counts alone leaves *when* unchecked: a chunk loop that dropped one group and
+/// duplicated another, or a corpus slice taken with the wrong offset, can keep every
+/// sample count equal. The bounds are the cheapest field on the report that moves
+/// when a stamp does.
+///
+/// They do **not** cover MCAP's `log_time`, which the report never derives an edge
+/// time from — `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
+/// compares every message's `log_time` against the corpus for that reason, and its
+/// third mutant is the one that proves nothing here can.
+fn edge_time_rows(report: &tf_tree_ingest::IngestReport) -> Vec<EdgeTimeRow> {
+    let mut rows: Vec<EdgeTimeRow> = report
+        .edges
+        .iter()
+        .map(|e| {
+            (
+                e.parent.clone(),
+                e.child.clone(),
+                e.samples,
+                e.source_oldest_ns,
+                e.source_newest_ns,
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The message-time span of the chunk `write_mcap_chunked` damages, computed from
+/// the corpus rather than written down as a constant.
+fn damaged_chunk_span(messages: &[FixtureMessage], per_chunk: usize) -> (u64, u64) {
+    let at = DAMAGED_CHUNK_ORDINAL as usize * per_chunk;
+    let group = &messages[at..at + per_chunk];
+    let times: Vec<u64> = group
+        .iter()
+        .map(|m| u64::try_from(m.log_time_ns).unwrap())
+        .collect();
+    (*times.iter().min().unwrap(), *times.iter().max().unwrap())
+}
+
+/// **The hand-rolled writer produces a recording, not an approximation of one.**
+///
+/// The same corpus written twice — once through `mcap::Writer`, once through the
+/// hand-rolled chunk writer with no summary section — ingests to the same
+/// transforms, the same edges and the same per-edge sample counts.
+///
+/// This is the regression guard for the writer itself, and everything below
+/// depends on it: a writer whose clean bytes were subtly wrong would make every
+/// damage test meaningless, because the fault the reader reported would be the
+/// writer's rather than the damage's.
+///
+/// Mutant: emit the `Channel` record *before* the `Schema` record in
+/// `chunked_mcap_bytes` — applied, and this failed with `NoTransforms`, because
+/// `handle_record` classifies a channel against the schema ids it has seen *so
+/// far* and had seen none. Mutant 2: number a message's `channel_id` one higher
+/// than its channel's (`channel_id(slot + 1)`) — applied, and this failed on
+/// `transforms_read`, at 2 against 162: `small_recording` declares its two static
+/// edges first, so `/tf_static` is `topics[0]` and gets channel id 1 while `/tf`
+/// gets 2. Under the mutant `/tf_static`'s messages carry id 2 — `/tf`'s channel —
+/// and `/tf`'s carry id 3, which no `Channel` record declares, so the two surviving
+/// transforms are the static ones and the 160 dynamic ones are the silent drop.
+/// (An earlier revision of this note had the two topics the wrong way round, which
+/// would send the next reader to assert on `/tf`'s sample count — the one number
+/// the mutant zeroes.)
+///
+/// A third mutant **survived** and is worth recording: dropping the `+ 1` from
+/// `channel_id`, so channels are numbered from `0`. Nothing in this crate reserves
+/// channel id `0` — only `schema_id` `0` is special, meaning "no schema" — and the
+/// writer uses the same function for the `Channel` record and for every `Message`
+/// that names it, so the numbering is internally consistent and no reader can
+/// tell. The one-based scheme is a fidelity choice (it is what a recorder writes),
+/// not a property any test holds.
+#[test]
+fn an_uncompressed_chunked_recording_still_ingests() {
+    let dir = Scratch::new("chunked_clean");
+    let messages = small_recording();
+
+    let by_crate = write(&dir, "crate.mcap", &messages);
+    let by_hand = dir.path("hand.mcap");
+    write_mcap_chunked(&by_hand, &messages, ChunkedSpec::new(60)).unwrap();
+
+    let mut f1 = Frames::default();
+    let a = tf_tree_ingest::run(&by_crate, &IngestOptions::default(), &mut f1)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &f1)));
+    let mut f2 = Frames::default();
+    let b = tf_tree_ingest::run(&by_hand, &IngestOptions::default(), &mut f2)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &f2)));
+
+    assert_eq!(b.survey.transforms_read, a.survey.transforms_read);
+    assert_eq!(b.report.samples_pushed, a.report.samples_pushed);
+    assert_eq!(b.report.samples_pushed, 160, "the fixture's own count");
+    assert_eq!(b.report.static_edges, 2);
+    assert_eq!(b.report.dynamic_edges, 3);
+    // Times as well as counts: the two writers must agree on *when* each edge was
+    // published, not merely on how much of it there was.
+    assert_eq!(edge_time_rows(&b.report), edge_time_rows(&a.report));
+    // Nothing about a summary-free file is anomalous, and the reader must not
+    // mistake the absence of one for a truncation.
+    assert!(!b.report.anomalies.truncated);
+    assert_eq!(b.report.anomalies.bad_chunks, 0);
+}
+
+/// **THE CENTREPIECE: one corrupt chunk does not lose the recording.**
+///
+/// Under the default [`OnBadChunk::Skip`] the damaged second chunk is skipped and
+/// the chunks either side of it are read in full — so the loss is bounded by the
+/// chunk rather than by "everything after the first fault", which is what a reader
+/// that stopped at the first bad chunk would give and would look identical on a
+/// fixture whose damage was in the last chunk.
+///
+/// **"Bounded by the chunk" is a property of this damage class, not of the skip
+/// policy.** `FlippedBitInRecords` is caught by `chunk_records` before a single
+/// record is handed to the callback, so the whole chunk is lost and the whole chunk
+/// is reported. A fault the *framing walk* raises arrives after earlier records have
+/// already been delivered, and there the boundary is a record while the report still
+/// blames the chunk — see
+/// `a_framing_fault_mid_chunk_keeps_what_it_already_delivered`, which measures that
+/// case rather than leaving this sentence to be read as covering it.
+///
+/// The counts are asserted exactly, not as "more than zero": three samples for
+/// `sensor_a` and three for `sensor_c`, and `sensor_b` — whose three messages were
+/// all in the damaged chunk — absent from the report and unqueryable in the tree.
+///
+/// Mutant: in `read_chunk`, return the fault instead of calling `note_or_fail`
+/// (i.e. no skip policy at all) — applied, and this failed with "chunk 1 is
+/// unreadable: its CRC32 is 0x91c0fdca but the data hashes to 0x77cb8a16": the
+/// whole recording lost to one bad chunk, which is the behaviour the policy exists
+/// to replace. Mutant 2: `break` out of `read_tf`'s record loop once
+/// `skips.bad_chunks > 0` — applied, and the edge rows came back as
+/// `[("base_link", "sensor_a", 3)]` alone: a skip that silently ends the read costs
+/// everything after the fault while still reporting exactly one bad chunk, which is
+/// the failure this test's *third* chunk exists to catch.
+#[test]
+fn one_corrupt_chunk_does_not_lose_the_recording() {
+    let dir = Scratch::new("chunk_skip");
+    let messages = three_sensors_nine_messages();
+    let path = dir.path("damaged.mcap");
+    write_mcap_chunked(
+        &path,
+        &messages,
+        ChunkedSpec::new(3).damaged(ChunkDamage::FlippedBitInRecords),
+    )
+    .unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    assert_eq!(
+        edge_rows(&out.report),
+        vec![
+            ("base_link".to_string(), "sensor_a".to_string(), 3),
+            ("base_link".to_string(), "sensor_c".to_string(), 3),
+        ],
+        "the first and third chunks must survive whole, and only the second is lost"
+    );
+    assert_eq!(out.report.samples_pushed, 6);
+    assert_eq!(out.report.anomalies.bad_chunks, 1);
+
+    // The survivors are usable, not merely counted.
+    for (child, stamp) in [("sensor_a", 1_010_000_000i64), ("sensor_c", 1_070_000_000)] {
+        let iso = out
+            .tree
+            .lookup("base_link", child, Stamp::<SystemDomain>::from_nanos(stamp))
+            .unwrap_or_else(|e| panic!("{child} at {stamp} should resolve: {e:?}"));
+        assert!(iso.t.x.is_finite() && (iso.q.norm() - 1.0).abs() < 1e-12);
+    }
+    // And the loss is real: `sensor_b` is not silently present with garbage.
+    assert!(
+        out.tree
+            .lookup(
+                "base_link",
+                "sensor_b",
+                Stamp::<SystemDomain>::from_nanos(1_040_000_000)
+            )
+            .is_err(),
+        "the skipped chunk's edge must be absent, not empty-but-present"
+    );
+}
+
+/// **A framing fault mid-chunk keeps every record it had already delivered, and the
+/// report still blames the whole chunk.** Pinned because the two halves of that
+/// sentence disagree, and nothing else in the crate notices.
+///
+/// `ChunkDamage::InnerRecordRunsPastTheEnd` is caught by `for_each_record`, not by
+/// `chunk_records`: the walk reaches the last record's inflated length only after
+/// `handle_record` has accepted the two before it. So `note_or_fail` counts one
+/// skipped chunk and reports the chunk header's whole span as lost, while two of the
+/// three transforms in that span are in the tree and `sensor_b` looks like a
+/// complete edge at two samples. An operator reading "the transforms between
+/// 1.03 s and 1.05 s are missing" is being told something false about two thirds of
+/// that window.
+///
+/// **Reported as a `source.rs` finding, not fixed here** — this PR adds a fixture
+/// and does not touch the read path. The candidate fix is for `read_chunk` to report
+/// what a partly-walked chunk actually cost (a record count, or a span narrowed to
+/// the records that did not arrive) rather than the header's span. This test exists
+/// so that fix has an exact set of numbers to change, and so nobody reads
+/// `one_corrupt_chunk_does_not_lose_the_recording`'s "bounded by the chunk" as
+/// covering this class.
+///
+/// Mutant: in `read_chunk`, pass `tolerate_tail = true` unconditionally instead of
+/// `!complete` — applied, and this failed on `bad_chunks`, `0` against `1`: an inner
+/// record whose body runs past the end of the records field is then read as a
+/// trailing fragment, so the same eight samples arrive and the recording is declared
+/// whole. The partial ingest is then invisible instead of merely mis-reported, which
+/// is the worse of the two.
+#[test]
+fn a_framing_fault_mid_chunk_keeps_what_it_already_delivered() {
+    let dir = Scratch::new("chunk_inner_framing");
+    let messages = three_sensors_nine_messages();
+    let path = dir.path("damaged.mcap");
+    write_mcap_chunked(
+        &path,
+        &messages,
+        ChunkedSpec::new(3).damaged(ChunkDamage::InnerRecordRunsPastTheEnd),
+    )
+    .unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    // Eight, not six: the damaged chunk's first two messages were delivered before
+    // the walk reached the record whose length is a lie.
+    assert_eq!(out.report.samples_pushed, 8);
+    // Two of `sensor_b`'s three, and their stamps say *which* two: the report shows a
+    // plausible-looking edge whose window ends one message early.
+    assert_eq!(
+        edge_time_rows(&out.report),
+        vec![
+            (
+                "base_link".to_string(),
+                "sensor_a".to_string(),
+                3,
+                Some(1_000_000_000),
+                Some(1_020_000_000)
+            ),
+            (
+                "base_link".to_string(),
+                "sensor_b".to_string(),
+                2,
+                Some(1_030_000_000),
+                Some(1_040_000_000)
+            ),
+            (
+                "base_link".to_string(),
+                "sensor_c".to_string(),
+                3,
+                Some(1_060_000_000),
+                Some(1_080_000_000)
+            ),
+        ],
+        "the damaged chunk's edge survives partially, which is the finding"
+    );
+    // And yet the report accounts for the whole chunk, span included.
+    assert_eq!(out.report.anomalies.bad_chunks, 1);
+    let (lo, hi) = damaged_chunk_span(&messages, 3);
+    assert_eq!(out.report.anomalies.bad_chunk_span_ns, Some((lo, hi)));
+    // The contradiction in one assertion: a transform the report calls lost is
+    // queryable, at a stamp inside the span the report calls lost.
+    let stamp = 1_040_000_000i64;
+    assert!(
+        i64::try_from(lo).unwrap() <= stamp && stamp <= i64::try_from(hi).unwrap(),
+        "the retained stamp must fall inside the reported loss"
+    );
+    out.tree
+        .lookup(
+            "base_link",
+            "sensor_b",
+            Stamp::<SystemDomain>::from_nanos(stamp),
+        )
+        .unwrap_or_else(|e| panic!("sensor_b at {stamp} was delivered: {e:?}"));
+}
+
+/// A skipped chunk is **counted**, and the report says *when* the recording lost
+/// data.
+///
+/// A count alone is not actionable — "one chunk was unreadable" tells an operator
+/// nothing they can do. The span comes from the damaged chunk's own header and is
+/// asserted against the corpus's real log times, which is why
+/// `chunked_mcap_bytes` writes the true min/max rather than zero: `chunk_span`
+/// reports both-zero as "this writer did not track message times", so a lazy
+/// fixture would make this assertion pass while measuring nothing.
+///
+/// Mutant: delete `skips.bad_chunks += 1` in `source.rs`'s `note_or_fail` —
+/// applied, and this failed on `bad_chunks` (`0` against the `1` expected). The
+/// ingest still succeeded, and because the report's skip row is gated on
+/// `bad_chunks > 0` the summary then said nothing at all about the chunk: the
+/// mutant is precisely "silently lose part of the recording". Mutant 2: neutralise
+/// the `if let Some((lo, hi)) = span` update so `bad_chunk_span_ns` stays `None` —
+/// applied, and this failed with `None` against
+/// `Some((1030000000, 1050000000))`, the summary degrading to "their headers named
+/// no message times" for a recording whose headers name them.
+#[test]
+fn a_corrupt_chunk_is_counted_and_its_span_reported() {
+    let dir = Scratch::new("chunk_span");
+    let messages = three_sensors_nine_messages();
+    let path = dir.path("damaged.mcap");
+    write_mcap_chunked(
+        &path,
+        &messages,
+        ChunkedSpec::new(3).damaged(ChunkDamage::UncompressedCrc),
+    )
+    .unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    assert_eq!(out.report.anomalies.bad_chunks, 1);
+    let (lo, hi) = damaged_chunk_span(&messages, 3);
+    assert_eq!(
+        out.report.anomalies.bad_chunk_span_ns,
+        Some((lo, hi)),
+        "the reported span must be the damaged chunk's real message times"
+    );
+    let summary = out.report.summary();
+    assert!(
+        summary.contains("chunk(s) were unreadable"),
+        "the report must surface the skip:\n{summary}"
+    );
+    assert!(
+        summary.contains(&lo.to_string()) && summary.contains(&hi.to_string()),
+        "the report must place the loss in time:\n{summary}"
+    );
+}
+
+/// Under `--on-bad-chunk halt` the ingest **fails, naming the chunk**, and the
+/// ordinal is the damaged chunk's own.
+///
+/// The ordinal is asserted to be `1` rather than merely "some number", because an
+/// off-by-one in `read_tf`'s `chunk_ordinal` is otherwise invisible: every other
+/// assertion in this file passes either way, and the number's whole purpose is to
+/// be compared against `mcap info`'s chunk numbering by a human looking at a
+/// damaged recording.
+///
+/// Mutant: pass `chunk_ordinal` instead of `chunk_ordinal - 1` to `read_chunk`, so
+/// the ordinal becomes one-based — applied, and this failed with `2` against the
+/// `1` expected. Mutant 2: in `note_or_fail`, drop the
+/// `|| on_bad_chunk == OnBadChunk::Halt` term so `Halt` skips like `Skip` —
+/// applied, and this failed on `unwrap_err`, the survey having returned six
+/// transforms and `bad_chunks: 1` to a user who asked to be *told* the recording is
+/// not whole.
+#[test]
+fn a_corrupt_chunk_under_halt_names_the_chunk_ordinal() {
+    let dir = Scratch::new("chunk_halt");
+    let path = dir.path("damaged.mcap");
+    write_mcap_chunked(
+        &path,
+        &three_sensors_nine_messages(),
+        ChunkedSpec::new(3).damaged(ChunkDamage::UncompressedCrc),
+    )
+    .unwrap();
+
+    let opts = IngestOptions {
+        on_bad_chunk: OnBadChunk::Halt,
+        ..IngestOptions::default()
+    };
+    let mut frames = Frames::default();
+    let err = tf_tree_ingest::survey(&path, &opts, &mut frames).unwrap_err();
+    match err {
+        IngestError::BadChunk { chunk, kind } => {
+            assert_eq!(
+                chunk, DAMAGED_CHUNK_ORDINAL,
+                "the second chunk is ordinal 1, zero-based"
+            );
+            assert!(matches!(kind, BadChunkKind::Crc { .. }), "got {kind:?}");
+        }
+        other => panic!("expected BadChunk, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(text.contains("chunk 1"), "the message must name it: {text}");
+}
+
+/// **An unknown codec is a hard error, not a skip — even under
+/// [`OnBadChunk::Skip`].**
+///
+/// Every chunk in a recording uses the same codec, so skipping them all would
+/// answer a question nobody asked: `NoTransforms`, or a partial count, about a
+/// file that is perfectly intact and needs one `mcap compress` command. The
+/// relabelled-codec fixture is the only way to reach this from a file whose bytes
+/// are otherwise clean.
+///
+/// Both classifications are checked: `"zstd"` is a codec this build knows the name
+/// of and cannot decode, and `"brotli"` is one it does not know at all — the second
+/// must not degrade into a damaged-chunk skip just because the name is
+/// unrecognised.
+///
+/// Mutant: in `note_or_fail`, make `ChunkFault::Unsupported` skippable
+/// (`let skippable = !matches!(fault, ChunkFault::Callback(_))`) — applied, and
+/// this failed for both codecs with "got 6 of 9 transforms and 1 bad chunk(s)". The
+/// survey succeeded and blamed an unreadable chunk, which explains nothing about
+/// the compression that is the actual cause and hides the one-command remedy. On a
+/// real recording, where *every* chunk is compressed, the same mutant yields
+/// `NoTransforms` about an intact file.
+#[test]
+fn an_unknown_codec_in_a_chunk_is_a_hard_error_not_a_skip() {
+    let dir = Scratch::new("chunk_codec");
+    for (name, want) in [
+        ("zstd", tf_tree_ingest::ChunkCodec::Zstd),
+        ("brotli", tf_tree_ingest::ChunkCodec::Other),
+    ] {
+        let path = dir.path(&format!("{name}.mcap"));
+        write_mcap_chunked(
+            &path,
+            &three_sensors_nine_messages(),
+            ChunkedSpec::new(3).damaged(ChunkDamage::Relabelled(name)),
+        )
+        .unwrap();
+        let mut frames = Frames::default();
+        // The **default** policy, which is `Skip`: this must fail anyway.
+        let err = match tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames) {
+            Err(e) => e,
+            Ok(s) => panic!(
+                "a {name} chunk must not be skipped under the default policy; \
+                 got {} of 9 transforms and {} bad chunk(s)",
+                s.transforms_read, s.anomalies.bad_chunks
+            ),
+        };
+        assert_eq!(err, IngestError::CompressedChunk { codec: want });
+        assert!(
+            err.to_string().contains("cannot read"),
+            "the message must name the build's limitation: {err}"
+        );
+    }
+}
+
+/// **A skipped chunk that carried the only `Channel` record silently drops every
+/// later message.** This test exists to document that, not to celebrate it.
+///
+/// It is the caveat [`OnBadChunk`]'s doc comment promises the report will surface,
+/// and it is only constructible because the hand-rolled writer emits **no summary
+/// section** — with one, the `Channel` record is repeated at the end of the file
+/// and the loss does not happen.
+///
+/// The control matters as much as the case: the same layout *undamaged* ingests the
+/// six messages that follow the definitions, and drops the three that precede them
+/// because MCAP is read in order. So the damaged run's loss of all nine is caused
+/// by the skip and not by the layout.
+///
+/// **What actually happens is worse than the docs imply, and is reported as a
+/// finding rather than fixed here**: the dropped messages have no counter, `survey`
+/// returns `NoTransforms` when no edge survives, and an error carries no anomalies —
+/// so in exactly the case the caveat is about, the report that was supposed to
+/// surface the skip does not exist. The user is told "the recording contains no
+/// tf2_msgs/msg/TFMessage transforms" about a file that contains nine, with no
+/// mention of the chunk. `OnBadChunk`'s doc comment now carries that caveat and
+/// names this test, so the promise and the behaviour no longer contradict each other
+/// while the fix waits; the fix itself — a counter for unknown-channel drops and an
+/// error variant beside `TruncatedBeforeAnyChunk` for "chunks were skipped and
+/// nothing survived" — is a `source.rs` change and belongs to its own commit.
+///
+/// Mutant: none applied — this test pins observed behaviour rather than a guard,
+/// and the property is **structurally guaranteed** by the absence of a summary
+/// section plus `handle_record`'s unknown-channel early return, which has no
+/// counter to break. What it does defend is the *diagnosis*: if a later commit
+/// makes this case report anything at all, this test fails and has to be rewritten,
+/// which is the review this behaviour deserves.
+#[test]
+fn a_skipped_chunk_that_carried_the_only_channel_drops_the_rest() {
+    let dir = Scratch::new("chunk_defs");
+    let messages = three_sensors_nine_messages();
+
+    // The control: definitions in the second chunk, nothing damaged.
+    let control = dir.path("control.mcap");
+    write_mcap_chunked(
+        &control,
+        &messages,
+        ChunkedSpec::new(3).definitions_in_damaged_chunk(),
+    )
+    .unwrap();
+    let mut f1 = Frames::default();
+    let ok = tf_tree_ingest::run(&control, &IngestOptions::default(), &mut f1)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &f1)));
+    assert_eq!(
+        edge_rows(&ok.report),
+        vec![
+            ("base_link".to_string(), "sensor_b".to_string(), 3),
+            ("base_link".to_string(), "sensor_c".to_string(), 3),
+        ],
+        "messages before the Channel record belong to an unknown channel and are \
+         dropped; that is MCAP's ordering, not the skip"
+    );
+    assert_eq!(ok.report.anomalies.bad_chunks, 0);
+
+    // The case: the same layout, with that chunk damaged.
+    let damaged = dir.path("damaged.mcap");
+    write_mcap_chunked(
+        &damaged,
+        &messages,
+        ChunkedSpec::new(3)
+            .definitions_in_damaged_chunk()
+            .damaged(ChunkDamage::FlippedBitInRecords),
+    )
+    .unwrap();
+    let mut f2 = Frames::default();
+    let err = tf_tree_ingest::survey(&damaged, &IngestOptions::default(), &mut f2).unwrap_err();
+    assert_eq!(
+        err,
+        IngestError::NoTransforms,
+        "losing the only Channel record loses every message in the file"
+    );
+    // **The finding, asserted so it cannot quietly change:** the diagnosis does not
+    // name the chunk that was skipped, because a failed survey has no report to name
+    // it from. Asserted on the ordinal rather than on the word "chunk", which a
+    // reword aimed at some other user (a hint about compressed chunks, say) would
+    // trip without telling anyone anything about this behaviour.
+    let text = tf_tree_ingest::describe(err, &f2).to_string();
+    assert!(
+        !text.contains(&format!("chunk {DAMAGED_CHUNK_ORDINAL}")),
+        "if the diagnosis has improved to name the skip, this test must be rewritten \
+         to match: {text}"
+    );
+}
+
+/// A lying `uncompressed_size` is **not detected today**, and that is pinned rather
+/// than hidden.
+///
+/// `decompress::ChunkHead` does not retain the field, so no code path can compare
+/// it, and an uncompressed chunk's records field is bounded by `compressed_size`,
+/// which the fixture leaves honest. So the recording ingests whole and reports
+/// nothing.
+///
+/// **This is a check that is available and unwritten, not one that waits on a
+/// decoder.** With `compression` empty the records are stored verbatim, so
+/// `uncompressed_size == compressed_size == records.len()` is checkable from the
+/// header alone — `mcap` treats them as equal, and
+/// `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate` asserts
+/// it. A partially rewritten chunk header (the field scrambled, `compressed_size` and
+/// the CRC in another sector and intact) therefore ingests with `bad_chunks == 0`
+/// today. Whichever commit adds that four-line comparison in `decompress` — or the
+/// one that adds a decoder, where the field becomes the allocation size and the
+/// decompression-bomb bound — has to rewrite this test to expect
+/// `LengthMismatch` or `ImplausibleSize`. Deleting it silently is the outcome its
+/// wording exists to prevent.
+///
+/// Mutant: **no mutant of the check can kill this, because there is no check** —
+/// `ChunkHead` has no `uncompressed_size` field to mutate. Mutants of the writer and
+/// of the walk do kill it, which is what keeps the nine-sample assertion honest: the
+/// `put_str`-as-`u16` mutant recorded in `fixture::tests` fails this test too, since
+/// the file then has no parseable first record.
+#[test]
+fn a_lying_uncompressed_size_is_not_detected_by_this_build() {
+    let dir = Scratch::new("chunk_usize");
+    let path = dir.path("lying.mcap");
+    write_mcap_chunked(
+        &path,
+        &three_sensors_nine_messages(),
+        ChunkedSpec::new(3).damaged(ChunkDamage::UncompressedSizeTooLarge),
+    )
+    .unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+    assert_eq!(out.report.samples_pushed, 9, "nothing is lost");
+    assert_eq!(
+        out.report.anomalies.bad_chunks, 0,
+        "and nothing is reported, because nothing reads the field"
+    );
 }
