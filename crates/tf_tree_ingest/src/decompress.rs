@@ -41,8 +41,13 @@
 //!
 //! So the framing is ours instead. It is nine bytes — `opcode: u8`, `len: u64`
 //! little-endian, `body[len]` — plus an eight-byte magic at each end of the file,
-//! and it is the *same* framing inside a chunk, so [`for_each_record`] serves
-//! both. What stays with `mcap` is every record **body**: `parse_record`,
+//! and it is the *same* framing inside a chunk. There are still **two** walks of
+//! it, and neither can serve the other: [`for_each_record`] walks a chunk's
+//! records field, which is a `&[u8]` already in hand, while `source::read_tf`
+//! walks the file through a `BufReader` and must bound each record's declared
+//! length before allocating for it. Keeping them separate is deliberate; keeping
+//! them *consistent* is manual, so a change to one framing rule belongs in both.
+//! What stays with `mcap` is every record **body**: `parse_record`,
 //! `records::*`, the `ChunkHeader` layout. That is the line worth holding — the
 //! framing is trivial and we already walked it for chunk interiors, whereas a
 //! `Schema`, `Channel` or `Message` body is genuinely not ours to re-derive.
@@ -521,6 +526,24 @@ pub(crate) fn chunk_records<'a>(
         // second policy.
         return Err(ChunkFault::Bad(BadChunkKind::ImplausibleSize { declared }));
     };
+    // **A `want` no `Vec` can hold is refused here rather than at the allocator.**
+    //
+    // `Vec::reserve_exact` panics with "capacity overflow" for any capacity past
+    // `isize::MAX`, and `decode_lz4` reserves `want + 1` — the budget that its own
+    // docs call the only output bound on that path. So without this, a chunk
+    // header declaring such a size is a panic in the reader reachable from a file.
+    // `usize::MAX` is worse still: the `+ 1` wraps to zero in a build without
+    // overflow checks, pairing a `reserve_exact(0)` with a budget that saturates
+    // to `u64::MAX` and leaving `read_to_end` unbounded — precisely the bomb the
+    // budget exists to stop.
+    //
+    // Unreachable at the default ceilings; the guard exists because **both** of
+    // the guards above are caller-widenable (`--max-chunk-size` saturates to
+    // `u64::MAX`, and the ratio guard's `saturating_mul` pins there too), and it
+    // covers the class rather than the `usize::MAX` corner of it.
+    if want > isize::MAX as usize {
+        return Err(ChunkFault::Bad(BadChunkKind::ImplausibleSize { declared }));
+    }
     let payload = payload_of(declared_fits()?);
 
     // No codec frame is zero bytes — a zstd frame is at least 13 and an LZ4 frame

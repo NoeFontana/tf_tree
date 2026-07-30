@@ -2620,3 +2620,263 @@ fn the_predicate_reports_a_build_with_codecs() {
         "the default build compiles both codecs in"
     );
 }
+
+/// §5.6's `tf_prefix` is applied by **both** passes, which is the only way the
+/// two can agree about which edge a sample belongs to.
+///
+/// Pass one interns prefixed names; pass two looks its buffer up by
+/// `frames.id(&p.name)`. A prefix applied in one and not the other is not an
+/// error — every lookup simply misses, `fill` returns `Ok`, the report still
+/// prints the surveyed per-edge counts, and the arena is empty. That is silent
+/// total data loss on a flag a multi-robot recording is ingested with.
+///
+/// Mutant: replace `fill`'s `match &opts.tf_prefix` normalizer with
+/// `NameNormalizer::new()` — applied, and this failed with `samples_pushed` at
+/// **0**. `tf_tree_cli::tests::tf_prefix_and_static_topic_reach_the_library`
+/// stayed green with it, because the names it asserts come from the survey and
+/// so cannot see pass two at all.
+#[test]
+fn a_tf_prefix_is_applied_by_both_passes() {
+    let dir = Scratch::new("prefix");
+    let path = write(&dir, "prefix.mcap", &small_recording());
+
+    let opts = IngestOptions {
+        tf_prefix: Some("robot1".into()),
+        ..IngestOptions::default()
+    };
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &opts, &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    let mut names: Vec<&str> = frames.all().iter().map(String::as_str).collect();
+    names.sort_unstable();
+    assert!(
+        names.iter().all(|n| n.starts_with("robot1/")),
+        "pass one must intern the prefixed names: {names:?}"
+    );
+
+    // **The half no existing test reaches.** The report's per-edge counts come
+    // from the survey, so they are prefixed either way; `samples_pushed` is what
+    // pass two actually managed to store, and it is zero if pass two normalized
+    // differently from pass one.
+    assert!(
+        out.report.samples_pushed > 0,
+        "pass two normalized with a different prefix than pass one, so every \
+         `frames.id` lookup missed and the samples were dropped in silence"
+    );
+    assert_eq!(
+        out.report
+            .edges
+            .iter()
+            .filter(|e| !e.is_static)
+            .map(|e| e.samples)
+            .sum::<u64>(),
+        out.report.samples_pushed,
+        "the report claims samples the arena does not hold"
+    );
+    assert!(
+        out.report
+            .remaps
+            .iter()
+            .any(|(raw, mapped)| raw == "odom" && mapped == "robot1/odom"),
+        "§5.6's remap table must reach the report: {:?}",
+        out.report.remaps
+    );
+    assert!(
+        out.tree.frame("map").is_err(),
+        "the unprefixed name must not also be in the tree"
+    );
+}
+
+/// **A spill directory that cannot be written is `IngestError::Spill`, not a
+/// panic and not a quietly short ingest.**
+///
+/// `IngestError::Spill` exists so a full or read-only `--spill-dir` is not
+/// reported as a problem with the recording, which was read fine — and until now
+/// nothing in the crate constructed it. Every failure in `spill::io()` (a short
+/// write, ENOSPC on `write_all`, EBADF on the merge's `read_exact`) reaches the
+/// caller through that one mapping and the one `?` chain out of `fill_spilled`;
+/// a nonexistent directory is the member of that family a test can produce
+/// portably.
+///
+/// The `Ok` arm is the assertion that matters: an ingest whose run file never
+/// existed must not hand back a tree holding a fraction of the recording.
+#[test]
+fn an_unusable_spill_directory_is_reported_as_a_spill_failure() {
+    let dir = Scratch::new("spill_enoent");
+    // 100 samples on one edge against a 1 KiB cap: 6 400 B on its own, so
+    // `plan_groups` routes it to `Group::Spilled` and `fill_spilled` runs.
+    let msgs: Vec<FixtureMessage> = (0..100i64)
+        .map(|i| {
+            FixtureMessage::dynamic(
+                "odom",
+                "base_link",
+                1_000_000_000 + i * 1_000_000,
+                pose(i as f64),
+            )
+        })
+        .collect();
+    let path = write(&dir, "spill.mcap", &msgs);
+
+    let opts = IngestOptions {
+        max_memory_bytes: 1024,
+        spill_dir: Some(dir.path("no/such/directory")),
+        ..IngestOptions::default()
+    };
+    let mut frames = Frames::default();
+    match tf_tree_ingest::run(&path, &opts, &mut frames) {
+        Err(IngestError::Spill { .. }) => {}
+        Err(e) => panic!("wanted a Spill failure, got {e:?}"),
+        Ok(out) => panic!(
+            "an ingest whose run file could not be created reported success, \
+             with {} of 100 samples",
+            out.report.samples_pushed
+        ),
+    }
+}
+
+/// §5.6: a transform whose parent or child name is empty is **dropped and
+/// counted**, and the recording around it still ingests.
+///
+/// Both spellings of empty, because `NameNormalizer` reaches `NameError::Empty`
+/// by two routes and only one of them is obvious: `""`, and a bare `"/"`, which
+/// is what a launch file with an unsubstituted variable produces.
+///
+/// The count is the half that matters. A dropped transform with no counter is
+/// indistinguishable from a publisher that never ran, and the edge is *not*
+/// created — so without the anomaly row the report says nothing at all about the
+/// loss.
+///
+/// Mutant: delete `out.anomalies.empty_names += 1` in `survey` — this fails at 0
+/// against 2 and the summary row vanishes; nothing else in the crate notices.
+#[test]
+fn an_empty_frame_name_is_dropped_and_counted() {
+    let dir = Scratch::new("empty_names");
+    let mut msgs: Vec<FixtureMessage> = (1..5)
+        .map(|i| FixtureMessage::dynamic("odom", "base_link", i * 1_000_000_000, pose(i as f64)))
+        .collect();
+    msgs.push(FixtureMessage::dynamic(
+        "",
+        "base_link",
+        5_000_000_000,
+        pose(5.0),
+    ));
+    // A bare slash normalizes to empty too, and is the likelier one in the field.
+    msgs.push(FixtureMessage::dynamic(
+        "odom",
+        "/",
+        6_000_000_000,
+        pose(6.0),
+    ));
+    let path = write(&dir, "empty_names.mcap", &msgs);
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    assert_eq!(out.report.anomalies.empty_names, 2);
+    assert_eq!(
+        out.report.samples_pushed, 4,
+        "the rest of the recording survives"
+    );
+    assert_eq!(
+        out.report.dynamic_edges, 1,
+        "a dropped transform must not create an edge"
+    );
+    assert!(
+        out.report.summary().contains("empty frame name"),
+        "the drop must reach the report:\n{}",
+        out.report.summary()
+    );
+}
+
+/// **A whole recording with no TF in it is `NoTransforms`** — the arm the variant
+/// is named for, and the one the truncation and ceiling tests are each defined
+/// *against*.
+///
+/// Two files, because "no transforms" has two innocent causes and both must land
+/// on the same non-alarming answer: a recording with nothing in it at all, and a
+/// recording full of messages whose schema is not `tf2_msgs/msg/TFMessage`. The
+/// second is the discovery rule's negative — §3.3 keys on the schema, so a topic
+/// that merely *looks* like `/tf` must not be decoded — and
+/// `remapped_topics_are_found_by_schema` only ever states the positive.
+///
+/// Mutant: return `TruncatedBeforeAnyChunk` unconditionally from that branch —
+/// both rows fail, which is the ordering the other two tests assume.
+#[test]
+fn a_recording_with_no_transforms_in_it_says_exactly_that() {
+    let dir = Scratch::new("no_tf");
+
+    let empty = dir.path("empty.mcap");
+    write_mcap(&empty, &[]).unwrap();
+    let mut f1 = Frames::default();
+    assert_eq!(
+        tf_tree_ingest::survey(&empty, &IngestOptions::default(), &mut f1).unwrap_err(),
+        IngestError::NoTransforms,
+        "a complete recording with nothing in it is not truncation"
+    );
+
+    // The same corpus every other test ingests, under a schema that is not TF.
+    let other = dir.path("imu.mcap");
+    let msgs: Vec<FixtureMessage> = (1..5)
+        .map(|i| FixtureMessage::dynamic("odom", "base_link", i * 1_000_000_000, pose(i as f64)))
+        .collect();
+    write_mcap_as(&other, &msgs, "sensor_msgs/msg/Imu", &[]).unwrap();
+    let mut f2 = Frames::default();
+    assert_eq!(
+        tf_tree_ingest::survey(&other, &IngestOptions::default(), &mut f2).unwrap_err(),
+        IngestError::NoTransforms,
+        "a channel whose schema is not TF must not be read for its topic name"
+    );
+    assert!(
+        f2.is_empty(),
+        "no frame may be interned from a non-TF channel: {:?}",
+        f2.all()
+    );
+}
+
+/// §3.2's *"frame declared, never published"*: an edge every sample of which was
+/// dropped stays **in the tree and is flagged**, and the recording around it
+/// ingests.
+///
+/// A recording cannot show an edge that was declared and never published any
+/// other way — there is no declaration record in a bag — so the reachable form is
+/// an edge whose every transform was dropped by an earlier rule. A publisher that
+/// never sets `header.stamp` is the ordinary cause, and it is the same
+/// misconfiguration §3.2 calls "extremely common".
+///
+/// Two properties, and the second is the quiet one: the surveyed edge is declared
+/// with `Capacity::slots(0)`, so this is the only test in which
+/// `TreeBuilder::build` is handed a zero-sample dynamic edge at all.
+///
+/// Mutant: drop the `!e.is_static() && e.samples == 0` filter in
+/// `Survey::edges_without_samples` — this fails on the row, and the report then
+/// says nothing about an edge a user can query and never get an answer from.
+#[test]
+fn an_edge_whose_every_sample_was_dropped_is_declared_and_flagged() {
+    let dir = Scratch::new("no_samples");
+    let mut msgs: Vec<FixtureMessage> = (1..5)
+        .map(|i| FixtureMessage::dynamic("odom", "base_link", i * 1_000_000_000, pose(i as f64)))
+        .collect();
+    msgs.push(FixtureMessage::dynamic("base_link", "laser", 0, pose(9.0)).logged_at(1_000_000_000));
+    let path = write(&dir, "no_samples.mcap", &msgs);
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+
+    assert_eq!(
+        out.report.edges_without_samples,
+        vec!["base_link -> laser".to_string()]
+    );
+    assert_eq!(
+        out.report.dynamic_edges, 2,
+        "the edge is kept in the topology, not dropped with its samples"
+    );
+    assert_eq!(out.report.samples_pushed, 4);
+    assert!(
+        out.report.summary().contains("no samples"),
+        "the flag must reach the report:\n{}",
+        out.report.summary()
+    );
+}
