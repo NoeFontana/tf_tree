@@ -342,6 +342,13 @@ pub struct Anomalies {
     /// runs past the end of the file; calling that corruption would tell an
     /// operator their recording is damaged when it is only incomplete.
     pub bad_chunks: u64,
+    /// Of [`bad_chunks`](Anomalies::bad_chunks), how many were refused by one of
+    /// this reader's limits rather than found damaged.
+    ///
+    /// Reported separately because the remedy differs and only this one has a
+    /// remedy at all: a flag. See [`crate::IngestError::AllChunksOverLimit`], which
+    /// is what the same condition becomes when it takes *every* chunk.
+    pub chunks_over_limit: u64,
     /// The span the skipped chunks covered, from their own declared message times.
     ///
     /// "Three chunks were unreadable" is not actionable; "the transforms between
@@ -544,6 +551,7 @@ pub fn survey(
     out.anomalies.filtered_channels = skips.filtered_channels + skips.non_cdr;
     out.anomalies.truncated = skips.truncated;
     out.anomalies.bad_chunks = skips.bad_chunks;
+    out.anomalies.chunks_over_limit = skips.chunks_over_limit;
     out.anomalies.bad_chunk_span_ns = skips.bad_chunk_span_ns;
     out.anomalies.stripped_slash_names = normalizer.stripped_count();
     out.remaps = normalizer.remaps().to_vec();
@@ -558,7 +566,18 @@ pub fn survey(
         // smaller than one chunk; `truncation_recovery_is_record_granular` shows
         // records inside a cut chunk are recovered, so the reachable class is a very
         // different and much larger one.
-        return Err(if out.anomalies.truncated {
+        //
+        // **The limit case is tested first, ahead of truncation.** It is the only
+        // one of the three with a remedy the operator can act on — a flag — and a
+        // recording can be both truncated and written with chunks over the ceiling,
+        // in which case naming the knob is strictly more useful than naming the cut.
+        // `Anomalies::truncated` still says the file is a prefix, so nothing is lost
+        // by ordering it second.
+        return Err(if out.anomalies.chunks_over_limit > 0 {
+            IngestError::AllChunksOverLimit {
+                skipped: out.anomalies.chunks_over_limit,
+            }
+        } else if out.anomalies.truncated {
             IngestError::TruncatedBeforeAnyChunk
         } else {
             IngestError::NoTransforms

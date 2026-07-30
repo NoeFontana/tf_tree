@@ -2170,6 +2170,112 @@ fn a_lying_uncompressed_size_is_refused() {
     }
 }
 
+/// **A recording every chunk of which exceeds a ceiling is not reported as a
+/// recording with nothing in it.**
+///
+/// The bomb guards refuse a chunk with `ImplausibleSize`, which is a skippable bad
+/// chunk — correctly, because a corrupt `uncompressed_size` off a bad sector lands
+/// there too and must not cost the whole file. But a *ceiling* is uniform across a
+/// recording in a way damage is not: chunk size is a writer setting, so when the
+/// ceiling is the thing that refused them it refuses every one. The skips then took
+/// the file, and the answer used to be `NoTransforms` — "the recording contains no
+/// tf2_msgs/msg/TFMessage transforms" about a recording full of them, sending an
+/// operator to look for a publisher that had been running the whole time.
+///
+/// Both halves are asserted, because a fix that only changed the message would be a
+/// fix to the symptom: the counter has to distinguish a ceiling from damage, and
+/// the error has to be the one that names a flag.
+///
+/// Mutant: drop the `chunks_over_limit > 0` arm from `ingest::fill`'s
+/// empty-edges branch — applied, and this failed with `NoTransforms`, which is
+/// exactly the diagnosis it exists to prevent. Mutant 2: count every skipped chunk
+/// in `chunks_over_limit` rather than only the two limit kinds — applied, and
+/// `a_lying_uncompressed_size_is_refused` fails, because a chunk with a rewritten
+/// header would then be reported as one this reader declined to allocate for.
+///
+/// **The fixture has to be compressed**, and that is the guards' design rather than
+/// a convenience: `chunk_records` returns an uncompressed chunk by borrow and
+/// allocates nothing, so no ceiling applies to it and none should. The ceilings
+/// bound an output buffer, and there is only an output buffer on the codec path.
+#[cfg(feature = "compression")]
+#[test]
+fn a_recording_over_every_ceiling_names_the_flag_not_an_empty_recording() {
+    let dir = Scratch::new("chunk_over_limit");
+    let path = dir.path("big.mcap");
+    write_mcap_chunked(
+        &path,
+        &three_sensors_nine_messages(),
+        ChunkedSpec::new(3).compressed(FixtureCodec::Zstd),
+    )
+    .unwrap();
+
+    // A ceiling below every chunk in the file. `0` rather than a size near the real
+    // one, so the test cannot start passing for the wrong reason if the fixture's
+    // chunks change size.
+    let opts = IngestOptions {
+        max_chunk_uncompressed_bytes: 0,
+        ..IngestOptions::default()
+    };
+    let mut frames = Frames::default();
+    match tf_tree_ingest::survey(&path, &opts, &mut frames).unwrap_err() {
+        IngestError::AllChunksOverLimit { skipped } => assert_eq!(skipped, 3),
+        other => panic!("expected AllChunksOverLimit, got {other:?}"),
+    }
+
+    // And under `halt` it is the ordinary named fault, because the policy did not
+    // change — only the diagnosis when the skips take everything.
+    let opts = IngestOptions {
+        max_chunk_uncompressed_bytes: 0,
+        on_bad_chunk: OnBadChunk::Halt,
+        ..IngestOptions::default()
+    };
+    let mut frames = Frames::default();
+    match tf_tree_ingest::survey(&path, &opts, &mut frames).unwrap_err() {
+        IngestError::BadChunk { chunk, kind } => {
+            assert_eq!(chunk, 0);
+            assert!(
+                matches!(kind, BadChunkKind::ImplausibleSize { .. }),
+                "got {kind:?}"
+            );
+        }
+        other => panic!("expected BadChunk, got {other:?}"),
+    }
+}
+
+/// **A ceiling refusal is counted apart from damage, and only when it is one.**
+///
+/// The counter behind `AllChunksOverLimit` is a *subset* of `bad_chunks`, so the
+/// two ways it can be wrong are opposite: counting nothing makes the diagnosis
+/// above unreachable, and counting every skipped chunk turns a bad sector into
+/// "raise --max-chunk-size". The second is the one a naive implementation gets
+/// wrong, and it is what this asserts — the recording here is *damaged*, and the
+/// limit counter must stay at zero while `bad_chunks` rises.
+#[test]
+fn damage_is_not_counted_as_a_ceiling_refusal() {
+    let dir = Scratch::new("chunk_damage_vs_limit");
+    let path = dir.path("damaged.mcap");
+    write_mcap_chunked(
+        &path,
+        &three_sensors_nine_messages(),
+        ChunkedSpec::new(3).damaged(ChunkDamage::UncompressedCrc),
+    )
+    .unwrap();
+
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+    assert_eq!(out.report.anomalies.bad_chunks, 1);
+    assert_eq!(
+        out.report.anomalies.chunks_over_limit, 0,
+        "a failed CRC is damage; there is no flag to raise for it"
+    );
+    assert!(
+        !out.report.summary().contains("--max-chunk-size"),
+        "the report must not offer a remedy that cannot help: {}",
+        out.report.summary()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Compressed recordings — the case rosbag2 and Foxglove actually write.
 //

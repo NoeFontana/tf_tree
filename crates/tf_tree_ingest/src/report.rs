@@ -211,6 +211,7 @@ impl IngestReport {
         );
         let _ = write!(s, ",\"truncated\":{}", a.truncated);
         let _ = write!(s, ",\"bad_chunks\":{}", a.bad_chunks);
+        let _ = write!(s, ",\"chunks_over_limit\":{}", a.chunks_over_limit);
         s.push_str(",\"bad_chunk_span_ns\":");
         match a.bad_chunk_span_ns {
             Some((lo, hi)) => {
@@ -371,6 +372,20 @@ impl IngestReport {
                     a.bad_chunks
                 ),
             },
+        );
+        // A subset of the row above, and the only skip with a remedy: those chunks
+        // were sound and this reader declined to allocate for them. Without this
+        // line the operator reads "unreadable" about a recording that is merely
+        // larger than a default, and the flag that fixes it appears nowhere.
+        row(
+            a.chunks_over_limit > 0,
+            format!(
+                "{} of those were not damaged — they exceeded this reader's limits \
+                 (--max-chunk-size, --max-chunk-expansion, or a zstd frame asking \
+                 for more decoding window than a chunk that size is allowed). \
+                 Raising the flag reads them",
+                a.chunks_over_limit
+            ),
         );
         row(
             a.zero_stamp_drops > 0,
@@ -533,6 +548,66 @@ mod tests {
         let json = report.to_json();
         assert!(json.contains("\"rate_hz\":null"), "{json}");
         assert!(!json.contains("NaN"), "{json}");
+    }
+
+    /// **A ceiling refusal is reported as one, not merely as an unreadable chunk.**
+    ///
+    /// The `bad_chunks` row calls every skip "unreadable" and offers
+    /// `--on-bad-chunk=halt`. For a chunk the reader simply declined to allocate
+    /// for, that is a true sentence with the wrong subject — the recording is fine
+    /// — and the flag that would have read it appears nowhere in the report.
+    ///
+    /// Built by hand rather than through an ingest because the condition needs a
+    /// recording whose chunks exceed a ceiling, which
+    /// `ingest::a_recording_over_every_ceiling_names_the_flag_not_an_empty_recording`
+    /// covers end to end; what is asserted here is the rendering, and only the
+    /// rendering.
+    ///
+    /// Mutant: delete the `chunks_over_limit` row from `summary` — applied, and the
+    /// `--max-chunk-size` assertion failed. Nothing else in the crate noticed,
+    /// which is why this test exists rather than being folded into an ingest test.
+    #[test]
+    fn a_ceiling_refusal_is_reported_apart_from_damage() {
+        let with_limit = |over: u64| {
+            IngestReport {
+                source: "x.mcap".into(),
+                tool_version: "0",
+                frames: 0,
+                static_edges: 0,
+                dynamic_edges: 0,
+                transforms_read: 0,
+                samples_pushed: 0,
+                span_ns: None,
+                fill: FillStats::default(),
+                edges: Vec::new(),
+                anomalies: crate::Anomalies {
+                    bad_chunks: 4,
+                    chunks_over_limit: over,
+                    ..crate::Anomalies::default()
+                },
+                remaps: Vec::new(),
+                edges_without_samples: Vec::new(),
+            }
+            .summary()
+        };
+
+        let text = with_limit(3);
+        assert!(
+            text.contains("--max-chunk-size") && text.contains("--max-chunk-expansion"),
+            "the flags that would read those chunks must be named: {text}"
+        );
+        assert!(
+            text.contains("not damaged"),
+            "and the report must say the chunks were sound: {text}"
+        );
+
+        // Zero is silent, like every other anomaly row: a report that always prints
+        // the line trains the reader to skip it.
+        assert!(
+            !with_limit(0).contains("--max-chunk-size"),
+            "{}",
+            with_limit(0)
+        );
     }
 
     /// The characters that actually break a hand-written encoder are escaped.

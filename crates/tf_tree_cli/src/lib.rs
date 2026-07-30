@@ -550,14 +550,46 @@ fn cmd_ingest(
 /// `IngestError` is `Copy` and `String`-free by house rule, so it cannot carry a
 /// frame name or a suggested command; both are joined on here, at the only layer
 /// that has a terminal to print to.
+/// The remedy shared by every refusal that came from a ceiling rather than from
+/// damage.
+///
+/// One constant and not two copies: the `BadChunk` arm (under
+/// `--on-bad-chunk=halt`) and the `AllChunksOverLimit` arm (under the default
+/// `skip`) are the same condition met at different policies, and a reader who fixes
+/// the wording in one place should not be able to leave the other stale.
+const LIMIT_REMEDY: &str =
+    "\x20 --max-chunk-size <MiB> raises the ceiling on a chunk's uncompressed\n\
+     \x20 size, and --max-chunk-expansion its ratio to the compressed bytes.\n\
+     \x20 Both bound what this reader will allocate for one chunk, so raise them\n\
+     \x20 to what the recording actually needs rather than to the maximum.";
+
 fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -> anyhow::Error {
     let text = tf_tree_ingest::describe(e, frames).to_string();
     match e {
+        // **The two limit refusals get the flags, not the skip policy.** Under
+        // `--on-bad-chunk=halt` a chunk over a ceiling arrives here as `BadChunk`
+        // like any other, and suggesting `skip` — which is already the default —
+        // would be advice to lose the chunk when the chunk is fine and the reader's
+        // ceiling is what refused it. `AllChunksOverLimit` below is the same
+        // condition once it has taken the whole recording.
+        tf_tree_ingest::IngestError::BadChunk {
+            kind:
+                tf_tree_ingest::BadChunkKind::ImplausibleSize { .. }
+                | tf_tree_ingest::BadChunkKind::ImplausibleWindow { .. },
+            ..
+        } => anyhow::anyhow!("{text}\n{LIMIT_REMEDY}"),
         tf_tree_ingest::IngestError::BadChunk { .. } => anyhow::anyhow!(
             "{text}\n\
              \x20 --on-bad-chunk=skip (the default) would drop just this chunk and\n\
              \x20 report the span of time it takes with it, instead of refusing the\n\
              \x20 whole recording."
+        ),
+        tf_tree_ingest::IngestError::AllChunksOverLimit { .. } => anyhow::anyhow!(
+            "{text}\n\
+             \x20 The recording is not damaged: every chunk in it was larger than\n\
+             \x20 this reader will allocate for, which is what a writer configured\n\
+             \x20 with big chunks produces.\n\
+             {LIMIT_REMEDY}"
         ),
         // **One message for both builds, deliberately.** zstd and lz4 are decoded
         // by pure-Rust codecs behind `tf_tree_ingest`'s default-on `compression`
@@ -1633,6 +1665,84 @@ mod tests {
             text.contains('7'),
             "and the chunk must be identified: {text}"
         );
+    }
+
+    /// **A refusal that came from a ceiling names the ceiling's flag, and never
+    /// `--on-bad-chunk=skip`.**
+    ///
+    /// The generic `BadChunk` advice is actively wrong for these two kinds. `skip`
+    /// is already the default, and following it drops a chunk that is not damaged —
+    /// the recording is sound and this reader declined to allocate for it. Both
+    /// policies are covered because an operator meets the same condition as
+    /// `BadChunk` under `halt` and as `AllChunksOverLimit` under `skip`, and a
+    /// remedy that appears under only one of them is a remedy half the users never
+    /// see.
+    ///
+    /// Mutant: delete the `ImplausibleSize | ImplausibleWindow` arm, so both fall
+    /// through to the generic `BadChunk` one — applied, and the `--max-chunk-size`
+    /// assertion fails while the `--on-bad-chunk` one fires, which is the
+    /// misdirection in one line.
+    #[test]
+    fn a_ceiling_refusal_names_the_flag_that_raises_it() {
+        let frames = tf_tree_ingest::Frames::default();
+        let halt = ingest_err(
+            tf_tree_ingest::IngestError::BadChunk {
+                chunk: 3,
+                kind: tf_tree_ingest::BadChunkKind::ImplausibleSize {
+                    declared: 200 * 1024 * 1024,
+                },
+            },
+            &frames,
+        )
+        .to_string();
+        let skip = ingest_err(
+            tf_tree_ingest::IngestError::AllChunksOverLimit { skipped: 812 },
+            &frames,
+        )
+        .to_string();
+
+        for (label, text) in [("halt", &halt), ("skip", &skip)] {
+            assert!(
+                text.contains("--max-chunk-size"),
+                "{label}: the flag that raises the ceiling must be named: {text}"
+            );
+            assert!(
+                text.contains("--max-chunk-expansion"),
+                "{label}: and the other ceiling, which refuses the same chunk for a \
+                 different reason: {text}"
+            );
+            assert!(
+                !text.contains("--on-bad-chunk"),
+                "{label}: skipping a sound chunk is not the remedy here: {text}"
+            );
+        }
+        assert!(
+            skip.contains("812") && skip.contains("not damaged"),
+            "the whole-recording case must say the file is intact: {skip}"
+        );
+    }
+
+    /// A window refusal reaches the same arm as a size refusal.
+    ///
+    /// Its own test because the two kinds are separate variants matched in one
+    /// pattern, and an edit that splits the pattern would leave one of them falling
+    /// through to advice about `--on-bad-chunk` with nothing to catch it.
+    #[test]
+    fn a_window_refusal_reaches_the_ceiling_remedy_too() {
+        let frames = tf_tree_ingest::Frames::default();
+        let text = ingest_err(
+            tf_tree_ingest::IngestError::BadChunk {
+                chunk: 0,
+                kind: tf_tree_ingest::BadChunkKind::ImplausibleWindow {
+                    requested: 64 * 1024 * 1024,
+                    ceiling: 8 * 1024 * 1024,
+                },
+            },
+            &frames,
+        )
+        .to_string();
+        assert!(text.contains("--max-chunk-size"), "{text}");
+        assert!(!text.contains("--on-bad-chunk"), "{text}");
     }
 
     /// The `split` refusal cites the section that records it as unbuilt, so a
