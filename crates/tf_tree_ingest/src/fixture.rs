@@ -567,20 +567,27 @@ impl FixtureCodec {
 /// `docs/PHASE5.md` §12's ingest gate is asserted by no code. A benchmark whose
 /// corpus came from *this* function would understate it by the factor above, which is
 /// why one has not simply been added; §11 records what it would take.
+///
+/// **`bytes` is taken by value so the uncompressed arm is a move.** It used to take
+/// a slice and `to_vec()` it, which reintroduced exactly the full-size copy the
+/// `body.append` at this function's only call site claims to have removed — the copy
+/// was back and only the comment said otherwise. The compressed arms read it as a
+/// slice and would not care either way; the uncompressed one is every fixture this
+/// repository wrote before codecs existed, so it is the arm worth not copying.
 #[cfg_attr(not(feature = "compression"), allow(unused_variables))]
-fn compress_records(codec: FixtureCodec, bytes: &[u8]) -> Result<Vec<u8>, FixturePlanError> {
+fn compress_records(codec: FixtureCodec, bytes: Vec<u8>) -> Result<Vec<u8>, FixturePlanError> {
     match codec {
-        FixtureCodec::None => Ok(bytes.to_vec()),
+        FixtureCodec::None => Ok(bytes),
         #[cfg(feature = "compression")]
         FixtureCodec::Zstd => Ok(ruzstd::encoding::compress_to_vec(
-            bytes,
+            &bytes[..],
             ruzstd::encoding::CompressionLevel::Fastest,
         )),
         #[cfg(feature = "compression")]
         FixtureCodec::Lz4 => {
             use std::io::Write;
             let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
-            enc.write_all(bytes)
+            enc.write_all(&bytes)
                 .map_err(|_| FixturePlanError::CodecFailed {
                     codec: codec.name(),
                 })?;
@@ -1144,7 +1151,7 @@ fn chunk_body(
             codec: codec.name(),
         });
     }
-    let mut payload = compress_records(codec, &bytes)?;
+    let mut payload = compress_records(codec, bytes)?;
     let mut compression = codec.name();
     let mut uncompressed_size = uncompressed_size_true;
     let mut compressed_size = payload.len() as u64;
@@ -1181,7 +1188,10 @@ fn chunk_body(
     put_str(&mut body, compression);
     put_u64(&mut body, compressed_size);
     // Moved rather than copied: the records field is the whole chunk and this is the
-    // one full-size copy in the writer that costs nothing to remove.
+    // one full-size copy in the writer that costs nothing to remove. It is a move all
+    // the way back to the caller's records for an uncompressed fixture, which is what
+    // `compress_records` taking `bytes` by value buys — an earlier revision copied
+    // there and left this comment describing a saving it had undone.
     body.append(&mut payload);
     Ok(body)
 }
