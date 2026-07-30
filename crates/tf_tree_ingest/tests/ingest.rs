@@ -16,6 +16,13 @@ use tf_tree_ingest::fixture::{
     small_recording, two_publishers_with_latency, write_mcap, write_mcap_as, write_mcap_chunked,
     ChunkDamage, ChunkedSpec, FixtureMessage, DAMAGED_CHUNK_ORDINAL,
 };
+// Only the compressed tests use these, and they are `#[cfg(feature =
+// "compression")]` — a plain `use` would be an unused import in the codec-free
+// build, which `-D warnings` rejects.
+#[cfg(feature = "compression")]
+use tf_tree_ingest::fixture::{
+    conformance_recording, FixtureCodec, CONFORMANCE_MESSAGES_PER_CHUNK,
+};
 use tf_tree_ingest::{
     BadChunkKind, ClockResetPolicy, Frames, IngestError, IngestOptions, OnBadChunk,
 };
@@ -1598,6 +1605,15 @@ fn damaged_chunk_span(messages: &[FixtureMessage], per_chunk: usize) -> (u64, u6
 /// would send the next reader to assert on `/tf`'s sample count — the one number
 /// the mutant zeroes.)
 ///
+/// **This is also the regression the codec work most risks**, which is why it is
+/// named rather than left as one of the crowd: the uncompressed path is now one
+/// branch of a `match` on the codec, and it must still be returned by borrow with no
+/// decoder anywhere near it. Mutant: `ChunkCodec::parse("")` → `Self::Other` —
+/// applied, and this failed with `the recording uses an unrecognised
+/// codec-compressed chunks, which this build cannot read`. **42 of the crate's 94
+/// tests died with it**, which is the right shape for a one-line change to codec
+/// classification: every uncompressed chunk in every recording refused.
+///
 /// A third mutant **survived** and is worth recording: dropping the `+ 1` from
 /// `channel_id`, so channels are numbered from `0`. Nothing in this crate reserves
 /// channel id `0` — only `schema_id` `0` is special, meaning "no schema" — and the
@@ -1917,25 +1933,72 @@ fn a_corrupt_chunk_under_halt_names_the_chunk_ordinal() {
 /// relabelled-codec fixture is the only way to reach this from a file whose bytes
 /// are otherwise clean.
 ///
-/// Both classifications are checked: `"zstd"` is a codec this build knows the name
-/// of and cannot decode, and `"brotli"` is one it does not know at all — the second
-/// must not degrade into a damaged-chunk skip just because the name is
-/// unrecognised.
+/// **`"brotli"` and not `"zstd"`, and that changed with this build.** zstd and lz4
+/// are now decoded, so a chunk relabelled `"zstd"` is a chunk that lies about its
+/// payload — damage, and skippable, which
+/// [`a_mislabelled_codec_is_damage_not_an_unsupported_codec`] covers. What remains
+/// unsupported is a name outside the MCAP specification entirely, and *that* must
+/// not degrade into a damaged-chunk skip just because the name is unrecognised.
 ///
 /// Mutant: in `note_or_fail`, make `ChunkFault::Unsupported` skippable
 /// (`let skippable = !matches!(fault, ChunkFault::Callback(_))`) — applied, and
-/// this failed for both codecs with "got 6 of 9 transforms and 1 bad chunk(s)". The
-/// survey succeeded and blamed an unreadable chunk, which explains nothing about
-/// the compression that is the actual cause and hides the one-command remedy. On a
-/// real recording, where *every* chunk is compressed, the same mutant yields
-/// `NoTransforms` about an intact file.
+/// this failed with "a brotli chunk must not be skipped under the default policy;
+/// got 6 of 9 transforms and 1 bad chunk(s)". The survey succeeded and blamed an
+/// unreadable chunk, which explains nothing about the compression that is the
+/// actual cause and hides the one-command remedy. On a real recording, where
+/// *every* chunk is compressed, the same mutant yields `NoTransforms` about an
+/// intact file.
 #[test]
 fn an_unknown_codec_in_a_chunk_is_a_hard_error_not_a_skip() {
     let dir = Scratch::new("chunk_codec");
-    for (name, want) in [
-        ("zstd", tf_tree_ingest::ChunkCodec::Zstd),
-        ("brotli", tf_tree_ingest::ChunkCodec::Other),
-    ] {
+    let name = "brotli";
+    let path = dir.path("brotli.mcap");
+    write_mcap_chunked(
+        &path,
+        &three_sensors_nine_messages(),
+        ChunkedSpec::new(3).damaged(ChunkDamage::Relabelled(name)),
+    )
+    .unwrap();
+    let mut frames = Frames::default();
+    // The **default** policy, which is `Skip`: this must fail anyway.
+    let err = match tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames) {
+        Err(e) => e,
+        Ok(s) => panic!(
+            "a {name} chunk must not be skipped under the default policy; \
+             got {} of 9 transforms and {} bad chunk(s)",
+            s.transforms_read, s.anomalies.bad_chunks
+        ),
+    };
+    assert_eq!(
+        err,
+        IngestError::CompressedChunk {
+            codec: tf_tree_ingest::ChunkCodec::Other
+        }
+    );
+    assert!(
+        err.to_string().contains("cannot read"),
+        "the message must name the build's limitation: {err}"
+    );
+}
+
+/// **A chunk that claims a codec it does not carry is damage, and one damaged
+/// chunk must not cost the recording.**
+///
+/// The two failures are a step apart and want opposite policies. An *unsupported*
+/// codec is never skippable, because every chunk in the file uses it. A chunk that
+/// says `"zstd"` over bytes that are not zstd is one bad chunk, and the skip policy
+/// is exactly what recovers the other two.
+///
+/// Mutant: in `decompress::decode_zstd`, map every `Err` — not only
+/// `TargetTooSmall` — through `ChunkFault::Unsupported` instead of
+/// `BadChunkKind::Decompress` — applied, and this failed on `unwrap_or_else` with
+/// `CompressedChunk`: one mislabelled chunk in a 400 000-chunk recording would take
+/// the whole file with it, and the diagnosis would blame a codec the build has.
+#[cfg(feature = "compression")]
+#[test]
+fn a_mislabelled_codec_is_damage_not_an_unsupported_codec() {
+    let dir = Scratch::new("chunk_mislabelled");
+    for name in ["zstd", "lz4"] {
         let path = dir.path(&format!("{name}.mcap"));
         write_mcap_chunked(
             &path,
@@ -1944,19 +2007,15 @@ fn an_unknown_codec_in_a_chunk_is_a_hard_error_not_a_skip() {
         )
         .unwrap();
         let mut frames = Frames::default();
-        // The **default** policy, which is `Skip`: this must fail anyway.
-        let err = match tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames) {
-            Err(e) => e,
-            Ok(s) => panic!(
-                "a {name} chunk must not be skipped under the default policy; \
-                 got {} of 9 transforms and {} bad chunk(s)",
-                s.transforms_read, s.anomalies.bad_chunks
-            ),
-        };
-        assert_eq!(err, IngestError::CompressedChunk { codec: want });
-        assert!(
-            err.to_string().contains("cannot read"),
-            "the message must name the build's limitation: {err}"
+        let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+            .unwrap_or_else(|e| panic!("{name}: {}", tf_tree_ingest::describe(e, &frames)));
+        assert_eq!(
+            out.report.anomalies.bad_chunks, 1,
+            "{name}: the mislabelled chunk is one skippable bad chunk"
+        );
+        assert_eq!(
+            out.report.samples_pushed, 6,
+            "{name}: the chunks either side of it survive"
         );
     }
 }
@@ -2049,34 +2108,26 @@ fn a_skipped_chunk_that_carried_the_only_channel_drops_the_rest() {
     );
 }
 
-/// A lying `uncompressed_size` is **not detected today**, and that is pinned rather
-/// than hidden.
+/// A lying `uncompressed_size` on an **uncompressed** chunk is refused, with no
+/// decoder involved.
 ///
-/// `decompress::ChunkHead` does not retain the field, so no code path can compare
-/// it, and an uncompressed chunk's records field is bounded by `compressed_size`,
-/// which the fixture leaves honest. So the recording ingests whole and reports
-/// nothing.
+/// The records are stored verbatim under `compression == ""`, so
+/// `uncompressed_size == compressed_size == records.len()` is an invariant
+/// checkable from the header alone. A previous revision of this test pinned the
+/// *opposite* — the field was not retained, so a partially rewritten chunk header
+/// (the size scrambled, `compressed_size` and the CRC in another sector and intact)
+/// ingested with `bad_chunks == 0` — and said in its own wording that whichever
+/// commit closed the gap had to rewrite it. This is that rewrite.
 ///
-/// **This is a check that is available and unwritten, not one that waits on a
-/// decoder.** With `compression` empty the records are stored verbatim, so
-/// `uncompressed_size == compressed_size == records.len()` is checkable from the
-/// header alone — `mcap` treats them as equal, and
-/// `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate` asserts
-/// it. A partially rewritten chunk header (the field scrambled, `compressed_size` and
-/// the CRC in another sector and intact) therefore ingests with `bad_chunks == 0`
-/// today. Whichever commit adds that four-line comparison in `decompress` — or the
-/// one that adds a decoder, where the field becomes the allocation size and the
-/// decompression-bomb bound — has to rewrite this test to expect
-/// `LengthMismatch` or `ImplausibleSize`. Deleting it silently is the outcome its
-/// wording exists to prevent.
+/// The other two chunks survive, which is the half that says the fix did not
+/// become a reason to refuse the file: the damage is one skippable bad chunk.
 ///
-/// Mutant: **no mutant of the check can kill this, because there is no check** —
-/// `ChunkHead` has no `uncompressed_size` field to mutate. Mutants of the writer and
-/// of the walk do kill it, which is what keeps the nine-sample assertion honest: the
-/// `put_str`-as-`u16` mutant recorded in `fixture::tests` fails this test too, since
-/// the file then has no parseable first record.
+/// Mutant: neutralise the `head.uncompressed_size != head.compressed_size` arm in
+/// `decompress::chunk_records` — applied, and this failed on `bad_chunks`, `0`
+/// against `1`, with the nine transforms all present. That is exactly the behaviour
+/// the test this one replaced used to *assert*.
 #[test]
-fn a_lying_uncompressed_size_is_not_detected_by_this_build() {
+fn a_lying_uncompressed_size_is_refused() {
     let dir = Scratch::new("chunk_usize");
     let path = dir.path("lying.mcap");
     write_mcap_chunked(
@@ -2089,9 +2140,340 @@ fn a_lying_uncompressed_size_is_not_detected_by_this_build() {
     let mut frames = Frames::default();
     let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
         .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
-    assert_eq!(out.report.samples_pushed, 9, "nothing is lost");
     assert_eq!(
-        out.report.anomalies.bad_chunks, 0,
-        "and nothing is reported, because nothing reads the field"
+        out.report.anomalies.bad_chunks, 1,
+        "the header lies, and the reader must say so"
     );
+    assert_eq!(
+        out.report.samples_pushed, 6,
+        "and only that chunk is lost, not the recording"
+    );
+
+    // Under `halt` the fault is named, and it is a length disagreement rather than
+    // a CRC one — the check is on the header's own two numbers, so it fires before
+    // anything hashes.
+    let opts = IngestOptions {
+        on_bad_chunk: OnBadChunk::Halt,
+        ..IngestOptions::default()
+    };
+    let mut frames = Frames::default();
+    let err = tf_tree_ingest::survey(&path, &opts, &mut frames).unwrap_err();
+    match err {
+        IngestError::BadChunk { chunk, kind } => {
+            assert_eq!(chunk, DAMAGED_CHUNK_ORDINAL);
+            assert!(
+                matches!(kind, BadChunkKind::LengthMismatch { .. }),
+                "got {kind:?}"
+            );
+        }
+        other => panic!("expected BadChunk, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compressed recordings — the case rosbag2 and Foxglove actually write.
+//
+// Every fixture below is compressed by the same crates that read it back, which
+// proves round-trip and **not** conformance. `a_real_libzstd_recording_ingests`
+// closes that gap for zstd against the host's `zstd` CLI; there is no `lz4` CLI
+// here, so lz4 has round-trip coverage only, and this comment is the honest
+// statement of that asymmetry rather than a claim that both are equal.
+// ---------------------------------------------------------------------------
+
+/// **A zstd recording ingests byte-for-byte identically to the uncompressed one.**
+///
+/// The comparison is against the *same corpus* written uncompressed by the same
+/// writer, so the only variable is the codec. Sample counts alone would not be
+/// enough — a decoder that dropped a block and a writer that dropped a message look
+/// the same in a count — so the per-edge source time bounds are compared too, and
+/// the tree is queried at a stamp inside the compressed chunk.
+///
+/// Mutant: in `decompress::decode_zstd`, hand `decode_all` a slice of `want - 1`
+/// bytes — applied, and this failed with `zstd packed: the recording contains no
+/// tf2_msgs/msg/TFMessage transforms`: every chunk in the file over-runs its
+/// one-byte-short buffer, all of them are skipped, and an intact recording reads as
+/// empty. It killed six other tests with it, `a_real_libzstd_recording_ingests`
+/// included.
+#[cfg(feature = "compression")]
+#[test]
+fn a_zstd_recording_ingests_identically() {
+    a_compressed_recording_ingests_identically(FixtureCodec::Zstd, "zstd");
+}
+
+/// **An lz4 recording ingests byte-for-byte identically to the uncompressed one.**
+///
+/// Mutant: use `lz4_flex::block::decompress` in place of the frame decoder —
+/// applied, and this failed with `lz4 packed: the recording contains no
+/// tf2_msgs/msg/TFMessage transforms`. Every chunk faults, because MCAP's `"lz4"` is
+/// the LZ4 *frame* container and the block decoder does not understand its 4-byte
+/// magic. That is the silent-correctness trap the crate `#[deprecated]`s its own
+/// block re-exports to prevent, and it is why this test exists separately from the
+/// zstd one rather than as a loop inside it.
+#[cfg(feature = "compression")]
+#[test]
+fn an_lz4_recording_ingests_identically() {
+    a_compressed_recording_ingests_identically(FixtureCodec::Lz4, "lz4");
+}
+
+/// The body of the two tests above: same corpus, same writer, one codec apart.
+#[cfg(feature = "compression")]
+fn a_compressed_recording_ingests_identically(codec: FixtureCodec, tag: &str) {
+    let dir = Scratch::new(&format!("codec_{tag}"));
+    let messages = small_recording();
+    let spec = ChunkedSpec::new(60);
+
+    let plain = dir.path("plain.mcap");
+    write_mcap_chunked(&plain, &messages, spec).unwrap();
+    let packed = dir.path("packed.mcap");
+    write_mcap_chunked(&packed, &messages, spec.compressed(codec)).unwrap();
+
+    // The fixture really is smaller, so "identical" below is not two readings of
+    // the same bytes.
+    let (plain_len, packed_len) = (
+        std::fs::metadata(&plain).unwrap().len(),
+        std::fs::metadata(&packed).unwrap().len(),
+    );
+    assert!(
+        packed_len < plain_len,
+        "{tag}: the compressed fixture ({packed_len} B) is not smaller than the \
+         uncompressed one ({plain_len} B), so this test compares nothing"
+    );
+
+    let mut f1 = Frames::default();
+    let a = tf_tree_ingest::run(&plain, &IngestOptions::default(), &mut f1)
+        .unwrap_or_else(|e| panic!("{tag} plain: {}", tf_tree_ingest::describe(e, &f1)));
+    let mut f2 = Frames::default();
+    let b = tf_tree_ingest::run(&packed, &IngestOptions::default(), &mut f2)
+        .unwrap_or_else(|e| panic!("{tag} packed: {}", tf_tree_ingest::describe(e, &f2)));
+
+    assert_eq!(b.survey.transforms_read, a.survey.transforms_read, "{tag}");
+    assert_eq!(b.report.samples_pushed, a.report.samples_pushed, "{tag}");
+    assert_eq!(
+        b.report.samples_pushed, 160,
+        "{tag}: the fixture's own count"
+    );
+    assert_eq!(
+        edge_time_rows(&b.report),
+        edge_time_rows(&a.report),
+        "{tag}"
+    );
+    assert_eq!(b.report.static_edges, 2, "{tag}");
+    assert_eq!(b.report.dynamic_edges, 3, "{tag}");
+    assert!(!b.report.anomalies.truncated, "{tag}");
+    assert_eq!(b.report.anomalies.bad_chunks, 0, "{tag}");
+
+    // And the tree answers, at a stamp that lives in a compressed chunk.
+    let iso = b
+        .tree
+        .lookup(
+            "map",
+            "laser",
+            Stamp::<SystemDomain>::from_nanos(1_500_000_000),
+        )
+        .unwrap_or_else(|e| panic!("{tag}: the compressed recording must resolve: {e:?}"));
+    assert!(
+        iso.t.x.is_finite() && (iso.q.norm() - 1.0).abs() < 1e-12,
+        "{tag}"
+    );
+}
+
+/// **A short decompression is not read as a short recording.**
+///
+/// The header declares 64 bytes more than the codec produces. Without the
+/// produced-against-declared check the tail of the output buffer is zeros, which
+/// frame as empty records and lose the chunk's real content *silently* — the
+/// walk stops on a clean boundary with nothing to complain about, which is the
+/// worst shape a data-loss bug can take.
+///
+/// Both codecs, because each detects it differently: zstd by `decode_all` returning
+/// a short count, lz4 by the byte count `read_to_end` reached.
+///
+/// **Mutant: in `decode_zstd`, replace `Ok(written) if written == want` with `Ok(_)`
+/// — applied, and this test still passed.** The reason is worth recording rather
+/// than papering over: this fixture carries an honest `uncompressed_crc`, and a
+/// short decode leaves zero padding that the CRC over the whole records field also
+/// rejects. So end to end the property is guarded **twice**, and no single mutant of
+/// either check kills this test.
+///
+/// The length check is isolated one level down, by
+/// `decompress::tests::each_codec_round_trips_and_catches_both_length_disagreements`,
+/// whose CRC-0 rows remove the backstop — `uncompressed_crc == 0` means "not
+/// computed" per the specification and real writers emit it — and which that same
+/// mutant does kill, with the zero padding visible in the returned records.
+///
+/// What this test does catch, observed: swapping lz4's frame decoder for the block
+/// API (`samples_pushed` 9 against 6), and a fixture that writes the codec name
+/// without compressing. It is the end-to-end statement of the property; the unit
+/// test is the one that says *which* check enforces it.
+#[cfg(feature = "compression")]
+#[test]
+fn a_short_decompression_is_not_read_as_a_short_recording() {
+    let dir = Scratch::new("codec_short");
+    let messages = three_sensors_nine_messages();
+    for (codec, tag) in [(FixtureCodec::Zstd, "zstd"), (FixtureCodec::Lz4, "lz4")] {
+        let path = dir.path(&format!("{tag}.mcap"));
+        write_mcap_chunked(
+            &path,
+            &messages,
+            ChunkedSpec::new(3)
+                .compressed(codec)
+                .damaged(ChunkDamage::UncompressedSizeTooLarge),
+        )
+        .unwrap();
+
+        let mut frames = Frames::default();
+        let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+            .unwrap_or_else(|e| panic!("{tag}: {}", tf_tree_ingest::describe(e, &frames)));
+        assert_eq!(
+            out.report.anomalies.bad_chunks, 1,
+            "{tag}: the length disagreement must be reported"
+        );
+        assert_eq!(
+            out.report.samples_pushed, 6,
+            "{tag}: and the chunk's records must not be handed over half-formed"
+        );
+    }
+}
+
+/// **A truncated *compressed* recording is reported as truncated, not as corrupt.**
+///
+/// A partial codec frame is not decodable, so the cut chunk's records are lost —
+/// that is the one thing compression costs, and `decompress`'s module docs have
+/// always said so. What must not happen is `bad_chunks` counting it: nothing is
+/// wrong with the file beyond where it stops, and telling an operator their
+/// recording is damaged sends them looking for a bad disk.
+///
+/// The complete chunks before the cut are read in full, which is what separates
+/// this from "the reader gave up".
+///
+/// Mutant: in `chunk_records`, neutralise the `if !complete { return Ok(&[]) }` arm
+/// so the truncated payload flows on — applied, and this failed on `bad_chunks`,
+/// `1` against `0`: the cut chunk faults (as a length disagreement, since
+/// `compressed_size` names bytes that were never written) and `note_or_fail` counts
+/// it as damage.
+#[cfg(feature = "compression")]
+#[test]
+fn a_truncated_compressed_recording_is_truncated_not_corrupt() {
+    let dir = Scratch::new("codec_truncated");
+    let messages = three_sensors_nine_messages();
+    for (codec, tag) in [(FixtureCodec::Zstd, "zstd"), (FixtureCodec::Lz4, "lz4")] {
+        let whole = tf_tree_ingest::fixture::chunked_mcap_bytes(
+            &messages,
+            ChunkedSpec::new(3).compressed(codec),
+        )
+        .unwrap();
+        // **Cut four bytes into the last chunk's payload**, so two chunks are
+        // complete and the third is a partial codec frame.
+        //
+        // Derived from the writer's own tail rather than guessed: after the last
+        // chunk record come a `DataEnd` (9 + 4), a `Footer` (9 + 20) and the
+        // 8-byte end magic, so the last chunk record's body ends
+        // `HAND_ROLLED_TAIL` bytes from the end. An earlier revision of this test
+        // cut at a fixed offset from the end and landed in the `Footer` instead,
+        // where every chunk is complete and the assertions below passed for the
+        // wrong reason.
+        const HAND_ROLLED_TAIL: usize = (9 + 4) + (9 + 20) + 8;
+        let cut = whole.len() - HAND_ROLLED_TAIL - 4;
+        let path = dir.path(&format!("{tag}.mcap"));
+        std::fs::write(&path, &whole[..cut]).unwrap();
+
+        let mut frames = Frames::default();
+        let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames)
+            .unwrap_or_else(|e| panic!("{tag}: {}", tf_tree_ingest::describe(e, &frames)));
+        assert!(
+            out.report.anomalies.truncated,
+            "{tag}: the recording is a prefix and the report must say so"
+        );
+        assert_eq!(
+            out.report.anomalies.bad_chunks, 0,
+            "{tag}: an incomplete file is not a damaged one"
+        );
+        assert_eq!(
+            out.report.samples_pushed, 6,
+            "{tag}: the two complete chunks are read in full"
+        );
+    }
+}
+
+/// **A recording compressed by real libzstd ingests, with the same transforms as
+/// the uncompressed equivalent.**
+///
+/// Every other compressed fixture in this repository is encoded by `ruzstd`, the
+/// same crate that decodes it. That proves round-trip and **not** conformance: an
+/// encoder and a decoder from one crate can agree with each other and both
+/// disagree with the zstd that rosbag2 links. `testdata/zstd_conformance.mcap`'s
+/// chunk payloads were produced by the `zstd` CLI, version 1.5.5, i.e. by libzstd
+/// itself; `testdata/ATTRIBUTION.md` records the command line and
+/// `examples/gen_zstd_conformance.rs` regenerates it.
+///
+/// **A missing file fails loudly.** A `#[ignore]` or an early `return` here would
+/// leave the only conformance evidence in the repository silently unchecked, which
+/// is worse than not having it.
+///
+/// Mutant: byte 300 of the committed file flipped, which the framing walk locates
+/// inside the first chunk's libzstd payload (the first chunk record starts at 92 and
+/// its payload at 145) — applied, and this failed with `the recording contains no
+/// tf2_msgs/msg/TFMessage transforms`: the corrupted frame no longer decodes, every
+/// chunk after it is fine but the definitions were in the first, so nothing
+/// survives. Mutant 2: in `decode_zstd`, feed `decode_all` `&payload[1..]` —
+/// applied, and this failed the same way, i.e. libzstd's frame magic is really being
+/// parsed rather than skipped past.
+///
+/// A third mutant is worth recording because it **survived**: flipping byte 80,
+/// which lands in the `Header` record's `library` string rather than in a chunk.
+/// Nothing in this crate reads that field, so the file is still a valid recording of
+/// the same transforms. It is the check that the byte offsets above were located
+/// rather than guessed.
+#[cfg(feature = "compression")]
+#[test]
+fn a_real_libzstd_recording_ingests() {
+    let path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/zstd_conformance.mcap"
+    ));
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        panic!(
+            "the committed libzstd conformance fixture is missing or unreadable \
+             ({}): {e}. It is the only evidence in this repository that the \
+             pure-Rust decoder agrees with libzstd; regenerate it with \
+             `cargo run -p tf_tree_ingest --features fixture \
+             --example gen_zstd_conformance` (needs the `zstd` CLI) rather than \
+             skipping this test.",
+            path.display()
+        )
+    });
+    assert!(
+        bytes.len() < 64 * 1024,
+        "the fixture is meant to stay a few kilobytes; it is {} B",
+        bytes.len()
+    );
+
+    let mut frames = Frames::default();
+    let real = tf_tree_ingest::run(path, &IngestOptions::default(), &mut frames)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
+    assert_eq!(real.report.anomalies.bad_chunks, 0);
+    assert!(!real.report.anomalies.truncated);
+
+    // The control: the same corpus, uncompressed, written here and now. Comparing
+    // against a number written down would pass just as well against a fixture
+    // generated from the wrong corpus.
+    let dir = Scratch::new("conformance_control");
+    let control = dir.path("control.mcap");
+    write_mcap_chunked(
+        &control,
+        &conformance_recording(),
+        ChunkedSpec::new(CONFORMANCE_MESSAGES_PER_CHUNK),
+    )
+    .unwrap();
+    let mut f2 = Frames::default();
+    let plain = tf_tree_ingest::run(&control, &IngestOptions::default(), &mut f2)
+        .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &f2)));
+
+    assert_eq!(
+        real.survey.transforms_read, plain.survey.transforms_read,
+        "libzstd's chunks must decode to the same transforms as the uncompressed \
+         corpus; if the corpus moved, regenerate the fixture"
+    );
+    assert_eq!(real.report.samples_pushed, plain.report.samples_pushed);
+    assert_eq!(edge_time_rows(&real.report), edge_time_rows(&plain.report));
 }

@@ -212,11 +212,33 @@ cpp-deps:
 ingest-check:
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --features fixture
+    # **The codec-free build, which `--workspace` compiles nowhere.**
+    #
+    # `tf_tree_ingest`'s `compression` feature is default-**on**, so every other
+    # recipe in this file compiles exactly one configuration and
+    # `#[cfg(not(feature = "compression"))]` code — `tests/codec_free.rs`, the
+    # `is_built_in` arm that refuses a codec, `fixture`'s refusal to write one —
+    # is compiled by nothing. That is the same shape as the four defects
+    # `test-rust` and `shm-check` exist for, one crate over: a configuration
+    # nobody builds is not a checked configuration, and here the unchecked one is
+    # what a `--no-default-features` consumer gets.
+    #
+    # Verified to be a real gate rather than a no-op: this line runs 83 tests,
+    # four of which exist only in this configuration.
+    cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_ingest --no-default-features
     # The CLI's `ingest_err` arms are the only place the remedy text for a
     # compressed or bad chunk exists, and they are reachable only from a build
     # that can produce those errors.
     cargo clippy -p tf_tree_cli --all-targets -- -D warnings
     cargo nextest run -p tf_tree_cli
+    # And the CLI without its defaults, which drops both `counters` and
+    # `compression` — the second forwards to `tf_tree_ingest/compression`, and the
+    # workspace declares that dependency `default-features = false`, so this is
+    # the configuration where a missing feature edge would show up as a CLI that
+    # cannot read an ordinary bag.
+    cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_cli --no-default-features
 
 lint: py-compile
     cargo fmt --all -- --check

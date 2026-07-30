@@ -62,7 +62,19 @@ tf_tree_ingest.workspace = true
 tf_tree_ipc = { workspace = true, optional = true }
 
 [features]
-default = ["counters"]
+default = ["counters", "compression"]
+# **Reading zstd/lz4-compressed recordings, and this line is load-bearing for the
+# same reason `counters` is.** The workspace declares `tf_tree_ingest` with
+# `default-features = false`, so without this the CLI would link an ingest that
+# refuses every compressed bag — the ordinary case, since rosbag2 and Foxglove
+# both write zstd chunks by default — and `cargo build --workspace` would hide it,
+# because building `tf_tree_ingest` as a member turns its defaults on and feature
+# unification then covers for the missing edge. `cargo build -p tf_tree_cli` and
+# `cargo install` do not.
+#
+# The codecs are pure Rust (`ruzstd`, `lz4_flex`), so this adds no C build step;
+# see `crates/tf_tree_ingest/Cargo.toml` for why that is the whole point.
+compression = ["tf_tree_ingest/compression"]
 # `docs/PHASE5.md` §5's diagnostic counters, which `TFT010`/`TFT011` read.
 # Needed explicitly because the workspace declares `tf_tree` with
 # `default-features = false` (see the comment on that declaration): without

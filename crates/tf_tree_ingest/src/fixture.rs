@@ -17,11 +17,30 @@
 //! quirks. `docs/PHASE5.md` §0.0 records that ROS 2 is available in a container
 //! and can produce a real recording; that is the test this one does not replace.
 //!
-//! # Uncompressed, deliberately
+//! # Compression: `mcap::Writer`'s fixtures are uncompressed, the hand-rolled
+//! ones need not be
 //!
-//! [`WriteOptions::compression(None)`](mcap::WriteOptions::compression), because
-//! this build of `mcap` has no codecs (see the crate docs). A fixture written
-//! with zstd would be unreadable by the very code it is testing.
+//! [`write_mcap`] passes
+//! [`WriteOptions::compression(None)`](mcap::WriteOptions::compression), and that
+//! stays true for a reason that has not changed: `mcap` is taken
+//! `default-features = false`, so *its* writer has no codecs to offer.
+//!
+//! The hand-rolled writer does. [`ChunkedSpec::compressed`] compresses each
+//! chunk's records with `ruzstd` or `lz4_flex` — the same pure-Rust crates
+//! `crate::decompress` reads them back with — so the compressed path has fixtures
+//! at all. Two honest caveats, because "it round-trips" is a weaker claim than it
+//! looks:
+//!
+//! * A fixture this module compresses proves **round-trip**, not conformance with
+//!   what a real recorder writes. `testdata/zstd_conformance.mcap` is compressed
+//!   by the real `zstd` CLI (libzstd 1.5.5) for exactly that gap; see
+//!   `testdata/ATTRIBUTION.md`. There is no `lz4` CLI on this host, so **lz4 has
+//!   round-trip coverage only** — stated rather than implied.
+//! * The codec is orthogonal to [`ChunkDamage`], and each damage variant's
+//!   documented fault is the one it produces on an **uncompressed** chunk unless
+//!   the variant says otherwise. `ChunkDamage::UncompressedSizeTooLarge` is the
+//!   one deliberately exercised both ways, because the check that catches it is a
+//!   different check on each path.
 //!
 //! # Why there is a second writer
 //!
@@ -321,6 +340,53 @@ pub fn small_recording() -> Vec<FixtureMessage> {
     out
 }
 
+/// Messages per chunk in `testdata/zstd_conformance.mcap`.
+///
+/// A constant shared by the generator and the test rather than a number written
+/// twice: the test compares the committed file against a control it writes from
+/// [`conformance_recording`], and a chunk layout that differed between the two
+/// would make the comparison a comparison of layouts.
+pub const CONFORMANCE_MESSAGES_PER_CHUNK: usize = 4;
+
+/// The corpus behind `testdata/zstd_conformance.mcap` — **small on purpose**.
+///
+/// Twelve messages over three chunks, a few kilobytes in total. It is committed as
+/// a binary file, so its size is a permanent cost to every clone; what it has to
+/// exercise is that libzstd's frames decode, that a chunk boundary is crossed, and
+/// that statics and dynamics both survive. None of that needs a hundred messages.
+///
+/// Kept separate from [`small_recording`] because it is **frozen**: the committed
+/// file was generated from these exact bytes, so changing this function invalidates
+/// it and `ingest::a_real_libzstd_recording_ingests` will say so by failing on the
+/// transform count.
+#[must_use]
+pub fn conformance_recording() -> Vec<FixtureMessage> {
+    let mut out = vec![FixtureMessage::static_edge(
+        "base_link",
+        "laser",
+        [
+            0.9238795325112867,
+            0.0,
+            0.0,
+            0.3826834323650898,
+            0.2,
+            0.0,
+            0.31,
+        ],
+    )];
+    for i in 0..11i64 {
+        let t = 1_000_000_000 + i * 10_000_000;
+        let a = i as f64 * 0.05;
+        out.push(FixtureMessage::dynamic(
+            "odom",
+            "base_link",
+            t,
+            [a.cos(), 0.0, 0.0, a.sin(), a, a * 2.0, a * 3.0],
+        ));
+    }
+    out
+}
+
 /// The shape of a **real** `/tf`: several publishers, each stamping at a
 /// different point in its own pipeline, interleaved into one topic.
 ///
@@ -424,6 +490,88 @@ pub enum DefinitionsIn {
     DamagedChunk,
 }
 
+/// Which codec a hand-rolled fixture's chunk records are compressed with.
+///
+/// Defaults to [`FixtureCodec::None`] so that **every fixture written before this
+/// existed is byte-identical to what it was** — the corrupt-chunk suite computes
+/// its expectations from exact chunk layouts, and a fixture that quietly started
+/// compressing would move all of them at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FixtureCodec {
+    /// Records stored verbatim; `compression` is `""`.
+    #[default]
+    None,
+    /// `"zstd"`, via `ruzstd`'s encoder.
+    Zstd,
+    /// `"lz4"`, via `lz4_flex`'s **frame** encoder — which is the container MCAP's
+    /// `"lz4"` names, and not the raw block format.
+    Lz4,
+}
+
+impl FixtureCodec {
+    /// The string this codec writes into a chunk header's `compression` field.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            FixtureCodec::None => "",
+            FixtureCodec::Zstd => "zstd",
+            FixtureCodec::Lz4 => "lz4",
+        }
+    }
+
+    /// Whether this build has an **encoder** for it.
+    ///
+    /// Both encoders arrive with the `compression` feature, so a codec-free build
+    /// can neither write nor read a compressed fixture — which is consistent, and
+    /// is why `chunked_mcap_bytes` refuses with
+    /// [`FixturePlanError::CodecUnavailable`] rather than silently writing an
+    /// uncompressed chunk under a compressed name. That silent substitution is the
+    /// vacuous-fixture failure this module's error type exists to prevent.
+    #[must_use]
+    pub fn is_available(self) -> bool {
+        match self {
+            FixtureCodec::None => true,
+            #[cfg(feature = "compression")]
+            FixtureCodec::Zstd | FixtureCodec::Lz4 => true,
+            #[cfg(not(feature = "compression"))]
+            FixtureCodec::Zstd | FixtureCodec::Lz4 => false,
+        }
+    }
+}
+
+/// Compress one chunk's records field, as the codec MCAP names it does.
+///
+/// The compression level is the cheapest one on purpose: these corpora are a few
+/// kilobytes and the property under test is the framing and the length
+/// bookkeeping, not the ratio.
+#[cfg_attr(not(feature = "compression"), allow(unused_variables))]
+fn compress_records(codec: FixtureCodec, bytes: &[u8]) -> Result<Vec<u8>, FixturePlanError> {
+    match codec {
+        FixtureCodec::None => Ok(bytes.to_vec()),
+        #[cfg(feature = "compression")]
+        FixtureCodec::Zstd => Ok(ruzstd::encoding::compress_to_vec(
+            bytes,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        )),
+        #[cfg(feature = "compression")]
+        FixtureCodec::Lz4 => {
+            use std::io::Write;
+            let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            enc.write_all(bytes)
+                .map_err(|_| FixturePlanError::CodecFailed {
+                    codec: codec.name(),
+                })?;
+            enc.finish().map_err(|_| FixturePlanError::CodecFailed {
+                codec: codec.name(),
+            })
+        }
+        #[cfg(not(feature = "compression"))]
+        other => Err(FixturePlanError::CodecUnavailable {
+            codec: other.name(),
+        }),
+    }
+}
+
 /// A deliberate defect in the second chunk of a hand-rolled fixture.
 ///
 /// Each variant documents the fault it produces **in this build** — the codec-free
@@ -445,21 +593,25 @@ pub enum ChunkDamage {
     CompressedSizeTooLarge,
     /// `compressed_size` declares four bytes fewer than the records field holds.
     ///
-    /// Detected in every build, but as `BadChunkKind::Crc` and **not** as a length
-    /// fault: a short declaration is satisfiable, so the reader hands over a
-    /// shortened records field, and the CRC — which covers the whole field — is
-    /// what disagrees. That is worth a fixture because the fault kind is not the one
-    /// the damage's name suggests.
+    /// Detected in every build, as `BadChunkKind::LengthMismatch`, because on an
+    /// uncompressed chunk the two size fields must agree and this variant makes
+    /// them differ by four.
     ///
-    /// **The guarantee is only as wide as the CRC.** `decompress::check_crc`
-    /// returns `Ok` unconditionally when the saved hash is `0`, which the MCAP
-    /// specification defines as "not computed" and which real writers do produce.
-    /// A chunk with no computed CRC whose `compressed_size` is short by exactly the
-    /// framed size of its last inner record would therefore lose that record with
-    /// no fault at all: the walk stops on a clean boundary and has nothing to
-    /// complain about. No fixture reaches that combination — this variant keeps the
-    /// honest CRC, and no variant sets it to `0` — so it is a gap in `decompress`
-    /// rather than a claim made here.
+    /// **It used to be caught by the CRC instead, and the change closed a real
+    /// gap.** A short declaration is satisfiable, so the reader used to hand over a
+    /// shortened records field and the CRC — which covers the whole field — was the
+    /// only thing that disagreed. `decompress::check_crc` returns `Ok`
+    /// unconditionally when the saved hash is `0`, which the MCAP specification
+    /// defines as "not computed" and which real writers do produce, so a chunk with
+    /// no computed CRC whose `compressed_size` was short by exactly the framed size
+    /// of its last inner record lost that record with **no fault at all**: the walk
+    /// stopped on a clean boundary and had nothing to complain about. The
+    /// `uncompressed_size == compressed_size` check now fires first and does not
+    /// depend on a CRC being present.
+    ///
+    /// On a *compressed* chunk the same lie truncates the codec frame instead, so
+    /// it surfaces as `BadChunkKind::Decompress`. No fixture combines the two;
+    /// stated so that nobody reads this row as covering both.
     CompressedSizeTooSmall,
     /// `uncompressed_crc` holds a hash the records do not have.
     ///
@@ -507,30 +659,26 @@ pub enum ChunkDamage {
     /// [`ChunkDamage::FlippedBitInRecords`], the two `compressed_size` lies) are
     /// rejected before any record is delivered and are the all-or-nothing case.
     InnerRecordRunsPastTheEnd,
-    /// `uncompressed_size` declares more bytes than the records field holds.
+    /// `uncompressed_size` declares 64 bytes more than the records field holds.
     ///
-    /// **Undetected in this build — a check that is available and has not been
-    /// written, not one that needs a decoder.** `decompress::ChunkHead` does not
-    /// retain `uncompressed_size`, so no code path can compare it, and an
-    /// uncompressed chunk's records field is bounded by `compressed_size`, which is
-    /// honest here. So a fixture with this damage ingests cleanly and reports
-    /// nothing.
+    /// **Detected in every build, as `BadChunkKind::LengthMismatch` — but by a
+    /// different check on each path, which is why this is the one variant worth
+    /// writing both ways.**
     ///
-    /// The precondition is *not* a codec. When `compression` is `""` the records are
-    /// stored verbatim, so `uncompressed_size == compressed_size == records.len()`
-    /// is an invariant checkable today from two `u64`s nine bytes apart in a header
-    /// `ChunkHead::parse` already walks past — `mcap`'s own writer and reader treat
-    /// them as equal, and
-    /// `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
-    /// asserts it. Adding that comparison is a `decompress` change and is left to
-    /// its own commit rather than smuggled into a fixture PR.
+    /// * Uncompressed: the records are stored verbatim, so
+    ///   `uncompressed_size == compressed_size` is an invariant, checkable from two
+    ///   `u64`s nine bytes apart in a header `ChunkHead::parse` already walks past.
+    ///   `mcap`'s own writer and reader treat them as equal, and
+    ///   `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
+    ///   asserts it of every clean chunk here.
+    /// * Compressed: the field is the allocation size, so the decoder is handed a
+    ///   64-byte-too-large output buffer, produces less than it, and the produced
+    ///   length disagrees with the declared one.
     ///
-    /// The variant is kept because a decoder needs it too: there this field becomes
-    /// the allocation size and the decompression-bomb bound, and the lie must become
-    /// `BadChunkKind::LengthMismatch` or `BadChunkKind::ImplausibleSize`. No test
-    /// here pretends it is caught today;
-    /// `a_lying_uncompressed_size_is_not_detected_by_this_build` pins the opposite
-    /// and has to be rewritten by whichever commit closes the gap.
+    /// An earlier revision of this variant was undetected in every build, and its
+    /// docs said so at length. Both halves of that gap are closed;
+    /// `ingest::a_lying_uncompressed_size_is_refused` and
+    /// `ingest::a_short_decompression_is_not_read_as_a_short_recording` are where.
     UncompressedSizeTooLarge,
 }
 
@@ -545,17 +693,32 @@ pub struct ChunkedSpec {
     pub definitions: DefinitionsIn,
     /// The defect to write into the second chunk, if any.
     pub damage: Option<ChunkDamage>,
+    /// Which codec compresses **every** chunk's records field.
+    ///
+    /// Every chunk and not one, because that is what a recorder writes: a bag is
+    /// compressed or it is not. A per-chunk codec would be a file no tool
+    /// produces, and the interesting property of a compressed recording is that
+    /// the reader meets the codec on every chunk rather than once.
+    pub codec: FixtureCodec,
 }
 
 impl ChunkedSpec {
-    /// An undamaged fixture with the definitions in the first chunk.
+    /// An undamaged, uncompressed fixture with the definitions in the first chunk.
     #[must_use]
     pub fn new(messages_per_chunk: usize) -> ChunkedSpec {
         ChunkedSpec {
             messages_per_chunk,
             definitions: DefinitionsIn::FirstChunk,
             damage: None,
+            codec: FixtureCodec::None,
         }
+    }
+
+    /// Compress every chunk's records with `codec`.
+    #[must_use]
+    pub fn compressed(mut self, codec: FixtureCodec) -> ChunkedSpec {
+        self.codec = codec;
+        self
     }
 
     /// Damage the second chunk (see [`DAMAGED_CHUNK_ORDINAL`]).
@@ -645,6 +808,30 @@ pub enum FixturePlanError {
     NothingToDamage {
         /// Which damage found nothing to apply itself to.
         damage: &'static str,
+    },
+    /// [`ChunkedSpec::compressed`] asked for a codec this build cannot encode.
+    ///
+    /// Refused rather than written uncompressed under a compressed name, which
+    /// would be a fixture that silently stopped testing compression — and would
+    /// then be *read* as a relabelled chunk, i.e. as a different test entirely.
+    #[error(
+        "this build cannot write {codec} fixtures: the `compression` feature is off, so no \
+         encoder is compiled in"
+    )]
+    CodecUnavailable {
+        /// The codec name that was asked for.
+        codec: &'static str,
+    },
+    /// An encoder that is present failed on the records it was given.
+    ///
+    /// Its own variant rather than a `panic!` (which this workspace denies) or a
+    /// silent fallback: an encoder failing on a few kilobytes of MCAP records
+    /// would mean the codec crate is broken, and a fixture helper is the wrong
+    /// place to decide that quietly.
+    #[error("the {codec} encoder failed on a fixture's records")]
+    CodecFailed {
+        /// The codec name that failed.
+        codec: &'static str,
     },
 }
 
@@ -771,7 +958,7 @@ pub fn chunked_mcap_bytes(
         push_record(
             &mut out,
             mcap::records::op::CHUNK,
-            &chunk_body(records, start, end, damage)?,
+            &chunk_body(records, start, end, damage, spec.codec)?,
         );
     }
 
@@ -837,46 +1024,44 @@ fn push_record(out: &mut Vec<u8>, opcode: u8, body: &[u8]) {
     out.extend_from_slice(body);
 }
 
-/// Assemble a chunk record's body, applying `damage`.
+/// Assemble a chunk record's body under `codec`, applying `damage`.
 ///
 /// The field order is the specification's and is checked against
 /// `decompress::ChunkHead::parse` and `mcap::parse_record` by this module's tests:
 /// `message_start_time`, `message_end_time`, `uncompressed_size`,
 /// `uncompressed_crc`, `compression`, `compressed_size`, then the records.
+///
+/// # The three phases are ordered, and the order is the whole subtlety
+///
+/// 1. **Damage that rewrites the records themselves** — the bit flip and the
+///    inflated inner length. It must happen before compression, or the codec would
+///    faithfully encode clean bytes and the fixture would be undamaged.
+/// 2. **Compression**, which fixes `compressed_size` and leaves
+///    `uncompressed_size` and `uncompressed_crc` describing the bytes that went
+///    *in*. That is what the MCAP specification says both fields cover, and it is
+///    what makes the CRC a check on the decoder's output rather than on its input.
+/// 3. **Damage that lies in the header** — the two `compressed_size` variants, the
+///    CRC, the relabel and `uncompressed_size`. After compression, because each of
+///    them is a lie about a number compression has just computed.
 fn chunk_body(
     records: RecordBuf,
     start_ns: u64,
     end_ns: u64,
     damage: Option<ChunkDamage>,
+    codec: FixtureCodec,
 ) -> Result<Vec<u8>, FixturePlanError> {
     let RecordBuf {
         mut bytes,
         last_len_at,
     } = records;
-    let mut compression = "";
-    let mut uncompressed_size = bytes.len() as u64;
-    let mut compressed_size = bytes.len() as u64;
-    // The honest hash, over the records as they were built. **Which bytes a
-    // variant leaves this covering is the whole difference** between the CRC check
-    // catching that variant and the framing walk catching it.
-    let mut uncompressed_crc = crc32fast::hash(&bytes);
+    // **Hashed before phase 1**, so [`ChunkDamage::FlippedBitInRecords`] keeps the
+    // hash of the *clean* bytes — a CRC that agreed with the flip would make that
+    // variant an intact chunk, and the CRC is the only thing that can witness a
+    // bit flip inside a CDR payload.
+    let clean_crc = crc32fast::hash(&bytes);
 
+    // Phase 1: damage that rewrites the records field.
     match damage {
-        None => {}
-        Some(ChunkDamage::CompressedSizeTooLarge) => compressed_size += 64,
-        Some(ChunkDamage::CompressedSizeTooSmall) => {
-            // Fewer than four bytes to give up means the subtraction saturates and
-            // the declaration stops being a lie, so the fixture would be intact.
-            if bytes.len() < 4 {
-                return Err(FixturePlanError::NothingToDamage {
-                    damage: "CompressedSizeTooSmall",
-                });
-            }
-            compressed_size -= 4;
-        }
-        Some(ChunkDamage::UncompressedCrc) => {
-            uncompressed_crc = a_wrong_but_nonzero_crc(uncompressed_crc);
-        }
         Some(ChunkDamage::FlippedBitInRecords) => {
             // Mid-field, so the flip lands inside a message body rather than in the
             // first record's opcode — a corrupted opcode would be caught by the
@@ -893,10 +1078,9 @@ fn chunk_body(
                 }
             }
         }
-        Some(ChunkDamage::Relabelled(name)) => compression = name,
         Some(ChunkDamage::InnerRecordRunsPastTheEnd) => {
-            // No last record means no length field to inflate; recomputing the CRC
-            // over unpatched bytes below would then restore the honest hash and the
+            // No last record means no length field to inflate; the CRC computed
+            // below over unpatched bytes would then be the honest hash and the
             // chunk would read as intact.
             let Some(at) = last_len_at else {
                 return Err(FixturePlanError::NothingToDamage {
@@ -905,11 +1089,56 @@ fn chunk_body(
             };
             let declared = u64_at(&bytes, at).saturating_add(64);
             bytes[at..at + 8].copy_from_slice(&declared.to_le_bytes());
-            // Recomputed over the patched bytes; see the variant's docs for why
-            // that is the point rather than an oversight.
-            uncompressed_crc = crc32fast::hash(&bytes);
         }
+        _ => {}
+    }
+
+    // Phase 2: compression, and the two fields that describe what went into it.
+    //
+    // **Which bytes the CRC covers is the whole difference** between the CRC check
+    // catching a variant and the framing walk catching it.
+    // `InnerRecordRunsPastTheEnd` is re-hashed over its *patched* bytes on purpose:
+    // a CRC that failed first would mean it never reached the framing walk, and it
+    // would then be testing the same code path as `UncompressedCrc` while appearing
+    // to test another.
+    let uncompressed_size_true = bytes.len() as u64;
+    let mut uncompressed_crc = if damage == Some(ChunkDamage::InnerRecordRunsPastTheEnd) {
+        crc32fast::hash(&bytes)
+    } else {
+        clean_crc
+    };
+    if !codec.is_available() {
+        return Err(FixturePlanError::CodecUnavailable {
+            codec: codec.name(),
+        });
+    }
+    let mut payload = compress_records(codec, &bytes)?;
+    let mut compression = codec.name();
+    let mut uncompressed_size = uncompressed_size_true;
+    let mut compressed_size = payload.len() as u64;
+
+    // Phase 3: damage that lies in the header.
+    match damage {
+        Some(ChunkDamage::CompressedSizeTooLarge) => compressed_size += 64,
+        Some(ChunkDamage::CompressedSizeTooSmall) => {
+            // Fewer than four bytes to give up means the subtraction saturates and
+            // the declaration stops being a lie, so the fixture would be intact.
+            if payload.len() < 4 {
+                return Err(FixturePlanError::NothingToDamage {
+                    damage: "CompressedSizeTooSmall",
+                });
+            }
+            compressed_size -= 4;
+        }
+        Some(ChunkDamage::UncompressedCrc) => {
+            uncompressed_crc = a_wrong_but_nonzero_crc(uncompressed_crc);
+        }
+        // The relabel overrides the codec's own name by design: its purpose is a
+        // `compression` field that disagrees with the bytes, and on an
+        // uncompressed fixture (the only way it is used) there is no name to lose.
+        Some(ChunkDamage::Relabelled(name)) => compression = name,
         Some(ChunkDamage::UncompressedSizeTooLarge) => uncompressed_size += 64,
+        _ => {}
     }
 
     let mut body = Vec::new();
@@ -921,7 +1150,7 @@ fn chunk_body(
     put_u64(&mut body, compressed_size);
     // Moved rather than copied: the records field is the whole chunk and this is the
     // one full-size copy in the writer that costs nothing to remove.
-    body.append(&mut bytes);
+    body.append(&mut payload);
     Ok(body)
 }
 
@@ -1315,7 +1544,7 @@ mod tests {
     /// saved hash covers the whole records field; and a lying `uncompressed_size`
     /// is caught by **nothing at all** in this codec-free build.
     ///
-    /// Mutant: `chunk_body` recomputing the CRC over the flipped bytes for
+    /// Mutant: `chunk_body` hashing the records *after* the flip for
     /// `FlippedBitInRecords` — applied, and the `FlippedBitInRecords` row failed
     /// with **no fault at all**: the flip lands inside a CDR payload, so with a
     /// matching CRC the chunk reads as intact and the fixture has silently stopped
@@ -1331,7 +1560,8 @@ mod tests {
             let bytes = chunked_mcap_bytes(&messages, spec.damaged(damage)).unwrap();
             let body = chunk_at(&bytes, DAMAGED_CHUNK_ORDINAL as usize);
             let mut scratch = Vec::new();
-            match decompress::chunk_records(&body, true, &mut scratch) {
+            let limits = crate::IngestOptions::default().chunk_limits();
+            match decompress::chunk_records(&body, true, limits, &mut scratch) {
                 Err(fault) => Some(fault),
                 Ok(records) => decompress::for_each_record(records, false, |_, _| Ok(())).err(),
             }
@@ -1341,9 +1571,12 @@ mod tests {
             fault_of(ChunkDamage::CompressedSizeTooLarge),
             Some(ChunkFault::Bad(BadChunkKind::LengthMismatch { .. }))
         ));
+        // A short `compressed_size` is now caught by the size invariant rather than
+        // by the CRC, which is what closes the "no computed CRC" gap the variant's
+        // docs used to record as a live one.
         assert!(matches!(
             fault_of(ChunkDamage::CompressedSizeTooSmall),
-            Some(ChunkFault::Bad(BadChunkKind::Crc { .. }))
+            Some(ChunkFault::Bad(BadChunkKind::LengthMismatch { .. }))
         ));
         assert!(matches!(
             fault_of(ChunkDamage::UncompressedCrc),
@@ -1353,6 +1586,24 @@ mod tests {
             fault_of(ChunkDamage::FlippedBitInRecords),
             Some(ChunkFault::Bad(BadChunkKind::Crc { .. }))
         ));
+        // **`Relabelled("zstd")`'s fault depends on the build, and that is the
+        // point of the variant rather than a wart.** With a zstd decoder compiled
+        // in, `"zstd"` over uncompressed records is a chunk that lies about its
+        // payload — damage, and skippable. Without one it is a codec this build
+        // does not have — unsupported, and never skippable. Both rows are asserted
+        // in the configuration that can reach them.
+        #[cfg(feature = "compression")]
+        assert!(
+            matches!(
+                fault_of(ChunkDamage::Relabelled("zstd")),
+                Some(ChunkFault::Bad(BadChunkKind::Decompress {
+                    codec: ChunkCodec::Zstd
+                }))
+            ),
+            "got {:?}",
+            fault_of(ChunkDamage::Relabelled("zstd"))
+        );
+        #[cfg(not(feature = "compression"))]
         assert_eq!(
             fault_of(ChunkDamage::Relabelled("zstd")),
             Some(ChunkFault::Unsupported(ChunkCodec::Zstd))
@@ -1366,11 +1617,116 @@ mod tests {
             fault_of(ChunkDamage::InnerRecordRunsPastTheEnd),
             Some(ChunkFault::Bad(BadChunkKind::InnerFraming { .. }))
         ));
-        assert_eq!(
-            fault_of(ChunkDamage::UncompressedSizeTooLarge),
-            None,
-            "this build does not read uncompressed_size; see the variant's docs"
+        // **The row that used to read `None`.** `uncompressed_size` is now retained
+        // and, on an uncompressed chunk, compared against `compressed_size` — an
+        // invariant that needed no decoder and was simply unchecked.
+        assert!(
+            matches!(
+                fault_of(ChunkDamage::UncompressedSizeTooLarge),
+                Some(ChunkFault::Bad(BadChunkKind::LengthMismatch { .. }))
+            ),
+            "got {:?}",
+            fault_of(ChunkDamage::UncompressedSizeTooLarge)
         );
+    }
+
+    /// **A compressed fixture round-trips, and the codec is really in the file.**
+    ///
+    /// Both halves matter. The chunk header must name the codec and carry a
+    /// `compressed_size` that differs from `uncompressed_size` — otherwise the
+    /// fixture is an uncompressed one under a compressed name, which is a
+    /// *different* test (`ChunkDamage::Relabelled`) wearing this one's name. And
+    /// the records must come back byte-identical to what an uncompressed fixture
+    /// of the same corpus holds, which is what makes the ingest-level comparison
+    /// in `tests/ingest.rs` a comparison of the reader rather than of two corpora.
+    ///
+    /// Mutant: have `compress_records` return `bytes.to_vec()` for every codec, i.e.
+    /// write the codec name without compressing — applied, and this failed on
+    /// `Zstd chunk 0 was written uncompressed under a codec name`, with both sizes at
+    /// 476. Mutant 2: `compressed_size = uncompressed_size_true`, i.e. describe the
+    /// bytes that went *into* the codec — applied, and this failed the same
+    /// assertion, the same way. Both took four other tests with them, including
+    /// `ingest::a_zstd_recording_ingests_identically`, which failed on its own
+    /// vacuity guard: `the compressed fixture (21332 B) is not smaller than the
+    /// uncompressed one (21320 B), so this test compares nothing`.
+    #[cfg(feature = "compression")]
+    #[test]
+    fn a_compressed_fixture_round_trips_through_the_reader() {
+        let messages = corpus(9);
+        let plain = chunked_mcap_bytes(&messages, ChunkedSpec::new(3)).unwrap();
+        let limits = crate::IngestOptions::default().chunk_limits();
+        for codec in [FixtureCodec::Zstd, FixtureCodec::Lz4] {
+            let spec = ChunkedSpec::new(3).compressed(codec);
+            let bytes = chunked_mcap_bytes(&messages, spec).unwrap();
+            for ordinal in 0..3usize {
+                let body = chunk_at(&bytes, ordinal);
+                // The header really names the codec, and really shrank.
+                let compression = compression_of(&body);
+                assert_eq!(compression, codec.name(), "chunk {ordinal}");
+                let (declared_uncompressed, declared_compressed) = sizes_of(&body);
+                assert_ne!(
+                    declared_compressed, declared_uncompressed,
+                    "{codec:?} chunk {ordinal} was written uncompressed under a codec name"
+                );
+
+                let mut scratch = Vec::new();
+                let got = decompress::chunk_records(&body, true, limits, &mut scratch)
+                    .unwrap_or_else(|e| panic!("{codec:?} chunk {ordinal}: {e:?}"));
+                let mut plain_scratch = Vec::new();
+                let plain_body = chunk_at(&plain, ordinal);
+                let want = decompress::chunk_records(&plain_body, true, limits, &mut plain_scratch)
+                    .unwrap();
+                assert_eq!(got, want, "{codec:?} chunk {ordinal} did not round-trip");
+            }
+        }
+    }
+
+    /// The `compression` field of a chunk record body.
+    ///
+    /// Only the compressed round-trip test reads it, so it is gated with that test
+    /// rather than carrying an `allow(dead_code)`: a helper nothing calls is dead in
+    /// exactly one configuration, and the `cfg` says which.
+    #[cfg(feature = "compression")]
+    fn compression_of(body: &[u8]) -> &str {
+        let len = u32::from_le_bytes([body[28], body[29], body[30], body[31]]) as usize;
+        core::str::from_utf8(&body[32..32 + len]).unwrap()
+    }
+
+    /// `(uncompressed_size, compressed_size)` from a chunk record body.
+    #[cfg(feature = "compression")]
+    fn sizes_of(body: &[u8]) -> (u64, u64) {
+        let name_len = u32::from_le_bytes([body[28], body[29], body[30], body[31]]) as usize;
+        (u64_at(body, 16), u64_at(body, 32 + name_len))
+    }
+
+    /// A codec-free build **refuses** to write a compressed fixture rather than
+    /// writing an uncompressed one under a compressed name.
+    ///
+    /// The silent substitution would be worse than a missing test: the fixture
+    /// would then be read as a *relabelled* chunk, so a compression test would pass
+    /// while exercising the mislabelled-payload path instead.
+    ///
+    /// Mutant: delete `chunk_body`'s `codec.is_available()` guard — applied, and
+    /// **all 83 tests still passed**: `compress_records`'s own
+    /// `#[cfg(not(feature = "compression"))]` arm returns the same
+    /// `CodecUnavailable`, with the same codec name. The property is therefore
+    /// **structurally guarded** by that arm; the guard in `chunk_body` is a second,
+    /// earlier statement of it, kept because it is where a reader looks. What this
+    /// test adds is that the refusal is an error a caller can read rather than a
+    /// silent substitution, asserted in the one configuration where it happens.
+    #[cfg(not(feature = "compression"))]
+    #[test]
+    fn a_codec_free_build_refuses_to_write_a_compressed_fixture() {
+        for codec in [FixtureCodec::Zstd, FixtureCodec::Lz4] {
+            let err =
+                chunked_mcap_bytes(&corpus(9), ChunkedSpec::new(3).compressed(codec)).unwrap_err();
+            assert_eq!(
+                err,
+                FixturePlanError::CodecUnavailable {
+                    codec: codec.name()
+                }
+            );
+        }
     }
 
     /// A corpus too small to have a survivor on each side of the damage is an
@@ -1478,7 +1834,8 @@ mod tests {
             ChunkDamage::InnerRecordRunsPastTheEnd,
             ChunkDamage::CompressedSizeTooSmall,
         ] {
-            let err = chunk_body(RecordBuf::default(), 0, 0, Some(damage)).unwrap_err();
+            let err = chunk_body(RecordBuf::default(), 0, 0, Some(damage), FixtureCodec::None)
+                .unwrap_err();
             assert!(
                 matches!(err, FixturePlanError::NothingToDamage { .. }),
                 "{damage:?} left an empty chunk intact: {err:?}"
@@ -1486,7 +1843,7 @@ mod tests {
         }
         // An empty chunk is still writable when nothing is asked of it, so the guard
         // is about the damage and not about the emptiness.
-        assert!(chunk_body(RecordBuf::default(), 0, 0, None).is_ok());
+        assert!(chunk_body(RecordBuf::default(), 0, 0, None, FixtureCodec::None).is_ok());
     }
 
     /// `DefinitionsIn::DamagedChunk` really moves the `Schema` and `Channel`
@@ -1508,7 +1865,8 @@ mod tests {
         let ops_in = |ordinal: usize| -> Vec<u8> {
             let body = chunk_at(&bytes, ordinal);
             let mut scratch = Vec::new();
-            let records = decompress::chunk_records(&body, true, &mut scratch).unwrap();
+            let limits = crate::IngestOptions::default().chunk_limits();
+            let records = decompress::chunk_records(&body, true, limits, &mut scratch).unwrap();
             let mut ops = Vec::new();
             decompress::for_each_record(records, false, |op, _| {
                 ops.push(op);

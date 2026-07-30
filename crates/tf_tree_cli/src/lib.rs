@@ -422,6 +422,33 @@ pub struct IngestArgs {
     /// than ordinary interleaving, in milliseconds.
     #[arg(long, value_name = "MILLIS", default_value_t = 100)]
     pub clock_reset_threshold: u64,
+    /// Largest chunk this reader will decompress, in MiB.
+    ///
+    /// A chunk header's `uncompressed_size` is a number off a disk, and it is both
+    /// the allocation size and the decompression-bomb bound. Real recorders chunk
+    /// at 1–8 MiB, so the default is over an order of magnitude above them — but a
+    /// recording written with larger chunks is unusual rather than corrupt, and the
+    /// person who meets the limit is the person who cannot patch the library.
+    ///
+    /// The default is derived from the library constant rather than written down, so
+    /// the two cannot drift.
+    #[arg(
+        long,
+        value_name = "MIB",
+        default_value_t = tf_tree_ingest::DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES / (1024 * 1024)
+    )]
+    pub max_chunk_size: u64,
+    /// Largest `uncompressed_size / compressed_size` a chunk may claim.
+    ///
+    /// The other half of the bomb guard: `--max-chunk-size` alone cannot refuse
+    /// 64 MiB of output from 200 bytes of input, and no ceiling loose enough for a
+    /// real 8 MiB chunk can.
+    #[arg(
+        long,
+        value_name = "RATIO",
+        default_value_t = tf_tree_ingest::DEFAULT_MAX_CHUNK_EXPANSION_RATIO
+    )]
+    pub max_chunk_expansion: u64,
     /// Where to put §3.1's temporary run file. Defaults to the system temporary
     /// directory.
     ///
@@ -482,6 +509,12 @@ impl IngestArgs {
                 .saturating_mul(1_000_000),
             future_horizon_ns: horizon as i64,
             tf_prefix: self.tf_prefix.clone(),
+            // `saturating_mul` for the same reason the library's ratio guard uses
+            // it: `--max-chunk-size 18446744073709551615` is a number a user can
+            // type, and an overflow here would wrap it into a *tiny* ceiling that
+            // refuses every recording.
+            max_chunk_uncompressed_bytes: self.max_chunk_size.saturating_mul(1024 * 1024),
+            max_chunk_expansion_ratio: self.max_chunk_expansion,
             spill_dir: self.spill_dir.clone(),
         })
     }
@@ -520,10 +553,21 @@ fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -
              \x20 report the span of time it takes with it, instead of refusing the\n\
              \x20 whole recording."
         ),
+        // **One message for both builds, deliberately.** zstd and lz4 are decoded
+        // by pure-Rust codecs behind `tf_tree_ingest`'s default-on `compression`
+        // feature, so reaching here means either a codec name outside the MCAP
+        // specification or a `--no-default-features` build — and a user cannot tell
+        // which from the outside, so the message names both and the remedy that
+        // covers either. Splitting it on `#[cfg]` would make the arm a user meets
+        // depend on how their binary was built, which is the one fact they are
+        // least able to check.
         tf_tree_ingest::IngestError::CompressedChunk { .. } => anyhow::anyhow!(
             "{text}\n\
-             \x20 this build has no zstd or lz4 (they vendor a C build step, which\n\
-             \x20 docs/PHASE2.md §2 forbids). Rewrite the recording uncompressed:\n\
+             \x20 zstd and lz4 are read by pure-Rust codecs behind tf_tree_ingest's\n\
+             \x20 default-on `compression` feature — mcap's own would vendor a C\n\
+             \x20 build step, which docs/PHASE2.md §2 forbids. So this is either a\n\
+             \x20 codec outside the MCAP specification, or a build with that feature\n\
+             \x20 off. Either way, rewriting the recording uncompressed works:\n\
              \x20   mcap compress --compression none <in.mcap> -o <out.mcap>"
         ),
         tf_tree_ingest::IngestError::ClockResetSplitUnsupported => anyhow::anyhow!(
@@ -1455,15 +1499,18 @@ mod tests {
         );
     }
 
-    /// **The `CompressedChunk` remedy is this crate's headline mitigation for
-    /// `default-features = false` on `mcap`, and it is a bare string.**
+    /// **The `CompressedChunk` remedy is a bare string, and it is now the message
+    /// for a *narrower* case than it used to be.**
     ///
-    /// A zstd-compressed recording is what Foxglove writes by default and what
-    /// `rosbag2` writes with `compression_mode` set, so it is the first thing
-    /// many users will meet. It cannot be reached from an end-to-end test — this
-    /// build has no codecs, so it cannot *write* a compressed fixture to feed
-    /// itself — which is exactly why deleting the whole message was invisible.
-    /// Asserting on `ingest_err` is the only level at which it is reachable.
+    /// zstd and lz4 are decoded (`tf_tree_ingest`'s default-on `compression`
+    /// feature), so an ordinary compressed recording no longer reaches this arm at
+    /// all. What does is a codec name outside the MCAP specification, or a build
+    /// with the feature off — and a user cannot tell those apart from the outside,
+    /// which is why the message names both rather than being split on `#[cfg]`.
+    ///
+    /// It is still only reachable at this level: `ingest_err` is a `match` on an
+    /// error value, and an end-to-end test would have to fabricate a recording with
+    /// an invented codec name to get here.
     ///
     /// Mutant: delete the `CompressedChunk` arm, leaving the `_` fallthrough —
     /// applied, and this failed with only the generic "uses compressed chunks"
@@ -1491,6 +1538,60 @@ mod tests {
             "and it must name the codec, so a user can tell which of the two \
              they have: {text}"
         );
+    }
+
+    /// **The chunk bounds default to exactly what the library defaults to, and are
+    /// reachable from the command line at all.**
+    ///
+    /// Two separate claims, and both are the kind that rot silently. A CLI default
+    /// written as a literal drifts from the library constant the moment either
+    /// moves, and the drift is invisible: both numbers are plausible, and every
+    /// existing test passes with a ceiling that is wrong by a factor of two. And a
+    /// bound with no flag is a bound whose whole justification — "the person who
+    /// meets a limit cannot patch the crate" — is false for the only shipped
+    /// consumer.
+    ///
+    /// Mutant: `default_value_t = 64` in place of the derived expression — applied,
+    /// and this test still passed, because 64 MiB *is* the current default. So the
+    /// derived expression is what makes the property hold, and this assertion only
+    /// catches the drift *after* the constant moves; that is what it is for, and
+    /// pretending the mutant died would be worse than saying so. Mutant 2: pass
+    /// `DEFAULT_MAX_CHUNK_EXPANSION_RATIO` in `to_options` instead of
+    /// `self.max_chunk_expansion` — applied, and the `--max-chunk-expansion 4`
+    /// assertion failed with 1024, i.e. a flag that parses and does nothing.
+    #[test]
+    fn the_chunk_bounds_default_to_the_librarys_and_are_settable() {
+        let parse = |extra: &[&str]| -> tf_tree_ingest::IngestOptions {
+            let mut args: Vec<&str> = vec!["tf_tree", "ingest", "--bag", "/nonexistent.mcap"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).expect("parse").command {
+                Command::Ingest { opts, .. } => opts.to_options().expect("options"),
+                // `Command` derives no `Debug` (its variants hold types that do
+                // not), so the failure names the subcommand asked for rather than
+                // the one received.
+                _ => panic!("`ingest` did not parse as Command::Ingest"),
+            }
+        };
+
+        let defaults = parse(&[]);
+        let library = tf_tree_ingest::IngestOptions::default();
+        assert_eq!(
+            defaults.max_chunk_uncompressed_bytes, library.max_chunk_uncompressed_bytes,
+            "the CLI's --max-chunk-size default has drifted from the library's"
+        );
+        assert_eq!(
+            defaults.max_chunk_expansion_ratio, library.max_chunk_expansion_ratio,
+            "the CLI's --max-chunk-expansion default has drifted from the library's"
+        );
+
+        let set = parse(&["--max-chunk-size", "7", "--max-chunk-expansion", "4"]);
+        assert_eq!(set.max_chunk_uncompressed_bytes, 7 * 1024 * 1024);
+        assert_eq!(set.max_chunk_expansion_ratio, 4);
+
+        // A MiB count no multiplication can hold saturates rather than wrapping into
+        // a ceiling that refuses every recording.
+        let huge = parse(&["--max-chunk-size", &u64::MAX.to_string()]);
+        assert_eq!(huge.max_chunk_uncompressed_bytes, u64::MAX);
     }
 
     /// A bad chunk's error points at the policy that would have kept the rest of

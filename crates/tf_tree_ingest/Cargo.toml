@@ -24,6 +24,21 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
+# **Chunk decompression, and it is ON by default because a default-off fix is a
+# fix nobody gets.** rosbag2 and Foxglove both write zstd chunks by default, so
+# without this the ordinary case — a user pointing `tf_tree ingest` at a real
+# bag — fails with `IngestError::CompressedChunk`.
+#
+# **One feature, not `zstd` + `lz4`.** A bag is whatever the recorder wrote, so
+# nobody wants zstd-but-not-lz4; splitting it yields four configurations of
+# which three would never be exercised by any gate.
+#
+# **And it is deliberately not *named* `zstd`/`lz4`**, because those read as
+# "turn on `mcap`'s zstd/lz4 features" — which is exactly the mistake that
+# reintroduces the C build step `docs/PHASE2.md` §2 forbids. The codecs behind
+# this flag are ours and pure Rust; see the two dependencies below.
+compression = ["dep:ruzstd", "dep:lz4_flex"]
+default = ["compression"]
 # Writing a `.tft` (`docs/PHASE5.md` §2) needs `tf_tree`'s frozen backend, which
 # is Linux-only and behind `shm` because it reuses the same mapping code. Ingest
 # into an in-process `Tree` needs none of that and is always available, which is
@@ -40,10 +55,51 @@ tf_tree_bridge.workspace = true
 # **`default-features = false` is load-bearing and is `docs/PHASE5.md` §0.0's
 # decisive constraint.** The crate's defaults are `[zstd, lz4]`, which vendor C
 # through `zstd-sys`/`lz4-sys` and violate `docs/PHASE2.md` §2's no-C-build-step
-# rule. The cost is real and is surfaced rather than hidden: a chunk compressed
-# with either codec fails as `IngestError::CompressedChunk`, which names the
-# `mcap` CLI command that rewrites the file uncompressed.
+# rule. That rule is untouched by the `compression` feature above: the codecs
+# this crate decodes chunks with are **ours** — pure-Rust `ruzstd` and
+# `lz4_flex`, driven by `crate::decompress` over a chunk handed over whole — so
+# no `*-sys` crate enters the graph and there is still no C build step. What
+# `mcap` keeps owning is every record *body*; what it must never own is the
+# decompressor factory, which is the only thing its `zstd`/`lz4` features are
+# for.
 mcap = { version = "0.25", default-features = false }
+# **The zstd decoder, pure Rust — `docs/PHASE2.md` §2's no-C rule is why it is
+# this crate and not `zstd`/`zstd-sys`.** rosbag2 and Foxglove write zstd chunks
+# by default, so this is the codec that decides whether an ordinary bag ingests.
+#
+# Supply-chain disclosure, because "pure Rust" is not "safe Rust": ruzstd
+# carries **39 `unsafe` occurrences across two files**
+# (`decoding/ringbuffer.rs`, `decoding/decode_buffer.rs`), compiled
+# unconditionally under every feature combination. That is a fact about a
+# dependency, not a hole in ours — `docs/decisions/0007`'s unsafe budget and
+# this crate's `#![forbid(unsafe_code)]` are about boundaries *we* own — but a
+# reader weighing the decoder against the C one deserves the number rather than
+# an implication that there is none.
+#
+# It also fixes the workspace MSRV at 1.87 (`rust-version = "1.87"`); the root
+# manifest's MSRV comment records that trade.
+ruzstd = { version = "0.9", optional = true }
+# **The lz4 decoder, pure Rust. MCAP's `"lz4"` is the LZ4 *frame* format**, so
+# `crate::decompress` drives `lz4_flex::frame::FrameDecoder` and never the
+# block-format helpers — the crate `#[deprecated]`s its crate-root block
+# re-exports precisely because reaching for them here is a silent correctness
+# bug rather than a compile error.
+#
+# **Its default features are kept on purpose, and that inverts the reflex this
+# manifest applies everywhere else.** lz4_flex has no crate-level
+# `forbid(unsafe_code)`; the attribute is applied per module, gated on
+# `all(feature = "safe-encode", feature = "safe-decode")`, both of which are
+# defaults. Under them `frame/decompress.rs` contains **zero** `unsafe` and the
+# 35 unsafe sites in `block/decompress.rs` plus 9 in `fastcpy_unsafe.rs` are
+# never compiled. Writing `default-features = false` here would silently opt us
+# *into* them, which is the opposite of what it does for every other dependency
+# in this file. `frame` is a default feature and implies `std`.
+lz4_flex = { version = "0.14", optional = true }
+# Not named here, but new in `Cargo.lock` and worth one line: **`twox-hash 2.x`
+# arrives through both crates above** — ruzstd's default `hash` feature wants
+# xxhash64 for the zstd content checksum, lz4_flex's `frame` feature wants
+# xxhash32 for the LZ4 frame checksum. Same major, so Cargo unifies them to one
+# version (`cargo tree -d` is the check). It carries 4 `unsafe` occurrences.
 thiserror.workspace = true
 # **Chunk CRC32 validation, which became this crate's job with `emit_chunks`.**
 #
@@ -63,7 +119,16 @@ blake3 = { workspace = true, optional = true }
 # Self-reference so the fixture writer is compiled for this crate's own tests
 # without being part of what the crate ships. Cargo unifies the two views of the
 # package, so the lib is built once, with `fixture` on, for the test profile.
-tf_tree_ingest = { path = ".", features = ["fixture"] }
+#
+# **`default-features = false` here is what makes `--no-default-features`
+# testable at all**, and it is easy to get wrong: a dev-dependency's features are
+# unified with the package's own, so without this line
+# `cargo nextest run -p tf_tree_ingest --no-default-features` would re-enable
+# `compression` through this very edge and the codec-free build — the one
+# `#[cfg(not(feature = "compression"))]` tests exist for — would be compiled by
+# nothing. The package's own defaults still apply when it is the package being
+# built, so the ordinary `cargo nextest run -p tf_tree_ingest` is unaffected.
+tf_tree_ingest = { path = ".", default-features = false, features = ["fixture"] }
 # `tests/frozen_bag.rs` recomputes §2.3's `source_digest` independently of the
 # code that wrote it, so the assertion is not the implementation compared with
 # itself.
@@ -75,3 +140,11 @@ blake3 = { workspace = true }
 [[test]]
 name = "frozen_bag"
 required-features = ["shm"]
+
+# The generator behind `testdata/zstd_conformance.mcap`. An example rather than a
+# test because it **shells out to the host's `zstd` CLI**, which is a build-host
+# assumption no gate may depend on; the committed output is what the gate reads.
+# `testdata/ATTRIBUTION.md` records the provenance and the command line.
+[[example]]
+name = "gen_zstd_conformance"
+required-features = ["fixture"]
