@@ -141,6 +141,25 @@ fn recompress_chunk(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
 /// fixture *stronger*: nothing in `decompress` verifies that checksum (ruzstd
 /// computes one and compares nothing), so leaving it in would invite a reader to
 /// believe it is what validates the frame. The chunk CRC32 is the check that runs.
+///
+/// # The write runs on its own thread, and that is a deadlock fix
+///
+/// Writing the whole input from this thread and only then calling
+/// `wait_with_output` pins both ends of a pipe pair: once the child has filled the
+/// pipe this process is not draining, it blocks on its own write, and this process
+/// is still blocked on `write_all`. Neither side moves again.
+///
+/// It happened to be safe while every chunk here was ~660 bytes, but this file's
+/// whole instruction is "run it when the corpus changes", and a large enough one
+/// hangs the generator with no diagnostic at all. Measured on this host against the
+/// two shapes side by side, with an incompressible corpus so the *output* is as
+/// large as the input: 4 MiB completes either way, and **64 MiB hangs the
+/// single-threaded shape indefinitely** — killed at a 60-second budget — while the
+/// threaded one finishes. Handing the write to a thread means something is always
+/// draining stdout.
+///
+/// The regenerated `zstd_conformance.mcap` is byte-identical across the change,
+/// which is the check that this bought safety and not different bytes.
 fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut child = Command::new("zstd")
         .args(["-19", "--no-check", "-c", "-q"])
@@ -148,15 +167,24 @@ fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run the `zstd` CLI, which this generator needs: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("the zstd child has no stdin")?
-        .write_all(bytes)?;
+    let mut stdin = child.stdin.take().ok_or("the zstd child has no stdin")?;
+    // Owned by the thread, so the handle is dropped — and the child sees EOF — even
+    // if the write fails partway. Leaking it would replace this deadlock with
+    // another: the child would wait forever for an input that never ends.
+    let input = bytes.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
     let done = child.wait_with_output()?;
+    // Joined after the child has exited, so a `zstd` that rejected its arguments
+    // and closed stdin early surfaces as its own exit status below rather than as
+    // this thread's `BrokenPipe` — the second is a true error about the wrong
+    // thing.
+    let wrote = writer
+        .join()
+        .map_err(|_| "the stdin writer thread panicked")?;
     if !done.status.success() {
         return Err(format!("zstd exited with {}", done.status).into());
     }
+    wrote?;
     Ok(done.stdout)
 }
 
