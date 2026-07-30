@@ -2149,9 +2149,10 @@ fn a_lying_uncompressed_size_is_refused() {
         "and only that chunk is lost, not the recording"
     );
 
-    // Under `halt` the fault is named, and it is a length disagreement rather than
-    // a CRC one — the check is on the header's own two numbers, so it fires before
-    // anything hashes.
+    // Under `halt` the fault is named, and it is the *stored-size* disagreement
+    // rather than a CRC one — the check is on the header's own two numbers, so it
+    // fires before anything hashes — and rather than `LengthMismatch`, because no
+    // decoder ran and neither number is a decoder's output.
     let opts = IngestOptions {
         on_bad_chunk: OnBadChunk::Halt,
         ..IngestOptions::default()
@@ -2162,12 +2163,20 @@ fn a_lying_uncompressed_size_is_refused() {
         IngestError::BadChunk { chunk, kind } => {
             assert_eq!(chunk, DAMAGED_CHUNK_ORDINAL);
             assert!(
-                matches!(kind, BadChunkKind::LengthMismatch { .. }),
+                matches!(kind, BadChunkKind::StoredSizeMismatch { .. }),
                 "got {kind:?}"
             );
         }
         other => panic!("expected BadChunk, got {other:?}"),
     }
+    // The rendered message must not send the reader to a decompressor that this
+    // path never reaches. That is the whole reason the variant exists, so it is
+    // asserted rather than left to the variant's docs.
+    let text = tf_tree_ingest::describe(err, &frames).to_string();
+    assert!(
+        !text.contains("produced"),
+        "no decoder ran, so nothing was 'produced': {text}"
+    );
 }
 
 /// **A recording every chunk of which exceeds a ceiling is not reported as a
