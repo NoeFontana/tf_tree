@@ -223,8 +223,8 @@ ingest-check:
     # nobody builds is not a checked configuration, and here the unchecked one is
     # what a `--no-default-features` consumer gets.
     #
-    # Verified to be a real gate rather than a no-op: this line runs 83 tests,
-    # four of which exist only in this configuration.
+    # Verified to be a real gate rather than a no-op: this line runs 85 tests,
+    # five of which exist only in this configuration.
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --no-default-features
     # The CLI's `ingest_err` arms are the only place the remedy text for a
@@ -322,6 +322,51 @@ fmt:
 # cargo-deny: advisories, licenses, bans, sources.
 audit:
     cargo deny check
+
+# **The MSRV floor, on the host rather than only in CI.**
+#
+# `SUPPORT.md` calls the floor "enforced, not intended", and until this recipe
+# existed the only thing enforcing it was CI's `msrv` job — which has produced no
+# run since 2026-07-23. A floor whose only gate is a workflow nobody is running is
+# back to being intended, which is the exact failure that took `rust-version` from
+# 1.83 to 1.85: the number looked authoritative and nothing had ever compiled
+# against it.
+#
+# This mirrors that job step for step, and deliberately so — the version is read
+# out of the manifest rather than written here, the `--locked` build uses the
+# committed lockfile (a transitive crate that quietly needs a newer toolchain is
+# the drift being caught, so re-resolving would hide it), and `--lib --bins`
+# because the promise covers what a downstream *links*, not what our
+# dev-dependencies need.
+#
+# Requires the floor's toolchain to be installed; when it is not, the recipe stops
+# with the exact `rustup toolchain install` line to run rather than falling back to
+# `stable`, which would make it pass while checking nothing.
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    want=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+    test -n "$want" || { echo "no rust-version in Cargo.toml"; exit 1; }
+    rustup toolchain list | grep -q "^$want" \
+        || { echo "the floor is $want; install it: rustup toolchain install $want"; exit 1; }
+    echo "==> building the workspace on the declared floor, $want"
+    cargo "+$want" build --workspace --lib --bins --locked
+    # `cargo build --workspace` cannot see `crates/tf_tree_py` or
+    # `crates/tf_tree_tf2_sys`: both are excluded from the workspace (maturin builds
+    # one, the other needs a ROS 2 install), so both spell `rust-version` by hand and
+    # neither is compiled by the line above. Compared rather than compiled, which is
+    # the strongest check available for a crate this host cannot build.
+    echo "==> every hand-written rust-version agrees with the workspace"
+    rc=0
+    for m in crates/*/Cargo.toml xtask/Cargo.toml; do
+        got=$(grep -m1 '^rust-version *=' "$m" | cut -d'"' -f2 || true)
+        [ -n "$got" ] || continue
+        if [ "$got" != "$want" ]; then
+            echo "$m: declares rust-version $got, workspace declares $want"
+            rc=1
+        fi
+    done
+    exit $rc
 
 # Run the benchmark suite and the go/no-go gate.
 bench:

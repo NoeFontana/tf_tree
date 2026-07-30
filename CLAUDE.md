@@ -113,6 +113,7 @@ Everything goes through `just`; CI mirrors it 1:1.
 | `just fmt` | auto-format + clippy `--fix` |
 | `just loom` | concurrency model checking (`cargo xtask loom`) |
 | `just miri` | UB checking on arena + core |
+| `just msrv` | the declared MSRV floor: `--locked` build on it, plus every hand-written `rust-version` |
 | `just bench` | benchmark suite + go/no-go gate |
 | `just ros-build` / `just ros-test` | `ros/tf_tree_ros` in the container — nothing on the host can |
 | `just tf2-check` | the container-only crates: `tf_tree_tf2_sys`, and `tf_tree_c --features bridge` |

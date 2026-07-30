@@ -1683,10 +1683,10 @@ mod tests {
     /// unsupported and nothing tries to decode.
     ///
     /// Mutant: make `is_built_in` return `true` for `Zstd`/`Lz4` unconditionally,
-    /// i.e. drop its `#[cfg]` — applied, and **all 83 tests still passed**. That is
-    /// not a gap being hidden: `decompress_into`'s fallback arm returns
-    /// `ChunkFault::Unsupported` for any codec it has no decoder for, so the answer
-    /// is identical by construction. The property is **structurally guarded** by that
+    /// i.e. drop its `#[cfg]` — applied, and **all 85 tests still passed** (97 of 97
+    /// in the default build). That is not a gap being hidden: `decompress_into`'s
+    /// fallback arm returns `ChunkFault::Unsupported` for any codec it has no decoder
+    /// for, so the answer is identical by construction. The property is **structurally guarded** by that
     /// arm, which exists precisely so that a `cfg` mistake cannot become a wrong
     /// answer, and saying so is more useful than inventing a kill.
     ///

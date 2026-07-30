@@ -1736,9 +1736,9 @@ mod tests {
     /// while exercising the mislabelled-payload path instead.
     ///
     /// Mutant: delete `chunk_body`'s `codec.is_available()` guard — applied, and
-    /// **all 83 tests still passed**: `compress_records`'s own
-    /// `#[cfg(not(feature = "compression"))]` arm returns the same
-    /// `CodecUnavailable`, with the same codec name. The property is therefore
+    /// **all 85 tests still passed** (97 of 97 in the default build):
+    /// `compress_records`'s own `#[cfg(not(feature = "compression"))]` arm returns
+    /// the same `CodecUnavailable`, with the same codec name. The property is therefore
     /// **structurally guarded** by that arm; the guard in `chunk_body` is a second,
     /// earlier statement of it, kept because it is where a reader looks. What this
     /// test adds is that the refusal is an error a caller can read rather than a

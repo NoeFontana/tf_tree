@@ -55,11 +55,12 @@ fn corpus() -> Vec<FixtureMessage> {
 /// a `cfg` that covered only one of them would be invisible everywhere else.
 ///
 /// Mutant: make `ChunkCodec::is_built_in` return `true` for `Zstd`/`Lz4`
-/// unconditionally, i.e. drop its `#[cfg]` — applied, and **all 83 tests still
-/// passed**, this one included. `decompress_into`'s fallback arm returns
-/// `ChunkFault::Unsupported` for any codec it has no decoder for, so the answer is
-/// unchanged; the property is **structurally guarded** by that arm, which exists
-/// precisely so a `cfg` mistake cannot become a wrong answer.
+/// unconditionally, i.e. drop its `#[cfg]` — applied, and **all 85 tests still
+/// passed**, this one included (97 of 97 in the default build).
+/// `decompress_into`'s fallback arm returns `ChunkFault::Unsupported` for any codec
+/// it has no decoder for, so the answer is unchanged; the property is
+/// **structurally guarded** by that arm, which exists precisely so a `cfg` mistake
+/// cannot become a wrong answer.
 ///
 /// Mutant 2, which does kill it: turn `chunk_records`'s
 /// `return Err(ChunkFault::Unsupported(head.codec))` into
@@ -123,10 +124,11 @@ fn a_compressed_chunk_is_refused_by_name_in_a_codec_free_build() {
 ///
 /// Mutant: `ChunkCodec::parse("")` → `Self::Other` — applied, and this failed with
 /// `the recording uses an unrecognised codec-compressed chunks, which this build
-/// cannot read` (39 of this configuration's 83 tests died with it). That mutant is
-/// the reason this test is here rather than only in the default configuration: the
-/// uncompressed path is now one arm of a codec `match`, and this is the build where
-/// nothing else can reach the other arms at all.
+/// cannot read` (39 of this configuration's 85 tests died with it, and 42 of the
+/// default build's 97). That mutant is the reason this test is here rather than only
+/// in the default configuration: the uncompressed path is now one arm of a codec
+/// `match`, and this is the build where nothing else can reach the other arms at
+/// all.
 #[test]
 fn an_uncompressed_recording_still_ingests_in_a_codec_free_build() {
     let dir = std::env::temp_dir().join(format!(
