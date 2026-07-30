@@ -485,10 +485,15 @@ pub fn survey(
     out.remaps = normalizer.remaps().to_vec();
     if out.edges.is_empty() {
         // **Which of the two "nothing here" cases this is, is the whole value of
-        // the message.** Reading is chunk-granular, so a recording cut before its
-        // first complete chunk yields zero transforms for a reason that has
-        // nothing to do with what was published — and `NoTransforms` would send
-        // the user looking for a publisher instead of at their file.
+        // the message.** Reading is record-granular, even inside a chunk (see
+        // `source::read_tf`), so a recording cut before its first complete *record*
+        // yields zero transforms for a reason that has nothing to do with what was
+        // published — and `NoTransforms` would send the user looking for a publisher
+        // instead of at their file. An earlier revision of this comment said
+        // *chunk*-granular, which would make this arm look reachable only for files
+        // smaller than one chunk; `truncation_recovery_is_record_granular` shows
+        // records inside a cut chunk are recovered, so the reachable class is a very
+        // different and much larger one.
         return Err(if out.anomalies.truncated {
             IngestError::TruncatedBeforeAnyChunk
         } else {

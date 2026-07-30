@@ -159,6 +159,19 @@ struct ChannelRole {
 /// same "the counts below cover only part of the recording" framing, and carries
 /// the *time span* that was lost.
 ///
+/// **Except when nothing survives at all, where there is no report to put it in.**
+/// If the lost `Channel` record was the only one, no edge is built,
+/// [`survey`](crate::survey) fails with [`IngestError::NoTransforms`], and an error
+/// carries no [`Anomalies`](crate::Anomalies) — so `bad_chunks` and
+/// `bad_chunk_span_ns` are discarded in precisely the case this section is about,
+/// and the operator is told the recording contains no transforms about a file that
+/// contains thousands. `tests/ingest.rs`'s
+/// `a_skipped_chunk_that_carried_the_only_channel_drops_the_rest` pins that, with
+/// the numbers. The fix is a counter for unknown-channel drops plus a distinct error
+/// variant for "transforms were present but every channel definition was lost",
+/// mirroring how [`IngestError::TruncatedBeforeAnyChunk`] exists so that "nothing
+/// here" can say why; until it lands, this paragraph is the warning.
+///
 /// Both passes read the same file, so a deterministic bad chunk is skipped
 /// identically in the survey and the fill, and the two stay consistent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

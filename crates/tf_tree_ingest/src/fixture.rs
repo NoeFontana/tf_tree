@@ -5,8 +5,9 @@
 //! Nothing this module produces came off a robot. There is no rosbag2 bag in
 //! this repository, and vendoring one would add tens of megabytes and a
 //! licensing question for a test that needs a few kilobytes. So the fixtures
-//! here are *fabricated*: real MCAP framing (written by the `mcap` crate's own
-//! writer) around real CDR payloads (written by [`crate::cdr::encode_tf_message`],
+//! here are *fabricated*: real MCAP framing (written either by the `mcap` crate's
+//! own writer or, for the chunked fixtures, by hand — see "Why there is a second
+//! writer") around real CDR payloads (written by [`crate::cdr::encode_tf_message`],
 //! whose byte-level agreement with the wire is proved separately against
 //! hand-assembled bytes in `cdr::tests::wire_bytes_decode_w_last`).
 //!
@@ -50,9 +51,13 @@
 //! function that serializes one: `records::{Header, SchemaHeader, Channel,
 //! MessageHeader, ChunkHeader, Footer}` derive `binrw::BinWrite`, and writing
 //! through that derive needs `binrw` in scope as a direct dependency, which the
-//! dependency budget forbids. So the bodies are written by hand and checked
-//! against `mcap::parse_record` and `mcap::read::LinearReader` in this module's
-//! tests — the crate remains the oracle even though it cannot be the writer.
+//! dependency budget forbids. So the bodies are written by hand and read back in
+//! this module's tests with `mcap::read::LinearReader`, whose iterator hands every
+//! record body to `mcap::parse_record` — the crate remains the oracle even though
+//! it cannot be the writer. What that oracle does *not* cover is stated where it
+//! is used (`a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`): with chunks
+//! emitted raw it never computes a chunk CRC, so the CRC is checked by an explicit
+//! assertion there.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -64,8 +69,10 @@ use crate::cdr::{encode_tf_message, TransformStamped};
 /// The schema name a real `rosbag2` writes for `/tf`.
 pub const TF_SCHEMA: &str = "tf2_msgs/msg/TFMessage";
 
-/// Target uncompressed chunk size for every fixture in this module: **4 KiB**,
-/// against `mcap`'s 1 MiB default.
+/// Target uncompressed chunk size for the `mcap::Writer` fixtures in this module:
+/// **4 KiB**, against `mcap`'s 1 MiB default. The hand-rolled fixtures do not read
+/// it — they chunk by message count, see [`ChunkedSpec`] — so editing this number
+/// moves [`write_mcap`] and [`write_mcap_as`] and nothing else.
 ///
 /// The corpora here are a few kilobytes, so at the default each fixture would be
 /// exactly one chunk — and one chunk is a degenerate fixture for two properties
@@ -85,9 +92,13 @@ pub const TF_SCHEMA: &str = "tf2_msgs/msg/TFMessage";
 /// would justify deleting the record-granular tests as testing something the
 /// reader does not do.
 ///
-/// **The inner-record walk crosses boundaries.** A single chunk exercises
-/// `crate::decompress::for_each_record` once, from a clean start, which is the
-/// case least likely to be wrong.
+/// **The inner-record walk is entered once per chunk.** Records never straddle a
+/// chunk boundary — the format does not permit it, and
+/// `crate::decompress::for_each_record` is restarted from a clean start on each
+/// chunk's records field — so a single-chunk fixture exercises that walk exactly
+/// once, from a clean start, which is the case least likely to be wrong. Several
+/// chunks enter it several times, each with a different prefix of the corpus
+/// behind it.
 pub const FIXTURE_CHUNK_SIZE: u64 = 4 * 1024;
 
 /// One fabricated message: a topic, a log time, and the transforms in it.
@@ -380,7 +391,15 @@ pub const DAMAGED_CHUNK_ORDINAL: u64 = 1;
 
 /// Fewest chunks a damaged fixture must split into, so there is a survivor on
 /// each side of the damage.
-const MIN_CHUNKS_FOR_DAMAGE: usize = 3;
+///
+/// **Derived from [`DAMAGED_CHUNK_ORDINAL`] rather than written down**, because the
+/// two encode one property and a hardcoded `3` left behind by a moved ordinal
+/// fails in the worst direction: asking to damage a chunk past the last one passes
+/// the guard, matches nothing in the loop, and hands back a pristine recording —
+/// exactly the vacuous fixture [`FixturePlanError`] exists to refuse.
+const fn min_chunks_for_damage() -> usize {
+    DAMAGED_CHUNK_ORDINAL as usize + 2
+}
 
 /// Which chunk carries the `Schema` and `Channel` records.
 ///
@@ -392,19 +411,27 @@ pub enum DefinitionsIn {
     /// The first chunk, which is where a real recorder puts them.
     #[default]
     FirstChunk,
-    /// The **damaged** chunk (see [`DAMAGED_CHUNK_ORDINAL`]), which is the layout
-    /// that makes the caveat in [`OnBadChunk`](crate::OnBadChunk)'s docs
-    /// reproducible: skipping this chunk costs the only `Channel` record in the
-    /// file, so every message in every later chunk belongs to a channel the reader
-    /// has never heard of and is dropped without a counter.
-    SecondChunk,
+    /// The chunk [`ChunkedSpec::damaged`] damages, wherever
+    /// [`DAMAGED_CHUNK_ORDINAL`] puts it — named for that relationship and not for
+    /// a position, because the placement is only interesting for its overlap with
+    /// the damage.
+    ///
+    /// It is the layout that makes the caveat in
+    /// [`OnBadChunk`](crate::OnBadChunk)'s docs reproducible: skipping this chunk
+    /// costs the only `Channel` record in the file, so every message in every later
+    /// chunk belongs to a channel the reader has never heard of and is dropped
+    /// without a counter.
+    DamagedChunk,
 }
 
 /// A deliberate defect in the second chunk of a hand-rolled fixture.
 ///
-/// Each variant documents the [`BadChunkKind`](crate::BadChunkKind) it produces
-/// **in this build** — the codec-free one — because that is not always the fault a
-/// reader would guess, and one variant produces no fault at all.
+/// Each variant documents the fault it produces **in this build** — the codec-free
+/// one — because that is not always the fault a reader would guess. Five produce a
+/// [`BadChunkKind`](crate::BadChunkKind); [`ChunkDamage::Relabelled`] produces
+/// `ChunkFault::Unsupported`, which is deliberately *not* damage in the
+/// `BadChunkKind` sense and is never skippable; and
+/// [`ChunkDamage::UncompressedSizeTooLarge`] produces nothing at all today.
 /// `fixture::tests::each_damage_variant_produces_its_documented_fault` is where
 /// each of those claims is checked against `crate::decompress` rather than
 /// asserted in prose.
@@ -421,8 +448,18 @@ pub enum ChunkDamage {
     /// Detected in every build, but as `BadChunkKind::Crc` and **not** as a length
     /// fault: a short declaration is satisfiable, so the reader hands over a
     /// shortened records field, and the CRC — which covers the whole field — is
-    /// what disagrees. That ordering is the reason a lying-short size cannot
-    /// silently drop the tail of a chunk, and it is worth having a fixture for.
+    /// what disagrees. That is worth a fixture because the fault kind is not the one
+    /// the damage's name suggests.
+    ///
+    /// **The guarantee is only as wide as the CRC.** `decompress::check_crc`
+    /// returns `Ok` unconditionally when the saved hash is `0`, which the MCAP
+    /// specification defines as "not computed" and which real writers do produce.
+    /// A chunk with no computed CRC whose `compressed_size` is short by exactly the
+    /// framed size of its last inner record would therefore lose that record with
+    /// no fault at all: the walk stops on a clean boundary and has nothing to
+    /// complain about. No fixture reaches that combination — this variant keeps the
+    /// honest CRC, and no variant sets it to `0` — so it is a gap in `decompress`
+    /// rather than a claim made here.
     CompressedSizeTooSmall,
     /// `uncompressed_crc` holds a hash the records do not have.
     ///
@@ -457,21 +494,43 @@ pub enum ChunkDamage {
     /// recomputed **on purpose**: a CRC that failed first would mean this variant
     /// never reached the framing walk, and it would then be testing the same code
     /// path as [`ChunkDamage::UncompressedCrc`] while appearing to test another.
+    ///
+    /// **This is the one variant whose skip is not all-or-nothing, and a test using
+    /// it must say so.** The fault is raised by `for_each_record` *during* the walk,
+    /// so every record before it has already been handed to the reader's callback
+    /// and is in the tree; `note_or_fail` then counts the whole chunk as skipped and
+    /// reports its whole header span as lost. The chunk is simultaneously partly
+    /// ingested and reported as gone.
+    /// `ingest::a_framing_fault_mid_chunk_keeps_what_it_already_delivered` pins the
+    /// exact numbers and records the consequence as a `source.rs` finding; the
+    /// variants caught by `chunk_records` ([`ChunkDamage::UncompressedCrc`],
+    /// [`ChunkDamage::FlippedBitInRecords`], the two `compressed_size` lies) are
+    /// rejected before any record is delivered and are the all-or-nothing case.
     InnerRecordRunsPastTheEnd,
     /// `uncompressed_size` declares more bytes than the records field holds.
     ///
-    /// **Undetectable in this build, and that is recorded rather than hidden.**
-    /// `decompress::ChunkHead` deliberately does not retain `uncompressed_size` —
-    /// no codec is compiled in, so nothing reads it — and an uncompressed chunk's
-    /// records field is bounded by `compressed_size`, which is honest here. So a
-    /// fixture with this damage ingests cleanly and reports nothing.
+    /// **Undetected in this build — a check that is available and has not been
+    /// written, not one that needs a decoder.** `decompress::ChunkHead` does not
+    /// retain `uncompressed_size`, so no code path can compare it, and an
+    /// uncompressed chunk's records field is bounded by `compressed_size`, which is
+    /// honest here. So a fixture with this damage ingests cleanly and reports
+    /// nothing.
     ///
-    /// It is kept because it is a fixture capability the *next* PR needs: the
-    /// commit that adds a decoder makes this field the allocation size and the
-    /// decompression-bomb bound, at which point the lie must become
+    /// The precondition is *not* a codec. When `compression` is `""` the records are
+    /// stored verbatim, so `uncompressed_size == compressed_size == records.len()`
+    /// is an invariant checkable today from two `u64`s nine bytes apart in a header
+    /// `ChunkHead::parse` already walks past — `mcap`'s own writer and reader treat
+    /// them as equal, and
+    /// `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
+    /// asserts it. Adding that comparison is a `decompress` change and is left to
+    /// its own commit rather than smuggled into a fixture PR.
+    ///
+    /// The variant is kept because a decoder needs it too: there this field becomes
+    /// the allocation size and the decompression-bomb bound, and the lie must become
     /// `BadChunkKind::LengthMismatch` or `BadChunkKind::ImplausibleSize`. No test
     /// here pretends it is caught today;
-    /// `a_lying_uncompressed_size_is_not_detected_by_this_build` pins the opposite.
+    /// `a_lying_uncompressed_size_is_not_detected_by_this_build` pins the opposite
+    /// and has to be rewritten by whichever commit closes the gap.
     UncompressedSizeTooLarge,
 }
 
@@ -506,24 +565,24 @@ impl ChunkedSpec {
         self
     }
 
-    /// Put the `Schema` and `Channel` records in the second chunk — the one
+    /// Put the `Schema` and `Channel` records in the chunk
     /// [`ChunkedSpec::damaged`] damages.
     #[must_use]
-    pub fn definitions_in_second_chunk(mut self) -> ChunkedSpec {
-        self.definitions = DefinitionsIn::SecondChunk;
+    pub fn definitions_in_damaged_chunk(mut self) -> ChunkedSpec {
+        self.definitions = DefinitionsIn::DamagedChunk;
         self
     }
 
     /// Whether this layout needs a chunk on each side of the damaged one.
-    fn needs_three_chunks(self) -> bool {
-        self.damage.is_some() || self.definitions == DefinitionsIn::SecondChunk
+    fn needs_a_survivor_each_side(self) -> bool {
+        self.damage.is_some() || self.definitions == DefinitionsIn::DamagedChunk
     }
 
     /// Ordinal of the chunk that carries the definitions.
     fn definitions_chunk(self) -> usize {
         match self.definitions {
             DefinitionsIn::FirstChunk => 0,
-            DefinitionsIn::SecondChunk => DAMAGED_CHUNK_ORDINAL as usize,
+            DefinitionsIn::DamagedChunk => DAMAGED_CHUNK_ORDINAL as usize,
         }
     }
 }
@@ -534,6 +593,12 @@ impl ChunkedSpec {
 /// (`docs/PROJECT.md` §5), even though its only consumer is a test: a fixture
 /// helper that silently produced something *other* than what was asked for is how
 /// a damage test goes vacuous, so this is an error rather than a clamp.
+///
+/// **Nothing about a [`ChunkedSpec`] is clamped**, which is the half of that policy
+/// that has to be maintained in the writer rather than stated here: a zero chunk
+/// size and a damage that lands on nothing are both refused below rather than
+/// reinterpreted, because either would change the chunk layout every damage test
+/// computes its expectations from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FixturePlanError {
     /// The corpus does not split into enough chunks to damage the second one and
@@ -549,6 +614,38 @@ pub enum FixturePlanError {
         /// How many were needed.
         needed: usize,
     },
+    /// [`ChunkedSpec::messages_per_chunk`] was `0`.
+    ///
+    /// Refused rather than read as `1`, because a computed count that came out zero
+    /// (`messages.len() / groups` with too many groups, say) would otherwise make
+    /// [`DAMAGED_CHUNK_ORDINAL`] name the second *message* instead of the second
+    /// group, and a long enough corpus still splits into three chunks — so
+    /// [`FixturePlanError::TooFewChunks`] would not fire and the test would assert
+    /// survivor counts against a layout nobody chose.
+    #[error(
+        "messages_per_chunk was 0; a chunk layout no caller chose is how a damage \
+         test starts measuring nothing, so this is refused rather than read as 1"
+    )]
+    ZeroMessagesPerChunk,
+    /// The chunk to be damaged holds no record the damage can land on.
+    ///
+    /// Three variants are defined relative to the records field's own contents — the
+    /// bit flip, the inflated inner length, and the four-byte-short
+    /// `compressed_size` — and an empty field leaves each of them with nothing to
+    /// change. All three would otherwise return a chunk that is byte-for-byte
+    /// intact, which is a silently undamaged fixture: the corrupt-chunk tests would
+    /// pass while nothing was corrupt. Unreachable as this writer stands
+    /// (`slice::chunks` yields no empty group and every message becomes a record);
+    /// refused so that it stays
+    /// unreachable when a later spec knob can produce an empty chunk.
+    #[error(
+        "the chunk to damage holds no records, so {damage} would leave it intact; a \
+         fixture that is quietly undamaged is worse than one that fails to build"
+    )]
+    NothingToDamage {
+        /// Which damage found nothing to apply itself to.
+        damage: &'static str,
+    },
 }
 
 /// Write `messages` to `path` as an MCAP with hand-rolled framing, **no summary
@@ -556,6 +653,14 @@ pub enum FixturePlanError {
 ///
 /// See this module's docs for why this exists beside [`write_mcap`], and
 /// [`ChunkDamage`] for what each defect produces.
+///
+/// Two asymmetries with [`write_mcap`] are worth knowing before sizing a fixture
+/// for this writer. It **buffers the whole file** and writes it in one call, where
+/// `write_mcap` streams through a `BufWriter`, so a large corpus costs its own size
+/// in memory. And the schema name and message encoding are fixed at [`TF_SCHEMA`]
+/// and `cdr`: the knobs [`write_mcap_as`] exposes have no equivalent here, and a
+/// chunked fixture that needs one should grow [`ChunkedSpec`] rather than fork a
+/// third writer.
 ///
 /// # Errors
 ///
@@ -583,13 +688,15 @@ pub fn chunked_mcap_bytes(
     messages: &[FixtureMessage],
     spec: ChunkedSpec,
 ) -> Result<Vec<u8>, FixturePlanError> {
-    // Zero would divide by zero below, and a caller that passed it meant "one".
-    let per = spec.messages_per_chunk.max(1);
+    if spec.messages_per_chunk == 0 {
+        return Err(FixturePlanError::ZeroMessagesPerChunk);
+    }
+    let per = spec.messages_per_chunk;
     let chunks = messages.len().div_ceil(per);
-    if spec.needs_three_chunks() && chunks < MIN_CHUNKS_FOR_DAMAGE {
+    if spec.needs_a_survivor_each_side() && chunks < min_chunks_for_damage() {
         return Err(FixturePlanError::TooFewChunks {
             chunks,
-            needed: MIN_CHUNKS_FOR_DAMAGE,
+            needed: min_chunks_for_damage(),
         });
     }
 
@@ -632,6 +739,10 @@ pub fn chunked_mcap_bytes(
             }
         }
         for (i, m) in group.iter().enumerate() {
+            // Unreachable by construction: `topics` was collected from these same
+            // messages a few lines above, so every topic has a slot. Written as a
+            // `continue` rather than an error because an error variant for a state
+            // this function makes impossible would be untestable dead code.
             let Some(slot) = topics.iter().position(|t| *t == m.topic.as_str()) else {
                 continue;
             };
@@ -660,7 +771,7 @@ pub fn chunked_mcap_bytes(
         push_record(
             &mut out,
             mcap::records::op::CHUNK,
-            &chunk_body(records, start, end, damage),
+            &chunk_body(records, start, end, damage)?,
         );
     }
 
@@ -737,7 +848,7 @@ fn chunk_body(
     start_ns: u64,
     end_ns: u64,
     damage: Option<ChunkDamage>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FixturePlanError> {
     let RecordBuf {
         mut bytes,
         last_len_at,
@@ -754,7 +865,14 @@ fn chunk_body(
         None => {}
         Some(ChunkDamage::CompressedSizeTooLarge) => compressed_size += 64,
         Some(ChunkDamage::CompressedSizeTooSmall) => {
-            compressed_size = compressed_size.saturating_sub(4);
+            // Fewer than four bytes to give up means the subtraction saturates and
+            // the declaration stops being a lie, so the fixture would be intact.
+            if bytes.len() < 4 {
+                return Err(FixturePlanError::NothingToDamage {
+                    damage: "CompressedSizeTooSmall",
+                });
+            }
+            compressed_size -= 4;
         }
         Some(ChunkDamage::UncompressedCrc) => {
             uncompressed_crc = a_wrong_but_nonzero_crc(uncompressed_crc);
@@ -764,16 +882,29 @@ fn chunk_body(
             // first record's opcode — a corrupted opcode would be caught by the
             // framing walk and this variant is about the CRC being the only witness.
             let at = bytes.len() / 2;
-            if let Some(b) = bytes.get_mut(at) {
-                *b ^= 0x01;
+            match bytes.get_mut(at) {
+                Some(b) => *b ^= 0x01,
+                // An empty records field has no bit to flip, and returning the chunk
+                // unflipped would hand back an intact fixture under a damaged name.
+                None => {
+                    return Err(FixturePlanError::NothingToDamage {
+                        damage: "FlippedBitInRecords",
+                    })
+                }
             }
         }
         Some(ChunkDamage::Relabelled(name)) => compression = name,
         Some(ChunkDamage::InnerRecordRunsPastTheEnd) => {
-            if let Some(at) = last_len_at {
-                let declared = u64_at(&bytes, at).saturating_add(64);
-                bytes[at..at + 8].copy_from_slice(&declared.to_le_bytes());
-            }
+            // No last record means no length field to inflate; recomputing the CRC
+            // over unpatched bytes below would then restore the honest hash and the
+            // chunk would read as intact.
+            let Some(at) = last_len_at else {
+                return Err(FixturePlanError::NothingToDamage {
+                    damage: "InnerRecordRunsPastTheEnd",
+                });
+            };
+            let declared = u64_at(&bytes, at).saturating_add(64);
+            bytes[at..at + 8].copy_from_slice(&declared.to_le_bytes());
             // Recomputed over the patched bytes; see the variant's docs for why
             // that is the point rather than an oversight.
             uncompressed_crc = crc32fast::hash(&bytes);
@@ -788,8 +919,10 @@ fn chunk_body(
     put_u32(&mut body, uncompressed_crc);
     put_str(&mut body, compression);
     put_u64(&mut body, compressed_size);
-    body.extend_from_slice(&bytes);
-    body
+    // Moved rather than copied: the records field is the whole chunk and this is the
+    // one full-size copy in the writer that costs nothing to remove.
+    body.append(&mut bytes);
+    Ok(body)
 }
 
 /// A CRC that is wrong and is **not** `0`.
@@ -950,10 +1083,20 @@ mod tests {
     }
 
     /// **The `mcap` crate accepts every byte this writer produces.** Its own reader
-    /// walks the file, validating chunk CRCs (`LinearReader::new` turns
-    /// `validate_chunk_crcs` on, unlike the default this crate's reader inherits),
-    /// and its `parse_record` reads back each body with the field values that went
-    /// in.
+    /// walks the file and hands every record body to `mcap::parse_record`, which
+    /// reads back the field values that went in — including the outer framing and
+    /// each chunk's declared `compressed_size` against the bytes present.
+    ///
+    /// **What that reader does not check is the chunk CRC**, so the explicit
+    /// `uncompressed_crc` assertion below is not redundant. `LinearReader::new` does
+    /// set `with_validate_chunk_crcs(true)`, but it also sets
+    /// `with_emit_chunks(true)` (mcap-0.25.0 `src/read.rs:56`), and the CRC is only
+    /// computed on the chunk-expansion path, which `!emit_chunks` gates
+    /// (`sans_io/linear_reader.rs:475`). Verified rather than reasoned: a fixture
+    /// damaged with `UncompressedCrc` or `FlippedBitInRecords` is read by
+    /// `LinearReader::new` as six good records and no error. The chunk CRC is
+    /// covered here and in `each_damage_variant_produces_its_documented_fault`, via
+    /// `crate::decompress::check_crc`.
     ///
     /// This is the test that keeps every damage test below meaningful: a writer
     /// whose clean output was subtly wrong would produce faults that look like the
@@ -965,7 +1108,12 @@ mod tests {
     /// time) against the 345 bytes actually present. Mutant 2: write a string's
     /// length prefix as `u16` in `put_str` — applied, and `LinearReader` refused
     /// the very first record with "not enough bytes in reader", before any
-    /// assertion ran.
+    /// assertion ran. Mutant 3: add a millisecond to `log_time` for every message
+    /// except the first of each chunk — applied, and the per-message table below
+    /// failed. That mutant is the reason the table exists: it survives the entire
+    /// integration suite, because `IngestReport` takes its per-edge times from the
+    /// CDR *stamps* and never from MCAP's `log_time`, so nothing outside this loop
+    /// can see a `log_time` the writer got wrong after the first record.
     #[test]
     fn a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate() {
         let messages = corpus(6);
@@ -1049,6 +1197,45 @@ mod tests {
         assert!(later
             .iter()
             .all(|r| matches!(r, mcap::records::Record::Message { .. })));
+
+        // **Every message, not just the first.** A stamp or a payload that was right
+        // in the first record of the first chunk and wrong afterwards is invisible to
+        // the report — `IngestReport` derives its per-edge times from the CDR
+        // *stamps*, so a drifting MCAP `log_time` reaches no assertion outside this
+        // loop — and the fixture would then make some unrelated timing test fail with
+        // a diagnosis pointing at the engine.
+        let all_messages: Vec<(u16, u32, u64, u64, Vec<u8>)> = chunks
+            .iter()
+            .flat_map(|(_, data)| mcap::read::LinearReader::sans_magic(data))
+            .filter_map(|r| match r.expect("every inner record must parse") {
+                mcap::records::Record::Message { header, data } => Some((
+                    header.channel_id,
+                    header.sequence,
+                    header.log_time,
+                    header.publish_time,
+                    data.to_vec(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<(u16, u32, u64, u64, Vec<u8>)> = messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let t = log_time_of(m);
+                (
+                    channel_id(0),
+                    i as u32,
+                    t,
+                    t,
+                    encode_tf_message(&m.transforms),
+                )
+            })
+            .collect();
+        assert_eq!(
+            all_messages, want,
+            "every message must carry its own channel, sequence, times and payload"
+        );
 
         // **No summary section**, which is the property that makes a skipped
         // definitions chunk unrecoverable and is therefore the point.
@@ -1193,11 +1380,15 @@ mod tests {
     /// shortens its corpus: with two chunks there is no third to assert survived,
     /// and with one there is not even a second to damage.
     ///
-    /// Mutant: delete the `chunks < MIN_CHUNKS_FOR_DAMAGE` branch — applied, and
+    /// Mutant: delete the `chunks < min_chunks_for_damage()` branch — applied, and
     /// this failed on the first `unwrap_err`, with the whole two-chunk file printed
-    /// as the unexpected `Ok`. It was the **only** failure in the crate (67 of 68
-    /// tests still passed), which is the point: nothing else notices a damage
-    /// fixture that has no surviving chunk after the damage.
+    /// as the unexpected `Ok`. It was the **only** failure in the crate, which is
+    /// the point: nothing else notices a damage fixture that has no surviving chunk
+    /// after the damage. Mutant 2: `min_chunks_for_damage` returning
+    /// `DAMAGED_CHUNK_ORDINAL as usize + 1`, i.e. requiring only that the damaged
+    /// chunk *exist* — applied, and this failed on the first `unwrap_err`, which
+    /// returned the whole two-chunk file: a fixture whose damage is in its last
+    /// chunk, so nothing after the fault is left to prove the read resumed.
     #[test]
     fn a_corpus_too_short_to_damage_is_refused() {
         let spec = ChunkedSpec::new(3).damaged(ChunkDamage::UncompressedCrc);
@@ -1218,16 +1409,87 @@ mod tests {
         // The same corpus is fine when nothing is damaged and the definitions are
         // where a recorder puts them.
         assert!(chunked_mcap_bytes(&corpus(6), ChunkedSpec::new(3)).is_ok());
-        // …and asking for the definitions in the second chunk needs three too,
+        // …and asking for the definitions in the damaged chunk needs three too,
         // because that layout exists to be damaged.
         assert!(chunked_mcap_bytes(
             &corpus(6),
-            ChunkedSpec::new(3).definitions_in_second_chunk()
+            ChunkedSpec::new(3).definitions_in_damaged_chunk()
         )
         .is_err());
+        // The requirement is derived from the ordinal, not written down: a survivor
+        // on each side of chunk `DAMAGED_CHUNK_ORDINAL` is two more chunks than the
+        // ordinal itself.
+        assert_eq!(min_chunks_for_damage(), DAMAGED_CHUNK_ORDINAL as usize + 2);
     }
 
-    /// `DefinitionsIn::SecondChunk` really moves the `Schema` and `Channel`
+    /// `messages_per_chunk: 0` is **refused**, not read as one.
+    ///
+    /// A count that came out zero by arithmetic — `messages.len() / groups` with more
+    /// groups than messages — used to be clamped to one, which silently made
+    /// `DAMAGED_CHUNK_ORDINAL` name the second *message* instead of the second group.
+    /// A corpus long enough still splits into three chunks that way, so
+    /// `TooFewChunks` never fired and the damage tests asserted survivor counts
+    /// against a layout nobody chose.
+    ///
+    /// Mutant: restore `let per = spec.messages_per_chunk.max(1)` and delete the
+    /// guard — applied, and this failed on `unwrap_err` with a nine-chunk file, one
+    /// message each.
+    #[test]
+    fn a_zero_chunk_size_is_refused_rather_than_clamped() {
+        assert_eq!(
+            chunked_mcap_bytes(&corpus(9), ChunkedSpec::new(0)).unwrap_err(),
+            FixturePlanError::ZeroMessagesPerChunk
+        );
+        // And with damage asked for as well, since that is the caller who would be
+        // hurt by the clamp.
+        assert_eq!(
+            chunked_mcap_bytes(
+                &corpus(9),
+                ChunkedSpec::new(0).damaged(ChunkDamage::UncompressedCrc)
+            )
+            .unwrap_err(),
+            FixturePlanError::ZeroMessagesPerChunk
+        );
+    }
+
+    /// A damage with nothing to land on is **refused**, not applied to nothing.
+    ///
+    /// Three arms patch or shorten the records field itself, and an empty field
+    /// leaves each of them with nothing to do: the bit flip has no byte, the inflated
+    /// inner length has no length field (and would then recompute the *honest* CRC
+    /// over unpatched bytes), and the short `compressed_size` saturates back to the
+    /// truthful one. Each would hand back an intact chunk under a damaged name, which
+    /// makes every test using it pass while nothing is corrupt.
+    ///
+    /// `chunk_body` is called directly because the public writer cannot reach this
+    /// state today — `slice::chunks` yields no empty group and every message becomes
+    /// a record — and the guard exists so that it stays unreachable when a later spec
+    /// knob (a flush-on-timer chunk, a definitions-only chunk) can produce an empty
+    /// one.
+    ///
+    /// Mutant: restore `if let Some(b) = bytes.get_mut(at)` in the
+    /// `FlippedBitInRecords` arm, so an empty field is flipped and nothing happens —
+    /// applied, and this failed on the first `unwrap_err`, which returned a 40-byte
+    /// all-zero chunk body: a well-formed, empty, entirely undamaged chunk.
+    #[test]
+    fn a_damage_with_nothing_to_land_on_is_refused() {
+        for damage in [
+            ChunkDamage::FlippedBitInRecords,
+            ChunkDamage::InnerRecordRunsPastTheEnd,
+            ChunkDamage::CompressedSizeTooSmall,
+        ] {
+            let err = chunk_body(RecordBuf::default(), 0, 0, Some(damage)).unwrap_err();
+            assert!(
+                matches!(err, FixturePlanError::NothingToDamage { .. }),
+                "{damage:?} left an empty chunk intact: {err:?}"
+            );
+        }
+        // An empty chunk is still writable when nothing is asked of it, so the guard
+        // is about the damage and not about the emptiness.
+        assert!(chunk_body(RecordBuf::default(), 0, 0, None).is_ok());
+    }
+
+    /// `DefinitionsIn::DamagedChunk` really moves the `Schema` and `Channel`
     /// records, and moves *all* of them.
     ///
     /// Mutant: `definitions_chunk` returning `0` for both variants — applied, and
@@ -1240,7 +1502,7 @@ mod tests {
     fn the_definitions_can_be_moved_into_the_damaged_chunk() {
         let bytes = chunked_mcap_bytes(
             &corpus(9),
-            ChunkedSpec::new(3).definitions_in_second_chunk(),
+            ChunkedSpec::new(3).definitions_in_damaged_chunk(),
         )
         .unwrap();
         let ops_in = |ordinal: usize| -> Vec<u8> {
