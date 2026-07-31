@@ -117,7 +117,7 @@
 //! which is Phase 1 invariant 6 restated — and changed in what it may conclude:
 //! it makes the per-edge **drop** decision and nothing else.
 
-use std::collections::BTreeMap;
+use crate::interner::StrInterner;
 
 /// A reading of a local **steady** (monotonic) clock, in nanoseconds.
 ///
@@ -476,7 +476,7 @@ impl Default for ClockPolicy {
 /// How many distinct publishers [`OffsetTable`] will track.
 ///
 /// See the bound's justification at its use in [`OffsetTable::observe`].
-const MAX_TRACKED_PUBLISHERS: usize = 64;
+pub(crate) const MAX_TRACKED_PUBLISHERS: usize = 64;
 
 /// The EWMA divisor: the baseline moves by a **1/8** of each residual.
 ///
@@ -552,7 +552,15 @@ pub struct CommonMode {
 /// the original defect.
 #[derive(Debug)]
 pub struct OffsetTable {
-    rows: BTreeMap<String, Offset>,
+    /// Publisher name → id, capped at [`MAX_TRACKED_PUBLISHERS`]. The cap lives
+    /// here now rather than on the row count, which is the same bound stated in
+    /// the place that owns the identity.
+    ids: StrInterner,
+    /// One row per interned publisher, indexed by its id. `None` until that
+    /// publisher's first sample defines a baseline — and after
+    /// [`OffsetTable::clear`], which blanks the rows and **keeps the ids**, so a
+    /// recreate does not make every publisher's next sample re-intern its name.
+    rows: Vec<Option<Offset>>,
     policy: ClockPolicy,
     steps: u64,
     common_modes: u64,
@@ -569,7 +577,8 @@ impl OffsetTable {
     #[must_use]
     pub fn new(policy: ClockPolicy) -> OffsetTable {
         OffsetTable {
-            rows: BTreeMap::new(),
+            ids: StrInterner::with_cap(MAX_TRACKED_PUBLISHERS),
+            rows: Vec::new(),
             policy,
             steps: 0,
             common_modes: 0,
@@ -624,18 +633,23 @@ impl OffsetTable {
 
         // Scoped so the mutable borrow of one row ends before the agreement scan
         // reads all of them.
+        // One hash, where this was a `BTreeMap<String, _>` descent — six
+        // node-name comparisons at the cap — on every accepted transform.
+        let Some(id) = self.ids.intern(owner) else {
+            // Past the cap. A publisher with no row can never corroborate
+            // anything, which makes a halt harder to reach and never easier.
+            return None;
+        };
+        if self.rows.len() <= id.get() {
+            self.rows.resize(id.get() + 1, None);
+        }
         let delta = {
-            let Some(row) = self.rows.get_mut(owner) else {
-                if self.rows.len() < MAX_TRACKED_PUBLISHERS {
-                    self.rows.insert(
-                        owner.to_string(),
-                        Offset {
-                            baseline: offset,
-                            stepped_at: None,
-                            step_delta: 0,
-                        },
-                    );
-                }
+            let Some(row) = self.rows[id.get()].as_mut() else {
+                self.rows[id.get()] = Some(Offset {
+                    baseline: offset,
+                    stepped_at: None,
+                    step_delta: 0,
+                });
                 // A publisher's first sample defines its baseline; there is
                 // nothing yet for it to have stepped away from.
                 return None;
@@ -662,10 +676,14 @@ impl OffsetTable {
         // Agreement, not coincidence. A real `/clock` step moves everyone by the
         // same amount; two nodes restarting independently do not.
         let mut publishers: u32 = 1;
-        for (name, other) in &self.rows {
-            if name == owner {
+        for (other_id, other) in self.rows.iter().enumerate() {
+            // An index compare, where this was a node-name `memcmp` per row.
+            if other_id == id.get() {
                 continue;
             }
+            let Some(other) = other else {
+                continue;
+            };
             let Some(at) = other.stepped_at else {
                 continue;
             };
@@ -714,13 +732,22 @@ impl OffsetTable {
     /// a step, and those steps would agree — so the bridge would report a second
     /// clock reset caused by nothing but its own response to the first.
     pub fn clear(&mut self) {
-        self.rows.clear();
+        // **The rows are blanked and the ids are kept.** Forgetting the names
+        // too would make every publisher's first post-recreate sample re-intern
+        // and re-allocate, which is the same reason
+        // `Ingest::forget_the_old_recording` rewinds its guards in place rather
+        // than dropping them. `tracked()` counts live rows, so it still reports
+        // zero here — which is what the assertion in
+        // `clear_forgets_the_time_base_that_was_thrown_away` reads.
+        for row in &mut self.rows {
+            *row = None;
+        }
     }
 
     /// How many publishers have a row.
     #[must_use]
     pub fn tracked(&self) -> usize {
-        self.rows.len()
+        self.rows.iter().filter(|r| r.is_some()).count()
     }
 
     /// Offset steps observed, promoted or not (§5.9).

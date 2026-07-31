@@ -67,7 +67,7 @@ const EMPTY: u32 = u32::MAX;
 /// cannot alias a shorter one — without it `"ab"` and `"ab\0"` would hash alike.
 /// That is a statement about the hash being well-formed, not about security; the
 /// comparison in [`EdgeIndex::find`] catches the collision either way.
-fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     let mut it = bytes.chunks_exact(8);
     for c in &mut it {
         let mut w = [0u8; 8];
@@ -104,6 +104,26 @@ fn hash_pair(parent: &str, child: &str) -> u64 {
     h ^ (h >> 29)
 }
 
+/// How many buckets a table holding `n` entries gets: a power of two, at least
+/// `4n + 4`, never below 16.
+///
+/// **One function, because four copies of the same arithmetic is how a load
+/// factor drifts** — and this one is not a tuning knob that can be nudged in one
+/// place and left in another. [`EdgeIndex::find`] has **no bound of its own**:
+/// it walks buckets until it meets an empty one, and the only reason that
+/// terminates is that the table can never be full. If the sizing here and the
+/// growth check in [`EdgeIndex::insert`] ever disagreed in the direction that
+/// let the load reach 1.0, a probe for an absent key would spin forever on a
+/// bridge that is supposed to run unattended for a fortnight.
+///
+/// The quarter load factor is what keeps the expected probe count at ~1.16, and
+/// the `+ 4` is what keeps the invariant true at `n = 0`. `crate::interner` uses
+/// it too, so both tables in this crate share one definition of "full".
+#[inline]
+pub(crate) fn buckets_for(n: usize) -> usize {
+    (4 * n + 4).next_power_of_two().max(16)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Bucket {
     hash: u64,
@@ -113,10 +133,10 @@ struct Bucket {
 /// A `(parent, child)` → `V` table probed by reference, without allocating.
 #[derive(Debug)]
 pub(crate) struct EdgeIndex<V> {
-    /// Power-of-two length, always at least `4 * keys.len() + 4`. The load factor
-    /// is therefore never above a quarter, which bounds the probe walk and — the
-    /// part that matters for termination — guarantees there is always an empty
-    /// bucket for [`EdgeIndex::find`]'s loop to stop on.
+    /// Sized by [`buckets_for`], so the load factor is never above a quarter.
+    /// That bounds the probe walk and — the part that matters for termination —
+    /// guarantees there is always an empty bucket for [`EdgeIndex::find`]'s loop
+    /// to stop on.
     buckets: Vec<Bucket>,
     mask: usize,
     /// `keys[i]` is entry `i`'s key. Owned, because a hit is confirmed against
@@ -134,7 +154,7 @@ impl<V> Default for EdgeIndex<V> {
 impl<V> EdgeIndex<V> {
     /// A table sized for `n` entries up front, so a fixed key set never rehashes.
     pub(crate) fn with_capacity(n: usize) -> EdgeIndex<V> {
-        let len = (4 * n + 4).next_power_of_two().max(16);
+        let len = buckets_for(n);
         EdgeIndex {
             buckets: vec![
                 Bucket {
@@ -188,7 +208,7 @@ impl<V> EdgeIndex<V> {
         let e = self.keys.len();
         self.keys.push((Box::from(parent), Box::from(child)));
         self.values.push(v);
-        if self.buckets.len() < 4 * self.keys.len() + 4 {
+        if self.buckets.len() < buckets_for(self.keys.len()) {
             self.rehash();
         } else {
             let h = hash_pair(parent, child);
@@ -198,7 +218,7 @@ impl<V> EdgeIndex<V> {
     }
 
     fn rehash(&mut self) {
-        let len = (4 * self.keys.len() + 4).next_power_of_two().max(16);
+        let len = buckets_for(self.keys.len());
         let mut buckets = vec![
             Bucket {
                 hash: 0,
@@ -366,5 +386,45 @@ mod tests {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(2);
         let e = t.insert("map", "odom", 0);
         assert_eq!(t.key(e), ("map", "odom"));
+    }
+    /// **The table is never full, at any size** — which is the only reason
+    /// [`EdgeIndex::find`] terminates.
+    ///
+    /// `find` walks buckets until it meets an empty one and has no bound of its
+    /// own, so a load factor that reached 1.0 would make a probe for an absent
+    /// key spin forever. [`buckets_for`] is the single definition of "full" that
+    /// keeps that from happening, and this asserts it over the range where the
+    /// power-of-two rounding is doing the work.
+    ///
+    /// Mutant: `buckets_for` returning `(n + 1).next_power_of_two().max(16)` — a
+    /// load factor of 1 rather than a quarter — applied, and this failed at
+    /// `n = 5: load factor above a quarter (16 buckets)`. It also took
+    /// `rehashing_preserves_every_key` with it, at `256 buckets for 200 keys`,
+    /// which is the same invariant seen from the other side.
+    #[test]
+    fn the_table_is_never_full() {
+        for n in 0..600usize {
+            let b = buckets_for(n);
+            assert!(
+                b > n,
+                "n = {n}: {b} buckets cannot hold {n} keys and an empty one"
+            );
+            assert!(
+                b >= 4 * n,
+                "n = {n}: load factor above a quarter ({b} buckets)"
+            );
+            assert!(b.is_power_of_two(), "n = {n}: {b} is not a power of two");
+        }
+    }
+
+    /// A probe for a key that is not there **returns**, at every size — the
+    /// termination property stated as behaviour rather than as arithmetic.
+    #[test]
+    fn a_stranger_misses_at_every_size() {
+        let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);
+        for i in 0..300u32 {
+            t.insert(&format!("p{i}"), &format!("c{i}"), i);
+            assert_eq!(t.get("absent", "absent"), None, "after {i} inserts");
+        }
     }
 }

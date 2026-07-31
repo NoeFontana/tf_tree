@@ -374,7 +374,7 @@ pub enum HaltReason {
 ///
 /// Bracketed because a ROS node name cannot contain `<`, so a real node can
 /// never collide with a sentinel.
-fn owner_key(p: &Publisher) -> &str {
+pub(crate) fn owner_key(p: &Publisher) -> &str {
     match p {
         Publisher::Node(n) => n.as_str(),
         Publisher::UnknownGid => "<unknown-gid>",
@@ -575,13 +575,17 @@ impl Ingest {
         let clocks = (0..statics.slots())
             .map(|_| ClockGuard::with_threshold(clock.on_reset, clock.reset_threshold_nanos))
             .collect();
+        // Seeded from the same `declared` `StaticStore` was, and in the same
+        // order, so a slot means the same edge in both tables — the invariant
+        // `the_authority_and_the_statics_agree_about_slots` pins.
+        let authority = Authority::seeded(authority, &declared);
         Ingest {
             // Four raw spellings per declared edge is the bound; see the field.
             raw: EdgeIndex::with_capacity(4 * statics.slots()),
             statics,
             names,
             declared,
-            authority: Authority::new(authority),
+            authority,
             clocks,
             clock,
             offsets: OffsetTable::new(clock),
@@ -836,7 +840,7 @@ impl Ingest {
             statics, authority, ..
         } = self;
         let (sp, sc) = statics.names_of(slot);
-        match authority.admit(sp, sc, publisher) {
+        match authority.admit_at(slot, publisher) {
             Verdict::Accept => {}
             // `Fatal` outside the window means `Strict` has degraded to
             // `FirstWriterWins` plus counters, deliberately and permanently: a
@@ -3358,6 +3362,38 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                 i.statics.names_of(slot),
                 (p, c),
                 "slot {slot:?} does not name the edge it was resolved from"
+            );
+        }
+    }
+    /// **`StaticStore` and `Authority` agree about what a slot means.**
+    ///
+    /// `Ingest::offer` resolves an edge once and then addresses *both* tables
+    /// with the resulting slot — the kind from one, the owner from the other.
+    /// They are separate structures that happen to be seeded from the same
+    /// `config.edges` in the same order, and nothing in the type system says so.
+    /// If they ever disagreed, a transform would be checked against one edge's
+    /// kind and written under another edge's owner, with no error anywhere: the
+    /// silent misattribution this whole indexing scheme exists to avoid.
+    ///
+    /// Mutant: seed `Authority` from `config.edges.iter().rev()` — applied, and
+    /// this failed at the first edge with `("base", "gps")` where `("map",
+    /// "odom")` was expected.
+    #[test]
+    fn the_authority_and_the_statics_agree_about_slots() {
+        let i = ingest();
+        for e in &i.declared().edges {
+            let (p, c) = e.key();
+            let statics_slot = i
+                .statics
+                .resolve(p, c)
+                .unwrap_or_else(|| panic!("declared edge {p} -> {c} has no slot in statics"));
+            let authority_slot = i
+                .authority
+                .slot_of(p, c)
+                .unwrap_or_else(|| panic!("declared edge {p} -> {c} has no slot in authority"));
+            assert_eq!(
+                statics_slot, authority_slot,
+                "{p} -> {c}: statics says {statics_slot:?}, authority says {authority_slot:?}"
             );
         }
     }
