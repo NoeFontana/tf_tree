@@ -25,6 +25,28 @@
 //! Stamps are rebased so the earliest sample is 0. Real bags carry wall-clock
 //! epochs around 1.8e18 ns; rebasing keeps dumps readable and keeps every stamp
 //! comfortably inside the unsigned time ROS requires.
+//!
+//! # There is exactly one clock in this format, and it is the header stamp
+//!
+//! A `D` line carries `<stamp_ns>` and nothing else — no MCAP log time, no
+//! arrival time, no receipt time. The converter discards them, and this replay
+//! harness has never needed one: it drives the engine, whose only notion of time
+//! *is* the stamp.
+//!
+//! It is worth saying out loud because a consumer downstream does need one.
+//! `tf_tree_bridge`'s §5.5 clock rules judge a publisher's stamps against a
+//! reference clock that is independent of them — a local steady clock online,
+//! `RawRecord::log_time_ns` offline — precisely because a stamp cannot check
+//! itself. A caller feeding this format into that machinery (`tf_tree_cli`'s
+//! `topology --discover` is the one in this workspace) must pass
+//! `SteadyNanos::UNKNOWN` and accept that the common-mode layer is absent for
+//! this corpus. **What it must not do is pass `stamp_ns` as the receipt time**,
+//! which would make every publisher's measured offset identically zero and turn
+//! the detector back into the circular one it replaced.
+//!
+//! Adding a log-time column here would fix that, and would also invalidate every
+//! recorded `.tfstream` in `testdata/` — so it is a change to make when something
+//! actually needs it, not on speculation.
 
 use std::collections::BTreeMap;
 

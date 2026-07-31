@@ -25,6 +25,36 @@ fn stream_path() -> PathBuf {
         .join("../../testdata/tfstream/indoor_atelier.tfstream")
 }
 
+/// One recorded dynamic sample, shaped for [`Ingest::offer`].
+///
+/// **`received` is left at `SteadyNanos::UNKNOWN`, and that is a statement about
+/// the corpus rather than laziness.** §5.5's common-mode detector measures each
+/// publisher's `stamp - received` against a clock that is not the one under
+/// test; a `.tfstream` records neither the bag's log time nor any other arrival
+/// time, only a rebased header stamp. Passing the stamp as the receipt time
+/// would make every offset identically zero and quietly re-enable inference over
+/// the signal being checked — the exact substitution
+/// `tf_tree_bridge::SteadyNanos`' documentation forbids.
+///
+/// The consequence for the assertions below is worth stating, because it is what
+/// keeps them honest: with no receipt clock the offset table never records a
+/// step, so a regression here can only ever reach the ladder's bottom rung — a
+/// per-edge `Drop { NonMonotonic }`. `clock_resets == 0` in
+/// `the_discovered_config_accepts_the_stream_it_came_from` is therefore
+/// *structurally* true, and the load-bearing assertion beside it is
+/// `dropped_non_monotonic == 0`, which is a real claim about this recording.
+fn dynamic_sample(
+    parent: &str,
+    child: &str,
+    s: &tf_tree_bench::replay::Sample,
+) -> tf_tree_bridge::Sample {
+    let mut sample = Sample::identity(parent, child, s.stamp_ns);
+    sample.pose = [
+        s.pose.q.w, s.pose.q.x, s.pose.q.y, s.pose.q.z, s.pose.t.x, s.pose.t.y, s.pose.t.z,
+    ];
+    sample
+}
+
 /// **The whole chain, on a real robot's `/tf`.**
 ///
 /// Discover the topology, print it, parse the printed file back, build the
@@ -141,14 +171,10 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
     let mut verified = 0u64;
     for _ in 0..2 {
         for (parent, child, iso) in &stream.static_edges {
-            let s = Sample {
-                frame_id: parent.clone(),
-                child_frame_id: child.clone(),
-                stamp_nanos: 0,
-                pose: [
-                    iso.q.w, iso.q.x, iso.q.y, iso.q.z, iso.t.x, iso.t.y, iso.t.z,
-                ],
-            };
+            let mut s = Sample::identity(parent, child, 0);
+            s.pose = [
+                iso.q.w, iso.q.x, iso.q.y, iso.q.z, iso.t.x, iso.t.y, iso.t.z,
+            ];
             match ingest.offer(Topic::TfStatic, &s, &publisher) {
                 Action::StaticVerified { .. } => verified += 1,
                 other => panic!("{parent} -> {child}: {other:?}"),
@@ -160,24 +186,22 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
     let mut published = 0u64;
     for s in &stream.samples {
         let (parent, child) = &stream.dynamic_edges[s.edge];
-        let sample = Sample {
-            frame_id: parent.clone(),
-            child_frame_id: child.clone(),
-            stamp_nanos: s.stamp_ns,
-            pose: [
-                s.pose.q.w, s.pose.q.x, s.pose.q.y, s.pose.q.z, s.pose.t.x, s.pose.t.y, s.pose.t.z,
-            ],
-        };
+        let sample = dynamic_sample(parent, child, s);
         match ingest.offer(Topic::Tf, &sample, &publisher) {
             Action::Publish { .. } => published += 1,
-            // A real recording interleaves five edges, so a sample can arrive
-            // with a stamp behind one already seen on another edge. §5.5's
-            // clock guard is global by design (it tracks the *bridge's* notion
-            // of now), so this is expected and is not a discovery defect —
-            // what matters is that nothing is undeclared.
-            Action::Drop {
-                reason: tf_tree_bridge::DropReason::NonMonotonic { .. },
-            } => {}
+            // **Every other outcome is a failure, `NonMonotonic` included.**
+            //
+            // This used to tolerate a `Drop { NonMonotonic }`: a real recording
+            // interleaves five edges, and while §5.5's guard was one guard over
+            // the merged stream a sample could arrive behind a high-water mark
+            // that some *other* edge had set. `docs/decisions/0011` scoped the
+            // guard per edge, so the only regression left to report is an edge
+            // going backwards against its own last accepted stamp — which this
+            // recording, whose publishers are each internally monotone, never
+            // does. The arm was measured dead before it was removed (replacing
+            // it with a `panic!` leaves this test green), so keeping it would
+            // have been a decorative tolerance for something that cannot
+            // happen, hiding a real regression if one ever started.
             other => panic!("{parent} -> {child} @ {}: {other:?}", s.stamp_ns),
         }
     }
@@ -193,10 +217,16 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
     assert_eq!(stats.dropped_bad_name, 0);
     assert_eq!(stats.dropped_kind_change, 0);
     assert!(stats.balanced(), "{stats:?}");
-    assert!(
-        published > 900,
-        "the bulk of a 1066-sample recording must be published, got {published}"
+    // **All of it, not most of it.** The old bound was `> 900`, sized for the
+    // stream-wide guard's incidental drops; with the guard scoped per edge this
+    // corpus loses nothing, and saying so exactly is the positive evidence that
+    // per-edge scoping did not start dropping traffic on a real robot.
+    assert_eq!(
+        published, 1066,
+        "every sample of a 1066-sample recording must be published"
     );
+    assert_eq!(stats.dropped_non_monotonic, 0);
+    assert_eq!(stats.clock_resets, 0);
 }
 
 /// **A config that names an edge the robot does not publish is fine; one that
@@ -231,14 +261,7 @@ fn an_edge_missing_from_the_config_is_counted_and_named_once() {
     let mut first_times = 0u64;
     for s in &stream.samples {
         let (parent, child) = &stream.dynamic_edges[s.edge];
-        let sample = Sample {
-            frame_id: parent.clone(),
-            child_frame_id: child.clone(),
-            stamp_nanos: s.stamp_ns,
-            pose: [
-                s.pose.q.w, s.pose.q.x, s.pose.q.y, s.pose.q.z, s.pose.t.x, s.pose.t.y, s.pose.t.z,
-            ],
-        };
+        let sample = dynamic_sample(parent, child, s);
         if let Action::UndeclaredEdge {
             parent,
             child,

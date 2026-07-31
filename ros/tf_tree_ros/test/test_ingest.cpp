@@ -314,27 +314,103 @@ void counting_handler(
 }
 }  // namespace
 
-/// **A halted bridge says so once, not once per transform.**
+/// Two dynamic edges with one publisher each — the shape a `/clock` reset
+/// actually has, and now the only shape that can produce one.
 ///
-/// §5.5 stops the bridge on a backward clock jump past the threshold, and the
-/// stop is *latched*: the ABI answers `TFT_BRIDGE_HALT` to every later
-/// transform forever. The `HALT` and `RECREATE` arms of `report()` were the only
-/// two that did not gate on `out.first_time` — and could not, because the ABI
-/// never set it there. On a robot whose `/tf` carries 20 transforms at 100 Hz, a
-/// bag loop or a sim reset therefore produced 2000 `RCLCPP_FATAL` a second for
-/// the life of the process, each formatting and taking rcutils' logging mutex on
-/// the ingest thread, and each burying the one line that says what to do. §5.4
-/// requires the diagnostic be "loud, **rate-limited**".
+/// It is local to the test below rather than in `kTopology` because
+/// `an_undeclared_edge_is_dropped_without_stopping_the_declared_one` publishes
+/// `map -> odom` *expecting* it to be undeclared.
+constexpr const char * kTwoOwnerTopology = R"(
+[[edge]]
+parent = "odom"
+child = "base_link"
+kind = "dynamic"
+capacity = 256
+
+[[edge]]
+parent = "map"
+child = "odom"
+kind = "dynamic"
+capacity = 256
+)";
+
+/// One node publishing one edge, so that two of these are two *publishers* as
+/// far as §5.3's attribution and §5.5's step detector are concerned.
+class OneEdgeBroadcaster
+{
+public:
+  OneEdgeBroadcaster(
+    const std::string & name, const std::string & topic, std::string parent, std::string child)
+  : node_(std::make_shared<rclcpp::Node>(name)),
+    pub_(node_->create_publisher<tf2_msgs::msg::TFMessage>(
+        topic, rclcpp::QoS(rclcpp::KeepLast(100)).reliable())),
+    parent_(std::move(parent)), child_(std::move(child))
+  {
+  }
+
+  void publish_at(int64_t stamp_ns)
+  {
+    tf2_msgs::msg::TFMessage msg;
+    msg.transforms.push_back(make_transform(parent_, child_, stamp_ns));
+    pub_->publish(msg);
+  }
+
+private:
+  rclcpp::Node::SharedPtr node_;
+  rclcpp::Publisher<tf2_msgs::msg::TFMessage>::SharedPtr pub_;
+  std::string parent_;
+  std::string child_;
+};
+
+/// **A halted bridge says so once, not once per transform** — and it takes two
+/// publishers moving together to halt it at all.
 ///
-/// The assertion is on the count and not on the text: one line is the contract.
+/// Two properties, and the second is what makes the first reachable.
+///
+/// *One witness is not a clock.* This test used to publish a 5 s regression from
+/// a single broadcaster on a single edge and expect a stop. That rule was wrong
+/// three times over (`docs/decisions/0012`): a node restarting republishes its
+/// own history and looks exactly like a rewind, so promoting one source's
+/// regression to a halt stops a healthy robot because one publisher bounced.
+/// What a `/clock` reset actually looks like is *every* publisher's stamps
+/// stepping by the *same* amount at the same moment, and that is what this
+/// fixture produces — two nodes, two edges, one shared −5 s step. Their stamps
+/// advance with real time before the step so that neither one's offset from the
+/// receipt clock is drifting when it happens: a stamp held constant while the
+/// steady clock runs is itself a ramp, and a ramp is not a step.
+///
+/// *And the stop is announced once.* A stop is latched — the ABI answers
+/// `TFT_BRIDGE_HALT` to every later transform forever — so an ungated
+/// `RCLCPP_FATAL` is one line per transform for the life of the process: on a
+/// robot whose `/tf` carries 20 transforms at 100 Hz, 2000 `FATAL` a second,
+/// each taking rcutils' logging mutex on the ingest thread and each burying the
+/// one line that says what to do. §5.4 requires the diagnostic be "loud,
+/// **rate-limited**". The assertion is on the count, not the text: one line is
+/// the contract.
 ///
 /// **Mutant:** remove the `if (out.first_time != 0)` guard from `report()`'s
-/// `TFT_BRIDGE_HALT` arm. The count goes to one per refused transform — 6 here,
-/// and unbounded on a real robot — and `EXPECT_EQ(fatal, 1)` fails. Applied; it
-/// dies. **Mutant:** delete `o.first_time = 1` from the `Action::Halt` arm in
-/// `crates/tf_tree_c/src/bridge.rs`. The transition is then indistinguishable
-/// from the replay, nothing is ever logged, and the same expectation fails at 0.
-/// Applied; it dies.
+/// `TFT_BRIDGE_HALT` arm. The count goes to one per refused transform and
+/// `EXPECT_EQ(fatal, 1)` fails. (Stated, not applied.)
+/// **Mutant — APPLIED, in `docker/tf2`, and observed:** delete
+/// `s.received_steady_nanos = received_steady_nanos;` from
+/// `BridgeHandle::offer_one`. Every sample then carries the ABI's "no receipt
+/// clock" sentinel, so neither publisher's offset can be measured, neither
+/// regression is a *step*, the two rewinds stay two isolated faults — and
+/// nothing halts. `refused_after_halt` never moves and the wait times out. This
+/// is the one that pins the whole L0 plumbing; a version of this file that
+/// passed without it would be testing the engine and not this package.
+///
+/// Applied against the real tree and run: `just ros-test` reported
+/// `[  FAILED  ] IngestTest.a_clock_reset_is_announced_once_and_not_once_per_refused_transform
+/// (20282 ms)`, `83% tests passed, 1 tests failed out of 6`. The 20-second
+/// duration is the finding rather than incidental — it is the wait expiring on a
+/// halt that can never arrive, because with no receipt clock the offset table has
+/// no reference against which a step could exist. Source restored byte-identical
+/// afterwards.
+/// **Mutant:** publish both rewinds from the *same* `OneEdgeBroadcaster`. Two
+/// edges step together but one publisher owns both, which is a restart and not
+/// a clock, so the bridge correctly declines to halt and the wait times out —
+/// the false quorum that made the second design wrong.
 TEST_F(IngestTest, a_clock_reset_is_announced_once_and_not_once_per_refused_transform)
 {
   g_fatal_lines.store(0);
@@ -342,23 +418,64 @@ TEST_F(IngestTest, a_clock_reset_is_announced_once_and_not_once_per_refused_tran
   rcutils_logging_set_output_handler(counting_handler);
 
   uint64_t refused = 0;
+  uint64_t applied = 0;
+  uint64_t resets_while_healthy = 0;
   {
-    tf_tree_ros::BridgeHandle bridge(node_.get(), options());
+    tf_tree_ros::BridgeOptions o = options();
+    o.topology_toml = kTwoOwnerTopology;
+    tf_tree_ros::BridgeHandle bridge(node_.get(), o);
 
-    tf2_msgs::msg::TFMessage forward;
-    forward.transforms.push_back(make_transform("odom", "base_link", 10 * kStamp));
-    ASSERT_TRUE(pump_until(pub_, forward, bridge, 1, std::chrono::seconds(20)));
-    ASSERT_GE(bridge.stats().applied, 1u);
+    OneEdgeBroadcaster wheels("clock_reset_wheel_driver", topic_, "odom", "base_link");
+    OneEdgeBroadcaster localizer("clock_reset_localizer", topic_, "map", "odom");
 
-    // A bag loop: far past §5.5's 100 ms jitter threshold. The first of these
-    // halts the bridge; every one after it is refused by the latch, and each
-    // refusal is an outcome `report()` sees.
-    tf2_msgs::msg::TFMessage backward;
-    backward.transforms.push_back(make_transform("odom", "base_link", 5 * kStamp));
+    // **Stamps read from the same steady clock the bridge times receipt with,
+    // not incremented by a fixed step per iteration.** The property wanted is a
+    // stream whose stamps track wall time, because that is what a real
+    // broadcaster produces and it is what leaves each publisher's
+    // stamp-minus-receipt offset *flat*. A fixed `+20 ms` per `sleep_for(20ms)`
+    // only approximates it: `sleep_for` guarantees a minimum and overshoots, so
+    // the stamps fall a little further behind real time every iteration, and a
+    // smoothed baseline trails a constant ramp by a fixed multiple of it. On a
+    // loaded machine that ramp is a slow step — and a *common-mode* one, since
+    // both broadcasters share this clock — which would halt the bridge during
+    // the healthy phase and report itself as "the broadcasters never got going".
+    // Reading the clock removes the ramp rather than budgeting for it, and
+    // `resets_while_healthy` below asserts it is gone rather than assuming.
+    const auto period = std::chrono::milliseconds(20);
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t rewind = 0;
+    const auto stamp_now = [&t0, &rewind] {
+        const int64_t elapsed =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+        return 10 * kStamp + elapsed + rewind;
+      };
+
+    // Both publishers, discovered and applying, with enough samples behind them
+    // that their offsets are established rather than being learned.
+    const auto warm = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < warm) {
+      const int64_t stamp = stamp_now();
+      wheels.publish_at(stamp);
+      localizer.publish_at(stamp);
+      std::this_thread::sleep_for(period);
+      applied = bridge.stats().applied;
+      if (applied >= 20) {
+        break;
+      }
+    }
+    resets_while_healthy = bridge.stats().clock_resets;
+
+    // The reset: one step, shared, far past §5.5's 100 ms jitter threshold. Both
+    // publishers step inside the same message-pair, which is inside any
+    // correlation window measured in seconds.
+    rewind = -5 * kStamp;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (std::chrono::steady_clock::now() < deadline) {
-      pub_->publish(backward);
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      const int64_t stamp = stamp_now();
+      wheels.publish_at(stamp);
+      localizer.publish_at(stamp);
+      std::this_thread::sleep_for(period);
       refused = bridge.stats().refused_after_halt;
       if (refused >= 5) {
         break;
@@ -368,7 +485,20 @@ TEST_F(IngestTest, a_clock_reset_is_announced_once_and_not_once_per_refused_tran
   const int fatal = g_fatal_lines.load();
   rcutils_logging_set_output_handler(g_previous_handler);
 
-  ASSERT_GE(refused, 5u) << "the bridge never latched, so there was nothing to rate-limit";
+  ASSERT_GE(applied, 20u)
+    << "the two broadcasters never got going, so there was no steady state to step away from";
+  // Asserted before the halt is asserted, because a bridge that stopped during
+  // the healthy phase would satisfy every expectation below it for the wrong
+  // reason — and a false common-mode halt is the one failure this whole design
+  // is a response to.
+  ASSERT_EQ(resets_while_healthy, 0u)
+    << "the bridge decided the clock had moved while both publishers were healthy and their "
+       "stamps were tracking wall time";
+  ASSERT_GE(refused, 5u)
+    << "two publishers stepped by the same -5 s and the bridge did not stop. Either the receipt "
+       "clock is not reaching the sample, or §5.3's attribution did not resolve the two GIDs to "
+       "two distinct nodes — in which case they are one publisher to the detector and one witness "
+       "is never enough";
   EXPECT_EQ(fatal, 1)
     << "the halt was logged " << fatal << " times against " << refused
     << " refused transforms; §5.4 requires the diagnostic be rate-limited";

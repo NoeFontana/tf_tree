@@ -492,6 +492,79 @@ fn a_bag_loop_still_halts_with_a_per_edge_guard() {
     );
 }
 
+/// **The reset names the coordinate that survives the reset.**
+///
+/// A real recorder's log time is monotone whatever the header stamps do, so a
+/// looped bag has each stamp twice and each log time once. That asymmetry is the
+/// whole point of reporting both: the error's own advice is to cut the recording,
+/// and `mcap` and `ros2 bag` cut on log time. Reporting only `at_ns` tells an
+/// operator to cut at a coordinate that occurs twice.
+///
+/// It is also this half's version of the rule the online redesign is built on —
+/// judge a clock against a reference that is not itself. `log_time_ns` is the
+/// offline twin of the injected steady receipt clock, and this test is where the
+/// two are actually different numbers rather than incidentally equal.
+///
+/// The fixture matters: `FixtureMessage::dynamic` sets `log_time_ns == stamp_ns`,
+/// which would make every assertion below vacuous, so the second loop is
+/// explicitly `logged_at` a time that keeps going forward while its stamps go
+/// back. `a_bag_loop_still_halts_with_a_per_edge_guard` above does *not* do that
+/// — its two loops share both clocks — which is exactly why it cannot pin this.
+///
+/// Mutant: report the stamp as both coordinates
+/// (`at_log_time_ns: rec.stamp_ns`) — applied, and this test failed with
+/// `assertion `left == right` failed: the log time must be the recorder's
+/// clock, not a second copy of the stamp
+///   left: 10000000000
+///  right: 21000000000`.
+#[test]
+fn a_reset_reports_the_recorders_clock_and_not_only_the_stamp() {
+    const LOOP_NS: i64 = 1_000_000_000;
+    // Ten messages a loop, one edge, 100 ms apart: enough that the rewind is
+    // far past the 100 ms threshold and small enough to read.
+    let dir = Scratch::new("logtime");
+    let mut msgs = Vec::new();
+    for loop_index in 0..2i64 {
+        for i in 0..10i64 {
+            let stamp = 10_000_000_000 + i * 100_000_000;
+            // The stamps repeat; the recorder's clock does not.
+            let log_time = stamp + loop_index * (10 * LOOP_NS);
+            msgs.push(
+                FixtureMessage::dynamic("odom", "base_link", stamp, pose(i as f64))
+                    .logged_at(log_time),
+            );
+        }
+    }
+    let path = write(&dir, "logtime.mcap", &msgs);
+
+    let mut frames = Frames::default();
+    let err = tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames).unwrap_err();
+    let IngestError::ClockReset {
+        at_ns,
+        at_log_time_ns,
+        by_ns,
+        ..
+    } = err
+    else {
+        panic!("expected a clock reset, got {err:?}");
+    };
+    // The first message of the second loop: stamp back to the start, 900 ms
+    // behind the 10.9 s high-water mark the first loop left.
+    assert_eq!(at_ns, 10_000_000_000);
+    assert_eq!(by_ns, 900_000_000);
+    assert_eq!(
+        at_log_time_ns, 20_000_000_000,
+        "the log time must be the recorder's clock, not a second copy of the stamp"
+    );
+
+    // And the operator can read it, not merely match on it.
+    let text = tf_tree_ingest::describe(err, &frames).to_string();
+    assert!(
+        text.contains("20000000000"),
+        "the message must name the log time to cut at: {text}"
+    );
+}
+
 /// §3.2's `split` policy is refused with a reason rather than silently doing
 /// something else. **That refusal is the decided behaviour**, argued in §3.2's
 /// amendment — an ingest that produced N arenas would change the output type of

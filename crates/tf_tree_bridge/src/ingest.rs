@@ -1,18 +1,25 @@
 //! The decision pipeline — where §5.4 to §5.7 meet.
 //!
 //! Each of those sections is a table that answers one question. This is the
-//! order they are asked in, and the order is not arbitrary:
+//! order they are asked in, and the order is not arbitrary. The numbering is
+//! `offer`'s own: an earlier revision's list was one step short of the code,
+//! because *"declared?"* was inserted later and nobody renumbered.
 //!
+//! 0. **The startup window** (§5.4). Not a table and not about this sample —
+//!    the only step that can answer before the transform is even counted. See
+//!    below.
 //! 1. **Names** (§5.6). Everything downstream keys on `(parent, child)`, so a
 //!    name that is going to be rewritten must be rewritten before anything
 //!    records it. Getting this wrong gives you an authority table keyed on
 //!    `/base_link` and a static table keyed on `base_link`, which agree about
 //!    nothing.
-//! 2. **Kind** (§5.7). A hard error, and cheaper to detect than a clock
+//! 2. **Declared?** (§5.8). Before the kind check, because an undeclared edge
+//!    has no declared kind to clash with.
+//! 3. **Kind** (§5.7). A hard error, and cheaper to detect than a clock
 //!    comparison — but more importantly, an edge whose kind is wrong should not
 //!    also be reported as a clock or authority problem. One fault, one
 //!    diagnostic.
-//! 3. **Static value** (§5.7), *before* authority and **only on
+//! 4. **Static value** (§5.7), *before* authority and **only on
 //!    `/tf_static`**. §5.7 says it in that order and it means it: on a
 //!    differing value, *"a diagnostic naming both publishers and both values,
 //!    **then** apply the authority policy"*.
@@ -26,22 +33,67 @@
 //!    — was unreachable through the pipeline. The converse broke too: a second
 //!    publisher offering an *identical* latched value got a loud authority
 //!    diagnostic where §5.7 requires silence.
-//! 4. **Authority** (§5.4). Whether this publisher may write the edge at all.
+//! 5. **Authority** (§5.4). Whether this publisher may write the edge at all.
 //!    Before the clock, because a sample from the wrong publisher should not
-//!    move the clock's high-water mark — otherwise a rejected intruder
+//!    move that edge's high-water mark — otherwise a rejected intruder
 //!    publishing from the future makes the *owner's* subsequent samples look
 //!    non-monotonic.
-//! 5. **Clock** (§5.5). Last, and **dynamic only**, so that only samples which
+//! 6. **Clock** (§5.5). Last, and **dynamic only**, so that only samples which
 //!    are actually going to be written may advance time.
 //!
-//! Step 4 before step 5 is the other one that is easy to get backwards and hard
+//! Step 5 before step 6 is the other one that is easy to get backwards and hard
 //! to notice: with those reversed, one misconfigured node can silently stall the
 //! correct one, and the diagnostic blames the victim.
+//!
+//! # Facts are per edge; judgments need corroboration
+//!
+//! `docs/decisions/0011` is the reason two of the steps above have a shape that
+//! is otherwise surprising. Every table below answers an exact question about
+//! one edge and one message: does this publisher own it, does this value match
+//! the declared one, is this stamp behind the newest this edge accepted. *"The
+//! clock has been reset"* and *"this deployment must not start"* are judgments
+//! **about a set of those facts**, and deriving either from a single fact is
+//! what that record found:
+//!
+//! - **The clock** (§5.5) had one [`ClockGuard`] for the whole stream, so a
+//!   publisher's `transform_tolerance` — a steady, correct offset of one edge
+//!   relative to another, larger than any threshold — read as a bag loop and
+//!   latched the bridge on a healthy robot. The guard is now per edge and
+//!   decides one thing only: whether *this* sample is dropped. Promotion to
+//!   "the clock moved" is a separate ladder with its own evidence — see
+//!   `crate::clock`'s module docs, which record why `0011`'s quorum was itself
+//!   wrong three times over and what replaced it.
+//! - **`Strict`** (§5.4) is defined by §5.4's table as *"refuse to start if a
+//!   conflict is detected within a startup window"*, and there was no startup
+//!   window. There is one now: conflicts are accumulated while it is open and
+//!   the halt happens once, at its close, naming everything found. Outside it,
+//!   `Strict` is `FirstWriterWins` plus counters.
+//!
+//! # The two windows are counted in different units, on purpose
+//!
+//! The **startup** window is counted in transforms offered
+//! ([`BridgeStats::transforms`], incremented unconditionally at the top of
+//! `offer`), with an explicit [`Ingest::close_startup_window`] as the real
+//! mechanism and the ordinal only as a backstop. `0011` chose that because the
+//! crate had no clock at all; it now has one, and the ordinal is kept **by
+//! choice**. What the window asks is *"is this deployment still starting up"*,
+//! and the answer belongs to a caller that knows what it launched — the rclcpp
+//! node drives it from a one-shot steady timer. A backstop measured in
+//! transforms is deterministic, forgeable by nobody, and needs no reading from a
+//! caller who supplied none.
+//!
+//! The **correlation** window in `crate::clock` is nanoseconds of receipt time
+//! ([`crate::SteadyNanos`]) and could not be anything else: it asks whether two
+//! publishers moved *at the same time*, and a transform ordinal makes that mean
+//! two seconds on a busy stream and minutes on a sparse one. That difference is
+//! the whole of P3 in `crate::clock`'s module docs.
 
 use std::collections::BTreeMap;
 
 use crate::authority::{Authority, AuthorityPolicy, Verdict};
-use crate::clock::{ClockGuard, ClockVerdict, OnClockReset};
+use crate::clock::{
+    ClockEvidence, ClockGuard, ClockPolicy, ClockVerdict, JumpKind, OffsetTable, OnClockReset,
+};
 use crate::config::TopologyConfig;
 use crate::edgemap::{insert, lookup_mut, ByEdge};
 use crate::names::NameNormalizer;
@@ -58,6 +110,27 @@ const MAX_UNDECLARED_PARENTS: usize = 256;
 /// Distinct undeclared children remembered per parent. See
 /// [`MAX_UNDECLARED_PARENTS`].
 const MAX_UNDECLARED_CHILDREN: usize = 256;
+
+/// How long §5.4's startup window stays open without an explicit close:
+/// **4096 transforms**.
+///
+/// A backstop, not the mechanism. The window exists to answer "did this
+/// *deployment* start up misconfigured", which is a question about a duration,
+/// and this crate has no clock but the transform ordinal (see the module docs).
+/// A caller that owns a real clock closes the window itself with
+/// [`Ingest::close_startup_window`] — the `rclcpp` node is expected to drive it
+/// from a one-shot **steady** timer, not from `node_->get_clock()`, which is
+/// `/clock` under `use_sim_time` and regresses on exactly the bag loop §5.5
+/// detects.
+///
+/// The backstop is what keeps a caller that never closes it — a binding in
+/// another language, a test — from accumulating conflicts forever and never
+/// reporting them. 4096 transforms is roughly two seconds of a typical
+/// 20-transform, 100 Hz `/tf`, and proportionally longer on a sparse stream,
+/// where startup is correspondingly slower anyway. It is a poor proxy for a
+/// duration and `docs/decisions/0011` says so in as many words rather than
+/// pretending otherwise.
+const STARTUP_WINDOW_TRANSFORMS: u64 = 4096;
 
 /// Which topic a sample arrived on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,12 +246,31 @@ pub enum Action {
         /// Why.
         reason: HaltReason,
     },
-    /// The clock went backwards past the threshold under
-    /// [`OnClockReset::Recreate`]: build a fresh arena, then re-offer this
-    /// sample.
+    /// The clock moved under [`OnClockReset::Recreate`]: build a fresh arena,
+    /// then re-offer this sample.
     RecreateArena {
-        /// How far back time went.
-        by_nanos: i64,
+        /// New time minus old time — **negative for a rewind**.
+        ///
+        /// Signed, and named for the sign, because the clock can now be judged
+        /// to have moved *forward* as well: an authoritative jump report
+        /// ([`Ingest::note_time_jump`]) and a common-mode step both see a sim
+        /// fast-forward or a bag seek, which no backward-regression watcher can.
+        /// The convention is `rcl_time_jump_t::delta`'s — *"the new time minus
+        /// the last time before the jump"* — so the two ends of the seam agree
+        /// about the sign without a conversion nobody would remember to write.
+        delta_nanos: i64,
+        /// Which rung of §5.5's ladder fired, and how strong it was.
+        ///
+        /// Carried for the same reason [`HaltReason::ClockReset`] carries it,
+        /// and it was missing here first: under `Recreate` the C seam had no way
+        /// to distinguish a rebuild the *time source reported* from one this
+        /// bridge *inferred* from two publishers agreeing, so it reported
+        /// `TFT_BRIDGE_EVIDENCE_NONE` for every inferred recreate. An operator
+        /// whose arena is being rebuilt in the field needs to know which of
+        /// those happened before anything else — a reported jump means the sim
+        /// or the bag did it, an inferred one means the bridge decided, and only
+        /// the second one can be wrong.
+        evidence: ClockEvidence,
     },
 }
 
@@ -200,17 +292,94 @@ pub enum DropReason {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HaltReason {
     /// `Strict` policy, and two publishers appeared on one edge.
+    ///
+    /// **No longer produced by `offer`** — `docs/decisions/0011` moved
+    /// `Strict`'s halt to the close of the startup window, where it can name
+    /// every conflict instead of the first, so a per-message authority halt is
+    /// now [`HaltReason::StartupConflicts`]. The variant is kept because §5.4's
+    /// contract is that a `Strict` conflict stops the bridge, and a future
+    /// policy that stops on a *specific* pair — a named edge allow-list, say —
+    /// is the natural user of it. If it is still unconstructed when Phase 5
+    /// closes, delete it then, deliberately.
     AuthorityConflict {
         /// The prior owner.
         owner: Publisher,
         /// The publisher that collided with it.
         intruder: Publisher,
     },
-    /// `Halt` policy, and the clock went backwards.
+    /// `Halt` policy, and the clock was judged to have moved.
     ClockReset {
-        /// By how much.
-        by_nanos: i64,
+        /// New time minus old time — **negative for a rewind**. See
+        /// [`Action::RecreateArena`]'s `delta_nanos` for the sign convention
+        /// and why it is signed at all.
+        delta_nanos: i64,
+        /// Which rung of the ladder fired, and how strong it was.
+        ///
+        /// Carried because the halt cannot name its members: the C seam's
+        /// outcome has room for exactly one `(parent, child)` pair, filled from
+        /// the arriving sample, and growing that POD is a
+        /// `struct_size`-versioned break. This is what is left of the evidence,
+        /// and it is not decoration — *"the time source reported it"* and
+        /// *"two publishers stepped together"* send an operator to different
+        /// places.
+        evidence: ClockEvidence,
     },
+    /// `Strict` policy, and the startup window closed with conflicts recorded
+    /// (§5.4, `docs/decisions/0011`).
+    ///
+    /// **One halt for the whole startup, not one per conflict.** `Strict`
+    /// exists for CI, and CI wants every misconfiguration out of one run: a
+    /// deployment with four bad publishers should take one boot to diagnose,
+    /// not four. So both conflict kinds are accumulated while the window is
+    /// open and this is raised once at its close, if anything was found.
+    ///
+    /// The counts are the summary; the enumeration lives in
+    /// [`Authority::conflicts`], which a caller reads to print every offending
+    /// edge with both of its publishers.
+    StartupConflicts {
+        /// Distinct `(edge, owner, intruder)` authority conflicts recorded.
+        authority: u32,
+        /// Distinct static edges whose value was contradicted (§5.7).
+        statics: u32,
+    },
+}
+
+/// A publisher's identity as one borrowed string, keying [`OffsetTable`]'s
+/// per-publisher offset baselines.
+///
+/// Borrowed and not owned because this runs on **every** dynamic sample: an
+/// owned key would allocate at message rate for a table that stops growing after
+/// each publisher's first sample.
+///
+/// # What happens when the middleware cannot attribute anything
+///
+/// The three non-node variants collapse to *fixed* sentinels, so an RMW with no
+/// endpoint introspection reports one identity for the whole robot. One identity
+/// means one baseline, which means common mode can never reach two publishers,
+/// which means **every** regression degrades to a drop and the bridge never
+/// halts on the inference path at all.
+///
+/// That is §5.3 satisfied by construction rather than by promise: *"attribution
+/// is diagnostic value, never a correctness dependency"*. Attribution quality
+/// now changes how well a clock event is *described* and how likely the fallback
+/// rung is to fire; it cannot make the bridge stop, and it cannot stop the
+/// bridge from stopping — the authoritative rung
+/// ([`Ingest::note_time_jump`]) needs no attribution whatsoever.
+///
+/// The predecessor of this function fed a quorum floor, where the same collapse
+/// had the *opposite* effect: one identity meant a floor of one, and a floor of
+/// one meant a lone regression halted. Identical code, inverted consequence —
+/// which is why the ladder, and not the key, is where the safety lives.
+///
+/// Bracketed because a ROS node name cannot contain `<`, so a real node can
+/// never collide with a sentinel.
+fn owner_key(p: &Publisher) -> &str {
+    match p {
+        Publisher::Node(n) => n.as_str(),
+        Publisher::UnknownGid => "<unknown-gid>",
+        Publisher::Unattributed => "<unattributed>",
+        Publisher::Declared => "<declared>",
+    }
 }
 
 /// The four tables, plus the declared topology and the counters, applied in
@@ -229,7 +398,58 @@ pub struct Ingest {
     declared: TopologyConfig,
     statics: StaticStore,
     authority: Authority,
-    clock: ClockGuard,
+    /// **One clock guard per edge** (§5.5, `docs/decisions/0011`).
+    ///
+    /// A single guard over the merged stream measured a quantity that does not
+    /// mean anything: the gap between two *different* publishers' stamps. AMCL
+    /// and `robot_localization` date `map -> odom` up to a second into the
+    /// future; a SLAM node dates it hundreds of milliseconds behind. Either is
+    /// a steady offset larger than any threshold on a correctly configured
+    /// robot, and the lagging edge's next message then read as a backward jump
+    /// off the leading edge's high-water mark — a latched bridge, on a robot
+    /// with nothing wrong with it.
+    ///
+    /// Per edge, the guard measures one publisher's regression against its own
+    /// last accepted stamp, which is exactly what Phase 1's ring would refuse
+    /// anyway. A [`ByEdge`] rather than a `(String, String)` key so the
+    /// steady-state probe allocates nothing; the two owned keys are paid once,
+    /// on an edge's first sample. `tests/steady_state_alloc.rs` is the gate.
+    clocks: ByEdge<ClockGuard>,
+    /// Every knob §5.5's detection has, in physical units.
+    ///
+    /// Held whole rather than distributed into the guards because a guard cannot
+    /// be asked what policy it holds and there may be no guard yet to ask: an
+    /// edge's guard is built on its first sample, which can be an hour after
+    /// construction. The threshold and the reset action both come from here, so
+    /// the per-edge drop decision and the promotion decision cannot be
+    /// configured out of step with each other.
+    clock: ClockPolicy,
+    /// Per-publisher stamp-to-receipt offsets, and the common-mode rule over
+    /// them — the *fallback* rung of `crate::clock`'s ladder.
+    ///
+    /// Strictly above the guards, never inside them: a guard's job is the exact
+    /// per-edge fact, and mixing a global judgment into it is the shape
+    /// `docs/decisions/0011` records as the original defect.
+    offsets: OffsetTable,
+    /// Whether §5.4's startup window is still open.
+    ///
+    /// Open from construction. Closed by [`Ingest::close_startup_window`], or
+    /// by the [`STARTUP_WINDOW_TRANSFORMS`] backstop, whichever comes first.
+    /// Under [`AuthorityPolicy::Strict`] the close is the only thing that
+    /// halts.
+    startup_window_open: bool,
+    /// Distinct static edges contradicted while the window was open.
+    ///
+    /// The window reads the conflicts already recorded rather than keeping a
+    /// second ledger — [`Authority::conflicts`] enumerates the authority half
+    /// exactly. [`StaticStore`] has no equivalent: it exposes a `u64` of
+    /// conflicting *observations*, and a latched static re-delivered to ten
+    /// late joiners is ten observations of one misconfiguration. So the count
+    /// of distinct edges is taken here, off the `first_time` flag the store
+    /// already computes. A `StaticStore::conflicts_by_edge()` accessor would
+    /// remove this field and let the halt name the edges as well as count
+    /// them; that is a change to a file this commit does not own.
+    startup_static_conflicts: u32,
     stats: BridgeStats,
     /// Undeclared edges seen, and how many times — the rate limiter behind
     /// `Action::UndeclaredEdge`'s `first_time`, and `doctor`'s list of what the
@@ -263,12 +483,37 @@ impl Ingest {
         )
     }
 
-    /// A pipeline with explicit policies.
+    /// A pipeline with an explicit authority policy and clock *action*, and
+    /// otherwise the default [`ClockPolicy`].
+    ///
+    /// The convenience shape, because `--on-clock-reset={halt,recreate}` is the
+    /// only clock knob §5.5 puts on the command line. Reach for
+    /// [`Ingest::with_policies`] to set a threshold, a correlation window or an
+    /// agreement tolerance.
     #[must_use]
     pub fn with(
         config: &TopologyConfig,
         authority: AuthorityPolicy,
         on_clock_reset: OnClockReset,
+        tf_prefix: Option<&str>,
+    ) -> Ingest {
+        Ingest::with_policies(
+            config,
+            authority,
+            ClockPolicy {
+                on_reset: on_clock_reset,
+                ..ClockPolicy::default()
+            },
+            tf_prefix,
+        )
+    }
+
+    /// A pipeline with every policy stated.
+    #[must_use]
+    pub fn with_policies(
+        config: &TopologyConfig,
+        authority: AuthorityPolicy,
+        clock: ClockPolicy,
         tf_prefix: Option<&str>,
     ) -> Ingest {
         // **`config` carries the names as the file writes them; everything this
@@ -286,7 +531,11 @@ impl Ingest {
             names,
             declared,
             authority: Authority::new(authority),
-            clock: ClockGuard::new(on_clock_reset),
+            clocks: BTreeMap::new(),
+            clock,
+            offsets: OffsetTable::new(clock),
+            startup_window_open: true,
+            startup_static_conflicts: 0,
             stats: BridgeStats {
                 queue_capacity: 100, // §5.2's KeepLast(100)
                 ..BridgeStats::default()
@@ -297,6 +546,19 @@ impl Ingest {
 
     /// Push one transform through every table.
     pub fn offer(&mut self, topic: Topic, sample: &Sample, publisher: &Publisher) -> Action {
+        // 0. The startup window's backstop (§5.4), **before the transform is
+        //    counted**. A window-close halt is not an event about the arriving
+        //    sample — it is caused by samples already counted, minutes ago — so
+        //    charging it a bucket in `BridgeStats::balanced()`'s ledger would
+        //    make the ledger a lie in order to keep it balanced. The arriving
+        //    sample is not processed either: the bridge is stopping, and the
+        //    caller latches on this outcome.
+        if self.startup_window_open && self.stats.transforms >= STARTUP_WINDOW_TRANSFORMS {
+            if let Some(halt) = self.close_startup_window() {
+                return halt;
+            }
+        }
+
         self.stats.transforms += 1;
 
         // 1. Names, first, because everything below keys on them.
@@ -412,22 +674,33 @@ impl Ingest {
                     // The diagnostic, carrying **both values** — the half that
                     // tells an operator which URDF is installed.
                     //
-                    // **And that is all that happens: the authority policy is
-                    // NOT consulted on this path**, because this arm returns and
-                    // every arm of this block returns, so step 5 below is
-                    // unreachable for a `/tf_static` sample. An earlier revision
-                    // of this comment said the policy "decides the disposition",
-                    // which was never true of the code beneath it.
+                    // **The authority policy is not consulted here, and that is
+                    // now a decision rather than an omission.** §5.7 says "then
+                    // apply the authority policy", and §5.4's only policy that
+                    // does anything beyond dropping-and-counting is `Strict`,
+                    // whose definition is "refuse to start if a conflict is
+                    // detected within a startup window". So the policy *is*
+                    // applied — by the window, at its close, which is where
+                    // `docs/decisions/0011` put it. What this arm owes the
+                    // window is the record, and the record is what the two
+                    // lines below and `StaticStore::reported` are.
                     //
-                    // Whether it *should* be consulted is open, not settled:
-                    // §5.7 does say "then apply the authority policy", but §5.4
-                    // defines `Strict` as refusing "within a startup window" and
-                    // there is no startup window in this crate to refuse within.
-                    // `docs/decisions/0011` carries the question; until it is
-                    // resolved, `Strict` does not halt on a static conflict and
-                    // this paragraph is the warning.
+                    // Routing this into `Authority::admit` instead would be
+                    // wrong twice over: the intruder would take ownership of an
+                    // edge nobody writes to, and `/tf_static` is
+                    // `transient_local`, so *when* a latched conflict is
+                    // observed is a DDS discovery artefact. A per-message halt
+                    // here fires at a time that carries no information about
+                    // when anything went wrong, and on a bridge that has been
+                    // healthy for an hour it kills a working robot because a
+                    // publisher it had never matched finally appeared.
                     self.stats.static_conflicts += 1;
                     self.stats.dropped_authority += 1;
+                    // Distinct edges, not observations: see the field's doc.
+                    if first_time && self.startup_window_open {
+                        self.startup_static_conflicts =
+                            self.startup_static_conflicts.saturating_add(1);
+                    }
                     return Action::StaticConflict {
                         parent,
                         child,
@@ -442,13 +715,34 @@ impl Ingest {
         }
 
         // 5. Authority, before the clock — see the module docs.
+        //
+        //    **Neither arm halts.** `Verdict::Fatal` is `Strict` reporting a
+        //    fact — two publishers on one edge — and §5.4 defines `Strict` as
+        //    refusing *"within a startup window"*, which is a judgment about
+        //    when. So both drops are disposed of identically here and the
+        //    window decides at its close, naming everything it found.
+        //    `Authority::admit` records the conflict under either policy, so
+        //    there is nothing for this function to accumulate.
         match self.authority.admit(&parent, &child, publisher) {
             Verdict::Accept => {}
+            // `Fatal` outside the window means `Strict` has degraded to
+            // `FirstWriterWins` plus counters, deliberately and permanently: a
+            // bridge that has been healthy for an hour must not be killed by a
+            // late-joining publisher. Inside it, this is the accumulation.
             Verdict::Reject {
                 owner,
                 intruder,
                 first_time,
+            }
+            | Verdict::Fatal {
+                owner,
+                intruder,
+                first_time,
             } => {
+                // **Count it.** `stats.transforms` was already incremented, so
+                // returning without an outcome bucket leaves `balanced()` false
+                // forever — precisely the shape `BridgeStats::balanced`'s own
+                // doc names as the bug it exists to detect.
                 self.stats.dropped_authority += 1;
                 return Action::AuthorityConflict {
                     parent,
@@ -458,22 +752,64 @@ impl Ingest {
                     first_time,
                 };
             }
-            Verdict::Fatal { owner, intruder } => {
-                // **Count it before halting.** `stats.transforms` was already
-                // incremented, so returning without an outcome bucket leaves
-                // `balanced()` false forever — precisely the shape
-                // `BridgeStats::balanced`'s own doc names as the bug it exists
-                // to detect. The clock-reset halt below always counted; these
-                // two paths disagreeing is what review found.
-                self.stats.dropped_authority += 1;
-                return Action::Halt {
-                    reason: HaltReason::AuthorityConflict { owner, intruder },
-                };
-            }
         }
 
         // 6. Clock, last: only a sample that will be written may advance time.
-        match self.clock.observe(sample.stamp_nanos) {
+        //
+        //    Two independent things happen here, and the order matters. First
+        //    the *fallback* rung of `crate::clock`'s ladder folds this sample's
+        //    stamp-to-receipt offset into its publisher's baseline, because a
+        //    common-mode step is a fact about the clock whichever way the
+        //    per-edge guard is about to rule — a forward jump leaves every edge
+        //    perfectly monotone, so a detector that only ran on regressions
+        //    could not see one at all. Then the per-edge guard rules on this
+        //    sample.
+        //
+        //    Statics never reach here (they returned at step 4), which is what
+        //    keeps a `robot_state_publisher`'s meaningless zero stamp out of its
+        //    own offset baseline.
+        if let Some(common) =
+            self.offsets
+                .observe(owner_key(publisher), sample.stamp_nanos, sample.received)
+        {
+            // **Charged to `dropped_non_monotonic`, including for a forward
+            // jump.** The ledger has exactly one bucket for "refused because
+            // time misbehaved", `balanced()` demands every counted transform
+            // land in one, and inventing a second bucket is a
+            // `struct_size`-versioned growth of `tft_bridge_stats` that this
+            // work does not own. The bucket's own doc states the widened
+            // meaning rather than leaving the name to imply a narrower one.
+            self.stats.dropped_non_monotonic += 1;
+            return self.apply_clock_reset(
+                common.delta_nanos,
+                ClockEvidence::CommonMode {
+                    publishers: common.publishers,
+                },
+            );
+        }
+
+        // The guard is this edge's, built on its first sample. `lookup_mut`
+        // then `insert` rather than `entry`, because `entry` needs owned keys
+        // whether or not it inserts — two allocations on every message of every
+        // edge, for a table that stops growing after each edge's first sample.
+        //
+        // A sample that promoted above never reaches the guard, so it does not
+        // move that edge's high-water mark. Under `Halt` that is what keeps
+        // every later sample refused on a bridge whose caller has no latch;
+        // under `Recreate` the marks have just been thrown away wholesale.
+        let verdict = match lookup_mut(&mut self.clocks, &parent, &child) {
+            Some(guard) => guard.observe(sample.stamp_nanos),
+            None => {
+                let mut guard = ClockGuard::with_threshold(
+                    self.clock.on_reset,
+                    self.clock.reset_threshold_nanos,
+                );
+                let verdict = guard.observe(sample.stamp_nanos);
+                insert(&mut self.clocks, &parent, &child, guard);
+                verdict
+            }
+        };
+        match verdict {
             ClockVerdict::Forward => {
                 self.stats.applied += 1;
                 Action::Publish {
@@ -483,26 +819,189 @@ impl Ingest {
                     pose: sample.pose,
                 }
             }
-            ClockVerdict::Jitter { by_nanos } => {
+            // **The ladder's bottom rung, and the two arms are deliberately one
+            // arm.** A regression past the threshold and a few milliseconds of
+            // jitter are the same *decision* — drop this sample, count it,
+            // diagnose it — and differ only in how alarming the number is. A
+            // single source regressing **never halts**, however far and however
+            // often, because one publisher restarting, hiccuping or replaying
+            // its own buffer is observationally exactly this and halting a
+            // healthy robot for it is an outage caused by the diagnostic rather
+            // than by the fault.
+            //
+            // Nothing is lost by not halting: Phase 1's ring would refuse these
+            // stamps anyway, so the arena is protected regardless, and
+            // `dropped_non_monotonic` is what `tf_tree doctor` reads. The
+            // guard's mark is deliberately not moved, so the offending
+            // publisher stays refused until it catches up.
+            //
+            // `clock_resets` is *not* touched here: it counts promotions, and
+            // this is a fact about one publisher.
+            ClockVerdict::Jitter { by_nanos } | ClockVerdict::Reset { by_nanos, .. } => {
                 self.stats.dropped_non_monotonic += 1;
                 Action::Drop {
                     reason: DropReason::NonMonotonic { by_nanos },
                 }
             }
-            ClockVerdict::Reset { by_nanos, policy } => {
-                self.stats.clock_resets += 1;
-                self.stats.dropped_non_monotonic += 1;
-                match policy {
-                    OnClockReset::Halt => Action::Halt {
-                        reason: HaltReason::ClockReset { by_nanos },
-                    },
-                    OnClockReset::Recreate => {
-                        self.clock.accept_reset(sample.stamp_nanos);
-                        Action::RecreateArena { by_nanos }
-                    }
+        }
+    }
+
+    /// The time source itself reported a jump — §5.5's authoritative path.
+    ///
+    /// **No inference, no threshold, no window, no corroboration.** ROS 2
+    /// publishes clock jumps (`rcl_clock_add_jump_callback`, surfaced by rclcpp
+    /// as `Clock::create_jump_callback`), and a `/clock` regression *is* the
+    /// event, observed once at its source. This handles the case §5.5 was
+    /// actually written for — a bag loop, a sim reset — exactly, and it handles
+    /// it without any of the ambiguity the fallback rung exists to manage.
+    ///
+    /// `delta_nanos` is the new time minus the last time before the jump, so a
+    /// rewind is **negative**; that is `rcl_time_jump_t::delta`'s own convention
+    /// and passing it through unnegated is what keeps the two ends of the seam
+    /// agreeing about the sign.
+    ///
+    /// Under [`OnClockReset::Recreate`] every per-edge guard and every offset
+    /// baseline is forgotten: they describe a time base that no longer exists,
+    /// and the new recording has to be able to start. Under
+    /// [`OnClockReset::Halt`] they are deliberately kept — see
+    /// `Ingest::apply_clock_reset`, which owns that argument for both rungs.
+    ///
+    /// # Threading, for the rclcpp caller
+    ///
+    /// rclcpp's jump post-callback does **not** run on the bridge's ingest
+    /// thread — with `NodeOptions::use_clock_thread` at its default of `true`
+    /// the node's `TimeSource` owns a dedicated `/clock` thread — and every
+    /// entry point on the C seam is thread-affine. The callback must therefore
+    /// record the jump into a slot the ingest thread drains, and call this from
+    /// there. This function makes no attempt to be thread-safe and should not:
+    /// a lock here would be a lock taken from inside `rcl`'s clock update.
+    ///
+    /// # No counter bucket
+    ///
+    /// Like [`Ingest::close_startup_window`], and for the same reason: this is
+    /// not an event about an arriving transform, so charging it a bucket in
+    /// [`BridgeStats::balanced`]'s ledger would make the ledger a lie in order
+    /// to keep it balanced. `clock_resets` *is* incremented — it counts
+    /// promotions and is not a ledger term.
+    pub fn note_time_jump(&mut self, delta_nanos: i64, kind: JumpKind) -> Action {
+        self.apply_clock_reset(delta_nanos, ClockEvidence::Reported { kind })
+    }
+
+    /// Apply [`ClockPolicy::on_reset`] to a clock event, whichever rung of the
+    /// ladder produced it.
+    ///
+    /// One place, so the two rungs cannot drift about what a reset *does* — the
+    /// mistake that put a promotion rule inside [`ClockGuard`] in the first
+    /// place. The caller charges the ledger, because only the caller knows
+    /// whether a transform is in hand.
+    /// # Why only `Recreate` forgets the old recording
+    ///
+    /// A rewind under `Halt` leaves every high-water mark exactly where it was,
+    /// and that is load-bearing rather than an omission. This type has no latch
+    /// — the C seam and the `rclcpp` node hold that — so a caller that keeps
+    /// offering after a halt keeps reaching this pipeline. With the guards
+    /// forgotten, the very next post-rewind sample would read as forward motion
+    /// and come back `Action::Publish`, writing the new recording's transforms
+    /// into an arena the bridge has just been told to stop using. Keeping the
+    /// marks means every later sample keeps being refused, which is the
+    /// behaviour a stopped bridge should have with or without a latch above it.
+    ///
+    /// Under `Recreate` the arena really is being rebuilt, so the marks describe
+    /// a recording that no longer exists and forgetting them is the whole point.
+    fn apply_clock_reset(&mut self, delta_nanos: i64, evidence: ClockEvidence) -> Action {
+        self.stats.clock_resets += 1;
+        match self.clock.on_reset {
+            OnClockReset::Halt => Action::Halt {
+                reason: HaltReason::ClockReset {
+                    delta_nanos,
+                    evidence,
+                },
+            },
+            OnClockReset::Recreate => {
+                self.forget_the_old_recording();
+                Action::RecreateArena {
+                    delta_nanos,
+                    evidence,
                 }
             }
         }
+    }
+
+    /// Rewind **every** edge's guard, and every offset baseline with them.
+    ///
+    /// Every guard, not the one that regressed, because the arena is rebuilt
+    /// whole: a mark left behind describes a recording that no longer exists,
+    /// and the edges that did not happen to be sampled during the loop would
+    /// spend the next recording refusing everything until it caught up with the
+    /// last one.
+    ///
+    /// The offset baselines go the same way, and for a sharper reason: they are
+    /// measured against a time base that has just been replaced, so *every*
+    /// publisher's first post-reset sample is a step — and those steps all agree
+    /// with each other, because they are all the same jump. Kept, they would
+    /// make the bridge report a second clock reset caused by nothing but its own
+    /// response to the first.
+    ///
+    /// [`ClockGuard::forget`] rather than dropping the map, so the two owned
+    /// `String` keys per edge survive and the first sample on every edge after
+    /// a recreate does not re-enter the allocating path. `accept_reset` is the
+    /// wrong call here twice over: the only stamp in hand belongs to the one
+    /// edge that regressed, and seeding every other edge's guard from it is
+    /// precisely the cross-edge contamination per-edge guards exist to remove.
+    fn forget_the_old_recording(&mut self) {
+        for children in self.clocks.values_mut() {
+            for guard in children.values_mut() {
+                guard.forget();
+            }
+        }
+        self.offsets.clear();
+    }
+
+    /// Close §5.4's startup window, and report what it found.
+    ///
+    /// Returns `Some(Action::Halt { StartupConflicts })` under
+    /// [`AuthorityPolicy::Strict`] if any conflict — authority or static — was
+    /// recorded while the window was open, and `None` otherwise. Idempotent: a
+    /// second call, and the [`STARTUP_WINDOW_TRANSFORMS`] backstop after an
+    /// explicit close, return `None`.
+    ///
+    /// **This is the mechanism; the backstop is the fallback.** A caller with a
+    /// real clock — the `rclcpp` node, from a one-shot steady timer — decides
+    /// what "startup" means in seconds, which is the unit the question is
+    /// actually about. See [`STARTUP_WINDOW_TRANSFORMS`].
+    ///
+    /// **No counter moves.** A window-close halt is caused by transforms
+    /// already counted and dropped, each in its own bucket, at the time they
+    /// arrived; charging it a bucket again would double-count them, and this
+    /// entry point may be called with no transform in hand at all.
+    ///
+    /// # What a caller does with the answer
+    ///
+    /// The counts are a summary. [`Ingest::authority`]'s
+    /// [`Authority::conflicts`] enumerates every offending edge with both of
+    /// its publishers, which is the report §5.4 wants CI to print — one run,
+    /// every misconfiguration.
+    pub fn close_startup_window(&mut self) -> Option<Action> {
+        if !self.startup_window_open {
+            return None;
+        }
+        self.startup_window_open = false;
+
+        // Only `Strict` refuses to start. The other two policies have already
+        // done everything they are going to do, per message, on the way past.
+        if self.authority.policy() != AuthorityPolicy::Strict {
+            return None;
+        }
+        // Read at close, and no filtering: nothing recorded so far can have
+        // happened after a window that is only now closing.
+        let authority = u32::try_from(self.authority.conflicts().count()).unwrap_or(u32::MAX);
+        let statics = self.startup_static_conflicts;
+        if authority == 0 && statics == 0 {
+            return None;
+        }
+        Some(Action::Halt {
+            reason: HaltReason::StartupConflicts { authority, statics },
+        })
     }
 
     /// The declared topology as this pipeline keys on it — §5.6's
@@ -559,6 +1058,24 @@ impl Ingest {
         &self.statics
     }
 
+    /// The per-publisher offset baselines behind the fallback rung of
+    /// `crate::clock`'s ladder, for `doctor` and for tests.
+    ///
+    /// `OffsetTable::tracked()` reading 1 on a robot with several `/tf`
+    /// publishers is the visible symptom of an RMW that cannot attribute — the
+    /// bridge still works, and this is where an operator sees that the inference
+    /// rung is dormant.
+    #[must_use]
+    pub fn offsets(&self) -> &OffsetTable {
+        &self.offsets
+    }
+
+    /// The clock policy in force (§5.5).
+    #[must_use]
+    pub fn clock_policy(&self) -> ClockPolicy {
+        self.clock
+    }
+
     /// Edges the robot publishes that the topology config does not declare,
     /// with how many transforms each swallowed.
     ///
@@ -583,17 +1100,46 @@ impl Ingest {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::clock::{CommonMode, SteadyNanos, DEFAULT_RESET_THRESHOLD_NANOS};
 
     fn node(n: &str) -> Publisher {
         Publisher::Node(n.to_string())
     }
     const MS: i64 = 1_000_000;
+    const S: i64 = 1_000_000_000;
 
-    /// The topology every test below runs against: one dynamic edge and one
-    /// static one, written in the real config format so these tests exercise
-    /// the parser the operator will use rather than a struct literal that could
-    /// drift from it.
+    /// A sample carrying a **receipt time**, which is what the common-mode rung
+    /// of `crate::clock`'s ladder needs and what `Sample::identity` deliberately
+    /// leaves unknown.
+    ///
+    /// Every test that is about the clock uses this; every test that is about
+    /// something else uses `Sample::identity` and thereby leaves the inference
+    /// rung dormant, which keeps those tests measuring what they claim to.
+    fn at(parent: &str, child: &str, stamp_nanos: i64, received: i64) -> Sample {
+        Sample::identity(parent, child, stamp_nanos).received_at(SteadyNanos(received))
+    }
+
+    /// The topology every test below runs against: **two** dynamic edges and
+    /// **two** static ones, written in the real config format so these tests
+    /// exercise the parser the operator will use rather than a struct literal
+    /// that could drift from it.
+    ///
+    /// Two of each, and not one, because a fixture with one edge of a kind
+    /// cannot express the questions §5.5 asks. Corroboration is between distinct
+    /// *publishers*, and the interesting negative cases — one node owning both
+    /// dynamic edges, two nodes stepping by unrelated amounts — need two edges
+    /// to arrange at all; the rule that statics never touch the clock is only
+    /// observable when two static edges can move together. The shape is also the
+    /// realistic one: `map -> odom` from a localizer and `odom -> base` from a
+    /// wheel driver is the pair whose steady stamp offset was the original
+    /// defect.
     const TOPO: &str = r#"
+[[edge]]
+parent = "map"
+child = "odom"
+kind = "dynamic"
+capacity = 256
+
 [[edge]]
 parent = "odom"
 child = "base"
@@ -603,6 +1149,12 @@ capacity = 256
 [[edge]]
 parent = "base"
 child = "lidar"
+kind = "static"
+pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+[[edge]]
+parent = "base"
+child = "gps"
 kind = "static"
 pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 "#;
@@ -652,8 +1204,10 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         assert_eq!(
             e,
             [
+                ("robot1/map", "robot1/odom"),
                 ("robot1/odom", "robot1/base"),
-                ("robot1/base", "robot1/lidar")
+                ("robot1/base", "robot1/lidar"),
+                ("robot1/base", "robot1/gps"),
             ]
         );
 
@@ -678,9 +1232,11 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         assert_eq!(
             i.remaps(),
             [
+                ("map".to_string(), "robot1/map".to_string()),
                 ("odom".to_string(), "robot1/odom".to_string()),
                 ("base".to_string(), "robot1/base".to_string()),
                 ("lidar".to_string(), "robot1/lidar".to_string()),
+                ("gps".to_string(), "robot1/gps".to_string()),
             ]
         );
     }
@@ -714,14 +1270,22 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// if it is not.
     ///
     /// A misconfigured node publishing from the future is rejected on
-    /// authority. If the clock had already seen its stamp, the *owner's*
-    /// subsequent samples would look non-monotonic and be dropped — one bad
-    /// node silently stalls the correct one, and the diagnostic blames the
-    /// victim.
+    /// authority. If **that edge's** guard had already seen its stamp, the
+    /// *owner's* subsequent samples would look non-monotonic and be dropped —
+    /// one bad node silently stalls the correct one, and the diagnostic blames
+    /// the victim.
     ///
-    /// Mutant: move the clock check above the authority check ⇒ the owner's
-    /// samples after the intruder's are dropped as non-monotonic and this
-    /// fails.
+    /// The ordering survives `docs/decisions/0011` untouched, and is one of the
+    /// few clock-adjacent rules that does: an authority intruder collides, by
+    /// definition, on an edge that already has an owner, so the poisoning it
+    /// describes was always *within* one edge and per-edge guards do not reach
+    /// it. Only the word "the clock" had to become "that edge's clock".
+    ///
+    /// Mutant: move the clock check above the authority check — applied, and
+    /// this failed at `matches!(.., Action::Publish { .. })` on the owner's
+    /// third sample, which came back
+    /// `Drop { reason: NonMonotonic { by_nanos: 3598990000000 } }` — the hour
+    /// the intruder had put into that edge's guard.
     #[test]
     fn a_rejected_publisher_cannot_move_the_clock() {
         let mut i = ingest();
@@ -782,42 +1346,111 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         assert_eq!(i.stats().dropped_undeclared, 0);
     }
 
-    /// **A static's stamp must not touch the clock.**
+    /// **A static's stamp must not touch the clock — on either rung of the
+    /// ladder.**
     ///
-    /// `robot_state_publisher` commonly stamps statics with zero. Feeding that
-    /// to the clock guard drags the high-water mark to the epoch and makes
-    /// every dynamic sample afterwards look like a bag loop — halting the
-    /// bridge on a correctly configured robot.
+    /// `robot_state_publisher` commonly stamps statics with zero, and
+    /// `/tf_static` is `transient_local`, so the same latched value is
+    /// re-delivered by whichever publisher a late joiner discovers — one of
+    /// which may stamp with `now()` and the next with the epoch. That is not a
+    /// fault: a static transform is constant and its stamp is meaningless.
     ///
-    /// Mutant: run statics through `clock.observe` ⇒ the dynamic sample after
-    /// the zero-stamped static is a `Halt`.
+    /// Originally the damage was to the *dynamic* stream: one shared high-water
+    /// mark, dragged to the epoch, made every subsequent dynamic sample look
+    /// like a bag loop. Per-edge guards moved that damage rather than removing
+    /// it, and the common-mode rung makes it worse again in a new way: two
+    /// latching nodes re-delivering at the epoch, against a receipt clock that
+    /// is genuinely now, are two publishers whose offsets step by the *same*
+    /// thousand seconds inside the correlation window — textbook agreement, and
+    /// a halt. So "statics return at step 4" is what stands between a
+    /// meaningless stamp and a stopped bridge, and it got more load-bearing, not
+    /// less.
+    ///
+    /// **Two publishers and not merely two edges**, and the fixture says so on
+    /// purpose: agreement is between distinct owners, so a single
+    /// `robot_state_publisher` re-latching both edges is one witness and would
+    /// leave the mutant merely dropping. Two independent latching nodes — a URDF
+    /// publisher and a `static_transform_publisher` for a bracket — is the
+    /// ordinary shape.
+    ///
+    /// Mutant: hoist step 6's `self.offsets.observe(..)` (and the common-mode
+    /// arm with it) above the `/tf_static` block — applied, and this failed at
+    /// `only the dynamic publisher has an offset baseline at all`, `left: 5,
+    /// right: 1`. The `tracked()` assertion is the tighter form of the check and
+    /// fires first: five latching publishers had been given offset baselines
+    /// measured from a meaningless stamp, any two of which agree the moment a
+    /// late joiner is served the latched set.
     #[test]
     fn a_zero_stamped_static_does_not_reset_the_clock() {
         let mut i = ingest();
+        // A receipt clock that really is running, so a static's meaningless
+        // stamp has something real to be measured against — which is exactly
+        // what makes the mutant reachable.
+        let t0 = 5_000 * S;
         i.offer(
             Topic::Tf,
-            &Sample::identity("odom", "base", 1_000_000 * MS),
+            &at("odom", "base", 1_000_000 * MS, t0),
             &node("/ekf"),
         );
-        // A latched static, stamped at the epoch, matching the declared value.
-        assert!(matches!(
-            i.offer(
-                Topic::TfStatic,
-                &Sample::identity("base", "lidar", 0),
-                &node("/rsp")
-            ),
-            Action::StaticVerified { .. }
-        ));
+        // Two independent latching publishers, one edge each — the ordinary
+        // shape: `robot_state_publisher` for the URDF's lidar mount, a
+        // `static_transform_publisher` for the GPS bracket. Both stamp with
+        // wall time.
+        for (child, publisher) in [("lidar", "/rsp_a"), ("gps", "/gps_mount_a")] {
+            assert!(matches!(
+                i.offer(
+                    Topic::TfStatic,
+                    &at("base", child, 1_000_000 * MS, t0 + 10 * MS),
+                    &node(publisher)
+                ),
+                Action::StaticVerified { .. }
+            ));
+        }
+        // A late joiner is served the same values by a publisher that stamps
+        // them at the epoch. Two edges, both "regressing" a thousand seconds.
+        //
+        // Collected rather than asserted one at a time on purpose: the second
+        // edge is where a mutant stops merely dropping a static and starts
+        // halting the bridge, and a per-offer `assert!` would stop at the first
+        // and never show it.
+        let redelivered: Vec<Action> = [("lidar", "/rsp_b"), ("gps", "/gps_mount_b")]
+            .into_iter()
+            .enumerate()
+            .map(|(k, (child, publisher))| {
+                i.offer(
+                    Topic::TfStatic,
+                    &at(
+                        "base",
+                        child,
+                        0,
+                        t0 + 20 * MS + i64::try_from(k).unwrap() * MS,
+                    ),
+                    &node(publisher),
+                )
+            })
+            .collect();
+        assert!(
+            redelivered
+                .iter()
+                .all(|a| matches!(a, Action::StaticVerified { .. })),
+            "a static's stamp is meaningless and must not reach any clock rule: {redelivered:?}"
+        );
         // The dynamic stream is unaffected.
         assert!(matches!(
             i.offer(
                 Topic::Tf,
-                &Sample::identity("odom", "base", 1_000_001 * MS),
+                &at("odom", "base", 1_000_001 * MS, t0 + 30 * MS),
                 &node("/ekf")
             ),
             Action::Publish { .. }
         ));
         assert_eq!(i.stats().clock_resets, 0);
+        assert_eq!(i.stats().dropped_non_monotonic, 0);
+        assert_eq!(
+            i.offsets().tracked(),
+            1,
+            "only the dynamic publisher has an offset baseline at all"
+        );
     }
 
     /// **The ledger balances over a realistic mixed stream**, which is what
@@ -1088,44 +1721,1347 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         assert_eq!(i.stats().dropped_kind_change, 0);
     }
 
-    /// **A `Strict` halt still balances the ledger.**
+    // ---- §5.5, the clock ladder --------------------------------------------
+    //
+    // Every test below fixes a receipt-clock origin `t0` and derives a healthy
+    // publisher's stamp from it as `STAMP0 + (received - t0)`, so a correct
+    // publisher's `stamp - received` offset is *exactly* constant and every
+    // step size in an assertion is exact rather than approximately right. `t0`
+    // is never 0, because `SteadyNanos(0)` is the "no receipt clock" sentinel.
+
+    /// The stamp a healthy publisher would emit at receipt-clock origin.
+    const STAMP0: i64 = 10_000 * MS;
+
+    /// **Two publishers a `transform_tolerance` apart never halt the bridge.**
     ///
-    /// `transforms` is incremented for every sample, so a path that returns
-    /// without an outcome bucket leaves `balanced()` false forever — the exact
-    /// shape `BridgeStats::balanced`'s own doc names as the bug it detects. The
-    /// clock-reset halt always counted; the authority halt did not, and the two
-    /// disagreeing is what review found.
+    /// The original defect, at the level of the pipeline, and it is what a
+    /// correctly configured robot looks like: AMCL and `robot_localization` date
+    /// `map -> odom` into the future while the wheel driver stamps
+    /// `odom -> base` at publish time. Each edge is perfectly monotone on its
+    /// own; only the *gap between them* is large, and it is large by
+    /// configuration, for the life of the robot.
     ///
-    /// Mutant: drop the `dropped_authority += 1` from the `Fatal` arm ⇒ this
-    /// fails.
+    /// 300 ms of skew, chosen to be **three times** the 100 ms reset threshold,
+    /// because no threshold separates these two publishers from a bag loop —
+    /// `transform_tolerance` is a user parameter with no ceiling. Two different
+    /// mechanisms have to hold for this to pass, and the test names both.
+    ///
+    /// Mutant: one shared guard for the whole stream (key both the `lookup_mut`
+    /// and the `insert` in step 6 on one entry, `"*", "*"`) — applied, and this
+    /// failed at `and so are the wheel driver's, at k=0: Drop { reason:
+    /// NonMonotonic { by_nanos: 300000000 } }`: the wheel driver refused, once
+    /// per message, for the life of the robot. Mutating only the `lookup_mut`
+    /// is *not* this mutant and passes — every lookup then misses, so every
+    /// sample gets a fresh guard and everything reads as forward motion.
+    ///
+    /// Mutant: threshold the raw offset instead of the residual in
+    /// `OffsetTable::observe` (`if offset.saturating_abs() <= ...`) — applied,
+    /// and this failed at `the localizer's own stamps are monotone, at k=10:
+    /// Halt { reason: ClockReset { delta_nanos: 0, evidence: CommonMode
+    /// { publishers: 2 } } }`. Both publishers' raw offsets are enormous — a
+    /// stamp and a steady clock have unrelated epochs — so *every* sample was a
+    /// step, every step had a residual of zero, and zero agrees with zero: a
+    /// halt on a robot with nothing wrong with it, reporting a clock jump of
+    /// exactly nothing.
     #[test]
-    fn a_strict_halt_leaves_the_ledger_balanced() {
-        let c = topo();
-        let mut i = Ingest::with(&c, AuthorityPolicy::Strict, OnClockReset::Halt, None);
+    fn two_publishers_a_transform_tolerance_apart_never_halt() {
+        let mut i = ingest();
+        /// AMCL's `transform_tolerance`, three times the reset threshold.
+        const TOLERANCE: i64 = 300 * MS;
+        let t0 = 5_000 * S;
+        for k in 0..100i64 {
+            let r = t0 + k * 10 * MS; // the wheel driver, 100 Hz
+            if k % 10 == 0 {
+                // The localizer, 10 Hz, dating its edge into the future.
+                let v = i.offer(
+                    Topic::Tf,
+                    &at("map", "odom", STAMP0 + (r - t0) + TOLERANCE, r),
+                    &node("/amcl"),
+                );
+                assert!(
+                    matches!(v, Action::Publish { .. }),
+                    "the localizer's own stamps are monotone, at k={k}: {v:?}"
+                );
+            }
+            let v = i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r - t0), r),
+                &node("/ekf"),
+            );
+            assert!(
+                matches!(v, Action::Publish { .. }),
+                "and so are the wheel driver's, at k={k}: {v:?}"
+            );
+        }
+        let s = i.stats();
+        assert_eq!(s.applied, 110, "every sample was written");
+        assert_eq!(s.dropped_non_monotonic, 0);
+        assert_eq!(s.clock_resets, 0, "nothing here is a clock reset");
+        assert!(s.balanced(), "{s:?}");
+        assert_eq!(
+            i.offsets().steps(),
+            0,
+            "a configuration is not an event: the tolerance is measured, not thresholded"
+        );
+    }
+
+    /// **A lone edge regressing past the threshold is a drop, not a halt.**
+    ///
+    /// The ladder's bottom rung. One publisher restarting, hiccuping, or
+    /// replaying its own buffer regresses exactly one edge, however far and
+    /// however often, and halting a healthy robot for it is an outage caused by
+    /// the diagnostic rather than by the fault. It is still refused and still
+    /// counted — Phase 1's ring would refuse it too — and `dropped_non_monotonic`
+    /// is what `tf_tree doctor` reads.
+    ///
+    /// The second edge keeps working throughout, which is the property a global
+    /// guard could not offer.
+    ///
+    /// Fifty consecutive regressions and **one** recorded step: a publisher that
+    /// stays broken must not sit in the correlation window re-arming itself at
+    /// message rate, or the next unrelated hiccup anywhere in the tree
+    /// corroborates it.
+    ///
+    /// Mutant: promote on the guard's own `Reset` verdict (give
+    /// `ClockVerdict::Reset` its own arm returning `self.apply_clock_reset(..)`)
+    /// — applied, and this failed at `one publisher is one publisher, at k=0`,
+    /// `left: Halt { reason: ClockReset { delta_nanos: -4900000000, evidence:
+    /// CommonMode { publishers: 1 } } }, right: Drop { reason: NonMonotonic
+    /// { by_nanos: 4900000000 } }`: a permanently latched bridge, from one node
+    /// restarting.
+    #[test]
+    fn a_lone_edge_regressing_past_the_threshold_is_dropped_not_halted() {
+        let mut i = ingest();
+        let t0 = 5_000 * S;
+        i.offer(Topic::Tf, &at("map", "odom", STAMP0, t0), &node("/amcl"));
+        i.offer(Topic::Tf, &at("odom", "base", STAMP0, t0), &node("/ekf"));
+
+        // The wheel driver restarts and replays its buffer from five seconds
+        // ago, once per message, for fifty messages.
+        for k in 0..50i64 {
+            let r = t0 + 100 * MS + k * MS;
+            assert_eq!(
+                i.offer(
+                    Topic::Tf,
+                    &at("odom", "base", STAMP0 + (r - t0) - 5 * S, r),
+                    &node("/ekf")
+                ),
+                Action::Drop {
+                    reason: DropReason::NonMonotonic {
+                        by_nanos: 5 * S - 100 * MS - k * MS
+                    }
+                },
+                "one publisher is one publisher, at k={k}"
+            );
+        }
+        // …and the localizer is untouched by any of it.
+        let r = t0 + 200 * MS;
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &at("map", "odom", STAMP0 + (r - t0), r),
+                &node("/amcl")
+            ),
+            Action::Publish { .. }
+        ));
+
+        let s = i.stats();
+        assert_eq!(s.clock_resets, 0, "no promotion, so no reset");
+        assert_eq!(s.dropped_non_monotonic, 50);
+        assert!(s.balanced(), "{s:?}");
+        assert_eq!(
+            i.offsets().steps(),
+            1,
+            "one bout of being broken is one step, not fifty"
+        );
+    }
+
+    /// **A real `/clock` rewind moves both publishers by the same amount, and
+    /// that is what halts the bridge.**
+    ///
+    /// The proof that the redesign did not quietly delete §5.5's detection. Both
+    /// publishers' `stamp - received` offsets drop by exactly 5 s, within 10 ms
+    /// of each other, because the thing underneath them moved by 5 s. Neither
+    /// publisher restarted; nothing about either edge alone says so.
+    ///
+    /// It also pins the ledger on the halting path: `transforms` is incremented
+    /// for every sample, so a path that returns without an outcome bucket leaves
+    /// `balanced()` false forever.
+    ///
+    /// Mutant: drop `self.stats.dropped_non_monotonic += 1;` from the
+    /// common-mode arm — applied, and this failed at `both refusals are
+    /// counted`, `left: 1, right: 2`; the `balanced()` assertion below it would
+    /// have failed too, at 11 buckets for 12 transforms.
+    ///
+    /// Mutant: `if publishers < 3` in `OffsetTable::observe` — applied, and this
+    /// failed at `left: Drop { reason: NonMonotonic { by_nanos: 4980000000 } },
+    /// right: Halt { reason: ClockReset { delta_nanos: -5000000000, evidence:
+    /// CommonMode { publishers: 2 } } }`: a bag loop across two publishers
+    /// stopped being detectable on a two-publisher robot, which is most
+    /// robots.
+    #[test]
+    fn a_clock_rewind_moving_both_publishers_by_the_same_delta_halts() {
+        let mut i = ingest();
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                assert!(matches!(
+                    i.offer(
+                        Topic::Tf,
+                        &at(parent, child, STAMP0 + (r - t0), r),
+                        &node(who)
+                    ),
+                    Action::Publish { .. }
+                ));
+            }
+        }
+
+        // The bag loops back five seconds. The first publisher to notice is
+        // still only one publisher.
+        let r1 = t0 + 50 * MS;
+        assert_eq!(
+            i.offer(
+                Topic::Tf,
+                &at("map", "odom", STAMP0 + (r1 - t0) - 5 * S, r1),
+                &node("/amcl")
+            ),
+            Action::Drop {
+                reason: DropReason::NonMonotonic {
+                    by_nanos: 5 * S - 10 * MS
+                }
+            }
+        );
+        assert_eq!(i.stats().clock_resets, 0);
+
+        // The second one agrees, to within the 10 ms between their messages.
+        // Two publishers do not restart in lockstep by the same amount; a clock
+        // they share does move both at once.
+        let r2 = t0 + 60 * MS;
+        assert_eq!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 5 * S, r2),
+                &node("/ekf")
+            ),
+            Action::Halt {
+                reason: HaltReason::ClockReset {
+                    delta_nanos: -5 * S,
+                    evidence: ClockEvidence::CommonMode { publishers: 2 },
+                }
+            }
+        );
+
+        let s = i.stats();
+        assert_eq!(s.clock_resets, 1, "one promotion, not one per regression");
+        assert_eq!(s.dropped_non_monotonic, 2, "both refusals are counted");
+        assert!(s.balanced(), "{s:?}");
+    }
+
+    /// **Two publishers restarting by unrelated amounts inside the window are
+    /// two faults — agreement is what decides, not coincidence in time.**
+    ///
+    /// The negative twin of the test above, at the same window and the same
+    /// receipt times: only the *sizes* differ. A launch file respawning two
+    /// nodes, or a machine coming back from suspend, moves two publishers within
+    /// a second of each other by whatever each had buffered. A rule that asked
+    /// only *"did two publishers step inside the window"* halts on that, which
+    /// is the same false halt in a new costume.
+    ///
+    /// 5 s against 400 ms is 92 % apart, so no plausible tolerance admits them.
+    ///
+    /// Mutant: drop the agreement test from `OffsetTable::observe` and count
+    /// every stepped row inside the window — applied, and this failed at
+    /// `left: Halt { reason: ClockReset { delta_nanos: -400000000, evidence:
+    /// CommonMode { publishers: 2 } } }, right: Drop { reason: NonMonotonic
+    /// { by_nanos: 380000000 } }` on the second regression: a 400 ms clock
+    /// rewind reported, that never happened.
+    #[test]
+    fn two_publishers_restarting_by_unrelated_amounts_do_not_halt() {
+        let mut i = ingest();
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                i.offer(
+                    Topic::Tf,
+                    &at(parent, child, STAMP0 + (r - t0), r),
+                    &node(who),
+                );
+            }
+        }
+
+        let r1 = t0 + 50 * MS;
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &at("map", "odom", STAMP0 + (r1 - t0) - 5 * S, r1),
+                &node("/amcl")
+            ),
+            Action::Drop { .. }
+        ));
+        let r2 = t0 + 60 * MS;
+        assert_eq!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 400 * MS, r2),
+                &node("/ekf")
+            ),
+            Action::Drop {
+                reason: DropReason::NonMonotonic { by_nanos: 380 * MS }
+            },
+            "two restarts inside a second are still two restarts"
+        );
+
+        let s = i.stats();
+        assert_eq!(s.clock_resets, 0, "no clock moved");
+        assert_eq!(s.dropped_non_monotonic, 2);
+        assert!(s.balanced(), "{s:?}");
+        assert_eq!(
+            (i.offsets().steps(), i.offsets().common_modes()),
+            (2, 0),
+            "both stepped; neither corroborated the other"
+        );
+    }
+
+    /// **Two regressions a correlation window apart are two faults, not one
+    /// clock — and the window is a second and a half of *physical* time.**
+    ///
+    /// `docs/decisions/0011` measured coincidence in transforms offered, so "at
+    /// the same time" meant two seconds on a busy stream and minutes on a sparse
+    /// one. Here the stream is deliberately busy — 150 healthy messages fill the
+    /// gap — and the gap is still 1.5 s, still outside the 1 s window, and still
+    /// two faults. Under the old unit those 150 transforms would have been well
+    /// *inside* a 4096-observation window and the bridge would have halted.
+    ///
+    /// Mutant: `let age = 0;` in `OffsetTable::observe`, so every recorded step
+    /// looks adjacent to every other — applied, and this failed at `an old fault
+    /// is not corroboration for this one`, `left: Halt { reason: ClockReset
+    /// { delta_nanos: -5000000000, evidence: CommonMode { publishers: 2 } } },
+    /// right: Drop { reason: NonMonotonic { by_nanos: 4990000000 } }`. An
+    /// unattended bridge would stop the robot on two unrelated single-publisher
+    /// faults an hour apart and blame the clock.
+    #[test]
+    fn two_regressions_a_correlation_window_apart_are_two_faults() {
+        let mut i = ingest();
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                i.offer(
+                    Topic::Tf,
+                    &at(parent, child, STAMP0 + (r - t0), r),
+                    &node(who),
+                );
+            }
+        }
+
+        // The localizer restarts and replays from five seconds ago: one
+        // publisher, one edge, a drop.
+        let r1 = t0 + 50 * MS;
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &at("map", "odom", STAMP0 + (r1 - t0) - 5 * S, r1),
+                &node("/amcl")
+            ),
+            Action::Drop { .. }
+        ));
+
+        // Then the robot is healthy for a second and a half. The wheel driver
+        // alone carries the stream, at 100 Hz, monotonically.
+        for j in 1..150i64 {
+            let r = r1 + j * 10 * MS;
+            assert!(
+                matches!(
+                    i.offer(
+                        Topic::Tf,
+                        &at("odom", "base", STAMP0 + (r - t0), r),
+                        &node("/ekf")
+                    ),
+                    Action::Publish { .. }
+                ),
+                "nothing is wrong with the stream, at j={j}"
+            );
+        }
+
+        // …and only now does the wheel driver have its own, unrelated hiccup —
+        // by exactly the same 5 s, so *only* the window can separate the two.
+        let r2 = r1 + 1_500 * MS;
+        assert_eq!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 5 * S, r2),
+                &node("/ekf")
+            ),
+            Action::Drop {
+                reason: DropReason::NonMonotonic {
+                    by_nanos: 5 * S - 10 * MS
+                }
+            },
+            "an old fault is not corroboration for this one"
+        );
+
+        let s = i.stats();
+        assert_eq!(s.clock_resets, 0, "two faults, no promotion");
+        assert_eq!(s.dropped_non_monotonic, 2);
+        assert!(s.balanced(), "{s:?}");
+        assert_eq!(i.offsets().steps(), 2);
+    }
+
+    /// **A forward jump is detected**, which no backward-regression watcher can
+    /// see at all.
+    ///
+    /// A sim fast-forward, a bag seek, an NTP step ahead: every stamp moves
+    /// *forward*, so every edge stays perfectly monotone, every guard reports
+    /// `Forward`, and the pre-redesign detector was structurally blind — a
+    /// bridge would keep writing across a discontinuity nothing reported. What
+    /// this rung tests is agreement, not regression, so the forward case falls
+    /// out rather than needing a rule of its own.
+    ///
+    /// Note the ledger shape, which is peculiar to this case and deliberate: the
+    /// *first* publisher's jumped sample is monotone and is **published**, and
+    /// only the sample that completes the corroboration is refused. So `applied`
+    /// counts it and `dropped_non_monotonic` counts the other — one bucket each,
+    /// as always.
+    ///
+    /// Mutant: `if residual > -self.policy.reset_threshold_nanos` in place of
+    /// `residual.saturating_abs() <= self.policy.reset_threshold_nanos`, i.e. a
+    /// watcher that looks only for backward motion — applied, and this failed at
+    /// `…two of them jumping forward together is the clock`, `left: Publish
+    /// { parent: "odom", child: "base", stamp_nanos: 40060000000, .. }, right:
+    /// Halt { reason: ClockReset { delta_nanos: 30000000000, evidence:
+    /// CommonMode { publishers: 2 } } }`: a 30 s forward seek went entirely
+    /// unnoticed and the bridge carried on writing across it.
+    #[test]
+    fn a_forward_common_mode_jump_is_detected() {
+        let mut i = ingest();
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                i.offer(
+                    Topic::Tf,
+                    &at(parent, child, STAMP0 + (r - t0), r),
+                    &node(who),
+                );
+            }
+        }
+
+        // Somebody seeks the bag thirty seconds ahead.
+        let r1 = t0 + 50 * MS;
+        assert!(
+            matches!(
+                i.offer(
+                    Topic::Tf,
+                    &at("map", "odom", STAMP0 + (r1 - t0) + 30 * S, r1),
+                    &node("/amcl")
+                ),
+                Action::Publish { .. }
+            ),
+            "one publisher jumping forward is monotone and is written"
+        );
+        let r2 = t0 + 60 * MS;
+        assert_eq!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) + 30 * S, r2),
+                &node("/ekf")
+            ),
+            Action::Halt {
+                reason: HaltReason::ClockReset {
+                    delta_nanos: 30 * S,
+                    evidence: ClockEvidence::CommonMode { publishers: 2 },
+                }
+            },
+            "…two of them jumping forward together is the clock"
+        );
+
+        let s = i.stats();
+        assert_eq!(s.applied, 11, "ten warm-up samples and the forward one");
+        assert_eq!(s.dropped_non_monotonic, 1, "only the halting sample");
+        assert_eq!(s.clock_resets, 1);
+        assert!(s.balanced(), "{s:?}");
+    }
+
+    /// **Attribution is not a correctness dependency** (§5.3, P5) — and this is
+    /// the regression test for the defect that motivated the whole redesign.
+    ///
+    /// [`Publisher::UnknownGid`] and [`Publisher::Unattributed`] are *unit*
+    /// variants, so on an RMW without endpoint introspection every publisher on
+    /// the robot compares equal. Under the quorum that was fatal: the floor was
+    /// derived from `Authority::distinct_owners()`, which read 1, so a quorum of
+    /// 1 was demanded and the **first** single-edge regression latched the
+    /// bridge permanently. §5.3 says in as many words that attribution is
+    /// *"diagnostic value, never a correctness dependency"*, and that was a
+    /// correctness dependency.
+    ///
+    /// Under the ladder the same collapse means one offset baseline, which means
+    /// common mode can never reach two, which means every regression degrades to
+    /// a drop. The inference rung goes dormant; nothing halts wrongly.
+    ///
+    /// The attributed half of this test runs the **identical** stamps, receipt
+    /// times and edges and *does* halt, so a broken fixture cannot make the
+    /// unattributed half pass by accident.
+    ///
+    /// Mutant: key the offset table on the edge rather than on the publisher
+    /// (`self.offsets.observe(&format!("{parent}/{child}"), ..)` in `offer`) —
+    /// applied, and this failed on the unattributed half at `unattributed: Halt
+    /// { reason: ClockReset { delta_nanos: -5000000000, evidence: CommonMode
+    /// { publishers: 2 } } }`, `left: true, right: false`. Under that key the
+    /// two halves stop differing at all, which is the tell: the rule would no
+    /// longer be about publishers, so attribution would be back in the halt
+    /// decision — by removing it rather than by using it.
+    #[test]
+    fn unattributed_publishers_never_halt() {
+        for (label, localizer, driver, halts) in [
+            ("attributed", node("/amcl"), node("/ekf"), true),
+            (
+                "unattributed",
+                Publisher::Unattributed,
+                Publisher::Unattributed,
+                false,
+            ),
+        ] {
+            let mut i = ingest();
+            let t0 = 5_000 * S;
+            for k in 0..5i64 {
+                let r = t0 + k * 10 * MS;
+                i.offer(
+                    Topic::Tf,
+                    &at("map", "odom", STAMP0 + (r - t0), r),
+                    &localizer,
+                );
+                i.offer(
+                    Topic::Tf,
+                    &at("odom", "base", STAMP0 + (r - t0), r),
+                    &driver,
+                );
+            }
+            // A genuine, unambiguous, five-second `/clock` rewind.
+            let r1 = t0 + 50 * MS;
+            assert!(matches!(
+                i.offer(
+                    Topic::Tf,
+                    &at("map", "odom", STAMP0 + (r1 - t0) - 5 * S, r1),
+                    &localizer
+                ),
+                Action::Drop { .. }
+            ));
+            let r2 = t0 + 60 * MS;
+            let second = i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 5 * S, r2),
+                &driver,
+            );
+            assert_eq!(
+                matches!(second, Action::Halt { .. }),
+                halts,
+                "{label}: {second:?}"
+            );
+            assert_eq!(i.stats().clock_resets, u64::from(halts), "{label}");
+            assert_eq!(
+                i.offsets().tracked(),
+                if halts { 2 } else { 1 },
+                "{label}: an unattributable robot has exactly one identity"
+            );
+            assert!(i.stats().balanced(), "{label}: {:?}", i.stats());
+        }
+    }
+
+    /// **The authoritative path halts with no inference at all** — no
+    /// threshold, no window, no corroboration, no transform in hand.
+    ///
+    /// ROS 2 publishes clock jumps, and a `/clock` regression *is* the event
+    /// rather than something to be deduced from its consequences. This is the
+    /// rung that handles what §5.5 was actually written for — a bag loop, a sim
+    /// reset — and it handles it exactly, on a bridge that has never seen a
+    /// single sample and has no receipt clock anywhere.
+    ///
+    /// It charges no counter bucket, like `close_startup_window` and for the
+    /// same reason: it is not an event about an arriving transform, so a bucket
+    /// would make [`BridgeStats::balanced`]'s ledger a lie in order to keep it
+    /// balanced. `clock_resets` moves, because it is not a ledger term.
+    ///
+    /// Mutant: `self.stats.dropped_non_monotonic += 1;` inside
+    /// `apply_clock_reset` rather than at the one call site that has a transform
+    /// in hand — applied, and this failed at `…so no bucket may be charged`,
+    /// `left: 1, right: 0`: one bucket charged for no transform, which the
+    /// `balanced()` assertion below would then have reported as 1 bucket for 0
+    /// transforms.
+    #[test]
+    fn note_time_jump_halts_with_no_inference_at_all() {
+        let mut i = ingest();
+        assert_eq!(
+            i.note_time_jump(-5 * S, JumpKind::Backward),
+            Action::Halt {
+                reason: HaltReason::ClockReset {
+                    delta_nanos: -5 * S,
+                    evidence: ClockEvidence::Reported {
+                        kind: JumpKind::Backward
+                    },
+                }
+            }
+        );
+        let s = i.stats();
+        assert_eq!(s.transforms, 0, "no transform was involved");
+        assert_eq!(s.dropped_non_monotonic, 0, "…so no bucket may be charged");
+        assert_eq!(s.clock_resets, 1, "…but it is a promotion");
+        assert!(s.balanced(), "{s:?}");
+    }
+
+    /// **An authoritative jump rewinds every guard and forgets every baseline,
+    /// so the next recording starts clean.**
+    ///
+    /// Under `recreate` this is the bag-loop workflow end to end, and note what
+    /// it does *not* need: the samples here carry no receipt clock at all
+    /// (`Sample::identity` leaves it unknown), so the inference rung is dormant
+    /// throughout and the whole thing runs on the reported signal.
+    ///
+    /// `JumpKind::ClockTypeChanged` and `JumpKind::Forward` take the same route:
+    /// the kind is evidence for the operator, not a branch — `use_sim_time`
+    /// being switched at runtime replaces the time base exactly as a rewind
+    /// does.
+    ///
+    /// Mutant: drop `self.forget_the_old_recording()` from `apply_clock_reset`'s
+    /// `Recreate` arm — applied, and this failed at `the new recording, on
+    /// map -> odom: Drop { reason: NonMonotonic { by_nanos: 8940000000 } }`
+    /// where a `Publish` was expected: the new recording's every sample refused
+    /// against the old recording's high-water mark, forever.
+    ///
+    /// Mutant: drop `self.offsets.clear()` from `forget_the_old_recording`,
+    /// keeping the guard rewind — applied, and this failed at `the new
+    /// recording, on odom -> base: RecreateArena { delta_nanos: -9000000000 }`:
+    /// the bridge rebuilding the arena a second time in response to nothing but
+    /// its own first rebuild. This is the failure a *`Recreate` reached through
+    /// `offer`* cannot show — there the step that caused it has already re-based
+    /// every participating publisher, and
+    /// `a_recreate_rewinds_every_edge_not_only_the_one_that_tripped_it` passes
+    /// under this mutant. Only a jump reported from *outside* leaves stale
+    /// baselines behind, and then every publisher's first post-jump sample is a
+    /// step and they all agree with each other. Hence the receipt clocks below:
+    /// this is the one test that pins the clear.
+    #[test]
+    fn an_authoritative_jump_rewinds_every_edge() {
+        let mut i = Ingest::with(
+            &topo(),
+            AuthorityPolicy::FirstWriterWins,
+            OnClockReset::Recreate,
+            None,
+        );
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                i.offer(
+                    Topic::Tf,
+                    &at(parent, child, STAMP0 + (r - t0), r),
+                    &node(who),
+                );
+            }
+        }
+
+        // The `/clock` subscription reports a nine-second rewind. Nothing was
+        // inferred: no publisher had regressed, and the last thing every edge
+        // saw was ordinary forward motion.
+        assert_eq!(
+            i.note_time_jump(-9 * S, JumpKind::Backward),
+            Action::RecreateArena {
+                delta_nanos: -9 * S,
+                evidence: ClockEvidence::Reported {
+                    kind: JumpKind::Backward
+                },
+            }
+        );
+
+        // The new recording starts nine seconds earlier, and **both** edges
+        // accept it — including the one no jump was ever observed on.
+        let r = t0 + 100 * MS;
+        for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+            let v = i.offer(
+                Topic::Tf,
+                &at(parent, child, STAMP0 + (r - t0) - 9 * S, r),
+                &node(who),
+            );
+            assert!(
+                matches!(v, Action::Publish { .. }),
+                "the new recording, on {parent} -> {child}: {v:?}"
+            );
+        }
+
+        // The other two kinds are the same decision.
+        for kind in [JumpKind::ClockTypeChanged, JumpKind::Forward] {
+            assert_eq!(
+                i.note_time_jump(3 * S, kind),
+                Action::RecreateArena {
+                    delta_nanos: 3 * S,
+                    evidence: ClockEvidence::Reported { kind },
+                },
+                "{kind:?}"
+            );
+        }
+        assert_eq!(i.stats().clock_resets, 3);
+        assert!(i.stats().balanced(), "{:?}", i.stats());
+    }
+
+    /// **A recreate rewinds *every* edge**, not only the one that tripped it.
+    ///
+    /// The arena is rebuilt whole, so a high-water mark left behind describes a
+    /// recording that no longer exists, and the edges that happened not to be
+    /// sampled during the loop would spend the whole next recording refusing
+    /// everything until it caught up with the last one. The localizer here is
+    /// the edge that did *not* complete the corroboration, so its guard is
+    /// rewound on somebody else's evidence or not at all.
+    ///
+    /// The **offset baselines** are deliberately not what this test pins. A
+    /// `Recreate` reached through `offer` is caused by a step, and a step has
+    /// already re-based every publisher that took part in it, so dropping
+    /// `self.offsets.clear()` leaves this fixture passing.
+    /// `an_authoritative_jump_rewinds_every_edge` is where that clear is pinned,
+    /// and its doc explains why only a jump reported from outside can show it.
+    ///
+    /// Mutant: drop `self.forget_the_old_recording()` from `apply_clock_reset`'s
+    /// `Recreate` arm — applied, and this failed at `the new recording, at j=0,
+    /// on map -> odom: Drop { reason: NonMonotonic { by_nanos: 8940000000 } }`:
+    /// an arena rebuilt, and then every sample of the new recording refused
+    /// against the recording it replaced.
+    #[test]
+    fn a_recreate_rewinds_every_edge_not_only_the_one_that_tripped_it() {
+        let mut i = Ingest::with(
+            &topo(),
+            AuthorityPolicy::FirstWriterWins,
+            OnClockReset::Recreate,
+            None,
+        );
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                i.offer(
+                    Topic::Tf,
+                    &at(parent, child, STAMP0 + (r - t0), r),
+                    &node(who),
+                );
+            }
+        }
+        let r1 = t0 + 50 * MS;
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &at("map", "odom", STAMP0 + (r1 - t0) - 9 * S, r1),
+                &node("/amcl")
+            ),
+            Action::Drop { .. }
+        ));
+        let r2 = t0 + 60 * MS;
+        assert_eq!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 9 * S, r2),
+                &node("/ekf")
+            ),
+            Action::RecreateArena {
+                delta_nanos: -9 * S,
+                evidence: ClockEvidence::CommonMode { publishers: 2 },
+            }
+        );
+
+        // The new recording runs. Both edges accept it, twice each — the second
+        // pass is what a stale baseline would turn into an agreeing step pair.
+        for j in 0..2i64 {
+            let r = t0 + 100 * MS + j * 10 * MS;
+            for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                let v = i.offer(
+                    Topic::Tf,
+                    &at(parent, child, STAMP0 + (r - t0) - 9 * S, r),
+                    &node(who),
+                );
+                assert!(
+                    matches!(v, Action::Publish { .. }),
+                    "the new recording, at j={j}, on {parent} -> {child}: {v:?}"
+                );
+            }
+        }
+        // And an ordinary single-publisher hiccup inside the new recording is an
+        // ordinary drop, not a second rebuild.
+        let r = t0 + 130 * MS;
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r - t0) - 9 * S - 200 * MS, r),
+                &node("/ekf")
+            ),
+            Action::Drop {
+                reason: DropReason::NonMonotonic { .. }
+            }
+        ));
+        assert_eq!(i.stats().clock_resets, 1, "one rebuild, not two");
+        assert!(i.stats().balanced(), "{:?}", i.stats());
+    }
+
+    /// **One node owning every edge never halts, whatever the magnitude.**
+    ///
+    /// The inverse of what `docs/decisions/0011` shipped, and the reversal is
+    /// the point. That record floored the quorum by `distinct_owners()` so a
+    /// single-publisher deployment would halt on its first regression "because
+    /// nothing else could ever agree with it". Two failures followed: at boot
+    /// the floor reads 1 on a robot that *has* two publishers because the second
+    /// has not published yet (AMCL waits for a map), so the wheel driver's first
+    /// hiccup latches the bridge; and an unattributable RMW makes the floor
+    /// permanently 1 for everyone.
+    ///
+    /// So the answer is inverted. With one witness there is no evidence that
+    /// separates "this node restarted" from "the clock moved", and the
+    /// conservative disposition of *no evidence* is to drop the sample — which
+    /// Phase 1 would do anyway — not to stop the robot. An operator of a genuine
+    /// single-publisher rig who wants a bag loop detected has the authoritative
+    /// path, which needs no witnesses at all.
+    ///
+    /// Both edges regress **in the same message**, which is exactly the topology
+    /// that broke the edge-counting quorum, and then a ten-hour regression
+    /// follows to pin "whatever the magnitude".
+    ///
+    /// Mutant: count rows rather than distinct publishers (key `OffsetTable` per
+    /// edge, `self.offsets.observe(&format!("{parent}/{child}"), ..)`) —
+    /// applied, and this failed at `one node owns both edges`, `left: 2,
+    /// right: 1`, one line before it could reach the restart. That assertion is
+    /// the cheap form of the whole test: two rows for one node is already the
+    /// bug, and the `Drop`s below are its consequence.
+    #[test]
+    fn one_publisher_owning_every_edge_never_halts() {
+        let mut i = ingest();
+        let solo = node("/ekf"); // an EKF publishing the whole chain
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            let r = t0 + k * 10 * MS;
+            for (parent, child) in [("map", "odom"), ("odom", "base")] {
+                assert!(matches!(
+                    i.offer(Topic::Tf, &at(parent, child, STAMP0 + (r - t0), r), &solo),
+                    Action::Publish { .. }
+                ));
+            }
+        }
+        assert_eq!(i.offsets().tracked(), 1, "one node owns both edges");
+
+        // It restarts, and both of its edges regress in the same `TFMessage` —
+        // one receipt time, so nothing could be closer together in the window.
+        let r1 = t0 + 50 * MS;
+        for (parent, child) in [("map", "odom"), ("odom", "base")] {
+            let v = i.offer(
+                Topic::Tf,
+                &at(parent, child, STAMP0 + (r1 - t0) - 9 * S, r1),
+                &solo,
+            );
+            assert!(
+                matches!(
+                    v,
+                    Action::Drop {
+                        reason: DropReason::NonMonotonic { .. }
+                    }
+                ),
+                "one publisher cannot corroborate itself, on {parent} -> {child}: {v:?}"
+            );
+        }
+
+        // …and a ten-hour regression is still one publisher.
+        let r2 = t0 + 60 * MS;
+        assert!(matches!(
+            i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 36_000 * S, r2),
+                &solo
+            ),
+            Action::Drop { .. }
+        ));
+
+        let s = i.stats();
+        assert_eq!(s.clock_resets, 0, "no magnitude promotes a lone witness");
+        assert_eq!(s.dropped_non_monotonic, 3);
+        assert!(s.balanced(), "{s:?}");
+    }
+
+    /// **Every knob in [`ClockPolicy`] actually reaches the pipeline.**
+    ///
+    /// `Ingest::with` fixes four of the five at their defaults, so
+    /// `Ingest::with_policies` is the only way an operator moves them — and a
+    /// knob that is accepted and then ignored is worse than no knob, because the
+    /// operator believes they have changed something and stops looking.
+    ///
+    /// One knob from each rung is pinned. `reset_threshold_nanos` decides what
+    /// counts as motion at all, and it has to reach the per-edge guard *and* the
+    /// offset step detector — the two measure the same publisher misbehaving by
+    /// the same amount, and a build where one moved and the other did not would
+    /// disagree about a single sample. `correlation_window_nanos` decides how
+    /// close together two steps must fall. Each half feeds identical stamps and
+    /// receipt times under the default and under a changed policy, so nothing
+    /// but the policy can explain the difference.
+    ///
+    /// Note what the threshold half does *not* assert: both builds return
+    /// `Action::Drop` for the regressing sample, because jitter and a
+    /// past-threshold regression have the same disposition. The threshold is
+    /// visible only in whether a *step* was recorded, which is what makes the
+    /// step counter worth exposing.
+    ///
+    /// Mutant: `ClockGuard::new(self.clock.on_reset)` in place of
+    /// `ClockGuard::with_threshold(self.clock.on_reset,
+    /// self.clock.reset_threshold_nanos)` — applied, and this test **passed**.
+    /// Recorded because it is a true statement about the pipeline and not a gap
+    /// in the fixture: under the ladder a jitter drop and a past-threshold
+    /// regression have the same disposition *and* the same counter, so the
+    /// per-edge guard's threshold has no observable effect through `Ingest` at
+    /// all. It is fed from the same field anyway, so a future arm that does
+    /// distinguish them cannot be configured out of step with the step
+    /// detector, and the guard's own boundary is pinned directly by
+    /// `clock::tests::the_threshold_boundary_is_exact`. What the first half
+    /// below actually pins is the *step detector's* copy of the constant.
+    ///
+    /// Mutant: `offsets: OffsetTable::new(ClockPolicy::default())` in
+    /// `Ingest::with_policies` — applied, and this failed at `a 1 s threshold
+    /// must not see a 500 ms hiccup at all`, `left: 1, right: 0`.
+    ///
+    /// Mutant: hard-code the window (`age > 1_000_000_000` in
+    /// `OffsetTable::observe`), which leaves the threshold half passing —
+    /// applied, and this failed at `a 10 ms window cannot correlate steps 50 ms
+    /// apart: Halt { reason: ClockReset { delta_nanos: -5000000000, evidence:
+    /// CommonMode { publishers: 2 } } }`, `left: true, right: false`.
+    #[test]
+    fn the_clock_policy_knobs_reach_the_pipeline() {
+        // --- reset_threshold_nanos --------------------------------------------
+        for (threshold, steps) in [(DEFAULT_RESET_THRESHOLD_NANOS, 1u64), (S, 0)] {
+            let mut i = Ingest::with_policies(
+                &topo(),
+                AuthorityPolicy::FirstWriterWins,
+                ClockPolicy {
+                    reset_threshold_nanos: threshold,
+                    ..ClockPolicy::default()
+                },
+                None,
+            );
+            let t0 = 5_000 * S;
+            for k in 0..5i64 {
+                let r = t0 + k * 10 * MS;
+                i.offer(
+                    Topic::Tf,
+                    &at("odom", "base", STAMP0 + (r - t0), r),
+                    &node("/ekf"),
+                );
+            }
+            let r = t0 + 50 * MS;
+            assert!(
+                matches!(
+                    i.offer(
+                        Topic::Tf,
+                        &at("odom", "base", STAMP0 + (r - t0) - 500 * MS, r),
+                        &node("/ekf")
+                    ),
+                    Action::Drop { .. }
+                ),
+                "either way the sample is refused, at threshold {threshold}"
+            );
+            assert_eq!(
+                i.offsets().steps(),
+                steps,
+                "a 1 s threshold must not see a 500 ms hiccup at all"
+            );
+        }
+
+        // --- correlation_window_nanos -----------------------------------------
+        for (window, halts) in [(S, true), (10 * MS, false)] {
+            let mut i = Ingest::with_policies(
+                &topo(),
+                AuthorityPolicy::FirstWriterWins,
+                ClockPolicy {
+                    correlation_window_nanos: window,
+                    ..ClockPolicy::default()
+                },
+                None,
+            );
+            let t0 = 5_000 * S;
+            for k in 0..5i64 {
+                let r = t0 + k * 10 * MS;
+                for (parent, child, who) in [("map", "odom", "/amcl"), ("odom", "base", "/ekf")] {
+                    i.offer(
+                        Topic::Tf,
+                        &at(parent, child, STAMP0 + (r - t0), r),
+                        &node(who),
+                    );
+                }
+            }
+            let r1 = t0 + 50 * MS;
+            i.offer(
+                Topic::Tf,
+                &at("map", "odom", STAMP0 + (r1 - t0) - 5 * S, r1),
+                &node("/amcl"),
+            );
+            // Fifty milliseconds later: inside a one-second window, well outside
+            // a ten-millisecond one.
+            let r2 = t0 + 100 * MS;
+            let v = i.offer(
+                Topic::Tf,
+                &at("odom", "base", STAMP0 + (r2 - t0) - 5 * S, r2),
+                &node("/ekf"),
+            );
+            assert_eq!(
+                matches!(v, Action::Halt { .. }),
+                halts,
+                "a 10 ms window cannot correlate steps 50 ms apart: {v:?}"
+            );
+            assert!(i.stats().balanced(), "{:?}", i.stats());
+        }
+    }
+
+    /// **The common-mode verdict is shaped for the seam that has to report it.**
+    ///
+    /// A halt crosses the C ABI as a POD with one `(parent, child)` pair and a
+    /// free-text `detail`, so the count of agreeing publishers is the whole of
+    /// the evidence an operator gets. This pins that `CommonMode` carries a real
+    /// count rather than a constant, by making a third publisher join.
+    ///
+    /// Mutant: `publishers: 2` hard-coded in `OffsetTable::observe`'s return —
+    /// applied, and this failed at `left: Some(CommonMode { delta_nanos:
+    /// -5000000000, publishers: 2 }), right: Some(CommonMode { delta_nanos:
+    /// -5000000000, publishers: 3 })`, which is the difference between "two
+    /// publishers coincided" and "the whole robot moved".
+    #[test]
+    fn the_agreeing_publisher_count_is_real() {
+        let mut t = OffsetTable::new(ClockPolicy::default());
+        let t0 = 5_000 * S;
+        for k in 0..5i64 {
+            for who in ["/a", "/b", "/c"] {
+                let r = t0 + k * 10 * MS;
+                t.observe(who, STAMP0 + (r - t0), SteadyNanos(r));
+            }
+        }
+        // Two publishers step; the third is the one whose count is under test.
+        for (j, who) in [(0i64, "/a"), (1, "/b")] {
+            let r = t0 + 50 * MS + j * MS;
+            t.observe(who, STAMP0 + (r - t0) - 5 * S, SteadyNanos(r));
+        }
+        let r = t0 + 52 * MS;
+        assert_eq!(
+            t.observe("/c", STAMP0 + (r - t0) - 5 * S, SteadyNanos(r)),
+            Some(CommonMode {
+                delta_nanos: -5 * S,
+                publishers: 3,
+            })
+        );
+    }
+
+    /// **`Strict` accumulates inside the startup window and halts once at its
+    /// close, naming everything it found.**
+    ///
+    /// §5.4 defines `Strict` as *"refuse to start if a conflict is detected
+    /// within a startup window. For CI."*, and CI wants every misconfiguration
+    /// out of one run: a deployment with a duplicate odometry publisher **and**
+    /// two `robot_state_publisher`s carrying different URDFs should take one
+    /// boot to diagnose, not two. A halt on the first conflict delivers a
+    /// quarter of what the policy is for.
+    ///
+    /// Both conflict kinds reach the window, which is the second half of what
+    /// `docs/decisions/0011` settled: §5.7 says a differing static value is
+    /// followed by *"then apply the authority policy"*, and the only policy
+    /// that does anything is this one.
+    ///
+    /// Mutant: return the halt from the `Verdict::Fatal` arm of `offer`, per
+    /// message, as before the change — applied, and this failed at
+    /// `Strict does not halt per message: Halt { reason: AuthorityConflict {
+    /// owner: Node("/a"), intruder: Node("/b") } }` on the second offer. The
+    /// static conflict below it was never reached at all: the run that was
+    /// supposed to report both misconfigurations reported one, which is the
+    /// three-quarters of the policy's value a halt-on-first throws away.
+    #[test]
+    fn strict_accumulates_conflicts_inside_the_window_and_halts_once_at_its_close() {
+        let mut i = Ingest::with(&topo(), AuthorityPolicy::Strict, OnClockReset::Halt, None);
         let s = |t: i64| Sample::identity("odom", "base", t);
         assert!(matches!(
             i.offer(Topic::Tf, &s(1_000 * MS), &node("/a")),
             Action::Publish { .. }
         ));
-        assert!(matches!(
-            i.offer(Topic::Tf, &s(1_010 * MS), &node("/b")),
-            Action::Halt {
-                reason: HaltReason::AuthorityConflict { .. }
+        // A second odometry publisher: recorded, dropped, diagnosed — and the
+        // bridge keeps running, because "within a startup window" is a question
+        // about time that this message cannot answer.
+        match i.offer(Topic::Tf, &s(1_010 * MS), &node("/b")) {
+            Action::AuthorityConflict {
+                owner,
+                intruder,
+                first_time,
+                ..
+            } => {
+                assert_eq!((owner, intruder), (node("/a"), node("/b")));
+                assert!(first_time);
             }
+            other => panic!("Strict does not halt per message: {other:?}"),
+        }
+        // …and a second URDF, on a different edge, is found in the same run.
+        let mut moved = Sample::identity("base", "lidar", 0);
+        moved.pose[4] = 0.25;
+        assert!(matches!(
+            i.offer(Topic::TfStatic, &moved, &node("/rsp_b")),
+            Action::StaticConflict { .. }
         ));
-        assert!(i.stats().balanced(), "{:?}", i.stats());
 
-        // ...and so does the clock halt, which is the path that was already
-        // right and is what made the disagreement visible.
-        let mut j = ingest();
-        j.offer(Topic::Tf, &s(10_000 * MS), &node("/a"));
+        assert_eq!(
+            i.close_startup_window(),
+            Some(Action::Halt {
+                reason: HaltReason::StartupConflicts {
+                    authority: 1,
+                    statics: 1,
+                }
+            }),
+            "one halt, naming both misconfigurations"
+        );
+        // The enumeration a caller prints from is on the tables, not on the
+        // halt: §5.4 wants both nodes and the edge, and the POD across the C
+        // seam has room for neither.
+        let conflicts: Vec<_> = i.authority().conflicts().collect();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            (conflicts[0].0, conflicts[0].1),
+            ("odom", "base"),
+            "the offending edge is nameable"
+        );
+
+        // The close charges no bucket: it is caused by transforms already
+        // counted, each in its own, at the time they arrived.
+        let s = i.stats();
+        assert_eq!(s.transforms, 3);
+        assert_eq!(
+            (s.applied, s.dropped_authority, s.static_conflicts),
+            (1, 2, 1)
+        );
+        assert!(s.balanced(), "{s:?}");
+        // Idempotent: the window does not reopen and cannot halt twice.
+        assert_eq!(i.close_startup_window(), None);
+    }
+
+    /// **A conflict first seen after the window closes does not halt**, and a
+    /// clean startup does not halt at all.
+    ///
+    /// `Strict` outside the window is `FirstWriterWins` plus counters, stated
+    /// rather than incidental. Two reasons it must be: a bridge that has been
+    /// healthy for an hour must not be killed by a late-joining publisher; and
+    /// `/tf_static` is `transient_local`, so *when* a latched conflict is
+    /// observed is a DDS discovery artefact and not a fault time — a
+    /// late-joining subscriber can otherwise surface a startup fault an hour in
+    /// and take down a working robot.
+    ///
+    /// Mutant: leave the window re-closable — drop the
+    /// `if !self.startup_window_open { return None; }` guard — applied, and
+    /// this failed at the second `close_startup_window()` with
+    /// `Some(Halt { reason: StartupConflicts { authority: 1, statics: 0 } })`
+    /// against `None`, which is the late-joiner outage this rule exists to
+    /// prevent.
+    #[test]
+    fn a_conflict_first_seen_after_the_window_closes_does_not_halt() {
+        let mut i = Ingest::with(&topo(), AuthorityPolicy::Strict, OnClockReset::Halt, None);
+        let s = |t: i64| Sample::identity("odom", "base", t);
         assert!(matches!(
-            j.offer(Topic::Tf, &s(0), &node("/a")),
-            Action::Halt {
-                reason: HaltReason::ClockReset { .. }
-            }
+            i.offer(Topic::Tf, &s(1_000 * MS), &node("/a")),
+            Action::Publish { .. }
         ));
-        assert!(j.stats().balanced(), "{:?}", j.stats());
+        assert_eq!(
+            i.close_startup_window(),
+            None,
+            "a clean startup must not halt"
+        );
+
+        // An hour later, a late joiner collides.
+        match i.offer(Topic::Tf, &s(1_010 * MS), &node("/b")) {
+            Action::AuthorityConflict { first_time, .. } => assert!(first_time),
+            other => panic!("still loud, still counted, still not fatal: {other:?}"),
+        }
+        assert_eq!(i.close_startup_window(), None, "the window does not reopen");
+        assert_eq!(i.stats().dropped_authority, 1, "…but it is still counted");
+        assert!(i.stats().balanced(), "{:?}", i.stats());
+    }
+
+    /// **A caller that never closes the window still gets its report.**
+    ///
+    /// The backstop. `close_startup_window` is the mechanism — a caller with a
+    /// real clock decides what "startup" means in seconds — but a binding in
+    /// another language, or a test, may never call it, and a `Strict` bridge
+    /// that accumulated conflicts and reported none would be the worst of both
+    /// designs. So the window also closes on its own at
+    /// `STARTUP_WINDOW_TRANSFORMS`.
+    ///
+    /// The halt lands on the offer *after* the ordinal reaches the backstop and
+    /// **charges that transform nothing**: it is not an event about the
+    /// arriving sample, which is why the check sits above `transforms += 1`.
+    ///
+    /// Mutant: move the backstop check below `self.stats.transforms += 1` —
+    /// applied, and this failed at the `balanced()` assertion with
+    /// `BridgeStats { transforms: 4096, applied: 4094, dropped_authority: 1, .. }`
+    /// — 4095 buckets for 4096 transforms, because the halting offer had been
+    /// counted and then given no bucket. The transform-count assertion above it
+    /// passes under this mutant (both orders halt at the same ordinal), which
+    /// is why the ledger is the assertion that catches it.
+    #[test]
+    fn the_startup_window_closes_itself_after_the_backstop() {
+        let mut i = Ingest::with(&topo(), AuthorityPolicy::Strict, OnClockReset::Halt, None);
+        let s = |t: i64| Sample::identity("odom", "base", t);
+        i.offer(Topic::Tf, &s(1_000 * MS), &node("/a"));
+        i.offer(Topic::Tf, &s(1_001 * MS), &node("/b")); // the conflict
+
+        let mut halted = None;
+        for k in 2..(STARTUP_WINDOW_TRANSFORMS as i64 + 100) {
+            if let Action::Halt { reason } =
+                i.offer(Topic::Tf, &s(1_000 * MS + k * MS), &node("/a"))
+            {
+                halted = Some(reason);
+                break;
+            }
+        }
+        assert_eq!(
+            halted,
+            Some(HaltReason::StartupConflicts {
+                authority: 1,
+                statics: 0
+            })
+        );
+        assert_eq!(
+            i.stats().transforms,
+            STARTUP_WINDOW_TRANSFORMS,
+            "the halting offer is not a transform the bridge processed"
+        );
+        assert!(i.stats().balanced(), "{:?}", i.stats());
+    }
+
+    /// **Only `Strict` refuses to start.** The other two policies close the
+    /// window with conflicts on the books and carry on.
+    ///
+    /// Every other startup-window test runs under `Strict`, because `Strict` is
+    /// the only policy that can halt — which left the *guard* that says so
+    /// unpinned, and it guards the default. `FirstWriterWins` is what a robot
+    /// runs, and a robot that stopped 4096 transforms in because two
+    /// `robot_state_publisher`s disagree about a lidar bracket would be an
+    /// outage introduced by a policy nobody selected. `LastWriterWins` is here
+    /// too because it records *fewer* authority conflicts than
+    /// `FirstWriterWins` — it reassigns the edge instead — so a guard keyed on
+    /// the wrong thing could pass on one and fail on the other.
+    ///
+    /// The static conflict is what makes this test non-vacuous under both: the
+    /// static store is consulted before authority, so it lands on the books
+    /// whatever the policy is, and the `static_conflicts` assertion is what says
+    /// the window had something it *could* have halted on.
+    ///
+    /// Mutant: drop the `if self.authority.policy() != AuthorityPolicy::Strict
+    /// { return None; }` guard from `close_startup_window` — applied, and this
+    /// failed on the first iteration with `Some(Halt { reason:
+    /// StartupConflicts { authority: 1, statics: 1 } })` against `None`, i.e.
+    /// the default policy halting a healthy robot at startup.
+    #[test]
+    fn only_strict_refuses_to_start_at_the_close_of_the_window() {
+        for policy in [
+            AuthorityPolicy::FirstWriterWins,
+            AuthorityPolicy::LastWriterWins,
+        ] {
+            let mut i = Ingest::with(&topo(), policy, OnClockReset::Halt, None);
+            // A second URDF: a conflict every policy records.
+            let mut moved = Sample::identity("base", "lidar", 0);
+            moved.pose[4] = 0.25;
+            assert!(matches!(
+                i.offer(Topic::TfStatic, &moved, &node("/rsp_b")),
+                Action::StaticConflict { .. }
+            ));
+            // …and a second odometry publisher, which `FirstWriterWins` records
+            // and `LastWriterWins` deliberately does not.
+            let s = |t: i64| Sample::identity("odom", "base", t);
+            i.offer(Topic::Tf, &s(1_000 * MS), &node("/a"));
+            i.offer(Topic::Tf, &s(1_010 * MS), &node("/b"));
+
+            assert_eq!(
+                i.close_startup_window(),
+                None,
+                "{policy:?} does not refuse to start"
+            );
+            assert_eq!(
+                i.stats().static_conflicts,
+                1,
+                "…and it had a conflict to refuse over, under {policy:?}"
+            );
+            assert_eq!(
+                i.authority().conflicts().count(),
+                usize::from(policy == AuthorityPolicy::FirstWriterWins),
+                "LastWriterWins reassigns rather than recording, under {policy:?}"
+            );
+            assert!(i.stats().balanced(), "{:?}", i.stats());
+        }
+    }
+
+    /// **`StartupConflicts` counts misconfigurations, not messages.**
+    ///
+    /// Both numbers on the halt are counts of *distinct faults*, and both have
+    /// an observation count sitting right next to them that a reader could take
+    /// instead. The distinction is the whole diagnostic: `Strict` exists to tell
+    /// CI *"you have two problems"*, and a halt reporting `authority: 4200`
+    /// because one intruder published at 100 Hz for 42 seconds says nothing
+    /// about how many things are wrong with the deployment. `/tf_static` makes
+    /// the same point harder: it is `transient_local`, so one misconfigured
+    /// bracket is re-delivered to every late joiner, and counting deliveries
+    /// would make the number a function of how many subscribers happened to
+    /// appear.
+    ///
+    /// The fixture keeps the two pairs of numbers far apart on purpose — 8
+    /// authority *drops* across 2 conflicts, 4 static *observations* across 1
+    /// edge — so neither substitution can pass by coincidence.
+    ///
+    /// Mutant: `self.authority.dropped()` in place of
+    /// `self.authority.conflicts().count()` — applied, and this failed at
+    /// `StartupConflicts { authority: 8, statics: 1 }` against
+    /// `{ authority: 2, statics: 1 }`.
+    ///
+    /// Mutant: `self.stats.static_conflicts` in place of
+    /// `self.startup_static_conflicts` — applied, and this failed at
+    /// `StartupConflicts { authority: 2, statics: 4 }`, which is the
+    /// late-joiner count and not a fault count at all.
+    #[test]
+    fn the_startup_halt_counts_faults_not_observations() {
+        let mut i = Ingest::with(&topo(), AuthorityPolicy::Strict, OnClockReset::Halt, None);
+        let odom = |t: i64| Sample::identity("odom", "base", t);
+        let map = |t: i64| Sample::identity("map", "odom", t);
+
+        // One conflict on `odom -> base`, at message rate: five drops.
+        i.offer(Topic::Tf, &odom(1_000 * MS), &node("/a"));
+        for k in 0..5i64 {
+            assert!(matches!(
+                i.offer(Topic::Tf, &odom(1_010 * MS + k * MS), &node("/b")),
+                Action::AuthorityConflict { .. }
+            ));
+        }
+        // A second, genuinely different misconfiguration on another edge: three
+        // more drops.
+        i.offer(Topic::Tf, &map(1_000 * MS), &node("/c"));
+        for k in 0..3i64 {
+            assert!(matches!(
+                i.offer(Topic::Tf, &map(1_010 * MS + k * MS), &node("/d")),
+                Action::AuthorityConflict { .. }
+            ));
+        }
+        // One bad lidar bracket, re-delivered to four late joiners.
+        let mut moved = Sample::identity("base", "lidar", 0);
+        moved.pose[4] = 0.25;
+        for _ in 0..4 {
+            assert!(matches!(
+                i.offer(Topic::TfStatic, &moved, &node("/rsp_b")),
+                Action::StaticConflict { .. }
+            ));
+        }
+
+        // The observation counts, which are what the halt must *not* report.
+        assert_eq!(i.authority().dropped(), 8);
+        assert_eq!(i.stats().static_conflicts, 4);
+
+        assert_eq!(
+            i.close_startup_window(),
+            Some(Action::Halt {
+                reason: HaltReason::StartupConflicts {
+                    authority: 2,
+                    statics: 1,
+                }
+            }),
+            "two publisher collisions and one bad bracket"
+        );
+        assert!(i.stats().balanced(), "{:?}", i.stats());
     }
 
     /// **The queue high-water mark only rises**, so a queue that fills between

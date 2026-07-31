@@ -72,6 +72,10 @@ ament_export_dependencies(rclcpp geometry_msgs tf2_msgs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  # Test-only, and only for `test_clock`: publishing `/clock` is how a test
+  # makes a `TimeSource` jump. Nothing in the library depends on the message
+  # type — it asks `rclcpp::Clock`, which is the seam that exists for this.
+  find_package(rosgraph_msgs REQUIRED)
 
   # These need a real DDS and a second participant, so they are `ctest`s rather
   # than unit tests — and `just ros-test` is the only gate they run in.
@@ -100,6 +104,16 @@ if(BUILD_TESTING)
   ament_add_gtest(test_node test/test_node.cpp TIMEOUT 120)
   if(TARGET test_node)
     target_link_libraries(test_node tf_tree_ros)
+  endif()
+
+  # §5.5's authoritative jump path, and the clock every diagnostic in
+  # `report()` is rate-limited on. **Its own binary because it is the only test
+  # in this package that turns `use_sim_time` on and publishes `/clock`**, which
+  # changes what "now" means for every node in the process — including the ones
+  # the other four suites build.
+  ament_add_gtest(test_clock test/test_clock.cpp TIMEOUT 180)
+  if(TARGET test_clock)
+    target_link_libraries(test_clock tf_tree_ros ${rosgraph_msgs_TARGETS})
   endif()
 
   # §5.8's amendment: form 3 attached to a node the caller is already spinning.

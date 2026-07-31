@@ -44,12 +44,13 @@
 
 use core::ffi::c_char;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use tf_tree::EdgeWriter;
 use tf_tree_bridge::{
-    Action, AuthorityPolicy, DropReason, HaltReason, Ingest, OnClockReset, Publisher, Sample,
-    Topic, TopologyConfig,
+    Action, AuthorityPolicy, ClockEvidence, DropReason, HaltReason, Ingest, JumpKind, OnClockReset,
+    Publisher, Sample, SteadyNanos, Topic, TopologyConfig,
 };
 
 use crate::error::{guard, set_error};
@@ -83,10 +84,23 @@ pub type tft_bridge_authority = i32;
 pub const TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS: tft_bridge_authority = 0;
 /// Reclaim on each new publisher. Documented as chaotic; never the default.
 pub const TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS: tft_bridge_authority = 1;
-/// Halt on the first conflict. For CI.
+/// Refuse to start if a conflict is detected within the startup window. For CI.
+///
+/// **Not "halt on the first conflict"**, which is what this said and what the
+/// code did before `docs/decisions/0011`. A conflict inside the window is
+/// dropped and counted like `FIRST_WRITER_WINS`, and the bridge halts **once**,
+/// at the window's close, reporting everything it found — CI wants every
+/// misconfiguration out of one run, not the first one out of four. Outside the
+/// window this policy *is* `FIRST_WRITER_WINS` plus counters, so a bridge that
+/// has been healthy for an hour is not killed by a late-joining publisher.
 pub const TFT_BRIDGE_AUTHORITY_STRICT: tft_bridge_authority = 2;
 
-/// §5.5's response to a backwards clock jump beyond the reset threshold.
+/// §5.5's response to the clock being judged to have moved.
+///
+/// **Not only backwards.** Since the authoritative path
+/// ([`tft_bridge_note_time_jump`]) and the common-mode path both see a sim
+/// fast-forward or a bag seek, this policy applies to a *forward* jump too — a
+/// backward-regression watcher structurally could not see one.
 pub type tft_bridge_on_clock_reset = i32;
 /// Stop and report. **The default.**
 pub const TFT_BRIDGE_ON_CLOCK_RESET_HALT: tft_bridge_on_clock_reset = 0;
@@ -112,8 +126,8 @@ pub const TFT_BRIDGE_UNDECLARED: tft_bridge_action = 3;
 pub const TFT_BRIDGE_STATIC_CONFLICT: tft_bridge_action = 4;
 /// The bridge must stop. `reason` is the authority conflict or the clock reset.
 pub const TFT_BRIDGE_HALT: tft_bridge_action = 5;
-/// The clock went backwards past the threshold under `RECREATE`: the caller
-/// must tear this bridge down and build a fresh one. `by_nanos` says how far.
+/// The clock moved under `RECREATE`: the caller must tear this bridge down and
+/// build a fresh one. `delta_nanos` says how far, and which way.
 pub const TFT_BRIDGE_RECREATE: tft_bridge_action = 6;
 /// The pipeline said write and **the arena refused**. `status` carries the
 /// engine's status code, which is the one an operator can act on.
@@ -130,13 +144,52 @@ pub const TFT_BRIDGE_REASON_BAD_NAME: tft_bridge_reason = 1;
 /// `first_time` is what keeps it to one line per pair of colliding publishers
 /// rather than one per message.
 pub const TFT_BRIDGE_REASON_NOT_THE_OWNER: tft_bridge_reason = 2;
-/// The stamp went backwards, but not far enough to be a reset (§5.5).
+/// **This edge's** stamp went backwards (§5.5). `delta_nanos` says how far, and
+/// is negative.
+///
+/// One publisher's stamps arriving out of order, at any magnitude: a few
+/// milliseconds of interleaving, or a node that restarted and is replaying its
+/// own buffer from five seconds ago. The sample is dropped and counted either
+/// way, which is the whole disposition — Phase 1's ring would refuse these
+/// stamps regardless, so the arena is protected without the bridge stopping.
+///
+/// **Distance is not evidence about the clock.** A lone regression is never
+/// promoted to [`TFT_BRIDGE_REASON_CLOCK_RESET`], however far it goes; that
+/// needs a reported jump or corroboration from a second publisher.
 pub const TFT_BRIDGE_REASON_NON_MONOTONIC: tft_bridge_reason = 3;
 /// The edge is already declared with the other kind (§5.7).
 pub const TFT_BRIDGE_REASON_KIND_CHANGE: tft_bridge_reason = 4;
-/// `STRICT`, and two publishers appeared on one edge (§5.4).
+/// `STRICT`, and a conflict was recorded on an edge (§5.4).
+///
+/// On a [`TFT_BRIDGE_HALT`] this is `STRICT`'s startup window closing with
+/// conflicts in it. `detail` carries how many of each kind — authority (§5.4)
+/// **and** static-value (§5.7) — because the halt is about a set of edges and
+/// this POD has room for one. `owner` and `intruder` are empty there, and so are
+/// `parent`/`child`: the window closed on transforms counted long before the one
+/// in hand, so there is no edge to name that would not be the wrong one.
 pub const TFT_BRIDGE_REASON_AUTHORITY_CONFLICT: tft_bridge_reason = 5;
-/// `HALT`, and the clock went backwards past the threshold (§5.5).
+/// The clock was judged to have moved (§5.5). `delta_nanos` is by how much —
+/// **negative for a rewind** — and `detail` names *which rung of §5.5's ladder
+/// fired*, because they are not equally strong:
+///
+/// * *"the time source reported it"* — [`tft_bridge_note_time_jump`], the
+///   authoritative path. No threshold, no window, no corroboration. This is a
+///   fact, and an operator reading it should look at the bag or the simulator.
+/// * *"N publishers stepped together"* — the fallback path, where two or more
+///   distinct publishers' stamp-to-receipt offsets moved by the same amount
+///   inside one correlation window. This is an inference, well corroborated;
+///   its one false-positive mode is two nodes restarting in lockstep, which is
+///   what the operator would go and look at.
+///
+/// **A single publisher regressing is never this.** It is
+/// [`TFT_BRIDGE_REASON_NON_MONOTONIC`], dropped and counted, because one node
+/// restarting, hiccuping or replaying its own buffer is observationally
+/// identical to it and halting a healthy robot for it is an outage caused by the
+/// diagnostic rather than by the fault.
+///
+/// `parent`/`child` name the edge whose sample completed a common-mode step, and
+/// are **empty** for a reported jump: that entry point has no transform in hand,
+/// so any edge it named would be an innocent one.
 pub const TFT_BRIDGE_REASON_CLOCK_RESET: tft_bridge_reason = 6;
 /// The pose was not a transform: NaN, infinity, or a quaternion that is not a
 /// unit quaternion. Checked **before** the pipeline — see [`tft_bridge_offer`].
@@ -157,6 +210,10 @@ pub const TFT_BRIDGE_REASON_ALREADY_HALTED: tft_bridge_reason = 8;
 #[derive(Clone, Copy)]
 pub struct tft_bridge_sample {
     /// `sizeof(tft_bridge_sample)` in the caller's build (§3.6).
+    ///
+    /// **A size from before `received_steady_nanos` existed is accepted**, and read as
+    /// the prefix it is — see [`tft_bridge_offer`]'s *"An older caller's sample
+    /// still works"*.
     pub struct_size: u32,
     /// Parent frame, NUL-terminated UTF-8, **exactly as it arrived**. Passing
     /// the raw name is deliberate: §5.6's normalization is what the bridge is
@@ -165,10 +222,130 @@ pub struct tft_bridge_sample {
     /// Child frame, likewise raw.
     pub child_frame_id: *const c_char,
     /// Stamp, nanoseconds, in the bridge's own time domain (§5.5).
+    ///
+    /// **The publisher's number, in the domain under suspicion.** Nothing §5.5
+    /// concludes about the clock is concluded by comparing this against another
+    /// publisher's stamp; it is compared against `received_steady_nanos`.
     pub stamp_nanos: i64,
     /// `[qw qx qy qz tx ty tz]`.
     pub pose: [f64; 7],
+    /// A reading of a local **steady (monotonic)** clock, in nanoseconds, taken
+    /// when the message carrying this transform arrived. `0` for "none".
+    ///
+    /// # Where a ROS caller gets one
+    ///
+    /// `rclcpp::Clock(RCL_STEADY_TIME).now().nanoseconds()`, read **once per
+    /// `TFMessage`** at subscription-callback entry and copied onto every sample
+    /// the message expands into.
+    ///
+    /// Not `node->get_clock()`: that is `RCL_ROS_TIME`, which under
+    /// `use_sim_time` *is* `/clock` — the clock under test. A detector whose
+    /// reference is the signal it is judging cannot judge it. `RCL_STEADY_TIME`
+    /// is unaffected by `use_sim_time`, which is the entire reason it is the
+    /// reference.
+    ///
+    /// Not once per transform, either: that puts a clock read on a 1 kHz path,
+    /// and it turns one measurement of a publisher's offset into twenty
+    /// slightly different ones.
+    ///
+    /// # What it is for, and what `0` costs
+    ///
+    /// §5.5 measures `stamp_nanos - received_steady_nanos` per publisher. That
+    /// difference *is* the publisher's `transform_tolerance` — a localizer
+    /// dating `map -> odom` 300 ms into the future has a steady offset of
+    /// +300 ms — so it is measured and subtracted rather than mistaken for a
+    /// jump. A **step** in it, agreed on by two or more distinct publishers
+    /// inside one correlation window, is the fallback evidence that the clock
+    /// moved.
+    ///
+    /// `0` means the caller has no steady clock to offer. The offset layer is
+    /// then simply absent for that sample: per-edge monotonicity is still
+    /// enforced and non-monotonic samples are still dropped and counted, so the
+    /// arena is protected exactly as before, and only the *corroborated* clock
+    /// verdict is unavailable. That is the honest degradation, and a safe one,
+    /// because a single witness never halts anything.
+    ///
+    /// **Do not pass `stamp_nanos` here.** It makes the difference identically
+    /// zero for every publisher, which re-enables inference over the signal
+    /// under suspicion and resurrects the `transform_tolerance` false positive
+    /// this field exists to remove.
+    ///
+    /// The name says *which clock*, and that is not verbosity. The whole bug
+    /// class this design removes is two clocks being confused for one, and a
+    /// field called `received_steady_nanos` sitting next to `stamp_nanos` would be an
+    /// invitation to fill it from whichever one was nearest.
+    pub received_steady_nanos: i64,
 }
+
+/// `tft_bridge_sample` as ABI **0.1** laid it out, before `received_steady_nanos`.
+///
+/// Frozen here so [`tft_bridge_offer`] can *compute* the size an older caller
+/// will send instead of hardcoding one. A literal `88` is right on exactly the
+/// targets somebody checked and silently wrong on any other pointer width or
+/// `i64` alignment — and it rots the first time a field before `pose` changes.
+///
+/// The assertions below are what keep it a description of history rather than a
+/// second, drifting definition: every field it declares must still sit at the
+/// same offset in the current struct, and its size must be exactly where the
+/// appended field begins. Reorder or resize anything ahead of `received_steady_nanos`
+/// and this fails to compile, which is the only moment at which the prefix rule
+/// could quietly stop being true.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct tft_bridge_sample_v1 {
+    struct_size: u32,
+    frame_id: *const c_char,
+    child_frame_id: *const c_char,
+    stamp_nanos: i64,
+    pose: [f64; 7],
+}
+
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(
+        offset_of!(tft_bridge_sample_v1, struct_size) == offset_of!(tft_bridge_sample, struct_size)
+    );
+    assert!(offset_of!(tft_bridge_sample_v1, frame_id) == offset_of!(tft_bridge_sample, frame_id));
+    assert!(
+        offset_of!(tft_bridge_sample_v1, child_frame_id)
+            == offset_of!(tft_bridge_sample, child_frame_id)
+    );
+    assert!(
+        offset_of!(tft_bridge_sample_v1, stamp_nanos) == offset_of!(tft_bridge_sample, stamp_nanos)
+    );
+    assert!(offset_of!(tft_bridge_sample_v1, pose) == offset_of!(tft_bridge_sample, pose));
+    // The appended field begins exactly where the old struct ended, so a v1
+    // caller's bytes are a prefix of a current one's with nothing in between.
+    assert!(
+        size_of::<tft_bridge_sample_v1>() == offset_of!(tft_bridge_sample, received_steady_nanos)
+    );
+    assert!(size_of::<tft_bridge_sample_v1>() < size_of::<tft_bridge_sample>());
+};
+
+/// Which way, and in what sense, the time source said its clock jumped —
+/// [`tft_bridge_note_time_jump`].
+///
+/// Mirrors `rcl_time_jump_t`: `rcl_clock_change_t` distinguishes a change of
+/// time *source* from motion within one source, and `rcl_duration_t delta` is
+/// *"the new time minus the last time before the jump"*.
+pub type tft_bridge_jump_kind = i32;
+/// The clock *source* changed: `use_sim_time` was switched at runtime
+/// (`RCL_ROS_TIME_ACTIVATED` / `RCL_ROS_TIME_DEACTIVATED`).
+///
+/// Its own kind rather than a large backward or forward jump because the delta
+/// across that boundary compares two different time bases and is not a duration
+/// in either of them.
+pub const TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED: tft_bridge_jump_kind = 0;
+/// Time moved backwards: a bag loop, a sim reset, an NTP step back.
+/// `delta_nanos` is negative.
+pub const TFT_BRIDGE_JUMP_BACKWARD: tft_bridge_jump_kind = 1;
+/// Time moved forwards past the source's reporting threshold: a bag seek, a sim
+/// fast-forward, an NTP step. `delta_nanos` is positive.
+///
+/// **Only the authoritative path can see this cheaply.** A forward jump leaves
+/// every edge's stamps perfectly monotone, so nothing in the per-edge machinery
+/// is even disturbed by it.
+pub const TFT_BRIDGE_JUMP_FORWARD: tft_bridge_jump_kind = 2;
 
 /// What the bridge decided, and everything needed to print a sentence about it.
 ///
@@ -205,8 +382,22 @@ pub struct tft_bridge_outcome {
     /// the one actionable line. §5.4 requires the diagnostic be "loud,
     /// **rate-limited**"; this field is the whole of that mechanism.
     pub first_time: u8,
-    /// How far time went backwards, for
-    /// [`TFT_BRIDGE_REASON_NON_MONOTONIC`] and [`TFT_BRIDGE_RECREATE`].
+    /// How far time went **backwards**, as a positive magnitude. `0` when it did
+    /// not.
+    ///
+    /// This is a *distance*, and it is unchanged: for
+    /// [`TFT_BRIDGE_REASON_NON_MONOTONIC`] it is how far this edge's stamp fell
+    /// short of its own last accepted one, which is what a caller printing
+    /// *"went backwards by %ld ns"* wants and always wanted.
+    ///
+    /// **Not the same field as [`tft_bridge_outcome::delta_nanos`], and
+    /// deliberately not merged with it.** One is a backwards distance and the
+    /// other is a signed displacement; they agree in magnitude on a rewind and
+    /// say different things on a jump forwards, where this is `0` and
+    /// `delta_nanos` is positive. C has no type that carries the distinction, so
+    /// the two names are the only thing preserving it — a later tidy-up that
+    /// collapsed them would print *"went backwards by -5000000000 ns"* on
+    /// exactly the fault the sentence exists for.
     pub by_nanos: i64,
     /// The parent frame. Normalized (§5.6) for every outcome the pipeline
     /// named an edge in; **as it arrived** for `TFT_BRIDGE_DROPPED`,
@@ -214,6 +405,12 @@ pub struct tft_bridge_outcome {
     /// reason. The difference is one leading `/` and any `tf_prefix`, so the
     /// pair identifies the same edge either way — and for
     /// [`TFT_BRIDGE_REASON_BAD_NAME`] the raw name is the only useful one.
+    ///
+    /// **Empty when the outcome is not about an arriving transform**: a
+    /// `STRICT` startup-window close, and a jump reported through
+    /// [`tft_bridge_note_time_jump`]. Both are judgments about transforms
+    /// counted earlier or about no transform at all, so any edge they named
+    /// would be an innocent one.
     pub parent: *const c_char,
     /// The child frame, on the same terms as `parent`.
     pub child: *const c_char,
@@ -227,7 +424,72 @@ pub struct tft_bridge_outcome {
     pub offered: [f64; 7],
     /// A one-line human-readable description, or `""`.
     pub detail: *const c_char,
+    /// How far time moved, and **which way**: new time minus old time, so a
+    /// rewind is **negative**. `0` where it does not apply.
+    ///
+    /// Set for [`TFT_BRIDGE_REASON_CLOCK_RESET`] and [`TFT_BRIDGE_RECREATE`] —
+    /// the clock event itself, however it was concluded — and for
+    /// [`TFT_BRIDGE_REASON_NON_MONOTONIC`], where it is the negation of
+    /// `by_nanos`.
+    ///
+    /// **Signed, because the clock can now be judged to have moved forwards.**
+    /// An authoritative jump report and a common-mode step both see a bag seek
+    /// or a sim fast-forward, which no backward-regression watcher could. The
+    /// convention is `rcl_time_jump_t::delta`'s — *"the new time minus the last
+    /// time before the jump"* — so the number a node reads out of `rcl` and the
+    /// number it reads back out of this struct are the same quantity, with no
+    /// conversion nobody would remember to write.
+    pub delta_nanos: i64,
+    /// **Which rung of §5.5's ladder concluded the clock moved** — one of the
+    /// `TFT_BRIDGE_EVIDENCE_*` codes, or [`TFT_BRIDGE_EVIDENCE_NONE`].
+    ///
+    /// This is the first thing an operator woken at 3 a.m. by a stopped bridge
+    /// needs, before the edge and before the delta. *"The time source reported a
+    /// backward jump"* is a fact: go and look at the bag or the simulator.
+    /// *"Three publishers stepped together by about the same amount"* is an
+    /// inference, well corroborated but capable of being wrong in a way the
+    /// first is not: go and look at those three nodes.
+    ///
+    /// The pipeline knows which one fired and used to discard it at this
+    /// boundary, leaving `detail` — a sentence — as the only carrier. A code is
+    /// what a caller can branch on.
+    pub clock_evidence: i32,
+    /// What the evidence consisted of, read according to `clock_evidence`:
+    ///
+    /// * [`TFT_BRIDGE_EVIDENCE_REPORTED`] — the [`tft_bridge_jump_kind`] the
+    ///   time source reported.
+    /// * [`TFT_BRIDGE_EVIDENCE_COMMON_MODE`] — how many distinct publishers
+    ///   stepped together and agreed. Always ≥ 2; one witness never concludes
+    ///   anything.
+    /// * [`TFT_BRIDGE_EVIDENCE_NONE`] — `0`, and meaningless.
+    pub clock_evidence_detail: u32,
 }
+
+/// Which rung of §5.5's ladder concluded that the clock moved.
+pub type tft_bridge_evidence = i32;
+/// No clock judgment was made on this outcome, and
+/// `clock_evidence_detail` is `0`.
+///
+/// The value **every** outcome starts at, set by `blank_outcome` before any arm
+/// runs, so a caller reading these two fields on an unrelated outcome sees
+/// "nothing to report" rather than the last clock event's evidence. That is the
+/// same mechanism the borrowed strings use, and it exists for the same reason: a
+/// field left over from a previous outcome points at valid memory and says
+/// something false, which is the failure a bridge diagnostic can least afford.
+pub const TFT_BRIDGE_EVIDENCE_NONE: tft_bridge_evidence = 0;
+/// The time source itself reported the jump, through
+/// [`tft_bridge_note_time_jump`]. No threshold, no window, no corroboration —
+/// this is not an inference at all. `clock_evidence_detail` is the
+/// [`tft_bridge_jump_kind`].
+pub const TFT_BRIDGE_EVIDENCE_REPORTED: tft_bridge_evidence = 1;
+/// Two or more distinct publishers' stamp-to-receipt offsets stepped by the same
+/// amount inside one correlation window. `clock_evidence_detail` is how many.
+///
+/// The fallback rung, for callers with no authoritative signal and for
+/// system-clock steps `/clock` never reports. A real clock step moves every
+/// publisher by the same amount and independent restarts do not, which is what
+/// makes agreement — rather than mere coincidence in time — the evidence.
+pub const TFT_BRIDGE_EVIDENCE_COMMON_MODE: tft_bridge_evidence = 2;
 
 /// How the bridge is configured at creation.
 #[repr(C)]
@@ -306,7 +568,15 @@ pub struct tft_bridge_stats {
     pub static_verified: u64,
     /// Dropped because another publisher owns the edge (§5.4).
     pub dropped_authority: u64,
-    /// Dropped because the stamp went backwards (§5.5).
+    /// Transforms **the clock rules refused** (§5.5).
+    ///
+    /// Named for the common case and wider than the name: an edge's stamp going
+    /// backwards against its own last accepted one, at any magnitude, *and* the
+    /// sample that completed a common-mode step — which may be perfectly
+    /// monotone, because the clock can be judged to have jumped forward. There
+    /// is one bucket for "refused because time misbehaved" and a second one
+    /// would be a `struct_size`-versioned growth of this struct, so the meaning
+    /// is stated here rather than left to the name to imply.
     pub dropped_non_monotonic: u64,
     /// Dropped because the frame name was unusable (§5.6).
     pub dropped_bad_name: u64,
@@ -319,12 +589,23 @@ pub struct tft_bridge_stats {
     /// quaternion). `tf2` has no equivalent check and no equivalent counter.
     pub dropped_bad_pose: u64,
     /// The pipeline approved the write and the arena refused it — a revoked
-    /// claim, or a per-edge stamp the global clock guard could not see.
+    /// claim, or a writer poisoned by a `fork()`. **Not a stamp the clock guard
+    /// missed:** since `docs/decisions/0011` the guard is per edge, so its
+    /// high-water mark is that edge's own last accepted stamp and the ring it
+    /// feeds cannot disagree with it.
     pub rejected_by_arena: u64,
     /// Offers refused because the bridge had already stopped — after a
     /// [`TFT_BRIDGE_HALT`] *or* a [`TFT_BRIDGE_RECREATE`], both of which latch.
     pub refused_after_halt: u64,
-    /// Clock resets detected (§5.5).
+    /// Clock resets concluded (§5.5) — **promotions**, not regressions.
+    ///
+    /// A single publisher's stamp going backwards is counted in
+    /// `dropped_non_monotonic` and nowhere else, however far it went. This
+    /// counts the times the clock itself was judged to have moved, by either
+    /// rung of §5.5's ladder: a jump the time source reported through
+    /// [`tft_bridge_note_time_jump`], or two or more distinct publishers whose
+    /// offsets stepped by the same amount inside one correlation window. Under
+    /// `HALT` it is therefore 0 or 1 for the life of a bridge.
     pub clock_resets: u64,
     /// Static-transform value conflicts (§5.7).
     pub static_conflicts: u64,
@@ -468,11 +749,13 @@ struct BridgeInner {
     /// §5.5's `--on-clock-reset`, and this ABI cannot recreate the arena for the
     /// reasons in [`tft_bridge_offer`]'s docs — so the *only* correct
     /// continuation is that the caller tears this bridge down. Left unlatched,
-    /// the pipeline's clock guard has already accepted the rewound stamp
-    /// (`ClockGuard::accept_reset`), so every subsequent offer would be approved
-    /// and the arena would refuse it per edge as non-monotonic: a bag loop would
-    /// turn into a silent, permanent stall reported one `rejected_by_arena` at a
-    /// time rather than the one loud outcome §5.5 asks for.
+    /// the pipeline has already **forgotten every edge's high-water mark** — the
+    /// `Recreate` path rewinds each guard to "no stamp seen yet", which is what
+    /// `docs/decisions/0011` replaced the old single `ClockGuard::accept_reset`
+    /// with — so every subsequent offer would be approved and the arena would
+    /// refuse it per edge as non-monotonic: a bag loop would turn into a silent,
+    /// permanent stall reported one `rejected_by_arena` at a time rather than the
+    /// one loud outcome §5.5 asks for.
     stopped: Option<Stopped>,
     dropped_bad_pose: u64,
     rejected_by_arena: u64,
@@ -494,8 +777,11 @@ struct BridgeInner {
 struct Stopped {
     /// [`TFT_BRIDGE_HALT`] or [`TFT_BRIDGE_RECREATE`].
     action: tft_bridge_action,
-    /// How far time went backwards, or `0` for an authority conflict.
+    /// How far time went backwards, or `0` for a conflict halt or a forward
+    /// jump. The replayed outcome's `by_nanos`.
     by_nanos: i64,
+    /// How far time moved and which way. The replayed outcome's `delta_nanos`.
+    delta_nanos: i64,
 }
 
 /// # Safety
@@ -863,12 +1149,41 @@ pub unsafe extern "C" fn tft_bridge_free(b: *mut tft_bridge) {
 /// plans. The caller tears the bridge down, rebuilds it, and re-plans — which is
 /// the only sequence that is correct, so it is the only one offered.
 ///
+/// # An older caller's sample still works
+///
+/// §3.6 promises fields can be appended to a `struct_size`-versioned struct
+/// *"without a major bump"*, and until `tft_bridge_sample::received_steady_nanos` was
+/// appended nothing here implemented it: the check was an exact equality, so a
+/// caller holding a `libtf_tree_c.a` newer than its header got
+/// [`TFT_ERR_BAD_STRUCT_SIZE`] on **every** offer — a total outage in precisely the case §3.6 was written for, and
+/// exactly the shape §4.4's prebuilt-library path makes reachable.
+///
+/// So a `struct_size` naming the pre-`received_steady_nanos` layout is accepted and
+/// read as the prefix it is. A *larger* size is still refused: that is a newer
+/// caller against an older library, where the library cannot know what the extra
+/// bytes mean, and [`tft_check_abi`](crate::tft_check_abi)'s minor rule already
+/// covers it.
+///
+/// **The missing field is filled from this library's own steady clock**, not
+/// left at `0`. `0` would be honest for a caller that has one and chose not to
+/// supply it, but a caller that predates the field cannot have chosen anything,
+/// and a monotonic reading taken microseconds after the message arrived is a
+/// good measurement of when it arrived — inside the 100 ms threshold and the 1 s
+/// correlation window by four orders of magnitude. The cost is that the reading
+/// is per *transform* rather than per message, so a 20-transform `TFMessage`
+/// spreads a publisher's offset by however long those 20 calls take; that is
+/// microseconds, and the baseline smooths it away. The alternative —
+/// substituting `stamp_nanos` — is the one thing that must never happen, because
+/// it re-enables inference over the signal under suspicion for exactly the
+/// callers who cannot see the fix.
+///
 /// # Safety
 ///
 /// `b` must be a live handle used from the thread that created it. `s` must
-/// point to a readable `tft_bridge_sample` with `struct_size` set and both frame
-/// pointers NUL-terminated. `gid` must be NULL or point to 16 readable bytes.
-/// `out` must point to a writable `tft_bridge_outcome` with `struct_size` set.
+/// point to a `tft_bridge_sample` with `struct_size` set and at least that many
+/// readable bytes, and both frame pointers NUL-terminated. `gid` must be NULL or
+/// point to 16 readable bytes. `out` must point to a writable
+/// `tft_bridge_outcome` with `struct_size` set.
 #[no_mangle]
 pub unsafe extern "C" fn tft_bridge_offer(
     b: *mut tft_bridge,
@@ -919,12 +1234,11 @@ pub unsafe extern "C" fn tft_bridge_offer(
         }
         // SAFETY: the caller contracts a readable sample with `struct_size` set.
         let declared = unsafe { core::ptr::addr_of!((*s).struct_size).read_unaligned() };
-        if declared as usize != core::mem::size_of::<tft_bridge_sample>() {
+        // SAFETY: the caller contracts `struct_size` readable bytes at `s`, and
+        // `read_sample` reads no more than the size it validates.
+        let Some(sample) = (unsafe { read_sample(s, declared) }) else {
             return bad_struct_size("tft_bridge_sample");
-        }
-        // SAFETY: `struct_size` matched this build's, so the whole struct is
-        // present and readable.
-        let sample = unsafe { core::ptr::read_unaligned(s) };
+        };
         let topic = match topic {
             TFT_BRIDGE_TOPIC_TF => Topic::Tf,
             TFT_BRIDGE_TOPIC_TF_STATIC => Topic::TfStatic,
@@ -958,13 +1272,20 @@ pub unsafe extern "C" fn tft_bridge_offer(
             o.action = st.action;
             o.reason = TFT_BRIDGE_REASON_ALREADY_HALTED;
             o.by_nanos = st.by_nanos;
+            o.delta_nanos = st.delta_nanos;
+            // **The evidence is not replayed**, and stays at
+            // `TFT_BRIDGE_EVIDENCE_NONE`. It was reported once, on the outcome
+            // that carried `first_time = 1`; a caller logging every replay is
+            // the failure `first_time` exists to prevent, and repeating the
+            // evidence would make each replay look like a fresh conclusion.
+            //
             // The wording follows the *latched* action, not the word "halt": a
             // caller told to recreate and then told it halted would read the
             // second as a different, worse fault than the first.
             set(
                 &mut inner.strings.detail,
                 if st.action == TFT_BRIDGE_RECREATE {
-                    "the clock went backwards past the reset threshold; free this bridge, \
+                    "the clock moved past the reset threshold; free this bridge, \
                      build a new one, and re-plan"
                 } else {
                     "the bridge halted; free it and build a new one"
@@ -1003,6 +1324,11 @@ pub unsafe extern "C" fn tft_bridge_offer(
         inner.scratch.child_frame_id.push_str(child);
         inner.scratch.stamp_nanos = sample.stamp_nanos;
         inner.scratch.pose = sample.pose;
+        // `read_sample` has already substituted this build's own steady clock
+        // for a caller that predates the field; a current caller's `0` means
+        // "no receipt clock", and the pipeline skips its offset layer for this
+        // sample rather than being fed a fiction.
+        inner.scratch.received = SteadyNanos(sample.received_steady_nanos);
 
         // SAFETY: the caller contracts `gid` is NULL or 16 readable bytes.
         let who = unsafe { publisher_of(&inner.gids, gid) };
@@ -1012,6 +1338,86 @@ pub unsafe extern "C" fn tft_bridge_offer(
         unsafe { core::ptr::write(out, o) };
         TFT_OK
     })
+}
+
+/// Read a caller's `tft_bridge_sample`, accepting the layout that predates
+/// `received_steady_nanos` as a prefix of the current one.
+///
+/// `None` means the size belongs to neither build and the caller gets
+/// [`TFT_ERR_BAD_STRUCT_SIZE`](crate::TFT_ERR_BAD_STRUCT_SIZE).
+///
+/// **The bounded copy is the whole safety argument**, and it is why relaxing the
+/// old `!=` to a `<=` would not have been enough on its own: the previous code
+/// read the *whole* struct with `read_unaligned`, so accepting a shorter one
+/// without narrowing the read is an out-of-bounds read in the one crate whose
+/// entire `unsafe` budget is argument validation. `copy_nonoverlapping` over
+/// `u8` also inherits `read_unaligned`'s tolerance of a misaligned caller
+/// pointer, because `u8` has alignment 1.
+///
+/// # Safety
+///
+/// `s` must be non-NULL and point to at least `declared` readable bytes.
+unsafe fn read_sample(s: *const tft_bridge_sample, declared: u32) -> Option<tft_bridge_sample> {
+    let current = core::mem::size_of::<tft_bridge_sample>();
+    let v1 = core::mem::size_of::<tft_bridge_sample_v1>();
+    let declared = declared as usize;
+    if declared != current && declared != v1 {
+        return None;
+    }
+    // Every field the copy below may leave untouched needs a defined value, and
+    // the defaults are the documented "not supplied": a NULL name is rejected by
+    // the caller a few lines later, and a `0` receipt time means "no steady
+    // clock", which is corrected immediately for the v1 case.
+    let mut sample = tft_bridge_sample {
+        struct_size: 0,
+        frame_id: core::ptr::null(),
+        child_frame_id: core::ptr::null(),
+        stamp_nanos: 0,
+        pose: [0.0; 7],
+        received_steady_nanos: 0,
+    };
+    // SAFETY: `declared` is one of the two validated sizes and both are at most
+    // `size_of::<tft_bridge_sample>()`, so the destination has room; the caller
+    // contracts `declared` readable bytes at `s`; the two regions cannot overlap
+    // because `sample` is a fresh local; `u8` imposes no alignment.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            s.cast::<u8>(),
+            core::ptr::addr_of_mut!(sample).cast::<u8>(),
+            declared,
+        );
+    }
+    if declared == v1 {
+        sample.received_steady_nanos = steady_now_nanos();
+    }
+    Some(sample)
+}
+
+/// This library's own steady clock, in nanoseconds, for a caller too old to have
+/// one to give.
+///
+/// `Instant` is Rust's monotonic clock — `CLOCK_MONOTONIC` on Linux, the same
+/// source `RCL_STEADY_TIME` reaches — so it satisfies the one property §5.5's
+/// detector needs of a reference: it is **independent of the clock under test**
+/// and unaffected by `use_sim_time`, by `/clock`, or by anything a publisher
+/// does.
+///
+/// Read only on the legacy path. A current caller supplies its own reading at
+/// message granularity, which is strictly better, and putting a clock read on
+/// the hot path for everybody in order to serve the callers who cannot ask for
+/// one would charge every caller 1 kHz for a measurement most of them already
+/// have.
+///
+/// The epoch is this process's first call. Nothing may be compared across
+/// processes and nothing here does — only differences within one publisher's
+/// stream are ever taken. The `+ 1` keeps the very first reading off `0`, which
+/// the pipeline reads as "no receipt clock at all": a one-nanosecond bias, in
+/// exchange for the one value in the range that means something else.
+fn steady_now_nanos() -> i64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let base = *BASE.get_or_init(Instant::now);
+    let ns = Instant::now().saturating_duration_since(base).as_nanos();
+    i64::try_from(ns).unwrap_or(i64::MAX).saturating_add(1)
 }
 
 /// Resolve a GID against the cache, per §5.3's degradation rules.
@@ -1071,12 +1477,17 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                 // Reaching it needs the arena to refuse a write the pipeline
                 // approved, and on a private heap arena that cannot happen:
                 //
-                // * `PushError::NonMonotonicStamp` is dominated by the global
-                //   clock guard. `Action::Publish` requires `stamp >= newest`,
-                //   and `newest` is the maximum over every accepted sample, so
-                //   it is `>=` any one edge's own last stamp. The `Recreate`
-                //   path is the only thing that rewinds `newest`, and it
-                //   latches `stopped` before another offer can be processed.
+                // * `PushError::NonMonotonicStamp` is dominated by the clock
+                //   guard, and `docs/decisions/0011` made that argument
+                //   *simpler* rather than breaking it. `Action::Publish`
+                //   requires `stamp >= newest`, and since the guards are per
+                //   edge, `newest` is **this edge's** last accepted stamp —
+                //   exactly the value its ring compares against, so the two
+                //   cannot disagree. (The old single guard dominated the ring
+                //   only incidentally, by being the maximum over every edge.)
+                //   The `Recreate` path is the only thing that rewinds those
+                //   marks, and it latches `stopped` before another offer can be
+                //   processed.
                 // * `PushError::ClaimRevoked` needs a reaper, and
                 //   `PushError::ChildDetached` needs a `fork()`; both are
                 //   `--features shm` machinery (`docs/PHASE2.md` §1, A4) that a
@@ -1182,7 +1593,16 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                 DropReason::BadName => TFT_BRIDGE_REASON_BAD_NAME,
                 DropReason::KindChange => TFT_BRIDGE_REASON_KIND_CHANGE,
                 DropReason::NonMonotonic { by_nanos } => {
+                    // **Both, and they are not redundant.** `by_nanos` is the
+                    // backwards distance a caller prints in "went backwards by
+                    // %ld ns"; `delta_nanos` is the signed displacement, so a
+                    // caller that reads only the signed field gets this edge's
+                    // regression in the same convention as the clock events
+                    // beside it. Filling one and leaving the other at 0 would
+                    // make the outcome quietly wrong for whichever caller read
+                    // the other.
                     o.by_nanos = *by_nanos;
+                    o.delta_nanos = -*by_nanos;
                     TFT_BRIDGE_REASON_NON_MONOTONIC
                 }
             };
@@ -1200,48 +1620,204 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             // because a halted bridge answers `HALT` to every transform
             // forever.
             o.first_time = 1;
-            match reason {
+            // **The detail is the match's value, not a write inside it.** The
+            // evidence two of these variants carry — which rung of §5.5's ladder
+            // fired, and the pair of startup conflict counts — has nowhere else
+            // to go: `tft_bridge_outcome` is a `struct_size`-versioned POD and
+            // growing it is a break neither `docs/decisions/0011` nor this took.
+            // So they ride in `detail`, and an arm that wrote `detail` itself
+            // would have had it overwritten by the "the bridge halted" sentence
+            // that used to follow this match unconditionally. Returning the
+            // string makes that mistake unrepresentable rather than a comment
+            // asking the next author not to make it.
+            let detail = match reason {
                 HaltReason::AuthorityConflict { owner, intruder } => {
                     o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
                     set(&mut inner.strings.owner, &owner.to_string());
                     set(&mut inner.strings.intruder, &intruder.to_string());
                     o.owner = ptr(&inner.strings.owner);
                     o.intruder = ptr(&inner.strings.intruder);
+                    name_the_edge(inner, o);
+                    "the bridge halted; free it and build a new one".to_string()
                 }
-                HaltReason::ClockReset { by_nanos } => {
+                HaltReason::ClockReset {
+                    delta_nanos,
+                    evidence,
+                } => {
                     o.reason = TFT_BRIDGE_REASON_CLOCK_RESET;
-                    o.by_nanos = *by_nanos;
+                    o.delta_nanos = *delta_nanos;
+                    o.by_nanos = backwards_by(*delta_nanos);
+                    set_evidence(o, *evidence);
+                    // **Named only for the inferred rung**, and the split is the
+                    // same argument `StartupConflicts` below makes. A
+                    // common-mode step is completed *by the arriving sample*, so
+                    // `scratch` holds the edge that completed it and naming it
+                    // is the diagnostic. A reported jump arrives through
+                    // `tft_bridge_note_time_jump` with no transform in hand at
+                    // all, so `scratch` holds whichever edge happened to be last
+                    // on the wire — an innocent one, printed as the cause.
+                    if matches!(evidence, ClockEvidence::CommonMode { .. }) {
+                        name_the_edge(inner, o);
+                    }
+                    format!(
+                        "the clock moved: {}; the bridge halted, free it and build a new one",
+                        clock_evidence(*evidence, *delta_nanos)
+                    )
                 }
-            }
-            name_the_edge(inner, o);
+                HaltReason::StartupConflicts { authority, statics } => {
+                    // **Reported under the authority reason, and that is a
+                    // limitation rather than a claim.** §5.4's `Strict` is what
+                    // raised this and a conflict is what it found, so the code is
+                    // the closest true one — but `statics` counts §5.7 value
+                    // disagreements, which that code does not name. A dedicated
+                    // `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` is
+                    // `docs/decisions/0011`'s implementation step 6 and cannot
+                    // land here: an unstable constant has to be added to
+                    // `UNSTABLE` in `xtask/src/headers.rs` in the same commit,
+                    // because the stable tier's cbindgen config is
+                    // exclude-by-complement and an unclassified constant is
+                    // emitted into the **frozen** `tf_tree.h` with nothing
+                    // failing. Until then both counts are in `detail`, which is
+                    // what the `rclcpp` HALT arm prints anyway.
+                    o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
+                    // **No `name_the_edge` here, deliberately.** The other two
+                    // arms are judgments *about the arriving sample*, so the
+                    // scratch names are that sample's and naming it is the
+                    // diagnostic. This one is not: the window closed on
+                    // transforms counted minutes ago and the arriving transform
+                    // was never processed, so `scratch` holds whichever edge
+                    // happened to be next on the wire. Printing it would name an
+                    // innocent edge as the cause of the halt. `parent`/`child`
+                    // stay at `blank_outcome`'s `""`, which is the documented
+                    // "does not apply to this outcome".
+                    format!(
+                        "STRICT: the startup window closed with {authority} authority and \
+                         {statics} static conflict(s); this deployment is misconfigured and \
+                         the bridge will not start"
+                    )
+                }
+            };
             inner.stopped = Some(Stopped {
                 action: TFT_BRIDGE_HALT,
                 by_nanos: o.by_nanos,
+                delta_nanos: o.delta_nanos,
             });
-            set(
-                &mut inner.strings.detail,
-                "the bridge halted; free it and build a new one",
-            );
+            set(&mut inner.strings.detail, &detail);
             o.detail = ptr(&inner.strings.detail);
         }
-        Action::RecreateArena { by_nanos } => {
+        Action::RecreateArena {
+            delta_nanos,
+            evidence,
+        } => {
             o.action = TFT_BRIDGE_RECREATE;
             // Latched on the same terms as `Action::Halt` above.
             o.first_time = 1;
             o.reason = TFT_BRIDGE_REASON_CLOCK_RESET;
-            o.by_nanos = *by_nanos;
-            name_the_edge(inner, o);
+            o.delta_nanos = *delta_nanos;
+            o.by_nanos = backwards_by(*delta_nanos);
+            // **The evidence, on both rungs.**
+            //
+            // An earlier revision of this arm could only report the
+            // authoritative case, because `Action::RecreateArena` carried the
+            // delta and nothing else — so an *inferred* recreate came out as
+            // `TFT_BRIDGE_EVIDENCE_NONE` and the operator could not tell a
+            // rebuild the sim or the bag had announced from one this bridge had
+            // decided on. `evidence` was added to the variant in
+            // `tf_tree_bridge` for exactly that, and it matters more under
+            // `Recreate` than under `Halt`: a halt stops and waits for a human,
+            // while a recreate throws the arena away and carries on, so nobody
+            // is looking unless the line says which of the two happened.
+            set_evidence(o, *evidence);
+            // **No edge is named**, unlike the halt above, and the asymmetry is
+            // deliberate rather than an omission: this arm is reached from both
+            // entry points and the pipeline's `RecreateArena` does not say which
+            // — it carries only the delta, because under `Recreate` the response
+            // is to throw the whole arena away and no edge is more implicated
+            // than any other. Naming `scratch` here would name an innocent edge
+            // for every jump reported with no transform in hand.
             inner.stopped = Some(Stopped {
                 action: TFT_BRIDGE_RECREATE,
-                by_nanos: *by_nanos,
+                by_nanos: o.by_nanos,
+                delta_nanos: *delta_nanos,
             });
             set(
                 &mut inner.strings.detail,
-                "the clock went backwards past the reset threshold; free this bridge, \
+                "the clock moved past the reset threshold; free this bridge, \
                  build a new one, and re-plan",
             );
             o.detail = ptr(&inner.strings.detail);
         }
+    }
+}
+
+/// How far a signed displacement went **backwards**, as a positive magnitude —
+/// `0` if it went forwards.
+///
+/// The one place the two representations are converted between, so a forward
+/// jump cannot end up reported as a backward distance by an arm that reached for
+/// `abs()`. `unsigned_abs` then `try_from` rather than `-delta`, because
+/// `-i64::MIN` overflows and the deltas here are caller-supplied.
+fn backwards_by(delta_nanos: i64) -> i64 {
+    if delta_nanos >= 0 {
+        return 0;
+    }
+    i64::try_from(delta_nanos.unsigned_abs()).unwrap_or(i64::MAX)
+}
+
+/// Copy the pipeline's evidence into the outcome's two branchable fields.
+///
+/// One function so the code and its detail can never disagree about which rung
+/// fired: [`clock_evidence`] writes the sentence and this writes the machine
+/// -readable form of the *same* value, and both take it as an argument rather
+/// than deriving it.
+fn set_evidence(o: &mut tft_bridge_outcome, evidence: ClockEvidence) {
+    match evidence {
+        ClockEvidence::Reported { kind } => {
+            o.clock_evidence = TFT_BRIDGE_EVIDENCE_REPORTED;
+            o.clock_evidence_detail = match kind {
+                JumpKind::ClockTypeChanged => TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED,
+                JumpKind::Backward => TFT_BRIDGE_JUMP_BACKWARD,
+                JumpKind::Forward => TFT_BRIDGE_JUMP_FORWARD,
+            }
+            .unsigned_abs();
+        }
+        ClockEvidence::CommonMode { publishers } => {
+            o.clock_evidence = TFT_BRIDGE_EVIDENCE_COMMON_MODE;
+            o.clock_evidence_detail = publishers;
+        }
+    }
+}
+
+/// The half-sentence naming which rung of §5.5's ladder concluded the clock
+/// moved, and by how much.
+///
+/// Kept out of [`fill`] so the two rungs are described in one place: *"the time
+/// source reported it"* and *"three publishers stepped together"* send an
+/// operator to different places, and a wording that drifted between the halt and
+/// the recreate would be worse than no wording at all.
+fn clock_evidence(evidence: ClockEvidence, delta_nanos: i64) -> String {
+    let (way, magnitude) = if delta_nanos < 0 {
+        ("backwards", delta_nanos.unsigned_abs())
+    } else {
+        ("forwards", delta_nanos.unsigned_abs())
+    };
+    match evidence {
+        ClockEvidence::Reported { kind } => {
+            let what = match kind {
+                // The delta across a source change compares two different time
+                // bases, so it is not a duration in either and is not printed as
+                // one.
+                JumpKind::ClockTypeChanged => {
+                    return "the time source itself changed (use_sim_time was switched)".to_string()
+                }
+                JumpKind::Backward => "backwards",
+                JumpKind::Forward => "forwards",
+            };
+            format!("the time source reported a jump {what} of {magnitude} ns")
+        }
+        ClockEvidence::CommonMode { publishers } => format!(
+            "{publishers} publishers' stamps stepped {way} together by about {magnitude} ns"
+        ),
     }
 }
 
@@ -1455,6 +2031,133 @@ pub unsafe extern "C" fn tft_bridge_note_message(b: *mut tft_bridge) -> tft_stat
     })
 }
 
+/// **The time source itself said its clock jumped** — §5.5's authoritative path.
+///
+/// ROS 2 publishes clock jumps. `rcl_clock_add_jump_callback`, surfaced by
+/// rclcpp as `Clock::create_jump_callback`, hands a node an `rcl_time_jump_t`
+/// the moment `/clock` steps or `use_sim_time` is switched. That is the event
+/// itself, observed at its source, with no threshold to tune and nothing to
+/// corroborate — so this entry point applies
+/// [`TFT_BRIDGE_ON_CLOCK_RESET_HALT`] or [`TFT_BRIDGE_ON_CLOCK_RESET_RECREATE`]
+/// directly. The inference the offer path runs is the *fallback*, for callers
+/// with no such signal, for system-clock steps `/clock` never reports, and as
+/// defence in depth.
+///
+/// `delta_nanos` is `rcl_time_jump_t::delta.nanoseconds` — *"the new time minus
+/// the last time before the jump"* — so a rewind is **negative**. Pass it
+/// through unnegated; `kind` is `rcl_clock_change_t` collapsed onto the three
+/// [`tft_bridge_jump_kind`] codes.
+///
+/// # It must not be called from the jump callback
+///
+/// rclcpp's jump post-callback does **not** run on the bridge's ingest thread:
+/// with `NodeOptions::use_clock_thread` at its default of `true` the node's
+/// `TimeSource` owns a dedicated `/clock` thread, and a source change can
+/// instead arrive on whichever executor spins the node. Every entry point here
+/// is thread-affine — a debug build of this library `abort()`s the whole ROS
+/// process, a release build returns
+/// [`TFT_ERR_WRONG_THREAD`](crate::TFT_ERR_WRONG_THREAD), so the release-only
+/// gate this repository runs would show the benign half of that. The callback
+/// must therefore only *record* the jump into a slot the ingest thread drains,
+/// and call this from there.
+///
+/// # It charges no counter
+///
+/// A reported jump is not an arriving transform, so it is not in the ledger
+/// `tft_bridge_stats` documents: `transforms` does not move and neither does any
+/// bucket — including on a bridge that has already stopped, where an offer would
+/// have charged `refused_after_halt`. `clock_resets` *is* incremented, because
+/// it counts clock events rather than transforms and is not a ledger term.
+///
+/// # Errors
+///
+/// * [`TFT_ERR_BAD_ENUM`](crate::TFT_ERR_BAD_ENUM) — `kind` is not one of the
+///   three [`tft_bridge_jump_kind`] codes.
+///
+/// A bridge that has already stopped is **not** an error: `*out` replays the
+/// latched action with [`TFT_BRIDGE_REASON_ALREADY_HALTED`], exactly as
+/// [`tft_bridge_offer`] does, because a bag that loops twice reports twice and
+/// the second report must not read as a call the caller got wrong.
+///
+/// # Safety
+///
+/// `b` must be a live handle used from the thread that created it. `out` must
+/// point to a writable `tft_bridge_outcome` with `struct_size` set.
+#[no_mangle]
+pub unsafe extern "C" fn tft_bridge_note_time_jump(
+    b: *mut tft_bridge,
+    delta_nanos: i64,
+    kind: tft_bridge_jump_kind,
+    out: *mut tft_bridge_outcome,
+) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        // SAFETY: `out` is non-null and the caller contracts `struct_size` set.
+        let declared = unsafe { core::ptr::addr_of!((*out).struct_size).read_unaligned() };
+        if declared as usize != core::mem::size_of::<tft_bridge_outcome>() {
+            return bad_struct_size("tft_bridge_outcome");
+        }
+        // A blank outcome before the handle is validated, for the same reason
+        // and with the same promise as `tft_bridge_offer`'s.
+        //
+        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
+        // invariants, so a bitwise write is a complete initialisation.
+        let mut o = blank_outcome();
+        unsafe { core::ptr::write(out, o) };
+
+        let kind = match kind {
+            TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED => JumpKind::ClockTypeChanged,
+            TFT_BRIDGE_JUMP_BACKWARD => JumpKind::Backward,
+            TFT_BRIDGE_JUMP_FORWARD => JumpKind::Forward,
+            _ => return bad_enum("kind"),
+        };
+        // SAFETY: the caller contracts a live handle.
+        let h = match unsafe { bridge_of(b) } {
+            Ok(h) => h,
+            Err(rc) => return rc,
+        };
+        let inner = &mut *h.inner;
+
+        // A stopped bridge stops — and charges nothing, unlike the offer path.
+        // `refused_after_halt` is a term in a ledger whose total is
+        // `transforms`, and this call is not a transform; counting it there
+        // would unbalance the ledger to keep a counter looking busy.
+        if let Some(st) = inner.stopped {
+            o.action = st.action;
+            o.reason = TFT_BRIDGE_REASON_ALREADY_HALTED;
+            o.by_nanos = st.by_nanos;
+            o.delta_nanos = st.delta_nanos;
+            set(
+                &mut inner.strings.detail,
+                if st.action == TFT_BRIDGE_RECREATE {
+                    "the clock moved past the reset threshold; free this bridge, \
+                     build a new one, and re-plan"
+                } else {
+                    "the bridge halted; free it and build a new one"
+                },
+            );
+            o.detail = ptr(&inner.strings.detail);
+            // SAFETY: as the first write above.
+            unsafe { core::ptr::write(out, o) };
+            return TFT_OK;
+        }
+
+        let action = inner.ingest.note_time_jump(delta_nanos, kind);
+        // **Through `fill`, with the same arena-write function the offer path
+        // uses.** `note_time_jump` produces only `Halt` or `RecreateArena`, so
+        // the pose is never read — and routing it here anyway is what stops the
+        // latch, the `first_time` rate limiter and the halt wording from
+        // existing twice and drifting. `Iso3::IDENTITY` is the argument the
+        // unreachable arm would ignore.
+        fill(inner, &action, tf_tree::Iso3::IDENTITY, &mut o);
+        // SAFETY: as the first write above.
+        unsafe { core::ptr::write(out, o) };
+        TFT_OK
+    })
+}
+
 /// Report the subscription queue depth (§5.9). The high-water mark is kept.
 ///
 /// # Safety
@@ -1568,6 +2271,13 @@ fn blank_outcome() -> tft_bridge_outcome {
         existing: [0.0; 7],
         offered: [0.0; 7],
         detail: empty,
+        delta_nanos: 0,
+        // **The `NONE` that keeps the evidence fields from ever going stale.**
+        // Every outcome passes through here before any arm runs, so the two
+        // clock-evidence fields are cleared once, in one place, rather than by
+        // each of the seven arms remembering to.
+        clock_evidence: TFT_BRIDGE_EVIDENCE_NONE,
+        clock_evidence_detail: 0,
     }
 }
 

@@ -110,7 +110,21 @@ use error::{amend_error, guard, record_lookup, set_error};
 /// compiled against and the library it links.
 pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// Minor ABI version. The runtime's may be **≥** the compiled-against value.
-pub const TFT_ABI_VERSION_MINOR: u32 = 1;
+///
+/// `1` → `2`: the §5 bridge seam gained an entry point
+/// (`tft_bridge_note_time_jump`), a field appended to `tft_bridge_sample`
+/// (`received_steady_nanos`), and three appended to `tft_bridge_outcome`
+/// (`delta_nanos`, `clock_evidence`, `clock_evidence_detail`). **Every one of
+/// them is an append**, which is exactly what a minor bump means under §3.6 —
+/// no existing field moved, changed type, or changed meaning, so a caller built
+/// against `0.1` reads the same bytes out of the same offsets.
+///
+/// The rule finally has an implementation behind it as well as a sentence:
+/// `tft_bridge_offer` reads a caller's shorter `tft_bridge_sample` as the prefix
+/// it is, instead of refusing it with `TFT_ERR_BAD_STRUCT_SIZE`. Until that
+/// landed, appending a field would have locked every older caller out of every
+/// call — which is the precise case §3.6 exists to prevent.
+pub const TFT_ABI_VERSION_MINOR: u32 = 2;
 
 /// The library's major ABI version.
 #[no_mangle]

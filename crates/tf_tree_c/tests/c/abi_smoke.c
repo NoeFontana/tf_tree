@@ -18,6 +18,7 @@
 #define TFT_ENABLE_UNSTABLE
 #include "tf_tree_unstable.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -196,6 +197,7 @@ static void check_bridge(void)
     tft_bridge *b = NULL;
     tft_bridge_options opts;
     tft_bridge_sample s;
+    tft_bridge_sample legacy;
     tft_bridge_outcome o;
     tft_bridge_stats stats;
     tft_tree *tree = NULL;
@@ -239,6 +241,25 @@ static void check_bridge(void)
           "an unset outcome string is empty, never NULL");
     CHECK(o.owner[0] == '\0', "…and empty means empty");
 
+    /* §3.6's append rule, from the only side that can state it in C: a caller
+     * compiled before `received_steady_nanos` was appended declares the smaller size,
+     * and must still be served. `offsetof` is where the old struct ended, so
+     * this stays correct on any target and does not rot when a size changes.
+     *
+     * The storage is a full, correctly aligned tft_bridge_sample declaring a
+     * short size, not a tight byte buffer: what this file exists to check is
+     * that the header compiles and the older size is accepted. The bounded read
+     * itself is pinned on the Rust side, where the fixture allocates exactly the
+     * prefix and a sanitizer can see past it. */
+    legacy = s;
+    legacy.stamp_nanos = 1500000000;
+    legacy.struct_size = (uint32_t)offsetof(tft_bridge_sample, received_steady_nanos);
+    memset(&o, 0xAA, sizeof o);
+    o.struct_size = (uint32_t)sizeof o;
+    CHECK(tft_bridge_offer(b, TFT_BRIDGE_TOPIC_TF, &legacy, gid, &o) == TFT_OK, why());
+    CHECK(o.action == TFT_BRIDGE_APPLIED,
+          "an appended field must not lock an older caller out");
+
     /* An edge the config does not declare: dropped, named, diagnosed once. */
     s.child_frame_id = "camera";
     memset(&o, 0xAA, sizeof o);
@@ -251,8 +272,8 @@ static void check_bridge(void)
     memset(&stats, 0, sizeof stats);
     stats.struct_size = (uint32_t)sizeof stats;
     CHECK(tft_bridge_get_stats(b, &stats) == TFT_OK, why());
-    CHECK(stats.transforms == 2, "two offers");
-    CHECK(stats.applied == 1, "one written");
+    CHECK(stats.transforms == 3, "three offers");
+    CHECK(stats.applied == 2, "two written, one of them by a caller declaring the older size");
     CHECK(stats.dropped_undeclared == 1, "one with nowhere to go");
     CHECK(stats.queue_capacity == 100, "§5.2's KeepLast(100)");
 

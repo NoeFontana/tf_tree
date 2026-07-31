@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rcl/time.h>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 
@@ -221,8 +223,46 @@ public:
 private:
   using Gid = std::array<uint8_t, 16>;
 
+  /// One time jump reported by rcl, waiting for the ingest thread to apply it.
+  ///
+  /// **This exists because the reporting thread is not the bridge's.** rclcpp
+  /// fires a jump callback from whichever thread updated the clock — with
+  /// `NodeOptions::use_clock_thread` (default `true`) that is the `TimeSource`'s
+  /// own `/clock` thread, and on a `use_sim_time` parameter change it is
+  /// whichever executor holds the node. Every `tft_bridge_*` entry point is
+  /// affinity-checked against the thread that created the bridge: a debug build
+  /// of `tf_tree_c` calls `std::process::abort()` and takes the whole ROS
+  /// process with it, a release build returns `TFT_ERR_WRONG_THREAD` and the
+  /// jump is silently lost. Neither is acceptable, and no amount of testing
+  /// makes the direct call safe — so the callback does not call the ABI at all.
+  /// It writes here, and `drain_time_jump` applies it on the ingest thread.
+  ///
+  /// Held by `shared_ptr` and captured by the callback **instead of `this`**.
+  /// rclcpp does not synchronize `~JumpHandler` against a callback already
+  /// running, so a callback firing while `~BridgeHandle` runs would touch a
+  /// destroyed object. Owning the slot separately makes that unrepresentable:
+  /// the worst case is a write into a slot nobody will ever drain.
+  struct JumpSlot
+  {
+    std::mutex mutex;
+    /// False when there is nothing to apply. The first jump wins; see
+    /// `coalesced`.
+    bool pending = false;
+    /// `rcl_time_jump_t::delta`: **the new time minus the old**, so a rewind is
+    /// negative. Passed to the ABI unnegated.
+    int64_t delta_nanos = 0;
+    tft_bridge_jump_kind kind = 0;
+    /// Jumps that arrived while one was already pending. A jump halts or
+    /// recreates the bridge, so the *first* one is the transition that matters
+    /// and the rest are consequences of it; they are counted rather than
+    /// overwriting it, so the log can say the clock was moved more than once.
+    uint64_t coalesced = 0;
+  };
+
   void run(std::promise<tft_status> & ready);
   tft_status create_bridge();
+  void register_jump_callback();
+  void drain_time_jump();
   void maybe_attribute(const uint8_t * gid);
   bool attribute_from_graph(const Gid & wanted);
   void ingest(
@@ -230,7 +270,7 @@ private:
     tft_bridge_topic topic);
   void offer_one(
     const geometry_msgs::msg::TransformStamped & t, const uint8_t * gid,
-    tft_bridge_topic topic);
+    tft_bridge_topic topic, int64_t received_steady_nanos);
   void report(const tft_bridge_outcome & out, tft_bridge_topic topic);
   void refresh_stats();
 
@@ -252,6 +292,36 @@ private:
   /// walks this GID has cost, or `kResolved` once one of them matched it.
   std::map<Gid, uint32_t> gid_state_;
 
+  /// **A local monotonic clock, and the only clock this class reads.**
+  ///
+  /// It has two jobs, and they are the same job. It is the receipt clock the
+  /// bridge's step detector measures each publisher's offset against — a
+  /// detector whose reference is the clock under suspicion cannot tell a clock
+  /// reset from the signal that would reveal one — and it is the clock every
+  /// `*_THROTTLE` in this file rate-limits on.
+  ///
+  /// The clock it is **not** is `node_->get_clock()`. That is `RCL_ROS_TIME`,
+  /// which under `use_sim_time` *is* `/clock`: it reads 0 until the first
+  /// `/clock` message, so `now >= last_logged + period` is false and every
+  /// throttled diagnostic is suppressed over exactly the boot window a
+  /// misconfigured bridge is diagnosed in; and it rewinds when a bag loops, so
+  /// after a rewind it suppresses diagnostics until sim time has climbed back
+  /// past the old mark — the diagnostics *about the rewind*, for the duration
+  /// of the rewind.
+  ///
+  /// `RCL_STEADY_TIME` must be named explicitly: `rclcpp::Clock`'s constructor
+  /// defaults to `RCL_SYSTEM_TIME`, so `rclcpp::Clock steady_;` compiles and
+  /// silently gives the system clock, which NTP steps.
+  ///
+  /// Ingest-thread only, like everything above it. `rcutils_steady_time_now` is
+  /// documented lock-free and allocation-free, which is what makes one read per
+  /// message affordable on this path.
+  rclcpp::Clock steady_{RCL_STEADY_TIME};
+
+  /// Whether an arena refusal has been logged yet. Ingest-thread only. The
+  /// first one is unconditional; see the `TFT_BRIDGE_REJECTED` arm.
+  bool rejected_reported_ = false;
+
   /// Only ever touched from `thread_`.
   tft_bridge * bridge_ = nullptr;
   std::thread thread_;
@@ -272,6 +342,22 @@ private:
   /// the constructor's future, and read by the constructor after — which is
   /// what orders the two accesses.
   std::string create_error_;
+
+  /// The hand-off from rcl's jump callback to the ingest thread. Never null.
+  std::shared_ptr<JumpSlot> jump_slot_ = std::make_shared<JumpSlot>();
+
+  /// Keeps the registered jump callback alive: rclcpp holds a `weak_ptr`, so
+  /// dropping this unregisters and the authoritative path silently never fires
+  /// — with nothing failing anywhere. Null when registration was refused, which
+  /// is a degradation and not an error (§5.3's rule, applied to a clock instead
+  /// of to a publisher name).
+  ///
+  /// **Declared after `jump_slot_` on purpose.** Members are destroyed in
+  /// reverse declaration order, so this one goes first and the callback is
+  /// unregistered before the slot it writes into is destroyed. The destructor
+  /// resets it explicitly as well, so the ordering does not depend on nobody
+  /// ever appending a member below it.
+  rclcpp::JumpHandler::SharedPtr jump_handler_;
 };
 
 }  // namespace tf_tree_ros

@@ -53,7 +53,10 @@ pub mod statics;
 pub mod stats;
 
 pub use authority::{Authority, AuthorityPolicy, Verdict};
-pub use clock::{ClockGuard, ClockVerdict, OnClockReset};
+pub use clock::{
+    ClockEvidence, ClockGuard, ClockPolicy, ClockVerdict, CommonMode, JumpKind, OffsetTable,
+    OnClockReset, SteadyNanos,
+};
 pub use config::{
     ConfigError, ConfigErrorKind, DomainMismatch, EdgeConfig, EdgeShape, RingSize, TopologyConfig,
 };
@@ -83,7 +86,22 @@ pub struct Sample {
     /// The child frame, likewise raw.
     pub child_frame_id: String,
     /// Stamp, nanoseconds in whichever domain the bridge is running.
+    ///
+    /// **The publisher's number, in the domain under suspicion.** Everything
+    /// §5.5 judges about the clock is judged against
+    /// [`Sample::received`], never against another publisher's stamp.
     pub stamp_nanos: i64,
+    /// When the *local steady clock* said this message arrived.
+    ///
+    /// A different type from [`Sample::stamp_nanos`] because confusing the two
+    /// is the whole bug class `docs/PHASE4.md` §5.5's detector kept falling into
+    /// — see [`SteadyNanos`], which also documents where a caller gets one and
+    /// what [`SteadyNanos::UNKNOWN`] costs.
+    ///
+    /// One reading per **message**, shared by every transform the message
+    /// expands into. [`Sample::identity`] leaves it unknown;
+    /// [`Sample::received_at`] sets it.
+    pub received: SteadyNanos,
     /// `[qw qx qy qz tx ty tz]`, the canonical order (`docs/PHASE1.md` §3.1).
     pub pose: [f64; 7],
 }
@@ -91,14 +109,38 @@ pub struct Sample {
 impl Sample {
     /// A sample with an identity rotation at `t`, for tests and for callers
     /// building one by hand.
+    ///
+    /// [`Sample::received`] is left at [`SteadyNanos::UNKNOWN`], which is the
+    /// honest answer for a caller that has not said otherwise: the common-mode
+    /// layer is then simply absent for this sample rather than fed a fiction.
+    /// Chain [`Sample::received_at`] to supply one.
+    ///
+    /// The three-argument shape is deliberate. Fifty-odd construction sites in
+    /// this repository route through it, and every one of them would have had to
+    /// invent a receipt time — which is exactly the pressure that ends with
+    /// somebody passing `stamp_nanos` and silently re-enabling inference over
+    /// the signal under suspicion.
     #[must_use]
     pub fn identity(frame_id: &str, child_frame_id: &str, stamp_nanos: i64) -> Sample {
         Sample {
             frame_id: frame_id.to_string(),
             child_frame_id: child_frame_id.to_string(),
             stamp_nanos,
+            received: SteadyNanos::UNKNOWN,
             pose: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         }
+    }
+
+    /// The same sample, with the local steady clock's reading of when its
+    /// message arrived.
+    ///
+    /// Take one reading per `TFMessage` and apply it to every transform the
+    /// message carries — see [`SteadyNanos`] for why per-message and not
+    /// per-transform.
+    #[must_use]
+    pub fn received_at(mut self, received: SteadyNanos) -> Sample {
+        self.received = received;
+        self
     }
 
     /// The `(parent, child)` pair this sample addresses, after normalization is
