@@ -377,6 +377,52 @@ spread was under 6 %, which is why a 33 % difference is reportable at all; a
 figure of the same order as that spread would not be. §7's gate criterion 3
 still prints `UNAVAILABLE`, and nothing here changes that.
 
+#### What interning the edge tables is worth, measured in instructions
+
+`examples/offer_cost.rs` under cachegrind, `N = 0` baseline subtracted, 200 000
+offers per row (`just bridge-footprint`). **Instructions, not nanoseconds**, and
+that is the point rather than a concession: cachegrind simulates, so these are
+exact under load on a host whose clock this document has already said cannot be
+trusted. They do not convert into a latency figure — cachegrind models no
+out-of-order execution, no prefetch and no store buffer.
+
+| path | edges | `Ir`/offer before | after | D1 miss/offer before | after |
+|---|---|---|---|---|---|
+| accepted `/tf` | 1 | 1 453 | 961 | 0.00 | 0.00 |
+| accepted `/tf` | **20** | **2 550** | **1 150** | **2.80** | **0.30** |
+| accepted `/tf` | 100 | 3 567 | 1 326 | 20.73 | 13.37 |
+| refused, stuck publisher | 20 | 2 553 | 936 | 3.80 | 0.30 |
+| undeclared edge | 20 | 1 751 | 1 859 | 0.00 | 0.00 |
+
+Rows are short names (`link0`); with ROS-shaped names — `robot1/arm/wrist_0_link`,
+fifteen shared bytes rather than four — the 20-edge accepted row costs **5.90**
+D1 misses before and 0.35 after, because a longer shared prefix is a longer
+`memcmp` at every node a `BTreeMap` descent visits.
+
+**The sweep is the finding, not the single number.** Before, `Ir` per offer rose
+with the edge count — 1 453 → 2 550 → 3 567 — because four two-level `ByEdge`
+descents are `O(log E)` each and at one edge a `BTreeMap` compares nothing at
+all. That rise *is* the lookup cost, and it is what an index removes.
+
+**The undeclared path got 6 % worse, and that is the trade.** It now pays a
+failed index probe before falling through to normalization and the undeclared
+table. It is a drop path for a misconfiguration, bounded at 256 × 256, and buying
+it back would mean not caching at all.
+
+**No wall-time claim is made.** This host fails `tf_tree_bench`'s
+`Fitness::probe` — four physical cores, SMT on, an unreadable governor — so every
+timing row in `crates/tf_tree_bench/baseline/results.json` remains `unavailable`
+and §7's gate criterion 3 still prints `UNAVAILABLE`.
+
+Allocations, which are exact everywhere and need no tooling
+(`tests/steady_state_alloc.rs`): the accepted and undeclared paths still cost
+**2**, because those are the two owned names `Action` carries across the C seam
+and they are the return value rather than waste. The **refused** path went
+**2 → 0** — the path a stuck publisher occupies at full rate for the life of the
+robot. Taking the other two to zero means `Action` carrying a `Copy` edge
+reference, which is a public API change at the foreign-caller boundary and wants
+a decision record first.
+
 ### What the `rclcpp` half turned up
 
 Six findings, in descending order of how much they changed. The first three are

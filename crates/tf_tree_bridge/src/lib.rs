@@ -46,6 +46,7 @@ pub mod authority;
 pub mod clock;
 pub mod config;
 pub mod discover;
+mod edgeindex;
 mod edgemap;
 pub mod ingest;
 pub mod names;

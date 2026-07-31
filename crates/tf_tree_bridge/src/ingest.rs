@@ -95,9 +95,10 @@ use crate::clock::{
     ClockEvidence, ClockGuard, ClockPolicy, ClockVerdict, JumpKind, OffsetTable, OnClockReset,
 };
 use crate::config::TopologyConfig;
+use crate::edgeindex::{EdgeIndex, EdgeSlot};
 use crate::edgemap::{insert, lookup_mut, ByEdge};
 use crate::names::NameNormalizer;
-use crate::statics::{StaticStore, StaticVerdict};
+use crate::statics::{StaticKind, StaticStore, StaticVerdict};
 use crate::stats::BridgeStats;
 use crate::{Publisher, Sample};
 
@@ -382,11 +383,47 @@ fn owner_key(p: &Publisher) -> &str {
     }
 }
 
+/// What §5.6 and §5.8 together decided about a sample's frames.
+enum Resolved {
+    /// The pair names this declared edge.
+    Declared(EdgeSlot),
+    /// It normalized, and the config does not declare it. The names are owned
+    /// because `Action::UndeclaredEdge` is about to take them.
+    Undeclared { parent: String, child: String },
+    /// It did not normalize (§5.6's `NameError`).
+    BadName,
+}
+
 /// The four tables, plus the declared topology and the counters, applied in
 /// order.
 #[derive(Debug)]
 pub struct Ingest {
     names: NameNormalizer,
+    /// Raw wire `(parent, child)` → the declared edge it names, so a spelling
+    /// seen once skips §5.6's normalization entirely.
+    ///
+    /// **Populated lazily, from the slow path, and that is the correctness
+    /// argument.** An entry exists only if that exact raw pair has already been
+    /// through [`NameNormalizer::normalize`] at least once, so every side effect
+    /// a skipped normalize could lose has already happened: both raw names are
+    /// in `seen`, so `first_sight` would be `false`, so `remaps` would not grow.
+    /// The one exception is the per-*occurrence* stripped-slash count, which
+    /// [`Ingest::resolve`] replays explicitly through
+    /// `NameNormalizer::note_stripped`.
+    ///
+    /// **Pre-seeding it at construction would be wrong**, and subtly: the config
+    /// declares `odom`, the wire sends `/odom`, and it is the first `normalize`
+    /// of `/odom` that appends `("/odom", "odom")` to `remaps()`. That row
+    /// crosses the C ABI as `tft_bridge_get_remap` and is what §5.6's *"log the
+    /// resulting mapping table at startup"* prints. A pre-seeded cache would
+    /// never call `normalize` on it and the row would vanish silently.
+    ///
+    /// **Bounded without a cap.** `normalize`'s preimage of a name is at most
+    /// two strings — the name, and the name with a leading `/` — so at most four
+    /// raw pairs per declared edge can ever be inserted, and a pair that does
+    /// not resolve to a declared edge is never inserted at all. Nothing the wire
+    /// says can grow it.
+    raw: EdgeIndex<EdgeSlot>,
     /// The declared topology **after** §5.6's normalization — the names this
     /// pipeline actually keys on.
     ///
@@ -414,7 +451,7 @@ pub struct Ingest {
     /// anyway. A [`ByEdge`] rather than a `(String, String)` key so the
     /// steady-state probe allocates nothing; the two owned keys are paid once,
     /// on an edge's first sample. `tests/steady_state_alloc.rs` is the gate.
-    clocks: ByEdge<ClockGuard>,
+    clocks: Vec<ClockGuard>,
     /// Every knob §5.5's detection has, in physical units.
     ///
     /// Held whole rather than distributed into the guards because a guard cannot
@@ -526,12 +563,26 @@ impl Ingest {
         // the two cannot drift — see `TopologyConfig::rewritten`.
         let mut names = tf_prefix.map_or_else(NameNormalizer::new, NameNormalizer::with_prefix);
         let declared = config.rewritten(&mut names);
+        let statics = StaticStore::seeded(&declared);
+        // **One guard per declared edge, built here rather than on first sight.**
+        // `ClockGuard::with_threshold` is a pure value constructor, and creating
+        // it now is observationally identical to creating it at an edge's first
+        // sample — which is what the old `lookup_mut`-then-`insert` pair did, one
+        // branch and one map write per new edge. Nothing exposes the guards, so
+        // an unsampled edge holding a fresh one is invisible; what it buys is
+        // that `forget_the_old_recording` has no keys to preserve and nothing on
+        // the post-recreate path allocates at all.
+        let clocks = (0..statics.slots())
+            .map(|_| ClockGuard::with_threshold(clock.on_reset, clock.reset_threshold_nanos))
+            .collect();
         Ingest {
-            statics: StaticStore::seeded(&declared),
+            // Four raw spellings per declared edge is the bound; see the field.
+            raw: EdgeIndex::with_capacity(4 * statics.slots()),
+            statics,
             names,
             declared,
             authority: Authority::new(authority),
-            clocks: BTreeMap::new(),
+            clocks,
             clock,
             offsets: OffsetTable::new(clock),
             startup_window_open: true,
@@ -541,6 +592,41 @@ impl Ingest {
                 ..BridgeStats::default()
             },
             undeclared: BTreeMap::new(),
+        }
+    }
+    /// §5.6 and §5.8 in one step: normalize, then find the declared edge.
+    ///
+    /// **A repeated spelling does not re-normalize.** See [`Ingest::raw`] for why
+    /// that is sound and for the one side effect it replays.
+    /// A slot's canonical `(parent, child)`, owned.
+    ///
+    /// The two allocations `Action` costs, isolated at the arms that actually
+    /// carry names so the drop arms pay nothing. They are §5.6's spelling from
+    /// the declared topology, not the wire's, so an `Action` names an edge the
+    /// same way however the sample spelled it.
+    fn edge_names(&self, slot: EdgeSlot) -> (String, String) {
+        let (p, c) = self.statics.names_of(slot);
+        (p.to_string(), c.to_string())
+    }
+
+    fn resolve(&mut self, sample: &Sample) -> Resolved {
+        let (rp, rc) = (sample.frame_id.as_str(), sample.child_frame_id.as_str());
+        if let Some(slot) = self.raw.get(rp, rc) {
+            self.names
+                .note_stripped(u64::from(rp.starts_with('/')) + u64::from(rc.starts_with('/')));
+            return Resolved::Declared(slot);
+        }
+        let (Ok(parent), Ok(child)) = (self.names.normalize(rp), self.names.normalize(rc)) else {
+            return Resolved::BadName;
+        };
+        let (parent, child) = (parent.name, child.name);
+        match self.statics.resolve(&parent, &child) {
+            Some(slot) => {
+                // Only declared pairs are cached, which is what bounds the table.
+                self.raw.insert(rp, rc, slot);
+                Resolved::Declared(slot)
+            }
+            None => Resolved::Undeclared { parent, child },
         }
     }
 
@@ -561,64 +647,82 @@ impl Ingest {
 
         self.stats.transforms += 1;
 
-        // 1. Names, first, because everything below keys on them.
-        let (Ok(parent), Ok(child)) = (
-            self.names.normalize(&sample.frame_id),
-            self.names.normalize(&sample.child_frame_id),
-        ) else {
-            self.stats.dropped_bad_name += 1;
-            return Action::Drop {
-                reason: DropReason::BadName,
-            };
+        // 1+2. Names and the declared edge, in one step. §5.6 still runs first —
+        //      everything below keys on normalized names — but a spelling this
+        //      bridge has already seen resolves straight to its slot without
+        //      normalizing, allocating or probing anything by name. See
+        //      `Ingest::resolve` and `Ingest::raw`.
+        //
+        //      Declared? is answered before the kind check, because an
+        //      undeclared edge has no declared kind to clash with, and reporting
+        //      `KindChange` for it would send an operator looking at
+        //      `/tf_static` for an edge nobody ever wrote down.
+        let slot = match self.resolve(sample) {
+            Resolved::Declared(slot) => slot,
+            Resolved::BadName => {
+                self.stats.dropped_bad_name += 1;
+                return Action::Drop {
+                    reason: DropReason::BadName,
+                };
+            }
+            Resolved::Undeclared { parent, child } => {
+                // Fast path first: a repeat must not allocate. `entry()` needs an
+                // owned key whether or not it inserts, so reaching for it
+                // unconditionally cloned both names on every message of an edge
+                // already known to be undeclared.
+                // **And bounded.** This table is keyed by a name that arrived from
+                // *outside the declared topology* — the one input nothing in the
+                // process constrains — and `undeclared()` `collect()`s the whole of
+                // it for `doctor`, so an unbounded table is also an unbounded
+                // allocation the moment anyone asks the bridge how it is doing. The
+                // cap is read before `lookup_mut` because that call holds the
+                // mutable borrow across the match.
+                //
+                // Past the cap the transform is still dropped and still counted in
+                // `dropped_undeclared`; only the per-edge breakdown stops growing,
+                // and `first_time` reports `false` so the caller stays quiet.
+                let at_cap = self.undeclared.len() >= MAX_UNDECLARED_PARENTS
+                    || self
+                        .undeclared
+                        .get(parent.as_str())
+                        .is_some_and(|c| c.len() >= MAX_UNDECLARED_CHILDREN);
+                let first_time = match lookup_mut(&mut self.undeclared, &parent, &child) {
+                    Some(n) => {
+                        *n += 1;
+                        false
+                    }
+                    None if at_cap => false,
+                    None => {
+                        insert(&mut self.undeclared, &parent, &child, 1);
+                        true
+                    }
+                };
+                self.stats.dropped_undeclared += 1;
+                return Action::UndeclaredEdge {
+                    parent,
+                    child,
+                    first_time,
+                };
+            }
         };
-        let (parent, child) = (parent.name, child.name);
-
-        // 2. Declared? Before the kind check, because an undeclared edge has no
-        //    declared kind to clash with, and reporting `KindChange` for it
-        //    would send an operator looking at `/tf_static` for an edge nobody
-        //    ever wrote down.
-        if !self.statics.is_declared(&parent, &child) {
-            // Fast path first: a repeat must not allocate. `entry()` needs an
-            // owned key whether or not it inserts, so reaching for it
-            // unconditionally cloned both names on every message of an edge
-            // already known to be undeclared.
-            // **And bounded.** This table is keyed by a name that arrived from
-            // *outside the declared topology* — the one input nothing in the
-            // process constrains — and `undeclared()` `collect()`s the whole of
-            // it for `doctor`, so an unbounded table is also an unbounded
-            // allocation the moment anyone asks the bridge how it is doing. The
-            // cap is read before `lookup_mut` because that call holds the
-            // mutable borrow across the match.
-            //
-            // Past the cap the transform is still dropped and still counted in
-            // `dropped_undeclared`; only the per-edge breakdown stops growing,
-            // and `first_time` reports `false` so the caller stays quiet.
-            let at_cap = self.undeclared.len() >= MAX_UNDECLARED_PARENTS
-                || self
-                    .undeclared
-                    .get(parent.as_str())
-                    .is_some_and(|c| c.len() >= MAX_UNDECLARED_CHILDREN);
-            let first_time = match lookup_mut(&mut self.undeclared, &parent, &child) {
-                Some(n) => {
-                    *n += 1;
-                    false
-                }
-                None if at_cap => false,
-                None => {
-                    insert(&mut self.undeclared, &parent, &child, 1);
-                    true
-                }
-            };
-            self.stats.dropped_undeclared += 1;
-            return Action::UndeclaredEdge {
-                parent,
-                child,
-                first_time,
-            };
-        }
+        // **The names are NOT materialized here.** Every arm below that returns
+        // an `Action` carrying them clones them from the declared topology at
+        // that point instead, because the arms that do *not* carry them — the
+        // two `Action::Drop`s — are the ones a misconfigured or stuck publisher
+        // occupies at full rate for the life of the robot. Cloning up here cost
+        // those paths two allocations per message to build names nothing read.
+        //
+        // Cloned from the declared topology rather than from the wire, so they
+        // are §5.6's canonical spelling whichever way the sample spelled them.
 
         // 3. Kind. A hard error, and one fault gets one diagnostic.
-        if topic == Topic::Tf && self.statics.observe_dynamic(&parent, &child).is_err() {
+        //
+        //    One array read, where this used to be a second full two-level
+        //    descent of `StaticStore::kinds` with the same key step 2 had just
+        //    probed — whose entire product was one bit, and whose inserting arm
+        //    was unreachable from here because step 2 rejects everything the
+        //    config does not declare.
+        if topic == Topic::Tf && self.statics.kind_at(slot) == StaticKind::Static {
             self.stats.dropped_kind_change += 1;
             return Action::Drop {
                 reason: DropReason::KindChange,
@@ -635,10 +739,7 @@ impl Ingest {
         //    high-water mark to the epoch and make every dynamic sample
         //    afterwards look like a bag loop, so statics never reach step 5.
         if topic == Topic::TfStatic {
-            match self
-                .statics
-                .observe_static(&parent, &child, sample.pose, publisher)
-            {
+            match self.statics.observe_static_at(slot, sample.pose, publisher) {
                 // `Declare` is unreachable through this pipeline, and is
                 // folded in here rather than given its own arm: an edge is
                 // either undeclared (returned at step 2) or seeded by
@@ -656,6 +757,7 @@ impl Ingest {
                     // ignore the message that matters. So this returns before
                     // authority is consulted at all.
                     self.stats.static_verified += 1;
+                    let (parent, child) = self.edge_names(slot);
                     return Action::StaticVerified { parent, child };
                 }
                 StaticVerdict::KindChanged { .. } => {
@@ -701,6 +803,7 @@ impl Ingest {
                         self.startup_static_conflicts =
                             self.startup_static_conflicts.saturating_add(1);
                     }
+                    let (parent, child) = self.edge_names(slot);
                     return Action::StaticConflict {
                         parent,
                         child,
@@ -723,7 +826,17 @@ impl Ingest {
         //    window decides at its close, naming everything it found.
         //    `Authority::admit` records the conflict under either policy, so
         //    there is nothing for this function to accumulate.
-        match self.authority.admit(&parent, &child, publisher) {
+        // **Destructured, so the two borrows are disjoint.** `admit` wants the
+        // names by reference and they live in `statics`; taking them through
+        // `self` would borrow all of `self` immutably while `authority` needs to
+        // be mutable, and the obvious way out — cloning the names first — put
+        // two allocations on the accept path to satisfy the borrow checker
+        // rather than to produce anything. Naming the fields is free.
+        let Ingest {
+            statics, authority, ..
+        } = self;
+        let (sp, sc) = statics.names_of(slot);
+        match authority.admit(sp, sc, publisher) {
             Verdict::Accept => {}
             // `Fatal` outside the window means `Strict` has degraded to
             // `FirstWriterWins` plus counters, deliberately and permanently: a
@@ -743,6 +856,7 @@ impl Ingest {
                 // returning without an outcome bucket leaves `balanced()` false
                 // forever — precisely the shape `BridgeStats::balanced`'s own
                 // doc names as the bug it exists to detect.
+                let (parent, child) = (sp.to_string(), sc.to_string());
                 self.stats.dropped_authority += 1;
                 return Action::AuthorityConflict {
                     parent,
@@ -788,30 +902,20 @@ impl Ingest {
             );
         }
 
-        // The guard is this edge's, built on its first sample. `lookup_mut`
-        // then `insert` rather than `entry`, because `entry` needs owned keys
-        // whether or not it inserts — two allocations on every message of every
-        // edge, for a table that stops growing after each edge's first sample.
+        // This edge's guard, by index. It used to be a `lookup_mut` and, on an
+        // edge's first sample, an `insert` — a two-level descent plus a branch
+        // that could only be taken once per edge but was tested on every
+        // message. The vector is sized at construction, so there is neither.
         //
         // A sample that promoted above never reaches the guard, so it does not
         // move that edge's high-water mark. Under `Halt` that is what keeps
         // every later sample refused on a bridge whose caller has no latch;
         // under `Recreate` the marks have just been thrown away wholesale.
-        let verdict = match lookup_mut(&mut self.clocks, &parent, &child) {
-            Some(guard) => guard.observe(sample.stamp_nanos),
-            None => {
-                let mut guard = ClockGuard::with_threshold(
-                    self.clock.on_reset,
-                    self.clock.reset_threshold_nanos,
-                );
-                let verdict = guard.observe(sample.stamp_nanos);
-                insert(&mut self.clocks, &parent, &child, guard);
-                verdict
-            }
-        };
+        let verdict = self.clocks[slot.get()].observe(sample.stamp_nanos);
         match verdict {
             ClockVerdict::Forward => {
                 self.stats.applied += 1;
+                let (parent, child) = self.edge_names(slot);
                 Action::Publish {
                     parent,
                     child,
@@ -949,10 +1053,8 @@ impl Ingest {
     /// edge that regressed, and seeding every other edge's guard from it is
     /// precisely the cross-edge contamination per-edge guards exist to remove.
     fn forget_the_old_recording(&mut self) {
-        for children in self.clocks.values_mut() {
-            for guard in children.values_mut() {
-                guard.forget();
-            }
+        for guard in &mut self.clocks {
+            guard.forget();
         }
         self.offsets.clear();
     }
@@ -3163,5 +3265,100 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             s.balanced(),
             "the ledger must still balance: {s:?}" // `static_verified` is a bucket
         );
+    }
+    /// **A cached spelling still counts every stripped slash.**
+    ///
+    /// `Ingest::resolve` skips `NameNormalizer::normalize` for a raw pair it has
+    /// seen before, and §5.9's stripped-slash figure counts every *occurrence*
+    /// rather than every first sight — so it is the one thing that skip would
+    /// silently freeze. `resolve` replays it through
+    /// `NameNormalizer::note_stripped`, and this is the assertion that the
+    /// replay is exact rather than approximately right.
+    ///
+    /// Mutant: delete the `note_stripped` call from `Ingest::resolve` — applied,
+    /// and this failed with `2 != 200`: the first sighting still counted, and
+    /// every one of the ninety-nine repeats after it vanished.
+    #[test]
+    fn a_cached_spelling_still_counts_every_stripped_slash() {
+        let mut i = ingest();
+        for k in 0..100i64 {
+            let s = at("/odom", "/base", 1_000_000_000 + k * MS, 5_000 * S + k * MS);
+            assert!(matches!(
+                i.offer(Topic::Tf, &s, &node("/ekf")),
+                Action::Publish { .. }
+            ));
+        }
+        // Two slashes per message, a hundred messages, however many of them
+        // took the cache.
+        assert_eq!(i.names().stripped_count(), 200);
+    }
+
+    /// **A cached spelling still produces its remap row**, because the cache is
+    /// populated lazily rather than pre-seeded.
+    ///
+    /// The config declares `odom`; the wire sends `/odom`. It is the *first*
+    /// `normalize` of `/odom` that appends `("/odom", "odom")` to `remaps()`,
+    /// and that row crosses the C ABI as `tft_bridge_get_remap` and is what
+    /// §5.6's "log the resulting mapping table at startup" prints. A cache
+    /// filled at construction from the declared names would never call
+    /// `normalize` on the slashed spelling and the row would vanish with no
+    /// error anywhere.
+    ///
+    /// The second half — that a hundred repeats add no second row — is what says
+    /// the cache is actually being taken; without it this test would pass on an
+    /// implementation that never cached at all.
+    ///
+    /// Mutant: pre-seed `raw` in `Ingest::with_policies` by inserting every
+    /// declared pair under its own spelling *and* its slashed one — applied, and
+    /// this failed on the `remaps` assertion with an empty table.
+    #[test]
+    fn a_cached_spelling_still_produces_its_remap_row() {
+        let mut i = ingest();
+        for k in 0..100i64 {
+            let s = at("/odom", "/base", 1_000_000_000 + k * MS, 5_000 * S + k * MS);
+            let _ = i.offer(Topic::Tf, &s, &node("/ekf"));
+        }
+        let rows: Vec<(&str, &str)> = i
+            .remaps()
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert!(
+            rows.contains(&("/odom", "odom")),
+            "§5.6's remap table lost the row the wire's spelling produced: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|(a, _)| *a == "/odom").count(),
+            1,
+            "one row per distinct raw spelling, not one per message: {rows:?}"
+        );
+    }
+
+    /// Every declared edge resolves to its own slot, and the slot names it back.
+    ///
+    /// This is the invariant every `Vec` index in the pipeline rests on: the
+    /// clock guards, the kinds, the static values and the conflict counters are
+    /// all addressed by it, and `Action::Publish`'s names come back through it.
+    /// A slot that named the wrong edge would attribute one publisher's
+    /// transform to another with nothing anywhere reporting it.
+    ///
+    /// Mutant: in `StaticStore::slot_or_insert`, push to `kinds`/`values` before
+    /// taking `self.index.len()` as the slot — applied, and this failed at the
+    /// first edge with an off-by-one that put every edge's kind one slot late.
+    #[test]
+    fn every_declared_edge_resolves_to_a_slot_that_names_it_back() {
+        let i = ingest();
+        for e in &i.declared().edges {
+            let (p, c) = e.key();
+            let slot = i
+                .statics
+                .resolve(p, c)
+                .unwrap_or_else(|| panic!("declared edge {p} -> {c} has no slot"));
+            assert_eq!(
+                i.statics.names_of(slot),
+                (p, c),
+                "slot {slot:?} does not name the edge it was resolved from"
+            );
+        }
     }
 }

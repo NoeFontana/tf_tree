@@ -27,9 +27,8 @@
 //! URDFs disagree" rather than "your two URDFs were serialized differently".
 
 use crate::config::{EdgeShape, TopologyConfig};
-use crate::edgemap::{insert, lookup, ByEdge};
+use crate::edgeindex::{EdgeIndex, EdgeSlot};
 use crate::Publisher;
-use std::collections::BTreeMap;
 
 /// Which topic an edge was declared from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,17 +70,33 @@ pub enum StaticVerdict {
 
 /// Tracks declared edges and their static values.
 ///
-/// The `(parent, child)` tables are [`ByEdge`] — nested, so the per-transform
-/// probes in [`Self::is_declared`] and [`Self::observe_dynamic`] allocate
-/// nothing. See `crate::edgemap` for the full argument.
+/// # One index, four parallel vectors
+///
+/// The `(parent, child)` tables used to be [`ByEdge`] — nested, so a probe
+/// allocated nothing. That solved allocation and left the *work*: two
+/// `BTreeMap<String, _>::get`s per probe, each `O(log n)` with a full
+/// frame-name `memcmp` at every visited node, and `Ingest::offer` probed this
+/// store **twice** per transform with the same key.
+///
+/// The declared set is fixed at construction, so it is answered once by
+/// [`EdgeIndex`] and every table becomes a `Vec` indexed by the resulting
+/// [`EdgeSlot`]. See `crate::edgeindex` for the measurement that motivated it.
+///
+/// The store still grows when it is built unseeded — `tf_tree_ingest` uses it
+/// that way, discovering edges from a recording rather than from a config — so
+/// the index is a growing table and not a perfect hash.
 #[derive(Debug, Default)]
 pub struct StaticStore {
-    kinds: ByEdge<StaticKind>,
-    values: ByEdge<([f64; 7], Publisher)>,
-    /// Conflicts already reported per edge. Left flat: it is touched only when
-    /// two publishers actually disagree about a static, which is a fault
-    /// condition and not a rate.
-    reported: BTreeMap<(String, String), u64>,
+    /// `(parent, child)` → the slot every vector below is indexed by.
+    index: EdgeIndex<EdgeSlot>,
+    kinds: Vec<StaticKind>,
+    /// `None` for a dynamic edge, which has no declared constant.
+    values: Vec<Option<([f64; 7], Publisher)>>,
+    /// Conflicts already reported per edge, so the diagnostic is rate-limited by
+    /// identity. A `Vec` now rather than a keyed map: the slot is already in
+    /// hand at the one place it is read, so the two owned `String`s that probe
+    /// used to build are gone from the conflict path entirely.
+    reported: Vec<u64>,
     conflicts: u64,
 }
 
@@ -107,16 +122,21 @@ impl StaticStore {
     /// machinery was for.
     #[must_use]
     pub fn seeded(config: &TopologyConfig) -> StaticStore {
-        let mut s = StaticStore::new();
+        let mut s = StaticStore {
+            index: EdgeIndex::with_capacity(config.edges.len()),
+            ..StaticStore::default()
+        };
         for e in &config.edges {
             let (parent, child) = e.key();
             match e.shape {
                 EdgeShape::Static { pose } => {
-                    insert(&mut s.kinds, parent, child, StaticKind::Static);
-                    insert(&mut s.values, parent, child, (pose, Publisher::Declared));
+                    let slot = s.slot_or_insert(parent, child, StaticKind::Static);
+                    s.kinds[slot.get()] = StaticKind::Static;
+                    s.values[slot.get()] = Some((pose, Publisher::Declared));
                 }
                 EdgeShape::Dynamic { .. } => {
-                    insert(&mut s.kinds, parent, child, StaticKind::Dynamic);
+                    let slot = s.slot_or_insert(parent, child, StaticKind::Dynamic);
+                    s.kinds[slot.get()] = StaticKind::Dynamic;
                 }
             }
         }
@@ -130,7 +150,7 @@ impl StaticStore {
     /// is dropped, counted and diagnosed"* a lookup rather than a second table.
     #[must_use]
     pub fn is_declared(&self, parent: &str, child: &str) -> bool {
-        lookup(&self.kinds, parent, child).is_some()
+        self.index.get(parent, child).is_some()
     }
 
     /// Record that `(parent, child)` arrived on `/tf` — a dynamic edge.
@@ -141,12 +161,12 @@ impl StaticStore {
     ///
     /// [`StaticKind::Static`] if the edge is already a static one.
     pub fn observe_dynamic(&mut self, parent: &str, child: &str) -> Result<(), StaticKind> {
-        match lookup(&self.kinds, parent, child) {
-            Some(StaticKind::Static) => Err(StaticKind::Static),
-            Some(StaticKind::Dynamic) => Ok(()),
+        match self.index.get(parent, child) {
+            Some(slot) if self.kinds[slot.get()] == StaticKind::Static => Err(StaticKind::Static),
+            Some(_) => Ok(()),
             // The only allocating arm, and it runs once per edge ever.
             None => {
-                insert(&mut self.kinds, parent, child, StaticKind::Dynamic);
+                self.slot_or_insert(parent, child, StaticKind::Dynamic);
                 Ok(())
             }
         }
@@ -160,25 +180,39 @@ impl StaticStore {
         pose: [f64; 7],
         publisher: &Publisher,
     ) -> StaticVerdict {
-        if let Some(StaticKind::Dynamic) = lookup(&self.kinds, parent, child) {
+        let slot = self.slot_or_insert(parent, child, StaticKind::Static);
+        self.observe_static_at(slot, pose, publisher)
+    }
+
+    /// [`Self::observe_static`] for a caller that already holds the slot.
+    ///
+    /// The whole of §5.7's machinery, with the two name probes removed. A slot
+    /// exists only for an edge the store knows, which is what makes the
+    /// `Declare` arm below reachable *only* from an unseeded store — a seeded
+    /// one has a value on file for every static edge before any message arrives.
+    pub(crate) fn observe_static_at(
+        &mut self,
+        slot: EdgeSlot,
+        pose: [f64; 7],
+        publisher: &Publisher,
+    ) -> StaticVerdict {
+        if self.kinds[slot.get()] == StaticKind::Dynamic {
             return StaticVerdict::KindChanged {
                 declared: StaticKind::Dynamic,
             };
         }
-        let Some((existing, owner)) = lookup(&self.values, parent, child) else {
-            insert(&mut self.kinds, parent, child, StaticKind::Static);
-            insert(&mut self.values, parent, child, (pose, publisher.clone()));
+        let Some((existing, owner)) = &self.values[slot.get()] else {
+            self.kinds[slot.get()] = StaticKind::Static;
+            self.values[slot.get()] = Some((pose, publisher.clone()));
             return StaticVerdict::Declare;
         };
         if same_pose(existing, &pose) {
             return StaticVerdict::Idempotent;
         }
         let (existing, owner) = (*existing, owner.clone());
-        // Only here does a key get built: this is the conflict path.
-        let seen = self
-            .reported
-            .entry((parent.to_string(), child.to_string()))
-            .or_insert(0);
+        // The conflict path, and it no longer builds a key to get here: the slot
+        // indexes the counter directly.
+        let seen = &mut self.reported[slot.get()];
         let first_time = *seen == 0;
         *seen += 1;
         self.conflicts += 1;
@@ -191,6 +225,45 @@ impl StaticStore {
         }
     }
 
+    /// The slot for `(parent, child)`, creating it with `kind` if it is new.
+    ///
+    /// The one allocating path, and it runs once per edge ever. Every vector is
+    /// extended in lockstep with the index so a slot is always in range of all
+    /// four — the invariant every `self.kinds[slot.get()]` below rests on.
+    fn slot_or_insert(&mut self, parent: &str, child: &str, kind: StaticKind) -> EdgeSlot {
+        if let Some(slot) = self.index.get(parent, child) {
+            return slot;
+        }
+        let e = self.index.len();
+        let slot = EdgeSlot(u32::try_from(e).unwrap_or(u32::MAX));
+        self.index.insert(parent, child, slot);
+        self.kinds.push(kind);
+        self.values.push(None);
+        self.reported.push(0);
+        slot
+    }
+
+    /// The slot for `(parent, child)`, or `None` if the store does not know it.
+    pub(crate) fn resolve(&self, parent: &str, child: &str) -> Option<EdgeSlot> {
+        self.index.get(parent, child)
+    }
+
+    /// A slot's declared kind.
+    pub(crate) fn kind_at(&self, slot: EdgeSlot) -> StaticKind {
+        self.kinds[slot.get()]
+    }
+
+    /// A slot's `(parent, child)`, so a caller holding only an index can still
+    /// name the edge in an `Action`.
+    pub(crate) fn names_of(&self, slot: EdgeSlot) -> (&str, &str) {
+        self.index.key(slot.get())
+    }
+
+    /// How many edges the store knows — the length every parallel `Vec` has.
+    pub(crate) fn slots(&self) -> usize {
+        self.kinds.len()
+    }
+
     /// Static conflicts seen (§5.9).
     #[must_use]
     pub fn conflicts(&self) -> u64 {
@@ -200,7 +273,7 @@ impl StaticStore {
     /// The declared kind of an edge, if any.
     #[must_use]
     pub fn kind_of(&self, parent: &str, child: &str) -> Option<StaticKind> {
-        lookup(&self.kinds, parent, child).copied()
+        self.index.get(parent, child).map(|s| self.kinds[s.get()])
     }
 }
 
