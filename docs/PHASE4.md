@@ -388,11 +388,15 @@ out-of-order execution, no prefetch and no store buffer.
 
 | path | edges | `Ir`/offer before | after | D1 miss/offer before | after |
 |---|---|---|---|---|---|
-| accepted `/tf` | 1 | 1 453 | 961 | 0.00 | 0.00 |
-| accepted `/tf` | **20** | **2 550** | **1 150** | **2.80** | **0.30** |
-| accepted `/tf` | 100 | 3 567 | 1 326 | 20.73 | 13.37 |
-| refused, stuck publisher | 20 | 2 553 | 936 | 3.80 | 0.30 |
-| undeclared edge | 20 | 1 751 | 1 859 | 0.00 | 0.00 |
+| accepted `/tf` | 1 | 1 453 | 898 | 0.00 | 0.00 |
+| accepted `/tf` | **20** | **2 550** | **909** | **2.80** | **0.00** |
+| accepted `/tf` | 100 | 3 567 | 901 | 20.73 | 8.57 |
+| refused, stuck publisher | 20 | 2 553 | 695 | 3.80 | 0.00 |
+| undeclared edge | 20 | 1 751 | 1 839 | 0.00 | 0.00 |
+
+**The `after` column is flat in the edge count, and that is the whole claim.**
+898 / 909 / 901 across 1 / 20 / 100 edges, against 1 453 / 2 550 / 3 567 before.
+The `O(log E)` term is not smaller; it is gone.
 
 Rows are short names (`link0`); with ROS-shaped names — `robot1/arm/wrist_0_link`,
 fifteen shared bytes rather than four — the 20-edge accepted row costs **5.90**
@@ -409,10 +413,45 @@ failed index probe before falling through to normalization and the undeclared
 table. It is a drop path for a misconfiguration, bounded at 256 × 256, and buying
 it back would mean not caching at all.
 
-**No wall-time claim is made.** This host fails `tf_tree_bench`'s
-`Fitness::probe` — four physical cores, SMT on, an unreadable governor — so every
-timing row in `crates/tf_tree_bench/baseline/results.json` remains `unavailable`
-and §7's gate criterion 3 still prints `UNAVAILABLE`.
+#### The wall-clock sanity check, and what it is worth
+
+Instruction counts cannot see an allocator or a memory-bandwidth wall, so the
+same harness has a timed mode: `threads` **independent bridges**, because
+`Ingest::offer` takes `&mut self` and the ABI is thread-affine — N threads
+sharing one `Ingest` is a configuration the design forbids, and a harness that
+pretended otherwise would measure nothing real.
+
+Paired against the pre-interning build, **ABBA-interleaved** over 10 pairs so a
+warm-start advantage cannot favour one side, each invocation itself a min of 7
+rounds, pinned to distinct *physical* cores (SMT siblings on this host are
+`(0,1) (2,3) (4,5) (6,7)`):
+
+| threads | before | after | median ratio | pairs agreeing |
+|---|---|---|---|---|
+| 1 | 124.1 ns | 87.0 ns | 0.701 | 10/10 |
+| 2 | 125.3 ns | 87.8 ns | 0.701 | 10/10 |
+| 4 | 126.6 ns | 88.6 ns | 0.702 | 10/10 |
+
+**An A/A null control** — the same binary on both sides — gave a median ratio of
+0.991 with a 7/3 sign split and a spread of ±1.7 %. That is the noise floor, and
+it is what makes a 30 % difference reportable at all; a figure of the same order
+as that spread would not be.
+
+Two things this says that the instruction count could not. Per-thread cost is
+**flat** as threads rise on both sides, so the denser tables do not run into an
+allocator or a bandwidth wall at four cores. And **−30 % time against −64 %
+instructions** is the expected direction with a smaller magnitude, because what
+is left is not instruction-bound: the accepted path costs 87 ns where the refused
+path costs 74 ns, and that gap carries both the two surviving `Action`
+allocations and the arena write. This measurement does not separate those two,
+and it should not be read as though it did.
+
+**None of this is a claim in this repository's sense of the word.** This host
+fails `tf_tree_bench`'s `Fitness::probe` — four physical cores, SMT on, an
+unreadable governor — so every timing row in
+`crates/tf_tree_bench/baseline/results.json` remains `unavailable`, §7's gate
+criterion 3 still prints `UNAVAILABLE`, and the numbers above are a sanity check
+on the instruction counts rather than a substitute for them.
 
 Allocations, which are exact everywhere and need no tooling
 (`tests/steady_state_alloc.rs`): the accepted and undeclared paths still cost

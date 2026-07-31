@@ -49,6 +49,7 @@ pub mod discover;
 mod edgeindex;
 mod edgemap;
 pub mod ingest;
+mod interner;
 pub mod names;
 pub mod statics;
 pub mod stats;

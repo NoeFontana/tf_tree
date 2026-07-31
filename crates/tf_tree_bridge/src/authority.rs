@@ -20,7 +20,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::edgemap::{insert, lookup, ByEdge};
+use crate::config::TopologyConfig;
+use crate::edgeindex::{EdgeIndex, EdgeSlot};
+use crate::interner::StrInterner;
 use crate::Publisher;
 
 /// How to resolve two publishers on one edge.
@@ -104,18 +106,57 @@ pub enum Verdict {
 }
 
 /// Per-edge ownership, and the conflicts seen so far.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Authority {
     policy: AuthorityPolicy,
-    /// `(parent, child)` -> owner.
-    owners: ByEdge<Publisher>,
+    /// `(parent, child)` -> the slot `owners` is indexed by.
+    ///
+    /// Built from the same `config.edges` order [`crate::StaticStore::seeded`]
+    /// walks, so an edge has the *same* slot in both — which is what lets
+    /// [`crate::Ingest`] resolve once and address both. A test asserts they
+    /// agree, because a mismatch would attribute one publisher's transform to
+    /// another edge with nothing anywhere reporting it.
+    index: EdgeIndex<EdgeSlot>,
+    /// Owner per slot. `None` until an edge is first written.
+    owners: Vec<Option<Publisher>>,
+    /// Publisher name -> id, capped. See [`crate::interner`] for why a runtime
+    /// key needs a cap and what exceeding it costs.
+    ids: StrInterner,
+    /// id -> publisher, so [`Self::conflicts`] can still hand back a
+    /// `&Publisher` from a key that stores only ids.
+    pubs: Vec<Publisher>,
     /// Conflicts already reported, so the diagnostic is rate-limited by
     /// *identity* rather than by a timer. A timer would report the same pair
     /// again every interval forever; this reports each distinct
     /// (edge, owner, intruder) once and counts the rest.
-    reported: BTreeMap<(String, String, Publisher, Publisher), u64>,
+    ///
+    /// **`Copy` keys, and that closed a real hole.** The key used to be
+    /// `(String, String, Publisher, Publisher)`, which cost **four allocations
+    /// on every probe** of the reject path — a path two live publishers on one
+    /// edge occupy at full message rate — and, worse, was the one table on the
+    /// offer path with **no bound at all**: two of its four components are node
+    /// names off the wire. Interning both makes the probe allocation-free and
+    /// the table finitely bounded at `slots x cap x cap`.
+    reported: BTreeMap<(u32, u32, u32), u64>,
     /// Samples dropped by policy, in total. §5.9 exposes it.
     dropped: u64,
+}
+
+impl Default for Authority {
+    /// Hand-written rather than derived, so the publisher interner gets its real
+    /// cap: a derived `Default` would give it zero and silently refuse to
+    /// attribute anything.
+    fn default() -> Authority {
+        Authority {
+            policy: AuthorityPolicy::default(),
+            index: EdgeIndex::default(),
+            owners: Vec::new(),
+            ids: StrInterner::with_cap(crate::clock::MAX_TRACKED_PUBLISHERS),
+            pubs: Vec::new(),
+            reported: BTreeMap::new(),
+            dropped: 0,
+        }
+    }
 }
 
 impl Authority {
@@ -124,7 +165,54 @@ impl Authority {
     pub fn new(policy: AuthorityPolicy) -> Authority {
         Authority {
             policy,
+            ids: StrInterner::with_cap(crate::clock::MAX_TRACKED_PUBLISHERS),
             ..Authority::default()
+        }
+    }
+
+    /// A table whose slots are `config`'s edges, in declaration order.
+    ///
+    /// The same order [`crate::StaticStore::seeded`] uses, which is what makes a
+    /// slot mean the same edge in both.
+    #[must_use]
+    pub(crate) fn seeded(policy: AuthorityPolicy, config: &TopologyConfig) -> Authority {
+        let mut a = Authority::new(policy);
+        a.index = EdgeIndex::with_capacity(config.edges.len());
+        for e in &config.edges {
+            let (p, c) = e.key();
+            a.slot_or_insert(p, c);
+        }
+        a
+    }
+
+    /// The slot for an edge, creating it if the table is growing.
+    fn slot_or_insert(&mut self, parent: &str, child: &str) -> EdgeSlot {
+        if let Some(slot) = self.index.get(parent, child) {
+            return slot;
+        }
+        let slot = EdgeSlot(u32::try_from(self.index.len()).unwrap_or(u32::MAX));
+        self.index.insert(parent, child, slot);
+        self.owners.push(None);
+        slot
+    }
+
+    /// The id for a publisher, interning it if the cap allows.
+    ///
+    /// Past the cap every further publisher collapses onto one sentinel id,
+    /// which merges their conflict rows. That loses a *breakdown*, never a
+    /// count: `dropped` and the verdict are unaffected, and the degradation
+    /// matches `Publisher::Unattributed`'s, which §5.3 already sanctions.
+    fn id_for(&mut self, publisher: &Publisher) -> u32 {
+        let key = crate::ingest::owner_key(publisher);
+        match self.ids.intern(key) {
+            Some(id) => {
+                if self.pubs.len() <= id.get() {
+                    self.pubs.resize(id.get() + 1, Publisher::Unattributed);
+                    self.pubs[id.get()] = publisher.clone();
+                }
+                id.0
+            }
+            None => u32::MAX,
         }
     }
 
@@ -144,8 +232,18 @@ impl Authority {
         // lines down. Building a `(String, String)` key to reach it cost two
         // allocations per message on a correctly configured robot. See
         // `crate::edgemap`.
-        let Some(owner) = lookup(&self.owners, parent, child) else {
-            insert(&mut self.owners, parent, child, publisher.clone());
+        let slot = self.slot_or_insert(parent, child);
+        self.admit_at(slot, publisher)
+    }
+
+    /// [`Self::admit`] for a caller that already holds the slot.
+    ///
+    /// One array index where `admit` did a two-level `ByEdge` descent — the
+    /// probe that ran on every accepted transform to answer a question the slot
+    /// already encodes.
+    pub(crate) fn admit_at(&mut self, slot: EdgeSlot, publisher: &Publisher) -> Verdict {
+        let Some(owner) = self.owners[slot.get()].as_ref() else {
+            self.owners[slot.get()] = Some(publisher.clone());
             return Verdict::Accept;
         };
         if owner == publisher {
@@ -155,7 +253,7 @@ impl Authority {
         let owner = owner.clone();
         match self.policy {
             AuthorityPolicy::LastWriterWins => {
-                insert(&mut self.owners, parent, child, publisher.clone());
+                self.owners[slot.get()] = Some(publisher.clone());
                 Verdict::Accept
             }
             // **`Strict` records exactly what `FirstWriterWins` records**, and
@@ -165,7 +263,7 @@ impl Authority {
             // leaving `owners` alone is what stops a caller that ignores the
             // verdict from finding the edge silently reassigned underneath it.
             AuthorityPolicy::Strict => {
-                let first_time = self.record(parent, child, &owner, publisher);
+                let first_time = self.record(slot, &owner, publisher);
                 Verdict::Fatal {
                     owner,
                     intruder: publisher.clone(),
@@ -173,7 +271,7 @@ impl Authority {
                 }
             }
             AuthorityPolicy::FirstWriterWins => {
-                let first_time = self.record(parent, child, &owner, publisher);
+                let first_time = self.record(slot, &owner, publisher);
                 Verdict::Reject {
                     owner,
                     intruder: publisher.clone(),
@@ -189,23 +287,12 @@ impl Authority {
     /// Shared by the two arms that drop, so the two cannot drift: an earlier
     /// revision had this inline in `FirstWriterWins` only, and `Strict`
     /// returned without recording anything at all.
-    fn record(
-        &mut self,
-        parent: &str,
-        child: &str,
-        owner: &Publisher,
-        intruder: &Publisher,
-    ) -> bool {
+    fn record(&mut self, slot: EdgeSlot, owner: &Publisher, intruder: &Publisher) -> bool {
         // The only allocating path in `admit`, and it is the fault path: two
         // publishers actually disagree about an edge. The steady state — one
         // publisher, or the owner's own samples — never reaches it.
-        let rk = (
-            parent.to_string(),
-            child.to_string(),
-            owner.clone(),
-            intruder.clone(),
-        );
-        let seen = self.reported.entry(rk).or_insert(0);
+        let (o, i) = (self.id_for(owner), self.id_for(intruder));
+        let seen = self.reported.entry((slot.0, o, i)).or_insert(0);
         let first_time = *seen == 0;
         *seen += 1;
         self.dropped += 1;
@@ -235,15 +322,29 @@ impl Authority {
     /// 000 samples from `/odom_node`" is the sentence that makes an operator
     /// act, and "there was a conflict once" is not.
     pub fn conflicts(&self) -> impl Iterator<Item = (&str, &str, &Publisher, &Publisher, u64)> {
-        self.reported
-            .iter()
-            .map(|((p, c, o, i), n)| (p.as_str(), c.as_str(), o, i, *n))
+        self.reported.iter().map(|((slot, o, i), n)| {
+            let (p, c) = self.index.key(*slot as usize);
+            (p, c, &self.pubs[*o as usize], &self.pubs[*i as usize], *n)
+        })
+    }
+
+    /// The slot this table has assigned to an edge, if any.
+    ///
+    /// Exists so a test can assert this table and `StaticStore` agree about slot
+    /// numbering — an invariant `Ingest::offer` relies on every transform and
+    /// which no type enforces. `cfg(test)` because that assertion is its only
+    /// caller: the pipeline addresses this table by a slot it already holds.
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, parent: &str, child: &str) -> Option<EdgeSlot> {
+        self.index.get(parent, child)
     }
 
     /// The owner of an edge, if one has been established.
     #[must_use]
     pub fn owner_of(&self, parent: &str, child: &str) -> Option<&Publisher> {
-        lookup(&self.owners, parent, child)
+        self.index
+            .get(parent, child)
+            .and_then(|s| self.owners[s.get()].as_ref())
     }
 
     // **`distinct_owners()` was here, and it is deliberately gone.**

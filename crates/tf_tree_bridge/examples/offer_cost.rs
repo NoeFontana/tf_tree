@@ -52,6 +52,7 @@
 )]
 
 use std::hint::black_box;
+use std::time::Instant;
 
 use tf_tree_bridge::{Action, Ingest, Publisher, Sample, SteadyNanos, Topic, TopologyConfig};
 
@@ -64,7 +65,7 @@ const STAMP0: i64 = 10_000_000_000;
 const MS: i64 = 1_000_000;
 
 /// How frame names are spelled, which decides what a `memcmp` costs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Names {
     /// `link0 -> link1`. Four shared bytes.
     Short,
@@ -94,7 +95,7 @@ fn topology(edges: usize, style: Names) -> String {
     s
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// The accepted `/tf` transform. The path a healthy robot spends its life on.
     Declared,
@@ -187,6 +188,49 @@ fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
     black_box(accepted)
 }
 
+/// Wall-clock cost per offer, over `threads` **independent** bridges.
+///
+/// # Why independent bridges, and what that does and does not test
+///
+/// `Ingest::offer` takes `&mut self` and the C ABI is thread-affine —
+/// `tft_bridge_offer` is legal only on the thread that created the bridge — so
+/// there is no such thing as N threads sharing one `Ingest`, and a harness that
+/// pretended otherwise would be measuring a configuration the design forbids.
+/// N threads here is N bridges, which is the shape a multi-robot host actually
+/// runs.
+///
+/// So this does **not** measure lock contention; there are no locks. What it
+/// does measure, and what a single-threaded instruction count structurally
+/// cannot see, is whether the change is bought back by the allocator or by
+/// memory bandwidth once several bridges run at once. An interning refactor
+/// trades a scattered `BTreeMap` walk for a denser table, and denser tables
+/// share a last-level cache.
+///
+/// # The statistic
+///
+/// Min of `ROUNDS` rounds. Every source of noise on this host **adds** time and
+/// none removes it, so the fastest round is the closest thing to the work
+/// itself — the same argument `crates/tf_tree_c/examples/bridge_cost.rs` makes.
+/// The figure is ns per offer *per thread*, so a perfectly scaling change holds
+/// it flat as `threads` rises and a bandwidth-bound one does not.
+fn time(mode: Mode, edges: usize, style: Names, n: usize, threads: usize) {
+    const ROUNDS: usize = 7;
+    let mut best = f64::INFINITY;
+    for _ in 0..ROUNDS {
+        let t0 = Instant::now();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(move || run(mode, edges, style, n));
+            }
+        });
+        let per = t0.elapsed().as_secs_f64() * 1e9 / (n as f64);
+        if per < best {
+            best = per;
+        }
+    }
+    println!("offer_time mode={mode:?} edges={edges} threads={threads} ns_per_offer={best:.1}");
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let mode = match a.get(1).map(String::as_str).unwrap_or("declared") {
@@ -210,6 +254,12 @@ fn main() {
         _ => Names::Short,
     };
 
+    // A `threads` argument switches from the counted mode to the timed one.
+    // They share `run`, so the two cannot measure different work.
+    if let Some(threads) = a.get(5).and_then(|s| s.parse::<usize>().ok()) {
+        time(mode, edges, style, n, threads.max(1));
+        return;
+    }
     let accepted = run(mode, edges, style, n);
     // One line, so `just bridge-footprint` can prefix it with the cachegrind
     // ledger without reformatting. `accepted` is printed so a run that silently

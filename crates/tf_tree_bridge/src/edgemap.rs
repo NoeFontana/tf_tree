@@ -9,16 +9,16 @@
 //! `String`s and drop them again — to answer a question about memory the map
 //! was already holding.
 //!
-//! That is affordable in a config parser and not on the ingest path. The bridge
-//! runs [`crate::Ingest::offer`] on **every** transform a robot publishes, and
-//! §5.8 put two such lookups on it (is the edge declared; who owns it). At
-//! twenty edges and 1 kHz the tuple keys cost tens of thousands of allocations a
-//! second for nothing.
+//! **One table is left, and it is the one this shape is still right for.**
+//! `Ingest::undeclared` is keyed by names that are by definition *not* in the
+//! config, so no construction-time table can hold them and the argument above is
+//! the whole of what is available. Every other `(parent, child)` map in this
+//! crate was keyed by the *declared* topology, which is fixed at construction —
+//! so its key set is turned into dense slots once and probed with one hash. See
+//! `crate::edgeindex`, and the measurement in its module docs.
 //!
-//! Nesting `parent → child → T` makes both levels probe with `&str` through the
-//! ordinary `String: Borrow<str>` impl. Allocation then happens once per edge,
-//! when it is first inserted, which is what "allocate at construction" means for
-//! a table whose key set is fixed by the topology file.
+//! `undeclared` is also only reached on the drop path, where the two owned
+//! normalized names already exist for `Action::UndeclaredEdge`.
 //!
 //! `crates/tf_tree_bridge/tests/steady_state_alloc.rs` is the gate on this.
 //!
@@ -30,11 +30,6 @@ use std::collections::BTreeMap;
 
 /// `parent → child → T`. See the module docs for why it is nested.
 pub(crate) type ByEdge<T> = BTreeMap<String, BTreeMap<String, T>>;
-
-/// Probe by reference. Allocates nothing.
-pub(crate) fn lookup<'a, T>(m: &'a ByEdge<T>, parent: &str, child: &str) -> Option<&'a T> {
-    m.get(parent).and_then(|c| c.get(child))
-}
 
 /// Probe by reference for mutation. Allocates nothing.
 pub(crate) fn lookup_mut<'a, T>(
