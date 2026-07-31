@@ -39,6 +39,17 @@ pub enum AuthorityPolicy {
     /// Refuse to start if a conflict appears within a startup window. For CI,
     /// where "this configuration has two publishers on one edge" should fail
     /// the build rather than produce a diagnostic nobody reads.
+    ///
+    /// **The window is `Ingest`'s, not this table's** (`docs/decisions/0011`).
+    /// This module answers one question — "does this publisher own this edge?"
+    /// — per edge and exactly, and a table that also knew what time it was
+    /// would be the conflation that record is about. So `admit` reports a
+    /// conflict under `Strict` as [`Verdict::Fatal`] whenever it sees one, and
+    /// [`crate::Ingest`] decides whether that is inside the startup window (in
+    /// which case it is accumulated) or outside it (in which case `Strict`
+    /// degrades to `FirstWriterWins` plus counters, because a bridge that has
+    /// been healthy for an hour must not be killed by a late-joining
+    /// publisher).
     Strict,
 }
 
@@ -64,13 +75,31 @@ pub enum Verdict {
         /// else.
         first_time: bool,
     },
-    /// Under [`AuthorityPolicy::Strict`], a conflict inside the startup window.
-    /// The bridge must stop.
+    /// Under [`AuthorityPolicy::Strict`], a conflict. **A fact, not an order.**
+    ///
+    /// It says "`Strict` saw two publishers on this edge", which is what this
+    /// table can know. Whether that stops the bridge is a judgment about *when*
+    /// it happened, and only [`crate::Ingest`] holds the startup window that
+    /// answers it — see [`AuthorityPolicy::Strict`].
+    ///
+    /// The sample is dropped either way, and the same `reported`/`dropped`
+    /// bookkeeping [`Verdict::Reject`] gets is done for it, so a `Strict`
+    /// conflict is visible to [`Authority::conflicts`] and therefore to
+    /// `tf_tree doctor`. Before `docs/decisions/0011` this arm returned without
+    /// recording anything, on the assumption that the bridge was about to stop
+    /// — which stopped being true the moment the halt moved to the window's
+    /// close, and would have left CI's own policy the one that reported least.
     Fatal {
         /// The prior owner.
         owner: Publisher,
         /// The publisher that collided with it.
         intruder: Publisher,
+        /// Whether this is the first time these two have collided on this edge.
+        ///
+        /// Same meaning and same source as [`Verdict::Reject`]'s: `Strict` is
+        /// no longer a per-message halt, so its diagnostic needs the same rate
+        /// limiter every other per-message diagnostic has.
+        first_time: bool,
     },
 }
 
@@ -129,21 +158,22 @@ impl Authority {
                 insert(&mut self.owners, parent, child, publisher.clone());
                 Verdict::Accept
             }
-            AuthorityPolicy::Strict => Verdict::Fatal {
-                owner,
-                intruder: publisher.clone(),
-            },
+            // **`Strict` records exactly what `FirstWriterWins` records**, and
+            // does not touch `owners`. Both halves matter. The bookkeeping is
+            // what puts the conflict in front of `doctor` and in front of the
+            // startup window's close, which is now the only thing that halts;
+            // leaving `owners` alone is what stops a caller that ignores the
+            // verdict from finding the edge silently reassigned underneath it.
+            AuthorityPolicy::Strict => {
+                let first_time = self.record(parent, child, &owner, publisher);
+                Verdict::Fatal {
+                    owner,
+                    intruder: publisher.clone(),
+                    first_time,
+                }
+            }
             AuthorityPolicy::FirstWriterWins => {
-                let rk = (
-                    parent.to_string(),
-                    child.to_string(),
-                    owner.clone(),
-                    publisher.clone(),
-                );
-                let seen = self.reported.entry(rk).or_insert(0);
-                let first_time = *seen == 0;
-                *seen += 1;
-                self.dropped += 1;
+                let first_time = self.record(parent, child, &owner, publisher);
                 Verdict::Reject {
                     owner,
                     intruder: publisher.clone(),
@@ -151,6 +181,45 @@ impl Authority {
                 }
             }
         }
+    }
+
+    /// Count a dropped sample against this conflict, and say whether it is the
+    /// first of its kind.
+    ///
+    /// Shared by the two arms that drop, so the two cannot drift: an earlier
+    /// revision had this inline in `FirstWriterWins` only, and `Strict`
+    /// returned without recording anything at all.
+    fn record(
+        &mut self,
+        parent: &str,
+        child: &str,
+        owner: &Publisher,
+        intruder: &Publisher,
+    ) -> bool {
+        // The only allocating path in `admit`, and it is the fault path: two
+        // publishers actually disagree about an edge. The steady state — one
+        // publisher, or the owner's own samples — never reaches it.
+        let rk = (
+            parent.to_string(),
+            child.to_string(),
+            owner.clone(),
+            intruder.clone(),
+        );
+        let seen = self.reported.entry(rk).or_insert(0);
+        let first_time = *seen == 0;
+        *seen += 1;
+        self.dropped += 1;
+        first_time
+    }
+
+    /// The policy this table was built with.
+    ///
+    /// Read by [`crate::Ingest`] at the close of the startup window, which is
+    /// the one place `Strict` differs from `FirstWriterWins` in what *happens*
+    /// rather than in what is recorded.
+    #[must_use]
+    pub fn policy(&self) -> AuthorityPolicy {
+        self.policy
     }
 
     /// Total samples dropped by policy (§5.9).
@@ -175,6 +244,39 @@ impl Authority {
     #[must_use]
     pub fn owner_of(&self, parent: &str, child: &str) -> Option<&Publisher> {
         lookup(&self.owners, parent, child)
+    }
+
+    /// How many **distinct publishers** have been established as owners.
+    ///
+    /// This is the corroboration floor `ResetQuorum` is capped by, and it has to
+    /// be a publisher count rather than an edge count. An earlier revision fed
+    /// the quorum the number of declared dynamic *edges*, which is a proxy that
+    /// fails on the exact topology the quorum was corrected for: one node owning
+    /// `map -> odom` and `odom -> base_link` declares two edges, so the floor
+    /// stayed at two, so that node could never corroborate itself — and §5.5's
+    /// detection went silently unreachable for it, which is the defect the floor
+    /// exists to prevent.
+    ///
+    /// Derived rather than tracked: the owner table is already here, already
+    /// bounded by the declared topology, and this runs only on a regression, so
+    /// there is no second copy of the truth to drift.
+    ///
+    /// # One publisher is not a degraded case
+    ///
+    /// If only one publisher has ever owned an edge, a backward jump is
+    /// *observationally identical* whether that publisher restarted or the clock
+    /// moved — there is no second party whose agreement could tell them apart.
+    /// Halting on the first regression is therefore not a weaker answer there; it
+    /// is the only answer the evidence supports, and it is what §5.5 asks for.
+    #[must_use]
+    pub fn distinct_owners(&self) -> usize {
+        let mut seen: BTreeMap<&Publisher, ()> = BTreeMap::new();
+        for children in self.owners.values() {
+            for owner in children.values() {
+                seen.insert(owner, ());
+            }
+        }
+        seen.len()
     }
 }
 
@@ -272,21 +374,53 @@ mod tests {
         assert_eq!(a.dropped(), 0, "nothing is dropped, which is the problem");
     }
 
-    /// **`Strict` fails rather than degrades**, which is what CI wants.
+    /// **`Strict` reports a conflict as `Fatal`, and records it like every
+    /// other drop.**
+    ///
+    /// The recording half is the part `docs/decisions/0011` added. `Fatal` no
+    /// longer stops the bridge where it is raised — [`crate::Ingest`]'s startup
+    /// window decides that — so an arm that returned without touching
+    /// `reported` or `dropped` made CI's own policy the one whose conflicts
+    /// were invisible to `conflicts()` and to `tf_tree doctor`.
+    ///
+    /// Mutant: restore the old body — `AuthorityPolicy::Strict =>
+    /// Verdict::Fatal { owner, intruder, first_time: true }`, with no
+    /// `self.record(..)` — applied, and this failed at the *second* `admit`,
+    /// `Fatal { .., first_time: true } != Fatal { .., first_time: false }`: a
+    /// conflict that is loud forever is loud at the message rate, and the
+    /// `dropped()` and `conflicts()` assertions below it were both zero.
     #[test]
-    fn strict_reports_a_conflict_as_fatal() {
+    fn strict_reports_a_conflict_as_fatal_and_still_records_it() {
         let mut a = Authority::new(AuthorityPolicy::Strict);
+        assert_eq!(a.policy(), AuthorityPolicy::Strict);
         assert_eq!(a.admit("odom", "base", &node("/a")), Verdict::Accept);
         assert_eq!(
             a.admit("odom", "base", &node("/b")),
             Verdict::Fatal {
                 owner: node("/a"),
                 intruder: node("/b"),
+                first_time: true,
             }
         );
         // Fatal does not mutate ownership: a caller that ignores it and keeps
         // going must not find the edge silently reassigned underneath it.
         assert_eq!(a.owner_of("odom", "base"), Some(&node("/a")));
+
+        // …and the conflict is on the books, rate-limited by identity exactly
+        // as `FirstWriterWins`'s is, so the window's close and `doctor` can
+        // both read it.
+        assert_eq!(
+            a.admit("odom", "base", &node("/b")),
+            Verdict::Fatal {
+                owner: node("/a"),
+                intruder: node("/b"),
+                first_time: false,
+            }
+        );
+        assert_eq!(a.dropped(), 2);
+        let all: Vec<_> = a.conflicts().collect();
+        assert_eq!(all.len(), 1, "one distinct conflict, seen twice: {all:?}");
+        assert_eq!(all[0].4, 2);
     }
 
     /// **An RMW that reports no GIDs must not lose the whole stream.**

@@ -499,8 +499,16 @@ void BridgeHandle::offer_one(
 void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic)
 {
   // Nothing here decides anything: `out.action` is the decision, already made.
-  // `out.first_time` is the pipeline's own rate limiter, and it is the only
-  // reason a 1 kHz misconfigured edge does not emit a thousand lines a second.
+  //
+  // What every arm still owes is rate limiting, and there are two mechanisms
+  // because the ABI sets `out.first_time` on some actions and not others. Where
+  // it is set — `UNDECLARED`, `STATIC_CONFLICT`, `NOT_THE_OWNER`, `HALT`,
+  // `RECREATE` — it is the pipeline's own limiter and is the better one: it is
+  // keyed on the *fact* (once per edge, once per stop) rather than on the
+  // clock, so it neither repeats nor hides. Where it is not — `REJECTED`, and
+  // the drop reasons in `TFT_BRIDGE_DROPPED` — gating on it would silence the
+  // arm outright, so those throttle instead, on this side of the seam. Each of
+  // those arms carries the argument for its own choice.
   switch (out.action) {
     case TFT_BRIDGE_APPLIED:
     case TFT_BRIDGE_STATIC_VERIFIED:
@@ -564,6 +572,81 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
         }
         return;
       }
+      // **The other drop reasons are throttled, one call site each**
+      // (`docs/decisions/0011` D3). They used to share the single
+      // `first_time`-gated line at the bottom of this arm, which never fired:
+      // `fill`'s `Action::Drop` arm in `crates/tf_tree_c/src/bridge.rs` sets
+      // neither `first_time` nor `detail`, so the gate was permanently false
+      // and the message, had it fired, would have rendered as
+      // "odom -> base dropped from /tf: " with an empty reason. Both halves are
+      // fixed here rather than by changing the ABI, exactly as the
+      // `TFT_BRIDGE_REJECTED` arm below already does it.
+      //
+      // **And deliberately not by giving `Action::Drop` a `first_time` field.**
+      // The three reasons do not share rate-limiting semantics, so one flag
+      // would be wrong for at least one of them:
+      //
+      //   * `KIND_CHANGE` is bounded by the declared topology — genuinely once
+      //     per edge, which is the question `first_time` answers.
+      //   * `NON_MONOTONIC` is high frequency by nature: a publisher a few
+      //     milliseconds out of order drops on most of its samples, for as long
+      //     as it runs. `first_time` would announce the first one and then hide
+      //     a fault that is still happening — under-reporting, not rate
+      //     limiting.
+      //   * `BAD_NAME` is the one that decides it. The name *failed*
+      //     normalization, so the key any per-edge first-time table would be
+      //     built on is chosen by the publisher and is unbounded — the growth
+      //     bug `NameNormalizer::seen` is capped to avoid, reintroduced.
+      //
+      // Throttling a log costs nothing diagnostic, because the log is not the
+      // reporting surface. `tft_bridge_stats::dropped_bad_name`,
+      // `dropped_kind_change` and `dropped_non_monotonic` are exact — every
+      // dropped transform lands in exactly one of them and the ledger balances
+      // — and they are what `tf_tree doctor` reads. These lines exist to put a
+      // human on the trail, not to be counted.
+      //
+      // **Three call sites, not one throttled tail.** rcutils keeps a
+      // throttle's `last_logged` in a function-local `static` per macro
+      // expansion, so a single shared site would let a 1 kHz `NON_MONOTONIC`
+      // edge consume the whole budget and starve the once-per-edge
+      // `KIND_CHANGE` line — the exact under-reporting the paragraph above
+      // rejects. Written as an `if` chain rather than a nested `switch` to
+      // match the `NOT_THE_OWNER` sub-arm directly above.
+      if (out.reason == TFT_BRIDGE_REASON_BAD_NAME) {
+        // The **raw** wire names, and here that is not a limitation: `fill`
+        // takes them from the scratch sample, and normalization is precisely
+        // what failed, so a normalized pair does not exist. The raw one is the
+        // only thing that identifies the message an operator has to go find.
+        RCLCPP_WARN_THROTTLE(
+          log_, *node_->get_clock(), 5000,
+          "%s carries a frame name that does not normalize (%s -> %s): dropped. "
+          "dropped_bad_name in `tf_tree doctor` carries the exact count.",
+          topic_name(topic), out.parent, out.child);
+        return;
+      }
+      if (out.reason == TFT_BRIDGE_REASON_KIND_CHANGE) {
+        RCLCPP_WARN_THROTTLE(
+          log_, *node_->get_clock(), 5000,
+          "%s -> %s arrived on %s, but that edge is already established as the other kind: "
+          "dropped. An edge is static or dynamic, never both.",
+          out.parent, out.child, topic_name(topic));
+        return;
+      }
+      if (out.reason == TFT_BRIDGE_REASON_NON_MONOTONIC) {
+        RCLCPP_WARN_THROTTLE(
+          log_, *node_->get_clock(), 5000,
+          "%s -> %s went backwards by %" PRId64 " ns on %s: dropped. This is below the "
+          "clock-reset threshold, so it is that publisher's own jitter, not a clock reset.",
+          out.parent, out.child, out.by_nanos, topic_name(topic));
+        return;
+      }
+      // `TFT_BRIDGE_REASON_BAD_POSE` is the only reason left, and it is the one
+      // drop the ABI does give a `detail` (the layout error text). It is not
+      // part of D3 and is left exactly as it was, `first_time` gate included —
+      // which means this branch is dead for the same reason the three above
+      // were, since the ABI sets `first_time` on no `TFT_BRIDGE_DROPPED`
+      // outcome. That is a separate finding from the one D3 settles, and
+      // fixing it here would be a behaviour change nobody asked for.
       if (out.first_time != 0) {
         RCLCPP_WARN(
           log_, "%s -> %s dropped from %s: %s", out.parent, out.child, topic_name(topic),
@@ -572,10 +655,10 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
       return;
 
     case TFT_BRIDGE_REJECTED:
-      // **Throttled, because the comment below claims every arm is gated and
-      // this one was not.** The falsehood matters more here than it would for a
-      // stop: a halt is latched exactly once, while an arena refusal is
-      // per-sample and can repeat for as long as the robot runs.
+      // **Throttled, because this arm is ungated and unlike a stop it repeats.**
+      // A halt is latched and announced exactly once, so leaving it ungated
+      // would cost one wrong line; an arena refusal is per-sample and can
+      // repeat for as long as the robot runs.
       //
       // Throttling rather than `first_time`, deliberately: the ABI never sets
       // that flag on this action — `Action::Publish`'s reject path in
@@ -587,16 +670,17 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
         out.child, out.status, out.detail);
       return;
 
-    // **Both stops are gated on `first_time` like every other arm**, and this
-    // is not belt-and-braces. A stop is *latched*: the ABI replays the same
-    // action for every later transform forever, so an ungated `RCLCPP_FATAL`
-    // here is one line per transform for the life of the process — on a robot
-    // whose `/tf` carries 20 transforms at 100 Hz, 2000 `FATAL` a second, each
-    // formatting and taking rcutils' logging mutex on the ingest thread, and
-    // each pushing the one actionable line further up the scrollback. §5.4
-    // requires the diagnostic be "loud, **rate-limited**"; this is the second
-    // half of that. `tft_bridge_outcome::first_time` is 1 on the offer that
-    // stops the bridge and 0 on every replay.
+    // **Both stops are gated on `first_time`**, like every arm the ABI sets
+    // that flag on, and this is not belt-and-braces. A stop is *latched*: the
+    // ABI replays the same action for every later transform forever, so an
+    // ungated `RCLCPP_FATAL` here is one line per transform for the life of the
+    // process — on a robot whose `/tf` carries 20 transforms at 100 Hz, 2000
+    // `FATAL` a second, each formatting and taking rcutils' logging mutex on
+    // the ingest thread, and each pushing the one actionable line further up
+    // the scrollback. §5.4 requires the diagnostic be "loud,
+    // **rate-limited**"; this is the second half of that.
+    // `tft_bridge_outcome::first_time` is 1 on the offer that stops the bridge
+    // and 0 on every replay.
     case TFT_BRIDGE_HALT:
       if (out.first_time != 0) {
         RCLCPP_FATAL(

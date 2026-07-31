@@ -170,14 +170,19 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
         };
         match ingest.offer(Topic::Tf, &sample, &publisher) {
             Action::Publish { .. } => published += 1,
-            // A real recording interleaves five edges, so a sample can arrive
-            // with a stamp behind one already seen on another edge. §5.5's
-            // clock guard is global by design (it tracks the *bridge's* notion
-            // of now), so this is expected and is not a discovery defect —
-            // what matters is that nothing is undeclared.
-            Action::Drop {
-                reason: tf_tree_bridge::DropReason::NonMonotonic { .. },
-            } => {}
+            // **Every other outcome is a failure, `NonMonotonic` included.**
+            //
+            // This used to tolerate a `Drop { NonMonotonic }`: a real recording
+            // interleaves five edges, and while §5.5's guard was one guard over
+            // the merged stream a sample could arrive behind a high-water mark
+            // that some *other* edge had set. `docs/decisions/0011` scoped the
+            // guard per edge, so the only regression left to report is an edge
+            // going backwards against its own last accepted stamp — which this
+            // recording, whose publishers are each internally monotone, never
+            // does. The arm was measured dead before it was removed (replacing
+            // it with a `panic!` leaves this test green), so keeping it would
+            // have been a decorative tolerance for something that cannot
+            // happen, hiding a real regression if one ever started.
             other => panic!("{parent} -> {child} @ {}: {other:?}", s.stamp_ns),
         }
     }
@@ -193,10 +198,16 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
     assert_eq!(stats.dropped_bad_name, 0);
     assert_eq!(stats.dropped_kind_change, 0);
     assert!(stats.balanced(), "{stats:?}");
-    assert!(
-        published > 900,
-        "the bulk of a 1066-sample recording must be published, got {published}"
+    // **All of it, not most of it.** The old bound was `> 900`, sized for the
+    // stream-wide guard's incidental drops; with the guard scoped per edge this
+    // corpus loses nothing, and saying so exactly is the positive evidence that
+    // per-edge scoping did not start dropping traffic on a real robot.
+    assert_eq!(
+        published, 1066,
+        "every sample of a 1066-sample recording must be published"
     );
+    assert_eq!(stats.dropped_non_monotonic, 0);
+    assert_eq!(stats.clock_resets, 0);
 }
 
 /// **A config that names an edge the robot does not publish is fine; one that

@@ -83,7 +83,15 @@ pub type tft_bridge_authority = i32;
 pub const TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS: tft_bridge_authority = 0;
 /// Reclaim on each new publisher. Documented as chaotic; never the default.
 pub const TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS: tft_bridge_authority = 1;
-/// Halt on the first conflict. For CI.
+/// Refuse to start if a conflict is detected within the startup window. For CI.
+///
+/// **Not "halt on the first conflict"**, which is what this said and what the
+/// code did before `docs/decisions/0011`. A conflict inside the window is
+/// dropped and counted like `FIRST_WRITER_WINS`, and the bridge halts **once**,
+/// at the window's close, reporting everything it found — CI wants every
+/// misconfiguration out of one run, not the first one out of four. Outside the
+/// window this policy *is* `FIRST_WRITER_WINS` plus counters, so a bridge that
+/// has been healthy for an hour is not killed by a late-joining publisher.
 pub const TFT_BRIDGE_AUTHORITY_STRICT: tft_bridge_authority = 2;
 
 /// §5.5's response to a backwards clock jump beyond the reset threshold.
@@ -134,9 +142,20 @@ pub const TFT_BRIDGE_REASON_NOT_THE_OWNER: tft_bridge_reason = 2;
 pub const TFT_BRIDGE_REASON_NON_MONOTONIC: tft_bridge_reason = 3;
 /// The edge is already declared with the other kind (§5.7).
 pub const TFT_BRIDGE_REASON_KIND_CHANGE: tft_bridge_reason = 4;
-/// `STRICT`, and two publishers appeared on one edge (§5.4).
+/// `STRICT`, and a conflict was recorded on an edge (§5.4).
+///
+/// On a [`TFT_BRIDGE_HALT`] this is `STRICT`'s startup window closing with
+/// conflicts in it. `detail` carries how many of each kind — authority (§5.4)
+/// **and** static-value (§5.7) — because the halt is about a set of edges and
+/// this POD has room for one. `owner` and `intruder` are empty there, and so are
+/// `parent`/`child`: the window closed on transforms counted long before the one
+/// in hand, so there is no edge to name that would not be the wrong one.
 pub const TFT_BRIDGE_REASON_AUTHORITY_CONFLICT: tft_bridge_reason = 5;
-/// `HALT`, and the clock went backwards past the threshold (§5.5).
+/// `HALT`, and a quorum of publishers said the clock went backwards past the
+/// threshold (§5.5). `by_nanos` is the regression on the edge that completed the
+/// quorum, `parent`/`child` name it, and `detail` says how many edges were
+/// regressing together — "5 edges" is a bag loop and "2 edges" may be two
+/// publishers that hiccuped at once.
 pub const TFT_BRIDGE_REASON_CLOCK_RESET: tft_bridge_reason = 6;
 /// The pose was not a transform: NaN, infinity, or a quaternion that is not a
 /// unit quaternion. Checked **before** the pipeline — see [`tft_bridge_offer`].
@@ -319,12 +338,21 @@ pub struct tft_bridge_stats {
     /// quaternion). `tf2` has no equivalent check and no equivalent counter.
     pub dropped_bad_pose: u64,
     /// The pipeline approved the write and the arena refused it — a revoked
-    /// claim, or a per-edge stamp the global clock guard could not see.
+    /// claim, or a writer poisoned by a `fork()`. **Not a stamp the clock guard
+    /// missed:** since `docs/decisions/0011` the guard is per edge, so its
+    /// high-water mark is that edge's own last accepted stamp and the ring it
+    /// feeds cannot disagree with it.
     pub rejected_by_arena: u64,
     /// Offers refused because the bridge had already stopped — after a
     /// [`TFT_BRIDGE_HALT`] *or* a [`TFT_BRIDGE_RECREATE`], both of which latch.
     pub refused_after_halt: u64,
-    /// Clock resets detected (§5.5).
+    /// Clock resets detected (§5.5) — **promotions**, not regressions.
+    ///
+    /// A single publisher's stamp going backwards past the threshold is counted
+    /// in `dropped_non_monotonic` and nowhere else; this counts the times a
+    /// quorum of distinct publishers regressed inside one correlation window,
+    /// which is the only evidence that the *clock* moved rather than a node
+    /// restarting. Under `HALT` it is therefore 0 or 1 for the life of a bridge.
     pub clock_resets: u64,
     /// Static-transform value conflicts (§5.7).
     pub static_conflicts: u64,
@@ -468,11 +496,13 @@ struct BridgeInner {
     /// §5.5's `--on-clock-reset`, and this ABI cannot recreate the arena for the
     /// reasons in [`tft_bridge_offer`]'s docs — so the *only* correct
     /// continuation is that the caller tears this bridge down. Left unlatched,
-    /// the pipeline's clock guard has already accepted the rewound stamp
-    /// (`ClockGuard::accept_reset`), so every subsequent offer would be approved
-    /// and the arena would refuse it per edge as non-monotonic: a bag loop would
-    /// turn into a silent, permanent stall reported one `rejected_by_arena` at a
-    /// time rather than the one loud outcome §5.5 asks for.
+    /// the pipeline has already **forgotten every edge's high-water mark** — the
+    /// `Recreate` path rewinds each guard to "no stamp seen yet", which is what
+    /// `docs/decisions/0011` replaced the old single `ClockGuard::accept_reset`
+    /// with — so every subsequent offer would be approved and the arena would
+    /// refuse it per edge as non-monotonic: a bag loop would turn into a silent,
+    /// permanent stall reported one `rejected_by_arena` at a time rather than the
+    /// one loud outcome §5.5 asks for.
     stopped: Option<Stopped>,
     dropped_bad_pose: u64,
     rejected_by_arena: u64,
@@ -1071,12 +1101,17 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                 // Reaching it needs the arena to refuse a write the pipeline
                 // approved, and on a private heap arena that cannot happen:
                 //
-                // * `PushError::NonMonotonicStamp` is dominated by the global
-                //   clock guard. `Action::Publish` requires `stamp >= newest`,
-                //   and `newest` is the maximum over every accepted sample, so
-                //   it is `>=` any one edge's own last stamp. The `Recreate`
-                //   path is the only thing that rewinds `newest`, and it
-                //   latches `stopped` before another offer can be processed.
+                // * `PushError::NonMonotonicStamp` is dominated by the clock
+                //   guard, and `docs/decisions/0011` made that argument
+                //   *simpler* rather than breaking it. `Action::Publish`
+                //   requires `stamp >= newest`, and since the guards are per
+                //   edge, `newest` is **this edge's** last accepted stamp —
+                //   exactly the value its ring compares against, so the two
+                //   cannot disagree. (The old single guard dominated the ring
+                //   only incidentally, by being the maximum over every edge.)
+                //   The `Recreate` path is the only thing that rewinds those
+                //   marks, and it latches `stopped` before another offer can be
+                //   processed.
                 // * `PushError::ClaimRevoked` needs a reaper, and
                 //   `PushError::ChildDetached` needs a `fork()`; both are
                 //   `--features shm` machinery (`docs/PHASE2.md` §1, A4) that a
@@ -1200,28 +1235,82 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             // because a halted bridge answers `HALT` to every transform
             // forever.
             o.first_time = 1;
-            match reason {
+            // **The detail is the match's value, not a write inside it.** The
+            // numbers `docs/decisions/0011` added to two of these variants —
+            // `correlated_edges`, and the pair of conflict counts — have nowhere
+            // else to go: `tft_bridge_outcome` is a `struct_size`-versioned POD
+            // and growing it is a break that record deliberately did not take.
+            // So they ride in `detail`, and an arm that wrote `detail` itself
+            // would have had it overwritten by the "the bridge halted" sentence
+            // that used to follow this match unconditionally. Returning the
+            // string makes that mistake unrepresentable rather than a comment
+            // asking the next author not to make it.
+            let detail = match reason {
                 HaltReason::AuthorityConflict { owner, intruder } => {
                     o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
                     set(&mut inner.strings.owner, &owner.to_string());
                     set(&mut inner.strings.intruder, &intruder.to_string());
                     o.owner = ptr(&inner.strings.owner);
                     o.intruder = ptr(&inner.strings.intruder);
+                    name_the_edge(inner, o);
+                    "the bridge halted; free it and build a new one".to_string()
                 }
-                HaltReason::ClockReset { by_nanos } => {
+                HaltReason::ClockReset {
+                    by_nanos,
+                    correlated_edges,
+                } => {
                     o.reason = TFT_BRIDGE_REASON_CLOCK_RESET;
                     o.by_nanos = *by_nanos;
+                    name_the_edge(inner, o);
+                    // The count is evidence, not decoration. §5.5's judgment is
+                    // now a quorum (`docs/decisions/0011`), and the outcome names
+                    // only the edge that completed it — so without this an
+                    // operator cannot tell a whole-tree bag loop from two
+                    // publishers that happened to hiccup together, which is the
+                    // quorum's one false-positive mode.
+                    format!(
+                        "the clock went backwards on {correlated_edges} edge(s) at once; \
+                         the bridge halted, free it and build a new one"
+                    )
                 }
-            }
-            name_the_edge(inner, o);
+                HaltReason::StartupConflicts { authority, statics } => {
+                    // **Reported under the authority reason, and that is a
+                    // limitation rather than a claim.** §5.4's `Strict` is what
+                    // raised this and a conflict is what it found, so the code is
+                    // the closest true one — but `statics` counts §5.7 value
+                    // disagreements, which that code does not name. A dedicated
+                    // `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` is
+                    // `docs/decisions/0011`'s implementation step 6 and cannot
+                    // land here: an unstable constant has to be added to
+                    // `UNSTABLE` in `xtask/src/headers.rs` in the same commit,
+                    // because the stable tier's cbindgen config is
+                    // exclude-by-complement and an unclassified constant is
+                    // emitted into the **frozen** `tf_tree.h` with nothing
+                    // failing. Until then both counts are in `detail`, which is
+                    // what the `rclcpp` HALT arm prints anyway.
+                    o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
+                    // **No `name_the_edge` here, deliberately.** The other two
+                    // arms are judgments *about the arriving sample*, so the
+                    // scratch names are that sample's and naming it is the
+                    // diagnostic. This one is not: the window closed on
+                    // transforms counted minutes ago and the arriving transform
+                    // was never processed, so `scratch` holds whichever edge
+                    // happened to be next on the wire. Printing it would name an
+                    // innocent edge as the cause of the halt. `parent`/`child`
+                    // stay at `blank_outcome`'s `""`, which is the documented
+                    // "does not apply to this outcome".
+                    format!(
+                        "STRICT: the startup window closed with {authority} authority and \
+                         {statics} static conflict(s); this deployment is misconfigured and \
+                         the bridge will not start"
+                    )
+                }
+            };
             inner.stopped = Some(Stopped {
                 action: TFT_BRIDGE_HALT,
                 by_nanos: o.by_nanos,
             });
-            set(
-                &mut inner.strings.detail,
-                "the bridge halted; free it and build a new one",
-            );
+            set(&mut inner.strings.detail, &detail);
             o.detail = ptr(&inner.strings.detail);
         }
         Action::RecreateArena { by_nanos } => {

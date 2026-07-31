@@ -355,7 +355,10 @@ typedef struct {
   uint64_t dropped_bad_pose;
   /**
    * The pipeline approved the write and the arena refused it — a revoked
-   * claim, or a per-edge stamp the global clock guard could not see.
+   * claim, or a writer poisoned by a `fork()`. **Not a stamp the clock guard
+   * missed:** since `docs/decisions/0011` the guard is per edge, so its
+   * high-water mark is that edge's own last accepted stamp and the ring it
+   * feeds cannot disagree with it.
    */
   uint64_t rejected_by_arena;
   /**
@@ -364,7 +367,13 @@ typedef struct {
    */
   uint64_t refused_after_halt;
   /**
-   * Clock resets detected (§5.5).
+   * Clock resets detected (§5.5) — **promotions**, not regressions.
+   *
+   * A single publisher's stamp going backwards past the threshold is counted
+   * in `dropped_non_monotonic` and nowhere else; this counts the times a
+   * quorum of distinct publishers regressed inside one correlation window,
+   * which is the only evidence that the *clock* moved rather than a node
+   * restarting. Under `HALT` it is therefore 0 or 1 for the life of a bridge.
    */
   uint64_t clock_resets;
   /**
@@ -418,7 +427,15 @@ typedef struct {
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Halt on the first conflict. For CI.
+ * Refuse to start if a conflict is detected within the startup window. For CI.
+ *
+ * **Not "halt on the first conflict"**, which is what this said and what the
+ * code did before `docs/decisions/0011`. A conflict inside the window is
+ * dropped and counted like `FIRST_WRITER_WINS`, and the bridge halts **once**,
+ * at the window's close, reporting everything it found — CI wants every
+ * misconfiguration out of one run, not the first one out of four. Outside the
+ * window this policy *is* `FIRST_WRITER_WINS` plus counters, so a bridge that
+ * has been healthy for an hour is not killed by a late-joining publisher.
  */
 #define TFT_BRIDGE_AUTHORITY_STRICT 2
 #endif
@@ -540,14 +557,25 @@ typedef struct {
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * `STRICT`, and two publishers appeared on one edge (§5.4).
+ * `STRICT`, and a conflict was recorded on an edge (§5.4).
+ *
+ * On a [`TFT_BRIDGE_HALT`] this is `STRICT`'s startup window closing with
+ * conflicts in it. `detail` carries how many of each kind — authority (§5.4)
+ * **and** static-value (§5.7) — because the halt is about a set of edges and
+ * this POD has room for one. `owner` and `intruder` are empty there, and so are
+ * `parent`/`child`: the window closed on transforms counted long before the one
+ * in hand, so there is no edge to name that would not be the wrong one.
  */
 #define TFT_BRIDGE_REASON_AUTHORITY_CONFLICT 5
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * `HALT`, and the clock went backwards past the threshold (§5.5).
+ * `HALT`, and a quorum of publishers said the clock went backwards past the
+ * threshold (§5.5). `by_nanos` is the regression on the edge that completed the
+ * quorum, `parent`/`child` name it, and `detail` says how many edges were
+ * regressing together — "5 edges" is a bag loop and "2 edges" may be two
+ * publishers that hiccuped at once.
  */
 #define TFT_BRIDGE_REASON_CLOCK_RESET 6
 #endif

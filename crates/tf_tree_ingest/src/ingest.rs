@@ -27,12 +27,11 @@
 //!
 //! # And the guard is per **edge**, not per stream
 //!
-//! The online bridge watches one clock, because it *is* one publisher. A
-//! recording is not: `/tf` carries every publisher on the robot interleaved into
-//! one file, and they do not stamp at the same instant. A localization node
-//! stamps `map -> odom` at the scan it processed and publishes 200 ms later,
-//! while `odom -> base_link` is stamped as it is published. Both are correct;
-//! their stamps interleave by whatever the slower pipeline's latency is, which is
+//! `/tf` carries every publisher on the robot interleaved into one stream, and
+//! they do not stamp at the same instant. A localization node stamps
+//! `map -> odom` at the scan it processed and publishes 200 ms later, while
+//! `odom -> base_link` is stamped as it is published. Both are correct; their
+//! stamps interleave by whatever the slower pipeline's latency is, which is
 //! hundreds of milliseconds and not the tens the 100 ms threshold assumes.
 //!
 //! A single guard over the merged stream therefore reports a *reset* — the whole
@@ -42,6 +41,35 @@
 //! Phase 1 invariant 6 is a per-edge rule. It still catches what the check is
 //! for: a bag loop or a sim reset moves `/clock` itself, so **every** edge
 //! regresses at once and the first one to be observed halts.
+//!
+//! # The two halves agree about scope and diverge about promotion
+//!
+//! An earlier revision of the section above opened by contrasting this with the
+//! online bridge — *"the online bridge watches one clock, because it **is** one
+//! publisher"*. That was never true of `/tf`, which carries the same interleaved
+//! publishers live as it does in a recording, and
+//! `docs/decisions/0011` acted on it: `tf_tree_bridge` keeps one [`ClockGuard`]
+//! per edge too, for exactly the reasons above.
+//!
+//! What the two halves still differ about is deliberate, and it is not *scope*
+//! but **promotion** — what it takes to turn "this edge regressed" into "the
+//! clock moved":
+//!
+//! - **Offline, here, the first regressing edge halts.** A recording is a closed
+//!   artefact, either coherent or not, and a human is reading the answer.
+//!   Stopping to say *"`map -> odom` regresses at t"* costs a rerun and nothing
+//!   else, and the operator can look at the file.
+//! - **Online it takes a quorum** — distinct *publishers* regressing inside a
+//!   correlation window (`tf_tree_bridge::clock::ResetQuorum`). That bridge runs
+//!   unattended on a robot, where halting on one node's restart is an outage
+//!   caused by the diagnostic rather than by the fault, and nobody is there to
+//!   rerun anything.
+//!
+//! So the asymmetry is a difference in what a wrong answer costs, not a
+//! disagreement about what a clock reset is. The one place it closes is a
+//! deployment that cannot supply a second publisher at all: the online quorum is
+//! floored by what the topology declares, and with a single dynamic edge it
+//! halts on the first regression, as this half always does.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

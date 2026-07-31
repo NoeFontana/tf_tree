@@ -50,7 +50,22 @@ pub struct BridgeStats {
     /// "the robot publishes three edges your config does not list", which is a
     /// question with an answer.
     pub dropped_undeclared: u64,
-    /// Clock resets detected (§5.5).
+    /// Clock resets detected (§5.5) — **promotions, not regressions**.
+    ///
+    /// Narrowed by `docs/decisions/0011`. The clock guard is per edge, and one
+    /// edge's stamps going backwards past the threshold is a fact about one
+    /// publisher: it is dropped, and counted in `dropped_non_monotonic`, and it
+    /// does **not** appear here. This counts the times a quorum of distinct
+    /// edges regressed together and the bridge concluded that the *clock* moved
+    /// — which under the default `OnClockReset::Halt` is 0 or 1 for the life of
+    /// the bridge, because the first one stops it.
+    ///
+    /// The distinction is the whole of that record: a counter that conflated
+    /// them would report a healthy robot whose estimator lags its wheel
+    /// odometry as resetting its clock hundreds of times a second.
+    ///
+    /// Not a term in [`BridgeStats::balanced`] — the transform a promotion was
+    /// detected on is already counted in `dropped_non_monotonic`, which is.
     pub clock_resets: u64,
     /// Static-transform value conflicts (§5.7).
     pub static_conflicts: u64,

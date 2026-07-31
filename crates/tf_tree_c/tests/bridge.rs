@@ -478,8 +478,9 @@ fn an_authority_conflict_names_both_publishers_and_the_edge() {
 /// imaginary node and `FirstWriterWins` would hand it every edge.
 ///
 /// Mutant: delete the `key == [0u8; 16]` early return in `publisher_of` ⇒ the
-/// zero GID misses the cache and resolves to `<unknown publisher>`, so the
-/// second assertion fails.
+/// zero GID misses the cache and resolves to `<unknown publisher>`, which under
+/// `Strict` is a second publisher on the edge, so the sample is dropped as
+/// `NOT_THE_OWNER` and the `TFT_BRIDGE_APPLIED` assertion fails.
 #[test]
 fn an_unreported_gid_degrades_rather_than_failing() {
     let b = Bridge::new(TFT_BRIDGE_AUTHORITY_STRICT, TFT_BRIDGE_ON_CLOCK_RESET_HALT);
@@ -488,7 +489,9 @@ fn an_unreported_gid_degrades_rather_than_failing() {
     assert_eq!(o.action, TFT_BRIDGE_APPLIED);
 
     // An all-zero GID is the same publisher as no GID, so `Strict` — which
-    // halts on the *second* distinct publisher — must not fire.
+    // records a conflict on the *second* distinct publisher of an edge, and
+    // halts once at its startup window's close if it recorded any — must find
+    // nothing to record.
     let zero = [0u8; 16];
     let o = b.offer(
         TFT_BRIDGE_TOPIC_TF,
@@ -513,17 +516,41 @@ fn an_unreported_gid_degrades_rather_than_failing() {
     assert_eq!(rc, TFT_ERR_BAD_ENUM);
 }
 
-/// **A halted bridge refuses everything afterwards, and the ledger still
-/// balances.**
+/// **`STRICT` halts when its startup window closes, not on the message that
+/// collided — and a halted bridge then refuses everything, with the ledger still
+/// balancing.**
 ///
 /// §5.5 says the bridge *stops*. This ABI cannot exit somebody else's process,
 /// so stopping means latching: a caller that logs the halt and keeps offering
-/// would push exactly the stamps §5.5 exists to prevent.
+/// would push exactly the stamps §5.5 exists to prevent. That half is unchanged.
+///
+/// What `docs/decisions/0011` changed is the **trigger**. `STRICT` used to
+/// return `Fatal` on the second message that collided, which is neither §5.4's
+/// *"refuse to start if a conflict is detected within a startup window"* nor of
+/// any use to the CI the policy exists for: a deployment with four misconfigured
+/// publishers took four boots to diagnose, each reporting one of them. Now the
+/// collision is dropped and counted exactly as `FIRST_WRITER_WINS` would,
+/// conflicts accumulate while the window is open, and **one** halt at its close
+/// reports how many of each kind were found.
+///
+/// This fixture drives the window's **backstop** — 4096 transforms, a private
+/// constant of `tf_tree_bridge` — because that is the only close a C caller can
+/// reach today: `Ingest::close_startup_window` has no ABI entry point yet
+/// (`docs/decisions/0011`'s implementation step 6). Hence the loop rather than a
+/// third offer.
 ///
 /// Mutant: delete `inner.stopped = Some(…)` from the `Action::Halt` arm ⇒ the
-/// offer after the halt is applied and the `TFT_BRIDGE_HALT` assertion fails.
-/// Mutant: drop `+ inner.refused_after_halt` from `transforms` in
-/// `tft_bridge_get_stats` ⇒ `assert_balanced` fails, short by 3.
+/// offers after the halt are processed and the `TFT_BRIDGE_HALT` assertion in
+/// the replay loop fails. Mutant: drop `+ inner.refused_after_halt` from
+/// `transforms` in `tft_bridge_get_stats` ⇒ the offered-transform assertion
+/// fails first (4096 against 4099), and `assert_balanced` would too, short by 3.
+/// Mutant: restore the unconditional `set(&mut inner.strings.detail, "the bridge
+/// halted; …")` after the `Action::Halt` match — the shape this arm had before,
+/// and the one the halt's numbers cannot survive ⇒ the `"1 authority"`
+/// assertion fails on an outcome that says only that something halted. Mutant:
+/// call `name_the_edge(inner, o)` in the `StartupConflicts` arm ⇒ the halt names
+/// whichever edge happened to be next on the wire as its cause and the
+/// empty-name assertion fails.
 #[test]
 fn a_halted_bridge_refuses_every_later_offer() {
     let b = Bridge::new(TFT_BRIDGE_AUTHORITY_STRICT, TFT_BRIDGE_ON_CLOCK_RESET_HALT);
@@ -536,46 +563,81 @@ fn a_halted_bridge_refuses_every_later_offer() {
             TFT_OK
         );
     }
-    b.offer(
-        TFT_BRIDGE_TOPIC_TF,
-        "odom",
-        "base",
-        1_000 * MS,
-        POSE,
-        Some(&a),
+    // Every `tft_bridge_offer` call this test makes, counted, because the
+    // ledger assertion at the end is about one specific offer that is
+    // deliberately **not** counted by the bridge.
+    let mut offers = 0u64;
+    let mut offer = |stamp: i64, gid: &[u8; 16]| {
+        offers += 1;
+        b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", stamp, POSE, Some(gid))
+    };
+
+    offer(1_000 * MS, &a);
+    let o = offer(1_010 * MS, &z);
+    assert_eq!(
+        o.action,
+        TFT_BRIDGE_DROPPED,
+        "inside the window a STRICT collision is dropped, not halted on: {}",
+        text(o.detail)
     );
-    let o = b.offer(
-        TFT_BRIDGE_TOPIC_TF,
-        "odom",
-        "base",
-        1_010 * MS,
-        POSE,
-        Some(&z),
-    );
-    assert_eq!(o.action, TFT_BRIDGE_HALT);
-    assert_eq!(o.reason, TFT_BRIDGE_REASON_AUTHORITY_CONFLICT);
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_NOT_THE_OWNER);
     assert_eq!(
         (text(o.owner), text(o.intruder)),
-        ("/a".into(), "/b".into())
+        ("/a".into(), "/b".into()),
+        "and it still names both publishers, which is what the close will count"
+    );
+
+    // The backstop. Every offer until it fires is the owner's and is written;
+    // the bound is generous so that a changed constant fails the `expect` below
+    // rather than silently passing on a rewritten rule.
+    let mut halt = None;
+    for k in 0..16_384i64 {
+        let o = offer(2_000 * MS + k * MS, &a);
+        if o.action == TFT_BRIDGE_HALT {
+            halt = Some(o);
+            break;
+        }
+        assert_eq!(
+            o.action,
+            TFT_BRIDGE_APPLIED,
+            "the owner keeps working while the window is open: {} / {}",
+            o.reason,
+            text(o.detail)
+        );
+    }
+    let o = halt.expect("the startup window's backstop must close it and halt");
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_AUTHORITY_CONFLICT);
+    assert_eq!(o.first_time, 1, "the transition is the loud one");
+    let detail = text(o.detail);
+    assert!(
+        detail.contains("1 authority") && detail.contains("0 static"),
+        "the close reports how many of each kind it found, or CI learns nothing \
+         from it: {detail:?}"
+    );
+    assert_eq!(
+        (text(o.parent), text(o.child)),
+        (String::new(), String::new()),
+        "a window-close halt is not about the transform in hand, so it names no \
+         edge rather than an innocent one"
     );
 
     for k in 0..3i64 {
-        let o = b.offer(
-            TFT_BRIDGE_TOPIC_TF,
-            "odom",
-            "base",
-            1_020 * MS + k * MS,
-            POSE,
-            Some(&a),
-        );
+        let o = offer(90_000 * MS + k * MS, &a);
         assert_eq!(o.action, TFT_BRIDGE_HALT, "a halt does not wear off");
         assert_eq!(o.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
+        assert_eq!(o.first_time, 0, "and the replay is rate-limited");
     }
     let s = b.stats();
     assert_eq!(s.refused_after_halt, 3);
     assert_eq!(
-        s.applied, 1,
-        "only the first publisher's sample was written"
+        s.dropped_authority, 1,
+        "the collision was counted once, by the message that made it"
+    );
+    assert_eq!(
+        s.transforms,
+        offers - 1,
+        "a window-close halt is caused by transforms already counted, so it \
+         charges no bucket and is not itself an offered transform"
     );
     assert_balanced(&s);
 }
@@ -584,10 +646,20 @@ fn a_halted_bridge_refuses_every_later_offer() {
 ///
 /// §5.5's `recreate` builds a fresh arena; this ABI will not, because every
 /// plan the node compiled points into the current one. So the only correct
-/// continuation is that the caller tears the bridge down — and the pipeline's
-/// clock guard has *already accepted* the rewound stamp, so an unlatched bridge
-/// would approve every subsequent sample and let the arena refuse them one at a
-/// time as non-monotonic: a bag loop turning into a silent permanent stall.
+/// continuation is that the caller tears the bridge down — and the pipeline has
+/// *already forgotten* every edge's high-water mark (`docs/decisions/0011`
+/// rewinds each per-edge guard to "no stamp seen yet" on this path, in place of
+/// the old single `ClockGuard::accept_reset`), so an unlatched bridge would
+/// approve every subsequent sample and let the arena refuse them one at a time
+/// as non-monotonic: a bag loop turning into a silent permanent stall.
+///
+/// **Two offers reach a reset here because this fixture declares one dynamic
+/// edge.** `docs/decisions/0011`'s quorum wants a second publisher before it
+/// calls a regression "the clock", but it is floored by what the deployment can
+/// supply: with one dynamic edge there is no second publisher to mistake a
+/// restart for, so the first past-threshold jump is unambiguous and is the
+/// reset. The next test in this file covers the unfloored case, where a second
+/// dynamic edge means a second publisher really could exist.
 ///
 /// Mutant: delete `inner.stopped = Some(…)` from the `RecreateArena` arm ⇒ the
 /// next offer is `TFT_BRIDGE_APPLIED` and this fails. Mutant: latch it with
@@ -622,6 +694,126 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     assert_balanced(&b.stats());
 }
 
+/// **With two publishers to tell apart, one regressing edge is a restart and two
+/// are the clock — and the halt says how many corroborated it.**
+///
+/// This is `docs/decisions/0011`'s §5.5 rule at the seam, in the shape the rest
+/// of this file cannot express: `TOPO` declares one dynamic edge, which floors
+/// the quorum to one, so every other clock fixture here halts on the first
+/// regression. That floor is correct — with one dynamic edge there is no second
+/// publisher a restart could be confused with — but it means nothing in this
+/// file exercises the quorum itself, and the quorum is the whole reason a
+/// correctly configured robot with a lagging estimator no longer latches its
+/// bridge. Hence a local topology with a second dynamic edge and a second
+/// publisher.
+///
+/// The count has to ride in `detail` because `tft_bridge_outcome` has room for
+/// exactly one `(parent, child)` pair — filled here with the edge that
+/// *completed* the quorum — and growing that POD is a `struct_size`-versioned
+/// break 0011 declined to take. It is not decoration: "5 edges" is a bag loop
+/// and "2 edges" may be two publishers that hiccuped at once, which is the
+/// quorum's one false-positive mode and the thing an operator would go and look
+/// at.
+///
+/// Mutant: drop `correlated_edges` from the `HaltReason::ClockReset` detail and
+/// return the plain "the bridge halted" sentence ⇒ the `"2 edge"` assertion
+/// fails and the halt no longer says what it concluded. Mutant: promote every
+/// regression, by returning `Reached` unconditionally from `ResetQuorum::record`
+/// ⇒ the first offer halts and the `TFT_BRIDGE_DROPPED` assertion fails, which
+/// is the false halt on a healthy robot that 0011 exists to remove. Mutant:
+/// increment `clock_resets` on the isolated regression too ⇒ the `0` assertion
+/// fails, and the counter goes back to meaning "regressions" instead of
+/// "promotions".
+#[test]
+fn a_clock_reset_needs_a_second_publisher_and_reports_how_many_corroborated() {
+    /// Two dynamic edges from two nodes — the pair 0011 was opened about: a
+    /// localizer's `map -> odom` and a wheel driver's `odom -> base`.
+    const TWO_PUBLISHERS: &str = r#"
+[[edge]]
+parent = "map"
+child = "odom"
+kind = "dynamic"
+capacity = 256
+
+[[edge]]
+parent = "odom"
+child = "base"
+kind = "dynamic"
+capacity = 256
+"#;
+    let b = Bridge::try_new(
+        TWO_PUBLISHERS,
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+        0,
+        None,
+    )
+    .unwrap_or_else(|rc| panic!("tft_bridge_create: {rc} ({})", last_message()));
+    let (amcl, wheels) = ([0x77u8; 16], [0x88u8; 16]);
+    for (g, n) in [(&amcl, "/amcl"), (&wheels, "/wheel_driver")] {
+        let name = CString::new(n).unwrap();
+        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
+        assert_eq!(
+            unsafe { tft_bridge_attribute(b.0, g.as_ptr(), name.as_ptr()) },
+            TFT_OK
+        );
+    }
+    for (p, c, g) in [("map", "odom", &amcl), ("odom", "base", &wheels)] {
+        let o = b.offer(TFT_BRIDGE_TOPIC_TF, p, c, 10_000 * MS, POSE, Some(g));
+        assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
+    }
+
+    // `/amcl` restarts and republishes from five seconds ago. Alone, that is a
+    // node restarting — dropped, counted, and the bridge keeps running.
+    let o = b.offer(
+        TFT_BRIDGE_TOPIC_TF,
+        "map",
+        "odom",
+        5_000 * MS,
+        POSE,
+        Some(&amcl),
+    );
+    assert_eq!(
+        o.action,
+        TFT_BRIDGE_DROPPED,
+        "one publisher regressing is that publisher, not the clock: {}",
+        text(o.detail)
+    );
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_NON_MONOTONIC);
+    assert_eq!(o.by_nanos, 5_000 * MS);
+    let s = b.stats();
+    assert_eq!((s.dropped_non_monotonic, s.clock_resets), (1, 0));
+
+    // The wheel driver regresses by the same five seconds. Two independent
+    // publishers do not restart in lockstep, so the only cause left is the
+    // clock they share.
+    let o = b.offer(
+        TFT_BRIDGE_TOPIC_TF,
+        "odom",
+        "base",
+        5_000 * MS,
+        POSE,
+        Some(&wheels),
+    );
+    assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_CLOCK_RESET);
+    assert_eq!(o.by_nanos, 5_000 * MS);
+    assert_eq!(
+        (text(o.parent), text(o.child)),
+        ("odom".into(), "base".into()),
+        "the outcome names the edge that completed the quorum"
+    );
+    let detail = text(o.detail);
+    assert!(
+        detail.contains("2 edge"),
+        "and the detail carries what the pair cannot: how many corroborated it: \
+         {detail:?}"
+    );
+    let s = b.stats();
+    assert_eq!((s.dropped_non_monotonic, s.clock_resets), (2, 1));
+    assert_balanced(&s);
+}
+
 /// **A stop is `first_time = 1` exactly once, and the replay after it is
 /// rate-limited like every other repeated outcome.**
 ///
@@ -634,12 +826,23 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
 /// diagnostic be "loud, **rate-limited**"; `first_time` is the whole of that
 /// mechanism and it was set on three arms out of five.
 ///
+/// **The stop is a clock reset, and two offers reach one because this fixture
+/// declares a single dynamic edge**: `docs/decisions/0011`'s quorum is floored
+/// by the number of dynamic edges the deployment declares, so with one there is
+/// no second publisher a regression could be confused with and the first
+/// past-threshold jump *is* the reset. The `clock_resets` assertion below is
+/// what says the promotion happened rather than a bare drop — that counter
+/// counts promotions now, not regressions.
+///
 /// Mutant: delete `o.first_time = 1` from the `Action::Halt` arm ⇒ the halting
 /// offer reports 0 and a caller has no way to tell the transition from the
 /// replay; the first `assert_eq!(o.first_time, 1)` fails. Mutant: the same
 /// deletion in `Action::RecreateArena` ⇒ the second one fails. Mutant: set
 /// `o.first_time = 1` on the `Stopped` short-circuit path ⇒ every replayed
-/// offer claims to be the first and the `0` assertions fail.
+/// offer claims to be the first and the `0` assertions fail. Mutant: hard-code
+/// `clock_resets: 0` in `tft_bridge_get_stats` ⇒ the promotion the halt was
+/// raised from is invisible to `tf_tree doctor`, and the `clock_resets`
+/// assertion fails.
 #[test]
 fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
     let b = Bridge::new(
@@ -649,7 +852,14 @@ fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
     b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_000 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_CLOCK_RESET);
     assert_eq!(o.first_time, 1, "the transition is the loud one");
+    assert_eq!(
+        b.stats().clock_resets,
+        1,
+        "the regression was promoted to a reset, which is what `clock_resets` \
+         counts since docs/decisions/0011"
+    );
     for k in 0..4i64 {
         let o = b.offer(
             TFT_BRIDGE_TOPIC_TF,

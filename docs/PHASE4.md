@@ -332,9 +332,12 @@ because anything changed.
 
 - **`TFT_BRIDGE_REJECTED` is unreachable from a heap-arena bridge, and that is
   a proof rather than an omission.** It needs the arena to refuse a write the
-  pipeline approved. `NonMonotonicStamp` cannot happen because the global clock
-  guard's high-water mark dominates every per-edge stamp, and the one thing that
-  rewinds it — `Recreate` — latches the bridge first. `ClaimRevoked` needs a
+  pipeline approved. `NonMonotonicStamp` cannot happen because each edge's own
+  clock guard holds that edge's last accepted stamp, which dominates that edge's
+  ring exactly, and the one thing that rewinds it — `Recreate` — latches the
+  bridge first. (Before §5.5's amendment the guard was global and the same
+  conclusion needed a longer argument; per-edge scoping made it simpler, not
+  weaker.) `ClaimRevoked` needs a
   reaper and `ChildDetached` a `fork()`, both `--features shm` machinery a bridge
   over its own arena never engages. The arm is kept, with the argument written
   next to it, because breaking the one invariant that makes it unreachable is
@@ -932,6 +935,54 @@ ROS permits any number of publishers per edge; `tf_tree` permits exactly one (D7
 | `LastWriterWins` | Reclaim on each new publisher. Available, documented as chaotic, never the default. |
 | `Strict` | Refuse to start if a conflict is detected within a startup window. For CI. |
 
+> **Amendment — `Strict`'s "startup window" is a window the bridge accumulates
+> *inside*, and it halts once at its close, not on the message that conflicts.**
+>
+> Settled by [`0011`](./decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md).
+>
+> The row above is the whole of what §5.4 said, and it does not say when the
+> judgment is taken. Taken per message it is not "refuse to start" at all: the
+> first colliding sample halts, whenever it arrives, and there is no window in it.
+> Two things make that the wrong reading.
+>
+> **CI wants every misconfiguration in one run.** `Strict` exists for CI — this
+> row says so in three words. Halting on the first conflict reports one, so four
+> misconfigured publishers take four runs to diagnose, each paying a full boot.
+>
+> **`/tf_static` is `transient_local`, so *when* a conflict is observed is a DDS
+> discovery artefact, not a fault time.** Latched statics reach a subscriber when
+> discovery matches it, which can be seconds after either process started and
+> arbitrarily long after the fault was introduced. A per-message halt on a static
+> conflict therefore fires at a time carrying no information about when anything
+> went wrong.
+>
+> So, normatively:
+>
+> - The window is **open from construction** and closes at whichever comes first:
+>   an explicit `close_startup_window()` — the primary mechanism, and how a caller
+>   that owns a real clock supplies a real duration; or a backstop of 4096
+>   transforms, so a caller that never closes it still reports. The `rclcpp` node
+>   drives the explicit close from a one-shot **steady** timer (`startup_window_sec`,
+>   default 5.0) — never `node_->get_clock()`, which is `/clock` under
+>   `use_sim_time` and regresses on exactly the bag loop §5.5 detects.
+> - **Inside the window** no conflict halts per message. Both kinds — authority
+>   (§5.4) and static value (§5.7) — are recorded and counted, and each sample is
+>   disposed of exactly as `FirstWriterWins` would. There is no separate ledger:
+>   the close reads what `Authority::conflicts()` and `StaticStore` already hold.
+> - **At the close**, under `Strict` only, a non-empty record halts once with
+>   `StartupConflicts { authority, statics }`, and the seam's `detail` enumerates
+>   **every** recorded edge with both of its publishers, not the first.
+> - **Outside the window `Strict` degrades to `FirstWriterWins` plus counters.**
+>   Stated, not incidental: a bridge healthy for an hour must not be killed by a
+>   late-joining publisher.
+> - **A window-close halt charges no counter bucket.** It is not an event about an
+>   arriving transform — it is caused by transforms already counted — so charging
+>   it would unbalance §5.9's ledger.
+>
+> The unit is transforms because the crate has no clock at all; `0011` §*Known
+> limitations* records that an ordinal is a poor proxy for a duration here, which
+> is why the explicit close exists and the backstop is only a backstop.
+
 The diagnostic must be loud, rate-limited, and surfaced in `tf_tree doctor`, because **this is the feature that finds pre-existing bugs in the host system** (§1, criterion 3).
 
 > **Clarification — "rate-limited" applies to the *stop* as well, and that is
@@ -960,6 +1011,63 @@ If `use_sim_time` is true, the bridge tags every edge it declares with the `SimT
 **NORMATIVE:** the bridge refuses to write to an edge whose declared domain differs from its own, and fails at startup rather than at first message. Sim and real transforms in one arena is a class of bug worth making impossible.
 
 Also handle: `/clock` jumps backwards (bag loop, sim reset). On a detected backward jump beyond a threshold, the bridge **stops and reports** rather than pushing non-monotonic stamps that Phase 1 will reject one at a time. Offer `--on-clock-reset={halt,recreate}` where `recreate` builds a fresh arena instance.
+
+> **Amendment — the threshold is per *edge*, and "a detected backward jump" is
+> promoted to a clock reset only by a quorum of distinct *publishers*, floored by
+> what the deployment can supply.**
+>
+> Settled by [`0011`](./decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md),
+> whose *Rationale* records that the publisher unit and the floor are themselves
+> corrections to that record, found in adversarial review after it shipped.
+>
+> The sentence above never says what the high-water mark is per, and one guard
+> over the merged stream cannot tell two different things apart:
+>
+> - A real `/clock` reset moves **every** edge backwards at once.
+> - A publisher's `transform_tolerance` — AMCL and `robot_localization` date
+>   `map -> odom` up to a second into the future, a SLAM node dates it hundreds of
+>   milliseconds behind its last keyframe — is a *persistent* offset of **one**
+>   edge relative to another, while each edge on its own stays perfectly monotone.
+>
+> Against one shared mark those are the same observation, and no threshold
+> separates them: `transform_tolerance` is a user parameter with no ceiling, so it
+> ranges over exactly the magnitudes a reset does. The lagging edge's next message
+> then reads as a backward jump off the leading edge's mark, and the bridge halts,
+> permanently, on a correctly configured robot. The offline half
+> (`tf_tree_ingest`) had already decided this the other way and kept a guard per
+> edge.
+>
+> So, normatively:
+>
+> - **The guard is per edge.** The 100 ms default now bounds one publisher's own
+>   stamp regression, which is a quantity it is the right size for.
+> - **Promotion is a separate rule.** A past-threshold regression is dropped and
+>   counted (`dropped_non_monotonic`) whatever the rule concludes; `clock_resets`
+>   narrows to mean **promotions**, and under `halt` is 0 or 1 for the life of the
+>   bridge.
+> - **The quorum counts distinct publishers, not distinct edges**, inside a
+>   correlation window of 4096 transforms. Edges are the wrong unit: one node
+>   owning two dynamic edges regresses both at once when it restarts, which would
+>   halt on the single-publisher event the rule exists to tolerate. Two
+>   *publishers* do not restart in lockstep, so the only thing left beneath them is
+>   the clock they share. The reported `correlated_edges` is still an edge count —
+>   that is what an operator can go and look at.
+> - **The demand is floored by the declared dynamic edges.** A deployment that
+>   declares one dynamic edge has at most one possible witness; demanding two there
+>   makes this section's detection *structurally unreachable and silently so* — a
+>   bag loop reporting `dropped_non_monotonic: 500` and `clock_resets: 0`. With one
+>   publisher a past-threshold jump is unambiguous, so **such a deployment halts on
+>   the first regression**, which is this section unamended. Operators of
+>   single-publisher rigs should note that a lone node restarting therefore stops
+>   the bridge, and use `--on-clock-reset=recreate` for a looping bag.
+> - **`recreate` rewinds every edge's guard** and forgets the quorum's history,
+>   rather than seeding every guard from the one stamp that tripped the reset — the
+>   cross-edge contamination this amendment removes.
+>
+> The window is counted in transforms because the crate has no clock; §5.4's
+> amendment and `0011` carry that argument, and the residual limitations —
+> including that the floor bounds *possible* publishers rather than counting live
+> ones — are recorded in `0011` §*Known limitations*.
 
 ### 5.6 Frame names
 
