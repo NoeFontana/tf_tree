@@ -532,6 +532,47 @@ tf2-bench:
 tf2-scaling:
     ./docker/tf2/run.sh 'cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
 
+# Instructions per `Ingest::offer` — cachegrind, N=0 baseline subtracted.
+#
+# The bridge's answer to `footprint`, and it exists for the same reason: this
+# host fails `tf_tree_bench`'s `Fitness::probe` (four physical cores, SMT on, an
+# unreadable governor) and `perf_event_paranoid` is 4, so hardware counters are
+# denied. cachegrind simulates, so unlike `bridge-cost` below this does NOT need
+# an idle machine — every number is exact under load, and slow for the same
+# reason (~50x).
+#
+# **The sweep is the measurement, not decoration.** A `BTreeMap` with one key
+# compares nothing, so `edges=1` is the control: if `Ir`/offer does not rise from
+# 1 to 100 edges, there is no lookup cost to remove and any refactor claiming
+# otherwise is unjustified. Name style is swept for the same reason — `link0`
+# shares four bytes with `link1`, a real `robot1/arm/wrist_0_link` shares fifteen.
+#
+# Cache geometry is pinned rather than read from CPUID, so a rebuilt image cannot
+# silently move `D1 misses` while `Ir` stays put.
+bridge-footprint:
+    ./docker/tf2/run.sh 'set -e; cargo build --release -q -p tf_tree_bridge --example offer_cost; \
+        B=./target/tf2-docker/release/examples/offer_cost; \
+        for m in declared undeclared regressing; do \
+          for e in 1 20 100; do \
+            for st in short ros; do \
+              for n in 0 200000; do \
+                valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes \
+                  --I1=32768,8,64 --D1=32768,8,64 --LL=33554432,16,64 \
+                  --cachegrind-out-file=/dev/null $B $m $n $e $st 2>&1 \
+                  | grep -E "I refs|D1  misses|Mispredicts" | tr -s " " \
+                  | sed "s|^|[$m e=$e $st n=$n] |"; \
+              done; done; done; done'
+
+# Wall-clock cost of one `tft_bridge_offer`, through the C ABI.
+#
+# **RUN THIS ON AN IDLE MACHINE, and it is still not a claim.** `bridge_cost.rs`
+# has had no recipe since it was written; this is it. The host fails the timing
+# fitness probe, so the output is indicative and belongs in a commit message
+# marked as such, never in `results.json` as `measured`.
+bridge-cost:
+    cargo build --release -q -p tf_tree_c --features bridge --example bridge_cost
+    taskset -c 2 ./target/release/examples/bridge_cost
+
 # Memory footprint and computation-per-lookup vs tf2 (docs/benchmarks/tf2.md).
 #
 # Not timing-based, so unlike `tf2-bench` and `tf2-scaling` this does NOT need an

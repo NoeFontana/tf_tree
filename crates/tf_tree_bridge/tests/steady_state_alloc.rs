@@ -113,7 +113,7 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
         ingest.offer(Topic::Tf, &s, publisher);
     }
     let after = ALLOCATIONS.load(Ordering::Relaxed);
-    (after - before) / ITERS
+    after - before
 }
 
 /// Allocating calls per `offer` for a publisher **stuck below its own high-water
@@ -160,7 +160,7 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
         (ITERS + 8) as u64,
         "the fixture must really be on the regression path"
     );
-    (after - before) / ITERS
+    after - before
 }
 
 /// **No path allocates for its table lookups — including the path a *broken*
@@ -230,26 +230,38 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     // already-known frame built a `String` purely to discover it was already
     // there. Probing with `contains` first borrows and allocates nothing.
     //
-    // The budgets are equalities in spirit; `<=` so that removing an allocation
-    // is never a test failure.
-    // The regressing path gets the *same* budget as the happy one, and that is
-    // the whole claim: a broken publisher must not cost the bridge more than a
-    // working one. The two normalized names are the only allocation, and the
-    // per-publisher offset row is paid once, on that publisher's first sample.
-    const DECLARED_BUDGET: usize = 2;
-    const UNDECLARED_BUDGET: usize = 2;
-    const REGRESSING_BUDGET: usize = 2;
+    // **Exact equalities on the TOTAL, not `<=` on an average, and both halves
+    // of that changed for a reason.**
+    //
+    // `<=` was right while the counts were a cost being bounded. They are now a
+    // *property* being pinned: the regressing path allocates nothing, and a
+    // budget of "at most 2" would go on passing if all two came back. An
+    // improvement that no test can lose is not a gate.
+    //
+    // And the totals, because the old `(after - before) / ITERS` was integer
+    // division by 2000: one allocation every 2001 messages rounded to zero.
+    // That is precisely the shape of an amortized table growth — a `Vec`
+    // doubling, an index rehash, a capped table filling — which is exactly what
+    // this file now has to watch, since `Ingest` gained two hash tables.
+    //
+    // The per-offer figure is still what a reader wants, so the failure message
+    // prints it as a fraction: `0.0005 per offer` is how one allocation per two
+    // thousand messages announces itself.
+    const DECLARED_PER_OFFER: usize = 2;
+    const UNDECLARED_PER_OFFER: usize = 2;
+    const REGRESSING_PER_OFFER: usize = 0;
 
-    assert!(
-        declared <= DECLARED_BUDGET,
-        "declared path: {declared} allocations per offer, budget {DECLARED_BUDGET}"
-    );
-    assert!(
-        undeclared <= UNDECLARED_BUDGET,
-        "undeclared path: {undeclared} allocations per offer, budget {UNDECLARED_BUDGET}"
-    );
-    assert!(
-        regressing <= REGRESSING_BUDGET,
-        "regressing path: {regressing} allocations per offer, budget {REGRESSING_BUDGET}"
-    );
+    let check = |what: &str, got: usize, want_each: usize| {
+        let want = want_each * ITERS;
+        assert_eq!(
+            got,
+            want,
+            "{what} path: {got} allocations across {ITERS} offers ({:.4} per offer), \
+             expected exactly {want} ({want_each} per offer)",
+            got as f64 / ITERS as f64
+        );
+    };
+    check("declared", declared, DECLARED_PER_OFFER);
+    check("undeclared", undeclared, UNDECLARED_PER_OFFER);
+    check("regressing", regressing, REGRESSING_PER_OFFER);
 }

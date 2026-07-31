@@ -175,6 +175,24 @@ impl NameNormalizer {
     pub fn stripped_count(&self) -> u64 {
         self.stripped
     }
+
+    /// Add `n` to the stripped-slash count without normalizing anything.
+    ///
+    /// **One caller, and it exists to keep a number honest.** `Ingest::resolve`
+    /// caches raw wire spellings that have already been normalized once, so a
+    /// repeat skips [`Self::normalize`] entirely. Every side effect that skip
+    /// could lose has already happened — the raw names are in `seen`, so
+    /// `first_sight` is `false` and `remaps` would not grow — *except* this one,
+    /// because [`Self::stripped_count`] counts every **occurrence** rather than
+    /// every first sight (`a_stripped_slash_is_counted_every_time` pins that).
+    ///
+    /// A cached name normalized successfully, so its body was non-empty, so
+    /// `raw.starts_with('/')` is exactly the condition [`Self::normalize`]
+    /// increments on. Replaying it there keeps this count bit-identical to the
+    /// uncached pipeline.
+    pub(crate) fn note_stripped(&mut self, n: u64) {
+        self.stripped += n;
+    }
 }
 
 #[cfg(test)]
