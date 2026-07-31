@@ -16,12 +16,18 @@
 //!
 //! # Why the source is a `.tfstream` and not a subscription
 //!
-//! There is no ROS 2 in this environment (`docs/PHASE4.md` §0.0 records it),
-//! and `--discover`'s value does not depend on one: the collector in
+//! `--discover`'s value does not depend on a live ROS 2 graph: the collector in
 //! [`tf_tree_bridge::Discovery`] takes `(topic, sample)` pairs and does not
 //! know where they came from. The `rclcpp` half feeds it from a subscription;
-//! this feeds it from a recording, and both print the same file. That is also
-//! what makes §6.3 and §6.4 self-contained — the corpus in
+//! this feeds it from a recording, and both print the same file.
+//!
+//! **Not because ROS 2 is unavailable.** An earlier revision of this paragraph
+//! said there was none in this environment and cited `docs/PHASE4.md` §0.0 for
+//! it; §0.0 says the opposite, in a paragraph written specifically to retract
+//! that claim — ROS 2 is in `docker/tf2`, `ros/tf_tree_ros` builds against it,
+//! and `just ros-test` is its gate. The reason is the one above: a collector
+//! that takes `(topic, sample)` pairs is testable without a graph, which is
+//! also what makes §6.3 and §6.4 self-contained — the corpus in
 //! `testdata/tfstream/` is a real robot's `/tf`, not a fixture somebody
 //! invented (see its `ATTRIBUTION.md`).
 
