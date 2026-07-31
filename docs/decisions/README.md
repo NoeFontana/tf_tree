@@ -21,6 +21,7 @@ changed is where the *existing* architecture and Phase 1 contract live:
 | [`0008`](./0008-the-name-tf-tree.md) | **Implemented** — the name `tf_tree` is free on crates.io and PyPI, measured, and is kept. |
 | [`0009`](./0009-descoping-phase-6.md) | **Ready** — Phase 6 reduced from four items to one. Covariance and copy-on-write branches are **cut**, URDF leaves the engine, cumulative B-splines stay. Amends D2 and `PROJECT.md` §1. |
 | [`0010`](./0010-naming-the-record-size-refusal.md) | **Draft** — `IngestError::RecordTooLarge`, so a record past `tf_tree_ingest`'s private 256 MiB ceiling is not reported as "this file is not an MCAP". Two open questions. |
+| [`0011`](./0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md) | **Draft** — the online bridge's clock guard is global where the offline half is per-edge; a static conflict never reaches the authority policy; `Action::Drop` has no `first_time`. Three open questions. |
 
 Cite `docs/PROJECT.md` and `docs/PHASE1.md`, never `0002`/`0003`; they are kept
 in place, unedited apart from their banners, as history.

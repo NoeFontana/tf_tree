@@ -318,8 +318,44 @@ void BridgeHandle::maybe_attribute(const uint8_t * gid)
 bool BridgeHandle::attribute_from_graph(const Gid & wanted)
 {
   bool found = false;
-  for (const std::string * topic : {&opts_.tf_topic, &opts_.tf_static_topic}) {
-    for (const auto & info : node_->get_publishers_info_by_topic(*topic)) {
+  // **The topic the subscription actually got, not the one that was asked
+  // for.** `create_subscription` applies ROS remapping — `--ros-args -r
+  // /tf:=/robot1/tf`, the standard multi-robot pattern — while
+  // `get_publishers_info_by_topic` is documented as taking "the actual topic
+  // name used; it will not be automatically remapped". Walking `opts_.tf_topic`
+  // on a remapped bridge therefore enumerates publishers on a topic nobody is
+  // using, finds none, and leaves every GID unresolved.
+  //
+  // That is not a cosmetic loss of names. An unresolved GID becomes
+  // `Publisher::UnknownGid`, which is a *unit* variant, so `Authority::admit`'s
+  // `owner == publisher` makes two distinct broadcasters compare **equal** —
+  // §5.4's detection is silently off in exactly the deployment where two
+  // publishers on one edge are most likely. `docs/PHASE4.md` §0.0 measured that
+  // blend once already, with the cache disabled.
+  const std::string topics[2] = {sub_tf_->get_topic_name(), sub_static_->get_topic_name()};
+  for (const std::string & topic : topics) {
+    // §5.3: an RMW without topic-endpoint introspection makes rclcpp throw here
+    // (`RCL_RET_UNSUPPORTED` becomes `RCLError`). Attribution is diagnostic
+    // value and **never a correctness dependency**, so the throw is contained
+    // and the caller's attempt counter walks this GID up to `kMaxAttempts` and
+    // stops trying.
+    //
+    // **Contained here and not at `run`'s `spin_once`**, deliberately:
+    // `maybe_attribute` runs *before* the transform loop in `ingest`, so an
+    // outer-only catch would abort every message before a single transform was
+    // offered — turning a crash into permanent silent ingest loss, which is
+    // worse than the crash and is the opposite of §5.3's "degrade gracefully".
+    std::vector<rclcpp::TopicEndpointInfo> endpoints;
+    try {
+      endpoints = node_->get_publishers_info_by_topic(topic);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(
+        log_, *node_->get_clock(), 5000,
+        "the graph could not be walked for %s (%s); publishers on it stay unattributed",
+        topic.c_str(), e.what());
+      continue;
+    }
+    for (const auto & info : endpoints) {
       const auto & gid = info.endpoint_gid();
 
       // An all-zero GID is what an RMW leaves when it has nothing to report,
@@ -372,7 +408,31 @@ void BridgeHandle::run(std::promise<tft_status> & ready)
   // join never returns. The poll interval costs only shutdown latency: the
   // wait set still returns the instant a message arrives.
   while (!stop_.load(std::memory_order_relaxed) && rclcpp::ok(node_->get_node_options().context())) {
-    exec_->spin_once(std::chrono::milliseconds(50));
+    // **`run` is a `std::thread` entry point, so nothing may leave it.** An
+    // exception that escapes is `std::terminate` — the whole host process, and
+    // with it every other node composed into the same container.
+    // `docs/PHASE4.md` §3.4 makes exactly this argument for the Rust half
+    // ("killing the host process on an internal bug is unacceptable") and wraps
+    // every `extern "C"` body in `catch_unwind`; this side of the same seam has
+    // the same obligation and had no equivalent. `CMakeLists.txt` already
+    // records the hole in passing.
+    //
+    // This is the **backstop**, not the containment: the throw that is actually
+    // reachable — `get_publishers_info_by_topic` on an RMW without endpoint
+    // introspection — is caught at its own site in `attribute_from_graph`,
+    // because catching it only here would skip the transform loop and lose the
+    // ingest entirely rather than just the attribution.
+    try {
+      exec_->spin_once(std::chrono::milliseconds(50));
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR_THROTTLE(
+        log_, *node_->get_clock(), 5000,
+        "contained an exception from the ingest callback: %s; the bridge keeps ingesting", e.what());
+    } catch (...) {
+      RCLCPP_ERROR_THROTTLE(
+        log_, *node_->get_clock(), 5000,
+        "contained a non-std exception from the ingest callback; the bridge keeps ingesting");
+    }
   }
 
   exec_->remove_callback_group(group_);
@@ -512,9 +572,19 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
       return;
 
     case TFT_BRIDGE_REJECTED:
-      RCLCPP_ERROR(
-        log_, "the arena refused %s -> %s (status %d): %s", out.parent, out.child, out.status,
-        out.detail);
+      // **Throttled, because the comment below claims every arm is gated and
+      // this one was not.** The falsehood matters more here than it would for a
+      // stop: a halt is latched exactly once, while an arena refusal is
+      // per-sample and can repeat for as long as the robot runs.
+      //
+      // Throttling rather than `first_time`, deliberately: the ABI never sets
+      // that flag on this action — `Action::Publish`'s reject path in
+      // `crates/tf_tree_c/src/bridge.rs` leaves `blank_outcome`'s zero — so
+      // gating on it would silence the arm outright instead of rate-limiting
+      // it. The fix belongs on this side of the seam.
+      RCLCPP_ERROR_THROTTLE(
+        log_, *node_->get_clock(), 5000, "the arena refused %s -> %s (status %d): %s", out.parent,
+        out.child, out.status, out.detail);
       return;
 
     // **Both stops are gated on `first_time` like every other arm**, and this

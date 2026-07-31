@@ -920,9 +920,11 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
         }
         let need = e.samples.saturating_mul(SAMPLE_BYTES);
         if need > cap {
-            // Emitted in place, so the spilled edge keeps its position in the
-            // canonical order and the number of re-reads stays a function of the
-            // survey alone.
+            // Emitted in place in the **packing** order, not the canonical one —
+            // so the spilled edge still keeps a fixed position and the number of
+            // re-reads stays a function of the survey alone. `rank` is the tie
+            // break, which is what makes "fixed" mean deterministic here rather
+            // than merely stable.
             flush(&mut cur, &mut cur_bytes, &mut groups);
             groups.push(Group::Spilled(i));
             continue;

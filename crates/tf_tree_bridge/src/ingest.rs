@@ -49,6 +49,16 @@ use crate::statics::{StaticStore, StaticVerdict};
 use crate::stats::BridgeStats;
 use crate::{Publisher, Sample};
 
+/// Distinct undeclared *parent* frames remembered by [`Ingest::undeclared`].
+///
+/// See the bound's justification at its use in [`Ingest::offer`]. A topology
+/// this far off its config is already a misconfiguration the report names; what
+/// the cap buys is that the misconfiguration cannot also exhaust the bridge.
+const MAX_UNDECLARED_PARENTS: usize = 256;
+/// Distinct undeclared children remembered per parent. See
+/// [`MAX_UNDECLARED_PARENTS`].
+const MAX_UNDECLARED_CHILDREN: usize = 256;
+
 /// Which topic a sample arrived on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topic {
@@ -310,11 +320,28 @@ impl Ingest {
             // owned key whether or not it inserts, so reaching for it
             // unconditionally cloned both names on every message of an edge
             // already known to be undeclared.
+            // **And bounded.** This table is keyed by a name that arrived from
+            // *outside the declared topology* — the one input nothing in the
+            // process constrains — and `undeclared()` `collect()`s the whole of
+            // it for `doctor`, so an unbounded table is also an unbounded
+            // allocation the moment anyone asks the bridge how it is doing. The
+            // cap is read before `lookup_mut` because that call holds the
+            // mutable borrow across the match.
+            //
+            // Past the cap the transform is still dropped and still counted in
+            // `dropped_undeclared`; only the per-edge breakdown stops growing,
+            // and `first_time` reports `false` so the caller stays quiet.
+            let at_cap = self.undeclared.len() >= MAX_UNDECLARED_PARENTS
+                || self
+                    .undeclared
+                    .get(parent.as_str())
+                    .is_some_and(|c| c.len() >= MAX_UNDECLARED_CHILDREN);
             let first_time = match lookup_mut(&mut self.undeclared, &parent, &child) {
                 Some(n) => {
                     *n += 1;
                     false
                 }
+                None if at_cap => false,
                 None => {
                     insert(&mut self.undeclared, &parent, &child, 1);
                     true
@@ -382,9 +409,23 @@ impl Ingest {
                     offered,
                     first_time,
                 } => {
-                    // The diagnostic first — carrying **both values**, which is
-                    // the half that tells an operator which URDF is installed —
-                    // and then the authority policy decides the disposition.
+                    // The diagnostic, carrying **both values** — the half that
+                    // tells an operator which URDF is installed.
+                    //
+                    // **And that is all that happens: the authority policy is
+                    // NOT consulted on this path**, because this arm returns and
+                    // every arm of this block returns, so step 5 below is
+                    // unreachable for a `/tf_static` sample. An earlier revision
+                    // of this comment said the policy "decides the disposition",
+                    // which was never true of the code beneath it.
+                    //
+                    // Whether it *should* be consulted is open, not settled:
+                    // §5.7 does say "then apply the authority policy", but §5.4
+                    // defines `Strict` as refusing "within a startup window" and
+                    // there is no startup window in this crate to refuse within.
+                    // `docs/decisions/0011` carries the question; until it is
+                    // resolved, `Strict` does not halt on a static conflict and
+                    // this paragraph is the warning.
                     self.stats.static_conflicts += 1;
                     self.stats.dropped_authority += 1;
                     return Action::StaticConflict {

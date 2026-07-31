@@ -51,6 +51,13 @@ pub struct Normalized {
     pub first_sight: bool,
 }
 
+/// How many distinct raw frame names the warn-once set remembers.
+///
+/// See the bound's justification at its use in [`NameNormalizer::normalize`].
+/// Far above any real robot's frame count — `docs/PHASE4.md`'s corpora run to
+/// tens — and far below a size that costs a bridge its memory.
+const MAX_TRACKED_NAMES: usize = 8192;
+
 /// Normalizes frame names and remembers which ones it has warned about.
 #[derive(Debug, Default)]
 pub struct NameNormalizer {
@@ -121,7 +128,21 @@ impl NameNormalizer {
         // across twenty edges is twenty thousand pointless allocations a second.
         // The probe borrows (`BTreeSet<String>: Borrow<str>`) and allocates
         // nothing; only a genuinely new name pays.
-        let first_sight = if self.seen.contains(raw) {
+        // **And bounded**, because both tables are keyed by a string the
+        // *publisher* chose and nothing upstream drops a message before its
+        // names are normalized — `Ingest::offer` normalizes at step 1 and only
+        // checks the declared topology at step 2. So a name that will be
+        // dropped microseconds later, and can never reach the arena, is still
+        // interned here permanently. A perception node that mints a frame per
+        // detection (`tag_36h11_1417`, `object_88231`) therefore adds a row per
+        // detection, on a bridge `docs/PHASE4.md` §1 asks to run unattended for
+        // a fortnight.
+        //
+        // Past the cap the only thing lost is the warn-once bookkeeping: every
+        // name still normalizes identically, `first_sight` simply reports
+        // `false`, so the caller goes quiet rather than loud. A missing log line
+        // beats an OOM-killed bridge.
+        let first_sight = if self.seen.contains(raw) || self.seen.len() >= MAX_TRACKED_NAMES {
             false
         } else {
             self.seen.insert(raw.to_string());

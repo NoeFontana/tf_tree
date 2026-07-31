@@ -182,9 +182,14 @@ TEST(Attribution, a_second_publisher_on_one_edge_is_dropped_and_both_nodes_are_n
             << " dropped_non_monotonic=" << bridge.stats().dropped_non_monotonic
             << " dropped_undeclared=" << bridge.stats().dropped_undeclared;
 
-  // The record settles once §5.3's 1 Hz cache has seen the new publisher; until
-  // then the intruder is legitimately `<unknown publisher>`, which §5.3 calls a
-  // sanctioned degradation rather than a failure.
+  // The record settles once the intruder's GID has been walked. `maybe_attribute`
+  // walks on an *unseen GID*, synchronously and before the sample is offered, so
+  // there is no interval to wait out — but an endpoint can lag its own first
+  // sample, so the walk is retried on later messages and the first conflict can
+  // legitimately name `<unknown publisher>`, which §5.3 calls a sanctioned
+  // degradation rather than a failure. **There is no periodic refresh.** The 1 Hz
+  // timer this comment used to describe was removed as *wrong* rather than late:
+  // see this file's docstring above and `BridgeHandle::maybe_attribute`.
   const std::string want_owner = owner.qualified_name();
   const std::string want_intruder = intruder.qualified_name();
   ASSERT_TRUE(
