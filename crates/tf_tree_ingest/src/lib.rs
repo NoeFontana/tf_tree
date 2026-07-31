@@ -267,8 +267,16 @@ pub enum IngestError {
     /// report is *which* edge regressed — an earlier revision watched the merged
     /// stream and said "clock reset" when the truth was two publishers with
     /// different latencies, which is a diagnosis a user cannot act on.
+    ///
+    /// **And it names two clocks**, because after a rewind only one of them
+    /// still locates anything. `at_ns` is the stamp that regressed, which in a
+    /// looped recording occurs twice; `at_log_time_ns` is the recorder's own
+    /// monotone clock at that record, which occurs once and is the coordinate
+    /// `mcap` and `ros2 bag` cut on — so it is the one the message's own advice
+    /// to split the recording is actionable in.
     #[error(
-        "clock reset on edge {parent:?} -> {child:?} at stamp {at_ns} (backwards by {by_ns} ns)"
+        "clock reset on edge {parent:?} -> {child:?} at stamp {at_ns} \
+         (log time {at_log_time_ns}, backwards by {by_ns} ns)"
     )]
     ClockReset {
         /// Parent frame of the regressing edge.
@@ -277,6 +285,9 @@ pub enum IngestError {
         child: FrameId,
         /// The stamp that regressed.
         at_ns: i64,
+        /// The recorder's log time for the record carrying that stamp — the
+        /// reference clock that is not the one under test.
+        at_log_time_ns: i64,
         /// How far back it went.
         by_ns: i64,
     },
@@ -337,12 +348,14 @@ impl core::fmt::Display for Described<'_> {
                 parent,
                 child,
                 at_ns,
+                at_log_time_ns,
                 by_ns,
             } => write!(
                 f,
                 "edge {} -> {} jumped {by_ns} ns backwards at stamp {at_ns}, past the \
-                 reset threshold; raise --clock-reset-threshold if this publisher is \
-                 merely late rather than replayed",
+                 reset threshold; the recording's own log time there is {at_log_time_ns}, \
+                 which is where to cut it. Raise --clock-reset-threshold if this \
+                 publisher is merely late rather than replayed",
                 n(parent),
                 n(child)
             ),

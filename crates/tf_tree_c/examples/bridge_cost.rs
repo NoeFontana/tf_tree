@@ -127,6 +127,12 @@ fn main() {
     ];
 
     let mut stamp: i64 = 1_000_000_000;
+    // The steady receipt clock the ROS caller reads once per `TFMessage`. Read
+    // here on the same schedule — once per sweep, not once per transform —
+    // because the offset layer's cost is part of what this measures, and a
+    // benchmark that left `received_steady_nanos` at `0` would silently skip it.
+    let mut received = Instant::now();
+    let epoch = received;
     let mut out = tft_bridge_outcome {
         struct_size: core::mem::size_of::<tft_bridge_outcome>() as u32,
         action: 0,
@@ -141,6 +147,9 @@ fn main() {
         existing: [0.0; 7],
         offered: [0.0; 7],
         detail: ptr::null(),
+        delta_nanos: 0,
+        clock_evidence: TFT_BRIDGE_EVIDENCE_NONE,
+        clock_evidence_detail: 0,
     };
 
     let ns = bench(|| {
@@ -152,6 +161,7 @@ fn main() {
             // does, and it keeps the clock guard's compare on its real branch.
             if k % EDGES == 0 {
                 stamp += 1_000_000;
+                received = Instant::now();
             }
             let s = tft_bridge_sample {
                 struct_size: core::mem::size_of::<tft_bridge_sample>() as u32,
@@ -159,6 +169,11 @@ fn main() {
                 child_frame_id: c.as_ptr(),
                 stamp_nanos: black_box(stamp),
                 pose,
+                received_steady_nanos: i64::try_from(
+                    received.saturating_duration_since(epoch).as_nanos(),
+                )
+                .unwrap_or(i64::MAX)
+                .saturating_add(1),
             };
             out.struct_size = core::mem::size_of::<tft_bridge_outcome>() as u32;
             // SAFETY: live handle on its creating thread, a live sample whose

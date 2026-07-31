@@ -246,38 +246,19 @@ impl Authority {
         lookup(&self.owners, parent, child)
     }
 
-    /// How many **distinct publishers** have been established as owners.
-    ///
-    /// This is the corroboration floor `ResetQuorum` is capped by, and it has to
-    /// be a publisher count rather than an edge count. An earlier revision fed
-    /// the quorum the number of declared dynamic *edges*, which is a proxy that
-    /// fails on the exact topology the quorum was corrected for: one node owning
-    /// `map -> odom` and `odom -> base_link` declares two edges, so the floor
-    /// stayed at two, so that node could never corroborate itself — and §5.5's
-    /// detection went silently unreachable for it, which is the defect the floor
-    /// exists to prevent.
-    ///
-    /// Derived rather than tracked: the owner table is already here, already
-    /// bounded by the declared topology, and this runs only on a regression, so
-    /// there is no second copy of the truth to drift.
-    ///
-    /// # One publisher is not a degraded case
-    ///
-    /// If only one publisher has ever owned an edge, a backward jump is
-    /// *observationally identical* whether that publisher restarted or the clock
-    /// moved — there is no second party whose agreement could tell them apart.
-    /// Halting on the first regression is therefore not a weaker answer there; it
-    /// is the only answer the evidence supports, and it is what §5.5 asks for.
-    #[must_use]
-    pub fn distinct_owners(&self) -> usize {
-        let mut seen: BTreeMap<&Publisher, ()> = BTreeMap::new();
-        for children in self.owners.values() {
-            for owner in children.values() {
-                seen.insert(owner, ());
-            }
-        }
-        seen.len()
-    }
+    // **`distinct_owners()` was here, and it is deliberately gone.**
+    //
+    // It existed to floor §5.5's quorum by how many publishers a deployment
+    // could supply, and it made a *diagnostic* — attribution — into a
+    // *correctness dependency*, which §5.3 forbids. `Publisher::UnknownGid` and
+    // `Publisher::Unattributed` are unit variants, so on an RMW without endpoint
+    // introspection every publisher compares equal, the count is permanently 1,
+    // the floor is permanently 1, and every single-edge regression halts the
+    // bridge. It also read 1 at boot for a deployment that had two publishers,
+    // because the second had not published yet.
+    //
+    // The clock ladder no longer promotes on one witness at all, so there is
+    // nothing left to floor. See `crate::clock`'s module docs.
 }
 
 #[cfg(test)]

@@ -1,8 +1,36 @@
 # 0011: The online bridge's clock guard, and what a static conflict does about authority
 
-**Status:** ready
+**Status:** ready — **its clock half is superseded by
+[`0012`](./0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)**
 **Owner:** @NoeFontana
 **Implementation:** (filled in as work lands)
+
+> **Read this scoping note before anything below it.** This record carries three
+> decisions and only the first is retired.
+>
+> - **§*Decision* 1 — the clock guard — is SUPERSEDED by `0012`.** The per-edge
+>   `ClockGuard` survives (`0012` keeps it verbatim); the *promotion* rule does
+>   not. `ResetQuorum`, `QuorumVerdict`, `QUORUM_EDGES`,
+>   `DEFAULT_CORRELATION_WINDOW`, `MAX_TRACKED_EDGES`, the
+>   `Authority::distinct_owners()` corroboration floor and
+>   `HaltReason::ClockReset { by_nanos, correlated_edges }` are all deleted. The
+>   quorum — including corrections A and B in this record's *Rationale* — was
+>   the second and third of **three** rules that all turned out wrong; `0012`
+>   §*Context* records each with its reproduction, and the root cause they share.
+>   Everything below about the quorum is **history, not normative**: do not
+>   implement it, and do not cite it.
+> - **§*Decision* 2 — the `AuthorityPolicy::Strict` startup window — STANDS.**
+>   Unchanged and not revisited by `0012`. One correction only: this record
+>   justifies the window's *unit* by "the crate has no clock at all", which is
+>   false once `0012`'s `SteadyNanos` exists. The startup window keeps its
+>   transform ordinal by **choice**, and the two windows no longer share a
+>   rationale.
+> - **§*Decision* 3 — `Action::Drop` keeps its shape — STANDS.** Unchanged and
+>   not revisited.
+>
+> This record is otherwise unedited. It is where the quorum's argument, its two
+> in-flight corrections and the reasoning that produced them are kept in full,
+> because `0012` exists as a consequence of them.
 
 ## Context
 

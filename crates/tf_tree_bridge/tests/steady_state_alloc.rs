@@ -22,7 +22,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tf_tree_bridge::{Ingest, Publisher, Sample, Topic, TopologyConfig};
+use tf_tree_bridge::{Action, Ingest, Publisher, Sample, SteadyNanos, Topic, TopologyConfig};
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -70,43 +70,123 @@ kind = "dynamic"
 capacity = 256
 "#;
 
+/// A receipt-clock origin. Never 0: `SteadyNanos(0)` is the "no receipt clock"
+/// sentinel, and a fixture that used it would leave the per-publisher offset
+/// table dormant and measure a path this test does not mean to measure.
+const T0: i64 = 5_000_000_000_000;
+/// The stamp a healthy publisher emits at `T0`.
+const STAMP0: i64 = 10_000_000_000;
+/// One millisecond.
+const MS: i64 = 1_000_000;
+
 /// Allocating calls per `offer`, averaged over `ITERS` steady-state messages.
 ///
 /// The `Sample` and the `Publisher` are built once and reused, so what is
 /// measured is `offer`'s own cost and not the caller's message construction.
+///
+/// **The stamp and the receipt clock advance together**, which is not cosmetic.
+/// An earlier version advanced `stamp_nanos` by 1 ms per iteration and left
+/// `received` frozen, so the publisher's `stamp - received` offset drifted by
+/// 1 ms per message — and once that drift crossed the 100 ms reset threshold the
+/// offset table would have started recording spurious steps in the middle of the
+/// measurement. It could not have halted (one publisher never promotes), but it
+/// would have made an allocation budget flaky rather than failing cleanly, which
+/// is the worst failure mode a steady-state test can have.
 fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
     let config = TopologyConfig::parse(TOPO).unwrap();
     let mut ingest = Ingest::new(&config);
     let mut s = sample.clone();
 
     // Warm-up. The first message for an edge legitimately allocates: it interns
-    // the frame names, and for an undeclared edge it creates the counter entry.
-    for k in 0..8 {
-        s.stamp_nanos = k * 1_000_000;
+    // the frame names, for an undeclared edge it creates the counter entry, and
+    // for the first sight of a publisher it creates the offset baseline.
+    for k in 0..8i64 {
+        s.stamp_nanos = STAMP0 + k * MS;
+        s.received = SteadyNanos(T0 + k * MS);
         ingest.offer(Topic::Tf, &s, publisher);
     }
 
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for k in 0..ITERS {
-        s.stamp_nanos = (8 + k as i64) * 1_000_000;
+        s.stamp_nanos = STAMP0 + (8 + k as i64) * MS;
+        s.received = SteadyNanos(T0 + (8 + k as i64) * MS);
         ingest.offer(Topic::Tf, &s, publisher);
     }
     let after = ALLOCATIONS.load(Ordering::Relaxed);
     (after - before) / ITERS
 }
 
-/// **Neither the declared nor the undeclared path allocates for its table
-/// lookups.** Both budgets are exact upper bounds on the *current* code, chosen
-/// to sit strictly below what the flat-tuple maps cost, so the regression they
-/// exist to catch cannot slip back in under them.
+/// Allocating calls per `offer` for a publisher **stuck below its own high-water
+/// mark** — the path a broken node occupies at message rate, indefinitely.
+///
+/// Every iteration takes the clock rules' refusal path: the per-edge guard
+/// reports a past-threshold regression and the sample is dropped, counted and
+/// diagnosed. The offset stays constant (stamp and receipt advance in lockstep
+/// five seconds apart), so the initial step is recorded once during warm-up and
+/// the measured window is the *sustained* regression, which is what a stuck
+/// publisher actually produces.
+fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
+    let config = TopologyConfig::parse(TOPO).unwrap();
+    let mut ingest = Ingest::new(&config);
+    let mut s = Sample::identity("odom", "base", STAMP0).received_at(SteadyNanos(T0));
+
+    // One good message establishes the high-water mark, the frame names and the
+    // publisher's offset baseline…
+    assert!(matches!(
+        ingest.offer(Topic::Tf, &s, publisher),
+        Action::Publish { .. }
+    ));
+    // …and then the publisher restarts and replays from five seconds ago. The
+    // first of these is the one step this fixture contains.
+    for k in 0..8i64 {
+        s.stamp_nanos = STAMP0 - 5_000 * MS + k * MS;
+        s.received = SteadyNanos(T0 + (1 + k) * MS);
+        ingest.offer(Topic::Tf, &s, publisher);
+    }
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    for k in 0..ITERS {
+        let k = 8 + k as i64;
+        s.stamp_nanos = STAMP0 - 5_000 * MS + k * MS;
+        s.received = SteadyNanos(T0 + (1 + k) * MS);
+        assert!(matches!(
+            ingest.offer(Topic::Tf, &s, publisher),
+            Action::Drop { .. }
+        ));
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    assert_eq!(
+        ingest.stats().dropped_non_monotonic,
+        (ITERS + 8) as u64,
+        "the fixture must really be on the regression path"
+    );
+    (after - before) / ITERS
+}
+
+/// **No path allocates for its table lookups — including the path a *broken*
+/// publisher occupies.** All three budgets are exact upper bounds on the
+/// *current* code, chosen to sit strictly below what the flat-tuple maps cost,
+/// so the regression they exist to catch cannot slip back in under them.
 ///
 /// The undeclared case is the one `first_time` was supposed to have solved:
 /// it silenced the log for a 1 kHz undeclared edge and left the allocator
 /// running at 1 kHz anyway, which is the more expensive half.
 ///
+/// **The regressing case is the one whose absence let a real defect through.**
+/// Every scenario here used to feed strictly increasing stamps, so the gate
+/// could only ever see the happy path — and the clock machinery it replaced
+/// allocated *twice per sample* on the regression path (a `BTreeMap` built to
+/// count distinct owners, a `BTreeSet` built to count distinct publishers),
+/// which a stuck publisher occupies at message rate for as long as it is stuck,
+/// because a past-threshold regression deliberately does not advance the
+/// high-water mark. Two heap allocations per message at 1 kHz, indefinitely,
+/// with every test green.
+///
 /// Fixture note: `base -> lidar` is genuinely absent from `TOPO`, so the
 /// undeclared path is really taken — a fixture whose "undeclared" edge was
-/// declared would measure the declared path twice and pass regardless.
+/// declared would measure the declared path twice and pass regardless. The
+/// regressing fixture asserts its own `Action::Drop`s and its
+/// `dropped_non_monotonic` total for the same reason.
 ///
 /// Mutant: change `StaticStore`'s `kinds` back to
 /// `BTreeMap<(String, String), StaticKind>`, probed with
@@ -120,12 +200,25 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
 /// `let first_sight = self.seen.insert(raw.to_string());` ⇒ both budgets are
 /// exceeded by 2, one owned key per frame allocated and dropped again on every
 /// message of a frame already seen.
+/// Mutant: build the offset row with
+/// `self.rows.entry(owner.to_string()).or_insert(..)` in `OffsetTable::observe`
+/// instead of probing with `get_mut(&str)` first — applied, and this failed at
+/// `declared path: 3 allocations per offer, budget 2`, because `entry` needs an
+/// owned key whether or not it inserts.
+/// Mutant: take an owned publisher identity on the refusal path in
+/// `Ingest::offer` (`let _owner = owner_key(publisher).to_string();` at the top
+/// of the `Jitter | Reset` arm — which is what the deleted quorum did, once per
+/// regressing sample) — applied, and this failed at `regressing path: 3
+/// allocations per offer, budget 2` **with the other two budgets still met**.
+/// That asymmetry is the point of this scenario: no other fixture here can see
+/// it, and the code this replaced allocated twice on exactly that path.
 #[test]
 fn offer_does_not_allocate_for_its_table_lookups() {
     let publisher = Publisher::Node("/ekf".to_string());
 
     let declared = allocs_per_offer(&Sample::identity("odom", "base", 0), &publisher);
     let undeclared = allocs_per_offer(&Sample::identity("base", "lidar", 0), &publisher);
+    let regressing = allocs_per_regressing_offer(&publisher);
 
     // Two, one per frame: the owned normalized name `NameNormalizer::normalize`
     // returns, which the caller keeps. Nothing else on either path allocates in
@@ -139,8 +232,13 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     //
     // The budgets are equalities in spirit; `<=` so that removing an allocation
     // is never a test failure.
+    // The regressing path gets the *same* budget as the happy one, and that is
+    // the whole claim: a broken publisher must not cost the bridge more than a
+    // working one. The two normalized names are the only allocation, and the
+    // per-publisher offset row is paid once, on that publisher's first sample.
     const DECLARED_BUDGET: usize = 2;
     const UNDECLARED_BUDGET: usize = 2;
+    const REGRESSING_BUDGET: usize = 2;
 
     assert!(
         declared <= DECLARED_BUDGET,
@@ -149,5 +247,9 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     assert!(
         undeclared <= UNDECLARED_BUDGET,
         "undeclared path: {undeclared} allocations per offer, budget {UNDECLARED_BUDGET}"
+    );
+    assert!(
+        regressing <= REGRESSING_BUDGET,
+        "regressing path: {regressing} allocations per offer, budget {REGRESSING_BUDGET}"
     );
 }

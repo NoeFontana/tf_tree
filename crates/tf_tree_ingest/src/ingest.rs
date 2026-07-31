@@ -59,17 +59,55 @@
 //!   artefact, either coherent or not, and a human is reading the answer.
 //!   Stopping to say *"`map -> odom` regresses at t"* costs a rerun and nothing
 //!   else, and the operator can look at the file.
-//! - **Online it takes a quorum** — distinct *publishers* regressing inside a
-//!   correlation window (`tf_tree_bridge::clock::ResetQuorum`). That bridge runs
+//! - **Online, one witness never halts, at any magnitude.** The bridge runs a
+//!   ladder: an authoritative jump reported by the time source itself, or a
+//!   *common-mode* step — two or more distinct publishers whose stamp-to-receipt
+//!   offsets moved inside the same window **by the same amount** — promotes to a
+//!   halt; anything less is dropped, counted and diagnosed. That bridge runs
 //!   unattended on a robot, where halting on one node's restart is an outage
 //!   caused by the diagnostic rather than by the fault, and nobody is there to
 //!   rerun anything.
 //!
 //! So the asymmetry is a difference in what a wrong answer costs, not a
-//! disagreement about what a clock reset is. The one place it closes is a
-//! deployment that cannot supply a second publisher at all: the online quorum is
-//! floored by what the topology declares, and with a single dynamic edge it
-//! halts on the first regression, as this half always does.
+//! disagreement about what a clock reset is.
+//!
+//! **An earlier revision of this paragraph claimed the asymmetry closes** on a
+//! deployment that cannot supply a second publisher, because the online promotion
+//! rule was floored by what the topology declared. It no longer does, and the gap
+//! is wider than it was, on purpose: making a *diagnostic's* strength depend on
+//! attribution — which RMW implementations report unevenly — made attribution a
+//! correctness dependency, which `docs/PHASE4.md` §5.3 forbids outright. The
+//! online half now degrades to a drop when it cannot corroborate, so a single
+//! dynamic edge regressing there is *never* a halt, where here it always is.
+//! Nothing is lost by that: online, Phase 1 invariant 6 refuses the regressing
+//! sample anyway, so the arena is protected by the drop and the halt was only
+//! ever the *announcement*.
+//!
+//! # Both halves anchor on a clock that is not the one under test
+//!
+//! The rule the online redesign is built on is that a detector's reference clock
+//! must be independent of the signal it is judging — inferring "`/clock` was
+//! reset" from `/clock`-derived stamps alone is what produced three successive
+//! wrong rules. Online that reference is injected: a local **steady** clock read
+//! once per `TFMessage` and carried on every sample as `SteadyNanos`.
+//!
+//! **This half has had the same kind of reference all along**, and it is
+//! [`RawRecord::log_time_ns`] — when the recorder wrote the message, not when a
+//! publisher stamped it. Its own documentation states the reason in the same
+//! terms: §3.2's future-stamp check *"needs a reference clock that is not the
+//! header stamp, or the check is circular"*. It is the only reference a bag
+//! actually contains, and the two halves now use it for the same purpose rather
+//! than by coincidence:
+//!
+//! - the future-stamp anomaly is `stamp - log_time` against a horizon, which is
+//!   the same `stamp - received` quantity the online offset table smooths per
+//!   publisher; and
+//! - a reset is reported with **both** coordinates on
+//!   [`IngestError::ClockReset`], because after a rewind the stamp is the one
+//!   coordinate that no longer identifies a place in the file. `at_ns` occurs
+//!   twice in a looped recording; the log time occurs once, and it is what
+//!   `mcap` and `ros2 bag` cut on — which is what makes the message's own
+//!   advice, *split the recording*, an instruction rather than a suggestion.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -336,7 +374,16 @@ pub struct Anomalies {
     pub out_of_order: u64,
     /// Backward jumps beyond the threshold.
     pub clock_resets: u64,
-    /// Where the first one was, if any.
+    /// Where the first one was **in stamp space**, if any.
+    ///
+    /// **Structurally always `None` today, and deliberately left that way here.**
+    /// Both [`ClockResetPolicy`] arms return an error on the first reset, so this
+    /// is written and then discarded with the rest of the [`Survey`]; the
+    /// coordinates a caller can actually read are the ones on
+    /// [`IngestError::ClockReset`], which is why the log-time coordinate was
+    /// added *there* and not given a dead twin beside this. It stays as the
+    /// field a non-halting policy would fill (§3.2's unimplemented `split`)
+    /// rather than being removed and re-added.
     pub first_reset_at_ns: Option<i64>,
     /// `/tf_static` samples offering a different value for an already-declared
     /// static edge (§5.7's tolerance).
@@ -562,6 +609,11 @@ pub fn survey(
             out.anomalies.zero_stamp_drops += 1;
             return Ok(());
         }
+        // `stamp - log_time`: the recorder's clock is the reference, because the
+        // header stamp cannot check itself. This is the offline twin of the
+        // online `stamp - received` offset — see the module docs' section on the
+        // reference clock — and it is the reason `log_time_ns` exists on
+        // [`RawRecord`] at all.
         let ahead = rec.stamp_ns.saturating_sub(rec.log_time_ns);
         if ahead > opts.future_horizon_ns {
             out.anomalies.future_stamps += 1;
@@ -582,6 +634,7 @@ pub fn survey(
                             parent,
                             child,
                             at_ns: rec.stamp_ns,
+                            at_log_time_ns: rec.log_time_ns,
                             by_ns: by_nanos,
                         })
                     }

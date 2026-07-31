@@ -92,14 +92,39 @@ impl Bridge {
         }
     }
 
-    /// Offer one transform and return the outcome, checking the call itself was
-    /// well-formed. The `CString`s outlive the call, which is all the ABI asks.
+    /// Offer one transform with **no receipt clock**, which is what a caller
+    /// that has none supplies.
+    ///
+    /// Deliberately the default for this file: §5.5's offset layer is then
+    /// absent, so every fixture that is about names, authority, statics or the
+    /// arena keeps testing exactly what it used to. The handful that are about
+    /// the clock say so by calling [`Bridge::offer_at`].
     fn offer(
         &self,
         topic: tft_bridge_topic,
         parent: &str,
         child: &str,
         stamp: i64,
+        pose: [f64; 7],
+        gid: Option<&[u8; 16]>,
+    ) -> tft_bridge_outcome {
+        self.offer_at(topic, parent, child, stamp, 0, pose, gid)
+    }
+
+    /// Offer one transform and return the outcome, checking the call itself was
+    /// well-formed. The `CString`s outlive the call, which is all the ABI asks.
+    ///
+    /// `received` is the local steady clock's reading for the message this
+    /// transform came in — the reference §5.5 measures each publisher's stamp
+    /// against, and never derived from a stamp.
+    #[allow(clippy::too_many_arguments)]
+    fn offer_at(
+        &self,
+        topic: tft_bridge_topic,
+        parent: &str,
+        child: &str,
+        stamp: i64,
+        received: i64,
         pose: [f64; 7],
         gid: Option<&[u8; 16]>,
     ) -> tft_bridge_outcome {
@@ -110,6 +135,7 @@ impl Bridge {
             child_frame_id: c.as_ptr(),
             stamp_nanos: stamp,
             pose,
+            received_steady_nanos: received,
         };
         let mut out = poisoned_outcome();
         // SAFETY: live handle on its creating thread, a live sample whose name
@@ -123,6 +149,17 @@ impl Bridge {
                 &mut out,
             )
         };
+        assert_eq!(rc, TFT_OK, "the call was malformed: {}", last_message());
+        out
+    }
+
+    /// Report a jump the time source itself announced — §5.5's authoritative
+    /// rung, with no transform in hand.
+    fn note_time_jump(&self, delta_nanos: i64, kind: tft_bridge_jump_kind) -> tft_bridge_outcome {
+        let mut out = poisoned_outcome();
+        // SAFETY: live handle on its creating thread; `out` is a live local with
+        // `struct_size` set.
+        let rc = unsafe { tft_bridge_note_time_jump(self.0, delta_nanos, kind, &mut out) };
         assert_eq!(rc, TFT_OK, "the call was malformed: {}", last_message());
         out
     }
@@ -328,6 +365,17 @@ fn an_offer_on_a_declared_edge_is_written_and_reads_back() {
             "component {i}: read {g}, wrote {w} — full read-back {got:?}"
         );
     }
+    assert_eq!(
+        (
+            o.clock_evidence,
+            o.clock_evidence_detail,
+            o.by_nanos,
+            o.delta_nanos
+        ),
+        (TFT_BRIDGE_EVIDENCE_NONE, 0, 0, 0),
+        "an ordinary write says nothing about the clock, and the fields that \
+         describe clock events say nothing rather than something stale"
+    );
     let s = b.stats();
     assert_eq!((s.applied, s.rejected_by_arena), (1, 0));
     assert_balanced(&s);
@@ -647,25 +695,32 @@ fn a_halted_bridge_refuses_every_later_offer() {
 /// §5.5's `recreate` builds a fresh arena; this ABI will not, because every
 /// plan the node compiled points into the current one. So the only correct
 /// continuation is that the caller tears the bridge down — and the pipeline has
-/// *already forgotten* every edge's high-water mark (`docs/decisions/0011`
-/// rewinds each per-edge guard to "no stamp seen yet" on this path, in place of
-/// the old single `ClockGuard::accept_reset`), so an unlatched bridge would
-/// approve every subsequent sample and let the arena refuse them one at a time
-/// as non-monotonic: a bag loop turning into a silent permanent stall.
+/// *already forgotten* every edge's high-water mark on this path, so an
+/// unlatched bridge would approve every subsequent sample and let the arena
+/// refuse them one at a time as non-monotonic: a bag loop turning into a silent
+/// permanent stall.
 ///
-/// **Two offers reach a reset here because this fixture declares one dynamic
-/// edge.** `docs/decisions/0011`'s quorum wants a second publisher before it
-/// calls a regression "the clock", but it is floored by what the deployment can
-/// supply: with one dynamic edge there is no second publisher to mistake a
-/// restart for, so the first past-threshold jump is unambiguous and is the
-/// reset. The next test in this file covers the unfloored case, where a second
-/// dynamic edge means a second publisher really could exist.
+/// **The stop arrives through [`tft_bridge_note_time_jump`], and it has to.**
+/// This fixture is one publisher on one dynamic edge, and under §5.5's ladder a
+/// single source *never* promotes its own regression, however far back it goes
+/// — that is the whole correction: a lone node restarting is observationally
+/// identical to a bag loop, and the previous rule's floor turned it into a
+/// latched bridge on a healthy robot. What a lone bag loop really has is the
+/// authoritative signal, because `rcl` reports the `/clock` rewind to the node
+/// directly. So the fixture uses it, and the latch is exercised through the
+/// entry point a real replay deployment would use.
 ///
 /// Mutant: delete `inner.stopped = Some(…)` from the `RecreateArena` arm ⇒ the
-/// next offer is `TFT_BRIDGE_APPLIED` and this fails. Mutant: latch it with
-/// `action: TFT_BRIDGE_HALT` ⇒ the caller is told a worse fault than the one
-/// that happened, and both the second `TFT_BRIDGE_RECREATE` assertion and the
-/// `"re-plan"` one fail.
+/// next offer comes back **`TFT_BRIDGE_REJECTED`** (*"left: 7, right: 6"*), not
+/// `APPLIED` — which is the failure mode this test's second paragraph describes,
+/// caught in the act: the pipeline waved the sample through because the recreate
+/// had rewound every high-water mark, and the arena refused it as
+/// non-monotonic. One `rejected_by_arena` per sample, forever, instead of one
+/// loud outcome. Mutant: latch it with `action: TFT_BRIDGE_HALT` ⇒ the caller is
+/// told a worse fault than the one that happened, and both the second
+/// `TFT_BRIDGE_RECREATE` assertion and the `"re-plan"` one fail. Mutant: negate
+/// the delta on the way through `note_time_jump` ⇒ *"left: 5000000000, right:
+/// -5000000000"*, a rewind reported as a fast-forward.
 #[test]
 fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     let b = Bridge::new(
@@ -673,10 +728,22 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
         TFT_BRIDGE_ON_CLOCK_RESET_RECREATE,
     );
     b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
-    // A bag loop: far more than the 100 ms jitter threshold.
-    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_000 * MS, POSE, None);
+    // A bag loop, as `rcl_time_jump_t` reports it: new time minus old, so a
+    // five-second rewind is negative.
+    let o = b.note_time_jump(-5_000 * MS, TFT_BRIDGE_JUMP_BACKWARD);
     assert_eq!(o.action, TFT_BRIDGE_RECREATE, "{}", text(o.detail));
+    assert_eq!(o.delta_nanos, -5_000 * MS);
     assert_eq!(o.by_nanos, 5_000 * MS);
+    assert_eq!(
+        (o.clock_evidence, o.clock_evidence_detail),
+        (
+            TFT_BRIDGE_EVIDENCE_REPORTED,
+            TFT_BRIDGE_JUMP_BACKWARD as u32
+        ),
+        "a reported jump keeps its evidence through RECREATE, where the \
+         pipeline's own action does not carry any"
+    );
+    assert_eq!(o.first_time, 1, "the transition is the loud one");
     assert!(text(o.detail).contains("re-plan"));
 
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_010 * MS, POSE, None);
@@ -685,7 +752,7 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
         "a recreate must not degrade into a halt on the next call"
     );
     assert_eq!(o.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
-    assert_eq!(o.by_nanos, 5_000 * MS);
+    assert_eq!(o.delta_nanos, -5_000 * MS);
     assert!(
         text(o.detail).contains("re-plan"),
         "and the sentence keeps saying what to do, not \"halted\": {:?}",
@@ -694,36 +761,114 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     assert_balanced(&b.stats());
 }
 
-/// **With two publishers to tell apart, one regressing edge is a restart and two
-/// are the clock — and the halt says how many corroborated it.**
+/// **A lone publisher regressing by five seconds is dropped, not promoted —
+/// however many times it does it.**
 ///
-/// This is `docs/decisions/0011`'s §5.5 rule at the seam, in the shape the rest
-/// of this file cannot express: `TOPO` declares one dynamic edge, which floors
-/// the quorum to one, so every other clock fixture here halts on the first
-/// regression. That floor is correct — with one dynamic edge there is no second
-/// publisher a restart could be confused with — but it means nothing in this
-/// file exercises the quorum itself, and the quorum is the whole reason a
-/// correctly configured robot with a lagging estimator no longer latches its
-/// bridge. Hence a local topology with a second dynamic edge and a second
-/// publisher.
+/// This is the defect §5.5's ladder exists to remove, stated as a fixture. One
+/// node restarting and replaying its own buffer looks *exactly* like a bag loop
+/// to anything watching one edge's stamps, and the rule that promoted it stopped
+/// robots that had nothing wrong with them. Distance is not evidence: the
+/// arriving samples are refused either way, because Phase 1's ring would refuse
+/// them anyway, so nothing is lost by not stopping.
 ///
-/// The count has to ride in `detail` because `tft_bridge_outcome` has room for
-/// exactly one `(parent, child)` pair — filled here with the edge that
-/// *completed* the quorum — and growing that POD is a `struct_size`-versioned
-/// break 0011 declined to take. It is not decoration: "5 edges" is a bag loop
-/// and "2 edges" may be two publishers that hiccuped at once, which is the
-/// quorum's one false-positive mode and the thing an operator would go and look
-/// at.
+/// Note the offers carry a real receipt clock, so the offset layer is fully
+/// engaged and this is not passing merely because that layer was asleep.
 ///
-/// Mutant: drop `correlated_edges` from the `HaltReason::ClockReset` detail and
-/// return the plain "the bridge halted" sentence ⇒ the `"2 edge"` assertion
-/// fails and the halt no longer says what it concluded. Mutant: promote every
-/// regression, by returning `Reached` unconditionally from `ResetQuorum::record`
-/// ⇒ the first offer halts and the `TFT_BRIDGE_DROPPED` assertion fails, which
-/// is the false halt on a healthy robot that 0011 exists to remove. Mutant:
-/// increment `clock_resets` on the isolated regression too ⇒ the `0` assertion
-/// fails, and the counter goes back to meaning "regressions" instead of
-/// "promotions".
+/// Mutant: promote a lone step by returning `Some(CommonMode { publishers: 1, …
+/// })` from `OffsetTable::observe` when one publisher steps ⇒ the first
+/// regression halts, and every `TFT_BRIDGE_DROPPED` assertion here fails.
+/// Mutant: drop the `publishers < 2` guard entirely ⇒ the same.
+#[test]
+fn a_lone_publisher_regressing_is_never_promoted_however_far_it_goes() {
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+    );
+    // A steady 100 Hz stream, stamps and receipts advancing together.
+    for k in 0..5i64 {
+        let o = b.offer_at(
+            TFT_BRIDGE_TOPIC_TF,
+            "odom",
+            "base",
+            10_000 * MS + k * 10 * MS,
+            1_000 * MS + k * 10 * MS,
+            POSE,
+            None,
+        );
+        assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
+    }
+    // It restarts and replays from five seconds ago, forever.
+    for k in 0..20i64 {
+        let o = b.offer_at(
+            TFT_BRIDGE_TOPIC_TF,
+            "odom",
+            "base",
+            5_000 * MS + k * 10 * MS,
+            1_050 * MS + k * 10 * MS,
+            POSE,
+            None,
+        );
+        assert_eq!(
+            o.action,
+            TFT_BRIDGE_DROPPED,
+            "sample {k}: one publisher is not the clock: {}",
+            text(o.detail)
+        );
+        assert_eq!(o.reason, TFT_BRIDGE_REASON_NON_MONOTONIC);
+        assert!(o.by_nanos > 0, "and the drop says how far");
+        assert!(o.delta_nanos < 0, "and which way");
+        assert_eq!(o.clock_evidence, TFT_BRIDGE_EVIDENCE_NONE);
+    }
+    let s = b.stats();
+    assert_eq!(
+        (s.dropped_non_monotonic, s.clock_resets),
+        (20, 0),
+        "twenty refusals and not one conclusion about the clock"
+    );
+    assert_balanced(&s);
+}
+
+/// **Two publishers whose offsets step by the same amount are the clock; one is
+/// not — and the halt says which rung concluded it.**
+///
+/// §5.5's fallback rung at the seam, in the shape the rest of this file cannot
+/// express: `TOPO` declares one dynamic edge, so nothing else here can put two
+/// distinct publishers inside one correlation window. Hence a local topology
+/// with a second dynamic edge and a second publisher — the pair the rule was
+/// opened about, a localizer's `map -> odom` and a wheel driver's `odom ->
+/// base`.
+///
+/// **The receipt clock is what makes this work at all.** Each publisher's
+/// `stamp - received` offset is tracked, so a `transform_tolerance` is measured
+/// and subtracted rather than mistaken for a jump; what promotes is a *step* in
+/// that offset, seen in two distinct publishers within a second of each other
+/// and agreeing about its size. A real `/clock` step moves everybody by the same
+/// amount and two independent restarts do not, which is why agreement is the
+/// evidence rather than mere coincidence in time.
+///
+/// The delta is `-5_020 * MS` and not a round five seconds because it is
+/// measured against the *receipt* clock: the wheel driver's post-rewind message
+/// arrives 20 ms of real time after its last pre-rewind one, and those 20 ms are
+/// part of how far its offset moved. That is the measurement being honest about
+/// what it is, and the agreement tolerance — 25 % of 5 s, or 1.25 s — exists
+/// precisely so two publishers sampling the same jump at different instants
+/// still agree.
+///
+/// The evidence has to ride in `detail` because `tft_bridge_outcome` has room
+/// for exactly one `(parent, child)` pair — filled here with the edge whose
+/// sample *completed* the step — and growing that POD is a
+/// `struct_size`-versioned break. It is not decoration: an operator told "two
+/// publishers stepped together" goes and looks at those two nodes, and one told
+/// "the time source reported it" goes and looks at the bag.
+///
+/// Mutant: drop the evidence from the `HaltReason::ClockReset` detail and return
+/// the plain "the bridge halted" sentence ⇒ the `"publishers"` assertion fails
+/// and the halt no longer says what it concluded. Mutant: promote a single
+/// witness, by removing `OffsetTable::observe`'s `publishers < 2` guard ⇒ the
+/// first offer halts and the `TFT_BRIDGE_DROPPED` assertion fails, which is the
+/// false halt on a healthy robot this design exists to remove. Mutant: increment
+/// `clock_resets` on the isolated regression too ⇒ the `0` assertion fails, and
+/// the counter goes back to meaning "regressions" instead of "promotions".
 #[test]
 fn a_clock_reset_needs_a_second_publisher_and_reports_how_many_corroborated() {
     /// Two dynamic edges from two nodes — the pair 0011 was opened about: a
@@ -758,56 +903,86 @@ capacity = 256
             TFT_OK
         );
     }
+    // Both publishers' first sample defines their offset baseline: there is
+    // nothing yet for either to have stepped away from.
     for (p, c, g) in [("map", "odom", &amcl), ("odom", "base", &wheels)] {
-        let o = b.offer(TFT_BRIDGE_TOPIC_TF, p, c, 10_000 * MS, POSE, Some(g));
+        let o = b.offer_at(
+            TFT_BRIDGE_TOPIC_TF,
+            p,
+            c,
+            10_000 * MS,
+            1_000 * MS,
+            POSE,
+            Some(g),
+        );
         assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
     }
 
-    // `/amcl` restarts and republishes from five seconds ago. Alone, that is a
-    // node restarting — dropped, counted, and the bridge keeps running.
-    let o = b.offer(
+    // `/amcl` republishes from five seconds ago, 10 ms of real time later.
+    // Alone, that is a node restarting — dropped, counted, and the bridge keeps
+    // running.
+    let o = b.offer_at(
         TFT_BRIDGE_TOPIC_TF,
         "map",
         "odom",
         5_000 * MS,
+        1_010 * MS,
         POSE,
         Some(&amcl),
     );
     assert_eq!(
         o.action,
         TFT_BRIDGE_DROPPED,
-        "one publisher regressing is that publisher, not the clock: {}",
+        "one publisher stepping is that publisher, not the clock: {}",
         text(o.detail)
     );
     assert_eq!(o.reason, TFT_BRIDGE_REASON_NON_MONOTONIC);
-    assert_eq!(o.by_nanos, 5_000 * MS);
+    assert_eq!(o.delta_nanos, -5_000 * MS);
     let s = b.stats();
     assert_eq!((s.dropped_non_monotonic, s.clock_resets), (1, 0));
 
-    // The wheel driver regresses by the same five seconds. Two independent
-    // publishers do not restart in lockstep, so the only cause left is the
-    // clock they share.
-    let o = b.offer(
+    // The wheel driver's offset steps by the same five seconds, 10 ms after
+    // that. Two independent publishers do not restart in lockstep *and by the
+    // same amount*, so the only cause left is the clock they share.
+    let o = b.offer_at(
         TFT_BRIDGE_TOPIC_TF,
         "odom",
         "base",
         5_000 * MS,
+        1_020 * MS,
         POSE,
         Some(&wheels),
     );
     assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
     assert_eq!(o.reason, TFT_BRIDGE_REASON_CLOCK_RESET);
-    assert_eq!(o.by_nanos, 5_000 * MS);
+    assert_eq!(
+        (o.clock_evidence, o.clock_evidence_detail),
+        (TFT_BRIDGE_EVIDENCE_COMMON_MODE, 2),
+        "the inferred rung, and how many publishers agreed — the first thing an \
+         operator needs, and a code rather than a sentence to grep"
+    );
+    assert_eq!(
+        o.by_nanos,
+        5_020 * MS,
+        "the backwards distance is the magnitude of the displacement, because \
+         this jump went backwards"
+    );
+    assert_eq!(
+        o.delta_nanos,
+        -5_020 * MS,
+        "the step is measured against the receipt clock, so it carries the 20 ms \
+         of real time that passed as well as the 5 s rewind"
+    );
     assert_eq!(
         (text(o.parent), text(o.child)),
         ("odom".into(), "base".into()),
-        "the outcome names the edge that completed the quorum"
+        "the outcome names the edge whose sample completed the step"
     );
     let detail = text(o.detail);
     assert!(
-        detail.contains("2 edge"),
-        "and the detail carries what the pair cannot: how many corroborated it: \
-         {detail:?}"
+        detail.contains("2 publishers") && detail.contains("backwards"),
+        "and the detail carries what the pair cannot: which rung concluded it, \
+         and which way: {detail:?}"
     );
     let s = b.stats();
     assert_eq!((s.dropped_non_monotonic, s.clock_resets), (2, 1));
@@ -826,20 +1001,22 @@ capacity = 256
 /// diagnostic be "loud, **rate-limited**"; `first_time` is the whole of that
 /// mechanism and it was set on three arms out of five.
 ///
-/// **The stop is a clock reset, and two offers reach one because this fixture
-/// declares a single dynamic edge**: `docs/decisions/0011`'s quorum is floored
-/// by the number of dynamic edges the deployment declares, so with one there is
-/// no second publisher a regression could be confused with and the first
-/// past-threshold jump *is* the reset. The `clock_resets` assertion below is
-/// what says the promotion happened rather than a bare drop — that counter
-/// counts promotions now, not regressions.
+/// **The stop is a reported clock jump**, because a single publisher on a single
+/// edge can no longer produce one and should not be able to: §5.5's ladder never
+/// promotes one witness. A bag replay really does have the authoritative signal,
+/// so the fixture uses it — and it also proves the new entry point latches
+/// through exactly the same machinery `offer` does, which is why it goes through
+/// `fill` rather than growing a second copy of the halt wording.
+///
+/// The `clock_resets` assertion is what says a promotion happened rather than a
+/// bare drop — that counter counts promotions, not regressions.
 ///
 /// Mutant: delete `o.first_time = 1` from the `Action::Halt` arm ⇒ the halting
-/// offer reports 0 and a caller has no way to tell the transition from the
+/// call reports 0 and a caller has no way to tell the transition from the
 /// replay; the first `assert_eq!(o.first_time, 1)` fails. Mutant: the same
 /// deletion in `Action::RecreateArena` ⇒ the second one fails. Mutant: set
-/// `o.first_time = 1` on the `Stopped` short-circuit path ⇒ every replayed
-/// offer claims to be the first and the `0` assertions fail. Mutant: hard-code
+/// `o.first_time = 1` on either `Stopped` short-circuit path ⇒ every replayed
+/// call claims to be the first and the `0` assertions fail. Mutant: hard-code
 /// `clock_resets: 0` in `tft_bridge_get_stats` ⇒ the promotion the halt was
 /// raised from is invisible to `tf_tree doctor`, and the `clock_resets`
 /// assertion fails.
@@ -850,16 +1027,21 @@ fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
         TFT_BRIDGE_ON_CLOCK_RESET_HALT,
     );
     b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
-    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_000 * MS, POSE, None);
+    let o = b.note_time_jump(-5_000 * MS, TFT_BRIDGE_JUMP_BACKWARD);
     assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
     assert_eq!(o.reason, TFT_BRIDGE_REASON_CLOCK_RESET);
     assert_eq!(o.first_time, 1, "the transition is the loud one");
     assert_eq!(
         b.stats().clock_resets,
         1,
-        "the regression was promoted to a reset, which is what `clock_resets` \
-         counts since docs/decisions/0011"
+        "the reported jump is a promotion, which is what `clock_resets` counts"
     );
+    // A jump reported twice — a bag that loops twice — replays the latch and is
+    // rate-limited exactly like a repeated offer.
+    let o = b.note_time_jump(-5_000 * MS, TFT_BRIDGE_JUMP_BACKWARD);
+    assert_eq!(o.action, TFT_BRIDGE_HALT);
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
+    assert_eq!(o.first_time, 0);
     for k in 0..4i64 {
         let o = b.offer(
             TFT_BRIDGE_TOPIC_TF,
@@ -881,12 +1063,122 @@ fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
         TFT_BRIDGE_ON_CLOCK_RESET_RECREATE,
     );
     b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
-    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_000 * MS, POSE, None);
+    let o = b.note_time_jump(-5_000 * MS, TFT_BRIDGE_JUMP_BACKWARD);
     assert_eq!(o.action, TFT_BRIDGE_RECREATE, "{}", text(o.detail));
     assert_eq!(o.first_time, 1);
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 5_010 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_RECREATE);
     assert_eq!(o.first_time, 0);
+}
+
+/// **A reported jump charges no counter, names no edge, and refuses a code it
+/// does not know.**
+///
+/// Three properties of the authoritative entry point that nothing else pins.
+///
+/// *No counter.* `tft_bridge_stats`' ledger totals to `transforms`, and this
+/// call is not a transform — not even on a stopped bridge, where an offer would
+/// have charged `refused_after_halt`. A counter that moved here would have to be
+/// added to the ledger to keep it balancing, which would be the ledger lying in
+/// order to look consistent. `clock_resets` moves, because it counts clock
+/// events rather than transforms and is not a ledger term.
+///
+/// *No edge.* The call has no transform in hand, so `scratch` holds whichever
+/// edge happened to be last on the wire — an innocent one. This is the same
+/// argument the `STRICT` window-close halt makes, and it is why the `ClockReset`
+/// arm names an edge only for the inferred rung.
+///
+/// *An unknown kind is a call fault*, like an out-of-range topic: it says the
+/// caller's build disagrees with this one about an enum, which is not something
+/// an outcome code can express.
+///
+/// Mutant: call `name_the_edge` unconditionally in the `HaltReason::ClockReset`
+/// arm ⇒ the halt names `odom -> base`, an edge that did nothing wrong:
+/// *"assertion `left == right` failed: a reported jump is not about any
+/// transform, so it names no edge rather than an innocent one; left:
+/// `("odom", "base")`, right: `("", "")`"*.
+///
+/// Mutant: increment `inner.refused_after_halt` on `note_time_jump`'s stopped
+/// path ⇒ `(transforms, refused_after_halt)` reads `(2, 1)` against `(1, 0)`.
+/// Note what that mutant does **not** break: `assert_balanced` still passes,
+/// because `tft_bridge_get_stats` folds `refused_after_halt` into `transforms`
+/// as well, so the ledger stays self-consistent while both numbers describe an
+/// event that was never a transform. The explicit assertion is the only thing
+/// standing between that and a counter nobody can interpret.
+///
+/// Mutant: accept any `kind` by defaulting to `JumpKind::Backward` ⇒ the
+/// `TFT_ERR_BAD_ENUM` assertion fails.
+///
+/// Mutant: report the evidence as `TFT_BRIDGE_EVIDENCE_COMMON_MODE` ⇒ the halt
+/// sends a field engineer to look at two publishers that did nothing, when the
+/// time source had already said what happened. Mutant: fill
+/// `clock_evidence_detail` from `delta_nanos` instead of the jump kind ⇒ the
+/// code is right and the number is nonsense, which the paired assertion catches
+/// and a `clock_evidence`-only assertion would not.
+#[test]
+fn a_reported_jump_charges_nothing_and_names_no_edge() {
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+    );
+    b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
+
+    let mut out = poisoned_outcome();
+    // SAFETY: live handle on its creating thread; `out` is a live local with
+    // `struct_size` set.
+    let rc = unsafe { tft_bridge_note_time_jump(b.0, -MS, 99, &mut out) };
+    assert_eq!(rc, TFT_ERR_BAD_ENUM, "an unknown jump kind is a call fault");
+    assert_eq!(
+        out.action, TFT_BRIDGE_DROPPED,
+        "and *out is still well-formed"
+    );
+
+    // `use_sim_time` switched at runtime: a source change, whose delta compares
+    // two different time bases and is therefore not printed as a duration.
+    let o = b.note_time_jump(7_000 * MS, TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED);
+    assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_CLOCK_RESET);
+    assert_eq!(
+        (text(o.parent), text(o.child)),
+        (String::new(), String::new()),
+        "a reported jump is not about any transform, so it names no edge rather \
+         than an innocent one"
+    );
+    assert_eq!(
+        (o.clock_evidence, o.clock_evidence_detail),
+        (
+            TFT_BRIDGE_EVIDENCE_REPORTED,
+            TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED as u32
+        ),
+        "the strongest rung, and which kind of jump it was"
+    );
+    assert_eq!(
+        o.by_nanos, 0,
+        "a source change reported as a positive delta did not go backwards, so \
+         the backwards distance is 0 rather than the magnitude"
+    );
+    assert_eq!(o.delta_nanos, 7_000 * MS);
+    let detail = text(o.detail);
+    assert!(
+        detail.contains("time source"),
+        "the strongest rung says so, so an operator knows this is a fact and not \
+         an inference: {detail:?}"
+    );
+
+    let s = b.stats();
+    assert_eq!(
+        (s.transforms, s.refused_after_halt),
+        (1, 0),
+        "one offered transform, and the jump reports are not transforms"
+    );
+    assert_eq!(s.clock_resets, 1);
+    assert_balanced(&s);
+
+    // Again, on a stopped bridge: still no bucket moves.
+    b.note_time_jump(-MS, TFT_BRIDGE_JUMP_BACKWARD);
+    let s = b.stats();
+    assert_eq!((s.transforms, s.refused_after_halt), (1, 0));
+    assert_balanced(&s);
 }
 
 /// **A topology that declares no edges is refused at `tft_bridge_create`.**
@@ -1056,8 +1348,20 @@ fn an_undeclared_edge_is_diagnosed_once_and_names_both_frames() {
 ///
 /// Mutant: delete the `name_the_edge(inner, o)` call from `fill`'s
 /// `Action::Drop` arm ⇒ `parent` and `child` read `""` and this fails.
+/// **`by_nanos` and `delta_nanos` are both set, and they are not the same
+/// number.** One is a backwards *distance* — what a caller printing "went
+/// backwards by %ld ns" wants — and the other is the signed displacement the
+/// clock events use, so a caller reading either gets a true answer without
+/// having to know which arm produced the outcome. C has no type that carries
+/// that distinction; two field names are the whole of it.
+///
 /// Mutant: raise the drop's `by_nanos` assignment to `0` ⇒ the caller cannot
 /// tell a 40 ms interleave from a 4 s one, and the `by_nanos` assertion fails.
+/// Mutant: assign `o.delta_nanos = *by_nanos`, dropping the negation ⇒ a
+/// backward step reports a positive displacement, which under that field's one
+/// convention reads as a jump *forward*. Mutant: collapse the two, setting only
+/// `by_nanos` ⇒ `delta_nanos` stays 0 and the second assertion fails — which is
+/// the tidy-up this pair exists to stop.
 #[test]
 fn a_jittered_stamp_is_dropped_and_names_the_edge() {
     let b = Bridge::new(
@@ -1069,7 +1373,14 @@ fn a_jittered_stamp_is_dropped_and_names_the_edge() {
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 960 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_DROPPED);
     assert_eq!(o.reason, TFT_BRIDGE_REASON_NON_MONOTONIC);
-    assert_eq!(o.by_nanos, 40 * MS);
+    assert_eq!(o.by_nanos, 40 * MS, "the backwards distance, positive");
+    assert_eq!(o.delta_nanos, -40 * MS, "and the signed displacement");
+    assert_eq!(
+        (o.clock_evidence, o.clock_evidence_detail),
+        (TFT_BRIDGE_EVIDENCE_NONE, 0),
+        "no clock judgment was made, so the evidence fields say so rather than \
+         holding whatever the last one held"
+    );
     assert_eq!(
         (text(o.parent), text(o.child)),
         ("odom".into(), "base".into()),
@@ -1102,6 +1413,7 @@ fn a_bad_handle_still_leaves_a_printable_outcome() {
         child_frame_id: ptr::null(),
         stamp_nanos: 0,
         pose: POSE,
+        received_steady_nanos: 0,
     };
     let mut out = poisoned_outcome();
     // SAFETY: a NULL handle is explicitly contracted as valid input; `s` and
@@ -1127,8 +1439,9 @@ fn a_bad_handle_still_leaves_a_printable_outcome() {
 /// **A `struct_size` from another build is refused, on every struct that
 /// carries one** (§3.6, §6.1).
 ///
-/// Mutant: delete the `tft_bridge_sample` size check ⇒ the second case reads a
-/// struct laid out by a different build and returns `TFT_OK`, so the
+/// Mutant: delete the `tft_bridge_sample` size check — that is,
+/// `read_sample`'s `declared != current && declared != v1` ⇒ the second case
+/// reads a struct laid out by a different build and returns `TFT_OK`, so the
 /// `TFT_ERR_BAD_STRUCT_SIZE` assertion fails.
 #[test]
 fn a_struct_size_from_another_build_is_refused() {
@@ -1143,6 +1456,7 @@ fn a_struct_size_from_another_build_is_refused() {
         child_frame_id: c.as_ptr(),
         stamp_nanos: MS,
         pose: POSE,
+        received_steady_nanos: 0,
     };
 
     let mut out = poisoned_outcome();
@@ -1170,11 +1484,131 @@ fn a_struct_size_from_another_build_is_refused() {
         "and *out is still well-formed"
     );
 
+    // …and a size *larger* than this build's is refused too: that is a newer
+    // caller against an older library, whose extra bytes this build cannot
+    // interpret. `tft_check_abi`'s minor rule is what covers that direction.
+    let ahead = tft_bridge_sample {
+        struct_size: core::mem::size_of::<tft_bridge_sample>() as u32 + 8,
+        ..good
+    };
+    let mut out = poisoned_outcome();
+    // SAFETY: as above. The declared size overstates the struct, which is
+    // exactly what must be refused *before* anything reads that far.
+    let rc = unsafe { tft_bridge_offer(b.0, TFT_BRIDGE_TOPIC_TF, &ahead, ptr::null(), &mut out) };
+    assert_eq!(rc, TFT_ERR_BAD_STRUCT_SIZE);
+
     assert_eq!(
         b.stats().transforms,
         0,
         "no malformed call reached the pipeline"
     );
+}
+
+/// **A caller built before `received_steady_nanos` existed still works** — §3.6's
+/// append rule, which the exact-equality check had promised and never
+/// implemented.
+///
+/// §3.6 says fields may be appended to a `struct_size`-versioned struct without
+/// a major bump. Until this test there was nothing behind that sentence: every
+/// `struct_size` check in this file is an exact equality, so a caller holding a
+/// `libtf_tree_c.a` newer than its own header got `TFT_ERR_BAD_STRUCT_SIZE` on
+/// **every** offer — a total outage, in precisely the case the rule exists for,
+/// and reachable through §4.4's prebuilt-library path.
+///
+/// The old size is *computed* — `offset_of!` of the appended field is where the
+/// old struct ended — rather than written as `88`, which is right on the targets
+/// somebody checked and silently wrong elsewhere.
+///
+/// The missing field is filled from the library's own steady clock rather than
+/// left at the "no receipt clock" sentinel, so a legacy caller still gets the
+/// offset layer: the reading is taken microseconds after the message arrived,
+/// which against a 100 ms threshold is the same answer. What must never happen
+/// is substituting `stamp_nanos`, which would make every publisher's offset
+/// identically zero and re-enable inference over the signal under suspicion —
+/// for exactly the callers who cannot see the fix.
+///
+/// Mutant: accept only the current size, by dropping `declared != v1` from
+/// `read_sample`'s guard ⇒ *"an appended field must not lock an older caller
+/// out: a struct_size field names a size this build does not know; left: -3,
+/// right: 0"*.
+///
+/// Mutant: keep accepting the short struct but restore the whole-struct
+/// `core::ptr::read_unaligned` ⇒ **this test still passes**, which is exactly
+/// why the fixture allocates the prefix tightly instead of declaring a short
+/// size over a full-size struct. Under `just asan` the same run reports
+/// *"AddressSanitizer: heap-buffer-overflow … READ of size 96"* — the whole
+/// current struct, read out of an 88-byte allocation. Relaxing the size check
+/// without narrowing the read is the trap this pair of mutants exists to mark.
+#[test]
+fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+    );
+    let (p, c) = (CString::new("odom").unwrap(), CString::new("base").unwrap());
+    // The size a caller compiled against ABI 0.1 sends: everything up to but
+    // not including the appended field.
+    let v1_size = core::mem::offset_of!(tft_bridge_sample, received_steady_nanos);
+    assert!(v1_size < core::mem::size_of::<tft_bridge_sample>());
+
+    // **Allocated as exactly `v1_size` bytes**, so a read past the prefix is a
+    // genuine heap overrun a sanitizer can see, rather than a read into the
+    // tail of a full-size struct that happens to be there.
+    let mut short = vec![0u8; v1_size];
+    {
+        let full = tft_bridge_sample {
+            struct_size: v1_size as u32,
+            frame_id: p.as_ptr(),
+            child_frame_id: c.as_ptr(),
+            stamp_nanos: 1_000 * MS,
+            pose: POSE,
+            received_steady_nanos: 0,
+        };
+        // SAFETY: `full` is a live `tft_bridge_sample` and `short` has exactly
+        // `v1_size` bytes, which is less than its size — a prefix copy.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                ptr::addr_of!(full).cast::<u8>(),
+                short.as_mut_ptr(),
+                v1_size,
+            );
+        }
+    }
+
+    let mut out = poisoned_outcome();
+    // SAFETY: live handle on its creating thread; `short` holds `v1_size`
+    // readable bytes and declares that size, which is what the ABI contracts;
+    // `out` is a live local with `struct_size` set.
+    let rc = unsafe {
+        tft_bridge_offer(
+            b.0,
+            TFT_BRIDGE_TOPIC_TF,
+            short.as_ptr().cast::<tft_bridge_sample>(),
+            ptr::null(),
+            &mut out,
+        )
+    };
+    assert_eq!(
+        rc,
+        TFT_OK,
+        "an appended field must not lock an older caller out: {}",
+        last_message()
+    );
+    assert_eq!(out.action, TFT_BRIDGE_APPLIED, "{}", text(out.detail));
+    assert_eq!(
+        (text(out.parent), text(out.child)),
+        ("odom".into(), "base".into()),
+        "and every field the prefix does carry survived the bounded copy"
+    );
+    let got = b
+        .tree()
+        .at("odom", "base", 1_000 * MS)
+        .expect("a prefix sample is written like any other");
+    assert!(
+        (got[4] - POSE[4]).abs() < 1e-12,
+        "the pose came through the prefix intact: {got:?}"
+    );
+    assert_balanced(&b.stats());
 }
 
 /// **A declared dynamic edge whose domain is not the bridge's is refused at

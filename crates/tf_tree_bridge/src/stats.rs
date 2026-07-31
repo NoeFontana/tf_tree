@@ -33,8 +33,26 @@ pub struct BridgeStats {
     pub static_verified: u64,
     /// Dropped because another publisher owns the edge (§5.4).
     pub dropped_authority: u64,
-    /// Dropped because the stamp went backwards by less than the reset
-    /// threshold (§5.5).
+    /// Dropped because **time misbehaved** (§5.5). The bridge's one bucket for
+    /// every refusal the clock rules produce, and it is wider than its name.
+    ///
+    /// Three kinds of sample land here:
+    ///
+    /// - the stamp went backwards by less than the reset threshold — jitter,
+    ///   the case the name describes;
+    /// - the stamp went backwards *past* the threshold on one edge, which is a
+    ///   fact about one publisher and never on its own a clock reset;
+    /// - the sample on which a **common-mode step** was detected, whether that
+    ///   step was backwards or **forwards**. A forward jump leaves every stamp
+    ///   perfectly monotone, so nothing about that sample is non-monotonic; it
+    ///   is charged here anyway because it *is* refused (the bridge is halting
+    ///   or the arena is being rebuilt), because [`BridgeStats::balanced`]
+    ///   requires every counted transform to land in exactly one bucket, and
+    ///   because a second bucket would be a `struct_size`-versioned growth of
+    ///   the C seam's mirror of this struct.
+    ///
+    /// So read it as *"transforms the clock rules refused"*. `clock_resets` is
+    /// what separates the third kind from the first two.
     pub dropped_non_monotonic: u64,
     /// Dropped because the frame name was empty or unusable (§5.6).
     pub dropped_bad_name: u64,
@@ -55,17 +73,22 @@ pub struct BridgeStats {
     /// Narrowed by `docs/decisions/0011`. The clock guard is per edge, and one
     /// edge's stamps going backwards past the threshold is a fact about one
     /// publisher: it is dropped, and counted in `dropped_non_monotonic`, and it
-    /// does **not** appear here. This counts the times a quorum of distinct
-    /// edges regressed together and the bridge concluded that the *clock* moved
-    /// — which under the default `OnClockReset::Halt` is 0 or 1 for the life of
-    /// the bridge, because the first one stops it.
+    /// does **not** appear here — **however far it went and however often**.
+    /// This counts the times the bridge concluded that the *clock* moved, which
+    /// takes either an authoritative jump report from the time source
+    /// (`Ingest::note_time_jump`) or a common-mode step agreed on by at least
+    /// two distinct publishers. Under the default `OnClockReset::Halt` it is 0
+    /// or 1 for the life of the bridge, because the first one stops it.
     ///
     /// The distinction is the whole of that record: a counter that conflated
     /// them would report a healthy robot whose estimator lags its wheel
     /// odometry as resetting its clock hundreds of times a second.
     ///
-    /// Not a term in [`BridgeStats::balanced`] — the transform a promotion was
-    /// detected on is already counted in `dropped_non_monotonic`, which is.
+    /// Not a term in [`BridgeStats::balanced`]. A promotion detected on an
+    /// arriving transform charges that transform to `dropped_non_monotonic`,
+    /// which is a term; a promotion reported by `Ingest::note_time_jump` has no
+    /// transform in hand at all and charges no bucket, exactly like the startup
+    /// window's close.
     pub clock_resets: u64,
     /// Static-transform value conflicts (§5.7).
     pub static_conflicts: u64,

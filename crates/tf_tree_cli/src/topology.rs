@@ -41,6 +41,29 @@ use tf_tree_bridge::{Discovery, EdgeShape, Sample, Topic, TopologyConfig};
 
 /// Read a `.tfstream`, collect its topology, and return the config it implies.
 ///
+/// # Why every sample's receipt time is [`tf_tree_bridge::SteadyNanos::UNKNOWN`]
+///
+/// §5.5's common-mode detector needs a reference clock that is *independent of
+/// the clock under test* — online that is the local steady clock read once per
+/// `TFMessage`, offline it is the recorder's log time. **A `.tfstream` carries
+/// neither.** Its grammar (see [`tf_tree_bench::replay`]) is `S`/`D` lines with
+/// a rebased header stamp and nothing else: the converter that produced it
+/// discarded the bag's log times, and the stamps that remain are the very
+/// signal a receipt clock exists to corroborate.
+///
+/// So this passes the sentinel and says so, rather than passing a silent zero
+/// or — the tempting error — `stamp_nanos`. Substituting the stamp would make
+/// every publisher's offset identically zero, which re-enables inference over
+/// the signal under suspicion and resurrects the defect that per-publisher
+/// offsets were introduced to remove.
+///
+/// It costs nothing here. [`Discovery::observe`] normalizes names and records
+/// edge shape; it never consults a clock guard, an offset table or a stamp
+/// beyond storing it. The sentinel is only load-bearing for callers that feed
+/// [`tf_tree_bridge::Ingest`], where it means the common-mode layer is absent
+/// and a lone regression degrades to a per-edge drop — which is the ladder's
+/// bottom rung behaving exactly as designed.
+///
 /// # Errors
 ///
 /// If the stream cannot be read or parsed.
@@ -68,30 +91,25 @@ pub fn discover_from_tfstream(
     // resolves a clash to whichever topic it saw first, so the order it is fed
     // is part of what it reports.
     for (parent, child, iso) in &stream.static_edges {
-        d.observe(
-            Topic::TfStatic,
-            &Sample {
-                frame_id: parent.clone(),
-                child_frame_id: child.clone(),
-                stamp_nanos: 0,
-                pose: pose_of(iso),
-            },
-        );
+        // `Sample::identity` and then the pose, rather than a struct literal:
+        // `Sample` is not `#[non_exhaustive]` and gained `received` once
+        // already, so a literal here breaks this file every time a field is
+        // appended for a reason that has nothing to do with `--discover`.
+        //
+        // `received` stays at `SteadyNanos::UNKNOWN` — see the note above
+        // `discover_from_tfstream`.
+        let mut sample = Sample::identity(parent, child, 0);
+        sample.pose = pose_of(iso);
+        d.observe(Topic::TfStatic, &sample);
     }
     for s in &stream.samples {
         let (parent, child) = stream
             .dynamic_edges
             .get(s.edge)
             .ok_or_else(|| anyhow!("sample references edge {} which does not exist", s.edge))?;
-        d.observe(
-            Topic::Tf,
-            &Sample {
-                frame_id: parent.clone(),
-                child_frame_id: child.clone(),
-                stamp_nanos: s.stamp_ns,
-                pose: pose_of(&s.pose),
-            },
-        );
+        let mut sample = Sample::identity(parent, child, s.stamp_ns);
+        sample.pose = pose_of(&s.pose);
+        d.observe(Topic::Tf, &sample);
     }
     Ok(d)
 }
