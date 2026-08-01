@@ -370,6 +370,27 @@ For depth 3 this releases from about `n = 6`. The worst case where we do *not* r
 
 Publish the constants and add a benchmark row proving the crossover behaves as predicted.
 
+> **Amendment — `NS_PER_STEP_ESTIMATE = 55` came from a benchmark that never
+> interpolated, and the paragraph above is why nothing broke.**
+>
+> [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md) found that
+> the Phase 1 lookup benchmark queried **on-grid** stamps, so `I::eval` never
+> ran. The "~150 ns" depth-3 figure this section derives 55 ns/step from is
+> really **~290 ns**, i.e. **~97 ns/step** — a 1.8× error in the input.
+>
+> It moves the depth-3 release crossover from `n ≈ 6` to `n ≈ 4`. That is the
+> whole consequence, and it is the strongest evidence available that this
+> section's design is right: it absorbed a wrong input and the behaviour on both
+> sides of the threshold stayed cheap. **The constant is not changed here**,
+> because changing it against a number `0013` has not yet re-baselined would
+> repeat the mistake in the other direction.
+>
+> **NORMATIVE ([`API.md`](./API.md) §3.4):** when `0013` re-baselines,
+> `NS_PER_STEP_ESTIMATE` is re-derived from the new number **in the same
+> commit**, and this section gains a line naming the measurement it came from.
+> A constant with no cited source is how this happened; a constant whose source
+> is a superseded benchmark is how it stayed hidden.
+
 ### 6.2 Rules while the GIL is released — NORMATIVE
 
 1. **Touch no Python object.** Extract raw pointers and lengths *before* `allow_threads` and use only plain Rust data inside.

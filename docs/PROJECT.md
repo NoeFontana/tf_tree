@@ -69,7 +69,7 @@ Phases are ordered by *what constrains what*, not by user-visible value.
 
 > **This phase was four items and is now one.** [`0009`](./decisions/0009-descoping-phase-6.md) descoped **covariance** (a tree cannot compose a correct one — see §1) and **copy-on-write branches** (they serve the loop-closure use case D2 rejects, and contradict fixed capacity, one-writer-per-edge and append-only ids simultaneously), and moved **URDF parsing** out of the engine: it becomes an optional converter emitting the topology config Phase 4 already ships, built on the existing `urdf-rs` crate, and it is not owed by any phase. Phase 6 was the only phase not organised by this section's own "what constrains what" principle, and a remainder is where scope drifts without anyone deciding it should.
 
-**Phase 7 — the compatibility layer, gated (D21).** `tf2_ros::Buffer`-compatible shim and arena → `/tf` egress. Does not begin until Phases 4 and 5 have produced the operating experience its hundred small semantic judgements require.
+**Phase 7 — the compatibility layer, gated (D21).** `tf2_ros::Buffer`-compatible shim and arena → `/tf` egress. Does not begin until Phases 4 and 5 have produced the operating experience its hundred small semantic judgements require. Specified in `docs/PHASE7.md`, which is a **requirements artifact and not an implementation authorization**: its §4 states the semantic judgements as questions, and §0.0 lists the four gates that must be met before §3–§6 are built.
 
 **Phase 8 — inter-host replication.** Interest-based subscription, delta-coded wire format, clock-domain alignment with reported uncertainty, pluggable transport (Zenoh default).
 
@@ -148,6 +148,8 @@ The Rust ecosystem norm and the only choice compatible with industrial adoption.
 **D21 — The compatibility layer is Phase 7, and it is gated on evidence, not scheduled.**
 `tf2_ros::Buffer` API compatibility and arena → `/tf` egress wait until Phases 4 and 5 have produced operating experience: a real node on real hardware (`PHASE4.md` §1) and offline users who adopted nothing (`PHASE5.md` §0). The shim is a hundred small semantic judgements about what `tf2` does when asked something ambiguous, and each one made without that experience is a guess that ships as a compatibility promise. Phase 4's bridge is **ingress-only** for the same reason: one direction removes every loopback, echo and authority-cycle question from the phase. *Do not* schedule the shim; gate it. Cited as **D28**/**D29** by the Phase 4 and 5 specs.
 
+> **[`docs/PHASE7.md`](./PHASE7.md) is the requirements artifact this gate asks for, and writing it did not open the gate.** Its §4 states the eleven judgements known before operating experience *as questions with an evidence column*, and the discipline it asks for in the meantime is one line: every surprise-log entry is filed against a J-row or opens a new one. A row answered from that document rather than from the log is the failure this decision exists to prevent. Two of the judgements were decidable in advance because they are about *our* design rather than `tf2`'s behaviour, and both were pulled out into their own records rather than left in a gated document: the wait ([`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md)) and the stored claim ([`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md)). Their core-side halves are **not** gated by D21 — see each record's implementation plan.
+
 **D22 — A disabled feature never forks the layout hash.**
 When a cargo feature is compiled out, the arena *regions* it would use stay declared in the layout and keep being counted by `layout_hash`; only the code that touches them disappears. Sizing the arena per feature set would make `layout_hash` a function of the build configuration, so two correctly-built participants of the same version would refuse to attach to each other and report a layout mismatch naming no actionable cause. A wasted region in a build that does not use it is cheap; a version-skew diagnostic that lies is not. First consumers: `PHASE5.md` §5.5 (`counters`) and §1.2 (the Phase 6 spline region, declared absent with offset `0`). Cited as **D34** by the Phase 5 spec.
 
@@ -171,6 +173,9 @@ When a cargo feature is compiled out, the arena *regions* it would use stay decl
 - Reaping from the owner only, or trusting a bare PID as an identity (D15, D17)
 - Defaulting a consumer to read-write attach (D18)
 - Using `shm_open` instead of a sealed `memfd`, or skipping `MADV_DONTFORK`
+- Adding public API to any binding without checking it against [`API.md`](./API.md) §1's six rules — in particular: putting an allocating or name-resolving operation on `Plan` (R2), accepting a float stamp anywhere (R3), giving a layout parameter a default (R4), or handing a user a type carrying a lifetime that they will want to store (§2.1)
+- Adding a second spelling of an existing path — a `coverage` beside `span`, a `resample` beside `at(arange(...))` — instead of documenting the one that exists
+- Putting a blocking wait, a futex, or any notification primitive in the arena ([`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md))
 
 ## 7. Glossary
 
@@ -201,3 +206,7 @@ When a cargo feature is compiled out, the arena *regions* it would use stay decl
 | `docs/PHASE2.md` | Normative implementation spec for Phase 2: shared memory, lifecycle, liveness, crash-consistency, fault injection. Contains mandatory Phase 1 amendments A1–A8. |
 | `docs/RUNBOOK.md` | Operator-facing failure modes, written during Phase 2. Every row maps to a `doctor` check. |
 | `docs/PHASE3.md` | Written at the end of Phase 2: Python binding constraints plus the measured Phase 2 numbers. |
+| `docs/PHASE4.md` | Normative implementation spec for Phase 4: `sample_with_derivatives`, the two-tier C ABI, the header-only C++ wrapper, the one-way ROS 2 ingest bridge. Its §1 exit criterion is operational, not a feature list. |
+| `docs/PHASE5.md` | Normative implementation spec for Phase 5: the frozen `.tft` arena, bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, the `TFT001`–`TFT019` catalogue, `tf_tree top`. |
+| `docs/PHASE7.md` | Requirements artifact for the `tf2`-shaped shim. **Gated by D21, not scheduled** — §0.0 lists four gates, none met. Its §4 J-table is what Phase 4's surprise log is filed against. |
+| `docs/API.md` | **Not a phase.** The API contract: six rules that generate every binding (§1), the normative surface of each (§2–§5), the delta table (§6), and the §7 check a new surface passes. Read before adding public API anywhere. |

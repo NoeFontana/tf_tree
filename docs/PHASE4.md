@@ -691,6 +691,10 @@ Feature completion is not the gate. The gate is:
 
 1. **A real node, on real hardware, for ≥ 2 weeks continuous**, consuming transforms from `tf_tree` via the bridge, with no correctness incident.
 2. **A written log of every surprise** — API friction, missing operations, confusing errors, deployment papercuts. This log *is* the design input for Phase 7 and is more valuable than the code.
+
+   > **It now has somewhere to be filed.** [`PHASE7.md`](./PHASE7.md) §4 is a table of the semantic judgements the shim must make, stated as questions with an evidence column. **Every log entry is filed against a J-row or opens a new one** — that is the discipline, and it is the *only* Phase 7 work authorized before its §0.0 gates are met. A log that produces no new rows means either the log or that table is not being read. A J-row answered from `PHASE7.md` instead of from this log is exactly the guess-shipped-as-a-compatibility-promise that D21 exists to prevent.
+   >
+   > Entries that turn out to be about *our* design rather than about `tf2`'s behaviour are decidable without waiting, and get their own decision record rather than sitting in a gated document. Two already have: [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) (a claim that is stored rather than scoped — which the C ABI and the bridge in this phase both hand-rolled) and [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) (the blocking wait).
 3. **At least one pre-existing bug found in the host system** by the bridge's multi-publisher detection (§5.4). This is a falsifiable prediction: real ROS systems routinely have two nodes publishing one edge, and `tf2` averages them silently. If two weeks of running finds nothing, either the detection is broken or the host stack is unusually clean — determine which.
 
 Do not proceed to Phase 5 having only met criterion 1.
@@ -890,6 +894,8 @@ uint32_t tft_abi_version_minor(void);
 ```
 
 Rules: **major must match exactly**; the runtime minor may be ≥ the compiled-against minor. Every struct passed by pointer begins with `uint32_t struct_size`, so fields can be appended without a major bump (the Vulkan approach); the callee validates `struct_size` and rejects unknown sizes.
+
+**Appending a `tft_layout` enumerator is a minor bump**, by the same rule and for the same reason: an older caller never names the new value, and `tft_plan_at` already rejects an enumerator it does not know (`bad_enum("layout")`) rather than computing a size from it. This is the path [`API.md`](./API.md) §3.3 uses to carry `Layout::QuatTwist` — derivatives as a batch layout — into C and Python in Phase 5 without a major bump and without touching any `struct_size`.
 
 The C++ header performs this check in a static initializer and throws / aborts on mismatch with both versions named. A silently mismatched ABI is a debugging session nobody deserves.
 
@@ -1179,6 +1185,17 @@ The diagnostic must be loud, rate-limited, and surfaced in `tf_tree doctor`, bec
 If `use_sim_time` is true, the bridge tags every edge it declares with the `SimTime` domain and drives its clock from `/clock`; otherwise `SystemTime`. Phase 1's typed domains then do the rest: a consumer querying with the wrong domain gets `TimeDomainMismatch` instead of a plausible wrong answer.
 
 **NORMATIVE:** the bridge refuses to write to an edge whose declared domain differs from its own, and fails at startup rather than at first message. Sim and real transforms in one arena is a class of bug worth making impossible.
+
+> **This is the write side only.** The read side — which domain a *query* is
+> made in — is unspecified here and is specified by
+> [`PHASE7.md`](./PHASE7.md) §4 J9: a shim `Buffer` derives its query domain
+> from the `rcl_clock_type_t` of the clock it was constructed with, and fails at
+> construction on a mismatch, for the same reason this section fails at startup.
+> Until that ships, a native consumer names its domain in the type and the
+> compiler checks it (D9); nothing infers it from a node's `use_sim_time`.
+> [`API.md`](./API.md) §5.2 records why an epoch mistake is unfixable after the
+> fact — the constant offset is not recoverable from one-way stamps — and
+> therefore why the domain is a type rather than a convention.
 
 Also handle: `/clock` jumps backwards (bag loop, sim reset). On a detected backward jump beyond a threshold, the bridge **stops and reports** rather than pushing non-monotonic stamps that Phase 1 will reject one at a time. Offer `--on-clock-reset={halt,recreate}` where `recreate` builds a fresh arena instance.
 
@@ -1568,6 +1585,17 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
 | Bridge CPU at 1 kHz × 20 edges | %CPU, and as a fraction of one `tf2` consumer |
 | `at_with_derivatives` vs `at` | ratio (expect ~2×) |
 
+> **The native *embedding* path is not in this table, and should be.**
+> Every row above measures a foreign boundary against native Rust *in-crate*.
+> But `Plan::at` sits across a crate boundary from every consumer too, and Rust
+> does not inline across crates without `#[inline]` or LTO — this workspace's
+> `[profile.release]` sets `lto = "thin"`, so nothing here has ever measured the
+> path an embedder's default `cargo build --release` produces.
+> [`API.md`](./API.md) §2.3 makes it **NORMATIVE** that a row measures the facade
+> called **from a separate crate** against the in-crate path, gated at the same
+> 5% this section applies to the C ABI. It lands in the Phase 5 benchmark
+> artifact (`PHASE5.md` §9.2), because that is where the table that ships lives.
+
 **Gate:**
 
 1. C ABI within **5%** of native for depth-3 lookup.
@@ -1583,7 +1611,8 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
 
 - **Phase 5 requires a `FORMAT_VERSION` bump** (`PHASE5.md` §1). Do not add arena fields opportunistically during Phase 4 — collect anything you wish existed into the Phase 5 bump so the break happens exactly once.
 - The bridge's authority conflicts, drop counters, and queue depth are Phase 5 `doctor` inputs. Emit them in a structured form now rather than as log lines.
-- Carry the surprise log (§1.2) directly into `docs/PHASE7.md` as the shim's requirements list.
+- Carry the surprise log (§1.2) directly into [`docs/PHASE7.md`](./PHASE7.md) as the shim's requirements list. **That document now exists** and its §4 is the table each entry is filed against; §1.2's amendment above is the procedure.
+- [`docs/API.md`](./API.md) is the contract this phase's C and C++ surfaces are retro-checked against. Two of its rows are Phase 5 work that originates here: `Layout::QuatTwist` (§3.6's minor-bump note) and the cross-crate embedding benchmark row (§7's note).
 
 ---
 
