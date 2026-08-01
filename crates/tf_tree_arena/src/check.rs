@@ -165,3 +165,133 @@ pub(crate) fn validate_arena_header(h: &ArenaHeader, size: u64) -> Result<(), Sh
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::heap::{Arena, HeapArena};
+    use alloc::vec;
+
+    fn arena() -> HeapArena {
+        let layout = ArenaLayout::new(8, 4, vec![16, 0, 4, 64]).unwrap();
+        HeapArena::new(&layout, 0, 0, [0; 16])
+    }
+
+    /// Every field the geometry block compares, scrambled one at a time.
+    ///
+    /// The block is the only thing bounding `participant_table_off` /
+    /// `max_participants` before `ArenaView::participants` builds a slice from
+    /// them, and this module's own header records that omitting it shipped an
+    /// out-of-bounds slice for a release. Poking each field individually is what
+    /// makes a *partial* deletion attributable: a single scrambled-header case
+    /// would pass as long as any one comparison survived.
+    ///
+    /// Mutant: drop any one `&& implied.… == h.…` conjunct ⇒ the case naming that
+    /// field reports `Ok(())` and fails.
+    #[test]
+    fn a_header_that_disagrees_with_its_own_counts_is_refused() {
+        let good = arena();
+        assert_eq!(
+            validate_arena_header(good.header(), good.len() as u64),
+            Ok(()),
+            "the fixture must pass, or the failures below prove nothing"
+        );
+
+        type Poke = fn(&mut ArenaHeader);
+        let pokes: [(&str, Poke); 13] = [
+            ("frame_table_off", |h| h.frame_table_off += 64),
+            ("frame_hash_off", |h| h.frame_hash_off += 64),
+            ("topo_block_off", |h| h.topo_block_off += 64),
+            ("topo_block_stride", |h| h.topo_block_stride += 64),
+            ("claim_table_off", |h| h.claim_table_off += 64),
+            ("participant_table_off", |h| h.participant_table_off += 64),
+            ("max_participants", |h| h.max_participants += 1),
+            ("edge_table_off", |h| h.edge_table_off += 64),
+            ("stamp_arena_off", |h| h.stamp_arena_off += 64),
+            ("pose_arena_off", |h| h.pose_arena_off += 64),
+            ("edge_counters_off", |h| h.edge_counters_off += 64),
+            ("participant_counters_off", |h| {
+                h.participant_counters_off += 64
+            }),
+            ("pose_slots", |h| h.pose_slots += 1),
+        ];
+
+        for (field, poke) in pokes {
+            let a = arena();
+            let size = a.len() as u64;
+            // SAFETY: this test uniquely owns `a`, whose base is a live,
+            // 64-byte-aligned, initialized `ArenaHeader` written by
+            // `HeapArena::new`. No other reference to it is live across this
+            // call, so the `&mut` is unaliased for its whole (statement-long)
+            // lifetime.
+            unsafe { poke(&mut *a.base().cast::<ArenaHeader>()) };
+            assert_eq!(
+                validate_arena_header(a.header(), size),
+                Err(ShmError::HeaderInconsistent),
+                "{field} is not compared against the implied geometry"
+            );
+        }
+    }
+
+    /// Identity, then vocabulary, then geometry, then self-consistency.
+    ///
+    /// The order is documented on [`validate_arena_header`] as "each one
+    /// narrowing what the next is allowed to assume", and it is observable only
+    /// by breaking several fields at once and watching which error comes out
+    /// first. Each step below repairs exactly the field the previous step's
+    /// error named, so the sequence of errors *is* the order.
+    ///
+    /// Mutant: hoist the version check above the magic check ⇒ the first
+    /// assertion sees `VersionMismatch` and fails.
+    #[test]
+    fn the_checks_run_in_the_documented_order() {
+        let a = arena();
+        let size = a.len() as u64;
+
+        // SAFETY: as in the test above — sole owner, live initialized header,
+        // no other reference live across the `&mut`'s use.
+        let h = unsafe { &mut *a.base().cast::<ArenaHeader>() };
+        h.magic ^= 1;
+        h.format_version ^= 0x5555;
+        h.layout_hash ^= 0x5555;
+        assert_eq!(
+            validate_arena_header(a.header(), size),
+            Err(ShmError::BadMagic)
+        );
+
+        // SAFETY: as above.
+        let h = unsafe { &mut *a.base().cast::<ArenaHeader>() };
+        h.magic ^= 1;
+        assert_eq!(
+            validate_arena_header(a.header(), size),
+            Err(ShmError::VersionMismatch {
+                found: FORMAT_VERSION ^ 0x5555,
+                expected: FORMAT_VERSION,
+            })
+        );
+
+        // SAFETY: as above.
+        let h = unsafe { &mut *a.base().cast::<ArenaHeader>() };
+        h.format_version ^= 0x5555;
+        assert_eq!(
+            validate_arena_header(a.header(), size),
+            Err(ShmError::LayoutMismatch {
+                found: layout_hash() ^ 0x5555,
+                expected: layout_hash(),
+            })
+        );
+
+        // SAFETY: as above.
+        let h = unsafe { &mut *a.base().cast::<ArenaHeader>() };
+        h.layout_hash ^= 0x5555;
+        assert_eq!(
+            validate_arena_header(a.header(), size - 64),
+            Err(ShmError::SizeMismatch {
+                actual: size - 64,
+                expected: size,
+            })
+        );
+    }
+}

@@ -69,6 +69,7 @@ fn main() {
     const PUSH_NOT_DETACHED: i32 = 13;
     const CLAIM_NOT_DETACHED: i32 = 14;
     const FRAME_NOT_DETACHED: i32 = 15;
+    const GEN_NOT_BUMPED_ONCE: i32 = 16;
 
     fn layout() -> TreeBuilder {
         TreeBuilder::new()
@@ -96,6 +97,18 @@ fn main() {
     let plan = tree.plan(parent_frame, child_frame).expect("plan");
     let slot = tree.participant_slot();
     let edge = writer.edge().get();
+
+    // The fork generation as the parent last saw it. Everything the detachment
+    // checks below rely on is downstream of this counter, but none of them can
+    // tell how *far* it moved — `detached()` is a comparison against a captured
+    // value, so it says "different" for a bump of one and for a bump of two
+    // alike. The size of the bump is the only thing that pins
+    // `tf_tree_ipc::fork::arm`'s `Once`: registering the handler on every call
+    // (and `arm` is called from several constructors) would step the generation
+    // by more than one per fork, and an `arm` that registered nothing at all
+    // would step it by none. Neither is visible anywhere else in this workspace,
+    // because this file owns its only `fork()`.
+    let gen_before = tf_tree_ipc::fork::generation();
 
     // SAFETY: `fork` is called from a single-threaded region of this process —
     // no worker threads of our own have been started, and the only extra thread
@@ -130,6 +143,8 @@ fn main() {
             status = CLAIM_NOT_DETACHED;
         } else if tree.frame("brand_new_name").is_ok() {
             status = FRAME_NOT_DETACHED;
+        } else if tf_tree_ipc::fork::generation().wrapping_sub(gen_before) != 1 {
+            status = GEN_NOT_BUMPED_ONCE;
         }
 
         if mode == "drop" {

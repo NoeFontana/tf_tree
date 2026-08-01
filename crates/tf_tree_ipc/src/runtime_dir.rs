@@ -402,6 +402,53 @@ mod tests {
         let _ = std::fs::remove_dir(PathBuf::from(format!("/tmp/tf_tree-{}", uid + 1)));
     }
 
+    /// **A symlinked runtime directory is refused, never followed.**
+    ///
+    /// `/tmp` is world-writable, so another user can pre-create
+    /// `/tmp/tf_tree-<uid>` as a symlink into a directory this uid owns. A
+    /// following `stat` then sees a directory owned by us, the ownership check
+    /// passes, the `0700` chmod is skipped, and the entire rendezvous — lock
+    /// file, socket, identity records — lands somewhere the operator never
+    /// chose. Since this directory *is* the sharing boundary, that is the one
+    /// thing `ensure_dir` is strict about, and until now nothing exercised it:
+    /// changing its `symlink_metadata` back to `std::fs::metadata` left every
+    /// test in the crate green.
+    #[test]
+    fn a_symlinked_runtime_directory_is_refused_rather_than_followed() {
+        let target = scratch("symlink-target");
+        let link = std::env::temp_dir().join(format!(
+            "tf_tree_ipc_test-{}-{}-symlink-link",
+            std::process::id(),
+            current_uid()
+        ));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let env = FakeEnv::new(&[("TF_TREE_RUNTIME_DIR", link.to_str().unwrap())]);
+        let err = RuntimeDir::resolve_with(&env, current_uid()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IpcError::RuntimeDirUnusable {
+                    source: RuntimeDirSource::Env,
+                    ..
+                }
+            ),
+            "a symlink must be refused, not followed: {err}"
+        );
+
+        // ...and the same path as a real directory resolves fine, so the
+        // refusal above is attributable to the symlink and not to the path.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir_all(&link).unwrap();
+        let rd = RuntimeDir::resolve_with(&env, current_uid()).unwrap();
+        assert_eq!(rd.path(), link);
+        assert_eq!(rd.source(), RuntimeDirSource::Env);
+
+        std::fs::remove_dir_all(&link).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+    }
+
     #[test]
     fn a_local_filesystem_passes_the_normative_check() {
         let dir = scratch("statfs");

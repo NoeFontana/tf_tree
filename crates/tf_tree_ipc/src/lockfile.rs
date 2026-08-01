@@ -170,12 +170,11 @@ impl LockFile {
 
     /// Take the lowest free participant slot.
     ///
-    /// Scanning is honest here only because this crate does not yet speak the
-    /// §3.7 attach protocol. In the finished design the *owner* assigns the slot
-    /// under its accept loop and hands it back in the `HelloResponse`, which is
-    /// what makes the arena-side record fully populated before any claim can
-    /// reference it. Until then, a joiner picks its own — the locks make that
-    /// race-free even if it is not the final protocol.
+    /// **Not the joiner path.** §3.7 landed: the *owner* assigns a joiner's slot
+    /// in its accept loop and returns it in the `HelloResponse`, and
+    /// `Open::register_at` takes exactly that byte. This scan is what a
+    /// **creator or a taker-over** uses — neither has an owner to ask — which is
+    /// also why `Open::register_any` locks before it writes the identity record.
     ///
     /// # Errors
     ///
@@ -356,12 +355,13 @@ impl LockFile {
         Ok(Identity::from_bytes(&buf))
     }
 
-    /// The descriptor, for code that needs to prove two `LockFile`s are distinct
-    /// open file descriptions.
-    #[must_use]
-    pub fn as_file(&self) -> &File {
-        &self.file
-    }
+    // `as_file` removed: it had no caller anywhere in the workspace, and the
+    // consumer its doc named — "code that needs to prove two `LockFile`s are
+    // distinct open file descriptions" — does not exist; the test for that
+    // property opens two `LockFile`s and contends the lock bytes instead.
+    // Handing out `&File` also widened this type's contract, because it let a
+    // caller `set_len` or `try_clone` the rendezvous file from outside the
+    // module that owns the lock lifetime.
 
     fn set(&self, range: Range, kind: LockKind, role: LockRole) -> Result<LockAttempt, IpcError> {
         ofd::try_lock(self.file.as_fd(), range, kind)
@@ -383,7 +383,6 @@ fn participant_range(slot: u32) -> Result<Range, IpcError> {
     Ok(Range::byte(PARTICIPANT_BASE + u64::from(slot)))
 }
 
-/// The identity record offset for `slot`.
 /// The claim-lease byte for `edge`.
 ///
 /// Bounded so an edge id from a corrupt header cannot address a byte outside
@@ -497,6 +496,49 @@ mod tests {
         drop(a);
         // Slot 0 is free again the instant its description closed.
         assert_eq!(c.take_any_participant().unwrap(), 0);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// **`docs/PHASE2.md` §11.2 scenario 6**: the 65th participant is refused,
+    /// and the message says how to raise the limit.
+    ///
+    /// The exhaustion arm of [`LockFile::take_any_participant`] is otherwise
+    /// unreachable from any test in the workspace — every other one takes at
+    /// most three slots — so `Err(NoParticipantSlots)` could be replaced by
+    /// `Ok(0)` and every suite would stay green while two participants shared
+    /// slot 0, one arena record and one lock byte, with nothing reporting it.
+    #[test]
+    fn the_sixty_fifth_participant_is_refused_and_told_why() {
+        let path = scratch("full");
+        let mut holders: Vec<LockFile> = Vec::new();
+        for expect in 0..MAX_PARTICIPANTS {
+            let lf = LockFile::open(&path).unwrap();
+            assert_eq!(lf.take_any_participant().unwrap(), expect);
+            holders.push(lf);
+        }
+
+        let extra = LockFile::open(&path).unwrap();
+        let err = extra.take_any_participant().unwrap_err();
+        assert_eq!(
+            err,
+            IpcError::NoParticipantSlots {
+                limit: MAX_PARTICIPANTS
+            }
+        );
+        // §11.2 asks for the *message* too: "all slots are live" on its own
+        // sends an operator hunting a leak that does not exist.
+        let msg = err.to_string();
+        assert!(msg.contains("64"), "{msg}");
+        assert!(msg.contains("MAX_PARTICIPANTS"), "{msg}");
+
+        // The limit is a concurrency bound, not a one-way quota: one departure
+        // frees exactly one slot, and it is the slot that departed.
+        holders.pop();
+        assert_eq!(
+            extra.take_any_participant().unwrap(),
+            MAX_PARTICIPANTS - 1,
+            "a released slot must become takeable again"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

@@ -128,19 +128,6 @@ pub fn generation() -> u64 {
 mod tests {
     use super::*;
 
-    /// Arming twice must not register the handler twice — a doubly-registered
-    /// handler bumps the counter by 2 per fork, which is still "different" and
-    /// so still passes any test that only asserts inequality. This asserts the
-    /// `Once` is doing its job at all.
-    #[test]
-    fn arming_is_idempotent() {
-        arm();
-        arm();
-        arm();
-        // Nothing forked, so the generation is still whatever it was.
-        assert_eq!(generation(), generation());
-    }
-
     /// In the parent — the process running this test — the generation never
     /// moves on its own. If this ever fails, something is calling the handler
     /// outside a fork.
@@ -155,10 +142,16 @@ mod tests {
     }
 
     /// The real behaviour is only observable across a `fork`, which needs
-    /// `unsafe` and a child process; that lives in
-    /// `crates/tf_tree_bench/src/bin/fork_child.rs` and is driven by
-    /// `crates/tf_tree_bench/tests/fork.rs`. This test records the link so the
-    /// coverage is findable from here.
+    /// `unsafe` and a child process; `docs/decisions/0005` records that
+    /// exception exactly once, for `crates/tf_tree_bench/src/bin/fork_child.rs`,
+    /// and this workspace has no second `fork()` — which is why there is no
+    /// arming test here at all. That child captures [`generation`] before the
+    /// fork and asserts it moved by **exactly one** afterwards, and that is what
+    /// pins the `Once` in [`arm`]: a handler registered twice bumps by two,
+    /// which is still merely "different" and would satisfy any weaker check,
+    /// while an `arm` that registered nothing would bump by zero. Both fail that
+    /// child loudly, with their own exit status. This test records the link so
+    /// the coverage is findable from here.
     #[test]
     fn the_cross_fork_behaviour_is_tested_elsewhere() {
         assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
