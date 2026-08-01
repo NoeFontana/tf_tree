@@ -565,7 +565,72 @@ harness, so it is a property of the loop and not of `tf_tree_core` — and **hal
 codegen context** that no rearrangement of the harness reproduces: inlining
 decisions and register pressure inside the real fold.
 
-That split is what makes Lever 2 the right next move rather than another
-arithmetic win. It attacks both halves at once: restructuring locate /
-interpolate / compose replaces the per-step walk with three tighter loops *and*
-changes the inlining context that the other half lives in.
+That split looked like it made Lever 2 the right next move. §14 measured whether
+Lever 2 has anything to win before writing it, and the answer is no.
+
+---
+
+## 14. Lever 2 is falsified — there is no ILP to recover
+
+**Verdict: rejected, without implementing it.** §11 called Lever 2 *"the one
+remaining lever with a plausible 2x in it"*. It has none.
+
+Lever 2's entire thesis (§4) is that the fold serialises work that need not be
+serial: each `sample()` is its own dependent load chain, and `acc` carries a
+dependency across every step, so the *d* chains run end to end instead of
+overlapping in the out-of-order window. Restructuring into locate / interpolate /
+compose would let them overlap.
+
+That thesis is testable **without the rewrite**. `t_guard_sample` already samples
+*d* edges with no accumulator chaining them and no `?` between them — precisely
+the shape the "locate" phase would create. If the chains overlap when nothing
+stops them, per-sample cost must fall as *d* rises.
+
+| *d* | *d* different edges | **one ring, *d* stamps** |
+|---|---|---|
+| 1 | 56.80 (1.00×) | 55.56 (1.00×) |
+| 2 | 63.06 (1.11×) | 62.40 (1.12×) |
+| 3 | 59.60 (1.05×) | 63.82 (1.15×) |
+| 4 | 58.29 (1.03×) | 61.19 (1.10×) |
+| 6 | 57.24 (1.01×) | 60.56 (1.09×) |
+
+**Per-sample cost does not fall. It rises.** The right-hand column is the control
+that makes this conclusive: a depth-*d* chain has *d* different rings, so raising
+*d* also multiplies the working set — six rings at capacity 4096 is 1.7 MiB
+against one ring's 288 KiB, past this host's 512 KiB L2 — and a real win could
+have been hidden inside that. Repeating the measurement against **one** ring
+sampled at *d* different stamps holds the footprint fixed and the chains just as
+independent. It is flat-to-worse there too.
+
+### Why, and what it means for everything else
+
+Because §12 already established what the dominant term is: the search is
+**memory-bound**, not latency-bound. Adding independent work to a computation
+that is waiting on cache does not hide the wait — it multiplies the misses
+competing for the same L1. Six searches in flight over a 32 KiB stamp array
+evict each other.
+
+This is the third time this document has recorded the same failure shape, and it
+is worth naming as a rule rather than an anecdote:
+
+> §5 assumed real stamps were isochronous. The branchless rewrite assumed the
+> search's `if` was mispredicting. Lever 2 assumed *d* dependent chains would
+> overlap. Each was a plausible mechanism, reasoned about rather than measured,
+> and each was wrong. **The cheap test of a structural lever is usually available
+> before the structure is built** — here it was two harness loops against code
+> that already existed.
+
+### What survives
+
+- **SIMD across *stamps* (Lever 5) survives, and only that half.** §4's phase 2
+  and any cross-*step* vectorisation die with Lever 2 — the steps do not overlap,
+  so there is nothing to widen. Batch elements are a different axis, and
+  interpolation (22.2 ns, 31%) is genuinely arithmetic-bound rather than
+  memory-bound, so it is the one term a wider ALU can still attack.
+- **Footprint, not parallelism, is the lever on the search.** A compact stamp
+  summary (§12), a shorter `HISTORY_SECS`, or anything else that keeps the probed
+  array in L1. Not more chains in flight.
+- **Huge pages stop being a side quest.** If the hot path is memory-bound at the
+  cache level, its behaviour at the *TLB* level is no longer a footnote — and the
+  arena asks for `MADV_HUGEPAGE` without anything checking whether the kernel
+  granted it.

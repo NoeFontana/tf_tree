@@ -310,6 +310,36 @@ fn t_guard_sample(view: &ArenaView<'_>, edges: &[EdgeId], stamps: &[i64]) -> f64
     })
 }
 
+/// `d` independent samples of **one** ring, at `d` different stamps, per group.
+///
+/// The ILP control. Repeating the same *stamp* would not do — the `d` samples
+/// would be the identical computation and would fold away — so the group takes
+/// `d` consecutive stamps from the sweep. The chains are as independent as a
+/// depth-`d` plan's are, while the memory footprint stays exactly one ring's.
+fn t_ilp_control(view: &ArenaView<'_>, edge: EdgeId, stamps: &[i64], d: usize) -> f64 {
+    let groups = stamps.len() / d;
+    median_ns(groups * d, || {
+        let mut acc = 0.0;
+        for grp in stamps.chunks_exact(d) {
+            for &t in grp {
+                let (interp, ring) = view.sampler(black_box(edge)).unwrap();
+                let r = match InterpPolicy::from_u8(interp) {
+                    InterpPolicy::LerpSlerp => {
+                        ring.sample::<LerpSlerp>(black_box(t), ExtrapPolicy::Error)
+                    }
+                    InterpPolicy::ScLerp => {
+                        ring.sample::<ScLerp>(black_box(t), ExtrapPolicy::Error)
+                    }
+                };
+                if let Ok(p) = r {
+                    acc += p.t.x;
+                }
+            }
+        }
+        acc
+    })
+}
+
 /// `fold_at`, replicated in the harness: iterate the plan's `[Step; MAX_DEPTH]`
 /// array, match the discriminant, sample, propagate with `?`, compose.
 ///
@@ -469,6 +499,56 @@ fn main() {
         "{:>34} {dispatch:>12.2}   guard_sample - sampler - sample(between)",
         "interp-policy dispatch"
     );
+
+    // --- is there any instruction-level parallelism to win? ----------------
+    //
+    // This is the measurement Lever 2 stands or falls on, and it is worth making
+    // *before* restructuring anything. `t_guard_sample` samples `edges.len()`
+    // **independent** edges per stamp: no accumulator chaining them, no `?`
+    // between them, nothing but `d` separate dependent-load chains issued back
+    // to back. That is precisely the shape Lever 2's "locate" phase would create.
+    //
+    // So if the per-sample cost falls as `d` rises, the chains overlap when
+    // nothing forces them not to, and the serial fold is leaving that on the
+    // table. If it is flat, the out-of-order engine was already overlapping them
+    // through the fold's accumulator and `?`, and Lever 2 has nothing to win.
+    println!("\n## available ILP: d independent samples per stamp (capacity {CAP})");
+    println!("{:>10} {:>16} {:>14}", "d (edges)", "ns/sample", "vs d=1");
+    let mut ilp_base = f64::NAN;
+    for &d in DEPTHS {
+        let (tr, nm) = chain(d);
+        let pl = tr
+            .plan(tr.frame(&nm[d]).unwrap(), tr.frame(&nm[0]).unwrap())
+            .unwrap();
+        let g = tr.guard();
+        let es = plan_edges(&pl);
+        let ns = t_guard_sample(g.view(), &es, &between);
+        if d == 1 {
+            ilp_base = ns;
+        }
+        println!("{d:>10} {ns:>16.2} {:>13.2}x", ns / ilp_base);
+    }
+    println!("  flat  -> the OoO engine already overlaps them; Lever 2 has nothing to win");
+    println!("  falls -> the serial fold is leaving that overlap on the table");
+
+    // **The control that makes the sweep above conclusive.** A depth-`d` chain
+    // has `d` *different* rings, so raising `d` also multiplies the working set
+    // — six rings at capacity 4096 is 1.7 MiB against one ring's 288 KiB, past
+    // this host's 512 KiB L2. A real ILP win could be hidden by that.
+    //
+    // So repeat the sweep against **one** ring sampled `d` times. The chains are
+    // just as independent and the footprint does not move. If this is flat too,
+    // the absence of overlap is a property of the work and not of the cache.
+    println!("\n## the control: d independent samples of ONE ring (footprint fixed)");
+    println!("{:>10} {:>16} {:>14}", "d (repeats)", "ns/sample", "vs d=1");
+    let mut ctl_base = f64::NAN;
+    for &d in DEPTHS {
+        let ns = t_ilp_control(view1, edges1[0], &between, d);
+        if d == 1 {
+            ctl_base = ns;
+        }
+        println!("{d:>10} {ns:>16.2} {:>13.2}x", ns / ctl_base);
+    }
 
     // --- the search versus capacity ----------------------------------------
     //
