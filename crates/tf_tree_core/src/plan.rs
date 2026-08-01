@@ -250,9 +250,57 @@ pub struct Plan {
     steps: [Step; MAX_DEPTH],
     len: u8,
     domain: u8,
+    /// How many of `steps[..len]` are [`Step::Dyn`], computed once at compile
+    /// time. See [`Plan::new`] for why this is stored rather than counted.
+    dyn_count: u8,
+    /// The edge of the *first* [`Step::Dyn`], or [`EdgeId`]`(0)` when there is
+    /// none. Only meaningful together with `dyn_count`; read it through
+    /// [`Plan::first_dynamic_edge`], never directly.
+    first_dyn: EdgeId,
 }
 
 impl Plan {
+    /// Assemble a plan and derive everything that is a pure function of its
+    /// steps.
+    ///
+    /// # Why these two are stored and not computed on demand
+    ///
+    /// They used to be computed on demand, and `Plan::at` called *both* — once
+    /// through `check_domain` → `has_dynamic`, and once for `note`'s
+    /// attribution. Each is an O(`len`) scan over a 1 KiB `[Step; MAX_DEPTH]`
+    /// array, so a depth-14 lookup walked 28 steps before folding anything.
+    /// `first_dynamic_edge`'s own doc comment already said it was
+    /// "loop-invariant" and hoisted it for the *batch* path; the scalar path
+    /// kept paying it per call.
+    ///
+    /// Both are functions of the compiled steps alone, so compile time is the
+    /// right place. `Plan` is a value type — **not an arena structure** — so
+    /// this costs no format version and no layout hash; the two fields land in
+    /// padding the struct already had.
+    ///
+    /// Every construction goes through here so the derivation cannot drift from
+    /// the steps it describes; `plan_derived_fields_match_a_fresh_scan` pins it.
+    fn new(generation: u64, steps: [Step; MAX_DEPTH], len: usize, domain: u8) -> Plan {
+        let mut dyn_count = 0u8;
+        let mut first_dyn = EdgeId(0);
+        for step in &steps[..len] {
+            if let Step::Dyn { edge, .. } = step {
+                if dyn_count == 0 {
+                    first_dyn = *edge;
+                }
+                dyn_count = dyn_count.saturating_add(1);
+            }
+        }
+        Plan {
+            generation,
+            steps,
+            len: len as u8,
+            domain,
+            dyn_count,
+            first_dyn,
+        }
+    }
+
     /// The topology generation this plan was compiled against.
     #[inline]
     #[must_use]
@@ -266,6 +314,36 @@ impl Plan {
     #[must_use]
     pub fn domain(&self) -> u8 {
         self.domain
+    }
+
+    /// What [`Plan::new`] derived, next to what a fresh scan of the same steps
+    /// produces — `((stored_has_dynamic, stored_edge), (scanned, scanned))`.
+    ///
+    /// Test-only, and it lives here because the fields are private to this
+    /// module. The scanning half is the pre-optimisation implementation of
+    /// [`Plan::has_dynamic`] and [`Plan::first_dynamic_edge`], kept verbatim so
+    /// the test compares against the behaviour that was replaced rather than
+    /// against a paraphrase of it.
+    #[cfg(test)]
+    pub(crate) fn derived_vs_scan_for_test(&self) -> ((bool, EdgeId), (bool, EdgeId)) {
+        let scanned_has = self.steps().iter().any(|s| matches!(s, Step::Dyn { .. }));
+        let scanned_first = {
+            let mut found = None;
+            for step in self.steps() {
+                if let Step::Dyn { edge, .. } = step {
+                    if found.is_some() {
+                        found = Some(EdgeId(0));
+                        break;
+                    }
+                    found = Some(*edge);
+                }
+            }
+            found.unwrap_or(EdgeId(0))
+        };
+        (
+            (self.has_dynamic(), self.first_dynamic_edge()),
+            (scanned_has, scanned_first),
+        )
     }
 
     /// The compiled steps (post-folding).
@@ -291,7 +369,7 @@ impl Plan {
 
     #[inline]
     fn has_dynamic(&self) -> bool {
-        self.steps().iter().any(|s| matches!(s, Step::Dyn { .. }))
+        self.dyn_count > 0
     }
 
     #[inline]
@@ -433,18 +511,17 @@ impl Plan {
     /// Attributing a multi-edge plan's success to one of its edges would put a
     /// number in `doctor`'s table that means something different from every
     /// other number in the same column.
+    ///
+    /// Reads the fields [`Plan::new`] derived; it no longer scans. The `== 1`
+    /// test is what preserves the "several edges credit nobody" rule, which is
+    /// why the count is stored and not just a `has_dynamic` flag.
     #[inline]
     fn first_dynamic_edge(&self) -> EdgeId {
-        let mut found = None;
-        for step in self.steps() {
-            if let Step::Dyn { edge, .. } = step {
-                if found.is_some() {
-                    return EdgeId(0);
-                }
-                found = Some(*edge);
-            }
+        if self.dyn_count == 1 {
+            self.first_dyn
+        } else {
+            EdgeId(0)
         }
-        found.unwrap_or(EdgeId(0))
     }
 
     /// Fold the plan at `t`, accumulating the body twist alongside the pose.
@@ -1614,12 +1691,12 @@ pub fn compile(
     if target == source {
         // Identity plan; still stamp it with a consistent generation.
         let generation = topo.stable_generation();
-        return Ok(Plan {
+        return Ok(Plan::new(
             generation,
-            steps: [Step::Static(Iso3::IDENTITY); MAX_DEPTH],
-            len: 0,
-            domain: 0,
-        });
+            [Step::Static(Iso3::IDENTITY); MAX_DEPTH],
+            0,
+            0,
+        ));
     }
 
     // Retry the whole walk if a topology mutation lands between reads, so every
@@ -1762,12 +1839,7 @@ pub fn compile(
         }
 
         let (steps, len, domain) = fold(&steps, len, &edge_meta)?;
-        return Ok(Plan {
-            generation: start_gen,
-            steps,
-            len: len as u8,
-            domain,
-        });
+        return Ok(Plan::new(start_gen, steps, len, domain));
     }
 }
 

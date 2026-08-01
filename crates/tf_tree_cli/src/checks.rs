@@ -57,7 +57,7 @@ use tf_tree_bench::fixture::PushSample;
 
 use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
 use crate::doctor::{self, Observations, Snapshot};
-use crate::hostfacts::{HostFacts, MemLock, Thp};
+use crate::hostfacts::{HostFacts, MemLock, ShmemThp, Thp};
 
 /// A stamp further than this from the reference clock is not a late sample, it
 /// is a units error or uninitialised memory.
@@ -1010,6 +1010,31 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
              so the huge-page policy is unknown",
         )),
         Thp::Always | Thp::Madvise => {}
+    }
+    // **The knob that governs the live arena**, which is a sealed `memfd` mapped
+    // `MAP_SHARED` — shmem, not anonymous memory. `enabled` above does not apply
+    // to it. Reading only `enabled` reported a host as passing while
+    // `MappedArena`'s `MADV_HUGEPAGE` was a no-op and the arena took 4 KiB
+    // pages, which is the failure this check exists to catch.
+    if !host.shmem_thp.honours_madvise() {
+        out.push(Finding::about(
+            Tft::Tft016,
+            "host",
+            if host.shmem_thp == ShmemThp::Unknown {
+                "/sys/kernel/mm/transparent_hugepage/shmem_enabled was absent or \
+                 unrecognised, so the huge-page policy for the live arena's memfd \
+                 mapping is unknown"
+                    .to_string()
+            } else {
+                format!(
+                    "shmem transparent huge pages are '{}', so MADV_HUGEPAGE on the arena's \
+                     MAP_SHARED memfd does nothing and the live arena takes 4 KiB pages \
+                     regardless of what transparent_hugepage/enabled says; set \
+                     shmem_enabled to 'advise' to make PHASE5 §2.3's alignment count",
+                    host.shmem_thp.name()
+                )
+            },
+        ));
     }
     match host.memlock {
         MemLock::Bytes(limit) if limit < inp.arena_bytes => out.push(Finding::about(

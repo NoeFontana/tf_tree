@@ -2,7 +2,10 @@
 
 **Status:** partly implemented, partly **falsified by measurement**. Levers 1
 and 1b are in; Lever 3 is rejected on real data. See §11 for what each lever
-actually returned versus what this document projected.
+actually returned versus what this document projected, and **§12 for the
+per-term measurement that replaces §11's residual row — it inverts the ranking:
+the bracket search, not interpolation, is the largest term, and it is a cache
+cliff rather than a probe curve.**
 **Measured on:** AMD EPYC-Milan, 4 physical cores, 2445 MHz fixed, idle
 **Reproduce:** `cargo run --release -p tf_tree_bench --example cost_model`
 
@@ -383,15 +386,251 @@ separately, not by following this document's plan.
 
 Depth-3, three dynamic steps, capacity 4096, pinned: **217 ns `LerpSlerp`**,
 296 ns `ScLerp`. Against §11.3's 100 ns / 150 ns gate this still fails by ~2x,
-and §9's flag stands. The per-step budget is now roughly:
+and §9's flag stands. The per-step budget was estimated as:
 
 | Term | ns/step | Note |
 |---|---|---|
 | Interpolation | ~27 | was 50; Lever 1 |
 | Bracket search | ~20 | latency-bound on a serial dependent-load chain |
-| Slot reads, composition, bounds checks | ~25 | |
+| Slot reads, composition, bounds checks | ~25 | a **residual**, not a measurement |
 
-Closing a 2x gap from here needs Lever 2's restructure — overlapping the *d*
-independent dependent-load chains — not another arithmetic win. That is the one
-remaining lever with a plausible 2x in it, and it is also the one most likely to
-be defeated by the `#![forbid(unsafe_code)]` constraint on autovectorisation.
+**§12 replaces this table with a measured one, and the ranking inverts.**
+
+---
+
+## 12. The residual, measured — and the search is the largest term
+
+**Reproduce:** `taskset -c 2 cargo run --release -p tf_tree_bench --example step_cost`
+**Measured on:** AMD EPYC-Milan, 4 physical cores, L1d 32 KiB, L2 512 KiB, idle
+
+§11's third row was a subtraction. That is the very thing §11's own post-mortem
+says not to do — *"the explanation for a cost needs its own measurement"* — so
+`step_cost` measures each term directly and then **checks that they add up**.
+
+### The measured decomposition
+
+Per dynamic step, capacity 4096, `LerpSlerp`, stamps swept across the window and
+landing between samples. Measured marginal from the depth sweep: **72.5 ns/step**.
+
+| Term | ns/step | Share | How measured |
+|---|---|---|---|
+| **Bracket search** | **24.3** | **34%** | `sample(exact) − sample(Hold)` |
+| **Interpolation** | **22.2** | **31%** | `sample(between) − sample(exact) − read_slot` |
+| Fold overhead + the two O(depth) scans | ~11.5 | 16% | residual against the depth sweep |
+| `Iso3` composition | 6.8 | 9% | direct, chained |
+| `read_slot` ×2 | 6.6 | 9% | direct |
+| `ArenaView::sampler` | 1.9 | 3% | direct |
+| Ring preamble | 1.7 | 2% | `sample(Hold) − read_slot` |
+| Interp-policy dispatch | ~0 | 0% | `guard_sample − sampler − sample(between)` |
+| **sum** | **75.0** | | vs 72.5 measured — **3% closure** |
+
+Per call, once: `Plan::at` on an identity plan is **3.8 ns**.
+
+**Two of §11's three rows were wrong in the same direction.** Search is not 20 ns
+and interpolation is not 27; search is the *larger* of the two, and the residual
+row was ~25 when the genuinely unexplained part is ~11.5. Lever 1 over-delivered
+on interpolation relative to what §11 credited it, and the search was
+under-counted.
+
+### The search is a cache cliff, not a probe curve
+
+The reason the search costs what it does is not the probe count. Sweeping ring
+capacity at depth 1, with `Hold` — which reads one pose slot and runs **no
+search** — as the control:
+
+| capacity | stamps | poses | `sample(exact)` | `sample(Hold)` | Δ/log2 |
+|---|---|---|---|---|---|
+| 64 | 0.5 KiB | 4 KiB | 12.78 | 5.01 | — |
+| 256 | 2 KiB | 16 KiB | 13.45 | 4.97 | 0.34 |
+| 1 024 | 8 KiB | 64 KiB | 14.37 | 4.97 | 0.46 |
+| 4 096 | **32 KiB** | 256 KiB | 32.53 | 4.97 | **9.08** |
+| 16 384 | 128 KiB | 1 024 KiB | 43.31 | 5.03 | 5.39 |
+
+Two things fall out, and the control is what makes them conclusive:
+
+1. **`Hold` is flat to within 1% across a 256× range of pose-array size.**
+   Reading one pose slot costs ~5.0 ns whether the pose array is 4 KiB or 1 MiB.
+   The pose array's size costs nothing, so shrinking `PoseSlot` would buy nothing
+   here.
+2. **The whole cliff is the stamp array.** Cost is flat — 0.3–0.5 ns per doubling
+   — while the stamps fit comfortably in L1, then steps by ~9 ns per doubling at
+   exactly the capacity whose stamp array is **32 KiB, this host's L1d size**.
+   Effective per-probe cost goes from ~1 ns (L1-resident) to ~2.3–2.7 ns (not).
+
+§1's model — *"the ring is small and hot; the probes hit L1/L2"* at **1.72 ns per
+probe** — holds only while the stamp array fits L1. It was measured at depth 3,
+where three rings share the cache, and generalised into a per-probe constant. It
+is not a constant; it is a step function of `capacity × 8 bytes` against L1d.
+
+**And the reference capacity understates it.** Real edges are not sized in slots;
+they are sized by `Capacity::history(rate_hz, HISTORY_SECS)`, and the benchmark
+fixture keeps 10 s. So the capacity an edge gets is a function of how fast it
+publishes:
+
+| fixture edge | rate | slots | stamp array | where that lands |
+|---|---|---|---|---|
+| `map → odom` | 10 Hz | 128 | 1 KiB | flat, L1 |
+| `odom → base_link` | 50 Hz | 512 | 4 KiB | flat, L1 |
+| `base_link → laser` | 200 Hz | 2 048 | 16 KiB | flat, L1 |
+| `base_link → imu_link` | **1 kHz** | **16 384** | **128 KiB** | **the far end of the cliff** |
+
+A 1 kHz IMU edge pays roughly **3× the search cost** of a 10 Hz map edge — 43 ns
+against 14 — for no reason other than that its stamp array does not fit L1. That
+is the realistic case, not the pathological one, and it is why the reference
+table above at capacity 4096 reads as the middle of the curve rather than the
+end of it.
+
+It also names a knob nobody has been told about: `HISTORY_SECS` is what sets
+that array's size, and a consumer that only ever queries the last second is
+paying full search cost for ten. That is a deployment note for
+`docs/RUNBOOK.md`, not an engine change.
+
+### What this changes about the levers
+
+- **Lever 3's rejection stands, and for a better reason than §5 gave.** §5 killed
+  interpolation-seeding because the seed lands 11–48 indices off on real data.
+  The stronger reason is that reducing the *probe count* was never the lever:
+  probes are ~1 ns each when the stamps are resident. The lever is reducing the
+  *stamp footprint the search touches*.
+- **A compact stamp summary is a new lever this measurement suggests**, and it is
+  not in §1–§7: search a 1-in-16 summary array first (256 entries = 2 KiB at
+  capacity 4096, permanently L1-resident), then finish within a range that spans
+  two cache lines. It needs a new arena region, so it is a `FORMAT_VERSION` break
+  and needs its own decision record — but it attacks the largest measured term,
+  which nothing currently proposed does.
+- **Lever 2's restructure is still worth doing** and its case is *stronger*: with
+  the search at 34% and latency-bound on a serial dependent-load chain, the
+  overlap it buys applies to the largest term rather than the second.
+- **The interp-policy dispatch is free** (0 ns within noise), so resolving it at
+  plan-compile time would buy nothing. Measured so nobody spends a day on it.
+
+### The residual that is left
+
+~11.5 ns/step, roughly flat per step across depths 1–6 (spread 2.95 ns). It is
+per-*step*, not per-call, so the identity-plan floor cannot contain it. The two
+O(depth) scans in `Plan::at` — `check_domain` → `has_dynamic`, and
+`first_dynamic_edge` — have exactly that shape, and both are pure functions of
+the compiled plan. §13 records what removing them actually returned.
+
+---
+
+## 13. The two O(depth) scans were not the residual
+
+**Verdict: falsified.** Removing both scans moved nothing.
+
+`Plan::at` computed `has_dynamic` and `first_dynamic_edge` on every call, each an
+O(`len`) walk of a 1 KiB `[Step; MAX_DEPTH]` array — 28 steps of scanning on a
+depth-14 lookup, before folding anything. `first_dynamic_edge`'s own doc comment
+called it "an O(plan length) scan … loop-invariant" and hoisted it for the batch
+path while the scalar path kept paying it. Both are functions of the compiled
+steps, so `Plan::new` now derives them once (`dyn_count`, `first_dyn`).
+
+`bench_ab` over the depth sweep, pinned, idle host:
+
+| depth | before | after | verdict |
+|---|---|---|---|
+| 1 | 77.6 | 75.6 | noise |
+| 2 | 155.1 | 155.4 | noise |
+| 3 | 228.5 | 228.5 | noise |
+| 4 | 299.2 | 298.6 | noise |
+| 6 | 440.1 | 435.7 | noise |
+
+**Every row is noise.** The reasoning was the same shape §11 diagnoses — a
+plausible mechanism (28 iterations! 1 KiB!) reasoned about instead of measured.
+An out-of-order core hides a pair of predictable, non-faulting scans completely
+behind memory-bound work that is already in flight.
+
+**It is kept anyway, and the reason is not performance.** It is the same amount
+of code, it puts the derivation in one place where a test can pin it against a
+fresh scan, and `dyn_count` is the *dynamic-step count* that `docs/PHASE1.md`
+§11.3 needs a row to state. Recorded here so nobody re-derives the expectation.
+
+### So what *is* the residual?
+
+Measured rather than guessed this time. `step_cost` gained a **fold replica**: a
+harness-side copy of `fold_at` that walks the same step array through the same
+`match` and the same `?`, calling the same primitives. Where it lands separates
+the two candidates.
+
+| depth | predicted | fold replica | measured | walk (replica − pred.) | context (meas. − replica) |
+|---|---|---|---|---|---|
+| 1 | 67.2 | 68.1 | 77.0 | 0.9 | 8.9 |
+| 2 | 130.7 | 146.0 | 155.0 | 15.4 | 9.0 |
+| 3 | 194.2 | 211.6 | 229.3 | 17.4 | 17.7 |
+| 4 | 257.6 | 275.3 | 299.3 | 17.7 | 24.0 |
+| 6 | 384.6 | 407.3 | 434.1 | 22.7 | 26.8 |
+
+Roughly **half the residual is the step-array walk itself** — reproducible in the
+harness, so it is a property of the loop and not of `tf_tree_core` — and **half is
+codegen context** that no rearrangement of the harness reproduces: inlining
+decisions and register pressure inside the real fold.
+
+That split looked like it made Lever 2 the right next move. §14 measured whether
+Lever 2 has anything to win before writing it, and the answer is no.
+
+---
+
+## 14. Lever 2 is falsified — there is no ILP to recover
+
+**Verdict: rejected, without implementing it.** §11 called Lever 2 *"the one
+remaining lever with a plausible 2x in it"*. It has none.
+
+Lever 2's entire thesis (§4) is that the fold serialises work that need not be
+serial: each `sample()` is its own dependent load chain, and `acc` carries a
+dependency across every step, so the *d* chains run end to end instead of
+overlapping in the out-of-order window. Restructuring into locate / interpolate /
+compose would let them overlap.
+
+That thesis is testable **without the rewrite**. `t_guard_sample` already samples
+*d* edges with no accumulator chaining them and no `?` between them — precisely
+the shape the "locate" phase would create. If the chains overlap when nothing
+stops them, per-sample cost must fall as *d* rises.
+
+| *d* | *d* different edges | **one ring, *d* stamps** |
+|---|---|---|
+| 1 | 56.80 (1.00×) | 55.56 (1.00×) |
+| 2 | 63.06 (1.11×) | 62.40 (1.12×) |
+| 3 | 59.60 (1.05×) | 63.82 (1.15×) |
+| 4 | 58.29 (1.03×) | 61.19 (1.10×) |
+| 6 | 57.24 (1.01×) | 60.56 (1.09×) |
+
+**Per-sample cost does not fall. It rises.** The right-hand column is the control
+that makes this conclusive: a depth-*d* chain has *d* different rings, so raising
+*d* also multiplies the working set — six rings at capacity 4096 is 1.7 MiB
+against one ring's 288 KiB, past this host's 512 KiB L2 — and a real win could
+have been hidden inside that. Repeating the measurement against **one** ring
+sampled at *d* different stamps holds the footprint fixed and the chains just as
+independent. It is flat-to-worse there too.
+
+### Why, and what it means for everything else
+
+Because §12 already established what the dominant term is: the search is
+**memory-bound**, not latency-bound. Adding independent work to a computation
+that is waiting on cache does not hide the wait — it multiplies the misses
+competing for the same L1. Six searches in flight over a 32 KiB stamp array
+evict each other.
+
+This is the third time this document has recorded the same failure shape, and it
+is worth naming as a rule rather than an anecdote:
+
+> §5 assumed real stamps were isochronous. The branchless rewrite assumed the
+> search's `if` was mispredicting. Lever 2 assumed *d* dependent chains would
+> overlap. Each was a plausible mechanism, reasoned about rather than measured,
+> and each was wrong. **The cheap test of a structural lever is usually available
+> before the structure is built** — here it was two harness loops against code
+> that already existed.
+
+### What survives
+
+- **SIMD across *stamps* (Lever 5) survives, and only that half.** §4's phase 2
+  and any cross-*step* vectorisation die with Lever 2 — the steps do not overlap,
+  so there is nothing to widen. Batch elements are a different axis, and
+  interpolation (22.2 ns, 31%) is genuinely arithmetic-bound rather than
+  memory-bound, so it is the one term a wider ALU can still attack.
+- **Footprint, not parallelism, is the lever on the search.** A compact stamp
+  summary (§12), a shorter `HISTORY_SECS`, or anything else that keeps the probed
+  array in L1. Not more chains in flight.
+- **Huge pages stop being a side quest.** If the hot path is memory-bound at the
+  cache level, its behaviour at the *TLB* level is no longer a footnote — and the
+  arena asks for `MADV_HUGEPAGE` without anything checking whether the kernel
+  granted it.
