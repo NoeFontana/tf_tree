@@ -903,6 +903,227 @@ Those are crash-*recovery* properties rather than
 correctness-under-normal-operation properties, and none of the numbers above
 depend on them — but they must be in place before this is production-safe.
 
+## The performance suite: contention, scale, duration, and the transport
+
+Everything above this line is measured on one 24-frame fixture, in windows of a
+few seconds, against a **quiescent** tree, with `tf2::BufferCore` fed
+in-process. Four sections follow, each closing one of those.
+
+Every number here is **indicative**: this host has 4 physical cores with SMT and
+an unreadable frequency governor, so it fails `tf_tree_bench`'s own
+`Fitness::probe` and every harness in the suite says so in its output. What is
+*not* host-dependent is the shape of each curve and the ratios between rows
+taken minutes apart on the same machine, and that is what these sections are
+for.
+
+### Read scaling with concurrent writers — `just contended-scaling`
+
+[`PHASE1.md`](../PHASE1.md) §11.2 specifies "1/2/4/8/16 reader threads, **4
+concurrent writers**, cores pinned". Until now the writers and the pinning were
+both in this document's own "not measured" list. `contended_scaling` runs N
+reader *processes* and M writer *processes* on one shared arena, each placed on
+its own core by `taskset` — processes rather than threads because per-thread
+placement needs `sched_setaffinity`, and `CLAUDE.md`'s unsafe budget routes a
+new kind of `unsafe` to a decision record.
+
+24 frames, 3 dynamic steps, 3 s per point, 8 logical CPUs:
+
+| readers | writers | Mlookup/s | scale | svc p50 | svc p99 | svc p99.9 |
+|---|---|---|---|---|---|---|
+| 1 | 0 | 4.64 | 1.00x | 250 ns | 300 ns | 360 ns |
+| 2 | 0 | 6.70 | 1.45x | 330 ns | 410 ns | 502 ns |
+| 4 | 0 | 13.43 | 2.90x | 330 ns | 410 ns | 500 ns |
+| 8 | 0 | 26.55 | **5.73x** | 330 ns | 410 ns | 520 ns |
+| 1 | 4 | 4.38 | 0.94x | 270 ns | 330 ns | 400 ns |
+| 2 | 4 | 6.22 | 1.34x | 350 ns | 422 ns | 480 ns |
+| 4 | 4 | 12.33 | 2.66x | 360 ns | 420 ns | 470 ns |
+| 8 | 4 | 24.09 | **5.20x** | 360 ns | 430 ns | 480 ns |
+
+**Four concurrent writers cost about 9%** — of aggregate throughput at 8 readers
+(26.55 → 24.09 Mlookup/s) and of p50 (330 → 360 ns). The tail is *flat*: p99.9
+does not move, and at 8 readers it is marginally lower under load than without.
+
+`err_slot_recycled + err_slot_contended` was **0** on every row. That is worth
+stating precisely, because it is easy to over-read: those counters record reads
+that **failed**, not reads that retried. A successful seqlock retry is invisible
+to the arena by design, and what it costs shows up in the ~9% above.
+
+The scaling column is the §11.3 gate's, and it still fails on this host for the
+reason it always has — 8 threads over 4 physical cores can only exceed 4x via
+SMT. What is new is that it now fails by a *measured* margin **under the load the
+gate actually specifies** (5.20x) rather than only on an empty road (5.73x).
+
+`svc` is the per-lookup service distribution, taken in a dense loop with one
+clock pair per lookup and the clock's own cost measured and reported alongside
+(28–31 ns on this host). The first revision of this harness reported latency
+only from an open-loop schedule and printed a p50 of **61 µs** for an operation
+costing ~300 ns, because at any achievable tick rate the dominant term is the OS
+deciding to run you. Both distributions are now reported, separately.
+
+Two cross-checks, because a new harness that disagrees with the old ones is
+measuring something else:
+
+* The 1-reader/0-writer row (250 ns p50) lands on `scale_sweep`'s independent
+  `robot` measurement (251 ns p50) — different binary, different loop, same
+  workload.
+* `benches/read_scaling` grew a `read_scaling_writers` group so the portable
+  criterion path also stops measuring an empty road. Its writers publish at the
+  fixture's **nominal** rates, and at 8 threads it reports 925.9 µs against the
+  quiescent group's 933.4 µs — no difference. That is the expected answer and it
+  is why `contended_scaling` exists: at 50–1000 Hz a writer is invisible against
+  millions of lookups a second, so the pressure has to be applied by a writer per
+  core. An earlier revision of that group ran its writers flat out and starved
+  the readers so badly the bench could not complete a row in ten minutes; the
+  file records it.
+
+### Scale — `just scale-sweep`
+
+Lookup cost against tree **width**, at a fixed dynamic-step count, which is the
+only way to separate size from depth.
+
+| workload | frames | edges | dyn steps | at p50 | latest_common p50 | plan compile | build |
+|---|---|---|---|---|---|---|---|
+| `recorded` | 10 | 9 | 2 | 80 ns | 60 ns | 116 ns | 0.7 ms |
+| `robot` | 24 | 23 | 3 | 251 ns | 100 ns | 144 ns | 2.7 ms |
+| `humanoid` | 117 | 116 | 12 | 880 ns | 210 ns | 161 ns | 0.9 ms |
+| `av` | 375 | 374 | 14 | 1012 ns | 231 ns | 171 ns | 2.1 ms |
+| `fleet_16` | 385 | 384 | 4 | 330 ns | 120 ns | 238 ns | 44 ms |
+| `fleet_64` | 1537 | 1536 | 4 | 330 ns | 120 ns | 245 ns | 120 ms |
+| `extreme_wide` | 12289 | 12288 | 4 | 320 ns | 111 ns | 244 ns | 364 ms |
+
+**Width is free.** The last three rows hold the dynamic-step count at 4 while the
+tree grows 32x, from 385 to 12 289 frames, and `at p50` does not move — it goes
+*down* by 10 ns, which is noise. The earlier four-point row above topped out at
+375 frames and could only say "primarily depth"; this says it at two orders more.
+
+**Depth is what costs**: `humanoid` (12 steps) to `av` (14 steps) is
+880 → 1012 ns, about 66 ns per additional dynamic step, which is the
+interpolation cost [`PHASE1.md`](../PHASE1.md) §11.3 predicts.
+
+**Plan compilation is nearly flat too** — 116 ns at 10 frames, 244 ns at 12 289,
+and the last three rows (32x the tree) are within 3% of each other. It walks to
+the root, so it scales with depth rather than with the tree. `build` does scale,
+linearly in samples, and 364 ms for a 12 289-frame arena is a startup cost worth
+knowing rather than a surprise.
+
+Ring depth, one edge, stamps swept across the whole ring:
+
+| slots | retained | MiB | at p50 | at p99.9 |
+|---|---|---|---|---|
+| 8 | 7 | 0.0 | 90 ns | 101 ns |
+| 1 024 | 1 023 | 0.1 | 90 ns | 150 ns |
+| 16 384 | 16 383 | 1.1 | 91 ns | 160 ns |
+| 262 144 | 262 143 | 18.0 | 119 ns | 450 ns |
+| 1 048 576 | 1 048 575 | 72.0 | 120 ns | 700 ns |
+
+The binary search behaves: a 131 072x deeper ring costs 30 ns at p50, and 20 of
+those 30 arrive in one step — between 16 K and 256 K slots, i.e. between a ring
+that fits in cache and one that does not. The **tail** is where that shows
+plainly: p99.9 goes 101 → 700 ns. It is a property of the machine as much as of
+the engine, and no previous benchmark varied this axis at all.
+
+Publish, one thread round-robin over N edges: 6.84 ns/push at 1 edge, 7.01 at 16,
+7.41 at 64, 10.33 at 256. Per-edge isolation holds through 64; the step at 256 is
+the working set (256 rings is 18 MiB of first-touched pages), not false sharing —
+`EdgeCounters` is padded to 128 bytes precisely so two edges never share a line.
+
+**The limits, printed by the engine rather than copied from a header:**
+
+* **59 651 678 sample slots (~4.00 GiB) in one arena**, past which
+  `LayoutError::ArenaTooLarge` — every region offset in the header is a `u32`.
+  This was undocumented, and it is the one that binds first on any populated
+  tree; `TooManyFrames`/`TooManyEdges` are `u32` counts nothing reaches.
+* 16 compiled plan steps (`MAX_DEPTH`), as the section below already records.
+
+### Duration — `just soak`
+
+40 s, 24-frame fixture (10 s of retained history), 2 reader threads, 4 writer
+threads, snapshots every 10 s:
+
+| interval | Mlookup/s | p50 | p99.9 | publish→visible p50 | ring laps | RSS | declined |
+|---|---|---|---|---|---|---|---|
+| 0 | 5.18 | 280 ns | 470 ns | 191 ns | 1.0 | 2636 KiB | 131 ppm |
+| 1 | 5.22 | 280 ns | 460 ns | 191 ns | 1.0 | 2636 KiB | 130 ppm |
+| 2 | 5.04 | 280 ns | 470 ns | 200 ns | 1.0 | 2656 KiB | 137 ppm |
+| 3 | 5.24 | 280 ns | 470 ns | 191 ns | 1.0 | 2656 KiB | 130 ppm |
+
+No drift: p99.9 ends at 1.00x its first interval, RSS grows 20 KiB, and the rings
+lapped 3.9 times — which the harness *asserts*, because a soak that never lapped
+a ring did not exercise the path it exists for and must fail rather than print a
+clean table. Laps are `interval / retained`, both read from the arena, so the
+assertion holds for a workload with a different history too.
+
+The `declined` column is the harness's own, not the engine's, and it is reported
+as a rate precisely so that is checkable: the readers re-probe the retained
+window every few thousand lookups while the writers slide it, so queries aimed at
+the oldest end occasionally land just below it. **Stable at ~130 ppm across every
+interval** is the expected shape; a rate that *grew* would mean the window was
+sliding faster than the readers could follow.
+
+**Publish-to-visible is ~190 ns at p50** and this is the first time it has been
+measured. It is [`PHASE5.md`](../PHASE5.md) §9.2's required row: not lookup
+latency, but how long after a writer's `push` returns that a *different thread*
+can read the sample. A probe writer records when `push` returned and a probe
+reader spins until the arena reports that stamp. Its p99.9 is milliseconds and is
+not a claim about the engine — the probe reader is one of six runnable threads on
+four cores, and what that tail measures is the scheduler descheduling it.
+
+### The transport — `just dds-bench`
+
+Every tf2 comparison above this section feeds `tf2::BufferCore` in-process.
+That is deliberately generous to tf2 and is **not** what a deployed node pays:
+`mp_bench` says so in its own output ("this tf2 column is a FLOOR ... but no
+transport"). This is the run that pays it — one publisher, real DDS, the
+container's RMW, [`PHASE4.md`](../PHASE4.md) §5.2's QoS, 4 consumers, 100 Hz,
+100 ms query lag, 3 s warm-up discarded, 10 s measured.
+
+| arm | procs | consumers | svc p50 | svc p99 | svc p99.9 | CPU %/consumer | PSS |
+|---|---|---|---|---|---|---|---|
+| `tf2.processes` | 4 | 4 | 3.54 µs | 14.85 µs | 18.82 µs | 0.014% | **63.11 MiB** |
+| `tf2.composed` | 1 | 4 | 1.48 µs | 7.33 µs | 13.95 µs | 0.004% | 24.09 MiB |
+| `tf_tree.composed` | 1 | 4 | **0.86 µs** | **4.10 µs** | **9.15 µs** | **0.003%** | 24.65 MiB |
+
+Against the ordinary ROS deployment (`tf2.processes`, one listener per node):
+**4.1x on p50, 2.1x on p99.9, 4.7x on CPU per consumer, 2.6x on memory.**
+
+`tf2.composed` is in the table because without it the comparison is a strawman:
+it is tf2's *best* case, one listener shared by four threads in one process, and
+tf_tree still leads it 1.7x at p50 and 1.5x at p99.9 at comparable memory.
+
+Both arms are the same executable with a different `--mode`, so the schedule, the
+query set, the warm-up window and the measurement code are literally the same
+code. The publisher plan, the bridge's topology config and the query set are all
+*generated* from one workload entry, so §9.3's "identical data" is structural
+rather than promised.
+
+**What this comparison does not have, and why.** There is no multi-process
+tf_tree arm. `tft_bridge_create` builds its arena with `TreeBuilder::build()` —
+a **heap** arena — so no second process can attach to what the bridge fills.
+That is the arm the project's central claim is about, and closing it is
+[`0015`](../decisions/0015-the-bridge-fills-a-shared-arena.md), a draft decision
+record: `tft_bridge_options` gains an optional `arena_name` and the bridge
+becomes an ordinary producer of the arena Phase 2 already specified. The report
+prints this gap above its own table on every run until then.
+
+#### A bridge defect this harness found
+
+The first run of the tf_tree arm reported **10 070 transforms received, 187
+applied, 9 864 dropped as authority conflicts, and 100% of lookups failing** —
+against a single publisher and a correctly declared topology.
+
+`tf_tree_bridge::Publisher` is keyed on the **resolved node name**, not on the
+GID. At bridge startup the graph cache has not resolved the publisher yet, so the
+first `/tf` messages are attributed to an unknown name; under the default
+`first_writer_wins` that unknown name becomes the edge's owner, and every later
+message — now correctly resolved — is a *different* `Publisher` value and is
+rejected. Permanently, because `FirstWriterWins` never re-inserts the owner.
+
+The benchmark works around it with `last_writer_wins`, which re-inserts. **The
+fix is to key authority on the GID**, which is the identity that does not change,
+and it belongs in `tf_tree_bridge`. It was found only because the aggregator
+flags a row whose lookups mostly failed instead of printing its (excellent)
+latencies as a result.
+
 ## A real difference: maximum chain depth
 
 tf_tree caps a compiled plan at `tf_tree_core::MAX_DEPTH` (**16** steps); a
@@ -945,13 +1166,31 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
 * **The 6x scaling gate, on >= 8 physical cores.** Measured 5.35x-5.62x on a
   4-core host, where 8 threads can only exceed 4x via SMT. Not a fair test of the
   criterion either way.
-* **Read scaling under concurrent writers.** Every reader benchmark here runs
-  against a quiescent tree. [`PHASE1.md`](../PHASE1.md) §11.2 specifies 4 concurrent
-  writers, which would additionally stress tf_tree's seqlock retry path and
-  tf2's writer/reader lock exclusion.
-* **Per-thread core pinning.** The harness pins nothing; `taskset` on the whole
-  process is the current best approximation.
+* ~~**Read scaling under concurrent writers.**~~ **Done** — `just
+  contended-scaling`, above. Four concurrent writers cost ~9% of aggregate
+  throughput and nothing at p99.9, with zero slot-failure counters.
+* ~~**Per-thread core pinning.**~~ **Done for the multi-process harness** —
+  `contended_scaling` places each reader and each writer on its own core with
+  `taskset`, one process per core. The criterion benches still pin nothing and
+  say so; per-*thread* placement needs `sched_setaffinity`, which `CLAUDE.md`'s
+  unsafe budget routes to a decision record.
 * **A non-SMT machine.** 4 physical cores cap what an 8-thread row can show.
+* **tf2 under concurrent writers.** `contended_scaling` is tf_tree-only, because
+  a second process cannot reach a `BufferCore` at all. The in-process
+  head-to-head under writers belongs in `tf2_scaling`, which has the interleaved
+  two-engine thread harness; it does not have a writer sweep yet. This is the
+  row that should separate the engines most sharply — every
+  `tf2::lookupTransform` excludes against `setTransform` on one mutex — and it
+  is the largest remaining gap in this document.
+* **tf_tree across processes over DDS.** `just dds-bench`'s tf_tree arm is a
+  composed container, because `tft_bridge_create` builds a heap arena. See the
+  transport section above; the fix is a decision record, not a benchmark.
+* **A second RMW.** `docker/tf2` carries one, so the DDS numbers' sensitivity to
+  the middleware vendor is unmeasured. [`PHASE4.md`](../PHASE4.md) §0.0 already
+  records the missing second RMW.
+* **An ingest-throughput benchmark.** [`PHASE5.md`](../PHASE5.md) §12 gate 5 is
+  still held by nobody. It is an offline path, so this suite deliberately did
+  not fold it in.
 
 ## Runbook for pinned hardware
 
@@ -968,3 +1207,29 @@ taskset -c 2 ./docker/tf2/run.sh \
 
 Report p50/p99/p99.9, not means — [`PHASE1.md`](../PHASE1.md) §11.2 is explicit that the tail is
 what a control loop cares about.
+
+The performance suite above is run the same way, and its harnesses **refuse** on
+a busy machine rather than producing a number that describes somebody else's
+workload:
+
+```bash
+just contended-scaling --workload robot --seconds 8   # §11.2's row, pinned
+just scale-sweep                                      # width, depth, ring, fan-out, limits
+just soak-long                                        # 30 minutes, fails on drift
+just dds-bench 'CONSUMERS=16 SECONDS_MEASURED=120'    # end to end, in the container
+```
+
+To find out whether a change to the core helped:
+
+```bash
+just bench-run robot          # writes target/bench-runs/<sha>/
+# ... change the engine ...
+just bench-run robot
+just bench-ab target/bench-runs/<a>/contended_scaling.json \
+               target/bench-runs/<b>/contended_scaling.json
+```
+
+`bench_ab` reads the direction and the tolerance from the file rather than
+inferring either from a key name, and exits non-zero on a regression, so it drops
+into a bisect script unwrapped. Two runs of the same build must report every row
+as `noise` — that property is the reason to trust it, and it is checked.

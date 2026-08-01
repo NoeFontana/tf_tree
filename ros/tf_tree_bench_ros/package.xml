@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tf_tree_bench_ros</name>
+  <version>0.1.0</version>
+  <description>
+    The end-to-end comparison `docs/PHASE5.md` §9.1 specifies: N tf2 consumers
+    over a real DDS against a bridge plus N tf_tree consumers, on identical
+    data with identical QoS. Benchmark-only; nothing here is shipped, and it is
+    a separate package from `tf_tree_ros` so a deployment never installs a
+    benchmark.
+  </description>
+  <maintainer email="noe.fontana.pro@gmail.com">Noe Fontana</maintainer>
+  <license>Apache-2.0</license>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf_tree_ros</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -111,3 +111,107 @@ fn no_allocations_after_construction() {
     let _ = &iso;
     drop(writers);
 }
+
+/// The same gate over the *large* topologies the performance suite added.
+///
+/// The test above proves the hot path allocates nothing on a 24-frame tree with
+/// a three-step plan. Neither of those is where an allocation would hide. The
+/// things that scale with the workload — the compiled plan's step array, the
+/// guard's per-edge bookkeeping, the bracket search's state — are all
+/// fixed-size by design (`Plan` is `[Step; MAX_DEPTH]` and `Copy`, invariant 8),
+/// and this asserts that the design survived contact with a 1537-frame tree, a
+/// four-dynamic-step plan and a ring that laps repeatedly during the loop.
+///
+/// **Ring wraparound is the specific thing added here.** The test above pushes
+/// a million samples into a 128-slot ring, so it laps too — but on an edge that
+/// is *not* on the query path. Here the pushes land on an edge the plan reads,
+/// so the reader crosses the writer's wrap on every lap, which is the path
+/// where a retry allocating a scratch buffer would show up.
+///
+/// Host-independent, so unlike everything else in this suite it is a hard gate
+/// and runs in `cargo nextest run --workspace`.
+#[test]
+fn no_allocations_on_a_large_topology_across_ring_wraparound() {
+    use tf_tree::InterpPolicy;
+    use tf_tree_bench::workload::{self, Backing};
+
+    // `fleet_64`: 1537 frames, 256 dynamic edges, a cross-fleet plan of four
+    // dynamic steps. `av` would add depth but not width; this adds both the
+    // width and the multi-robot plan shape.
+    let w = workload::by_name("fleet_64").expect("fleet_64 in the catalogue");
+    let built = w
+        .build(InterpPolicy::LerpSlerp, Backing::Heap)
+        .expect("build fleet_64");
+    assert_eq!(
+        built.shape.dyn_steps,
+        Some(4),
+        "this test is about a multi-step plan; the catalogue changed under it"
+    );
+
+    let plan = built.plans().expect("compile")[0];
+    let guard = built.tree.guard();
+    let query: Stamp = Stamp::from_nanos(built.stamp_at(0.5));
+
+    // Publish onto an edge the plan *reads*, so the reader crosses the writer's
+    // ring wrap. `publishers[0]` is robot 0's `map->odom`, which the cross-fleet
+    // pair traverses.
+    let p = &built.publishers[0];
+    let parent = built.tree.frame(&p.parent).expect("parent frame");
+    let child = built.tree.frame(&p.child).expect("child frame");
+    let writer = built.tree.claim(child, parent).expect("claim");
+
+    let iso = fixture::dynamic_pose(p.seed, 0);
+    let step_ns = (1e9 / p.rate_hz) as i64;
+    let mut push_stamp = p.next_stamp_ns;
+
+    plan.at(&guard, query).expect("warm at");
+    writer.push(push_stamp, &iso).expect("warm push");
+    push_stamp += step_ns;
+
+    // The ring holds 10 s at 50 Hz — 512 slots — so this laps roughly 390 times.
+    // A first revision of this test pushed 1000 samples and lapped twice, which
+    // is enough to be true and not enough to be evidence.
+    const ITERS: usize = 200_000;
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut acc = 0.0f64;
+    let mut answered = 0usize;
+    for _ in 0..ITERS {
+        writer.push(push_stamp, &iso).expect("push");
+        push_stamp += step_ns;
+        // The query stamp is fixed while the window slides past it, so the later
+        // iterations legitimately fall out of the retained window. Both branches
+        // are on the no-allocation path and both must stay on it — an error path
+        // that formats a message would allocate, which is exactly what
+        // `CLAUDE.md`'s "no `String` in any error type" rule is protecting.
+        if let Ok(pose) = plan.at(&guard, query) {
+            acc += pose.t.x;
+            answered += 1;
+        }
+    }
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+
+    assert!(acc.is_finite(), "accumulator went non-finite: {acc}");
+    assert!(
+        answered > 0,
+        "every lookup was declined, so the success path was never measured"
+    );
+    assert!(
+        answered < ITERS,
+        "no lookup was declined, so the error path was never measured — this test \
+         is supposed to cross the window's edge"
+    );
+
+    let allocations = after - before;
+    assert_eq!(
+        allocations,
+        0,
+        "expected zero allocations across {ITERS} push+at calls on fleet_64 \
+         ({} answered, {} declined), saw {allocations}",
+        answered,
+        ITERS - answered
+    );
+
+    let _ = &iso;
+    drop(writer);
+}
