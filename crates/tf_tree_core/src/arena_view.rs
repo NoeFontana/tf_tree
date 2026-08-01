@@ -544,13 +544,37 @@ impl<'a> ArenaView<'a> {
             return None;
         }
 
+        // The record's own `stamp_off`/`pose_off`/`capacity` triple is foreign
+        // input on every path that maps bytes this process did not write — a
+        // peer's `memfd`, and since Phase 5 a `.tft` file `FrozenArena::open`
+        // took from disk. `validate_arena_header` bounds the *regions* and says
+        // so itself (`check.rs`, "would produce out-of-bounds reads rather than
+        // an error"); nothing bounded a sub-range *inside* them, so a corrupt or
+        // crafted triple formed a typed slice running past the end of the
+        // mapping. It is reachable from safe code too: `declare_edge` and
+        // `EdgeRecord::dynamic` are safe `pub fn`s that write a caller-supplied
+        // record, so `tf_tree` — which is `#![forbid(unsafe_code)]` — could
+        // cause UB without writing a single `unsafe` block.
+        //
+        // `stamp_slots`/`pose_slots` are the counts the two regions were sized
+        // from, and the header check already proved they agree with the
+        // segment's geometry. No legitimate edge can trip this: the facade
+        // assigns `stamp_off` cumulatively from a running offset.
+        if (edge.stamp_off as usize).saturating_add(cap) > self.header.stamp_slots as usize
+            || (edge.pose_off as usize).saturating_add(cap) > self.header.pose_slots as usize
+        {
+            return None;
+        }
+
         let stamp_byte_off = self.header.stamp_arena_off as usize + edge.stamp_off as usize * 8;
         let pose_byte_off = self.header.pose_arena_off as usize + edge.pose_off as usize * 64;
 
-        // SAFETY: `ArenaBuilder::declare_edge` sized `stamp_off`/`pose_off`/
-        // `capacity` to name a `cap`-slot sub-range wholly inside the stamp/pose
-        // arenas; the helpers' own SAFETY contracts (in `crate::buffer`) cover
-        // alignment and validity.
+        // SAFETY: the bounds check above proved `stamp_off + cap <= stamp_slots`
+        // and `pose_off + cap <= pose_slots`, so both sub-ranges lie wholly
+        // inside the stamp/pose arenas whose extents `validate_arena_header`
+        // confirmed against the mapping. This is enforced here rather than
+        // assumed of `ArenaBuilder::declare_edge`, which only asserts the
+        // invariant — it writes the caller's record unvalidated.
         let stamps = unsafe { stamp_slots(self.base, stamp_byte_off, cap) };
         let poses = unsafe { pose_slots(self.base, pose_byte_off, cap) };
 

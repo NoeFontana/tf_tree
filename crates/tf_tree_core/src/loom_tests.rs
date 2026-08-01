@@ -3,10 +3,12 @@
 //! These are the hard gate for step 5 of `docs/PHASE1.md`'s implementation
 //! order, and for its §10.2 *Concurrency (loom)*: the publish/read/claim/
 //! intern protocols must be sound under every interleaving loom explores, not
-//! merely on x86. Buffers are capacity 2–4 and push counts <= 3 to keep the
-//! state space tractable. Each test drives the *shared* algorithm code (the same
-//! functions the production arena view calls) over heap-allocated instances
-//! built from `crate::sync` (loom) atomics.
+//! merely on x86. Buffers are capacity 4 and push counts <= 5 to keep the state
+//! space tractable — small, but never so small that the code under test becomes
+//! unreachable, which is a failure mode these models have already had once (see
+//! [`writer_wraps_reader_gets_valid_or_recycled`]). Each test drives the
+//! *shared* algorithm code (the same functions the production arena view calls)
+//! over heap-allocated instances built from `crate::sync` (loom) atomics.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use loom::sync::Arc;
@@ -103,33 +105,54 @@ fn writer_three_pushes_reader_never_torn() {
     });
 }
 
-/// Loom test 2: the writer wraps the ring (capacity 2, three pushes) while a
-/// reader samples. The reader returns a valid sample or a documented error,
-/// never a torn or nonsensical one.
+/// Loom test 2 (`docs/PHASE1.md` §10.2, bullet 2): the writer **laps** the ring
+/// while a reader samples. The reader returns the one interpolation the
+/// published history permits, or a documented error — never a pose assembled
+/// from two eras.
+///
+/// # Why capacity 4 and five pushes, and not capacity 2 and three
+///
+/// [`SampleRing::retained`] is `capacity - 1`, so a capacity-2 ring has a
+/// readable window of exactly *one* sample. `sample()` then finds `t_old ==
+/// t_new` and can only ever answer `NoData` or `Extrapolation`: the bracket
+/// search, the interpolation and the trailing `head - i > retained`
+/// revalidation — the entire subject of this test — are unreachable. That was
+/// this test's shape until it was measured: a `panic!` planted in the `Ok` arm
+/// never fired, across every interleaving loom explores. Five pushes into four
+/// slots is the smallest configuration in which the ring genuinely laps a
+/// reader *and* the reader has something to interpolate.
+///
+/// The assertion is bit equality against the single legal answer, not
+/// finiteness. Finiteness was the old check and it proves nothing here: a pose
+/// interpolated between two samples from different eras is perfectly finite.
+/// Whether the writer has landed three, four or five pushes when the reader
+/// looks, the only bracket containing `t = 25` is `(20, 30)` at `s = 0.5`, so
+/// any other value the reader could return is a splice.
 #[test]
 fn writer_wraps_reader_gets_valid_or_recycled() {
     loom::model(|| {
-        let hr = Arc::new(HeapRing::new(2));
+        let hr = Arc::new(HeapRing::new(4));
+        // The only legal `Ok`: stamps 20 and 30 bracket t = 25 at s = 0.5.
+        let expect = <LerpSlerp as tf_tree_math::Interp>::eval(&pose(2), &pose(3), 0.5).to_bits();
 
         let w = Arc::clone(&hr);
         let writer = thread::spawn(move || {
             let ring = w.ring();
-            ring.push(10, &pose(1)).unwrap();
-            ring.push(20, &pose(2)).unwrap();
-            ring.push(30, &pose(3)).unwrap(); // wraps: overwrites slot 0
+            // Stamps 10..50 into four slots: the fifth push laps slot 0.
+            for i in 1..=5u64 {
+                ring.push(i as i64 * 10, &pose(i)).unwrap();
+            }
         });
 
         let r = Arc::clone(&hr);
         let reader = thread::spawn(move || {
             let ring = r.ring();
-            match ring.sample::<LerpSlerp>(15, ExtrapPolicy::Error) {
-                Ok(iso) => {
-                    // A consistent result: every component must be finite.
-                    let b = iso.to_bits();
-                    for w in b {
-                        assert!(f64::from_bits(w).is_finite(), "non-finite component");
-                    }
-                }
+            match ring.sample::<LerpSlerp>(25, ExtrapPolicy::Error) {
+                Ok(iso) => assert_eq!(
+                    iso.to_bits(),
+                    expect,
+                    "reader composed a sample from two eras"
+                ),
                 Err(
                     LookupError::NoData { .. }
                     | LookupError::Extrapolation { .. }

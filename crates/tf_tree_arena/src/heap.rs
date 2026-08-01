@@ -207,9 +207,10 @@ pub(crate) unsafe fn write_header_at(
     // SAFETY: by contract `base` is 64-byte aligned (matching ArenaHeader's
     // align(64)) and backed by at least size_of::<ArenaHeader>() owned, zeroed
     // bytes. An all-zero bit pattern is a valid ArenaHeader (integers and
-    // atomics accept any pattern), so forming `&mut *hdr` and assigning scalar
-    // fields is sound. The atomic fields are deliberately left at their zeroed
-    // value (topo_generation/topo_active/frame_count/edge_count all start at 0).
+    // atomics accept any pattern), so forming `&mut *base.cast::<ArenaHeader>()`
+    // and assigning scalar fields is sound. The atomic fields are deliberately
+    // left at their zeroed value: `topo` (one packed word since A1), plus
+    // frame_count, edge_count and participant_count, all starting at 0.
     // The caller uniquely owns the region, so nothing aliases it.
     let h = unsafe { &mut *base.cast::<ArenaHeader>() };
     h.magic = u64::from_le_bytes(TF_TREE_MAGIC);

@@ -25,9 +25,14 @@ pub(crate) use loom::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, Orde
 /// A spin hint that yields to the model checker under `loom` and emits a plain
 /// CPU spin hint otherwise.
 ///
-/// Unbounded waits (the interning publish-then-spin, the topology odd-generation
-/// retry) must call this so `loom` schedules the thread they are waiting on
-/// rather than spinning forever inside a single interleaving.
+/// Waits that spin on another thread — the interning publish-then-spin
+/// (`frame::wait_for_publish`, bounded between liveness checks by A8), the
+/// topology mutation lock's bounded acquire spin (A2), plan compilation's
+/// snapshot retry, and the pose-slot seqlock retry in `buffer::read_slot` —
+/// must call this so `loom` schedules the thread they are waiting on rather
+/// than spinning forever inside a single interleaving. The odd generation the
+/// *topology* once used is gone: A1 removed that state entirely, and the only
+/// surviving odd/even sequence is the per-slot one in `buffer`.
 #[cfg(not(loom))]
 #[inline]
 pub(crate) fn spin() {

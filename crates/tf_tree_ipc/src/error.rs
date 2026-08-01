@@ -332,8 +332,6 @@ pub enum IpcError {
         /// means nobody is attached and the *ownership* byte was what stayed
         /// held — a process that took it and never began serving.
         holder_slots: u64,
-        /// Lowest held slot, for a message that does not need bit twiddling.
-        /// Meaningless when `holder_slots` is zero.
         /// The lowest held slot, or `None` when no participant byte is held.
         ///
         /// `Option` rather than a sentinel: an empty mask has no first slot, and

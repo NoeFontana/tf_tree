@@ -175,7 +175,9 @@ impl EdgeRecord {
 #[cfg(not(loom))]
 #[repr(C, align(64))]
 pub struct ClaimRecord {
-    /// `0` = free, else `participant_slot + 1`.
+    /// `0` = free, else `(epoch << 16) | (participant_slot + 1)` as built by
+    /// `pack_owner` — the `participant_slot + 1` shorthand `docs/PHASE2.md` §1
+    /// A3 uses names only the low half of the word.
     ///
     /// **One word carries both the state and the full identity** (`docs/PHASE2.md`
     /// §1, A3), because the identity is an *indirection* into a participant
@@ -214,7 +216,8 @@ const _: () = {
 /// touches. The `claim`/`release` algorithm is identical to the production one.
 #[cfg(loom)]
 pub struct ClaimRecord {
-    /// `0` = free, else `participant_slot + 1`.
+    /// `0` = free, else `(epoch << 16) | (participant_slot + 1)`, exactly as in
+    /// the production record; `pack_owner` is shared between the two.
     pub owner: AtomicU64,
     /// Claim epoch; bumped on claim and on reap.
     pub epoch: AtomicU64,
@@ -414,11 +417,16 @@ pub struct Publisher<'a> {
     ring: SampleRing<'a>,
     claim: &'a ClaimRecord,
     epoch: u64,
-    /// The owner word this writer wrote when it claimed — `participant_slot + 1`.
+    /// The owner word this writer wrote when it claimed —
+    /// `(epoch << 16) | (participant_slot + 1)`, as built by [`pack_owner`].
     ///
     /// Retained so `Drop` can release with a compare-exchange instead of a
     /// store, and therefore cannot free a claim that has since passed to
-    /// somebody else. See [`release`].
+    /// somebody else. **The epoch is part of the word on purpose**: a bare
+    /// `slot + 1` is constant per participant, so the same participant
+    /// re-claiming after a `ClaimRevoked` would produce an identical word and a
+    /// stale release would free the new claim. See [`pack_owner`] and
+    /// [`release`].
     owner: u64,
     /// Set by [`Publisher::abandon`]; makes `Drop` touch no arena memory.
     abandoned: bool,

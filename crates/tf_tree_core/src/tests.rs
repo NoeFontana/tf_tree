@@ -252,6 +252,43 @@ fn wrapped_ring_retained_samples_read_back_exactly() {
         .unwrap();
 }
 
+/// [`SampleRing::sample_from`]'s galloping search must return exactly what
+/// [`SampleRing::sample`] returns, from **any** starting cursor.
+///
+/// The downward-gallop arm is unreachable from every in-tree caller —
+/// `Plan::fold_at_cursors` seeds each cursor to 0 and only runs for monotone
+/// stamps — so nothing exercised it, even though `sample_from` is public. Both
+/// arms exist only to establish `bracket`'s precondition
+/// (`stamp[lo] <= t < stamp[hi]`); break it and `bracket` returns an index
+/// whose stamp is *above* `t`, `s` goes negative, and the caller gets a
+/// confidently wrong pose with no error at all.
+///
+/// The ring is deliberately wrapped (20 pushes into 16 slots) so the logical
+/// window does not start at 0 and the cursor clamp is exercised too.
+///
+/// Mutant: `hint.saturating_sub(step)` -> `hint.saturating_sub(step / 2)` in
+/// the downward arm ⇒ fails.
+#[test]
+fn sample_from_agrees_with_sample_from_every_cursor() {
+    let hr = HeapRing::new(16);
+    let ring = hr.ring();
+    for i in 0..20u64 {
+        ring.push(i as i64 * 100, &pose(i + 1)).unwrap();
+    }
+    for t in (300..=2000).step_by(7) {
+        let want = ring.sample::<LerpSlerp>(t, ExtrapPolicy::Error);
+        for start in 0..21u64 {
+            let mut cursor = start;
+            let got = ring.sample_from::<LerpSlerp>(t, ExtrapPolicy::Error, &mut cursor);
+            match (&got, &want) {
+                (Ok(g), Ok(w)) => assert_eq!(g.to_bits(), w.to_bits(), "t={t} start={start}"),
+                (Err(g), Err(w)) => assert_eq!(g, w, "t={t} start={start}"),
+                _ => panic!("t={t} start={start}: {got:?} vs {want:?}"),
+            }
+        }
+    }
+}
+
 // ---- claim / publisher --------------------------------------------------
 
 #[test]
@@ -937,6 +974,64 @@ fn compile_rejects_the_no_edge_sentinel() {
     assert_eq!(err, LookupError::MissingEdge { child: b });
 }
 
+/// `docs/PHASE1.md` §7.1 pins `MAX_DEPTH` at 16 and makes a longer combined
+/// path [`LookupError::TreeTooDeep`]. Nothing in the workspace asserted it, so
+/// the four depth guards in `compile` were free to be off by one — and the
+/// failure is not a clean panic but a *truncated plan*: a transform composed
+/// from the bottom of the chain and missing its top, which looks entirely
+/// plausible.
+///
+/// Mutant: `if nt >= MAX_DEPTH` -> `if nt > MAX_DEPTH` in the first
+/// depth-equalisation loop ⇒ `t_edges[16]` panics out of bounds.
+#[test]
+fn max_depth_is_the_exact_boundary_between_a_plan_and_tree_too_deep() {
+    use alloc::format;
+
+    // 20 frame slots => ids 1..=19: a root plus an 18-link chain.
+    let layout = ArenaLayout::new(20, 20, alloc::vec![0; 20]).unwrap();
+    let arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
+    let view = ArenaView::new(&arena);
+
+    let mut chain: Vec<FrameId> = Vec::new();
+    for i in 0..19u32 {
+        chain.push(view.intern(&format!("f{i}")).unwrap());
+    }
+    for w in chain.windows(2) {
+        // Edge id == the child's frame id: non-zero, in range, and unique, so
+        // no link trips the `MissingEdge` sentinel check instead.
+        view.topology()
+            .set_parent(w[1], w[0].get(), w[1].get())
+            .unwrap();
+    }
+
+    let meta = |eid: EdgeId| {
+        view.edge(eid).map(|e| crate::plan::EdgeMeta {
+            kind: crate::edge::EdgeKind::from_u8(e.kind),
+            domain: e.domain,
+            static_pose: Iso3::from_bits(&e.static_pose),
+        })
+    };
+
+    // Exactly MAX_DEPTH links: compiles, with every step retained.
+    let root = chain[0];
+    let at_limit = chain[crate::MAX_DEPTH];
+    let plan = crate::plan::compile(&view.topology(), meta, at_limit, root).unwrap();
+    assert_eq!(
+        plan.len(),
+        crate::MAX_DEPTH,
+        "a depth-16 path must compile whole"
+    );
+
+    // One link further: refused, and the error names the depth that overflowed.
+    let past_limit = chain[crate::MAX_DEPTH + 1];
+    assert_eq!(
+        crate::plan::compile(&view.topology(), meta, past_limit, root).unwrap_err(),
+        LookupError::TreeTooDeep {
+            depth: crate::MAX_DEPTH as u16
+        }
+    );
+}
+
 // ---- topology -----------------------------------------------------------
 
 #[test]
@@ -961,8 +1056,9 @@ fn topology_depth_and_cycle_detection() {
     assert_eq!(read(c).2, 20);
     assert_eq!(read(a).2, 0); // root has no edge
 
-    // Each successful mutation advanced the generation by 2 (even, stable).
-    assert_eq!(topo.generation() % 2, 0);
+    // A1 removed the odd "write in progress" state: each successful mutation is
+    // a single publishing store that advances the generation by exactly 1.
+    assert_eq!(topo.generation(), 2, "two mutations, two generations");
     let before = topo.generation();
 
     // Attaching a under c would close a cycle a->b->c->a.
@@ -971,8 +1067,9 @@ fn topology_depth_and_cycle_detection() {
         err,
         crate::error::TopologyError::WouldCreateCycle { child: a }
     );
-    // The failed mutation left the tree intact and the generation stable/even.
-    assert_eq!(topo.generation() % 2, 0);
+    // The failed mutation left the tree intact — `a` is still a root. The
+    // generation is pinned exactly three lines below, so there is nothing a
+    // parity check could add here.
     assert_eq!(read(a).0, 0);
     // And edge_of_child for the earlier attach survived the aborted mutation.
     assert_eq!(read(c).2, 20);
@@ -1255,18 +1352,29 @@ fn constant_twist_extends_the_last_segment_and_agrees_with_sample() {
 #[test]
 fn constant_twist_with_one_sample_is_no_segment() {
     let hr = HeapRing::new(8);
-    twist_ring(&hr, 1);
+    // A *non-identity* single sample. `twist_ring(&hr, 1)` pushes `pose(0)`,
+    // which is exactly `Iso3::IDENTITY`, so an implementation that invented an
+    // identity pose rather than holding the published one passed unnoticed —
+    // and `is_ok()` would not have told them apart even if it had not.
+    hr.ring().push(0, &pose(3)).unwrap();
     assert!(matches!(
         hr.ring()
             .sample_with_twist(10_000, ExtrapPolicy::ConstantTwist),
         Err(LookupError::NoSegment { .. })
     ));
-    // But the plain sample still answers: the pose is available, only the
-    // derivative is not.
-    assert!(hr
-        .ring()
-        .sample::<ScLerp>(10_000, ExtrapPolicy::ConstantTwist)
-        .is_ok());
+    // The plain sample still answers, and it answers with the sample that was
+    // published — held, not extrapolated and not invented.
+    //
+    // Mutant: return `Iso3::IDENTITY` from `constant_twist`'s
+    // `newest == lo_logical` arm ⇒ fails.
+    assert_eq!(
+        hr.ring()
+            .sample::<ScLerp>(10_000, ExtrapPolicy::ConstantTwist)
+            .expect("the pose is available; only the derivative is not")
+            .to_bits(),
+        pose(3).to_bits(),
+        "a single-sample ConstantTwist must hold the published sample"
+    );
 }
 
 /// **At exactly the newest stamp the twist is the left limit** — the segment

@@ -67,7 +67,7 @@ impl EdgeId {
 /// A lookup or sample failure.
 ///
 /// `Copy`, allocation-free, `no_std`. Returned by the sample/read path and by
-/// plan evaluation (the latter lands in a later PR).
+/// plan compilation and evaluation ([`crate::plan`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LookupError {

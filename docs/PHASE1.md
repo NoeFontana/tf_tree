@@ -459,6 +459,31 @@ Stamps live in a **separate** array of `AtomicI64`, so binary search touches 8 s
 
 ### 6.2 Publish protocol (single writer)
 
+> **Two lines of the listing below were corrected in place** — it had drifted
+> from the shipped `SampleRing::push`, and this section is normative, so the
+> listing is now the amended version rather than the original with a note
+> attached. What changed, and why, so a reader comparing this against an older
+> revision is not left guessing:
+>
+> - **The odd flip** is `slot.seq.load(Relaxed) | 1`, where this listing used to
+>   read `s.wrapping_add(1)`. That is amendment **A5** in
+>   [`PHASE2.md`](./PHASE2.md) §1: forcing the parity instead of incrementing it
+>   means a writer killed mid-write leaves a stale odd value the next writer
+>   heals idempotently, rather than landing its `s+1` on an even value and
+>   inverting the protocol for that slot from then on. A5 shipped in the code;
+>   this listing had never been updated for it.
+> - **The heartbeat** is a plain `store(h + 1)`, where this listing used to read
+>   `fetch_add(1)`. The ordering annotation is unchanged — `Relaxed` either way —
+>   and no atomic ordering is weakened. Only the atomicity goes, which bought
+>   nothing: the ring is single-writer by construction (D7), the same guarantee
+>   the neighbouring plain `head.store` already rests on, and `heartbeat` equals
+>   `head` at every quiescent point because `head` is written in exactly one
+>   place and never reset. The stored value is identical. Measured 8.66 → 4.65
+>   ns/push.
+>
+> The ordering annotations remain NORMATIVE as written; neither correction
+> weakens one.
+
 ```rust
 // NORMATIVE ordering annotations.
 fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
@@ -470,8 +495,8 @@ fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
     let idx = (h & self.mask) as usize;
     let slot = &self.poses[idx];
 
-    let s = slot.seq.load(Ordering::Relaxed);
-    slot.seq.store(s.wrapping_add(1), Ordering::Relaxed);   // -> odd
+    let s = slot.seq.load(Ordering::Relaxed) | 1;           // A5: force, do not increment
+    slot.seq.store(s, Ordering::Relaxed);                   // -> odd (idempotent if already)
     core::sync::atomic::fence(Ordering::Release);
 
     self.stamps[idx].store(stamp, Ordering::Relaxed);
@@ -479,9 +504,9 @@ fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
         slot.data[i].store(*w, Ordering::Relaxed);
     }
 
-    slot.seq.store(s.wrapping_add(2), Ordering::Release);   // -> even, publishes data
+    slot.seq.store(s.wrapping_add(1), Ordering::Release);   // -> even, publishes data
     self.rec.head.store(h + 1, Ordering::Release);          // publishes the sample
-    self.claim.heartbeat.fetch_add(1, Ordering::Relaxed);
+    self.claim.heartbeat.store(h + 1, Ordering::Relaxed);   // single writer: a store, not an RMW
     Ok(())
 }
 ```
