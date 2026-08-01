@@ -487,6 +487,62 @@ is not a constant; it is a step function of `capacity × 8 bytes` against L1d.
 per-*step*, not per-call, so the identity-plan floor cannot contain it. The two
 O(depth) scans in `Plan::at` — `check_domain` → `has_dynamic`, and
 `first_dynamic_edge` — have exactly that shape, and both are pure functions of
-the compiled plan. §13 will record what removing them actually returned, since
-this attribution is a hypothesis about the residual and not yet a measurement of
-it.
+the compiled plan. §13 records what removing them actually returned.
+
+---
+
+## 13. The two O(depth) scans were not the residual
+
+**Verdict: falsified.** Removing both scans moved nothing.
+
+`Plan::at` computed `has_dynamic` and `first_dynamic_edge` on every call, each an
+O(`len`) walk of a 1 KiB `[Step; MAX_DEPTH]` array — 28 steps of scanning on a
+depth-14 lookup, before folding anything. `first_dynamic_edge`'s own doc comment
+called it "an O(plan length) scan … loop-invariant" and hoisted it for the batch
+path while the scalar path kept paying it. Both are functions of the compiled
+steps, so `Plan::new` now derives them once (`dyn_count`, `first_dyn`).
+
+`bench_ab` over the depth sweep, pinned, idle host:
+
+| depth | before | after | verdict |
+|---|---|---|---|
+| 1 | 77.6 | 75.6 | noise |
+| 2 | 155.1 | 155.4 | noise |
+| 3 | 228.5 | 228.5 | noise |
+| 4 | 299.2 | 298.6 | noise |
+| 6 | 440.1 | 435.7 | noise |
+
+**Every row is noise.** The reasoning was the same shape §11 diagnoses — a
+plausible mechanism (28 iterations! 1 KiB!) reasoned about instead of measured.
+An out-of-order core hides a pair of predictable, non-faulting scans completely
+behind memory-bound work that is already in flight.
+
+**It is kept anyway, and the reason is not performance.** It is the same amount
+of code, it puts the derivation in one place where a test can pin it against a
+fresh scan, and `dyn_count` is the *dynamic-step count* that `docs/PHASE1.md`
+§11.3 needs a row to state. Recorded here so nobody re-derives the expectation.
+
+### So what *is* the residual?
+
+Measured rather than guessed this time. `step_cost` gained a **fold replica**: a
+harness-side copy of `fold_at` that walks the same step array through the same
+`match` and the same `?`, calling the same primitives. Where it lands separates
+the two candidates.
+
+| depth | predicted | fold replica | measured | walk (replica − pred.) | context (meas. − replica) |
+|---|---|---|---|---|---|
+| 1 | 67.2 | 68.1 | 77.0 | 0.9 | 8.9 |
+| 2 | 130.7 | 146.0 | 155.0 | 15.4 | 9.0 |
+| 3 | 194.2 | 211.6 | 229.3 | 17.4 | 17.7 |
+| 4 | 257.6 | 275.3 | 299.3 | 17.7 | 24.0 |
+| 6 | 384.6 | 407.3 | 434.1 | 22.7 | 26.8 |
+
+Roughly **half the residual is the step-array walk itself** — reproducible in the
+harness, so it is a property of the loop and not of `tf_tree_core` — and **half is
+codegen context** that no rearrangement of the harness reproduces: inlining
+decisions and register pressure inside the real fold.
+
+That split is what makes Lever 2 the right next move rather than another
+arithmetic win. It attacks both halves at once: restructuring locate /
+interpolate / compose replaces the per-step walk with three tighter loops *and*
+changes the inlining context that the other half lives in.

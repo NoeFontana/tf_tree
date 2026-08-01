@@ -310,6 +310,62 @@ fn t_guard_sample(view: &ArenaView<'_>, edges: &[EdgeId], stamps: &[i64]) -> f64
     })
 }
 
+/// `fold_at`, replicated in the harness: iterate the plan's `[Step; MAX_DEPTH]`
+/// array, match the discriminant, sample, propagate with `?`, compose.
+///
+/// This exists to split the residual. [`t_guard_sample`] measures the sampling
+/// work in a tight loop over one edge; the real fold does the same work while
+/// walking a 1 KiB step array through a `match` and a `?` on every step. If this
+/// replica lands on `Plan::at`'s measured number, the residual **is** that walk.
+/// If it lands on the prediction instead, the residual is codegen context —
+/// inlining and register pressure inside `tf_tree_core` — and no rearrangement
+/// of the harness can find it.
+fn t_fold_replica(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps: &[i64]) -> f64 {
+    median_ns(stamps.len(), || {
+        let mut acc = 0.0;
+        for &t in stamps {
+            let mut iso = Iso3::IDENTITY;
+            let mut ok = true;
+            for step in plan.steps() {
+                iso = match step {
+                    Step::Static(m) => iso * *m,
+                    Step::Dyn { edge, inverted } => {
+                        let Some((interp, ring)) = view.sampler(*edge) else {
+                            ok = false;
+                            break;
+                        };
+                        let r = match InterpPolicy::from_u8(interp) {
+                            InterpPolicy::LerpSlerp => {
+                                ring.sample::<LerpSlerp>(black_box(t), ExtrapPolicy::Error)
+                            }
+                            InterpPolicy::ScLerp => {
+                                ring.sample::<ScLerp>(black_box(t), ExtrapPolicy::Error)
+                            }
+                        };
+                        match r {
+                            Ok(p) => {
+                                if *inverted {
+                                    iso.mul_inv(&p)
+                                } else {
+                                    iso * p
+                                }
+                            }
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                };
+            }
+            if ok {
+                acc += iso.t.x;
+            }
+        }
+        acc
+    })
+}
+
 /// The whole thing — `Plan::at`, which is what the terms above must sum to.
 fn t_plan_at(tree: &Tree, target: &str, source: &str, stamps: &[i64]) -> f64 {
     let t = tree.frame(target).unwrap();
@@ -463,8 +519,8 @@ fn main() {
         guard_sample + compose
     );
     println!(
-        "\n{:>7} {:>12} {:>12} {:>12} {:>12} {:>14}",
-        "depth", "measured", "predicted", "residual", "resid/step", "resid % of ns"
+        "\n{:>7} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "depth", "measured", "predicted", "residual", "resid/step", "fold replica", "unexplained"
     );
 
     let per_step = guard_sample + compose;
@@ -477,11 +533,19 @@ fn main() {
         let residual = measured - predicted;
         let rps = residual / d as f64;
         resid_per_step.push(rps);
+
+        // The same plan, folded by the harness's own replica of `fold_at`.
+        let t = tree.frame(&names[d]).unwrap();
+        let s = tree.frame(&names[0]).unwrap();
+        let pl = tree.plan(t, s).unwrap();
+        let g = tree.guard();
+        let replica = t_fold_replica(g.view(), &pl, &between);
+
         println!(
-            "{d:>7} {measured:>12.1} {predicted:>12.1} {residual:>12.1} {rps:>12.2} {:>13.1}%",
-            100.0 * residual / measured
+            "{d:>7} {measured:>12.1} {predicted:>12.1} {residual:>12.1} {rps:>12.2} {replica:>12.1} {:>12.1}",
+            measured - replica
         );
-        rows.push((d, measured, predicted, residual));
+        rows.push((d, measured, predicted, residual, replica));
     }
 
     // A residual that is roughly constant per step is a *per-step* cost the
@@ -493,17 +557,20 @@ fn main() {
         "\nresidual per step across depths 1..6: {lo:.2} .. {hi:.2} ns  (spread {:.2})",
         hi - lo
     );
-    println!(
-        "  A residual that is flat per *step* is a per-step cost outside the three primitives."
-    );
-    println!(
-        "  `Plan::at`'s two O(depth) scans -- check_domain -> has_dynamic, and first_dynamic_edge"
-    );
-    println!("  -- are exactly that shape, and the identity-plan floor cannot see them.");
+    println!("  `fold replica` walks the same [Step; MAX_DEPTH] array through the same match and");
+    println!("  the same `?` as `fold_at`, calling the same primitives. Where it lands says what");
+    println!("  the residual is:");
+    println!("    replica ~= measured   -> the residual IS the step-array walk, and is attackable");
+    println!("    replica ~= predicted  -> the residual is codegen context inside tf_tree_core");
 
     if let Some(path) = json {
         let mut run = Run::begin(1);
         let mut primitives = RunRow::new("step_cost", "chain", "tf_tree", "primitives");
+        // **Directional metrics only.** `dispatch_ns` is deliberately not in
+        // this list: it is a derived *difference* that measures ~0, and giving a
+        // near-zero quantity a direction plus a 10% relative tolerance makes the
+        // differ report a 0.5 ns wobble as a 46% regression — which it did, on
+        // the first A/B run. It is emitted below as informational instead.
         for (k, v) in [
             ("sampler_ns", sampler),
             ("read_slot_ns", read_slot),
@@ -514,18 +581,19 @@ fn main() {
             ("fixed_per_call_ns", fixed),
             ("bracket_ns", bracket),
             ("interp_in_context_ns", interp),
-            ("dispatch_ns", dispatch),
             ("sample_hold_ns", sample_hold),
             ("ring_preamble_ns", preamble),
         ] {
             primitives = primitives.metric(Metric::new(k, v, "ns").lower_is_better(0.10));
         }
+        primitives = primitives.metric(Metric::new("dispatch_ns", dispatch, "ns"));
         run.push(primitives);
 
-        for (d, measured, predicted, residual) in rows {
+        for (d, measured, predicted, residual, replica) in rows {
             run.push(
                 RunRow::new("step_cost", "chain", "tf_tree", format!("depth={d}"))
                     .metric(Metric::new("lookup_ns", measured, "ns").lower_is_better(0.10))
+                    .metric(Metric::new("fold_replica_ns", replica, "ns").lower_is_better(0.10))
                     .metric(Metric::new("predicted_ns", predicted, "ns"))
                     .metric(Metric::new("residual_ns", residual, "ns"))
                     .metric(Metric::new(

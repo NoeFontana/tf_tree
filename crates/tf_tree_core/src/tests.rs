@@ -1463,3 +1463,97 @@ fn an_empty_ring_is_no_data_not_no_segment() {
         Err(LookupError::NoData { .. })
     ));
 }
+
+/// The two fields `Plan::new` derives must always equal what a fresh scan of the
+/// plan's own steps produces.
+///
+/// `Plan::at` used to compute both on every call — once through `check_domain`
+/// → `has_dynamic`, once for `note`'s attribution — each an O(`len`) scan over a
+/// 1 KiB step array. Storing them at compile time removed both from the scalar
+/// hot path, and bought in exchange a value that can go *stale* with respect to
+/// the steps it describes. Nothing else in the type can catch that, so this
+/// does, across the four shapes whose answers differ.
+///
+/// The `== 1` rule in `first_dynamic_edge` is the subtle one: a plan crossing
+/// several dynamic edges must credit **no** edge (`EdgeId(0)`), because
+/// attributing a multi-edge plan's success to one of them would put a number in
+/// `doctor`'s table meaning something different from every other number in the
+/// same column.
+///
+/// Mutants this kills, checked by making each edit and watching it fail:
+/// `first_dynamic_edge` testing `>= 1` instead of `== 1`, and `dyn_count` never
+/// incremented.
+///
+/// Assigning `first_dyn` on *every* dynamic step rather than only the first is
+/// an **equivalent** mutant — the whole suite still passes with it applied —
+/// because `first_dyn` is only ever read when `dyn_count == 1`, where the first
+/// and the last dynamic step are the same one. Recorded so nobody reads the
+/// field name as a guarantee the tests enforce; the `if dyn_count == 0` guard is
+/// there for clarity, not for correctness.
+#[test]
+fn plan_derived_fields_match_a_fresh_scan() {
+    let layout = ArenaLayout::new(8, 4, alloc::vec![4, 4, 4, 4]).unwrap();
+    let arena = HeapArena::new(&layout, 7, 0, [0u8; 16]);
+    let view = ArenaView::new(&arena);
+    let x = view.intern("x").unwrap();
+    let y = view.intern("y").unwrap();
+    let z = view.intern("z").unwrap();
+    view.topology().set_parent(y, x.get(), 1).unwrap();
+    view.topology().set_parent(z, y.get(), 2).unwrap();
+
+    // The `edge_meta` closure is the caller's, so a plan's steps can be forced
+    // dynamic or static without declaring records for either.
+    // `&ArenaView` is `Copy`, so the inner `move` copies the borrow rather than
+    // consuming the view — which is what lets `meta` be called more than once.
+    let vref = &view;
+    let meta = move |kind: crate::edge::EdgeKind| {
+        move |eid: EdgeId| {
+            vref.edge(eid).map(|e| crate::plan::EdgeMeta {
+                kind,
+                domain: e.domain,
+                static_pose: Iso3::from_bits(&e.static_pose),
+            })
+        }
+    };
+    let dynamic = crate::edge::EdgeKind::Dynamic;
+    let stat = crate::edge::EdgeKind::Static;
+
+    for (label, plan) in [
+        (
+            "identity",
+            crate::plan::compile(&view.topology(), meta(dynamic), x, x).unwrap(),
+        ),
+        (
+            "all static",
+            crate::plan::compile(&view.topology(), meta(stat), x, z).unwrap(),
+        ),
+        (
+            "one dynamic edge",
+            crate::plan::compile(&view.topology(), meta(dynamic), x, y).unwrap(),
+        ),
+        (
+            "two dynamic edges",
+            crate::plan::compile(&view.topology(), meta(dynamic), x, z).unwrap(),
+        ),
+    ] {
+        let (stored, scanned) = plan.derived_vs_scan_for_test();
+        assert_eq!(
+            stored, scanned,
+            "{label}: stored fields disagree with a scan"
+        );
+    }
+
+    // The shapes above are only a guard if they actually differ, so pin the
+    // answers themselves — otherwise a `Plan::new` that derived nothing at all
+    // would still agree with a scan of a plan that had no dynamic steps.
+    let one = crate::plan::compile(&view.topology(), meta(dynamic), x, y).unwrap();
+    assert_eq!(one.derived_vs_scan_for_test().0, (true, EdgeId(1)));
+    let two = crate::plan::compile(&view.topology(), meta(dynamic), x, z).unwrap();
+    assert_eq!(
+        two.derived_vs_scan_for_test().0,
+        (true, EdgeId(0)),
+        "a plan crossing two dynamic edges must credit no edge"
+    );
+    let none = crate::plan::compile(&view.topology(), meta(stat), x, z).unwrap();
+    assert_eq!(none.derived_vs_scan_for_test().0, (false, EdgeId(0)));
+}
