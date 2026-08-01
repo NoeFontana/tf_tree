@@ -151,34 +151,21 @@ impl MappedArena {
         .map_err(ShmError::Create)?;
         ftruncate(&fd, len as u64).map_err(ShmError::Truncate)?;
 
-        // MAP_POPULATE prefaults the whole arena. `docs/PHASE2.md` §7.1 wants it
-        // for a reason that matters more than throughput: without it the *first*
-        // touch of each page takes a fault, so the very first lookup after
-        // attach — often inside a control loop's first iteration — pays a
-        // page-fault storm that never shows up in a steady-state benchmark.
+        // **No `MAP_POPULATE`** — see `unsafe_map`, which is where that decision
+        // and its measurement live. `docs/PHASE2.md` §7.1 is NORMATIVE that
+        // population happens at declaration granularity; mapping the whole arena
+        // eagerly charged 66.3 MiB of RSS against 66.1 MiB declared.
+        // `MappedArena::populate_hot` puts back exactly the pages that are read.
         let base = unsafe_map(len, ProtFlags::READ | ProtFlags::WRITE, &fd)?;
 
-        // SAFETY: `base` addresses `len` freshly zeroed bytes (a memfd is
-        // zero-filled and was just sized), page-aligned hence 64-byte aligned,
-        // and no other mapping of this fd exists yet, so this call uniquely owns
-        // the region.
-        unsafe {
-            write_header_at(
-                base.as_ptr(),
-                len,
-                layout,
-                creator_pid,
-                owner_start_time,
-                boot_id,
-                instance_uuid()?,
-            )
-        };
-
-        // Step 5, the load-bearing one. SEAL itself prevents any future seal
-        // being added, so a peer cannot later add F_SEAL_WRITE and freeze the
-        // writer out.
-        fcntl_add_seals(&fd, REQUIRED_SEALS | SealFlags::SEAL).map_err(ShmError::Seal)?;
-
+        // **Take ownership of the mapping before the first fallible step.** Every
+        // `?` below returns early, and until this value exists there is no `Drop`
+        // to `munmap`: a failed `getrandom` or `F_ADD_SEALS` would strand the
+        // segment's address space, and — because the mapping holds its own
+        // reference to the memfd inode — its committed pages too, for the life of
+        // the process. Dropping `fd` does not release them. The whole reason
+        // `MappedArena` owns the mapping is that `Drop` unmaps it exactly once;
+        // the construction was simply on the wrong side of the fallible steps.
         let arena = MappedArena {
             owner_pid: rustix::process::getpid(),
             base,
@@ -186,6 +173,29 @@ impl MappedArena {
             fd,
             writable: true,
         };
+
+        let uuid = instance_uuid()?;
+        // SAFETY: `arena.base` addresses `len` freshly zeroed bytes (a memfd is
+        // zero-filled and was just sized), page-aligned hence 64-byte aligned,
+        // and no other mapping of this fd exists yet, so this call uniquely owns
+        // the region.
+        unsafe {
+            write_header_at(
+                arena.base.as_ptr(),
+                len,
+                layout,
+                creator_pid,
+                owner_start_time,
+                boot_id,
+                uuid,
+            )
+        };
+
+        // Step 5, the load-bearing one. SEAL itself prevents any future seal
+        // being added, so a peer cannot later add F_SEAL_WRITE and freeze the
+        // writer out.
+        fcntl_add_seals(&arena.fd, REQUIRED_SEALS | SealFlags::SEAL).map_err(ShmError::Seal)?;
+
         arena.advise();
         Ok(arena)
     }
@@ -241,9 +251,6 @@ impl MappedArena {
         Ok(arena)
     }
 
-    /// Apply the mapping policy from `docs/PHASE2.md` §7. Both calls are
-    /// best-effort: a kernel without transparent huge pages, or a mapping the
-    /// kernel declines to mark, is not a reason to fail an attach.
     /// Fault in `[offset, offset + len)` of this arena, up front.
     ///
     /// # Why this is not `MADV_WILLNEED`
@@ -346,6 +353,8 @@ impl MappedArena {
     /// | participant table | all (8 KiB, and every liveness check walks it) |
     /// | edge table | `edge_count` records |
     /// | stamp + pose arenas | all — under `0004` they are sized to the declared rings exactly |
+    /// | edge counters | `edge_count` records — written by `Guard::drop` on every read batch |
+    /// | participant counters | all (8 KiB) — same path, keyed by the reader's own slot |
     ///
     /// The headroom tails are what this leaves cold, and they are the whole
     /// win: on the measured arena above, 66 MiB of it.
@@ -381,8 +390,25 @@ impl MappedArena {
         self.populate(h.edge_table_off as usize, edges * 128);
         self.populate(h.stamp_arena_off as usize, h.stamp_slots as usize * 8);
         self.populate(h.pose_arena_off as usize, h.pose_slots as usize * 64);
+
+        // v3's counter regions (`docs/PHASE5.md` §5.2). These are not
+        // diagnostics-only pages that a `top` invocation happens to touch:
+        // `Guard::drop` does a `fetch_add` into `edge_counters` at the end of
+        // every read batch and `note_err` writes there on every failure, so they
+        // are on the *lookup* path of any read-write participant — exactly the
+        // pages §7.1 exists to warm. Left out, an attaching process takes ~34
+        // minor faults at 1-3 µs each inside a control loop's first iterations,
+        // against a 150 ns p50 budget.
+        self.populate(h.edge_counters_off as usize, edges * 128);
+        self.populate(
+            h.participant_counters_off as usize,
+            h.max_participants as usize * 128,
+        );
     }
 
+    /// Apply the mapping policy from `docs/PHASE2.md` §7. Both calls are
+    /// best-effort: a kernel without transparent huge pages, or a mapping the
+    /// kernel declines to mark, is not a reason to fail an attach.
     fn advise(&self) {
         // MADV_DONTFORK is the easy one to forget (§7.3) and the consequences
         // are subtle: a forked child would otherwise inherit the mapping and
@@ -706,6 +732,110 @@ mod tests {
         let attached = MappedArena::attach(fd, AttachMode::ReadOnly).unwrap();
 
         assert_eq!(attached.header().instance_uuid, uuid);
+    }
+
+    /// **The seal check is the whole `memfd`-not-`shm_open` argument**, and it
+    /// runs before the segment is mapped: once mapped, any fd holder could
+    /// `ftruncate` it and every subsequent read would fault with `SIGBUS` from
+    /// inside a lookup, which a library cannot recover from.
+    ///
+    /// Mutant: delete the `seals.contains(REQUIRED_SEALS)` guard in `attach` ⇒
+    /// the unsealed case below maps happily and this fails. Nothing else in the
+    /// workspace exercises it — every other test attaches to a segment `create`
+    /// has just sealed for it.
+    #[test]
+    fn an_unsealed_or_undersized_segment_is_refused_before_it_is_mapped() {
+        let len = fixture().total_size() as u64;
+
+        // No `ALLOW_SEALING`, so the segment can never be sealed and a peer
+        // could shrink it under us.
+        let raw = memfd_create(c"tf_tree.unsealed", MemfdFlags::CLOEXEC).unwrap();
+        ftruncate(&raw, len).unwrap();
+        let refused = MappedArena::attach(raw, AttachMode::ReadOnly).err();
+        assert_eq!(refused, Some(ShmError::Unsealed));
+
+        // Sealed, but too small to hold a header — so the header cannot even be
+        // read to find out what the segment claims to be.
+        let tiny = memfd_create(
+            c"tf_tree.tiny",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        ftruncate(&tiny, 64).unwrap();
+        fcntl_add_seals(&tiny, REQUIRED_SEALS | SealFlags::SEAL).unwrap();
+        let refused = MappedArena::attach(tiny, AttachMode::ReadOnly).err();
+        assert_eq!(refused, Some(ShmError::TooSmall));
+    }
+
+    /// **`docs/PHASE2.md` §11.2 scenario 4**: a segment from a different build
+    /// is rejected by value, naming both sides.
+    ///
+    /// Each case is a single-field edit to an otherwise perfectly good segment,
+    /// which is the shape of the real failure: the same binary, rebuilt. Mutant:
+    /// drop any one of the three comparisons in `validate_arena_header` ⇒ the
+    /// corresponding case here reports `None` or the next error down, and fails.
+    #[test]
+    fn attach_refuses_a_segment_this_build_cannot_read() {
+        type Poke = fn(&mut ArenaHeader);
+        let cases: [(Poke, ShmError); 3] = [
+            (|h| h.magic ^= 1, ShmError::BadMagic),
+            (
+                |h| h.format_version ^= 0x5555,
+                ShmError::VersionMismatch {
+                    found: FORMAT_VERSION ^ 0x5555,
+                    expected: FORMAT_VERSION,
+                },
+            ),
+            (
+                |h| h.layout_hash ^= 0x5555,
+                ShmError::LayoutMismatch {
+                    found: layout_hash() ^ 0x5555,
+                    expected: layout_hash(),
+                },
+            ),
+        ];
+
+        for (poke, want) in cases {
+            let owner = create();
+            // SAFETY: `owner` is this test's own read-write mapping of a segment
+            // no other process holds, and its base is a live, page-aligned
+            // (hence 64-byte aligned), initialized `ArenaHeader`. No other
+            // reference to it is live across this call.
+            unsafe { poke(&mut *owner.base().cast::<ArenaHeader>()) };
+            let fd = rustix::io::fcntl_dupfd_cloexec(owner.as_raw_fd(), 0).unwrap();
+            let refused = MappedArena::attach(fd, AttachMode::ReadOnly).err();
+            assert_eq!(refused, Some(want));
+        }
+    }
+
+    /// `CName::as_cstr`'s `from_bytes_with_nul_unchecked` requires **exactly
+    /// one** NUL, at the end — and `MappedArena::create` takes the name from an
+    /// arbitrary caller (`tf_tree::TreeBuilder::build_shared` passes it
+    /// straight through), so `create("a\0b")` is reachable public API and this
+    /// truncation is the sole guarantor of that precondition.
+    ///
+    /// Mutant: drop the interior-NUL truncation in `CName::new` ⇒ the buffer
+    /// holds two NULs, the `unsafe` becomes unsound, and the `"a\0b"` case
+    /// fails. Mutant: use `CAP` instead of `CAP - 1` for the length bound ⇒ the
+    /// terminator is overwritten and the long case fails.
+    #[test]
+    fn a_segment_name_is_always_exactly_one_nul_terminated_string() {
+        for (input, want) in [
+            ("tf_tree.default", "tf_tree.default"),
+            ("", ""),
+            ("a\0b", "a"),
+            ("\0leading", ""),
+        ] {
+            let n = CName::new(input);
+            assert_eq!(n.as_cstr().to_bytes(), want.as_bytes(), "{input:?}");
+        }
+
+        let long = "x".repeat(4 * CName::CAP);
+        let n = CName::new(&long);
+        assert_eq!(n.as_cstr().to_bytes().len(), CName::CAP - 1);
+        // And the truncated name still reaches the kernel, rather than being
+        // refused: the whole point of truncating instead of erroring.
+        MappedArena::create(&long, &fixture(), 0, 0, [0; 16]).unwrap();
     }
 
     /// Adding a field must not have moved the segment's size or its hash, or

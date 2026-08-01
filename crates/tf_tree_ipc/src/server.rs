@@ -64,6 +64,9 @@ pub struct OwnerServer {
     owner_pid: u32,
     /// The fork generation this server bound its socket in — see `Drop`.
     fork_gen: u64,
+    /// `(st_dev, st_ino)` of the socket file this server published, captured
+    /// from the *path* right after the `rename` — see `unlink_if_still_ours`.
+    bound: (u64, u64),
 }
 
 /// Ask a running [`OwnerServer`] to stop.
@@ -142,6 +145,16 @@ impl OwnerServer {
             raw_os_error: e.raw_os_error().unwrap_or(0),
         })?;
 
+        // Identify the file just published, so teardown can tell it apart from a
+        // successor's. It must be `stat` on the *path*: `fstat` on the listener
+        // returns its `sockfs` inode, which shares no device with any filesystem
+        // and so never compares equal to the bound path (measured: `dev=8` for
+        // the listener against `dev=2049` for the path on tmpfs).
+        #[allow(clippy::unnecessary_cast)]
+        let bound = rustix::fs::stat(sock_path)
+            .map(|s| (s.st_dev as u64, s.st_ino as u64))
+            .map_err(io)?;
+
         let shutdown = rustix::event::eventfd(
             0,
             rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
@@ -149,6 +162,7 @@ impl OwnerServer {
         .map_err(io)?;
 
         Ok(OwnerServer {
+            bound,
             listener,
             shutdown,
             sock_path: sock_path.to_path_buf(),
@@ -244,7 +258,9 @@ impl OwnerServer {
                         return Ok(());
                     }
                     TOKEN_LISTENER => {
-                        if let Ok((sock, slot)) = self.accept_one(segment, &mut assign) {
+                        if let Ok((sock, slot)) =
+                            self.accept_one(segment, &mut assign, &mut on_hangup)
+                        {
                             // Reuse a departed client's index rather than always
                             // appending. An owner runs for the life of the robot
                             // and §11.2 cycles attach/detach 10^4 times; an
@@ -272,6 +288,14 @@ impl OwnerServer {
                                 } else {
                                     clients[idx] = Some((sock, slot));
                                 }
+                            } else {
+                                // `epoll::add` can fail with ENOSPC once
+                                // `fs.epoll.max_user_watches` is reached, or
+                                // ENOMEM under pressure. An unwatched connection
+                                // produces no hangup event, so the same leak as
+                                // the `sendmsg` path above applies: give the slot
+                                // back rather than granting it forever.
+                                on_hangup(slot);
                             }
                         }
                     }
@@ -294,13 +318,20 @@ impl OwnerServer {
     ///
     /// Returns the connection and the slot granted, or an error if the client
     /// was rejected or misbehaved — in which case its socket is dropped here.
-    fn accept_one<A>(
+    ///
+    /// `on_hangup` is the caller's slot-release callback, the same one [`Self::serve`]
+    /// runs when a watched participant dies. It is needed here because `assign`
+    /// reserves the slot *before* the response is sent: a failure after that
+    /// point produces a slot nobody holds and nobody will ever hang up on.
+    fn accept_one<A, H>(
         &self,
         segment: BorrowedFd<'_>,
         assign: &mut A,
+        on_hangup: &mut H,
     ) -> Result<(OwnedFd, u32), IpcError>
     where
         A: FnMut(&HelloRequest) -> Result<u32, HelloStatus>,
+        H: FnMut(u32),
     {
         let sock = accept_with(&self.listener, SocketFlags::CLOEXEC).map_err(io)?;
 
@@ -360,13 +391,25 @@ impl OwnerServer {
             cmsg.push(SendAncillaryMessage::ScmRights(&granted));
         }
 
-        sendmsg(
+        if let Err(e) = sendmsg(
             &sock,
             &[std::io::IoSlice::new(&bytes)],
             &mut cmsg,
             SendFlags::empty(),
-        )
-        .map_err(io)?;
+        ) {
+            // `assign` has already reserved the slot, and this send is where a
+            // client that died mid-handshake shows up: `SIGKILL`ed between its
+            // own `sendmsg` and `recvmsg`, the owner's send returns `EPIPE`.
+            // Nothing will ever hang up on a connection the peer never received,
+            // so the slot must go back here or it stays granted for the lifetime
+            // of the owner. Sixty-four such deaths — one supervised node in a
+            // crash loop — would otherwise wedge an empty arena at
+            // `NoParticipantSlots` until the owner itself is restarted.
+            if status == HelloStatus::Ok {
+                on_hangup(slot);
+            }
+            return Err(io(e));
+        }
 
         if status == HelloStatus::Ok {
             Ok((sock, slot))
@@ -430,21 +473,31 @@ impl OwnerServer {
     /// silently make the new owner unreachable while it happily keeps serving a
     /// socket no client can find.
     ///
-    /// Comparing `(st_dev, st_ino)` of the listener against what the path names
-    /// today closes it: after a successor's `rename` the inodes differ, so this
-    /// leaves the path alone. Not perfectly atomic — the successor could rename
-    /// between the `stat` and the `unlink` — but that window is a single
-    /// syscall wide, against a window that is otherwise the entire lifetime of
-    /// the process, and §3.9 already makes a stale socket path a state every
-    /// client tolerates.
+    /// Comparing the identity this server *published* (`bound`, captured from
+    /// the path at bind time) against what the path names today closes it:
+    /// after a successor's `rename` the inodes differ, so this leaves the path
+    /// alone. Not perfectly atomic — the successor could rename between the
+    /// `stat` and the `unlink` — but that window is a single syscall wide,
+    /// against a window that is otherwise the entire lifetime of the process,
+    /// and §3.9 already makes a stale socket path a state every client
+    /// tolerates.
+    ///
+    /// **This compares against `bound`, not against `fstat(listener)`.** It used
+    /// to do the latter, which made the whole function a no-op: a listening
+    /// socket's fd resolves to an inode in `sockfs`, which shares no device with
+    /// the filesystem holding the path, so the equality could never hold on any
+    /// kernel. The socket was therefore *never* unlinked, not even on a clean
+    /// stop, and the successor protection this comment argues for had never run.
+    /// Nothing failed either way, which is how it survived — hence the two tests
+    /// below, which fail for an unconditional `remove_file` and for the old
+    /// `fstat` form respectively.
     fn unlink_if_still_ours(&self) {
-        let Ok(mine) = rustix::fs::fstat(&self.listener) else {
-            return;
-        };
         let Ok(theirs) = rustix::fs::stat(&self.sock_path) else {
             return;
         };
-        if (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino) {
+        #[allow(clippy::unnecessary_cast)]
+        let theirs = (theirs.st_dev as u64, theirs.st_ino as u64);
+        if theirs == self.bound {
             let _ = std::fs::remove_file(&self.sock_path);
         }
     }
@@ -454,5 +507,92 @@ impl OwnerServer {
 fn io(e: rustix::io::Errno) -> IpcError {
     IpcError::HandshakeIo {
         raw_os_error: e.raw_os_error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn desc() -> SegmentDescriptor {
+        SegmentDescriptor {
+            format_version: 3,
+            layout_hash: 0xDEAD_BEEF,
+            arena_size: 4096,
+            instance_uuid: [0x5A; 16],
+            boot_id: [0xCD; 16],
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tf_tree_ipc_srv-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// **An outgoing owner must not unlink its successor's socket.**
+    ///
+    /// §3.5 lets a survivor inherit the owner role, and it publishes by
+    /// `rename`ing its own socket over the shared path. By the time the previous
+    /// owner winds down, that path names *somebody else's live listener* — and a
+    /// plain `remove_file` there makes the new owner unreachable while it keeps
+    /// serving a socket no client can find, with nothing reporting an error
+    /// anywhere.
+    ///
+    /// Mutants this kills: replacing `unlink_if_still_ours` with an
+    /// unconditional `remove_file` fails the second assertion; comparing
+    /// `fstat(listener)` against the path — the form this code shipped with —
+    /// fails the third, because a listening socket's inode lives in `sockfs` and
+    /// never matches the filesystem the path is on.
+    #[test]
+    fn winding_down_leaves_a_successors_socket_alone() {
+        let dir = scratch("succession");
+        let sock = dir.join("a.sock");
+
+        let first = OwnerServer::bind_at(&sock, desc(), 111).unwrap();
+        let first_ino = rustix::fs::stat(&sock).unwrap().st_ino;
+
+        // The heir takes over: same path, its own socket.
+        let second = OwnerServer::bind_at(&sock, desc(), 222).unwrap();
+        let heir_ino = rustix::fs::stat(&sock).unwrap().st_ino;
+        assert_ne!(first_ino, heir_ino, "the heir did not republish the path");
+
+        drop(first);
+        assert_eq!(
+            rustix::fs::stat(&sock).map(|s| s.st_ino).ok(),
+            Some(heir_ino),
+            "the outgoing owner unlinked its successor's socket"
+        );
+
+        // And the last owner *does* clean up after itself, so §3.9's stale path
+        // is a crash artefact rather than the normal outcome of a clean stop.
+        drop(second);
+        assert!(
+            rustix::fs::stat(&sock).is_err(),
+            "a cleanly-stopping owner must not leave its socket behind"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The pid-suffixed temporary `bind_at` renames from is an implementation
+    /// detail that must not survive the bind, or a runtime directory accumulates
+    /// one dead socket per owner that ever ran.
+    #[test]
+    fn binding_leaves_only_the_published_path() {
+        let dir = scratch("tmp-path");
+        let sock = dir.join("b.sock");
+        let server = OwnerServer::bind_at(&sock, desc(), 4242).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["b.sock"], "leftover files in {dir:?}");
+        assert_eq!(server.sock_path(), sock);
+        drop(server);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
