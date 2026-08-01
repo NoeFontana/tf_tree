@@ -760,3 +760,65 @@ nothing here. If that ever needs fixing, a smaller direct-mapped cursor array
 (4 entries, `k % 4`, tag-checked) would cut the initialisation and keep the win
 for shallow plans, at the cost of collisions on deep ones.
 
+---
+
+## 17. The cliff under a writer — the contention hypothesis is falsified, and §16 gets stronger
+
+§12 and §16 were both measured on a **quiescent** tree, which is not the deployed
+condition, and that left two open worries pointing opposite ways:
+
+* the cliff might get **worse** under a writer, because every push writes the
+  stamp cache lines a reader is probing — which would raise the value of every
+  footprint lever;
+* the **cursor might stop helping**, because its whole benefit is resuming into a
+  line that is still warm, and a writer is exactly what makes it cold.
+
+`contended_search` measures both. One dynamic edge, one reader asking at a fixed
+lag behind the newest stamp — what a consumer actually does, and what keeps the
+query inside a window the writer is sliding — and either zero or one writer
+publishing at the edge's nominal 1 kHz. **Zero out-of-window failures in every
+cell**, so the columns are comparable.
+
+Median ns/query, three runs, pinned to two cores:
+
+| capacity | stamps | fresh, quiet | fresh, +writer | cursor, quiet | cursor, +writer |
+|---|---|---|---|---|---|
+| 1 024 | 8 KiB | 9.7 – 9.9 | 9.6 – 9.7 | 5.3 – 5.4 | 5.4 – 5.5 |
+| 4 096 | 32 KiB | 10.8 – 11.5 | 10.8 – 11.5 | 5.4 – 5.5 | 5.4 |
+| 16 384 | 128 KiB | 11.7 – 18.1 | 11.7 – 17.5 | 5.4 | 5.4 – 5.5 |
+
+### Both worries are answered, and neither the way I expected
+
+**A writer costs the search essentially nothing.** The writer's multiplier is
+0.89× – 1.06× on every column — noise in both directions. The invalidation
+mechanism is real in principle and is simply not what a 1 kHz publisher does to a
+reader: one store per millisecond against a reader issuing tens of thousands of
+probes in the same interval.
+
+**The cursor's benefit survives contention entirely** — and in this access
+pattern it is *larger* than §16 measured, because §16 swept the whole window
+while a real consumer polls near the newest stamp. Here the cursor is worth
+**1.8× – 2.4×**.
+
+More striking than the ratio: **the cursor makes the search capacity-independent.**
+5.34 – 5.52 ns across a 16× range of ring capacity, quiescent or contended, while
+the fresh search climbs with it. The cliff is not merely reduced; for the pattern
+a consumer actually uses, it is gone.
+
+That is the strongest confirmation yet of §12's mechanism. If the cost were probe
+*count*, the cursor could not flatten it — a bigger ring is more probes either
+way. Only a locality explanation predicts a flat line.
+
+### What this does not cover
+
+One writer, on the **same edge** as the reader. That is deliberately the sharpest
+test of the invalidation hypothesis, because it is the only configuration where
+the writer touches the exact lines the reader probes. `docs/PHASE1.md` §11.2
+specifies *four* concurrent writers, but four writers necessarily sit on four
+different edges — a weaker test of this mechanism, and one `read_scaling`'s
+`+writers` group already covers for aggregate throughput.
+
+Higher publish rates are also unmeasured. A 1 kHz writer is one store per
+millisecond; a pathological publisher is not, and nothing here bounds where that
+starts to bite.
+
