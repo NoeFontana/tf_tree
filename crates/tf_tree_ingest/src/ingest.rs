@@ -564,7 +564,7 @@ pub fn survey(
                 frames.name(parent),
                 frames.name(child),
                 rec.pose,
-                &Publisher::Node(rec.topic.to_owned()),
+                &Publisher::Topic(rec.topic.to_owned()),
             ) {
                 StaticVerdict::Declare => out.edges[slot].static_pose = Some(rec.pose),
                 StaticVerdict::Idempotent => {}

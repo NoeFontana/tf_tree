@@ -214,7 +214,7 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
 /// it, and the code this replaced allocated twice on exactly that path.
 #[test]
 fn offer_does_not_allocate_for_its_table_lookups() {
-    let publisher = Publisher::Node("/ekf".to_string());
+    let publisher = Publisher::named(&tf_tree_bridge::gid_for_name("/ekf"), "/ekf");
 
     let declared = allocs_per_offer(&Sample::identity("odom", "base", 0), &publisher);
     let undeclared = allocs_per_offer(&Sample::identity("base", "lidar", 0), &publisher);

@@ -260,28 +260,19 @@ int run_tf_tree(const Args & args, const std::vector<Pair> & pairs)
 
   tf_tree_ros::BridgeOptions o;
   o.topology_toml = read_file(args.topology_path);
-  // **`last_writer_wins`, and it is a workaround for a real defect rather than
-  // a benchmark tuning knob.**
+  // **Defaults, including `first_writer_wins`.** An earlier revision of this
+  // file set `last_writer_wins` to work around a real defect: authority was
+  // keyed on the resolved node name rather than on the GID, so a publisher the
+  // graph renamed from `_NODE_NAME_UNKNOWN_` to its real name became a second
+  // publisher and `first_writer_wins` rejected it forever — 9 864 of 10 070
+  // transforms dropped here, and 100 % of lookups failing.
   //
-  // `tf_tree_bridge::Publisher` is keyed on the *resolved node name*, not on the
-  // GID. At bridge startup the graph cache has not resolved the publisher yet,
-  // so the first `/tf` messages are attributed to an unknown name; under the
-  // default `first_writer_wins` that unknown name becomes the edge's owner, and
-  // every later message — now correctly resolved to `/tf_bench_publisher` — is a
-  // *different* `Publisher` value and is rejected. Permanently, because
-  // `FirstWriterWins` never re-inserts the owner.
-  //
-  // Measured here on the first run of this harness: 10 070 transforms received,
-  // 187 applied, 9 864 dropped as authority conflicts, and 100 % of lookups
-  // failing — against a single publisher and a correctly declared topology.
-  //
-  // `last_writer_wins` recovers, because it re-inserts. The proper fix is to key
-  // authority on the GID, which is the identity that does not change, and that
-  // belongs in `tf_tree_bridge` rather than in a benchmark.
-  o.authority = tf_tree_ros::Authority::LastWriterWins;
-  // Everything else is default, deliberately: §9.3's "identical executor
-  // configuration" cuts both ways, and a bridge otherwise tuned for the
-  // benchmark would not be the bridge an operator deploys.
+  // That is fixed in `tf_tree_bridge` (identity is the GID; the name is
+  // presentation), so the benchmark runs the configuration an operator deploys.
+  // Reverting it here is also what keeps the fix honest: if the defect came
+  // back, this arm would report a `FAILING` row again.
+  // §9.3's "identical executor configuration" cuts both ways, and a bridge
+  // tuned for the benchmark would not be the bridge an operator deploys.
   tf_tree_ros::BridgeHandle bridge(node.get(), o);
 
   std::vector<tft_plan *> plans;

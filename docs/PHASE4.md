@@ -1010,6 +1010,48 @@ Log the negotiated QoS at startup and warn on any incompatibility event.
 
 **Degrade gracefully:** GID reporting varies across RMW implementations. On failure, attribute to `"<unknown publisher>"` and keep running — attribution is diagnostic value, never a correctness dependency.
 
+> **Amendment — the identity is the GID; the name is presentation. This was
+> implemented the other way round and it broke a real deployment.**
+>
+> "Match one against the other" above says which of the two is the identity, and
+> the implementation used the other one: `tf_tree_bridge::Publisher::Node` held a
+> `String` and `Authority` compared publishers by it. A node name is not stable.
+> `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an endpoint discovered before
+> its participant's node information arrives and corrects it on a later graph
+> walk, so one publisher is attributed twice under two names — and under §5.4's
+> default `FirstWriterWins` the placeholder took the edge and the corrected name
+> was then an intruder, permanently, because that policy never re-inserts.
+>
+> Measured, against **one** correctly configured publisher with a declared
+> topology: 10 070 transforms received, 187 applied, 9 864 dropped as authority
+> conflicts, 100 % of consumer lookups failing. Found by the §9.1 DDS comparison
+> in `crates/tf_tree_bench`, because its aggregator flags an arm whose lookups
+> mostly failed rather than reporting that arm's latencies.
+>
+> So, normatively:
+>
+> - **A publisher's identity is its GID.** `Publisher::Gid` carries the rendered
+>   GID as its identity and the node name as an `Option<String>` beside it;
+>   `PartialEq`, `Ord` and `Hash` read the identity alone. They are hand-written
+>   rather than derived, so that adding a field cannot silently rejoin the key.
+> - **Attribution updates a name, never an identity.** `tft_bridge_attribute`
+>   mutates the cache entry's name; it does not insert a new publisher.
+> - **A GID with no name is a distinct publisher.** This retires
+>   `Publisher::UnknownGid`, whose unit-variant blend the amendment above already
+>   named: on an RMW that reports GIDs but resolves no names, every publisher
+>   compared equal and §5.4's detection was silently off. Such a publisher now
+>   prints its GID, so a diagnostic about two of them fighting can distinguish
+>   them.
+> - **`Publisher::Unattributed` stays a unit variant**, for no GID at all. That
+>   is the case `0012`'s ladder is about, and collapsing it is the required
+>   direction: less attribution means less detection, never more stopping. This
+>   change only ever moves the distinct-publisher count *up*, so it cannot make
+>   the bridge stop where it previously did not — except by detecting a conflict
+>   that is real.
+> - Offline ingest has no middleware and therefore no GID; it identifies a
+>   publisher by the recording's topic (`Publisher::Topic`), which is stable for
+>   the length of a recording. A peer of `Gid`, not a degradation of it.
+
 > **Amendment — "never a correctness dependency" is a constraint on the decision
 > pipeline, not a description of it, and it was violated. It is now structural.**
 >

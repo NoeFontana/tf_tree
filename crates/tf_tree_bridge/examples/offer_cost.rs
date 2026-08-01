@@ -116,7 +116,7 @@ enum Mode {
 fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
     let cfg = TopologyConfig::parse(&topology(edges, style)).unwrap();
     let mut ingest = Ingest::new(&cfg);
-    let publisher = Publisher::Node("/ekf".to_string());
+    let publisher = Publisher::named(&tf_tree_bridge::gid_for_name("/ekf"), "/ekf");
 
     // **Built before the loop, and this is not a detail.** Assigning
     // `s.frame_id = p.clone()` inside the loop would put a `String` allocation
