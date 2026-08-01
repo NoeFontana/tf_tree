@@ -1020,22 +1020,19 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
         out.push(Finding::about(
             Tft::Tft016,
             "host",
-            match host.shmem_thp {
-                ShmemThp::Unknown => "/sys/kernel/mm/transparent_hugepage/shmem_enabled was \
-                     absent or unrecognised, so the huge-page policy for the live arena's \
-                     memfd mapping is unknown"
-                    .to_string(),
-                other => format!(
+            if host.shmem_thp == ShmemThp::Unknown {
+                "/sys/kernel/mm/transparent_hugepage/shmem_enabled was absent or \
+                 unrecognised, so the huge-page policy for the live arena's memfd \
+                 mapping is unknown"
+                    .to_string()
+            } else {
+                format!(
                     "shmem transparent huge pages are '{}', so MADV_HUGEPAGE on the arena's \
                      MAP_SHARED memfd does nothing and the live arena takes 4 KiB pages \
                      regardless of what transparent_hugepage/enabled says; set \
                      shmem_enabled to 'advise' to make PHASE5 §2.3's alignment count",
-                    match other {
-                        ShmemThp::Never => "never",
-                        ShmemThp::Deny => "deny",
-                        _ => "not honouring madvise",
-                    }
-                ),
+                    host.shmem_thp.name()
+                )
             },
         ));
     }

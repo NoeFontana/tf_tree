@@ -99,6 +99,24 @@ impl ShmemThp {
             ShmemThp::Always | ShmemThp::WithinSize | ShmemThp::Advise | ShmemThp::Force
         )
     }
+
+    /// The policy as the kernel spells it, for a diagnostic that quotes it back.
+    ///
+    /// Round-trips with [`parse_shmem_thp`], so the string a finding prints is
+    /// the string an operator can write into the sysfs file — which is the whole
+    /// point of quoting it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ShmemThp::Always => "always",
+            ShmemThp::WithinSize => "within_size",
+            ShmemThp::Advise => "advise",
+            ShmemThp::Never => "never",
+            ShmemThp::Deny => "deny",
+            ShmemThp::Force => "force",
+            ShmemThp::Unknown => "unknown",
+        }
+    }
 }
 
 /// The soft `RLIMIT_MEMLOCK`, in bytes.
@@ -301,6 +319,20 @@ mod tests {
         }
         for p in [ShmemThp::Never, ShmemThp::Deny, ShmemThp::Unknown] {
             assert!(!p.honours_madvise(), "{p:?} must not honour madvise");
+        }
+
+        // `name()` must round-trip through the parser: the finding quotes the
+        // policy back at the operator, and a string they cannot write into the
+        // sysfs file is worse than no string at all.
+        for p in [
+            ShmemThp::Always,
+            ShmemThp::WithinSize,
+            ShmemThp::Advise,
+            ShmemThp::Never,
+            ShmemThp::Deny,
+            ShmemThp::Force,
+        ] {
+            assert_eq!(parse_shmem_thp(&format!("[{}]", p.name())), p);
         }
     }
 

@@ -136,21 +136,33 @@ fn map_facts(addr: usize) -> MapFacts {
     out
 }
 
-/// The `/proc/vmstat` counter `key`, or `None` if absent.
+/// The `/proc/vmstat` counters named by `keys`, in order; `None` for any absent.
 ///
 /// **This is what separates the two ways a grant can be zero**, and without it
 /// the harness can only say "no huge pages" and leave the reader to guess:
 ///
-/// * `thp_file_fallback` rising ⇒ the kernel *tried* and could not find a
-///   contiguous 2 MiB block. That is memory fragmentation, and it is a host
-///   condition that comes and goes.
-/// * both counters flat ⇒ the kernel never tried at all. That is policy or a
-///   kernel that does not support it here — a permanent condition, and not
-///   something the arena can influence.
-fn vmstat(key: &str) -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
-    s.lines()
-        .find_map(|l| l.strip_prefix(key)?.trim().parse().ok())
+/// * `thp_*_fallback` rising ⇒ the kernel *tried* and could not find a
+///   contiguous 2 MiB block. That is memory fragmentation, a host condition that
+///   comes and goes.
+/// * every counter flat ⇒ the kernel never tried at all. That is policy, or a
+///   kernel that does not support it here — permanent, and not something the
+///   arena can influence.
+///
+/// Matches the **whole** field name rather than a prefix, and reads the file
+/// once. `/proc/vmstat` carries both `thp_fault_fallback` and
+/// `thp_fault_fallback_charge`, and the former is a strict prefix of the latter,
+/// so a `strip_prefix` match returns whichever the kernel happens to print
+/// first — a silently wrong number rather than a missing one.
+fn vmstat_all(keys: &[&str]) -> Vec<Option<u64>> {
+    let text = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    keys.iter()
+        .map(|key| {
+            text.lines().find_map(|l| {
+                let (name, value) = l.split_once(' ')?;
+                (name == *key).then(|| value.trim().parse().ok())?
+            })
+        })
+        .collect()
 }
 
 fn read_sysfs(path: &str) -> String {
@@ -290,7 +302,7 @@ fn main() {
         (EDGES as u64 * u64::from(SLOTS) * 72) / (1024 * 1024)
     );
 
-    let before: Vec<Option<u64>> = THP_COUNTERS.iter().map(|k| vmstat(k)).collect();
+    let before = vmstat_all(THP_COUNTERS);
 
     let (heap, names) = build(false);
     report(
@@ -313,8 +325,8 @@ fn main() {
         "{:>26} {:>10} {:>10} {:>10}",
         "counter", "before", "after", "delta"
     );
-    for (k, b) in THP_COUNTERS.iter().zip(before) {
-        let a = vmstat(k);
+    let after = vmstat_all(THP_COUNTERS);
+    for ((k, b), a) in THP_COUNTERS.iter().zip(before).zip(after) {
         match (b, a) {
             (Some(b), Some(a)) => println!("{k:>26} {b:>10} {a:>10} {:>10}", a - b),
             _ => println!("{k:>26} {:>10} {:>10} {:>10}", "-", "-", "-"),
