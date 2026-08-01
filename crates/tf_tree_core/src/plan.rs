@@ -912,6 +912,27 @@ impl Plan {
     ) -> Result<(&'s [Stamp<D>], &'s [Iso3]), LookupError> {
         self.check_generation(g)?;
         self.check_domain::<D>()?;
+        // Counted **once per call, not once per fold.** `subdivide` evaluates
+        // the plan up to `MAX_KNOTS` times for a single caller-visible lookup,
+        // and crediting each bisection separately would make this one entry
+        // point dominate `lookups_ok` — a number that means "lookups" everywhere
+        // else in `doctor`'s table. One call, one outcome.
+        self.note(
+            g,
+            self.first_dynamic_edge(),
+            self.fold_adaptive(g, span, tol, scratch),
+        )
+    }
+
+    /// [`Self::at_adaptive`]'s body, split out so the counter bracket wraps a
+    /// single expression.
+    fn fold_adaptive<'s, D: Domain>(
+        &self,
+        g: &Guard,
+        span: (Stamp<D>, Stamp<D>),
+        tol: ErrBound,
+        scratch: &'s mut AdaptiveScratch<D>,
+    ) -> Result<(&'s [Stamp<D>], &'s [Iso3]), LookupError> {
         scratch.stamps.clear();
         scratch.poses.clear();
 

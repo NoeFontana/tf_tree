@@ -139,21 +139,38 @@ impl OwnerServer {
         // it. Set it explicitly rather than depend on ambient state.
         rustix::fs::chmod(&tmp, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).map_err(io)?;
         listen(&listener, BACKLOG).map_err(io)?;
+
+        // Identify the file about to be published, so teardown can tell it apart
+        // from a successor's.
+        //
+        // **`stat` the temporary, before the rename — not the path, after it.**
+        // Two reasons, and the first is a correctness bug rather than a
+        // preference. `rename` preserves the inode, so both forms name the same
+        // file in the quiet case; but between our `rename` and a `stat` of the
+        // published path, a concurrent takeover may rename *its* socket over
+        // that path. `bound` would then hold the successor's identity, and this
+        // server's teardown would unlink a live successor's socket — precisely
+        // the failure `unlink_if_still_ours` exists to prevent, and one that only
+        // became reachable now that its comparison does something. `tmp` is
+        // pid-suffixed and this process just bound it, so nobody can substitute
+        // it. Second: a `stat` of the path also fails with `ENOENT` if somebody
+        // removes it in that window, failing a bind whose listener is up,
+        // listening, and correctly published.
+        //
+        // It cannot be `fstat` on the listener either: that returns the socket's
+        // `sockfs` inode, which shares no device with any filesystem and so never
+        // compares equal to the path (measured: `dev=8` against `dev=2049` on
+        // tmpfs). That form is what made this a no-op for the whole of its life.
+        #[allow(clippy::unnecessary_cast)]
+        let bound = rustix::fs::stat(&tmp)
+            .map(|s| (s.st_dev as u64, s.st_ino as u64))
+            .map_err(io)?;
+
         // Publish atomically: a client sees the old socket, or this one
         // listening, never a half-built one.
         std::fs::rename(&tmp, sock_path).map_err(|e| IpcError::HandshakeIo {
             raw_os_error: e.raw_os_error().unwrap_or(0),
         })?;
-
-        // Identify the file just published, so teardown can tell it apart from a
-        // successor's. It must be `stat` on the *path*: `fstat` on the listener
-        // returns its `sockfs` inode, which shares no device with any filesystem
-        // and so never compares equal to the bound path (measured: `dev=8` for
-        // the listener against `dev=2049` for the path on tmpfs).
-        #[allow(clippy::unnecessary_cast)]
-        let bound = rustix::fs::stat(sock_path)
-            .map(|s| (s.st_dev as u64, s.st_ino as u64))
-            .map_err(io)?;
 
         let shutdown = rustix::event::eventfd(
             0,
@@ -288,15 +305,29 @@ impl OwnerServer {
                                 } else {
                                     clients[idx] = Some((sock, slot));
                                 }
-                            } else {
-                                // `epoll::add` can fail with ENOSPC once
-                                // `fs.epoll.max_user_watches` is reached, or
-                                // ENOMEM under pressure. An unwatched connection
-                                // produces no hangup event, so the same leak as
-                                // the `sendmsg` path above applies: give the slot
-                                // back rather than granting it forever.
-                                on_hangup(slot);
                             }
+                            // **No `on_hangup` on the `epoll::add` failure path,
+                            // deliberately — the asymmetry with `accept_one`'s
+                            // `sendmsg` arm is the point.** There the response
+                            // never reached the client, so it never learned its
+                            // slot and cannot be holding it; releasing is free.
+                            // Here the handshake already *succeeded*: the client
+                            // holds `HelloStatus::Ok`, the slot number and the
+                            // segment fd. Releasing the grant would let the next
+                            // joiner be handed the same slot, and `register_at`
+                            // writes its identity record *before* taking the lock
+                            // byte — an ordering its own doc justifies by "nobody
+                            // else is racing us for *this* byte, because the owner
+                            // hands each client a different one". Breaking that
+                            // overwrites a live participant's record, leaving a
+                            // held slot naming the wrong pid, which is what makes
+                            // `ArenaHeldButUnreachable` point an operator at the
+                            // wrong process.
+                            //
+                            // So this leaks the slot, bounded at 64 and only under
+                            // ENOSPC/ENOMEM. That is strictly the better failure:
+                            // a slot nobody can use, rather than two participants
+                            // who disagree about who owns one.
                         }
                     }
                     token => {
@@ -443,12 +474,18 @@ impl OwnerServer {
 
 impl Drop for OwnerServer {
     fn drop(&mut self) {
-        // Never from a `fork` child. The listener fd is inherited, so it still
-        // `stat`s equal to the path — `unlink_if_still_ours` would conclude the
-        // socket is ours and remove the **parent's** live listening path, after
-        // which no client can find an owner that is still perfectly happy to
-        // serve one. The child's own fd closing is harmless: the description
-        // stays open in the parent.
+        // Never from a `fork` child. `bound` — the `(st_dev, st_ino)` this
+        // server published — is copied verbatim into the child, so the child's
+        // `unlink_if_still_ours` matches and removes the **parent's** live
+        // listening path, after which no client can find an owner that is still
+        // perfectly happy to serve one. The child's own fd closing is harmless:
+        // the description stays open in the parent.
+        //
+        // This rationale used to cite the inherited listener fd `stat`ing equal
+        // to the path. That was never true — a listening socket's inode is in
+        // `sockfs` — and it was the same mistake that made
+        // `unlink_if_still_ours` itself a no-op. The guard is still required;
+        // only its reason changed.
         //
         // **Coverage, stated plainly: no test fails when this check is
         // removed.** In this workspace an `OwnerServer` only ever lives on the
