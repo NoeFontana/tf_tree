@@ -396,6 +396,128 @@ fn t_fold_replica(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps:
     })
 }
 
+/// A **monotone** sweep across the retained window — one pass, never resetting.
+///
+/// [`swept_between`] cycles `k % (FILL - 2)`, so it wraps twice over `N` and a
+/// cursor would gallop backwards at each wrap. That is a fine model of random
+/// access and a bad model of a consumer, which polls forward in time. This is
+/// the forward-only case.
+fn monotone_between() -> Vec<i64> {
+    let span = FILL as i64 - 3;
+    (0..N as i64)
+        .map(|k| (1 + k * span / N as i64) * 1_000_000 + 500_000)
+        .collect()
+}
+
+/// `sample_from` — the galloping cursor — against `sample`, on a monotone sweep.
+///
+/// **This bounds the one lever the measurements actually point at.** §12 found
+/// the search is 34% of a step and that its cost is random probes into a stamp
+/// array too big for L1. A cursor does not make the array smaller; it makes the
+/// access *local*, resuming beside the previous answer instead of restarting at
+/// the window midpoint — so the probes land in the line the last query already
+/// pulled in.
+///
+/// `sample_from` already exists and is already wired into the batch path
+/// (`fold_at_cursors`, used by `at_many`/`at_adaptive`). The scalar `Plan::at`
+/// path does **not** use it and restarts a full binary search on every call.
+/// Giving it one needs somewhere to keep per-thread mutable state, which is a
+/// design question — so bound the prize before proposing anywhere to put it.
+fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
+    median_ns(stamps.len(), || {
+        let mut acc = 0.0;
+        let mut cursor = 0u64;
+        for &t in stamps {
+            if let Ok(p) =
+                ring.sample_from::<LerpSlerp>(black_box(t), ExtrapPolicy::Error, &mut cursor)
+            {
+                acc += p.t.x;
+            }
+        }
+        acc
+    })
+}
+
+/// The fold again, but walking a **compact** step encoding instead of the
+/// 2048-byte `[Step; MAX_DEPTH]` array — the upper bound on what shrinking
+/// `Step` could return.
+///
+/// `Step` is **128 bytes**, not the 64 it looks like, because `Step::Static`
+/// carries an `Iso3` and `Iso3` is `#[repr(C, align(64))]` with an explicit
+/// 8-byte pad. The enum discriminant then rounds the whole thing to two cache
+/// lines. So a depth-6 fold walks 768 bytes — 12 cache lines — to read six
+/// discriminants and six edge ids.
+///
+/// This models the shrunken form: one `u32` per step (tag + inverted + edge or
+/// static index), so 16 steps fit in a single 64-byte line, with static poses in
+/// a side array touched only when a static step is actually reached. Everything
+/// else — the sampler resolution, the sample, the compose order — is identical
+/// to [`t_fold_replica`], so the difference between the two is the walk and
+/// nothing else.
+///
+/// **Harness-only, deliberately.** Bounding the win costs one function; changing
+/// `Iso3`'s layout would touch a `Pod` type that the C ABI and the Python
+/// zero-copy buffers both see. Measure first.
+fn t_fold_compact(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps: &[i64]) -> f64 {
+    const DYN: u32 = 1 << 31;
+    const INV: u32 = 1 << 30;
+    let mut ops = [0u32; 16];
+    let mut statics: Vec<Iso3> = Vec::new();
+    for (i, step) in plan.steps().iter().enumerate() {
+        ops[i] = match step {
+            Step::Dyn { edge, inverted } => DYN | if *inverted { INV } else { 0 } | edge.0,
+            Step::Static(m) => {
+                statics.push(*m);
+                (statics.len() - 1) as u32
+            }
+        };
+    }
+    let n = plan.steps().len();
+
+    median_ns(stamps.len(), || {
+        let mut acc = 0.0;
+        for &t in stamps {
+            let mut iso = Iso3::IDENTITY;
+            let mut ok = true;
+            for &op in &ops[..n] {
+                if op & DYN == 0 {
+                    iso = iso * statics[op as usize];
+                    continue;
+                }
+                let Some((interp, ring)) = view.sampler(EdgeId(op & !(DYN | INV))) else {
+                    ok = false;
+                    break;
+                };
+                let r = match InterpPolicy::from_u8(interp) {
+                    InterpPolicy::LerpSlerp => {
+                        ring.sample::<LerpSlerp>(black_box(t), ExtrapPolicy::Error)
+                    }
+                    InterpPolicy::ScLerp => {
+                        ring.sample::<ScLerp>(black_box(t), ExtrapPolicy::Error)
+                    }
+                };
+                match r {
+                    Ok(p) => {
+                        iso = if op & INV != 0 {
+                            iso.mul_inv(&p)
+                        } else {
+                            iso * p
+                        }
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                acc += iso.t.x;
+            }
+        }
+        acc
+    })
+}
+
 /// The whole thing — `Plan::at`, which is what the terms above must sum to.
 fn t_plan_at(tree: &Tree, target: &str, source: &str, stamps: &[i64]) -> f64 {
     let t = tree.frame(target).unwrap();
@@ -550,6 +672,47 @@ fn main() {
         println!("{d:>10} {ns:>16.2} {:>13.2}x", ns / ctl_base);
     }
 
+    // --- what a query-to-query cursor is worth -----------------------------
+    println!("\n## the galloping cursor vs a fresh search (depth 1, monotone sweep)");
+    println!("{:>34} {:>12} {:>10}", "path", "ns/sample", "vs fresh");
+    let mono = monotone_between();
+    let fresh_mono = t_sample(&ring1, &mono);
+    let cursor_mono = t_sample_cursor(&ring1, &mono);
+    println!(
+        "{:>34} {fresh_mono:>12.2} {:>9.2}x",
+        "sample (fresh search)", 1.0
+    );
+    println!(
+        "{:>34} {cursor_mono:>12.2} {:>9.2}x",
+        "sample_from (cursor)",
+        cursor_mono / fresh_mono
+    );
+    // The same pair at a capacity deep in the cliff, which is where a realistic
+    // 1 kHz edge with 10 s of history actually sits (16384 slots, 128 KiB of
+    // stamps). If the cursor is worth anything, it is worth most here.
+    let (trb, nmb) = chain_cap(1, 16_384);
+    let plb = trb
+        .plan(trb.frame(&nmb[1]).unwrap(), trb.frame(&nmb[0]).unwrap())
+        .unwrap();
+    let gb = trb.guard();
+    let (_, rb) = gb.view().sampler(plan_edges(&plb)[0]).unwrap();
+    let span_b = 16_384i64 - 4;
+    let mono_b: Vec<i64> = (0..N as i64)
+        .map(|k| (1 + k * span_b / N as i64) * 1_000_000 + 500_000)
+        .collect();
+    let fresh_b = t_sample(&rb, &mono_b);
+    let cursor_b = t_sample_cursor(&rb, &mono_b);
+    println!("\n  at capacity 16384 (128 KiB of stamps — a 1 kHz edge, 10 s history):");
+    println!(
+        "{:>34} {fresh_b:>12.2} {:>9.2}x",
+        "sample (fresh search)", 1.0
+    );
+    println!(
+        "{:>34} {cursor_b:>12.2} {:>9.2}x",
+        "sample_from (cursor)",
+        cursor_b / fresh_b
+    );
+
     // --- the search versus capacity ----------------------------------------
     //
     // The textbook model says the search costs `log2(capacity)` dependent
@@ -600,7 +763,7 @@ fn main() {
     );
     println!(
         "\n{:>7} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "depth", "measured", "predicted", "residual", "resid/step", "fold replica", "unexplained"
+        "depth", "measured", "predicted", "residual", "resid/step", "fold replica", "compact walk"
     );
 
     let per_step = guard_sample + compose;
@@ -620,12 +783,12 @@ fn main() {
         let pl = tree.plan(t, s).unwrap();
         let g = tree.guard();
         let replica = t_fold_replica(g.view(), &pl, &between);
+        let compact = t_fold_compact(g.view(), &pl, &between);
 
         println!(
-            "{d:>7} {measured:>12.1} {predicted:>12.1} {residual:>12.1} {rps:>12.2} {replica:>12.1} {:>12.1}",
-            measured - replica
+            "{d:>7} {measured:>12.1} {predicted:>12.1} {residual:>12.1} {rps:>12.2} {replica:>12.1} {compact:>12.1}",
         );
-        rows.push((d, measured, predicted, residual, replica));
+        rows.push((d, measured, predicted, residual, replica, compact));
     }
 
     // A residual that is roughly constant per step is a *per-step* cost the
@@ -669,11 +832,12 @@ fn main() {
         primitives = primitives.metric(Metric::new("dispatch_ns", dispatch, "ns"));
         run.push(primitives);
 
-        for (d, measured, predicted, residual, replica) in rows {
+        for (d, measured, predicted, residual, replica, compact) in rows {
             run.push(
                 RunRow::new("step_cost", "chain", "tf_tree", format!("depth={d}"))
                     .metric(Metric::new("lookup_ns", measured, "ns").lower_is_better(0.10))
                     .metric(Metric::new("fold_replica_ns", replica, "ns").lower_is_better(0.10))
+                    .metric(Metric::new("fold_compact_ns", compact, "ns").lower_is_better(0.10))
                     .metric(Metric::new("predicted_ns", predicted, "ns"))
                     .metric(Metric::new("residual_ns", residual, "ns"))
                     .metric(Metric::new(

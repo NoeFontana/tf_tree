@@ -267,7 +267,7 @@ impl Plan {
     ///
     /// They used to be computed on demand, and `Plan::at` called *both* — once
     /// through `check_domain` → `has_dynamic`, and once for `note`'s
-    /// attribution. Each is an O(`len`) scan over a 1 KiB `[Step; MAX_DEPTH]`
+    /// attribution. Each is an O(`len`) scan over a 2 KiB `[Step; MAX_DEPTH]`
     /// array, so a depth-14 lookup walked 28 steps before folding anything.
     /// `first_dynamic_edge`'s own doc comment already said it was
     /// "loop-invariant" and hoisted it for the *batch* path; the scalar path
@@ -405,11 +405,11 @@ impl Plan {
     /// `t`. Assumes the caller has already validated generation and domain.
     fn fold_at(&self, g: &Guard, t: i64) -> Result<Iso3, LookupError> {
         let mut acc = Iso3::IDENTITY;
-        for step in self.steps() {
+        for (k, step) in self.steps().iter().enumerate() {
             acc = match step {
                 Step::Static(m) => acc * *m,
                 Step::Dyn { edge, inverted } => {
-                    let p = g.sample(*edge, t, ExtrapPolicy::Error)?;
+                    let p = g.sample_hinted(k, *edge, t, ExtrapPolicy::Error)?;
                     if *inverted {
                         acc.mul_inv(&p)
                     } else {
@@ -1165,6 +1165,56 @@ pub struct Guard<'a> {
     /// participant total and no edge, which is the honest answer.
     #[cfg(feature = "counters")]
     ok_edge: core::cell::Cell<Option<EdgeId>>,
+    /// Per-step bracket-search hints, packed `(edge << 32) | index`, so a
+    /// scalar lookup resumes beside the previous answer instead of restarting at
+    /// the window midpoint.
+    ///
+    /// # Why this is worth ~9% of a lookup
+    ///
+    /// `docs/design/fast-path.md` §12 measured the bracket search at **34% of a
+    /// dynamic step**, and its capacity sweep showed the cost is not the probe
+    /// count but whether the probed *stamp array* fits L1 — flat to capacity
+    /// 1024, then stepping hard at 32 KiB of stamps, this host's L1d. A cursor
+    /// does not shrink that array; it makes the access **local**, so the probes
+    /// land in a line the previous query already pulled in.
+    ///
+    /// Measured on a monotone sweep (`step_cost`): 54.58 -> 40.71 ns/sample at
+    /// capacity 4096, and 58.54 -> 41.37 at capacity 16384 — which is what a
+    /// 1 kHz edge with 10 s of history actually gets. It also nearly **flattens
+    /// the cliff**: a fresh search costs +7% going 4096 -> 16384, the cursor
+    /// +1.6%.
+    ///
+    /// # Why this cannot affect a result
+    ///
+    /// [`SampleRing::sample_from`](crate::buffer::SampleRing::sample_from) is
+    /// documented and tested to return exactly what
+    /// [`SampleRing::sample`](crate::buffer::SampleRing::sample) returns for the
+    /// same `t`; only the search path differs. So a stale, wrong or absent
+    /// cursor is a bad *hint* and never a wrong answer. That is what makes this
+    /// safe to keep in a cache that nothing invalidates, and it is also why the
+    /// index may be packed into 32 bits: a logical index past `u32::MAX` — 49
+    /// days of unbroken 1 kHz publishing — truncates to a wrong hint, which the
+    /// gallop corrects.
+    ///
+    /// # Why a `Cell`, and why on the `Guard`
+    ///
+    /// `Guard` is `!Sync` by construction and created per batch on one thread —
+    /// the same argument `ok` above carries from `docs/PHASE5.md` §5.4 — so a
+    /// non-atomic cell is sound and is what the hot path should pay.
+    ///
+    /// One array rather than two, and one word rather than two, because the cost
+    /// of this cache is **initialising it**: every cell is written when a guard
+    /// is built, and that is the whole of `Guard::new`'s 1.4 -> 8.5 ns. Packing
+    /// halved the stores. (An inline-`const` initialiser was also tried and
+    /// moved nothing.)
+    ///
+    /// The edge half is the self-invalidation. One `Guard` can evaluate several
+    /// plans, and step `k` of one plan is a different edge from step `k` of
+    /// another; without the tag the hint would send the gallop somewhere
+    /// arbitrary — still correct, but potentially costing more than a plain
+    /// search. Using the hint only on a tag match makes a mismatched cursor cost
+    /// one comparison instead.
+    cursor: [core::cell::Cell<u64>; MAX_DEPTH],
     /// `(generation at creation, how to read it now)`, for the fork check.
     ///
     /// **The flush is a write into the arena from a destructor**, and a shared
@@ -1346,6 +1396,9 @@ impl<'a> Guard<'a> {
         Guard {
             view,
             generation,
+            // `EdgeId(0)` is the sentinel no builder hands out, so a fresh guard
+            // matches no edge and every step takes the cold path once.
+            cursor: [const { core::cell::Cell::new(0) }; MAX_DEPTH],
             #[cfg(feature = "counters")]
             ok: core::cell::Cell::new(0),
             #[cfg(feature = "counters")]
@@ -1537,8 +1590,10 @@ impl<'a> Guard<'a> {
             view,
             generation: DETACHED,
             // A detached guard fails every evaluation, so it never counts a
-            // success and its destructor is a no-op — but the fields must
-            // exist, and starting them at zero is what makes that true.
+            // success, never reaches a search, and its destructor is a no-op —
+            // but the fields must exist, and starting them at zero is what makes
+            // that true.
+            cursor: [const { core::cell::Cell::new(0) }; MAX_DEPTH],
             #[cfg(feature = "counters")]
             ok: core::cell::Cell::new(0),
             #[cfg(feature = "counters")]
@@ -1585,6 +1640,45 @@ impl<'a> Guard<'a> {
             InterpPolicy::LerpSlerp => ring.sample::<LerpSlerp>(t, policy),
             InterpPolicy::ScLerp => ring.sample::<ScLerp>(t, policy),
         }
+    }
+
+    /// [`Self::sample`], resuming from this guard's cursor for step `k`.
+    ///
+    /// The scalar fold's entry point. It differs from [`Self::sample`] only in
+    /// *where the bracket search starts*: `sample` restarts at the window
+    /// midpoint every call, this resumes beside the previous answer. See
+    /// [`Guard::cursor`] for the measurement and for why a wrong cursor
+    /// cannot produce a wrong result.
+    ///
+    /// The tag check is what keeps a mismatched hint cheap. `k` indexes the
+    /// plan's step, and one guard may evaluate several plans, so the cursor is
+    /// only trusted when it was last written by this same edge.
+    pub(crate) fn sample_hinted(
+        &self,
+        k: usize,
+        edge: EdgeId,
+        t: i64,
+        policy: ExtrapPolicy,
+    ) -> Result<Iso3, LookupError> {
+        // A plan is bounded by MAX_DEPTH, so this is always in range; the guard
+        // keeps the array access provably safe rather than relying on it.
+        let Some(slot) = self.cursor.get(k) else {
+            return self.sample(edge, t, policy);
+        };
+        let packed = slot.get();
+        let mut cursor = if (packed >> 32) as u32 == edge.0 {
+            packed & 0xFFFF_FFFF
+        } else {
+            0
+        };
+        let out = self.sample_from(edge, t, policy, &mut cursor);
+        // Written on success only. A failed sample leaves `cursor` wherever the
+        // search abandoned it, and storing that would poison the next query's
+        // hint with a position no successful search produced.
+        if out.is_ok() {
+            slot.set((u64::from(edge.0) << 32) | (cursor & 0xFFFF_FFFF));
+        }
+        out
     }
 
     /// Sample edge `edge` at `t` and also return its body twist, in 1/second.

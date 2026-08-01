@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo nextest run *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo check *)",
+      "Bash(cargo fmt --all --check)",
+      "Bash(cargo fmt --check *)",
+      "Bash(cargo deny check *)",
+      "Bash(cargo tree *)",
+      "Bash(just lint)",
+      "Bash(just shm-check)",
+      "Bash(just test)",
+      "Bash(just loom)",
+      "Bash(just miri)",
+      "Bash(just test-rust)",
+      "Bash(just test-doc)",
+      "Bash(just ros-test)",
+      "Bash(just c-abi-check)",
+      "Bash(just c-header-check)",
+      "Bash(just msrv)",
+      "Bash(just bench-check)",
+      "Bash(just ingest-check)",
+      "Bash(just py-test)",
+      "Bash(just py-test-freethreaded)",
+      "Bash(just py-lint)",
+      "Bash(just tf2-check)",
+      "Bash(just versions)",
+      "Bash(just --list)",
+      "Bash(lscpu*)"
+    ]
+  }
+}
