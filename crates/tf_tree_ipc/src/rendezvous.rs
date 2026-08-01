@@ -165,9 +165,9 @@ impl Rendezvous {
 
     /// `<runtime_dir>/<domain>/<name>.sock`.
     ///
-    /// Nothing in this crate binds it yet — the `SOCK_SEQPACKET` protocol is
-    /// §3.7 and lands with `MappedArena` — but the path is part of the identity
-    /// and belongs here, not in the code that eventually binds it.
+    /// [`crate::OwnerServer::bind_at`] binds it and [`crate::attach`] connects
+    /// to it, but the path is part of the rendezvous identity, so it is derived
+    /// here rather than in the code that binds it.
     #[must_use]
     pub fn sock_path(&self) -> &Path {
         &self.sock_path

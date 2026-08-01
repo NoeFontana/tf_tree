@@ -17,14 +17,15 @@
 //!   description closes — which the kernel does on process death, including
 //!   `SIGKILL` — and two descriptions conflict even inside one process.
 //!
-//! # Why raw syscalls
+//! # Why `libc::fcntl`
 //!
 //! `rustix` 1.1 exposes `flock` (whole file), `fcntl_lock` (classic `F_SETLK`,
 //! whole file) and `fcntl_getlk` (classic `F_GETLK`). None of the three can take
 //! an OFD lock, and byte-range OFD locking is exactly what §3.3's layout needs.
-//! The dependency budget in §2 allows `rustix` and *no libc crate and no C build
-//! step*, so the remaining option is to issue `fcntl` directly. That is the only
-//! `unsafe` in this crate and it lives entirely in this module.
+//! So this module calls `fcntl` through `libc` — a **documented deviation from
+//! §2's "no libc crate"**, argued in full in the block comment below. It is one
+//! of the two `unsafe` sites in this crate; the other is `fork`'s
+//! `pthread_atfork` shim.
 //!
 //! # SAFETY (module invariant)
 //!
@@ -33,9 +34,9 @@
 //! reads it for `F_OFD_SETLK` and reads *and writes* it for `F_OFD_GETLK`, never
 //! retains it, and never touches any other user memory. Every caller in this
 //! module passes `&mut libc::flock`, so the pointer is valid, aligned, unaliased
-//! and sized correctly by construction; `libc::flock` is the kernel's own
-//! identical to the kernel's `struct flock` on the two 64-bit architectures this
-//! module supports.
+//! and sized correctly by construction; `libc::flock` is `libc`'s own
+//! definition, which is the kernel's `struct flock` on every target `libc`
+//! supports.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 

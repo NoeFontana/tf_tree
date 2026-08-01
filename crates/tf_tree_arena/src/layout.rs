@@ -339,12 +339,13 @@ impl ArenaLayout {
         self.computed.regions[R_FRAME_HASH]
     }
 
-    /// The topology region (both blocks, contiguous).
+    /// The topology region — all [`TOPO_BLOCKS`] blocks, contiguous.
     pub fn topo_blocks(&self) -> Region {
         self.computed.regions[R_TOPO]
     }
 
-    /// Byte stride between the two topology blocks.
+    /// Byte stride between consecutive topology blocks (A1: there are
+    /// [`TOPO_BLOCKS`] of them, not two).
     pub fn topo_block_stride(&self) -> usize {
         self.computed.topo_stride
     }

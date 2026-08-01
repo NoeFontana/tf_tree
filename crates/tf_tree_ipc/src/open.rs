@@ -37,14 +37,19 @@
 //! `SIGSTOP`ped and never takes over, no new process can join, and that is the
 //! right answer, because the alternative is divergence.
 //!
-//! # What this module does not do yet
+//! # What this module leaves to its caller
 //!
-//! Steps 1 and 5 involve the `SOCK_SEQPACKET` protocol (§3.7) and `memfd`
-//! creation (§3.6), which land with `MappedArena`. Here, "is someone serving?"
-//! is a [`ServerProbe`] the caller injects, and "serve" means taking the locks
-//! and returning an [`OpenOutcome`] that tells the caller which of bind/create
-//! it now owes. That split is not a stub: the lock-file half is where every race
-//! in §3.4 lives, and it is testable to the last branch without a socket.
+//! Steps 1 and 5 are injected rather than performed here, and that is what keeps
+//! this module free of both the socket and the arena. The socket lives one
+//! module over, in [`crate::OwnerServer`] and [`crate::attach`]; the arena is
+//! not reachable from this crate at all — its `Cargo.toml` lists `rustix` and
+//! `libc` and nothing else, so `memfd` creation cannot happen here even in
+//! principle. "Is someone serving?" is therefore a [`ServerProbe`] the caller
+//! injects — [`crate::SocketProbe`] runs the real §3.7 handshake, [`NoServer`]
+//! is the test one — and "serve" means taking the locks and returning an
+//! [`OpenOutcome`] that tells the caller which of bind/create it now owes. That
+//! split is not a stub: the lock-file half is where every race in §3.4 lives,
+//! and it is testable to the last branch without a socket.
 
 use std::path::Path;
 use std::time::{Duration, Instant};

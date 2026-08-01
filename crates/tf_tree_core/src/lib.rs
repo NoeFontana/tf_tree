@@ -10,13 +10,15 @@
 //! shared-memory design (Phase 1) backed by a heap allocation — every layout
 //! decision exists so Phase 2's `MappedArena` is a one-line swap.
 //!
-//! This PR implements steps 4 and 5 of `docs/PHASE1.md`'s implementation order
-//! (see its appendix): the concurrency core —
-//! frame interning ([`frame`]), topology ([`topology`]), edge records and the
-//! claim table ([`edge`]), the seqlock sample buffer ([`buffer`]), and bracket
-//! search ([`sample`]). Plan compilation, `Guard`, `at`/`at_many`, `TreeBuilder`
-//! and the public convenience API are the next PR; the internal primitives they
-//! call live here.
+//! The whole of `docs/PHASE1.md`'s implementation order lives here: the
+//! concurrency core — frame interning ([`frame`]), topology ([`topology`]),
+//! edge records and the claim table ([`edge`]), the seqlock sample buffer
+//! ([`buffer`]), bracket search ([`sample`]) — and, above it, plan compilation
+//! and evaluation ([`plan`]: [`plan::Plan`], [`plan::Guard`], `at`/`at_many`).
+//! Phase 2's participant table ([`participant`]) and Phase 5's diagnostic
+//! counters ([`counters`]) sit alongside them. `TreeBuilder` and the public
+//! convenience API live in the `tf_tree` facade, which drives the primitives
+//! here.
 //!
 //! # Load-bearing invariants
 //!

@@ -146,7 +146,8 @@ pub struct SegmentDescriptor {
     /// for it (see that type's docs). The owner holds it so that the server can
     /// compare it against [`HelloRequest::client_boot_id`] and emit
     /// [`HelloStatus::BootIdMismatch`], which is the one §3.7 rejection this
-    /// message cannot itself explain. Unused until the server lands.
+    /// message cannot itself explain. Read by [`crate::OwnerServer`]'s
+    /// pre-arena checks, so it must be populated by every owner.
     pub boot_id: [u8; 16],
 }
 

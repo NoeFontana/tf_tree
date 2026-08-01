@@ -56,11 +56,12 @@
 //! | §3.6 `memfd` creation, and wiring this into `tf_tree::open()` | **not yet** — `docs/decisions/0005` step 5 |
 //! | §6.1 claim leases: [`LockFile::try_take_claim`] and friends | implemented; the arena-side two-phase acquire is `docs/decisions/0005` step 7 |
 //!
-//! Because §3.7 is absent, [`Open::open`] takes a [`ServerProbe`] that answers
-//! "is anyone serving?". That is not a placeholder for the interesting part: the
-//! interesting part is the lock-file half, where every race in §3.4 lives, and
-//! injecting the probe is what makes the split-brain race reproducible on demand
-//! instead of once in a thousand runs.
+//! [`Open::open`] takes a [`ServerProbe`] rather than calling [`attach`] itself,
+//! and keeps doing so now that §3.7 has landed — [`SocketProbe`] is the real
+//! probe, [`NoServer`] the test one. That is not a placeholder for the
+//! interesting part: the interesting part is the lock-file half, where every
+//! race in §3.4 lives, and injecting the probe is what makes the split-brain
+//! race reproducible on demand instead of once in a thousand runs.
 //!
 //! # Platform
 //!
