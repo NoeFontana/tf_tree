@@ -10,6 +10,14 @@ use tf_tree::{AdaptiveScratch, ErrBound, Iso3, LerpSlerp, Stamp, SystemDomain, M
 
 /// `at_many` over a monotone stamp sweep equals calling `at` per stamp, and the
 /// long sweep exercises the galloping (resume-from-cursor) path.
+///
+/// **The reference side takes a fresh `Guard` per stamp, and that is now
+/// load-bearing.** `Guard` carries a per-step bracket-search cursor, so
+/// `plan.at` on a *reused* guard resumes from the previous answer exactly as
+/// `at_many` does — comparing the two on one guard would compare galloping
+/// against galloping and assert nothing about the binary search. A guard built
+/// per stamp starts every cursor cold, which is the independent search this test
+/// means by "binary".
 #[test]
 fn at_many_monotone_matches_per_stamp() {
     let c = Chain::new(64, 1000);
@@ -25,11 +33,86 @@ fn at_many_monotone_matches_per_stamp() {
     plan.at_many(&g, &stamps, &mut out).unwrap();
 
     for (s, got) in stamps.iter().zip(out.iter()) {
-        let want = plan.at(&g, *s).unwrap();
+        let want = plan.at(&c.tree.guard(), *s).unwrap();
         assert_eq!(
             got.to_bits(),
             want.to_bits(),
             "galloping vs binary at {s:?}"
+        );
+    }
+}
+
+/// A warm cursor never changes an answer.
+///
+/// `Guard` caches a per-step bracket-search hint so a scalar `Plan::at` resumes
+/// beside the previous answer instead of restarting at the window midpoint —
+/// worth ~9% at depth 3 (`docs/design/fast-path.md` §16). The entire safety
+/// argument for that cache is that
+/// [`SampleRing::sample_from`] returns exactly what `sample` returns and only
+/// the *search path* differs, so a stale, wrong or absent hint costs time and
+/// never accuracy. Nothing else in the type system enforces that, so this does.
+///
+/// Three shapes, because the cursor is in a different state in each:
+///
+/// * **monotone forward** — the case the cache is for, and the one where the
+///   hint is always warm and always close;
+/// * **non-monotone** — the hint points past the answer, so the gallop must walk
+///   *backwards* and still land exactly;
+/// * **two plans interleaved on one guard** — step `k` alternates between two
+///   different edges, so the tag check is exercised on every call.
+///
+/// **Mutants, all three applied and run** — two of them survive, and saying so
+/// is the point:
+///
+/// * `let i = lo` instead of `self.bracket(lo, hi, t)` in `sample_from` — the
+///   gallop's lower bound used as the answer. **Caught**, and this test is the
+///   only one of the eight that catches it.
+/// * dropping the tag check in `Guard::sample_hinted`, so one plan's cursor is
+///   used as another's hint. **Survives**, correctly: the gallop corrects a
+///   wrong hint, so the tag is a *performance* guard and no correctness test can
+///   or should kill it.
+/// * dropping `clamp(lo_logical, newest)` on the hint in `sample_from`.
+///   **Survives** — a cursor is only ever written after a successful sample, so
+///   it is already inside the window and the clamp is defence against a state
+///   this path cannot reach.
+#[test]
+fn a_warm_cursor_never_changes_an_answer() {
+    let c = Chain::new(64, 1000);
+    let max_t = (c.n as i64 - 1) * c.dt;
+    let base_map = c.tree.plan(c.base, c.map).unwrap();
+    let odom_map = c.tree.plan(c.odom, c.map).unwrap();
+
+    // Cold reference: a fresh guard per lookup, so every cursor starts at 0 and
+    // every search is an independent binary search.
+    let cold = |plan: &tf_tree::Plan, s: Stamp| plan.at(&c.tree.guard(), s).unwrap();
+
+    let monotone: Vec<Stamp> = (0..500).map(|k| ns((k as i64 * max_t) / 500)).collect();
+    // Deterministic jumps around the window: forwards, backwards, and repeats.
+    let scattered: Vec<Stamp> = (0..500)
+        .map(|k: i64| ns(((k * 7919) % (max_t / 1000)) * 1000))
+        .collect();
+
+    for (label, stamps) in [("monotone", &monotone), ("scattered", &scattered)] {
+        let warm = c.tree.guard();
+        for s in stamps {
+            assert_eq!(
+                base_map.at(&warm, *s).unwrap().to_bits(),
+                cold(&base_map, *s).to_bits(),
+                "{label}: warm cursor disagreed with a cold search at {s:?}"
+            );
+        }
+    }
+
+    // Two plans on one guard: `base->map` has two dynamic steps and `odom->map`
+    // has one, so step 0 alternates between two different edges and the tag
+    // check decides on every call whether the hint is usable.
+    let shared = c.tree.guard();
+    for (i, s) in monotone.iter().enumerate() {
+        let plan = if i % 2 == 0 { &base_map } else { &odom_map };
+        assert_eq!(
+            plan.at(&shared, *s).unwrap().to_bits(),
+            cold(plan, *s).to_bits(),
+            "interleaved plans: warm cursor disagreed at {s:?}"
         );
     }
 }

@@ -519,7 +519,7 @@ the compiled plan. §13 records what removing them actually returned.
 **Verdict: falsified.** Removing both scans moved nothing.
 
 `Plan::at` computed `has_dynamic` and `first_dynamic_edge` on every call, each an
-O(`len`) walk of a 1 KiB `[Step; MAX_DEPTH]` array — 28 steps of scanning on a
+O(`len`) walk of a `[Step; MAX_DEPTH]` array — **2048 bytes**, see §15 — 28 steps of scanning on a
 depth-14 lookup, before folding anything. `first_dynamic_edge`'s own doc comment
 called it "an O(plan length) scan … loop-invariant" and hoisted it for the batch
 path while the scalar path kept paying it. Both are functions of the compiled
@@ -536,7 +536,7 @@ steps, so `Plan::new` now derives them once (`dyn_count`, `first_dyn`).
 | 6 | 440.1 | 435.7 | noise |
 
 **Every row is noise.** The reasoning was the same shape §11 diagnoses — a
-plausible mechanism (28 iterations! 1 KiB!) reasoned about instead of measured.
+plausible mechanism (28 iterations! 2 KiB!) reasoned about instead of measured.
 An out-of-order core hides a pair of predictable, non-faulting scans completely
 behind memory-bound work that is already in flight.
 
@@ -634,3 +634,129 @@ is worth naming as a rule rather than an anecdote:
   cache level, its behaviour at the *TLB* level is no longer a footnote — and the
   arena asks for `MADV_HUGEPAGE` without anything checking whether the kernel
   granted it.
+
+---
+
+## 15. Shrinking `Step` — falsified, and it cost one harness function
+
+**Verdict: rejected, without implementing it.** §13 split the residual and found
+half of it reproducible by a *fold replica* that walks the plan's step array.
+That looked like a lever, and a measurement of the array's real size made it look
+like a big one:
+
+`Step` is **128 bytes**, not the 64 it appears to be. `Step::Static` carries an
+`Iso3`, and `Iso3` is `#[repr(C, align(64))]` with an explicit 8-byte pad — so
+the enum discriminant rounds the whole variant to two cache lines and
+`[Step; MAX_DEPTH]` is **2048 bytes**. A depth-6 fold walks 768 bytes, twelve
+cache lines, to read six discriminants and six edge ids. (§13 and `plan.rs` both
+said "1 KiB"; both understated it by 2× and are corrected.)
+
+Better still, the fix looked unconstrained: `Plan` is a value type, **not an
+arena structure**, so there is no `FORMAT_VERSION` to break. And `Iso3`'s
+`align(64)` justifies itself as *"so the Phase 2 shared-memory arena can store
+slots without re-deriving layout"* — which is not true: the arena stores
+`[AtomicU64; 7]` in `PoseSlot` and `[u64; 7]` in `EdgeRecord::static_pose`. It
+never stores a typed `Iso3` at all.
+
+So: bound the win before changing a `Pod` type that the C ABI and the Python
+zero-copy buffers both see. `step_cost` gained a **compact walk** — the same
+fold, the same samples, the same compose order, driven from one `u32` per step
+(tag + inverted + edge or static index), so sixteen steps fit in a single cache
+line instead of thirty-two.
+
+| depth | fold replica (2048 B array) | compact walk (64 B array) |
+|---|---|---|
+| 1 | 68.6 | 68.2 |
+| 2 | 143.1 | 142.6 |
+| 3 | 209.3 | 209.5 |
+| 4 | 276.6 | 276.5 |
+| 6 | 409.1 | 412.4 |
+
+**A 32× smaller walked array is worth nothing.** At depth 6 the compact form is
+marginally *slower*.
+
+The reason is the same one §14 turns on, seen from the other side: the step array
+is walked **sequentially**, and a linear scan of a few hundred bytes is exactly
+what a hardware prefetcher exists for — those loads are already in flight behind
+the ~64 ns of sampling work per step. The stamp array is **randomly probed** by a
+binary search whose next address depends on the last comparison, and no
+prefetcher can help with that.
+
+> Sequential footprint is free. Random footprint is not. Four of this
+> document's levers died because they attacked code shape or code size; the one
+> that worked (§16) attacked the *access pattern*.
+
+---
+
+## 16. The scalar cursor — the first lever that returned anything
+
+**Verdict: in.** ~9% off a depth-3 lookup, and it flattens the capacity cliff.
+
+`sample_from`'s galloping cursor already existed and was already wired into the
+**batch** path (`fold_at_cursors`, used by `at_many`/`at_adaptive`). Scalar
+`Plan::at` did not use it: every call restarted the bracket search at the window
+midpoint, discarding everything the previous call learned.
+
+Given §12 — the search is 34% of a step, and its cost is *whether the probed
+stamp array fits L1* — a cursor is the one lever that changes the thing that
+actually costs: it does not shrink the array, it makes the access **local**, so
+probes land in a line the previous query already pulled in.
+
+Bounded in the harness first, on a monotone sweep, before touching the engine:
+
+| | capacity 4096 (32 KiB stamps) | capacity 16384 (128 KiB — a 1 kHz edge, 10 s) |
+|---|---|---|
+| `sample` (fresh search) | 54.58 | 58.54 |
+| `sample_from` (cursor) | **40.71** (0.75×) | **41.37** (0.71×) |
+
+It also **nearly flattens the cliff**: a fresh search costs +7% going 4096 →
+16384; the cursor costs +1.6%. Exactly what cache locality predicts, and a second
+independent confirmation of §12's mechanism.
+
+### What shipped
+
+`Guard` gained one packed `u64` per step — `(edge << 32) | index`. `Guard` is
+`!Sync` by construction and built per batch on one thread, so a plain `Cell` is
+sound; that is the same argument `docs/PHASE5.md` §5.4 already makes for the
+`ok` counter. The edge tag is self-invalidation: one guard can evaluate several
+plans, and step `k` of one is a different edge from step `k` of another.
+
+**Nothing here can change a result.** `sample_from` is documented and tested to
+return exactly what `sample` returns for the same `t`; only the search path
+differs. A stale, wrong or absent hint costs time and never accuracy — which is
+what makes a cache that nothing invalidates safe.
+
+`Plan::at`, end to end, pinned and idle:
+
+| depth | before | after | |
+|---|---|---|---|
+| 1 | 76.9 | 72.8 | −5.4% |
+| 2 | 156.7 | 142.6 | −9.0% |
+| 3 | **228.6** | **207.0** | **−9.4%** |
+| 4 | 298.4 | 274.6 | −8.0% |
+| 6 | 438.1 | 411.1 | −6.2% |
+
+Consistent across three settled runs. `bench_ab` labels these `noise` because its
+tolerance is 10%, set to catch *regressions*; a real 6–9% win sits under it, and
+that is a property of the gate rather than of the change.
+
+### What it costs, stated rather than buried
+
+`Guard::new` goes from **1.4 ns to 8.5 ns** — the cursor array must be
+initialised, and 128 bytes of stores is what that costs. Packing two arrays into
+one and switching to an inline-`const` initialiser were both tried and neither
+moved it.
+
+So the trade depends entirely on how a consumer holds its guard:
+
+| pattern | before | after | |
+|---|---|---|---|
+| guard hoisted across a batch (the intended shape, §5.4) | 116.8 | **107.5** | −8.0% |
+| guard rebuilt per lookup | 122.3 | 123.3 | +0.8%, within noise |
+
+Batched consumers win; per-lookup consumers break even. `guard_cost`'s own header
+notes the Python scalar path is the per-call one, so it is the one that gains
+nothing here. If that ever needs fixing, a smaller direct-mapped cursor array
+(4 entries, `k % 4`, tag-checked) would cut the initialisation and keep the win
+for shallow plans, at the cost of collisions on deep ones.
+
