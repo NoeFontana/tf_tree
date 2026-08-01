@@ -1,13 +1,19 @@
 //! Host facts behind `TFT016` — `docs/PHASE5.md` §6.
 //!
-//! Two properties of the machine that change how an arena behaves and that
-//! nothing in the arena can see:
+//! Properties of the machine that change how an arena behaves and that nothing
+//! in the arena can see:
 //!
-//! * **Transparent huge pages.** §2.3 aligns a frozen arena to 2 MiB precisely
-//!   so the mapping is THP-eligible, and cites the arithmetic: a 115 MB index on
-//!   4 KiB pages needs ~28 000 TLB entries and 55 on 2 MiB pages. On a host with
-//!   THP set to `never` that alignment buys nothing, and the p99 lookup latency
-//!   an operator measures will not match the one in the benchmark report.
+//! * **Transparent huge pages, for anonymous mappings.** §2.3 aligns a frozen
+//!   arena to 2 MiB precisely so the mapping is THP-eligible, and cites the
+//!   arithmetic: a 115 MB index on 4 KiB pages needs ~28 000 TLB entries and 55
+//!   on 2 MiB pages. On a host with THP set to `never` that alignment buys
+//!   nothing, and the p99 lookup latency an operator measures will not match the
+//!   one in the benchmark report.
+//! * **Transparent huge pages, for *shmem* mappings** — a **separate** sysfs
+//!   knob, and the one that governs the live arena. See [`ShmemThp`]: reading
+//!   only the first file reported a host as healthy while `MADV_HUGEPAGE` on the
+//!   arena's `MAP_SHARED` `memfd` was a silent no-op, which is the failure
+//!   `TFT016` exists to catch.
 //! * **`RLIMIT_MEMLOCK`.** Locking the arena is how a hard-real-time consumer
 //!   keeps a page fault out of its control loop. A limit below the arena size
 //!   means `mlock` will fail, and it fails at the worst possible moment —
@@ -37,6 +43,64 @@ pub enum Thp {
     Unknown,
 }
 
+/// The kernel's transparent-huge-page policy **for shmem mappings**, which is a
+/// different knob from [`Thp`] with a different vocabulary.
+///
+/// # Why this exists separately, and why reading only [`Thp`] was a defect
+///
+/// A live tf_tree arena is a sealed `memfd` mapped `MAP_SHARED` — shmem, not
+/// anonymous memory — and shmem THP is **not** governed by
+/// `transparent_hugepage/enabled`. It is governed by
+/// `transparent_hugepage/shmem_enabled`, whose default on a stock distribution
+/// is `never`:
+///
+/// ```text
+/// enabled:       always [madvise] never
+/// shmem_enabled: always within_size advise [never] deny force
+/// ```
+///
+/// So a host reads as perfectly healthy on `enabled` while
+/// `MappedArena`'s `MADV_HUGEPAGE` (`mapped.rs`) is silently a no-op and the
+/// arena gets 4 KiB pages. `TFT016` reported that host as passing, which is the
+/// one thing a diagnostic must not do.
+///
+/// The frozen `.tft` path is a file mapping and is governed by neither of these
+/// two files, which is why [`HostFacts`] reports both settings rather than
+/// collapsing them into one verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShmemThp {
+    /// `always` — every shmem mapping large enough gets huge pages.
+    Always,
+    /// `within_size` — huge pages only up to the file's size. An arena is mapped
+    /// whole, so this behaves like [`ShmemThp::Advise`] for us.
+    WithinSize,
+    /// `advise` — only mappings that asked. `MADV_HUGEPAGE` is honoured, which
+    /// is what `MappedArena` issues, so this is the setting that makes §2.3's
+    /// alignment mean something.
+    Advise,
+    /// `never` — `MADV_HUGEPAGE` on a shmem mapping does nothing. **The stock
+    /// default.**
+    Never,
+    /// `deny` — as `never`, and refuses even where it would otherwise apply.
+    Deny,
+    /// `force` — huge pages everywhere, ignoring the advice.
+    Force,
+    /// The file was absent or in a shape this does not recognise. Absent is the
+    /// normal reading on a kernel built without `CONFIG_TRANSPARENT_HUGEPAGE`.
+    Unknown,
+}
+
+impl ShmemThp {
+    /// Whether `MADV_HUGEPAGE` on a `MAP_SHARED` `memfd` can be honoured.
+    #[must_use]
+    pub fn honours_madvise(self) -> bool {
+        matches!(
+            self,
+            ShmemThp::Always | ShmemThp::WithinSize | ShmemThp::Advise | ShmemThp::Force
+        )
+    }
+}
+
 /// The soft `RLIMIT_MEMLOCK`, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemLock {
@@ -51,21 +115,58 @@ pub enum MemLock {
 /// What the host says about itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostFacts {
-    /// Transparent huge pages.
+    /// Transparent huge pages for **anonymous** mappings. Governs the frozen
+    /// `.tft` path's eligibility, not the live arena's.
     pub thp: Thp,
+    /// Transparent huge pages for **shmem** mappings — the live arena's `memfd`.
+    /// See [`ShmemThp`] for why this is a separate knob and why reading only
+    /// `thp` reported a broken host as healthy.
+    pub shmem_thp: ShmemThp,
     /// Soft `RLIMIT_MEMLOCK`.
     pub memlock: MemLock,
 }
 
-/// Read both facts. Linux-only; `TFT016` is skipped elsewhere.
+/// Read every fact. Linux-only; `TFT016` is skipped elsewhere.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn probe() -> HostFacts {
     let thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
         .map_or(Thp::Unknown, |s| parse_thp(&s));
+    let shmem_thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
+        .map_or(ShmemThp::Unknown, |s| parse_shmem_thp(&s));
     let memlock = std::fs::read_to_string("/proc/self/limits")
         .map_or(MemLock::Unknown, |s| parse_memlock(&s));
-    HostFacts { thp, memlock }
+    HostFacts {
+        thp,
+        shmem_thp,
+        memlock,
+    }
+}
+
+/// Parse `/sys/kernel/mm/transparent_hugepage/shmem_enabled`.
+///
+/// Same bracketed-token shape as [`parse_thp`], different vocabulary — six
+/// policies rather than three — so it cannot share that parser without silently
+/// mapping `advise` and `within_size` to [`Thp::Unknown`], which would report
+/// "policy unknown" on a correctly configured host.
+#[must_use]
+pub fn parse_shmem_thp(s: &str) -> ShmemThp {
+    match bracketed(s) {
+        Some("always") => ShmemThp::Always,
+        Some("within_size") => ShmemThp::WithinSize,
+        Some("advise") => ShmemThp::Advise,
+        Some("never") => ShmemThp::Never,
+        Some("deny") => ShmemThp::Deny,
+        Some("force") => ShmemThp::Force,
+        _ => ShmemThp::Unknown,
+    }
+}
+
+/// The token between `[` and `]`, which is how both `transparent_hugepage`
+/// files mark the active policy.
+fn bracketed(s: &str) -> Option<&str> {
+    let rest = &s[s.find('[')? + 1..];
+    Some(&rest[..rest.find(']')?])
 }
 
 /// Parse `/sys/kernel/mm/transparent_hugepage/enabled`.
@@ -76,17 +177,10 @@ pub fn probe() -> HostFacts {
 /// words.
 #[must_use]
 pub fn parse_thp(s: &str) -> Thp {
-    let Some(open) = s.find('[') else {
-        return Thp::Unknown;
-    };
-    let rest = &s[open + 1..];
-    let Some(close) = rest.find(']') else {
-        return Thp::Unknown;
-    };
-    match &rest[..close] {
-        "always" => Thp::Always,
-        "madvise" => Thp::Madvise,
-        "never" => Thp::Never,
+    match bracketed(s) {
+        Some("always") => Thp::Always,
+        Some("madvise") => Thp::Madvise,
+        Some("never") => Thp::Never,
         _ => Thp::Unknown,
     }
 }
@@ -139,6 +233,75 @@ mod tests {
         assert_eq!(parse_thp("always madvise never\n"), Thp::Unknown);
         assert_eq!(parse_thp(""), Thp::Unknown);
         assert_eq!(parse_thp("[bogus]"), Thp::Unknown);
+    }
+
+    /// **`shmem_enabled` is a different knob with a different vocabulary**, and
+    /// it is the one that governs the live arena.
+    ///
+    /// A live arena is a sealed `memfd` mapped `MAP_SHARED`, so its huge-page
+    /// eligibility comes from `shmem_enabled`, not from `enabled`. This host
+    /// reads `always [madvise] never` on the first and
+    /// `always within_size advise [never] deny force` on the second — healthy by
+    /// the wrong file, and `MADV_HUGEPAGE` a silent no-op by the right one. Both
+    /// real strings are pinned below.
+    ///
+    /// Mutant: route `shmem_enabled` through `parse_thp` ⇒ `advise` and
+    /// `within_size` both become `Unknown`, so a correctly configured host is
+    /// reported as "policy unknown" instead of passing. Applied and confirmed.
+    #[test]
+    fn shmem_thp_parsing_covers_all_six_policies_not_the_three_of_enabled() {
+        // The two files as this host actually reports them.
+        assert_eq!(parse_thp("always [madvise] never\n"), Thp::Madvise);
+        assert_eq!(
+            parse_shmem_thp("always within_size advise [never] deny force\n"),
+            ShmemThp::Never
+        );
+
+        for (s, want) in [
+            (
+                "[always] within_size advise never deny force",
+                ShmemThp::Always,
+            ),
+            (
+                "always [within_size] advise never deny force",
+                ShmemThp::WithinSize,
+            ),
+            (
+                "always within_size [advise] never deny force",
+                ShmemThp::Advise,
+            ),
+            (
+                "always within_size advise never [deny] force",
+                ShmemThp::Deny,
+            ),
+            (
+                "always within_size advise never deny [force]",
+                ShmemThp::Force,
+            ),
+            (
+                "always within_size advise never deny force",
+                ShmemThp::Unknown,
+            ),
+            ("", ShmemThp::Unknown),
+        ] {
+            assert_eq!(parse_shmem_thp(s), want, "parsing {s:?}");
+        }
+
+        // Only these four let `MappedArena`'s MADV_HUGEPAGE do anything. Getting
+        // this set wrong is the whole check: `never` is the stock default, so a
+        // predicate that accepted it would restore the defect this test exists
+        // to pin.
+        for p in [
+            ShmemThp::Always,
+            ShmemThp::WithinSize,
+            ShmemThp::Advise,
+            ShmemThp::Force,
+        ] {
+            assert!(p.honours_madvise(), "{p:?} should honour madvise");
+        }
+        for p in [ShmemThp::Never, ShmemThp::Deny, ShmemThp::Unknown] {
+            assert!(!p.honours_madvise(), "{p:?} must not honour madvise");
+        }
     }
 
     /// **The limit names contain spaces**, so a whitespace split and an index

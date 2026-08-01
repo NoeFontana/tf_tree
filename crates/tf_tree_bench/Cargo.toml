@@ -126,6 +126,12 @@ required-features = ["shm"]
 name = "heap_vs_shared"
 required-features = ["shm"]
 
+# Same reason: the whole point is the `MAP_SHARED` memfd mapping, whose
+# huge-page policy is the one `transparent_hugepage/shmem_enabled` governs.
+[[example]]
+name = "hugepage_grant"
+required-features = ["shm"]
+
 # The workspace's only `fork()`. See the file header for why `unsafe` here is a
 # recorded exception (`docs/decisions/0005` step 9) rather than an oversight.
 [[bin]]
