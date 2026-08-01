@@ -976,6 +976,57 @@ measuring something else:
   the readers so badly the bench could not complete a row in ten minutes; the
   file records it.
 
+### What a writer costs a reader — `TF2_WRITERS=N just tf2-scaling`
+
+The section above is tf_tree alone, because a second process cannot reach a
+`tf2::BufferCore` at all. This is the in-process head-to-head, and it is the row
+that separates the two designs most sharply.
+
+The writers publish to dynamic edges the query path does **not** traverse. That
+is the measurement rather than a courtesy:
+
+* `tf2::BufferCore` takes **one mutex for the whole buffer**, so a write to any
+  edge excludes every reader of every other edge.
+* tf_tree's rings are per edge with a seqlock per slot, so a write to an edge a
+  reader is not reading costs that reader nothing.
+
+Two writers, `fixture_depth6`, 15 rounds, engines interleaved within every round:
+
+| | tf_tree M/s | tf2 M/s | ratio |
+|---|---|---|---|
+| 1 thread, 0 writers | 6.66 | 3.00 | 2.2x |
+| 1 thread, 2 writers | 6.63 | **0.62** | **10.7x** |
+| 4 threads, 0 writers | 20.77 | 1.16 | 17.9x |
+| 4 threads, 2 writers | 20.65 | **0.81** | **25.6x** |
+
+| p50 / p99.9 | 0 writers | 2 writers |
+|---|---|---|
+| tf_tree, 1 thread | 190 ns / 281 ns | 191 ns / 310 ns |
+| tf2, 1 thread | 431 ns / 741 ns | **2554 ns / 23 044 ns** |
+
+**Two writers cost tf_tree's readers 0.5% of throughput and nothing at p50. They
+cost tf2's readers 79% of throughput, 5.9x at p50 and 31x at p99.9** — for
+writes to edges those readers never touch.
+
+The recorded stream says the same, more so: 16.6x at one thread and 43.0x at
+four.
+
+Two honest notes. tf2's `worst` round ratio falls to 0.54 at one thread, so its
+contended single-thread row is soft — the mutex makes it bursty, which is itself
+the finding, but the median is what to quote and not the best. And tf2's
+throughput *rises* from 1 to 4 threads under writers (0.62 → 0.81 M/s), which is
+not scaling: at one thread its single reader loses the mutex to the writers more
+often than four readers collectively do.
+
+An earlier revision of this harness gave each writer thread its own stamp counter
+starting from the same base. Both engines' state outlives a pass while the
+threads do not, so the second pass republished stamps the first had already
+written — tf_tree rejected them silently, and tf2 rejected them *with a
+`TF_OLD_DATA` warning per sample*, filling the measured window with stderr I/O
+and reporting tf2 at 0.36 M/s with a 50% spread. That number would have been
+published as tf2's cost under contention. The counter is now shared across every
+writer and every pass.
+
 ### Scale — `just scale-sweep`
 
 Lookup cost against tree **width**, at a fixed dynamic-step count, which is the
@@ -1173,13 +1224,14 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
   say so; per-*thread* placement needs `sched_setaffinity`, which `CLAUDE.md`'s
   unsafe budget routes to a decision record.
 * **A non-SMT machine.** 4 physical cores cap what an 8-thread row can show.
-* **tf2 under concurrent writers.** `contended_scaling` is tf_tree-only, because
-  a second process cannot reach a `BufferCore` at all. The in-process
-  head-to-head under writers belongs in `tf2_scaling`, which has the interleaved
-  two-engine thread harness; it does not have a writer sweep yet. This is the
-  row that should separate the engines most sharply — every
-  `tf2::lookupTransform` excludes against `setTransform` on one mutex — and it
-  is the largest remaining gap in this document.
+* ~~**tf2 under concurrent writers.**~~ **Done** — `TF2_WRITERS=N just
+  tf2-scaling`, in the section above. It separates the engines more sharply than
+  any other row here.
+* **tf2 under writers on the *queried* edges.** The sweep above writes edges the
+  query path does not traverse, which is the architectural comparison. Writing on
+  path additionally slides the queried window under a fixed stamp sweep, so it
+  needs the moving-window handling `contended_scaling` has and `tf2_scaling` does
+  not. Expect it to hurt both engines; the question is by how much each.
 * **tf_tree across processes over DDS.** `just dds-bench`'s tf_tree arm is a
   composed container, because `tft_bridge_create` builds a heap arena. See the
   transport section above; the fix is a decision record, not a benchmark.

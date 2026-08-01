@@ -705,8 +705,14 @@ tf2-bench:
 # tf2's per-lookup mutex. Reports p50/p99/p99.9, not means.
 #
 # RUN THIS ON AN IDLE MACHINE. Competing load makes the 8-thread rows worthless.
-tf2-scaling:
-    ./docker/tf2/run.sh 'cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
+# `TF2_WRITERS=N` adds N writer threads per engine, on dynamic edges the query
+# path does NOT traverse — PHASE1 §11.2's contended configuration, and the row
+# where tf2's single buffer mutex and tf_tree's per-edge seqlock differ most.
+# Default 0, so the quiescent rows stay the continuity anchor.
+#
+# Concurrent read scaling, both engines interleaved. TF2_WRITERS=N to contend it.
+tf2-scaling *ENV:
+    ./docker/tf2/run.sh '{{ENV}} cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
 
 # Instructions per `Ingest::offer` — cachegrind, N=0 baseline subtracted.
 #

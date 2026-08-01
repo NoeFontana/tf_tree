@@ -98,6 +98,23 @@ struct Load {
     target_c: FrameName,
     source_c: FrameName,
     stamps: Vec<i64>,
+    /// Dynamic edges of this load that the query path does **not** traverse,
+    /// as `(parent, child)`. See [`writable_edges`] for why the writers use
+    /// these and not the queried ones.
+    writable: Vec<(String, String)>,
+    /// The next stamp any writer may publish, shared by **every** writer thread
+    /// across **every** pass and thread count.
+    ///
+    /// It has to be shared, and the first revision learned that the hard way.
+    /// Both engines' state lives in this `Load` and outlives a pass, while the
+    /// writer threads do not — so a per-writer counter starting from the same
+    /// base meant the second pass republished stamps the first had already
+    /// written. tf_tree rejects those silently as out-of-order; **tf2 rejects
+    /// them and prints a `TF_OLD_DATA` warning per sample**, so the measured
+    /// window filled with stderr I/O and tf2's throughput row came out at 0.36
+    /// M/s with a 50 % spread. That is an artefact of the harness, and it would
+    /// have been published as tf2's cost under contention.
+    next_stamp: std::sync::atomic::AtomicI64,
 }
 
 fn fixture_load() -> Load {
@@ -110,10 +127,23 @@ fn fixture_load() -> Load {
     let now = fixture::NOW_NS;
     let lo = now - 100_000_000;
     let per_round = env_usize("TF2_PER_ROUND", 4096) as i64;
-    let stamps = (0..per_round)
+    let stamps: Vec<i64> = (0..per_round)
         .map(|k| lo + (now - lo) * k / per_round)
         .collect();
+    let writable = writable_edges(
+        &tree,
+        "camera_optical",
+        "map",
+        &fixture::DYNAMIC_EDGES
+            .iter()
+            .map(|(p, c, _)| ((*p).to_owned(), (*c).to_owned()))
+            .collect::<Vec<_>>(),
+    );
     Load {
+        next_stamp: std::sync::atomic::AtomicI64::new(
+            stamps.last().copied().unwrap_or(0) + 1_000_000,
+        ),
+        writable,
         name: "fixture_depth6",
         tree,
         tf2,
@@ -133,10 +163,15 @@ fn replay_load() -> Load {
     let tf2 = replay_tf2::load_tf2(&stream).expect("tf2");
     let (lo, hi) = stream.common_window().expect("window");
     let per_round = env_usize("TF2_PER_ROUND", 4096) as i64;
-    let stamps = (0..per_round)
+    let stamps: Vec<i64> = (0..per_round)
         .map(|k| lo + (hi - lo) * k / per_round)
         .collect();
+    let writable = writable_edges(&tree, "camera_link", "odom_combined", &stream.dynamic_edges);
     Load {
+        next_stamp: std::sync::atomic::AtomicI64::new(
+            stamps.last().copied().unwrap_or(0) + 1_000_000,
+        ),
+        writable,
         name: "recorded_stream",
         tree,
         tf2,
@@ -145,6 +180,139 @@ fn replay_load() -> Load {
         target_c: FrameName::new("camera_link").unwrap(),
         source_c: FrameName::new("odom_combined").unwrap(),
         stamps,
+    }
+}
+
+/// Writer threads per engine. `TF2_WRITERS`, default **0**.
+///
+/// Zero by default so every committed number in `docs/benchmarks/tf2.md` keeps
+/// meaning what it meant: the quiescent rows are the continuity anchor, and the
+/// writer rows are a second experiment run beside them, not a replacement.
+fn writer_count() -> usize {
+    std::env::var("TF2_WRITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The dynamic edges of `tree` that the `target <- source` plan does **not**
+/// traverse.
+///
+/// # Why the writers avoid the queried edges, and why that is the fair test
+///
+/// This is the measurement, not a way of being gentle. A robot's normal state is
+/// many publishers writing many edges while a node reads a few, and the two
+/// engines answer that case completely differently:
+///
+/// * `tf2::BufferCore` takes **one mutex for the whole buffer**. A write to any
+///   edge excludes every reader of every other edge.
+/// * tf_tree's rings are per edge, with a seqlock per slot. A write to an edge a
+///   reader is not reading costs that reader nothing at all.
+///
+/// So writing off-path is precisely the configuration in which the architectural
+/// difference is the only difference. Writing *on* path would additionally slide
+/// the queried window out from under a fixed stamp sweep, which turns a latency
+/// measurement into a measurement of the error path — the trap
+/// `src/bin/contended_scaling.rs` documents hitting, and the reason it re-probes
+/// the retained window before every point. That case is not measured here and
+/// the report says so.
+///
+/// Edges are compared by `EdgeId`, obtained by compiling a one-step plan for the
+/// candidate, rather than by name — a name comparison would miss an edge the
+/// query reaches inverted.
+fn writable_edges(
+    tree: &Tree,
+    target: &str,
+    source: &str,
+    dynamic: &[(String, String)],
+) -> Vec<(String, String)> {
+    let edge_of = |parent: &str, child: &str| -> Option<tf_tree::EdgeId> {
+        let (p, c) = (tree.frame(parent).ok()?, tree.frame(child).ok()?);
+        tree.plan(c, p).ok()?.steps().iter().find_map(|s| match s {
+            tf_tree::Step::Dyn { edge, .. } => Some(*edge),
+            tf_tree::Step::Static(_) => None,
+        })
+    };
+
+    let on_path: Vec<tf_tree::EdgeId> = (|| {
+        let (t, s) = (tree.frame(target).ok()?, tree.frame(source).ok()?);
+        Some(
+            tree.plan(t, s)
+                .ok()?
+                .steps()
+                .iter()
+                .filter_map(|st| match st {
+                    tf_tree::Step::Dyn { edge, .. } => Some(*edge),
+                    tf_tree::Step::Static(_) => None,
+                })
+                .collect(),
+        )
+    })()
+    .unwrap_or_default();
+
+    dynamic
+        .iter()
+        .filter(|(p, c)| edge_of(p, c).is_some_and(|e| !on_path.contains(&e)))
+        .cloned()
+        .collect()
+}
+
+/// One writer thread: publish to `edge` on whichever engine the round selected.
+///
+/// `which` says which engine the reader is on right now:
+///
+/// * `Some(a)` — the **throughput** pass, which measures one engine per round.
+///   The writer follows it, so exactly `writers` threads are busy and always
+///   against the engine under test. Writing to both continuously would instead
+///   double the runnable thread count and put each engine's writer into the
+///   other's measurement as background load.
+/// * `None` — the **latency** pass, where each reader alternates engines sample
+///   by sample and there is no round to follow. The writer alternates too, so
+///   both engines are contended throughout and symmetrically.
+fn writer_loop(
+    load: &Load,
+    edge: &(String, String),
+    which: Option<&AtomicUsize>,
+    stop: &AtomicBool,
+    seed: usize,
+) {
+    let (parent, child) = edge;
+    let (Ok(p), Ok(c)) = (load.tree.frame(parent), load.tree.frame(child)) else {
+        return;
+    };
+    let Ok(w) = load.tree.claim(c, p) else { return };
+    let (Ok(pc), Ok(cc)) = (FrameName::new(parent), FrameName::new(child)) else {
+        return;
+    };
+
+    // Stamps come from the load's shared counter, which starts above every
+    // populated stamp so tf_tree's monotonicity rule holds from the first push,
+    // and which never goes backwards across passes — see `Load::next_stamp` for
+    // what a per-writer counter cost. Both engines get the identical sequence,
+    // because handing them different stamps would be a difference in the
+    // workload rather than in the engine.
+    let pose = fixture::dynamic_pose(seed as f64, 0);
+    let mut alternating = 0usize;
+
+    while !stop.load(Ordering::Acquire) {
+        let stamp = load.next_stamp.fetch_add(1_000_000, Ordering::Relaxed);
+        let engine = match which {
+            Some(a) => ENGINES[a.load(Ordering::Acquire)],
+            None => {
+                alternating ^= 1;
+                ENGINES[alternating]
+            }
+        };
+        match engine {
+            Engine::TfTree => {
+                let _ = w.push(stamp, &pose);
+            }
+            Engine::Tf2 => {
+                let _ = load
+                    .tf2
+                    .set_transform_by_name(&pc, &cc, stamp, &pose, false);
+            }
+        }
     }
 }
 
@@ -216,7 +384,18 @@ fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 
 
     let mut ns: [Vec<u128>; 2] = [Vec::with_capacity(rounds), Vec::with_capacity(rounds)];
 
+    // Separate from `stop`, which is the readers' barrier protocol: the writers
+    // must keep running across the barrier waits *between* rounds too, or the
+    // tree is quiescent for part of every measured window.
+    let stop_writers = AtomicBool::new(false);
+    let stop_writers = &stop_writers;
+    let writers = writer_count().min(load.writable.len());
+
     thread::scope(|scope| {
+        for i in 0..writers {
+            let edge = &load.writable[i % load.writable.len()];
+            scope.spawn(move || writer_loop(load, edge, Some(which), stop_writers, i));
+        }
         for _ in 0..threads - 1 {
             scope.spawn(move || loop {
                 start.wait();
@@ -253,6 +432,7 @@ fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 
 
         stop.store(true, Ordering::Release);
         start.wait();
+        stop_writers.store(true, Ordering::Release);
     });
 
     let total = (threads * per_round) as f64;
@@ -307,8 +487,16 @@ fn measure_latency_pair(load: &Load, plan: &Plan, threads: usize) -> [Percentile
     let start = Barrier::new(threads);
     let mut all: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
 
+    let stop_writers = AtomicBool::new(false);
+    let stop_writers = &stop_writers;
+    let writers = writer_count().min(load.writable.len());
+
     thread::scope(|scope| {
         let start = &start;
+        for i in 0..writers {
+            let edge = &load.writable[i % load.writable.len()];
+            scope.spawn(move || writer_loop(load, edge, None, stop_writers, i));
+        }
         let mut handles = Vec::new();
         for _ in 0..threads - 1 {
             handles.push(scope.spawn(move || {
@@ -325,6 +513,7 @@ fn measure_latency_pair(load: &Load, plan: &Plan, threads: usize) -> [Percentile
             all[0].extend(got[0].iter().copied());
             all[1].extend(got[1].iter().copied());
         }
+        stop_writers.store(true, Ordering::Release);
     });
 
     core::array::from_fn(|w| {
@@ -432,7 +621,29 @@ fn main() {
     println!("rounds         : {rounds} per engine per thread count, engines interleaved");
     println!("latency        : {lat} samples/thread/engine, interleaved\n");
     println!("Engines alternate within every round, so drift lands on both equally.");
-    println!("`spread` is (best - median)/best: small means the machine was quiet.\n");
+    println!("`spread` is (best - median)/best: small means the machine was quiet.");
+    let writers = writer_count();
+    if writers == 0 {
+        println!("writers        : 0 (quiescent tree). Set TF2_WRITERS=N for the contended rows —");
+        println!(
+            "                 that is docs/PHASE1.md §11.2's configuration, and the row where"
+        );
+        println!(
+            "                 tf2's single buffer mutex and tf_tree's per-edge seqlock differ."
+        );
+    } else {
+        println!("writers        : {writers} per engine, on dynamic edges the query path does NOT");
+        println!("                 traverse. That is the measurement: tf2::BufferCore takes one");
+        println!("                 mutex for the WHOLE buffer, so a write to any edge excludes");
+        println!("                 every reader; tf_tree's rings are per edge, so it costs a");
+        println!("                 reader of another edge nothing. Writing ON path additionally");
+        println!("                 slides the queried window and is not measured here.");
+        println!(
+            "                 Budget cores: {writers} writers + N readers must fit, or the rows"
+        );
+        println!("                 are scheduler noise.");
+    }
+    println!();
 
     for load in [fixture_load(), replay_load()] {
         let t = load.tree.frame(&load.target).unwrap();
