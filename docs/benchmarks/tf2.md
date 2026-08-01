@@ -1099,9 +1099,11 @@ rather than promised.
 **What this comparison does not have, and why.** There is no multi-process
 tf_tree arm. `tft_bridge_create` builds its arena with `TreeBuilder::build()` —
 a **heap** arena — so no second process can attach to what the bridge fills.
-Giving the bridge a shared arena is new C ABI surface, which `CLAUDE.md` routes
-to a decision record rather than to a benchmark. The report prints that sentence
-above its own table on every run.
+That is the arm the project's central claim is about, and closing it is
+[`0015`](../decisions/0015-the-bridge-fills-a-shared-arena.md), a draft decision
+record: `tft_bridge_options` gains an optional `arena_name` and the bridge
+becomes an ordinary producer of the arena Phase 2 already specified. The report
+prints this gap above its own table on every run until then.
 
 #### A bridge defect this harness found
 
