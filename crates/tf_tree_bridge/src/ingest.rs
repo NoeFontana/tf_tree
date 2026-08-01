@@ -354,11 +354,18 @@ pub enum HaltReason {
 ///
 /// # What happens when the middleware cannot attribute anything
 ///
-/// The three non-node variants collapse to *fixed* sentinels, so an RMW with no
-/// endpoint introspection reports one identity for the whole robot. One identity
-/// means one baseline, which means common mode can never reach two publishers,
-/// which means **every** regression degrades to a drop and the bridge never
-/// halts on the inference path at all.
+/// An RMW that reports **no GID at all** yields [`Publisher::Unattributed`] for
+/// every sample — a unit variant, so it is one identity for the whole robot.
+/// One identity means one baseline, which means common mode can never reach two
+/// publishers, which means **every** regression degrades to a drop and the
+/// bridge never halts on the inference path at all.
+///
+/// An RMW that reports GIDs but resolves no *names* is a different case and now
+/// behaves differently: those publishers are distinct identities, so detection
+/// keeps working and only the *naming* in the diagnostic degrades. That is the
+/// right direction — `docs/PHASE4.md` §5.3's amendment demands that fewer
+/// identifiable publishers mean less detection, never more stopping, and this
+/// change only ever moves the count *up*.
 ///
 /// That is §5.3 satisfied by construction rather than by promise: *"attribution
 /// is diagnostic value, never a correctness dependency"*. Attribution quality
@@ -373,14 +380,12 @@ pub enum HaltReason {
 /// which is why the ladder, and not the key, is where the safety lives.
 ///
 /// Bracketed because a ROS node name cannot contain `<`, so a real node can
-/// never collide with a sentinel.
+/// never collide with a sentinel — and a GID key is bracketed for the same
+/// reason.
 pub(crate) fn owner_key(p: &Publisher) -> &str {
-    match p {
-        Publisher::Node(n) => n.as_str(),
-        Publisher::UnknownGid => "<unknown-gid>",
-        Publisher::Unattributed => "<unattributed>",
-        Publisher::Declared => "<declared>",
-    }
+    // One line, because the key *is* the identity and lives in the value —
+    // see `Publisher`'s own docs for why it is the GID and not the name.
+    p.key()
 }
 
 /// What §5.6 and §5.8 together decided about a sample's frames.
@@ -1209,7 +1214,7 @@ mod tests {
     use crate::clock::{CommonMode, SteadyNanos, DEFAULT_RESET_THRESHOLD_NANOS};
 
     fn node(n: &str) -> Publisher {
-        Publisher::Node(n.to_string())
+        Publisher::named(&crate::gid_for_name(n), n)
     }
     const MS: i64 = 1_000_000;
     const S: i64 = 1_000_000_000;

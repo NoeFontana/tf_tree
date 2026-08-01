@@ -518,6 +518,133 @@ fn an_authority_conflict_names_both_publishers_and_the_edge() {
     assert_balanced(&b.stats());
 }
 
+/// **A publisher that gets renamed is still the same publisher.**
+///
+/// This is the regression test for the defect `crates/tf_tree_bench`'s DDS
+/// comparison found. `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an
+/// endpoint discovered before its participant's node information arrives and
+/// corrects it on a later graph walk, so the *same* GID is attributed twice with
+/// two different names. When identity was the name, `FirstWriterWins` gave the
+/// edge to the placeholder and then rejected the real publisher forever:
+/// measured at 9 864 of 10 070 transforms dropped, against one correctly
+/// configured publisher, with 100 % of consumer lookups failing.
+///
+/// Mutant: make `tft_bridge_attribute` `insert` a fresh `Publisher` keyed on the
+/// name instead of mutating the entry's name ⇒ the second offer is
+/// `TFT_BRIDGE_DROPPED` / `NOT_THE_OWNER` and this fails on the first assert.
+#[test]
+fn a_publisher_renamed_by_a_later_graph_walk_keeps_its_edge() {
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+    );
+    let gid = [0x55u8; 16];
+
+    // The graph's first answer: an endpoint it can see but cannot yet name.
+    let placeholder = CString::new("/_NODE_NAMESPACE_UNKNOWN_/_NODE_NAME_UNKNOWN_").unwrap();
+    // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
+    assert_eq!(
+        unsafe { tft_bridge_attribute(b.0, gid.as_ptr(), placeholder.as_ptr()) },
+        TFT_OK
+    );
+    let o = b.offer(
+        TFT_BRIDGE_TOPIC_TF,
+        "odom",
+        "base",
+        1_000 * MS,
+        POSE,
+        Some(&gid),
+    );
+    assert_eq!(
+        o.action, TFT_BRIDGE_APPLIED,
+        "the first sample takes the edge"
+    );
+
+    // The graph's second answer, for the same endpoint.
+    let real = CString::new("/tf_bench_publisher").unwrap();
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { tft_bridge_attribute(b.0, gid.as_ptr(), real.as_ptr()) },
+        TFT_OK
+    );
+    let o = b.offer(
+        TFT_BRIDGE_TOPIC_TF,
+        "odom",
+        "base",
+        1_001 * MS,
+        POSE,
+        Some(&gid),
+    );
+    assert_eq!(
+        o.action, TFT_BRIDGE_APPLIED,
+        "a rename is not a change of publisher; the edge's owner did not move"
+    );
+    assert_balanced(&b.stats());
+}
+
+/// **Two publishers the graph cannot name are still two publishers.**
+///
+/// The other half of the same defect, and the one `docs/PHASE4.md` §5.3's
+/// amendment already named: `Publisher::UnknownGid` was a *unit* variant, so on
+/// a walk that resolved no names every publisher compared equal and §5.4's
+/// conflict detection was silently off — in exactly the deployment least able to
+/// diagnose it. A GID with no name is now a distinct identity.
+///
+/// Note what this does **not** change: a publisher with no GID *at all* is still
+/// `Publisher::Unattributed`, a unit variant, because `0012`'s ladder requires
+/// that less attribution mean less detection and never more stopping. That case
+/// is `an_unreported_gid_degrades_rather_than_failing` below.
+///
+/// Mutant: have `publisher_of` return one shared sentinel for an uncached GID
+/// instead of populating the cache ⇒ both offers are `TFT_BRIDGE_APPLIED` and
+/// the conflict assertion fails.
+#[test]
+fn two_unnamed_publishers_on_one_edge_still_conflict() {
+    let b = Bridge::new(
+        TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+    );
+    // Neither GID is ever passed to `tft_bridge_attribute`, so neither has a
+    // name — the state an RMW without endpoint introspection leaves.
+    let (one, two) = ([0x66u8; 16], [0x77u8; 16]);
+
+    let o = b.offer(
+        TFT_BRIDGE_TOPIC_TF,
+        "odom",
+        "base",
+        1_000 * MS,
+        POSE,
+        Some(&one),
+    );
+    assert_eq!(o.action, TFT_BRIDGE_APPLIED);
+
+    let o = b.offer(
+        TFT_BRIDGE_TOPIC_TF,
+        "odom",
+        "base",
+        1_001 * MS,
+        POSE,
+        Some(&two),
+    );
+    assert_eq!(
+        o.action, TFT_BRIDGE_DROPPED,
+        "two distinct GIDs are two publishers even with no names for them"
+    );
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_NOT_THE_OWNER);
+    // And the diagnostic must be able to tell them apart, or it says two
+    // identical things are fighting.
+    let (owner, intruder) = (text(o.owner), text(o.intruder));
+    assert_ne!(
+        owner, intruder,
+        "the diagnostic must distinguish them: {owner} vs {intruder}"
+    );
+    assert!(
+        owner.starts_with("<gid:"),
+        "unnamed publishers print their GID: {owner}"
+    );
+    assert_balanced(&b.stats());
+}
+
 /// **An unattributed publisher is not an error** (§5.3: attribution degrades).
 ///
 /// A GID of all zeroes is what an RMW that reports none leaves behind, so it

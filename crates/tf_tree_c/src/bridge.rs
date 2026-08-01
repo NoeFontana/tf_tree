@@ -723,7 +723,12 @@ struct BridgeInner {
     /// arena was built from, so there is no second set of names to keep in step
     /// with either.
     writers: BTreeMap<String, EdgeWriter<'static>>,
-    /// §5.3's GID → publisher cache, filled by [`tft_bridge_attribute`].
+    /// §5.3's GID → publisher cache: **the one home of publisher identity**.
+    ///
+    /// Populated on first sight of a GID by [`publisher_of`] and enriched with a
+    /// node name by [`tft_bridge_attribute`]. Both halves matter — the first is
+    /// what makes an unnamed publisher a *distinct* publisher, the second is
+    /// what makes a diagnostic readable.
     ///
     /// Holds a whole [`Publisher`] rather than a `String` so the hot path can
     /// hand the pipeline a `&Publisher` without building one — a
@@ -1331,7 +1336,7 @@ pub unsafe extern "C" fn tft_bridge_offer(
         inner.scratch.received = SteadyNanos(sample.received_steady_nanos);
 
         // SAFETY: the caller contracts `gid` is NULL or 16 readable bytes.
-        let who = unsafe { publisher_of(&inner.gids, gid) };
+        let who = unsafe { publisher_of(&mut inner.gids, gid) };
         let action = inner.ingest.offer(topic, &inner.scratch, who);
         fill(inner, &action, iso, &mut o);
         // SAFETY: as the first write above.
@@ -1425,11 +1430,10 @@ fn steady_now_nanos() -> i64 {
 /// # Safety
 ///
 /// `gid` must be NULL or point to 16 readable bytes.
-unsafe fn publisher_of(gids: &BTreeMap<[u8; 16], Publisher>, gid: *const u8) -> &Publisher {
+unsafe fn publisher_of(gids: &mut BTreeMap<[u8; 16], Publisher>, gid: *const u8) -> &Publisher {
     /// Returned when the middleware told us nothing. `static` so the borrow
     /// outlives the map's.
     static UNATTRIBUTED: Publisher = Publisher::Unattributed;
-    static UNKNOWN: Publisher = Publisher::UnknownGid;
     if gid.is_null() {
         return &UNATTRIBUTED;
     }
@@ -1440,7 +1444,18 @@ unsafe fn publisher_of(gids: &BTreeMap<[u8; 16], Publisher>, gid: *const u8) -> 
     if key == [0u8; 16] {
         return &UNATTRIBUTED;
     }
-    gids.get(&key).unwrap_or(&UNKNOWN)
+    // **First sight populates the cache, so this map is the one home of
+    // publisher identity** and a GID is a distinct publisher from the first
+    // sample, named or not. Previously an unresolved GID became the unit variant
+    // `Publisher::UnknownGid`, which made every unnamed publisher compare equal
+    // — §5.4 detection silently off, which `docs/PHASE4.md` §5.3's amendment
+    // already named as a blend.
+    //
+    // The insert is bounded by the number of publishers on `/tf`, not by the
+    // message rate: every later sample from the same GID takes the `Occupied`
+    // arm, which allocates nothing. `tft_bridge_attribute` then *upgrades* the
+    // entry's name in place without touching its identity.
+    gids.entry(key).or_insert_with(|| Publisher::from_gid(&key))
 }
 
 /// Turn a pipeline [`Action`] into the outcome POD, performing the arena write
@@ -1930,7 +1945,17 @@ pub unsafe extern "C" fn tft_bridge_attribute(
             );
             return TFT_ERR_UNKNOWN_FRAME;
         };
-        h.inner.gids.insert(key, Publisher::Node(name.to_string()));
+        // **Upgrade the name, never the identity.** A graph walk can rename a
+        // GID — `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an endpoint
+        // found before its participant's node info arrives and corrects it
+        // later — and an `insert` of a freshly built `Publisher` would be a new
+        // identity only if identity were the name. It is not, and this says so
+        // in the code rather than relying on that: the entry is mutated.
+        h.inner
+            .gids
+            .entry(key)
+            .and_modify(|p| p.set_name(name))
+            .or_insert_with(|| Publisher::named(&key, name));
         TFT_OK
     })
 }

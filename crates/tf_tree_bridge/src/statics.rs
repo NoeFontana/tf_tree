@@ -305,7 +305,7 @@ mod tests {
     use super::*;
 
     fn node(n: &str) -> Publisher {
-        Publisher::Node(n.to_string())
+        Publisher::named(&crate::gid_for_name(n), n)
     }
     const ID: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 

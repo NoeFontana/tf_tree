@@ -1075,20 +1075,28 @@ That is deliberately generous to tf2 and is **not** what a deployed node pays:
 `mp_bench` says so in its own output ("this tf2 column is a FLOOR ... but no
 transport"). This is the run that pays it — one publisher, real DDS, the
 container's RMW, [`PHASE4.md`](../PHASE4.md) §5.2's QoS, 4 consumers, 100 Hz,
-100 ms query lag, 3 s warm-up discarded, 10 s measured.
+100 ms query lag, 3 s warm-up discarded, 10 s measured, both arms on
+stock defaults.
 
 | arm | procs | consumers | svc p50 | svc p99 | svc p99.9 | CPU %/consumer | PSS |
 |---|---|---|---|---|---|---|---|
-| `tf2.processes` | 4 | 4 | 3.54 µs | 14.85 µs | 18.82 µs | 0.014% | **63.11 MiB** |
-| `tf2.composed` | 1 | 4 | 1.48 µs | 7.33 µs | 13.95 µs | 0.004% | 24.09 MiB |
-| `tf_tree.composed` | 1 | 4 | **0.86 µs** | **4.10 µs** | **9.15 µs** | **0.003%** | 24.65 MiB |
+| `tf2.processes` | 4 | 4 | 4.16 µs | 16.13 µs | 28.03 µs | 0.012% | **63.02 MiB** |
+| `tf2.composed` | 1 | 4 | 1.58 µs | 7.90 µs | 17.79 µs | 0.003% | 24.02 MiB |
+| `tf_tree.composed` | 1 | 4 | **0.83 µs** | 8.70 µs | **11.97 µs** | 0.004% | 24.81 MiB |
 
 Against the ordinary ROS deployment (`tf2.processes`, one listener per node):
-**4.1x on p50, 2.1x on p99.9, 4.7x on CPU per consumer, 2.6x on memory.**
+**5.0x on p50, 2.3x on p99.9, 2.5x on memory.** CPU per consumer is at the
+resolution floor for all three arms at this consumer count — 0.003–0.012% of a
+core — so the earlier "4.7x on CPU" reading was over-read from three significant
+figures of a number near zero, and is withdrawn. `just contended-scaling`'s CPU
+column is the one with room to say something.
 
 `tf2.composed` is in the table because without it the comparison is a strawman:
-it is tf2's *best* case, one listener shared by four threads in one process, and
-tf_tree still leads it 1.7x at p50 and 1.5x at p99.9 at comparable memory.
+it is tf2's *best* case, one listener shared by four threads in one process.
+tf_tree leads it 1.9x at p50 and 1.5x at p99.9 at comparable memory — and
+**trails it at p99**, 8.70 µs against 7.90, which is a 4-core host with three
+runnable arms rather than a property of either engine, and is left in the table
+rather than dropped.
 
 Both arms are the same executable with a different `--mode`, so the schedule, the
 query set, the warm-up window and the measurement code are literally the same
@@ -1103,24 +1111,43 @@ Giving the bridge a shared arena is new C ABI surface, which `CLAUDE.md` routes
 to a decision record rather than to a benchmark. The report prints that sentence
 above its own table on every run.
 
-#### A bridge defect this harness found
+#### A bridge defect this harness found — and fixed
 
 The first run of the tf_tree arm reported **10 070 transforms received, 187
 applied, 9 864 dropped as authority conflicts, and 100% of lookups failing** —
 against a single publisher and a correctly declared topology.
 
-`tf_tree_bridge::Publisher` is keyed on the **resolved node name**, not on the
-GID. At bridge startup the graph cache has not resolved the publisher yet, so the
-first `/tf` messages are attributed to an unknown name; under the default
-`first_writer_wins` that unknown name becomes the edge's owner, and every later
-message — now correctly resolved — is a *different* `Publisher` value and is
-rejected. Permanently, because `FirstWriterWins` never re-inserts the owner.
+`tf_tree_bridge::Publisher` was keyed on the **resolved node name**, not on the
+GID. `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an endpoint discovered
+before its participant's node information arrives and corrects it on a later
+graph walk, so the same publisher was attributed twice under two names. Under the
+default `first_writer_wins` the placeholder became the edge's owner and the
+corrected name was a *different* publisher, rejected permanently — that policy
+never re-inserts.
 
-The benchmark works around it with `last_writer_wins`, which re-inserts. **The
-fix is to key authority on the GID**, which is the identity that does not change,
-and it belongs in `tf_tree_bridge`. It was found only because the aggregator
-flags a row whose lookups mostly failed instead of printing its (excellent)
-latencies as a result.
+**Fixed.** [`PHASE4.md`](../PHASE4.md) §5.3 already says the GID is the identity
+("match one against the other"); the implementation used the name. `Publisher`
+now carries the GID as its identity with the node name as presentation, and
+`PartialEq`/`Ord`/`Hash` read the identity alone — hand-written rather than
+derived, precisely so a later field cannot silently rejoin the key.
+
+The same change closes the *opposite* defect, which §5.3's own amendment had
+already named without fixing: `Publisher::UnknownGid` was a **unit** variant, so
+on an RMW that reports GIDs but resolves no names every publisher compared equal
+and §5.4's conflict detection was silently off — in exactly the deployment least
+able to diagnose it. A GID with no name is now a distinct publisher, and prints
+its GID so a diagnostic can tell two of them apart. A publisher with **no GID at
+all** stays the unit `Unattributed`, because `0012`'s ladder requires that less
+attribution mean less detection and never more stopping.
+
+Two regression tests gate it (`crates/tf_tree_c/tests/bridge.rs`), and both were
+checked against mutants: putting the name back in the identity fails the rename
+test, and collapsing uncached GIDs to a sentinel fails the two-publishers test.
+This same arm now runs at **0 dropped of 16 373 transforms under the default
+policy**, which is the end-to-end evidence.
+
+It was found only because the aggregator flags a row whose lookups mostly failed
+instead of printing its (excellent) latencies as a result.
 
 ## A real difference: maximum chain depth
 

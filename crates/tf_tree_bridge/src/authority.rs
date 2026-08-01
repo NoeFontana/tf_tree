@@ -368,7 +368,7 @@ mod tests {
     use super::*;
 
     fn node(n: &str) -> Publisher {
-        Publisher::Node(n.to_string())
+        Publisher::named(&crate::gid_for_name(n), n)
     }
 
     /// **The default policy is stable under a flapping intruder.**

@@ -161,7 +161,10 @@ fn the_discovered_config_accepts_the_stream_it_came_from() {
 
     let stream = tf_tree_bench::replay::TfStream::load(&stream_path()).expect("load");
     let mut ingest = Ingest::new(&config);
-    let publisher = Publisher::Node("/robot_state_publisher".to_string());
+    let publisher = Publisher::named(
+        &tf_tree_bridge::gid_for_name("/robot_state_publisher"),
+        "/robot_state_publisher",
+    );
 
     // The latched statics, delivered twice — which is what a transient-local
     // subscription actually sees when a second late joiner appears. Both
@@ -257,7 +260,7 @@ fn an_edge_missing_from_the_config_is_counted_and_named_once() {
 
     let stream = tf_tree_bench::replay::TfStream::load(&stream_path()).expect("load");
     let mut ingest = Ingest::new(&config);
-    let publisher = Publisher::Node("/ekf".to_string());
+    let publisher = Publisher::named(&tf_tree_bridge::gid_for_name("/ekf"), "/ekf");
     let mut first_times = 0u64;
     for s in &stream.samples {
         let (parent, child) = &stream.dynamic_edges[s.edge];
