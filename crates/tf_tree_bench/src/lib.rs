@@ -26,9 +26,13 @@ pub mod mp;
 pub mod replay;
 /// `docs/PHASE5.md` §9's benchmark artifact: the report and its honesty rules.
 pub mod report;
+/// The A/B run store: what every harness emits, and how two runs are compared.
+pub mod runstore;
 /// Spawning child processes attached to a shared arena (Phase 2). Linux-only.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod shm_util;
+/// The named workload catalogue: what load a harness is running, in one place.
+pub mod workload;
 
 #[cfg(feature = "tf2")]
 pub mod replay_tf2;

@@ -1672,7 +1672,7 @@ fn iso8601_utc(t: SystemTime) -> String {
 }
 
 /// JSON string literal, escaped per RFC 8259.
-fn jstr(s: &str) -> String {
+pub(crate) fn jstr(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -1697,7 +1697,7 @@ fn jstr(s: &str) -> String {
 /// `NaN` and `Infinity` are not JSON. Emitting them would produce a file that
 /// every consumer rejects, which is a worse failure than a `null` a reader can
 /// see.
-fn jnum(v: f64) -> String {
+pub(crate) fn jnum(v: f64) -> String {
     if v.is_finite() {
         format!("{v}")
     } else {
@@ -1705,7 +1705,7 @@ fn jnum(v: f64) -> String {
     }
 }
 
-fn jmetrics(m: &[Metric]) -> String {
+pub(crate) fn jmetrics(m: &[Metric]) -> String {
     let mut s = String::from("{");
     for (i, x) in m.iter().enumerate() {
         if i > 0 {

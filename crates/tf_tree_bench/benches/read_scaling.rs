@@ -2,9 +2,28 @@
 // >= 6x from 1 to 8 threads). Each thread runs its own `Guard` over the shared,
 // lock-free `Tree` and evaluates a copy of the same depth-3 plan.
 //
-// This is a portable approximation of the gate row: it does NOT pin cores or run
-// concurrent writers, so the scaling factor it reports is indicative, not the
-// official number (which needs dedicated, core-pinned hardware).
+// This is a portable approximation of the gate row: it does NOT pin cores, so
+// the scaling factor it reports is indicative, not the official number (which
+// needs dedicated, core-pinned hardware). The pinned, multi-process version is
+// `src/bin/contended_scaling.rs`.
+//
+// # Two groups, and why the second one exists
+//
+// `read_scaling` runs against a quiescent tree. `read_scaling_writers` runs the
+// identical readers with a live publisher on every dynamic edge, which is what
+// `docs/PHASE1.md` §11.2 actually specifies ("4 concurrent writers") and what
+// `docs/benchmarks/tf2.md` listed under "What is still not measured".
+//
+// The quiescent group is kept rather than replaced. It is the continuity anchor
+// for every committed number, and the *difference* between the two groups is
+// the measurement — what the seqlock retry path costs a reader when somebody is
+// actually writing. One group alone answers neither question.
+//
+// The writers here publish at the fixture's NOMINAL rates, so this group is the
+// portable, always-runnable version of the question. The version with real
+// pressure — a writer per core, saturating — is `src/bin/contended_scaling.rs`,
+// and `writer_loop` below records what happened when this file tried to be that
+// instead.
 //
 // # What is and is not inside the timed region
 //
@@ -58,14 +77,66 @@ fn worker_pass(tree: &Tree, plan: &tf_tree::Plan) {
 }
 
 fn read_scaling(c: &mut Criterion) {
+    scaling_group(c, "read_scaling", 0);
+}
+
+/// The same readers, with `WRITER_EDGES` live publishers on the tree.
+fn read_scaling_writers(c: &mut Criterion) {
+    scaling_group(c, "read_scaling_writers", WRITER_EDGES);
+}
+
+/// How many of the fixture's four dynamic edges get a live publisher in the
+/// contended group. All four, which is `docs/PHASE1.md` §11.2's figure.
+const WRITER_EDGES: usize = 4;
+
+/// One writer, publishing at its edge's **nominal** rate.
+///
+/// # Why nominal and not as fast as possible
+///
+/// The first revision of this ran the writers flat out, on the reasoning that at
+/// 50-1000 Hz a writer touches a cache line a few thousand times a second, which
+/// against millions of lookups per second is indistinguishable from no writer at
+/// all - so a full-speed writer supplies more of the thing being studied.
+///
+/// That reasoning is right about the contention and wrong about the benchmark.
+/// Four spinning writers plus eight reader threads is twelve runnable threads,
+/// and on a four-core host the readers are starved: the group ran for over ten
+/// minutes without completing a single row. A benchmark nobody can run supplies
+/// no contention at all.
+///
+/// So this publishes at the fixture's rates, which is what a robot does, and the
+/// strong version of the question lives where it can be asked properly -
+/// `src/bin/contended_scaling.rs`, which pins every reader and every writer to
+/// its own core and knows how many it has.
+fn writer_loop(tree: &tf_tree::Tree, edge: usize, stop: &AtomicBool) {
+    let (parent, child, rate_hz) = fixture::DYNAMIC_EDGES[edge];
+    let (Ok(p), Ok(c)) = (tree.frame(parent), tree.frame(child)) else {
+        return;
+    };
+    let Ok(w) = tree.claim(c, p) else { return };
+    let step = (1e9 / rate_hz) as i64;
+    // Start above the populated history so every push is in order.
+    let mut stamp = (fixture::HISTORY_SECS * rate_hz) as i64 * step + step;
+    let period = std::time::Duration::from_secs_f64(1.0 / rate_hz);
+    while !stop.load(Ordering::Acquire) {
+        let _ = w.push(stamp, &fixture::dynamic_pose(edge as f64, stamp));
+        stamp += step;
+        std::thread::sleep(period);
+    }
+}
+
+fn scaling_group(c: &mut Criterion, name: &str, writers: usize) {
     let tree = fixture::build_tree().expect("build fixture");
-    let (_writers, _samples) = fixture::spin_up(&tree).expect("populate history");
+    let (populate, _samples) = fixture::spin_up(&tree).expect("populate history");
+    // The populating writers must be released before the bench's own writers can
+    // claim the same edges — a claim is a lease, and a second one is refused.
+    drop(populate);
 
     let t = tree.frame("imu_link").expect("target");
     let s = tree.frame("map").expect("source");
     let plan = tree.plan(t, s).expect("plan");
 
-    let mut group = c.benchmark_group("read_scaling");
+    let mut group = c.benchmark_group(name);
     for &threads in &[1usize, 2, 4, 8] {
         group.throughput(criterion::Throughput::Elements(
             (threads * PER_THREAD) as u64,
@@ -79,9 +150,18 @@ fn read_scaling(c: &mut Criterion) {
         let start = Barrier::new(threads);
         let done = Barrier::new(threads);
         let stop = AtomicBool::new(false);
+        // Separate from `stop`: the writers must keep running across every
+        // `b.iter` batch, including the barrier waits between them. Tying them
+        // to the reader barrier would leave the tree quiescent for exactly the
+        // moments the readers are being timed.
+        let stop_writers = AtomicBool::new(false);
         let (tree, start, done, stop) = (&tree, &start, &done, &stop);
+        let stop_writers = &stop_writers;
 
         thread::scope(|scope| {
+            for edge in 0..writers {
+                scope.spawn(move || writer_loop(tree, edge, stop_writers));
+            }
             for _ in 0..threads - 1 {
                 scope.spawn(move || loop {
                     start.wait();
@@ -105,10 +185,11 @@ fn read_scaling(c: &mut Criterion) {
             // `thread::scope` can join them instead of deadlocking on `start`.
             stop.store(true, Ordering::Release);
             start.wait();
+            stop_writers.store(true, Ordering::Release);
         });
     }
     group.finish();
 }
 
-criterion_group!(benches, read_scaling);
+criterion_group!(benches, read_scaling, read_scaling_writers);
 criterion_main!(benches);

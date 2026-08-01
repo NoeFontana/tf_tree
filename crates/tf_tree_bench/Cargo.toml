@@ -184,3 +184,53 @@ name = "counter_cost"
 [[bin]]
 name = "bench_report"
 path = "src/bin/bench_report.rs"
+
+# **The A/B differ.** Deliberately no `required-features`: it reads two JSON
+# files and compares them, so it must build — and be testable — in the same
+# plain `--workspace` build the harnesses that need `shm` cannot appear in.
+# A comparison tool that only exists in the configuration that produces the
+# heaviest measurements is one nobody reaches for on the light ones.
+[[bin]]
+name = "bench_ab"
+path = "src/bin/bench_ab.rs"
+
+# Reader/writer child for `contended_scaling`. It attaches to a shared arena over
+# an inherited fd and is placed on a core by `taskset`, so it must be a separate
+# executable — the same reason `shm_child` and `mp_consumer` are.
+[[bin]]
+name = "load_child"
+path = "src/bin/load_child.rs"
+required-features = ["shm"]
+
+# **`docs/PHASE1.md` §11.2's read-scaling row, with the writers and the pinning
+# it actually specifies.** Every other reader benchmark here runs against a
+# quiescent tree; this one does not, which is the whole reason it exists.
+[[bin]]
+name = "contended_scaling"
+path = "src/bin/contended_scaling.rs"
+required-features = ["shm"]
+
+# **The extreme-scale sweep.** No `required-features`: every axis it measures —
+# width, ring depth, publish fan-out, and the arena's own limits — is a
+# single-process property, so it must run on a host with neither ROS nor shared
+# memory. That is the same reasoning `footprint` uses.
+[[bin]]
+name = "scale_sweep"
+path = "src/bin/scale_sweep.rs"
+
+# **The long-duration soak.** Single process, so no `shm` and no ROS; it watches
+# a healthy system for drift over minutes to hours, which is a different question
+# from `shm_torture`'s (correctness under `SIGKILL`) and is not answerable by
+# running that one for longer.
+[[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
+
+# **The Rust half of the §9.1 end-to-end comparison.** It generates the inputs
+# (so the publisher, the bridge config and the query set all come from one
+# workload entry rather than three hand-written files) and aggregates the
+# outputs. No `required-features`: `emit-config` must run wherever the container
+# is driven from, and the aggregation is text processing.
+[[bin]]
+name = "dds_report"
+path = "src/bin/dds_report.rs"

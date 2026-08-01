@@ -57,13 +57,14 @@ crates/tf_tree_bench/   criterion + tf2 differential harness
 crates/tf_tree_tf2_sys/ the tf2 side of the differential harness
 crates/tf_tree_cli/     binary `tf_tree` (alias `tft`)
 ros/tf_tree_ros/        ament_cmake package: the §5 ingest bridge. NOT a cargo crate.
+ros/tf_tree_bench_ros/  ament_cmake package: PHASE5 §9.1's DDS comparison. Benchmark-only, never shipped.
 xtask/                  loom / miri / bench-gate runners
 ```
 
 `ros/tf_tree_ros/` needs `rclcpp`, which exists only inside `docker/tf2`, so it
 is outside the cargo workspace and outside every host recipe — `cargo fmt`,
 `clippy` and `nextest` cannot see it, exactly like `crates/tf_tree_tf2_sys`.
-**`just ros-build` and `just ros-test` are its entire gate**; run them after
+**`just ros-build` and `just ros-test` are its entire gate** (both cover `tf_tree_bench_ros` too — `colcon --base-paths ros` picks up every package under `ros/`); run them after
 touching anything under `ros/`, and note that `just ros-test` also rebuilds
 `tf_tree_c --features bridge`, so a change on the Rust side of the seam is
 covered by it too. CI's `tf2` job runs `just ros-test` after `just tf2-check`. It reaches the engine only through
@@ -115,6 +116,9 @@ Everything goes through `just`; CI mirrors it 1:1.
 | `just miri` | UB checking on arena + core |
 | `just msrv` | the declared MSRV floor: `--locked` build on it, plus every hand-written `rust-version` |
 | `just bench` | benchmark suite + go/no-go gate |
+| `just contended-scaling` / `scale-sweep` / `soak` | the exploratory performance suite: `docs/PHASE1.md` §11.2's writers-and-pinning row, the width/depth/ring/fan-out axes, and multi-minute drift. Exploratory by design — they emit JSON and do **not** feed `just bench-check` |
+| `just bench-run` / `just bench-ab` | the A/B loop: run the suite, change the core, run again, get a per-row verdict. Non-zero exit on a regression past the tolerance the baseline itself recorded |
+| `just dds-bench` | `docs/PHASE5.md` §9.1 end-to-end over a real DDS, in the container. The only measurement here that includes the transport |
 | `just ros-build` / `just ros-test` | `ros/tf_tree_ros` in the container — nothing on the host can |
 | `just tf2-check` | the container-only crates: `tf_tree_tf2_sys`, and `tf_tree_c --features bridge` |
 

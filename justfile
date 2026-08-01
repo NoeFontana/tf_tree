@@ -446,6 +446,162 @@ bench-baseline-update:
     cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report
     cp target/bench-report/results.json crates/tf_tree_bench/baseline/results.json
 
+# --- The performance suite (exploratory; NOT the `bench-check` gate) ---------
+#
+# These harnesses answer the two questions `bench-report` does not. `bench-report`
+# produces `docs/PHASE5.md` §9's artifact and `bench-check` gates it against a
+# committed baseline; both are deliberately narrow, because a gate has to be.
+# What was missing is everything either side of that: the §11.2 row nobody had
+# measured, the axes nobody had swept, the hours nobody had run, and a way to
+# ask "did that change help?" in one command.
+#
+# **None of these feed `just bench-check`.** This host fails `Fitness::probe`
+# (four physical cores, SMT on, an unreadable governor), so every timing row here
+# would be Indicative, and a gate that flaps is a gate people learn to ignore.
+# The one exception is the zero-allocation gate, which is host-independent and
+# runs in `just test` where it belongs.
+
+# List the workload catalogue: what each named load is and why it is there.
+workloads:
+    cargo run --release -p tf_tree_bench --features shm --bin contended_scaling -- --list
+
+# **`docs/PHASE1.md` §11.2's read-scaling row, with the writers and the pinning.**
+#
+# Every other reader benchmark in this repository runs against a QUIESCENT tree —
+# `benches/read_scaling.rs` says so in its own header and `docs/benchmarks/tf2.md`
+# lists both gaps under "What is still not measured". This runs N reader processes
+# and M writer processes on one shared arena, each `taskset`-pinned to its own
+# core, and reports aggregate throughput, per-lookup service percentiles and the
+# open-loop cycle tail.
+#
+# REFUSES TO RUN on a busy machine, for `mp-bench`'s reason: latency here is
+# largely a measurement of the scheduler.
+#
+# PHASE1 §11.2's read-scaling row: N readers x M writers, pinned, on one arena.
+contended-scaling *ARGS:
+    cargo build --release --features shm -p tf_tree_bench --bins
+    taskset -c 0-7 ./target/release/contended_scaling {{ARGS}}
+
+# Where tf_tree bends and where it breaks: lookup cost against tree WIDTH at a
+# fixed dynamic-step count, plan-compile and build cost against tree size, ring
+# depth from 8 to 1M slots, publish fan-out to 256 edges, and the arena's own
+# limits printed by the engine rather than copied from a header.
+#
+# Needs no ROS and no shared memory — every axis is a single-process property.
+#
+# Extreme-scale sweep: width, depth, ring size, publish fan-out, and the limits.
+scale-sweep *ARGS:
+    cargo run --release -p tf_tree_bench --bin scale_sweep -- {{ARGS}}
+
+# Steady state over minutes: does the tail drift, does RSS grow, do the rings
+# actually lap? EXITS NON-ZERO if the last interval's p99.9 exceeds the first's
+# by more than 3x, if RSS grows past 8 MiB, or if the rings never lapped — the
+# last of which is a failure of the experiment rather than of the engine, and is
+# the vacuous-green case `docs/PHASE2.md` §11.4's torture harness was rewritten
+# to avoid.
+#
+# Long-duration steady state: does the tail drift, does RSS grow, do rings lap?
+soak *ARGS:
+    cargo run --release -p tf_tree_bench --bin soak -- {{ARGS}}
+
+# The overnight version. Thirty minutes laps the fixture's 10 s rings about 180
+# times, which is the only way the wraparound path is exercised at all.
+#
+# The overnight soak: 30 minutes on fleet_16, one snapshot a minute.
+soak-long:
+    cargo run --release -p tf_tree_bench --bin soak -- \
+        --workload fleet_16 --duration 30m --interval 60s \
+        --json target/bench-runs/soak-long.json
+
+# --- The A/B loop: did that change help? ------------------------------------
+#
+# Every harness above takes `--json <path>`. `bench-run` writes one file per
+# commit, `bench-ab` compares two and exits non-zero on a regression, so it drops
+# into a bisect script without further wrapping.
+#
+# The direction a metric may move and the slack below which a move is not news
+# both travel IN the file, next to the number. Nothing in the differ infers
+# either from a key name — that is `results.json` schema /2's argument, one level
+# down: a checker that guesses will one day pass a doubled latency because
+# somebody named a field `ops_ns`.
+
+# Run the light half of the suite and write target/bench-runs/<sha>[-dirty].json.
+bench-run workload="robot":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sha=$(git rev-parse --short HEAD)
+    if [ -n "$(git status --porcelain)" ]; then sha="$sha-dirty"; fi
+    out="target/bench-runs/$sha"
+    mkdir -p "$out"
+    cargo build --release --features shm -p tf_tree_bench --bins
+    taskset -c 0-7 ./target/release/contended_scaling \
+        --workload {{workload}} --seconds 3 --readers 1,2,4,8 --writers 0,4 \
+        --json "$out/contended_scaling.json"
+    ./target/release/scale_sweep --json "$out/scale_sweep.json"
+    echo
+    echo "wrote $out/{contended_scaling,scale_sweep}.json"
+
+# Compare two run files. Non-zero exit means something regressed past its own
+# tolerance.
+#
+# Compare two run files; non-zero exit means a metric regressed past its tolerance.
+bench-ab a b:
+    cargo run --release -p tf_tree_bench --bin bench_ab -- {{a}} {{b}}
+
+# --- Profiling: where does the time actually go? ----------------------------
+
+# Sampling profile of a workload, folded to a flamegraph.
+#
+# Uses the `profiling` profile — release codegen with debuginfo kept — because
+# `[profile.release]` strips it and every tool then falls back to function-level
+# attribution, at which point the answer is "it is all in fold_at", which is true
+# and tells you nothing. `profile-lookup` relies on the same thing.
+#
+# `perf` needs `kernel.perf_event_paranoid <= 1`; this host ships 4. The recipe
+# checks and prints the one command that fixes it rather than failing obscurely,
+# and points at the simulated path below, which needs no permissions at all.
+#
+# Sampling profile of a workload, for a flamegraph. Needs perf_event_paranoid <= 1.
+profile workload="fleet_16" seconds="20":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 4)
+    if [ "$paranoid" -gt 1 ]; then
+        echo "perf_event_paranoid is $paranoid; perf cannot sample. Either:" >&2
+        echo "  sudo sysctl kernel.perf_event_paranoid=1" >&2
+        echo "or use the simulated, permission-free path:" >&2
+        echo "  just profile-cachegrind {{workload}}" >&2
+        exit 1
+    fi
+    command -v perf >/dev/null || { echo "perf is not installed" >&2; exit 1; }
+    cargo build --profile profiling -p tf_tree_bench --bin soak
+    mkdir -p target/profile
+    perf record -F 999 -g --call-graph dwarf -o target/profile/perf.data -- \
+        ./target/profiling/soak --workload {{workload}} \
+            --duration {{seconds}}s --interval {{seconds}}s
+    perf script -i target/profile/perf.data > target/profile/out.perf
+    echo "wrote target/profile/out.perf — fold it with inferno-collapse-perf or stackcollapse-perf"
+
+# Exact, simulated, and needs no privileges: instruction counts and cache misses
+# per source line over any workload.
+#
+# The generalisation of `profile-lookup`, which is pinned to `footprint`'s one
+# hardcoded query. Simulated, so no idle machine is needed and the counts are
+# exact — but it is roughly 50x slower than native, so keep the workload small.
+#
+# Per-line instruction counts and cache misses over a workload. No privileges needed.
+profile-cachegrind workload="robot":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v valgrind >/dev/null || { echo "valgrind is not installed" >&2; exit 1; }
+    cargo build --profile profiling -q -p tf_tree_bench --bin soak
+    mkdir -p target/profile
+    valgrind --tool=cachegrind --branch-sim=yes --cache-sim=yes \
+        --cachegrind-out-file=target/profile/cg.out \
+        ./target/profiling/soak --workload {{workload}} --duration 4s --interval 2s \
+        >/dev/null 2>&1 || true
+    cg_annotate --show=Ir,Bcm,D1mr --sort=Ir --auto=yes target/profile/cg.out
+
 # `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
 # where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
 # `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one
@@ -504,6 +660,26 @@ ros-build:
 # Build ros/tf_tree_ros and run its ctests. The only gate this package has.
 ros-test:
     ./docker/tf2/run.sh './ros/build.sh --test'
+
+# **`docs/PHASE5.md` §9.1's end-to-end comparison, over a real DDS.**
+#
+# The one measurement in this repository that includes the transport. Every other
+# tf2 comparison here feeds `tf2::BufferCore` in-process, which is deliberately
+# generous to tf2 and is not what a deployed node pays — `mp_bench` says so in
+# its own output ("this tf2 column is a FLOOR ... but no transport"). This runs N
+# `tf2_ros::TransformListener` consumers against one publisher over the container's
+# real RMW, and the same query set through the ingest bridge.
+#
+# **It prints, every run, the arm it cannot measure and why**: the bridge builds a
+# heap arena, so there is no multi-process tf_tree arm until a decision record
+# gives it a shared one. §9.3 is normative that an honest gap beats a favourable
+# number nobody trusts.
+#
+# Env: WORKLOAD, CONSUMERS, SECONDS_MEASURED, WARMUP, HZ.
+#
+# N tf2 listeners over DDS against the bridge, on identical data and QoS.
+dds-bench *ENV:
+    ./docker/tf2/run.sh './ros/build.sh && {{ENV}} ./ros/dds_bench.sh'
 
 # The tf2::BufferCore differential — the migration-credibility test.
 #
