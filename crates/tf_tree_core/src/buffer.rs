@@ -278,7 +278,26 @@ impl SampleRing<'_> {
         // sample to the bracket search.
         slot.seq.store(odd.wrapping_add(1), Ordering::Release); // -> even
         self.head.store(h + 1, Ordering::Release);
-        self.heartbeat.fetch_add(1, Ordering::Relaxed);
+
+        // **A store, not a locked read-modify-write.** The heartbeat counts
+        // pushes, and the post-push count is `h + 1`, already in a register:
+        // `head` is written here and nowhere else in the workspace and is never
+        // reset, and this line is the only writer of `ClaimRecord::heartbeat`,
+        // so the two are equal at every quiescent point.
+        //
+        // The ordering is unchanged — `Relaxed` before and after. What goes away
+        // is the atomicity, which bought nothing: the ring is single-writer by
+        // construction (invariant 4 / D7), the same guarantee the plain `head`
+        // store immediately above already rests on. On x86 `fetch_add` lowers to
+        // a `lock`-prefixed instruction whose implicit full barrier drains the
+        // store buffer right behind the eight relaxed payload stores above.
+        // Measured on `push/single_writer`: 8.85 ns -> 4.60 ns per push.
+        //
+        // This is the cost `counters.rs`'s module doc already rules out for
+        // publish-side diagnostics — "a relaxed `fetch_add` on the push path
+        // costs ~5-10 ns ... to store something the arena already holds" —
+        // applied to the last such `fetch_add` left on the push path.
+        self.heartbeat.store(h + 1, Ordering::Relaxed);
         Ok(())
     }
 

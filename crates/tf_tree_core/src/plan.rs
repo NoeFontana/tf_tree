@@ -387,10 +387,37 @@ impl Plan {
         // publisher that is working correctly, which is worse than not counting
         // them at all (`docs/PHASE5.md` §5.2's attribution argument, applied in
         // the other direction).
-        match self.fold_at(g, t.nanos()) {
-            Ok(iso) => {
-                g.note_ok(self.first_dynamic_edge());
-                Ok(iso)
+        self.note(g, self.first_dynamic_edge(), self.fold_at(g, t.nanos()))
+    }
+
+    /// Record one evaluation's outcome against the diagnostic counters.
+    ///
+    /// Every entry point that folds the plan goes through here, not just
+    /// [`Self::at`]. `docs/PHASE5.md` §5.3 makes the error-path counters
+    /// normative and always-on, and §5.2 makes them the whole basis of `TFT010`
+    /// and `TFT011` — so a path that folds without counting is a path whose
+    /// failures never reach `tf_tree top` or `doctor`. The batch entry points
+    /// are exactly the ones that must not be missed: `at_many_into` is the
+    /// Python zero-copy path and `at_with_derivatives` is the C ABI's, so
+    /// leaving them silent meant the two flagship consumers contributed nothing
+    /// to the operator's view of who is failing.
+    ///
+    /// `edge` is [`Self::first_dynamic_edge`]. It is a parameter rather than a
+    /// call inside this function because it is an O(plan length) scan over the
+    /// steps and it is loop-invariant: a batch caller resolves it once and
+    /// passes the same value for every element, which is the difference between
+    /// a per-element cost of a few nanoseconds and one proportional to depth.
+    #[inline]
+    fn note<T>(
+        &self,
+        g: &Guard,
+        edge: EdgeId,
+        r: Result<T, LookupError>,
+    ) -> Result<T, LookupError> {
+        match r {
+            Ok(v) => {
+                g.note_ok(edge);
+                Ok(v)
             }
             Err(e) => {
                 g.note_err(&e);
@@ -510,7 +537,11 @@ impl Plan {
     ) -> Result<Sample, LookupError> {
         self.check_generation(g)?;
         self.check_domain::<D>()?;
-        let (pose, twist) = self.fold_at_with_derivatives(g, t.nanos())?;
+        let (pose, twist) = self.note(
+            g,
+            self.first_dynamic_edge(),
+            self.fold_at_with_derivatives(g, t.nanos()),
+        )?;
         Ok(Sample {
             pose,
             twist,
@@ -543,6 +574,12 @@ impl Plan {
     /// edge is empty.
     pub fn latest(&self, g: &Guard) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
+        self.note(g, self.first_dynamic_edge(), self.fold_latest(g))
+    }
+
+    /// [`Self::latest`]'s fold, split out so the counter bracket in
+    /// [`Self::note`] wraps a single expression.
+    fn fold_latest(&self, g: &Guard) -> Result<Iso3, LookupError> {
         let mut acc = Iso3::IDENTITY;
         for step in self.steps() {
             acc = match step {
@@ -571,6 +608,12 @@ impl Plan {
     /// not reach the common stamp.
     pub fn latest_common(&self, g: &Guard) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
+        self.note(g, self.first_dynamic_edge(), self.fold_latest_common(g))
+    }
+
+    /// [`Self::latest_common`]'s fold, split out for the same reason as
+    /// [`Self::fold_latest`].
+    fn fold_latest_common(&self, g: &Guard) -> Result<Iso3, LookupError> {
         let mut common = i64::MAX;
         let mut any = false;
         for step in self.steps() {
@@ -687,15 +730,17 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain::<D>()?;
 
+        // Hoisted: loop-invariant, and an O(plan length) scan (see [`Self::note`]).
+        let edge = self.first_dynamic_edge();
         let monotone = stamps.windows(2).all(|w| w[0].nanos() <= w[1].nanos());
         if monotone {
             let mut cursors = [0u64; MAX_DEPTH];
             for (s, o) in stamps.iter().zip(out.iter_mut()) {
-                *o = self.fold_at_cursors(g, s.nanos(), &mut cursors)?;
+                *o = self.note(g, edge, self.fold_at_cursors(g, s.nanos(), &mut cursors))?;
             }
         } else {
             for (s, o) in stamps.iter().zip(out.iter_mut()) {
-                *o = self.fold_at(g, s.nanos())?;
+                *o = self.note(g, edge, self.fold_at(g, s.nanos()))?;
             }
         }
         Ok(())
@@ -823,16 +868,18 @@ impl Plan {
         // already elides the check and because ~245 us of interpolation dwarfs
         // it either way. It stays because it says what it means and drops the
         // manual index arithmetic, not because it is faster.
+        // Hoisted: loop-invariant, and an O(plan length) scan (see [`Self::note`]).
+        let edge = self.first_dynamic_edge();
         let monotone = stamps.windows(2).all(|w| w[0] <= w[1]);
         if monotone {
             let mut cursors = [0u64; MAX_DEPTH];
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
-                let iso = self.fold_at_cursors(g, *s, &mut cursors)?;
+                let iso = self.note(g, edge, self.fold_at_cursors(g, *s, &mut cursors))?;
                 write(&iso, dst);
             }
         } else {
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
-                let iso = self.fold_at(g, *s)?;
+                let iso = self.note(g, edge, self.fold_at(g, *s))?;
                 write(&iso, dst);
             }
         }

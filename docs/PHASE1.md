@@ -459,6 +459,23 @@ Stamps live in a **separate** array of `AtomicI64`, so binary search touches 8 s
 
 ### 6.2 Publish protocol (single writer)
 
+> **Amended by [`PHASE2.md`](./PHASE2.md) §1 — A5, and by the heartbeat store below.**
+> Two lines of this listing no longer match the shipped `SampleRing::push`, and the
+> code is the amended version in both cases:
+>
+> - The odd flip is `slot.seq.load(Relaxed) | 1`, **not** `s.wrapping_add(1)`. A5
+>   forces the parity instead of incrementing it, so a writer killed mid-write
+>   leaves a stale odd value that the next writer heals idempotently rather than
+>   inverting the protocol for that slot.
+> - The heartbeat is a plain `store(h + 1)`, **not** `fetch_add(1)`. The ordering
+>   annotation is unchanged (`Relaxed` either way); only the atomicity goes, and
+>   the ring is single-writer by construction (D7), which is the same guarantee
+>   the neighbouring plain `head.store` already rests on. `heartbeat` equals
+>   `head` at every quiescent point — `head` is written in exactly one place and
+>   never reset — so the stored value is identical. Measured: 8.85 → 4.60 ns/push.
+>
+> The ordering annotations remain NORMATIVE as written; neither amendment weakens one.
+
 ```rust
 // NORMATIVE ordering annotations.
 fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
@@ -470,8 +487,8 @@ fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
     let idx = (h & self.mask) as usize;
     let slot = &self.poses[idx];
 
-    let s = slot.seq.load(Ordering::Relaxed);
-    slot.seq.store(s.wrapping_add(1), Ordering::Relaxed);   // -> odd
+    let s = slot.seq.load(Ordering::Relaxed) | 1;           // A5: force, do not increment
+    slot.seq.store(s, Ordering::Relaxed);                   // -> odd (idempotent if already)
     core::sync::atomic::fence(Ordering::Release);
 
     self.stamps[idx].store(stamp, Ordering::Relaxed);
@@ -479,9 +496,9 @@ fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
         slot.data[i].store(*w, Ordering::Relaxed);
     }
 
-    slot.seq.store(s.wrapping_add(2), Ordering::Release);   // -> even, publishes data
+    slot.seq.store(s.wrapping_add(1), Ordering::Release);   // -> even, publishes data
     self.rec.head.store(h + 1, Ordering::Release);          // publishes the sample
-    self.claim.heartbeat.fetch_add(1, Ordering::Relaxed);
+    self.claim.heartbeat.store(h + 1, Ordering::Relaxed);   // single writer: a store, not an RMW
     Ok(())
 }
 ```
