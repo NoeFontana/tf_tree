@@ -1,8 +1,8 @@
 # 0014: The push heartbeat is a store, not a locked read-modify-write
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** `engine/five-lens-hygiene`
+**Implementation:** #114
 
 ## Context
 
@@ -77,7 +77,8 @@ though it is never a reaping trigger (D17).
   push". Anything that resets `head` without resetting `heartbeat`, or introduces
   a second writer to either, breaks the equality. Both are single-writer today and
   D7 is what keeps them so; a future multi-writer edge type would have to revisit
-  this line and `head.store` together.
+  this line and `head.store` together. **This is enforced, not merely stated** —
+  see the `debug_assert_eq!` in `push` and resolution 1 below.
 - No consumer is affected: nothing in the workspace reads `ClaimRecord::heartbeat`
   except `ArenaView::ring_of`'s wiring and one core test asserting it equals 3
   after 3 pushes, which still passes.
@@ -93,15 +94,51 @@ though it is never a reaping trigger (D17).
    [`0013`](./0013-the-benchmark-gate-never-interpolated.md), so the push and
    lookup numbers are re-baselined exactly once rather than twice.
 
-Steps 1 and 2 have landed on `engine/five-lens-hygiene` ahead of ratification;
-revert them if this record is rejected.
+4. Assert the equality in `push` — see resolution 1 below. Verified by `just
+   test`, `just loom` and `just miri`, all of which build with debug assertions
+   on and exercise `push` directly.
 
-## Open questions
+All four steps have landed in #114.
 
-1. Should the "heartbeat == head" equality be asserted somewhere, rather than
-   left as a property this record argues for? A debug assertion in `push` costs
-   nothing in release and would catch a future second writer to either field.
-2. PHASE1 carries no amendment markers at all — A1–A8 were applied to the code
-   and never annotated in the document they amend. Is the inline box added here
-   the pattern to apply retroactively to the rest, or should `PHASE2.md` §1 stay
-   the single index of amendments?
+## Resolved questions
+
+Both were open while this record was `draft`; recorded here rather than deleted,
+because the reasoning is the part worth keeping.
+
+**1 — Assert the equality, don't just argue it. Resolved: yes, `debug_assert_eq!`
+in `push`.**
+
+The whole safety argument for this change is "`heartbeat == head` at every
+quiescent point", and that is a property of *the rest of the codebase*, not of
+this function — it holds because nothing else writes either field. A future
+reset path, or a second writer, breaks it silently. `fetch_add` tolerated that
+divergence (it would keep counting, just from the wrong base); a store cannot.
+
+So the invariant is asserted immediately before the store. It costs nothing in
+release, and it runs under `just loom`, `just miri` and the entire debug test
+suite — which is precisely where a new writer would first appear. Checked before
+adding it that no such path exists today: `head` is written only by `push` and
+zeroed by both `EdgeRecord` constructors, and nothing in `tf_tree_ingest`, the
+facade or the frozen-arena path writes it, so the assertion cannot fire
+spuriously on any current path.
+
+**2 — Is the inline amendment box the pattern for PHASE1? Resolved: no. `PHASE2.md`
+§1 stays the single index; PHASE1 listings are corrected in place with a box
+saying what changed.**
+
+The two are not alternatives, and conflating them is what produced the drift this
+record documents. `PHASE2.md` §1 is the *index of amendments* — it says what A1–A8
+are and argues for them, and it must stay the one place to look. What it cannot do
+is stop a reader of `PHASE1.md` §6.2 from copying a stale listing, which is exactly
+what happened: A5 shipped in the code and §6.2 kept showing `s.wrapping_add(1)` for
+the entire life of the project, and nobody noticed until a lens went looking for
+comments that lie.
+
+So a normative PHASE1 listing is **corrected in place** to match shipped code, with
+a short box recording what changed and pointing at the amendment that caused it.
+The listing is the thing people read and copy; it has to be right. The box exists
+so the correction is not mistaken for the original.
+
+Applying this retroactively to A1–A4 and A6–A8 is *not* part of this record — it is
+a separate documentation sweep, and doing it here would bury a protocol change
+inside a doc refactor. Worth scheduling; the §6.2 box is the template.

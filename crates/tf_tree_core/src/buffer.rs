@@ -297,6 +297,20 @@ impl SampleRing<'_> {
         // publish-side diagnostics — "a relaxed `fetch_add` on the push path
         // costs ~5-10 ns ... to store something the arena already holds" —
         // applied to the last such `fetch_add` left on the push path.
+        //
+        // The equality this rests on is asserted rather than left to the prose
+        // (`0014` open question 1). Free in release, and it runs under `just
+        // loom`, `just miri` and the whole debug test suite — which is where a
+        // second writer to `head` or `heartbeat`, or a path that resets one
+        // without the other, would first show up. `fetch_add` tolerated such a
+        // divergence silently; a store cannot, so the invariant stops being a
+        // comment somebody has to re-derive.
+        debug_assert_eq!(
+            self.heartbeat.load(Ordering::Relaxed),
+            h,
+            "heartbeat diverged from head before this push: something other \
+             than `push` wrote one of them (see decision 0014)"
+        );
         self.heartbeat.store(h + 1, Ordering::Relaxed);
         Ok(())
     }
