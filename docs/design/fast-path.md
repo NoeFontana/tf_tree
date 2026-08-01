@@ -462,6 +462,29 @@ probe** — holds only while the stamp array fits L1. It was measured at depth 3
 where three rings share the cache, and generalised into a per-probe constant. It
 is not a constant; it is a step function of `capacity × 8 bytes` against L1d.
 
+**And the reference capacity understates it.** Real edges are not sized in slots;
+they are sized by `Capacity::history(rate_hz, HISTORY_SECS)`, and the benchmark
+fixture keeps 10 s. So the capacity an edge gets is a function of how fast it
+publishes:
+
+| fixture edge | rate | slots | stamp array | where that lands |
+|---|---|---|---|---|
+| `map → odom` | 10 Hz | 128 | 1 KiB | flat, L1 |
+| `odom → base_link` | 50 Hz | 512 | 4 KiB | flat, L1 |
+| `base_link → laser` | 200 Hz | 2 048 | 16 KiB | flat, L1 |
+| `base_link → imu_link` | **1 kHz** | **16 384** | **128 KiB** | **the far end of the cliff** |
+
+A 1 kHz IMU edge pays roughly **3× the search cost** of a 10 Hz map edge — 43 ns
+against 14 — for no reason other than that its stamp array does not fit L1. That
+is the realistic case, not the pathological one, and it is why the reference
+table above at capacity 4096 reads as the middle of the curve rather than the
+end of it.
+
+It also names a knob nobody has been told about: `HISTORY_SECS` is what sets
+that array's size, and a consumer that only ever queries the last second is
+paying full search cost for ten. That is a deployment note for
+`docs/RUNBOOK.md`, not an engine change.
+
 ### What this changes about the levers
 
 - **Lever 3's rejection stands, and for a better reason than §5 gave.** §5 killed
