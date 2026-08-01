@@ -14,7 +14,10 @@ independent engine that solves the same problem with a different data structure,
 and it is deliberately named so that people looking for a `tf2` alternative can
 find it ([`0008`](./docs/decisions/0008-the-name-tf-tree.md) records that
 decision). There is no drop-in `tf2_ros::Buffer` shim today; that is Phase 7 and
-it is gated on evidence this project has not yet produced.
+it is gated on evidence this project has not yet produced —
+[`docs/PHASE7.md`](./docs/PHASE7.md) is what it will have to be, including the
+places it will deliberately *refuse* to reproduce `tf2`'s behaviour, and its
+§0.0 is honest about which gates are unmet.
 
 ## Status
 

@@ -33,6 +33,11 @@ the reason several orderings look the way they do.
 - `docs/PHASE5.md` §8 is a section about **not** building something. Visualization
   is deliberately absent, with the argument recorded. Do not propose a viewer
   integration without refuting §8.1 first.
+- `docs/PHASE7.md` exists and **its existence is not permission to build it.**
+  The `tf2` shim is gated on operating evidence (D21), §0.0 lists four gates and
+  none is met. Its §4 is a table of *questions*; answering one from that document
+  rather than from Phase 4's surprise log is the exact failure the gate exists to
+  prevent.
 
 | Document | Role |
 | --- | --- |
@@ -41,7 +46,9 @@ the reason several orderings look the way they do.
 | [`docs/PHASE2.md`](./docs/PHASE2.md) | Normative Phase 2 spec; §1 holds Phase 1 amendments A1–A8 (all applied), §0.0 is the status table. **Engine half implemented.** |
 | [`docs/PHASE3.md`](./docs/PHASE3.md) | Normative Phase 3 spec (Python bindings). **Implemented.** |
 | [`docs/PHASE4.md`](./docs/PHASE4.md) | Normative Phase 4 spec (C ABI, C++ wrapper, ROS 2 ingest bridge, `sample_with_derivatives`). §0.0 records what this environment cannot gate. **ROS 2 *is* available, in `docker/tf2`** — an earlier revision of this line said otherwise and was wrong. What is missing is a second RMW, clang in that image, and a robot. |
-| [`docs/PHASE5.md`](./docs/PHASE5.md) | Normative Phase 5 spec (frozen `.tft` arena, bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, `TFT001`–`TFT016`, `tf_tree top`). |
+| [`docs/PHASE5.md`](./docs/PHASE5.md) | Normative Phase 5 spec (frozen `.tft` arena, bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, `TFT001`–`TFT019`, `tf_tree top`). |
+| [`docs/PHASE7.md`](./docs/PHASE7.md) | The `tf2`-shaped shim. **GATED by D21 and not scheduled** — §0.0 lists four gates, none met. It is a *requirements artifact*, not an authorization: §4's J-table states the semantic judgements as questions, and the only work it authorizes today is filing Phase 4's surprise log against those rows. |
+| [`docs/API.md`](./docs/API.md) | **Not a phase.** The cross-cutting API contract: six rules (§1) every binding obeys, the normative surface of Rust/Python/C/C++ (§2–§5), the delta table (§6), and the §7 check a new surface passes. **Read §1 before adding public API to any binding.** It authorizes nothing on its own — §6 names the phase or record each row lands in. |
 | [`docs/decisions/`](./docs/decisions/) | Decision-record process, retained for *future* decisions. `0002`–`0003` are superseded; [`0004`](./docs/decisions/0004-builder-time-edge-declaration.md), [`0005`](./docs/decisions/0005-the-shared-memory-seam.md) and [`0006`](./docs/decisions/0006-the-eight-phase-roadmap.md) are authoritative. |
 
 ## Project shape (Phase 1 — pure Rust)
@@ -91,6 +98,22 @@ records why (typed errors and zero-copy buffers do not survive a C boundary).
   Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
   relies on; every crate with `unsafe` carries a module `// SAFETY:` block and
   `#![deny(unsafe_op_in_unsafe_fn)]`.
+  > **Pending, and not yet true of the code:**
+  > [`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md) is
+  > `ready` and moves `tf_tree` from `forbid` to `deny` with **one** documented
+  > exception — `OwnedWriter`, the single place a lifetime is extended in the
+  > workspace, replacing two hand-rolled `extend_to_static` helpers (one of whose
+  > ancestors leaked a claim lease and bypassed the fork guard). This is the
+  > first exercise of `0007`'s budget as a *criterion*. Until that record's step
+  > 1 lands, the line above is the rule; step 1 changes the code and this line
+  > together.
+- **API shape is checked against [`docs/API.md`](./docs/API.md) §1 before it is
+  written.** Six rules: three tiers always (R1); the hot tier never allocates,
+  locks or converts (R2); integer-nanosecond stamps carrying a domain (R3);
+  layout stated, never inferred (R4); errors are `Copy` identifiers with prose in
+  a separate layer (R5); read-only by default (R6). A question those six do not
+  answer is a decision record, not an API choice. §7 is the checklist a whole new
+  surface passes.
 - **No pointers in the arena; fixed capacity; no growth/realloc; `#[repr(C)]`
   everywhere; append-only `FrameId`/`EdgeId` (tombstone, never recycle).**
 - **`ArcSwap`/`Arc`/`Box`/`Vec` inside an arena structure is forbidden**

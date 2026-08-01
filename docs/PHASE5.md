@@ -106,7 +106,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | Bag ingestion | MCAP and rosbag2 → arena or `.tft`, two-pass, out-of-order tolerant (§3) |
 | Offline Python API | identical to the online API, plus dataset helpers (§4) |
 | Diagnostic counters | consumer-side failure counters, always on and free; publish-side derived (§5) |
-| Diagnostics catalogue | 16 checks (`TFT001`–`TFT016`), each with a detection rule and a severity (§6) |
+| Diagnostics catalogue | 16 checks (`TFT001`–`TFT016`), each with a detection rule and a severity (§6). §6's amendments append `TFT017`–`TFT019`, so the shipped catalogue is **19** |
 | `tf_tree top` | TUI plus an embedded static web view (§7) |
 | Stored-sample iteration | `iter_edge` / `iter_edges` / `frame_path` — audit and export, viewer-neutral (§8.3) |
 | Benchmark artifact | one command, reproducible, honest, CI-gated (§9) |
@@ -654,6 +654,45 @@ ds.manifest                        # source path, digest, ingest options, versio
 > `samples`/`pushes_total` amendment already had to correct once. `manifest`
 > needs a CBOR *reader*, where the crate has only a writer.
 
+### 4.4 Three API-contract deltas that land here — NORMATIVE
+
+[`API.md`](./API.md) §6 rows 7, 8 and 9. They are grouped here because this is
+the phase that opens the Python module anyway; none of them is a new idea and
+each is a gap between Python and a surface that already has the feature.
+
+**1. `Layout::QuatTwist` — derivatives reach Python and C (`API.md` §3.3).**
+Rust and C have had `at_with_derivatives` since Phase 4
+(`tft_plan_at_with_derivatives`, unstable tier); Python was scoped out by
+`PHASE4.md` §0 and has had no path to a twist since. It ships as a **fourth
+`Layout` variant**, not a fourth method: a contiguous `(N, 13)` write of
+`[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`, carried to both bindings by the
+layout dispatch that already exists. A separate `at_d` would need its own GIL
+threshold (§6.1), its own buffer validation and its own tests, for the same
+bytes. `LerpSlerp` returns `DerivativesUnavailable` here exactly as it does from
+`at_with_derivatives` — a layout that quietly changed meaning per interpolator
+would be the quaternion-order trap in the time axis. On the C side this is one
+new `tft_layout` enumerator and therefore a **minor** ABI bump
+(`PHASE4.md` §3.6).
+
+**2. Introspection: `tree.frames()`, `tree.edges()`, `plan.edges()`
+(`API.md` §3.2).** A notebook user currently shells out to the CLI to see what
+is in an arena, and this is the phase whose users live in notebooks. These are
+tier-1/tier-2 calls, so R2 is not in tension. `plan.depth()` and `tree.span()`
+already ship. **`tree.edges()` here is the *names* half only** — the identities
+of the edges on a tree — and is a different thing from §4.2's `ds.edges()`,
+which promises per-edge rate, jitter and gaps and stays held back until §3's
+counting pass exists. Ship the names; do not let them acquire statistics by
+adjacency, because a rate computed from a ring is the error §4.2 just finished
+refusing.
+
+**3. Exact stamp converters: `from_parts` / `from_timespec` / `from_ros`
+(`API.md` §5.1).** `from_sec` exists and carries a lossy-above-10⁷-seconds
+warning, and today that warning points nowhere. What users resent is writing
+`stamp.sec * 10**9 + stamp.nanosec` in every node; the fix is an exact, total
+converter on every surface, none of which takes a float. `tf_tree.from_ros`
+converts a `builtin_interfaces/Time` exactly and **never** via `to_sec()`.
+`from_sec` stays, keeps its warning, and stays out of every example.
+
 ### 4.3 The dataloader pattern
 
 Document it, do not ship a class. A `torch.utils.data.Dataset` subclass would bind us to a framework version for no benefit; the pattern is four lines:
@@ -869,6 +908,7 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 | `TFT016` | THP disabled, or `RLIMIT_MEMLOCK` below arena size | info | `/sys`, `getrlimit` |
 | `TFT017` | Dynamic edge with no live writer | warn | claim table (added by the amendment below) |
 | `TFT018` | Stamps arriving out of monotonic order | error | observed push stream (added by the amendment below) |
+| `TFT019` | A wall-clock domain stepped backwards — `TFT018`'s cause, not a publisher fault | warn | `TFT018`'s evidence + the edge's domain tag (added by the amendment below) |
 
 Output modes: human (default, coloured, grouped by severity), `--json` (stable schema, for CI), and `--exit-code` (non-zero if any error-severity check fires) so `doctor` can gate a robot's startup or a CI job.
 
@@ -980,6 +1020,54 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 >
 > The `uncatalogued` array stays in the `--json` schema with no producer. It is a
 > stable key, and it is the shape any future check without an id would take.
+
+> **Amendment — `TFT019`: `CLOCK_REALTIME` is not monotone, and the failure
+> reads like our bug.** ([`API.md`](./API.md) §5.3.)
+>
+> NTP steps and leap seconds move `CLOCK_REALTIME` backwards. `PHASE1.md` §2
+> invariant 6 requires per-edge non-decreasing stamps, so a clock step surfaces
+> as a **burst of `NonMonotonicStamp` rejections** — entirely correct behaviour
+> that reads as a `tf_tree` defect to whoever meets it at 3 a.m., and that
+> `TFT018` reports, accurately and unhelpfully, as "a publisher restarted
+> without resetting its clock".
+>
+> **`TFT019` is an attribution, not a second detector.** It fires on exactly
+> `TFT018`'s evidence plus one more fact the arena already holds — the edge's
+> **declared domain**. A run of rejections concentrated in a short window, on an
+> edge whose domain is a **wall clock** (`SystemTime`, not `SteadyDomain` and not
+> `SimTime`), is reported as a clock step: the publisher is not at fault and
+> restarting it will not help. Where `TFT018` says *what*, `TFT019` says *who*.
+>
+> Three things it deliberately does not do:
+>
+> * **It does not fire on a steady or sim domain.** A `SteadyDomain` edge cannot
+>   have stepped, so a run of rejections there is a real publisher fault and
+>   `TFT018` alone is the honest answer. `SimTime` has its own, much harder
+>   version of this question — a `/clock` reset against a publisher's
+>   `transform_tolerance` — and it is settled by
+>   [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)
+>   with an **authoritative** `rcl` signal. `TFT019` must not attempt an
+>   inference `0012` spent three rules falsifying. This check is the
+>   single-process, no-ROS case, where there is no authoritative signal and no
+>   second publisher, and a good diagnostic is the only honest response.
+> * **It does not demote `TFT018`.** `TFT018` stays an error and keeps failing
+>   `doctor --exit-code`; `TFT019` is a warn that explains it. Rejected pushes
+>   are lost data whatever caused them.
+> * **It does not reuse the bridge's counter.** `dropped_non_monotonic` is a
+>   *bridge* counter (`PHASE4.md` §5.5's ladder), not an `EdgeCounters` field, and
+>   an arena with no bridge in front of it has none. The evidence is the observed
+>   push stream, which is what `TFT018` already reconstructs — including its
+>   stated skip on a live arena, which `TFT019` inherits rather than works around.
+>
+> The catalogue therefore runs to **`TFT019`**, appended by the same rule the
+> `TFT017`/`TFT018` amendment establishes: ids are a public contract, appending
+> is additive, and none is ever recycled or given a second meaning.
+>
+> **Paired with a documentation line, not just a check:** anything published at
+> rate should declare a steady or PTP domain (`API.md` §2.5 keeps `Domain` an
+> open trait for exactly this). The check tells an operator what happened; the
+> doc line is how the next robot avoids it. `RUNBOOK.md`'s `NonMonotonicStamp`
+> section carries both.
 
 ---
 
@@ -1222,6 +1310,9 @@ Ship a container image and a small public sample recording so a stranger can run
 | Frozen `.tft`: 16 dataloader workers, total RSS | MB, vs 16 bag parses |
 | `.tft` open time vs bag parse time | ms |
 | Differential agreement (`LerpSlerp`) | max deviation |
+| **Facade `Plan::at` from a separate crate vs in-crate**, depth 3 | ratio, gated at 5% |
+
+The last row is `tf_tree` against itself and belongs in this table anyway: it is the only measurement of the path an **embedder** actually compiles. `PHASE4.md` §7 gates the C ABI at 5% against native in-crate Rust, and nothing gates native *out-of-crate* Rust, which is what a user's node links. [`API.md`](./API.md) §2.3 makes the row and the gate normative, along with the `#[inline]` attributes and the LTO guidance that are how it is passed. Report it with the embedder's default profile, **not** this workspace's — `[profile.release]` here sets `lto = "thin"`, which is precisely what hides the effect.
 
 ### 9.3 Honesty requirements — NORMATIVE
 

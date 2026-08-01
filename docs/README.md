@@ -1,6 +1,7 @@
 # Docs
 
-Six canonical documents carry the project. Read them in this order:
+Six canonical documents carry the project, plus two that are not phases. Read
+them in this order:
 
 1. [`PROJECT.md`](./PROJECT.md) — what tf_tree is, the architecture in one page,
    the eight-phase roadmap, and the **decision log D1–D22** (§5) with the rationale
@@ -29,9 +30,21 @@ Six canonical documents carry the project. Read them in this order:
    gate at all.
 6. [`PHASE5.md`](./PHASE5.md) — the **normative** Phase 5 specification
    (offline, observability, and the adoption wedge: the frozen `.tft` arena,
-   bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, the `TFT001`–`TFT016`
+   bag ingestion, `FORMAT_VERSION = 3`, diagnostic counters, the `TFT001`–`TFT019`
    catalogue, `tf_tree top`). §8 is a section about **not** building something,
    and it is deliberate — read it before proposing a viewer integration.
+
+Two documents cut across the phases:
+
+- [`API.md`](./API.md) — the **API contract**: the six rules (§1) that generate
+  every binding, the normative surface of Rust, Python, C and C++, and the §7
+  checklist any new surface has to pass. Read it before adding public API to any
+  of them. It authorizes nothing on its own — its §6 delta table names the phase
+  or decision record each row lands in.
+- [`PHASE7.md`](./PHASE7.md) — the `tf2`-shaped compatibility shim, **gated by
+  D21 and not scheduled**. Its §0.0 lists the four gates and none is met. Before
+  they are, the only work it authorizes is filing Phase 4's surprise log against
+  its §4 J-rows.
 
 The roadmap was re-cut from six phases to eight by
 [`decisions/0006`](./decisions/0006-the-eight-phase-roadmap.md), which also holds

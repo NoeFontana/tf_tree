@@ -135,8 +135,27 @@ A push arrived with a stamp older than the edge's newest. Equal stamps are
 accepted — that is required for idempotent replay — but going backwards is not.
 
 Usually a publisher restarting without resetting its clock, or two sources
-merged into one edge. `doctor`'s `out-of-order` check reports it from observed
-history.
+merged into one edge. `doctor`'s `out-of-order` check (`TFT018`) reports it from
+observed history.
+
+**Before you go looking for the publisher, check the edge's domain.** A *burst*
+of these on an edge in a **wall-clock** domain is usually not a publisher fault
+at all: `CLOCK_REALTIME` is not monotone, and an NTP step or a leap second moves
+it backwards. Invariant 6 then rejects every stamp until the clock catches up —
+correct behaviour that looks exactly like a broken node. `doctor`'s `TFT019`
+makes that call for you: same evidence as `TFT018`, plus the domain tag, reported
+as a clock step rather than as a publisher fault. Restarting the publisher will
+not help; the data lost during the step is gone either way.
+
+The fix is a domain that cannot step. Anything published **at rate** should use
+a steady or PTP-disciplined domain rather than the system wall clock — `Domain`
+is an open trait, so a driver with a PTP clock declares its own. Reserve
+`SystemTime` for stamps that genuinely have to be comparable to wall-clock time
+outside the process.
+
+A `SimTime` edge is a different problem — a `/clock` reset from a bag loop or a
+sim restart — and is handled by the bridge's authoritative jump signal, not by
+this section.
 
 ### `ClaimRevoked { edge }`
 
@@ -324,7 +343,8 @@ Almost certainly a bug — topology should be near-static after startup.
 | `short-buffer` | Ring shorter than the observed publish latency | Raise that edge's capacity. This is the warning that precedes `Extrapolation`/`SlotRecycled` outages |
 | `inconsistent-rate` | A frame published at a wildly varying rate | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
-| `out-of-order` | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
+| `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
+| `TFT019` | The same rejections, on an edge in a **wall-clock** domain | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain |
 
 ---
 
