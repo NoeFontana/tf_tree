@@ -1165,13 +1165,14 @@ pub struct Guard<'a> {
     /// participant total and no edge, which is the honest answer.
     #[cfg(feature = "counters")]
     ok_edge: core::cell::Cell<Option<EdgeId>>,
-    /// Per-step bracket-search hints, so a scalar lookup resumes beside the
-    /// previous answer instead of restarting at the window midpoint.
+    /// Per-step bracket-search hints, packed `(edge << 32) | index`, so a
+    /// scalar lookup resumes beside the previous answer instead of restarting at
+    /// the window midpoint.
     ///
-    /// # Why this is worth 25-29% of a sample
+    /// # Why this is worth ~9% of a lookup
     ///
     /// `docs/design/fast-path.md` §12 measured the bracket search at **34% of a
-    /// dynamic step**, and §12's capacity sweep showed the cost is not the probe
+    /// dynamic step**, and its capacity sweep showed the cost is not the probe
     /// count but whether the probed *stamp array* fits L1 — flat to capacity
     /// 1024, then stepping hard at 32 KiB of stamps, this host's L1d. A cursor
     /// does not shrink that array; it makes the access **local**, so the probes
@@ -1190,31 +1191,29 @@ pub struct Guard<'a> {
     /// [`SampleRing::sample`](crate::buffer::SampleRing::sample) returns for the
     /// same `t`; only the search path differs. So a stale, wrong or absent
     /// cursor is a bad *hint* and never a wrong answer. That is what makes this
-    /// safe to keep in a cache that nothing invalidates.
+    /// safe to keep in a cache that nothing invalidates, and it is also why the
+    /// index may be packed into 32 bits: a logical index past `u32::MAX` — 49
+    /// days of unbroken 1 kHz publishing — truncates to a wrong hint, which the
+    /// gallop corrects.
     ///
-    /// # Why a `Cell` per element, and why on the `Guard`
+    /// # Why a `Cell`, and why on the `Guard`
     ///
     /// `Guard` is `!Sync` by construction and created per batch on one thread —
     /// the same argument `ok` above carries from `docs/PHASE5.md` §5.4 — so a
-    /// non-atomic cell is sound and is what the hot path should pay. A
-    /// `Cell<[u64; MAX_DEPTH]>` would copy the whole array on every `get`/`set`;
-    /// per-element cells load and store one word.
+    /// non-atomic cell is sound and is what the hot path should pay.
     ///
-    /// `cursor_edge` is the self-invalidation. One `Guard` can evaluate several
+    /// One array rather than two, and one word rather than two, because the cost
+    /// of this cache is **initialising it**: every cell is written when a guard
+    /// is built, and that is the whole of `Guard::new`'s 1.4 -> 8.5 ns. Packing
+    /// halved the stores. (An inline-`const` initialiser was also tried and
+    /// moved nothing.)
+    ///
+    /// The edge half is the self-invalidation. One `Guard` can evaluate several
     /// plans, and step `k` of one plan is a different edge from step `k` of
     /// another; without the tag the hint would send the gallop somewhere
-    /// arbitrary, which is still correct but can cost up to twice a plain
-    /// search. Storing the edge and using the hint only on a match makes a
-    /// mismatched cursor cost one comparison instead.
-    /// Packed `(edge << 32) | index`, one word per step.
-    ///
-    /// Two arrays became one because the cost of this cache is **initialising
-    /// it**: a guard is built per batch and every cell must be written, so 32
-    /// stores became 16 and `Guard::new` went from 8.9 ns back toward its
-    /// original 1.4. Packing is safe for the index precisely because the whole
-    /// cache is: a logical index past `u32::MAX` — 49 days of unbroken 1 kHz
-    /// publishing — truncates to a wrong *hint*, and a wrong hint is corrected
-    /// by the gallop, never returned.
+    /// arbitrary — still correct, but potentially costing more than a plain
+    /// search. Using the hint only on a tag match makes a mismatched cursor cost
+    /// one comparison instead.
     cursor: [core::cell::Cell<u64>; MAX_DEPTH],
     /// `(generation at creation, how to read it now)`, for the fork check.
     ///
