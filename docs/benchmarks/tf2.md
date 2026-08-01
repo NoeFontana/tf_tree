@@ -1037,25 +1037,36 @@ the working set (256 rings is 18 MiB of first-touched pages), not false sharing 
 
 ### Duration — `just soak`
 
-40 s, 24-frame fixture, 2 reader threads, 4 writer threads, snapshots every 10 s:
+40 s, 24-frame fixture (10 s of retained history), 2 reader threads, 4 writer
+threads, snapshots every 10 s:
 
-| interval | Mlookup/s | p50 | p99.9 | publish→visible p50 | ring laps | RSS |
-|---|---|---|---|---|---|---|
-| 0 | 4.47 | 340 ns | 500 ns | 280 ns | 5.8 | 2677 KiB |
-| 1 | 4.40 | 350 ns | 500 ns | 250 ns | 5.8 | 2677 KiB |
-| 2 | 4.45 | 340 ns | 490 ns | 211 ns | 5.8 | 2689 KiB |
-| 3 | 4.42 | 340 ns | 490 ns | 250 ns | 5.8 | 2689 KiB |
+| interval | Mlookup/s | p50 | p99.9 | publish→visible p50 | ring laps | RSS | declined |
+|---|---|---|---|---|---|---|---|
+| 0 | 5.18 | 280 ns | 470 ns | 191 ns | 1.0 | 2636 KiB | 131 ppm |
+| 1 | 5.22 | 280 ns | 460 ns | 191 ns | 1.0 | 2636 KiB | 130 ppm |
+| 2 | 5.04 | 280 ns | 470 ns | 200 ns | 1.0 | 2656 KiB | 137 ppm |
+| 3 | 5.24 | 280 ns | 470 ns | 191 ns | 1.0 | 2656 KiB | 130 ppm |
 
-No drift: p99.9 ends at 0.98x its first interval, RSS grows 12 KiB, and the rings
-lapped 23 times — which the harness *asserts*, because a soak that never lapped a
-ring did not exercise the path it exists for and must fail rather than print a
-clean table.
+No drift: p99.9 ends at 1.00x its first interval, RSS grows 20 KiB, and the rings
+lapped 3.9 times — which the harness *asserts*, because a soak that never lapped
+a ring did not exercise the path it exists for and must fail rather than print a
+clean table. Laps are `interval / retained`, both read from the arena, so the
+assertion holds for a workload with a different history too.
 
-**Publish-to-visible is ~250 ns at p50** and this is the first time it has been
+The `declined` column is the harness's own, not the engine's, and it is reported
+as a rate precisely so that is checkable: the readers re-probe the retained
+window every few thousand lookups while the writers slide it, so queries aimed at
+the oldest end occasionally land just below it. **Stable at ~130 ppm across every
+interval** is the expected shape; a rate that *grew* would mean the window was
+sliding faster than the readers could follow.
+
+**Publish-to-visible is ~190 ns at p50** and this is the first time it has been
 measured. It is [`PHASE5.md`](../PHASE5.md) §9.2's required row: not lookup
 latency, but how long after a writer's `push` returns that a *different thread*
 can read the sample. A probe writer records when `push` returned and a probe
-reader spins until the arena reports that stamp.
+reader spins until the arena reports that stamp. Its p99.9 is milliseconds and is
+not a claim about the engine — the probe reader is one of six runnable threads on
+four cores, and what that tail measures is the scheduler descheduling it.
 
 ### The transport — `just dds-bench`
 

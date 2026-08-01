@@ -425,13 +425,29 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
         }
 
         // --- coordinator -------------------------------------------------
-        let probe_cap = f64::from(
-            built
-                .publishers
-                .first()
-                .map_or(1.0, |p| p.rate_hz * fixture::HISTORY_SECS) as u32,
-        )
-        .max(1.0);
+        //
+        // Ring laps per interval are `interval / retained`, both in seconds, and
+        // the retained span is read from the arena rather than assumed. An
+        // earlier revision derived it from `fixture::HISTORY_SECS`, which is a
+        // constant about *one* workload — it would have reported `extreme_wide`
+        // (1 s of history) as lapping ten times less often than it does, and the
+        // coverage assertion below rests on this number.
+        let probe_plan = built
+            .tree
+            .frame(&built.publishers[0].parent)
+            .ok()
+            .zip(built.tree.frame(&built.publishers[0].child).ok())
+            .and_then(|(p, c)| built.tree.plan(c, p).ok());
+        let retained_secs = || -> f64 {
+            let Some(plan) = probe_plan.as_ref() else {
+                return f64::NAN;
+            };
+            let guard = built.tree.guard();
+            match plan.span(&guard) {
+                Ok(Some((lo, hi))) if hi > lo => (hi - lo) as f64 / 1e9,
+                _ => f64::NAN,
+            }
+        };
 
         let mut prev_errors = errors(&built.tree);
         for index in 0..intervals {
@@ -460,7 +476,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
                 visible_p50_ns: vis.quantile(0.50),
                 visible_p999_ns: vis.quantile(0.999),
                 // Laps of the probe edge's ring during this interval.
-                wraps: pu as f64 / f64::from(n_writers.max(1) as u32) / probe_cap,
+                wraps: args.interval.as_secs_f64() / retained_secs(),
                 rss_kib: ProcStats::read().pss_kib,
                 err_delta: {
                     let now = errors(&built.tree);

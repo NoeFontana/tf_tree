@@ -507,7 +507,7 @@ impl Workload {
             } => stream_plan(
                 &crate::replay::synth_robot(depth, branches, samples, rate_hz),
                 self.queries,
-                rate_hz,
+                Some(rate_hz),
             ),
             Topology::Fleet {
                 robots,
@@ -712,15 +712,20 @@ fn recorded_plan(rel_path: &str, queries: QuerySpec) -> Result<BuildPlan> {
     // interval over the samples of each edge. A *mean* would be dragged by the
     // gaps §3.2 says every real recording has, and a rate is only used here to
     // pace a live publisher and to fill `nominal_rate_hz`.
-    stream_plan_recorded(&stream, queries)
+    stream_plan(&stream, queries, None)
 }
 
-fn stream_plan_recorded(stream: &TfStream, queries: QuerySpec) -> Result<BuildPlan> {
-    let counts = stream.samples_per_edge();
-    let window = stream
-        .common_window()
-        .ok_or_else(|| anyhow!("recording has no window covered by every dynamic edge"))?;
-
+/// Turn a [`TfStream`] into a [`BuildPlan`].
+///
+/// `rate_hz` is `None` for a recording, whose rate is not declared and is
+/// therefore *measured* ([`median_rate_hz`]), and `Some` for a synthetic stream,
+/// which was generated at a rate we already know.
+///
+/// That one parameter is the whole difference between the two callers. An
+/// earlier revision had them as two functions and they were 90% identical, down
+/// to a `counts[i]` in one that was the same number as `samples.len()` in the
+/// other.
+fn stream_plan(stream: &TfStream, queries: QuerySpec, rate_hz: Option<f64>) -> Result<BuildPlan> {
     let mut per_edge: Vec<Vec<(i64, Iso3)>> = vec![Vec::new(); stream.dynamic_edges.len()];
     for Sample {
         edge,
@@ -744,78 +749,24 @@ fn stream_plan_recorded(stream: &TfStream, queries: QuerySpec) -> Result<BuildPl
     let mut dynamics = Vec::with_capacity(stream.dynamic_edges.len());
     for (i, (p, c)) in stream.dynamic_edges.iter().enumerate() {
         let samples = std::mem::take(&mut per_edge[i]);
-        let rate_hz = median_rate_hz(&samples);
-        // Size for what the recording holds, plus the one slot a ring cannot
-        // hand back (`SampleRing::retained`) — the same reasoning
-        // `TfStream::build_tree` documents. Sizing for `count` alone loses the
-        // oldest sample when `count` is a power of two, and the oldest sample is
-        // exactly what `common_window`'s lower bound points at.
-        let want = u32::try_from(counts[i])
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
-        let history_secs = if rate_hz > 0.0 {
-            samples.len() as f64 / rate_hz
-        } else {
-            0.0
-        };
-        dynamics.push(DynEdge {
-            parent: p.clone(),
-            child: c.clone(),
-            rate_hz,
-            history_secs,
-            capacity: Capacity::slots(want),
-            samples,
-            seed: i as f64,
-        });
-    }
-
-    let pairs = resolve_pairs(queries, &statics, &dynamics)?;
-    let publishers = publishers_of(&dynamics);
-    Ok(BuildPlan {
-        statics,
-        dynamics,
-        pairs,
-        window,
-        publishers,
-    })
-}
-
-fn stream_plan(stream: &TfStream, queries: QuerySpec, rate_hz: f64) -> Result<BuildPlan> {
-    let mut per_edge: Vec<Vec<(i64, Iso3)>> = vec![Vec::new(); stream.dynamic_edges.len()];
-    for Sample {
-        edge,
-        stamp_ns,
-        pose,
-    } in &stream.samples
-    {
-        per_edge[*edge].push((*stamp_ns, *pose));
-    }
-
-    let statics: Vec<StaticEdge> = stream
-        .static_edges
-        .iter()
-        .map(|(p, c, pose)| StaticEdge {
-            parent: p.clone(),
-            child: c.clone(),
-            pose: *pose,
-        })
-        .collect();
-
-    let mut dynamics = Vec::with_capacity(stream.dynamic_edges.len());
-    for (i, (p, c)) in stream.dynamic_edges.iter().enumerate() {
-        let samples = std::mem::take(&mut per_edge[i]);
+        let rate = rate_hz.unwrap_or_else(|| median_rate_hz(&samples));
+        // Size for what the stream holds, plus the one slot a ring cannot hand
+        // back (`SampleRing::retained`) — the same reasoning
+        // `TfStream::build_tree` documents. Sizing for the count alone loses the
+        // oldest sample when it is a power of two, and the oldest sample is
+        // exactly what the common window's lower bound points at.
         let want = u32::try_from(samples.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
-        let history_secs = if rate_hz > 0.0 {
-            samples.len() as f64 / rate_hz
+        let history_secs = if rate > 0.0 {
+            samples.len() as f64 / rate
         } else {
             0.0
         };
         dynamics.push(DynEdge {
             parent: p.clone(),
             child: c.clone(),
-            rate_hz,
+            rate_hz: rate,
             history_secs,
             capacity: Capacity::slots(want),
             samples,
