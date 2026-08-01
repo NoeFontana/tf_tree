@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_math"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "libm",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_tf2_sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "tf_tree_math",
