@@ -776,16 +776,22 @@ condition, and that left two open worries pointing opposite ways:
 `contended_search` measures both. One dynamic edge, one reader asking at a fixed
 lag behind the newest stamp — what a consumer actually does, and what keeps the
 query inside a window the writer is sliding — and either zero or one writer
-publishing at the edge's nominal 1 kHz. **Zero out-of-window failures in every
-cell**, so the columns are comparable.
+publishing at the edge's nominal 1 kHz.
 
-Median ns/query, three runs, pinned to two cores:
+Three things are asserted rather than assumed, because each would make the result
+a measurement of nothing: that pushes **landed**, that none were **refused**, and
+that no query fell **outside the retained window**. All three hold in every cell.
 
-| capacity | stamps | fresh, quiet | fresh, +writer | cursor, quiet | cursor, +writer |
-|---|---|---|---|---|---|
-| 1 024 | 8 KiB | 9.7 – 9.9 | 9.6 – 9.7 | 5.3 – 5.4 | 5.4 – 5.5 |
-| 4 096 | 32 KiB | 10.8 – 11.5 | 10.8 – 11.5 | 5.4 – 5.5 | 5.4 |
-| 16 384 | 128 KiB | 11.7 – 18.1 | 11.7 – 17.5 | 5.4 | 5.4 – 5.5 |
+Median ns/query, pinned to two cores:
+
+| capacity | stamps | fresh, quiet | fresh, +writer | writer cost | cursor, quiet | cursor, +writer | writer cost |
+|---|---|---|---|---|---|---|---|
+| 1 024 | 8 KiB | 9.84 | 9.82 | 1.00× | 5.40 | 5.53 | 1.02× |
+| 4 096 | 32 KiB | 10.94 | 10.93 | 1.00× | 5.44 | 5.52 | 1.01× |
+| 16 384 | 128 KiB | 12.60 | 12.15 | 0.96× | 5.47 | 5.56 | 1.02× |
+
+The writer achieved **918–939 Hz** — below its nominal 1 kHz, because `sleep`
+overshoots — and that works out to **~8 pushes per million reader queries**.
 
 ### Both worries are answered, and neither the way I expected
 
@@ -808,6 +814,34 @@ a consumer actually uses, it is gone.
 That is the strongest confirmation yet of §12's mechanism. If the cost were probe
 *count*, the cursor could not flatten it — a bigger ring is more probes either
 way. Only a locality explanation predicts a flat line.
+
+### The ratio is the whole explanation
+
+**~8 pushes per million queries.** The reader out-issues the writer by roughly
+125 000 to one. A cache line can only be contended if two parties touch it in
+overlapping windows, and at four orders of magnitude apart they essentially never
+do. The invalidation mechanism is real in principle; a `/tf` publisher is simply
+nowhere near fast enough to exercise it against a reader in a tight loop.
+
+That number is also what makes the result *portable*: it does not depend on this
+host's cache sizes, only on the rate ratio, and no realistic publisher changes
+the ratio by four orders of magnitude.
+
+### A methodological defect this found in itself
+
+The first version of this harness ran 4096 queries a round — about 40 µs — so a
+whole 41-round loop finished in under two milliseconds and the writer landed
+**four pushes** during the entire contended measurement. The contended columns
+were very nearly a measurement of *no writer*.
+
+It surfaced through an impossible number rather than through review: the derived
+publish rate was quantised by a ±1-push error to ±250 Hz, and printed **1182 Hz
+for a loop that sleeps 1 ms**. A rate above the reciprocal of its own sleep
+period cannot happen, which is what made it worth chasing.
+
+The rounds are now sized so each loop runs ~200 ms and the writer lands ~200
+pushes. The conclusion did not change — but before the fix it was not supported,
+and a reader had no way to tell.
 
 ### What this does not cover
 

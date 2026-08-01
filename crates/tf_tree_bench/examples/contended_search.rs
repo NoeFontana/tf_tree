@@ -50,7 +50,7 @@
 )]
 
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Tree, TreeBuilder};
@@ -65,9 +65,20 @@ use tf_tree_math::LerpSlerp;
 /// sitting at the far end of §12's cliff.
 const DT_NS: i64 = 1_000_000;
 /// Queries per timed round.
-const N: usize = 4096;
+///
+/// **Sized so the writer actually runs during the measurement.** At ~10 ns a
+/// query, 4096 queries is 40 microseconds and a whole 41-round loop is under two
+/// milliseconds — during which a 1 kHz publisher lands *four* pushes. The
+/// contended columns were then a measurement of almost no writer, and the
+/// derived publish rate was quantised to +/-250 Hz by a +/-1 push error, which
+/// is how this was noticed: it reported 1182 Hz for a loop that sleeps 1 ms.
+///
+/// A million queries a round puts each loop at ~200 ms and ~200 pushes, so the
+/// rate is accurate to well under a percent and the writer is unambiguously
+/// running.
+const N: usize = 1_048_576;
 /// Timed rounds; the median is reported.
-const ROUNDS: usize = 41;
+const ROUNDS: usize = 21;
 /// How far behind the newest stamp the reader asks. A quarter of the retained
 /// window: far enough that a sliding window never overtakes the query, close
 /// enough to be what a consumer actually asks for.
@@ -110,7 +121,7 @@ fn read_loop(ring: &SampleRing<'_>, cursor: bool, cap: u32) -> (f64, u64) {
     let mut per_round = Vec::with_capacity(ROUNDS);
     let mut cur = 0u64;
 
-    for round in 0..ROUNDS + 5 {
+    for round in 0..ROUNDS + 2 {
         let t0 = Instant::now();
         let mut acc = 0.0;
         for _ in 0..N {
@@ -134,7 +145,7 @@ fn read_loop(ring: &SampleRing<'_>, cursor: bool, cap: u32) -> (f64, u64) {
         }
         let dt = t0.elapsed().as_nanos() as f64 / N as f64;
         black_box(acc);
-        if round >= 5 {
+        if round >= 2 {
             per_round.push(dt);
         }
     }
@@ -150,7 +161,7 @@ fn main() {
         LAG_FRACTION * 100.0
     );
     println!(
-        "{:>9} {:>10} {:>11} {:>11} {:>9} {:>11} {:>11} {:>9} {:>8}",
+        "{:>9} {:>10} {:>11} {:>11} {:>9} {:>11} {:>11} {:>9} {:>10} {:>8}",
         "capacity",
         "stamps",
         "fresh q",
@@ -159,7 +170,8 @@ fn main() {
         "cursor q",
         "cursor +w",
         "w cost",
-        "fails"
+        "writer Hz",
+        "push/Mq"
     );
 
     for &cap in &[1024u32, 4096, 16384] {
@@ -173,9 +185,18 @@ fn main() {
 
         // --- with one writer at the edge's nominal rate ---
         let stop = AtomicBool::new(false);
-        let (fresh_w, cursor_w, f3, f4) = std::thread::scope(|s| {
+        // **The vacuity guard.** `push` returns a `Result`, and a writer whose
+        // pushes are all rejected is indistinguishable from no writer at all —
+        // which would make "a writer costs nothing" a measurement of nothing.
+        // Count what actually landed, and report the rate achieved rather than
+        // the rate intended: `sleep` overshoots, so a 1 ms period is not 1 kHz.
+        let pushed = AtomicU64::new(0);
+        let refused = AtomicU64::new(0);
+        let (fresh_w, cursor_w, f3, f4, hz) = std::thread::scope(|s| {
             let tref = &tree;
             let stop_ref = &stop;
+            let ok_ref = &pushed;
+            let bad_ref = &refused;
             s.spawn(move || {
                 let map = tref.frame("map").unwrap();
                 let base = tref.frame("base").unwrap();
@@ -186,23 +207,55 @@ fn main() {
                 let period = Duration::from_nanos(DT_NS as u64);
                 while !stop_ref.load(Ordering::Relaxed) {
                     let t = k * DT_NS;
-                    let _ = w.push(t, &dynamic_pose(0.0, t));
+                    match w.push(t, &dynamic_pose(0.0, t)) {
+                        Ok(()) => ok_ref.fetch_add(1, Ordering::Relaxed),
+                        Err(_) => bad_ref.fetch_add(1, Ordering::Relaxed),
+                    };
                     k += 1;
                     std::thread::sleep(period);
                 }
             });
+            // Snapshot the count *with* the clock. The writer is already
+            // running by the time the reader starts, so dividing the total by
+            // the reader's elapsed time credits pre-start pushes to a shorter
+            // interval — which reported 1204 Hz for a 1 ms sleep period, a rate
+            // that loop cannot reach.
+            let t0 = Instant::now();
+            let base = pushed.load(Ordering::Relaxed);
             let a = read_loop(&ring, false, cap);
             let b = read_loop(&ring, true, cap);
+            let secs = t0.elapsed().as_secs_f64();
+            let landed = pushed.load(Ordering::Relaxed) - base;
             stop.store(true, Ordering::Relaxed);
-            (a.0, b.0, a.1, b.1)
+            (a.0, b.0, a.1, b.1, landed as f64 / secs)
         });
+        assert!(
+            pushed.load(Ordering::Relaxed) > 0 && refused.load(Ordering::Relaxed) == 0,
+            "capacity {cap}: writer landed {} pushes and had {} refused — a writer that \
+             did not publish makes the '+writer' columns a measurement of nothing",
+            pushed.load(Ordering::Relaxed),
+            refused.load(Ordering::Relaxed)
+        );
 
         println!(
-            "{cap:>9} {:>9} K {fresh_q:>11.2} {fresh_w:>11.2} {:>8.2}x {cursor_q:>11.2} {cursor_w:>11.2} {:>8.2}x {:>8}",
+            "{cap:>9} {:>9} K {fresh_q:>11.2} {fresh_w:>11.2} {:>8.2}x {cursor_q:>11.2} {cursor_w:>11.2} {:>8.2}x {:>10} {:>8.1}",
             u64::from(cap) * 8 / 1024,
             fresh_w / fresh_q,
             cursor_w / cursor_q,
-            f1 + f2 + f3 + f4
+            format!("{hz:.0}"),
+            // Pushes per million reader queries. At `ns` nanoseconds a query a
+            // reader issues `1e9 / ns` of them a second, so this is
+            // `hz / (1e9 / ns) * 1e6`, i.e. `hz * ns / 1000`. It is the ratio
+            // that explains the result: a publisher and a reader running four
+            // orders of magnitude apart cannot contend for a cache line often
+            // enough to show up.
+            hz * ((fresh_w + cursor_w) / 2.0) / 1000.0
+        );
+        assert_eq!(
+            f1 + f2 + f3 + f4,
+            0,
+            "capacity {cap}: queries fell outside the retained window, so the columns \
+             are not comparable"
         );
     }
 
@@ -210,7 +263,9 @@ fn main() {
     println!("  made the search slower. Compare the two — if the writer costs the cursor");
     println!("  much more than it costs a fresh search, the cursor's benefit is a");
     println!("  quiescent-tree artifact and §16's number does not survive deployment.");
-    println!("\n  'fails' counts queries that fell outside the retained window. A run with");
-    println!("  a nonzero count measured fewer samples than it claims; a large one is not");
-    println!("  comparable to a quiescent run at all.");
+    println!("\n  'writer Hz' is what the publisher **achieved**, not what it asked for:");
+    println!("  `sleep` overshoots, so a 1 ms period is not 1 kHz. A writer whose pushes");
+    println!("  were all refused would be indistinguishable from no writer, so the run");
+    println!("  asserts that pushes landed, that none were refused, and that no query");
+    println!("  fell outside the retained window.");
 }
