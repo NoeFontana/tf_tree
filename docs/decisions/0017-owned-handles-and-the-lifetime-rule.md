@@ -98,8 +98,9 @@ plan handles, routing both the publisher and the bridge's writer map through
 
 **`Tree` does not become `Clone`.** `Arc<Tree>` is the embedding idiom and gets
 one paragraph of crate-level documentation saying so (`API.md` §2.2). A derived
-`Clone` would either register a second participant slot — out of 64 — or share
-one and lie about it; and `Arc` is already what `tests/tsan.rs`, `TreeShare` and
+`Clone` would either register a second participant slot — out of the 64 an arena
+gets by default — or share one and lie about it; and `Arc` is already what
+`crates/tf_tree/tests/tsan.rs`, `tf_tree_c`'s `TreeShare` and
 `Py<PyTree>` each arrived at independently.
 
 ## Rationale

@@ -133,8 +133,10 @@ enforces is better when it fits, and most publishers are scoped.
 
 ### 2.2 `Tree` is not `Clone`, and `Arc<Tree>` is the idiom — NORMATIVE (doc)
 
-`Tree` owns an `ArenaBacking` and holds a registered participant slot out of 64.
-A derived `Clone` would either burn a second slot or lie about sharing one.
+`Tree` owns its arena backing and holds a registered slot in the arena's
+participant table — 64 slots by default (`DEFAULT_MAX_PARTICIPANTS`), and a
+number an arena is built with rather than an unbounded pool. A derived `Clone`
+would either burn a second slot or lie about sharing one.
 `Arc<Tree>` is what `tests/tsan.rs`, `tf_tree_c`'s `TreeShare` and PyO3's
 `Py<PyTree>` all already do.
 
@@ -181,10 +183,25 @@ caller.
 ### 2.5 Domains are an open trait
 
 `Domain` stays implementable by users — a driver with a PTP-disciplined clock
-declares `struct PtpDomain;` — with the built-ins (`SystemDomain`, `SimTime`,
-`SteadyDomain`) provided. If the built-in set is closed, everything collapses to
-`SystemDomain` and `TimeDomainMismatch` never fires for the people who need it
-most. See §5.2.
+declares `struct PtpDomain;` and picks a free `TAG`. If the built-in set is
+closed, everything collapses to `SystemDomain` and `TimeDomainMismatch` never
+fires for the people who need it most. See §5.2.
+
+**The built-in set today is two: `SystemDomain` (tag 0) and `SensorDomain`
+(tag 1).** `SimTime` and `SteadyDomain` are named by `PHASE4.md` §5.5 and by
+[`PHASE7.md`](./PHASE7.md) §4 J9 and **do not exist** — the bridge carries a
+domain as a bare `u8` tag (`TopologyConfig::default_domain`), so "the bridge tags
+edges `SimTime`" is today a statement about a number an operator chooses.
+
+That is this section's own warning arriving early rather than a contradiction of
+it: two built-ins is close enough to a closed set that a sim deployment and a
+steady-clock driver both end up on tag 0, which is exactly the collapse. The
+trait being open is what makes the fix cheap — a `SimTime` and a `SteadyDomain`
+beside the existing two, each a unit struct and a `TAG` — and until they exist,
+**no document may describe them as available.** J9 is a proposal in a gated
+table and may name them; §5.3's `doctor` check may not depend on them, and does
+not (`PHASE5.md` §6's `TFT019` amendment keys on the tag and discloses what it
+cannot yet distinguish).
 
 ### 2.6 Stability tiering — deferred, and the deferral is recorded
 
@@ -211,8 +228,9 @@ which is what makes the vectorized path the *obvious* path).
 
 Float stamps; `asyncio`; any view into the arena; `pickle` of `Tree`/`Plan`/
 `Publisher`; keyword arguments on `at`, `at_into`, `latest`, `push` (measured:
-`METH_FASTCALL` is 29 ns cheaper, ~10% of a depth-3 budget); any logic with a
-branch in it that could live in Rust.
+`METH_FASTCALL` is 29 ns cheaper — ~10% of a depth-3 budget at §3.4's corrected
+290 ns, and the "20%" `PHASE3.md` §4.2 states against the superseded 150 ns);
+any logic with a branch in it that could live in Rust.
 
 Also refused, and this one gets asked: **`scipy.spatial.transform.Rotation`
 interop.** It pulls scipy into a wheel that needs only NumPy, and
@@ -365,7 +383,8 @@ and not a convention.
 
 `PHASE4.md` §5.5 already makes the ingest bridge tag edges `SimTime` or
 `SystemTime` from `use_sim_time`, and makes a domain mismatch a **startup**
-failure rather than a first-message one. **The read side is not yet specified,
+failure rather than a first-message one — at the level of a `u8` tag, since
+per §2.5 neither type exists yet. **The read side is not yet specified,
 and [`PHASE7.md`](./PHASE7.md) §4 J9 specifies it**: a `Buffer` derives its query
 domain from the `rcl_clock_type_t` of the clock it was constructed with, so a
 node mixing `/clock`-driven sim time with a driver's steady time gets
@@ -384,13 +403,16 @@ tf_tree defect to whoever meets it at 3 a.m.
 
 **Implementation items:**
 
-1. A `doctor` check that names the cause: a run of rejected pushes on an edge in
-   a **wall-clock domain**, reported as a clock step and not as a publisher
-   fault. It ships as `TFT019` (`PHASE5.md` §6) — a refinement of `TFT018`'s
-   attribution, not a second detector — and gets a row in `RUNBOOK.md` under
-   `NonMonotonicStamp`.
+1. A `doctor` check that names the cause: a run of rejected pushes on an edge
+   whose **domain tag is a wall clock**, reported as a clock step and not as a
+   publisher fault. It ships as `TFT019` (`PHASE5.md` §6) — a refinement of
+   `TFT018`'s attribution, not a second detector — and gets a row in
+   `RUNBOOK.md` under `NonMonotonicStamp`. Per §2.5, the only built-in wall
+   clock today is `SystemDomain`; the check keys on the tag and states what it
+   cannot yet tell apart rather than inferring it.
 2. A documentation line recommending a steady or PTP domain for anything
-   published at rate.
+   published at rate — which is also the argument for §2.5's missing built-ins,
+   since today there is no steady domain to recommend by name.
 
 The online bridge's much harder version of this problem — distinguishing a
 `/clock` reset from a publisher's `transform_tolerance` — is settled by

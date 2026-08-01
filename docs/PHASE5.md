@@ -1033,18 +1033,36 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 >
 > **`TFT019` is an attribution, not a second detector.** It fires on exactly
 > `TFT018`'s evidence plus one more fact the arena already holds — the edge's
-> **declared domain**. A run of rejections concentrated in a short window, on an
-> edge whose domain is a **wall clock** (`SystemTime`, not `SteadyDomain` and not
-> `SimTime`), is reported as a clock step: the publisher is not at fault and
-> restarting it will not help. Where `TFT018` says *what*, `TFT019` says *who*.
+> **declared domain tag** (`EdgeRecord::domain`). A run of rejections
+> concentrated in a short window, on an edge whose tag is a **wall clock**, is
+> reported as a clock step: the publisher is not at fault and restarting it will
+> not help. Where `TFT018` says *what*, `TFT019` says *who*.
+>
+> **Which tags are wall clocks is a shorter list than it should be, and the check
+> says so.** The built-in `Domain` set is two — `SystemDomain` (tag 0) and
+> `SensorDomain` (tag 1) — and `Domain` is an open trait, so a user-declared tag
+> carries no way to state "this clock can step". `TFT019` therefore fires only on
+> **tag 0**, and on any other tag it **skips with a reason naming the tag**,
+> exactly as `TFT007` skips an undeclared rate rather than comparing against
+> zero. Guessing that an unknown tag is steady would fabricate an all-clear on
+> the one edge most likely to be a PTP driver that lost lock.
+>
+> This is [`API.md`](./API.md) §2.5's warning arriving as a concrete cost: with
+> only two built-ins, a sim deployment and a steady-clock driver both land on
+> tag 0 and both get told their clock stepped. Adding `SimTime` and
+> `SteadyDomain` — each a unit struct and a `TAG` — is what makes the check
+> precise, and it is *not* done here, because `PHASE4.md` §5.5 names those
+> domains for the bridge and the naming should be decided once, in one place,
+> with the bridge's `u8` tag mapping settled at the same time.
 >
 > Three things it deliberately does not do:
 >
-> * **It does not fire on a steady or sim domain.** A `SteadyDomain` edge cannot
->   have stepped, so a run of rejections there is a real publisher fault and
->   `TFT018` alone is the honest answer. `SimTime` has its own, much harder
->   version of this question — a `/clock` reset against a publisher's
->   `transform_tolerance` — and it is settled by
+> * **It does not fire on a steady or sim tag** — see above; today it cannot
+>   identify one, and it skips rather than guesses. Once those domains exist, a
+>   steady edge cannot have stepped, so a run of rejections there is a real
+>   publisher fault and `TFT018` alone is the honest answer. Sim time has its
+>   own, much harder version of this question — a `/clock` reset against a
+>   publisher's `transform_tolerance` — and it is settled by
 >   [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)
 >   with an **authoritative** `rcl` signal. `TFT019` must not attempt an
 >   inference `0012` spent three rules falsifying. This check is the
@@ -1064,10 +1082,11 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > is additive, and none is ever recycled or given a second meaning.
 >
 > **Paired with a documentation line, not just a check:** anything published at
-> rate should declare a steady or PTP domain (`API.md` §2.5 keeps `Domain` an
-> open trait for exactly this). The check tells an operator what happened; the
-> doc line is how the next robot avoids it. `RUNBOOK.md`'s `NonMonotonicStamp`
-> section carries both.
+> rate should declare a steady or PTP domain rather than the system wall clock.
+> `Domain` is an open trait, so a driver with a PTP clock can declare one today
+> even though no built-in steady domain exists yet (`API.md` §2.5). The check
+> tells an operator what happened; the doc line is how the next robot avoids it.
+> `RUNBOOK.md`'s `NonMonotonicStamp` section carries both.
 
 ---
 
