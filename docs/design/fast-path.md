@@ -2,7 +2,10 @@
 
 **Status:** partly implemented, partly **falsified by measurement**. Levers 1
 and 1b are in; Lever 3 is rejected on real data. See §11 for what each lever
-actually returned versus what this document projected.
+actually returned versus what this document projected, and **§12 for the
+per-term measurement that replaces §11's residual row — it inverts the ranking:
+the bracket search, not interpolation, is the largest term, and it is a cache
+cliff rather than a probe curve.**
 **Measured on:** AMD EPYC-Milan, 4 physical cores, 2445 MHz fixed, idle
 **Reproduce:** `cargo run --release -p tf_tree_bench --example cost_model`
 
@@ -383,15 +386,107 @@ separately, not by following this document's plan.
 
 Depth-3, three dynamic steps, capacity 4096, pinned: **217 ns `LerpSlerp`**,
 296 ns `ScLerp`. Against §11.3's 100 ns / 150 ns gate this still fails by ~2x,
-and §9's flag stands. The per-step budget is now roughly:
+and §9's flag stands. The per-step budget was estimated as:
 
 | Term | ns/step | Note |
 |---|---|---|
 | Interpolation | ~27 | was 50; Lever 1 |
 | Bracket search | ~20 | latency-bound on a serial dependent-load chain |
-| Slot reads, composition, bounds checks | ~25 | |
+| Slot reads, composition, bounds checks | ~25 | a **residual**, not a measurement |
 
-Closing a 2x gap from here needs Lever 2's restructure — overlapping the *d*
-independent dependent-load chains — not another arithmetic win. That is the one
-remaining lever with a plausible 2x in it, and it is also the one most likely to
-be defeated by the `#![forbid(unsafe_code)]` constraint on autovectorisation.
+**§12 replaces this table with a measured one, and the ranking inverts.**
+
+---
+
+## 12. The residual, measured — and the search is the largest term
+
+**Reproduce:** `taskset -c 2 cargo run --release -p tf_tree_bench --example step_cost`
+**Measured on:** AMD EPYC-Milan, 4 physical cores, L1d 32 KiB, L2 512 KiB, idle
+
+§11's third row was a subtraction. That is the very thing §11's own post-mortem
+says not to do — *"the explanation for a cost needs its own measurement"* — so
+`step_cost` measures each term directly and then **checks that they add up**.
+
+### The measured decomposition
+
+Per dynamic step, capacity 4096, `LerpSlerp`, stamps swept across the window and
+landing between samples. Measured marginal from the depth sweep: **72.5 ns/step**.
+
+| Term | ns/step | Share | How measured |
+|---|---|---|---|
+| **Bracket search** | **24.3** | **34%** | `sample(exact) − sample(Hold)` |
+| **Interpolation** | **22.2** | **31%** | `sample(between) − sample(exact) − read_slot` |
+| Fold overhead + the two O(depth) scans | ~11.5 | 16% | residual against the depth sweep |
+| `Iso3` composition | 6.8 | 9% | direct, chained |
+| `read_slot` ×2 | 6.6 | 9% | direct |
+| `ArenaView::sampler` | 1.9 | 3% | direct |
+| Ring preamble | 1.7 | 2% | `sample(Hold) − read_slot` |
+| Interp-policy dispatch | ~0 | 0% | `guard_sample − sampler − sample(between)` |
+| **sum** | **75.0** | | vs 72.5 measured — **3% closure** |
+
+Per call, once: `Plan::at` on an identity plan is **3.8 ns**.
+
+**Two of §11's three rows were wrong in the same direction.** Search is not 20 ns
+and interpolation is not 27; search is the *larger* of the two, and the residual
+row was ~25 when the genuinely unexplained part is ~11.5. Lever 1 over-delivered
+on interpolation relative to what §11 credited it, and the search was
+under-counted.
+
+### The search is a cache cliff, not a probe curve
+
+The reason the search costs what it does is not the probe count. Sweeping ring
+capacity at depth 1, with `Hold` — which reads one pose slot and runs **no
+search** — as the control:
+
+| capacity | stamps | poses | `sample(exact)` | `sample(Hold)` | Δ/log2 |
+|---|---|---|---|---|---|
+| 64 | 0.5 KiB | 4 KiB | 12.78 | 5.01 | — |
+| 256 | 2 KiB | 16 KiB | 13.45 | 4.97 | 0.34 |
+| 1 024 | 8 KiB | 64 KiB | 14.37 | 4.97 | 0.46 |
+| 4 096 | **32 KiB** | 256 KiB | 32.53 | 4.97 | **9.08** |
+| 16 384 | 128 KiB | 1 024 KiB | 43.31 | 5.03 | 5.39 |
+
+Two things fall out, and the control is what makes them conclusive:
+
+1. **`Hold` is flat to within 1% across a 256× range of pose-array size.**
+   Reading one pose slot costs ~5.0 ns whether the pose array is 4 KiB or 1 MiB.
+   The pose array's size costs nothing, so shrinking `PoseSlot` would buy nothing
+   here.
+2. **The whole cliff is the stamp array.** Cost is flat — 0.3–0.5 ns per doubling
+   — while the stamps fit comfortably in L1, then steps by ~9 ns per doubling at
+   exactly the capacity whose stamp array is **32 KiB, this host's L1d size**.
+   Effective per-probe cost goes from ~1 ns (L1-resident) to ~2.3–2.7 ns (not).
+
+§1's model — *"the ring is small and hot; the probes hit L1/L2"* at **1.72 ns per
+probe** — holds only while the stamp array fits L1. It was measured at depth 3,
+where three rings share the cache, and generalised into a per-probe constant. It
+is not a constant; it is a step function of `capacity × 8 bytes` against L1d.
+
+### What this changes about the levers
+
+- **Lever 3's rejection stands, and for a better reason than §5 gave.** §5 killed
+  interpolation-seeding because the seed lands 11–48 indices off on real data.
+  The stronger reason is that reducing the *probe count* was never the lever:
+  probes are ~1 ns each when the stamps are resident. The lever is reducing the
+  *stamp footprint the search touches*.
+- **A compact stamp summary is a new lever this measurement suggests**, and it is
+  not in §1–§7: search a 1-in-16 summary array first (256 entries = 2 KiB at
+  capacity 4096, permanently L1-resident), then finish within a range that spans
+  two cache lines. It needs a new arena region, so it is a `FORMAT_VERSION` break
+  and needs its own decision record — but it attacks the largest measured term,
+  which nothing currently proposed does.
+- **Lever 2's restructure is still worth doing** and its case is *stronger*: with
+  the search at 34% and latency-bound on a serial dependent-load chain, the
+  overlap it buys applies to the largest term rather than the second.
+- **The interp-policy dispatch is free** (0 ns within noise), so resolving it at
+  plan-compile time would buy nothing. Measured so nobody spends a day on it.
+
+### The residual that is left
+
+~11.5 ns/step, roughly flat per step across depths 1–6 (spread 2.95 ns). It is
+per-*step*, not per-call, so the identity-plan floor cannot contain it. The two
+O(depth) scans in `Plan::at` — `check_domain` → `has_dynamic`, and
+`first_dynamic_edge` — have exactly that shape, and both are pure functions of
+the compiled plan. §13 will record what removing them actually returned, since
+this attribution is a hypothesis about the residual and not yet a measurement of
+it.
