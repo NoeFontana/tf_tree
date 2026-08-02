@@ -15,13 +15,42 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use tf_tree::Stamp;
 use tf_tree_bench::fixture;
 
-/// Number of allocating calls (`alloc` + `realloc`) seen since process start.
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Allocating calls (`alloc` + `realloc`) made **by this thread**.
+    ///
+    /// Thread-local, and that is load-bearing rather than tidy. `cargo test`
+    /// runs this file's two tests on separate threads by default, and the other
+    /// test's construction phase legitimately allocates several thousand times.
+    /// Against a *process-global* counter those allocations land inside this
+    /// test's measured window, so the gate failed by ~4000 on every commit
+    /// anyone ran it against — a false failure, which is why it reported `FAIL`
+    /// while the engine was in fact allocation-free. `--test-threads=1` also
+    /// hides it, so pinning the counter to the thread is the fix that does not
+    /// depend on how the runner is invoked.
+    ///
+    /// `const { Cell::new(0) }` is required, not stylistic: a lazily-initialised
+    /// thread-local can allocate on first access, and doing that *inside* the
+    /// global allocator would recurse.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// This thread's allocating-call count.
+///
+/// `try_with` rather than `with`: during thread teardown the local may already
+/// be destroyed, and a panic from inside the allocator is not recoverable.
+fn allocations() -> usize {
+    ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Record one allocating call on this thread, if the local is still live.
+fn note_allocation() {
+    let _ = ALLOCATIONS.try_with(|c| c.set(c.get().wrapping_add(1)));
+}
 
 /// A `System`-backed allocator that counts allocating calls. Deallocations are
 /// not counted — the gate asserts that no *new* allocation happens in the hot
@@ -29,13 +58,14 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 struct CountingAllocator;
 
 // SAFETY: `CountingAllocator` forwards every call unchanged to `System`, which is
-// a sound `GlobalAlloc`. The only added work is a `Relaxed` atomic increment on
+// a sound `GlobalAlloc`. The only added work is a thread-local counter bump on
 // the allocating paths, which cannot affect the returned pointers or their
-// validity. This impl therefore upholds every `GlobalAlloc` invariant that
+// validity, and which uses `try_with` so a destroyed local cannot panic out of
+// the allocator. This impl therefore upholds every `GlobalAlloc` invariant that
 // `System` upholds. (Test-only binary; the crate proper is `#![forbid(unsafe_code)]`.)
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_allocation();
         // SAFETY: forwarding an unmodified `layout` to the system allocator.
         unsafe { System.alloc(layout) }
     }
@@ -48,7 +78,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_allocation();
         // SAFETY: `ptr`/`layout` originate from `System` and `new_size` is passed
         // through unchanged, so this satisfies `System::realloc`'s contract.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -88,7 +118,7 @@ fn no_allocations_after_construction() {
     const ITERS: usize = 1_000_000;
 
     // --- measured window: must not allocate ----------------------------
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = allocations();
     let mut acc = 0.0f64;
     for _ in 0..ITERS {
         lidar.push(push_stamp, &iso).expect("push");
@@ -96,7 +126,7 @@ fn no_allocations_after_construction() {
         let pose = plan.at(&guard, query).expect("at");
         acc += pose.t.x;
     }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = allocations();
 
     // Keep `acc` observable so the loop is not optimized away.
     assert!(acc.is_finite(), "accumulator went non-finite: {acc}");
@@ -173,7 +203,7 @@ fn no_allocations_on_a_large_topology_across_ring_wraparound() {
     // is enough to be true and not enough to be evidence.
     const ITERS: usize = 200_000;
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = allocations();
     let mut acc = 0.0f64;
     let mut answered = 0usize;
     for _ in 0..ITERS {
@@ -189,7 +219,7 @@ fn no_allocations_on_a_large_topology_across_ring_wraparound() {
             answered += 1;
         }
     }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = allocations();
 
     assert!(acc.is_finite(), "accumulator went non-finite: {acc}");
     assert!(
