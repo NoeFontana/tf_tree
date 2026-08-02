@@ -674,6 +674,18 @@ would be the quaternion-order trap in the time axis. On the C side this is one
 new `tft_layout` enumerator and therefore a **minor** ABI bump
 (`PHASE4.md` §3.6).
 
+> **Status: the core and C halves have landed; the Python half has not.**
+> `Layout::QuatTwist` is in `tf_tree_core` and `Plan::at_many_into` serves it;
+> `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is in the frozen header, accepted by
+> `tft_plan_at` and `tft_plan_at_many`, and reachable by type from the C++
+> wrapper as `layout_of<Quat7Twist6>`. **`tf_tree_py` still hard-codes
+> `Layout::Mat4` and has no `layout=` parameter**, so the Python half of this
+> NORMATIVE item is outstanding and is the work that remains: a `layout=`
+> argument, its buffer validation, and a GIL-release threshold per §6.1. This
+> note is here because the paragraph above reads as delivered otherwise, and
+> "carried to both bindings by the layout dispatch that already exists" is true
+> of the *dispatch* and not yet of Python's call into it.
+
 **2. Introspection: `tree.frames()`, `tree.edges()`, `plan.edges()`
 (`API.md` §3.2).** A notebook user currently shells out to the CLI to see what
 is in an arena, and this is the phase whose users live in notebooks. These are

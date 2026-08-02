@@ -231,7 +231,7 @@ fn put_qvec7_wxyz(t: &Iso3, dst: &mut [u8]) {
 }
 
 #[inline]
-fn put_f64(dst: &mut [u8], vals: &[f64]) {
+pub(crate) fn put_f64(dst: &mut [u8], vals: &[f64]) {
     for (i, v) in vals.iter().enumerate() {
         dst[i * 8..i * 8 + 8].copy_from_slice(&v.to_ne_bytes());
     }

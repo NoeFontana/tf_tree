@@ -451,16 +451,32 @@ fn at_many_into_handles_unsorted_stamps() {
 /// reversed puts one call down each branch, and the rows must come back
 /// element-for-element identical after un-reversing.
 ///
-/// Reversed rather than shuffled on purpose: it is the ordering that makes the
-/// *downward* gallop arm run, which is the arm no in-tree caller reaches (every
-/// cursor is seeded to `0`) and therefore the one that can rot unnoticed.
+/// **Reversed is not a second gallop direction.** An earlier revision of this
+/// comment said the reversed order was what made `bracket_from`'s *downward*
+/// arm run; that is false, and was checked rather than reasoned about. The
+/// reversed call is non-monotone, so it takes the fallback arm, which calls
+/// `bracket` and never `bracket_from` — no gallop runs in either direction.
+/// Reversed is simply the cheapest input that is guaranteed non-monotone while
+/// still being a permutation of the forward one, which is what lets the rows be
+/// compared element for element. Injecting `panic!()` into `bracket_from`'s
+/// downward arm leaves this test **passing** and fails `tf_tree_core`'s
+/// `sample_from_agrees_with_sample_from_every_cursor` and
+/// `sample_with_twist_from_agrees_with_sample_with_twist_from_every_cursor` —
+/// that arm's coverage is there, in the `start in 0..21` sweep, and deleting it
+/// would leave the arm untested whatever this test says.
 ///
-/// Mutant: in `fold_batch_with_twist`, hand `fold_at_with_derivatives_cursors`
-/// a `cursors` array declared *inside* the loop, so every stamp restarts cold
-/// ⇒ still passes, because a cold cursor is a valid cursor. Mutant B: seed the
-/// gallop from `newest` instead of `*cursor` ⇒ also passes. Both are the point:
-/// the cursor is a hint, and the only thing this test can pin is that the two
-/// branches never disagree. The *advance* is pinned in `tf_tree_core`'s
+/// What this *does* pin is the upward arm the monotone batch really uses, and
+/// it pins it against an independent answer rather than against itself.
+/// Mutant, run: in `bracket_from`'s upward arm, hand `bracket` a lower bound of
+/// `hint + step` instead of `hint + step / 2` ⇒ fails, "stamp 0 element 0
+/// disagreed between the cursor and fallback loops", `13824777323826317557`
+/// against `...562`.
+///
+/// Mutant B, run: in `fold_batch_with_twist`, declare the `cursors` array
+/// *inside* the loop so every stamp restarts cold ⇒ still passes, because a
+/// cold cursor is a valid cursor. That is the shape of the limit here: the
+/// cursor is a hint, so no assertion about the *values* can see whether it
+/// advanced. The advance is pinned in `tf_tree_core`'s
 /// `sample_with_twist_from_agrees_with_sample_with_twist_from_every_cursor`.
 #[test]
 fn quat_twist_agrees_between_the_cursor_and_fallback_batch_loops() {

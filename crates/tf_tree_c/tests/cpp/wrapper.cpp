@@ -210,6 +210,61 @@ static void check_payload_sizes_agree()
     CHECK(tft_layout_size(9999) == 0, "unknown layout, library");
 }
 
+/// **`publishable` must agree with the library about which layouts are
+/// output-only**, or the `static_assert` in `push` is a compile error for a call
+/// that would have worked, or — far worse — absent for one that would not.
+///
+/// The predicate is a mirror of a decision made in `layout::read`, exactly as
+/// `payload_bytes` mirrors `tft_layout_size`, so it gets the same treatment: the
+/// header's compile-time answer is checked against the library's run-time one
+/// for every layout, rather than trusted.
+///
+/// The direction that matters is the second `CHECK`. `push` cannot be *called*
+/// with an unpublishable layout any more — that is the point of the change — so
+/// this drives `tft_publisher_push` directly, which is the only way left to ask
+/// the library what it thinks.
+///
+/// Mutant, run: `publishable` returns `true` for everything (and the two
+/// negative `static_assert`s above are removed, or they fail to compile first)
+/// ⇒ two failures, both "the header says publishable but the library refuses
+/// the layout" — one for each output-only layout. Reverse mutant: teach
+/// `layout::read` to accept the twist layout ⇒ the `else` arm fires instead.
+static void check_publishable_agrees_with_the_library()
+{
+    static_assert(!tf_tree::publishable(TFT_LAYOUT_QVEC7_WXYZ_TWIST6),
+                  "a twist is derived from the arena, never published into it");
+    static_assert(!tf_tree::publishable(TFT_LAYOUT_AFFINE12_ROW_F32),
+                  "the f32 affine encoding is an output encoding");
+    static_assert(tf_tree::publishable(TFT_LAYOUT_QVEC7_WXYZ), "the canonical layout publishes");
+
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_publishable_tree_create(&raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+    auto pub_r = tree.claim("robot", "world");
+    CHECK_R(pub_r, "claim");
+    tf_tree::Publisher pub = std::move(VALUE_OF(pub_r));
+
+    // Big enough for the widest payload, and a valid identity pose for the
+    // layouts that will actually read it — so a refusal is about the layout and
+    // not about the bytes.
+    double buf[16] = {};
+    buf[0] = 1.0;  // qw for the QVEC7 orders
+    const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ,       TFT_LAYOUT_QVEC7_XYZW,
+                              TFT_LAYOUT_MAT4_COL,         TFT_LAYOUT_MAT4_ROW,
+                              TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_QVEC7_WXYZ_TWIST6};
+    std::int64_t stamp = 1;
+    for (tft_layout l : all) {
+        const tft_status s = tft_publisher_push(pub.raw(), stamp++, l, buf);
+        if (tf_tree::publishable(l)) {
+            CHECK(s != TFT_ERR_BAD_ENUM,
+                  "the header says publishable but the library refuses the layout");
+        } else {
+            CHECK(s == TFT_ERR_BAD_ENUM,
+                  "the header says unpublishable but the library accepts the layout");
+        }
+    }
+}
+
 #ifdef TF_TREE_HAS_EIGEN
 /// **The premise behind `raw_writable<Eigen::Isometry3d>`.**
 ///
@@ -759,6 +814,7 @@ int main()
 
     check_abi_guard_ran();
     check_payload_sizes_agree();
+    check_publishable_agrees_with_the_library();
 #ifdef TF_TREE_NO_EXCEPTIONS
     check_success_does_not_touch_the_error_slot();
 #endif

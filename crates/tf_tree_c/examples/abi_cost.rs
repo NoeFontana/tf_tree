@@ -203,6 +203,88 @@ fn main() {
         batch_ns / native_ns
     );
 
+    // --- the twist layout's batch, where the monotone cursor is the point ---
+    //
+    // **Ascending stamps, deliberately.** `Layout::QuatTwist`'s batch fold has
+    // a monotone-cursor branch that turns the per-step bracket search from
+    // `O(log n)` into `O(1)` amortized, and `docs/API.md` §3.3's n = 1024
+    // ML/perception batch is the caller it exists for. `tft_plan_at_many` used
+    // to evaluate this layout with a scalar `at_with_derivatives` per element,
+    // which cannot reach that branch — these rows are what says whether it does
+    // now, and the native row beside them is what separates "the boundary" from
+    // "derivatives cost twice a pose".
+    //
+    // The strided row is the second half of the same question: a caller writing
+    // into an array of its own structs cannot be handed the batch's buffer
+    // directly, so it takes the chunked path instead of the zero-copy one.
+    let sorted: Vec<i64> = (0..N)
+        .map(|i| 10_000_000 + (i as i64 * 600_000_000) / N as i64)
+        .collect();
+    let mut nrows = vec![0.0f64; N * 13];
+    let twist_native_ns = bench(|| {
+        let g = native.guard();
+        nplan
+            .at_many_into::<tf_tree::SystemDomain>(
+                &g,
+                black_box(&sorted),
+                tf_tree::Layout::QuatTwist,
+                &mut nrows,
+            )
+            .unwrap();
+        nrows[0]
+    });
+    let mut trows = vec![0u8; N * 104];
+    let twist_abi_ns = bench(|| {
+        // SAFETY: live plan; `sorted` has N elements and `trows` is N*104 bytes,
+        // which is exactly what a tightly packed 13-`f64` layout touches.
+        let rc = unsafe {
+            tft_plan_at_many(
+                plan,
+                sorted.as_ptr(),
+                N,
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                trows.as_mut_ptr().cast(),
+                0,
+            )
+        };
+        debug_assert_eq!(rc, TFT_OK);
+        trows[0] as f64
+    });
+    const TWIST_STRIDE: usize = 128;
+    let mut srows = vec![0u8; N * TWIST_STRIDE];
+    let twist_strided_ns = bench(|| {
+        // SAFETY: live plan; the last element occupies 104 bytes at
+        // (N-1)*TWIST_STRIDE, which is inside `srows`.
+        let rc = unsafe {
+            tft_plan_at_many(
+                plan,
+                sorted.as_ptr(),
+                N,
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                srows.as_mut_ptr().cast(),
+                TWIST_STRIDE,
+            )
+        };
+        debug_assert_eq!(rc, TFT_OK);
+        srows[0] as f64
+    });
+    println!("\nQVEC7_WXYZ_TWIST6 batch, ascending stamps — API.md §3.3");
+    println!("{:>28} {:>10}", "path", "ns/elem");
+    println!(
+        "{:>28} {twist_native_ns:>10.1}",
+        "native at_many_into(QuatTwist)"
+    );
+    println!("{:>28} {twist_abi_ns:>10.1}", "tft_plan_at_many, packed");
+    println!(
+        "{:>28} {twist_strided_ns:>10.1}",
+        "tft_plan_at_many, strided"
+    );
+    println!(
+        "  packed {:.3}x native, strided {:.3}x native",
+        twist_abi_ns / twist_native_ns,
+        twist_strided_ns / twist_native_ns
+    );
+
     // --- catch_unwind, isolated ---
     //
     // Same trivial body, called through `guard` and directly. §3.4 claims this is

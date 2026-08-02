@@ -526,6 +526,14 @@ tft_status tft_plan_at(const tft_plan *plan, int64_t stamp, tft_layout layout, v
  * first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT` depends
  * on the stamp and can fire part-way through.
  *
+ * **Sort your stamps.** This layout is evaluated by the engine's batch fold,
+ * which rides a resumable cursor per plan step when the stamps are
+ * non-decreasing — an `O(1)` amortized bracket search instead of `O(log n)` per
+ * stamp per step. Unsorted stamps get the same answers and pay the searches.
+ * A tightly packed `out` (`out_stride_bytes` of `0` or 104, `f64`-aligned) is
+ * written in place with no intermediate copy; any other stride is evaluated in
+ * chunks and scattered, which restarts the cursor once per chunk.
+ *
  * # Safety
  *
  * `plan` must be a live handle. `stamps` must point to `n` readable `int64_t`.

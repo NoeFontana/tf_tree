@@ -488,6 +488,35 @@ constexpr std::size_t payload_bytes(tft_layout layout)
                                                                               : 0;
 }
 
+/// Whether `layout` can be *read from* caller memory, i.e. published.
+///
+/// **Two of the six layouts are output-only, and the header has to know it.**
+/// The wrapper's opening claim is that getting a layout wrong is not
+/// expressible — but `layout_of<T>` picks a layout for a *type*, and a type can
+/// name a layout that only makes sense in one direction. `Quat7Twist6` is the
+/// first such type: `Publisher::push<Quat7Twist6>` satisfies every other
+/// `static_assert` (it is trivially copyable, and 104 bytes is not smaller than
+/// the payload) and fails only at run time with `TFT_ERR_BAD_ENUM`.
+///
+/// `docs/API.md` §4 is unambiguous about which of those two it should be:
+/// "anything that can be wrong there must be a `static_assert`, not a runtime
+/// branch." So this predicate exists, and `push`/`push_many` assert on it.
+///
+/// The two refusals are different refusals, and both are the library's, mirrored
+/// here for the same reason `payload_bytes` mirrors `tft_layout_size` — with the
+/// same cross-check, in `wrapper.cpp`, so the mirror cannot drift:
+///
+/// * `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` — a twist is *derived* from the arena, never
+///   stored in it. There is no publish direction to implement, not merely one
+///   that has not been written yet.
+/// * `TFT_LAYOUT_AFFINE12_ROW_F32` — an output encoding for GPU upload.
+///   Accepting a publication in `f32` would quietly halve the precision of
+///   everything downstream (`docs/PROJECT.md` §5, "f64 only").
+constexpr bool publishable(tft_layout layout)
+{
+    return layout != TFT_LAYOUT_QVEC7_WXYZ_TWIST6 && layout != TFT_LAYOUT_AFFINE12_ROW_F32;
+}
+
 /// Whether `T` may receive a raw layout write into its own storage.
 ///
 /// The default is `std::is_trivially_copyable`, which is the correct standard
@@ -868,6 +897,11 @@ public:
                       "if its storage really is a plain scalar array at offset 0");
         static_assert(sizeof(T) >= payload_bytes(layout_of<T>::value),
                       "T is smaller than the layout it selects, so the read would overrun it");
+        static_assert(publishable(layout_of<T>::value),
+                      "T selects an output-only layout: a twist is derived from the arena and "
+                      "never published into it, and the f32 affine encoding exists for GPU "
+                      "upload. Push the pose type instead (Quat7 is Quat7Twist6's pose half, "
+                      "at the same offsets)");
         const tft_status s = tft_publisher_push(h_.get(), stamp, layout_of<T>::value, &value);
         if (s != TFT_OK) {
             TF_TREE_FAIL(s);
@@ -886,6 +920,11 @@ public:
                       "if its storage really is a plain scalar array at offset 0");
         static_assert(sizeof(T) >= payload_bytes(layout_of<T>::value),
                       "T is smaller than the layout it selects, so the read would overrun it");
+        static_assert(publishable(layout_of<T>::value),
+                      "T selects an output-only layout: a twist is derived from the arena and "
+                      "never published into it, and the f32 affine encoding exists for GPU "
+                      "upload. Push the pose type instead (Quat7 is Quat7Twist6's pose half, "
+                      "at the same offsets)");
         const tft_status s = tft_publisher_push_many(h_.get(), stamps, n, layout_of<T>::value,
                                                      values, sizeof(T));
         if (s != TFT_OK) {

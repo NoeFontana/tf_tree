@@ -562,6 +562,14 @@ pub unsafe extern "C" fn tft_plan_at(
 /// first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT` depends
 /// on the stamp and can fire part-way through.
 ///
+/// **Sort your stamps.** This layout is evaluated by the engine's batch fold,
+/// which rides a resumable cursor per plan step when the stamps are
+/// non-decreasing — an `O(1)` amortized bracket search instead of `O(log n)` per
+/// stamp per step. Unsorted stamps get the same answers and pay the searches.
+/// A tightly packed `out` (`out_stride_bytes` of `0` or 104, `f64`-aligned) is
+/// written in place with no intermediate copy; any other stride is evaluated in
+/// chunks and scattered, which restarts the cursor once per chunk.
+///
 /// # Safety
 ///
 /// `plan` must be a live handle. `stamps` must point to `n` readable `int64_t`.
@@ -642,6 +650,23 @@ pub unsafe extern "C" fn tft_plan_at_many(
         // duplicated lines is the cheaper trade, and the failure reporting —
         // the part with an argument in it — is shared by `note_batch_failure`.
         if layout::carries_twist(layout) {
+            // The twist layout goes through `Plan::at_many_into` — the *same*
+            // batch fold, and the same monotone cursor, the Rust and Python
+            // batch paths use. Evaluating it with a scalar `at_with_derivatives`
+            // per element, as this used to, cannot reach that branch and pays an
+            // independent `O(log n)` bracket search per stamp per plan step.
+            //
+            // It returns `false` for *any* failure and reports nothing, because
+            // `at_many_into` says only which error, never which element. The
+            // scalar loop below then re-runs the batch, reproduces the failure
+            // and reports the index — which is what keeps §4.3's promise that
+            // `frame_b` says how many leading elements are live. The rows it
+            // rewrites on the way are bit-identical to the ones already there
+            // (that is what the cursor being a *hint* means), so the buffer ends
+            // in the state the doc comment describes either way.
+            if twist_batch(&h.plan, &g, ts, dst, stride, payload) {
+                return TFT_OK;
+            }
             for (i, &t) in ts.iter().enumerate() {
                 match h
                     .plan
@@ -667,6 +692,95 @@ pub unsafe extern "C" fn tft_plan_at_many(
         }
         TFT_OK
     })
+}
+
+/// Evaluate `stamps` in [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] through
+/// [`tf_tree::Plan::at_many_into`], returning `false` if any element failed.
+///
+/// # Why this exists at all
+///
+/// `Layout::QuatTwist`'s batch fold rides a monotone cursor per plan step, so
+/// ascending stamps cost `O(1)` amortized in the bracket search instead of
+/// `O(log n)`. That is the reason the layout is a *batch* layout — it is
+/// `docs/API.md` §3.3's n = 1024 ML/perception row — and a per-element scalar
+/// call cannot reach it.
+///
+/// **Measured, and smaller than the complexity suggests.** On
+/// `tf_tree_bench`'s fixture — ten seconds of history, up to 1 kHz, n = 1024 —
+/// the cursor is worth 3.0 % (342 against 352 ns/element, in-process A/B of the
+/// two arms on the same stamps). On `examples/abi_cost.rs`'s 64-sample rings it
+/// is 1.4 % (240 → 237 ns/element, packed), because a binary search over 64
+/// L1-resident stamps is a handful of nanoseconds against ~240 of interpolation
+/// and adjoint composition. The win scales with ring depth, and the reason to
+/// take it is that it costs nothing: it *is* the Rust path.
+///
+/// # Two shapes, one fold
+///
+/// `at_many_into` writes thirteen **contiguous** `f64` per stamp into a Rust
+/// slice; §4.3's `out_stride_bytes` exists because a C caller's buffer is often
+/// neither contiguous nor `f64`-aligned.
+///
+/// * **Tightly packed and aligned** — a `Quat7Twist6[]`, or the `(N, 13)` array
+///   §3.3 is about, which is what the C++ wrapper passes: the caller's own
+///   memory *is* the output slice. No copy and no chunking, so one cursor runs
+///   the length of the batch.
+/// * **Anything else**: `CHUNK` rows at a time through a stack buffer, then
+///   scattered at the caller's stride. The cursor restarts once per chunk
+///   instead of once per stamp, which is 1/`CHUNK` of the searches the scalar
+///   loop paid.
+///
+/// `CHUNK` is deliberately small. The buffer is a plain array, so its zeroing
+/// is paid even by a batch of one: 32 rows is 3.3 KiB of stack and leaves under
+/// one probe per element of restart cost, where 512 would save a rounding error
+/// of search and charge every short batch 53 KiB.
+fn twist_batch(
+    plan: &tf_tree::Plan,
+    g: &tf_tree::Guard<'_>,
+    stamps: &[i64],
+    dst: &mut [u8],
+    stride: usize,
+    payload: usize,
+) -> bool {
+    /// `f64` per row — `Layout::QuatTwist::elems()`.
+    const ROW: usize = 13;
+    /// Rows per pass of the scatter path.
+    const CHUNK: usize = 32;
+    debug_assert_eq!(payload, ROW * 8, "the twist layout is thirteen f64");
+
+    if stride == payload && dst.as_ptr().align_offset(core::mem::align_of::<f64>()) == 0 {
+        // `dst.len()` is the span the caller's arguments were validated
+        // against — `(n-1) * stride + payload`, which with `stride == payload`
+        // is exactly `n * ROW` f64.
+        //
+        // SAFETY: `dst` is a live, uniquely borrowed `&mut [u8]` whose start is
+        // `f64`-aligned (tested immediately above) and whose length is `n *
+        // payload`, a multiple of eight. The reborrow below is the only access
+        // to those bytes while it lives, so the two slices never alias, and
+        // `f64` has no invalid bit patterns — whatever the caller left in the
+        // buffer is a valid, if meaningless, `f64`.
+        let rows = unsafe {
+            core::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f64>(), dst.len() / 8)
+        };
+        return plan
+            .at_many_into::<SystemDomain>(g, stamps, tf_tree::Layout::QuatTwist, rows)
+            .is_ok();
+    }
+
+    let mut scratch = [0.0f64; CHUNK * ROW];
+    for (c, part) in stamps.chunks(CHUNK).enumerate() {
+        let rows = &mut scratch[..part.len() * ROW];
+        if plan
+            .at_many_into::<SystemDomain>(g, part, tf_tree::Layout::QuatTwist, rows)
+            .is_err()
+        {
+            return false;
+        }
+        for (j, row) in rows.chunks_exact(ROW).enumerate() {
+            let off = (c * CHUNK + j) * stride;
+            layout::put_f64(&mut dst[off..off + payload], row);
+        }
+    }
+    true
 }
 
 /// Record the failure of element `i` of a batch, at stamp `t`.
