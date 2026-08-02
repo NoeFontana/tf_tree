@@ -561,6 +561,42 @@ impl PyPlan {
     /// is why this takes the keyword at all: **every** batch entry point has an
     /// `_into` form, and a layout reachable only through the allocating one
     /// would be a batch path with no allocation-free tier.
+    ///
+    /// # The two paths disagree about what a stamp is, and the `mat4` one is
+    /// the one that is wrong
+    ///
+    /// This method has two stamp dispatches — one for the default `mat4`
+    /// layout, in the body below, and one in `at_into_layout` for the other
+    /// three. They are **not** the same, and until one of them moves a caller
+    /// can observe which one they are on:
+    ///
+    /// | `stamps` | `at`, and `at_into(layout=..)` | `at_into` (`mat4`) |
+    /// | --- | --- | --- |
+    /// | `np.int64(t)` | accepted (§3 lists it) | `BufferError` |
+    /// | `1.5` | `TypeError`, 238 ns ULP (§3) | `BufferError` |
+    /// | a `list`, or a non-`int64` array | numpy's or PyO3's own conversion `TypeError` | `BufferError` naming `(N,) int64` |
+    ///
+    /// `docs/PHASE3.md` §3 is NORMATIVE about the first two rows, so the
+    /// `mat4` column is a defect on both: `np.int64` is what `stamps[i]` hands
+    /// you, and a `float` must meet the measurement rather than a complaint
+    /// about a buffer. The `layout=` path was fixed to match `at`; **the
+    /// `mat4` path is outstanding, not decided.** It is deferred rather than
+    /// done because closing it moves the third row too — the shape-naming
+    /// `BufferError` that this path, alone, still gives — and that is a
+    /// change to the default overload's error surface with its own tests,
+    /// not a line inside a layout feature. Recorded rather than silently
+    /// tolerated: a reader who finds this table is looking at the last place
+    /// the two shapes differ.
+    ///
+    /// The third row is the price the fix charged, and it is charged
+    /// **symmetrically**: `at` has always answered a `list` or a `float64`
+    /// array that way, because there is no cast left to fail once the array
+    /// probe has been fallen through — [`stamp_from_any`] has the last word
+    /// and raises PyO3's or numpy's own conversion error. Matching `at`
+    /// exactly was the point, so `at_into(.., layout=..)` gives up the
+    /// shape-naming `BufferError` for it. §3's two rows are worth more than
+    /// one message: they are what a caller *writes*, and the message is what
+    /// they read once.
     #[pyo3(signature = (stamps, out, /, *, layout = None))]
     fn at_into(
         &self,

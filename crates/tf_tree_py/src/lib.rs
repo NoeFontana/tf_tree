@@ -19,10 +19,23 @@
 //! So the attribute stays — explicit beats inherited, and a future PyO3 could
 //! flip the default back — but **it is not what makes the claim true, and no
 //! test of the attribute can be non-vacuous.** What makes it true is that every
-//! `#[pyclass]` here is `Send + Sync` (`Tree` and `Plan` already are in Rust;
-//! `Publisher` is `!Sync` by design and is therefore not exposed yet) and that
-//! there is no global mutable state. What *checks* it is the concurrent
-//! evaluation test on a `3.14t` interpreter, and ThreadSanitizer (§7.3).
+//! `#[pyclass]` here is `Send + Sync` and that there is no global mutable
+//! state. `Tree` and `Plan` already are both in Rust; `tf_tree::Publisher` is
+//! `Send + !Sync` by design, so [`PyPublisher`] does not hold one directly —
+//! it holds an [`OwnedWriter`](tf_tree::OwnedWriter) behind a `Mutex`, which is
+//! `Sync` because the writer is `Send`. That is what makes exposing it as
+//! `tf_tree.Publisher` sound, and an earlier revision of this paragraph said
+//! it was *not* exposed, which had not been true since it was added.
+//!
+//! **The `Send + Sync` half is the compiler's, not ours.** A `#[pyclass]`
+//! without `unsendable` expands to an `assert_pyclass_send_sync::<Self>()`
+//! (`pyo3-macros-backend-0.29.0/src/pyclass.rs:2932`), so a field that is not
+//! both stops the build at the attribute — verified by giving `PyPublisher` a
+//! `PhantomData<*const u8>`, which produces `error[E0277]: *const u8 cannot be
+//! shared between threads safely` pointing at its `#[pyclass]` line. **The
+//! no-global-mutable-state half is not checked by anything**, and that is the
+//! one the concurrent evaluation test on a `3.14t` interpreter and
+//! ThreadSanitizer (§7.3) are for.
 //!
 //! # Time is integer nanoseconds (§3)
 //!

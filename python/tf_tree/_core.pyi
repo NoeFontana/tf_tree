@@ -154,6 +154,16 @@ class Plan:
         input is refused rather than silently copied — a silent copy would
         defeat the point of this method while appearing to work.
 
+        **With `layout=`, a bad `stamps` is reported the way `at` reports it**
+        — numpy's or PyO3's own conversion `TypeError` ("only integer scalar
+        arrays can be converted to a scalar index" for a float64 array) rather
+        than a `BufferError` naming `(N,) int64`. That is the trade for the two
+        things it bought: an `np.int64` scalar is accepted, and a `float` stamp
+        meets the `TypeError` carrying the 238 ns measurement instead of a
+        complaint about a buffer. The default `mat4` path still gives the
+        shape-naming `BufferError`, and still refuses `np.int64`; the
+        difference is in `Plan.at_into.__doc__`.
+
         `out` is typed `object` rather than `NDArray` because the device check
         below accepts anything and then refuses it by message. **Only
         `numpy.ndarray` is written to** (subclasses included); a `memoryview`,

@@ -899,6 +899,41 @@ def test_at_into_refuses_a_float_stamp_with_the_measurement_too(
 
 
 @pytest.mark.parametrize(("layout", "elems", "dtype"), LAYOUT_OUT)
+def test_the_layout_path_reports_a_bad_stamps_array_exactly_as_at_does(
+    twistable, layout, elems, dtype
+):
+    """The price the two tests around this one charged, pinned so it stays paid
+    on purpose.
+
+    Falling *through* the array cast is what buys §3's two rows — an
+    ``np.int64`` scalar accepted, a ``float`` met with the 238 ns measurement —
+    and it costs the one message that used to name the shape: a ``float64``
+    stamps array now raises numpy's own ``TypeError: only integer scalar arrays
+    can be converted to a scalar index``, from ``stamp_from_any``, instead of
+    ``BufferError: stamps must be an (N,) int64 array, or an int``.
+
+    That is a **regression in one message and a fix in two behaviours**, and it
+    is deliberate because ``at`` has always answered exactly this way: the
+    assertion below is that the two are byte-identical, which is the property
+    that was actually wanted. ``at_into``'s default ``mat4`` path still gives
+    the shape-naming ``BufferError`` — the last place the two stamp dispatches
+    disagree, recorded in ``Plan.at_into.__doc__``.
+
+    Mutant: restore the ``else`` on the ``layout=`` path => ``BufferError`` is
+    raised, which is not a ``TypeError``, so ``pytest.raises`` fails.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros((1, elems), dtype=dtype)
+    bad = np.array([1_500_000_000.0])  # float64, not int64
+    with pytest.raises(TypeError) as into_exc:
+        p.at_into(bad, out, layout=layout)
+    with pytest.raises(TypeError) as at_exc:
+        p.at(bad, layout=layout)
+    assert str(into_exc.value) == str(at_exc.value)
+    assert not out.any(), "the buffer was written before the stamp was validated"
+
+
+@pytest.mark.parametrize(("layout", "elems", "dtype"), LAYOUT_OUT)
 def test_a_numpy_int64_scalar_is_an_accepted_stamp(twistable, layout, elems, dtype):
     """§3 lists the accepted stamp types: ``int``, an ``np.int64`` scalar, and a
     C-contiguous ``np.int64`` array.
@@ -1118,24 +1153,67 @@ def _ml_flags(cls: type, name: str) -> int:
     There is no Python-level accessor for it, so this walks the
     ``PyMethodDescrObject`` by hand. The offsets are **discovered, not
     hard-coded**: the ``PyObject`` head is 16 bytes under the GIL build and 32
-    under the free-threaded one, so the search is for the slot holding
-    ``d_type``, after which ``PyDescrObject`` fixes ``d_name``, ``d_qualname``
-    and then ``d_method``. Reading ``ml_name`` back and comparing it to the
-    method's own name is the check that the walk found the right structure —
-    without it a wrong offset would report a garbage flag word as a pass.
+    under the free-threaded one (``method_descriptor.__basicsize__`` is 56 and
+    72 respectively on 3.14), so the walk searches for where the
+    ``PyDescrObject`` starts.
+
+    **It searches for all three of its fields at once**, which is what makes a
+    failure legible rather than a garbage read. ``d_type``, ``d_name`` and
+    ``d_qualname`` are all objects this code can name — ``cls``,
+    ``descr.__name__``, ``descr.__qualname__`` — so a candidate offset has to
+    match three known pointers in a row before the slot after them is believed
+    to be ``d_method``. Searching for ``d_type`` alone did not: one pointer
+    match is a much weaker signal, and everything after it was then read on
+    faith. ``d_qualname`` is computed lazily and is ``NULL`` until first
+    touched, which is why ``__qualname__`` is read before the slots are.
+
+    Two more properties, both of which the earlier form lacked:
+
+    * **No read leaves the object.** The last candidate offset is
+      ``__basicsize__ - 32``, because ``d_method`` is the fourth slot from
+      there and has to end inside the object. The earlier form probed a fixed
+      ``range(0, 64, 8)`` window whose last slot *starts* at offset 56 — past
+      the end of a 56-byte object under the GIL build.
+    * **Reading ``ml_name`` back and comparing it to the method's own name** is
+      the last check: without it a wrong offset would report a garbage flag
+      word as a pass.
+
+    So a future CPython that moves any of ``d_type``, ``d_name``,
+    ``d_qualname`` or ``d_method`` relative to each other fails here with the
+    ``AssertionError`` below — and **that is the whole promise**. It is not
+    that this cannot crash: if a release inserted a field between
+    ``d_qualname`` and ``d_method``, the three-pointer signature would still
+    match and ``ml_name`` would dereference whatever that field holds — a
+    ``ValueError: NULL pointer access`` if it is null, a segfault if it is
+    merely wrong. ctypes has no way to make that read safe. A crash is a bad
+    outcome and a silently wrong ``ml_flags`` is a worse one, and this trades
+    toward the first.
     """
     import ctypes
 
     voidp = ctypes.POINTER(ctypes.c_void_p)
     descr = getattr(cls, name)
+    # `d_qualname` is filled on first access — touch it before reading slots.
+    signature = (id(cls), id(descr.__name__), id(descr.__qualname__))
     base = id(descr)
-    for head in range(0, 64, 8):
-        if ctypes.cast(base + head, voidp)[0] != id(cls):
+
+    def slot(offset: int) -> int:
+        return ctypes.cast(base + offset, voidp)[0] or 0
+
+    # `d_method` is the fourth slot from `head`, so `head + 32` is the first
+    # byte past it and may not exceed the object.
+    for head in range(0, type(descr).__basicsize__ - 32 + 1, 8):
+        if tuple(slot(head + 8 * i) for i in range(3)) != signature:
             continue
-        method_def = ctypes.cast(base + head + 24, voidp)[0]
-        ml_name = ctypes.cast(method_def, ctypes.POINTER(ctypes.c_char_p))[0]
-        if ml_name == name.encode():
-            return ctypes.cast(method_def + 16, ctypes.POINTER(ctypes.c_int))[0]
+        # Three known pointers in a row cannot be a coincidence, so the walk is
+        # committed here: if the name does not read back, the structure moved
+        # and the answer is the AssertionError, not a further search.
+        method_def = slot(head + 24)
+        if method_def:
+            ml_name = ctypes.cast(method_def, ctypes.POINTER(ctypes.c_char_p))[0]
+            if ml_name == name.encode():
+                return ctypes.cast(method_def + 16, ctypes.POINTER(ctypes.c_int))[0]
+        break
     raise AssertionError(
         f"could not locate PyMethodDef for {cls.__name__}.{name}: CPython's "
         "descriptor layout has moved and this probe needs updating"
