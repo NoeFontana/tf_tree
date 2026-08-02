@@ -1184,16 +1184,40 @@ The diagnostic must be loud, rate-limited, and surfaced in `tf_tree doctor`, bec
 
 If `use_sim_time` is true, the bridge tags every edge it declares as `SimDomain` and drives its clock from `/clock`; otherwise `SystemDomain`. Phase 1's typed domains then do the rest: a consumer querying with the wrong domain gets `TimeDomainMismatch` instead of a plausible wrong answer.
 
-> **Amendment — the types exist; the bridge does not use them yet.** This section
-> first spelled them `SimTime`/`SystemTime`, names nothing ever had. The set is
-> uniformly `*Domain` and the tags are fixed: `SystemDomain` 0, `SensorDomain` 1,
-> `SimDomain` 2, `SteadyDomain` 3 ([`API.md`](./API.md) §2.5). **The paragraph
-> above is therefore true of a number and not yet of a name** —
-> `TopologyConfig::default_domain` is still a bare `u8` and
-> `tf_tree_bridge::config::parse_domain` still maps only `"system"` and
-> `"sensor"`, so a deployment that wants tag 2 writes `2`. Rewiring `parse_domain`
-> onto the four names is what makes this section true as written, and it is a
-> separate change.
+> **Amendment — the names are wired; what is left is the *derivation*, and it is
+> named here rather than hedged.** This section first spelled the types
+> `SimTime`/`SystemTime`, names nothing ever had. The set is uniformly `*Domain`
+> and the tags are fixed: `SystemDomain` 0, `SensorDomain` 1, `SimDomain` 2,
+> `SteadyDomain` 3 ([`API.md`](./API.md) §2.5).
+>
+> **`tf_tree_bridge::config::parse_domain` now maps all four spellings** —
+> `"system"`, `"sensor"`, `"sim"`, `"steady"` — each through the engine's own
+> `Domain::TAG` rather than through a literal repeated in the parser, so a
+> deployment that wants sim time writes `domain = "sim"` and no longer has to
+> know that it is `2`. `TopologyConfig::default_domain` stays a `u8` **and that
+> is the design, not the remainder**: `Domain` is an open trait, a user-declared
+> domain picks a free tag from 4 upwards, and a parser that accepted only the
+> four names would refuse the case the trait is open for. The numeric form is
+> therefore kept and tested alongside the names.
+>
+> **The remainder is the first clause of the paragraph above: "if `use_sim_time`
+> is true".** Nothing derives the bridge's own tag from `use_sim_time`. It is an
+> explicit `time_domain` parameter (default `0`) read in
+> `ros/tf_tree_ros/src/bridge_node.cpp`, passed through `BridgeOptions` to
+> `tft_bridge_options::domain`; that node *warns* when `use_sim_time` is true and
+> `time_domain` is still 0, and does not change it. So an operator who sets
+> `use_sim_time` and forgets `time_domain` still gets a `SystemDomain`-tagged
+> arena, with a log line. Closing that is an `rclcpp`-side change, gated only by
+> `just ros-test`, and it is the whole of what stands between this section and
+> being true as written.
+>
+> **The NORMATIVE paragraph below is met**, and has been since §5.8's config
+> file: `TopologyConfig::check_domain` refuses any *dynamic* edge whose declared
+> domain is not the bridge's, and it is called from `tft_bridge_create` before
+> the arena is built and from `tf_tree topology --config <f> --domain N`, so it
+> fails at startup and not at first message. Static edges are exempt — their constant
+> carries no stamp, and `robot_state_publisher` stamps `/tf_static` at zero
+> whatever `use_sim_time` says.
 
 **NORMATIVE:** the bridge refuses to write to an edge whose declared domain differs from its own, and fails at startup rather than at first message. Sim and real transforms in one arena is a class of bug worth making impossible.
 
