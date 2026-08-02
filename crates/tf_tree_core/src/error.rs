@@ -301,14 +301,20 @@ pub enum FrameError {
     ///
     /// Never constructed by this crate; the `std` facade is what detects it.
     ChildDetached,
-    /// The arena is mapped read-only, so a name that is not already interned
-    /// cannot be added.
+    /// **This name is not declared in this arena, and this participant cannot
+    /// declare it.**
     ///
-    /// Interning publishes into the arena's hash table with a
-    /// `compare_exchange`, which a `PROT_READ` mapping cannot service — the
-    /// process would take `SIGSEGV` rather than an error. A read-only
-    /// participant can *resolve* any name the creator declared; it cannot
-    /// introduce new ones.
+    /// Not a permissions complaint about a frame that exists — the name is
+    /// *absent*, and the read-only mapping is only the reason nothing can be
+    /// done about it here. Every name the creator declared resolves fine
+    /// through a `PROT_READ` mapping, because resolving is a pure read; it is
+    /// *interning a new one* that publishes into the hash table with a
+    /// `compare_exchange`, which a read-only mapping answers with `SIGSEGV`
+    /// rather than with an error.
+    ///
+    /// So it is the ordinary "unknown frame" answer on the default attach, and
+    /// the remedies are the ones for an undeclared name: wait for the publisher
+    /// that will intern it, or declare it where the arena is created.
     ReadOnly,
 }
 

@@ -19,6 +19,13 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 /// A scratch runtime directory, removed when the test ends.
+///
+/// **`set_var` is process-wide, and that is safe here only because `nextest`
+/// gives every test its own process.** Under plain `cargo test` these tests
+/// share one process and one environment, so two `Scratch`es would race and the
+/// loser would resolve the winner's rendezvous. Every recipe that runs this
+/// target uses `cargo nextest run`; a `cargo test` invocation of it is not
+/// supported and would fail intermittently rather than loudly.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -136,6 +143,338 @@ fn a_consumer_that_will_not_create_fails_fast_on_an_empty_machine() {
     assert!(
         line.contains("no arena"),
         "the error should name the absent arena: {line}"
+    );
+}
+
+/// **The zero-argument convenience still joins a served arena.**
+///
+/// `tf_tree::open()` is the call a README reader types and the only consumer of
+/// [`tf_tree::Open::new`]'s *defaults* anywhere in the workspace — every other
+/// caller names `mode` and `create` explicitly. `docs/decisions/0019` moved that
+/// `create` default from `IfAbsent` to `Never`, and nothing but this test would
+/// notice if the move had broken the join path.
+///
+/// Bit-for-bit, like `a_foreign_process_joins_and_reads_the_same_transform`:
+/// attaching to the wrong segment would still return `Ok`.
+///
+/// **Mutant: make `open()` pass `CreatePolicy::IfAbsent`** ⇒ still passes here
+/// (an arena is serving, so the join path is taken either way), which is why
+/// `a_read_only_attach_refuses_to_create` exists as well. **Mutant: break the
+/// free function's body** ⇒ the child reports `error ...` and this fails.
+#[test]
+fn the_free_open_joins_a_served_arena() {
+    let scratch = Scratch::new("free-open");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    let published = owner.line();
+    assert!(published.starts_with("owning "), "got {published}");
+    let owner_value = published.strip_prefix("owning ").unwrap().to_string();
+
+    let mut joiner = Kid::spawn(&scratch.0, &["open-free"]);
+    let joined = joiner.line();
+    assert!(
+        joined.starts_with("joined "),
+        "tf_tree::open() did not join a served arena: {joined}"
+    );
+    assert_eq!(
+        joined.strip_prefix("joined ").unwrap(),
+        owner_value,
+        "tf_tree::open() read a different transform than the owner published"
+    );
+}
+
+/// **`docs/decisions/0019` §2a: a read-only attach cannot create.**
+///
+/// **The `layout_if_creating` is load-bearing and the test is vacuous without
+/// it.** Without a layout, `ro` + a creating policy already failed, with
+/// `NoLayoutToCreate`, so an assertion on the *new* variant would pass against
+/// a build that never learned the rule. Supplying the builder is what makes the
+/// old code reach `OpenOutcome::Created`.
+///
+/// Both creating policies, because `Always` is a different branch of the
+/// rendezvous (it skips the split-brain yield) and only `IfAbsent` would be
+/// covered otherwise.
+///
+/// **Mutant: allow the combination** ⇒ the first open returns `Ok` and the
+/// re-open below finds a freshly created empty arena instead of `ArenaAbsent`.
+#[test]
+fn a_read_only_attach_refuses_to_create() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let _scratch = Scratch::new("ro-create");
+
+    let layout = || {
+        TreeBuilder::new()
+            .default_interp(InterpPolicy::LerpSlerp)
+            .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+    };
+
+    for policy in [CreatePolicy::IfAbsent, CreatePolicy::Always] {
+        let err = tf_tree::Open::new()
+            .mode(AttachMode::ReadOnly)
+            .create(policy)
+            .layout_if_creating(layout())
+            .open()
+            .err()
+            .expect("a read-only creator must be refused");
+        assert!(
+            matches!(err, tf_tree::OpenError::ReadOnlyCannotCreate),
+            "expected ReadOnlyCannotCreate for {policy:?}, got {err:?}"
+        );
+    }
+
+    // **And the machine is still empty.** The refusal has to happen before
+    // anything is created, not after — an error returned over a segment that
+    // now exists would leave the next `Never` consumer joining an empty arena
+    // and reporting itself healthy.
+    let err = tf_tree::Open::new()
+        .create(CreatePolicy::Never)
+        .open()
+        .err()
+        .expect("nothing should have been created");
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+        ),
+        "the refused open left an arena behind: {err:?}"
+    );
+}
+
+/// **`Open::require_create` refuses to join, and leaves nothing behind.**
+///
+/// `CreatePolicy` has no "create, or refuse if one is already live" setting, so
+/// a second arena owner — `docs/decisions/0015`'s ROS bridge is the caller this
+/// exists for — would otherwise take the *join* path and start claiming edges
+/// in an arena somebody else sized (`docs/decisions/0019` §3, question 1).
+///
+/// The second half is the part worth a test: a refusal that returned while its
+/// `Session` lived would leave this process's participant lock byte taken and a
+/// socket the owner still counts, so a bridge that retried a few times would
+/// exhaust the slot table.
+///
+/// **Mutant: return `ArenaAlreadyLive` without dropping the session** ⇒ slot 1
+/// reads held after the refusal and the second assertion fails.
+/// **Mutant: ignore `require_create`** ⇒ the open returns `Ok` and the first
+/// `expect` fails.
+#[test]
+fn require_create_refuses_a_live_arena_and_releases_its_slot() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("require-create");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "));
+
+    let err = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .require_create(true)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .open()
+        .err()
+        .expect("a second owner must not silently join");
+    assert!(
+        matches!(err, tf_tree::OpenError::ArenaAlreadyLive),
+        "expected ArenaAlreadyLive, got {err:?}"
+    );
+
+    // The owner holds slot 0. The refused attach was granted slot 1 and must
+    // have given it back.
+    let lock = tf_tree_ipc::LockFile::open(&scratch.0.join("0/default.lock")).unwrap();
+    assert!(
+        !lock.probe_participant(1).unwrap().held,
+        "the refused attach kept its participant lock byte"
+    );
+
+    // And an ordinary consumer is unaffected — the refusal is about this
+    // caller's intent, not about the arena.
+    let mut joiner = Kid::spawn(&scratch.0, &["join"]);
+    assert!(
+        joiner.line().starts_with("joined "),
+        "the refusal disturbed the arena"
+    );
+}
+
+/// A consumer that starts before its publisher waits, and the wait resolves.
+///
+/// `docs/decisions/0019` §2b's first wait. The owner is spawned ~200 ms after
+/// the wait begins, so `Ok` alone proves nothing — the elapsed lower bound is
+/// what says the call really waited rather than racing to a lucky attach.
+///
+/// **Mutant: classify `ArenaAbsent` as terminal** ⇒ `await_open` returns
+/// `Err(ArenaAbsent)` in microseconds and the `expect` fails.
+#[test]
+fn a_consumer_waits_for_an_arena_that_starts_late() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("late-start");
+    let dir = scratch.0.clone();
+
+    let (tx, rx) = mpsc::channel::<Kid>();
+    let spawner = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut owner = Kid::spawn(&dir, &["own"]);
+        assert!(
+            owner.line().starts_with("owning "),
+            "the owner did not start"
+        );
+        // Hand it back so it stays alive for the assertions below; dropping it
+        // here would kill the arena mid-test.
+        let _ = tx.send(owner);
+    });
+
+    let started = Instant::now();
+    let tree = tf_tree::Open::new()
+        .await_open(Duration::from_secs(20))
+        .expect("the wait should have outlasted a publisher 200 ms late");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the wait returned before the publisher could have started ({elapsed:?}) — \
+         it did not actually wait"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the wait took far longer than the publisher's 200 ms delay: {elapsed:?}"
+    );
+    assert!(!tree.is_writable(), "the default attach is read-only (D18)");
+
+    let owner = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the spawner thread never produced an owner");
+    drop(tree);
+    drop(owner);
+    spawner.join().expect("spawner thread");
+}
+
+/// A wait with no publisher at all gives up inside a bounded time.
+///
+/// **Run on a worker thread with a `recv_timeout` on the main one, and that is
+/// deliberate.** This repository has **no `.config/nextest.toml`**, so there is
+/// no `slow-timeout` / `terminate-after` to bound a test that never returns: an
+/// `await_open` that ignored its deadline would hang the whole suite instead of
+/// failing one test. The channel is this test supplying its own bound.
+///
+/// **Mutant: ignore the deadline** ⇒ the `recv_timeout` expires and this fails
+/// with the message below, rather than the run hanging.
+#[test]
+fn a_wait_for_an_arena_that_never_starts_gives_up() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let _scratch = Scratch::new("never-starts");
+
+    let budget = Duration::from_millis(300);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = tf_tree::Open::new().await_open(budget);
+        let _ = tx.send((outcome.err(), started.elapsed()));
+    });
+
+    let (err, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "await_open never returned: it ignored its deadline. There is no \
+         .config/nextest.toml in this repository, so nothing else would have \
+         bounded this",
+    );
+    let err = err.expect("an empty machine has no arena to open");
+
+    // **The last retryable error, verbatim — there is no `Timeout` variant.**
+    // `ArenaAbsent` already says exactly what was true for the whole budget,
+    // and a second spelling would carry strictly less.
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+                | tf_tree::OpenError::Rendezvous(
+                    tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. }
+                )
+        ),
+        "expected the last retryable rendezvous error, got {err:?}"
+    );
+    assert!(elapsed >= budget, "it gave up early: {elapsed:?}");
+    assert!(
+        elapsed < budget * 20,
+        "it overran its budget by more than the backoff can explain: {elapsed:?}"
+    );
+}
+
+/// **`docs/decisions/0019` §2b's second wait: a frame interned after the arena
+/// already exists.**
+///
+/// The owner declares `frame_headroom`, because the shared fixture declares
+/// none and a late intern into it fails `CapacityExceeded` — which would time
+/// the waiter out for a reason that has nothing to do with the wait.
+///
+/// The consumer's id must equal the *owner's*, which is what rules out the
+/// failure this method is shaped to avoid: a wait that interned the name itself
+/// and handed back an id for a frame nobody declared.
+///
+/// **Mutant: build the predicate on `Tree::frame`** ⇒ the read-only consumer
+/// gets `FrameError::ReadOnly` immediately and never resolves.
+/// **Mutant: drop the memoization or the deadline** ⇒ caught by the elapsed
+/// bounds.
+#[test]
+fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("late-frame");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own-headroom"]);
+    assert_eq!(owner.line(), "owning");
+
+    let consumer = tf_tree::Open::new()
+        .open()
+        .expect("join the arena the owner already created");
+    assert!(!consumer.is_writable(), "the default attach is read-only");
+    assert!(
+        consumer.frames().unwrap().iter().all(|n| n != "late_frame"),
+        "the frame under test was already interned before the wait began"
+    );
+
+    // Poke from a thread, ~200 ms in, so the wait below has something to wait
+    // for. Taking the pipe rather than calling `Kid::poke` leaves `owner`
+    // borrowable for `line()` afterwards.
+    let mut stdin = owner.0.stdin.take().expect("piped stdin");
+    let poker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = writeln!(stdin, "go");
+    });
+
+    let started = Instant::now();
+    let [late] = consumer
+        .await_frames(["late_frame"], Duration::from_secs(20))
+        .expect("the frame was interned well inside the budget");
+    let elapsed = started.elapsed();
+
+    poker.join().expect("poker thread");
+    let interned = owner.line();
+    let owner_id: u32 = interned
+        .strip_prefix("interned ")
+        .expect(&interned)
+        .parse()
+        .unwrap();
+
+    assert_eq!(
+        late.get(),
+        owner_id,
+        "the waiter resolved to a different id than the owner interned"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the wait returned before the owner could have interned ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the wait far outlasted the intern it was waiting for: {elapsed:?}"
     );
 }
 

@@ -187,10 +187,19 @@ pub struct Open {
 pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// First backoff interval. Doubles up to [`MAX_BACKOFF`].
-const MIN_BACKOFF: Duration = Duration::from_micros(200);
+///
+/// **`pub` rather than private because `docs/decisions/0019` §2b's
+/// `Open::await_open` is a second poll loop over this same rendezvous**, and a
+/// restated pair of constants is a pair that drifts. `pub(crate)` — which is
+/// the widening that record's plan names — does not cross a crate boundary and
+/// the facade is a different crate, so this is the narrowest one that reaches
+/// it.
+pub const MIN_BACKOFF: Duration = Duration::from_micros(200);
 /// Backoff ceiling — small enough that a 5 s timeout still gives hundreds of
 /// attempts, so a takeover that completes in a millisecond is joined promptly.
-const MAX_BACKOFF: Duration = Duration::from_millis(4);
+///
+/// `pub` for the reason [`MIN_BACKOFF`] gives.
+pub const MAX_BACKOFF: Duration = Duration::from_millis(4);
 
 impl Open {
     /// Start from an already-resolved rendezvous.

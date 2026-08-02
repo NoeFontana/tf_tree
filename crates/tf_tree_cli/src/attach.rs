@@ -41,7 +41,17 @@ pub struct AttachArgs {
     /// Create the arena if it is absent. Off by default: a `doctor` run against
     /// a mistyped domain must say "nothing there", not conjure an empty arena
     /// and pronounce it healthy.
-    #[arg(long, global = true)]
+    ///
+    /// **`requires = "rw"`** (`docs/decisions/0019` plan step 1). A read-only
+    /// attach that asks to create is now `OpenError::ReadOnlyCannotCreate`, so
+    /// without this clap would accept `--create` alone and the open would refuse
+    /// it one layer down, with a message about a combination the user never
+    /// knowingly wrote. Kept rather than deleted — this crate has no
+    /// `layout_if_creating` today, so `--create --rw` still cannot create
+    /// anything and reports `NoLayoutToCreate`, but the flag is what
+    /// `tf_tree serve` (§1) grows into, and deleting a flag that a later
+    /// subcommand re-adds is churn a user sees twice.
+    #[arg(long, global = true, requires = "rw")]
     pub create: bool,
     /// Seconds to wait for a contended rendezvous to settle.
     #[arg(long, global = true, default_value_t = 5)]

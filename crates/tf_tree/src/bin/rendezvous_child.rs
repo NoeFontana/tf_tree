@@ -12,6 +12,8 @@
 //! rendezvous_child own    -> "owning <transform>", then parks serving
 //! rendezvous_child join   -> "joined <transform>" | "error <display>"   (read-only)
 //! rendezvous_child join-rw -> as above, but registers in the arena table
+//! rendezvous_child open-free -> as `join`, but through the zero-argument `tf_tree::open()`
+//! rendezvous_child own-headroom -> "owning", then on stdin: "interned <frame id>"
 //! rendezvous_child peer-alive <slot> -> "alive <bool>", then parks
 //! rendezvous_child own-claiming      -> "claimed <edge>", then parks holding it
 //! rendezvous_child join-claiming     -> "claimed <edge>", then parks holding it
@@ -114,6 +116,42 @@ fn main() {
                     }
                 }
                 Err(e) => say(&format!("error {e}")),
+            }
+        }
+        // **The zero-argument convenience, in a process that is not a child of
+        // the owner.** `tf_tree::open()` is what a README reader types, and it
+        // is the only caller of `Open::new()`'s *defaults* in the workspace —
+        // every other one names `mode` and `create` explicitly, so nothing else
+        // would notice if those defaults broke.
+        "open-free" => {
+            match tf_tree::open() {
+                Ok(tree) => {
+                    say(&format!("joined {}", render(&tree, 1_500)));
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Err(e) => say(&format!("error {e}")),
+            };
+        }
+        // Own an arena that has room for a frame nobody declared, then intern
+        // one when the parent says so. The fixture `layout()` declares **no**
+        // headroom, so a late intern there fails `CapacityExceeded` and the
+        // waiting parent would time out for the wrong reason.
+        "own-headroom" => {
+            let tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::IfAbsent)
+                .layout_if_creating(layout().frame_headroom(4))
+                .open()
+                .expect("create the arena");
+            say("owning");
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
+            let id = tree.frame("late_frame").expect("intern the late frame");
+            say(&format!("interned {}", id.get()));
+            loop {
+                std::thread::park();
             }
         }
         // Create the arena, claim an edge, and park holding it — so the parent

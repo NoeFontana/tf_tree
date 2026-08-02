@@ -145,7 +145,9 @@ pub(crate) fn lookup_err(e: LookupError) -> PyErr {
              now at {current}; call tree.plan(...) again"
         )),
         LookupError::UnknownFrame { hash } => {
-            FrameNotDeclaredError::new_err(format!("no frame with hash {hash:#x} in this arena"))
+            FrameNotDeclaredError::new_err(format!(
+                "no frame with hash {hash:#x} in this arena; if the name is spelled right, its publisher has not declared it yet — wait for one, or declare it on the builder that creates the arena"
+            ))
         }
         LookupError::BufferTooSmall { need, got } => BufferError::new_err(format!(
             "output buffer holds {got} elements; this batch needs {need}"
