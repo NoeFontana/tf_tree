@@ -1664,7 +1664,9 @@ capacity = 512
     /// only the four names would refuse the case the trait is open *for*.
     ///
     /// Mutant: drop the `Value::Str("sim")` arm ⇒ `"sim"` falls into the
-    /// `Value::Str(s)` refusal and the row fails on the `unwrap`.
+    /// `Value::Str(s)` refusal and the row panics in the `unwrap_or_else`
+    /// (`domain must be "system", "sensor", "sim", "steady" or 0..=255: "sim"
+    /// for domain = "sim"`).
     #[test]
     fn every_built_in_domain_is_spellable_by_name() {
         let cases: [(&str, u8); 6] = [
@@ -1699,7 +1701,8 @@ capacity = 512
     /// is a `u8` and one past it is a typo, not a domain.
     ///
     /// Mutant: make the `Value::Str(s)` arm return `Ok(SystemDomain::TAG)` ⇒
-    /// the first two rows parse and this fails on the `unwrap_err`.
+    /// `"sim_time"` parses and the first row panics on the `Ok(c)` arm of the
+    /// `match` below (`domain = "sim_time" parsed, as tag 0`).
     #[test]
     fn a_domain_that_is_not_a_built_in_name_is_refused_by_name() {
         let cases = [

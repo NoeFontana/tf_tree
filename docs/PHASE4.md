@@ -1196,8 +1196,13 @@ If `use_sim_time` is true, the bridge tags every edge it declares as `SimDomain`
 > changed the topology file and nothing else:** the file is where a deployment
 > that wants sim time writes `domain = "sim"` rather than `2`, while every other
 > end of the same deployment still carries the integer — `EdgeRecord::domain` in
-> the arena, `tft_bridge_options::domain` in the C ABI, the node's `time_domain`
-> parameter, and `tf_tree doctor`'s output.
+> the arena (`crates/tf_tree_core/src/edge.rs`), `tft_bridge_options::domain` in
+> the C ABI, the node's `time_domain` parameter, and the `--domain N` flag on
+> `tf_tree topology --config <f>`, which is how the check below is run by hand.
+> **`tf_tree doctor` is not on that list**: `doctor::EdgeInfo::domain` is copied
+> out of the `EdgeRecord` when a snapshot is captured and is read by nothing —
+> no check consumes it and no rendering prints it, so no output of that command
+> carries a domain in either form.
 > `TopologyConfig::default_domain` stays a `u8` **and that is the design, not the
 > remainder**: `Domain` is an open trait, a user-declared domain picks a free tag
 > from 4 upwards, and a parser that accepted only the four names would refuse the
@@ -1214,8 +1219,14 @@ If `use_sim_time` is true, the bridge tags every edge it declares as `SimDomain`
 > not fail alike:**
 >
 > - `use_sim_time` true, `time_domain` **and** the config's domain both left at
->   `0`: the bridge comes up, the arena is tagged `SystemDomain`, and that one
->   warning is the only sign. This is the case the warning is for.
+>   `0`: the bridge comes up and the arena is tagged `SystemDomain`. That warning
+>   is the only *diagnostic* — nothing fails and nothing is retried — but it is
+>   not the only place the tag appears in the log: the `ingest bridge up` INFO
+>   line that `BridgeHandle` emits moments later
+>   (`ros/tf_tree_ros/src/bridge_handle.cpp:282-292`) ends with `domain=%u`, so
+>   the effective tag is also stated positively, next to the QoS actually
+>   resolved. The warning is what an operator greps for; the INFO line is what
+>   confirms the tag once they know to look.
 > - `use_sim_time` true, the config says `domain = "sim"` — the spelling the
 >   paragraph above recommends — and `time_domain` is left at `0`: **the bridge
 >   does not come up.** `check_domain` sees the first *dynamic* edge declared 2
