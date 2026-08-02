@@ -13,13 +13,19 @@ test: test-rust test-doc ingest-check
 test-rust:
     cargo nextest run --workspace --no-tests=pass
     # **`tf_tree_c`'s `bridge` feature is default-off, so `--workspace` compiles
-    # none of it.** `crates/tf_tree_c/src/bridge.rs` — nine `extern "C"` entry
+    # none of it.** `crates/tf_tree_c/src/bridge.rs` — **ten** `extern "C"` entry
     # points, the only ones that both decide and write — could be replaced with
     # literal garbage and `cargo build --workspace --all-targets`, this
     # `nextest` line above and `cargo clippy --workspace --all-targets` all
-    # still passed; only `cargo fmt --check` noticed. Its 21 tests ran nowhere
+    # still passed; only `cargo fmt --check` noticed. Its tests ran nowhere
     # but the two `+nightly` rows of `just c-abi-check`, so on a machine without
     # a nightly toolchain the §5 seam had no gate at all.
+    #
+    # **Counts, re-measured** — this comment said "nine entry points" and
+    # "21 tests" and both were stale. `grep -c 'extern "C" fn' bridge.rs` is 10;
+    # `cargo nextest run -p tf_tree_c --features bridge` runs **60** tests
+    # against **31** without the feature, so the feature is worth **29** tests
+    # that `cargo nextest run --workspace` never runs.
     #
     # This is the same shape `shm-check` exists for, one crate over: a
     # default-off feature is invisible to `--workspace`, and a file nobody
@@ -302,7 +308,7 @@ c-header-check:
     cargo xtask headers --check
     # **`bridge` is in this build, and the smoke test is compiled with
     # `-DTFT_HAVE_BRIDGE`.** The bridge declarations are emitted inside
-    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the nine §5 entry
+    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the ten §5 entry
     # points would be in the committed header and compiled by nothing — which is
     # exactly the state that let a function and a typedef share the name
     # `tft_bridge_stats` through a whole revision. A header nobody compiles is
@@ -460,6 +466,37 @@ ingest-check:
         { echo "tf_tree_cli's default build has no zstd decoder: is 'compression' still in [features] default?"; exit 1; }
     cargo tree -q -p tf_tree_cli -e normal | grep -q lz4_flex || \
         { echo "tf_tree_cli's default build has no lz4 decoder: is 'compression' still in [features] default?"; exit 1; }
+
+# **Rustdoc, with warnings denied — the docs.rs shop window.**
+#
+# Nothing gated rustdoc until this recipe existed, and warnings accumulate
+# silently because `cargo doc` exits 0 on every one of them. Measured before it
+# was written: `cargo doc --no-deps --workspace` emitted **80** warnings — 44
+# unresolved intra-doc links, 35 public items linking to private ones, one
+# redundant explicit target. Every one of those renders on docs.rs as a dead
+# link the moment a crate is published.
+#
+# **The configuration is docs.rs's, not `--workspace`'s, and that is the point.**
+# Every publishable crate here sets `all-features = true` and
+# `rustdoc-args = ["--cfg", "docsrs"]` in `[package.metadata.docs.rs]`, so the
+# build that renders publicly is the all-features one — the same flags are
+# passed here so this recipe checks what ships rather than something adjacent to
+# it. `tf_tree_bench` and `xtask` take a second line because they are
+# `publish = false` and `tf_tree_bench --all-features` enables `tf2`, whose build
+# script needs a ROS 2 install no host recipe has.
+#
+# **What this deliberately does NOT gate**: a plain default-feature
+# `cargo doc --no-deps -p tf_tree` still reports 2 unresolved links —
+# `Tree::open_frozen` and `crate::open`, both `#[cfg(all(feature = "shm",
+# target_os = "linux"))]`. They resolve in the build docs.rs performs, and
+# de-linking them would trade two working links in the rendered documentation
+# for a clean run of a command that is not the gate.
+doc:
+    RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo doc --no-deps --all-features \
+        -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
+        -p tf_tree_ipc -p tf_tree_c -p tf_tree_cli -p tf_tree_ingest \
+        -p tf_tree_bridge
+    RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p tf_tree_bench -p xtask
 
 lint: py-compile
     cargo fmt --all -- --check

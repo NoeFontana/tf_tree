@@ -14,7 +14,7 @@
 //! * Random `SIGKILL` at 1–10 Hz — yes, and it is the whole point: a killed
 //!   process cannot clean up, so every claim, participant slot and lock byte it
 //!   held has to be recovered by somebody else with no cooperation from it.
-//! * Continuous invariant checking — yes, see [`Invariant`].
+//! * Continuous invariant checking — yes, see `Invariant`.
 //!
 //! …with one boundary on the second bullet that is worth stating before anyone
 //! quotes this as "we kill anything, anywhere": **the killed processes are the
@@ -22,7 +22,7 @@
 //! arena and is not a candidate victim, because `docs/PHASE2.md` §3.5's takeover
 //! is not wired into `tf_tree::open` yet and a run that kills the owner spends
 //! the rest of its life in `ArenaHeldButUnreachable` proving nothing.
-//! [`imp::attach_observer`] carries the measurement and the one-line change that
+//! `imp::attach_observer` carries the measurement and the one-line change that
 //! reverses this when §3.5 lands.
 //!
 //! **One is not**, and is not faked: "a random crash point armed in 10% of
@@ -36,7 +36,7 @@
 //!
 //! §11.4 also says "run it under ASan ... and with `TF_TREE_PARANOID=1`".
 //! `just shm-torture-asan` is the first. There is no `TF_TREE_PARANOID`: this
-//! process validates every read unconditionally (see [`Invariant`]), which is
+//! process validates every read unconditionally (see `Invariant`), which is
 //! what that env var was for, so adding a switch to turn the checking *off*
 //! would be the only thing it could mean.
 //!
@@ -51,7 +51,7 @@
 //! # How a violation gets out of a child
 //!
 //! A child that sees a bad transform prints one `VIOLATION ...` line to stderr
-//! and exits [`EXIT_VIOLATION`]. The driver distinguishes that from the exit of
+//! and exits `EXIT_VIOLATION`. The driver distinguishes that from the exit of
 //! a child it killed itself, and from an ordinary error — a child that fails to
 //! join because the owner was killed mid-handshake is expected, and is retried,
 //! not reported.

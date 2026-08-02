@@ -35,7 +35,7 @@
 //!
 //! # Thread affinity, for the same reason as `tft_publisher`
 //!
-//! A bridge holds one [`OwnedWriter`](tf_tree::OwnedWriter) per declared
+//! A bridge holds one [`OwnedWriter`] per declared
 //! dynamic edge, and those are `Send + !Sync`. §5.9 asks for a dedicated
 //! `SingleThreadedExecutor` on its own thread, which is exactly the shape this
 //! allows: the thread that called [`tft_bridge_create`] owns the handle, a debug
@@ -679,7 +679,7 @@ static EMPTY: [c_char; 1] = [0];
 /// An ingest bridge: the decision pipeline, the arena it writes to, one claim
 /// per declared dynamic edge, and §5.3's GID cache.
 ///
-/// `#[repr(C)]` for the same reason as [`tft_tree`]: [`check_bridge`] validates
+/// `#[repr(C)]` for the same reason as [`tft_tree`]: `check_bridge` validates
 /// the magic word through a field projection, and `repr(Rust)` promises nothing
 /// about where that field lands.
 ///

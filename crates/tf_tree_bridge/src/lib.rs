@@ -166,7 +166,7 @@ impl Sample {
 /// This is the whole point of the shape below, and getting it wrong cost a real
 /// deployment. §5.3 says to *match* the message's GID against the graph's, so
 /// the GID is what identifies a publisher; the node name is what a diagnostic
-/// prints. An earlier revision made [`Publisher::Node`]'s `String` the identity,
+/// prints. An earlier revision made `Publisher::Node`'s `String` the identity,
 /// and a name is not stable:
 ///
 /// * `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an endpoint discovered
@@ -188,7 +188,7 @@ impl Sample {
 ///
 /// # What this fixes in the other direction, and what it must not
 ///
-/// The old [`Publisher::UnknownGid`] was a *unit* variant, so on a walk that
+/// The old `Publisher::UnknownGid` was a *unit* variant, so on a walk that
 /// resolved no names every publisher compared **equal** and §5.4's conflict
 /// detection was silently off — `docs/PHASE4.md` §5.3's amendment names that
 /// blend. A GID we have no name for is still a distinct publisher, and now
@@ -207,7 +207,7 @@ pub enum Publisher {
         /// The stable identity: the 16-byte GID rendered as `<gid:…>`.
         ///
         /// Rendered once, at construction, rather than held as bytes plus a
-        /// derived key — [`crate::ingest::owner_key`] runs on **every** dynamic
+        /// derived key — `crate::ingest::owner_key` runs on **every** dynamic
         /// sample and must return a borrow, so the key has to be the stored
         /// form rather than something computed per call.
         id: Box<str>,
@@ -273,7 +273,7 @@ impl Publisher {
         }
     }
 
-    /// The stable identity, as the string [`crate::ingest::owner_key`] returns.
+    /// The stable identity, as the string `crate::ingest::owner_key` returns.
     #[must_use]
     pub fn key(&self) -> &str {
         match self {

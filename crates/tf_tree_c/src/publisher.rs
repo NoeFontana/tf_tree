@@ -9,7 +9,7 @@
 //! builds on use from another thread.**
 //!
 //! That is implemented here, plus one thing §3.2 does not require: in *release*
-//! builds the same check returns [`TFT_ERR_WRONG_THREAD`] rather than
+//! builds the same check returns `TFT_ERR_WRONG_THREAD` rather than
 //! proceeding. §3.2's argument is "a loud abort in debug beats silent corruption
 //! in release"; it does, but a status code beats both, and the check is one
 //! thread-local load and a compare that the branch predictor gets right every
@@ -250,7 +250,7 @@ fn writer_of(h: &tft_publisher) -> Result<&OwnedWriter, tft_status> {
 ///
 /// `Tree::frame` interns; it does not look up. So mistyping `child` declares a
 /// new frame, which then has no incoming edge and the claim fails with
-/// [`TFT_ERR_NO_EDGE`] — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
+/// `TFT_ERR_NO_EDGE` — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
 /// the frame table's headroom is exhausted and the name genuinely cannot be
 /// interned. Frame ids are never recycled (`docs/PROJECT.md` §5 D10), so a typo
 /// costs a headroom slot for the life of the arena.
@@ -326,7 +326,7 @@ pub unsafe extern "C" fn tft_tree_claim(
 ///
 /// Matrix layouts are validated — a left-handed or scaled matrix is refused
 /// rather than converted into a plausible wrong rotation. See
-/// [`crate::layout::read`].
+/// `crate::layout::read`.
 ///
 /// # Safety
 ///

@@ -758,7 +758,7 @@ impl Plan {
     /// | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
     /// | all five on this path, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
     ///
-    /// **Five, not six.** [`Self::fold_at_cursors`] was marked in the same
+    /// **Five, not six.** `Self::fold_at_cursors` was marked in the same
     /// commit and is not on this path at all — no row above ever moved because
     /// of it. It was measured separately, on the batch entry point that does
     /// reach it, and removed: see its own doc comment for the numbers. Marking
@@ -776,7 +776,7 @@ impl Plan {
     /// **The price is the caller's code size: 106 B → 1565 B at every embedder
     /// call site**, ~15×, and that is the *scalar* caller only. It is why
     /// `fold_at_with_derivatives`, `fold_latest` and `fold_latest_common` are
-    /// deliberately not marked — and why [`Self::fold_at_cursors`], whose price
+    /// deliberately not marked — and why `Self::fold_at_cursors`, whose price
     /// on the batch path went unmeasured for a round, no longer is either.
     ///
     /// Note the second row of the first table: `lto = "thin"` does **not**
@@ -1120,7 +1120,7 @@ impl Plan {
     /// own stamp — both are `min` over [`SampleRing::newest_stamp`](crate::buffer::SampleRing::newest_stamp).
     ///
     /// The two do *not* share a helper, on purpose: `latest_common` is a lookup
-    /// path and folding it onto [`Guard::window`] would cost it a second atomic
+    /// path and folding it onto `Guard::window` would cost it a second atomic
     /// load and a second mask per edge to compute a lower end it never uses.
     /// `spans_agree_with_latest_common` in `tests.rs` pins the agreement instead.
     ///
@@ -1146,7 +1146,7 @@ impl Plan {
     /// # Staleness
     ///
     /// On a live arena the answer ages the moment it is returned, and the two
-    /// ends are not even one snapshot of one ring — see [`Guard::window`]. That
+    /// ends are not even one snapshot of one ring — see `Guard::window`. That
     /// is the same contract [`Self::latest`] has, and refusing to answer would be
     /// worse than answering the question that was asked. On a frozen `.tft`, the
     /// case §4.2 is about, nothing pushes and the interval is exact.
@@ -2209,7 +2209,7 @@ impl<'a> Guard<'a> {
     /// There is deliberately no `poisoned(view, err)` taking an arbitrary error.
     /// One was written and replaced: carrying the error meant a 32-byte
     /// `Option<LookupError>` field on a struct that is built once per `at()`
-    /// call, to express a generality nothing needed. See [`DETACHED`].
+    /// call, to express a generality nothing needed. See `DETACHED`.
     #[must_use]
     pub fn detached(view: ArenaView<'a>) -> Guard<'a> {
         Guard {

@@ -416,7 +416,7 @@ typedef struct {
  * finite difference that would look like an answer. Nothing is written for
  * that element or any after it.
  *
- * It is **not** readable — see [`read`]. A velocity is derived from the arena,
+ * It is **not** readable — see `read`. A velocity is derived from the arena,
  * never stored in it.
  */
 #define TFT_LAYOUT_QVEC7_WXYZ_TWIST6 5
@@ -536,7 +536,7 @@ tft_status tft_tree_open(tft_tree **out);
  * Release a tree handle. Freeing NULL is a no-op.
  *
  * Any plan compiled from this tree stays valid: the underlying tree is
- * refcounted and this drops one reference (see [`tft_plan::share`]).
+ * refcounted and this drops one reference (see `tft_plan::share`).
  *
  * # Safety
  *
@@ -675,7 +675,7 @@ tft_status tft_last_error(tft_error *out);
  *
  * `Tree::frame` interns; it does not look up. So mistyping `child` declares a
  * new frame, which then has no incoming edge and the claim fails with
- * [`TFT_ERR_NO_EDGE`] — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
+ * `TFT_ERR_NO_EDGE` — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
  * the frame table's headroom is exhausted and the name genuinely cannot be
  * interned. Frame ids are never recycled (`docs/PROJECT.md` §5 D10), so a typo
  * costs a headroom slot for the life of the arena.
@@ -704,7 +704,7 @@ tft_status tft_tree_claim(const tft_tree *tree,
  *
  * Matrix layouts are validated — a left-handed or scaled matrix is refused
  * rather than converted into a plausible wrong rotation. See
- * [`crate::layout::read`].
+ * `crate::layout::read`.
  *
  * # Safety
  *

@@ -72,15 +72,15 @@ pub enum StaticVerdict {
 ///
 /// # One index, four parallel vectors
 ///
-/// The `(parent, child)` tables used to be [`ByEdge`] — nested, so a probe
+/// The `(parent, child)` tables used to be `ByEdge` — nested, so a probe
 /// allocated nothing. That solved allocation and left the *work*: two
 /// `BTreeMap<String, _>::get`s per probe, each `O(log n)` with a full
 /// frame-name `memcmp` at every visited node, and `Ingest::offer` probed this
 /// store **twice** per transform with the same key.
 ///
 /// The declared set is fixed at construction, so it is answered once by
-/// [`EdgeIndex`] and every table becomes a `Vec` indexed by the resulting
-/// [`EdgeSlot`]. See `crate::edgeindex` for the measurement that motivated it.
+/// `EdgeIndex` and every table becomes a `Vec` indexed by the resulting
+/// `EdgeSlot`. See `crate::edgeindex` for the measurement that motivated it.
 ///
 /// The store still grows when it is built unseeded — `tf_tree_ingest` uses it
 /// that way, discovering edges from a recording rather than from a config — so

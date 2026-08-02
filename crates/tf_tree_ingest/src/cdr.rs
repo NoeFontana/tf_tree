@@ -7,7 +7,7 @@
 //! knows OMG CDR. §0.0 records that the `mcap` crate needs no ROS; that is only
 //! true if the one message type this phase cares about is decoded here. The
 //! whole grammar below is four primitives and two strings, and it is entirely
-//! specified by the alignment rules restated in [`Reader`].
+//! specified by the alignment rules restated in `Reader`.
 //!
 //! # The one place a mistake would be silent
 //!
@@ -16,7 +16,7 @@
 //! (`docs/PHASE1.md` §3.1). A transposition here does not fail — it produces a
 //! valid unit quaternion describing a *different* rotation, which then flows all
 //! the way into a `.tft` and out into somebody's training set. It is
-//! transposed once, in [`Reader::transform`], and tested against bytes captured
+//! transposed once, in `Reader::transform`, and tested against bytes captured
 //! from the wire order rather than against this module's own encoder.
 //!
 //! # It allocates per transform, and that is a known, measured, accepted cost

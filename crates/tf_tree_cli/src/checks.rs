@@ -117,7 +117,7 @@ pub(crate) const OCCUPANCY_LIMIT: f64 = 0.80;
 /// every edge of a monotonic-clock arena as decades stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clock {
-    /// The arena's newest stamp is within [`ABSURD_HORIZON_NS`] of the system
+    /// The arena's newest stamp is within `ABSURD_HORIZON_NS` of the system
     /// clock, so the two share an epoch and wall-clock comparisons mean
     /// something.
     Wall(i64),
@@ -152,7 +152,7 @@ impl Clock {
     ///
     /// # Why this is a vote and not a single stamp
     ///
-    /// [`ABSURD_HORIZON_NS`] does double duty: it is the domain-agreement
+    /// `ABSURD_HORIZON_NS` does double duty: it is the domain-agreement
     /// threshold here *and* `TFT006`'s absurdity radius. So whatever this
     /// function picks as the reference is, by construction, the one value
     /// `TFT006` can never call absurd. Deriving it from an extremum — the
@@ -884,7 +884,7 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft007, out)
 }
 
-/// The disclosure that pairs with [`tft007`]: which edges its result covers.
+/// The disclosure that pairs with `tft007`: which edges its result covers.
 ///
 /// `None` when the answer is unambiguous — nothing was compared (the check
 /// skipped and says so itself, naming which of its two gaps it hit), or every

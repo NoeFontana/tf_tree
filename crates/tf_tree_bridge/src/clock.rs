@@ -38,7 +38,7 @@
 //! 3. **A quorum floored by `Authority::distinct_owners()`.** Two defects. At
 //!    boot the second publisher has not published yet (AMCL waits for a map), so
 //!    the floor is 1 and the wheel driver's first regression latches a permanent
-//!    halt. And [`crate::Publisher::UnknownGid`] and
+//!    halt. And `crate::Publisher::UnknownGid` and
 //!    [`crate::Publisher::Unattributed`] are *unit* variants, so on an RMW
 //!    without endpoint introspection every publisher compares equal, the floor
 //!    is permanently 1, and every single-edge regression halts — which makes

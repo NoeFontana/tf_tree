@@ -649,11 +649,11 @@ fn handle(
 /// when a client connects and says nothing — which is also what makes it
 /// testable. It returns once every connection it accepted has finished.
 ///
-/// # One thread per connection, capped at [`MAX_CONNECTIONS`]
+/// # One thread per connection, capped at `MAX_CONNECTIONS`
 ///
 /// The accept loop hands each socket to a scoped thread and goes straight back
 /// to `accept`. **This is not throughput, it is availability.** Handling
-/// connections inline costs a full [`IO_TIMEOUT`] per peer that connects and
+/// connections inline costs a full `IO_TIMEOUT` per peer that connects and
 /// says nothing, and those costs add: five silent sockets blanked the operator's
 /// view for ten seconds, linear in the number of peers and bounded by nothing.
 /// A local port scanner or a stuck `curl` loop is enough, and it lands at
@@ -665,7 +665,7 @@ fn handle(
 /// That is also why `serve` returning means every handler has finished — a
 /// bounded run cannot leave a response half-written.
 ///
-/// Past [`MAX_CONNECTIONS`] in flight a connection is closed unread rather than
+/// Past `MAX_CONNECTIONS` in flight a connection is closed unread rather than
 /// queued, and the first time that happens is reported once. A cap is not
 /// optional: threads are the resource an unauthenticated peer would otherwise
 /// allocate without limit.

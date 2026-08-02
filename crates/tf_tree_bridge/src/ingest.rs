@@ -1073,13 +1073,13 @@ impl Ingest {
     /// Returns `Some(Action::Halt { StartupConflicts })` under
     /// [`AuthorityPolicy::Strict`] if any conflict — authority or static — was
     /// recorded while the window was open, and `None` otherwise. Idempotent: a
-    /// second call, and the [`STARTUP_WINDOW_TRANSFORMS`] backstop after an
+    /// second call, and the `STARTUP_WINDOW_TRANSFORMS` backstop after an
     /// explicit close, return `None`.
     ///
     /// **This is the mechanism; the backstop is the fallback.** A caller with a
     /// real clock — the `rclcpp` node, from a one-shot steady timer — decides
     /// what "startup" means in seconds, which is the unit the question is
-    /// actually about. See [`STARTUP_WINDOW_TRANSFORMS`].
+    /// actually about. See `STARTUP_WINDOW_TRANSFORMS`.
     ///
     /// **No counter moves.** A window-close halt is caused by transforms
     /// already counted and dropped, each in its own bucket, at the time they

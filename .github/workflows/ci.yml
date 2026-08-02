@@ -1,3 +1,31 @@
+# **Read this before reading a tick.**
+#
+# GitHub Actions has produced **no run of this workflow since 2026-07-23**. The
+# four runs it has ever produced were all on that day and all against a much
+# earlier revision of this file; every job added since — `msrv`, `miri`, `tf2`,
+# `shm`, `loom`, `bench-gate`, and everything this commit adds — has executed
+# zero times. Diagnosed rather than guessed: the workflow is `active`, the
+# triggers below match the events the repository is actually receiving (pushes
+# to `main` and pull requests both appear in the events API), and "Dependabot
+# Updates" runs keep completing. What stopped is user-workflow runs on this
+# account's **private** repositories, all of them, at the same time
+# (`tf_tree` 2026-07-23, `loop` 2026-07-23, `jepa-core` 2026-07-24), while the
+# same account's **public** repositories keep running (`python-template`,
+# 2026-07-31). Private minutes are metered and public ones are not, so this is
+# an account-level Actions billing/quota state, not a repository setting, not a
+# trigger condition, and not a missing runner. **Nothing in this file can fix
+# it**, and no change to it should be read as having done so.
+#
+# So: the gate is the `just` recipe, run locally, on a stated architecture. Every
+# job here is deliberately a thin wrapper around one, so that the day runs
+# resume, CI and a developer's terminal are running the same commands rather
+# than two drifting transcriptions of them.
+#
+# **The `ubuntu-24.04-arm` rows have never executed.** They are named in the
+# `test` and `shm` matrices below, and `CLAUDE.md` cites "the aarch64 CI target"
+# as one of the two defences against a weakened atomic ordering. That defence is
+# currently inert: on this repository the aarch64 rows are YAML and nothing
+# else. `just loom` is the half that still runs, and it runs on x86-64.
 name: CI
 
 on:
@@ -13,6 +41,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # **`just lint`, not a transcription of two of its lines.**
+  #
+  # This job used to run `cargo fmt --all -- --check` and `cargo clippy
+  # --workspace --all-targets` directly. `just lint` is those two plus six more
+  # clippy invocations, each of which exists because a default-off (or
+  # default-*on*) feature makes a file invisible to `--workspace`. One of them —
+  # `-p tf_tree_c --features test-hooks` — ran in **no workflow at all** under
+  # the old spelling, and the justfile records that a real warning had been
+  # sitting in `publish.rs` unseen. Running the recipe is what makes CLAUDE.md's
+  # "CI mirrors these recipes 1:1" true rather than aspirational.
+  #
+  # `just lint` depends on `py-compile`, which skips loudly when there is no
+  # `.venv` — correct here, because the `bindings` job below is that gate and
+  # needs only an interpreter.
+  #
+  # `cargo deny check` stays as the action rather than `just audit`: the action
+  # supplies the binary, and the recipe is one line either way.
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -22,10 +67,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just lint
+        run: just lint
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -145,27 +191,18 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      - name: cargo nextest
-        run: cargo nextest run --workspace --no-tests=pass
-      - name: cargo test --doc
-        run: cargo test --doc --workspace
-      # **`tf_tree_ingest`'s feature axes, which the `--workspace` line above
-      # compiles exactly one of.** `compression` is default-ON, so
-      # `#[cfg(not(feature = "compression"))]` code — `tests/codec_free.rs`, the
-      # `is_built_in` arm that refuses a codec, `fixture`'s `CodecUnavailable` arm —
-      # is compiled by nothing here: `cargo nextest run --workspace` runs 612 tests
-      # and includes none of the five that exist only in that configuration.
-      # `fixture` is default-OFF and has the same hole in the other direction. The
-      # recipe also asserts, against the dependency graph, that the shipped CLI's
-      # default build still links both codecs, which no test in that crate can see.
-      #
-      # `just test` depends on `ingest-check`, but this job does not run `just test`
-      # — it runs the two commands above directly — so without this step CLAUDE.md's
-      # "CI mirrors these recipes 1:1" was false for exactly the configuration this
-      # PR created. Same shape as the `-p tf_tree_c --features bridge` gap that
-      # `test-rust` carries a comment about.
-      - name: just ingest-check
-        run: just ingest-check
+      # **`just test`, not its parts.** This job used to run `cargo nextest run
+      # --workspace`, `cargo test --doc --workspace` and `just ingest-check` as
+      # three separate steps. That is `just test` minus exactly one line —
+      # `test-rust`'s `cargo nextest run -p tf_tree_c --features bridge`, which
+      # covers the ten `extern "C"` entry points of the §5 ingest seam, the only
+      # ones that both decide and write. Measured rather than asserted: that
+      # command runs **60** tests where the default-feature build runs **31**,
+      # so 29 tests existed and executed in no job here at all. `just
+      # c-abi-check` runs the same target under Miri, and that recipe was in no
+      # workflow either — see the `c-abi` job below.
+      - name: just test
+        run: just test
 
   # **`tf_tree` with `unstable` OFF — the tier every published consumer gets.**
   #
@@ -205,6 +242,17 @@ jobs:
       - name: just stable-tier-check
         run: just stable-tier-check
 
+  # `just doc` — rustdoc with warnings denied, at the configuration docs.rs
+  # builds (`all-features = true` in every publishable crate's
+  # `[package.metadata.docs.rs]`).
+  #
+  # This job previously spelled its own `cargo doc` line, covering six of the
+  # workspace's eleven members and omitting `tf_tree_c`, `tf_tree_ingest`,
+  # `tf_tree_bridge`, `tf_tree_bench` and `xtask`. Since it has never executed,
+  # none of it was enforced anywhere, and `cargo doc --no-deps --workspace` had
+  # accumulated **80** warnings — 44 unresolved intra-doc links, 35 public items
+  # linking to private ones, one redundant explicit target. All 80 are fixed and
+  # the recipe is now the gate; it covers the five members this job missed.
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -212,18 +260,121 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Every crate except `tf_tree_bench`, whose `tf2` feature reaches the
-      # ROS-only bridge: `--all-features` would enable it, and its build script
-      # needs a ROS 2 install this runner does not have. Nothing is lost —
-      # `tf_tree_bench` is `publish = false` and documents nothing public.
-      - name: cargo doc
-        env:
-          RUSTDOCFLAGS: "-D warnings --cfg docsrs"
-        run: |
-          cargo doc --no-deps --all-features \
-            -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
-            -p tf_tree_ipc -p tf_tree_cli
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just doc
+        run: just doc
 
+  # **`just c-abi-check` — `docs/PHASE4.md` §6.1 and §7 gate 4, which ran in no
+  # workflow until this job existed.**
+  #
+  # The C ABI is the one place in the workspace where `unsafe` faces a caller
+  # the compiler cannot see, and `tf_tree_c` is deliberately excluded from the
+  # `miri` job below. So the four Miri targets this recipe runs — `abi`, `live`,
+  # `publish` and the `bridge` seam, the last of which hands C a fistful of
+  # `const char *` borrowed from the handle — plus the ASan pass had exactly one
+  # gate: whoever remembered to type it. The justfile records that Miri caught a
+  # real alignment UB here, in a *test* that claimed foreign pointers were
+  # safely rejected.
+  #
+  # Its own job rather than a step on `miri`: `-Zbuild-std` for the ASan row is
+  # a from-scratch standard library and pushes this past the wall-clock of
+  # everything else in the file.
+  c-abi:
+    name: C ABI (Miri + ASan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # `miri` for the four Miri rows; `rust-src` for the ASan row's
+          # `-Zbuild-std`, without which a use-after-free inside `Box::from_raw`
+          # is invisible.
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just c-abi-check
+        run: just c-abi-check
+
+  # **The two recipes that check the *header* and the *package* rather than the
+  # crate — `docs/PHASE4.md` §6.2 and §4.4. Neither was in any workflow.**
+  #
+  # `c-header-check` is the only thing in this repository that compiles the
+  # committed `crates/tf_tree_c/include/*.h`, and it is the only thing that
+  # notices when they have drifted from `src/`. The justfile records the failure
+  # mode concretely: a header with an unbalanced `#endif` shipped once and every
+  # Rust test still passed.
+  #
+  # `cmake-check` builds a downstream project that reaches tf_tree only through
+  # `find_package(tf_tree CONFIG)`. Three real packaging defects were invisible
+  # until that consumer existed.
+  #
+  # `clang` is installed explicitly: §6.2's matrix is two compilers, and a row
+  # that silently degrades to one compiler is not the matrix.
+  c-surface:
+    name: C header + CMake package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: just c-header-check
+        run: just c-header-check
+      - name: just cmake-check
+        run: just cmake-check
+
+  # **The Python suite, which ran in no workflow.**
+  #
+  # The `bindings` job below compiles `tf_tree_py` and lints it; nothing
+  # anywhere executed a single `pytest`. `docs/PHASE3.md` §7.3 requires the
+  # suite to pass on **both** interpreters — 3.14 and the free-threaded 3.14t —
+  # and that is exactly the claim `tf_tree_py`'s `gil_used = false` rests on.
+  # The `wheels` workflow builds wheels and never runs a test against one.
+  #
+  # `just py-setup` provisions both interpreters through uv, so the floors in
+  # §10.1 are what actually gets used rather than whatever the runner ships.
+  python:
+    name: python bindings (pytest, 3.14 + 3.14t)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: astral-sh/setup-uv@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just py-setup
+        run: just py-setup
+      - name: just py-lint
+        run: just py-lint
+      - name: just py-test
+        run: just py-test
+      - name: just py-test-freethreaded
+        run: just py-test-freethreaded
+
+  # **This job is deliberately NOT `just miri`, and the difference is a real
+  # one: it adds `-Zmiri-strict-provenance`, which the recipe does not set.**
+  # So a green `just miri` on a developer's machine does not imply a green job
+  # here — CI is the stricter of the two. Left as-is rather than reconciled,
+  # because reconciling it means choosing which side moves and neither choice is
+  # free: dropping the flag here weakens the only provenance check in the
+  # repository, and adding it to the recipe is a change to a gate that has to be
+  # run on both architectures before it can be claimed. It is recorded so the
+  # next reader knows the two are not the same command.
   miri:
     name: miri
     runs-on: ubuntu-latest
@@ -326,6 +477,10 @@ jobs:
           just shm-check
           just shm-rendezvous
 
+  # Spelled as the recipe rather than as its body. It is one line either way,
+  # and with the aarch64 rows above not executing, this is currently the whole
+  # of the weak-memory defence — it should be impossible for it to drift from
+  # what a developer runs.
   loom:
     name: loom
     runs-on: ubuntu-latest
@@ -333,8 +488,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo xtask loom
-        run: cargo xtask loom
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just loom
+        run: just loom
 
   # `docs/PHASE5.md` §10: "the benchmark artifact as a regression gate".
   #

@@ -3,10 +3,10 @@
 //! # The convention, stated once and carried by the type name
 //!
 //! A [`Twist`] is a **body-frame (right) twist**, `V^b = (T⁻¹ Ṫ)^∨`, matching
-//! the right-perturbation convention this crate already fixes for [`log_se3`]
+//! the right-perturbation convention this crate already fixes for [`log_se3`](crate::log_se3)
 //! (`lib.rs` convention 5) and that `docs/PHASE1.md` §3.1 fixes for covariance.
-//! Component order is `[ω, v]` — angular first — the same order [`log_se3`]
-//! returns and [`exp_se3`] consumes.
+//! Component order is `[ω, v]` — angular first — the same order [`log_se3`](crate::log_se3)
+//! returns and [`exp_se3`](crate::exp_se3) consumes.
 //!
 //! Everyone gets this wrong once. The two things worth knowing before using it:
 //!
@@ -22,7 +22,7 @@
 //!
 //! `docs/PHASE4.md` §2.3 describes the fold as "one 6×6 adjoint application per
 //! plan step". That is the *identity*, not a required representation. For
-//! `T = (q, t)` the two forms below need two [`Quat::rotate`] calls and one
+//! `T = (q, t)` the two forms below need two [`Quat::rotate`](crate::Quat::rotate) calls and one
 //! [`Vec3::cross`] — against 36 multiply-adds plus a rotation-matrix extraction
 //! that a literal 6×6 would first have to build:
 //!
