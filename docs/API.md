@@ -168,14 +168,34 @@ is a call per step.
 > **Amendment — item 1 is done and measured, items 2 and 3 are not, and the
 > paragraph above states the wrong mechanism.**
 >
-> `#[inline]` is on `Plan::at`, on both scalar folds (`fold_at` and
-> `fold_at_cursors`) and on the three `Guard` sampling entry points
-> (`sample`, `sample_hinted`, `sample_from`). The `Iso3` operators **already
-> carried it** — every method on `Iso3`, `Vec3` and `Quat`, and `impl Mul` — so
-> `tf_tree_math` was not touched. Deliberately *not* marked:
+> `#[inline]` is on `Plan::at`, on the scalar fold `fold_at`, and on the three
+> `Guard` sampling entry points (`sample`, `sample_hinted`, `sample_from`) —
+> **five placements, not the six this amendment first claimed.** The `Iso3`
+> operators **already carried it** — every method on `Iso3`, `Vec3` and `Quat`,
+> and `impl Mul` — so `tf_tree_math` was not touched. Deliberately *not* marked:
 > `fold_at_with_derivatives`, `fold_latest`, `fold_latest_common`. Each is large,
 > none is on the measured hot path, and `#[inline]` on a large body grows the
 > caller at every site.
+>
+> **`fold_at_cursors` was the sixth, and it is now the counter-example that
+> earns the rest.** It is the *batch* fold: reachable from `at_many`,
+> `at_many_into`, `at_many_into_f32` and `fold_batch`, and not from `Plan::at`,
+> so the probe below never executed it and it was marked by symmetry with
+> `fold_at`. Extending the probe with an `#[inline(never)]` caller doing
+> `at_many_into(.., Layout::Mat4, ..)` over 1024 monotone stamps at depth 3, best
+> of five, and toggling that one attribute:
+>
+> | downstream profile | with `#[inline]` | without |
+> | --- | --- | --- |
+> | `lto = false`, `codegen-units = 16` | 328 ns/elem | **285 ns/elem** |
+> | `lto = "thin"`, `codegen-units = 1` | 285 ns/elem | **278 ns/elem** |
+>
+> A pessimization in both, so it was removed. `objdump` says why: at the default
+> profile the body is ~1.9 kB and LLVM declines to inline it at either
+> `fold_batch` call site *with or without* the hint — both builds leave a real
+> call — so the attribute only duplicated a 1.9 kB function into the embedder's
+> object. The scalar tables below are unaffected: `Plan::at` cannot reach it, and
+> the probe's `caller_scalar` is byte-identical across the two builds.
 >
 > **Measured**, because a change on the hot path justified by a mechanism nobody
 > checked is worth less than silence. Method: an external crate depending on
@@ -199,7 +219,7 @@ is a call per step.
 > | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
 > | `fold_at` alone | 62 B | 1 → `Plan::at` |
 > | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
-> | all six, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+> | all five on this path, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
 >
 > So there was exactly **one** cross-crate call, not one per step, and what the
 > attribute changes is LLVM's `inlinehint` on the *non-generic* links. `fold_at`
@@ -209,7 +229,9 @@ is a call per step.
 > it is now a measurement rather than an assertion.
 >
 > **The price is caller code size: 106 B → 1565 B, ~15×, at every embedder call
-> site.** That is the trade this section should have named and did not.
+> site.** That is the trade this section should have named and did not — and it
+> is the *scalar* caller's price. The batch caller's was named nowhere until
+> `fold_at_cursors` was measured above, which is the reason it went the other way.
 >
 > **`lto = "thin"` does not subsume the hint**, which corrects the other thing
 > this amendment first claimed. This workspace's own profile still moves ~4.5%,

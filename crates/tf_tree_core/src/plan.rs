@@ -645,7 +645,30 @@ impl Plan {
 
     /// Like [`Self::fold_at`] but each dynamic step gallops from its own resumable
     /// cursor (`cursors[step_index]`), for a monotone stamp sweep.
-    #[inline]
+    ///
+    /// **Deliberately not `#[inline]`, and that is a measurement.** It was
+    /// marked alongside [`Self::fold_at`] for symmetry and the probe behind
+    /// [`Self::at`]'s table never executed it — the measured path is
+    /// `at → fold_at`, while this one is reached only from `at_many`,
+    /// `at_many_into`, `at_many_into_f32` and [`Self::fold_batch`]. Extending
+    /// that probe with an `#[inline(never)]` caller doing
+    /// `at_many_into(.., Layout::Mat4, ..)` over 1024 monotone stamps at depth
+    /// 3, best of five, x86-64, isolating this one attribute:
+    ///
+    /// | downstream profile | with `#[inline]` | without |
+    /// | --- | --- | --- |
+    /// | `lto = false`, `codegen-units = 16` | 328 ns/elem | **285 ns/elem** |
+    /// | `lto = "thin"`, `codegen-units = 1` | 285 ns/elem | **278 ns/elem** |
+    ///
+    /// It is a pessimization in both, and `objdump` says why. At the default
+    /// profile the body is ~1.9 kB and LLVM **declines to inline it at either
+    /// `fold_batch` call site with or without the hint** — both builds leave a
+    /// real call — so all the attribute does is codegen a second copy of it into
+    /// the embedder's object instead of calling the one in this crate. Under
+    /// thin LTO it does inline, and still loses. The scalar caller is untouched
+    /// either way: [`Self::at`] cannot reach this function, and that probe's
+    /// `caller_scalar` is byte-identical (`0x9ca`, same disassembly) across the
+    /// two builds — so [`Self::at`]'s tables stand as measured.
     fn fold_at_cursors(
         &self,
         g: &Guard,
@@ -700,7 +723,13 @@ impl Plan {
     /// | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
     /// | `fold_at` alone | 62 B | 1 → `Plan::at` |
     /// | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
-    /// | all six, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+    /// | all five on this path, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+    ///
+    /// **Five, not six.** [`Self::fold_at_cursors`] was marked in the same
+    /// commit and is not on this path at all — no row above ever moved because
+    /// of it. It was measured separately, on the batch entry point that does
+    /// reach it, and removed: see its own doc comment for the numbers. Marking
+    /// it had been symmetry, not measurement.
     ///
     /// **`at` is generic, so its MIR crossed the crate boundary anyway and a
     /// downstream caller was already inlining it.** On its own the attribute
@@ -712,9 +741,10 @@ impl Plan {
     /// rows above test rather than assert.
     ///
     /// **The price is the caller's code size: 106 B → 1565 B at every embedder
-    /// call site**, ~15×. That is the trade, and it is why
+    /// call site**, ~15×, and that is the *scalar* caller only. It is why
     /// `fold_at_with_derivatives`, `fold_latest` and `fold_latest_common` are
-    /// deliberately not marked.
+    /// deliberately not marked — and why [`Self::fold_at_cursors`], whose price
+    /// on the batch path went unmeasured for a round, no longer is either.
     ///
     /// Note the second row of the first table: `lto = "thin"` does **not**
     /// subsume the hint. This workspace's own profile still moves ~4.5%, so the

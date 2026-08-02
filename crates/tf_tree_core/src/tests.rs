@@ -1579,8 +1579,10 @@ fn plan_derived_fields_match_a_fresh_scan() {
 /// cumulatively, which is what `TreeBuilder` does in the facade and what
 /// `ArenaView::ring_of` bounds-checks against.
 ///
-/// Nothing is ever published into these rings: a *declared* rate is a property
-/// of the topology, and reading it must not depend on a stream existing.
+/// **The rings come back empty**, and the rate tests rely on that: a *declared*
+/// rate is a property of the topology, and reading it must not depend on a
+/// stream existing. A test that needs the fold to actually answer calls
+/// [`seed_rate_chain`] on the view afterwards.
 fn rate_chain_arena(rates: [u32; 4]) -> HeapArena {
     let layout = ArenaLayout::new(8, 5, alloc::vec![0, 4, 4, 4, 4]).unwrap();
     let mut arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
@@ -1657,6 +1659,36 @@ fn short_edge_table_arena(rates: [u32; 3]) -> HeapArena {
     arena
 }
 
+/// Publish `pose(i)` into edge `i` of a [`rate_chain_arena`], twice: at stamp
+/// `0` and at stamp `1000`. Returns the pose a full `f0 -> f4` lookup anywhere
+/// in that window must produce.
+///
+/// Two samples carrying the *same* pose, so interpolation across the segment
+/// reproduces it exactly and the composed answer is
+/// `pose(1)·pose(2)·pose(3)·pose(4)` with no float slack to allow for. One
+/// sample would leave the fold with no segment and `ExtrapPolicy::Error`.
+///
+/// The `Publisher` is dropped at the end of each iteration, which releases the
+/// claim; the samples it wrote stay in the ring, which is all a reader needs.
+fn seed_rate_chain(view: &ArenaView<'_>) -> Iso3 {
+    let mut expected = Iso3::IDENTITY;
+    for i in 1..=4u32 {
+        let edge = EdgeId(i);
+        let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+        let pubr = Publisher::new(
+            view.ring(edge).unwrap(),
+            view.claim(edge).unwrap(),
+            epoch,
+            owner,
+        );
+        let p = pose(u64::from(i));
+        pubr.push(0, &p).unwrap();
+        pubr.push(1000, &p).unwrap();
+        expected = expected * p;
+    }
+    expected
+}
+
 /// Compile `lookup(target, source)` over an arena built by [`rate_chain_arena`].
 fn compile_chain(
     view: &ArenaView<'_>,
@@ -1678,7 +1710,7 @@ fn compile_chain(
     .unwrap()
 }
 
-/// **The four built-in domain tags are `0`–`3`, distinct, and in that order.**
+/// **The four built-in domain tags are `0`–`3`, in that order.**
 ///
 /// A tag is written into `EdgeRecord::domain` at declaration time and read by
 /// every consumer, every recording and every diagnostic, so re-numbering one
@@ -1686,23 +1718,47 @@ fn compile_chain(
 /// "unfixable after the fact" applied to the numbering rather than to the
 /// choice. This test exists to make that re-numbering a red build.
 ///
-/// The distinctness half is not redundant with the values half: `Domain::TAG`
-/// is a per-impl constant with nothing structural preventing two domains from
-/// sharing one, and two domains sharing a tag is exactly the collapse
-/// `docs/API.md` §2.5 describes — `TimeDomainMismatch` stops firing between
-/// them and nothing else changes.
+/// **Distinctness is a separate test on purpose.** These four `assert_eq!`s
+/// imply it, so a distinctness loop placed after them could never be reached in
+/// a failing state — it would be a dead assertion carrying a written argument
+/// for why it is not dead, which is what this test used to hold. What
+/// distinctness actually constrains is the *set*, and that survives a
+/// deliberate re-numbering of these literals, so it now lives in
+/// [`the_built_in_domain_tags_are_pairwise_distinct`], where it is the first
+/// thing that runs.
 ///
 /// Mutant: `SimDomain::TAG = 0` (the value it effectively had before it was a
-/// type). Applied: the `SystemDomain`/`SimDomain` distinctness assertion fails,
-/// and so does `a_sim_stamp_cannot_query_a_system_domain_plan` below.
+/// type). Applied: `assert_eq!(SimDomain::TAG, 2)` fails, `left: 0, right: 2`.
 #[test]
-fn the_built_in_domain_tags_are_fixed_and_distinct() {
+fn the_built_in_domain_tags_are_fixed() {
     use crate::plan::{Domain, SensorDomain, SimDomain, SteadyDomain, SystemDomain};
 
     assert_eq!(SystemDomain::TAG, 0, "the default domain must stay tag 0");
     assert_eq!(SensorDomain::TAG, 1);
     assert_eq!(SimDomain::TAG, 2);
     assert_eq!(SteadyDomain::TAG, 3);
+}
+
+/// **No two built-in domains share a tag.**
+///
+/// [`the_built_in_domain_tags_are_fixed`] pins today's four literals; this pins
+/// the property those literals happen to have. `Domain::TAG` is a per-impl
+/// constant with nothing structural preventing a collision, and two domains
+/// sharing a tag is exactly the collapse `docs/API.md` §2.5 describes —
+/// `TimeDomainMismatch` stops firing between them and nothing else changes.
+/// Standing alone rather than after the value assertions is what makes it
+/// reachable: it is the first assertion in its own test.
+///
+/// **What it does not cover:** a *fifth*, user-declared domain colliding with a
+/// built-in. §2.5 keeps the trait open and reserves `0`–`3` by documentation,
+/// so that collision is possible and is not checkable from inside this crate.
+///
+/// Mutant: `SimDomain::TAG = 0`. Applied: fails at the first pair —
+/// ``assertion `left != right` failed: two built-in domains share a tag: 0 and
+/// 0``.
+#[test]
+fn the_built_in_domain_tags_are_pairwise_distinct() {
+    use crate::plan::{Domain, SensorDomain, SimDomain, SteadyDomain, SystemDomain};
 
     let tags = [
         SystemDomain::TAG,
@@ -1726,11 +1782,24 @@ fn the_built_in_domain_tags_are_fixed_and_distinct() {
 /// bag has been playing, and well-formed the whole time (`docs/API.md` §2.5,
 /// §5.2).
 ///
-/// The control below is the same query in the plan's own domain — otherwise
-/// this would pass equally well against a plan that refused everything.
+/// **The fixture is seeded, and that is the whole point.** Against empty rings
+/// this test passed for the wrong reason: `NoData` shadows the domain check, so
+/// a tag collision died at the *data* arm and the silent wrong answer was never
+/// demonstrated. With [`seed_rate_chain`] the same stamp in the plan's own
+/// domain returns a pose, so the two refusals below are refusals of a query
+/// that would otherwise have been answered — which is the failure being
+/// described: a `/clock` stamp served, plausibly, out of a wall-clock stream.
+///
+/// The control at the end is that successful query. It is also what keeps this
+/// from passing against a plan that refused everything.
 ///
 /// Mutant: `SimDomain::TAG = 0`. Applied: the first assertion fails with
-/// `Ok(..)`, which is the silent wrong answer this whole mechanism exists to
+/// `left: Ok(Iso3 { q: Quat { w: 0.9909511798837932, .. }, t: Vec3 { x:
+/// 0.8347429715979104, .. } }), right: Err(TimeDomainMismatch { expected: 0,
+/// got: 2 })`. That `Ok` is bit-identical to the pose the control asserts
+/// (checked by swapping the control in as the first assertion under the same
+/// mutant, where it passes) — i.e. the sim stamp was answered out of the
+/// wall-clock stream, which is the silent wrong answer this mechanism exists to
 /// prevent.
 #[test]
 fn a_sim_stamp_cannot_query_a_system_domain_plan() {
@@ -1738,6 +1807,7 @@ fn a_sim_stamp_cannot_query_a_system_domain_plan() {
 
     let arena = rate_chain_arena([0, 0, 0, 0]);
     let view = ArenaView::new(&arena);
+    let expected = seed_rate_chain(&view);
     let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
     let plan = compile_chain(&view, root, leaf);
     let g = Guard::new(ArenaView::new(&arena));
@@ -1759,11 +1829,11 @@ fn a_sim_stamp_cannot_query_a_system_domain_plan() {
         "a CLOCK_MONOTONIC stamp reached a wall-clock plan"
     );
 
-    // Control: the plan's own domain gets past the check and fails for a
-    // reason about *data*, not about time domains.
+    // Control: the plan's own domain gets past the check and is *answered*.
     assert_eq!(
         plan.at(&g, Stamp::<SystemDomain>::from_nanos(1)),
-        Err(LookupError::NoData { edge: EdgeId(1) })
+        Ok(expected),
+        "the fixture must answer in its own domain, or the refusals above prove nothing"
     );
 }
 
