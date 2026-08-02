@@ -80,9 +80,10 @@ jobs:
 
   # **The `tf2::BufferCore` differential, which ran in no automated gate at all.**
   #
-  # `ci.yml`'s `tf2` job comment excludes `tf2-differential` and `tf2-replay`
-  # from pull requests because they are "minutes of work" — true, and the reason
-  # they belong here rather than nowhere. They are *tests*, not measurements:
+  # `ci.yml`'s `tf2` job keeps `tf2-differential` and `tf2-replay` off every pull
+  # request because they are minutes of work, and points here for where they do
+  # run; this job is the other half of that sentence. They are *tests*, not
+  # measurements:
   # `tf2-differential` checks tf_tree against tf2 on generated topologies and
   # `tf2-replay` does it over a real recorded `/tf` stream, both to a stated
   # tolerance, both host-independent. Excluding them from PRs and then not

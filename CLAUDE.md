@@ -127,9 +127,12 @@ records why (typed errors and zero-copy buffers do not survive a C boundary).
   "and the aarch64 CI target", and it was not true.** The `ubuntu-24.04-arm`
   rows are in `.github/workflows/ci.yml`'s `test` and `shm` matrices and they
   have **never executed**: GitHub Actions has produced no run of any workflow
-  for this repository since 2026-07-23 (`ci.yml`'s header carries the
-  diagnosis — an account-level Actions billing state on private repositories,
-  not a repository setting and not fixable from here). Until runs resume, the
+  for this repository since 2026-07-23, while pushes to `main` kept arriving
+  (`ci.yml`'s header carries the API evidence, and the caveat that the *cause*
+  — an account-level Actions billing state on private repositories — is
+  inferred from which repositories stopped, not read from an API this token can
+  reach). Either way it is not a repository setting, not a missing runner label,
+  and not fixable from here. Until runs resume, the
   weak-memory defence is `just loom` on x86-64 and nothing else, and a change to
   an ordering needs a human to say which architecture they ran on.
 - No `String` in any error type or hot path; errors are `Copy` and name the
@@ -159,8 +162,9 @@ table, run locally, are the gate; a PR's checks are not.
 | `just shm-check` | fmt/clippy/tests for everything behind the default-off `shm` feature, named target by target. A new `shm`-only test target belongs on that list in the commit that adds it |
 | `just embed-cost` / `embed-cost-check` | `docs/PHASE5.md` §9.2's two embedding measurements — the **gated** crate-boundary row and the **exploratory** profile comparison. `embed-cost-check` is the gate for the default-off `embed-probe` / `bench-probe` features, which `just test` compiles out exactly like `shm`. `embed-cost` builds a third target directory (`--profile embedder`, 166 MiB measured) and `just bench-check` / `just bench-baseline-update` both depend on it — they must, or the baseline gate fails on the difference between the two recipes rather than on the code |
 | `just test-doc-error-codes` | the `compile_fail,E0277` pins, on nightly — stable rustdoc ignores the error code, so `just test-doc` does not check them |
-| `just lint` | `cargo fmt --check`, `clippy -D warnings`, `cargo deny check` |
-| `just doc` | rustdoc with warnings denied, at the configuration docs.rs builds (each crate's `all-features = true`). No recipe gated rustdoc before it existed and `cargo doc --no-deps --workspace` had accumulated 80 warnings; they are fixed and this is what keeps them fixed |
+| `just lint` | `cargo fmt --check` plus **six** `clippy -D warnings` passes: the `--workspace --all-targets` one, then five that name a feature the workspace pass compiles out (`tf_tree_c` with `bridge` and with `test-hooks`; `tf_tree_ingest` with `fixture` and with `--no-default-features`; `tf_tree_cli --no-default-features`). It does **not** run `cargo deny check` — that is `just audit`, and CI supplies it through the cargo-deny action |
+| `just audit` | `cargo deny check` — advisories, licences, bans, sources |
+| `just doc` | rustdoc with warnings denied. Line 1 is the nine crates that document a public surface, at `--all-features --cfg docsrs` — what docs.rs renders for the five publishable ones. Line 2 is `tf_tree_bench` at `shm,embed-probe` (not `--all-features`: that would enable `tf2` and need ROS 2), line 3 is `xtask`. `tf_tree_bench`'s `tf2` code is **not** covered here; `just tf2-check` is where it compiles. No recipe gated rustdoc before this one and `cargo doc --no-deps --workspace` had accumulated 80 warnings; they are fixed and this is what keeps them fixed |
 | `just fmt` | auto-format + clippy `--fix` |
 | `just loom` | concurrency model checking (`cargo xtask loom`) |
 | `just miri` | UB checking on arena, core, and the facade's one `unsafe` (`OwnedWriter`) |

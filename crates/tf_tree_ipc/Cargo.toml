@@ -11,6 +11,14 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+# The crate has no `[features]` today, so `all-features` is currently a no-op —
+# it is here so that adding one cannot silently change what docs.rs renders
+# relative to what `just doc` checks. That recipe's comment claimed every
+# publishable crate carried this block; this crate was the counter-example.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lints]
 workspace = true
 
