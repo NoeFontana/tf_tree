@@ -29,7 +29,7 @@ use tf_tree_math::{log_so3, Interp, Iso3, LerpSlerp, ScLerp, Twist};
 use crate::arena_view::ArenaView;
 use crate::edge::EdgeKind;
 use crate::error::{EdgeId, FrameId, LookupError};
-use crate::layout::{write_affine32, write_mat4, write_quat, Layout};
+use crate::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 use crate::sample::ExtrapPolicy;
 use crate::sync::spin;
 use crate::topology::TopologyView;
@@ -1244,6 +1244,12 @@ impl Plan {
     /// `out` is a flat `f64` slice of at least `stamps.len() * layout.elems()`.
     /// Use [`Self::at_many_into_f32`] for [`Layout::Affine32`].
     ///
+    /// [`Layout::QuatTwist`] is the batch form of [`Self::at_with_derivatives`]
+    /// and folds through exactly that path, so the thirteen `f64` it writes per
+    /// stamp are the same bits the scalar call would produce — including its
+    /// refusals. It is the only layout here that can fail for a reason the pose
+    /// layouts cannot.
+    ///
     /// **`stamps` is raw nanoseconds, with the domain as the type parameter.**
     /// `Stamp<D>` is a newtype and not `repr(transparent)`, so a caller holding
     /// `&[i64]` — every FFI caller, and the NumPy path in particular — would
@@ -1259,6 +1265,11 @@ impl Plan {
     /// **before a single element is written**, so a rejected call leaves the
     /// caller's buffer untouched — `docs/PHASE3.md` §5.3 requires that, because
     /// a half-written output is worse than none: it looks like data.
+    ///
+    /// For [`Layout::QuatTwist`], additionally
+    /// [`LookupError::DerivativesUnavailable`] and [`LookupError::NoSegment`],
+    /// exactly as [`Self::at_with_derivatives`] returns them — a `LerpSlerp`
+    /// edge is refused rather than finite-differenced.
     ///
     /// Otherwise as [`Self::at`].
     pub fn at_many_into<D: Domain>(
@@ -1288,6 +1299,11 @@ impl Plan {
         match layout {
             Layout::Mat4 => self.fold_batch(g, stamps, write_mat4, n, out),
             Layout::Quat => self.fold_batch(g, stamps, write_quat, n, out),
+            // The one arm that does not go through `fold_batch`: it needs the
+            // twist, so it folds through `fold_at_with_derivatives` instead.
+            // See [`Self::fold_batch_with_twist`] for why that is a sibling and
+            // not a generic parameter on the existing loop.
+            Layout::QuatTwist => self.fold_batch_with_twist(g, stamps, n, out),
             // Unreachable: rejected by the `is_f32` check above. Returning the
             // same error rather than panicking keeps this crate free of a
             // panic path the workspace lints forbid, and a future f32 layout
@@ -1370,6 +1386,54 @@ impl Plan {
                 let iso = self.note(g, edge, self.fold_at(g, *s))?;
                 write(&iso, dst);
             }
+        }
+        Ok(())
+    }
+
+    /// [`Layout::QuatTwist`]'s batch loop — [`Self::fold_batch`]'s sibling.
+    ///
+    /// # Why a sibling rather than a parameter on `fold_batch`
+    ///
+    /// `fold_batch` is generic over the *emitter*, not over the fold. This one
+    /// needs a different fold — [`Self::fold_at_with_derivatives`], which
+    /// returns `(Iso3, Twist)` — so making the existing loop serve both would
+    /// mean either a second closure the pose layouts pass as a no-op or a
+    /// branch on the layout inside the loop. Both put work into the scalar
+    /// batch path, which is the one path in this file whose per-element cost is
+    /// measured in nanoseconds. Duplicating twelve lines is the cheaper trade,
+    /// and the module doc for [`crate::layout`] already fixes it as the rule.
+    ///
+    /// # Why there is no monotone cursor branch
+    ///
+    /// `fold_batch` gallops from a resumable cursor when the stamps ascend.
+    /// There is no cursor-resumable twist sampler — [`Guard::sample_with_twist`]
+    /// has no `_from` variant — so this walks each stamp independently. That is
+    /// a real cost against the pose layouts and it is **left as a cost**: adding
+    /// a galloping twist sampler is a change to the search path, which is the
+    /// hot code the benchmark gate watches, and it is not what
+    /// `docs/PHASE5.md` §4.4 asked for.
+    ///
+    /// # Why it calls the same fold `at_with_derivatives` does
+    ///
+    /// Bit-identity with the scalar call is the property that makes this a
+    /// *layout* and not a second implementation of derivatives. Anything else
+    /// here — a finite difference, a re-derived adjoint chain — would be a
+    /// second answer to the same question, and the first symptom would be two
+    /// bindings disagreeing about a velocity.
+    #[inline]
+    fn fold_batch_with_twist(
+        &self,
+        g: &Guard,
+        stamps: &[i64],
+        elems: usize,
+        out: &mut [f64],
+    ) -> Result<(), LookupError> {
+        // Hoisted for the same reason as in `fold_batch`: loop-invariant, and
+        // an O(plan length) scan (see [`Self::note`]).
+        let edge = self.first_dynamic_edge();
+        for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
+            let (pose, twist) = self.note(g, edge, self.fold_at_with_derivatives(g, *s))?;
+            write_quat_twist(&pose, &twist, dst);
         }
         Ok(())
     }

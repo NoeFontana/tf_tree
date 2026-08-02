@@ -153,6 +153,32 @@ static void check_round_trip(void)
     CHECK(rc == TFT_OK, why());
     CHECK(twist[3] > 1.99 && twist[3] < 2.01, "2 m in 1 s is 2 m/s");
 
+    /*
+     * The appended layout — docs/API.md §3.3. Pose and twist in one row of 13,
+     * and the pose-only entry point refuses it rather than leaving six slots of
+     * whatever this stack frame held where a velocity is supposed to be.
+     */
+    {
+        double row[13];
+        size_t i;
+        CHECK(tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ_TWIST6) == sizeof row,
+              "13 doubles");
+        for (i = 0; i < 13; i++) { row[i] = -12345.5; }
+        rc = tft_plan_at_with_derivatives(plan, 500000000,
+                                          TFT_LAYOUT_QVEC7_WXYZ_TWIST6, row, NULL);
+        CHECK(rc == TFT_OK, why());
+        for (i = 0; i < 7; i++) {
+            CHECK(row[i] == out[i], "the pose half is QVEC7_WXYZ");
+        }
+        CHECK(row[10] > 1.99 && row[10] < 2.01, "the tail's v.x is the same 2 m/s");
+
+        for (i = 0; i < 13; i++) { row[i] = -12345.5; }
+        CHECK(tft_plan_at(plan, 500000000, TFT_LAYOUT_QVEC7_WXYZ_TWIST6, row)
+                  == TFT_ERR_BAD_ENUM,
+              "a pose-only call must refuse a layout carrying a twist");
+        CHECK(row[0] == -12345.5, "a refused call must not write");
+    }
+
     CHECK(tft_tree_frame_count(tree) == 3, "world/robot/tool");
     CHECK(tft_tree_edge_count(tree) == 2, "one dynamic, one static");
 

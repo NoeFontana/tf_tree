@@ -87,7 +87,7 @@ pub use error::{
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
-    TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW,
+    TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_WXYZ_TWIST6, TFT_LAYOUT_QVEC7_XYZW,
 };
 #[cfg(feature = "test-hooks")]
 pub use publisher::tft_test_push_unguarded;
@@ -124,7 +124,16 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// it is, instead of refusing it with `TFT_ERR_BAD_STRUCT_SIZE`. Until that
 /// landed, appending a field would have locked every older caller out of every
 /// call — which is the precise case §3.6 exists to prevent.
-pub const TFT_ABI_VERSION_MINOR: u32 = 2;
+///
+/// `2` → `3`: one appended `tft_layout` enumerator,
+/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`], carrying `at_with_derivatives` as a layout
+/// (`docs/API.md` §3.3). §3.6 names this case explicitly: an older caller never
+/// spells the new value, and every entry point that takes a `tft_layout`
+/// rejects a discriminant it does not define rather than computing a size from
+/// it — so a `0.2` caller against a `0.3` library is unchanged in every byte it
+/// can observe. No struct grew, nothing moved, and no existing enumerator
+/// changed meaning.
+pub const TFT_ABI_VERSION_MINOR: u32 = 3;
 
 /// The library's major ABI version.
 #[no_mangle]
@@ -489,6 +498,12 @@ pub unsafe extern "C" fn tft_plan_at(
         let Some(n) = layout::payload_bytes(layout) else {
             return bad_enum("layout");
         };
+        // A twist-carrying layout is refused *here*, before the lookup, because
+        // this entry point evaluates a pose and has nothing to put in the tail.
+        // `tft_plan_at_with_derivatives` is the one that does.
+        if layout::carries_twist(layout) {
+            return bad_enum("layout carries a twist; use tft_plan_at_with_derivatives");
+        }
         // SAFETY: `check` confirmed the magic word, so this points at a live
         // `tft_plan` constructed by `tft_plan_create`.
         let h = unsafe { &*plan };
@@ -499,8 +514,15 @@ pub unsafe extern "C" fn tft_plan_at(
         let g = h.share.tree.guard();
         match h.plan.at(&g, Stamp::<SystemDomain>::from_nanos(stamp)) {
             Ok(iso) => {
-                layout::write(&iso, layout, dst);
-                TFT_OK
+                if layout::write(&iso, None, layout, dst) {
+                    TFT_OK
+                } else {
+                    // Unreachable: `carries_twist` refused above. Kept because
+                    // the alternative to answering `write`'s question here is
+                    // discarding it, and the thing being discarded is "six
+                    // slots of this buffer are not a velocity".
+                    bad_enum("layout")
+                }
             }
             Err(e) => record_lookup(e),
         }
@@ -535,6 +557,12 @@ pub unsafe extern "C" fn tft_plan_at_many(
         let Some(payload) = layout::payload_bytes(layout) else {
             return bad_enum("layout");
         };
+        // As `tft_plan_at`: this loop folds poses, so a layout with a twist tail
+        // has no source for it. There is no batch derivatives entry point in the
+        // C ABI today; `docs/API.md` §3.3 scopes the layout, not a second loop.
+        if layout::carries_twist(layout) {
+            return bad_enum("layout carries a twist; use tft_plan_at_with_derivatives");
+        }
         // Zero elements is a no-op, not an error, and must be handled before the
         // NULL checks: a caller looping over an empty set legitimately passes
         // NULL for both pointers.
@@ -585,7 +613,10 @@ pub unsafe extern "C" fn tft_plan_at_many(
             match h.plan.at(&g, Stamp::<SystemDomain>::from_nanos(t)) {
                 Ok(iso) => {
                     let off = i * stride;
-                    layout::write(&iso, layout, &mut dst[off..off + payload]);
+                    if !layout::write(&iso, None, layout, &mut dst[off..off + payload]) {
+                        // Unreachable: `carries_twist` refused above.
+                        return bad_enum("layout");
+                    }
                 }
                 // Stop at the first failure. A partially written buffer is worse
                 // than none because it looks like data (PHASE3 §5.3's reasoning,

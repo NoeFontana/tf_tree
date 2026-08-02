@@ -522,6 +522,137 @@ fn derivatives_match_a_central_difference_of_the_pose() {
     );
 }
 
+/// **`TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is the same numbers in one buffer** —
+/// `docs/API.md` §3.3's `(N, 13)` row, appended as a **minor** ABI bump
+/// (`docs/PHASE4.md` §3.6).
+///
+/// The whole claim of a layout — rather than a fourth entry point — is that it
+/// is a *re-encoding* and never a second computation. So this asserts the 104
+/// bytes against the 56-byte pose write and the 6-element twist buffer taken
+/// from the very same call, bit for bit. A tolerance would let a second
+/// implementation hide inside it.
+///
+/// Mutant: have the twist arm of `layout::write` recompute the pose from the
+/// quaternion instead of reusing `put_qvec7_wxyz` ⇒ the memcmp fails on the
+/// last bit of some component. Mutant B: emit `v` before `ω` ⇒ the tail
+/// comparison against `out_twist` fails.
+#[test]
+fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+    let at = 300_000_000i64;
+
+    assert_eq!(
+        tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ_TWIST6),
+        104,
+        "13 f64 — the size a C caller allocates from"
+    );
+
+    let mut row = [0u8; 104];
+    let mut twist = [0.0f64; 6];
+    // SAFETY: live plan; `row` is exactly `tft_layout_size` bytes and `twist`
+    // exactly `TFT_TWIST_BYTES`.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_with_derivatives(
+                p.0,
+                at,
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                row.as_mut_ptr().cast(),
+                twist.as_mut_ptr(),
+            )
+        },
+        TFT_OK
+    );
+
+    // The pose half against the layout it extends, from an independent call.
+    let mut pose = [0u8; 56];
+    // SAFETY: live plan, correctly sized buffer.
+    assert_eq!(
+        unsafe { tft_plan_at(p.0, at, TFT_LAYOUT_QVEC7_WXYZ, pose.as_mut_ptr().cast()) },
+        TFT_OK
+    );
+    assert_eq!(
+        &row[..56],
+        &pose[..],
+        "the pose half is not QVEC7_WXYZ byte for byte"
+    );
+
+    // The tail against `out_twist` from the same call — the two spellings of
+    // the same six numbers must not diverge.
+    for (i, v) in twist.iter().enumerate() {
+        assert_eq!(
+            read_f64(&row, 7 + i).to_bits(),
+            v.to_bits(),
+            "twist slot {i} differs between out_pose's tail and out_twist"
+        );
+    }
+    // Non-vacuity: the fixture must actually be moving, or six zeros would
+    // satisfy every assertion above.
+    assert!(
+        twist.iter().any(|v| v.abs() > 1e-9),
+        "the fixture's twist is zero; this test would pass against a stub"
+    );
+}
+
+/// **The pose-only entry points refuse the twist layout**, before they evaluate
+/// anything and without touching the caller's buffer.
+///
+/// `tft_plan_at` folds a pose. It has no twist, so filling the last six slots
+/// would mean either the caller's own stale bytes or a confident zero — a
+/// velocity either way to anything downstream, and undetectable by any check a
+/// C caller can run. `TFT_ERR_BAD_ENUM` is the right answer and the one an
+/// older caller already gets for a discriminant it does not know, which is why
+/// appending the enumerator is a minor bump at all.
+///
+/// Mutant: delete the `carries_twist` guard in `tft_plan_at` ⇒ `write` still
+/// refuses and the status is still `TFT_ERR_BAD_ENUM`, but the sentinel
+/// assertion holds and the *lookup runs first*; delete the `write` return check
+/// as well and this fails outright with `TFT_OK` and a half-written row.
+#[test]
+fn the_pose_only_entry_points_refuse_the_twist_layout() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+
+    const SENTINEL: u8 = 0xAA;
+    let mut row = [SENTINEL; 104];
+    // SAFETY: live plan; the buffer is the layout's full size, so a write that
+    // wrongly went ahead would be in bounds and therefore visible rather than UB.
+    assert_eq!(
+        unsafe {
+            tft_plan_at(
+                p.0,
+                300_000_000,
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                row.as_mut_ptr().cast(),
+            )
+        },
+        TFT_ERR_BAD_ENUM
+    );
+    assert!(row.iter().all(|b| *b == SENTINEL), "tft_plan_at wrote");
+
+    let stamps = [300_000_000i64, 320_000_000];
+    let mut rows = [SENTINEL; 208];
+    // SAFETY: live plan, `stamps` is two readable i64, `rows` is 2 × 104 bytes.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_many(
+                p.0,
+                stamps.as_ptr(),
+                stamps.len(),
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                rows.as_mut_ptr().cast(),
+                0,
+            )
+        },
+        TFT_ERR_BAD_ENUM
+    );
+    assert!(
+        rows.iter().all(|b| *b == SENTINEL),
+        "tft_plan_at_many wrote"
+    );
+}
+
 /// **Either output may be NULL.** Asking for only the twist is a real request,
 /// and asking for neither is the caller's mistake, not a silent no-op.
 #[test]

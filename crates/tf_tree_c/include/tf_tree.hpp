@@ -484,6 +484,7 @@ constexpr std::size_t payload_bytes(tft_layout layout)
     return layout == TFT_LAYOUT_QVEC7_WXYZ || layout == TFT_LAYOUT_QVEC7_XYZW ? 56
            : layout == TFT_LAYOUT_MAT4_COL || layout == TFT_LAYOUT_MAT4_ROW   ? 128
            : layout == TFT_LAYOUT_AFFINE12_ROW_F32                            ? 48
+           : layout == TFT_LAYOUT_QVEC7_WXYZ_TWIST6                           ? 104
                                                                               : 0;
 }
 

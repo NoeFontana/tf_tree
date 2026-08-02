@@ -463,6 +463,89 @@ fn lerpslerp_is_refused_and_names_the_edge() {
     }
 }
 
+/// **`Layout::QuatTwist` inherits the refusal** — `docs/API.md` §3.3,
+/// `docs/PHASE5.md` §4.4, and NORMATIVE.
+///
+/// The batch layout is the only place derivatives reach a Python or C caller,
+/// and it is exactly the place where "just fill the tail with something" is
+/// tempting: the buffer is already sized, the pose half succeeded, and six zeros
+/// or a finite difference would look like an answer. It must not. A layout whose
+/// meaning depends on which interpolator the publisher happened to declare is
+/// the quaternion-order trap moved into the time axis — the caller cannot see
+/// it, no norm check fires, and the number is simply a different quantity.
+///
+/// The buffer is checked untouched as well. `PHASE3.md` §5.3's rule is that a
+/// rejected call leaves the caller's memory alone, and a twist layout that wrote
+/// its pose half before discovering the refusal would leave 7 live elements and
+/// 6 stale ones per row with nothing marking the boundary.
+///
+/// Mutant: give `Layout::QuatTwist` its own emitter that finite-differences the
+/// pose instead of routing through `fold_at_with_derivatives` ⇒ this returns
+/// `Ok` and the assertion on the error fails. Mutant B: emit the pose half
+/// before folding the twist ⇒ the sentinel assertion fails.
+#[test]
+fn the_quat_twist_layout_refuses_lerpslerp_exactly_as_the_scalar_call_does() {
+    use tf_tree::{Layout, Stamp, SystemDomain};
+
+    let cfg = EdgeCfg::new(Capacity::slots(64));
+    let tree = TreeBuilder::new()
+        .default_interp(InterpPolicy::LerpSlerp)
+        .dynamic_edge("map", "base", cfg)
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let base = tree.frame("base").unwrap();
+    let w = tree.claim(base, map).unwrap();
+    for i in 0..8i64 {
+        w.push(i * 10_000_000, &common::pose(i as u64 + 1)).unwrap();
+    }
+    let plan = tree.plan(map, base).unwrap();
+    let g = tree.guard();
+
+    let want_edge = plan
+        .steps()
+        .iter()
+        .find_map(|s| match s {
+            tf_tree::Step::Dyn { edge, .. } => Some(*edge),
+            tf_tree::Step::Static(_) => None,
+        })
+        .expect("the plan has a dynamic edge");
+
+    let stamps = [25_000_000i64, 35_000_000];
+
+    // The pose-only layouts still work over the same stamps, so the refusal is
+    // specific to the derivative and not to the fixture.
+    let mut poses = vec![0.0f64; stamps.len() * Layout::Quat.elems()];
+    plan.at_many_into::<SystemDomain>(&g, &stamps, Layout::Quat, &mut poses)
+        .expect("the pose layout must still work over a LerpSlerp edge");
+
+    const SENTINEL: f64 = -12345.5;
+    let mut rows = vec![SENTINEL; stamps.len() * Layout::QuatTwist.elems()];
+    match plan.at_many_into::<SystemDomain>(&g, &stamps, Layout::QuatTwist, &mut rows) {
+        Err(LookupError::DerivativesUnavailable { edge, interp }) => {
+            assert_eq!(interp, InterpPolicy::LerpSlerp.as_u8());
+            assert_eq!(edge, want_edge, "the offending edge must be named");
+        }
+        other => panic!("expected DerivativesUnavailable, got {other:?}"),
+    }
+    assert!(
+        rows.iter().all(|v| *v == SENTINEL),
+        "a refused QuatTwist batch wrote into the caller's buffer"
+    );
+
+    // The scalar call refuses identically — the whole point of the layout is
+    // that it is the same path, so a divergence in the *error* is as much a
+    // divergence as one in the numbers.
+    assert_eq!(
+        plan.at_with_derivatives(&g, Stamp::<SystemDomain>::from_nanos(stamps[0]))
+            .unwrap_err(),
+        LookupError::DerivativesUnavailable {
+            edge: want_edge,
+            interp: InterpPolicy::LerpSlerp.as_u8(),
+        }
+    );
+}
+
 /// A single-sample edge has a pose but no segment, and must say so *specifically*.
 ///
 /// `NoData` would be wrong and actively misleading: there is data, and the caller

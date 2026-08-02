@@ -66,8 +66,17 @@ typedef struct tft_publisher tft_publisher;
  * it is, instead of refusing it with `TFT_ERR_BAD_STRUCT_SIZE`. Until that
  * landed, appending a field would have locked every older caller out of every
  * call — which is the precise case §3.6 exists to prevent.
+ *
+ * `2` → `3`: one appended `tft_layout` enumerator,
+ * [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`], carrying `at_with_derivatives` as a layout
+ * (`docs/API.md` §3.3). §3.6 names this case explicitly: an older caller never
+ * spells the new value, and every entry point that takes a `tft_layout`
+ * rejects a discriminant it does not define rather than computing a size from
+ * it — so a `0.2` caller against a `0.3` library is unchanged in every byte it
+ * can observe. No struct grew, nothing moved, and no existing enumerator
+ * changed meaning.
  */
-#define TFT_ABI_VERSION_MINOR 2
+#define TFT_ABI_VERSION_MINOR 3
 
 /**
  * Sentinel for an id field that does not apply to this error.
@@ -349,6 +358,24 @@ typedef struct {
  * 3×4 `f32` row-major — GPU upload.
  */
 #define TFT_LAYOUT_AFFINE12_ROW_F32 4
+
+/**
+ * `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]` `f64` — pose **and body twist**.
+ *
+ * [`TFT_LAYOUT_QVEC7_WXYZ`] with six more slots holding the same twist
+ * `TFT_TWIST_BYTES` describes, in the same `[ω, v]` order. It is the
+ * layout form of `at_with_derivatives` (`docs/API.md` §3.3), and appending it
+ * is a **minor** ABI bump under `docs/PHASE4.md` §3.6: an older caller never
+ * names the value and every entry point rejects a discriminant it does not
+ * know rather than computing a size from it.
+ *
+ * **Only `tft_plan_at_with_derivatives` accepts it.**
+ * `tft_plan_at` and `tft_plan_at_many` evaluate a pose and have no twist to
+ * put in the tail, so they refuse it with `TFT_ERR_BAD_ENUM` rather than
+ * leaving six slots of whatever the caller's buffer held — which would be a
+ * velocity to anything reading it.
+ */
+#define TFT_LAYOUT_QVEC7_WXYZ_TWIST6 5
 
 /**
  * The library's major ABI version.

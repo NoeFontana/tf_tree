@@ -149,8 +149,41 @@ fn an_unknown_layout_is_refused() {
     assert_eq!(tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ), 56);
     assert_eq!(tft_layout_size(TFT_LAYOUT_MAT4_ROW), 128);
     assert_eq!(tft_layout_size(TFT_LAYOUT_AFFINE12_ROW_F32), 48);
+    assert_eq!(tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ_TWIST6), 104);
     // Not a layout this build defines.
     assert_eq!(tft_layout_size(9999), 0);
+}
+
+/// **The appended enumerator is a minor bump, and `tft_check_abi` says so.**
+///
+/// §3.6's rule is that the major must match exactly and the runtime's minor may
+/// exceed the compiled-against one. A caller built against the header that
+/// predates `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` therefore still links: it passes
+/// `(0, 2)` and this library is `(0, 3)`. That is the entire compatibility
+/// argument for adding a layout rather than a function, so it is asserted
+/// rather than asserted-in-prose.
+///
+/// Mutant: bump `TFT_ABI_VERSION_MAJOR` instead ⇒ the first assertion fails and
+/// every existing C caller has to be rebuilt for a value they never name.
+#[test]
+fn an_older_caller_still_links_across_the_layout_addition() {
+    // Read through the exported functions rather than the constants: these are
+    // what a linked caller actually observes, and a constant comparison is a
+    // tautology the compiler folds away.
+    assert_eq!(
+        tft_abi_version_major(),
+        0,
+        "no major bump for an appended enum"
+    );
+    assert!(
+        tft_abi_version_minor() >= 3,
+        "the appended layout is a minor bump"
+    );
+    // The caller that compiled before the enumerator existed.
+    assert_eq!(tft_check_abi(0, 2), TFT_OK);
+    // ...and one from the future is still refused, because it may name a
+    // discriminant this build would reject.
+    assert_ne!(tft_check_abi(0, TFT_ABI_VERSION_MINOR + 1), TFT_OK);
 }
 
 /// **`tft_last_error` validates `struct_size`** (§3.6's Vulkan rule), so a

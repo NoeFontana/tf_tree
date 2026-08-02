@@ -105,7 +105,7 @@ pub use open::{open, CreatePolicy, Open, OpenError};
 // Re-export the core engine surface so downstream code depends only on `tf_tree`.
 pub use tf_tree_core::arena_view::ArenaView;
 pub use tf_tree_core::edge::{EdgeKind, Publisher};
-pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, Layout};
+pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 pub use tf_tree_core::plan::{
     AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
     SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,

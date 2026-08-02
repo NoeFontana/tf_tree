@@ -194,8 +194,9 @@ static void check_success_does_not_touch_the_error_slot()
 
 static void check_payload_sizes_agree()
 {
-    const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW, TFT_LAYOUT_MAT4_COL,
-                              TFT_LAYOUT_MAT4_ROW, TFT_LAYOUT_AFFINE12_ROW_F32};
+    const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ,        TFT_LAYOUT_QVEC7_XYZW,
+                              TFT_LAYOUT_MAT4_COL,          TFT_LAYOUT_MAT4_ROW,
+                              TFT_LAYOUT_AFFINE12_ROW_F32,  TFT_LAYOUT_QVEC7_WXYZ_TWIST6};
     for (tft_layout l : all) {
         CHECK(tf_tree::payload_bytes(l) == tft_layout_size(l),
               "the header's compile-time payload size disagrees with the library's");

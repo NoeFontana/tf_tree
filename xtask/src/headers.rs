@@ -102,6 +102,13 @@ const STABLE: &[&str] = &[
     "TFT_LAYOUT_MAT4_COL",
     "TFT_LAYOUT_MAT4_ROW",
     "TFT_LAYOUT_AFFINE12_ROW_F32",
+    // Appended by `docs/API.md` §3.3 — a minor bump under §3.6. The enumerator
+    // is stable even though the only entry point that accepts it,
+    // `tft_plan_at_with_derivatives`, is not: a discriminant is a number a
+    // caller may be handed back or may need to reject, and a number that exists
+    // only behind `TFT_ENABLE_UNSTABLE` would be un-nameable by code that can
+    // still receive it. Same argument as `TFT_ERR_BAD_CONFIG` above.
+    "TFT_LAYOUT_QVEC7_WXYZ_TWIST6",
     "tft_layout_size",
     // Lifecycle and the hot path — §3.2, §3.7.
     "tft_tree_open",

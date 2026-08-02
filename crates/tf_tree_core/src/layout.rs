@@ -32,7 +32,7 @@
 //! the conversion would otherwise happen anyway — one pass later, over a buffer
 //! that had to exist. Nothing reads it back.
 
-use tf_tree_math::Iso3;
+use tf_tree_math::{Iso3, Twist};
 
 /// How a transform is written into a caller's buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,25 @@ pub enum Layout {
     /// wastes a quarter of the buffer and all of the bandwidth that goes with
     /// it. GPU-facing.
     Affine32,
+    /// `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`, `f64`. 13 elements.
+    ///
+    /// [`Layout::Quat`] with the body twist appended — angular first, matching
+    /// [`tf_tree_math::twist`]'s `[ω, v]` order and `log_se3`'s. This is how
+    /// `at_with_derivatives` reaches a batch caller (`docs/API.md` §3.3,
+    /// `docs/PHASE5.md` §4.4): **a fourth layout rather than a fourth method**,
+    /// because one variant rides the dispatch that already exists into every
+    /// binding, where a second entry point would need its own buffer validation
+    /// and its own GIL threshold for the same bytes.
+    ///
+    /// It is the one layout whose emission can *fail*: `LerpSlerp` has no exact
+    /// body twist, so an edge using it yields
+    /// [`LookupError::DerivativesUnavailable`] here exactly as it does from
+    /// `at_with_derivatives`, rather than a finite difference that would look
+    /// like an answer. A layout that quietly changed meaning per interpolator
+    /// would be the quaternion-order trap moved into the time axis.
+    ///
+    /// [`LookupError::DerivativesUnavailable`]: crate::LookupError::DerivativesUnavailable
+    QuatTwist,
 }
 
 impl Layout {
@@ -65,6 +84,7 @@ impl Layout {
             Layout::Mat4 => 16,
             Layout::Quat => 7,
             Layout::Affine32 => 12,
+            Layout::QuatTwist => 13,
         }
     }
 
@@ -128,6 +148,33 @@ pub fn write_quat(iso: &Iso3, out: &mut [f64]) {
     out[4] = iso.t.x;
     out[5] = iso.t.y;
     out[6] = iso.t.z;
+}
+
+/// Write `iso` and `twist` as `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`.
+///
+/// The first seven elements are [`write_quat`]'s, unchanged and delegated to
+/// rather than repeated — a second copy of the quaternion order is a second
+/// place for it to be wrong, and this crate's whole argument about `w`-first is
+/// that the order must have one home.
+///
+/// The tail is `[ω, v]`, **angular first**: `tf_tree_math::twist`'s convention,
+/// which is also `log_se3`'s and `exp_se3`'s. `TFT_TWIST_BYTES` in the C ABI's
+/// unstable header already documents the same six slots in the same order, so a
+/// caller reading a `QuatTwist` row's tail and a caller reading
+/// `tft_plan_at_with_derivatives`'s `out_twist` are reading the same thing.
+///
+/// The twist is body-frame and expressed in the plan's **source** frame; see
+/// `Plan::at_with_derivatives` for why, and for the example that shows a
+/// magnitude check cannot tell the two conventions apart.
+#[inline]
+pub fn write_quat_twist(iso: &Iso3, twist: &Twist, out: &mut [f64]) {
+    write_quat(iso, out);
+    out[7] = twist.omega.x;
+    out[8] = twist.omega.y;
+    out[9] = twist.omega.z;
+    out[10] = twist.v.x;
+    out[11] = twist.v.y;
+    out[12] = twist.v.z;
 }
 
 /// Write `iso` as a row-major 3x4 `f32` affine.
@@ -257,13 +304,77 @@ mod tests {
         }
     }
 
+    /// **`QuatTwist`'s first seven elements are exactly `Quat`'s.**
+    ///
+    /// The pose half is the same bytes in the same order, so a consumer that
+    /// already parses a `(N, 7)` row can read a `(N, 13)` one by ignoring the
+    /// tail. Asserted bit-for-bit rather than within a tolerance: the two go
+    /// through the same emitter, and anything less than equality would mean one
+    /// of them recomputed the quaternion.
+    ///
+    /// Mutant: inline `write_quat`'s seven stores into `write_quat_twist` and
+    /// transpose any two of them ⇒ fails here while every twist assertion still
+    /// passes, because the tail is untouched.
+    #[test]
+    fn quat_twist_opens_with_exactly_the_quat_layout() {
+        let iso = sample();
+        let twist = Twist::new(
+            tf_tree_math::Vec3::new(0.11, -0.22, 0.33),
+            tf_tree_math::Vec3::new(-1.5, 2.25, 0.125),
+        );
+        let mut q = [0.0f64; 7];
+        write_quat(&iso, &mut q);
+        let mut qt = [0.0f64; 13];
+        write_quat_twist(&iso, &twist, &mut qt);
+
+        for (i, want) in q.iter().enumerate() {
+            assert_eq!(
+                qt[i].to_bits(),
+                want.to_bits(),
+                "element {i} differs from the Quat layout"
+            );
+        }
+    }
+
+    /// **The tail is `[ω, v]`, angular first** — `tf_tree_math::twist`'s order,
+    /// `log_se3`'s order, and `TFT_TWIST_BYTES`'s order.
+    ///
+    /// Swapping ω and v produces six live `f64` in six live slots and no norm
+    /// check anywhere can see it: an angular velocity in rad/s and a linear one
+    /// in m/s are both just numbers. The fixture uses values whose magnitudes
+    /// are of the same order so that "these are obviously the angular ones"
+    /// cannot rescue a consumer that got it wrong.
+    ///
+    /// Mutant: write `v` into slots 7..10 and `ω` into 10..13 ⇒ fails.
+    #[test]
+    fn quat_twist_tail_is_omega_then_v() {
+        let twist = Twist::new(
+            tf_tree_math::Vec3::new(0.11, -0.22, 0.33),
+            tf_tree_math::Vec3::new(0.44, -0.55, 0.66),
+        );
+        let mut qt = [0.0f64; 13];
+        write_quat_twist(&sample(), &twist, &mut qt);
+        assert_eq!(qt[7], twist.omega.x);
+        assert_eq!(qt[8], twist.omega.y);
+        assert_eq!(qt[9], twist.omega.z);
+        assert_eq!(qt[10], twist.v.x);
+        assert_eq!(qt[11], twist.v.y);
+        assert_eq!(qt[12], twist.v.z);
+    }
+
     #[test]
     fn element_counts_match_the_emitters() {
         assert_eq!(Layout::Mat4.elems(), 16);
         assert_eq!(Layout::Quat.elems(), 7);
         assert_eq!(Layout::Affine32.elems(), 12);
+        assert_eq!(Layout::QuatTwist.elems(), 13);
         assert!(Layout::Affine32.is_f32());
         assert!(!Layout::Mat4.is_f32());
         assert!(!Layout::Quat.is_f32());
+        // `QuatTwist` is `f64` like the pose layouts, so it goes through
+        // `at_many_into` and not `at_many_into_f32`. Pinned because `is_f32` is
+        // what routes it, and a stray `true` here would send a 13-element `f64`
+        // write down the `f32` path.
+        assert!(!Layout::QuatTwist.is_f32());
     }
 }
