@@ -3,10 +3,12 @@
 **Status:** ready
 **Owner:** @NoeFontana
 **Implementation:** steps 1–5 landed — `OwnedWriter`, `Tree::claim_owned`, the
-crate attribute move, and the drop / lease / fork / `compile_fail` tests. Steps
-6–8 (the `tf_tree_py` and `tf_tree_c` migrations, and the crate-level docs) are
-outstanding, and until they land the two `extend_to_static` helpers this record
-exists to delete are still in the tree.
+crate attribute move, and the drop / lease / fork / `compile_fail` tests.
+`just miri` now covers `tf_tree`, which is what step 2's mutant was always
+stated against; it immediately found that the `EdgeWriter` has to be **boxed**
+(see *Consequences*). Steps 6–8 (the `tf_tree_py` and `tf_tree_c` migrations,
+and the crate-level docs) are outstanding, and until they land the two
+`extend_to_static` helpers this record exists to delete are still in the tree.
 
 ## Context
 
@@ -82,7 +84,7 @@ impl Tree {
 ///
 /// `Send + !Sync`, exactly as `EdgeWriter` is — single-writer-per-edge stays a
 /// type-level property (D7), not a convention this type relaxes.
-pub struct OwnedWriter { /* Arc<Tree>, EdgeWriter<'static> — both private */ }
+pub struct OwnedWriter { /* Arc<Tree>, Box<EdgeWriter<'static>> — both private */ }
 
 impl OwnedWriter {
     pub fn push<D: Domain>(&self, stamp: Stamp<D>, iso: &Iso3) -> Result<(), PushError>;
@@ -163,6 +165,22 @@ meet it will have less context than the person who already got it wrong.
   `Publisher::abandon` on a forked child, the `ClaimLease` release, the fork
   generation compare. A missing guard here is the exact defect this record
   exists to remove.
+- **The `EdgeWriter` has to be behind a `Box`, and that was not foreseen here.**
+  Adding `tf_tree` to `just miri` (step 2's stated verification, which the
+  recipe could not perform while the crate was excluded) reported
+  *"deallocating while item \[SharedReadOnly …\] is strongly protected"* on the
+  inline version, under Stacked Borrows and again under `-Zmiri-tree-borrows`.
+  Passing a value **by value** strongly protects the reference-typed fields
+  inside it for the duration of the call, and `drop(writer)` / `release(self)`
+  are exactly that — a by-value pass whose callee frees the arena those
+  references point into. A `Box` is only weakly protected and retagging does not
+  reach through it, so the boxed form is sound; an implicit end-of-scope drop
+  never tripped it either way. The cost is one pointer chase in the owned
+  `push` — no existing path changed — and the alternative that would cost
+  nothing is `Publisher` holding raw pointers instead of `&`, which is a change
+  to the `no_std` core's hot struct and therefore its own record.
+  **Steps 6 and 7 inherit this**: `tf_tree_py` and `tf_tree_c` route through
+  `OwnedWriter` and must not "simplify" the box away.
 - It commits us to `API.md` §2.1 as a rule that new API is checked against, not
   a description of the current state.
 

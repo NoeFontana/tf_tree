@@ -35,19 +35,27 @@ fn layout() -> TreeBuilder {
 /// **The `Arc` field is real, and it is what keeps the arena alive.**
 ///
 /// The record's step 2 states the mutant as "drop the `Arc` field ⇒
-/// use-after-free under `just miri`", and that is true — but `just miri` covers
-/// `tf_tree_arena` and `tf_tree_core` only, so nothing in the current gate set
-/// would actually observe it. A UAF that no gate can see is not a test.
-///
-/// So this asserts the property *directly*, with a `Weak`: after the caller's
-/// handle is gone the tree must still be alive, and after the writer is gone it
-/// must not be. That is the same fact the UAF would be a consequence of, and it
-/// fails deterministically on a machine with no nightly toolchain.
+/// use-after-free under `just miri`". That recipe now covers `tf_tree`, so the
+/// mutant is observable as stated — but this test also asserts the property
+/// *directly*, with a `Weak`: after the caller's handle is gone the tree must
+/// still be alive, and after the writer is gone it must not be. That is the same
+/// fact the UAF would be a consequence of, and it fails deterministically on a
+/// machine with no nightly toolchain.
 ///
 /// The `push` between the two halves is not decoration: it is the operation that
-/// would be reading and writing the freed arena under the mutant, so its
-/// presence is what makes this test *also* a miri test the day the facade is
-/// added to that recipe.
+/// would be reading and writing the freed arena under the mutant, which is what
+/// makes this a Miri test and not only an `Arc` bookkeeping test.
+///
+/// Mutant C — and this one was **found by adding the crate to `just miri`, not
+/// predicted**: un-box `OwnedWriter::writer` (`Box<EdgeWriter<'static>>` ⇒
+/// `EdgeWriter<'static>`). The suite still passes; `cargo miri test -p tf_tree`
+/// fails this test with *"deallocating while item \[SharedReadOnly …\] is
+/// strongly protected"*, and `-Zmiri-tree-borrows` fails it too. `release`
+/// below passes the writer **by value**, which strongly protects the arena
+/// references inside it for the duration of the call, and the call is where the
+/// last `Arc` — and with it the arena — goes away. Implicit end-of-scope drop
+/// does not trip it; the two by-value spellings this type documents are exactly
+/// the ones that do.
 ///
 /// Mutant: delete the `tree: Arc<Tree>` field from `OwnedWriter` (replace it
 /// with nothing, or with `PhantomData`) ⇒ the `strong_count` assertion fails at

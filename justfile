@@ -33,14 +33,44 @@ test-doc:
 loom:
     cargo xtask loom
 
-# Undefined-behavior checking under Miri (arena + core).
+# Undefined-behavior checking under Miri (arena + core + the facade).
 #
 # `miri-soft-float` is opt-in here and nowhere else: Miri cannot execute the x86
 # inline `sqrt` asm libm's default `arch` feature emits. Enabling it globally
 # would compile the shipped binaries and the benchmarks with soft floats too.
+#
+# **`tf_tree` is here because `docs/decisions/0017` put the workspace's only
+# lifetime extension in it** (`OwnedWriter`), and that record names `just miri`
+# as the verification for its step 2 — a gate the recipe could not perform while
+# the crate was excluded. It earned its place immediately: adding it caught a
+# real *"deallocating while item [SharedReadOnly …] is strongly protected"* in
+# the first version of that type, which no other gate in this repository could
+# see. See also the `c-abi-check` comment below on not leaving crates out.
+#
+# It gets its own line because it needs `-Zmiri-disable-isolation`: building a
+# `Tree` reads `/proc/sys/kernel/random/boot_id` and the process start time
+# (A7's reboot check), and Miri refuses filesystem access without it. Default
+# features only, deliberately — `shm` is `memfd_create` and `fcntl(F_OFD_*)`,
+# which Miri cannot execute at all (`0005` *What we commit to*), and the `fork`
+# half of the same protocol lives in `tf_tree_bench`'s `fork_child` binary.
+# Both are covered by `just shm-check` instead, which builds that binary and
+# runs the `fork` and `multiprocess` suites.
+#
+# **Two targets, not the whole crate, and this is a measurement rather than a
+# preference.** The facade's `unsafe` is one block, and `tests/owned_writer.rs`
+# is what exercises it; the crate's other targets are safe-code numerics whose
+# arena and engine work is already interpreted by the command above, against the
+# crates that own it. Under Miri they cost hours for no additional UB coverage:
+# `tests/batch.rs` had not finished after twenty minutes, and
+# `tests/construction.rs` — the cheapest of them — takes 160 s against this
+# pair's 2 s. **If a second `unsafe` ever lands in `tf_tree`, the target that
+# covers it joins this line**; that is the whole rule, and a `--test` list is
+# how it stays visible instead of silently drifting to nothing.
 miri:
     cargo +nightly miri test -p tf_tree_arena -p tf_tree_core \
         --features tf_tree_core/miri-soft-float
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p tf_tree \
+        --features tf_tree_core/miri-soft-float --lib --test owned_writer
 
 # **The C ABI under Miri and ASan — `docs/PHASE4.md` §6.1 and §7 gate 4.**
 #

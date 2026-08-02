@@ -142,6 +142,10 @@ diffs. A drifted header is a failed build, not a surprise at release.
 `#![forbid(unsafe_code)]` from the facade — the crate most readers audit first,
 and the one whose safety claim carries the most weight with the industrial
 integrators D18 is aimed at. A separate crate costs one `Cargo.toml`.
+(`0017` later moved that crate to `deny` with **one** greppable `#[allow]`, for
+`OwnedWriter` — see the amendment on rule 2. The argument here is unaffected and
+if anything sharper: a whole C ABI is an unbounded number of such exceptions,
+which is a different thing from one.)
 
 **Why depend on `tf_tree` rather than `tf_tree_core`?** Going to `core` directly
 would let the C ABI construct a `Guard` or a `Plan` without the facade's

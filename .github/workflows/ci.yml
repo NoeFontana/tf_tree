@@ -199,6 +199,15 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-strict-provenance"
         run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core --features tf_tree_core/miri-soft-float
+      # The facade's one `unsafe` — `OwnedWriter`'s lifetime extension
+      # (`docs/decisions/0017`). `-Zmiri-disable-isolation` because building a
+      # `Tree` reads `/proc` for the boot id and the process start time; see the
+      # `miri` recipe in the justfile for why this is two targets and not the
+      # whole crate.
+      - name: cargo miri test (facade)
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-disable-isolation"
+        run: cargo +nightly miri test -p tf_tree --features tf_tree_core/miri-soft-float --lib --test owned_writer
 
   # The only job that needs a container, because it is the only job that needs
   # ROS 2. `tf_tree_tf2_sys` is excluded from the workspace (it links `-ltf2`, so

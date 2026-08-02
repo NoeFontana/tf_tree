@@ -409,10 +409,17 @@ pub fn reap(rec: &ClaimRecord) {
 /// ```
 ///
 /// but deliberately **not** `Sync` (this must fail to compile):
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn assert_sync<T: Sync>() {}
 /// assert_sync::<tf_tree_core::edge::Publisher<'static>>();
 /// ```
+///
+/// The error code is pinned so the negative test cannot pass for the wrong
+/// reason: a bare `compile_fail` also succeeds when the type is renamed or
+/// un-exported, which is the failure mode this repository's `Mutant:` notes
+/// exist to prevent. **rustdoc enforces the code on nightly only** — measured:
+/// mutating it to `E0599` fails `cargo +nightly test --doc -p tf_tree_core`
+/// with *"Some expected error codes were not found"*, and passes on stable.
 pub struct Publisher<'a> {
     ring: SampleRing<'a>,
     claim: &'a ClaimRecord,

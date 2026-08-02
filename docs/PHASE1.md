@@ -46,7 +46,20 @@ avalanche would change `FrameRecord::name_hash` and therefore the arena format,
 so it is not a change to make casually mid-phase. Revisit it when the format
 version moves anyway.
 
-**Unsafe budget:** `#![forbid(unsafe_code)]` on `tf_tree_math`, `tf_tree`, `tf_tree_cli`. `unsafe` is permitted only in `tf_tree_arena` and in exactly two modules of `tf_tree_core` (`buffer.rs`, `arena_view.rs`), each of which must carry a module-level `// SAFETY:` doc block stating its invariants. Every `unsafe` block gets its own `// SAFETY:` comment naming which invariant it relies on.
+**Unsafe budget:** `#![forbid(unsafe_code)]` on `tf_tree_math`, `tf_tree_cli`. `tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]`. `unsafe` is permitted only in `tf_tree_arena` and in exactly two modules of `tf_tree_core` (`buffer.rs`, `arena_view.rs`), each of which must carry a module-level `// SAFETY:` doc block stating its invariants. Every `unsafe` block gets its own `// SAFETY:` comment naming which invariant it relies on.
+
+> **`tf_tree`'s entry was corrected in place**, and this paragraph's crate list
+> is Phase 1's only; the rest of the budget is unchanged. It said `forbid` for
+> `tf_tree` until
+> [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) moved the
+> crate to `deny` for one lifetime extension, in `OwnedWriter` — the workspace's
+> only one, which replaced two hand-rolled `extend_to_static` helpers in crates
+> the Rust test suite cannot instrument. The rule the list is a snapshot of is
+> [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md)'s criterion —
+> `unsafe` only at a boundary the compiler cannot see across — and the phases
+> after this one added `tf_tree_ipc`, `tf_tree_py` and `tf_tree_c` under it.
+> Corrected rather than annotated because this section is normative and a rule
+> that says `forbid` while the code says `deny` is worse than either.
 
 **If a design question is not answered by this document, stop and ask rather than choosing.** The most expensive failure mode here is an agent that picks a reasonable-looking simplification in the concurrency or layout sections.
 
@@ -862,7 +875,7 @@ The third criterion is the one that actually decides the project. `tf2::BufferCo
 - [ ] All §10 tests pass, including loom and Miri, in CI on x86-64 **and aarch64**
 - [ ] §11 benchmark suite runs via `cargo xtask bench-gate` and reports the full table
 - [ ] The gate in §11.3 is met, or a written explanation of which criterion failed and by how much
-- [ ] `#![forbid(unsafe_code)]` holds on `tf_tree_math`, `tf_tree`, `tf_tree_cli`
+- [ ] `#![forbid(unsafe_code)]` holds on `tf_tree_math`, `tf_tree_cli`; `tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]` (`OwnedWriter`, per [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) — see §0's amended unsafe-budget note)
 - [ ] Every `unsafe` block has a `// SAFETY:` comment naming a §2 invariant
 - [ ] `tf_tree doctor` detects all seven listed conditions, each with a test
 - [ ] Public API documented with `#![deny(missing_docs)]`

@@ -136,7 +136,7 @@ Everything goes through `just`; CI mirrors it 1:1.
 | `just lint` | `cargo fmt --check`, `clippy -D warnings`, `cargo deny check` |
 | `just fmt` | auto-format + clippy `--fix` |
 | `just loom` | concurrency model checking (`cargo xtask loom`) |
-| `just miri` | UB checking on arena + core |
+| `just miri` | UB checking on arena, core, and the facade's one `unsafe` (`OwnedWriter`) |
 | `just msrv` | the declared MSRV floor: `--locked` build on it, plus every hand-written `rust-version` |
 | `just bench` | benchmark suite + go/no-go gate |
 | `just contended-scaling` / `scale-sweep` / `soak` | the exploratory performance suite: `docs/PHASE1.md` §11.2's writers-and-pinning row, the width/depth/ring/fan-out axes, and multi-minute drift. Exploratory by design — they emit JSON and do **not** feed `just bench-check` |

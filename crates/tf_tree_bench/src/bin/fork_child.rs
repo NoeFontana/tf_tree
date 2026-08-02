@@ -91,6 +91,19 @@ fn main() {
                 Writer::Owned(w) => w.push(stamp, iso),
             }
         }
+
+        /// The edge the writer itself says it claimed.
+        ///
+        /// Asked of the writer rather than re-derived from the topology on
+        /// purpose: the parent's post-fork re-validation compares this against
+        /// what the arena reports, and a value read out of the arena cannot
+        /// disagree with the arena.
+        fn edge(&self) -> u32 {
+            match self {
+                Writer::Scoped(w) => w.edge().get(),
+                Writer::Owned(w) => w.edge().get(),
+            }
+        }
     }
 
     // Exit codes the child uses. Distinct per assertion, so a failure names
@@ -138,15 +151,7 @@ fn main() {
     // what the child holds is genuinely inherited rather than re-derived.
     let plan = tree.plan(parent_frame, child_frame).expect("plan");
     let slot = tree.participant_slot();
-    // Read from the topology rather than from the writer: `OwnedWriter` exposes
-    // `push` and `release` and nothing else (`docs/decisions/0017`), and
-    // widening its surface so a test binary can ask a question the arena already
-    // answers would be the wrong way round.
-    let (_parent, _depth, edge, _gen) = tree
-        .arena_view()
-        .topology()
-        .read_frame(child_frame)
-        .expect("base is interned");
+    let edge = writer.edge();
 
     // The fork generation as the parent last saw it. Everything the detachment
     // checks below rely on is downstream of this counter, but none of them can

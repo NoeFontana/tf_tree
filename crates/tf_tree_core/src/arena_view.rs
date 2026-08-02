@@ -22,9 +22,11 @@
 //! * **Every record index is bounds-checked against the header's `max_frames` /
 //!   `max_edges` before a pointer is formed.** [`EdgeId`] is a plain public
 //!   `u32` newtype and [`FrameId::new`] accepts any non-zero `u32`, so an
-//!   out-of-range id is reachable from perfectly safe caller code (including
-//!   from `tf_tree`, which is `#![forbid(unsafe_code)]`). The checked accessors
-//!   return `None` rather than forming an out-of-bounds pointer.
+//!   out-of-range id is reachable from perfectly safe caller code — including
+//!   from every path in `tf_tree`, whose one `unsafe` is a lifetime extension
+//!   in `OwnedWriter` (`docs/decisions/0017`) and touches nothing here. The
+//!   checked accessors return `None` rather than forming an out-of-bounds
+//!   pointer.
 //!
 //! Every `unsafe` block below names which of these invariants it relies on.
 #![allow(unsafe_code)]
@@ -553,8 +555,9 @@ impl<'a> ArenaView<'a> {
         // crafted triple formed a typed slice running past the end of the
         // mapping. It is reachable from safe code too: `declare_edge` and
         // `EdgeRecord::dynamic` are safe `pub fn`s that write a caller-supplied
-        // record, so `tf_tree` — which is `#![forbid(unsafe_code)]` — could
-        // cause UB without writing a single `unsafe` block.
+        // record, so `tf_tree` could cause UB without writing a single `unsafe`
+        // block — its one `unsafe` is `OwnedWriter`'s lifetime extension
+        // (`docs/decisions/0017`) and is nowhere near this path.
         //
         // `stamp_slots`/`pose_slots` are the counts the two regions were sized
         // from, and the header check already proved they agree with the
@@ -593,9 +596,10 @@ impl<'a> ArenaView<'a> {
 ///
 /// Writing an [`EdgeRecord`] is a raw, non-atomic write of a whole 128-byte
 /// record: it is sound only when nothing else can observe the slot. Rather than
-/// leave that as a comment on a safe `pub fn` — where any caller, including the
-/// `#![forbid(unsafe_code)]` facade, could violate it — the capability is gated
-/// behind an `&mut` borrow of the arena. Holding one *proves* no other
+/// leave that as a comment on a safe `pub fn` — where any caller, including a
+/// facade that writes no `unsafe` on this path, could violate it — the
+/// capability is gated behind an `&mut` borrow of the arena. Holding one
+/// *proves* no other
 /// [`ArenaView`] exists, because a shared view borrows the same arena.
 ///
 /// Hand out shared views for the rest of construction with [`Self::view`].

@@ -123,9 +123,11 @@ pub use tf_tree_arena::{AttachMode, ShmError};
 /// This build's arena format version (`docs/PHASE5.md` §1).
 ///
 /// Re-exported as a function rather than the constant so the facade keeps its
-/// `#![forbid(unsafe_code)]` promise of exposing no arena internals: a caller
-/// gets the number it needs for a diagnostic without a path into
-/// `tf_tree_arena`.
+/// promise of exposing no arena internals: a caller gets the number it needs
+/// for a diagnostic without a path into `tf_tree_arena`. That promise is
+/// unchanged by `docs/decisions/0017` moving the crate from
+/// `#![forbid(unsafe_code)]` to `deny` with one exception — the exception is a
+/// lifetime extension, not a widening of what this surface hands out.
 #[must_use]
 pub fn arena_format_version() -> u32 {
     tf_tree_arena::FORMAT_VERSION
