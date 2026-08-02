@@ -104,6 +104,19 @@ class Plan:
     def depth(self) -> int:
         """Folded depth of this path, in edges."""
 
+    def edges(self) -> list[tuple[str, str]]:
+        """The **dynamic** edges this plan samples, as `(parent, child)` pairs.
+
+        In fold order — the order the compositions happen, which is the order
+        the plan is.
+
+        Shorter than `depth()` when the path crosses a static edge. A static
+        edge (or a whole run of them) is folded into one constant transform at
+        compile time and its identity does not survive the fold, so a plan
+        cannot list what it no longer knows. Use `Tree.edges()` for the
+        topology; this is what *this path samples at evaluation time*.
+        """
+
 class Publisher:
     """A claimed edge. Use as a context manager; the claim releases on exit."""
 
@@ -184,6 +197,35 @@ class Tree:
 
         On a live tree the answer is a snapshot that ages immediately, exactly
         as `Plan.latest` does.
+        """
+
+    def frames(self) -> list[str]:
+        """The frame names on this tree, in declaration order.
+
+        The cheap way to see what is in an arena without shelling out to
+        `tf_tree doctor`. Frame identity is append-only, so a name that appears
+        here will never be removed or renumbered — but on a *live* shared arena
+        a peer process can add one under you, so treat the list as a snapshot,
+        exactly as `Plan.latest` and `Tree.span` already are.
+
+        A name longer than 48 bytes was truncated when it was interned; the
+        stored form is what comes back.
+        """
+
+    def edges(self) -> list[tuple[str, str]]:
+        """The edges on this tree, as `(parent, child)` name pairs.
+
+        `(parent, child)` is the order `tf_tree.build` and `tf_tree.open(
+        create=...)` take, so `tf_tree.build(tree.edges())` reconstructs this
+        topology. It is deliberately *not* `Tree.publisher`'s `(child, parent)`
+        order: an edge list silently reversed builds a tree that is upside down
+        and still perfectly valid.
+
+        **Names only** — no rate, no jitter, no gaps, no sample count. Those are
+        `PHASE5.md` §4.2's `ds.edges()` and are held back until the counting
+        pass that can answer them honestly exists: a ring knows what it
+        *retained*, which is not what the publisher produced, and a rate derived
+        from the one and reported as the other is worse than no rate at all.
         """
 
     def instance_uuid(self) -> str:

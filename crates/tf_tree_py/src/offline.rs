@@ -11,27 +11,33 @@
 //!
 //! # What of §4.2 is here, and what deliberately is not
 //!
-//! §4.2 lists five helpers. Only `span` is in the module, and the omissions are
-//! decisions rather than a backlog:
+//! §4.2 lists five helpers. `span` is in the module and so, since §4.4, is the
+//! *names* half of `edges`; the omissions are decisions rather than a backlog:
 //!
 //! * `resample(t0, t1, hz)` is `plan.at(np.arange(t0, t1, 10**9 // hz))` — one
 //!   line of NumPy over the vectorised call §4.1 insists is the same one. A
 //!   binding for it would be a second spelling of an existing path, which is
 //!   exactly what §4.1 forbids.
-//! * `edges()`, `gaps()` and `manifest` each need engine surface that does not
-//!   exist yet: per-edge rate and jitter are §3's counting pass (the ring knows
-//!   what it *retained*, which is not what the source produced — see
-//!   `tf_tree::Tree::manifest`'s amendment), and `manifest` needs a CBOR
-//!   *reader* where the crate has only a writer. Shipping them off the retained
-//!   window would answer a different question than their names promise, which
-//!   is the failure §2.3's `samples`/`pushes_total` amendment already had to
-//!   correct once.
+//! * **`edges()` is two different queries and only one of them ships.** §4.4's
+//!   `tree.edges()` is the *identities* of the edges — a list of name pairs,
+//!   and [`edges_impl`] below. §4.2's `ds.edges()` promises per-edge rate,
+//!   jitter, gaps and count, and that half still needs §3's counting pass: the
+//!   ring knows what it *retained*, which is not what the source produced (see
+//!   `tf_tree::Tree::manifest`'s amendment), and dividing the one by the other
+//!   is the 4-kHz-off-a-1-kHz-edge error §2.3's `samples`/`pushes_total`
+//!   amendment already had to correct once. **The names must not acquire the
+//!   statistics by adjacency**, which is §4.4's own instruction and the reason
+//!   the two are named apart here rather than left to look like one feature
+//!   half-built.
+//! * `gaps()` needs the same counting pass, and `manifest` needs a CBOR
+//!   *reader* where the crate has only a writer.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use pyo3::prelude::*;
 
-use tf_tree::{EdgeId, FrameId, LookupError, Tree};
+use tf_tree::{ArenaView, EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
 use crate::errors::{lookup_err, NoDataError, TfTreeError};
 use crate::tree::PyTree;
@@ -118,16 +124,174 @@ pub(crate) fn span_impl(tree: &Tree, target: &str, source: &str) -> PyResult<Opt
 /// Only ever called on an error path, so the two `String`s it allocates are not
 /// a hot-path allocation — the rule they would otherwise violate.
 fn named_edge(tree: &Tree, edge: EdgeId) -> Option<(String, String)> {
-    let view = tree.arena_view();
+    named_edge_in(&tree.arena_view(), edge)
+}
+
+/// [`named_edge`] against a view the caller already holds.
+///
+/// The enumerators below call this per edge, and building an `ArenaView` per
+/// iteration to throw it away would be the kind of loop that reads as free
+/// because each step is cheap.
+fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)> {
     // One observation of the record: re-reading `view.edge(edge)` for the child
     // could name a parent and a child that never belonged to the same edge.
     let rec = view.edge(edge)?;
     let name = |raw: u32| -> Option<String> {
         let r = view.frame_record(FrameId::new(raw)?)?;
-        let n = (r.name_len as usize).min(r.name.len());
-        Some(String::from_utf8_lossy(&r.name[..n]).into_owned())
+        Some(stored_name(&r.name, r.name_len))
     };
     Some((name(rec.parent)?, name(rec.child)?))
+}
+
+/// A frame record's stored — and therefore possibly truncated — name.
+///
+/// `FrameRecord` keeps 48 bytes and a length; a longer name was cut at intern
+/// time and the cut is not recoverable here. `from_utf8_lossy` rather than a
+/// refusal because a truncation can land mid-codepoint, and a frame listing
+/// that raises on one bad byte tells the caller nothing about the other ninety
+/// frames.
+fn stored_name(bytes: &[u8], len: u8) -> String {
+    let n = (len as usize).min(bytes.len());
+    String::from_utf8_lossy(&bytes[..n]).into_owned()
+}
+
+/// The frame names on this tree, in `FrameId` order, behind `Tree.frames`.
+///
+/// # Why this walks the arena when [`span_impl`] refuses to
+///
+/// `span` is a forwarder because the thing it forwards to is *arithmetic* — the
+/// retained-window intersection — whose definition has already changed once,
+/// and a private copy of it in the one crate `just test`, `just miri` and
+/// `just loom` never build does not move when the definition does
+/// (`docs/PHASE5.md` §4.2's amendment). There is no arithmetic here: the frame
+/// table is append-only and the enumeration is `1..=frame_count`, the same
+/// three lines `tf_tree doctor`'s `Snapshot::capture` and `tf_tree_c`'s
+/// unstable enumerators already state independently.
+///
+/// **That is a reason it is tolerable here, not a reason it is right here.**
+/// The facade has no public `Tree::frames`, and the amendment's argument says a
+/// third copy should have become the first shared one. Adding it is a change to
+/// `crates/tf_tree/src/tree.rs`, which is out of this change's scope; when the
+/// facade grows the method, this becomes a forwarder like `span_impl`.
+///
+/// # The snapshot is a snapshot
+///
+/// On a live shared arena another process may intern a frame while this loop
+/// runs, so the list is what was true at some instant inside the call — exactly
+/// as `Plan::latest` and `Tree::span` already are. Frames are append-only, so
+/// what the list *does* promise is that nothing in it will ever be removed or
+/// renumbered.
+pub(crate) fn frames_impl(tree: &Tree) -> Vec<String> {
+    let view = tree.arena_view();
+    // Usable frame ids are `1..=frame_count`; slot 0 is the root sentinel.
+    let count = view.header().frame_count.load(Ordering::Relaxed);
+    let mut out = Vec::with_capacity(count as usize);
+    for raw in 1..=count {
+        // `raw >= 1`, so `FrameId::new` only declines an id past the table —
+        // which `frame_count <= max_frames` makes unreachable.
+        let Some(id) = FrameId::new(raw) else {
+            continue;
+        };
+        let Some(rec) = view.frame_record(id) else {
+            continue;
+        };
+        // **`frame_count` is bumped *before* the record is written**
+        // (`tf_tree_core::frame`'s `finish`: `fetch_add`, then `write_record`,
+        // then the Release publish). So a concurrent interner in another
+        // process can be counted here one instant before its name exists, and
+        // the slot still reads as zeros. A written record's `name_hash` is
+        // BLAKE3 of the name and is zero with probability 2⁻⁶⁴; a zeroed one is
+        // zero always. Skipping it reports that frame one call later, where
+        // taking it would report it as `""` — a name no caller can act on and
+        // one that looks like our bug rather than like a race they lost by a
+        // microsecond.
+        if rec.name_hash == 0 {
+            continue;
+        }
+        out.push(stored_name(&rec.name, rec.name_len));
+    }
+    out
+}
+
+/// The edges on this tree as `(parent, child)` name pairs, behind `Tree.edges`.
+///
+/// # `(parent, child)`, in that order, because `build` takes that order
+///
+/// `tf_tree.build([...])` and `tf_tree.open(create=[...])` both take
+/// `(parent, child)` pairs, so this is the list that reconstructs the topology
+/// it came from. Choosing `(child, parent)` — `Tree.publisher`'s order — would
+/// have made `tf_tree.build(tree.edges())` build a tree that is upside down and
+/// still valid, which is the quaternion-order trap in the topology axis.
+///
+/// # The pair is the edge's *declared* endpoints
+///
+/// `Tree::reparent` moves a child under a new parent by rewriting the topology
+/// block; `EdgeRecord::parent`, which is what this reads, keeps the frame the
+/// edge was declared under. The two agree on every tree that was never
+/// reparented, which is every tree Python can build — the binding exposes no
+/// `reparent` — and they can disagree on a shared arena a peer process has
+/// reparented. This reads the record because [`named_edge`], `tf_tree doctor`'s
+/// `Snapshot` and the CLI's edge listing all already do: one wrong-after-reparent
+/// answer beats two answers that disagree with each other.
+///
+/// # Names only — see the module docs
+///
+/// No rate, no jitter, no gap count, no sample count. That is §4.2's `ds.edges()`
+/// and it stays held back until §3's counting pass exists.
+pub(crate) fn edges_impl(tree: &Tree) -> Vec<(String, String)> {
+    let view = tree.arena_view();
+    // `edge_count` is stored as (declared edges + 1 sentinel), so the real ids
+    // are `1..edge_count` — `tf_tree_core::EdgeId`'s own doc comment, and the
+    // off-by-one that cost `tf_tree_c::unstable` a test.
+    let count = view.header().edge_count.load(Ordering::Relaxed);
+    let mut out = Vec::with_capacity(count.saturating_sub(1) as usize);
+    for raw in 1..count {
+        // `None` here means either an id past the edge table — which
+        // `edge_count <= max_edges` makes unreachable — or a slot whose record
+        // is still zeros, because a zeroed record names frame 0 and
+        // `FrameId::new(0)` declines. **That second case is what keeps the
+        // sentinel and any headroom slot out of this list**, not the loop
+        // bound, so the tempting "never drop an entry" refactor into
+        // `Tree::edge_name`'s `<root>` fallback would put `('', '')`-shaped
+        // noise in a notebook. `tests/python/test_api.py` pins it.
+        if let Some(pair) = named_edge_in(&view, EdgeId(raw)) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// The **dynamic** edges a compiled plan samples, behind `Plan.edges`.
+///
+/// # A plan does not remember its static edges, and cannot
+///
+/// `Step::Static` is "a folded static edge *or a run of them*", pre-inverted and
+/// composed at compile time (`tf_tree_core::plan::Step`). By the time a plan
+/// exists, the identities of the static edges that went into it are gone — not
+/// hidden, *gone*, which is the whole point of folding them. So this enumerates
+/// the `Step::Dyn` steps and the doc string says so; inventing ids for the
+/// folded ones would be fabricating topology, and returning nothing at all would
+/// be less useful than the answer the plan can actually give.
+///
+/// Fold order, not the order the frames appear in the path: a plan is a sequence
+/// of compositions and that is the sequence.
+///
+/// The direction each step composes in (`Step::Dyn { inverted }`) is not
+/// reported. The pair is the edge's identity — the same identity
+/// [`edges_impl`] hands out — and a plan from `base` to `map` names the same
+/// edge as one from `map` to `base`.
+pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> Vec<(String, String)> {
+    let view = tree.arena_view();
+    let mut out = Vec::with_capacity(plan.len());
+    for step in plan.steps() {
+        let Step::Dyn { edge, .. } = step else {
+            continue;
+        };
+        if let Some(pair) = named_edge_in(&view, *edge) {
+            out.push(pair);
+        }
+    }
+    out
 }
 
 /// Write this tree's arena to `path` as a `.tft` (§2.3), behind `Tree.freeze`.

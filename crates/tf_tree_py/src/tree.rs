@@ -151,6 +151,34 @@ impl PyTree {
         crate::offline::span_impl(&self.inner, target, source)
     }
 
+    /// The frame names on this tree, in declaration order (§4.4).
+    ///
+    /// A notebook user's first question about an arena is "what is in it", and
+    /// the only answer today is to shell out to the CLI. This is a tier-1 call
+    /// — one list, once, at import frequency — so R2's "the hot tier never
+    /// allocates" is not in tension with the `String`s it builds.
+    ///
+    /// See [`frames_impl`](crate::offline::frames_impl) for what the list
+    /// promises on a *live* arena and why a slot mid-intern is skipped.
+    fn frames(&self) -> Vec<String> {
+        crate::offline::frames_impl(&self.inner)
+    }
+
+    /// The edges on this tree as `(parent, child)` name pairs (§4.4).
+    ///
+    /// **Names only.** No rate, no jitter, no gaps, no sample count: that is
+    /// `docs/PHASE5.md` §4.2's `ds.edges()`, which stays held back until §3's
+    /// counting pass exists, because a rate computed from what a ring *retained*
+    /// answers a different question than its name promises.
+    ///
+    /// `(parent, child)` is `tf_tree.build`'s order, so
+    /// `tf_tree.build(tree.edges())` reconstructs the topology — see
+    /// [`edges_impl`](crate::offline::edges_impl), which also covers the one
+    /// case where the pair and the live topology can disagree.
+    fn edges(&self) -> Vec<(String, String)> {
+        crate::offline::edges_impl(&self.inner)
+    }
+
     /// Whether this tree's arena is shared with other processes.
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
@@ -547,6 +575,19 @@ impl PyPlan {
     /// Folded depth of this path, in edges.
     fn depth(&self) -> usize {
         self.plan.len()
+    }
+
+    /// The **dynamic** edges this plan samples, as `(parent, child)` pairs
+    /// (§4.4).
+    ///
+    /// Shorter than [`depth`](Self::depth) whenever the path crosses a static
+    /// edge: those are folded into a constant at compile time and their
+    /// identities do not survive the fold. See
+    /// [`plan_edges_impl`](crate::offline::plan_edges_impl) — the alternative
+    /// to saying so is fabricating ids for edges the plan genuinely no longer
+    /// knows about.
+    fn edges(&self) -> Vec<(String, String)> {
+        crate::offline::plan_edges_impl(self.tree(), &self.plan)
     }
 
     fn __repr__(&self) -> String {

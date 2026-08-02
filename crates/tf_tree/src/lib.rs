@@ -35,6 +35,47 @@
 //! [`tf_tree_core`]. This crate adds only what needs `std`: the concrete [`Tree`]
 //! owning a heap arena, the per-thread plan cache behind [`Tree::lookup`]
 //! (`thread_local!`), and [`Described`]'s `Display`.
+//!
+//! # [`Tree`] is not `Clone`, and `Arc<Tree>` is the embedding idiom
+//!
+//! [`Tree`] is `Send + Sync`, so a shared reference is all a reader needs — but
+//! it is deliberately not `Clone`, and the reason is that a `Tree` is not just a
+//! handle. It owns its arena backing *and* holds a registered slot in the
+//! arena's participant table — a fixed-size table (`DEFAULT_MAX_PARTICIPANTS`,
+//! 64) sized when the arena is created, not an unbounded pool. A derived
+//! `Clone` would have to pick one of two wrong answers: register a second slot,
+//! and burn a scarce resource every time somebody passed a tree by value; or
+//! share the first one, and report two participants as one to the reaper that
+//! decides whether a slot's owner is still alive.
+//!
+//! So share it with an `Arc`:
+//!
+//! ```
+//! use std::sync::Arc;
+//! use tf_tree::{Iso3, Stamp, TreeBuilder};
+//!
+//! let tree = Arc::new(
+//!     TreeBuilder::new()
+//!         .static_edge("map", "odom", &Iso3::IDENTITY)
+//!         .build()
+//!         .expect("layout"),
+//! );
+//! let reader = Arc::clone(&tree);
+//! let joined = std::thread::spawn(move || {
+//!     let now: Stamp = Stamp::from_nanos(0);
+//!     reader.lookup("map", "odom", now)
+//! })
+//! .join()
+//! .expect("reader thread");
+//! assert_eq!(joined.unwrap(), Iso3::IDENTITY);
+//! ```
+//!
+//! This is not new advice, which is the point of writing it down: `tests/tsan.rs`
+//! shares a tree between threads this way, `tf_tree_c`'s `TreeShare` is an
+//! `Arc<Tree>` behind a handle, and PyO3's `Py<PyTree>` is the same refcount
+//! spelled in CPython's allocator. Three surfaces arrived here independently and
+//! none of them said so where an embedder would look
+//! (`docs/API.md` §2.2).
 
 mod cache;
 mod tree;
@@ -103,8 +144,41 @@ mod open;
 pub use open::{open, CreatePolicy, Open, OpenError};
 
 // Re-export the core engine surface so downstream code depends only on `tf_tree`.
+
+/// Raw, read-only access to the arena's own tables.
+///
+/// # Stability
+///
+/// **This export is CLI-facing, and it moves behind an `unstable` feature
+/// before any published tag** (`docs/API.md` §2.6). C has two headers and the
+/// split *is* the promise; Rust has one visibility tier, so everything `pub`
+/// here reads as a stability commitment whether it was meant as one or not.
+/// This one was not: it exists so `tf_tree doctor` and `tf_tree top` can render
+/// what is in a segment without depending on `tf_tree_core` directly, and its
+/// shape follows the arena layout — which `docs/PHASE5.md` §1 is about to
+/// change on purpose.
+///
+/// The `tf_tree::unstable::*` mirror itself is **deferred while the crate is
+/// private** and is not to be built ahead of a reason to. The heading is not
+/// deferred, because it costs a comment and buys the difference between a move
+/// that executes a documented plan and a move that breaks somebody who had no
+/// way to know.
 pub use tf_tree_core::arena_view::ArenaView;
-pub use tf_tree_core::edge::{EdgeKind, Publisher};
+
+/// Whether an edge is dynamic, static or tombstoned.
+///
+/// # Stability
+///
+/// **CLI-facing, and it moves behind `unstable` with [`ArenaView`]** — read
+/// that item's note for the argument. It is here for the same consumer and is
+/// reachable only through the same door: the value comes from an `EdgeRecord`,
+/// which is an [`ArenaView`] read. An embedder declares an edge's kind by
+/// calling [`TreeBuilder::static_edge`] or [`TreeBuilder::dynamic_edge`] and
+/// never names this type. ([`EdgeMeta`] carries one, but its only consumer is
+/// `tf_tree_core::compile`, which this facade does not re-export.)
+pub use tf_tree_core::edge::EdgeKind;
+
+pub use tf_tree_core::edge::Publisher;
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 pub use tf_tree_core::plan::{
     AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
