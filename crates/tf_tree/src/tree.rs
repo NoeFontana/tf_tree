@@ -32,30 +32,31 @@ use tf_tree_math::Iso3;
 
 use crate::cache;
 
-/// First backoff interval for [`Tree::await_frames`]. Doubles up to
+/// First backoff interval for this crate's two waits. Doubles up to
 /// [`MAX_BACKOFF`].
 ///
-/// **The rendezvous' own pair** (`docs/decisions/0019` §2b names them), and the
-/// `const` assertion below is what keeps that true: `tf_tree_ipc` is optional
-/// and Linux-only, so a default build cannot name `tf_tree_ipc::MIN_BACKOFF` at
-/// all — but every build that *can* fails to compile if the two disagree. That
-/// is a stronger guarantee than a comment asking the next editor to change both,
-/// and it is why these are here rather than re-exported.
-const MIN_BACKOFF: Duration = Duration::from_micros(200);
-/// Backoff ceiling for [`Tree::await_frames`]; see [`MIN_BACKOFF`].
-const MAX_BACKOFF: Duration = Duration::from_millis(4);
-
-#[cfg(all(feature = "shm", target_os = "linux"))]
-const _: () = {
-    assert!(
-        MIN_BACKOFF.as_nanos() == tf_tree_ipc::MIN_BACKOFF.as_nanos(),
-        "the frames wait and the rendezvous must back off identically"
-    );
-    assert!(
-        MAX_BACKOFF.as_nanos() == tf_tree_ipc::MAX_BACKOFF.as_nanos(),
-        "the frames wait and the rendezvous must back off identically"
-    );
-};
+/// **One definition, and it is the facade's own** (`docs/decisions/0019` §2b).
+/// Both poll loops the record adds use it: [`Tree::await_frames`] here, and
+/// `crate::open::Open::await_open` one module over.
+///
+/// An earlier revision of this branch had it *twice* — widened to `pub` on
+/// `tf_tree_ipc` for `await_open`, and restated here behind a
+/// `const _: () = assert!(…)` equality check for `await_frames`, which cannot
+/// name `tf_tree_ipc` at all in a default build. That is two mechanisms for one
+/// pair of numbers, and the cost of the first is permanent public API on a crate
+/// that had no reason to grow any.
+///
+/// What the deleted assertion guaranteed was that these matched
+/// `tf_tree_ipc`'s *internal* handshake backoff, and that coupling was
+/// decorative rather than required: `await_open` retries whole `attempt()`
+/// calls, each of which runs the rendezvous' own retry loop inside it. They are
+/// nested loops over different work and nothing breaks if they disagree. The
+/// numbers are chosen for the same reason in both places — small enough that a
+/// takeover completing in a millisecond is joined promptly — not because one
+/// derives from the other.
+pub(crate) const MIN_BACKOFF: Duration = Duration::from_micros(200);
+/// Backoff ceiling for this crate's two waits; see [`MIN_BACKOFF`].
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_millis(4);
 
 /// Why [`Tree::await_frames`] could not produce ids.
 ///
@@ -97,6 +98,23 @@ pub enum AwaitError {
     /// refusing now is the reversible direction.
     #[error("await_frames refuses a writable tree; use Tree::frame, which interns on demand and cannot fail for absence")]
     WritableTree,
+    /// The tree is a frozen `.tft` image, so no name will ever be interned into
+    /// it.
+    ///
+    /// The sibling of [`AwaitError::WritableTree`] and refused for the same
+    /// reason: a wait that cannot mean what the caller thinks should say so
+    /// rather than sleep. `docs/PHASE5.md` §2.4 makes a frozen arena
+    /// permanently read-only *and* writer-free, so this wait is futile by
+    /// construction — polling it would burn the caller's whole budget and then
+    /// report [`AwaitError::Timeout`], which is technically honest and
+    /// practically a lie: nothing was late, and waiting longer would not help.
+    ///
+    /// A frozen tree's frame table is complete the moment it opens, so the
+    /// right call is [`Tree::frames`] or a direct [`Tree::lookup`] — and
+    /// [`Tree::describe`] on the resulting [`LookupError::UnknownFrame`] lists
+    /// what the file actually contains.
+    #[error("await_frames refuses a frozen .tft tree: it has no writers, so no name can appear")]
+    FrozenTree,
     /// A name resolved to an error rather than to an id.
     ///
     /// Terminal, not retried. [`FrameError::FrameHashCollision`] is a permanent
@@ -718,6 +736,27 @@ impl ArenaBacking {
             // heap arena is.
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ArenaBacking::Frozen(_) => false,
+            ArenaBacking::Heap(_) => false,
+        }
+    }
+
+    /// Whether this arena is a `.tft` image rather than something a process
+    /// could still be writing to.
+    ///
+    /// **Not derivable from the other two.** `is_writable() == false` is also
+    /// true of a live `PROT_READ` attachment, and `is_shared() == false` is also
+    /// true of a heap arena; only the pair identifies a frozen one, and a
+    /// predicate spelled as a conjunction of two unrelated answers is one
+    /// backing variant away from being wrong. [`Tree::await_frames`] is the
+    /// caller: a wait on a frozen tree is futile *by construction* — §2.4 says
+    /// a frozen arena has no writers at all — and futility that is statically
+    /// known should be an answer, not a nap.
+    fn is_frozen(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Frozen(_) => true,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ArenaBacking::Mapped(_) => false,
             ArenaBacking::Heap(_) => false,
         }
     }
@@ -1393,27 +1432,43 @@ impl Tree {
     /// different absences, and a consumer that started before its publisher
     /// meets both.
     ///
-    /// Array in, array out, and **no allocation**: `N` is a const generic, ids
-    /// found on an early iteration are memoized, and frames are append-only
-    /// (D10) so a name once found cannot become unfound.
+    /// Array in, array out, and **no allocation**: `N` is a const generic, and
+    /// ids found on an early iteration are memoized rather than re-probed —
+    /// which is legal because frames are append-only (D10), so a name once found
+    /// cannot become unfound. That memoization is a *cost* property only:
+    /// `find_frame` is idempotent, so dropping it would return the same ids,
+    /// just after re-hashing every already-resolved name on every iteration. No
+    /// assertion anywhere observes it, and `tests/rendezvous.rs` says so rather
+    /// than claiming a guard it does not have.
     ///
-    /// # The predicate is `find_frame`, and a writable tree is refused
+    /// # The predicate is `find_frame`, and two handles are refused outright
     ///
     /// The wait polls the arena's intern table directly, never [`Tree::frame`],
     /// which is the wrong predicate in *both* modes for opposite reasons: on a
-    /// read-only arena it answers [`FrameError::ReadOnly`] for an absent name,
-    /// and on a writable one it **interns and succeeds immediately**. The second
-    /// is the dangerous one — it is a confident wrong answer, an id for a name
-    /// nobody declared.
+    /// read-only arena it answers [`FrameError::ReadOnly`] for an absent name —
+    /// so the wait would never resolve — and on a writable one it **interns and
+    /// succeeds immediately**. The second is the dangerous one: it is a
+    /// confident wrong answer, an id for a name nobody declared.
     ///
     /// So a writable tree gets [`AwaitError::WritableTree`] rather than a
     /// silently-chosen meaning, before any sleep. A publisher already has
-    /// [`Tree::frame`], which on its tree cannot fail for absence.
+    /// [`Tree::frame`], which on its tree cannot fail for absence. A frozen
+    /// `.tft` gets [`AwaitError::FrozenTree`] for the sibling reason: it has no
+    /// writers, so the poll is futile by construction.
+    ///
+    /// **Which gate pins which half**, because they are not the same gate. The
+    /// `WritableTree` refusal is `tests/await_frames.rs` under plain
+    /// `just test`; `FrozenTree` is `tests/frozen.rs` under `just shm-check`;
+    /// and the choice of `find_frame` over [`Tree::frame`] can only be observed
+    /// on a *read-only* handle, which a default build cannot construct at all —
+    /// it is pinned by `a_consumer_waits_for_a_frame_interned_after_the_arena_exists`
+    /// in `tests/rendezvous.rs`, under `just shm-rendezvous`, and nowhere else.
     ///
     /// # Granularity
     ///
     /// A bounded poll — `MIN_BACKOFF` 200 µs doubling to `MAX_BACKOFF` 4 ms,
-    /// the rendezvous' own — not a notification. `docs/decisions/0018` records
+    /// this crate's pair, shared with `Open::await_open` — not a notification.
+    /// `docs/decisions/0018` records
     /// why there is no arena-resident primitive to wake on (a `PROT_READ`
     /// consumer cannot register on one without giving up D18's boundary), and
     /// the argument applies here with more force because topology settles once,
@@ -1423,10 +1478,13 @@ impl Tree {
     /// # Errors
     ///
     /// [`AwaitError::WritableTree`] immediately on a writable tree;
+    /// [`AwaitError::FrozenTree`] immediately on a frozen `.tft`;
     /// [`AwaitError::ChildDetached`] on a tree inherited across a `fork()`;
     /// [`AwaitError::Frame`] if a name resolves to a hash collision or a
     /// contended interner; [`AwaitError::Timeout`] carrying the hash of the
-    /// first name still missing when the budget ran out.
+    /// **first** name still missing when the budget ran out — first in `names`
+    /// order, not first probed, so a request whose leading names resolved names
+    /// the earliest one that did not.
     ///
     /// # Examples
     ///
@@ -1483,6 +1541,13 @@ impl Tree {
         // the worst of both answers.
         if self.is_writable() {
             return Err(AwaitError::WritableTree);
+        }
+        // The other statically-futile handle. A frozen arena is read-only *and*
+        // writer-free (`docs/PHASE5.md` §2.4), so the poll below would run the
+        // caller's whole budget and report a timeout for something that was
+        // never coming. Distinct condition, distinct answer.
+        if self.arena.is_frozen() {
+            return Err(AwaitError::FrozenTree);
         }
         let start = std::time::Instant::now();
         let mut found: [Option<FrameId>; N] = [None; N];
@@ -2830,10 +2895,26 @@ impl fmt::Display for Described<'_> {
             // about to ask next. Naming that costs one walk of a table this
             // process has already mapped.
             //
-            // **Bounded at eight, and sorted.** Unbounded, a `Display` on a
-            // 10 000-frame tree would allocate 10 000 `String`s to render one
-            // error line; sorted, two runs of the same failure print the same
-            // list, which `Tree::frames`' id order does not promise across
+            // **Bounded at eight, and sorted — and the bound is on the *text*,
+            // not on the allocation.** An earlier revision of this comment
+            // justified the truncation with "unbounded, a `Display` on a
+            // 10 000-frame tree would allocate 10 000 `String`s", which is
+            // false: `Tree::frames` allocates one `String` per frame and sorts
+            // all of them *before* the `truncate` below ever runs, so the
+            // allocation is 10 000 either way. What eight buys is a readable
+            // error line — an operator scanning a log wants a sample of the
+            // namespace, not a dump of it.
+            //
+            // Paying that allocation is a deliberate accept, not an oversight:
+            // this is `Display` on an error, reached once per failed lookup by a
+            // process that is already about to log or exit, and the frame table
+            // is memory this process has mapped. Making it genuinely bounded
+            // means a bounded-`k` selection over borrowed `&str`s out of the
+            // arena rather than `Tree::frames`' owned `Vec<String>`, which is a
+            // different method with different unsafe-free borrow plumbing; it is
+            // recorded as a follow-up rather than smuggled into an error-message
+            // change. Sorted, so two runs of the same failure print the same
+            // list — `Tree::frames`' id order does not promise that across
             // processes that interned in different orders.
             LookupError::UnknownFrame { hash } => {
                 write!(f, "unknown frame (name hash {hash:#018x})")?;

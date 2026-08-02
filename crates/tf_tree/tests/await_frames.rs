@@ -23,18 +23,36 @@ fn stamp() -> Stamp<SystemDomain> {
     Stamp::from_nanos(0)
 }
 
-/// **The crux.** A heap tree is writable, so `Tree::frame` would intern an
-/// undeclared name on demand and hand back an id for a frame nobody declared.
-/// `await_frames` refuses instead — and refuses *before* any sleep, which the
-/// elapsed-time assertion is what pins.
+/// **The crux, and it pins the *guard* — not the predicate.** A heap tree is
+/// writable, so `Tree::frame` would intern an undeclared name on demand and hand
+/// back an id for a frame nobody declared. `await_frames` refuses instead, and
+/// refuses *before* any sleep.
 ///
-/// **Mutant: build the predicate on `Tree::frame`** ⇒ `await_frames` returns
-/// `Ok([FrameId(1), FrameId(2)])` for `"nobody_declared_this"`, a confident
-/// wrong answer, and this test fails on the `assert_eq!`.
+/// **What this test cannot see.** A previous revision of this note claimed the
+/// killer here was "build the predicate on `Tree::frame`". It is not, and the
+/// mutation was run: with `match self.frame(name)` substituted for
+/// `view.find_frame(name)` and the `is_writable` guard untouched, this target
+/// reports *"5 tests run: 5 passed"*. The guard returns `WritableTree` before
+/// the predicate is reached, so on the only tree a default build can construct
+/// the predicate is unreachable. Killing the predicate mutant needs a *read-only*
+/// handle, and that needs a live shared arena:
+/// `a_consumer_waits_for_a_frame_interned_after_the_arena_exists` in
+/// `tests/rendezvous.rs` is the test that does it (verified — it fails
+/// `Frame(ReadOnly)`), and `just shm-rendezvous` is its only gate.
 ///
-/// **Mutant: drop the `is_writable` guard** ⇒ the poll on `find_frame` never
-/// resolves and the call takes the full five seconds, failing the elapsed
-/// assertion rather than the equality one.
+/// **Mutant: `if false && self.is_writable()`** ⇒ verified. `find_frame` answers
+/// `None` forever for the undeclared name, so the call runs the full budget:
+/// *"FAIL [5.007s] … left: Err(Timeout { hash: 13827985020167223838 }), right:
+/// Err(WritableTree)"*, with `elapsed 5.000076187s` in the message.
+/// `await_frames_of_nothing_is_not_a_special_case` fails alongside it, on
+/// *"left: Ok([]), right: Err(WritableTree)"*.
+///
+/// **Mutant: keep the guard but move it inside the deadline branch**, so the
+/// refusal is issued only after the budget is spent ⇒ verified. The equality
+/// assertion now *passes* — the answer is still `WritableTree` — and the
+/// elapsed bound is what fires: *"the refusal is a property of the handle and
+/// must not cost a poll: 5.000065135s"*. That is the assertion the second
+/// `assert!` exists for, and the reason it is not redundant with the first.
 #[test]
 fn await_frames_on_a_writable_tree_is_refused_immediately() {
     let tree = TreeBuilder::new()
@@ -116,11 +134,26 @@ fn an_undeclared_frame_describes_the_tree_it_is_not_in() {
     );
 }
 
-/// The listing is **bounded**: `Display` on a wide tree must not allocate one
-/// `String` per frame to render one error line.
+/// The rendered **text** is bounded at eight names and sorted.
 ///
-/// **Mutant: drop the `names.truncate(SHOWN)`** ⇒ `frame_11` appears and the
-/// last assertion fails.
+/// **It is the text, not the allocation.** `Described` reaches the frame list
+/// through `Tree::frames`, which allocates one `String` per frame and sorts all
+/// of them before `truncate` runs — so the truncation saves rendering, not
+/// memory, and this test asserts only what is true. See the arm's comment in
+/// `tree.rs` for why that allocation is an accepted cost on an error path.
+///
+/// **Mutant: drop the `names.truncate(SHOWN)`** ⇒ verified. *"the listing is
+/// unbounded: … this tree has frame_00, … frame_11, hub, … (13 total)"*, on the
+/// `!msg.contains("frame_11")` assertion.
+///
+/// **Mutant: drop the `names.sort_unstable()`** ⇒ verified, and it is the
+/// **first** assertion that catches it, not the `frame_11` one. Intern order
+/// puts `hub` first (it is the parent of every edge, so it is interned before
+/// `frame_00`), which shifts the window down by one: *"the first eight sorted
+/// names should be listed: … this tree has hub, frame_00, … frame_06, … (13
+/// total)"*. `frame_11` is still absent, so the bound assertion alone would have
+/// passed the mutant — which is why the `frame_07` half of the first assertion
+/// is load-bearing and not decoration.
 #[test]
 fn the_described_frame_listing_is_bounded_and_sorted() {
     let mut b = TreeBuilder::new();

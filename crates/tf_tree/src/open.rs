@@ -33,10 +33,10 @@ use tf_tree_arena::AttachMode;
 use tf_tree_ipc::{
     boot_id, self_start_time, AccessMode, ArenaName, EnvVar, HelloRequest, HelloStatus, IpcError,
     OpenOutcome, OwnerServer, Rendezvous, RuntimeDir, SegmentDescriptor, ShutdownHandle,
-    SocketProbe, SystemEnv, DEFAULT_OPEN_TIMEOUT, MAX_BACKOFF, MIN_BACKOFF,
+    SocketProbe, SystemEnv, DEFAULT_OPEN_TIMEOUT,
 };
 
-use crate::tree::{BuildError, Tree, TreeBuilder};
+use crate::tree::{BuildError, Tree, TreeBuilder, MAX_BACKOFF, MIN_BACKOFF};
 
 /// Re-exported so a caller does not have to depend on `tf_tree_ipc` directly
 /// just to name a policy `open()` already takes.
@@ -399,8 +399,9 @@ impl Open {
     ///
     /// # Granularity
     ///
-    /// A bounded poll — `MIN_BACKOFF` doubling to `MAX_BACKOFF`, the
-    /// rendezvous' own constants — not a notification. `docs/decisions/0018`
+    /// A bounded poll — `MIN_BACKOFF` doubling to `MAX_BACKOFF`, this crate's
+    /// own pair, shared with [`Tree::await_frames`] and defined once in
+    /// `crate::tree` — not a notification. `docs/decisions/0018`
     /// records why there is no arena-resident primitive to wake on, and it
     /// applies here with more force: topology settles once, at startup. So this
     /// returns *later* than the arena appeared, by up to one backoff interval
@@ -451,12 +452,31 @@ impl Open {
 
     /// One pass of §3.4.
     ///
-    /// `&mut self` so [`Open::await_open`] can call it repeatedly.
-    /// `self.layout.take()` is safe across retries because the only path that
-    /// consumes it returns either `Ok` — no retry — or
-    /// [`OpenError::NoLayoutToCreate`], which `is_retryable` classifies as
-    /// terminal. A second attempt therefore never finds the layout missing
-    /// where the first would have found it present.
+    /// `&mut self` so [`Open::await_open`] can call it repeatedly, and **the
+    /// layout is cloned rather than taken** — which is the difference between an
+    /// audit and a guarantee.
+    ///
+    /// The audit this replaces read: the only path that consumes the layout
+    /// returns either `Ok` (no retry) or [`OpenError::NoLayoutToCreate`], which
+    /// `is_retryable` classifies as terminal, so a second attempt never finds it
+    /// missing where the first found it present. That was **wrong**. On the same
+    /// `Created | TookOver` arm, `spawn_owner_server` returns
+    /// `OpenError::Rendezvous(IpcError::ArenaAbsent)` when `tree.shared_fd()` is
+    /// `None`, and `is_retryable` calls that **retryable** — so `await_open`
+    /// would loop with the layout already gone and report `NoLayoutToCreate`, a
+    /// diagnostic pointing at the caller for an internal invariant break.
+    ///
+    /// Unreachable today (a freshly `build_shared`-ed arena always has an fd),
+    /// which is precisely why a comment is the wrong instrument: nothing would
+    /// fail if the audit went stale again. Cloning removes the class instead of
+    /// re-auditing it, and it is what `&mut self` cost in the first place —
+    /// before `await_open` existed this method took `self` by value and simply
+    /// moved the layout out.
+    ///
+    /// The price is one [`TreeBuilder`] clone per *creating* attempt, next to a
+    /// `memfd_create`, an `mmap` and a socket bind. Consumers (`create =
+    /// Never`) never reach it, and a creating caller reaches it at most once —
+    /// `Created` either succeeds or fails terminally.
     fn attempt(&mut self, per_attempt: Duration) -> Result<Tree, OpenError> {
         // **Before `RuntimeDir::resolve()`, deliberately** (`docs/decisions/0019`
         // plan step 1). This is a property of the arguments alone; checking it
@@ -524,7 +544,9 @@ impl Open {
                 Ok(tree)
             }
             OpenOutcome::Created | OpenOutcome::TookOver => {
-                let builder = self.layout.take().ok_or(OpenError::NoLayoutToCreate)?;
+                // `clone`, not `take` — see this method's doc comment. A retry
+                // must find the layout exactly as the first attempt found it.
+                let builder = self.layout.clone().ok_or(OpenError::NoLayoutToCreate)?;
                 let mut tree = builder.build_shared(rv.name().as_str())?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 tree.use_claim_leases(open_claim_lock(&rv)?);

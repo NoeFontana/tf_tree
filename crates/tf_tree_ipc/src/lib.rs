@@ -106,7 +106,6 @@ pub use lockfile::{LockFile, LockProbe, CLAIM_BASE, MAX_CLAIM_BYTES, MAX_PARTICI
 pub use ofd::LockAttempt;
 pub use open::{
     CreatePolicy, NoServer, Open, OpenOutcome, Reach, ServerProbe, Session, DEFAULT_OPEN_TIMEOUT,
-    MAX_BACKOFF, MIN_BACKOFF,
 };
 pub use procstat::{boot_id, parse_start_time, self_comm, self_start_time, start_time_of};
 pub use rendezvous::{

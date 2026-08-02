@@ -417,10 +417,50 @@ fn a_wait_for_an_arena_that_never_starts_gives_up() {
 /// failure this method is shaped to avoid: a wait that interned the name itself
 /// and handed back an id for a frame nobody declared.
 ///
-/// **Mutant: build the predicate on `Tree::frame`** ⇒ the read-only consumer
-/// gets `FrameError::ReadOnly` immediately and never resolves.
-/// **Mutant: drop the memoization or the deadline** ⇒ caught by the elapsed
-/// bounds.
+/// **This is the only test in the repository that pins the predicate.**
+/// `await_frames`'s `is_writable` guard fires before the predicate on every tree
+/// a default build can construct, so `tests/await_frames.rs` is blind to it; a
+/// read-only handle needs a live shared arena, and this is where one exists.
+/// `just shm-rendezvous` is therefore the predicate's entire gate.
+///
+/// **Mutant: build the predicate on `Tree::frame`** (`match self.frame(name)`,
+/// `is_writable` guard untouched) ⇒ verified. *"FAIL [0.009s] … the frame was
+/// interned well inside the budget: Frame(ReadOnly)"* — the read-only consumer
+/// is refused on the first probe and never resolves.
+/// `a_frames_wait_for_a_name_nobody_will_intern_gives_up` fails with it
+/// (*"left: Frame(ReadOnly), right: Timeout { … }"*), so the predicate has two
+/// killers, both in this file. The same mutant leaves
+/// `cargo nextest run -p tf_tree --test await_frames` at *"5 tests run: 5
+/// passed"*, which is the measurement that moved this note here.
+///
+/// # What this test does not cover, stated rather than implied
+///
+/// An earlier revision claimed *"drop the memoization or the deadline ⇒ caught
+/// by the elapsed bounds"*. **Both mutants pass**, measured:
+///
+/// - `if false && slot.is_some()` (memoization off) ⇒ *"15 tests run: 15
+///   passed"*, this test at 0.210 s against 0.217 s unmutated, and the plain
+///   `await_frames` target at *"5 tests run: 5 passed"*. It cannot be caught
+///   here, and it cannot be caught anywhere: `find_frame` is idempotent and
+///   frames are append-only, so re-probing a found name returns the same id for
+///   a few hundred nanoseconds of hashing. The memoization is a **cost**
+///   property with no observable behaviour, and this note says so instead of
+///   inventing a guard for it. If that ever needs pinning it wants a benchmark,
+///   not an assertion.
+/// - `if false && start.elapsed() >= timeout` (deadline off) ⇒ **this test still
+///   passes**. The frame arrives at 200 ms against a 20 s budget, so it never
+///   reaches the deadline at all. That gap is real and is now closed by
+///   `a_frames_wait_for_a_name_nobody_will_intern_gives_up` below — the only
+///   test in the run that mutant fails — which is where the deadline claim
+///   belongs.
+///
+/// What the elapsed bounds here *do* pin is that the call waited rather than
+/// racing to a lucky read — the same thing they pin in
+/// `a_consumer_waits_for_an_arena_that_starts_late`.
+///
+/// It also pins the **live** half of `ArenaBacking::is_frozen`, which
+/// `tests/frozen.rs` cannot: mutating `Mapped(_) => true` ⇒ verified, *"the
+/// frame was interned well inside the budget: FrozenTree"*.
 #[test]
 fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
     use std::io::Write;
@@ -475,6 +515,118 @@ fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
     assert!(
         elapsed < Duration::from_secs(10),
         "the wait far outlasted the intern it was waiting for: {elapsed:?}"
+    );
+}
+
+/// **`AwaitError::Timeout`, which nothing else in any gate produces.**
+///
+/// Before this test the whole `if start.elapsed() >= timeout { … }` block in
+/// `Tree::await_frames` could be deleted and every suite stayed green —
+/// measured, `if false && start.elapsed() >= timeout` leaves `just test`'s
+/// `await_frames` target at *"5 tests run: 5 passed"*, and in
+/// `just shm-rendezvous` it fails **only** this test — *"15 tests run: 14
+/// passed, 1 failed"*, so the fourteen that predate it are all blind to the
+/// deadline. `docs/decisions/0019` §2b's second wait could hang a consumer
+/// forever with nothing to say so. Untested along with it: the
+/// first-missing-name hash, the `saturating_sub` clamp, and `all_interned::<0>`.
+///
+/// **The wait runs on a worker thread and the main thread bounds it with
+/// `recv_timeout`.** This repository has **no `.config/` directory at all** —
+/// verified, the root dotfiles are `.cargo`, `.claude`, `.git`, `.github`,
+/// `.gitignore`, and `find` reports no `nextest.toml` anywhere — so there is no
+/// `slow-timeout` or `terminate-after` profile setting, and a call that
+/// ignored its deadline would wedge the whole run instead of failing one test.
+/// The channel is this test supplying the bound nextest does not. It is the same
+/// shape `a_wait_for_an_arena_that_never_starts_gives_up` uses one wait over.
+///
+/// The `Tree` is built *inside* the thread rather than moved into it: `Scratch`
+/// has already put `TF_TREE_RUNTIME_DIR` in this process's environment, so the
+/// thread resolves the same rendezvous, and nothing has to be `Send`.
+///
+/// **`["map", …]` and not just the missing name.** `map` is in the fixture
+/// layout, so it resolves on the first probe and is memoized; the reported hash
+/// must then be the *second* name's. A `Timeout` that hashed `names[0]` would
+/// name a frame that is present, which is the most confusing answer available.
+///
+/// **Mutants, each applied, run, observed and reverted:**
+///
+/// - `if false && start.elapsed() >= timeout` (the deadline) ⇒ *"FAIL
+///   [30.008s] … await_frames never returned: it ignored its deadline. There is
+///   no .config/nextest.toml in this repository, so nothing else would have
+///   bounded this: Timeout"*. Thirty seconds and a named failure, not a hang.
+/// - `.next()` in place of `.find(|(_, slot)| slot.is_none())` (report
+///   `names[0]` rather than the first *missing* name) ⇒ *"the timeout named the
+///   wrong frame, or was not a timeout at all — left: Timeout { hash:
+///   10663285463286226064 }, right: Timeout { hash: 15926179251682185921 }"*.
+///   The left value is `map`'s hash, a frame that is present.
+/// - `if N == 0 { return None; }` at the head of `all_interned` ⇒ *"a
+///   zero-length request on a waitable tree must be answered without touching
+///   the arena — left: Err(Timeout { hash: 0 }), right: Ok([])"*. That `hash: 0`
+///   is the `map_or` fallback in the deadline branch, reached because no slot is
+///   missing — so this mutant also exercises the arm whose comment calls itself
+///   unreachable.
+#[test]
+fn a_frames_wait_for_a_name_nobody_will_intern_gives_up() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use tf_tree::AwaitError;
+    use tf_tree_core::frame::blake3_64;
+
+    /// Nothing in `rendezvous_child`'s fixture interns this, and nothing in this
+    /// test does either.
+    const MISSING: &str = "no_publisher_will_ever_declare_this";
+
+    let scratch = Scratch::new("frames-timeout");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(
+        owner.line().starts_with("owning "),
+        "the owner did not start"
+    );
+
+    let budget = Duration::from_millis(300);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let consumer = tf_tree::Open::new()
+            .open()
+            .expect("join the arena the owner is serving");
+        let writable = consumer.is_writable();
+        // **`all_interned::<0>` — reachable only from here.** The `N == 0` test
+        // in `tests/await_frames.rs` runs on a heap tree, so it is refused by
+        // the writable guard and the conversion helper is never called with an
+        // empty array anywhere else in the workspace.
+        let empty = consumer.await_frames([], Duration::from_millis(0));
+        let started = Instant::now();
+        let outcome = consumer.await_frames(["map", MISSING], budget);
+        let _ = tx.send((writable, empty, outcome, started.elapsed()));
+    });
+
+    let (writable, empty, outcome, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "await_frames never returned: it ignored its deadline. There is no \
+         .config/nextest.toml in this repository, so nothing else would have \
+         bounded this",
+    );
+
+    assert!(!writable, "the default attach must be read-only (D18)");
+    assert_eq!(
+        empty,
+        Ok([]),
+        "a zero-length request on a waitable tree must be answered without \
+         touching the arena"
+    );
+
+    let err = outcome.expect_err("a name nobody interned must not resolve");
+    assert_eq!(
+        err,
+        AwaitError::Timeout {
+            hash: blake3_64(MISSING)
+        },
+        "the timeout named the wrong frame, or was not a timeout at all"
+    );
+    assert!(elapsed >= budget, "it gave up early: {elapsed:?}");
+    assert!(
+        elapsed < budget * 20,
+        "it overran its budget by more than the backoff can explain: {elapsed:?}"
     );
 }
 

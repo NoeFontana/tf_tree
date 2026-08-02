@@ -306,6 +306,77 @@ fn a_frozen_tree_refuses_every_mutation() {
     assert!(!frozen.is_shared());
 }
 
+/// **A frozen tree refuses `await_frames` instead of napping through the
+/// caller's budget.**
+///
+/// `is_writable()` is `false` on a `.tft`, so the `WritableTree` guard does not
+/// catch it and the poll loop would run — for a name that can never appear,
+/// because §2.4 gives a frozen arena no writers at all. The refusal is the
+/// sibling of the writable one and rests on the same argument from
+/// `docs/decisions/0019`: a wait that cannot mean what the caller thinks should
+/// answer, not sleep.
+///
+/// **The absent name is asked first, and the ordering is the test's design.**
+/// A guard-less build answers a *present* name in microseconds — measured by
+/// timing `await_frames(["map"])` under that mutation, `Ok([FrameId(1)])` in
+/// **19.289 µs** — so a test that only asked for `map` would catch the mutant on
+/// the value but never on the clock, and would say nothing at all about the
+/// futile wait this guard exists to prevent. Asking for a name the file does not
+/// contain, against a **300 ms** budget, puts the mutant in the poll loop where
+/// both assertions can see it.
+///
+/// The budget is short on purpose: a guard-less build must *fail* in under a
+/// second, not wedge the suite. **This repository has no `.config/` directory at
+/// all** — verified, the root dotfiles are `.cargo`, `.claude`, `.git`,
+/// `.github`, `.gitignore`, and `find` reports no `nextest.toml` anywhere — so
+/// there is no `slow-timeout` or `terminate-after` profile setting to bound it.
+///
+/// **Mutants, each applied, run, observed and reverted:**
+/// - `if false && self.arena.is_frozen()` ⇒ *"assertion `left == right` failed:
+///   elapsed 300.090015ms — left: Err(Timeout { hash: 7284396103932369152 }),
+///   right: Err(FrozenTree)"*.
+/// - `ArenaBacking::is_frozen` returns `false` for `Frozen` ⇒ *"elapsed
+///   300.062125ms — left: Err(Timeout { hash: 7284396103932369152 }), right:
+///   Err(FrozenTree)"*, identical.
+/// - `is_frozen` returns `true` for `Mapped` ⇒ **not** caught here, and it
+///   cannot be: this file never constructs a live shared tree. Verified against
+///   `tests/rendezvous.rs`'s
+///   `a_consumer_waits_for_a_frame_interned_after_the_arena_exists`, which fails
+///   *"the frame was interned well inside the budget: FrozenTree"* — so the two
+///   halves of the predicate are pinned by two targets, in two recipes
+///   (`just shm-check` and `just shm-rendezvous`).
+#[test]
+fn a_frozen_tree_refuses_to_wait_for_a_frame() {
+    use std::time::{Duration, Instant};
+
+    use tf_tree::AwaitError;
+
+    let live = fixture();
+    let scratch = Scratch::new("await-frozen");
+    live.freeze_to(scratch.path(), None, [0; 32], 0).unwrap();
+    let frozen = Tree::open_frozen(scratch.path()).unwrap();
+    assert!(!frozen.is_writable(), "a .tft is permanently read-only");
+
+    // **The absent name first, because it is the one with somewhere to fail.**
+    // Without the guard this polls a file nobody can write to for the whole
+    // budget and then reports a timeout — wrong value *and* wrong cost.
+    let budget = Duration::from_millis(300);
+    let started = Instant::now();
+    let absent = frozen.await_frames(["a_frame_that_was_never_declared"], budget);
+    let elapsed = started.elapsed();
+    assert_eq!(absent, Err(AwaitError::FrozenTree), "elapsed {elapsed:?}");
+    assert!(
+        elapsed < budget / 10,
+        "a frozen arena has no writers, so waiting for an absent name is futile \
+         by construction and must not be attempted: {elapsed:?}"
+    );
+
+    // And a name the file *does* contain is refused just the same: the refusal
+    // is about the handle, not about the request.
+    let present = frozen.await_frames(["map"], Duration::from_secs(5));
+    assert_eq!(present, Err(AwaitError::FrozenTree));
+}
+
 /// A `.tft` written by a build with a different layout is refused, with both
 /// hashes named (§2.4, NORMATIVE).
 ///
