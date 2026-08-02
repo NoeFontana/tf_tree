@@ -1,4 +1,4 @@
-//! `doctor`'s recording sources — `docs/PHASE5.md` §6's third [`crate::Source`].
+//! `doctor`'s recording sources — `docs/PHASE5.md` §6's third `Source`.
 //!
 //! # Why this module exists
 //!
@@ -35,7 +35,7 @@
 //! *sorts* by stamp before pushing, so a bag-built arena is monotone twice over.
 //!
 //! The recording itself does carry it, because a recording is written in log
-//! order. [`arrival_observations`] replays that order with the same reader and
+//! order. `arrival_observations` replays that order with the same reader and
 //! the same filter `ingest::fill` uses, which is what makes `TFT018` and
 //! `TFT019` reach a verdict on a file a stranger already has.
 
@@ -62,7 +62,7 @@ use crate::doctor::{Observations, Snapshot};
 /// # Errors
 ///
 /// Any [`tf_tree_ingest::IngestError`], already rendered through
-/// [`crate::ingest_err`] so a `.db3` gets the `ros2 bag convert` remedy and a
+/// `ingest_err` so a `.db3` gets the `ros2 bag convert` remedy and a
 /// compressed chunk gets the flag rather than "corrupt file".
 pub fn open_bag(bag: &Path, opts: &IngestOptions) -> Result<Ingested> {
     let mut frames = tf_tree_ingest::Frames::default();

@@ -44,7 +44,7 @@
 //!   `EdgeRecord::nominal_rate_mhz` is written at declaration time from
 //!   `EdgeCfg::nominal_rate_hz`, and a topology file's `rate_hz` reaches it
 //!   through `TopologyConfig::builder`. An arena built without one still skips,
-//!   because a `0` means *undeclared* and not *0 Hz* — see [`tft007`].
+//!   because a `0` means *undeclared* and not *0 Hz* — see `tft007`.
 //! * **`TFT010`** is skipped whenever the `docs/PHASE5.md` §5 counters carry no
 //!   verdict — see [`no_counter_evidence`], which is *two* conditions: an engine
 //!   built without the feature, and an arena that has served **no lookups**. The
@@ -54,7 +54,7 @@
 //! * **`TFT011`** reports two independent pieces of evidence under one id — the
 //!   counters, and `capacity x period` against a per-sample arrival delay — and
 //!   skips only when *both* are blind, which is what a recording is. Where one
-//!   half survives it runs, and [`crate::evidence_notes`] discloses the other.
+//!   half survives it runs, and `evidence_notes` discloses the other.
 //! * **`TFT016`** is skipped when the host is not Linux.
 //! * **`TFT018`** (out-of-order stamps) is skipped wherever the push stream was
 //!   replayed from an arena's rings rather than recorded as it arrived, and the
