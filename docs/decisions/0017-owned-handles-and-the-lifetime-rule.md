@@ -6,7 +6,10 @@
 crate attribute move, and the drop / lease / fork / `compile_fail` tests.
 `just miri` now covers `tf_tree`, which is what step 2's mutant was always
 stated against; it immediately found that the `EdgeWriter` has to be **boxed**
-(see *Consequences*). Steps 6–8 (the `tf_tree_py` and `tf_tree_c` migrations,
+(see *Consequences*). **Steps 2 and 3's tests are `shm`-gated** — a claim lease
+is an OFD byte and a heap tree has no lock file — so `just shm-check` runs
+`crates/tf_tree/tests/owned_writer.rs`; `cargo nextest run --workspace` compiles
+those two out and is not their gate. Steps 6–8 (the `tf_tree_py` and `tf_tree_c` migrations,
 and the crate-level docs) are outstanding, and until they land the two
 `extend_to_static` helpers this record exists to delete are still in the tree.
 
@@ -87,7 +90,15 @@ impl Tree {
 pub struct OwnedWriter { /* Arc<Tree>, Box<EdgeWriter<'static>> — both private */ }
 
 impl OwnedWriter {
-    pub fn push<D: Domain>(&self, stamp: Stamp<D>, iso: &Iso3) -> Result<(), PushError>;
+    // Amended to the implemented signature: an `i64` stamp, matching
+    // `EdgeWriter::push` and `Publisher::push`. Neither takes a `Stamp<D>`, and
+    // the domain-typed spelling does not exist on any writer type — this record
+    // is not the place to introduce one, and an owned writer that differed from
+    // the scoped one on its hot method would be a second surface to keep in step.
+    pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError>;
+    // Forwarded by hand rather than via `Deref`, which would also expose
+    // `Publisher::push` — the copy without the fork check.
+    pub fn edge(&self) -> EdgeId;
     pub fn release(self);
 }
 ```

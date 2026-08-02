@@ -126,7 +126,10 @@ of them originally as a `transmute::<EdgeWriter, Publisher>` that leaked a claim
 lease and bypassed the fork guard for the life of every Python publisher.
 [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) adds
 `Tree::claim_owned` → `OwnedWriter` and makes it the single place lifetime
-extension is written in the workspace.
+extension is written in the workspace. **`OwnedWriter` has landed; the deletion
+of the two helpers is that record's steps 6–7 and is deliberately deferred**, so
+until those commits land all three exist and the sentence above is a statement
+of where this is going, not of where it is.
 
 `EdgeWriter<'a>` **stays**. A scoped claim whose scope the borrow checker
 enforces is better when it fits, and most publishers are scoped.

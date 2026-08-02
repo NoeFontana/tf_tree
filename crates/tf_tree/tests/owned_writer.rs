@@ -13,9 +13,14 @@
 //! The claim *lease* is an OFD byte in the rendezvous lock file, and a heap tree
 //! has no lock file at all (`Tree::take_claim_lease` returns `None` for one).
 //! So the defect that shipped is only reproducible under
-//! `--features shm` on Linux, which is what `just shm-check` runs. The first
-//! test below is the part that holds everywhere: that the `Arc` field is really
-//! there and really keeps the tree alive.
+//! `--features shm` on Linux. **`cargo nextest run --workspace` — `just test` —
+//! therefore compiles those two tests out entirely**, and the gate that runs
+//! them is `just shm-check`, which names this target explicitly:
+//! `cargo nextest run -p tf_tree --features shm --test owned_writer`. If a test
+//! is added here that needs `shm`, that line already covers it; if this file is
+//! renamed, that line has to move with it. The first two tests below are the
+//! part that holds everywhere — that the `Arc` field is really there and really
+//! keeps the tree alive — and those two do run under `just test`.
 //!
 //! The `shm` tests each take their own scratch runtime directory and set
 //! `TF_TREE_RUNTIME_DIR` for the process, exactly as `tests/rendezvous.rs` does
@@ -48,26 +53,34 @@ fn layout() -> TreeBuilder {
 ///
 /// Mutant C — and this one was **found by adding the crate to `just miri`, not
 /// predicted**: un-box `OwnedWriter::writer` (`Box<EdgeWriter<'static>>` ⇒
-/// `EdgeWriter<'static>`). The suite still passes; `cargo miri test -p tf_tree`
-/// fails this test with *"deallocating while item \[SharedReadOnly …\] is
-/// strongly protected"*, and `-Zmiri-tree-borrows` fails it too. `release`
+/// `EdgeWriter<'static>`). **Applied, observed:** the suite still passes (4/4);
+/// `cargo +nightly miri test -p tf_tree --test owned_writer` fails *this* test
+/// with *"error: Undefined Behavior: deallocating while item \[SharedReadOnly
+/// for &lt;…&gt;\] is strongly protected"*, reported inside
+/// `<HeapArena as Drop>::drop` with `OwnedWriter::release` on the backtrace;
+/// `-Zmiri-tree-borrows` fails it too, as *"deallocation through &lt;…&gt;
+/// (root of the allocation) … is forbidden"*. `release`
 /// below passes the writer **by value**, which strongly protects the arena
 /// references inside it for the duration of the call, and the call is where the
 /// last `Arc` — and with it the arena — goes away. Implicit end-of-scope drop
 /// does not trip it; the two by-value spellings this type documents are exactly
 /// the ones that do.
 ///
-/// Mutant: delete the `tree: Arc<Tree>` field from `OwnedWriter` (replace it
-/// with nothing, or with `PhantomData`) ⇒ the `strong_count` assertion fails at
-/// `1`, and past it the `upgrade` fails too, because the tree dies with the
-/// caller's handle and the `push` on the next line writes into a freed
-/// allocation.
+/// Mutant: replace the `tree: Arc<Tree>` field with
+/// `PhantomData<Arc<Tree>>`. **Applied, observed:** *"assertion `left == right`
+/// failed: claim_owned did not take a strong reference — left: 1, right: 2"*.
+/// Applied a second time with that first assertion also deleted, to check the
+/// rest of the test is not dead weight: it then fails at *"the tree died with
+/// the caller's handle: the writer is now pointing into a freed arena and the
+/// push below is a use-after-free"*. Both halves are load-bearing.
 ///
 /// Mutant B: `core::mem::forget(self)` in `OwnedWriter::release`, standing in
-/// for any destructor the owned shape might drop on the floor. Applied: the
-/// final `upgrade` assertion fails — and the two `shm` tests below fail with it,
-/// on the claim record and on the lease respectively, which is what says the
-/// three are covering different halves rather than the same one three times.
+/// for any destructor the owned shape might drop on the floor. **Applied,
+/// observed:** the final `upgrade` assertion fails — *"releasing the writer left
+/// the tree alive, so `OwnedWriter` is leaking a strong reference…"* — and the
+/// two `shm` tests below fail in the same run, on the claim record and on the
+/// lease respectively, which is what says the three cover different halves
+/// rather than the same one three times.
 #[test]
 fn an_owned_writer_keeps_its_tree_alive_by_itself() {
     let tree = Arc::new(layout().build().expect("layout"));
@@ -116,9 +129,13 @@ fn an_owned_writer_keeps_its_tree_alive_by_itself() {
 /// This is the positive half plus the thread that proves `Send` is usable and
 /// not merely satisfied.
 ///
-/// Mutant: add `unsafe impl Sync for OwnedWriter {}`. Applied: this test still
-/// passes and the `compile_fail` doc test on `OwnedWriter` fails — which is why
-/// both halves exist.
+/// Mutant: add `unsafe impl Sync for OwnedWriter {}`. **Applied, observed:**
+/// this test still passes, and `cargo test --doc -p tf_tree` fails the
+/// `compile_fail` doc test on `OwnedWriter` with *"Test compiled successfully,
+/// but it's marked `compile_fail`"* — which is why both halves exist. (That
+/// doc test's *error code* is a separate matter: stable ignores it, and
+/// `just test-doc-error-codes` is what checks it. Its `compile_fail` half, the
+/// one this mutant trips, is checked on stable.)
 #[test]
 fn an_owned_writer_moves_between_threads_but_is_never_shared() {
     fn assert_send<T: Send>() {}
@@ -198,13 +215,17 @@ fn join() -> tf_tree::Tree {
 /// the assertion that would fail if `OwnedWriter` dropped the `EdgeWriter`'s
 /// guts on the floor the way the `transmute::<EdgeWriter, Publisher>` did.
 ///
-/// Mutant: delete the `tree: Arc<Tree>` field ⇒ the `push` after
-/// `drop(claimer)` stores through a reference into a region that has just been
-/// `munmap`ped, so this test dies of `SIGSEGV` rather than failing an assertion.
+/// Mutant: replace the `tree: Arc<Tree>` field with `PhantomData` ⇒ the `push`
+/// after `drop(claimer)` stores through a reference into a region that has just
+/// been `munmap`ped. **Applied, observed:** nextest reports `SIGSEGV` for this
+/// test — *"(test aborted with signal 11: SIGSEGV)"* — rather than a failed
+/// assertion, while the heap-only test above fails its `strong_count` assertion
+/// in the same run.
 ///
 /// Mutant B: `core::mem::forget(self)` in `OwnedWriter::release`, i.e. an owned
-/// writer that keeps the claim record. Applied: the final `claim` fails with
-/// `AlreadyClaimed(EdgeAlreadyClaimed { owner_slot: 1 })` — a stored publisher
+/// writer that keeps the claim record. **Applied, observed:** the final `claim`
+/// fails — *"the edge was not released: a stored writer leaked its claim:
+/// AlreadyClaimed(EdgeAlreadyClaimed { owner_slot: 1 })"* — a stored publisher
 /// that has gone away and an edge nobody can take.
 #[test]
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -259,14 +280,19 @@ fn an_owned_writer_releases_a_shared_edge_for_the_next_claimer() {
 /// own description reports every byte it holds as free. Without the second
 /// description this test would pass against a writer that released nothing.
 ///
-/// Mutant: give `OwnedWriter` a `Publisher<'static>` field instead of an
-/// `EdgeWriter<'static>` — the exact shape of the `transmute` that shipped ⇒ the
-/// first assertion still passes, and the second fails with `held: true`, the
-/// edge locked for the life of the process.
+/// Mutant: give `OwnedWriter` a `Box<Publisher<'static>>` field instead of a
+/// `Box<EdgeWriter<'static>>`, taking it out of the `EdgeWriter` with a
+/// `ptr::read` and forgetting the rest — the exact shape of the `transmute` that
+/// shipped. **Applied, observed:** the first assertion still passes (the probe
+/// reports `held: true`, as it should) and the second fails — *"the lease
+/// outlived the writer: the edge is now permanently unclaimable and no reaper
+/// can tell…"* — because `probe_claim(edge).held` is still `true` after
+/// `release`. The re-claim test above fails in the same run with
+/// `LeaseContended { edge: EdgeId(1) }`, from the other side of the same byte.
 ///
 /// Mutant B: `core::mem::forget(self)` in `OwnedWriter::release`, which reaches
-/// the same place by a route that does not need the type edited. Applied: the
-/// second assertion fails.
+/// the same place by a route that does not need the type edited. **Applied,
+/// observed:** the second assertion fails, with the same message.
 #[test]
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn dropping_an_owned_writer_releases_the_claim_lease() {
