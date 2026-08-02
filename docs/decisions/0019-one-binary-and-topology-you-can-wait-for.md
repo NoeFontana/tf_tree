@@ -38,13 +38,29 @@ on which process started first. That is an unusual constraint (a `tf2` user has
 no arena and no such moment), and it is what `FrameNotDeclared` is really
 reporting.
 
-**And the default makes it worse.** `CreatePolicy::IfAbsent` is the default, so a
-read-only consumer that starts before any publisher **creates an empty arena with
-a default layout** — after which the publisher's `layout_if_creating` never runs
-and the topology is permanently wrong. `CreatePolicy::Never`'s own doc comment
-already names the failure: *"a consumer that creates an empty arena because the
-estimator has not started yet looks healthy and publishes nothing."* The remedy
-exists; the default is the trap.
+**And the defaults describe a participant nobody wants.** `Open::new()` defaults
+to `AttachMode::ReadOnly` *and* `CreatePolicy::IfAbsent`
+(`crates/tf_tree/src/open.rs:226-227`) — a configuration that asks to create an
+arena it cannot write.
+
+> **Correction, and it repeals the sentence this paragraph used to carry.** The
+> first revision of this record said that combination "creates an empty arena
+> with a default layout, after which the publisher's `layout_if_creating` never
+> runs and the topology is permanently wrong." **It does not.** `Open::open`
+> demands a `TreeBuilder` before it creates anything
+> (`crates/tf_tree/src/open.rs:337`), so `ro` + `IfAbsent` + no layout fails with
+> `OpenError::NoLayoutToCreate`. Reaching the empty arena needs a caller that
+> *also* passes `layout_if_creating`, and no such caller exists in the workspace.
+> The claim was written from the shape of the defaults rather than from the code,
+> and it was repeated verbatim into four other documents before anyone ran it.
+
+So §2a removes a **latent** class rather than an observed failure, and the honest
+justification is the simpler one: a builder whose own documented defaults are a
+configuration no correct program wants is a defect on its own terms.
+`CreatePolicy::Never`'s doc comment already names the hazard — *"a consumer that
+creates an empty arena because the estimator has not started yet looks healthy
+and publishes nothing"* — and nothing enforces it. The layout requirement is an
+accident that happens to mask it, not a rule that forbids it.
 
 **What forces the decision now.** `0015` is `draft` with three open questions,
 `PHASE2.md` §9 is unimplemented, and both are being weighed for 0.1.0. Building
@@ -83,21 +99,60 @@ removes the class by construction rather than by advice. This is `API.md` R6
 carried one step further: read-only is not merely the default, it is the thing
 that cannot create.
 
-**b. A consumer waits for topology rather than failing.** The primitives already
-ship — `Tree::frames`, `Tree::edges`, `tree.frame(name)`, and the topology
-generation — so the wait is a caller-side loop, exactly the shape
+**b. A consumer waits rather than failing — and it is two waits, not one.** The
+primitives already ship, so each is a caller-side loop, exactly the shape
 [`0018`](./0018-blocking-waits-belong-in-the-shim.md) settled for data:
 
-```rust
-let tree = tf_tree::Open::new().mode(AttachMode::ReadOnly).open()?;   // no create
-let (target, source) = tree.await_frames(["map", "base_link"], deadline)?;
+```text
+// Two waits, because they are two different absences.
+let tree = tf_tree::Open::new()
+    .mode(AttachMode::ReadOnly)                      // implies CreatePolicy::Never
+    .await_open(Duration::from_secs(5))?;            // wait for the arena
+let [target, source] =
+    tree.await_frames(["map", "base_link"], Duration::from_secs(5))?;
 let plan = tree.plan(target, source)?;
 ```
 
-`Tree::await_frames` is a convenience on the facade over that loop; **no arena
-primitive, no notification mechanism, no futex** — `0018`'s argument applies
-unchanged and with more force, because topology settles once at startup. A
-bounded backoff is adequate and the deadline is the caller's.
+> **`text`, not `rust`, deliberately.** The three calls yield `OpenError`,
+> `AwaitError` and `LookupError`, and `LookupError` implements neither `Display`
+> nor `Error` — `tf_tree_core` has no `Display` impl anywhere and no `thiserror`
+> — so no single `?`-chain unifies them, not even into `Box<dyn Error>`. The
+> first revision of this record printed this block as compilable Rust. It is
+> not, and fixing that belongs to a separate decision about giving
+> `tf_tree_core`'s errors real `Display` impls, not to this one.
+
+**Why two calls follows from a decision already made.** `CreatePolicy::Never`
+against an absent arena fails *fast* with `IpcError::ArenaAbsent` by design
+(`crates/tf_tree_ipc/src/open.rs:330-335`, pinned by
+`crates/tf_tree/tests/rendezvous.rs:127-140`), so a consumer racing the
+publisher's *process start* never reaches a frames-only wait — it never obtains a
+`Tree` to call one on. `Open::await_open` waits for the arena to exist;
+`Tree::await_frames` waits for names to be interned into an arena that already
+does. Folding them would mean making `Never` slow on an absent arena, repealing
+the fail-fast property a supervised deployment depends on, or returning a `Tree`
+the caller may not use until a second wait finished. Two absences, two names.
+
+**The predicate is `ArenaView::find_frame`, and `await_frames` refuses a writable
+tree.** `Tree::frame` is the wrong predicate in both modes, for opposite reasons:
+on a read-only arena it answers `FrameError::ReadOnly` for an absent name, and on
+a writable one it **interns and succeeds immediately**
+(`crates/tf_tree/src/tree.rs:1166-1181`) — so a wait built on it would return
+instantly and wrongly on exactly the tree a publisher holds. `find_frame` never
+inserts. And because "does this name exist" has two defensible answers on a
+writable tree, `await_frames` refuses one rather than picking silently — §3's
+rule about one diagnostic with two meanings — and points a writable caller at
+`Tree::frame`, which cannot fail for absence. `#[non_exhaustive]` keeps the
+relaxation available later; the refusal is the reversible direction.
+
+Both are convenience on the facade over a poll loop; **no arena primitive, no
+notification mechanism, no futex** — `0018`'s argument applies unchanged and with
+more force, because topology settles once at startup. A bounded backoff is
+adequate — `MIN_BACKOFF` 200 µs doubling to `MAX_BACKOFF` 4 ms, the rendezvous'
+own (`crates/tf_tree_ipc/src/open.rs:190-193`) — and the budget is a `Duration`
+the caller passes, matching `Open::timeout` rather than introducing this
+workspace's first public `Instant` deadline. `await_open` clamps `Open::timeout`
+to what is left, so one held-but-unreachable attempt cannot overrun the whole
+wait.
 
 **c. Headroom covers frames that arrive later.** `frame_headroom` /
 `edge_headroom` already exist and `PHASE7.md` §4 J3 already relies on them for
@@ -113,8 +168,22 @@ natural owner.** A deployment runs one or the other, never both.
 
 `0015`'s open questions, answered:
 
-1. **Sizing, and a live arena whose `layout_hash` differs: refuse.** Confirming
-   `0015`'s own leaning. A silent replace would strand every consumer holding the
+1. **Sizing, and a live arena that is not this bridge's: refuse.** Confirming
+   `0015`'s own leaning.
+
+   > **Correction — the mechanism named here does not detect what the question
+   > is about.** This resolution originally said "a live arena whose
+   > `layout_hash` differs". `tf_tree_arena::layout_hash()`
+   > (`crates/tf_tree_arena/src/layout.rs:433`) is a `const fn` over
+   > `ArenaHeader`'s size and alignment and the region *strides* — it is
+   > **independent of the declared topology**, so two arenas built from
+   > different configs by the same binary hash identically. The conclusion
+   > survives, by a better route: the bridge refuses to *join* at all
+   > (`Open::require_create`), so it never reaches a hash comparison.
+   > `LayoutMismatch` remains the right refusal for a *consumer* whose binary
+   > differs, which is the case it was actually built for. What a stale
+   > consumer should do about a restarted bridge is the instance UUID's job and
+   > is not settled here. A silent replace would strand every consumer holding the
    old mapping, and `LayoutMismatch` already exists as an attach error naming
    both values. `CreatePolicy::Always` is the operator's explicit act and already
    documents itself as "never take this path automatically." Adding an edge to
@@ -208,14 +277,25 @@ consumer cannot register on one without giving up D18's boundary.
   a real change in what that crate is: `doctor` and `top` are bounded or
   interactive, `serve` is a supervised process. It gains a signal-handling path
   and a metrics endpoint, and its tests gain a process-lifetime dimension.
-- **A read-only open can now fail where it previously succeeded** — a consumer
-  relying on `ro` + `IfAbsent` to bootstrap an empty arena breaks. That is
-  intended and is the point; the crate is private and no such consumer exists in
-  the workspace. `tf_tree_py`'s `mode="ro"` default and the C ABI's
-  `tft_tree_open` both inherit the rule and must be checked, not assumed.
-- **`Tree::await_frames` is new public API on the stable tier**, and is checked
-  against `API.md` §7 like any other: it is tier 1 (attach), allocates, and must
-  never appear on `Plan`.
+- **A read-only open can now fail where it previously succeeded** —
+  specifically a consumer passing `ro` + `IfAbsent`/`Always` **and**
+  `layout_if_creating`. Without the layout that combination already failed, with
+  `NoLayoutToCreate`, so the observable change is narrower than this record
+  first claimed. `Open::new()`'s `create` default also moves to
+  `CreatePolicy::Never` (see the plan's step 1), which supersedes
+  [`0005`](./0005-the-shared-memory-seam.md) §3.2's `// DEFAULT: IfAbsent` and
+  `PHASE2.md` §3.2 on that one point — `0005` is `implemented` and immutable, so
+  this record carries the supersession. Every workspace publisher already passes
+  `create` explicitly, so none changes.
+- **`Open::await_open`, `Tree::await_frames` and `AwaitError` are new public API
+  on the stable tier**, checked against `API.md` §7 like any other: tier 1, and
+  never on `Plan`. `AwaitError` is facade-local, `Copy` and `String`-free in the
+  shape of `OpenError` — *not* a `Timeout` variant on `tf_tree_core`'s
+  `LookupError`, which would put a wall-clock concept in a `no_std` crate `0018`
+  deliberately keeps free of one and add an unreachable variant to every
+  hot-path read's return type. Neither allocates: `await_frames` is
+  `[&str; N] -> [FrameId; N]`, so the earlier note that it "allocates" is
+  withdrawn.
 - **Two owners remain possible and that is not prevented in code** — a
   deployment that runs both a bridge with `arena_name` and `tf_tree serve` on the
   same `(domain, name)` gets question 3's refusal. Documented, not designed
@@ -223,17 +303,39 @@ consumer cannot register on one without giving up D18's boundary.
 
 ## Implementation plan
 
-1. **A read-only attach implies `CreatePolicy::Never`** — `Open::open` returns a
-   typed error when `mode` is read-only and `create` is not `Never`. Verified by
-   a test asserting the error, and by one asserting that `ro` + default policy no
-   longer creates an arena where none exists. **Mutant:** allow the combination
-   ⇒ the second test finds a freshly created empty arena.
-2. **`Tree::await_frames(names, deadline)`** on the facade, over the existing
-   `tree.frame` / generation primitives; no arena change. Verified by a test
-   where a publisher creates the arena `N` ms after the consumer starts waiting,
-   asserting the consumer resolves and that it returns before the deadline.
-   **Mutant:** ignore the deadline ⇒ a no-publisher case hangs instead of
-   returning `Timeout`.
+1. **A read-only attach implies `CreatePolicy::Never`** — `Open::open` returns
+   `OpenError::ReadOnlyCannotCreate` when `mode` is read-only and `create` is not
+   `Never`, checked before `RuntimeDir::resolve()` so a misconfiguration reports
+   as itself rather than as a missing runtime directory. `Open::new()`'s `create`
+   default becomes `Never` in the same change, so the builder's defaults are the
+   *consumer* and the error is reachable only by writing both halves explicitly.
+   The alternative — leaving the default at `IfAbsent` and patching the free
+   `tf_tree::open()` — ships a builder whose documented defaults are an error,
+   and is rejected for that reason. `tf_tree_cli`'s `--create` gains
+   `requires = "rw"` or is deleted; `attach.rs` never passes a layout, so it
+   cannot create anything today either.
+   Verified by a test that **supplies `layout_if_creating`** — without it the
+   combination already fails with `NoLayoutToCreate` and the assertion is
+   vacuous — asserting the new variant, then asserting the machine is still empty
+   by re-opening with `CreatePolicy::Never` and getting `IpcError::ArenaAbsent`.
+   **Mutant:** allow the combination ⇒ the first open returns `Ok` and the second
+   finds a freshly created empty arena instead of `ArenaAbsent`.
+2. **`Open::await_open(Duration)` and `Tree::await_frames(names, Duration)`** on
+   the facade; no arena change. `await_open` retries only `ArenaAbsent` and
+   `ArenaHeldButUnreachable` — the publisher-mid-start window — and returns every
+   other error verbatim, because retrying cannot change them and burning the
+   budget would replace a precise message with a timeout. `await_frames` polls
+   `ArenaView::find_frame`, never `Tree::frame`, and refuses a writable tree.
+   Verified by: a consumer waiting for an arena that starts 200 ms late; a wait
+   with no publisher at all, asserting it gives up inside a bounded elapsed time;
+   a frame interned after the arena exists (needs a child arm with
+   `frame_headroom`, since the existing fixture has none); and a writable-tree
+   refusal test **outside** `rendezvous.rs`, so plain `just test` gates it.
+   **Mutants:** classify `ArenaAbsent` as terminal ⇒ the late-start test returns
+   immediately; ignore the deadline ⇒ the no-publisher case hangs rather than
+   giving up; build the predicate on `Tree::frame` ⇒ the read-only wait never
+   resolves *and* the writable case returns `Ok` with a freshly interned id for a
+   name nobody declared.
 3. **`FrameNotDeclared`'s message and `RUNBOOK.md`'s row** name steps 1 and 2 and
    stop naming `tf_treed`. Verified by review and by the runbook's own check that
    every row names a real remedy.

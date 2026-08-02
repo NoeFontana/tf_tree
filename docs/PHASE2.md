@@ -748,8 +748,11 @@ Consequences, which must be enforced by types where possible and by errors where
 > section was really for is the last paragraph below: pre-declaration, so a
 > consumer can attach and plan before any publisher runs. `0019` §2 fixes that
 > without a daemon and without a config file — a read-only attach implies
-> `CreatePolicy::Never` (today's default silently creates an *empty* arena, which
-> is the real bug), a consumer waits for topology with `Tree::await_frames`, and
+> `CreatePolicy::Never` (`Open::new()` defaults to read-only *and*
+> create-if-absent, a configuration no correct program wants — it fails
+> `NoLayoutToCreate` today rather than creating an empty arena, so what §2a
+> removes is a latent class), a consumer waits for the arena with
+> `Open::await_open` and for topology with `Tree::await_frames`, and
 > `frame_headroom`/`edge_headroom` cover frames that arrive later.
 >
 > What survives, as `tf_tree serve --config <topology.toml>`: create and seal
@@ -914,7 +917,7 @@ Ship this table as `docs/RUNBOOK.md`. Every row must correspond to a `doctor` ch
 | `BootIdMismatch` | arena predates a reboot (only possible with a file-backed dev arena) | recreate the arena |
 | `ConnectionRefused` | owner not running, or a stale socket path | start the owner; the stale path is unlinked automatically |
 | `NoParticipantSlots` | more than `max_participants` attached | raise `--participants`; requires an owner restart |
-| `FrameNotDeclared` on a read-only participant | startup ordering: no publisher has declared it yet | wait for it — `Tree::await_frames` ([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2). Check the consumer is not creating the arena itself: a read-only attach implies `CreatePolicy::Never`, and the old default created an *empty* one |
+| `FrameNotDeclared` on a read-only participant | startup ordering: no publisher has declared it yet | wait for it — `Tree::await_frames` ([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2). Check the consumer is not creating the arena itself: a read-only attach implies `CreatePolicy::Never`, and the builder's default is now `Never` too |
 | `ClaimRevoked` during `push` | this writer was judged dead and reaped | the process was stalled; investigate scheduling, GC, or page-fault stalls |
 | `EdgeAlreadyClaimed` | two nodes configured to publish one edge | a genuine configuration error — `doctor` names both PIDs |
 | `SlotContended` / `SlotRecycled` | reader starved, or ring too shallow for the publish rate | increase edge capacity; `doctor` warns at 80% occupancy |
