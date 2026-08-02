@@ -686,14 +686,19 @@ new `tft_layout` enumerator and therefore a **minor** ABI bump
 >
 > **Two things the paragraph above did not anticipate.** A twist row is more
 > work per element than a pose row (measured at ~1.1x *relative to a pose row*),
-> so §6.1's estimate under-shoots it — but the same measurement shows the
-> estimate already under-shoots the **pose** row by ~2x, which is
-> [`API.md`](./API.md) §3.4's known `NS_PER_STEP_ESTIMATE` error seen from the
-> other side. The estimate is therefore deliberately *not* given a
-> layout-dependent multiplier: it would correct the smaller of the two errors and
-> leave the larger, both sides of the threshold stay far below CPython's switch
-> interval either way, and §3.4 is NORMATIVE that `NS_PER_STEP_ESTIMATE` is
-> re-derived from `0013`'s re-baseline rather than guessed at. And
+> so `PHASE3.md` §6.1's estimate under-shoots it — but the same measurement shows
+> the estimate under-shoots the **pose** row too, so a layout-dependent
+> multiplier would correct the smaller of the two errors and leave the larger,
+> and the estimate is deliberately not given one. **Both residuals are priced in
+> one place and not here**: `PHASE3.md` §6.1's amendment is the single account of
+> `NS_PER_STEP_ESTIMATE` — where the number comes from, what it under-shoots and
+> by how much, and why both sides of the threshold stay far below CPython's
+> switch interval regardless. An earlier revision of this block was a third
+> independent write-up of that arithmetic, quoting a "~2x" ratio and an
+> outstanding NORMATIVE instruction; the constant has since been re-derived
+> (55 → 64 ns/step, [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)),
+> which made both claims stale — which is exactly what three copies of one number
+> do. And
 > **`tf_tree.build` hard-coded `LerpSlerp`**, so no Python-constructed tree could
 > answer a twist at all — `build` and `open(create=...)` now take `interp=`,
 > spelled as §4.1's own layout sketch spells it, and **the default moved to

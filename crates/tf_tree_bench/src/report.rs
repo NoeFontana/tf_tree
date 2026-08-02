@@ -1216,10 +1216,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     let mut lookup = Row::unavailable(
         "lookup_latency",
         "Lookup latency, depth 3, hot path (p50, p99, p99.9)",
-        "tf_tree column: `map <- imu_link`, LerpSlerp, in-process, one thread. \
-         Percentiles include two Instant::now() calls, whose own cost is reported \
-         alongside as clock_overhead_p50_ns. The tf2 column is a separate, \
-         cross-engine comparison and is not attempted here.",
+        LOOKUP_NOTE,
         true,
         format!(
             "this row is single-threaded and in-process, so the only thing between it \
@@ -1582,6 +1579,50 @@ fn worse_entries(opts: &Options) -> Vec<Worse> {
     ]
 }
 
+/// The `lookup_latency` row's note — the sentence a reader of `results.json`
+/// actually sees, which is the only place this row explains what it measured.
+///
+/// **Two of its clauses are required rather than chosen, and both were missing.**
+///
+/// 1. `docs/PHASE1.md` §11.3 is NORMATIVE that "every reported latency row must
+///    state its dynamic-step count, not just its nominal depth", because the two
+///    readings of "depth 3" differ by ~2.8× and a static-heavy path can pass a
+///    gate without exercising the sampler at all. The note said "depth 3" in its
+///    title and nothing about steps.
+/// 2. The **stamp regime** decides whether the interpolator runs at all. This
+///    row queried `fixture::NOW_NS` — a knot on all four dynamic grids — until
+///    `docs/decisions/0013`, so every edge took `SampleRing::sample`'s exact-hit
+///    branch and what shipped as a lookup latency was `bracket` plus a seqlock
+///    read. A reader comparing a figure from before that change with one from
+///    after is comparing two different measurements, and only this string can
+///    tell them so.
+///
+/// Both are checked against the code that produces the number, not merely
+/// written here, by `tests::the_lookup_row_note_states_what_phase1_requires`
+/// below (a `#[cfg(test)]` item, so this is a name and not a link).
+/// The stamp half of that check needs the measured stamp to be reachable from a
+/// test without running the measurement, which is what [`LOOKUP_STAMP_NS`] is
+/// for.
+const LOOKUP_NOTE: &str = "tf_tree column: `map <- imu_link`, LerpSlerp, in-process, one \
+     thread. **3 dynamic steps** after constant folding (1 kHz, 200 Hz, 50 Hz), which is what \
+     docs/PHASE1.md §11.3's NORMATIVE reading of \"depth 3\" means. The query stamp is \
+     fixture::QUERY_NS = NOW_NS - 500 us, which is off-grid on every one of those three rates, \
+     so the interpolator runs on every step; it was on-grid until \
+     docs/decisions/0013, and a p50 published before that change is not comparable with one \
+     published after. Percentiles include two Instant::now() calls, whose own cost is reported \
+     alongside as clock_overhead_p50_ns. The tf2 column is a separate, cross-engine comparison \
+     and is not attempted here.";
+
+/// The stamp [`measure_lookup_latency`] queries, named so a test can reach it.
+///
+/// It is one `const` rather than an expression inlined at the call site for the
+/// same reason [`crate::embed`] reads `[profile.embedder]` back out of the
+/// manifest: [`LOOKUP_NOTE`] makes two claims about this stamp — that it is
+/// `fixture::QUERY_NS`, and that it is off every dynamic grid — and a claim
+/// nothing evaluates is how `docs/decisions/0013` stayed true for as long as it
+/// did.
+const LOOKUP_STAMP_NS: i64 = crate::fixture::QUERY_NS;
+
 /// Measure depth-3 hot-path lookup latency on this process.
 ///
 /// The percentiles include two `Instant::now()` calls per lookup, so the clock's
@@ -1616,7 +1657,7 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
         .plan(target, source)
         .map_err(|e| anyhow!("compiling the map <- imu_link plan: {e:?}"))?;
     let guard = tree.guard();
-    let stamp: Stamp = Stamp::from_nanos(crate::fixture::QUERY_NS);
+    let stamp: Stamp = Stamp::from_nanos(LOOKUP_STAMP_NS);
 
     // §9.3: warm, then discard, and state how long. Time-based rather than
     // iteration-based so the stated number is the one the report prints.
@@ -2757,6 +2798,84 @@ CPU part\t: 0xd0c
         assert!(p50 < 1_000_000.0, "p50 of {p50} ns is not a depth-3 lookup");
         assert!(get("clock_overhead_p50_ns") >= 0.0);
         assert!(m.iter().all(|x| x.value.is_finite()), "{m:?}");
+    }
+
+    /// [`LOOKUP_NOTE`] states the two things `docs/PHASE1.md` §11.3 requires,
+    /// and states them about the plan `measure_lookup_latency` actually compiles.
+    ///
+    /// This is a gate on a *string*, so it is written to fail for the reasons
+    /// that matter rather than on any edit: the step count is read out of the
+    /// compiled plan and formatted, so changing the fixture's `base_link ->
+    /// imu_link` chain fails this test without anyone touching the note, and
+    /// changing the note's number fails it without anyone touching the fixture.
+    ///
+    /// Three mutants were applied and each was observed fatal; all three
+    /// outputs are pasted in this branch's report.
+    ///
+    /// 1. In [`LOOKUP_NOTE`], write "**2 dynamic steps**" — assertion 1:
+    ///    *"the plan `map <- imu_link` compiles to 3 dynamic steps, so the note
+    ///    must contain `"**3 dynamic steps**"`"*.
+    /// 2. Set [`LOOKUP_STAMP_NS`] back to `crate::fixture::NOW_NS`, which is
+    ///    what `measure_lookup_latency` queried before `docs/decisions/0013` —
+    ///    assertion 2, *"the note names fixture::QUERY_NS and
+    ///    `measure_lookup_latency` queries something else, left: 9900000000,
+    ///    right: 9899500000"*. Note that it is assertion 2 and **not** the
+    ///    off-grid loop that catches this one: the loop runs on the stamp this
+    ///    row reads, and the name check runs first.
+    /// 3. Move `fixture::QUERY_NS` to `NOW_NS - 1_000_000`, which is off three
+    ///    of the four grids and *on* the 1 kHz one — assertion 3, naming the
+    ///    edge: *"base_link->imu_link: this row's stamp lands on the 1000 Hz
+    ///    grid"*. This is the mutant that shows the loop is live rather than
+    ///    shadowed by the equality above it.
+    #[test]
+    fn the_lookup_row_note_states_what_phase1_requires() {
+        // 1. The dynamic-step count, taken from the plan rather than from prose.
+        let tree = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp).expect("fixture");
+        let target = tree.frame("imu_link").expect("target frame");
+        let source = tree.frame("map").expect("source frame");
+        let plan = tree.plan(target, source).expect("plan");
+        let steps = crate::workload::dyn_steps(&plan);
+        let stated = format!("**{steps} dynamic steps**");
+        assert!(
+            LOOKUP_NOTE.contains(&stated),
+            "PHASE1 §11.3 requires this row to state its dynamic-step count, and \
+             the plan `map <- imu_link` compiles to {steps} dynamic steps, so the \
+             note must contain {stated:?}. It reads: {LOOKUP_NOTE}"
+        );
+
+        // 2. The note names a stamp, and it must be the one the measured loop
+        //    queries. Two claims, so two assertions.
+        assert!(
+            LOOKUP_NOTE.contains("fixture::QUERY_NS"),
+            "the note must name the stamp it was taken at: {LOOKUP_NOTE}"
+        );
+        assert_eq!(
+            LOOKUP_STAMP_NS,
+            crate::fixture::QUERY_NS,
+            "the note names fixture::QUERY_NS and `measure_lookup_latency` \
+             queries something else"
+        );
+
+        // 3. …and "off-grid" must be true of the stamp this row reads. That
+        //    duplicates `fixture`'s own test on purpose: `fixture` guards the
+        //    constant, this guards the *claim the note publishes about it*, and
+        //    the loop runs over every dynamic edge in the fixture — a superset
+        //    of the three on this path, so it cannot pass by missing one.
+        assert!(
+            LOOKUP_NOTE.contains("off-grid"),
+            "the note must state the stamp regime: {LOOKUP_NOTE}"
+        );
+        assert!(!crate::fixture::DYNAMIC_EDGES.is_empty());
+        for &(parent, child, rate_hz) in crate::fixture::DYNAMIC_EDGES {
+            let period_ns = (1e9 / rate_hz) as i64;
+            assert_ne!(
+                LOOKUP_STAMP_NS % period_ns,
+                0,
+                "{parent}->{child}: this row's stamp lands on the {rate_hz} Hz \
+                 grid, so that edge takes the exact-hit branch and the note's \
+                 \"off-grid … so the interpolator runs\" is false"
+            );
+        }
     }
 
     /// End-to-end: the report this tool actually assembles on *this* host must

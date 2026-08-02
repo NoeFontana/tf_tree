@@ -351,22 +351,24 @@ State this plainly in the docs rather than marketing a zero-copy-to-GPU pipeline
 
 ### 6.1 The threshold is computed, not constant — NORMATIVE
 
-Releasing the GIL costs a measured 40 ns. A depth-3 lookup costs ~150 ns. So:
+Releasing the GIL costs a measured 40 ns. A depth-3 lookup costs ~193 ns
+(re-baselined; the ~150 ns this line carried was `PHASE1.md` §11.3's *budget*,
+and the amendment below is where the measurement is). So:
 
-- **Never release for a scalar lookup.** It would add 27% for parallelism nobody can use in a 150 ns window.
+- **Never release for a scalar lookup.** It would add ~21% for parallelism nobody can use in a 193 ns window.
 - **Always release when the work is long enough that holding it would stall other threads.**
 
 The rule is expressed in work, not in element count, because depth varies:
 
 ```rust
 const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
-const NS_PER_STEP_ESTIMATE: u64 = 55;
+const NS_PER_STEP_ESTIMATE: u64 = 64;
 
 let est = n as u64 * plan.depth() as u64 * NS_PER_STEP_ESTIMATE;
 if est >= GIL_RELEASE_THRESHOLD_NS { py.allow_threads(|| kernel()) } else { kernel() }
 ```
 
-For depth 3 this releases from about `n = 6`. The worst case where we do *not* release is under 1 µs of GIL retention — far below CPython's 5 ms switch interval, so no other thread notices. The worst case where we do release is a 4% overhead. Both sides of the threshold are cheap, which is why the exact constant does not need tuning; **what matters is that neither branch is ever badly wrong.**
+For depth 3 this releases from `n = 6` exactly, at the constant above. The worst case where we do *not* release is under 1 µs of GIL retention — far below CPython's 5 ms switch interval, so no other thread notices. The worst case where we do release is a 4% overhead. Both sides of the threshold are cheap, which is why the exact constant does not need tuning; **what matters is that neither branch is ever badly wrong.**
 
 Publish the constants and add a benchmark row proving the crossover behaves as predicted.
 
@@ -377,8 +379,9 @@ Publish the constants and add a benchmark row proving the crossover behaves as p
 >
 > **The measurement.** `benches/lookup.rs`, row `lookup/depth3/sclerp`, at the
 > off-grid stamp `fixture::QUERY_NS` — three *dynamic* steps, `ScLerp` (Python's
-> default interpolator since [`API.md`](./API.md) §3), criterion's default
-> sampling mode with a 2 s warm-up discarded and **no `--quick`**, `taskset -c 2`,
+> default interpolator since [`API.md`](./API.md) §3), criterion 0.5.1's default
+> sampling mode — a 3 s warm-up discarded, then 100 samples over a 5 s window —
+> and **no `--quick`**, `taskset -c 2`,
 > `[profile.bench]` (`lto = "thin"`, `codegen-units = 1`), nine runs alternated
 > against the on-grid binary on a shared 4-core EPYC-Milan VM that fails
 > `Fitness::probe`:
@@ -393,15 +396,27 @@ Publish the constants and add a benchmark row proving the crossover behaves as p
 > than the pretty part of it.
 > [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)'s
 > *Re-baseline* section is the full protocol, the other three rows, and the
-> independent harness that corroborates them.
+> second harness.
+>
+> **One caveat travels with the number.** The row above is the fold *inlined
+> into its caller*; the same fold behind an `#[inline(never)]` call measures
+> ~35 % more (`0013`, *Corroboration*), and `0013`'s open question 3 is which of
+> the two a latency budget means. **That question does not reach this constant**,
+> and the reason is not that the difference is small — at 86 ns/step the depth-3
+> crossover would be `n = 4` rather than `n = 6`. It is that the batch path this
+> threshold governs was measured end to end and is *already* above both call
+> shapes: 328 ns/elem for a pose row and 369 ns/elem for a twist row at depth 3,
+> against the 192 ns/elem `est` predicts. `tf_tree_py::tree`'s `release_the_gil`
+> documents that residual, and the error runs in the safe direction — `est` too
+> low releases the GIL later, never sooner.
 >
 > **The 55 it replaces was never a measurement**: it came from `PHASE1.md`
 > §11.3's 150 ns *budget*, and the benchmark that was supposed to confirm it
 > queried on-grid stamps, so `I::eval` never ran and the confirmation was of
 > something else. `0013` also supersedes its own draft figure of ~290 ns
 > (~97 ns/step): that reading was taken with `cargo bench --quick`, whose
-> warm-up-free two-sample estimate reports these sub-microsecond rows 25–70 %
-> high on this host.
+> warm-up-free two-sample estimate reports these sub-microsecond rows **46–71 %**
+> high on this host, row by row.
 >
 > **What it moves: one element.** The release crossover is the smallest `n` with
 > `n · depth · NS ≥ 1000`.
