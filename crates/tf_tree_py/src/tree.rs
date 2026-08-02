@@ -19,11 +19,14 @@ use crate::errors::{lookup_err, BufferError, FrameNotDeclaredError, TfTreeError}
 /// large batch would stall other threads.
 ///
 /// The rule is expressed in estimated work rather than element count, because
-/// depth varies. Below the threshold the worst case is under 1 µs of GIL
-/// retention — far below CPython's 5 ms switch interval, so no other thread
-/// notices. Above it the worst case is a 4% overhead. **Both sides are cheap,
-/// which is why the exact constant does not need tuning**; what matters is that
-/// neither branch is ever badly wrong.
+/// depth varies. Below the threshold the *estimated* worst case is just under
+/// 1 µs of GIL retention — in real nanoseconds it is about twice that, because
+/// the estimate is low by ~2×; see [`release_the_gil`], which does the
+/// arithmetic. Either way it is three orders of magnitude below CPython's 5 ms
+/// switch interval, so no other thread notices. Above the threshold the
+/// worst-case overhead is 40 ns against ≥1 µs estimated (≥2 µs real), so ≤4%.
+/// **Both sides are cheap, which is why the exact constant does not need
+/// tuning**; what matters is that neither branch is ever badly wrong.
 pub(crate) const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
 /// Rough per-step cost used only to place the threshold above.
 const NS_PER_STEP_ESTIMATE: u64 = 55;
@@ -34,28 +37,42 @@ const NS_PER_STEP_ESTIMATE: u64 = 55;
 ///
 /// A twist row *is* more work per element than a pose row: it folds through
 /// `fold_at_with_derivatives`, which samples each edge's bracketing segment for
-/// a derivative as well as a pose. So `est` under-estimates a twist batch, and
-/// the branch it gets wrong is the *cheap* one — it holds the GIL a little longer
-/// than §6.1's stated worst case of just under 1 µs.
+/// a derivative as well as a pose. So `est` under-estimates a twist batch — but
+/// **it already under-estimates a pose batch by nearly as much**, and that is
+/// what settles the question.
 ///
-/// **By about 1.1×, measured.** Depth 3, n = 4000, `ScLerp` (the only policy
-/// that answers a twist at all), release build, pinned: **328 ns/elem** for
-/// `layout="quat"` against **369 ns/elem** for `layout="quat_twist"`, best of
-/// five within a process. Treat that as indicative rather than as a gate — the
-/// host was **not quiet** and one of three repetitions was discarded as
-/// polluted; what the measurement establishes is the *magnitude*, which is what
-/// this decision turns on.
+/// Depth 3, n = 4000, `ScLerp` (the only policy that answers a twist at all),
+/// release build, pinned: **328 ns/elem** for `layout="quat"` against
+/// **369 ns/elem** for `layout="quat_twist"`, best of five within a process.
+/// Treat both as indicative rather than as a gate — the host was **not quiet**
+/// and one of three repetitions was discarded as polluted; what they establish
+/// is the *magnitude*, which is what this decision turns on.
 ///
-/// So a twist batch can hold the GIL for ~1.1 µs where a pose batch holds it
-/// for ~1 µs, and that is not worth a second constant. §6.1's argument is that
-/// both sides of the threshold are cheap and **what matters is that neither
-/// branch is ever badly wrong**; 1.1 µs is still three orders of magnitude
+/// Against `NS_PER_STEP_ESTIMATE`, which predicts 3 × 55 = 165 ns/elem, that is
+/// arithmetic rather than a second measurement:
+///
+/// | layout | measured ns/elem | `est` says | ratio |
+/// | --- | --- | --- | --- |
+/// | `"quat"` | 328 | 165 | **2.0×** |
+/// | `"quat_twist"` | 369 | 165 | **2.2×** |
+///
+/// So the twist adds ~1.1× on top of a ~2× error the constant already carries
+/// on the pose row, and that ~2× is not news: `docs/API.md` §3.4 records the
+/// same thing from the other direction — 55 ns/step comes from a benchmark that
+/// queried on-grid stamps and so never interpolated
+/// (`docs/decisions/0013`), and the honest figure is ~97 ns/step. The 328 above
+/// is 109 ns/step, which agrees with it.
+///
+/// **The consequence is that §6.1's "just under 1 µs" worst case is really
+/// ~2 µs for a pose batch and ~2.2 µs for a twist one**, and the conclusion is
+/// unchanged for exactly the reason §6.1 gives: what matters is that neither
+/// branch is ever badly wrong, and 2.2 µs is still three orders of magnitude
 /// below CPython's 5 ms switch interval, so no other thread notices. A
-/// layout-dependent estimate would also mean two numbers to re-derive when
-/// `docs/decisions/0013` re-baselines instead of one, and `docs/API.md` §3.4 is
-/// NORMATIVE that `NS_PER_STEP_ESTIMATE` is re-derived **from that
-/// measurement, in that commit** — inventing a twist multiplier against
-/// today's superseded baseline is the same mistake in a second place.
+/// layout-dependent multiplier would correct the smaller of the two errors while
+/// leaving the larger, and would mean two numbers to re-derive when
+/// `docs/decisions/0013` re-baselines instead of one — and `docs/API.md` §3.4 is
+/// NORMATIVE that `NS_PER_STEP_ESTIMATE` is re-derived **from that measurement,
+/// in that commit**. Both rows above are for it to supersede.
 #[inline]
 fn release_the_gil(n: usize, depth: usize) -> bool {
     let est = (n as u64)
@@ -97,6 +114,18 @@ pub struct PyTree {
     /// alongside — not instead of — the `Py<PyTree>` refcount [`PyPlan`] holds:
     /// the `Arc` keeps the *arena* alive, the `Py` keeps the Python object
     /// alive, and only the first of those is what a claim points into.
+    ///
+    /// # Hot-path cost
+    ///
+    /// This field was a plain `Tree`, so **every** read entry point — `at`,
+    /// `at_into`, `latest`, `adaptive`, `lookup`, `edges` — now takes one extra
+    /// dependent load before `guard()`, where before the `Tree` was inline in
+    /// the pyclass. **Not measured**, and it is the same trade `tf_tree_c`'s
+    /// `TreeShare` records for the same reason: a pointer chase into an
+    /// allocation that is warm — `PyPlan::tree`
+    /// dereferences the `Py<PyTree>` in the instruction before — against a call
+    /// that then does a seqlock read and a depth-N fold. If it is ever worth a
+    /// number, `at`'s scalar `mat4` path is where to take it.
     pub(crate) inner: Arc<Tree>,
 }
 
@@ -458,8 +487,16 @@ impl PyPlan {
     /// What is known without measuring: `stamps` stays **positional**, so the
     /// 29 ns §4.2 actually measured is untouched, and PyO3 keeps the vectorcall
     /// convention for a signature with keyword-only arguments rather than
-    /// falling back to `PyArg_ParseTuple`. That bounds the exposure to the
-    /// difference between two vectorcall shapes, not to the 29 ns.
+    /// falling back to `PyArg_ParseTuple`. **That second half is verified, not
+    /// assumed** — §4.2 is NORMATIVE that it be checked, and
+    /// `tests/python/test_api.py::test_the_hot_methods_are_emitted_as_meth_fastcall`
+    /// reads the `PyMethodDef::ml_flags` PyO3 emitted: `at`, `at_into` and
+    /// `push` are `METH_FASTCALL | METH_KEYWORDS` (`0x82`) and `latest` is
+    /// `METH_NOARGS` (`0x04`), on both the GIL and the free-threaded build.
+    /// `METH_FASTCALL | METH_KEYWORDS` is still vectorcall — CPython calls it
+    /// through `_PyCFunctionFastWithKeywords` with an args array and a names
+    /// tuple, and builds no argument tuple — so the exposure is bounded by the
+    /// difference between two vectorcall shapes, not by the 29 ns.
     #[pyo3(signature = (stamps, /, *, layout = None))]
     fn at<'py>(
         &self,
@@ -914,6 +951,15 @@ impl PyPlan {
     /// `mat4` path is (§5.3) — and the dispatch is on `stamps` first for the
     /// same reason it is there: probing `out` first blames the argument the
     /// caller got right.
+    ///
+    /// **The stamp dispatch is [`Self::at_layout`]'s, to the letter**, and that
+    /// is a requirement rather than a tidiness: `docs/PHASE3.md` §3 is NORMATIVE
+    /// that the accepted stamp types are `int`, an `np.int64` scalar and an
+    /// `(N,)` `np.int64` array, and that a `float` meets the `TypeError`
+    /// carrying the 238 ns ULP. An `if PyInt { .. } else { cast_or_BufferError }`
+    /// gets **both** wrong — it refuses `np.int64` and it reports a `float` as a
+    /// buffer problem — so the array cast is *fallen through* rather than
+    /// `else`-d, and [`stamp_from_any`] is what has the last word.
     fn at_into_layout(
         &self,
         py: Python<'_>,
@@ -923,20 +969,23 @@ impl PyPlan {
         name: &str,
     ) -> PyResult<()> {
         let e = layout.elems();
-        let scalar = stamps.is_instance_of::<pyo3::types::PyInt>();
-        let (src_owned, src_arr) = if scalar {
-            ([stamp_from_any(stamps)?], None)
+        let src_arr = if stamps.is_instance_of::<pyo3::types::PyInt>() {
+            None
         } else {
-            let arr = stamps.cast::<PyArray1<i64>>().map_err(|_| {
-                BufferError::new_err("stamps must be an (N,) int64 array, or an int")
-            })?;
-            if !arr.is_c_contiguous() {
-                return Err(BufferError::new_err(
-                    "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
-                     explicitly if you meant to copy",
-                ));
+            stamps.cast::<PyArray1<i64>>().ok()
+        };
+        let scalar = src_arr.is_none();
+        let src_owned = match &src_arr {
+            Some(arr) => {
+                if !arr.is_c_contiguous() {
+                    return Err(BufferError::new_err(
+                        "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                         explicitly if you meant to copy",
+                    ));
+                }
+                [0i64]
             }
-            ([0i64], Some(arr))
+            None => [stamp_from_any(stamps)?],
         };
         // SAFETY: checked C-contiguous above; held across `eval_*`'s `detach`
         // per §6.2.
@@ -1326,22 +1375,31 @@ fn interp_from_str(name: &str) -> PyResult<InterpPolicy> {
 /// Topology is builder-time (decision `0004`), so there is no `declare_*` on a
 /// live tree: the layout is a property of the arena, fixed when it is created.
 ///
-/// # `interp=` and why its default is not the engine's
+/// # `interp=`, and why its default is the engine's
 ///
-/// **`"lerpslerp"`**, which is `tf2`-compatible translation-LERP plus
-/// rotation-SLERP — *not* `tf_tree::TreeBuilder`'s own `ScLerp` default. This
-/// binding has hard-coded it since Phase 3 and changing it here would silently
-/// change the numbers every existing caller gets, which is not a thing to do in
-/// a commit about layouts.
+/// **`"sclerp"`**, which is `tf_tree::TreeBuilder`'s own default and what
+/// `docs/PROJECT.md` §5 D5 requires — *do not* make `LerpSlerp` the default
+/// without a measurement justifying it. This binding hard-coded `LerpSlerp`
+/// from Phase 3 until now and no such measurement was ever recorded, so the
+/// divergence was a mistake rather than a decision — and it is not cosmetic.
+/// LERP+SLERP is left-invariant but **not** right-invariant, so a Python caller
+/// on the old default got interpolation failing an invariance the Rust caller's
+/// default satisfies, while `docs/API.md` §3 promised the Python surface
+/// diverges only in the two places it lists.
 ///
-/// It is now a keyword because it has an observable consequence it did not have
-/// before: **`LerpSlerp` has no exact body twist**, so
-/// `plan.at(stamps, layout="quat_twist")` over a tree built with the default
-/// raises `DerivativesUnavailableError`. Pass `interp="sclerp"` for a tree
-/// whose edges can answer it. `docs/PHASE3.md` §4.1 spells this keyword the
-/// same way in its own layout sketch.
+/// **This changes the numbers a caller who passed no `interp=` was getting.**
+/// It is a one-line break made before a published tag rather than a permanent
+/// divergence after one. `interp="lerpslerp"` stays, and is the right answer for
+/// bit-compatibility with `tf2` — which D5 says is what `LerpSlerp` is *for*.
+///
+/// The keyword also has an observable consequence beyond the numbers:
+/// **`LerpSlerp` has no exact body twist**, so
+/// `plan.at(stamps, layout="quat_twist")` over a `lerpslerp` tree raises
+/// `DerivativesUnavailableError`. With `ScLerp` the default, that layout works
+/// out of the box. `docs/PHASE3.md` §4.1 spells this keyword the same way in
+/// its own layout sketch.
 #[pyfunction]
-#[pyo3(signature = (edges, *, capacity = 1024, interp = "lerpslerp"))]
+#[pyo3(signature = (edges, *, capacity = 1024, interp = "sclerp"))]
 pub fn build(edges: Vec<(String, String)>, capacity: u32, interp: &str) -> PyResult<PyTree> {
     let mut b = tf_tree::TreeBuilder::new().default_interp(interp_from_str(interp)?);
     for (parent, child) in &edges {
@@ -1418,9 +1476,12 @@ pub fn push(
 /// its declared edges, so there is no way to create one without saying what is
 /// in it; that is why this is an edge list and not a boolean.
 ///
-/// `capacity` and `interp` describe the edges being created and are ignored
-/// when `create` is absent — they are [`build`]'s, with the same default and
-/// the same `layout="quat_twist"` consequence.
+/// `capacity` and `interp` describe the edges being created — they are
+/// [`build`]'s, with the same `"sclerp"` default and the same
+/// `layout="quat_twist"` consequence. Without `create` they describe nothing,
+/// but `interp` is still **parsed**: accepting `open(interp="screw")` silently
+/// while `build(interp="screw")` refuses it would make the same typo a startup
+/// error in one call and a no-op in the other.
 ///
 /// **Creating requires `mode="rw"`**, and is refused otherwise rather than
 /// quietly ignored. Both of §4.1's reasons for the read-only default survive
@@ -1428,7 +1489,7 @@ pub fn push(
 /// `rw` publisher — which has already opted into being able to corrupt the tree
 /// — still has to ask.
 #[pyfunction]
-#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "lerpslerp"))]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp"))]
 pub fn open_arena(
     name: Option<&str>,
     domain: Option<u32>,
@@ -1452,12 +1513,17 @@ pub fn open_arena(
              the arena it would have created",
         ));
     }
+    // **Parsed unconditionally, before `create` is consulted.** A misspelled
+    // policy is a startup error under `build` and must be one here too; folding
+    // this into the `if let` below made `open(interp="screw")` a silent no-op,
+    // which is the one shape of a keyword nobody notices they got wrong.
+    let policy = interp_from_str(interp)?;
     let mut o = tf_tree::Open::new().mode(attach).create(match &create {
         None => tf_tree::CreatePolicy::Never,
         Some(_) => tf_tree::CreatePolicy::IfAbsent,
     });
     if let Some(edges) = &create {
-        let mut b = tf_tree::TreeBuilder::new().default_interp(interp_from_str(interp)?);
+        let mut b = tf_tree::TreeBuilder::new().default_interp(policy);
         for (parent, child) in edges {
             b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
         }

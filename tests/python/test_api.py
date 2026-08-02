@@ -691,10 +691,10 @@ def test_plan_edges_of_a_self_plan_is_empty(tree):
 def twistable():
     """A tree whose edges can answer a twist.
 
-    ``tf_tree.build``'s default is ``interp="lerpslerp"``, which is
-    ``tf2``-compatible and has **no exact body twist** — so the default tree is
-    the one that *refuses* ``layout="quat_twist"``. That refusal has its own
-    test below; this fixture is the other half.
+    ``interp="sclerp"`` is spelled out rather than left to the default, so that
+    the tests below keep testing the *layout* even if the default ever moves
+    again. That the default already **is** ``"sclerp"`` is its own test —
+    ``test_the_default_interp_is_the_engines_own``.
     """
     t = tf_tree.build([("map", "base")], interp="sclerp")
     tf_tree.push(t, "base", "map", 1_000_000_000, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -774,26 +774,74 @@ def test_the_twist_layout_is_the_quat_layout_plus_six(twistable):
     np.testing.assert_allclose(twist[:, 10:13], [[1.0, 0.0, 0.0]] * 3, atol=1e-9)
 
 
-def test_lerpslerp_refuses_a_twist_rather_than_finite_differencing_it(tree):
+def test_lerpslerp_refuses_a_twist_rather_than_finite_differencing_it():
     """`docs/PHASE5.md` §4.4 item 1: the typed error, not a plausible number.
 
-    ``tree`` is the default fixture, so its edges are ``LerpSlerp`` — ``tf2``'s
-    interpolator, which has no exact body twist. A layout that quietly changed
-    meaning per interpolator would be the quaternion-order trap moved into the
-    time axis, so this is a refusal and it is **typed**: a caller branches on it
-    to decide whether to re-declare the edge or ask for a pose.
+    ``interp="lerpslerp"`` is ``tf2``'s interpolator and has no exact body
+    twist. A layout that quietly changed meaning per interpolator would be the
+    quaternion-order trap moved into the time axis, so this is a refusal and it
+    is **typed**: a caller branches on it to decide whether to re-declare the
+    edge or ask for a pose.
+
+    It has to be asked for explicitly now — ``tf_tree.build``'s default is
+    ``"sclerp"``, which is the whole point of the change: the layout works out
+    of the box and this is the opt-in that gives it up.
 
     Mutant: map ``LookupError::DerivativesUnavailable`` to the generic
     ``TfTreeError`` (delete the arm added to ``lookup_err``) => ``raises`` no
     longer matches the subclass and the test fails.
     """
-    p = tree.plan("map", "base")
+    t = tf_tree.build([("map", "base")], interp="lerpslerp")
+    tf_tree.push(t, "base", "map", 1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+    tf_tree.push(t, "base", "map", 2_000, [1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0])
+    p = t.plan("map", "base")
     stamps = np.array([1_500], dtype=np.int64)
     with pytest.raises(tf_tree.DerivativesUnavailableError):
         p.at(stamps, layout="quat_twist")
     # The pose layouts over the same edge are unaffected: it is the derivative
     # that does not exist, not the transform.
     assert p.at(stamps, layout="quat").shape == (1, 7)
+
+
+def test_the_default_interp_is_the_engines_own(tree):
+    """`docs/PROJECT.md` §5 D5: ScLerp is the default, and Python is not exempt.
+
+    D5 says in terms *do not* make ``LerpSlerp`` the default without a
+    measurement justifying it. This binding did exactly that from Phase 3, with
+    no measurement anywhere in the repository, so a Python caller got an
+    interpolator that is left-invariant but **not** right-invariant while the
+    Rust caller's default satisfies both — and `docs/API.md` §3 promised the
+    Python surface diverges only where it lists.
+
+    Checked two ways, because either alone is weak. The *observable* half is
+    that the default tree answers ``layout="quat_twist"``, which only ``ScLerp``
+    can. The *numeric* half is that it does not agree with an explicitly
+    ``lerpslerp`` tree on a rotation — the two interpolators coincide whenever
+    there is no rotation, so the fixture's pure translation could not tell them
+    apart and neither could most of this file.
+
+    Mutant: restore ``interp = "lerpslerp"`` in ``build``'s ``#[pyo3(signature
+    = ...)]`` => ``DerivativesUnavailableError: edge EdgeId(1) declares
+    interpolation policy 1, which has no exact derivative`` out of the first
+    assertion, which short-circuits the rest. The second half was checked
+    separately under the same mutant build: both trees then produce
+    ``[0.92387953, 0, 0, 0.38268343, 1, 0, 0]`` and ``np.allclose`` is ``True``,
+    so ``assert not`` would have failed too.
+    """
+    assert tree.plan("map", "base").at(1_500, layout="quat_twist").shape == (13,)
+
+    # A 90-degree yaw with an offset lever arm: LERP+SLERP and the SE(3) screw
+    # geodesic put the midpoint in different places.
+    q0 = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    q1 = [0.7071067811865476, 0.0, 0.0, 0.7071067811865476, 2.0, 0.0, 0.0]
+    mid = {}
+    for name in ("default", "lerpslerp"):
+        kw = {} if name == "default" else {"interp": "lerpslerp"}
+        t = tf_tree.build([("map", "base")], **kw)
+        tf_tree.push(t, "base", "map", 1_000, q0)
+        tf_tree.push(t, "base", "map", 2_000, q1)
+        mid[name] = t.plan("map", "base").at(1_500, layout="quat")
+    assert not np.allclose(mid["default"], mid["lerpslerp"])
 
 
 def test_a_float_stamp_is_still_refused_with_the_measurement_under_a_layout(tree):
@@ -813,6 +861,136 @@ def test_a_float_stamp_is_still_refused_with_the_measurement_under_a_layout(tree
     for layout in ("mat4", "quat", "affine32", "quat_twist"):
         with pytest.raises(TypeError, match="238 ns"):
             p.at(1.5, layout=layout)
+
+
+# `(layout, elems, dtype)` for the three non-`mat4` layouts. The buffer is
+# allocated **inside** each test rather than here: a module-level array would be
+# shared between the two below, and the one that writes into it would silently
+# arm the "nothing was written" assertion in the other.
+LAYOUT_OUT = [
+    ("quat", 7, np.float64),
+    ("affine32", 12, np.float32),
+    ("quat_twist", 13, np.float64),
+]
+
+
+@pytest.mark.parametrize(("layout", "elems", "dtype"), LAYOUT_OUT)
+def test_at_into_refuses_a_float_stamp_with_the_measurement_too(
+    twistable, layout, elems, dtype
+):
+    """§3 is NORMATIVE and does not have a per-*method* exception either.
+
+    ``at_into``'s ``layout=`` path dispatched on ``PyInt`` with an ``if/else``,
+    so the float fell into the array branch and was reported as
+    ``BufferError: stamps must be an (N,) int64 array, or an int`` — a complaint
+    about the argument the caller got *right*, and one that loses the 238 ns
+    number §3 requires the refusal to carry. The array cast is now fallen
+    *through* rather than ``else``-d, exactly as ``at`` does it.
+
+    Mutant: restore the ``else`` (``if scalar { .. } else { cast(..).map_err(
+    |_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?
+    }``) => ``BufferError`` is raised instead and all three rows fail.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros(elems, dtype=dtype)
+    with pytest.raises(TypeError, match="238 ns"):
+        p.at_into(1.5, out, layout=layout)
+    assert not out.any(), "the buffer was written before the stamp was validated"
+
+
+@pytest.mark.parametrize(("layout", "elems", "dtype"), LAYOUT_OUT)
+def test_a_numpy_int64_scalar_is_an_accepted_stamp(twistable, layout, elems, dtype):
+    """§3 lists the accepted stamp types: ``int``, an ``np.int64`` scalar, and a
+    C-contiguous ``np.int64`` array.
+
+    The middle one is not a nicety — it is what ``stamps[i]`` gives you, so a
+    caller indexing their own stamp array hits it on the first line they write.
+    The ``if/else`` dispatch refused it: an ``np.int64`` is not a Python ``int``
+    and is not an ``ndarray`` either, so it fell into the array branch and was
+    rejected as a buffer.
+
+    Mutant: as above => all three rows raise ``BufferError``.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros(elems, dtype=dtype)
+    t = np.array([1_250_000_000, 1_500_000_000], dtype=np.int64)[1]
+    assert isinstance(t, np.int64) and not isinstance(t, int)
+    p.at_into(t, out, layout=layout)
+    np.testing.assert_array_equal(out, p.at(1_500_000_000, layout=layout))
+    # `at` has always accepted it; the two must not disagree about what a stamp
+    # is, which is the whole reason this fix was "match the pose path exactly".
+    np.testing.assert_array_equal(p.at(t, layout=layout), out)
+
+
+# ---------------------------------------------------------------------------
+# The twist layout's second refusal (`docs/API.md` R5)
+# ---------------------------------------------------------------------------
+
+
+def test_a_single_sample_has_a_pose_but_no_segment_to_differentiate():
+    """``NoSegmentError``, and it is a *type* because the response differs.
+
+    ``DerivativesUnavailableError`` says the edge can never answer a twist and
+    the fix is to re-declare it. This says the edge can, but not yet — one
+    retained sample, so there is a pose and no interval. The fix is to publish
+    another sample or ask again later, which is the opposite response, and R5
+    is that a caller may branch on the *type* and not on the message.
+
+    It is newly reachable from Python because ``layout="quat_twist"`` is; before
+    it, nothing on this surface asked for a derivative.
+
+    Mutant: delete the ``LookupError::NoSegment`` arm from ``lookup_err`` so it
+    falls to the generic arm => ``pytest.raises`` sees a bare ``TfTreeError``
+    and the test fails.
+    """
+    t = tf_tree.build([("map", "base")], interp="sclerp")
+    tf_tree.push(t, "base", "map", 1_000_000_000, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    p = t.plan("map", "base")
+    # The pose is fine. That is the entire distinction from `NoDataError`.
+    assert p.at(1_000_000_000, layout="quat").shape == (7,)
+    with pytest.raises(tf_tree.NoSegmentError):
+        p.at(1_000_000_000, layout="quat_twist")
+
+
+def test_two_equal_stamps_bracket_a_zero_length_segment():
+    """The second cause, and the one that is legal rather than merely early.
+
+    `docs/PHASE1.md` §2 invariant 6 makes stamps non-decreasing, **not**
+    strictly increasing — equal stamps are accepted and the newer value wins —
+    so two samples at one stamp span zero time and have no derivative. A
+    finite difference here would divide by zero and report an infinite velocity
+    as if it were measured.
+
+    Mutant: as above => a bare ``TfTreeError``.
+    """
+    t = tf_tree.build([("map", "base")], interp="sclerp")
+    tf_tree.push(t, "base", "map", 5, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    tf_tree.push(t, "base", "map", 5, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+    p = t.plan("map", "base")
+    assert p.at(5, layout="quat").shape == (7,)
+    with pytest.raises(tf_tree.NoSegmentError):
+        p.at(5, layout="quat_twist")
+
+
+def test_no_segment_reaches_every_twist_entry_point():
+    """The scalar, batch and ``_into`` paths are three call sites; one arm.
+
+    All three go through ``lookup_err``, so this would pass on any one of them
+    — but the point is that a caller who moved from ``at`` to ``at_into`` for
+    the allocation is still catching the same class.
+
+    Mutant: as above => all three raise the base ``TfTreeError``.
+    """
+    t = tf_tree.build([("map", "base")], interp="sclerp")
+    tf_tree.push(t, "base", "map", 1_000_000_000, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    p = t.plan("map", "base")
+    s = 1_000_000_000
+    with pytest.raises(tf_tree.NoSegmentError):
+        p.at(s, layout="quat_twist")
+    with pytest.raises(tf_tree.NoSegmentError):
+        p.at(np.array([s], dtype=np.int64), layout="quat_twist")
+    with pytest.raises(tf_tree.NoSegmentError):
+        p.at_into(s, np.zeros(13), layout="quat_twist")
 
 
 def test_an_unknown_layout_is_refused_and_lists_the_ones_that_exist(tree):
@@ -904,6 +1082,110 @@ def test_an_unknown_interp_is_refused(tree):
     """Mutant: default an unknown name to ``ScLerp`` => nothing raises."""
     with pytest.raises(ValueError, match="sclerp"):
         tf_tree.build([("map", "base")], interp="screw")
+
+
+def test_open_validates_interp_even_with_nothing_to_create():
+    """The same typo must be the same error in both creation calls.
+
+    ``open`` parsed ``interp`` inside ``if let Some(edges) = &create``, so
+    ``tf_tree.open(interp="screw")`` without ``create=`` was silently accepted
+    while ``tf_tree.build(interp="screw")`` was refused — the one shape of a
+    wrong keyword nobody notices, because nothing happens.
+
+    ``mode="ro"`` and no ``create``, so this never reaches the shared-memory
+    layer: the refusal must land *before* the attach, which is also what makes
+    the test independent of whether an arena exists.
+
+    Mutant: move ``let policy = interp_from_str(interp)?;`` back inside the ``if
+    let Some(edges) = &create`` block => the typo is accepted, the call proceeds
+    to the attach, and what comes back is ``TfTreeError: no arena is serving and
+    CreatePolicy::Never forbids creating one`` — a complaint about the arena
+    instead of about the keyword, and not a ``ValueError``, so ``raises`` fails.
+    That *is* the bug: the misspelling reached the transport untouched.
+    """
+    with pytest.raises(ValueError, match="sclerp"):
+        tf_tree.open(name="tf_tree_test_no_such_arena", interp="screw")
+
+
+# ---------------------------------------------------------------------------
+# `docs/PHASE3.md` §4.2: verify METH_FASTCALL rather than assuming it
+# ---------------------------------------------------------------------------
+
+
+def _ml_flags(cls: type, name: str) -> int:
+    """The ``PyMethodDef::ml_flags`` CPython holds for ``cls.name``.
+
+    There is no Python-level accessor for it, so this walks the
+    ``PyMethodDescrObject`` by hand. The offsets are **discovered, not
+    hard-coded**: the ``PyObject`` head is 16 bytes under the GIL build and 32
+    under the free-threaded one, so the search is for the slot holding
+    ``d_type``, after which ``PyDescrObject`` fixes ``d_name``, ``d_qualname``
+    and then ``d_method``. Reading ``ml_name`` back and comparing it to the
+    method's own name is the check that the walk found the right structure —
+    without it a wrong offset would report a garbage flag word as a pass.
+    """
+    import ctypes
+
+    voidp = ctypes.POINTER(ctypes.c_void_p)
+    descr = getattr(cls, name)
+    base = id(descr)
+    for head in range(0, 64, 8):
+        if ctypes.cast(base + head, voidp)[0] != id(cls):
+            continue
+        method_def = ctypes.cast(base + head + 24, voidp)[0]
+        ml_name = ctypes.cast(method_def, ctypes.POINTER(ctypes.c_char_p))[0]
+        if ml_name == name.encode():
+            return ctypes.cast(method_def + 16, ctypes.POINTER(ctypes.c_int))[0]
+    raise AssertionError(
+        f"could not locate PyMethodDef for {cls.__name__}.{name}: CPython's "
+        "descriptor layout has moved and this probe needs updating"
+    )
+
+
+METH_VARARGS = 0x0001
+METH_KEYWORDS = 0x0002
+METH_NOARGS = 0x0004
+METH_FASTCALL = 0x0080
+
+
+def test_the_hot_methods_are_emitted_as_meth_fastcall():
+    """§4.2: "**Verify** that PyO3 actually emits ``METH_FASTCALL`` for these
+    signatures rather than assuming it; if it does not, that is 29 ns and worth
+    a hand-written shim."
+
+    That sentence is NORMATIVE and had been answered by assertion. It is the
+    reason ``at``, ``at_into``, ``latest`` and ``push`` take positional-only
+    arguments at all, so if the flag were not there, the whole shape of those
+    four signatures would be paying for nothing.
+
+    ``at`` and ``at_into`` carry a keyword-only ``layout=``, and the result is
+    ``METH_FASTCALL | METH_KEYWORDS`` — still vectorcall: CPython dispatches it
+    through ``_PyCFunctionFastWithKeywords`` with an args array and a names
+    tuple and builds no argument tuple. ``METH_VARARGS`` is what would mean
+    ``PyArg_ParseTuple``, and it is asserted absent.
+
+    ``latest`` takes nothing, so it gets ``METH_NOARGS`` — cheaper still, and
+    not a failure of the rule.
+
+    Mutant: give ``Plan::at`` a ``#[pyo3(signature = (*args, **kwargs))]`` =>
+    ``AssertionError: at: ml_flags=0x3, no METH_FASTCALL``. ``0x3`` is
+    ``METH_VARARGS | METH_KEYWORDS`` — the ``PyArg_ParseTuple`` shape §4.2 is
+    worried about — so the second assertion would fail too, but the first
+    short-circuits it.
+    """
+    from tf_tree import _core
+
+    for cls, name in (
+        (tf_tree.Plan, "at"),
+        (tf_tree.Plan, "at_into"),
+        (_core.Publisher, "push"),
+    ):
+        flags = _ml_flags(cls, name)
+        assert flags & METH_FASTCALL, f"{name}: ml_flags={flags:#x}, no METH_FASTCALL"
+        assert not flags & METH_VARARGS, f"{name}: ml_flags={flags:#x} is METH_VARARGS"
+
+    latest = _ml_flags(tf_tree.Plan, "latest")
+    assert latest & METH_NOARGS, f"latest: ml_flags={latest:#x}"
 
 
 # ---------------------------------------------------------------------------

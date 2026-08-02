@@ -48,7 +48,12 @@ def bench(fn, iters: int, reps: int = 9) -> float:
 
 
 def build_tf_tree():
-    t = tf_tree.build([("map", "base")])
+    # `interp="lerpslerp"` explicitly, because this is a comparison *against*
+    # tf2 and LERP+SLERP is tf2's own interpolator — the two must be doing the
+    # same arithmetic for the ratio to mean anything. It used to be the Python
+    # binding's default and is no longer (`API.md` §3), so relying on the
+    # default here would have silently switched this row to ScLerp.
+    t = tf_tree.build([("map", "base")], interp="lerpslerp")
     for k in range(N_SAMPLES):
         tf_tree.push(
             t, "base", "map", k * DT_NS, [1.0, 0.0, 0.0, 0.0, float(k), 0.0, 0.0]

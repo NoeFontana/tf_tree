@@ -31,8 +31,33 @@ class DerivativesUnavailableError(TfTreeError):
 
     Raised only by `layout="quat_twist"`: `LerpSlerp` is `tf2`'s interpolator
     and has no exact body twist, so it is refused rather than
-    finite-differenced. Declare the edge `ScLerp`, or ask for a pose layout.
+    finite-differenced. Declare the edge `ScLerp` — which is the default — or
+    ask for a pose layout.
+
+    A property of the *edge*, so it fires at element 0 of a batch and does not
+    go away on its own. Its sibling `NoSegmentError` is the opposite.
     """
+
+class NoSegmentError(TfTreeError):
+    """A pose exists at this stamp, but no segment to differentiate.
+
+    The other refusal `layout="quat_twist"` adds over the pose layouts, and the
+    one that is **transient**: the edge retains a single sample, or the two
+    samples bracketing the stamp carry equal stamps (which is legal — stamps are
+    non-decreasing, not strictly increasing). Publish another sample, or ask
+    again later.
+
+    Distinct from `NoDataError`, which means the edge is empty. Here the
+    transform is perfectly well defined and only the derivative is not, so being
+    told "no data" would send you to the wrong problem. A property of the
+    *stamp*, so it can fire partway through a batch.
+    """
+
+F32Layout = Literal["affine32"]
+"""The one layout that writes `float32`."""
+
+F64Layout = Literal["mat4", "quat", "quat_twist"]
+"""The layouts that write `float64`."""
 
 Layout = Literal["mat4", "quat", "affine32", "quat_twist"]
 """How a transform is written into memory. Stated, never inferred.
@@ -47,31 +72,52 @@ class Plan:
     """A compiled lookup path. Build with `Tree.plan`."""
 
     @overload
-    def at(
-        self, stamps: int, /, *, layout: Layout | None = ...
-    ) -> NDArray[np.float64] | NDArray[np.float32]:
-        """One stamp in, one transform out.
+    def at(self, stamps: int, /) -> NDArray[np.float64]:
+        """One stamp in, one `(4, 4)` float64 transform out.
 
-        `(4, 4)` float64 by default; `(7,)`, `(12,)` float32 or `(13,)` for the
-        other three layouts.
+        The default layout is `"mat4"`, which is float64 — so this returns
+        `NDArray[np.float64]`, not a union a caller has to narrow. Only
+        `layout="affine32"` produces float32, and it has its own overload.
+        """
+
+    @overload
+    def at(self, stamps: NDArray[np.int64], /) -> NDArray[np.float64]:
+        """`(N,)` stamps in, `(N, 4, 4)` float64 out — the path to prefer.
+
+        A Python loop over the scalar form costs ~200 ns per iteration; this
+        amortises to near-native.
         """
 
     @overload
     def at(
-        self, stamps: NDArray[np.int64], /, *, layout: Layout | None = ...
-    ) -> NDArray[np.float64] | NDArray[np.float32]:
-        """`(N,)` stamps in, `(N, ...)` out — the path to prefer.
+        self, stamps: int | NDArray[np.int64], /, *, layout: F32Layout
+    ) -> NDArray[np.float32]:
+        """`layout="affine32"`: `(12,)` or `(N, 12)` **float32**, row-major 3x4."""
 
-        A Python loop over the scalar form costs ~200 ns per iteration; this
-        amortises to near-native.
+    @overload
+    def at(
+        self, stamps: int | NDArray[np.int64], /, *, layout: F64Layout | None = ...
+    ) -> NDArray[np.float64]:
+        """`layout=` selects what is written per stamp (see `Layout`).
 
-        `layout=` selects what is written per stamp (see `Layout`). It is
-        keyword-only; `stamps` stays positional-only, which is where the
+        Keyword-only; `stamps` stays positional-only, which is where the
         measured 29 ns of `METH_FASTCALL` lives.
 
         `layout="quat_twist"` is `at_with_derivatives` as a batch: it appends
         the body twist, in the plan's **source** frame, angular part first. It
-        is the only layout that can raise `DerivativesUnavailableError`.
+        is the only layout that can raise `DerivativesUnavailableError` or
+        `NoSegmentError`.
+        """
+
+    @overload
+    def at(
+        self, stamps: int | NDArray[np.int64], /, *, layout: Layout | None = ...
+    ) -> NDArray[np.float64] | NDArray[np.float32]:
+        """The fallback, for a `layout` whose value is not statically known.
+
+        Passing a variable of type `Layout` cannot resolve to one dtype, so this
+        is the only overload that hands back a union — and it is reached only by
+        a caller who genuinely does not know which layout they are asking for.
         """
 
     @overload
@@ -322,12 +368,19 @@ def build(
     Topology is builder-time (decision `0004`), so there is no `declare_*` on a
     live tree: the layout is a property of the arena, fixed when it is created.
 
-    `interp` defaults to `"lerpslerp"` — `tf2`-compatible, and **not** the
-    engine's own `"sclerp"` default; this binding has spelled it that way since
-    Phase 3. It matters now because `LerpSlerp` has no exact body twist, so
-    `plan.at(stamps, layout="quat_twist")` over a default tree raises
-    `DerivativesUnavailableError`. Pass `interp="sclerp"` for a tree that can
-    answer it.
+    `interp` defaults to `"sclerp"` — the SE(3) screw geodesic, which is the
+    engine's own default and the only policy with an exact derivative, so
+    `plan.at(stamps, layout="quat_twist")` works on a tree built this way.
+
+    Pass `interp="lerpslerp"` for `tf2`-bit-compatible interpolation
+    (translation LERP + rotation SLERP). It is not right-invariant —
+    interpolating `T0 @ C, T1 @ C` is not `interp(T0, T1) @ C` — and it has no
+    exact body twist, so `layout="quat_twist"` over such an edge raises
+    `DerivativesUnavailableError`.
+
+    This binding hard-coded `"lerpslerp"` until now, diverging from Rust with no
+    measurement behind it; `PROJECT.md` §5 D5 requires one, so the default moved
+    rather than the rule.
     """
 
 def push(
@@ -363,8 +416,10 @@ def open_arena(
     `mode="rw"`** and is refused otherwise, so a read-only consumer still
     cannot bring an arena into existence.
 
-    `capacity` and `interp` describe the edges being created and are ignored
-    without `create`; both are `build`'s, with the same defaults.
+    `capacity` and `interp` describe the edges being created; both are
+    `build`'s, with the same defaults. Without `create` they describe nothing —
+    but `interp` is still validated, so a misspelling raises here exactly as it
+    does in `build` rather than being silently discarded.
     """
 
 def open_file(path: str | os.PathLike[str], /) -> Tree:
