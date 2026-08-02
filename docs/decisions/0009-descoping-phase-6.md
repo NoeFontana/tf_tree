@@ -203,6 +203,13 @@ therefore earned and stay.
 - **The `tf_treed --config <file.toml|urdf>` surface in `PHASE2.md` §9 loses its
   `urdf` half.** That section is unimplemented tooling, so this costs no code;
   it does remove a promise.
+
+  > **The surface moved, and this retraction moved with it.**
+  > [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) supersedes
+  > `PHASE2.md` §9: there is no `tf_treed`, and the capability is
+  > `tf_tree serve --config <topology.toml>`. It takes the topology format and
+  > nothing else, so the `urdf` half stays retracted — this bullet is unchanged
+  > in substance, only in where it applies.
 - **A future contributor may still add URDF**, against the topology config
   format, without a decision record — because it is then an ordinary tool, not
   an architectural change. That is the intended effect.

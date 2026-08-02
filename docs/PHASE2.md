@@ -38,7 +38,7 @@ population all landed under
 | Fork poisoning (§7.3) | **Done** — `pthread_atfork` counter; five destructors guarded |
 | Per-edge page population (§7.1) | **Done** — measured 66.3 MiB → 3.8 MiB on an over-provisioned arena |
 | CLI adoption — `--attach`, `tf_tree participants` | **Done** |
-| `tf_treed`, `tf_tree_record`, `/tf` ingest, diagnostics (§9, §10) | Not implemented |
+| `tf_tree serve` (was `tf_treed`), `tf_tree_record`, `/tf` ingest, diagnostics (§9, §10) | Not implemented; §9 superseded by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) |
 | Fault injection (§11.3) | **Not implemented.** There is no `crash-points` feature and no `TF_TREE_CRASH_AT`, so none of §11.3's eleven named mid-protocol abort sites can be reached. `shm_torture --crash-points` **refuses** rather than running the SIGKILL test and calling it §11.3 coverage: `SIGKILL` lands wherever the scheduler puts it, which is a different and much shallower set of states. §11.3's `intern.after_hash_cas_before_id_store` row is the exception — its fix is amendment A8, which *is* applied. |
 | `shm_torture` (§11.4) | **Done, minus §11.3's crash points and minus killing the owner.** `crates/tf_tree_bench/src/bin/shm_torture.rs`: N processes on one arena doing random attach/detach/claim/reap/push/lookup through the real rendezvous, with the driver `SIGKILL`ing one of them several times a second and replacing it. Every reader validates every transform (§11.4's non-unit-quaternion and NaN rules, unconditionally — which is what `TF_TREE_PARANOID=1` was for, so there is no such switch), and after the run a participant that was never killed reclaims and checks that no claim and no participant slot leaked. `just shm-torture` is §13's 30-minute nightly and `just shm-torture-asan` is its "under ASan" half; **`just shm-torture-self-test` is the part that runs on a branch** — it asserts an injected corrupt transform is caught *by a process that did not write it*, and that a run which validated too little **fails** rather than printing the same `0 violations` a healthy one does. That test is in `just shm-check`. **The killed processes are joiners; the driver owns the rendezvous and is never killed.** That is forced by §3.5: takeover is specified but not wired into `tf_tree::open` (that module's own docs say so), so when the owner dies nothing takes over, every joiner is turned away by §3.4's split-brain check, and the run wedges in `ArenaHeldButUnreachable` — which is exactly what the first revision of this harness did, for most seeds, while printing `PASS`. **§12.3 gate 3 is therefore partly met**: zero corrupt reads across a torture run, measured, over ~250 composed `map -> tool` reads per observation round and with a floor that fails the run below 16; "every §11.3 crash point recovers" is not, because the crash points do not exist, and "the owner dies mid-run" is not, because §3.5 is not wired up. |
 | §3.8's generous default layout | **Superseded by decision `0004`**, which sizes the arena from declared edges. Reconciling the two is its own decision; `0005` records the conflict rather than resolving it silently. |
@@ -66,7 +66,7 @@ them.
 | Crash-consistency | every arena mutation protocol audited and repaired (§1) |
 | Read-only attach | `PROT_READ` mapping as a real safety boundary |
 | Mapping policy | per-edge population, `MADV_HUGEPAGE`, `MADV_DONTFORK`, optional `mlock` |
-| `tf_treed` | reference owner daemon, ~400 lines |
+| ~~`tf_treed`~~ | **Not a crate.** [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) makes it `tf_tree serve`, a subcommand of `tf_tree_cli`, so the workspace gains no member |
 | `tf_tree_record` | MCAP record/replay — the correctness harness for this phase |
 | `/tf` ingest bridge | read-only ROS 2 → arena, for real-data benchmarking |
 | Diagnostics | `doctor`, `top`, `participants` |
@@ -732,6 +732,36 @@ Consequences, which must be enforced by types where possible and by errors where
 
 ## 9. `tf_treed`
 
+> **SUPERSEDED by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md).
+> There is no `tf_treed` binary. The capability is `tf_tree serve`, a subcommand
+> of the binary that already ships — and it is an escalation, not a prerequisite.**
+>
+> Two things dissolved this section. First, **most of its responsibilities were
+> already discharged elsewhere**: D16 said ownership is *configured, not
+> negotiated*, and this daemon existed to make configuring it trivial —
+> [`0005`](./decisions/0005-the-shared-memory-seam.md) §8 then retired the "no
+> takeover" half, so ownership is a role the kernel reassigns on an uncontended
+> `F_OFD_SETLK` and `OpenOutcome::TookOver` ships. Liveness, reaping and owner
+> death need no daemon.
+>
+> Second, **the part that did remain is not a lifecycle problem.** What this
+> section was really for is the last paragraph below: pre-declaration, so a
+> consumer can attach and plan before any publisher runs. `0019` §2 fixes that
+> without a daemon and without a config file — a read-only attach implies
+> `CreatePolicy::Never` (today's default silently creates an *empty* arena, which
+> is the real bug), a consumer waits for topology with `Tree::await_frames`, and
+> `frame_headroom`/`edge_headroom` cover frames that arrive later.
+>
+> What survives, as `tf_tree serve --config <topology.toml>`: create and seal
+> from the config, pre-declare, hold the arena open, export metrics, drain on
+> `SIGTERM` leaving the segment alive. What is retired: `--lock` and
+> `--socket-mode`, both of which the rendezvous owns and neither of which was ever
+> daemon-specific. [`0009`](./decisions/0009-descoping-phase-6.md)'s amendment
+> below travels with it — URDF is still owed by no phase.
+>
+> The rest of this section is kept as written, because `0019`'s §*Rationale*
+> argues against it and an argument needs its opponent on the page.
+
 The reference owner. Target ~400 lines. Deliberately boring: it holds no application logic, so it is the process least likely to crash.
 
 ```
@@ -884,7 +914,7 @@ Ship this table as `docs/RUNBOOK.md`. Every row must correspond to a `doctor` ch
 | `BootIdMismatch` | arena predates a reboot (only possible with a file-backed dev arena) | recreate the arena |
 | `ConnectionRefused` | owner not running, or a stale socket path | start the owner; the stale path is unlinked automatically |
 | `NoParticipantSlots` | more than `max_participants` attached | raise `--participants`; requires an owner restart |
-| `FrameNotDeclared` on a read-only participant | startup ordering: no publisher has declared it yet | pre-declare in `tf_treed` config |
+| `FrameNotDeclared` on a read-only participant | startup ordering: no publisher has declared it yet | wait for it — `Tree::await_frames` ([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2). Check the consumer is not creating the arena itself: a read-only attach implies `CreatePolicy::Never`, and the old default created an *empty* one |
 | `ClaimRevoked` during `push` | this writer was judged dead and reaped | the process was stalled; investigate scheduling, GC, or page-fault stalls |
 | `EdgeAlreadyClaimed` | two nodes configured to publish one edge | a genuine configuration error — `doctor` names both PIDs |
 | `SlotContended` / `SlotRecycled` | reader starved, or ring too shallow for the publish rate | increase edge capacity; `doctor` warns at 80% occupancy |
@@ -927,7 +957,7 @@ Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers 
 - [ ] `shm_torture` runs 30 minutes nightly, clean, under ASan
 - [ ] `HeapArena` / `MappedArena` replay produces **bit-identical** results (§10)
 - [ ] §12.3 gate met, or a written explanation of which criterion failed and by how much
-- [ ] `tf_treed` ships with a systemd unit and a container example
+- [ ] `tf_tree serve` ships with a systemd unit and a container example (§9, superseded by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md); not 0.1.0 scope)
 - [x] `docs/RUNBOOK.md` complete; every row maps to a `doctor` check (rows for unimplemented Phase 2 errors are marked as such)
 - [~] `docs/PHASE3.md` written and carrying §14 forward; the measured numbers land with §12
 
@@ -942,7 +972,7 @@ Steps 1–3 are the phase. Everything after them is comparatively mechanical.
 3. **`MappedArena` + attach protocol.** Owner and attacher, sealing, `SCM_RIGHTS`, header validation. Assert the zero-line-diff property in the read path.
 4. **Claims as OFD locks; arena-side reaping; crash-point harness** — the harness built alongside, not after.
 5. `tf_tree_record` and the bit-identical replay test.
-6. `tf_treed`.
+6. `tf_tree serve` — last, and possibly never: [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2 is shaped so the daemon may never become urgent.
 7. `doctor` / `top` / `participants` extensions.
 8. `/tf` ingest bridge. **Note the impedance mismatch:** ROS permits any number of publishers per edge; `tf_tree` permits one. The bridge must claim each edge on first sight and adopt a documented, configurable policy on conflict — `FirstWriterWins` (default, with a loud diagnostic naming both ROS publishers) or `LastWriterWins`. This mismatch is a feature, not a bug: it surfaces multi-publisher conflicts that `tf2` silently averages into garbage, and the bridge is where users will first discover their robot has one.
 9. Benchmarks and the gate.

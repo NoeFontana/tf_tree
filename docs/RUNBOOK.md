@@ -9,10 +9,13 @@ misbehaves. It is organised by **symptom**, because that is what you have when
 you arrive.
 
 **Implementation status.** Phase 2's rendezvous and lifecycle are implemented
-(decision [`0005`](./decisions/0005-the-shared-memory-seam.md)); `tf_treed`, the
-recorder and `/tf` ingest are not. Rows marked **(needs `tf_treed`)** describe
-situations whose *fix* is a daemon that does not exist yet — the error itself is
-real and reachable today. The seven `doctor` checks are `cycle`,
+(decision [`0005`](./decisions/0005-the-shared-memory-seam.md)); the recorder
+and `/tf` ingest are not. **There is no `tf_treed`, and there will not be** —
+[`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) replaces
+it with `tf_tree serve`, and more usefully removes the reason the rows below
+used to point at a daemon at all. Any row you find still marked
+*(needs `tf_treed`)* is a defect in this document: it is telling you to run a
+program that has never existed. The seven `doctor` checks are `cycle`,
 `unclaimed-dynamic`, `multi-writer`, `short-buffer`, `inconsistent-rate`,
 `unreachable`, `out-of-order`.
 
@@ -431,11 +434,36 @@ The runtime directory is on NFS or CIFS. File locks there have subtly different
 semantics and the whole rendezvous depends on them being exact, so `open()`
 rejects those filesystems. Point `TF_TREE_RUNTIME_DIR` at local storage.
 
-### `FrameNotDeclared` — *(needs `tf_treed`)*
+### `FrameNotDeclared`
 
 A read-only participant asked for a frame nobody has declared yet. This is a
-startup-ordering problem, not a typo: pre-declare the static structure in
-`tf_treed`'s config so consumers can attach and plan before any publisher runs.
+startup-ordering problem, not a typo — and there are two distinct causes, which
+want opposite responses.
+
+**First, check the consumer is not the process that created the arena.** With
+`CreatePolicy::IfAbsent` — the default — a consumer that starts before any
+publisher creates an *empty* arena with a default layout, after which the
+publisher's own `layout_if_creating` never runs and the topology is permanently
+wrong. That consumer then looks healthy and finds nothing, forever.
+`CreatePolicy::Never`'s doc comment has named this hazard since Phase 2, and
+[`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2 makes
+it unrepresentable: a read-only attach *implies* `CreatePolicy::Never`. On a
+build that predates that, pass it explicitly. `tf_tree participants` will show
+you a single read-only participant on an arena with no edges, which is the
+signature.
+
+**Otherwise the publisher genuinely has not started yet, and the answer is to
+wait rather than to fail.** `Tree::await_frames(["map", "base_link"], deadline)`
+blocks until the frames exist or the deadline passes, and returns their ids.
+Reach for it in a consumer's startup path instead of planning immediately.
+
+**If frames arrive during operation rather than at startup** — per-detection
+frames, a sensor that appears late — that is `frame_headroom` / `edge_headroom`,
+sized at build time. Exhaustion is a typed error naming the knob.
+
+A supervised deployment that wants none of this ambiguity can pre-declare the
+whole static structure up front with `tf_tree serve --config`, which is what
+that subcommand is for. It is an option, not a prerequisite.
 
 ### `TopologyChurn`
 

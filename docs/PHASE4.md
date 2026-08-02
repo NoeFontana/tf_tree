@@ -1438,6 +1438,14 @@ A transform arriving on `/tf_static` for an edge already declared *dynamic* (or 
 > does not exist; one comment in `tf_tree_ipc/src/server.rs` is its only mention
 > in the repo.
 >
+> > **Updated by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md).**
+> > `tf_treed` is not going to exist; §9 is superseded and the capability is
+> > `tf_tree serve --config <topology.toml>` (the URDF half was already retracted
+> > by [`0009`](./decisions/0009-descoping-phase-6.md)). **Nothing below changes**
+> > — the bridge taking its topology up front is still the resolution, and it is
+> > now the *primary* one rather than a stand-in for a daemon, since `0019` scopes
+> > the bridge as the owner whenever a ROS stack is the source of truth.
+>
 > **So the bridge takes its topology up front**, from a config file, and a
 > transform arriving for an undeclared edge is dropped, counted and diagnosed
 > once per edge naming both frames. `Action::DeclareStatic` is then reinterpreted
