@@ -309,18 +309,16 @@ types moved neither `FORMAT_VERSION` nor `layout_hash`.
 **What is settled, and what is not.** The naming and numbering are settled:
 `sim` is 2, `steady` is 3, permanently — the prerequisite
 [`PHASE7.md`](./PHASE7.md) §4 J9 asks for before its read side can be specified.
-**The write side now applies it:** `tf_tree_bridge::config::parse_domain` maps
-all four names onto their `Domain::TAG`, so a topology file says
-`domain = "sim"`. `TopologyConfig::default_domain` stays a `u8` on purpose —
-this section's own point is that the trait is open, and a user-declared domain
-from tag 4 upwards has no name for a parser to accept — so the numeric form is
-kept beside the names rather than replaced by them.
+**The write side now names it:** `tf_tree_bridge::config::parse_domain` maps all
+four names onto their `Domain::TAG`, so a topology file says `domain = "sim"`.
+`TopologyConfig::default_domain` stays a `u8` on purpose — this section's own
+point is that the trait is open, and a user-declared domain from tag 4 upwards
+has no name for a parser to accept — so the numeric form is kept beside the
+names rather than replaced by them.
 
-What is **still** missing from `PHASE4.md` §5.5 is one clause of it: nothing
-derives the bridge's tag from `use_sim_time`. It is an explicit `time_domain`
-parameter defaulting to 0, read in `ros/tf_tree_ros/src/bridge_node.cpp`, which
-warns when `use_sim_time` is true and the tag is still 0 rather than changing it.
-That is an `rclcpp`-side change; the naming half it was waiting on is done.
+One clause of `PHASE4.md` §5.5 is **still** open: nothing derives the bridge's
+own tag from `use_sim_time`. §5.5's amendment records what is left and what
+today's misconfigurations actually do; this document does not restate it.
 
 §5.3's `doctor` check does not depend on the two new types and still does not.
 `PHASE5.md` §6's `TFT019` keys on the tag and fires only on tag 0, which is now
@@ -570,7 +568,7 @@ and not a convention.
 failure rather than a first-message one. The mismatch half is implemented
 (`TopologyConfig::check_domain`, called before the arena is built) and a config
 file now names its domain (§2.5); the `use_sim_time` *derivation* is the clause
-that remains, on the `rclcpp` side. **The read side is not yet specified,
+that remains, and §5.5's amendment is where it is tracked. **The read side is not yet specified,
 and [`PHASE7.md`](./PHASE7.md) §4 J9 specifies it**: a `Buffer` derives its query
 domain from the `rcl_clock_type_t` of the clock it was constructed with, so a
 node mixing `/clock`-driven sim time with a driver's steady time gets

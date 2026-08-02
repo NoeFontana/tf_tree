@@ -1104,10 +1104,11 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > > than with "unknown tag" — is a refinement it can now make and has not made.
 > >
 > > The tag mapping is settled (`sim` 2, `steady` 3, permanently) and the
-> > bridge's write side now spells it: `tf_tree_bridge::config::parse_domain`
+> > bridge's config file now spells it: `tf_tree_bridge::config::parse_domain`
 > > maps all four names, so `domain = "sim"` and `domain = "steady"` are things
 > > an operator writes rather than numbers they have to look up
-> > (`PHASE4.md` §5.5). **Nothing in this check depends on that, but the field
+> > (`PHASE4.md` §5.5, whose amendment also records the clause of that section
+> > which is still open). **Nothing in this check depends on that, but the field
 > > does:** tags 2 and 3 were reachable only by an operator who wrote the
 > > integer, and are now reachable by one who wrote the obvious word, so the
 > > population of arenas `TFT019` skips on a non-zero tag is about to stop being

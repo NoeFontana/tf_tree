@@ -64,6 +64,15 @@
 //! domain = "sensor"          # …or a bare tag, for a user-declared domain
 //! ```
 //!
+//! **The `domain` lines above are not free-standing, and that example is not a
+//! config every bridge starts with.** [`TopologyConfig::check_domain`] refuses,
+//! at startup, any *dynamic* edge whose resolved domain differs from the tag
+//! the bridge itself stamps in — `ros/tf_tree_ros`'s `time_domain` parameter,
+//! reaching this crate as `tft_bridge_options::domain`. The one dynamic edge
+//! above overrides the file default to `"sensor"`, so that file starts a bridge
+//! only when that tag is `1`. Static edges are exempt: a constant carries no
+//! stamp for a domain to be wrong about.
+//!
 //! `rate_hz` does **two** things, and the second is why writing `capacity`
 //! instead is not a free simplification: it sizes the ring, and it is recorded
 //! in the arena as the edge's *declared nominal rate*
@@ -1642,10 +1651,12 @@ capacity = 512
     /// and as a per-edge override, and each resolves to the tag the *engine*
     /// defines rather than to a literal this parser repeats.
     ///
-    /// `docs/PHASE4.md` §5.5 is NORMATIVE that the bridge tags edges
-    /// `SimDomain` under `use_sim_time`. Until `"sim"` parsed, a deployment
-    /// that wanted tag 2 had to write `2` — the state that section's amendment
-    /// recorded as its own text being true of a number and not of a name.
+    /// `docs/PHASE4.md` §5.5 opens by saying the bridge tags every edge it
+    /// declares `SimDomain` under `use_sim_time`. Until `"sim"` parsed, a
+    /// deployment that wanted tag 2 had to write `2` — the state that section's
+    /// amendment recorded as its own text being true of a number and not of a
+    /// name. The *derivation* from `use_sim_time` is still not implemented and
+    /// this test does not claim otherwise; §5.5's amendment tracks it.
     ///
     /// The last two rows are the reason the integer form is not a legacy
     /// escape: [`Domain`] is an open trait and a user-declared domain picks a

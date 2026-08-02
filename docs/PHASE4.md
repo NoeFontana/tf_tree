@@ -1192,24 +1192,46 @@ If `use_sim_time` is true, the bridge tags every edge it declares as `SimDomain`
 >
 > **`tf_tree_bridge::config::parse_domain` now maps all four spellings** —
 > `"system"`, `"sensor"`, `"sim"`, `"steady"` — each through the engine's own
-> `Domain::TAG` rather than through a literal repeated in the parser, so a
-> deployment that wants sim time writes `domain = "sim"` and no longer has to
-> know that it is `2`. `TopologyConfig::default_domain` stays a `u8` **and that
-> is the design, not the remainder**: `Domain` is an open trait, a user-declared
-> domain picks a free tag from 4 upwards, and a parser that accepted only the
-> four names would refuse the case the trait is open for. The numeric form is
-> therefore kept and tested alongside the names.
+> `Domain::TAG` rather than through a literal repeated in the parser. **That
+> changed the topology file and nothing else:** the file is where a deployment
+> that wants sim time writes `domain = "sim"` rather than `2`, while every other
+> end of the same deployment still carries the integer — `EdgeRecord::domain` in
+> the arena, `tft_bridge_options::domain` in the C ABI, the node's `time_domain`
+> parameter, and `tf_tree doctor`'s output.
+> `TopologyConfig::default_domain` stays a `u8` **and that is the design, not the
+> remainder**: `Domain` is an open trait, a user-declared domain picks a free tag
+> from 4 upwards, and a parser that accepted only the four names would refuse the
+> case the trait is open for. The numeric form is therefore kept and tested
+> alongside the names.
 >
 > **The remainder is the first clause of the paragraph above: "if `use_sim_time`
-> is true".** Nothing derives the bridge's own tag from `use_sim_time`. It is an
-> explicit `time_domain` parameter (default `0`) read in
-> `ros/tf_tree_ros/src/bridge_node.cpp`, passed through `BridgeOptions` to
-> `tft_bridge_options::domain`; that node *warns* when `use_sim_time` is true and
-> `time_domain` is still 0, and does not change it. So an operator who sets
-> `use_sim_time` and forgets `time_domain` still gets a `SystemDomain`-tagged
-> arena, with a log line. Closing that is an `rclcpp`-side change, gated only by
-> `just ros-test`, and it is the whole of what stands between this section and
-> being true as written.
+> is true".** Nothing derives the bridge's own tag from `use_sim_time`. That tag
+> is an explicit `time_domain` parameter (default `0`), read in
+> `ros/tf_tree_ros/src/bridge_node.cpp` and passed through `BridgeOptions` to
+> `tft_bridge_options::domain`; the node *warns* when `use_sim_time` is true and
+> `time_domain` is still 0, and does not change it. **So the parameter and the
+> config file have to be set together, and the two ways of getting that wrong do
+> not fail alike:**
+>
+> - `use_sim_time` true, `time_domain` **and** the config's domain both left at
+>   `0`: the bridge comes up, the arena is tagged `SystemDomain`, and that one
+>   warning is the only sign. This is the case the warning is for.
+> - `use_sim_time` true, the config says `domain = "sim"` — the spelling the
+>   paragraph above recommends — and `time_domain` is left at `0`: **the bridge
+>   does not come up.** `check_domain` sees the first *dynamic* edge declared 2
+>   against a bridge tag of 0, `tft_bridge_create` returns `TFT_ERR_TIME_DOMAIN`,
+>   `BridgeHandle` throws `BridgeError`, and the node's constructor fails. That
+>   is the NORMATIVE paragraph below working, not a gap; the warning is then
+>   merely the first of two lines. An operator on this path should be reading the
+>   refusal, not hunting for a bridge that is running with a log line.
+>
+> Closing the derivation is a change to that one file,
+> `ros/tf_tree_ros/src/bridge_node.cpp` — make the bridge's tag *follow*
+> `use_sim_time`, as the paragraph above says it does, instead of warning that it
+> did not. It is gated only by `just ros-test`, which needs `docker/tf2`, and it
+> is the whole of what stands between this section and being true as written.
+> **This is the one place that remainder is recorded**; [`API.md`](./API.md) §2.5
+> and [`PHASE7.md`](./PHASE7.md) §4 J9 point here rather than restate it.
 >
 > **The NORMATIVE paragraph below is met**, and has been since §5.8's config
 > file: `TopologyConfig::check_domain` refuses any *dynamic* edge whose declared
