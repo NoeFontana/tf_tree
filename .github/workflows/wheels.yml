@@ -13,8 +13,17 @@
 # phase; free-threading became *supported* in 3.14 under PEP 779.
 #
 # NOTE: this workflow has never executed. GitHub Actions has produced no run for
-# this repository since 2026-07-23 (see #24), which is an account- or org-level
-# problem rather than a syntax one. Treat the first real run as unproven.
+# this repository since 2026-07-23 (see #24). The cause is now diagnosed rather
+# than suspected and is written up in `ci.yml`'s header: user-workflow runs
+# stopped on every one of this account's **private** repositories at once
+# (2026-07-23 to 2026-07-24) while its **public** ones kept running, which is an
+# account-level Actions billing state — not a trigger, not a runner, and not
+# anything this file can fix. Treat the first real run as unproven.
+#
+# **Nothing here tests a wheel.** These jobs build and (on a tag) publish; the
+# suite that would run against the artifact is `ci.yml`'s `python` job, which
+# builds its own extension with maturin. A wheel that imports but computes the
+# wrong transform would leave this workflow green.
 name: wheels
 
 on:

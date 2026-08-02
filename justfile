@@ -13,13 +13,19 @@ test: test-rust test-doc ingest-check
 test-rust:
     cargo nextest run --workspace --no-tests=pass
     # **`tf_tree_c`'s `bridge` feature is default-off, so `--workspace` compiles
-    # none of it.** `crates/tf_tree_c/src/bridge.rs` — nine `extern "C"` entry
+    # none of it.** `crates/tf_tree_c/src/bridge.rs` — **ten** `extern "C"` entry
     # points, the only ones that both decide and write — could be replaced with
     # literal garbage and `cargo build --workspace --all-targets`, this
     # `nextest` line above and `cargo clippy --workspace --all-targets` all
-    # still passed; only `cargo fmt --check` noticed. Its 21 tests ran nowhere
+    # still passed; only `cargo fmt --check` noticed. Its tests ran nowhere
     # but the two `+nightly` rows of `just c-abi-check`, so on a machine without
     # a nightly toolchain the §5 seam had no gate at all.
+    #
+    # **Counts, re-measured** — this comment said "nine entry points" and
+    # "21 tests" and both were stale. `grep -c 'extern "C" fn' bridge.rs` is 10;
+    # `cargo nextest run -p tf_tree_c --features bridge` runs **60** tests
+    # against **31** without the feature, so the feature is worth **29** tests
+    # that `cargo nextest run --workspace` never runs.
     #
     # This is the same shape `shm-check` exists for, one crate over: a
     # default-off feature is invisible to `--workspace`, and a file nobody
@@ -293,16 +299,31 @@ c-abi-check:
 #    `xtask headers` produced a header with an unbalanced `#endif`, and every
 #    Rust test still passed.
 #
-# `cbindgen` is needed only for step 1's regeneration and is deliberately not a
-# workspace dependency (MPL-2.0 against `deny.toml`'s allowlist). Install it with
-# `cargo install cbindgen`.
+# `cbindgen` is deliberately not a workspace dependency (MPL-2.0 against
+# `deny.toml`'s allowlist), so it has to be on `$PATH` as a binary:
+#
+#     cargo install cbindgen --locked --version 0.29.4
+#
+# **It is needed for step 1's `--check`, not only for regeneration.** `--check`
+# generates both headers and diffs them against the committed files, so without
+# the binary this recipe exits 1 on its first line and the compile matrix below
+# never runs. That is not hypothetical — CI's `c-surface` job shipped without
+# installing it and could not have passed on a clean runner; the job now installs
+# the version pinned above.
+#
+# The pin is a determinism measure, not a known incompatibility: cbindgen 0.28.0
+# and 0.29.4 were both measured to reproduce the committed headers byte-for-byte.
+# It is here because `--check` compares generated text to a committed file, so a
+# future release that changes whitespace would fail every PR for a reason that is
+# not a diff in `src/`. Bump it deliberately, with the regenerated headers in the
+# same commit.
 c-header-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo xtask headers --check
     # **`bridge` is in this build, and the smoke test is compiled with
     # `-DTFT_HAVE_BRIDGE`.** The bridge declarations are emitted inside
-    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the nine §5 entry
+    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the ten §5 entry
     # points would be in the committed header and compiled by nothing — which is
     # exactly the state that let a function and a typedef share the name
     # `tft_bridge_stats` through a whole revision. A header nobody compiles is
@@ -460,6 +481,63 @@ ingest-check:
         { echo "tf_tree_cli's default build has no zstd decoder: is 'compression' still in [features] default?"; exit 1; }
     cargo tree -q -p tf_tree_cli -e normal | grep -q lz4_flex || \
         { echo "tf_tree_cli's default build has no lz4 decoder: is 'compression' still in [features] default?"; exit 1; }
+
+# **Rustdoc, with warnings denied — the docs.rs shop window.**
+#
+# Nothing gated rustdoc until this recipe existed, and warnings accumulate
+# silently because `cargo doc` exits 0 on every one of them. Measured before it
+# was written: `cargo doc --no-deps --workspace` emitted **80** warnings — 44
+# unresolved intra-doc links, 35 public items linking to private ones, one
+# redundant explicit target. Every one of those renders on docs.rs as a dead
+# link the moment a crate is published.
+#
+# **The configuration is docs.rs's, not `--workspace`'s, and that is the point.**
+# The five publishable crates — `tf_tree`, `tf_tree_core`, `tf_tree_math`,
+# `tf_tree_arena`, `tf_tree_ipc` — each set `all-features = true` and
+# `rustdoc-args = ["--cfg", "docsrs"]` in `[package.metadata.docs.rs]`, so the
+# build that renders publicly is the all-features one, and the same flags are
+# passed here. That sentence was **false when it was first written**:
+# `tf_tree_ipc` had no `[package.metadata.docs.rs]` block at all, so docs.rs
+# would have rendered it at default features while this recipe checked it at
+# all-features. The block was added rather than the claim weakened. The other
+# four crates on line 1 (`tf_tree_c`, `tf_tree_cli`, `tf_tree_ingest`,
+# `tf_tree_bridge`) are `publish = false` and are here because they are public
+# API to *somebody* — a C caller, an operator, the ROS node.
+#
+# `--cfg docsrs` buys nothing today: no source file in the workspace reads it
+# (`rg 'docsrs|doc_cfg' crates/*/src` is empty). It is passed because docs.rs
+# passes it, so the day a `#[cfg_attr(docsrs, doc(cfg(...)))]` lands, this
+# recipe is already checking the configuration that renders.
+#
+# **Line 2 is `publish = false` and needs its own feature set.** `--all-features`
+# on `tf_tree_bench` enables `tf2`, whose build script needs a ROS 2 install no
+# host recipe has, so the features are named instead: `shm` and `embed-probe`
+# are enabled and `tf2` is not. That is not cosmetic — 9 of `tf_tree_bench`'s 13
+# `required-features` targets are documentable binaries, and at default features
+# rustdoc sees none of them nor `src/shm_util.rs`. Measured: a broken intra-doc
+# link injected into `shm_util.rs` left `cargo doc --no-deps -p tf_tree_bench`
+# exiting 0 and fails the line below. `xtask` has no features at all.
+#
+# `shm` makes line 2 Linux-only, exactly as `just shm-check` already is.
+#
+# **What this deliberately does NOT gate**, and there are two:
+#
+# * `tf_tree_bench`'s `tf2` feature — `src/tf2.rs`, `src/replay_tf2.rs`, the
+#   `tf2_scaling` binary and the `tf2_compare` bench. That code needs the
+#   container, and `just tf2-check` is where it is compiled and linted.
+# * A plain default-feature `cargo doc --no-deps -p tf_tree` still reports 2
+#   unresolved links — `Tree::open_frozen` and `crate::open`, both
+#   `#[cfg(all(feature = "shm", target_os = "linux"))]`. They resolve in the
+#   build docs.rs performs, and de-linking them would trade two working links in
+#   the rendered documentation for a clean run of a command that is not the gate.
+doc:
+    RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo doc --no-deps --all-features \
+        -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
+        -p tf_tree_ipc -p tf_tree_c -p tf_tree_cli -p tf_tree_ingest \
+        -p tf_tree_bridge
+    RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p tf_tree_bench \
+        --features shm,embed-probe
+    RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p xtask
 
 lint: py-compile
     cargo fmt --all -- --check

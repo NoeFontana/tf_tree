@@ -15,7 +15,7 @@
 //! killing the host process because of a bug in *us* is not acceptable, so every
 //! entry point wraps its body in [`catch_unwind`](std::panic::catch_unwind).
 //!
-//! Both are handled by one helper, [`guard`], because they happen at the same
+//! Both are handled by one helper, `guard`, because they happen at the same
 //! place: wrapping the body *is* the boundary. Two separate requirements
 //! remembered at thirty call sites would be two requirements to forget.
 

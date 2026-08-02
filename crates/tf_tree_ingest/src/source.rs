@@ -196,7 +196,7 @@ pub enum OnBadChunk {
 /// decompress one within.
 ///
 /// **One argument rather than two, and the reason is a smell this type exists to
-/// stop growing.** [`read_chunk`] already carries
+/// stop growing.** `read_chunk` already carries
 /// `#[allow(clippy::too_many_arguments)]`; adding the decompression bounds beside
 /// [`OnBadChunk`] as a second scalar would have made that eight and nine, and
 /// would have re-indented every `read_tf` call site for a parameter that belongs
@@ -223,7 +223,7 @@ pub struct SkipCounts {
     /// **Recovery is record-granular, including inside a chunk.** A recording cut
     /// mid-chunk still yields every whole record in that chunk's prefix, which is
     /// why this module owns the record framing rather than asking a reader for
-    /// complete records only — see [`RECORD_HEADER_LEN`].
+    /// complete records only — see `RECORD_HEADER_LEN`.
     ///
     /// The one case that cannot be recovered is a truncated *compressed* chunk: a
     /// partial codec frame is not decodable by a one-shot decoder, so that chunk's
@@ -232,7 +232,7 @@ pub struct SkipCounts {
     /// wrong with the chunk, the file simply stops inside it.
     pub truncated: bool,
     /// Chunks that did not decompress or did not check out, and were skipped
-    /// under [`OnBadChunk::Skip`](crate::ingest::OnBadChunk::Skip).
+    /// under [`OnBadChunk::Skip`].
     pub bad_chunks: u64,
     /// The span the skipped chunks covered, from their own declared message
     /// times.
@@ -260,7 +260,7 @@ pub struct SkipCounts {
     /// sector lands here too, and one bad sector must not cost a recording that
     /// `--on-bad-chunk=skip` would otherwise recover. So the fix is the
     /// *diagnosis*, not the policy — see
-    /// [`IngestError::AllChunksOverLimit`](crate::IngestError::AllChunksOverLimit).
+    /// [`IngestError::AllChunksOverLimit`].
     pub chunks_over_limit: u64,
 }
 

@@ -36,7 +36,7 @@
 //! * It performs **no lookups**, so it adds nothing to `lookups_ok` and cannot
 //!   invent an extrapolation failure. Even if it did, §5.6's amendment means a
 //!   read-only participant records nothing at all. That is asserted, not
-//!   claimed: [`tests::capturing_the_arena_moves_no_counter`] reads a populated
+//!   claimed: `tests::capturing_the_arena_moves_no_counter` reads a populated
 //!   arena repeatedly and requires every counter to stand still.
 //!
 //! # Its ages are against `doctor`'s reference clock
@@ -49,7 +49,7 @@
 //!
 //! # Frame names are somebody else's bytes
 //!
-//! Everything this view did not author goes through [`sanitize`] before it is
+//! Everything this view did not author goes through `sanitize` before it is
 //! written into an ANSI frame. See that function for what is at stake.
 //!
 //! # Rates here are observed, never a deviation from a nominal
@@ -735,7 +735,7 @@ pub struct Tick {
     ///
     /// A copy of the sampler's deque, and deliberately the *whole* one rather
     /// than the `feed_lines` the renderer will show: bounded at
-    /// [`FEED_CAPACITY`] by construction, so unlike the per-edge interval
+    /// `FEED_CAPACITY` by construction, so unlike the per-edge interval
     /// vectors it does not grow with the arena, and a tick that carried only
     /// the visible tail could not answer "did this fire twice over fourteen
     /// ticks", which is what the hysteresis tests ask it.

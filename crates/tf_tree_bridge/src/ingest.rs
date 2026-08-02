@@ -1073,13 +1073,13 @@ impl Ingest {
     /// Returns `Some(Action::Halt { StartupConflicts })` under
     /// [`AuthorityPolicy::Strict`] if any conflict — authority or static — was
     /// recorded while the window was open, and `None` otherwise. Idempotent: a
-    /// second call, and the [`STARTUP_WINDOW_TRANSFORMS`] backstop after an
+    /// second call, and the `STARTUP_WINDOW_TRANSFORMS` backstop after an
     /// explicit close, return `None`.
     ///
     /// **This is the mechanism; the backstop is the fallback.** A caller with a
     /// real clock — the `rclcpp` node, from a one-shot steady timer — decides
     /// what "startup" means in seconds, which is the unit the question is
-    /// actually about. See [`STARTUP_WINDOW_TRANSFORMS`].
+    /// actually about. See `STARTUP_WINDOW_TRANSFORMS`.
     ///
     /// **No counter moves.** A window-close halt is caused by transforms
     /// already counted and dropped, each in its own bucket, at the time they
@@ -2298,9 +2298,11 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// **Attribution is not a correctness dependency** (§5.3, P5) — and this is
     /// the regression test for the defect that motivated the whole redesign.
     ///
-    /// [`Publisher::UnknownGid`] and [`Publisher::Unattributed`] are *unit*
-    /// variants, so on an RMW without endpoint introspection every publisher on
-    /// the robot compares equal. Under the quorum that was fatal: the floor was
+    /// The then-`Publisher::UnknownGid` — since replaced by
+    /// [`Publisher::Gid`], which compares on the GID — and
+    /// [`Publisher::Unattributed`] were *unit* variants, so on an RMW without
+    /// endpoint introspection every publisher on
+    /// the robot compared equal. Under the quorum that was fatal: the floor was
     /// derived from `Authority::distinct_owners()`, which read 1, so a quorum of
     /// 1 was demanded and the **first** single-edge regression latched the
     /// bridge permanently. §5.3 says in as many words that attribution is

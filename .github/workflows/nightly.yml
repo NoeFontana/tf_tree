@@ -5,10 +5,14 @@ name: nightly
 # minutes nightly, clean, under ASan") and the sanitizer suites, which need a
 # nightly toolchain and `-Zbuild-std` and therefore take tens of minutes.
 #
-# **A green tick here is not evidence.** No run of any workflow has been produced
-# for this repository since 2026-07-23. Every job below is a thin wrapper around
-# a `just` recipe, and the recipe run locally — on a stated architecture — is the
-# gate. That is why the recipes came first and the jobs second.
+# **This workflow has produced zero runs, and the schedule is not why.** No run
+# of any user workflow has been produced for this repository since 2026-07-23,
+# scheduled or otherwise. `ci.yml`'s header carries the diagnosis: the same
+# account's private repositories all stopped at once while its public ones kept
+# running, which is an account-level Actions billing state and not something
+# this file can change. Every job below is a thin wrapper around a `just`
+# recipe, and the recipe run locally — on a stated architecture — is the gate.
+# That is why the recipes came first and the jobs second.
 
 on:
   schedule:
@@ -73,6 +77,33 @@ jobs:
           tool: just
       - name: just ${{ matrix.recipe }}
         run: just ${{ matrix.recipe }}
+
+  # **The `tf2::BufferCore` differential, which ran in no automated gate at all.**
+  #
+  # `ci.yml`'s `tf2` job keeps `tf2-differential` and `tf2-replay` off every pull
+  # request because they are minutes of work, and points here for where they do
+  # run; this job is the other half of that sentence. They are *tests*, not
+  # measurements:
+  # `tf2-differential` checks tf_tree against tf2 on generated topologies and
+  # `tf2-replay` does it over a real recorded `/tf` stream, both to a stated
+  # tolerance, both host-independent. Excluding them from PRs and then not
+  # running them anywhere left the migration-credibility claim ungated.
+  #
+  # `tf2-bench`, `tf2-scaling` and `dds-bench` stay out on purpose: those are
+  # timings, and a shared runner cannot produce one meaningfully.
+  tf2-differential:
+    name: tf2 differential + replay (container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just tf2-differential
+        run: just tf2-differential
+      - name: just tf2-replay
+        run: just tf2-replay
 
   cpp-sanitizers:
     name: cpp-check (ASan/UBSan)

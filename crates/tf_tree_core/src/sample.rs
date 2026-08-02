@@ -393,9 +393,9 @@ impl SampleRing<'_> {
     /// that layout is the only one paying an `O(log n)` binary search per stamp
     /// per plan step while every pose layout pays `O(1)` amortized.
     ///
-    /// Only the *start* of the search differs; [`Self::bracket_from`] is shared
+    /// Only the *start* of the search differs; `Self::bracket_from` is shared
     /// with `sample_from` and cannot return a different index than
-    /// [`Self::bracket`] would. `cursor` is updated to the lower bracket index
+    /// `Self::bracket` would. `cursor` is updated to the lower bracket index
     /// found, so the next call resumes there; seed it to `0` for the first.
     ///
     /// # Errors

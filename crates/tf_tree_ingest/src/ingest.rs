@@ -760,7 +760,7 @@ pub struct FillStats {
 /// | Allocation | Size | Bounded by `--max-memory`? |
 /// |---|---|---|
 /// | The arena, from `builder.build()` | 78 B per sample, measured | **No** |
-/// | Pass two's sort buffers | [`SAMPLE_BYTES`] = 64 B per sample | Yes |
+/// | Pass two's sort buffers | `SAMPLE_BYTES` = 64 B per sample | Yes |
 /// | The spill path's run index | 16 B per sorted run | **No** — reported as [`FillStats::peak_run_index_bytes`] |
 ///
 /// The arena is not capped because it *cannot* be: it is the output. Every
@@ -785,7 +785,7 @@ pub struct FillStats {
 /// Grouping's smallest unit is an edge, so it cannot serve a **single** edge
 /// whose samples exceed the cap on their own — at the default 4 GiB, 67 million
 /// samples on one edge. That case, and only that case, takes §3.1's other route:
-/// [`crate::spill`] sorts the edge in cap-sized runs, writes them to one
+/// `crate::spill` sorts the edge in cap-sized runs, writes them to one
 /// temporary file, and k-way merges them back. It is second choice rather than
 /// the general mechanism because a run file is a thing that can leak, fill a
 /// different filesystem, or outlive the process; re-reading the recording is

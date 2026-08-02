@@ -16,7 +16,7 @@
 //! Written by hand, the same choice `tf_tree`'s CBOR manifest writer makes and
 //! for the same reason: this is one flat document with no user-controlled
 //! structure, and the only thing that needs escaping is a frame name. The
-//! escaper is [`push_json_string`] and it is tested against the characters that
+//! escaper is `push_json_string` and it is tested against the characters that
 //! actually appear in a bag — a Windows path in `source`, and a frame name with
 //! a quote in it.
 

@@ -47,7 +47,7 @@
 //! # Panics cannot escape
 //!
 //! Since Rust 1.81 a panic crossing an `extern "C"` boundary aborts the process.
-//! Every entry point wraps its body in [`error::guard`], which converts a panic
+//! Every entry point wraps its body in `error::guard`, which converts a panic
 //! into `TFT_ERR_INTERNAL` with the payload in the thread-local detail. The one
 //! deliberate exception is [`tft_last_error`], which must stay callable from an
 //! error path.
@@ -330,7 +330,7 @@ const MAGIC_PLAN: u64 = 0x7446_5F50_4C41_4E31;
 
 /// An opaque handle to a transform tree. `Send + Sync`: shareable across threads.
 ///
-/// `#[repr(C)]` is load-bearing, not decoration: [`check_tree`] validates the
+/// `#[repr(C)]` is load-bearing, not decoration: `check_tree` validates the
 /// magic word through a field projection, and under the default `repr(Rust)` the
 /// compiler is free to reorder fields — so "the magic is first" would be an
 /// assumption that happens to hold today and could stop holding on a compiler
@@ -512,7 +512,7 @@ pub unsafe extern "C" fn tft_tree_open(out: *mut *mut tft_tree) -> tft_status {
 /// Release a tree handle. Freeing NULL is a no-op.
 ///
 /// Any plan compiled from this tree stays valid: the underlying tree is
-/// refcounted and this drops one reference (see [`tft_plan::share`]).
+/// refcounted and this drops one reference (see `tft_plan::share`).
 ///
 /// # Safety
 ///
@@ -972,7 +972,7 @@ pub extern "C" fn tft_layout_size(layout: tft_layout) -> usize {
 // Test-only panic hook — §6.1
 // ---------------------------------------------------------------------------
 
-/// A guarded entry point that does nothing, for measuring what [`guard`] costs.
+/// A guarded entry point that does nothing, for measuring what `guard` costs.
 ///
 /// Pairs with `tft_layout_size`, which is deliberately *not* guarded, so the
 /// difference between the two is `catch_unwind`'s landing pads plus the

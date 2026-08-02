@@ -29,7 +29,7 @@
 //! `(samples − 1) / span`, which is the mean interval and not the nominal rate
 //! the launch file claims. It is rounded **up** to two decimals so a recording
 //! that saw 4.29 Hz never produces a ring sized for 4.28, and then
-//! [`Capacity::history`] rounds up to a power of two on top of that. An edge
+//! [`Capacity::history`](tf_tree::Capacity::history) rounds up to a power of two on top of that. An edge
 //! with fewer than two samples has no measurable rate at all and gets an
 //! explicit slot count instead of a fabricated one.
 

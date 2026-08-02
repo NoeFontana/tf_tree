@@ -61,7 +61,7 @@ pub const TFT_LAYOUT_AFFINE12_ROW_F32: tft_layout = 4;
 /// finite difference that would look like an answer. Nothing is written for
 /// that element or any after it.
 ///
-/// It is **not** readable — see [`read`]. A velocity is derived from the arena,
+/// It is **not** readable — see `read`. A velocity is derived from the arena,
 /// never stored in it.
 pub const TFT_LAYOUT_QVEC7_WXYZ_TWIST6: tft_layout = 5;
 

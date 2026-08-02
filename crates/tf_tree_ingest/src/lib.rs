@@ -189,7 +189,7 @@ pub enum IngestError {
         codec: decompress::ChunkCodec,
     },
     /// A chunk was unreadable and the policy was
-    /// [`OnBadChunk::Halt`](ingest::OnBadChunk::Halt).
+    /// [`OnBadChunk::Halt`].
     ///
     /// It names the chunk, and that is not decoration — the same reason
     /// [`cdr::CdrError`] carries a byte offset. "Chunk 3 of 812 failed its CRC" is

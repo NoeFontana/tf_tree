@@ -11,9 +11,9 @@
 //!   keeps by editing two files in step. It is also `docs/PHASE5.md` §9.3's
 //!   "identical data" requirement, discharged by construction.
 //! * `aggregate` — read every consumer's line protocol, merge the histograms
-//!   with [`crate::mp::Histogram`] (the same code the Rust harnesses use, so no
+//!   with [`tf_tree_bench::mp::Histogram`] (the same code the Rust harnesses use, so no
 //!   second quantile implementation exists to disagree with the first), and emit
-//!   both the table and a [`crate::runstore`] run file.
+//!   both the table and a [`tf_tree_bench::runstore`] run file.
 //!
 //! # The asymmetry this report must state, every time
 //!
