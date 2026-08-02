@@ -419,7 +419,9 @@ pub fn reap(rec: &ClaimRecord) {
 /// un-exported, which is the failure mode this repository's `Mutant:` notes
 /// exist to prevent. **rustdoc enforces the code on nightly only** — measured:
 /// mutating it to `E0599` fails `cargo +nightly test --doc -p tf_tree_core`
-/// with *"Some expected error codes were not found"*, and passes on stable.
+/// with *"Some expected error codes were not found: \["E0599"\]"*, and still
+/// reports `ok` on stable. `just test-doc` is stable, so it does not check this
+/// line; `just test-doc-error-codes` does, and CI's `miri` job runs it.
 pub struct Publisher<'a> {
     ring: SampleRing<'a>,
     claim: &'a ClaimRecord,

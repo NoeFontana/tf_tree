@@ -801,12 +801,18 @@ impl<'a> core::ops::Deref for EdgeWriter<'a> {
 /// actually under test.
 ///
 /// **rustdoc enforces the code on nightly only** — measured: mutating it to
-/// `E0599` fails `cargo +nightly test --doc` with *"Some expected error codes
-/// were not found"* and passes on stable. So on the stable path this is a
-/// statement of intent, and the *renamed-or-unexported* half is covered instead
-/// by `assert_send::<tf_tree::OwnedWriter>()` in
+/// `E0599` fails `cargo +nightly test --doc -p tf_tree` with *"Some expected
+/// error codes were not found: \["E0599"\]"* and still reports `ok` on stable.
+/// So `just test-doc` (stable, `--workspace`) is **not** the gate for this line;
+/// `just test-doc-error-codes` is — one nightly command, run by CI's `miri` job,
+/// which exists so this pin is a check rather than something that reads like
+/// one.
+///
+/// The *renamed-or-unexported* half is covered on stable regardless, by
+/// `assert_send::<tf_tree::OwnedWriter>()` in
 /// `crates/tf_tree/tests/owned_writer.rs`, which stops compiling if the path
-/// moves. The two together leave no way for this to pass while testing nothing.
+/// moves. The three together leave no way for this to pass while testing
+/// nothing.
 ///
 /// # Every guard is reproduced, and not by copying one
 ///
