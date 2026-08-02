@@ -54,10 +54,9 @@ version moves anyway.
 > [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) moved the
 > crate to `deny` for one lifetime extension, in `OwnedWriter` — which exists to
 > replace two hand-rolled `extend_to_static` helpers in crates the Rust test
-> suite cannot instrument (`tf_tree_c`, `tf_tree_py`). It becomes the workspace's
-> only one when `0017` steps 6–7 delete those two; that deletion is deferred to
-> its own commits, so **both helpers are still in the tree today**. The rule the
-> list is a snapshot of is
+> suite cannot instrument (`tf_tree_c`, `tf_tree_py`). **`0017` steps 6–7 have
+> deleted both**, so it is now the workspace's only lifetime extension rather
+> than one of three. The rule the list is a snapshot of is
 > [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md)'s criterion —
 > `unsafe` only at a boundary the compiler cannot see across — and the phases
 > after this one added `tf_tree_ipc`, `tf_tree_py` and `tf_tree_c` under it.

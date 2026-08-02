@@ -239,7 +239,11 @@ def run_publisher() -> None:
     """Publish into the shared arena until killed."""
     import tf_tree
 
-    tree = tf_tree.open(mode="rw", create=EDGES, capacity=4096)
+    # `interp="lerpslerp"` explicitly: the consumers below are timed against
+    # `tf2_ros` buffers, so both sides must run tf2's own interpolator for the
+    # latency ratio to be like-for-like. It was the Python binding's default
+    # when this was written and is no longer (`API.md` §3).
+    tree = tf_tree.open(mode="rw", create=EDGES, capacity=4096, interp="lerpslerp")
     writers = [tree.publisher(child, parent) for parent, child in EDGES]
     print("READY", flush=True)
     period = 1.0 / PUB_HZ

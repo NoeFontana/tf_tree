@@ -2,16 +2,40 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** steps 1–5 landed — `OwnedWriter`, `Tree::claim_owned`, the
-crate attribute move, and the drop / lease / fork / `compile_fail` tests.
-`just miri` now covers `tf_tree`, which is what step 2's mutant was always
-stated against; it immediately found that the `EdgeWriter` has to be **boxed**
-(see *Consequences*). **Steps 2 and 3's tests are `shm`-gated** — a claim lease
-is an OFD byte and a heap tree has no lock file — so `just shm-check` runs
-`crates/tf_tree/tests/owned_writer.rs`; `cargo nextest run --workspace` compiles
-those two out and is not their gate. Steps 6–8 (the `tf_tree_py` and `tf_tree_c` migrations,
-and the crate-level docs) are outstanding, and until they land the two
-`extend_to_static` helpers this record exists to delete are still in the tree.
+**Implementation:** steps 1–7 landed; **step 8 alone is outstanding.** Steps 1–5 landed first — `OwnedWriter`,
+`Tree::claim_owned`, the crate attribute move, and the drop / lease / fork /
+`compile_fail` tests. `just miri` now covers `tf_tree`, which is what step 2's
+mutant was always stated against; it immediately found that the `EdgeWriter` has
+to be **boxed** (see *Consequences*). **Steps 2 and 3's tests are `shm`-gated**
+— a claim lease is an OFD byte and a heap tree has no lock file — so
+`just shm-check` runs `crates/tf_tree/tests/owned_writer.rs`;
+`cargo nextest run --workspace` compiles those two out and is not their gate.
+
+Steps 6 and 7 have now landed too, and **both `extend_to_static` helpers are
+deleted**: `PyPublisher` holds a `Mutex<Option<OwnedWriter>>`, `tft_publisher`
+holds an `Option<OwnedWriter>`, and `BridgeInner::writers` is a
+`BTreeMap<String, OwnedWriter>`. `OwnedWriter` is therefore the only lifetime
+extension in the workspace, present tense, and `crates/tf_tree/src/lib.rs`,
+`CLAUDE.md`, `PROJECT.md`, `PHASE1.md`, `API.md` §2.1 and the `justfile`'s
+`miri` comment all say so rather than promising it.
+
+Two consequences of steps 6–7 worth recording, because neither was foreseen
+above. **`tf_tree_c::TreeShare` now holds an `Arc<Tree>` rather than a `Tree`**
+— `claim_owned` takes `self: &Arc<Tree>`, so the `Arc` the facade requires has
+to exist somewhere, and the handle's own `Arc<TreeShare>` is a refcount on the
+wrapper rather than on the tree. The `Arc<TreeShare>` stays, exactly as this
+record says it should; the cost is one extra dependent load on `h.share.tree`,
+which was not measured. **`tft_publisher` lost its `_share` field** and
+`BridgeInner::share`'s "declared last on purpose" note is gone: with every
+writer carrying its own arena reference, the field order is no longer
+load-bearing, and a comment saying it is would be worse than none.
+
+**Step 8 is what is left**, and it is documentation only: `API.md` §2.2's
+`Arc<Tree>`-as-the-embedding-idiom paragraph landed ahead of the rest and must
+not be written twice, but the *lifetime rule itself* and the
+scoped-versus-owned guidance are still only on `OwnedWriter` and in this record
+— not on `tf_tree`'s crate docs, which is where §2.1 says an embedder looks.
+This record stays **ready** rather than **implemented** until that lands.
 
 ## Context
 
@@ -216,13 +240,19 @@ meet it will have less context than the person who already got it wrong.
    child getting `ChildDetached` and the parent's claim surviving. **Mutant:**
    omit the fork-generation compare ⇒ the child releases the parent's lease.
 5. `compile_fail` doc tests: `OwnedWriter` is `Send`, is **not** `Sync`.
-6. `tf_tree_py`: `PyPublisher` holds `Mutex<OwnedWriter>`; delete
-   `extend_to_static` and its module — verified by `just py-test` and by
+6. **Done.** `tf_tree_py`: `PyPublisher` holds `Mutex<Option<OwnedWriter>>`
+   (`Option` for the `release()` / `__exit__` disarm that predates this record);
+   `extend_to_static` deleted — verified by `just py-test` and by
    `rg 'transmute' crates/tf_tree_py` returning nothing.
-7. `tf_tree_c`: route `tft_publisher_*` **and `bridge.rs`'s writer map** through
-   `OwnedWriter`; delete `publisher::extend_to_static` — verified by
-   `just c-header-check`, the ASan build in `just cpp-check`, and `just ros-test`
-   for the bridge half.
+7. **Done.** `tf_tree_c`: `tft_publisher_*` **and `bridge.rs`'s writer map** go
+   through `OwnedWriter`; `publisher::extend_to_static` deleted — verified by
+   `cargo nextest run -p tf_tree_c --features bridge,test-hooks`,
+   `just c-header-check`, and `just c-abi-check`'s Miri and ASan rows.
+   `a_publisher_outlives_the_tree_handle_it_came_from` in
+   `crates/tf_tree_c/tests/publish.rs` is the new property this created: the
+   handle no longer keeps the arena alive itself, the writer does, so freeing
+   the tree first has to keep working. `just ros-test` covers the bridge half
+   and **was not run** — no container on this host.
 8. Crate-level docs: the lifetime rule and the scoped-vs-owned guidance —
    verified by `cargo doc` and by `#![deny(missing_docs)]`. **`Arc<Tree>` as the
    embedding idiom was in this step and has already landed** on `tf_tree`'s

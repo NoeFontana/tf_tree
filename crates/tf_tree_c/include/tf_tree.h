@@ -76,8 +76,24 @@ typedef struct tft_publisher tft_publisher;
  * not define rather than computing a size from it — so a `0.2` caller against
  * a `0.3` library is unchanged in every byte it can observe. No struct grew,
  * nothing moved, and no existing enumerator changed meaning.
+ *
+ * `3` → `4`: two appended entry points, [`tft_stamp_from_parts`] and
+ * [`tft_stamp_from_timespec`] (`docs/API.md` §5.1), and the one status code
+ * they can return, [`TFT_ERR_BAD_STAMP`]. **This is the additive case §3.6's
+ * rule is for, and it is worth stating why a new *function* is a minor bump
+ * rather than no bump at all**: the minor is exactly the number a caller
+ * compares to find out whether the symbols its header declares are present in
+ * the library it linked. Adding a symbol without moving it would let a caller
+ * compiled against this header link against a `0.3` library, pass
+ * `tft_check_abi`, and then fail at the dynamic loader — or, on a static link,
+ * not build. Nothing existing moved, changed type or changed meaning, so the
+ * major does not move.
+ *
+ * `TFT_ERR_BAD_STAMP` rides along for the reason its own documentation gives:
+ * only the two new functions return it, so a `0.3` caller cannot receive a
+ * code it cannot name.
  */
-#define TFT_ABI_VERSION_MINOR 3
+#define TFT_ABI_VERSION_MINOR 4
 
 /**
  * Sentinel for an id field that does not apply to this error.
@@ -331,6 +347,23 @@ typedef struct {
 #define TFT_ERR_BAD_CONFIG -40
 
 /**
+ * A `(sec, nanos)` pair is not a representable stamp: `nanos` is outside
+ * `[0, 1e9)`, or the total does not fit `int64_t`.
+ *
+ * **Returned only by `tft_stamp_from_parts` and `tft_stamp_from_timespec`**,
+ * which is what keeps adding it a minor bump under `docs/PHASE4.md` §3.6: a
+ * caller compiled against an older header never calls either function and can
+ * therefore never receive this code. The detail carries the offending pair —
+ * `requested` = seconds, `newest` = nanoseconds.
+ *
+ * It is deliberately not `TFT_ERR_BAD_ENUM`, which means "an enum argument is
+ * outside the range this build defines". This is an *arithmetic* refusal, and
+ * reusing a code whose message names enums would send an operator looking at
+ * the wrong argument.
+ */
+#define TFT_ERR_BAD_STAMP -41
+
+/**
  * Something the library did not anticipate — including a caught Rust panic.
  */
 #define TFT_ERR_INTERNAL -99
@@ -420,6 +453,64 @@ uint32_t tft_abi_version_minor(void);
  * silently mismatched ABI is a debugging session nobody deserves.
  */
 tft_status tft_check_abi(uint32_t compiled_major, uint32_t compiled_minor);
+
+/**
+ * Assemble a stamp from a `(sec, nanos)` pair, exactly — `docs/API.md` §5.1.
+ *
+ * The C spelling of `Stamp::from_parts`, and it refuses exactly what that
+ * refuses. This is the shape a ROS 2 `builtin_interfaces/Time` already has
+ * (`{int32 sec, uint32 nanosec}`), so the conversion users resent writing in
+ * every node — `stamp.sec * 1000000000 + stamp.nanosec` — becomes one call
+ * that cannot overflow silently.
+ *
+ * **No float, on any surface** (R3). The ecosystem already agrees with int64
+ * nanoseconds; accepting a double here would not recover precision a driver had
+ * already destroyed, only move the blame.
+ *
+ * # Why it returns a status and not the stamp
+ *
+ * Because two inputs have no correct answer and both plausible alternatives are
+ * silently wrong. Normalising an out-of-range `nanos` turns a malformed message
+ * into a well-formed stamp; wrapping an out-of-range sum hands back a stamp on
+ * the other side of the epoch that compares, interpolates and prints perfectly.
+ * There is no sentinel `int64_t` to return instead — every value is a legal
+ * stamp — so the refusal has to be the return value and the answer has to be an
+ * out-parameter.
+ *
+ * # Errors
+ *
+ * [`TFT_ERR_NULL_ARG`] if `out` is NULL. [`TFT_ERR_BAD_STAMP`] if `nanos` is
+ * outside `[0, 1e9)` or the sum does not fit `int64_t`; `*out` is not written
+ * in either case.
+ *
+ * # Safety
+ *
+ * `out` must be NULL or point to a writable `int64_t`.
+ */
+tft_status tft_stamp_from_parts(int64_t sec, uint32_t nanos, int64_t *out);
+
+/**
+ * Assemble a stamp from the two fields of a POSIX `struct timespec`.
+ *
+ * `tft_stamp_from_timespec(ts.tv_sec, ts.tv_nsec, &out)` — the fields rather
+ * than the struct, because `tf_tree_core`'s dependency budget has no `libc` in
+ * it and declaring our own `#[repr(C)]` copy would be a type the caller then
+ * has to convert *into*, which is the conversion this exists to remove.
+ * `time_t` and `long` are both `int64_t` on every 64-bit target, so there is no
+ * cast at the call site.
+ *
+ * # Errors
+ *
+ * Everything [`tft_stamp_from_parts`] refuses, plus a **negative `tv_nsec`**.
+ * POSIX permits one only in a *relative* `timespec` — an interval handed to
+ * `nanosleep` — so a negative field means an interval is being converted as an
+ * instant, which is the mistake this refusal catches.
+ *
+ * # Safety
+ *
+ * `out` must be NULL or point to a writable `int64_t`.
+ */
+tft_status tft_stamp_from_timespec(int64_t tv_sec, int64_t tv_nsec, int64_t *out);
 
 #if defined(TFT_HAVE_SHM)
 /**

@@ -26,23 +26,104 @@ class TopologyChangedError(TfTreeError): ...
 class FrameNotDeclaredError(TfTreeError): ...
 class BufferError(TfTreeError): ...
 
+class DerivativesUnavailableError(TfTreeError):
+    """This edge's interpolator has no exact derivative.
+
+    Raised only by `layout="quat_twist"`: `LerpSlerp` is `tf2`'s interpolator
+    and has no exact body twist, so it is refused rather than
+    finite-differenced. Declare the edge `ScLerp` — which is the default — or
+    ask for a pose layout.
+
+    A property of the *edge*, so it fires at element 0 of a batch and does not
+    go away on its own. Its sibling `NoSegmentError` is the opposite.
+    """
+
+class NoSegmentError(TfTreeError):
+    """A pose exists at this stamp, but no segment to differentiate.
+
+    The other refusal `layout="quat_twist"` adds over the pose layouts, and the
+    one that is **transient**: the edge retains a single sample, or the two
+    samples bracketing the stamp carry equal stamps (which is legal — stamps are
+    non-decreasing, not strictly increasing). Publish another sample, or ask
+    again later.
+
+    Distinct from `NoDataError`, which means the edge is empty. Here the
+    transform is perfectly well defined and only the derivative is not, so being
+    told "no data" would send you to the wrong problem. A property of the
+    *stamp*, so it can fire partway through a batch.
+    """
+
+F32Layout = Literal["affine32"]
+"""The one layout that writes `float32`."""
+
+F64Layout = Literal["mat4", "quat", "quat_twist"]
+"""The layouts that write `float64`."""
+
+Layout = Literal["mat4", "quat", "affine32", "quat_twist"]
+"""How a transform is written into memory. Stated, never inferred.
+
+`"mat4"` is `(4, 4)` / `(N, 4, 4)` float64; `"quat"` is `(7,)` / `(N, 7)`
+float64 as `[qw qx qy qz tx ty tz]`; `"affine32"` is `(12,)` / `(N, 12)`
+**float32**, row-major 3x4, GPU-facing; `"quat_twist"` is `(13,)` / `(N, 13)`
+float64, `"quat"` with the body twist `[wx wy wz vx vy vz]` appended.
+"""
+
 class Plan:
     """A compiled lookup path. Build with `Tree.plan`."""
 
     @overload
     def at(self, stamps: int, /) -> NDArray[np.float64]:
-        """One stamp in, a `(4, 4)` float64 matrix out."""
+        """One stamp in, one `(4, 4)` float64 transform out.
+
+        The default layout is `"mat4"`, which is float64 — so this returns
+        `NDArray[np.float64]`, not a union a caller has to narrow. Only
+        `layout="affine32"` produces float32, and it has its own overload.
+        """
 
     @overload
     def at(self, stamps: NDArray[np.int64], /) -> NDArray[np.float64]:
-        """`(N,)` stamps in, `(N, 4, 4)` out — the path to prefer.
+        """`(N,)` stamps in, `(N, 4, 4)` float64 out — the path to prefer.
 
         A Python loop over the scalar form costs ~200 ns per iteration; this
         amortises to near-native.
         """
 
     @overload
-    def at_into(self, stamps: int, out: object, /) -> None:
+    def at(
+        self, stamps: int | NDArray[np.int64], /, *, layout: F32Layout
+    ) -> NDArray[np.float32]:
+        """`layout="affine32"`: `(12,)` or `(N, 12)` **float32**, row-major 3x4."""
+
+    @overload
+    def at(
+        self, stamps: int | NDArray[np.int64], /, *, layout: F64Layout | None = ...
+    ) -> NDArray[np.float64]:
+        """`layout=` selects what is written per stamp (see `Layout`).
+
+        Keyword-only; `stamps` stays positional-only, which is where the
+        measured 29 ns of `METH_FASTCALL` lives.
+
+        `layout="quat_twist"` is `at_with_derivatives` as a batch: it appends
+        the body twist, in the plan's **source** frame, angular part first. It
+        is the only layout that can raise `DerivativesUnavailableError` or
+        `NoSegmentError`.
+        """
+
+    @overload
+    def at(
+        self, stamps: int | NDArray[np.int64], /, *, layout: Layout | None = ...
+    ) -> NDArray[np.float64] | NDArray[np.float32]:
+        """The fallback, for a `layout` whose value is not statically known.
+
+        Passing a variable of type `Layout` cannot resolve to one dtype, so this
+        is the only overload that hands back a union — and it is reached only by
+        a caller who genuinely does not know which layout they are asking for.
+        """
+
+    @overload
+    def at_into(
+        self, stamps: int, out: object, /, *, layout: Layout | None = ...
+    ) -> None:
         """Evaluate one stamp into a caller-provided `(4, 4)` float64 array.
 
         **The allocation-free scalar path, for a control loop.** A node does one
@@ -54,8 +135,16 @@ class Plan:
         """
 
     @overload
-    def at_into(self, stamps: NDArray[np.int64], out: object, /) -> None:
+    def at_into(
+        self, stamps: NDArray[np.int64], out: object, /, *, layout: Layout | None = ...
+    ) -> None:
         """Evaluate into a caller-provided `(N, 4, 4)` float64 array.
+
+        With `layout=`, `out` is `(N, layout_elems)` — or `(layout_elems,)` for
+        a scalar stamp — and `float32` for `"affine32"`, `float64` otherwise.
+        Every batch entry point has an `_into` form (`API.md` R2), so a layout
+        reachable only through the allocating call would be a batch path with
+        no allocation-free tier.
 
         Allocates nothing. `out` must be C-contiguous and exactly the right
         shape; it is validated completely *before* any element is written, so a
@@ -64,6 +153,16 @@ class Plan:
         Raises `BufferError` on a wrong shape, dtype or stride. Non-contiguous
         input is refused rather than silently copied — a silent copy would
         defeat the point of this method while appearing to work.
+
+        **With `layout=`, a bad `stamps` is reported the way `at` reports it**
+        — numpy's or PyO3's own conversion `TypeError` ("only integer scalar
+        arrays can be converted to a scalar index" for a float64 array) rather
+        than a `BufferError` naming `(N,) int64`. That is the trade for the two
+        things it bought: an `np.int64` scalar is accepted, and a `float` stamp
+        meets the `TypeError` carrying the 238 ns measurement instead of a
+        complaint about a buffer. The default `mat4` path still gives the
+        shape-naming `BufferError`, and still refuses `np.int64`; the
+        difference is in `Plan.at_into.__doc__`.
 
         `out` is typed `object` rather than `NDArray` because the device check
         below accepts anything and then refuses it by message. **Only
@@ -268,11 +367,30 @@ class Tree:
     def is_writable(self) -> bool:
         """Whether this process may publish into this tree."""
 
-def build(edges: list[tuple[str, str]], *, capacity: int = ...) -> Tree:
+def build(
+    edges: list[tuple[str, str]],
+    *,
+    capacity: int = ...,
+    interp: Literal["sclerp", "lerpslerp"] = ...,
+) -> Tree:
     """An in-process tree from `(parent, child)` edges.
 
     Topology is builder-time (decision `0004`), so there is no `declare_*` on a
     live tree: the layout is a property of the arena, fixed when it is created.
+
+    `interp` defaults to `"sclerp"` — the SE(3) screw geodesic, which is the
+    engine's own default and the only policy with an exact derivative, so
+    `plan.at(stamps, layout="quat_twist")` works on a tree built this way.
+
+    Pass `interp="lerpslerp"` for `tf2`-bit-compatible interpolation
+    (translation LERP + rotation SLERP). It is not right-invariant —
+    interpolating `T0 @ C, T1 @ C` is not `interp(T0, T1) @ C` — and it has no
+    exact body twist, so `layout="quat_twist"` over such an edge raises
+    `DerivativesUnavailableError`.
+
+    This binding hard-coded `"lerpslerp"` until now, diverging from Rust with no
+    measurement behind it; `PROJECT.md` §5 D5 requires one, so the default moved
+    rather than the rule.
     """
 
 def push(
@@ -292,6 +410,7 @@ def open_arena(
     mode: Literal["ro", "rw"] = ...,
     create: list[tuple[str, str]] | None = ...,
     capacity: int = ...,
+    interp: Literal["sclerp", "lerpslerp"] = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
 
@@ -306,6 +425,11 @@ def open_arena(
     is why this is an edge list rather than a boolean. **It requires
     `mode="rw"`** and is refused otherwise, so a read-only consumer still
     cannot bring an arena into existence.
+
+    `capacity` and `interp` describe the edges being created; both are
+    `build`'s, with the same defaults. Without `create` they describe nothing —
+    but `interp` is still validated, so a misspelling raises here exactly as it
+    does in `build` rather than being silently discarded.
     """
 
 def open_file(path: str | os.PathLike[str], /) -> Tree:
@@ -358,7 +482,30 @@ def open_file(path: str | os.PathLike[str], /) -> Tree:
     """
 
 def from_sec(seconds: float, /) -> int:
-    """Nanoseconds from float seconds. Lossy above ~10^7 s — see `Plan.at`."""
+    """Nanoseconds from float seconds. Lossy above ~10^7 s.
+
+    Prefer the exact converters: `from_parts` for a `(sec, nanosec)` pair and
+    `from_ros` for a `builtin_interfaces/Time`. Neither takes a float.
+    """
+
+def from_parts(sec: int, nanosec: int, /) -> int:
+    """Exact nanoseconds from a `(sec, nanosec)` pair.
+
+    Raises `ValueError` for a `nanosec` outside `[0, 1e9)` — **refused, not
+    normalised** — and for a sum outside `int64` — **refused, not wrapped**.
+    Both alternatives produce a stamp that looks perfectly well formed, which
+    is the failure this converter exists to prevent.
+    """
+
+def from_ros(stamp: object, /) -> int:
+    """Exact nanoseconds from a ROS 2 `builtin_interfaces/Time`.
+
+    Never via `to_sec()`: the message is `{int32 sec, uint32 nanosec}` and
+    converts exactly. Duck-typed on `.sec` and `.nanosec`, so `rclpy` is not a
+    dependency of this wheel and must not become one.
+
+    Refusals are `from_parts`'s.
+    """
 
 def has_shared_memory() -> bool:
     """Whether this build can share a tree between processes."""

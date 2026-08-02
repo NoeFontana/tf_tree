@@ -109,6 +109,20 @@ pub const TFT_ERR_NO_EDGE: tft_status = -39;
 /// declares a cycle, or describes a tree the engine will not build. The
 /// message names the line or the frame.
 pub const TFT_ERR_BAD_CONFIG: tft_status = -40;
+/// A `(sec, nanos)` pair is not a representable stamp: `nanos` is outside
+/// `[0, 1e9)`, or the total does not fit `int64_t`.
+///
+/// **Returned only by `tft_stamp_from_parts` and `tft_stamp_from_timespec`**,
+/// which is what keeps adding it a minor bump under `docs/PHASE4.md` §3.6: a
+/// caller compiled against an older header never calls either function and can
+/// therefore never receive this code. The detail carries the offending pair —
+/// `requested` = seconds, `newest` = nanoseconds.
+///
+/// It is deliberately not `TFT_ERR_BAD_ENUM`, which means "an enum argument is
+/// outside the range this build defines". This is an *arithmetic* refusal, and
+/// reusing a code whose message names enums would send an operator looking at
+/// the wrong argument.
+pub const TFT_ERR_BAD_STAMP: tft_status = -41;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
 

@@ -24,23 +24,27 @@
 //!
 //! # The lifetime
 //!
-//! `EdgeWriter<'a>` borrows the `Tree`. A C handle cannot carry a lifetime, so
-//! the borrow is extended to `'static` and its validity moved to a runtime
-//! guarantee: the handle holds an `Arc<TreeShare>`, so the arena outlives the
-//! claim for certain. This is the same trade `tf_tree_py` makes and it is
-//! spelled with a refcount rather than a comment *because* the comment version
-//! was a use-after-free there.
+//! `EdgeWriter<'a>` borrows the `Tree` and a C handle cannot carry a lifetime,
+//! so this handle holds an [`OwnedWriter`] — the facade's single reviewed
+//! lifetime extension (`docs/decisions/0017`), whose `Arc<Tree>` keeps the arena
+//! mapped for as long as the claim points into it. **This crate no longer
+//! extends a lifetime itself**; it used to, as a local `extend_to_static`, and
+//! deleting it was `0017` step 7.
+//!
+//! The `Arc<TreeShare>` this handle used to carry for that purpose is gone with
+//! it: the `OwnedWriter`'s own reference is what keeps the arena alive, and a
+//! second one beside it would be a refcount whose contribution nothing could
+//! state.
 
 use core::ffi::{c_char, c_void};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
-use tf_tree::{ClaimApiError, ClaimError, EdgeWriter, PushError};
+use tf_tree::{ClaimApiError, ClaimError, OwnedWriter, PushError};
 
 use crate::error::set_error;
 use crate::layout;
-use crate::{bad_enum, bad_handle, null_arg, TreeShare};
+use crate::{bad_enum, bad_handle, null_arg};
 use crate::{
     tft_status, tft_tree, TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_RELEASED, TFT_ERR_UNKNOWN_FRAME, TFT_OK,
 };
@@ -107,9 +111,12 @@ pub struct tft_publisher {
     /// Releasing explicitly matters more here than in Rust: a C caller that
     /// leaks the handle leaks the *claim*, and no other process can take the
     /// edge until this one exits.
-    writer: Option<EdgeWriter<'static>>,
-    /// Keeps the arena alive for at least as long as the claim points into it.
-    _share: Arc<TreeShare>,
+    ///
+    /// The [`OwnedWriter`] carries the arena reference that keeps this sound —
+    /// see the module docs. Setting this to `None` therefore drops both the
+    /// claim and this handle's share of the arena, which is what
+    /// [`tft_publisher_release`] promises.
+    writer: Option<OwnedWriter>,
 }
 
 /// # Safety
@@ -142,7 +149,7 @@ fn check_thread(h: &tft_publisher) -> tft_status {
 
 /// [`check_thread`]'s body, over a bare token.
 ///
-/// Split out so the bridge handle — which owns one `EdgeWriter` per declared
+/// Split out so the bridge handle — which owns one [`OwnedWriter`] per declared
 /// edge and is `!Sync` for exactly the same reason — enforces the rule through
 /// *this* code rather than a second copy of it. `what` names the handle type in
 /// the abort message, because "which handle did I move between threads" is the
@@ -211,7 +218,7 @@ fn wrong_thread_message(what: &str) -> String {
 ///
 /// Written once so the affinity check cannot be forgotten on a new entry point:
 /// there is no way to reach the writer that does not go through here.
-fn writer_of(h: &tft_publisher) -> Result<&EdgeWriter<'static>, tft_status> {
+fn writer_of(h: &tft_publisher) -> Result<&OwnedWriter, tft_status> {
     let rc = check_thread(h);
     if rc != TFT_OK {
         return Err(rc);
@@ -291,43 +298,22 @@ pub unsafe extern "C" fn tft_tree_claim(
             set_error(TFT_ERR_UNKNOWN_FRAME, "no such frame in this tree", |_| {});
             return TFT_ERR_UNKNOWN_FRAME;
         };
-        let writer = match h.share.tree.claim(cf, pf) {
+        // `claim_owned`, not `claim`: the returned writer carries its own
+        // `Arc<Tree>`, so this handle needs no `unsafe` and no second refcount
+        // to make the claim outlive this call (`docs/decisions/0017` step 7).
+        let writer = match h.share.tree.claim_owned(cf, pf) {
             Ok(w) => w,
             Err(e) => return map::claim(&e),
         };
-        // SAFETY: `EdgeWriter<'a>` borrows the `Tree`; the `Arc<TreeShare>`
-        // stored alongside is a strong reference to that same `Tree`, so it
-        // outlives this writer for certain. The writer is never handed out —
-        // only borrowed under `writer_of` — so no caller can outlive it either.
-        // This is the pattern `tf_tree_py` uses, for the same reason.
-        let writer = unsafe { extend_to_static(writer) };
         let handle = Box::new(tft_publisher {
             magic: MAGIC_PUBLISHER,
             owner: thread_token(),
             writer: Some(writer),
-            _share: Arc::clone(&h.share),
         });
         // SAFETY: `out` is non-null and the caller contracts it writable.
         unsafe { core::ptr::write(out, Box::into_raw(handle)) };
         TFT_OK
     })
-}
-
-/// Extend an `EdgeWriter`'s borrow to `'static`.
-///
-/// The signature pins both types so **only the lifetime can differ** — written
-/// inline as `transmute::<EdgeWriter, EdgeWriter>` it would compile across a
-/// type change as long as the sizes happened to match, which is precisely the
-/// bug that shipped in `tf_tree_py` (see `PyPublisher::inner`).
-///
-/// # Safety
-///
-/// The caller must keep the borrowed `Tree` alive for as long as the returned
-/// writer exists.
-pub(crate) unsafe fn extend_to_static(w: EdgeWriter<'_>) -> EdgeWriter<'static> {
-    // SAFETY: the caller's obligation above is exactly what the lifetime
-    // parameter encodes; nothing else about the type changes.
-    unsafe { core::mem::transmute::<EdgeWriter<'_>, EdgeWriter<'static>>(w) }
 }
 
 /// Publish one transform at `stamp`, read from `src` in `layout`.

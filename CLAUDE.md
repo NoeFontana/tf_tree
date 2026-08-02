@@ -99,12 +99,11 @@ records why (typed errors and zero-copy buffers do not survive a C boundary).
   **`tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]`**, granted by
   [`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md): the
   lifetime extension inside `OwnedWriter`. It is the place a lifetime is extended
-  *in the facade*, and — **once `0017` steps 6–7 land** — the only one in the
-  workspace. **Those two steps are deliberately deferred and are not done**, so
-  today there are three: `OwnedWriter`, plus the hand-rolled
-  `tf_tree_c::publisher::extend_to_static` (`crates/tf_tree_c/src/publisher.rs`,
-  used by `tft_tree_claim` and by `bridge.rs`'s writer map) and `tf_tree_py`'s
-  copy (`crates/tf_tree_py/src/tree.rs`). `OwnedWriter` exists to delete those
+  *in the facade* and — since `0017` steps 6–7 landed — **the only one in the
+  workspace**: those steps deleted the hand-rolled
+  `tf_tree_c::publisher::extend_to_static` (used by `tft_tree_claim` and by
+  `bridge.rs`'s writer map) and `tf_tree_py`'s copy, and both bindings now claim
+  through `Tree::claim_owned`. `OwnedWriter` existed to delete those
   two: an ancestor of one of them leaked a claim lease — so no
   reaper would ever collect the edge — and bypassed the fork guard. That was the
   first exercise of `0007`'s budget as a *criterion* rather than a crate list, and

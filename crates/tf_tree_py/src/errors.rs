@@ -52,6 +52,20 @@ create_exception!(
     TfTreeError,
     "An output buffer was the wrong shape, dtype, or size."
 );
+create_exception!(
+    _core,
+    DerivativesUnavailableError,
+    TfTreeError,
+    "This edge's interpolator has no exact derivative; layout='quat_twist' \
+     cannot be served over it."
+);
+create_exception!(
+    _core,
+    NoSegmentError,
+    TfTreeError,
+    "A pose exists at this stamp but there is no segment to differentiate; \
+     layout='quat_twist' needs two samples spanning a non-zero interval."
+);
 
 /// Add every exception type to the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -69,6 +83,11 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<FrameNotDeclaredError>(),
     )?;
     m.add("BufferError", py.get_type::<BufferError>())?;
+    m.add(
+        "DerivativesUnavailableError",
+        py.get_type::<DerivativesUnavailableError>(),
+    )?;
+    m.add("NoSegmentError", py.get_type::<NoSegmentError>())?;
     Ok(())
 }
 
@@ -130,6 +149,37 @@ pub(crate) fn lookup_err(e: LookupError) -> PyErr {
         }
         LookupError::BufferTooSmall { need, got } => BufferError::new_err(format!(
             "output buffer holds {got} elements; this batch needs {need}"
+        )),
+        // **The two refusals `layout="quat_twist"` adds over the pose layouts,
+        // and both get a type rather than a message** — `docs/API.md` R5 makes
+        // the exception *type* the contract, and each of these is a distinct
+        // decision a caller makes.
+        //
+        // `DerivativesUnavailable` is a property of an **edge**: `LerpSlerp` is
+        // `tf2`'s interpolator and has no exact body twist, so an edge that
+        // declares it is refused rather than finite-differenced
+        // (`docs/PHASE5.md` §4.4 item 1). It fires at element 0 of any batch and
+        // the fix is a re-declaration or a pose layout — permanent for the life
+        // of the arena.
+        LookupError::DerivativesUnavailable { edge, interp } => {
+            DerivativesUnavailableError::new_err(format!(
+                "edge {edge:?} declares interpolation policy {interp}, which has no \
+                 exact derivative; use layout='quat' or declare the edge ScLerp"
+            ))
+        }
+        // `NoSegment` is a property of a **stamp**, and is transient: the ring
+        // retains one sample, or the two bracketing `t` carry equal stamps —
+        // which invariant 6 permits — so there is a pose but no interval to
+        // differentiate over. The fix is to publish another sample or ask again
+        // later, which is the opposite response to the arm above — and telling
+        // the two apart by message text is what R5 forbids. `Plan::at_many_into`
+        // documents the consequence for a batch: the arm above always fires at
+        // element 0 and leaves `out` untouched, this one can fire after `k` rows
+        // are written.
+        LookupError::NoSegment { edge } => NoSegmentError::new_err(format!(
+            "edge {edge:?} has a pose at this stamp but no segment to \
+             differentiate: it retains one sample, or the two bracketing samples \
+             carry equal stamps. Publish another sample, or use layout='quat'"
         )),
         // Routed through the shared spelling so a fork victim gets the same
         // sentence whether it arrived through `lookup` or through `frames`.
