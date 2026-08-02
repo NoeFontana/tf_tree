@@ -212,14 +212,30 @@ impl Snapshot {
         let header = view.header();
         let topo = view.topology();
 
-        // **`Relaxed`, and it is the justified ordering rather than the cheap
-        // one.** `tf_tree_core::frame`'s `finish` does `frame_count.fetch_add`
-        // *first*, then `write_record`, then the Release publish into the intern
-        // table. An `Acquire` load here would therefore order this thread
-        // against everything the interner did *before* it took its id — and
-        // against nothing it did after, which is precisely the record about to
-        // be read. Acquire would read like a guarantee and buy none; the
-        // `name_hash` filter below is the actual guard.
+        // **`Relaxed`, because no stronger ordering on *this* load would mean
+        // anything.** `tf_tree_core::frame`'s `finish` does
+        // `frame_count.fetch_add` *first*, then `write_record`, then the Release
+        // publish into the intern table. An `Acquire` load here would therefore
+        // order this thread against everything the interner did *before* it took
+        // its id — and against nothing it did after, which is precisely the
+        // record about to be read. Acquire would read like a guarantee and buy
+        // none, so `Relaxed` is the honest spelling.
+        //
+        // **What it does not buy is a race-free read, and nothing here does.**
+        // `FrameRecord`'s own documentation states the rule: its fields are
+        // plain integers, so "a reader sees the record only after
+        // `ids[slot].load(Acquire) != ID_UNPUBLISHED`" — the publication edge is
+        // keyed by *name*, through the intern table, and there is no per-id
+        // signal at all. An enumeration keyed by id, which is what every caller
+        // that wants to list the frames must do, therefore has no edge to
+        // acquire and can materialize a record a concurrent interner is still
+        // writing. The `name_hash != 0` filter below is not that missing edge
+        // and is not claimed to be: it is a plausibility filter that turns the
+        // usual lost race into "the frame appears one `doctor` run later"
+        // instead of "a frame with an empty name". Against a genuinely
+        // concurrent interner this walk — and its three siblings — is
+        // best-effort, and the consolidation onto `Tree` noted below is where
+        // the ordering can be stated once and checked by `just loom`.
         let frame_count = header.frame_count.load(Ordering::Relaxed);
         let mut frames = Vec::with_capacity(frame_count as usize);
         for id in 1..=frame_count {
@@ -252,7 +268,9 @@ impl Snapshot {
             // even for the empty string — so a zero hash means "not written
             // yet". Skipping it lists that frame one `doctor` run later;
             // taking it prints a frame with an empty name, which reads as our
-            // bug rather than as a race lost by a microsecond.
+            // bug rather than as a race lost by a microsecond. This is a
+            // *filter on the value read*, not a synchronisation edge — see the
+            // ordering note above for what that does and does not buy.
             if rec.name_hash == 0 {
                 continue;
             }
@@ -682,6 +700,22 @@ pub struct OutOfOrderRun {
     /// `regressions > 0`; saturates at [`i64::MAX`] rather than wrapping, since
     /// a stamp is whatever an arbitrary publisher wrote.
     pub worst_backstep_ns: i64,
+    /// The longest run of **consecutive** arrivals that `docs/PHASE1.md` §2
+    /// invariant 6 would have rejected — each one carrying a stamp strictly
+    /// older than the newest *accepted* before it.
+    ///
+    /// This is the "concentration" half of the evidence, and it is a different
+    /// question from `regressions`. A clock that steps back by Δ against a
+    /// publisher running at *f* rejects about Δ·*f* arrivals in one unbroken
+    /// burst while producing a single adjacent regression; one misplaced sample
+    /// produces a single adjacent regression too, and a rejected run of one.
+    /// [`crate::checks`]'s `TFT019` is the consumer that needs to tell those
+    /// apart. `regressions > 0` and `longest_rejected_run > 0` are equivalent
+    /// conditions, so carrying this changes nothing about when `TFT018` fires.
+    ///
+    /// Counted in **arrivals**, not in seconds: the stamps are the quantity
+    /// under suspicion and the stream carries no independent arrival clock.
+    pub longest_rejected_run: usize,
 }
 
 /// The per-edge out-of-order evidence, in edge order. Empty when every observed
@@ -689,30 +723,49 @@ pub struct OutOfOrderRun {
 ///
 /// **One producer, two consumers, and that is the point.**
 /// [`check_out_of_order`] reports this as `TFT018` and
-/// [`crate::checks::tft019`] attributes it to a clock step.
+/// [`crate::checks::ClockStepEvidence`] attributes it to a clock step.
 /// `docs/PHASE5.md` §6's amendment requires the second to fire on *exactly* the
 /// first's evidence — "an attribution, not a second detector" — and a second
 /// scan of `obs` written to the same rule is precisely how that stops being
-/// true after one refactor.
+/// true after one refactor. One walk therefore computes both what `TFT018`
+/// reports (`regressions`, `worst_backstep_ns`) and the concentration fact only
+/// `TFT019` reads (`longest_rejected_run`).
 #[must_use]
 pub fn out_of_order_runs(obs: &Observations) -> Vec<OutOfOrderRun> {
     let mut out = Vec::new();
     for (edge, samples) in obs.by_edge() {
         let mut regressions = 0usize;
         let mut worst: i128 = 0;
-        for w in samples.windows(2) {
-            if w[1].stamp_ns < w[0].stamp_ns {
+        // The engine's own state, replayed: `newest` is what invariant 6 would
+        // have compared against, which only an *accepted* push advances. Equal
+        // stamps are accepted (replay is idempotent), so the test is `<`.
+        let mut newest = i64::MIN;
+        let mut run = 0usize;
+        let mut longest_rejected_run = 0usize;
+        let mut prev: Option<i64> = None;
+        for s in &samples {
+            let stamp = s.stamp_ns;
+            if let Some(p) = prev.filter(|&p| stamp < p) {
                 regressions += 1;
                 // In `i128`: two stamps at opposite ends of `i64` differ by more
                 // than `i64` holds, and both are values a publisher can write.
-                worst = worst.max(i128::from(w[0].stamp_ns) - i128::from(w[1].stamp_ns));
+                worst = worst.max(i128::from(p) - i128::from(stamp));
             }
+            if stamp < newest {
+                run += 1;
+                longest_rejected_run = longest_rejected_run.max(run);
+            } else {
+                run = 0;
+                newest = stamp;
+            }
+            prev = Some(stamp);
         }
         if regressions > 0 {
             out.push(OutOfOrderRun {
                 edge,
                 regressions,
                 worst_backstep_ns: i64::try_from(worst).unwrap_or(i64::MAX),
+                longest_rejected_run,
             });
         }
     }
@@ -1044,6 +1097,46 @@ mod tests {
         assert!(check_out_of_order(&obs).is_empty());
     }
 
+    /// **`longest_rejected_run` replays invariant 6, which is not the same
+    /// question as counting adjacent inversions.**
+    ///
+    /// A push is rejected when its stamp is older than the newest *accepted*
+    /// one, and a rejected push does not advance that mark — so one step
+    /// backwards rejects everything until the publisher climbs back over it,
+    /// however monotone those arrivals are among themselves. That run length is
+    /// the concentration evidence `TFT019` reads; `regressions` is 1 for both
+    /// the stray inversion and the clock step, which is exactly why a second
+    /// number is needed.
+    ///
+    /// The stream here is 0, 10, 20, then a 15-back step, then the publisher
+    /// carrying on at 10: 5, 15, 25. `5` and `15` are below the newest accepted
+    /// `20`; `25` is not. One adjacent inversion, two rejected arrivals.
+    ///
+    /// Mutant: move `newest = stamp;` out of the `else` arm so every arrival
+    /// advances it. Applied: `left: 1`, `right: 2` — with the mark advancing on
+    /// a rejected push, the run collapses to the adjacent-inversion count and
+    /// the two numbers stop being different questions.
+    /// Mutant B: `if stamp < newest` -> `if stamp <= newest`. Applied:
+    /// `left: 3`, `right: 2` — the equal stamp at the end of the second stream
+    /// is counted as rejected, though invariant 6 accepts it.
+    #[test]
+    fn a_rejected_run_is_measured_against_the_newest_accepted_stamp() {
+        let stream = |stamps: &[i64]| {
+            Observations::from_samples(stamps.iter().map(|&s| sample(1, 1, s, 0)).collect())
+        };
+
+        let runs = out_of_order_runs(&stream(&[0, 10, 20, 5, 15, 25]));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].regressions, 1, "one adjacent step backwards");
+        assert_eq!(runs[0].longest_rejected_run, 2);
+        assert_eq!(runs[0].worst_backstep_ns, 15);
+
+        // Equal stamps are accepted (replay is idempotent), so the arrival that
+        // lands exactly on the newest accepted stamp ends the run.
+        let runs = out_of_order_runs(&stream(&[0, 10, 20, 5, 15, 20]));
+        assert_eq!(runs[0].longest_rejected_run, 2);
+    }
+
     // --- healthy live fixture -------------------------------------------
 
     /// **A live writer's claim must resolve to that writer's pid.**
@@ -1095,11 +1188,13 @@ mod tests {
     /// headroom slot is both out of `1..=frame_count` and zeroed, so either
     /// check alone excludes it. Both are kept because they are justified
     /// independently: the bound is the semantic one (`frame_count` is what a
-    /// frame id may reach), while `name_hash != 0` closes a *race* window the
-    /// bound cannot — `frame_count` is bumped **before** the record is written,
-    /// so an interner in another process can be counted one instant before its
-    /// name exists. That window needs two processes and is **not** asserted
-    /// anywhere here.
+    /// frame id may reach), while `name_hash != 0` filters the *value* a race
+    /// the bound cannot touch produces — `frame_count` is bumped **before** the
+    /// record is written, so an interner in another process can be counted one
+    /// instant before its name exists. It filters rather than closes: nothing
+    /// here orders that record's stores against this reader, and the ordering
+    /// note on `capture` says what does and does not follow from that. The
+    /// window needs two processes and is **not** asserted anywhere here.
     ///
     /// Mutant: change the loop bound to `1..=header.max_frames`. Applied: still
     /// `PASS` — the `name_hash` filter absorbs it, which is how it was found

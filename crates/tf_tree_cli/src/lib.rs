@@ -866,6 +866,10 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
     let snap = Snapshot::capture(tree);
     let stats = checks::collect_edge_stats(tree, &snap);
     let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
+    // Captured here, not inside the check: `TFT019`'s outcome and its note in
+    // `Meta.notes` are two views of one split, and this is the only place both
+    // can read the same one.
+    let clock_step = checks::ClockStepEvidence::capture(&snap, &obs);
 
     let inputs = checks::Inputs {
         snap: &snap,
@@ -875,6 +879,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         clock,
         arena_bytes: tree.arena_size_bytes() as u64,
         occupancy: checks::occupancy_of(tree),
+        clock_step: &clock_step,
         live: src.is_live(),
         counters: tf_tree::counters_compiled_in(),
     };
@@ -891,7 +896,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         now_nanos: clock.nanos(),
         clock_source: clock.label(),
         counters_compiled_in: tf_tree::counters_compiled_in(),
-        notes: evidence_notes(src.is_live(), &snap, &obs),
+        notes: evidence_notes(src.is_live(), &snap, &obs, &clock_step),
     };
 
     if json {
@@ -924,13 +929,19 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 /// its `pass` covers less than it looks like it does.
 ///
 /// `TFT019`'s is the same shape: it appears only when the check attributed some
-/// out-of-order edges to a wall-clock step and refused others, which is the one
-/// case where neither its findings nor a skip reason names the tags it declined
-/// to guess about.
-fn evidence_notes(live: bool, snap: &Snapshot, obs: &Observations) -> Vec<String> {
+/// out-of-order edges to a wall-clock step and did not attribute others — a tag
+/// it declined to guess about, or a wall-clock edge whose rejections were not
+/// concentrated enough to be a step — which is the case where neither its
+/// findings nor a skip reason carries what it did not cover.
+fn evidence_notes(
+    live: bool,
+    snap: &Snapshot,
+    obs: &Observations,
+    clock_step: &checks::ClockStepEvidence,
+) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
     notes.extend(checks::rate_coverage_note(snap, obs));
-    notes.extend(checks::clock_step_coverage_note(snap, obs, live));
+    notes.extend(clock_step.coverage_note(live));
     if live {
         notes.push(
             "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
@@ -1532,7 +1543,12 @@ mod tests {
                 .collect(),
         );
 
-        let notes = evidence_notes(false, &snap, &obs);
+        let notes = evidence_notes(
+            false,
+            &snap,
+            &obs,
+            &checks::ClockStepEvidence::capture(&snap, &obs),
+        );
         let note = notes.iter().find(|n| n.starts_with("TFT007")).expect(
             "no coverage note in Meta.notes: a partial TFT007 pass would read as a full \
                      one",
@@ -1546,7 +1562,8 @@ mod tests {
     /// **The `TFT019` coverage note reaches `Meta.notes` too, and is silent on a
     /// live arena.**
     ///
-    /// Same argument as the `TFT007` test above: `checks::clock_step_coverage_note`
+    /// Same argument as the `TFT007` test above:
+    /// `ClockStepEvidence::coverage_note`
     /// is unit tested, but the line that *calls* it is not reachable from those
     /// tests, and deleting it leaves a partially-attributed run reading as a
     /// fully-attributed one. The `live` argument is passed here rather than
@@ -1555,7 +1572,7 @@ mod tests {
     /// about edges it "did not attribute" would describe a run that never
     /// happened.
     ///
-    /// Mutant: delete `notes.extend(checks::clock_step_coverage_note(snap, obs, live));`
+    /// Mutant: delete `notes.extend(clock_step.coverage_note(live));`
     /// from `evidence_notes`. Applied: the `expect` fires with "no TFT019
     /// coverage note".
     /// Mutant B: pass `false` for `live` at that call site. Applied: the live
@@ -1600,19 +1617,26 @@ mod tests {
             ],
             edges: vec![dyn_edge(1, 1, 2, 0), dyn_edge(2, 2, 3, 3)],
         };
+        // A clock step, not a stray inversion: ten pushes at a 10 ms period,
+        // the clock jumps 100 ms backwards, and the publisher carries on at the
+        // same rate — so the ten arrivals on the way back up are all rejected.
+        // That unbroken run is what `TFT019`'s concentration condition reads,
+        // and a four-sample stream with one inversion would not be attributed.
         let back = |edge: u32| {
-            [0, 100 * MS, 200 * MS, 150 * MS]
-                .into_iter()
-                .map(move |stamp_ns| PushSample {
-                    edge,
-                    writer_pid: 4711,
-                    stamp_ns,
-                    arrival_delay_ns: 0,
-                })
+            let mut stamps: Vec<i64> = (0..10).map(|i| i * 10 * MS).collect();
+            let last = stamps[stamps.len() - 1];
+            stamps.extend((0..=10).map(|i| last - 100 * MS + i * 10 * MS));
+            stamps.into_iter().map(move |stamp_ns| PushSample {
+                edge,
+                writer_pid: 4711,
+                stamp_ns,
+                arrival_delay_ns: 0,
+            })
         };
         let obs = Observations::from_samples(back(1).chain(back(2)).collect());
+        let ev = checks::ClockStepEvidence::capture(&snap, &obs);
 
-        let notes = evidence_notes(false, &snap, &obs);
+        let notes = evidence_notes(false, &snap, &obs, &ev);
         let note = notes
             .iter()
             .find(|n| n.starts_with("TFT019"))
@@ -1623,7 +1647,7 @@ mod tests {
         );
 
         assert!(
-            !evidence_notes(true, &snap, &obs)
+            !evidence_notes(true, &snap, &obs, &ev)
                 .iter()
                 .any(|n| n.starts_with("TFT019")),
             "a live arena skipped TFT019 outright, so there is no coverage to disclose"

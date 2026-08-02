@@ -11,7 +11,7 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — **three** unconditionally, and **six** more depending on what the
+//! reason — **three** unconditionally, and **seven** more depending on what the
 //! arena, the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
@@ -46,6 +46,10 @@
 //!   because a `0` means *undeclared* and not *0 Hz* — see [`tft007`].
 //! * **`TFT010`**/**`TFT016`** are skipped when the engine has no counters and
 //!   when the host is not Linux, respectively.
+//! * **`TFT018`** (out-of-order stamps) is skipped *on a live arena only*, for a
+//!   reason of its own rather than `TFT001`'s: the push stream is reconstructed
+//!   from a ring being written while it is read, so a slot at the old end can
+//!   already hold the next lap's sample — an inversion the publisher never made.
 //! * **`TFT019`** is skipped on a live arena — inheriting `TFT018`'s skip, since
 //!   it is `TFT018`'s evidence — and skipped when the edges that *did* go
 //!   backwards are in no wall-clock domain, naming their tags. It is an
@@ -57,7 +61,9 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
-use tf_tree::{Domain, EdgeId, EdgeKind, SystemDomain, Tree};
+use tf_tree::{
+    Domain, EdgeId, EdgeKind, SensorDomain, SimDomain, SteadyDomain, SystemDomain, Tree,
+};
 use tf_tree_bench::fixture::PushSample;
 
 use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
@@ -320,6 +326,14 @@ pub struct Inputs<'a> {
     pub arena_bytes: u64,
     /// Table occupancies as `(what, used, capacity)`.
     pub occupancy: Vec<(&'static str, u32, u32)>,
+    /// `TFT018`'s per-edge evidence, already split by domain tag and by whether
+    /// its rejections are concentrated.
+    ///
+    /// A field rather than a call inside [`tft019`] because
+    /// [`ClockStepEvidence::coverage_note`] needs the same split for
+    /// `Meta.notes`, and the two must be the same split rather than two walks
+    /// that happen to agree.
+    pub clock_step: &'a ClockStepEvidence,
     /// Whether the push stream was reconstructed from a live arena rather than
     /// recorded as it happened.
     pub live: bool,
@@ -1120,14 +1134,61 @@ fn tft018(inp: &Inputs<'_>) -> CheckOutcome {
 /// already on disk, so the literal and the type must not be able to drift apart.
 const WALL_CLOCK_TAG: u8 = <SystemDomain as Domain>::TAG;
 
-/// How [`tft019`] split `TFT018`'s evidence: what it attributed to a clock step,
-/// and what it refused to.
+/// How long a burst of rejected pushes has to be before `TFT019` will call it a
+/// clock step, in **arrivals on that edge**.
 ///
-/// Built once and used twice — by the check and by [`clock_step_coverage_note`]
-/// — so the report cannot say one thing in an outcome and another in a note.
-struct ClockStepEvidence {
-    /// Runs on a `SystemDomain` edge, with the edge for its label.
-    attributed: Vec<doctor::OutOfOrderRun>,
+/// # This number is not in the spec
+///
+/// `docs/PHASE5.md` §6's amendment says "a run of rejections **concentrated in a
+/// short window**" and `docs/API.md` §5.3 item 1 says "a run of rejected
+/// pushes". Neither names a length, so this constant is *this implementation's*
+/// choice and is stated here rather than left implicit in a `> 0`.
+///
+/// # Why a count of arrivals and not a duration
+///
+/// The stamps are the quantity under suspicion, and the observed stream carries
+/// no independent arrival clock — [`Observations::from_arena`] sets
+/// `arrival_delay_ns` to zero because the arena records no receipt time
+/// (`TFT004`'s skip reason is the same fact). A window measured in seconds could
+/// only be measured with the clock that stepped. Counting arrivals needs no
+/// clock at all.
+///
+/// # Why eight
+///
+/// A clock that steps back by Δ against a publisher at *f* Hz rejects about Δ·*f*
+/// arrivals in one unbroken burst, so eight is reached by an 8 ms step at 1 kHz,
+/// 80 ms at 100 Hz, 800 ms at 10 Hz. A *reordered* stream — a merge, a queue, a
+/// pair swapped in transit — rejects as many arrivals as the reorder distance,
+/// which is one to a few. Eight sits above the second population and well below
+/// the first.
+///
+/// **Both costs of the choice, named rather than implied.** A step shorter than
+/// eight publish periods is not attributed: `TFT018` still reports the rejected
+/// pushes, which is the answer that existed before `TFT019` and is not a
+/// regression. A reordering burst longer than eight arrivals on a wall-clock
+/// edge *is* attributed, and that is a false attribution this threshold does not
+/// prevent. Raising it trades the first for the second.
+const CLOCK_STEP_MIN_REJECTED_RUN: usize = 8;
+
+/// How `TFT019` split `TFT018`'s per-edge evidence: what it attributed to a
+/// wall-clock step, what was too diffuse to be one, and what it would not judge.
+///
+/// **Captured once per `doctor` run and read twice** — by [`tft019`] and by
+/// [`ClockStepEvidence::coverage_note`]. That is why it is a field of [`Inputs`]
+/// rather than a call inside each reader: two captures could not disagree today,
+/// but the report would then be walking `obs` once per reader to answer one
+/// question, and the invariant "the outcome and the note describe the same
+/// split" would be a convention instead of a type.
+pub struct ClockStepEvidence {
+    /// Runs on a `SystemDomain` edge whose rejections are concentrated enough to
+    /// be a step, each with the label to report it under.
+    attributed: Vec<(doctor::OutOfOrderRun, String)>,
+    /// Runs on a `SystemDomain` edge that are **not** concentrated: fewer than
+    /// [`CLOCK_STEP_MIN_REJECTED_RUN`] consecutive rejected arrivals, as
+    /// `(edge, longest run)`. A stray inversion on a wall clock is a publisher
+    /// fault, and reporting it as a clock step is the false all-clear this check
+    /// refuses in the other direction.
+    diffuse: Vec<(u32, usize)>,
     /// Runs on any other tag, as `(edge, tag)`, with `None` for an edge whose
     /// tag could not be read at all. Named, not counted: the skip reason has to
     /// say *which* tag it declined to guess about.
@@ -1138,44 +1199,147 @@ struct ClockStepEvidence {
     refused: Vec<(u32, Option<u8>)>,
 }
 
-/// Split `TFT018`'s per-edge evidence by the edge's declared domain tag.
-///
-/// There are two buckets, not three: an edge whose tag cannot be read joins the
-/// refused ones, because "the tag is unreadable" and "the tag is not zero" have
-/// the same consequence here — no clock step may be attributed.
-fn clock_step_evidence(snap: &Snapshot, obs: &Observations) -> ClockStepEvidence {
-    let index = snap.edge_index();
-    let mut ev = ClockStepEvidence {
-        attributed: Vec::new(),
-        refused: Vec::new(),
-    };
-    for run in doctor::out_of_order_runs(obs) {
-        match index.get(&run.edge).map(|e| e.domain) {
-            // A `const` in a pattern, so this is an equality test against tag 0
-            // and not a binding. Renaming `WALL_CLOCK_TAG` to anything
-            // lowercase would silently turn it into one that matches every tag.
-            Some(WALL_CLOCK_TAG) => ev.attributed.push(run),
-            Some(tag) => ev.refused.push((run.edge, Some(tag))),
-            // Reachable from a hand-assembled `Inputs` and from a recorded
-            // stream whose edge is absent from the snapshot. Tag 0 is not the
-            // honest default for an unknown tag — that is the fabricated
-            // all-clear this whole check refuses.
-            None => ev.refused.push((run.edge, None)),
+impl ClockStepEvidence {
+    /// Split `TFT018`'s per-edge evidence by the edge's declared domain tag and
+    /// by whether its rejections are concentrated.
+    ///
+    /// Three buckets, and an edge whose tag cannot be read joins the refused
+    /// ones: "the tag is unreadable" and "the tag is not a wall clock" have the
+    /// same consequence here — no clock step may be attributed.
+    ///
+    /// Captured unconditionally, including on a live arena where `TFT019` skips
+    /// and discards it. `live` is not a parameter because the split is a fact
+    /// about the stream and the skip is a fact about the check; folding them
+    /// would give this type two meanings.
+    #[must_use]
+    pub fn capture(snap: &Snapshot, obs: &Observations) -> ClockStepEvidence {
+        let index = snap.edge_index();
+        let mut ev = ClockStepEvidence {
+            attributed: Vec::new(),
+            diffuse: Vec::new(),
+            refused: Vec::new(),
+        };
+        for run in doctor::out_of_order_runs(obs) {
+            match index.get(&run.edge).map(|e| (e.domain, *e)) {
+                // A `const` in a pattern, so this is an equality test against
+                // tag 0 and not a binding. Renaming `WALL_CLOCK_TAG` to anything
+                // lowercase would silently turn it into one that matches every
+                // tag.
+                Some((WALL_CLOCK_TAG, e)) => {
+                    if run.longest_rejected_run >= CLOCK_STEP_MIN_REJECTED_RUN {
+                        ev.attributed.push((run, snap.edge_label(e)));
+                    } else {
+                        ev.diffuse.push((run.edge, run.longest_rejected_run));
+                    }
+                }
+                Some((tag, _)) => ev.refused.push((run.edge, Some(tag))),
+                // Reachable from a hand-assembled `Inputs` and from a recorded
+                // stream whose edge is absent from the snapshot. Tag 0 is not
+                // the honest default for an unknown tag — that is the fabricated
+                // all-clear this whole check refuses.
+                None => ev.refused.push((run.edge, None)),
+            }
         }
+        ev
     }
-    ev
+
+    /// The disclosure that pairs with [`tft019`]'s outcome: which edges its
+    /// result does *not* cover.
+    ///
+    /// `None` when the outcome already carries the whole story — nothing was
+    /// found, or everything found was attributed, or the skip reason itself
+    /// names every refused tag. [`crate::catalogue::Status`] is three-valued and
+    /// none of them is "ran, half blind"; this is the same gap
+    /// [`rate_coverage_note`] exists to fill.
+    ///
+    /// `live` is a parameter rather than a caller-side `if`: on a live arena the
+    /// check skipped outright, so a note listing edges it "did not attribute"
+    /// would describe a run that did not happen.
+    #[must_use]
+    pub fn coverage_note(&self, live: bool) -> Option<String> {
+        if live {
+            return None;
+        }
+        // Nothing attributed and nothing diffuse: either `TFT018` found nothing
+        // at all, or the skip reason names every refused tag itself.
+        if self.attributed.is_empty() && self.diffuse.is_empty() {
+            return None;
+        }
+        // Everything found was attributed.
+        if self.diffuse.is_empty() && self.refused.is_empty() {
+            return None;
+        }
+        let total = self.attributed.len() + self.diffuse.len() + self.refused.len();
+        let mut parts = Vec::new();
+        if !self.diffuse.is_empty() {
+            parts.push(format!(
+                "{} in the wall-clock domain but with no run of at least \
+                 {CLOCK_STEP_MIN_REJECTED_RUN} consecutive rejected arrivals, so a stray inversion \
+                 rather than a step ({})",
+                self.diffuse.len(),
+                self.diffuse
+                    .iter()
+                    .map(|&(edge, run)| format!("edge#{edge} longest run {run}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.refused.is_empty() {
+            parts.push(format!(
+                "{} in another time domain ({})",
+                self.refused.len(),
+                tag_list(&self.refused)
+            ));
+        }
+        Some(format!(
+            "TFT019 attributed {} of {total} edge(s) with out-of-order arrivals to a wall-clock \
+             step; the rest are not attributed: {}",
+            self.attributed.len(),
+            parts.join("; ")
+        ))
+    }
 }
 
-/// Render `(edge, tag)` pairs for a skip reason or a note.
+/// Render `(edge, tag)` pairs for a skip reason or a note, each with the reason
+/// that tag specifically is not a clock this check will blame.
+///
+/// Tag-specific rather than one blanket sentence: `SimDomain` (2) *does* step
+/// backwards — a `/clock` reset from a bag loop or a sim restart is exactly that
+/// — so telling its operator "a steady or PTP tag cannot have stepped at all"
+/// would be false about the one case with its own decision record.
 fn tag_list(refused: &[(u32, Option<u8>)]) -> String {
     refused
         .iter()
         .map(|&(edge, tag)| match tag {
-            Some(tag) => format!("edge#{edge} tag {tag}"),
+            Some(tag) => format!("edge#{edge} tag {tag} ({})", tag_refusal(tag)),
             None => format!("edge#{edge} (not in the snapshot, tag unreadable)"),
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Why a run on `tag` is not attributed to a wall clock stepping.
+fn tag_refusal(tag: u8) -> &'static str {
+    match tag {
+        // Unreachable: a tag-0 run is either attributed or diffuse, never
+        // refused. Answered anyway so this stays a total function of the tag.
+        WALL_CLOCK_TAG => "the system wall clock",
+        <SensorDomain as Domain>::TAG => {
+            "a sensor's own clock, which this build has no way to call steppable or steady"
+        }
+        <SimDomain as Domain>::TAG => {
+            "simulated time, which does step backwards on a /clock reset — telling that apart from \
+             a publisher's transform_tolerance needs the authoritative rcl signal decision 0012 \
+             specifies, and doctor has none offline"
+        }
+        <SteadyDomain as Domain>::TAG => {
+            "a steady clock, which cannot have stepped, so this is a real publisher fault"
+        }
+        _ => {
+            "a user-declared domain; Domain is an open trait, so the tag carries no statement \
+              that its clock can step"
+        }
+    }
 }
 
 /// `TFT019` — a wall clock stepped backwards, which is `TFT018`'s cause.
@@ -1191,9 +1355,20 @@ fn tag_list(refused: &[(u32, Option<u8>)]) -> String {
 ///
 /// The evidence is [`doctor::out_of_order_runs`] — literally the function
 /// `TFT018` reports from — plus one fact the arena already holds, the edge's
-/// declared `EdgeRecord::domain`. There is no second scan of the stream, no
-/// window threshold, and no counter: `dropped_non_monotonic` is a *bridge*
-/// counter and an arena with no bridge in front of it has none.
+/// declared `EdgeRecord::domain`. There is no second scan of the stream and no
+/// counter: `dropped_non_monotonic` is a *bridge* counter and an arena with no
+/// bridge in front of it has none.
+///
+/// # It fires on a *run*, not on an inversion
+///
+/// `docs/PHASE5.md` §6 says "a run of rejections **concentrated in a short
+/// window**"; the concentration is [`CLOCK_STEP_MIN_REJECTED_RUN`] consecutive
+/// rejected arrivals, which is this implementation's number and not the spec's —
+/// that constant carries the argument and both costs. A single stray inversion
+/// on a wall-clock edge is a publisher fault, and calling it an NTP step is the
+/// same fabricated all-clear this check refuses on an unknown tag, pointed the
+/// other way. Those edges land in `diffuse` and are disclosed in
+/// [`ClockStepEvidence::coverage_note`].
 ///
 /// # It fires only on tag 0, and says which tag when it does not
 ///
@@ -1221,6 +1396,9 @@ fn tag_list(refused: &[(u32, Option<u8>)]) -> String {
 /// * **No regressions at all** — `Pass`, not `Skipped`. This check's evidence is
 ///   `TFT018`'s and it is complete: every retained stream was examined and none
 ///   went backwards, so there is nothing to attribute and saying so is earned.
+/// * **Regressions on tag 0, none concentrated** — `Pass`, with the note. The
+///   evidence is complete here too and it says "not a step"; the note is what
+///   keeps that from reading as "nothing was seen".
 /// * **Regressions, none on tag 0** — `Skipped`, naming the tags. `Pass` there
 ///   would read as "no clock step", which is an assurance about clocks this
 ///   check is not able to give.
@@ -1234,81 +1412,50 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
              clock step would put a cause on an effect that never happened",
         );
     }
-    let ev = clock_step_evidence(inp.snap, inp.obs);
+    let ev = inp.clock_step;
     if ev.attributed.is_empty() {
-        if ev.refused.is_empty() {
-            // TFT018 found nothing, so there is nothing to attribute. Earned:
-            // the evidence is complete, not missing.
-            return CheckOutcome::ran(Tft::Tft019, Vec::new());
+        // A `Skipped` only when *nothing* was judged. A diffuse wall-clock run
+        // was judged — "not concentrated enough to be a step" is an answer, and
+        // `coverage_note` carries it — so it passes rather than skipping.
+        if !ev.refused.is_empty() && ev.diffuse.is_empty() {
+            return CheckOutcome::skipped(
+                Tft::Tft019,
+                format!(
+                    "the edge(s) with out-of-order arrivals are not in the system wall-clock \
+                     domain (tag {WALL_CLOCK_TAG}): {}. Reporting a clock step here would \
+                     fabricate an all-clear on what TFT018 reports as a publisher fault",
+                    tag_list(&ev.refused)
+                ),
+            );
         }
-        return CheckOutcome::skipped(
-            Tft::Tft019,
-            format!(
-                "the edge(s) with out-of-order arrivals are not in the system wall-clock domain \
-                 (tag {WALL_CLOCK_TAG}): {}. Domain is an open trait, so another tag carries no \
-                 statement that its clock can step — a steady or PTP tag cannot have stepped at \
-                 all — and reporting a clock step here would fabricate an all-clear on what \
-                 TFT018 reports as a publisher fault",
-                tag_list(&ev.refused)
-            ),
-        );
+        // Either TFT018 found nothing, or what it found is not step-shaped.
+        // Earned: the evidence is complete, not missing.
+        return CheckOutcome::ran(Tft::Tft019, Vec::new());
     }
-    let index = inp.snap.edge_index();
     let findings = ev
         .attributed
         .iter()
-        .map(|run| {
-            let label = index
-                .get(&run.edge)
-                .map_or_else(|| format!("edge#{}", run.edge), |e| inp.snap.edge_label(e));
+        .map(|(run, label)| {
             Finding::on_edge(
                 Tft::Tft019,
                 run.edge,
-                label,
+                label.clone(),
                 format!(
-                    "{} out-of-order arrival(s), worst {:.3} ms backwards, on an edge declared in \
-                     the system wall clock domain (tag {WALL_CLOCK_TAG}): CLOCK_REALTIME is not \
-                     monotone, so an NTP step or a leap second is the likely cause and restarting \
-                     the publisher will not help. Declare anything published at rate with \
-                     SteadyDomain (tag 3), or your own tag for a PTP-disciplined clock. TFT018 \
-                     still reports the rejected pushes — the data lost during the step is gone \
-                     either way",
+                    "{} out-of-order arrival(s) including a run of {} consecutive rejected \
+                     pushes, worst {:.3} ms backwards, on an edge declared in the system wall \
+                     clock domain (tag {WALL_CLOCK_TAG}): CLOCK_REALTIME is not monotone, so an \
+                     NTP step or a leap second is the likely cause and restarting the publisher \
+                     will not help. Declare anything published at rate with SteadyDomain (tag 3), \
+                     or your own tag for a PTP-disciplined clock. TFT018 still reports the \
+                     rejected pushes — the data lost during the step is gone either way",
                     run.regressions,
+                    run.longest_rejected_run,
                     run.worst_backstep_ns as f64 / 1e6,
                 ),
             )
         })
         .collect();
     CheckOutcome::ran(Tft::Tft019, findings)
-}
-
-/// The disclosure that pairs with [`tft019`]: which edges its result covers.
-///
-/// `None` unless `TFT019` both attributed *and* refused, which is the one case
-/// its status cannot carry. When it attributed nothing the skip reason names
-/// every refused tag itself; when it refused nothing there is nothing to
-/// disclose. [`crate::catalogue::Status`] is three-valued and none of them is
-/// "ran, half blind" — the same gap `rate_coverage_note` exists to fill.
-///
-/// `live` is a parameter rather than a caller-side `if`: on a live arena the
-/// check skipped outright, so a note listing edges it "did not attribute" would
-/// describe a run that did not happen.
-#[must_use]
-pub fn clock_step_coverage_note(snap: &Snapshot, obs: &Observations, live: bool) -> Option<String> {
-    if live {
-        return None;
-    }
-    let ev = clock_step_evidence(snap, obs);
-    if ev.attributed.is_empty() || ev.refused.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "TFT019 attributed {} of {} edge(s) with out-of-order arrivals to a wall-clock step; \
-         the rest are in another time domain and are not attributed: {}",
-        ev.attributed.len(),
-        ev.attributed.len() + ev.refused.len(),
-        tag_list(&ev.refused)
-    ))
 }
 
 /// The occupancy triples for [`Inputs::occupancy`], read from the header.
@@ -1431,6 +1578,10 @@ mod tests {
             clock,
             arena_bytes: 1 << 20,
             occupancy: Vec::new(),
+            // Leaked so the helper can keep its four-argument shape across
+            // thirty-odd call sites: `Inputs` borrows the split, and a test
+            // process that exits after one assertion has nothing to reclaim.
+            clock_step: Box::leak(Box::new(ClockStepEvidence::capture(snap, obs))),
             live: false,
             counters: true,
         }
@@ -1962,25 +2113,40 @@ mod tests {
         assert!(report.has_error(), "an out-of-order stream must still gate");
     }
 
-    /// A stream on `edge` that runs forward and then takes one step back of
-    /// `back_ns` — the shape a clock step leaves in the observed pushes.
+    /// One publish period in the synthetic streams below.
+    const PERIOD_NS: i64 = 10_000_000;
+
+    /// A stream on `edge` at [`PERIOD_NS`] that runs forward, has its clock
+    /// stepped back by `back_ns`, and then keeps publishing at the same rate.
+    ///
+    /// That is the shape a real clock step leaves, and it is not the same shape
+    /// as one misplaced sample: the publisher does not stop, so invariant 6
+    /// rejects every push until the clock climbs back past the newest accepted
+    /// stamp. The run is therefore `back_ns / PERIOD_NS` consecutive rejected
+    /// arrivals — the quantity `TFT019`'s concentration condition reads — while
+    /// the *adjacent* inversion count `TFT018` reports stays 1 either way. A
+    /// test that wants a stray inversion instead asks for a small `back_ns`.
     fn stepped_back(edge: u32, back_ns: i64) -> Vec<PushSample> {
-        const MS: i64 = 1_000_000;
-        [
-            0,
-            100 * MS,
-            200 * MS,
-            200 * MS - back_ns,
-            210 * MS - back_ns,
-        ]
-        .into_iter()
-        .map(|stamp_ns| PushSample {
-            edge,
-            writer_pid: 4711,
-            stamp_ns,
-            arrival_delay_ns: 0,
-        })
-        .collect()
+        let mut stamps: Vec<i64> = (0..10).map(|i| i * PERIOD_NS).collect();
+        let last = stamps[stamps.len() - 1];
+        let mut t = last - back_ns;
+        // `<= last` and not `< last`: the push that lands exactly on the newest
+        // accepted stamp is *accepted* (replay is idempotent), so it ends the
+        // rejected run rather than extending it.
+        while t <= last {
+            stamps.push(t);
+            t += PERIOD_NS;
+        }
+        stamps.push(t);
+        stamps
+            .into_iter()
+            .map(|stamp_ns| PushSample {
+                edge,
+                writer_pid: 4711,
+                stamp_ns,
+                arrival_delay_ns: 0,
+            })
+            .collect()
     }
 
     /// A two-edge chain `map -> odom -> base` whose second edge carries `domain`.
@@ -2014,12 +2180,15 @@ mod tests {
     /// provably wrong there — a steady clock cannot step, so the run *is* a
     /// publisher fault and `TFT018` alone is the honest answer.
     ///
-    /// Mutant: make the wall-clock arm `Some(_) => ev.attributed.push(run)`.
+    /// Mutant: make the wall-clock arm `Some((_, e))` (attribute every tag).
     /// Applied: the tag-3 edge is attributed and the first assertion fails —
     /// "only the wall-clock edge may be attributed", `left: [Some(1), Some(2)]`,
     /// `right: [Some(1)]`.
     /// Mutant B: `const WALL_CLOCK_TAG: u8 = 3`. Applied: the same assertion
     /// fails with `left: [Some(2)]`, `right: [Some(1)]`.
+    /// Mutant C: give the `SimDomain` arm of `tag_refusal` the steady arm's
+    /// text. Applied: the last assertion fails — "sim time must be sent to
+    /// 0012, not told its clock cannot step".
     #[test]
     fn tft019_fires_only_on_the_wall_clock_tag_and_names_the_tag_it_refuses() {
         const MS: i64 = 1_000_000;
@@ -2027,8 +2196,8 @@ mod tests {
         // backwards by the same amount, so only the tag can explain the
         // difference in outcome.
         let snap = chain_with_domains(0, 3);
-        let mut events = stepped_back(1, 50 * MS);
-        events.extend(stepped_back(2, 50 * MS));
+        let mut events = stepped_back(1, 100 * MS);
+        events.extend(stepped_back(2, 100 * MS));
         let obs = Observations::from_samples(events);
 
         let o = tft019(&inputs(&snap, &obs, &[], Clock::Wall(0)));
@@ -2040,7 +2209,7 @@ mod tests {
             o.findings
         );
         assert!(
-            o.findings[0].message.contains("50.000 ms")
+            o.findings[0].message.contains("100.000 ms")
                 && o.findings[0].message.contains("CLOCK_REALTIME")
                 && o.findings[0].message.contains("SteadyDomain"),
             "the finding must carry the size of the step, the cause, and the fix: {}",
@@ -2048,7 +2217,9 @@ mod tests {
         );
         // The half it did not attribute is disclosed, since neither the
         // findings nor a skip reason can carry it here.
-        let note = clock_step_coverage_note(&snap, &obs, false).expect("a partial run discloses");
+        let note = ClockStepEvidence::capture(&snap, &obs)
+            .coverage_note(false)
+            .expect("a partial run discloses");
         assert!(
             note.contains("edge#2 tag 3") && note.contains("1 of 2"),
             "{note}"
@@ -2063,16 +2234,33 @@ mod tests {
             Status::Skipped(why) => assert!(
                 why.contains("edge#1 tag 1")
                     && why.contains("edge#2 tag 3")
-                    && why.contains("open trait"),
+                    && why.contains("a steady clock, which cannot have stepped"),
                 "the skip must name every tag it declined to guess about: {why}"
             ),
             other => panic!("expected a skip on non-wall-clock tags, got {other:?}"),
         }
         assert_eq!(
-            clock_step_coverage_note(&snap, &obs, false),
+            ClockStepEvidence::capture(&snap, &obs).coverage_note(false),
             None,
             "the skip reason carries the whole disclosure here, so the note stays silent"
         );
+
+        // **Sim time is refused for its own reason.** A `/clock` reset from a
+        // bag loop or a sim restart *is* a backwards step, so the steady tag's
+        // "cannot have stepped at all" would be false here; telling it apart
+        // from a publisher's `transform_tolerance` is what decision 0012 is,
+        // and `doctor` has none of its signals offline.
+        let snap = chain_with_domains(2, 2);
+        let o = tft019(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("simulated time, which does step backwards")
+                    && why.contains("0012")
+                    && !why.contains("cannot have stepped"),
+                "sim time must be sent to 0012, not told its clock cannot step: {why}"
+            ),
+            other => panic!("expected a skip on the sim tag, got {other:?}"),
+        }
 
         // And a monotone stream on a wall-clock edge is a `Pass`, not a skip:
         // the evidence is TFT018's and it is complete — every retained stream
@@ -2081,6 +2269,70 @@ mod tests {
         let obs = Observations::from_samples(steady(1, 8, 50 * MS));
         let o = tft019(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert_eq!(o.status, Status::Pass, "{o:?}");
+    }
+
+    /// **A single stray inversion on a wall clock is not a clock step.**
+    ///
+    /// `docs/PHASE5.md` §6 asks for "a run of rejections *concentrated in a
+    /// short window*" and `docs/API.md` §5.3 for "a run of rejected pushes".
+    /// Firing on one misplaced sample is the same fabricated attribution the
+    /// tag refusal exists to prevent, pointed the other way: it tells an
+    /// operator the clock stepped when what actually happened is a publisher
+    /// hiccup, and `TFT018` alone is the honest answer there.
+    ///
+    /// The threshold ([`CLOCK_STEP_MIN_REJECTED_RUN`], in arrivals) is this
+    /// implementation's and not the spec's, so what this pins is the *shape* of
+    /// the rule: below it, `TFT019` passes and discloses; at it, it fires.
+    ///
+    /// Mutant: `run.longest_rejected_run >= CLOCK_STEP_MIN_REJECTED_RUN` ->
+    /// `run.regressions > 0`. Applied: the stray-inversion case is attributed
+    /// and the first assertion fails with `left: Fired`, `right: Pass`.
+    /// Mutant B: `>= CLOCK_STEP_MIN_REJECTED_RUN` -> `> CLOCK_STEP_MIN_REJECTED_RUN`.
+    /// Applied: the exactly-at-threshold stream is no longer attributed and the
+    /// last assertion fails with `left: Pass`, `right: Fired`.
+    #[test]
+    fn tft019_needs_a_run_of_rejections_not_a_single_inversion() {
+        let snap = chain_with_domains(0, 0);
+
+        // Two rejected arrivals: one sample out of place, not a clock that
+        // stepped. TFT018 still reports it — nothing is suppressed.
+        let obs = Observations::from_samples(stepped_back(1, 2 * PERIOD_NS));
+        let inp = inputs(&snap, &obs, &[], Clock::Wall(0));
+        assert_eq!(
+            tft019(&inp).status,
+            Status::Pass,
+            "a two-arrival inversion is a publisher fault, not an NTP step"
+        );
+        assert_eq!(
+            tft018(&inp).status,
+            Status::Fired,
+            "the detector is untouched: rejected pushes are lost data either way"
+        );
+        // A pass that covers less than it looks like it does says so.
+        let note = ClockStepEvidence::capture(&snap, &obs)
+            .coverage_note(false)
+            .expect("a diffuse wall-clock run is disclosed rather than silently passed");
+        assert!(
+            note.contains("edge#1 longest run 2")
+                && note.contains(&format!("at least {CLOCK_STEP_MIN_REJECTED_RUN}")),
+            "{note}"
+        );
+
+        // Exactly at the threshold: a step of `CLOCK_STEP_MIN_REJECTED_RUN`
+        // publish periods rejects that many pushes on the way back up.
+        let obs = Observations::from_samples(stepped_back(
+            1,
+            PERIOD_NS * CLOCK_STEP_MIN_REJECTED_RUN as i64,
+        ));
+        assert_eq!(
+            doctor::out_of_order_runs(&obs)[0].longest_rejected_run,
+            CLOCK_STEP_MIN_REJECTED_RUN,
+            "the fixture must sit exactly on the boundary for this to pin it"
+        );
+        assert_eq!(
+            tft019(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
+            Status::Fired
+        );
     }
 
     /// **`TFT019` inherits `TFT018`'s live-arena skip rather than working around
@@ -2098,7 +2350,7 @@ mod tests {
     fn tft019_inherits_tft018s_live_arena_skip() {
         const MS: i64 = 1_000_000;
         let snap = chain_with_domains(0, 0);
-        let obs = Observations::from_samples(stepped_back(1, 50 * MS));
+        let obs = Observations::from_samples(stepped_back(1, 100 * MS));
         let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
         inp.live = true;
 
@@ -2113,7 +2365,7 @@ mod tests {
             }
         }
         assert_eq!(
-            clock_step_coverage_note(&snap, &obs, true),
+            ClockStepEvidence::capture(&snap, &obs).coverage_note(true),
             None,
             "a note about edges the check did not attribute would describe a run that did not \
              happen"
@@ -2141,7 +2393,7 @@ mod tests {
     fn tft019_explains_tft018_without_demoting_it() {
         const MS: i64 = 1_000_000;
         let snap = chain_with_domains(0, 0);
-        let obs = Observations::from_samples(stepped_back(1, 50 * MS));
+        let obs = Observations::from_samples(stepped_back(1, 100 * MS));
         let inp = inputs(&snap, &obs, &[], Clock::Wall(0));
 
         assert_eq!(Tft::Tft019.severity(), crate::catalogue::Severity::Warn);
@@ -2212,8 +2464,8 @@ mod tests {
         assert_eq!(tft019(&inp).status, Status::Pass);
 
         // And where TFT018 does fire, TFT019 considers exactly its edges.
-        let mut events = stepped_back(1, 50 * MS);
-        events.extend(stepped_back(2, 20 * MS));
+        let mut events = stepped_back(1, 100 * MS);
+        events.extend(stepped_back(2, 200 * MS));
         let obs = Observations::from_samples(events);
         let inp = inputs(&snap, &obs, &[], Clock::Wall(0));
         let attributed: Vec<u32> = tft019(&inp)

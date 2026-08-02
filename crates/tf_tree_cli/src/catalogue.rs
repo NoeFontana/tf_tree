@@ -53,7 +53,7 @@
 //! first revision in.
 //!
 //! Going the other way, some ids have no detection *here*: three cannot detect
-//! anything in any configuration, and six more depend on what this arena, this
+//! anything in any configuration, and seven more depend on what this arena, this
 //! engine build and this host can supply. Each is reported [`Status::Skipped`]
 //! with the reason stated in [`crate::checks`], never silently passed.
 //!
