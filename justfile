@@ -499,8 +499,10 @@ bench-report-shm *ARGS:
 # both runs, took 10 s warm.** That is cheap enough that `bench-check` pays it;
 # see its comment.
 #
-# The output pair is left in `target/embed-cost/` for `bench-report`,
-# `bench-check` and `bench-baseline-update` to read with `--embed-cost`.
+# The output pair is left in `target/embed-cost/`. `bench-check` and
+# `bench-baseline-update` depend on this recipe and pass that directory with
+# `--embed-cost`; `just bench-report --embed-cost target/embed-cost` reads the
+# same pair by hand.
 embed-cost:
     #!/usr/bin/env bash
     set -euo pipefail
