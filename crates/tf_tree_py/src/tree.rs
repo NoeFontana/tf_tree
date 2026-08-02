@@ -5,9 +5,11 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use tf_tree::{AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, Stamp, SystemDomain, Tree};
+use tf_tree::{
+    AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree,
+};
 
 use crate::errors::{lookup_err, BufferError, FrameNotDeclaredError, TfTreeError};
 
@@ -26,10 +28,76 @@ pub(crate) const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
 /// Rough per-step cost used only to place the threshold above.
 const NS_PER_STEP_ESTIMATE: u64 = 55;
 
+/// §6.1's rule, in one place so the two callers cannot drift apart.
+///
+/// # Why `Layout::QuatTwist` does not get a multiplier here
+///
+/// A twist row *is* more work per element than a pose row: it folds through
+/// `fold_at_with_derivatives`, which samples each edge's bracketing segment for
+/// a derivative as well as a pose. So `est` under-estimates a twist batch, and
+/// the branch it gets wrong is the *cheap* one — it holds the GIL a little longer
+/// than §6.1's stated worst case of just under 1 µs.
+///
+/// **By about 1.1×, measured.** Depth 3, n = 4000, `ScLerp` (the only policy
+/// that answers a twist at all), release build, pinned: **328 ns/elem** for
+/// `layout="quat"` against **369 ns/elem** for `layout="quat_twist"`, best of
+/// five within a process. Treat that as indicative rather than as a gate — the
+/// host was **not quiet** and one of three repetitions was discarded as
+/// polluted; what the measurement establishes is the *magnitude*, which is what
+/// this decision turns on.
+///
+/// So a twist batch can hold the GIL for ~1.1 µs where a pose batch holds it
+/// for ~1 µs, and that is not worth a second constant. §6.1's argument is that
+/// both sides of the threshold are cheap and **what matters is that neither
+/// branch is ever badly wrong**; 1.1 µs is still three orders of magnitude
+/// below CPython's 5 ms switch interval, so no other thread notices. A
+/// layout-dependent estimate would also mean two numbers to re-derive when
+/// `docs/decisions/0013` re-baselines instead of one, and `docs/API.md` §3.4 is
+/// NORMATIVE that `NS_PER_STEP_ESTIMATE` is re-derived **from that
+/// measurement, in that commit** — inventing a twist multiplier against
+/// today's superseded baseline is the same mistake in a second place.
+#[inline]
+fn release_the_gil(n: usize, depth: usize) -> bool {
+    let est = (n as u64)
+        .saturating_mul(depth as u64)
+        .saturating_mul(NS_PER_STEP_ESTIMATE);
+    est >= GIL_RELEASE_THRESHOLD_NS
+}
+
+/// Parse the `layout=` keyword into the core's [`Layout`].
+///
+/// **No default and no inference** (`docs/API.md` R4): row-major versus
+/// column-major differ by a transpose, which for a rotation is its inverse, and
+/// `wxyz` versus `xyzw` is a different, still-unit quaternion. Both produce a
+/// valid-looking transform pointing the wrong way, so an unrecognised spelling
+/// is refused rather than guessed at.
+fn layout_from_str(name: &str) -> PyResult<Layout> {
+    match name {
+        "mat4" => Ok(Layout::Mat4),
+        "quat" => Ok(Layout::Quat),
+        "affine32" => Ok(Layout::Affine32),
+        "quat_twist" => Ok(Layout::QuatTwist),
+        other => Err(PyValueError::new_err(format!(
+            "unknown layout {other:?}; expected one of 'mat4' (N, 4, 4) float64, \
+             'quat' (N, 7) float64, 'affine32' (N, 12) float32, 'quat_twist' \
+             (N, 13) float64"
+        ))),
+    }
+}
+
 /// A transform tree.
 #[pyclass(name = "Tree", module = "tf_tree", frozen)]
 pub struct PyTree {
-    pub(crate) inner: Tree,
+    /// The engine, behind the `Arc` [`tf_tree::Tree::claim_owned`] requires.
+    ///
+    /// `Arc<Tree>` rather than `Tree` because that is the receiver type of
+    /// `claim_owned` (`self: &Arc<Tree>`), and [`PyPublisher`] is the one thing
+    /// here that has to outlive the scope it was created in. It is also the
+    /// embedding idiom the facade documents (`docs/API.md` §2.2), spelled here
+    /// alongside — not instead of — the `Py<PyTree>` refcount [`PyPlan`] holds:
+    /// the `Arc` keeps the *arena* alive, the `Py` keeps the Python object
+    /// alive, and only the first of those is what a claim points into.
+    pub(crate) inner: Arc<Tree>,
 }
 
 /// Reject a `float` stamp with the measurement that justifies it (§3).
@@ -92,33 +160,17 @@ impl PyTree {
             .inner
             .frame(parent)
             .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {parent:?}")))?;
-        let publisher = this
+        // `claim_owned`, not `claim`: this crate no longer extends a lifetime
+        // itself. `docs/decisions/0017` step 6 — the writer that comes back owns
+        // its `Arc<Tree>`, so the arena outlives it by construction and the
+        // `unsafe` that used to live here is the facade's single reviewed one.
+        let writer = this
             .inner
-            .claim(c, p)
+            .claim_owned(c, p)
             .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
-
-        // SAFETY: the only `unsafe` in this binding that is not a numpy slice.
-        //
-        // `EdgeWriter<'a>` borrows the `Tree`, and a `#[pyclass]` cannot carry a
-        // lifetime, so the borrow is extended to `'static` and its validity
-        // moved to a runtime guarantee: the `Py<PyTree>` stored alongside is a
-        // strong reference, so the `Tree` — and the arena the claim points into
-        // — outlives this writer for certain.
-        //
-        // That is the same guarantee `Plan` relies on, and it is spelled with a
-        // refcount rather than a comment *because* the comment version was a
-        // use-after-free (see `PyPlan::tree`). The writer is never handed out,
-        // only borrowed under the mutex, so no caller can outlive it either.
-        //
-        // The transmute is behind `extend_to_static`, whose signature pins both
-        // types so only the lifetime can differ. Inline, it read
-        // `transmute::<EdgeWriter, Publisher>` and compiled for as long as the
-        // two happened to be the same size — see `PyPublisher::inner`.
-        let writer = unsafe { extend_to_static(publisher) };
 
         Ok(PyPublisher {
             inner: Mutex::new(Some(writer)),
-            _tree: slf.clone().unbind(),
         })
     }
 
@@ -366,10 +418,64 @@ impl PyPlan {
     /// because a Python loop over scalar lookups costs ~200 ns per iteration
     /// while the same work through an array amortises to near-native.
     ///
-    /// **Positional-only.** `METH_FASTCALL` is a measured 29 ns cheaper than
-    /// `PyArg_ParseTuple` for one argument — 20% of a depth-3 budget (§4.2).
-    #[pyo3(signature = (stamps, /))]
-    fn at<'py>(&self, py: Python<'py>, stamps: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    /// **`stamps` is positional-only.** `METH_FASTCALL` is a measured 29 ns
+    /// cheaper than `PyArg_ParseTuple` for one argument (§4.2).
+    ///
+    /// # `layout=`
+    ///
+    /// Keyword-only, and the one keyword §4.2 permits here — "accepted as a
+    /// keyword only on the non-hot overload". Four values, each an explicit
+    /// statement of memory layout with no default that could be silently wrong
+    /// (`docs/API.md` R4):
+    ///
+    /// | `layout=` | scalar | batch | dtype |
+    /// | --- | --- | --- | --- |
+    /// | `"mat4"` (default) | `(4, 4)` | `(N, 4, 4)` | `float64` |
+    /// | `"quat"` | `(7,)` | `(N, 7)` | `float64` |
+    /// | `"affine32"` | `(12,)` | `(N, 12)` | **`float32`** |
+    /// | `"quat_twist"` | `(13,)` | `(N, 13)` | `float64` |
+    ///
+    /// `"quat_twist"` is `at_with_derivatives` as a layout
+    /// (`docs/PHASE5.md` §4.4 item 1): `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy
+    /// vz]`, the body twist in the plan's **source** frame, angular first. It
+    /// is the only layout whose emission can fail for a reason the others
+    /// cannot — a `LerpSlerp` edge has no exact body twist and raises
+    /// `DerivativesUnavailableError` rather than emitting a finite difference
+    /// that would look like an answer.
+    ///
+    /// **What the keyword costs the caller who does not pass one is not
+    /// established here, and saying so is the honest report.** §4.2 provides an
+    /// escape hatch — "if that measurably costs, add `at_quat` /
+    /// `at_affine32` as separate positional-only methods" — which needs a
+    /// number to trigger. An A/B was attempted: two release builds of this
+    /// crate differing only in whether `at`/`at_into` carry the keyword-only
+    /// parameter, `p.at_into(t, out)` at depth 3, best of seven over 300 k
+    /// iterations, pinned. It produced **nothing usable** — the run-to-run
+    /// spread on a *single* binary was 283–378 ns, several times any plausible
+    /// effect — because this host is shared and was not quiet. The number is
+    /// owed; it is not invented here.
+    ///
+    /// What is known without measuring: `stamps` stays **positional**, so the
+    /// 29 ns §4.2 actually measured is untouched, and PyO3 keeps the vectorcall
+    /// convention for a signature with keyword-only arguments rather than
+    /// falling back to `PyArg_ParseTuple`. That bounds the exposure to the
+    /// difference between two vectorcall shapes, not to the 29 ns.
+    #[pyo3(signature = (stamps, /, *, layout = None))]
+    fn at<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyAny>,
+        layout: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Anything but the default layout leaves the hot path entirely, before
+        // the scalar/array dispatch below, so `mat4` pays one `Option` test for
+        // the other three existing.
+        if let Some(name) = layout {
+            let layout = layout_from_str(name)?;
+            if layout != Layout::Mat4 {
+                return self.at_layout(py, stamps, layout);
+            }
+        }
         // **Scalar first, and it is not a style choice.** `cast::<PyArray1<i64>>`
         // on an `int` *fails*, and a failed downcast builds a `DowncastError` —
         // type-name lookups and a formatted message — that is then thrown away
@@ -411,13 +517,27 @@ impl PyPlan {
     ///
     /// The array is validated **completely before any element is written**: a
     /// half-written output is worse than none, because it looks like data.
-    #[pyo3(signature = (stamps, out, /))]
+    ///
+    /// `layout=` is [`at`](Self::at)'s, and `out`'s required shape and dtype
+    /// follow it: `(N, layout_elems)` — or `(layout_elems,)` for a scalar stamp
+    /// — and `float32` for `"affine32"`, `float64` for the rest. R2's corollary
+    /// is why this takes the keyword at all: **every** batch entry point has an
+    /// `_into` form, and a layout reachable only through the allocating one
+    /// would be a batch path with no allocation-free tier.
+    #[pyo3(signature = (stamps, out, /, *, layout = None))]
     fn at_into(
         &self,
         py: Python<'_>,
         stamps: &Bound<'_, PyAny>,
         out: &Bound<'_, PyAny>,
+        layout: Option<&str>,
     ) -> PyResult<()> {
+        if let Some(name) = layout {
+            let layout = layout_from_str(name)?;
+            if layout != Layout::Mat4 {
+                return self.at_into_layout(py, stamps, out, layout, name);
+            }
+        }
         // **`reject_device_memory` is not called on the numpy path, and that is
         // a measurement, not an omission.** It does `getattr("__dlpack_device__")`
         // and then *calls* it — a full Python method call and a tuple extract,
@@ -682,9 +802,6 @@ impl PyPlan {
         // keeps these pointers valid (§6.2).
         let (src, dst) = unsafe { (stamps.as_slice()?, out.as_slice_mut()?) };
 
-        let est = (n as u64)
-            .saturating_mul(self.plan.len() as u64)
-            .saturating_mul(NS_PER_STEP_ESTIMATE);
         let plan = *self.plan;
         let tree = self.tree();
 
@@ -695,9 +812,178 @@ impl PyPlan {
             // the intermediate buffer `at_into` exists to avoid.
             plan.at_many_into::<SystemDomain>(&g, src, Layout::Mat4, dst)
         };
-        let res = if est >= GIL_RELEASE_THRESHOLD_NS {
+        let res = if release_the_gil(n, self.plan.len()) {
             // `detach` is PyO3 0.29's name for what was `allow_threads`.
             // Touch no Python object inside (§6.2): only the raw slices above.
+            py.detach(run)
+        } else {
+            run()
+        };
+        res.map_err(lookup_err)
+    }
+
+    /// [`PyPlan::at`]'s `layout=` path: allocate the right shape and fill it.
+    ///
+    /// Off the `mat4` hot path by construction — [`PyPlan::at`] branches here
+    /// before its scalar/array dispatch — so this is written for clarity. It
+    /// still checks `PyInt` before attempting the array cast, for the reason
+    /// [`PyPlan::at`]'s own comment measures: a failed downcast builds and
+    /// throws away a `DowncastError`.
+    fn at_layout<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyAny>,
+        layout: Layout,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let e = layout.elems();
+        if stamps.is_instance_of::<pyo3::types::PyInt>() {
+            // **A one-element batch, not a scalar kernel.** `docs/PHASE3.md`
+            // §11.1 requires `at(t)` to equal `at([t])[0]` *bit-exactly*, and
+            // the cheapest way to guarantee that is for there to be one
+            // implementation. The scalar `mat4` path above is the deliberate
+            // exception — it predates this and is the measured hot path — and
+            // what a second implementation *saves* on these three layouts was
+            // not measured, because the reason not to have one is correctness
+            // rather than cost.
+            let src = [stamp_from_any(stamps)?];
+            return if layout.is_f32() {
+                let out = PyArray1::<f32>::zeros(py, [e], false);
+                // SAFETY: freshly allocated here, contiguous by construction,
+                // and no other reference to it exists.
+                let dst = unsafe { out.as_slice_mut()? };
+                self.eval_f32(py, &src, layout, dst)?;
+                Ok(out.into_any())
+            } else {
+                let out = PyArray1::<f64>::zeros(py, [e], false);
+                // SAFETY: as above.
+                let dst = unsafe { out.as_slice_mut()? };
+                self.eval_f64(py, &src, layout, dst)?;
+                Ok(out.into_any())
+            };
+        }
+
+        let stamps = stamps
+            .cast::<PyArray1<i64>>()
+            .map_err(|_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?;
+        if !stamps.is_c_contiguous() {
+            return Err(BufferError::new_err(
+                "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                 explicitly if you meant to copy",
+            ));
+        }
+        let n = stamps.len();
+        // SAFETY: checked C-contiguous above; the borrow is held across the
+        // `detach` inside `eval_*` for the reason §6.2 gives — NumPy refuses to
+        // resize an array while a buffer is exported.
+        let src = unsafe { stamps.as_slice()? };
+        if layout.is_f32() {
+            let out = PyArray2::<f32>::zeros(py, [n, e], false);
+            // SAFETY: freshly allocated here and contiguous by construction.
+            let dst = unsafe { out.as_slice_mut()? };
+            self.eval_f32(py, src, layout, dst)?;
+            Ok(out.into_any())
+        } else {
+            let out = PyArray2::<f64>::zeros(py, [n, e], false);
+            // SAFETY: as above.
+            let dst = unsafe { out.as_slice_mut()? };
+            self.eval_f64(py, src, layout, dst)?;
+            Ok(out.into_any())
+        }
+    }
+
+    /// [`PyPlan::at_into`]'s `layout=` path: validate `out`, then fill it.
+    ///
+    /// Everything is checked before a single element is written, exactly as the
+    /// `mat4` path is (§5.3) — and the dispatch is on `stamps` first for the
+    /// same reason it is there: probing `out` first blames the argument the
+    /// caller got right.
+    fn at_into_layout(
+        &self,
+        py: Python<'_>,
+        stamps: &Bound<'_, PyAny>,
+        out: &Bound<'_, PyAny>,
+        layout: Layout,
+        name: &str,
+    ) -> PyResult<()> {
+        let e = layout.elems();
+        let scalar = stamps.is_instance_of::<pyo3::types::PyInt>();
+        let (src_owned, src_arr) = if scalar {
+            ([stamp_from_any(stamps)?], None)
+        } else {
+            let arr = stamps.cast::<PyArray1<i64>>().map_err(|_| {
+                BufferError::new_err("stamps must be an (N,) int64 array, or an int")
+            })?;
+            if !arr.is_c_contiguous() {
+                return Err(BufferError::new_err(
+                    "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                     explicitly if you meant to copy",
+                ));
+            }
+            ([0i64], Some(arr))
+        };
+        // SAFETY: checked C-contiguous above; held across `eval_*`'s `detach`
+        // per §6.2.
+        let src: &[i64] = match &src_arr {
+            Some(a) => unsafe { a.as_slice()? },
+            None => &src_owned,
+        };
+        let n = src.len();
+        let want: &[usize] = if scalar { &[e] } else { &[n, e] };
+
+        if layout.is_f32() {
+            let arr = cast_out::<f32>(out, layout, want, name)?;
+            check_out(arr.as_untyped(), want)?;
+            // SAFETY: `check_out` proved C-contiguous, correctly shaped and
+            // writable; aliasing stays the caller's, exactly as `as_slice_mut`
+            // documents. Nothing has been written yet.
+            let dst = unsafe { arr.as_slice_mut()? };
+            self.eval_f32(py, src, layout, dst)
+        } else {
+            let arr = cast_out::<f64>(out, layout, want, name)?;
+            check_out(arr.as_untyped(), want)?;
+            // SAFETY: as above.
+            let dst = unsafe { arr.as_slice_mut()? };
+            self.eval_f64(py, src, layout, dst)
+        }
+    }
+
+    /// Fold `src` into `dst` in an `f64` layout, releasing the GIL if it pays.
+    fn eval_f64(
+        &self,
+        py: Python<'_>,
+        src: &[i64],
+        layout: Layout,
+        dst: &mut [f64],
+    ) -> PyResult<()> {
+        let plan = *self.plan;
+        let tree = self.tree();
+        let mut run = || {
+            let g = tree.guard();
+            plan.at_many_into::<SystemDomain>(&g, src, layout, dst)
+        };
+        let res = if release_the_gil(src.len(), self.plan.len()) {
+            py.detach(run)
+        } else {
+            run()
+        };
+        res.map_err(lookup_err)
+    }
+
+    /// [`Self::eval_f64`] for the one `f32` layout.
+    fn eval_f32(
+        &self,
+        py: Python<'_>,
+        src: &[i64],
+        layout: Layout,
+        dst: &mut [f32],
+    ) -> PyResult<()> {
+        let plan = *self.plan;
+        let tree = self.tree();
+        let mut run = || {
+            let g = tree.guard();
+            plan.at_many_into_f32::<SystemDomain>(&g, src, layout, dst)
+        };
+        let res = if release_the_gil(src.len(), self.plan.len()) {
             py.detach(run)
         } else {
             run()
@@ -718,38 +1004,34 @@ impl PyPlan {
 /// at a different level. An uncontended lock is ~15 ns against a `push` that
 /// already costs more.
 ///
-/// It also borrows the `Tree`. The `Py<PyTree>` below is what makes that sound
-/// — the same refcount `Plan` uses, for the same reason and after the same bug.
+/// It also has to outlive the scope that created it, which is what
+/// [`OwnedWriter`] is for: it carries its own `Arc<Tree>`, so the arena the
+/// claim points into cannot go away underneath it and this crate holds no
+/// lifetime of its own.
 #[pyclass(name = "Publisher", module = "tf_tree")]
 pub struct PyPublisher {
     /// `None` after `__exit__` or `release()`, so a use-after-release is a
     /// clear Python error rather than a claim held past its scope.
     ///
-    /// # This is an `EdgeWriter`, not a `Publisher`, and the difference is two
-    /// silent bugs
+    /// # Why an [`OwnedWriter`] and not a hand-rolled `EdgeWriter<'static>`
     ///
-    /// It held a `Publisher` until a `transmute::<EdgeWriter, Publisher>`
-    /// stopped compiling on a size change. That transmute was not a lifetime
-    /// extension — it reinterpreted one type as another, and since `publisher`
-    /// is `EdgeWriter`'s first field the bytes lined up and the rest were
-    /// dropped on the floor:
+    /// Because there is exactly one lifetime extension in the workspace and it
+    /// is not here (`docs/decisions/0017`). This field held an
+    /// `EdgeWriter<'static>` produced by a local `extend_to_static`, and before
+    /// that a type reinterpretation that was not a lifetime extension at all and
+    /// dropped the claim lease and the fork guard on the floor. Both failures
+    /// and the argument for centralising them are recorded in `0017` and on
+    /// [`OwnedWriter`]; **this comment deliberately does not restate them**,
+    /// because a second copy of a hazard's description drifts exactly the way a
+    /// second copy of its code did — and because `0017` step 6's stated
+    /// verification is a grep for the old spelling over this crate, which a
+    /// comment quoting it would defeat.
     ///
-    /// * the **claim lease** was never released. `ClaimLease`'s `Drop` is what
-    ///   unlocks the edge's OFD byte, so every Python publisher leaked one for
-    ///   the life of the process — and a leaked lease is indistinguishable from
-    ///   a live writer, so no reaper would ever collect the edge either.
-    /// * the **fork guard** was bypassed. `EdgeWriter::push` checks the fork
-    ///   generation and `Publisher::push` does not, so a `push` from a
-    ///   `multiprocessing` child would have written through a dangling pointer
-    ///   into an unmapped page instead of returning `ChildDetached` — and
-    ///   `multiprocessing` defaults to `fork` on Linux.
-    ///
-    /// Neither had a test, because nothing built this crate: it is excluded
-    /// from the workspace, so `just test` and `just lint` never saw it. That is
-    /// fixed in the `justfile` alongside this.
-    inner: Mutex<Option<tf_tree::EdgeWriter<'static>>>,
-    /// Keeps the arena alive for at least as long as the claim points into it.
-    _tree: Py<PyTree>,
+    /// `OwnedWriter` reproduces every guard by *containing* the `EdgeWriter`
+    /// whole, so the count cannot drift: `push` here is
+    /// [`OwnedWriter::push`](tf_tree::OwnedWriter::push), which forwards to the
+    /// fork-checked `EdgeWriter::push`.
+    inner: Mutex<Option<OwnedWriter>>,
 }
 
 #[pymethods]
@@ -838,7 +1120,7 @@ impl PyPublisher {
 }
 
 impl PyPublisher {
-    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Option<tf_tree::EdgeWriter<'static>>>> {
+    fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, Option<OwnedWriter>>> {
         self.inner
             .lock()
             .map_err(|_| TfTreeError::new_err("publisher mutex was poisoned by a panic"))
@@ -896,6 +1178,68 @@ fn reject_device_memory(obj: &Bound<'_, PyAny>) -> PyResult<()> {
     )))
 }
 
+/// Downcast `out` for a `layout=` write, or say exactly what was wanted.
+///
+/// `PyArrayDyn` rather than a fixed rank because the scalar overload wants
+/// `(elems,)` and the batch overload `(N, elems)`; the rank is then checked with
+/// the shape by [`check_out`], in one message instead of two. The **dtype** is
+/// still checked here, by the downcast itself, which is what keeps an
+/// `affine32` write out of a `float64` buffer.
+///
+/// A failed downcast falls through to [`reject_device_memory`] first, for the
+/// same reason `at_into`'s `mat4` path does: a CuPy or torch allocation is not
+/// a numpy subclass, so it lands here, and a CPU store to a `cudaMalloc`
+/// pointer is undefined rather than slow.
+fn cast_out<'a, 'py, T: numpy::Element>(
+    out: &'a Bound<'py, PyAny>,
+    layout: Layout,
+    want: &[usize],
+    name: &str,
+) -> PyResult<&'a Bound<'py, numpy::PyArrayDyn<T>>> {
+    if let Ok(arr) = out.cast::<numpy::PyArrayDyn<T>>() {
+        return Ok(arr);
+    }
+    reject_device_memory(out)?;
+    let dtype = if layout.is_f32() {
+        "float32"
+    } else {
+        "float64"
+    };
+    Err(BufferError::new_err(format!(
+        "layout={name:?} needs out to be a writable, C-contiguous {want:?} {dtype} \
+         numpy array. Other buffer-protocol objects are not accepted yet; \
+         np.asarray(...) it first"
+    )))
+}
+
+/// The three checks every `out` buffer passes before a single element is
+/// written (§5.3): contiguous, the right shape, and writable.
+///
+/// Shared by both `layout=` overloads so the order — and therefore which
+/// complaint a caller with two problems hears first — cannot drift between
+/// them.
+fn check_out(arr: &Bound<'_, numpy::PyUntypedArray>, want: &[usize]) -> PyResult<()> {
+    if !arr.is_c_contiguous() {
+        return Err(BufferError::new_err(
+            "out must be C-contiguous; pass np.ascontiguousarray(...) explicitly \
+             if you meant to copy",
+        ));
+    }
+    let shape = arr.shape();
+    if shape != want {
+        return Err(BufferError::new_err(format!(
+            "out must have shape {want:?}, got {shape:?}"
+        )));
+    }
+    if !is_writeable(arr) {
+        return Err(BufferError::new_err(
+            "out is not writable (NumPy reports NPY_ARRAY_WRITEABLE clear); \
+             a read-only mapping cannot receive a transform",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether NumPy marks this array writable.
 ///
 /// **This is the check whose absence made a read-only `np.memmap` a `SIGSEGV`
@@ -942,42 +1286,56 @@ fn iso_from_quat7(q: &[f64]) -> PyResult<tf_tree::Iso3> {
     ))
 }
 
-/// Extend an [`tf_tree::EdgeWriter`]'s borrow to `'static`.
+/// Parse the `interp=` keyword — `docs/PHASE3.md` §4.1's `interp="sclerp"`.
 ///
-/// # Safety
-///
-/// The caller must keep the `Tree` the writer borrows alive for at least as
-/// long as the returned value. [`PyTree::publisher`] does that with a
-/// `Py<PyTree>` — a refcount, not a promise.
-///
-/// # Why a function and not an inline `transmute`
-///
-/// **The signature is the point.** `transmute` will happily convert between two
-/// *different* types whose sizes agree, and that is what this replaced: a
-/// `transmute::<EdgeWriter, Publisher>` that compiled until a field was added,
-/// and until then discarded the claim lease and the fork guard. Here the input
-/// and output types are written out and only the lifetime is free, so the same
-/// mistake does not compile.
-unsafe fn extend_to_static(w: tf_tree::EdgeWriter<'_>) -> tf_tree::EdgeWriter<'static> {
-    // SAFETY: same type, and a lifetime the caller has undertaken to honour.
-    unsafe { core::mem::transmute(w) }
+/// A builder-time keyword on a startup call, so R2 is not in tension. The two
+/// spellings are the two `InterpPolicy` variants and there is deliberately no
+/// third: a name this does not know is refused rather than silently defaulted,
+/// because the whole difference between them is invisible in the output.
+fn interp_from_str(name: &str) -> PyResult<InterpPolicy> {
+    match name {
+        "sclerp" => Ok(InterpPolicy::ScLerp),
+        "lerpslerp" => Ok(InterpPolicy::LerpSlerp),
+        other => Err(PyValueError::new_err(format!(
+            "unknown interp {other:?}; expected 'sclerp' (SE(3) screw geodesic, \
+             the engine default, and the only one with an exact derivative) or \
+             'lerpslerp' (tf2-compatible)"
+        ))),
+    }
 }
 
 /// Build an in-process tree from a simple edge list.
 ///
 /// Topology is builder-time (decision `0004`), so there is no `declare_*` on a
 /// live tree: the layout is a property of the arena, fixed when it is created.
+///
+/// # `interp=` and why its default is not the engine's
+///
+/// **`"lerpslerp"`**, which is `tf2`-compatible translation-LERP plus
+/// rotation-SLERP — *not* `tf_tree::TreeBuilder`'s own `ScLerp` default. This
+/// binding has hard-coded it since Phase 3 and changing it here would silently
+/// change the numbers every existing caller gets, which is not a thing to do in
+/// a commit about layouts.
+///
+/// It is now a keyword because it has an observable consequence it did not have
+/// before: **`LerpSlerp` has no exact body twist**, so
+/// `plan.at(stamps, layout="quat_twist")` over a tree built with the default
+/// raises `DerivativesUnavailableError`. Pass `interp="sclerp"` for a tree
+/// whose edges can answer it. `docs/PHASE3.md` §4.1 spells this keyword the
+/// same way in its own layout sketch.
 #[pyfunction]
-#[pyo3(signature = (edges, *, capacity = 1024))]
-pub fn build(edges: Vec<(String, String)>, capacity: u32) -> PyResult<PyTree> {
-    let mut b = tf_tree::TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
+#[pyo3(signature = (edges, *, capacity = 1024, interp = "lerpslerp"))]
+pub fn build(edges: Vec<(String, String)>, capacity: u32, interp: &str) -> PyResult<PyTree> {
+    let mut b = tf_tree::TreeBuilder::new().default_interp(interp_from_str(interp)?);
     for (parent, child) in &edges {
         b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
     }
     let inner = b
         .build()
         .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
-    Ok(PyTree { inner })
+    Ok(PyTree {
+        inner: Arc::new(inner),
+    })
 }
 
 /// Publish one sample onto an edge, for tests and simple producers.
@@ -1043,19 +1401,24 @@ pub fn push(
 /// its declared edges, so there is no way to create one without saying what is
 /// in it; that is why this is an edge list and not a boolean.
 ///
+/// `capacity` and `interp` describe the edges being created and are ignored
+/// when `create` is absent — they are [`build`]'s, with the same default and
+/// the same `layout="quat_twist"` consequence.
+///
 /// **Creating requires `mode="rw"`**, and is refused otherwise rather than
 /// quietly ignored. Both of §4.1's reasons for the read-only default survive
 /// that: a `ro` consumer still cannot bring an arena into existence, and an
 /// `rw` publisher — which has already opted into being able to corrupt the tree
 /// — still has to ask.
 #[pyfunction]
-#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024))]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "lerpslerp"))]
 pub fn open_arena(
     name: Option<&str>,
     domain: Option<u32>,
     mode: &str,
     create: Option<Vec<(String, String)>>,
     capacity: u32,
+    interp: &str,
 ) -> PyResult<PyTree> {
     let attach = match mode {
         "ro" => AttachMode::ReadOnly,
@@ -1077,7 +1440,7 @@ pub fn open_arena(
         Some(_) => tf_tree::CreatePolicy::IfAbsent,
     });
     if let Some(edges) = &create {
-        let mut b = tf_tree::TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
+        let mut b = tf_tree::TreeBuilder::new().default_interp(interp_from_str(interp)?);
         for (parent, child) in edges {
             b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
         }
@@ -1092,5 +1455,7 @@ pub fn open_arena(
             .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
     }
     let inner = o.open().map_err(|e| TfTreeError::new_err(format!("{e}")))?;
-    Ok(PyTree { inner })
+    Ok(PyTree {
+        inner: Arc::new(inner),
+    })
 }

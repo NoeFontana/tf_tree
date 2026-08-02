@@ -94,6 +94,11 @@ const STABLE: &[&str] = &[
     // that never opted into `TFT_ENABLE_UNSTABLE` but can still receive it once
     // any stable entry point starts parsing config.
     "TFT_ERR_BAD_CONFIG",
+    // Returned only by the two stamp converters below, and stable for the same
+    // reason every other status code is: the library hands it *back*, so a
+    // caller who never defines `TFT_ENABLE_UNSTABLE` must still be able to name
+    // the negative number it received.
+    "TFT_ERR_BAD_STAMP",
     "TFT_ERR_INTERNAL",
     // Layouts — §3.5.
     "tft_layout",
@@ -117,6 +122,13 @@ const STABLE: &[&str] = &[
     // cannot name it can never receive it.
     "TFT_LAYOUT_QVEC7_WXYZ_TWIST6",
     "tft_layout_size",
+    // Stamps — `docs/API.md` §5.1. Pure functions over integers: no handle, no
+    // arena, nothing to get wrong at a lifetime. They are in the frozen header
+    // because the conversion they replace is the one every ROS 2 node writes by
+    // hand, and a caller who has to opt into an unstable header to avoid
+    // writing it will write it.
+    "tft_stamp_from_parts",
+    "tft_stamp_from_timespec",
     // Lifecycle and the hot path — §3.2, §3.7.
     "tft_tree_open",
     "tft_tree_free",

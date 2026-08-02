@@ -126,10 +126,10 @@ of them originally as a `transmute::<EdgeWriter, Publisher>` that leaked a claim
 lease and bypassed the fork guard for the life of every Python publisher.
 [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) adds
 `Tree::claim_owned` → `OwnedWriter` and makes it the single place lifetime
-extension is written in the workspace. **`OwnedWriter` has landed; the deletion
-of the two helpers is that record's steps 6–7 and is deliberately deferred**, so
-until those commits land all three exist and the sentence above is a statement
-of where this is going, not of where it is.
+extension is written in the workspace. **That record is now fully implemented**:
+`OwnedWriter` landed first and its steps 6–7 deleted both hand-rolled helpers,
+so `OwnedWriter` is the workspace's only lifetime extension — present tense, and
+a second one anywhere is a new decision record rather than a patch.
 
 `EdgeWriter<'a>` **stays**. A scoped claim whose scope the borrow checker
 enforces is better when it fits, and most publishers are scoped.
@@ -589,32 +589,36 @@ authorized by this document alone.
 
 | # | Change | Surface | Where | Lands in |
 |---|---|---|---|---|
-| 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | its own plan |
+| 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
 | 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **`#[inline]` landed** — five placements, measured; a sixth was measured as a *pessimization* and left off. LTO guidance and the gated bench row outstanding: Phase 5 bench artifact (`PHASE5.md` §9.2) |
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | its own plan |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
-| 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | `PHASE5.md` §4 — **core and C landed; Python outstanding** |
+| 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | **landed** — `PHASE5.md` §4.4 item 1 in full: `plan.at(..., layout=...)` and `at_into` serve all four layouts, `LerpSlerp` raises the typed `DerivativesUnavailableError`, and `tf_tree.build(interp="sclerp")` is what makes a Python-built tree able to answer one |
 | 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them |
-| 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | `PHASE5.md` §4 — **Rust landed** (`Stamp::from_parts`, `from_timespec`, both `const`, both `Option`); `from_ros` and the C half outstanding |
+| 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | **landed** — Rust (`Stamp::from_parts`, `from_timespec`), Python (`from_parts`, `from_ros`; duck-typed on `.sec`/`.nanosec`, no `rclpy` in the wheel) and C (`tft_stamp_from_parts`, `tft_stamp_from_timespec`, `TFT_ERR_BAD_STAMP`, ABI minor 3 → 4). One refusal table is asserted on both sides of the boundary |
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | `PHASE5.md` §6 |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 
-Items 2, 4, 8, 9 and 11 are additive and independent; 2 and 8 have landed.
-Items 1, 5 and 7 touch core and are the ones to sequence. Item 12 is gated by
-D21 and must not be started before `PHASE7.md` §0.0's four gates are met.
+Items 2, 4, 8, 9 and 11 are additive and independent; 2, 8 and 9 have landed.
+Items 1 and 7 have landed too. Item 5 touches core and is the one left to
+sequence. Item 12 is gated by D21 and must not be started before `PHASE7.md`
+§0.0's four gates are met.
 
-**Row 7 is half delivered, and the half that is missing is named rather than
-implied.** `Layout::QuatTwist` exists in `tf_tree_core`, and the C ABI serves it
-from `tft_plan_at`, `tft_plan_at_many` and the C++ `layout_of<Quat7Twist6>`.
-**Python does not**: `tf_tree_py` still hard-codes `Layout::Mat4` and exposes no
-`layout=` parameter at all, so there is no argument for a caller to pass. That is
-not a line of glue — it needs its own buffer validation and its own GIL
-threshold (`PHASE3.md` §6.1), which is the same argument §3.3 makes for why a
-separate `at_d` was not worth it. It stays row 7, still landing in
-`PHASE5.md` §4.4 item 1.
+**Row 7's Python half brought two things this section did not anticipate**,
+recorded here because the next reader will meet them. The `layout=` parameter is
+keyword-only on `at`/`at_into`, per `PHASE3.md` §4.2 — but §4.2 also asks for a
+measurement of what that keyword costs the caller who does not pass one, and
+**that measurement does not exist**: the A/B was attempted and this host's
+run-to-run spread on a single binary swamped any plausible effect. It is owed.
+And a Python-built tree could not answer a twist at all, because
+`tf_tree.build` hard-coded `LerpSlerp` — so `build` and `open(create=...)` gained
+an `interp=` keyword, spelled as `PHASE3.md` §4.1's own sketch spells it. **The
+default is unchanged at `"lerpslerp"`**; changing it would silently change every
+existing caller's numbers, which is not a thing to do in a commit about
+layouts.
 
 ---
 

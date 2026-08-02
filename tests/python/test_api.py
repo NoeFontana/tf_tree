@@ -304,7 +304,22 @@ def test_push_many_names_the_sample_it_rejected():
 
 
 def test_a_publisher_keeps_its_tree_alive():
-    """The same lifetime guarantee `Plan` needed, for the same reason."""
+    """A publisher outlives the `Tree` object it was claimed from.
+
+    `Plan` gets this from a `Py<PyTree>` — a CPython refcount on the wrapper.
+    `Publisher` gets it from somewhere else since `docs/decisions/0017` step 6:
+    it holds an `OwnedWriter`, whose `Arc<Tree>` keeps the **arena** alive
+    rather than the Python object. The observable behaviour is identical, which
+    is why this test did not change when the mechanism did.
+
+    **No mutant is claimed for this one, deliberately.** The mutation that
+    breaks it — deleting `OwnedWriter`'s `Arc<Tree>` — produces a
+    use-after-free that a release CPython extension does not reliably notice,
+    so a "Mutant:" note here would be a claim nothing checked. The gates that
+    do check it are `crates/tf_tree/tests/owned_writer.rs` under `just miri`
+    (`0017` step 2) and `a_publisher_outlives_the_tree_handle_it_came_from` in
+    `crates/tf_tree_c/tests/publish.rs` under `just c-abi-check`'s ASan row.
+    """
     import gc
 
     tree = tf_tree.build([("map", "base")])
@@ -665,3 +680,314 @@ def test_plan_edges_of_a_self_plan_is_empty(tree):
     assert p.depth() == 0
     assert p.edges() == []
     assert tree.span("base", "base") is None
+
+
+# ---------------------------------------------------------------------------
+# layout= (`docs/PHASE5.md` §4.4 item 1, `docs/API.md` §6 row 7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def twistable():
+    """A tree whose edges can answer a twist.
+
+    ``tf_tree.build``'s default is ``interp="lerpslerp"``, which is
+    ``tf2``-compatible and has **no exact body twist** — so the default tree is
+    the one that *refuses* ``layout="quat_twist"``. That refusal has its own
+    test below; this fixture is the other half.
+    """
+    t = tf_tree.build([("map", "base")], interp="sclerp")
+    tf_tree.push(t, "base", "map", 1_000_000_000, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    tf_tree.push(t, "base", "map", 2_000_000_000, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+    return t
+
+
+LAYOUT_SHAPES = [
+    ("mat4", (4, 4), (3, 4, 4), np.float64),
+    ("quat", (7,), (3, 7), np.float64),
+    ("affine32", (12,), (3, 12), np.float32),
+    ("quat_twist", (13,), (3, 13), np.float64),
+]
+
+
+@pytest.mark.parametrize(("name", "scalar", "batch", "dtype"), LAYOUT_SHAPES)
+def test_every_layout_has_the_shape_and_dtype_it_advertises(
+    twistable, name, scalar, batch, dtype
+):
+    """R4: the layout is stated, and what comes back is what was stated.
+
+    Mutant: return ``Layout::elems()`` for the wrong variant (swap ``Quat``'s 7
+    and ``QuatTwist``'s 13) => two rows fail on shape.
+    """
+    p = twistable.plan("map", "base")
+    stamps = np.array([1_000_000_000, 1_500_000_000, 2_000_000_000], dtype=np.int64)
+    one = p.at(1_500_000_000, layout=name)
+    many = p.at(stamps, layout=name)
+    assert one.shape == scalar and one.dtype == dtype
+    assert many.shape == batch and many.dtype == dtype
+
+
+@pytest.mark.parametrize(("name", "scalar", "batch", "dtype"), LAYOUT_SHAPES)
+def test_a_scalar_layout_call_is_the_one_element_batch_bit_for_bit(
+    twistable, name, scalar, batch, dtype
+):
+    """§11.1, extended to every layout.
+
+    The scalar ``mat4`` path is a genuinely separate implementation, because it
+    is the measured hot path and predates this; the other three are deliberately
+    a one-element batch so there is nothing that *can* diverge. Both claims are
+    checked here, and the ``mat4`` row is the one that could actually fail:
+    it is the only layout with two implementations to keep in step.
+
+    Mutant: make the scalar ``mat4`` path write ``write_quat`` instead of
+    ``write_mat4`` => the ``mat4`` row fails.
+    """
+    p = twistable.plan("map", "base")
+    t = 1_500_000_000
+    one = p.at(t, layout=name)
+    many = p.at(np.array([t], dtype=np.int64), layout=name)
+    np.testing.assert_array_equal(one.reshape(-1), many[0].reshape(-1))
+
+
+def test_the_twist_layout_is_the_quat_layout_plus_six(twistable):
+    """``quat_twist`` is ``quat`` with the body twist appended, not a re-derived
+    pose.
+
+    The first seven elements must be **bit-identical** to what ``quat`` writes:
+    the two go through different folds (``fold_batch`` against
+    ``fold_batch_with_twist``), and a pose that differed in the last bit between
+    them would mean two implementations of the same interpolation had drifted.
+
+    The twist itself is checked against the motion the fixture publishes: one
+    metre of +x over one second, no rotation, so the body linear velocity is
+    ``[1, 0, 0]`` m/s and the angular part is zero.
+
+    Mutant: write the twist as ``[v, w]`` instead of ``[w, v]`` => the angular
+    assertion sees 1.0 and fails.
+    """
+    p = twistable.plan("map", "base")
+    stamps = np.array([1_250_000_000, 1_500_000_000, 1_750_000_000], dtype=np.int64)
+    pose = p.at(stamps, layout="quat")
+    twist = p.at(stamps, layout="quat_twist")
+    np.testing.assert_array_equal(twist[:, :7], pose)
+    np.testing.assert_allclose(twist[:, 7:10], 0.0, atol=1e-12)
+    np.testing.assert_allclose(twist[:, 10:13], [[1.0, 0.0, 0.0]] * 3, atol=1e-9)
+
+
+def test_lerpslerp_refuses_a_twist_rather_than_finite_differencing_it(tree):
+    """`docs/PHASE5.md` §4.4 item 1: the typed error, not a plausible number.
+
+    ``tree`` is the default fixture, so its edges are ``LerpSlerp`` — ``tf2``'s
+    interpolator, which has no exact body twist. A layout that quietly changed
+    meaning per interpolator would be the quaternion-order trap moved into the
+    time axis, so this is a refusal and it is **typed**: a caller branches on it
+    to decide whether to re-declare the edge or ask for a pose.
+
+    Mutant: map ``LookupError::DerivativesUnavailable`` to the generic
+    ``TfTreeError`` (delete the arm added to ``lookup_err``) => ``raises`` no
+    longer matches the subclass and the test fails.
+    """
+    p = tree.plan("map", "base")
+    stamps = np.array([1_500], dtype=np.int64)
+    with pytest.raises(tf_tree.DerivativesUnavailableError):
+        p.at(stamps, layout="quat_twist")
+    # The pose layouts over the same edge are unaffected: it is the derivative
+    # that does not exist, not the transform.
+    assert p.at(stamps, layout="quat").shape == (1, 7)
+
+
+def test_an_unknown_layout_is_refused_and_lists_the_ones_that_exist(tree):
+    """R4 has no silently-wrong default, so a typo is an error rather than a
+    guess.
+
+    Mutant: add ``other => Ok(Layout::Mat4)`` to ``layout_from_str`` => no
+    exception is raised and the test fails.
+    """
+    p = tree.plan("map", "base")
+    with pytest.raises(ValueError, match="quat_twist"):
+        p.at(1_500, layout="matrix4")
+
+
+def test_at_into_serves_every_layout_and_validates_before_writing(twistable):
+    """R2's corollary: every batch entry point has an ``_into`` form.
+
+    Also the §5.3 rule, per layout: a buffer of the wrong shape is refused with
+    nothing written, so a rejected call leaves the caller's array as it was.
+
+    **The flat buffer is the case that carries the load.** A too-small one is
+    refused by the engine's own ``BufferTooSmall`` whatever this binding does;
+    a *flat* buffer of exactly the right element count is not, because the
+    engine sees a slice and cannot see a shape. Only the binding can refuse it,
+    and it must — a caller who passes ``(N*13,)`` believing it is ``(N, 13)``
+    gets the right bytes today and an off-by-a-transpose the moment they index
+    it.
+
+    Mutant: drop the ``check_out`` shape comparison => the flat buffer is
+    accepted and the test fails. (Dropping it does *not* break the too-small
+    case, which is why that assertion alone would not have been a test.)
+    """
+    p = twistable.plan("map", "base")
+    stamps = np.array([1_250_000_000, 1_750_000_000], dtype=np.int64)
+    for name, _scalar, _batch, dtype in LAYOUT_SHAPES:
+        want = p.at(stamps, layout=name)
+        out = np.zeros(want.shape, dtype=dtype)
+        p.at_into(stamps, out, layout=name)
+        np.testing.assert_array_equal(out, want)
+
+        # Too small: refused, and the buffer is untouched.
+        bad = np.zeros((len(stamps), 3), dtype=dtype)
+        with pytest.raises(tf_tree.BufferError):
+            p.at_into(stamps, bad, layout=name)
+        assert not bad.any()
+
+        # Right size, wrong shape.
+        flat = np.zeros(want.size, dtype=dtype)
+        with pytest.raises(tf_tree.BufferError):
+            p.at_into(stamps, flat, layout=name)
+        assert not flat.any()
+
+
+def test_at_into_refuses_the_wrong_dtype_for_a_layout(twistable):
+    """``affine32`` is the one ``float32`` layout, and a ``float64`` buffer for
+    it is a silent halving of precision if it is accepted.
+
+    Mutant: take the ``f64`` branch for ``affine32`` too (``is_f32()`` =>
+    ``false``) => the ``float64`` buffer is accepted by the binding and the
+    engine refuses it as ``WrongElementType``, which reaches Python as the base
+    ``TfTreeError`` rather than ``BufferError``, so the first block fails.
+    """
+    p = twistable.plan("map", "base")
+    stamps = np.array([1_500_000_000], dtype=np.int64)
+    with pytest.raises(tf_tree.BufferError, match="float32"):
+        p.at_into(stamps, np.zeros((1, 12), dtype=np.float64), layout="affine32")
+    with pytest.raises(tf_tree.BufferError, match="float64"):
+        p.at_into(stamps, np.zeros((1, 13), dtype=np.float32), layout="quat_twist")
+
+
+def test_a_scalar_layout_write_needs_a_one_dimensional_buffer(twistable):
+    """The scalar overload's ``out`` is ``(elems,)``, matching what ``at``
+    returns for a scalar stamp — not ``(1, elems)``.
+
+    Mutant: build ``want`` as ``[1, e]`` for the scalar case => the first call
+    raises and the test fails.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros(13, dtype=np.float64)
+    p.at_into(1_500_000_000, out, layout="quat_twist")
+    np.testing.assert_array_equal(out, p.at(1_500_000_000, layout="quat_twist"))
+    with pytest.raises(tf_tree.BufferError):
+        p.at_into(
+            1_500_000_000, np.zeros((1, 13), dtype=np.float64), layout="quat_twist"
+        )
+
+
+def test_an_unknown_interp_is_refused(tree):
+    """Mutant: default an unknown name to ``ScLerp`` => nothing raises."""
+    with pytest.raises(ValueError, match="sclerp"):
+        tf_tree.build([("map", "base")], interp="screw")
+
+
+# ---------------------------------------------------------------------------
+# Exact stamp converters (`docs/API.md` §5.1, §6 row 9)
+# ---------------------------------------------------------------------------
+
+# The twin of `crates/tf_tree_c/tests/abi.rs::PARTS_TABLE`, and it must stay
+# identical to it. `(sec, nanosec, expected)`, where `None` means **refused**.
+# A converter that agrees with Rust on the successes and disagrees at the edges
+# is the bug this row exists to prevent, and it is invisible to any test that
+# only checks the middle.
+PARTS_TABLE = [
+    (0, 0, 0),
+    (1_700_000_000, 123_456_789, 1_700_000_000_123_456_789),
+    (-1, 999_999_999, -1),
+    (-1, 0, -1_000_000_000),
+    # Exactly `i64::MIN`. `-9_223_372_037 * 1e9` alone is below it, so a staged
+    # `checked_mul`/`checked_add` would refuse this *representable* stamp.
+    (-9_223_372_037, 145_224_192, -(2**63)),
+    (-9_223_372_037, 145_224_191, None),
+    (9_223_372_036, 854_775_807, 2**63 - 1),
+    (9_223_372_036, 854_775_808, None),
+    (0, 1_000_000_000, None),
+    (0, 2**32 - 1, None),
+]
+
+
+@pytest.mark.parametrize(("sec", "nanosec", "want"), PARTS_TABLE)
+def test_from_parts_agrees_with_rust_including_the_refusals(sec, nanosec, want):
+    """Mutant: normalise out-of-range nanoseconds (``divmod`` into ``sec``)
+    instead of refusing => the ``(0, 1_000_000_000)`` row returns a number.
+    Mutant: compute the sum in ``i64`` with ``wrapping_add`` => the two
+    boundary refusals return wrapped stamps.
+    """
+    if want is None:
+        with pytest.raises(ValueError):
+            tf_tree.from_parts(sec, nanosec)
+    else:
+        assert tf_tree.from_parts(sec, nanosec) == want
+
+
+def test_from_parts_refuses_a_negative_nanosecond():
+    """A negative nanosecond field means a *relative* interval is being
+    converted as an instant — POSIX permits one only there. It is not
+    expressible in Rust's ``from_parts`` (whose field is ``u32``) and is
+    refused here for the same reason ``Stamp::from_timespec`` refuses it.
+
+    Mutant: use ``nanosec % 1_000_000_000`` for the range test => ``-1``
+    becomes a legal input.
+    """
+    with pytest.raises(ValueError, match=r"\[0, 1000000000\)"):
+        tf_tree.from_parts(0, -1)
+
+
+class _RosTime:
+    """A duck for `builtin_interfaces/Time`.
+
+    `rclpy` is not a dependency of this wheel and must not become one; the
+    message is two integer fields and the converter reads exactly those, so a
+    stand-in with the same two attributes exercises the real path.
+    """
+
+    def __init__(self, sec, nanosec):
+        self.sec = sec
+        self.nanosec = nanosec
+
+
+@pytest.mark.parametrize(("sec", "nanosec", "want"), PARTS_TABLE)
+def test_from_ros_is_from_parts_over_a_message(sec, nanosec, want):
+    """Mutant: convert via ``sec + nanosec / 1e9`` seconds and multiply back
+    (the ``to_sec()`` round trip §5.1 forbids) => row 2 comes back as
+    1700000000123456768 and the test fails.
+    """
+    msg = _RosTime(sec, nanosec)
+    if want is None:
+        with pytest.raises(ValueError):
+            tf_tree.from_ros(msg)
+    else:
+        assert tf_tree.from_ros(msg) == want
+
+
+def test_from_ros_says_what_it_wanted_when_handed_the_wrong_object():
+    """Mutant: let the ``getattr`` error propagate unchanged => an
+    ``AttributeError`` is raised instead of the ``TypeError`` this asserts, and
+    the message never names ``.nanosec``.
+    """
+    with pytest.raises(TypeError, match="nanosec"):
+        tf_tree.from_ros(object())
+
+    class _RclpyTimeish:
+        nanoseconds = 5
+
+    with pytest.raises(TypeError, match="nanoseconds"):
+        tf_tree.from_ros(_RclpyTimeish())
+
+
+def test_from_sec_still_exists_and_still_names_its_exact_siblings():
+    """`from_sec` is kept and kept lossy (§5.1); what it gains is somewhere to
+    point. The docstring is the thing a user reads at the moment they are about
+    to use it, so the pointer belongs there.
+
+    Mutant: delete ``from_parts`` from the docstring => the assertion fails.
+    """
+    assert tf_tree.from_sec(1.5) == 1_500_000_000
+    doc = tf_tree.from_sec.__doc__ or ""
+    assert "from_parts" in doc and "from_ros" in doc

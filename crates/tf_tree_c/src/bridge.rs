@@ -35,8 +35,8 @@
 //!
 //! # Thread affinity, for the same reason as `tft_publisher`
 //!
-//! A bridge holds one [`EdgeWriter`](tf_tree::EdgeWriter) per declared dynamic
-//! edge, and those are `Send + !Sync`. §5.9 asks for a dedicated
+//! A bridge holds one [`OwnedWriter`](tf_tree::OwnedWriter) per declared
+//! dynamic edge, and those are `Send + !Sync`. §5.9 asks for a dedicated
 //! `SingleThreadedExecutor` on its own thread, which is exactly the shape this
 //! allows: the thread that called [`tft_bridge_create`] owns the handle, a debug
 //! build `abort()`s on use from another, and a release build returns
@@ -47,14 +47,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use tf_tree::EdgeWriter;
+use tf_tree::OwnedWriter;
 use tf_tree_bridge::{
     Action, AuthorityPolicy, ClockEvidence, DropReason, HaltReason, Ingest, JumpKind, OnClockReset,
     Publisher, Sample, SteadyNanos, Topic, TopologyConfig,
 };
 
 use crate::error::{guard, set_error};
-use crate::publisher::{check_thread_token, extend_to_static, thread_token};
+use crate::publisher::{check_thread_token, thread_token};
 use crate::{bad_enum, bad_handle, layout, null_arg, TreeShare};
 use crate::{
     tft_status, tft_tree, TFT_ERR_BAD_CONFIG, TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_TIME_DOMAIN,
@@ -722,7 +722,7 @@ struct BridgeInner {
     /// trade against, and the keys come from the same `ingest.declared()` the
     /// arena was built from, so there is no second set of names to keep in step
     /// with either.
-    writers: BTreeMap<String, EdgeWriter<'static>>,
+    writers: BTreeMap<String, OwnedWriter>,
     /// §5.3's GID → publisher cache: **the one home of publisher identity**.
     ///
     /// Populated on first sight of a GID by [`publisher_of`] and enriched with a
@@ -765,11 +765,16 @@ struct BridgeInner {
     dropped_bad_pose: u64,
     rejected_by_arena: u64,
     refused_after_halt: u64,
-    /// Keeps the arena alive for at least as long as the claims point into it.
+    /// The handle share this bridge reads and hands out through
+    /// [`tft_bridge_tree`].
     ///
-    /// **Declared last on purpose.** Fields drop in declaration order, so every
-    /// [`EdgeWriter`] is dropped — releasing its claim and its lease — before
-    /// the last reference to the `Tree` it borrows from goes away.
+    /// **It is no longer what keeps the arena alive for the writers.** Each
+    /// [`OwnedWriter`] above carries its own `Arc<Tree>`
+    /// (`docs/decisions/0017`), so the arena outlives every claim whatever
+    /// order these fields drop in — which is why the "declared last on purpose"
+    /// note that used to sit here is gone rather than merely reworded. A field
+    /// order that is load-bearing and a field order that is not must not read
+    /// the same.
     share: Arc<TreeShare>,
 }
 
@@ -984,7 +989,9 @@ pub unsafe extern "C" fn tft_bridge_create(
             return bad_config("topology config: the declared topology does not build");
         };
 
-        let share = Arc::new(TreeShare { tree });
+        let share = Arc::new(TreeShare {
+            tree: Arc::new(tree),
+        });
         let mut writers = BTreeMap::new();
         // Claim every declared dynamic edge **now**, not on first message. D7
         // gives an edge one writer machine-wide, so "somebody else already owns
@@ -998,7 +1005,7 @@ pub unsafe extern "C" fn tft_bridge_create(
             let (Ok(c), Ok(p)) = (share.tree.frame(&e.child), share.tree.frame(&e.parent)) else {
                 return bad_config("topology config: a declared frame is not in the built tree");
             };
-            let w = match share.tree.claim(c, p) {
+            let w = match share.tree.claim_owned(c, p) {
                 Ok(w) => w,
                 Err(err) => {
                     let rc = crate::publisher::map::claim(&err);
@@ -1009,11 +1016,7 @@ pub unsafe extern "C" fn tft_bridge_create(
                     return rc;
                 }
             };
-            // SAFETY: `EdgeWriter<'a>` borrows the `Tree` inside `share`; the
-            // `Arc<TreeShare>` stored in the same struct is a strong reference
-            // to that same `Tree` and is dropped *after* the writers (see
-            // `BridgeInner::share`), so the borrow cannot outlive the arena.
-            writers.insert(e.child.clone(), unsafe { extend_to_static(w) });
+            writers.insert(e.child.clone(), w);
         }
 
         let inner = Box::new(BridgeInner {

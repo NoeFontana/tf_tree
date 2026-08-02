@@ -76,14 +76,15 @@ use tf_tree::{Stamp, SystemDomain, Tree};
 
 pub use error::{
     tft_error, tft_last_error, tft_status, TFT_ERR_ABI_MISMATCH, TFT_ERR_ALREADY_CLAIMED,
-    TFT_ERR_BAD_CONFIG, TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STRUCT_SIZE,
-    TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED, TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED,
-    TFT_ERR_EXTRAPOLATION, TFT_ERR_INTERNAL, TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION,
-    TFT_ERR_NOT_DYNAMIC, TFT_ERR_NOT_FINITE, TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES,
-    TFT_ERR_NO_EDGE, TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG, TFT_ERR_PARENT_MISMATCH,
-    TFT_ERR_READ_ONLY, TFT_ERR_RELEASED, TFT_ERR_RETRY, TFT_ERR_SLOT_CONTENDED,
-    TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED, TFT_ERR_TREE_TOO_DEEP,
-    TFT_ERR_UNKNOWN_FRAME, TFT_ERR_WRONG_THREAD, TFT_INVALID_ID, TFT_MESSAGE_LEN, TFT_OK,
+    TFT_ERR_BAD_CONFIG, TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STAMP,
+    TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED,
+    TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION, TFT_ERR_INTERNAL,
+    TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION, TFT_ERR_NOT_DYNAMIC, TFT_ERR_NOT_FINITE,
+    TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_EDGE, TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG,
+    TFT_ERR_PARENT_MISMATCH, TFT_ERR_READ_ONLY, TFT_ERR_RELEASED, TFT_ERR_RETRY,
+    TFT_ERR_SLOT_CONTENDED, TFT_ERR_SLOT_RECYCLED, TFT_ERR_TIME_DOMAIN, TFT_ERR_TOPOLOGY_CHANGED,
+    TFT_ERR_TREE_TOO_DEEP, TFT_ERR_UNKNOWN_FRAME, TFT_ERR_WRONG_THREAD, TFT_INVALID_ID,
+    TFT_MESSAGE_LEN, TFT_OK,
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
@@ -134,7 +135,23 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// not define rather than computing a size from it — so a `0.2` caller against
 /// a `0.3` library is unchanged in every byte it can observe. No struct grew,
 /// nothing moved, and no existing enumerator changed meaning.
-pub const TFT_ABI_VERSION_MINOR: u32 = 3;
+///
+/// `3` → `4`: two appended entry points, [`tft_stamp_from_parts`] and
+/// [`tft_stamp_from_timespec`] (`docs/API.md` §5.1), and the one status code
+/// they can return, [`TFT_ERR_BAD_STAMP`]. **This is the additive case §3.6's
+/// rule is for, and it is worth stating why a new *function* is a minor bump
+/// rather than no bump at all**: the minor is exactly the number a caller
+/// compares to find out whether the symbols its header declares are present in
+/// the library it linked. Adding a symbol without moving it would let a caller
+/// compiled against this header link against a `0.3` library, pass
+/// `tft_check_abi`, and then fail at the dynamic loader — or, on a static link,
+/// not build. Nothing existing moved, changed type or changed meaning, so the
+/// major does not move.
+///
+/// `TFT_ERR_BAD_STAMP` rides along for the reason its own documentation gives:
+/// only the two new functions return it, so a `0.3` caller cannot receive a
+/// code it cannot name.
+pub const TFT_ABI_VERSION_MINOR: u32 = 4;
 
 /// The library's major ABI version.
 #[no_mangle]
@@ -192,6 +209,117 @@ pub extern "C" fn tft_check_abi(compiled_major: u32, compiled_minor: u32) -> tft
 }
 
 // ---------------------------------------------------------------------------
+// Stamps — `docs/API.md` §5.1
+// ---------------------------------------------------------------------------
+
+/// Assemble a stamp from a `(sec, nanos)` pair, exactly — `docs/API.md` §5.1.
+///
+/// The C spelling of `Stamp::from_parts`, and it refuses exactly what that
+/// refuses. This is the shape a ROS 2 `builtin_interfaces/Time` already has
+/// (`{int32 sec, uint32 nanosec}`), so the conversion users resent writing in
+/// every node — `stamp.sec * 1000000000 + stamp.nanosec` — becomes one call
+/// that cannot overflow silently.
+///
+/// **No float, on any surface** (R3). The ecosystem already agrees with int64
+/// nanoseconds; accepting a double here would not recover precision a driver had
+/// already destroyed, only move the blame.
+///
+/// # Why it returns a status and not the stamp
+///
+/// Because two inputs have no correct answer and both plausible alternatives are
+/// silently wrong. Normalising an out-of-range `nanos` turns a malformed message
+/// into a well-formed stamp; wrapping an out-of-range sum hands back a stamp on
+/// the other side of the epoch that compares, interpolates and prints perfectly.
+/// There is no sentinel `int64_t` to return instead — every value is a legal
+/// stamp — so the refusal has to be the return value and the answer has to be an
+/// out-parameter.
+///
+/// # Errors
+///
+/// [`TFT_ERR_NULL_ARG`] if `out` is NULL. [`TFT_ERR_BAD_STAMP`] if `nanos` is
+/// outside `[0, 1e9)` or the sum does not fit `int64_t`; `*out` is not written
+/// in either case.
+///
+/// # Safety
+///
+/// `out` must be NULL or point to a writable `int64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn tft_stamp_from_parts(sec: i64, nanos: u32, out: *mut i64) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        let Some(s) = Stamp::<SystemDomain>::from_parts(sec, nanos) else {
+            return bad_stamp(sec, i64::from(nanos));
+        };
+        // SAFETY: `out` is non-null by the check above and the caller contracts
+        // it writable. Written only after the conversion succeeded, so a refused
+        // call leaves the caller's variable as it was.
+        unsafe { core::ptr::write(out, s.nanos()) };
+        TFT_OK
+    })
+}
+
+/// Assemble a stamp from the two fields of a POSIX `struct timespec`.
+///
+/// `tft_stamp_from_timespec(ts.tv_sec, ts.tv_nsec, &out)` — the fields rather
+/// than the struct, because `tf_tree_core`'s dependency budget has no `libc` in
+/// it and declaring our own `#[repr(C)]` copy would be a type the caller then
+/// has to convert *into*, which is the conversion this exists to remove.
+/// `time_t` and `long` are both `int64_t` on every 64-bit target, so there is no
+/// cast at the call site.
+///
+/// # Errors
+///
+/// Everything [`tft_stamp_from_parts`] refuses, plus a **negative `tv_nsec`**.
+/// POSIX permits one only in a *relative* `timespec` — an interval handed to
+/// `nanosleep` — so a negative field means an interval is being converted as an
+/// instant, which is the mistake this refusal catches.
+///
+/// # Safety
+///
+/// `out` must be NULL or point to a writable `int64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn tft_stamp_from_timespec(
+    tv_sec: i64,
+    tv_nsec: i64,
+    out: *mut i64,
+) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        let Some(s) = Stamp::<SystemDomain>::from_timespec(tv_sec, tv_nsec) else {
+            return bad_stamp(tv_sec, tv_nsec);
+        };
+        // SAFETY: as `tft_stamp_from_parts`.
+        unsafe { core::ptr::write(out, s.nanos()) };
+        TFT_OK
+    })
+}
+
+/// The one refusal both stamp converters raise, with the offending pair in the
+/// detail.
+///
+/// `requested` carries the seconds and `newest` the nanoseconds — both are plain
+/// `int64_t` detail fields with no other meaning on this path, and an operator
+/// reading `TFT_ERR_BAD_STAMP` wants to know *which* pair was rejected far more
+/// than they want a second message string.
+fn bad_stamp(sec: i64, nanos: i64) -> tft_status {
+    set_error(
+        TFT_ERR_BAD_STAMP,
+        "not a representable stamp: nanos must be in [0, 1000000000) and the \
+         total must fit int64. Both are refused rather than normalised or \
+         wrapped, because either would look like a valid time",
+        |d| {
+            d.requested = sec;
+            d.newest = nanos;
+        },
+    );
+    TFT_ERR_BAD_STAMP
+}
+
+// ---------------------------------------------------------------------------
 // Handles — §3.2
 // ---------------------------------------------------------------------------
 
@@ -243,8 +371,28 @@ pub struct tft_plan {
 }
 
 /// The tree, shared between its own handle and every plan compiled from it.
+///
+/// # Why the `Tree` is itself behind an `Arc`
+///
+/// [`tf_tree::Tree::claim_owned`] takes `self: &Arc<Tree>` — the `Arc` *is* the
+/// safety argument for the `'static` writer it returns
+/// (`docs/decisions/0017`), so a claim cannot be taken from a `Tree` that is
+/// merely a field of some other refcounted thing. This crate used to answer
+/// that with its own `extend_to_static`, which `0017` step 7 deletes; holding
+/// the `Arc` the facade asks for is what replaces it.
+///
+/// The two refcounts are not redundant. `Arc<TreeShare>` is the *handle*
+/// refcount — a `tft_tree` and every `tft_plan` compiled from it share one, so
+/// a C caller may free them in any order — and it will grow siblings of `tree`
+/// as the handle acquires state. `Arc<Tree>` is the *arena* refcount, and it is
+/// the one a publisher or a bridge writer holds after every handle is gone.
+///
+/// **The cost is one extra dependent load on `h.share.tree`**, which the read
+/// path takes before `guard()`. It was not measured; it is a pointer chase into
+/// an allocation the same call just touched, against a `tft_plan_at` that then
+/// does a seqlock read and a fold.
 pub(crate) struct TreeShare {
-    pub(crate) tree: Tree,
+    pub(crate) tree: Arc<Tree>,
 }
 
 /// Generate a magic-word validator that reads the field **by name**.
@@ -339,7 +487,9 @@ pub unsafe extern "C" fn tft_tree_open(out: *mut *mut tft_tree) -> tft_status {
             Ok(tree) => {
                 let h = Box::new(tft_tree {
                     magic: MAGIC_TREE,
-                    share: Arc::new(TreeShare { tree }),
+                    share: Arc::new(TreeShare {
+                        tree: Arc::new(tree),
+                    }),
                 });
                 // SAFETY: `out` is non-null by the check above and the caller
                 // contracts that it is writable.
@@ -908,7 +1058,9 @@ pub unsafe extern "C" fn tft_test_tree_create(out: *mut *mut tft_tree) -> tft_st
         }
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
-            share: Arc::new(TreeShare { tree }),
+            share: Arc::new(TreeShare {
+                tree: Arc::new(tree),
+            }),
         });
         // SAFETY: `out` is non-null and the caller contracts it writable.
         unsafe { core::ptr::write(out, Box::into_raw(h)) };
@@ -976,7 +1128,9 @@ pub unsafe extern "C" fn tft_test_lerpslerp_tree_create(out: *mut *mut tft_tree)
         core::mem::forget(w);
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
-            share: Arc::new(TreeShare { tree }),
+            share: Arc::new(TreeShare {
+                tree: Arc::new(tree),
+            }),
         });
         // SAFETY: `out` is non-null and the caller contracts it writable.
         unsafe { core::ptr::write(out, Box::into_raw(h)) };
@@ -1023,7 +1177,9 @@ pub unsafe extern "C" fn tft_test_publishable_tree_create(out: *mut *mut tft_tre
         };
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
-            share: Arc::new(TreeShare { tree }),
+            share: Arc::new(TreeShare {
+                tree: Arc::new(tree),
+            }),
         });
         // SAFETY: `out` is non-null and the caller contracts it writable.
         unsafe { core::ptr::write(out, Box::into_raw(h)) };

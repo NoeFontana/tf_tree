@@ -26,23 +26,58 @@ class TopologyChangedError(TfTreeError): ...
 class FrameNotDeclaredError(TfTreeError): ...
 class BufferError(TfTreeError): ...
 
+class DerivativesUnavailableError(TfTreeError):
+    """This edge's interpolator has no exact derivative.
+
+    Raised only by `layout="quat_twist"`: `LerpSlerp` is `tf2`'s interpolator
+    and has no exact body twist, so it is refused rather than
+    finite-differenced. Declare the edge `ScLerp`, or ask for a pose layout.
+    """
+
+Layout = Literal["mat4", "quat", "affine32", "quat_twist"]
+"""How a transform is written into memory. Stated, never inferred.
+
+`"mat4"` is `(4, 4)` / `(N, 4, 4)` float64; `"quat"` is `(7,)` / `(N, 7)`
+float64 as `[qw qx qy qz tx ty tz]`; `"affine32"` is `(12,)` / `(N, 12)`
+**float32**, row-major 3x4, GPU-facing; `"quat_twist"` is `(13,)` / `(N, 13)`
+float64, `"quat"` with the body twist `[wx wy wz vx vy vz]` appended.
+"""
+
 class Plan:
     """A compiled lookup path. Build with `Tree.plan`."""
 
     @overload
-    def at(self, stamps: int, /) -> NDArray[np.float64]:
-        """One stamp in, a `(4, 4)` float64 matrix out."""
+    def at(
+        self, stamps: int, /, *, layout: Layout | None = ...
+    ) -> NDArray[np.float64] | NDArray[np.float32]:
+        """One stamp in, one transform out.
 
-    @overload
-    def at(self, stamps: NDArray[np.int64], /) -> NDArray[np.float64]:
-        """`(N,)` stamps in, `(N, 4, 4)` out — the path to prefer.
-
-        A Python loop over the scalar form costs ~200 ns per iteration; this
-        amortises to near-native.
+        `(4, 4)` float64 by default; `(7,)`, `(12,)` float32 or `(13,)` for the
+        other three layouts.
         """
 
     @overload
-    def at_into(self, stamps: int, out: object, /) -> None:
+    def at(
+        self, stamps: NDArray[np.int64], /, *, layout: Layout | None = ...
+    ) -> NDArray[np.float64] | NDArray[np.float32]:
+        """`(N,)` stamps in, `(N, ...)` out — the path to prefer.
+
+        A Python loop over the scalar form costs ~200 ns per iteration; this
+        amortises to near-native.
+
+        `layout=` selects what is written per stamp (see `Layout`). It is
+        keyword-only; `stamps` stays positional-only, which is where the
+        measured 29 ns of `METH_FASTCALL` lives.
+
+        `layout="quat_twist"` is `at_with_derivatives` as a batch: it appends
+        the body twist, in the plan's **source** frame, angular part first. It
+        is the only layout that can raise `DerivativesUnavailableError`.
+        """
+
+    @overload
+    def at_into(
+        self, stamps: int, out: object, /, *, layout: Layout | None = ...
+    ) -> None:
         """Evaluate one stamp into a caller-provided `(4, 4)` float64 array.
 
         **The allocation-free scalar path, for a control loop.** A node does one
@@ -54,8 +89,16 @@ class Plan:
         """
 
     @overload
-    def at_into(self, stamps: NDArray[np.int64], out: object, /) -> None:
+    def at_into(
+        self, stamps: NDArray[np.int64], out: object, /, *, layout: Layout | None = ...
+    ) -> None:
         """Evaluate into a caller-provided `(N, 4, 4)` float64 array.
+
+        With `layout=`, `out` is `(N, layout_elems)` — or `(layout_elems,)` for
+        a scalar stamp — and `float32` for `"affine32"`, `float64` otherwise.
+        Every batch entry point has an `_into` form (`API.md` R2), so a layout
+        reachable only through the allocating call would be a batch path with
+        no allocation-free tier.
 
         Allocates nothing. `out` must be C-contiguous and exactly the right
         shape; it is validated completely *before* any element is written, so a
@@ -268,11 +311,23 @@ class Tree:
     def is_writable(self) -> bool:
         """Whether this process may publish into this tree."""
 
-def build(edges: list[tuple[str, str]], *, capacity: int = ...) -> Tree:
+def build(
+    edges: list[tuple[str, str]],
+    *,
+    capacity: int = ...,
+    interp: Literal["sclerp", "lerpslerp"] = ...,
+) -> Tree:
     """An in-process tree from `(parent, child)` edges.
 
     Topology is builder-time (decision `0004`), so there is no `declare_*` on a
     live tree: the layout is a property of the arena, fixed when it is created.
+
+    `interp` defaults to `"lerpslerp"` — `tf2`-compatible, and **not** the
+    engine's own `"sclerp"` default; this binding has spelled it that way since
+    Phase 3. It matters now because `LerpSlerp` has no exact body twist, so
+    `plan.at(stamps, layout="quat_twist")` over a default tree raises
+    `DerivativesUnavailableError`. Pass `interp="sclerp"` for a tree that can
+    answer it.
     """
 
 def push(
@@ -292,6 +347,7 @@ def open_arena(
     mode: Literal["ro", "rw"] = ...,
     create: list[tuple[str, str]] | None = ...,
     capacity: int = ...,
+    interp: Literal["sclerp", "lerpslerp"] = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
 
@@ -306,6 +362,9 @@ def open_arena(
     is why this is an edge list rather than a boolean. **It requires
     `mode="rw"`** and is refused otherwise, so a read-only consumer still
     cannot bring an arena into existence.
+
+    `capacity` and `interp` describe the edges being created and are ignored
+    without `create`; both are `build`'s, with the same defaults.
     """
 
 def open_file(path: str | os.PathLike[str], /) -> Tree:
@@ -358,7 +417,30 @@ def open_file(path: str | os.PathLike[str], /) -> Tree:
     """
 
 def from_sec(seconds: float, /) -> int:
-    """Nanoseconds from float seconds. Lossy above ~10^7 s — see `Plan.at`."""
+    """Nanoseconds from float seconds. Lossy above ~10^7 s.
+
+    Prefer the exact converters: `from_parts` for a `(sec, nanosec)` pair and
+    `from_ros` for a `builtin_interfaces/Time`. Neither takes a float.
+    """
+
+def from_parts(sec: int, nanosec: int, /) -> int:
+    """Exact nanoseconds from a `(sec, nanosec)` pair.
+
+    Raises `ValueError` for a `nanosec` outside `[0, 1e9)` — **refused, not
+    normalised** — and for a sum outside `int64` — **refused, not wrapped**.
+    Both alternatives produce a stamp that looks perfectly well formed, which
+    is the failure this converter exists to prevent.
+    """
+
+def from_ros(stamp: object, /) -> int:
+    """Exact nanoseconds from a ROS 2 `builtin_interfaces/Time`.
+
+    Never via `to_sec()`: the message is `{int32 sec, uint32 nanosec}` and
+    converts exactly. Duck-typed on `.sec` and `.nanosec`, so `rclpy` is not a
+    dependency of this wheel and must not become one.
+
+    Refusals are `from_parts`'s.
+    """
 
 def has_shared_memory() -> bool:
     """Whether this build can share a tree between processes."""

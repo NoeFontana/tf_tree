@@ -71,7 +71,7 @@ use crate::tree::PyTree;
 #[pyo3(signature = (path, /))]
 pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
     Ok(PyTree {
-        inner: open_frozen(&path)?,
+        inner: std::sync::Arc::new(open_frozen(&path)?),
     })
 }
 

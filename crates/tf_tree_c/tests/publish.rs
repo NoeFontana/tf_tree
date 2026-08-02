@@ -733,3 +733,45 @@ fn claiming_the_wrong_parent_is_its_own_error() {
         "once the frame table is full, an unseen name cannot be interned"
     );
 }
+
+/// **A publisher outlives the tree handle it was claimed from**, and the arena
+/// stays mapped underneath it — `docs/decisions/0017` step 7.
+///
+/// This handle no longer carries an `Arc<TreeShare>` of its own: the
+/// `OwnedWriter` it holds carries the `Arc<Tree>`, and *that* is what keeps the
+/// arena alive. Freeing the tree first is a reasonable thing for a C caller to
+/// do — there is no borrow checker to tell them otherwise — so the free order
+/// must not matter, exactly as it already does not for `tft_plan`.
+///
+/// **Where the gate is.** Nothing observable distinguishes a live arena from a
+/// freed one on this path, so a plain `cargo nextest` run of this test is not
+/// the check: `just c-abi-check`'s Miri and ASan rows are, and they build this
+/// target. Replacing `OwnedWriter`'s `tree: Arc<Tree>` field with a
+/// `PhantomData` and running the ASan row reports
+/// `AddressSanitizer: heap-use-after-free ... READ of size 8`. The same
+/// deletion is `0017` step 2's mutant under `just miri`, one crate over; this
+/// is the C surface's statement of it.
+#[test]
+fn a_publisher_outlives_the_tree_handle_it_came_from() {
+    let f = Fixture::new();
+    let p = f.claim("robot", "world").expect("claim");
+    // Free the tree handle while the claim is live. `Fixture::drop` would do it
+    // too, but *after* the publisher — which is the order that proves nothing.
+    let raw = f.0;
+    core::mem::forget(f);
+    // SAFETY: a live handle from `Fixture::new`, freed exactly once here.
+    unsafe { tft_tree_free(raw) };
+
+    // The claim still works, and still writes into a mapped arena.
+    assert_eq!(
+        p.push(
+            1_000,
+            TFT_LAYOUT_QVEC7_WXYZ,
+            &quat7([1.0, 0.0, 0.0, 0.0], [1.0, 2.0, 3.0])
+        ),
+        TFT_OK
+    );
+    // And releasing it still releases the claim rather than faulting.
+    // SAFETY: a live publisher handle, released from its creating thread.
+    assert_eq!(unsafe { tft_publisher_release(p.0) }, TFT_OK);
+}

@@ -297,3 +297,126 @@ fn an_abi_mismatch_names_both_versions() {
         "the library's version must appear: {m}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stamps — `docs/API.md` §5.1
+// ---------------------------------------------------------------------------
+
+/// The table both bindings are checked against.
+///
+/// `(sec, nanos, expected)`, where `None` means **refused**. Its twin lives in
+/// `tests/python/test_api.py::PARTS_TABLE` and the two must stay identical:
+/// a converter that agrees with Rust on the successes and disagrees at the
+/// edges is the bug this row of `docs/API.md` §6 exists to prevent, and it is
+/// invisible to any test that only checks the middle.
+const PARTS_TABLE: &[(i64, u32, Option<i64>)] = &[
+    (0, 0, Some(0)),
+    (1_700_000_000, 123_456_789, Some(1_700_000_000_123_456_789)),
+    // A negative second with a positive nanosecond field is how a stamp just
+    // before the epoch is spelled, and the sum is *not* `sec * 1e9`.
+    (-1, 999_999_999, Some(-1)),
+    (-1, 0, Some(-1_000_000_000)),
+    // Exactly `i64::MIN`, and the reason the range check is on the sum rather
+    // than staged: `-9_223_372_037 * 1e9` alone is below `i64::MIN`, so a
+    // `checked_mul` then `checked_add` refuses this *representable* stamp.
+    (-9_223_372_037, 145_224_192, Some(i64::MIN)),
+    (-9_223_372_037, 145_224_191, None),
+    // Exactly `i64::MAX`, and one past it.
+    (9_223_372_036, 854_775_807, Some(i64::MAX)),
+    (9_223_372_036, 854_775_808, None),
+    // Out-of-range nanoseconds are refused, not normalised into the next
+    // second — which is the whole point of the converter existing.
+    (0, 1_000_000_000, None),
+    (0, u32::MAX, None),
+];
+
+/// **`tft_stamp_from_parts` agrees with `Stamp::from_parts` on every row**,
+/// including the refusals.
+///
+/// Mutant: normalise instead of refusing (`nanos % 1e9`, carrying into `sec`)
+/// ⇒ the last two rows return `TFT_OK`. Mutant: stage the range check as
+/// `checked_mul` then `checked_add` ⇒ row 5 is refused, and that row is a
+/// stamp `int64_t` can hold.
+#[test]
+fn the_stamp_converter_refuses_what_rust_refuses() {
+    for &(sec, nanos, want) in PARTS_TABLE {
+        let mut out: i64 = 0x5A5A_5A5A_5A5A_5A5A;
+        // SAFETY: `out` is a live local.
+        let rc = unsafe { tft_stamp_from_parts(sec, nanos, &mut out) };
+        match want {
+            Some(ns) => {
+                assert_eq!(rc, TFT_OK, "({sec}, {nanos}) should convert");
+                assert_eq!(out, ns, "({sec}, {nanos})");
+            }
+            None => {
+                assert_eq!(rc, TFT_ERR_BAD_STAMP, "({sec}, {nanos}) should refuse");
+                assert_eq!(
+                    out, 0x5A5A_5A5A_5A5A_5A5A,
+                    "a refused conversion must not write *out"
+                );
+            }
+        }
+    }
+}
+
+/// `tft_stamp_from_timespec` is `from_parts` plus one refusal: POSIX permits a
+/// negative `tv_nsec` only in a *relative* interval, so a negative one here
+/// means an interval is being converted as an instant.
+///
+/// Mutant: cast `tv_nsec` to `u32` without the sign check ⇒ `(0, -1)` becomes
+/// `4294967295` nanoseconds, which the range check then refuses anyway — so the
+/// assertion that carries the load is `i64::MIN`, whose low 32 bits are zero
+/// and which such a cast turns into a wrong *answer* rather than a refusal.
+#[test]
+fn a_negative_tv_nsec_is_an_interval_not_an_instant() {
+    let mut out: i64 = 0;
+    // SAFETY: `out` is a live local, here and below.
+    assert_eq!(
+        unsafe { tft_stamp_from_timespec(1_700_000_000, 123_456_789, &mut out) },
+        TFT_OK
+    );
+    assert_eq!(out, 1_700_000_000_123_456_789);
+    for bad in [-1i64, -999_999_999, i64::MIN, 1_000_000_000] {
+        assert_eq!(
+            unsafe { tft_stamp_from_timespec(0, bad, &mut out) },
+            TFT_ERR_BAD_STAMP,
+            "tv_nsec = {bad}"
+        );
+    }
+}
+
+/// A NULL `out` is a NULL-argument error, not a crash and not a silent success.
+#[test]
+fn a_stamp_converter_rejects_a_null_out() {
+    // SAFETY: passing NULL is exactly what is under test; both entry points
+    // check it before any write.
+    unsafe {
+        assert_eq!(
+            tft_stamp_from_parts(0, 0, ptr::null_mut()),
+            TFT_ERR_NULL_ARG
+        );
+        assert_eq!(
+            tft_stamp_from_timespec(0, 0, ptr::null_mut()),
+            TFT_ERR_NULL_ARG
+        );
+    }
+}
+
+/// The refusal carries the offending pair, so an operator reading
+/// `TFT_ERR_BAD_STAMP` in a log knows which message was malformed.
+///
+/// Mutant: drop the `set_error` detail closure (`|_| {}`) ⇒ both fields stay 0
+/// and both assertions fail.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_refused_stamp_names_the_pair_that_was_refused() {
+    let mut out: i64 = 0;
+    // SAFETY: `out` is a live local.
+    assert_eq!(
+        unsafe { tft_stamp_from_parts(42, 1_500_000_000, &mut out) },
+        TFT_ERR_BAD_STAMP
+    );
+    let e = last_error().expect("detail must be available");
+    assert_eq!(e.requested, 42, "seconds");
+    assert_eq!(e.newest, 1_500_000_000, "nanoseconds");
+}

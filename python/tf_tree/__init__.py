@@ -18,6 +18,7 @@ final home. Use :meth:`Plan.at_into` to supply that home yourself.
 
 from ._core import (
     BufferError,
+    DerivativesUnavailableError,
     DisconnectedError,
     ExtrapolationError,
     FrameNotDeclaredError,
@@ -27,6 +28,8 @@ from ._core import (
     TopologyChangedError,
     Tree,
     build,
+    from_parts,
+    from_ros,
     from_sec,
     has_shared_memory,
     open_arena,
@@ -36,6 +39,7 @@ from ._core import (
 
 __all__ = [
     "BufferError",
+    "DerivativesUnavailableError",
     "DisconnectedError",
     "ExtrapolationError",
     "FrameNotDeclaredError",
@@ -45,6 +49,8 @@ __all__ = [
     "TopologyChangedError",
     "Tree",
     "build",
+    "from_parts",
+    "from_ros",
     "from_sec",
     "has_shared_memory",
     "open",

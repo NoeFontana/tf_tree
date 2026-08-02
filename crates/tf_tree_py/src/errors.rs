@@ -52,6 +52,13 @@ create_exception!(
     TfTreeError,
     "An output buffer was the wrong shape, dtype, or size."
 );
+create_exception!(
+    _core,
+    DerivativesUnavailableError,
+    TfTreeError,
+    "This edge's interpolator has no exact derivative; layout='quat_twist' \
+     cannot be served over it."
+);
 
 /// Add every exception type to the module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -69,6 +76,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<FrameNotDeclaredError>(),
     )?;
     m.add("BufferError", py.get_type::<BufferError>())?;
+    m.add(
+        "DerivativesUnavailableError",
+        py.get_type::<DerivativesUnavailableError>(),
+    )?;
     Ok(())
 }
 
@@ -131,6 +142,20 @@ pub(crate) fn lookup_err(e: LookupError) -> PyErr {
         LookupError::BufferTooSmall { need, got } => BufferError::new_err(format!(
             "output buffer holds {got} elements; this batch needs {need}"
         )),
+        // **A type, not a message, because a caller branches on it.** `LerpSlerp`
+        // is `tf2`'s interpolator and has no exact body twist, so
+        // `layout="quat_twist"` over an edge that declares it is refused rather
+        // than finite-differenced (`docs/PHASE5.md` §4.4 item 1). The response —
+        // re-declare the edge `ScLerp`, or ask for a pose layout — is a decision
+        // a program makes, and `docs/API.md` R5 is that the exception *type* is
+        // what such a decision may be written against. It is the only refusal
+        // `layout="quat_twist"` adds over the pose layouts.
+        LookupError::DerivativesUnavailable { edge, interp } => {
+            DerivativesUnavailableError::new_err(format!(
+                "edge {edge:?} declares interpolation policy {interp}, which has no \
+                 exact derivative; use layout='quat' or declare the edge ScLerp"
+            ))
+        }
         // Routed through the shared spelling so a fork victim gets the same
         // sentence whether it arrived through `lookup` or through `frames`.
         LookupError::ChildDetached => detached_err(),

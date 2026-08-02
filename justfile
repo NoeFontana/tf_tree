@@ -64,10 +64,11 @@ loom:
 # would compile the shipped binaries and the benchmarks with soft floats too.
 #
 # **`tf_tree` is here because `docs/decisions/0017` put a lifetime extension in
-# it** (`OwnedWriter` — the facade's only `unsafe`, and once that record's steps
-# 6–7 delete `tf_tree_c`'s and `tf_tree_py`'s `extend_to_static` helpers, the
-# workspace's only one; those two steps are deferred, so both helpers are still
-# in the tree and neither is reachable from here). That record names `just miri`
+# it** (`OwnedWriter` — the facade's only `unsafe`, and now the **workspace's**
+# only one: that record's steps 6–7 have deleted `tf_tree_c`'s and
+# `tf_tree_py`'s `extend_to_static` helpers, so this recipe covers every
+# lifetime extension there is rather than one of three). That record names
+# `just miri`
 # as the verification for its step 2 — a gate the recipe could not perform while
 # the crate was excluded. It earned its place immediately: adding it caught a
 # real *"deallocating while item [SharedReadOnly …] is strongly protected"* in

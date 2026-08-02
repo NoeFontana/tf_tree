@@ -47,7 +47,7 @@
 // See `docs/decisions/0007`.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 mod errors;
@@ -63,6 +63,11 @@ pub use tree::*;
 /// The only sanctioned path from a wall-clock float. Documented as lossy above
 /// ~10^7 s rather than silently accepted, because the loss is invisible: the
 /// value still *looks* like a timestamp.
+///
+/// **It now has exact siblings to point at**, which is what turns the warning
+/// from true into actionable (`docs/API.md` §5.1): [`from_parts`] for a
+/// `(sec, nanosec)` pair and [`from_ros`] for a `builtin_interfaces/Time`.
+/// Neither takes a float and neither loses a bit.
 #[pyfunction]
 #[pyo3(signature = (seconds, /))]
 fn from_sec(seconds: f64) -> PyResult<i64> {
@@ -70,6 +75,94 @@ fn from_sec(seconds: f64) -> PyResult<i64> {
         return Err(PyValueError::new_err("stamp must be finite"));
     }
     Ok((seconds * 1e9) as i64)
+}
+
+/// Nanoseconds in a second — the `[0, 1e9)` bound `from_parts` enforces.
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+/// Exact nanoseconds from a `(sec, nanosec)` pair — `docs/API.md` §5.1.
+///
+/// The Python spelling of `Stamp::from_parts`, and it refuses exactly what that
+/// refuses. **The refusals are the interesting half**, because both
+/// alternatives are the silent wrongness §5.1 exists to remove:
+///
+/// * a `nanosec` outside `[0, 1e9)` is **refused, not normalised** — carrying a
+///   malformed field into a plausible-looking stamp is how a wrong message
+///   becomes an unexplainable transform;
+/// * a sum outside `int64` is **refused, not wrapped** — a wrapped stamp lands
+///   on the other side of the epoch and then compares, interpolates and prints
+///   perfectly.
+///
+/// Note it is the *sum* that is range-checked and not the product: staging the
+/// check would refuse a one-second band of representable stamps at the negative
+/// end, exactly as the Rust side's comment records.
+///
+/// A negative `nanosec` is refused rather than being a type error, so that this
+/// and `Stamp::from_timespec` agree: POSIX permits a negative `tv_nsec` only in
+/// a *relative* interval, and converting one as an instant is a whole category
+/// of wrong.
+#[pyfunction]
+#[pyo3(signature = (sec, nanosec, /))]
+fn from_parts(sec: i64, nanosec: i64) -> PyResult<i64> {
+    if !(0..NANOS_PER_SEC).contains(&nanosec) {
+        return Err(PyValueError::new_err(format!(
+            "nanosec must be in [0, 1000000000), got {nanosec}. It is refused \
+             rather than normalised: a malformed field carried into a \
+             plausible-looking stamp is unrecoverable downstream"
+        )));
+    }
+    // `i128`, not a staged `checked_mul`/`checked_add`, for the reason the Rust
+    // side records: the staged form refuses a one-second band of *representable*
+    // stamps at the negative end. `i64 * 1e9 + u32` cannot overflow `i128`, so
+    // this arrives with the exact answer in hand and the only question left is
+    // whether it fits.
+    let total = i128::from(sec) * i128::from(NANOS_PER_SEC) + i128::from(nanosec);
+    i64::try_from(total).map_err(|_| {
+        PyValueError::new_err(format!(
+            "sec={sec}, nanosec={nanosec} is {total} ns, outside int64 \
+             (+/-292 years). It is refused rather than wrapped: a wrapped stamp \
+             lands on the other side of the epoch and still compares and \
+             interpolates perfectly"
+        ))
+    })
+}
+
+/// Exact nanoseconds from a ROS 2 `builtin_interfaces/Time`.
+///
+/// ```python
+/// t = tf_tree.from_ros(msg.header.stamp)
+/// ```
+///
+/// **Never via `to_sec()`** (`docs/PHASE3.md` §13, `docs/API.md` §5.1): the
+/// message is `{int32 sec, uint32 nanosec}` and converts exactly, so a float
+/// round trip would destroy precision this API exists to preserve — at a 2026
+/// epoch the ULP of `float64` seconds is 238 ns, which is every interval in a
+/// 1 kHz stream.
+///
+/// # Duck-typed, and deliberately
+///
+/// It reads `.sec` and `.nanosec` off whatever it is handed. **`rclpy` is not a
+/// dependency of this wheel and must not become one** — the package needs only
+/// NumPy, and a binding that imported `rclpy` to read two integers would be
+/// unusable in the notebook and the dataloader that are most of its users. Any
+/// object with those two fields works: the real message, a `dataclass`, a
+/// `SimpleNamespace` in a test.
+///
+/// Refusals are [`from_parts`]'s, unchanged.
+#[pyfunction]
+#[pyo3(signature = (stamp, /))]
+fn from_ros(stamp: &Bound<'_, PyAny>) -> PyResult<i64> {
+    let field = |name: &str| -> PyResult<i64> {
+        let v = stamp.getattr(name).map_err(|_| {
+            PyTypeError::new_err(format!(
+                "expected a builtin_interfaces/Time (anything with .sec and \
+                 .nanosec); this object has no .{name}. An rclpy.time.Time is \
+                 already integer nanoseconds — use its .nanoseconds directly"
+            ))
+        })?;
+        v.extract::<i64>()
+    };
+    from_parts(field("sec")?, field("nanosec")?)
 }
 
 /// Whether this build can share a tree between processes.
@@ -90,6 +183,8 @@ fn has_shared_memory() -> bool {
 #[pymodule(gil_used = false)]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_sec, m)?)?;
+    m.add_function(wrap_pyfunction!(from_parts, m)?)?;
+    m.add_function(wrap_pyfunction!(from_ros, m)?)?;
     m.add_function(wrap_pyfunction!(has_shared_memory, m)?)?;
     m.add_function(wrap_pyfunction!(tree::build, m)?)?;
     m.add_function(wrap_pyfunction!(tree::push, m)?)?;
