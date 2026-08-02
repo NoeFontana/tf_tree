@@ -213,3 +213,46 @@ fn attach_and_a_recording_source_are_mutually_exclusive_in_both_orders() {
         );
     }
 }
+
+/// **`freeze --from-live` refuses an ingest flag it cannot act on, exactly as
+/// `doctor` does.**
+///
+/// `IngestArgs` is flattened into `freeze` so `--from-bag` takes the §3 knobs.
+/// On `--from-live` there is no recording to read, so all eleven were parsed and
+/// dropped: `freeze --from-live --tf-prefix robot1` wrote a `.tft` with no
+/// prefix applied and exited 0. It is the same defect as `doctor`'s and it is
+/// closed with the same predicate rather than left as the one remaining
+/// instance.
+///
+/// The assertion stops at the flag rejection: it must fire **before** the
+/// attach, because the attach is what fails on a machine with no arena, and a
+/// rejection that only arrives after a successful attach is not a rejection an
+/// operator can rely on.
+///
+/// Mutant: delete the `anyhow::ensure!(set.is_empty(), ...)` block from
+/// `cmd_freeze`. Applied, and this failed on `the flag must be refused before
+/// the attach is attempted` — the run reaches `no arena at domain ...` instead.
+#[test]
+fn freeze_from_live_refuses_an_ingest_flag_it_will_ignore() {
+    let dir = Scratch::new("freeze-flags");
+    let out = dir.0.join("x.tft");
+
+    let res = tf_tree()
+        .args(["freeze", "--from-live", "--out"])
+        .arg(&out)
+        .args(["--tf-prefix", "robot1"])
+        .env("TF_TREE_RUNTIME_DIR", &dir.0)
+        .output()
+        .unwrap();
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("--tf-prefix") && stderr.contains("--from-bag"),
+        "the flag must be refused before the attach is attempted, naming itself \
+         and the source that would give it meaning: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "a refused invocation must not have written an index"
+    );
+}

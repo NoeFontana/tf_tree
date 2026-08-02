@@ -1622,6 +1622,20 @@ fn cmd_freeze(
         from_live,
         "`freeze` needs a source; pass `--from-live` or `--from-bag <PATH>`"
     );
+    // **The same rule `doctor` applies, for the same reason.** `IngestArgs` is
+    // flattened here so `--from-bag` takes the §3 knobs; `--from-live` reads no
+    // recording, so every one of them is dead on this path and accepting one
+    // silently tells a user their `--tf-prefix` was applied to a frozen index it
+    // never touched. `--report` is the deliberate exception and says so in its
+    // own help text — it names an output path, not an ingest behaviour.
+    let set = ingest.flags_set();
+    anyhow::ensure!(
+        set.is_empty(),
+        "{} {} only meaningful with --from-bag: --from-live copies a live arena and reads no \
+         recording.\n\x20 Drop the flag, or freeze the recording instead with --from-bag.",
+        set.join(", "),
+        if set.len() == 1 { "is" } else { "are" },
+    );
     let tree = live.open()?;
     // `as i64` would wrap silently once `as_nanos` passes 2^63 (2262-04-11) and
     // hand the header a negative "created" stamp that reads as 1901. Saturating
