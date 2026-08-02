@@ -159,8 +159,9 @@ impl PyTree {
     /// allocates" is not in tension with the `String`s it builds.
     ///
     /// See [`frames_impl`](crate::offline::frames_impl) for what the list
-    /// promises on a *live* arena and why a slot mid-intern is skipped.
-    fn frames(&self) -> Vec<String> {
+    /// promises on a *live* arena, why a slot mid-intern is skipped, and why a
+    /// tree inherited across a `fork()` raises instead of answering `[]`.
+    fn frames(&self) -> PyResult<Vec<String>> {
         crate::offline::frames_impl(&self.inner)
     }
 
@@ -171,11 +172,13 @@ impl PyTree {
     /// counting pass exists, because a rate computed from what a ring *retained*
     /// answers a different question than its name promises.
     ///
-    /// `(parent, child)` is `tf_tree.build`'s order, so
-    /// `tf_tree.build(tree.edges())` reconstructs the topology — see
+    /// `(parent, child)` is `tf_tree.build`'s order, so the list can be handed
+    /// straight back to it — but that rebuilds the *graph* only: this list does
+    /// not report an edge's kind and `tf_tree.build` cannot declare a static
+    /// edge, so a static edge comes back dynamic and empty. See
     /// [`edges_impl`](crate::offline::edges_impl), which also covers the one
     /// case where the pair and the live topology can disagree.
-    fn edges(&self) -> Vec<(String, String)> {
+    fn edges(&self) -> PyResult<Vec<(String, String)>> {
         crate::offline::edges_impl(&self.inner)
     }
 
@@ -586,7 +589,7 @@ impl PyPlan {
     /// [`plan_edges_impl`](crate::offline::plan_edges_impl) — the alternative
     /// to saying so is fabricating ids for edges the plan genuinely no longer
     /// knows about.
-    fn edges(&self) -> Vec<(String, String)> {
+    fn edges(&self) -> PyResult<Vec<(String, String)>> {
         crate::offline::plan_edges_impl(self.tree(), &self.plan)
     }
 

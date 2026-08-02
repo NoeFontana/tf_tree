@@ -138,3 +138,59 @@ def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
     # And the parent is unharmed — it still owns the edge it claimed.
     pub.push(3_000, [1.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0])
     pub.release()
+
+
+@shm
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
+def test_a_forked_child_is_refused_by_the_introspection_calls_too(runtime_dir):
+    """**An empty list is the wrong way to say "you forked".**
+
+    `Tree.frames`, `Tree.edges` and `Plan.edges` walk the `ArenaView` rather
+    than evaluating through a `Guard`, so they do not inherit the refusal the
+    test above pins. `Tree::view` substitutes a one-frame, zero-edge poison
+    arena for a detached tree — which is right, because it makes reading the
+    vanished mapping impossible — and the consequence is that an unguarded walk
+    *succeeds*, returning `[]`. A `multiprocessing` worker would read that as a
+    corrupt or empty arena and go looking for the wrong bug;
+    `docs/PHASE5.md` §4.3 makes `fork` the expected way these users arrive.
+
+    The plan is compiled **before** the fork on purpose: `Tree.plan` refuses in
+    the child on its own, so compiling there would test the guard that already
+    exists instead of the one this pins.
+
+    Mutant: delete the `if tree.detached()` guard from ``frames_impl``,
+    ``edges_impl`` and ``plan_edges_impl`` (`crates/tf_tree_py/src/offline.rs`).
+    Applied: all three calls return `[]` in the child, which exits 12 instead of
+    0 — the codes are `or`-ed so the *first* unrefused call is the one reported,
+    and 13 or 14 alone would name the other two. The exit status is the only
+    channel here: an assertion raised inside a fork child is invisible to
+    pytest.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    with tree.publisher("base", "map") as pub:
+        pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+    plan = tree.plan("map", "base")
+    # The parent answers all three; the child must not.
+    assert tree.frames() and tree.edges() and plan.edges()
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — the child never returns to pytest
+        status = 0
+        for code, call in ((12, tree.frames), (13, tree.edges), (14, plan.edges)):
+            try:
+                call()
+                status = status or code  # answered instead of refusing
+            except tf_tree.TfTreeError:
+                pass
+            except Exception:
+                status = status or code + 100  # refused, but as the wrong type
+        os._exit(status)
+
+    _, wstatus = os.waitpid(pid, 0)
+    assert os.WIFEXITED(wstatus), (
+        "the child was killed by a signal, not refused: "
+        f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
+    )
+    assert os.WEXITSTATUS(wstatus) == 0

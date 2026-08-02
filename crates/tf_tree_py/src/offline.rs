@@ -39,7 +39,7 @@ use pyo3::prelude::*;
 
 use tf_tree::{ArenaView, EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
-use crate::errors::{lookup_err, NoDataError, TfTreeError};
+use crate::errors::{detached_err, lookup_err, NoDataError, TfTreeError};
 use crate::tree::PyTree;
 
 /// Open a frozen `.tft` and read it through the ordinary `Tree` (§4.1).
@@ -164,15 +164,26 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 /// and a private copy of it in the one crate `just test`, `just miri` and
 /// `just loom` never build does not move when the definition does
 /// (`docs/PHASE5.md` §4.2's amendment). There is no arithmetic here: the frame
-/// table is append-only and the enumeration is `1..=frame_count`, the same
-/// three lines `tf_tree doctor`'s `Snapshot::capture` and `tf_tree_c`'s
-/// unstable enumerators already state independently.
+/// table is append-only and the enumeration is `1..=frame_count`, three lines
+/// `tf_tree doctor`'s `Snapshot::capture` and `tf_tree_c`'s unstable
+/// enumerators already state independently — though not identically, which is
+/// the next paragraph.
 ///
 /// **That is a reason it is tolerable here, not a reason it is right here.**
 /// The facade has no public `Tree::frames`, and the amendment's argument says a
 /// third copy should have become the first shared one. Adding it is a change to
 /// `crates/tf_tree/src/tree.rs`, which is out of this change's scope; when the
 /// facade grows the method, this becomes a forwarder like `span_impl`.
+///
+/// **The four copies do not agree, which is the argument, not a footnote.**
+/// `tf_tree_c::unstable` (`tft_tree_frame_name`) checks `FrameId::new`,
+/// `id <= frame_count` and `name_hash != 0`, and loads the count `Acquire`;
+/// `tf_tree_cli`'s `Snapshot::capture` checks only `FrameId::new` and loads
+/// `Relaxed`, so `tf_tree doctor` can print a zeroed headroom slot as a frame
+/// with an empty name; this one applies all three and loads `Relaxed` for the
+/// reason stated at the load. Two of those three crates belong to other
+/// branches, so this copy is made the correct one and the consolidation onto
+/// `Tree` is filed rather than smuggled in here.
 ///
 /// # The snapshot is a snapshot
 ///
@@ -181,36 +192,81 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 /// as `Plan::latest` and `Tree::span` already are. Frames are append-only, so
 /// what the list *does* promise is that nothing in it will ever be removed or
 /// renumbered.
-pub(crate) fn frames_impl(tree: &Tree) -> Vec<String> {
+///
+/// A tree inherited across a `fork()` has no snapshot to take: its mapping is
+/// gone (`MADV_DONTFORK`) and [`Tree::view`](tf_tree::Tree) substitutes a
+/// one-frame poison arena, which would make this answer `[]`. See the guard.
+///
+/// # Errors
+///
+/// [`detached_err`] on a tree inherited across a `fork()`.
+pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
+    // **Refuse a fork-detached tree rather than describing the poison arena.**
+    // `Tree::view` swaps in a one-frame, zero-edge heap arena for a detached
+    // tree so that no accessor reads the vanished mapping; every count below
+    // then reads 0 and this would hand a `multiprocessing` worker `[]` — which
+    // reads as an empty or corrupt arena, not as the fork it is. `span_impl`
+    // gets this for free by going through a `Guard`; a walk of the view has to
+    // say so itself. `docs/PHASE5.md` §4.3 makes `fork` the *expected* way in.
+    if tree.detached() {
+        return Err(detached_err());
+    }
     let view = tree.arena_view();
     // Usable frame ids are `1..=frame_count`; slot 0 is the root sentinel.
+    //
+    // **`Relaxed`, and that is the justified ordering, not the cheap one.**
+    // `tf_tree_core::frame`'s `finish` does `frame_count.fetch_add`, *then*
+    // `write_record`, then the Release publish into the intern table. An
+    // `Acquire` load here would therefore synchronize with everything the
+    // interner did *before* it took its id and with nothing it did after —
+    // which is precisely the record we are about to read. Acquire would buy
+    // ordering that reads like a guarantee and is not one; the `name_hash`
+    // filter below is the actual guard. (The other three copies disagree about
+    // this; see the doc comment's second section.)
     let count = view.header().frame_count.load(Ordering::Relaxed);
     let mut out = Vec::with_capacity(count as usize);
     for raw in 1..=count {
-        // `raw >= 1`, so `FrameId::new` only declines an id past the table —
-        // which `frame_count <= max_frames` makes unreachable.
+        // Three checks, the strictest set any of the four copies of this loop
+        // applies (`tf_tree_c::unstable::tft_tree_frame_name` states them as
+        // one chain; `tf_tree_cli`'s `Snapshot::capture` applies only the
+        // first):
+        //
+        //  1. `FrameId::new` rejects 0, the root sentinel.
+        //  2. `id <= frame_count` — *this loop's bound*, and load-bearing:
+        //     `frame_record` bounds against `max_frames`, which is
+        //     `frame_count + 1 + frame_headroom`, so an unbounded walk hands
+        //     back zeroed headroom slots as if they were frames.
+        //  3. `name_hash != 0`, below.
         let Some(id) = FrameId::new(raw) else {
             continue;
         };
         let Some(rec) = view.frame_record(id) else {
             continue;
         };
-        // **`frame_count` is bumped *before* the record is written**
-        // (`tf_tree_core::frame`'s `finish`: `fetch_add`, then `write_record`,
-        // then the Release publish). So a concurrent interner in another
-        // process can be counted here one instant before its name exists, and
-        // the slot still reads as zeros. A written record's `name_hash` is
-        // BLAKE3 of the name and is zero with probability 2⁻⁶⁴; a zeroed one is
-        // zero always. Skipping it reports that frame one call later, where
-        // taking it would report it as `""` — a name no caller can act on and
-        // one that looks like our bug rather than like a race they lost by a
-        // microsecond.
+        // **`frame_count` is bumped *before* the record is written**, so a
+        // concurrent interner in another process can be counted here one
+        // instant before its name exists, and the slot still reads as zeros. A
+        // written record's `name_hash` is BLAKE3 of the name — non-zero for
+        // every name including `""`, which hashes to `0xa6a1f9f5b94913af`; a
+        // zeroed one is zero always. Skipping it reports that frame one call
+        // later, where taking it would report it as `""` — a name no caller can
+        // act on and one that looks like our bug rather than like a race they
+        // lost by a microsecond.
+        //
+        // This is a filter, not a synchronization edge: the arena's model is
+        // that a record is written before its id is ever *published* and a
+        // shared read of a published record races nothing
+        // (`ArenaView::frame_record`'s SAFETY note). Enumerating by index steps
+        // outside that model — the id came from a counter, not from a publish —
+        // and no ordering available here puts it back inside. That is an
+        // argument for the enumeration living on `Tree`, where `just loom` and
+        // `just miri` can see it, which is the filed follow-up.
         if rec.name_hash == 0 {
             continue;
         }
         out.push(stored_name(&rec.name, rec.name_len));
     }
-    out
+    Ok(out)
 }
 
 /// The edges on this tree as `(parent, child)` name pairs, behind `Tree.edges`.
@@ -218,10 +274,26 @@ pub(crate) fn frames_impl(tree: &Tree) -> Vec<String> {
 /// # `(parent, child)`, in that order, because `build` takes that order
 ///
 /// `tf_tree.build([...])` and `tf_tree.open(create=[...])` both take
-/// `(parent, child)` pairs, so this is the list that reconstructs the topology
-/// it came from. Choosing `(child, parent)` — `Tree.publisher`'s order — would
-/// have made `tf_tree.build(tree.edges())` build a tree that is upside down and
-/// still valid, which is the quaternion-order trap in the topology axis.
+/// `(parent, child)` pairs, so a caller can hand this list straight back to
+/// either. Choosing `(child, parent)` — `Tree.publisher`'s order — would have
+/// made that hand-back build a tree that is upside down and still valid, which
+/// is the quaternion-order trap in the topology axis.
+///
+/// # It is the parent/child graph, and **not** a round trip
+///
+/// An earlier revision of this doc said `tf_tree.build(tree.edges())`
+/// "reconstructs the topology". It reconstructs the *graph*, and only for an
+/// all-dynamic tree it reconstructs anything usable: `tf_tree.build` has no way
+/// to declare a static edge and this list does not report an edge's kind, so on
+/// the surfaces this call is actually aimed at — a `.tft` from bag ingest, or a
+/// shared arena a Rust or C peer built with `TreeBuilder::static_edge` — every
+/// static edge comes back as a dynamic edge with an empty ring, and every lookup
+/// crossing one raises `NoData` instead of returning the constant it had.
+///
+/// Reporting the kind is surface `docs/PHASE5.md` §4.4 does not authorise, and
+/// declaring a static edge from Python is surface that does not exist at all, so
+/// the promise is withdrawn rather than half-kept. A documented limit beats a
+/// round trip that holds only on the case a test can reach.
 ///
 /// # The pair is the edge's *declared* endpoints
 ///
@@ -238,11 +310,26 @@ pub(crate) fn frames_impl(tree: &Tree) -> Vec<String> {
 ///
 /// No rate, no jitter, no gap count, no sample count. That is §4.2's `ds.edges()`
 /// and it stays held back until §3's counting pass exists.
-pub(crate) fn edges_impl(tree: &Tree) -> Vec<(String, String)> {
+///
+/// # Errors
+///
+/// [`detached_err`] on a tree inherited across a `fork()`.
+pub(crate) fn edges_impl(tree: &Tree) -> PyResult<Vec<(String, String)>> {
+    // See [`frames_impl`]: the poison arena a detached tree reads has zero
+    // edges, so without this the answer is a silent `[]`.
+    if tree.detached() {
+        return Err(detached_err());
+    }
     let view = tree.arena_view();
     // `edge_count` is stored as (declared edges + 1 sentinel), so the real ids
     // are `1..edge_count` — `tf_tree_core::EdgeId`'s own doc comment, and the
     // off-by-one that cost `tf_tree_c::unstable` a test.
+    //
+    // `Relaxed` needs no argument beyond `frames_impl`'s: unlike `frame_count`
+    // there is no window at all here. The edge table is sized and filled by
+    // `TreeBuilder`, and `edge_count` is stored exactly once
+    // (`tf_tree/src/tree.rs`) before the arena is ever shared; nothing declares
+    // an edge at runtime.
     let count = view.header().edge_count.load(Ordering::Relaxed);
     let mut out = Vec::with_capacity(count.saturating_sub(1) as usize);
     for raw in 1..count {
@@ -258,7 +345,7 @@ pub(crate) fn edges_impl(tree: &Tree) -> Vec<(String, String)> {
             out.push(pair);
         }
     }
-    out
+    Ok(out)
 }
 
 /// The **dynamic** edges a compiled plan samples, behind `Plan.edges`.
@@ -280,7 +367,16 @@ pub(crate) fn edges_impl(tree: &Tree) -> Vec<(String, String)> {
 /// reported. The pair is the edge's identity — the same identity
 /// [`edges_impl`] hands out — and a plan from `base` to `map` names the same
 /// edge as one from `map` to `base`.
-pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> Vec<(String, String)> {
+///
+/// # Errors
+///
+/// [`detached_err`] on a tree inherited across a `fork()`. The plan's own
+/// [`Guard`](tf_tree::Guard) would refuse too, but a plan is not evaluated here:
+/// nothing but this guard stands between a detached tree and a silent `[]`.
+pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> PyResult<Vec<(String, String)>> {
+    if tree.detached() {
+        return Err(detached_err());
+    }
     let view = tree.arena_view();
     let mut out = Vec::with_capacity(plan.len());
     for step in plan.steps() {
@@ -291,7 +387,7 @@ pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> Vec<(String, String)>
             out.push(pair);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Write this tree's arena to `path` as a `.tft` (§2.3), behind `Tree.freeze`.

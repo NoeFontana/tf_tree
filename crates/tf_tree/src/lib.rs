@@ -71,10 +71,11 @@
 //! ```
 //!
 //! This is not new advice, which is the point of writing it down: `tests/tsan.rs`
-//! shares a tree between threads this way, `tf_tree_c`'s `TreeShare` is an
-//! `Arc<Tree>` behind a handle, and PyO3's `Py<PyTree>` is the same refcount
-//! spelled in CPython's allocator. Three surfaces arrived here independently and
-//! none of them said so where an embedder would look
+//! shares a tree between threads this way, `tf_tree_c` hands out
+//! `Arc<TreeShare>` (a one-field wrapper around a `Tree`, so the refcount is on
+//! the wrapper rather than on the `Tree` itself), and PyO3's `Py<PyTree>` is the
+//! same refcount spelled in CPython's allocator. Three surfaces arrived here
+//! independently and none of them said so where an embedder would look
 //! (`docs/API.md` §2.2).
 
 mod cache;

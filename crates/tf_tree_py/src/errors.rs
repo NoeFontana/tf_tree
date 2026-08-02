@@ -72,6 +72,29 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// The error every entry point raises on a tree inherited across a `fork()`.
+///
+/// # Why a message rather than a class of its own
+///
+/// `TfTreeError` is the base, and this is deliberately not a new leaf: a
+/// detached tree is not a condition a program branches on — it is not
+/// retryable, not repairable, and the only response is to open a new tree in the
+/// child. `docs/PHASE3.md` §4.4's hierarchy exists so a caller can *program*
+/// against a distinction (which edge extrapolated, which frame is missing), and
+/// there is nothing to program against here.
+///
+/// The message says what to do because the caller almost never typed `fork` —
+/// `multiprocessing` did, and its default start method on Linux is what put
+/// them here.
+pub(crate) fn detached_err() -> PyErr {
+    TfTreeError::new_err(
+        "this tree was inherited across a fork(); the child's mapping is gone \
+         and the handle cannot be repaired. Open a new tree in the child \
+         (tf_tree.open(...)), or use multiprocessing's 'spawn' or 'forkserver' \
+         start method",
+    )
+}
+
 /// Map a `LookupError` to its Python exception, keeping the structured detail.
 ///
 /// `TopologyChanged` is the one a *correct* program routinely hits — a peer
@@ -108,6 +131,9 @@ pub(crate) fn lookup_err(e: LookupError) -> PyErr {
         LookupError::BufferTooSmall { need, got } => BufferError::new_err(format!(
             "output buffer holds {got} elements; this batch needs {need}"
         )),
+        // Routed through the shared spelling so a fork victim gets the same
+        // sentence whether it arrived through `lookup` or through `frames`.
+        LookupError::ChildDetached => detached_err(),
         other => TfTreeError::new_err(format!("{other:?}")),
     }
 }

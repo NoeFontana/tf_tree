@@ -545,81 +545,69 @@ def test_frames_lists_every_declared_frame_in_declaration_order(tree):
     is what makes `frames()[0]` the root of a tree a user just built, which is
     the first thing anyone prints.
 
+    The exact list is also what pins frame id 0 — the root sentinel — out of the
+    answer, so there is no separate sentinel test: any bound that reaches slot 0
+    changes this list.
+
     Mutant: iterate `1..frame_count` instead of `1..=frame_count` in
     ``frames_impl``. Applied: the last frame disappears and this fails with
-    ``['map', 'base'] != ['map', 'base', 'cam']`` — an off-by-one that a set
-    comparison would have caught only because the count changed, and not at all
-    if the mutation had been `0..frame_count` (which drops the root and picks up
-    the sentinel).
+    ``['map', 'base'] != ['map', 'base', 'cam']`` — an off-by-one a set
+    comparison would catch only incidentally, through the count.
     """
     assert tree.frames() == ["map", "base", "cam"]
 
 
-def test_frames_and_edges_never_return_the_sentinel_slot(tree):
-    """Frame id 0 is the root sentinel and edge id 0 is reserved.
+def test_edges_are_parent_child_pairs_and_exclude_the_sentinel(tree):
+    """`(parent, child)` — `build`'s order, not `publisher`'s — and no slot 0.
 
-    `edge_count` is stored as *declared + 1* for exactly that reason, and the
-    same off-by-one has already cost `tf_tree_c::unstable` a test. An empty
-    string or a `('', '')` pair reaching a notebook would read as a corrupt
-    arena rather than as our arithmetic.
+    **One exact-list assertion, deliberately, because it is what kills the
+    mutants.** A first revision of this file spread the property over three
+    tests (a sentinel test, a tuple-shape test, and this one); the review found
+    that the two extra tests killed nothing the equality below does not, while
+    their docstrings argued they were the only guard. They are folded in here
+    instead, because the argument is worth keeping and a second assertion of it
+    is not.
 
-    **The bound alone is not what protects this, which is why the mutant needs
-    two edits.** A zeroed edge slot names frame 0 for both endpoints, and
-    `FrameId::new(0)` is `None`, so ``named_edge_in`` declines it whatever the
-    loop bound is. It is the `None` *propagation* that is load-bearing — and the
-    tempting refactor is precisely to replace it with `Tree::edge_name`'s
-    `"<root>"` fallback so that no entry is ever dropped.
+    Order. An edge list silently reversed still builds a perfectly valid tree,
+    just upside down, so a test that only checked "two pairs of strings came
+    back" would pass against that bug. The rebuild below is the other half: the
+    rebuilt tree's `edges()` is derived the same way and would agree with itself
+    either way — it is the *frames* that give it away, since `map` is the root
+    of one tree and a leaf of the other.
 
-    Mutant: `for raw in 0..count` in ``edges_impl`` **and** a `"<root>"` fallback
-    for an unresolvable id in ``named_edge_in``. Applied: the last assertion
-    fails with ``3 == 2`` and
-    ``[('<root>', '<root>'), ('map', 'base'), ('base', 'cam')]``. Applying
-    either edit on its own changes nothing observable.
-    """
-    assert "" not in tree.frames()
-    assert all(p and c for p, c in tree.edges())
-    # Three frames, two edges: the sentinel is in neither count.
-    assert len(tree.frames()) == 3
-    assert len(tree.edges()) == 2
+    The rebuild is **the graph only**, and this fixture is where that is safe:
+    every edge a `tf_tree.build` tree can hold is dynamic. `edges()` does not
+    report an edge's kind and `tf_tree.build` cannot declare a static one, so
+    the same round trip over a `.tft` or a peer-built arena silently converts
+    every static edge into an empty dynamic one. That limit is documented on
+    `Tree.edges`; it is not asserted here because no Python surface can build
+    the tree that would show it.
 
+    Sentinel. Frame id 0 is the root sentinel and edge id 0 is reserved
+    (`edge_count` is stored as *declared + 1* for that reason, an off-by-one
+    that has already cost `tf_tree_c::unstable` a test). **The loop bound is not
+    what protects the edge list, which is why that mutant needs two edits**: a
+    zeroed edge slot names frame 0 at both ends and `FrameId::new(0)` is `None`,
+    so ``named_edge_in`` declines it whatever the bound is. It is the `None`
+    *propagation* that is load-bearing, and the tempting refactor is precisely
+    to replace it with `Tree::edge_name`'s `"<root>"` fallback so that no entry
+    is ever dropped.
 
-def test_edges_are_parent_child_pairs_and_rebuild_the_same_tree(tree):
-    """`(parent, child)` — `build`'s order, not `publisher`'s.
+    Mutants, all three run against this one assertion pair:
 
-    The round trip is the assertion that matters: an edge list silently reversed
-    still builds a perfectly valid tree, just upside down, so a test that only
-    checked "two pairs of strings came back" would pass against the bug this
-    guards. Rebuilding and comparing catches it, because the rebuilt tree's own
-    `edges()` is derived the same way and would agree with itself either way —
-    it is the *frames* that give it away: `map` is the root of one tree and a
-    leaf of the other.
-
-    Mutant: swap to `(child, parent)` in ``named_edge_in``. Applied: the first
-    equality fails at index 0 with ``('base', 'map') != ('map', 'base')``.
+    * swap to `(child, parent)` in ``named_edge_in`` — fails at index 0 with
+      ``('base', 'map') != ('map', 'base')``;
+    * `for raw in 0..count` in ``edges_impl`` **and** a `"<root>"` fallback in
+      ``named_edge_in`` — fails with a leading ``('<root>', '<root>')``. Either
+      edit alone changes nothing observable;
+    * append a per-edge sample count to the tuple in ``edges_impl``, the exact
+      shape `docs/PHASE5.md` §4.2's amendment refuses — fails on the tuple
+      arity.
     """
     assert tree.edges() == [("map", "base"), ("base", "cam")]
     rebuilt = tf_tree.build(tree.edges())
     assert rebuilt.edges() == tree.edges()
     assert rebuilt.frames() == tree.frames()
-
-
-def test_edges_carry_names_and_nothing_else(tree):
-    """The scope fence, as a test (`docs/PHASE5.md` §4.4).
-
-    §4.2's `ds.edges()` promises per-edge rate, jitter, gaps and count and is
-    deliberately held back until the counting pass that can answer it honestly
-    exists — a ring knows what it *retained*, not what the publisher produced.
-    This is the *names* half, and the way it stops being the names half is by
-    quietly growing a third element one afternoon.
-
-    Mutant: append a per-edge sample count to the tuple in ``edges_impl`` — the
-    exact shape §4.2's amendment refuses. `len(e) == 2` is what fails, and it
-    sends the reviewer to that amendment instead of to a merge.
-    """
-    for e in tree.edges():
-        assert isinstance(e, tuple)
-        assert len(e) == 2
-        assert all(isinstance(x, str) for x in e)
 
 
 def test_plan_edges_names_the_edges_the_plan_samples(tree):

@@ -115,6 +115,8 @@ class Plan:
         compile time and its identity does not survive the fold, so a plan
         cannot list what it no longer knows. Use `Tree.edges()` for the
         topology; this is what *this path samples at evaluation time*.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()`.
         """
 
 class Publisher:
@@ -210,22 +212,35 @@ class Tree:
 
         A name longer than 48 bytes was truncated when it was interned; the
         stored form is what comes back.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()` — the child's
+        mapping is gone, so there is nothing to list.
         """
 
     def edges(self) -> list[tuple[str, str]]:
         """The edges on this tree, as `(parent, child)` name pairs.
 
         `(parent, child)` is the order `tf_tree.build` and `tf_tree.open(
-        create=...)` take, so `tf_tree.build(tree.edges())` reconstructs this
-        topology. It is deliberately *not* `Tree.publisher`'s `(child, parent)`
-        order: an edge list silently reversed builds a tree that is upside down
-        and still perfectly valid.
+        create=...)` take. It is deliberately *not* `Tree.publisher`'s
+        `(child, parent)` order: an edge list silently reversed builds a tree
+        that is upside down and still perfectly valid.
+
+        **This is the parent/child graph, not a round trip.** The list does not
+        say whether an edge is static or dynamic, and `tf_tree.build` has no way
+        to declare a static one — so feeding it back reproduces the graph, but
+        every static edge comes back as a dynamic edge with no samples, and a
+        lookup crossing one raises `NoDataError` instead of returning the
+        constant it had. On a tree you built with `tf_tree.build` every edge is
+        already dynamic and the distinction cannot arise; on a `.tft` or on an
+        arena a Rust or C peer created, it can.
 
         **Names only** — no rate, no jitter, no gaps, no sample count. Those are
         `PHASE5.md` §4.2's `ds.edges()` and are held back until the counting
         pass that can answer them honestly exists: a ring knows what it
         *retained*, which is not what the publisher produced, and a rate derived
         from the one and reported as the other is worse than no rate at all.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()`.
         """
 
     def instance_uuid(self) -> str:

@@ -137,8 +137,11 @@ enforces is better when it fits, and most publishers are scoped.
 participant table — 64 slots by default (`DEFAULT_MAX_PARTICIPANTS`), and a
 number an arena is built with rather than an unbounded pool. A derived `Clone`
 would either burn a second slot or lie about sharing one.
-`Arc<Tree>` is what `tests/tsan.rs`, `tf_tree_c`'s `TreeShare` and PyO3's
-`Py<PyTree>` all already do.
+`Arc<Tree>` is what `tests/tsan.rs` does directly; `tf_tree_c` refcounts an
+`Arc<TreeShare>`, where `TreeShare` is a one-field wrapper holding the `Tree`
+(so the shared thing is the wrapper, not the `Tree` — an embedder grepping
+`tf_tree_c` for `Arc<Tree>` will not find it); and PyO3's `Py<PyTree>` is the
+same refcount spelled in CPython's allocator.
 
 This needs no code change and one paragraph of crate-level documentation. It is
 the first question every embedder asks, and today the answer exists only as
@@ -584,7 +587,7 @@ authorized by this document alone.
 | # | Change | Surface | Where | Lands in |
 |---|---|---|---|---|
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | its own plan |
-| 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | `0017` step 8 |
+| 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
 | 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | Phase 5 bench artifact (`PHASE5.md` §9.2) |
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | its own plan |
