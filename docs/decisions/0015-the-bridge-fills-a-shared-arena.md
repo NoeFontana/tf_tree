@@ -1,8 +1,20 @@
 # 0015: The bridge fills a shared arena
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
 **Implementation:** —
+
+> **Moved `draft` → `ready` by
+> [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md), which resolves
+> all three of the open questions below and scopes this record against the
+> other answer to the same problem.** The *Decision* and the seven-step
+> *Implementation plan* are unchanged.
+>
+> The scoping matters as much as the answers: **the bridge owns the arena when a
+> ROS stack is the source of truth, and `tf_tree serve` owns it when nothing else
+> is a natural owner.** A deployment runs one or the other, never both. Without
+> that line this record and `PHASE2.md` §9 were two answers to one question, each
+> written as though the other did not exist.
 
 ## Context
 
@@ -177,6 +189,32 @@ unchanged and must be tested, not assumed.
    verified by review.
 
 ## Open questions
+
+**All three are resolved by
+[`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3, which is why
+this record is `ready`.** They are kept below as written, with the answer under
+each, because the reasoning that produced the question is worth more than the
+answer alone.
+
+> **1 — Resolved: refuse.** The leaning below was right. A live arena under this
+> name with a different `layout_hash` is a startup refusal; `LayoutMismatch`
+> already exists as an attach error naming both values, and `CreatePolicy::Always`
+> is the operator's explicit act and already documents itself as "never take this
+> path automatically". That adding an edge restarts every participant is stated
+> rather than engineered around — it is D4 and `0004` being what they are.
+>
+> **2 — Resolved: no derivation.** The rendezvous is already namespaced by
+> `(domain, name)`, and `domain_from_env` falls back `TF_TREE_DOMAIN` →
+> `ROS_DOMAIN_ID` — precisely the convention two robots on one host already use.
+> So the collision this question worried about is already handled one layer down,
+> and deriving from `tf_prefix` would both couple what `PHASE4.md` §5.6 keeps
+> apart and make the name unguessable for the operator who has to attach to it.
+>
+> **3 — Resolved: beside §5.4, not inside it.** A second bridge on a held name is
+> a *rendezvous* fault; §5.4 is about two publishers on one *edge*, with per-edge
+> attribution. Folding them together would give one diagnostic two meanings —
+> the error `PHASE5.md` §6's `TFT017`/`TFT018` amendment refused when it declined
+> to reuse an existing id.
 
 1. **Who sizes the arena, and can it be resized without a restart?** The
    topology config fixes capacity at build time (`0004`, D4: fixed capacity, no
