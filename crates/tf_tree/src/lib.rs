@@ -1,4 +1,21 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+// `unsafe` boundary: **one lifetime extension, in [`OwnedWriter`], and nothing
+// else.** `EdgeWriter<'a>` borrows the `Tree`; `OwnedWriter` stores an
+// `Arc<Tree>` beside it and extends that borrow to `'static`, with the strong
+// reference — not a comment — as the thing that keeps the arena alive.
+// See `docs/decisions/0017`, which records why the facade takes the block
+// rather than each binding hand-rolling it (two did; one of them leaked a claim
+// lease and bypassed the fork guard for the life of every Python publisher).
+// **Those two hand-rolled helpers are still in `tf_tree_c` and `tf_tree_py`**:
+// deleting them is that record's steps 6–7, deliberately deferred to their own
+// commits. So this is the only lifetime extension *in this crate* today, and
+// the workspace's only one after those steps land — not before.
+//
+// This is `deny` rather than `forbid` so that the one site can `#[allow]`
+// itself and be *visible* — `rg 'allow\(unsafe_code\)' crates/tf_tree/src`
+// returns it and should return nothing else. A second site is a new kind of
+// boundary and needs its own record (`docs/decisions/0007`).
+#![deny(unsafe_op_in_unsafe_fn)]
 //! `std` facade for the `tf_tree` transform engine.
 //!
 //! Re-exports the [`tf_tree_core`] engine and adds the ergonomic, allocating
@@ -93,8 +110,8 @@ pub use frozen::FrozenFileError;
 pub use tf_tree_arena::{FrozenError, FrozenHeader, ARENA_FILE_ALIGN};
 
 pub use tree::{
-    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, ReparentError, Tree,
-    TreeBuilder,
+    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, OwnedWriter,
+    ReparentError, Tree, TreeBuilder,
 };
 
 /// Test scaffolding for `docs/decisions/0005` §5's CAS-to-lease window. Absent
@@ -110,9 +127,11 @@ pub use tf_tree_arena::{AttachMode, ShmError};
 /// This build's arena format version (`docs/PHASE5.md` §1).
 ///
 /// Re-exported as a function rather than the constant so the facade keeps its
-/// `#![forbid(unsafe_code)]` promise of exposing no arena internals: a caller
-/// gets the number it needs for a diagnostic without a path into
-/// `tf_tree_arena`.
+/// promise of exposing no arena internals: a caller gets the number it needs
+/// for a diagnostic without a path into `tf_tree_arena`. That promise is
+/// unchanged by `docs/decisions/0017` moving the crate from
+/// `#![forbid(unsafe_code)]` to `deny` with one exception — the exception is a
+/// lifetime extension, not a widening of what this surface hands out.
 #[must_use]
 pub fn arena_format_version() -> u32 {
     tf_tree_arena::FORMAT_VERSION

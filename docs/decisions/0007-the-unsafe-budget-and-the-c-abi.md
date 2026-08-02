@@ -61,6 +61,24 @@ changes.
    `unsafe` is confined to argument validation rather than smeared through the
    engine.
 
+   > **Amended by [`0017`](./0017-owned-handles-and-the-lifetime-rule.md), which
+   > moved `tf_tree` to `#![deny(unsafe_code)]` with exactly one `#[allow]`.**
+   > The clause above was written as a prediction and it was wrong about one
+   > case: `EdgeWriter<'a>` cannot be stored, three consumers needed to store it,
+   > and two hand-rolled the lifetime extension in crates the Rust test suite,
+   > Miri and TSan cannot instrument — one of them as a
+   > `transmute::<EdgeWriter, Publisher>` that leaked a claim lease and bypassed
+   > the fork guard for the life of every Python publisher. The block is now
+   > written once, in `OwnedWriter`, beside the `ClaimLease` and fork-guard code
+   > whose invariants it depends on.
+   >
+   > **Rule 1 is what made that decidable, and it is unchanged.** This is not a
+   > fifth boundary and no new *kind* of `unsafe` was admitted; it is one named
+   > exception with a record behind it, which is exactly the shape rule 1 asks
+   > for. The reason the paragraph above gave is still the reason `tf_tree` gets
+   > `deny` and one greppable `#[allow]` rather than a blanket
+   > `#![allow(unsafe_code)]`.
+
 3. **Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
    relies on, and every crate with `unsafe` carries a module-level `// SAFETY:`
    block explaining the boundary.** Unchanged, and this is the rule that matters.
@@ -124,6 +142,10 @@ diffs. A drifted header is a failed build, not a surprise at release.
 `#![forbid(unsafe_code)]` from the facade — the crate most readers audit first,
 and the one whose safety claim carries the most weight with the industrial
 integrators D18 is aimed at. A separate crate costs one `Cargo.toml`.
+(`0017` later moved that crate to `deny` with **one** greppable `#[allow]`, for
+`OwnedWriter` — see the amendment on rule 2. The argument here is unaffected and
+if anything sharper: a whole C ABI is an unbounded number of such exceptions,
+which is a different thing from one.)
 
 **Why depend on `tf_tree` rather than `tf_tree_core`?** Going to `core` directly
 would let the C ABI construct a `Guard` or a `Plan` without the facade's

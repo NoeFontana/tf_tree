@@ -53,7 +53,7 @@ just test             # cargo nextest + doctests
 just lint             # cargo fmt --check + clippy -D warnings + cargo-deny
 just fmt              # auto-format + clippy --fix
 just loom             # concurrency model checking
-just miri             # UB checking (arena + core)
+just miri             # UB checking (arena + core + the facade's one unsafe)
 just bench            # benchmark suite + go/no-go gate
 ```
 

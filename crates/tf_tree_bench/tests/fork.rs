@@ -102,3 +102,51 @@ fn a_forked_child_runs_its_destructors_without_touching_the_parent() {
         "child=exited 0 parent_ok=true note=lookup:true,push:true,alive:true,serve:true,lease:true"
     );
 }
+
+/// **The same, for a writer that owns its tree** — `docs/decisions/0017` step 4.
+///
+/// `OwnedWriter` is an `EdgeWriter<'static>` beside an `Arc<Tree>`, and the
+/// reason that record exists is that both hand-rolled versions of this shape got
+/// the destructor wrong: one of them was a `transmute::<EdgeWriter, Publisher>`
+/// which kept the first field and silently discarded the claim lease and the
+/// fork-generation compare. **Neither loss is visible from inside the child** —
+/// it passes every API check either way — so the assertion that carries this
+/// test is `lease:true` in the parent, probed from an independent open file
+/// description after the child is gone.
+///
+/// It also checks an ordering the scoped writer cannot have: the owned writer
+/// holds its own strong reference to the tree, so the child drops *two* handles
+/// to a mapping that is not there, in an order this type chose.
+///
+/// Mutants this fails against, each the shape of something that already shipped:
+///
+/// * omit the fork-generation compare in `ClaimLease::drop` (`if false` in place
+///   of the comparison). **Applied, observed:** `child=exited 0 parent_ok=false
+///   note=lookup:true,push:true,alive:true,serve:true,lease:false` — the child's
+///   inherited open file description released the **parent's** byte, leaving a
+///   live writer whose edge any reaper is now free to take. Note `push:true` in
+///   that run: the arena record is untouched, so nothing inside the parent
+///   notices, which is exactly why the probe is here;
+/// * keep only the `Publisher` inside `OwnedWriter` and forget the rest of the
+///   `EdgeWriter` — the literal shape of the `transmute` that shipped.
+///   **Applied, observed:** `child=signalled 11 parent_ok=true …
+///   lease:true`, *not* `lease:false`. Both halves of that are the defect:
+///   the child faults because the `Publisher` it now holds has no fork guard in
+///   front of its destructor's `compare_exchange`, and the parent's probe reads
+///   `lease:true` because the lease was dropped on the floor at claim time and
+///   so is **never** released — a byte held for the life of the process by
+///   nothing. An earlier revision of this note predicted `lease:false` here; it
+///   was written from intent and the run says otherwise, which is the whole
+///   reason these are stated as observations;
+/// * omit `Publisher::abandon` on the detached path (`EdgeWriter::drop`).
+///   **Applied, observed:** `child=signalled 11 parent_ok=true …
+///   lease:true` — a `compare_exchange` into the unmapped arena. The scoped
+///   sibling test above fails identically, which is the point: this mutant is
+///   not specific to the owned shape, and the one above is.
+#[test]
+fn a_forked_child_stands_down_an_owned_writer_too() {
+    assert_eq!(
+        run("owned", "owned"),
+        "child=exited 0 parent_ok=true note=lookup:true,push:true,alive:true,serve:true,lease:true"
+    );
+}

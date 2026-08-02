@@ -118,6 +118,21 @@ Responsibility split:
 
 `tf_tree` stays `#![forbid(unsafe_code)]`.
 
+> **Amendment note (not a revision).** This document is `implemented` and
+> therefore frozen — the sentence above stands as written, and the decision it
+> records was carried out exactly as stated. It is no longer true of the code:
+> [`0017`](./0017-owned-handles-and-the-lifetime-rule.md) moved `tf_tree` to
+> `#![deny(unsafe_code)]` with **exactly one** `#[allow]`, for the lifetime
+> extension inside `OwnedWriter`. Nothing this record decided changed with it —
+> the seam is still composed in `tf_tree`, and the two `unsafe` sites *this*
+> work needed (`pthread_atfork`, and the `fork()` in the test helper) are still
+> outside the crate. The same correction applies to the three other places this
+> document leans on the attribute — *Context*'s "that argument is void", §7's
+> poison-arena paragraph, and the "What we commit to" bullet. Their reasoning
+> survives unchanged: `SCM_RIGHTS` still needs no `unsafe`, and safe code still
+> must not be able to reach an unmapped page, because the one exception
+> `OwnedWriter` was granted puts no `unsafe` on any path they name.
+
 ### 2. `tf_tree::open()`
 
 ```rust
@@ -467,7 +482,9 @@ named test:
   unaffected.
 - `tf_tree` remains `#![forbid(unsafe_code)]`. The two `unsafe` sites this work needs
   (`pthread_atfork`, and the `fork()` in the test helper) live outside it and are named
-  here.
+  here. **(Amended: `0017` later moved the crate to `deny` with one `#[allow]` for
+  `OwnedWriter`'s lifetime extension — see the amendment note in §1. Both sites named
+  here are still outside the crate, so what this bullet commits to is intact.)**
 - The **fork test helper bends the documented unsafe budget**: it needs a real `fork()`
   without `exec`, which `std::process::Command` cannot do, so
   `crates/tf_tree_bench/src/bin/fork_child.rs` carries one `unsafe { libc::fork() }`

@@ -194,11 +194,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      # For the `test-doc-error-codes` step at the end of this job — the only
+      # nightly command here that is not `miri` itself.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - uses: Swatinem/rust-cache@v2
       - name: cargo miri test
         env:
           MIRIFLAGS: "-Zmiri-strict-provenance"
         run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core --features tf_tree_core/miri-soft-float
+      # The facade's one `unsafe` — `OwnedWriter`'s lifetime extension
+      # (`docs/decisions/0017`). `-Zmiri-disable-isolation` because building a
+      # `Tree` reads `/proc` for the boot id and the process start time; see the
+      # `miri` recipe in the justfile for why this is two targets and not the
+      # whole crate.
+      - name: cargo miri test (facade)
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-disable-isolation"
+        run: cargo +nightly miri test -p tf_tree --features tf_tree_core/miri-soft-float --lib --test owned_writer
+      # The two `compile_fail,E0277` pins. Stable rustdoc parses the error code
+      # and ignores it, so `just test-doc` cannot enforce them; this job already
+      # has the nightly toolchain that can. Seconds, and it is here rather than
+      # in `test` because that is the only place the toolchain exists.
+      - name: just test-doc-error-codes
+        run: just test-doc-error-codes
 
   # The only job that needs a container, because it is the only job that needs
   # ROS 2. `tf_tree_tf2_sys` is excluded from the workspace (it links `-ltf2`, so

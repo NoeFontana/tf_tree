@@ -930,8 +930,9 @@ fn capacity_rejection_leaves_the_table_usable() {
 
 /// Regression: `EdgeId` is a public `u32` newtype and `FrameId::new` accepts any
 /// non-zero `u32`, so out-of-range ids reach these accessors from safe code —
-/// including from the `#![forbid(unsafe_code)]` facade. They must report the
-/// miss, not form an out-of-bounds pointer.
+/// including from every path in the `tf_tree` facade, whose one `unsafe` is
+/// `OwnedWriter`'s lifetime extension and is nowhere near these. They must
+/// report the miss, not form an out-of-bounds pointer.
 #[test]
 fn out_of_range_ids_are_rejected_not_dereferenced() {
     let arena = single_dyn_edge_arena();

@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tf_tree_arena::{Arena, ArenaLayout, HeapArena, LayoutError};
 #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -629,8 +629,18 @@ impl ArenaBacking {
 /// harmless (our own release is a CAS and cannot clear a successor's claim) but
 /// it is a spurious epoch bump and a `ClaimRevoked` somebody has to explain.
 ///
-/// This cannot be enforced by `ManuallyDrop` here — that needs `unsafe`, and
-/// this crate is `#![forbid(unsafe_code)]`. **Do not reorder these fields.**
+/// This is not enforced by `ManuallyDrop`, and deliberately still is not.
+/// Doing so needs `unsafe`, and this crate's `unsafe` budget is one block, in
+/// [`OwnedWriter`], spent on the lifetime extension `docs/decisions/0017`
+/// authorised — an earlier revision of this sentence said the crate was
+/// `#![forbid(unsafe_code)]` and could not have a `ManuallyDrop` at any price,
+/// which stopped being true when that record landed. **Do not reorder these
+/// fields.**
+///
+/// # Storing one
+///
+/// You cannot: the lifetime is the point. [`OwnedWriter`] is the shape for a
+/// claim that outlives its scope (`docs/API.md` §2.1).
 pub struct EdgeWriter<'a> {
     publisher: Publisher<'a>,
     /// The fork generation this writer was claimed in.
@@ -718,6 +728,227 @@ impl<'a> core::ops::Deref for EdgeWriter<'a> {
 
     fn deref(&self) -> &Publisher<'a> {
         &self.publisher
+    }
+}
+
+/// An [`EdgeWriter`] that owns its tree — the claim shape for a writer that is
+/// **stored** rather than scoped (`docs/decisions/0017`, `docs/API.md` §2.1).
+///
+/// # Which one to use
+///
+/// [`Tree::claim`] is the default and stays it. Where the claim's scope is
+/// lexical the borrow checker enforces the claim's lifetime for free, and that
+/// is worth more than the `Arc` this type costs. Reach for [`Tree::claim_owned`]
+/// only when the writer outlives the scope that made it: a node that publishes
+/// for the life of the process, or a binding whose handle type cannot carry a
+/// lifetime at all. Two ways to claim an edge now exist, and if this one becomes
+/// the copy-pasted default the compile-time claim-scope check is lost for
+/// everybody.
+///
+/// # It carries no lifetime, which is the entire point
+///
+/// ```
+/// use std::sync::Arc;
+/// use tf_tree::{Capacity, EdgeCfg, Iso3, OwnedWriter, TreeBuilder};
+///
+/// // No lifetime parameter on the user's type. `EdgeWriter<'a>` cannot do this.
+/// struct OdomPublisher {
+///     writer: OwnedWriter,
+/// }
+///
+/// let tree = Arc::new(
+///     TreeBuilder::new()
+///         .dynamic_edge("odom", "base", EdgeCfg::new(Capacity::slots(64)))
+///         .build()
+///         .expect("layout"),
+/// );
+/// let base = tree.frame("base").unwrap();
+/// let odom = tree.frame("odom").unwrap();
+/// let node = OdomPublisher {
+///     writer: tree.claim_owned(base, odom).expect("claim"),
+/// };
+///
+/// // The caller's handle goes away; the writer keeps the arena alive by itself.
+/// drop(tree);
+/// node.writer.push(1_000, &Iso3::IDENTITY).expect("push");
+/// ```
+///
+/// # Auto traits
+///
+/// `Send + !Sync`, exactly as [`Publisher`] is: single-writer-per-edge stays a
+/// *type-level* property (`docs/PROJECT.md` §5 D7), not a convention this type
+/// relaxes. Both are inherited from the [`EdgeWriter`] field — there is no
+/// `unsafe impl Send` here and there must never be one, because an `unsafe impl`
+/// would still compile after somebody replaced the field with something that had
+/// no business crossing a thread.
+///
+/// `OwnedWriter` is `Send`:
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<tf_tree::OwnedWriter>();
+/// ```
+///
+/// but deliberately **not** `Sync` (this must fail to compile):
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<tf_tree::OwnedWriter>();
+/// ```
+///
+/// The error code is pinned on purpose. A bare `compile_fail` passes when the
+/// snippet fails to compile for *any* reason — including `OwnedWriter` being
+/// renamed, moved or un-exported — so it would keep reporting success while
+/// testing nothing. `E0277` is the unsatisfied-trait-bound failure that is
+/// actually under test.
+///
+/// **rustdoc enforces the code on nightly only** — measured: mutating it to
+/// `E0599` fails `cargo +nightly test --doc -p tf_tree` with *"Some expected
+/// error codes were not found: \["E0599"\]"* and still reports `ok` on stable.
+/// So `just test-doc` (stable, `--workspace`) is **not** the gate for this line;
+/// `just test-doc-error-codes` is — one nightly command, run by CI's `miri` job,
+/// which exists so this pin is a check rather than something that reads like
+/// one.
+///
+/// The *renamed-or-unexported* half is covered on stable regardless, by
+/// `assert_send::<tf_tree::OwnedWriter>()` in
+/// `crates/tf_tree/tests/owned_writer.rs`, which stops compiling if the path
+/// moves. The three together leave no way for this to pass while testing
+/// nothing.
+///
+/// # Every guard is reproduced, and not by copying one
+///
+/// `EdgeWriter::drop` does three things a hand-rolled owned writer has to do
+/// too: [`Publisher::abandon`] in a `fork` child, the `ClaimLease` release, and
+/// the fork-generation compare that decides both. This type gets all three by
+/// **containing the `EdgeWriter` whole** rather than by restating them, which is
+/// what makes the count unable to drift. The defect `0017` exists to remove was
+/// exactly a restatement that dropped two of the three: a
+/// `transmute::<EdgeWriter, Publisher>` in `tf_tree_py` that kept the first
+/// field, leaked the lease for the life of every Python publisher — so no reaper
+/// would ever collect the edge either — and bypassed the fork guard.
+///
+/// # Drop order is load-bearing, for a second reason
+///
+/// The fields are declared **writer first, `tree` second**, and Rust drops them
+/// in declaration order. The writer releases the claim by writing *into the
+/// arena*; the `Arc` is what keeps that arena mapped. Reversing them is a
+/// use-after-free on the last handle rather than the merely-wrong ordering
+/// [`EdgeWriter`]'s own field order guards against. **Do not reorder these
+/// fields.**
+///
+/// # Why the writer is behind a `Box`
+///
+/// Not for size, and not for the `Arc`: **an inline `EdgeWriter<'static>` here
+/// is Undefined Behavior on drop**, under Stacked Borrows *and* Tree Borrows.
+/// `just miri` reports it, the rest of the suite does not, and the box is what
+/// `just miri` goes green on.
+///
+/// The mechanism, because it is not obvious. An `EdgeWriter` holds `&`
+/// references into the arena. When a value is passed to a function **by
+/// value**, the reference-typed fields inside it are retagged with a *strong
+/// protector* for the whole call — that is what makes a reference argument
+/// dereferenceable for the duration of a call. Both `drop(writer)` and
+/// [`Self::release`] are exactly that: a by-value pass whose callee then drops
+/// the last `Arc`, and freeing the arena while a strong protector points into
+/// it is UB. It is not hypothetical model-lawyering — Miri's default
+/// (`-Zmiri-retag-fields=all`) reports
+/// *"deallocating while item \[SharedReadOnly …\] is strongly protected"*, and
+/// `-Zmiri-tree-borrows` reports the Tree Borrows equivalent.
+///
+/// A `Box` field is *weakly* protected — deallocating through it is exactly
+/// what a `Box` is for — and retagging does not reach through a pointer into
+/// the boxed value, so the arena references are never protected across the
+/// `Arc`'s release. Dropping through the box is then an ordinary in-place drop,
+/// which was already sound: an `OwnedWriter` that falls out of scope, or that
+/// lives in somebody's struct, never tripped this at all. Only the by-value
+/// spellings did — which are the two this type documents as the way to release.
+///
+/// **The cost is one pointer chase in [`Self::push`], and it buys soundness on
+/// the shape this type exists to provide.** [`EdgeWriter::push`],
+/// [`Publisher::push`] and every scoped claim are untouched: this is a new path
+/// that pays it, not an existing one that regressed. The alternative that would
+/// not pay it is `Publisher` holding raw pointers instead of `&` — a change to
+/// the `no_std` core's hot struct, which is a decision record, not a tidy-up.
+pub struct OwnedWriter {
+    /// The claim, with its borrow of the tree below extended to `'static`.
+    ///
+    /// Declared first so it drops first — see the type's doc comment.
+    ///
+    /// **Boxed for soundness, not for size, and it must stay boxed.** See the
+    /// type's *Why the writer is behind a `Box`* section: with the `EdgeWriter`
+    /// inline, `drop(writer)` and [`Self::release`] are both Undefined Behavior
+    /// under Stacked *and* Tree Borrows, and `just miri` says so.
+    writer: Box<EdgeWriter<'static>>,
+    /// The strong reference that makes the field above's `'static` true.
+    ///
+    /// Never read, hence the `allow` — but **do not delete it**, and do not
+    /// replace it with a `PhantomData`. It is the entire safety argument for the
+    /// `'static` above; removing it leaves a writer pointing into an arena
+    /// nothing is keeping alive, which is a use-after-free that compiles.
+    ///
+    /// Spelled without a leading underscore on purpose: the underscore
+    /// convention in this file means "held only for its `Drop`" (see
+    /// `EdgeWriter::_lease`), and this is held for its *refcount* — it has to be
+    /// alive for the writer's whole life, not merely torn down in a particular
+    /// order at the end of it.
+    #[allow(dead_code)]
+    tree: Arc<Tree>,
+}
+
+impl OwnedWriter {
+    /// The edge this writer owns.
+    ///
+    /// The same accessor [`Publisher::edge`] gives a scoped writer through
+    /// [`EdgeWriter`]'s `Deref`, forwarded by hand because `OwnedWriter` has no
+    /// `Deref`: one to [`Publisher`] would also expose [`Publisher::push`],
+    /// which is the copy without the fork check (see [`Self::push`]).
+    ///
+    /// It is not decoration. An `EdgeId` is what names a claim to everything
+    /// outside the arena's frame table — the lock file's byte, a counter row, a
+    /// diagnostic — and a caller that cannot ask the writer has to re-derive it
+    /// from a seqlock topology read that can fail, and then has no cross-check
+    /// left that the two agree.
+    #[inline]
+    #[must_use]
+    pub fn edge(&self) -> EdgeId {
+        self.writer.edge()
+    }
+
+    /// Publish `iso` at `stamp` on the claimed edge.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::NonMonotonicStamp`] if `stamp` predates the edge's newest;
+    /// [`PushError::ClaimRevoked`] if a reaper judged this writer dead and took
+    /// the edge away (`docs/PHASE2.md` §1, A4);
+    /// [`PushError::ChildDetached`] if this writer was claimed before a `fork()`
+    /// and is being used in the child.
+    ///
+    /// # Why this forwards to [`EdgeWriter::push`] and not to [`Publisher::push`]
+    ///
+    /// [`EdgeWriter::push`] is the one that carries the fork check; the
+    /// [`Publisher`] underneath it does not, and cannot — it is `no_std` and has
+    /// no notion of a process. Routing this around it would put a store into an
+    /// unmapped page one refactor away.
+    ///
+    /// `#[inline]` because this is a pure forwarder: the whole body is a call
+    /// this crate can see through, and without the attribute a downstream
+    /// embedder pays a real stack frame for the privilege of owning its tree.
+    /// [`EdgeWriter::push`] itself deliberately carries no such attribute — it
+    /// is not a forwarder, and changing that is a benchmark question, not a
+    /// tidying one.
+    #[inline]
+    pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
+        self.writer.push(stamp, iso)
+    }
+
+    /// Release the claim now, instead of at the end of the enclosing scope.
+    ///
+    /// Identical to dropping the value — which is the point of naming it. A
+    /// stored writer's scope is often a whole process, so "drop it" is advice
+    /// with nowhere to land, and `let _ = writer;` is the spelling that
+    /// silently does *not* release.
+    pub fn release(self) {
+        drop(self);
     }
 }
 
@@ -1050,6 +1281,94 @@ impl Tree {
             fork_gen: self.fork_gen,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             _lease: lease,
+        })
+    }
+
+    /// Claim `child`'s edge, keeping the tree alive for as long as the writer
+    /// lives (`docs/decisions/0017`).
+    ///
+    /// The scoped [`Tree::claim`] is preferable where the claim's scope is
+    /// lexical — the borrow checker then enforces the claim's lifetime for free.
+    /// Use this where the writer is *stored*: a node that publishes for the life
+    /// of the process, or a binding whose handle type cannot carry a lifetime.
+    /// See [`OwnedWriter`] for the full argument, and `docs/API.md` §2.1 for the
+    /// rule this exists to satisfy.
+    ///
+    /// # Why `self: &Arc<Self>` and not `Arc<Tree>` by value
+    ///
+    /// By value would force a clone at every call site that already holds the
+    /// handle, and it reads as though the tree were consumed. This spelling
+    /// makes the refcount bump an implementation detail while keeping the real
+    /// requirement — that the tree is *already* shared — visible in the
+    /// signature. It also means the method is simply unavailable on a `Tree` a
+    /// caller owns outright, which is the correct answer: they should be using
+    /// [`Tree::claim`].
+    ///
+    /// # Cost
+    ///
+    /// Exactly [`Tree::claim`] plus one `Arc` strong-count increment, paid once
+    /// at claim time. Nothing is added to `push`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClaimApiError`], exactly as [`Tree::claim`] — this is that call with
+    /// the tree's own handle stapled to the result.
+    pub fn claim_owned(
+        self: &Arc<Tree>,
+        child: FrameId,
+        parent: FrameId,
+    ) -> Result<OwnedWriter, ClaimApiError> {
+        // The one `unsafe` in this crate (`docs/decisions/0017`). `deny` rather
+        // than `forbid` at the crate root exists so this `allow` is greppable;
+        // `rg 'allow\(unsafe_code\)' crates/tf_tree/src` must return this line
+        // and nothing else.
+        #[allow(unsafe_code)]
+        // SAFETY: the `Tree` lives inside the `Arc`'s heap allocation, and the
+        // `Arc::clone` stored beside the writer below is what keeps that
+        // allocation alive for as long as the writer exists. Three facts, and
+        // all three are needed:
+        //
+        // 1. An `Arc`'s contents never move — the `Tree` is *in* the allocation
+        //    the `Arc` points at, so a reference into it stays valid across
+        //    every clone, move and send of the handle. This is a shared
+        //    reference into a shared-only allocation: `Arc` hands out `&mut`
+        //    only through `get_mut`/`try_unwrap`, and fact 2 makes both fail.
+        // 2. The clone is a *strong* reference, so there is no safe way for a
+        //    caller to move the `Tree` out from under the writer, or to drop the
+        //    allocation while it lives.
+        // 3. `OwnedWriter`'s two fields drop writer-then-`Arc` (declaration
+        //    order), so the claim release lands while the arena is still mapped.
+        //
+        // **This extends exactly one reference — the borrow of the `Tree` — and
+        // nothing else.** An earlier revision transmuted a whole `EdgeWriter`
+        // instead: a composite holding a `Drop` type and an `Option<ClaimLease>`
+        // whose field set can grow, and reinterpreting a composite is precisely
+        // how the defect this record exists to delete happened
+        // (`transmute::<EdgeWriter, Publisher>`, which was not a lifetime
+        // extension at all). This form cannot express that mistake.
+        //
+        // **And the claim is taken *through* the extended reference**, three
+        // lines below, which makes the pairing unstateable rather than merely
+        // stated: the writer provably borrows the same `Tree` the `Arc::clone`
+        // refers to, so no caller — here or later — can pair a writer claimed
+        // from tree A with an `Arc` for tree B. That is why this is written
+        // inline rather than as a constructor taking a writer and an `Arc`
+        // separately, which would be a safe fn with an unchecked precondition.
+        let tree: &'static Tree = unsafe { &*Arc::as_ptr(self) };
+
+        // Deliberately the same `claim` every other caller uses, rather than a
+        // second copy of its body: the two-phase acquire above — CAS, hook
+        // window, lease, epoch re-check — is the part of this file most likely
+        // to be edited and least likely to survive being written twice.
+        let writer = tree.claim(child, parent)?;
+
+        Ok(OwnedWriter {
+            // Boxed for soundness — `OwnedWriter`'s *Why the writer is behind a
+            // `Box`* section, and `just miri` if it is ever un-boxed. The
+            // allocation is paid once, at claim time, on a path that already
+            // does two syscalls.
+            writer: Box::new(writer),
+            tree: Arc::clone(self),
         })
     }
 

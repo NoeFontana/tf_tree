@@ -29,18 +29,75 @@ test-rust:
 test-doc:
     cargo test --doc --workspace
 
+# **The `compile_fail` error-code pins, which stable rustdoc does not check.**
+#
+# Two doc tests assert that a type is *not* `Sync` — `tf_tree::OwnedWriter` and
+# `tf_tree_core::edge::Publisher` (`docs/PROJECT.md` §5 D7). A bare
+# `compile_fail` passes when the snippet fails to compile for **any** reason,
+# including the type having been renamed, moved or un-exported, so both are
+# written `compile_fail,E0277` to pin the unsatisfied-trait-bound failure that is
+# actually under test.
+#
+# **Stable rustdoc parses the code and then ignores it.** Measured, by mutating
+# both pins to `E0599`: `cargo test --doc -p tf_tree -p tf_tree_core` still
+# reports `ok` on stable, and `cargo +nightly test --doc` fails with *"Some
+# expected error codes were not found: \["E0599"\]"*. So `just test-doc` — the
+# `--workspace` line above, on stable — is not the gate for these, and without
+# this recipe nothing was: the nightly toolchain appears elsewhere only in
+# `just miri` and `just c-abi-check`, neither of which runs a doctest.
+#
+# Kept separate from `test-doc` rather than folded into it because it is the one
+# doctest command that requires nightly; a contributor without that toolchain
+# gets a clear failure from a named recipe instead of a mystery from the main
+# test gate. It is seconds long, and CI runs it on the nightly job.
+test-doc-error-codes:
+    cargo +nightly test --doc -p tf_tree -p tf_tree_core
+
 # Concurrency model checking under loom (reduced buffer capacities).
 loom:
     cargo xtask loom
 
-# Undefined-behavior checking under Miri (arena + core).
+# Undefined-behavior checking under Miri (arena + core + the facade).
 #
 # `miri-soft-float` is opt-in here and nowhere else: Miri cannot execute the x86
 # inline `sqrt` asm libm's default `arch` feature emits. Enabling it globally
 # would compile the shipped binaries and the benchmarks with soft floats too.
+#
+# **`tf_tree` is here because `docs/decisions/0017` put a lifetime extension in
+# it** (`OwnedWriter` — the facade's only `unsafe`, and once that record's steps
+# 6–7 delete `tf_tree_c`'s and `tf_tree_py`'s `extend_to_static` helpers, the
+# workspace's only one; those two steps are deferred, so both helpers are still
+# in the tree and neither is reachable from here). That record names `just miri`
+# as the verification for its step 2 — a gate the recipe could not perform while
+# the crate was excluded. It earned its place immediately: adding it caught a
+# real *"deallocating while item [SharedReadOnly …] is strongly protected"* in
+# the first version of that type, which no other gate in this repository could
+# see. See also the `c-abi-check` comment below on not leaving crates out.
+#
+# It gets its own line because it needs `-Zmiri-disable-isolation`: building a
+# `Tree` reads `/proc/sys/kernel/random/boot_id` and the process start time
+# (A7's reboot check), and Miri refuses filesystem access without it. Default
+# features only, deliberately — `shm` is `memfd_create` and `fcntl(F_OFD_*)`,
+# which Miri cannot execute at all (`0005` *What we commit to*), and the `fork`
+# half of the same protocol lives in `tf_tree_bench`'s `fork_child` binary.
+# Both are covered by `just shm-check` instead, which builds that binary and
+# runs the `fork` and `multiprocess` suites.
+#
+# **Two targets, not the whole crate, and this is a measurement rather than a
+# preference.** The facade's `unsafe` is one block, and `tests/owned_writer.rs`
+# is what exercises it; the crate's other targets are safe-code numerics whose
+# arena and engine work is already interpreted by the command above, against the
+# crates that own it. Under Miri they cost hours for no additional UB coverage:
+# `tests/batch.rs` had not finished after twenty minutes, and
+# `tests/construction.rs` — the cheapest of them — takes 160 s against this
+# pair's 2 s. **If a second `unsafe` ever lands in `tf_tree`, the target that
+# covers it joins this line**; that is the whole rule, and a `--test` list is
+# how it stays visible instead of silently drifting to nothing.
 miri:
     cargo +nightly miri test -p tf_tree_arena -p tf_tree_core \
         --features tf_tree_core/miri-soft-float
+    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p tf_tree \
+        --features tf_tree_core/miri-soft-float --lib --test owned_writer
 
 # **The C ABI under Miri and ASan — `docs/PHASE4.md` §6.1 and §7 gate 4.**
 #
@@ -903,6 +960,15 @@ shm-check:
     # that adds it.
     cargo nextest run -p tf_tree_arena --features shm
     cargo nextest run -p tf_tree --features shm --test frozen
+    # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
+    # paragraphs above being obeyed rather than restated.** Half of
+    # `tests/owned_writer.rs` is `#[cfg(all(feature = "shm", target_os =
+    # "linux"))]`, because a claim *lease* is an OFD byte in the rendezvous lock
+    # file and a heap tree has no lock file at all. Those two tests are the ones
+    # that reproduce the shipped `tf_tree_py` defect — a leaked lease, so the
+    # edge is permanently unclaimable and invisible to every reaper — and
+    # `--workspace` compiles them out. The other half runs under `just test`.
+    cargo nextest run -p tf_tree --features shm --test owned_writer
     # **`docs/PHASE2.md` §11.4's torture harness, gated on a branch.** The
     # nightly is `just shm-torture` (30 minutes); this is the seconds-long
     # self-test that proves the harness's detector still detects. A soak test

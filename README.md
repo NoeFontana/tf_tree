@@ -143,7 +143,7 @@ just build          # cargo build --workspace --all-targets
 just test           # nextest + doctests
 just lint           # fmt --check + clippy -D warnings + cargo-deny
 just loom           # concurrency model checking
-just miri           # UB checking (arena + core)
+just miri           # UB checking (arena + core + the facade's one unsafe)
 just bench          # benchmark suite + go/no-go gate
 just bench-report   # the PHASE5 §9 artifact -> report/{results.json,index.html}
 just bench-check    # the same artifact against the committed baseline

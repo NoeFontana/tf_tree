@@ -57,7 +57,7 @@ the reason several orderings look the way they do.
 crates/tf_tree_math/    no_std; SE(3)/SO(3), quats, dual quats; #![forbid(unsafe_code)]
 crates/tf_tree_arena/   no_std+alloc; pointer-free arena + layout math (unsafe allowed)
 crates/tf_tree_core/    no_std+alloc; the engine; unsafe only in buffer.rs / arena_view.rs
-crates/tf_tree/         std facade; #![forbid(unsafe_code)]
+crates/tf_tree/         std facade; #![deny(unsafe_code)] + one #[allow]: OwnedWriter (0017)
 crates/tf_tree_ipc/     std; rendezvous, lock file, fd passing (unsafe: one atfork shim)
 crates/tf_tree_py/      PyO3 bindings; binds the Rust core directly, not the C ABI
 crates/tf_tree_bench/   criterion + tf2 differential harness
@@ -92,21 +92,26 @@ records why (typed errors and zero-copy buffers do not survive a C boundary).
   the arena's raw memory (`tf_tree_arena`, `tf_tree_core::{buffer, arena_view}`),
   the OS (`tf_tree_ipc`), a foreign runtime (`tf_tree_py`), and a foreign caller
   (`tf_tree_c`). A fifth kind needs a decision record.
-  `#![forbid(unsafe_code)]` stays on `tf_tree_math`, `tf_tree` and `tf_tree_cli`
-  — **the facade does not move**, because its provable safety is what lets a
-  reader trust the C ABI's `unsafe` is confined to argument validation.
+  `#![forbid(unsafe_code)]` stays on `tf_tree_math` and `tf_tree_cli`.
   Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
   relies on; every crate with `unsafe` carries a module `// SAFETY:` block and
   `#![deny(unsafe_op_in_unsafe_fn)]`.
-  > **Pending, and not yet true of the code:**
-  > [`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md) is
-  > `ready` and moves `tf_tree` from `forbid` to `deny` with **one** documented
-  > exception — `OwnedWriter`, the single place a lifetime is extended in the
-  > workspace, replacing two hand-rolled `extend_to_static` helpers (one of whose
-  > ancestors leaked a claim lease and bypassed the fork guard). This is the
-  > first exercise of `0007`'s budget as a *criterion*. Until that record's step
-  > 1 lands, the line above is the rule; step 1 changes the code and this line
-  > together.
+  **`tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]`**, granted by
+  [`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md): the
+  lifetime extension inside `OwnedWriter`. It is the place a lifetime is extended
+  *in the facade*, and — **once `0017` steps 6–7 land** — the only one in the
+  workspace. **Those two steps are deliberately deferred and are not done**, so
+  today there are three: `OwnedWriter`, plus the hand-rolled
+  `tf_tree_c::publisher::extend_to_static` (`crates/tf_tree_c/src/publisher.rs`,
+  used by `tft_tree_claim` and by `bridge.rs`'s writer map) and `tf_tree_py`'s
+  copy (`crates/tf_tree_py/src/tree.rs`). `OwnedWriter` exists to delete those
+  two: an ancestor of one of them leaked a claim lease — so no
+  reaper would ever collect the edge — and bypassed the fork guard. That was the
+  first exercise of `0007`'s budget as a *criterion* rather than a crate list, and
+  the argument for it is that the facade is where an embedder looks. `deny` rather
+  than `forbid` so the exception is greppable: `rg 'allow\(unsafe_code\)'
+  crates/tf_tree/src` must return one line. **A second site there needs a new
+  record**, and so does a fifth kind of boundary.
 - **API shape is checked against [`docs/API.md`](./docs/API.md) §1 before it is
   written.** Six rules: three tiers always (R1); the hot tier never allocates,
   locks or converts (R2); integer-nanosecond stamps carrying a domain (R3);
@@ -132,11 +137,13 @@ Everything goes through `just`; CI mirrors it 1:1.
 | Recipe | What it does |
 | --- | --- |
 | `just build` | `cargo build --workspace --all-targets` |
-| `just test` | `cargo nextest run --workspace` + doctests |
+| `just test` | `cargo nextest run --workspace` + doctests. **`--workspace` builds default features**, so anything `#[cfg]`-ed on `shm` is compiled out of it — those targets are `just shm-check`'s, not this one's |
+| `just shm-check` | fmt/clippy/tests for everything behind the default-off `shm` feature, named target by target. A new `shm`-only test target belongs on that list in the commit that adds it |
+| `just test-doc-error-codes` | the `compile_fail,E0277` pins, on nightly — stable rustdoc ignores the error code, so `just test-doc` does not check them |
 | `just lint` | `cargo fmt --check`, `clippy -D warnings`, `cargo deny check` |
 | `just fmt` | auto-format + clippy `--fix` |
 | `just loom` | concurrency model checking (`cargo xtask loom`) |
-| `just miri` | UB checking on arena + core |
+| `just miri` | UB checking on arena, core, and the facade's one `unsafe` (`OwnedWriter`) |
 | `just msrv` | the declared MSRV floor: `--locked` build on it, plus every hand-written `rust-version` |
 | `just bench` | benchmark suite + go/no-go gate |
 | `just contended-scaling` / `scale-sweep` / `soak` | the exploratory performance suite: `docs/PHASE1.md` §11.2's writers-and-pinning row, the width/depth/ring/fan-out axes, and multi-minute drift. Exploratory by design — they emit JSON and do **not** feed `just bench-check` |
