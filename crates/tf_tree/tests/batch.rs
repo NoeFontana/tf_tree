@@ -374,9 +374,17 @@ fn quat_twist_rows_are_bit_identical_to_at_with_derivatives() {
 /// than the write did" — which is why the error's `need` is asserted and not
 /// merely that it failed.
 ///
-/// Mutant: `Layout::QuatTwist => 7` in `elems()` ⇒ `need` becomes 28 here, and
-/// `quat_twist_rows_are_bit_identical_to_at_with_derivatives` reads its rows at
-/// the wrong stride.
+/// Mutant, run: `Layout::QuatTwist => 7` in `elems()` ⇒ this test dies at
+/// `layout.rs`'s `write_quat_twist` with "index out of bounds: the len is 7 but
+/// the index is 7", **not** with a `BufferTooSmall` naming `need: 28`. That is
+/// the point rather than a wrinkle: 51 ≥ 28, so a shrunk `elems()` makes the
+/// size check *pass* and the write run off the end of the row it was sized for.
+/// `quat_twist_rows_are_bit_identical_to_at_with_derivatives` dies the same way.
+///
+/// So the `need` assertion below is not what kills this mutant — the panic is.
+/// It is here for the mutation in the other direction (`=> 26`, say), where the
+/// check would refuse a buffer that is in fact long enough and no bounds check
+/// would ever fire.
 #[test]
 fn a_short_quat_twist_buffer_is_refused_before_anything_is_written() {
     use tf_tree::{Layout, LookupError};

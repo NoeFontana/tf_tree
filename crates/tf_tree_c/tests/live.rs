@@ -864,11 +864,20 @@ fn a_twist_batch_that_fails_part_way_reports_the_element_and_keeps_the_prefix() 
 /// from a `char` buffer, a packed struct, or an arena allocator.
 ///
 /// Mutant, run: delete the `align_offset` test from `twist_batch` so this call
-/// takes the packed arm ⇒ `just c-abi-check`'s Miri pass over this file fails
-/// with "Undefined Behavior: constructing invalid value of type `&mut [f64]`:
-/// encountered an unaligned reference (required 8 byte alignment but found 4)".
-/// It **passes** under a plain `cargo nextest run` on x86-64, which is exactly
-/// why the claim is stated against Miri and not against the values.
+/// takes the packed arm. Two distinct failures, and both were observed:
+///
+/// * Under `just c-abi-check`'s Miri pass — "Undefined Behavior: constructing
+///   invalid value of type `&mut [f64]`: encountered an unaligned reference
+///   (required 8 byte alignment but found 4)".
+/// * Under a plain `cargo nextest run` (the debug profile `just test` uses) —
+///   `SIGABRT`, "unsafe precondition(s) violated: `slice::from_raw_parts_mut`
+///   requires the pointer to be aligned and non-null". The standard library's
+///   own debug-assertion catches it before Miri is needed.
+///
+/// It survives **only** under `--release`, where `debug_assertions` is off and
+/// the UB goes unobserved on a target whose loads happen to work. That is the
+/// configuration Miri exists for here, and it is why the claim is stated against
+/// the arm that runs rather than against the values written.
 #[test]
 fn an_unaligned_packed_twist_batch_is_written_correctly() {
     let t = Tree::new();
