@@ -132,8 +132,8 @@ does. Folding them would mean making `Never` slow on an absent arena, repealing
 the fail-fast property a supervised deployment depends on, or returning a `Tree`
 the caller may not use until a second wait finished. Two absences, two names.
 
-**The predicate is `ArenaView::find_frame`, and `await_frames` refuses a writable
-tree.** `Tree::frame` is the wrong predicate in both modes, for opposite reasons:
+**The predicate is `ArenaView::find_frame`, and `await_frames` refuses two
+handles outright.** `Tree::frame` is the wrong predicate in both modes, for opposite reasons:
 on a read-only arena it answers `FrameError::ReadOnly` for an absent name, and on
 a writable one it **interns and succeeds immediately**
 (`crates/tf_tree/src/tree.rs:1166-1181`) — so a wait built on it would return
@@ -141,8 +141,18 @@ instantly and wrongly on exactly the tree a publisher holds. `find_frame` never
 inserts. And because "does this name exist" has two defensible answers on a
 writable tree, `await_frames` refuses one rather than picking silently — §3's
 rule about one diagnostic with two meanings — and points a writable caller at
-`Tree::frame`, which cannot fail for absence. `#[non_exhaustive]` keeps the
-relaxation available later; the refusal is the reversible direction.
+`Tree::frame`, which cannot fail for absence. **A frozen `.tft` is refused for
+the sibling reason**: it is read-only *and* writer-free, so the poll could only
+ever run the caller's whole budget and report a timeout for something that was
+never coming. Two statically-futile handles, two distinct answers
+(`WritableTree`, `FrozenTree`). `#[non_exhaustive]` keeps a later relaxation
+available; refusal is the reversible direction.
+
+The backoff pair is defined once **in the facade**, for both of its waits. An
+earlier draft of this section said it was "the rendezvous' own" and widened
+`tf_tree_ipc`'s constants to `pub` to share them — that coupling is decorative,
+since the two are nested loops over different work, and it bought a crate's
+public API for two numbers.
 
 Both are convenience on the facade over a poll loop; **no arena primitive, no
 notification mechanism, no futex** — `0018`'s argument applies unchanged and with

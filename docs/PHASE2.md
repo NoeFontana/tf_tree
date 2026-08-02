@@ -337,19 +337,34 @@ Falling back to `ROS_DOMAIN_ID` is deliberate: a ROS 2 system already has its is
 The zero-argument case must work:
 
 ```rust
-let tree = tf_tree::open()?;                 // join or create, defaults throughout
+// A consumer. The defaults are the consumer: read-only, and `CreatePolicy::Never`.
+let tree = tf_tree::open()?;                 // join, or ArenaAbsent
 let tree = tf_tree::open_named("robot")?;
 
+// A consumer that may start before the publisher's process does.
 let tree = tf_tree::Open::new()
     .domain(7)
     .name("robot")
-    .mode(AttachMode::ReadOnly)              // default for consumers (§8)
-    .layout_if_creating(layout)              // used only if we turn out to be the creator
+    .await_open(Duration::from_secs(5))?;    // 0019 §2b
+
+// A creator. Read-write is required: a read-only attach *cannot* create.
+let tree = tf_tree::Open::new()
+    .domain(7)
+    .name("robot")
+    .mode(AttachMode::ReadWrite)
     .create(CreatePolicy::IfAbsent)          // IfAbsent | Never | Always
+    .layout_if_creating(layout)              // sizes the arena if we turn out to be the creator
     .open()?;
 ```
 
-`CreatePolicy::Never` is for consumers that should fail fast rather than accidentally create an empty arena when the estimator has not started — worth recommending for anything running in a supervised deployment.
+> **Amended by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2a.**
+> `Open::new()`'s `create` default was `IfAbsent`; it is **`Never`**, so the builder's own defaults are
+> the consumer. And `AttachMode::ReadOnly` with any creating policy is now
+> `OpenError::ReadOnlyCannotCreate` rather than a request that could only ever produce an arena its
+> creator cannot write. The sample above used to show exactly that combination as the ordinary consumer
+> spelling.
+
+`CreatePolicy::Never` is what a consumer gets without asking. It is the default because a consumer that creates an arena the estimator has not populated looks healthy and finds nothing — worth stating explicitly in a supervised deployment even so.
 
 ### 3.3 The lock file — NORMATIVE
 
@@ -748,10 +763,11 @@ Consequences, which must be enforced by types where possible and by errors where
 > section was really for is the last paragraph below: pre-declaration, so a
 > consumer can attach and plan before any publisher runs. `0019` §2 fixes that
 > without a daemon and without a config file — a read-only attach implies
-> `CreatePolicy::Never` (`Open::new()` defaults to read-only *and*
-> create-if-absent, a configuration no correct program wants — it fails
-> `NoLayoutToCreate` today rather than creating an empty arena, so what §2a
-> removes is a latent class), a consumer waits for the arena with
+> `CreatePolicy::Never` (`Open::new()` *defaulted* to read-only **and**
+> create-if-absent, a configuration no correct program wants — it failed
+> `NoLayoutToCreate` rather than creating an empty arena, so what §2a removed
+> was a latent class; the default is now `Never`), a consumer waits for the
+> arena with
 > `Open::await_open` and for topology with `Tree::await_frames`, and
 > `frame_headroom`/`edge_headroom` cover frames that arrive later.
 >
