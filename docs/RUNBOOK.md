@@ -153,10 +153,15 @@ its clock can step. There, `TFT018` alone is the answer and the publisher is the
 place to look.
 
 The fix is a domain that cannot step. Anything published **at rate** should use a
-steady or PTP-disciplined domain rather than the system wall clock; `Domain` is
-open, so a driver with a PTP clock declares its own unit struct and `TAG`. There
-is no built-in steady domain yet. Reserve `SystemDomain` for stamps that
-genuinely have to be comparable to wall-clock time outside the process.
+steady or PTP-disciplined domain rather than the system wall clock: declare the
+edge with `SteadyDomain` (tag 3), or — `Domain` being an open trait — with your
+own unit struct and `TAG` if the clock is PTP-disciplined and you want to say so.
+Reserve `SystemDomain` for stamps that genuinely have to be comparable to
+wall-clock time outside the process.
+
+`TFT019` still fires only on tag 0 and so still skips a `SteadyDomain` edge —
+correctly, because a steady clock cannot step, so a run of rejections there *is*
+a publisher fault and `TFT018` alone is the honest answer.
 
 Sim time is a different problem — a `/clock` reset from a bag loop or a sim
 restart — and is handled by the bridge's authoritative jump signal, not by this

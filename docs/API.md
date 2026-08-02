@@ -165,6 +165,83 @@ is a call per step.
    ABI. Today the C ABI is measured against native and the native *embedding*
    path is not measured at all.
 
+> **Amendment — item 1 is done and measured, items 2 and 3 are not, and the
+> paragraph above states the wrong mechanism.**
+>
+> `#[inline]` is on `Plan::at`, on the scalar fold `fold_at`, and on the three
+> `Guard` sampling entry points (`sample`, `sample_hinted`, `sample_from`) —
+> **five placements, not the six this amendment first claimed.** The `Iso3`
+> operators **already carried it** — every method on `Iso3`, `Vec3` and `Quat`,
+> and `impl Mul` — so `tf_tree_math` was not touched. Deliberately *not* marked:
+> `fold_at_with_derivatives`, `fold_latest`, `fold_latest_common`. Each is large,
+> none is on the measured hot path, and `#[inline]` on a large body grows the
+> caller at every site.
+>
+> **`fold_at_cursors` was the sixth, and it is now the counter-example that
+> earns the rest.** It is the *batch* fold: reachable from `at_many`,
+> `at_many_into`, `at_many_into_f32` and `fold_batch`, and not from `Plan::at`,
+> so the probe below never executed it and it was marked by symmetry with
+> `fold_at`. Extending the probe with an `#[inline(never)]` caller doing
+> `at_many_into(.., Layout::Mat4, ..)` over 1024 monotone stamps at depth 3, best
+> of five, and toggling that one attribute:
+>
+> | downstream profile | with `#[inline]` | without |
+> | --- | --- | --- |
+> | `lto = false`, `codegen-units = 16` | 328 ns/elem | **285 ns/elem** |
+> | `lto = "thin"`, `codegen-units = 1` | 285 ns/elem | **278 ns/elem** |
+>
+> A pessimization in both, so it was removed. `objdump` says why: at the default
+> profile the body is ~1.9 kB and LLVM declines to inline it at either
+> `fold_batch` call site *with or without* the hint — both builds leave a real
+> call — so the attribute only duplicated a 1.9 kB function into the embedder's
+> object. The scalar tables below are unaffected: `Plan::at` cannot reach it, and
+> the probe's `caller_scalar` is byte-identical across the two builds.
+>
+> **Measured**, because a change on the hot path justified by a mechanism nobody
+> checked is worth less than silence. Method: an external crate depending on
+> `tf_tree` by path, one `#[inline(never)]` function doing a depth-3
+> interpolating lookup, 20 M iterations, best of five, x86-64.
+>
+> | downstream profile | before | after |
+> | --- | --- | --- |
+> | `lto = false`, `codegen-units = 16` (cargo's `--release` default) | 313 ns | 256 ns |
+> | `lto = "thin"`, `codegen-units = 1` (this workspace's own) | 217 ns | 207 ns |
+>
+> **The sentence above this amendment — "Rust does not inline across crates
+> without `#[inline]` or LTO, so without one of them the fold is a call per
+> step" — is not what happens.** `Plan::at` is *generic*, so its MIR crossed the
+> boundary regardless and the downstream caller was already inlining it.
+> `objdump` of that caller, default profile:
+>
+> | attribute placed on | caller `.text` | calls left in the caller |
+> | --- | --- | --- |
+> | nothing (the state before) | 106 B | 1 → `Plan::fold_at` |
+> | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
+> | `fold_at` alone | 62 B | 1 → `Plan::at` |
+> | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
+> | all five on this path, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+>
+> So there was exactly **one** cross-crate call, not one per step, and what the
+> attribute changes is LLVM's `inlinehint` on the *non-generic* links. `fold_at`
+> removes that call; `Plan::at`'s hint then stops the cost model halting at a
+> now-larger `at`; `Guard::sample*` removes the last one. "Marking fewer leaves
+> a call in the middle" survives as a claim — rows three and four are it — but
+> it is now a measurement rather than an assertion.
+>
+> **The price is caller code size: 106 B → 1565 B, ~15×, at every embedder call
+> site.** That is the trade this section should have named and did not — and it
+> is the *scalar* caller's price. The batch caller's was named nowhere until
+> `fold_at_cursors` was measured above, which is the reason it went the other way.
+>
+> **`lto = "thin"` does not subsume the hint**, which corrects the other thing
+> this amendment first claimed. This workspace's own profile still moves ~4.5%,
+> so the benchmark gate is *not* indifferent to the change. `just bench-ab` is
+> workspace-wide and was still not run.
+>
+> Item 2 (the `lto`/`codegen-units` guidance in the crate docs) and item 3 (the
+> gated cross-crate benchmark row) are untouched. The table above is item 3 done
+> once by hand; item 3 is doing it continuously.
+
 ### 2.4 Two things that are not going to exist
 
 Recorded here so they do not arrive later by adjacency.
@@ -187,21 +264,58 @@ declares `struct PtpDomain;` and picks a free `TAG`. If the built-in set is
 closed, everything collapses to `SystemDomain` and `TimeDomainMismatch` never
 fires for the people who need it most. See §5.2.
 
-**The built-in set today is two: `SystemDomain` (tag 0) and `SensorDomain`
-(tag 1).** `SimTime` and `SteadyDomain` are named by `PHASE4.md` §5.5 and by
-[`PHASE7.md`](./PHASE7.md) §4 J9 and **do not exist** — the bridge carries a
-domain as a bare `u8` tag (`TopologyConfig::default_domain`), so "the bridge tags
-edges `SimTime`" is today a statement about a number an operator chooses.
+**The built-in set is four, and tags `0`–`3` are reserved for it:**
+`SystemDomain` (0), `SensorDomain` (1), `SimDomain` (2), `SteadyDomain` (3). A
+user-declared domain picks a free tag from `4` upwards. All four live in
+`tf_tree_core::plan` and are re-exported through the `tf_tree` facade; each is a
+unit struct and a `TAG` and nothing else.
 
-That is this section's own warning arriving early rather than a contradiction of
-it: two built-ins is close enough to a closed set that a sim deployment and a
-steady-clock driver both end up on tag 0, which is exactly the collapse. The
-trait being open is what makes the fix cheap — a `SimTime` and a `SteadyDomain`
-beside the existing two, each a unit struct and a `TAG` — and until they exist,
-**no document may describe them as available.** J9 is a proposal in a gated
-table and may name them; §5.3's `doctor` check may not depend on them, and does
-not (`PHASE5.md` §6's `TFT019` amendment keys on the tag and discloses what it
-cannot yet distinguish).
+**Why four, when it was two — the argument is retained because it is still the
+reason the last two exist.** Two built-ins is close enough to a closed set that
+a sim deployment and a steady-clock driver both end up on tag 0, since both are
+"not a sensor"; `TimeDomainMismatch` then never fires for the two populations
+most exposed to the bug it exists to catch. That is this section's own opening
+warning arriving as a concrete cost. The trait being open is what made the fix
+cheap — two unit structs beside the existing two — but it was never a substitute
+for making it, and this is the argument to reach for the next time a domain is
+proposed.
+
+**A tag is a permanent choice.** It is written into `EdgeRecord::domain` at
+declaration time and read by every consumer, every diagnostic and every recording
+already on disk, so re-numbering one silently re-interprets all of them — §5.2's
+"unfixable after the fact" applied to the numbering rather than to the choice.
+The `Domain` trait's own documentation says so, and a test pins the four values
+rather than leaving them to convention.
+
+**`EdgeRecord::domain` is an existing `u8` field**, so declaring the two later
+types moved neither `FORMAT_VERSION` nor `layout_hash`.
+
+**What is settled, and what is not.** The naming and numbering are settled:
+`sim` is 2, `steady` is 3, permanently — the prerequisite
+[`PHASE7.md`](./PHASE7.md) §4 J9 asks for before its read side can be specified.
+What is **not** done is the write side *applying* it. `tf_tree_bridge`'s
+`TopologyConfig::default_domain` is still a bare `u8` and its `parse_domain`
+still maps only `"system"` and `"sensor"`, so `PHASE4.md` §5.5's "the bridge tags
+every edge it declares as `SimDomain`" is still a statement about a number an
+operator writes: a deployment that wants tag 2 today writes `2`. Rewiring
+`parse_domain` is a separate change and is the one that makes §5.5 true as
+written.
+
+§5.3's `doctor` check does not depend on the two new types and still does not.
+`PHASE5.md` §6's `TFT019` keys on the tag and fires only on tag 0, which is now
+*correct rather than merely conservative*: a `SteadyDomain` edge cannot have
+stepped, so a run of `NonMonotonicStamp` rejections there is a real publisher
+defect, and reporting it as a clock step would be the fabricated all-clear that
+amendment refuses. Teaching `TFT019` that tag 3 is provably steady is a
+refinement it can now make and has not yet made.
+
+> **Naming note, because two documents will send a reader looking for the wrong
+> identifier.** `PHASE4.md` §5.5 and `PHASE7.md` §4 J9 named these
+> `SimTime`/`SystemTime` before either existed. `SystemTime` has never existed
+> under that name, so that pairing was never this code's convention; the set is
+> uniformly `*Domain`, and both documents now say so. Where those documents
+> discuss ROS's `use_sim_time` — sim time the *concept*, not our type — the prose
+> is unchanged.
 
 ### 2.6 Stability tiering — deferred, and the deferral is recorded
 
@@ -365,6 +479,42 @@ examples. It already carries that warning in `tf_tree_py`; what it does not yet
 have is an exact sibling to be pointed at, which is what makes the warning
 actionable rather than merely true.
 
+> **Amendment — the Rust half ships, and it settles two shapes the other
+> surfaces have to mirror.**
+>
+> ```rust
+> Stamp::<D>::from_parts(sec: i64, nanos: u32)          -> Option<Stamp<D>>
+> Stamp::<D>::from_timespec(tv_sec: i64, tv_nsec: i64)  -> Option<Stamp<D>>
+> ```
+>
+> **`Option`, because "total" and "exact" are in tension with `Stamp` being a
+> bare `i64`.** Two inputs have no correct answer — a `nanos` outside
+> `[0, 1e9)`, and a sum outside `i64` — and both of the alternatives are the
+> silent wrongness this whole section exists to remove: normalising an
+> out-of-range nanosecond field converts a malformed message into a plausible
+> stamp, and wrapping the sum hands back a stamp on the other side of the epoch
+> that compares, interpolates and prints perfectly. `None` does not distinguish
+> them, because a caller rejects the message either way and a `Copy`,
+> `String`-free error carrying the distinction would be a new type for a fact no
+> consumer branches on (D11).
+>
+> Note the sum is what is range-checked, not the product: a staged
+> `checked_mul` then `checked_add` refuses a one-second band of *representable*
+> stamps at the negative end.
+>
+> **`from_timespec` takes the two fields, not a struct.** `tf_tree_core`'s
+> dependency budget is `libm` + `bytemuck` + `blake3`, so there is no
+> `libc::timespec` to accept and none may be added; declaring our own `#[repr(C)]`
+> copy would be worse, because it is a type the caller then has to convert
+> *into* — the conversion the method exists to remove. `time_t` and `long` are
+> both `i64` on a 64-bit target, so the call site is
+> `Stamp::from_timespec(ts.tv_sec, ts.tv_nsec)` with no cast. It adds exactly one
+> refusal over `from_parts`: a negative `tv_nsec`, which POSIX permits only in a
+> *relative* interval, so it means an interval is being converted as an instant.
+>
+> The Python `from_ros` and the C entry point are not built by this and inherit
+> the shape: exact, total, no float, and a refusal rather than a normalisation.
+
 ### 5.2 The epoch is the hard part, and it is what `Domain` is for
 
 Nanoseconds since *what* — Unix epoch, boot, TAI, a sensor's free-running
@@ -381,10 +531,11 @@ than a number (D19; `PROJECT.md` §4). Getting the domain wrong is therefore
 unfixable after the fact, and that asymmetry is why the domain is a **type** (D9)
 and not a convention.
 
-`PHASE4.md` §5.5 already makes the ingest bridge tag edges `SimTime` or
-`SystemTime` from `use_sim_time`, and makes a domain mismatch a **startup**
-failure rather than a first-message one — at the level of a `u8` tag, since
-per §2.5 neither type exists yet. **The read side is not yet specified,
+`PHASE4.md` §5.5 already makes the ingest bridge tag edges `SimDomain` or
+`SystemDomain` from `use_sim_time`, and makes a domain mismatch a **startup**
+failure rather than a first-message one. Both types now exist (§2.5); what the
+bridge still carries is a bare `u8` tag, so §5.5 is true of the *number* and not
+yet of the name. **The read side is not yet specified,
 and [`PHASE7.md`](./PHASE7.md) §4 J9 specifies it**: a `Buffer` derives its query
 domain from the `rcl_clock_type_t` of the clock it was constructed with, so a
 node mixing `/clock`-driven sim time with a driver's steady time gets
@@ -411,8 +562,9 @@ tf_tree defect to whoever meets it at 3 a.m.
    clock today is `SystemDomain`; the check keys on the tag and states what it
    cannot yet tell apart rather than inferring it.
 2. A documentation line recommending a steady or PTP domain for anything
-   published at rate — which is also the argument for §2.5's missing built-ins,
-   since today there is no steady domain to recommend by name.
+   published at rate — which was also the argument for §2.5's then-missing
+   built-ins, because there was no steady domain to recommend by name. There is
+   now: `SteadyDomain`, tag 3.
 
 The online bridge's much harder version of this problem — distinguishing a
 `/clock` reset from a publisher's `transform_tolerance` — is settled by

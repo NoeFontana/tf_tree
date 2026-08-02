@@ -1038,29 +1038,41 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > reported as a clock step: the publisher is not at fault and restarting it will
 > not help. Where `TFT018` says *what*, `TFT019` says *who*.
 >
-> **Which tags are wall clocks is a shorter list than it should be, and the check
-> says so.** The built-in `Domain` set is two — `SystemDomain` (tag 0) and
-> `SensorDomain` (tag 1) — and `Domain` is an open trait, so a user-declared tag
-> carries no way to state "this clock can step". `TFT019` therefore fires only on
-> **tag 0**, and on any other tag it **skips with a reason naming the tag**,
-> exactly as `TFT007` skips an undeclared rate rather than comparing against
-> zero. Guessing that an unknown tag is steady would fabricate an all-clear on
-> the one edge most likely to be a PTP driver that lost lock.
+> **`TFT019` fires only on tag 0**, and on any other tag it **skips with a
+> reason naming the tag**, exactly as `TFT007` skips an undeclared rate rather
+> than comparing against zero. `Domain` is an open trait, so a user-declared tag
+> carries no way to state "this clock can step", and guessing that an unknown tag
+> is steady would fabricate an all-clear on the one edge most likely to be a PTP
+> driver that lost lock.
 >
-> This is [`API.md`](./API.md) §2.5's warning arriving as a concrete cost: with
-> only two built-ins, a sim deployment and a steady-clock driver both land on
-> tag 0 and both get told their clock stepped. Adding `SimTime` and
-> `SteadyDomain` — each a unit struct and a `TAG` — is what makes the check
-> precise, and it is *not* done here, because `PHASE4.md` §5.5 names those
-> domains for the bridge and the naming should be decided once, in one place,
-> with the bridge's `u8` tag mapping settled at the same time.
+> When this was written the built-in set was two — `SystemDomain` (tag 0) and
+> `SensorDomain` (tag 1) — and that made the skip merely *conservative*: with
+> only two built-ins a sim deployment and a steady-clock driver both land on tag
+> 0 and both get told their clock stepped, which is [`API.md`](./API.md) §2.5's
+> warning arriving as a concrete cost.
+>
+> > **Amendment — the built-ins are now four, and the skip is correct rather
+> > than conservative.** `SimDomain` (tag 2) and `SteadyDomain` (tag 3) exist in
+> > `tf_tree_core::plan` (`API.md` §2.5). `TFT019` is **unchanged** and still
+> > fires only on tag 0, and that is now the right answer rather than the safe
+> > one: a `SteadyDomain` edge cannot have stepped, so a run of rejections there
+> > is a real publisher defect and reporting it as a clock step would be exactly
+> > the fabricated all-clear this check refuses. Teaching `TFT019` that tag 3 is
+> > *provably* steady — skipping with "steady domain, this is a real fault" rather
+> > than with "unknown tag" — is a refinement it can now make and has not made.
+> >
+> > The tag mapping is settled (`sim` 2, `steady` 3, permanently). The bridge's
+> > write side is **not** rewired: `tf_tree_bridge::config::parse_domain` still
+> > maps only `"system"` and `"sensor"`, so an operator who wants tag 2 today
+> > writes the number. Nothing in this check depends on that.
 >
 > Three things it deliberately does not do:
 >
-> * **It does not fire on a steady or sim tag** — see above; today it cannot
->   identify one, and it skips rather than guesses. Once those domains exist, a
->   steady edge cannot have stepped, so a run of rejections there is a real
->   publisher fault and `TFT018` alone is the honest answer. Sim time has its
+> * **It does not fire on a steady or sim tag** — see above; it skips rather
+>   than guesses, and since the amendment those two tags exist, so the skip is
+>   right for a stated reason: a steady edge cannot have stepped, so a run of
+>   rejections there is a real publisher fault and `TFT018` alone is the honest
+>   answer. Sim time has its
 >   own, much harder version of this question — a `/clock` reset against a
 >   publisher's `transform_tolerance` — and it is settled by
 >   [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)
@@ -1082,11 +1094,12 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > is additive, and none is ever recycled or given a second meaning.
 >
 > **Paired with a documentation line, not just a check:** anything published at
-> rate should declare a steady or PTP domain rather than the system wall clock.
-> `Domain` is an open trait, so a driver with a PTP clock can declare one today
-> even though no built-in steady domain exists yet (`API.md` §2.5). The check
-> tells an operator what happened; the doc line is how the next robot avoids it.
-> `RUNBOOK.md`'s `NonMonotonicStamp` section carries both.
+> rate should declare a steady or PTP domain rather than the system wall clock —
+> `SteadyDomain` (tag 3) since the amendment above, or, `Domain` being an open
+> trait, a driver's own unit struct and `TAG` for a PTP-disciplined clock
+> (`API.md` §2.5). The check tells an operator what happened; the doc line is how
+> the next robot avoids it. `RUNBOOK.md`'s `NonMonotonicStamp` section carries
+> both.
 
 ---
 

@@ -19,7 +19,7 @@ use crate::edge::{claim, EdgeRecord, Publisher};
 use crate::error::{ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError};
 use crate::layout::Layout;
 use crate::participant::ParticipantRecord;
-use crate::plan::{Guard, Query, Stamp, SystemDomain};
+use crate::plan::{Guard, Query, SensorDomain, Stamp, SystemDomain};
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU64};
 
@@ -484,6 +484,16 @@ fn a_poisoned_guard_refuses_every_evaluation() {
     // returns `Ok(None)` — a fork-poisoned child would be told the path is
     // answerable everywhere.
     assert_eq!(plan.span(&g), Err(LookupError::ChildDetached));
+    // The same argument, one step further: `slowest_nominal_rate_mhz` is the
+    // other half of `docs/decisions/0018`'s wait, and a waiter that missed the
+    // poison would sleep on a period it read out of an arena it can no longer
+    // reach, until its deadline, against a plan that can never be satisfied.
+    // Mutant: drop `check_generation` from `Plan::slowest_nominal_rate_mhz` and
+    // this returns `Ok(None)`.
+    assert_eq!(
+        plan.slowest_nominal_rate_mhz(&g),
+        Err(LookupError::ChildDetached)
+    );
     assert_eq!(
         plan.query(&g, Query::At(t)),
         Err(LookupError::ChildDetached)
@@ -1556,4 +1566,606 @@ fn plan_derived_fields_match_a_fresh_scan() {
     );
     let none = crate::plan::compile(&view.topology(), meta(stat), x, z).unwrap();
     assert_eq!(none.derived_vs_scan_for_test().0, (false, EdgeId(0)));
+}
+
+// ---- typed domains, exact stamps, and the declared publish rate ----------
+
+/// A five-frame chain `f0 -> f1 -> f2 -> f3 -> f4` over four dynamic edges,
+/// where edge `i` declares `rates[i]` milli-hertz (`0` = undeclared).
+///
+/// Edge index `0` is the topology block's "no edge" sentinel (see
+/// `compile_rejects_the_no_edge_sentinel`), so the chain occupies edges 1–4 and
+/// slot 0 is left with capacity 0. `stamp_off`/`pose_off` are assigned
+/// cumulatively, which is what `TreeBuilder` does in the facade and what
+/// `ArenaView::ring_of` bounds-checks against.
+///
+/// **The rings come back empty**, and the rate tests rely on that: a *declared*
+/// rate is a property of the topology, and reading it must not depend on a
+/// stream existing. A test that needs the fold to actually answer calls
+/// [`seed_rate_chain`] on the view afterwards.
+fn rate_chain_arena(rates: [u32; 4]) -> HeapArena {
+    let layout = ArenaLayout::new(8, 5, alloc::vec![0, 4, 4, 4, 4]).unwrap();
+    let mut arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
+    {
+        let mut builder = ArenaBuilder::new(&mut arena);
+        let mut frames = Vec::new();
+        for name in ["f0", "f1", "f2", "f3", "f4"] {
+            frames.push(builder.view().intern(name).unwrap());
+        }
+        for (i, &mhz) in rates.iter().enumerate() {
+            let edge = EdgeId(i as u32 + 1);
+            let mut record = EdgeRecord::dynamic(
+                frames[i].get(),
+                frames[i + 1].get(),
+                4,
+                i as u32 * 4,
+                i as u32 * 4,
+                0,
+                0,
+            );
+            record.nominal_rate_mhz = mhz;
+            builder.declare_edge(edge, record).unwrap();
+            builder
+                .view()
+                .topology()
+                .set_parent(frames[i + 1], frames[i].get(), edge.0)
+                .unwrap();
+        }
+    }
+    arena
+}
+
+/// [`rate_chain_arena`] with the edge table one slot shorter: the same five
+/// frames and the same four parent links, but `max_edges = 4`, so `EdgeId(4)` is
+/// **out of range** and `ArenaView::edge` answers `None` for it.
+///
+/// The point is the *generation*. `declare_edge` writes a table slot and does
+/// not touch the topology word, so an arena built from the same five `intern`s
+/// and the same four `set_parent`s carries the same generation as
+/// `rate_chain_arena` regardless of how many edge records it holds. That is what
+/// lets a plan compiled against the full arena get past `check_generation` here
+/// and reach the `UnknownEdge` arm, which is otherwise unreachable.
+fn short_edge_table_arena(rates: [u32; 3]) -> HeapArena {
+    let layout = ArenaLayout::new(8, 4, alloc::vec![0, 4, 4, 4]).unwrap();
+    let mut arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
+    {
+        let mut builder = ArenaBuilder::new(&mut arena);
+        let mut frames = Vec::new();
+        for name in ["f0", "f1", "f2", "f3", "f4"] {
+            frames.push(builder.view().intern(name).unwrap());
+        }
+        for i in 0..4usize {
+            let edge = EdgeId(i as u32 + 1);
+            if let Some(&mhz) = rates.get(i) {
+                let mut record = EdgeRecord::dynamic(
+                    frames[i].get(),
+                    frames[i + 1].get(),
+                    4,
+                    i as u32 * 4,
+                    i as u32 * 4,
+                    0,
+                    0,
+                );
+                record.nominal_rate_mhz = mhz;
+                builder.declare_edge(edge, record).unwrap();
+            }
+            builder
+                .view()
+                .topology()
+                .set_parent(frames[i + 1], frames[i].get(), edge.0)
+                .unwrap();
+        }
+    }
+    arena
+}
+
+/// Publish `pose(i)` into edge `i` of a [`rate_chain_arena`], twice: at stamp
+/// `0` and at stamp `1000`. Returns the pose a full `f0 -> f4` lookup anywhere
+/// in that window must produce.
+///
+/// Two samples carrying the *same* pose, so interpolation across the segment
+/// reproduces it exactly and the composed answer is
+/// `pose(1)·pose(2)·pose(3)·pose(4)` with no float slack to allow for. One
+/// sample would leave the fold with no segment and `ExtrapPolicy::Error`.
+///
+/// The `Publisher` is dropped at the end of each iteration, which releases the
+/// claim; the samples it wrote stay in the ring, which is all a reader needs.
+fn seed_rate_chain(view: &ArenaView<'_>) -> Iso3 {
+    let mut expected = Iso3::IDENTITY;
+    for i in 1..=4u32 {
+        let edge = EdgeId(i);
+        let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+        let pubr = Publisher::new(
+            view.ring(edge).unwrap(),
+            view.claim(edge).unwrap(),
+            epoch,
+            owner,
+        );
+        let p = pose(u64::from(i));
+        pubr.push(0, &p).unwrap();
+        pubr.push(1000, &p).unwrap();
+        expected = expected * p;
+    }
+    expected
+}
+
+/// Compile `lookup(target, source)` over an arena built by [`rate_chain_arena`].
+fn compile_chain(
+    view: &ArenaView<'_>,
+    target: crate::error::FrameId,
+    source: crate::error::FrameId,
+) -> crate::plan::Plan {
+    crate::plan::compile(
+        &view.topology(),
+        |eid| {
+            view.edge(eid).map(|e| crate::plan::EdgeMeta {
+                kind: crate::edge::EdgeKind::from_u8(e.kind),
+                domain: e.domain,
+                static_pose: Iso3::from_bits(&e.static_pose),
+            })
+        },
+        target,
+        source,
+    )
+    .unwrap()
+}
+
+/// **The four built-in domain tags are `0`–`3`, in that order.**
+///
+/// A tag is written into `EdgeRecord::domain` at declaration time and read by
+/// every consumer, every recording and every diagnostic, so re-numbering one
+/// silently re-interprets arenas already on disk — `docs/API.md` §5.2's
+/// "unfixable after the fact" applied to the numbering rather than to the
+/// choice. This test exists to make that re-numbering a red build.
+///
+/// **Distinctness is a separate test on purpose.** These four `assert_eq!`s
+/// imply it, so a distinctness loop placed after them could never be reached in
+/// a failing state — it would be a dead assertion carrying a written argument
+/// for why it is not dead, which is what this test used to hold. What
+/// distinctness actually constrains is the *set*, and that survives a
+/// deliberate re-numbering of these literals, so it now lives in
+/// [`the_built_in_domain_tags_are_pairwise_distinct`], where it is the first
+/// thing that runs.
+///
+/// Mutant: `SimDomain::TAG = 0` (the value it effectively had before it was a
+/// type). Applied: `assert_eq!(SimDomain::TAG, 2)` fails, `left: 0, right: 2`.
+#[test]
+fn the_built_in_domain_tags_are_fixed() {
+    use crate::plan::{Domain, SensorDomain, SimDomain, SteadyDomain, SystemDomain};
+
+    assert_eq!(SystemDomain::TAG, 0, "the default domain must stay tag 0");
+    assert_eq!(SensorDomain::TAG, 1);
+    assert_eq!(SimDomain::TAG, 2);
+    assert_eq!(SteadyDomain::TAG, 3);
+}
+
+/// **No two built-in domains share a tag.**
+///
+/// [`the_built_in_domain_tags_are_fixed`] pins today's four literals; this pins
+/// the property those literals happen to have. `Domain::TAG` is a per-impl
+/// constant with nothing structural preventing a collision, and two domains
+/// sharing a tag is exactly the collapse `docs/API.md` §2.5 describes —
+/// `TimeDomainMismatch` stops firing between them and nothing else changes.
+/// Standing alone rather than after the value assertions is what makes it
+/// reachable: it is the first assertion in its own test.
+///
+/// **What it does not cover:** a *fifth*, user-declared domain colliding with a
+/// built-in. §2.5 keeps the trait open and reserves `0`–`3` by documentation,
+/// so that collision is possible and is not checkable from inside this crate.
+///
+/// Mutant: `SimDomain::TAG = 0`. Applied: fails at the first pair —
+/// ``assertion `left != right` failed: two built-in domains share a tag: 0 and
+/// 0``.
+#[test]
+fn the_built_in_domain_tags_are_pairwise_distinct() {
+    use crate::plan::{Domain, SensorDomain, SimDomain, SteadyDomain, SystemDomain};
+
+    let tags = [
+        SystemDomain::TAG,
+        SensorDomain::TAG,
+        SimDomain::TAG,
+        SteadyDomain::TAG,
+    ];
+    for (i, a) in tags.iter().enumerate() {
+        for b in &tags[i + 1..] {
+            assert_ne!(a, b, "two built-in domains share a tag: {a} and {b}");
+        }
+    }
+}
+
+/// **A sim-time stamp must be refused by a system-domain plan.**
+///
+/// The point of adding the two domains is not that they exist but that the
+/// mismatch *fires*: with only two built-ins a sim deployment and a
+/// steady-clock driver both take [`SystemDomain`] by default, so a node mixing
+/// `/clock` time with a driver's clock gets a tree wrong by however long the
+/// bag has been playing, and well-formed the whole time (`docs/API.md` §2.5,
+/// §5.2).
+///
+/// **The fixture is seeded, and that is the whole point.** Against empty rings
+/// this test passed for the wrong reason: `NoData` shadows the domain check, so
+/// a tag collision died at the *data* arm and the silent wrong answer was never
+/// demonstrated. With [`seed_rate_chain`] the same stamp in the plan's own
+/// domain returns a pose, so the two refusals below are refusals of a query
+/// that would otherwise have been answered — which is the failure being
+/// described: a `/clock` stamp served, plausibly, out of a wall-clock stream.
+///
+/// The control at the end is that successful query. It is also what keeps this
+/// from passing against a plan that refused everything.
+///
+/// Mutant: `SimDomain::TAG = 0`. Applied: the first assertion fails with
+/// `left: Ok(Iso3 { q: Quat { w: 0.9909511798837932, .. }, t: Vec3 { x:
+/// 0.8347429715979104, .. } }), right: Err(TimeDomainMismatch { expected: 0,
+/// got: 2 })`. That `Ok` is bit-identical to the pose the control asserts
+/// (checked by swapping the control in as the first assertion under the same
+/// mutant, where it passes) — i.e. the sim stamp was answered out of the
+/// wall-clock stream, which is the silent wrong answer this mechanism exists to
+/// prevent.
+#[test]
+fn a_sim_stamp_cannot_query_a_system_domain_plan() {
+    use crate::plan::{SimDomain, SteadyDomain};
+
+    let arena = rate_chain_arena([0, 0, 0, 0]);
+    let view = ArenaView::new(&arena);
+    let expected = seed_rate_chain(&view);
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    assert_eq!(
+        plan.at(&g, Stamp::<SimDomain>::from_nanos(1)),
+        Err(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 2
+        }),
+        "a `/clock` stamp reached a wall-clock plan"
+    );
+    assert_eq!(
+        plan.at(&g, Stamp::<SteadyDomain>::from_nanos(1)),
+        Err(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 3
+        }),
+        "a CLOCK_MONOTONIC stamp reached a wall-clock plan"
+    );
+
+    // Control: the plan's own domain gets past the check and is *answered*.
+    assert_eq!(
+        plan.at(&g, Stamp::<SystemDomain>::from_nanos(1)),
+        Ok(expected),
+        "the fixture must answer in its own domain, or the refusals above prove nothing"
+    );
+}
+
+// ---- exact stamp converters ---------------------------------------------
+
+/// **`from_parts` is exact across the whole `i64` range, including below the
+/// epoch.**
+///
+/// `docs/API.md` §5.1 makes the converter normative *and* makes "no float
+/// anywhere" the reason it exists: `sec * 10**9 + nanos`, written by hand in
+/// every node, is the line users resent and also the line that wraps silently.
+/// `1_700_000_000_123_456_789` needs 61 bits of significand and `f64` has 53,
+/// so **the sum** cannot survive an `f64`; note carefully that the *product*
+/// can — see Mutant B′.
+///
+/// The negative case is the one a normalising implementation gets wrong: a
+/// `timespec` of `(-1, 250_000_000)` is 250 ms *after* one second before the
+/// epoch, i.e. −750 ms, not −1250 ms.
+///
+/// Mutant: `sec * NANOS_PER_SEC + nanos` in `i64` with plain arithmetic.
+/// Applied: a release build wraps silently and the `i64::MAX`/`i64::MIN`
+/// assertions fail with `Some(..)`.
+/// Mutant B: the whole expression in `f64` — `(sec as f64 * 1e9 + nanos as f64)
+/// as i64`. Applied (verified by editing `plan.rs` and running this test): the
+/// nanosecond-precision assertion fails with
+/// `left: 1700000000123456768, right: 1700000000123456789` — 21 ns of error in
+/// a stamp that prints as though it were exact.
+/// Mutant B′: the *staged* cast, `(sec as f64 * 1e9) as i128 + nanos as i128`,
+/// which is the form a reader will assume B covers, **and it does not**.
+/// `1.7e18` is `12969970703125 × 2^17`, so the product alone is exact in `f64`
+/// and the precision assertion above *passes*. It dies instead at the
+/// `i64::MIN` edge — `left: -9223372036854775296, right: -9223372036854775808`,
+/// where the `f64` ulp is 2048 ns — which is why the range assertions below are
+/// not redundant with the precision one. Deleting either lets one f64
+/// implementation through.
+/// Mutant C: the staged `sec.checked_mul(1e9)?.checked_add(nanos)` this was
+/// first written as. Applied: the `i64::MIN` assertion fails with
+/// `called Option::unwrap() on a None value` — the product alone is below
+/// `i64::MIN` while the sum is exactly `i64::MIN`, so one second of
+/// representable stamps at the negative end is refused.
+#[test]
+fn from_parts_is_exact_and_never_wraps() {
+    type S = Stamp<SystemDomain>;
+
+    assert_eq!(S::from_parts(0, 0).unwrap().nanos(), 0);
+    assert_eq!(
+        S::from_parts(1, 500_000_000).unwrap().nanos(),
+        1_500_000_000
+    );
+    assert_eq!(
+        S::from_parts(1_700_000_000, 123_456_789).unwrap().nanos(),
+        1_700_000_000_123_456_789,
+        "a nanosecond of a 2023 wall-clock stamp does not survive an f64"
+    );
+    assert_eq!(
+        S::from_parts(-1, 250_000_000).unwrap().nanos(),
+        -750_000_000,
+        "a pre-epoch timespec's nanoseconds are a positive remainder"
+    );
+
+    // The exact edges of the representable range, both ends. One nanosecond
+    // further in either direction has no answer at all.
+    assert_eq!(
+        S::from_parts(9_223_372_036, 854_775_807).unwrap().nanos(),
+        i64::MAX
+    );
+    assert!(S::from_parts(9_223_372_036, 854_775_808).is_none());
+    assert_eq!(
+        S::from_parts(-9_223_372_037, 145_224_192).unwrap().nanos(),
+        i64::MIN
+    );
+    assert!(S::from_parts(-9_223_372_037, 145_224_191).is_none());
+
+    // The multiplication overflows long before the addition can, so both are
+    // checked — a `checked_add` alone leaves this pair wrapping.
+    assert!(S::from_parts(i64::MAX, 0).is_none());
+    assert!(S::from_parts(i64::MIN, 0).is_none());
+}
+
+/// **A nanosecond field that is not a sub-second remainder is refused, not
+/// carried into the seconds.**
+///
+/// Both source formats — `builtin_interfaces/Time` and `struct timespec` —
+/// define the field as the remainder, so a value outside `[0, 1e9)` means the
+/// pair is not a `Time`. Normalising it is arithmetically exact and still
+/// wrong: it turns a malformed message into a plausible stamp, and a plausible
+/// stamp is one nothing downstream will question.
+///
+/// `999_999_999` is the last accepted value and `1_000_000_000` the first
+/// refused one, so an off-by-one in the bound cannot pass.
+///
+/// Mutant: drop the `nanos >= NANOS_PER_SEC` guard. Applied: the
+/// `1_000_000_000` assertion fails with `Some(Stamp(1000000000))` — a message
+/// claiming second 0 answered as second 1.
+#[test]
+fn from_parts_refuses_a_nanosecond_field_that_is_not_a_remainder() {
+    type S = Stamp<SystemDomain>;
+
+    assert_eq!(S::from_parts(0, 999_999_999).unwrap().nanos(), 999_999_999);
+    assert!(S::from_parts(0, 1_000_000_000).is_none());
+    assert!(S::from_parts(0, u32::MAX).is_none());
+    // ... and the refusal does not depend on the seconds being zero.
+    assert!(S::from_parts(1_700_000_000, 2_000_000_000).is_none());
+}
+
+/// **`from_timespec` takes the two fields, and refuses a relative interval.**
+///
+/// `tf_tree_core`'s dependency budget is `libm` + `bytemuck` + `blake3`
+/// (`docs/PROJECT.md` §5), so there is no `libc::timespec` to accept; the two
+/// fields are `time_t` and `long`, both `i64` on a 64-bit target, so the call
+/// site needs no cast.
+///
+/// POSIX allows a negative `tv_nsec` only in a *relative* `timespec` — the kind
+/// passed to `nanosleep`. An absolute time from `clock_gettime` never has one,
+/// so a negative value means an interval is being converted as if it were an
+/// instant. Everything else is refused by `from_parts` already; this guard is
+/// the only thing `from_timespec` adds.
+///
+/// Mutant: drop the `tv_nsec < 0` half of the guard, leaving
+/// `tv_nsec >= NANOS_PER_SEC`. Applied: the `(0, -4_294_967_296)` assertion
+/// fails with `Some(Stamp(0))` — an interval of −4.29 s answered as the epoch
+/// itself. **Verified by editing `plan.rs` and running this test**, which is
+/// the only way to know, because the obvious probes do not kill it: `-1 as u32`
+/// is `4_294_967_295`, which `from_parts` refuses as a non-remainder with or
+/// without the guard, so `(0, -1)` and `(-1, -1)` pass either way. Only a
+/// `tv_nsec` whose **low 32 bits land back inside `[0, 1e9)`** reaches
+/// `from_parts` with a value it will accept, and those are the two cases the
+/// guard actually exists for.
+#[test]
+fn from_timespec_refuses_a_relative_interval() {
+    type S = Stamp<SensorDomain>;
+
+    assert_eq!(
+        S::from_timespec(1_700_000_000, 123_456_789)
+            .unwrap()
+            .nanos(),
+        1_700_000_000_123_456_789
+    );
+    // The negatives a caller actually produces. These are refused by the
+    // `as u32` cast landing outside `[0, 1e9)`, not by the sign guard — see the
+    // Mutant note; they document the API, they do not defend it.
+    assert!(S::from_timespec(0, -1).is_none());
+    assert!(S::from_timespec(-1, -1).is_none());
+    // The negatives only the sign guard refuses: `-4_294_967_296` is
+    // `0xFFFF_FFFF_0000_0000`, so `as u32` is `0`, and `-4_294_967_291`'s low
+    // word is `5`. Without the guard these become second 0 and second 7.
+    assert!(S::from_timespec(0, -4_294_967_296).is_none());
+    assert!(S::from_timespec(7, -4_294_967_291).is_none());
+    // Delegation: everything `from_parts` refuses, this refuses too.
+    assert!(S::from_timespec(0, 1_000_000_000).is_none());
+    assert!(S::from_timespec(i64::MAX, 0).is_none());
+    // A negative *second* with a valid remainder is a legitimate pre-epoch
+    // stamp and must still be accepted.
+    assert_eq!(
+        S::from_timespec(-1, 250_000_000).unwrap().nanos(),
+        -750_000_000
+    );
+}
+
+// ---- the declared publish rate a waiter sleeps on ------------------------
+
+/// **The slowest declared rate on the path is the answer, not the fastest.**
+///
+/// `docs/decisions/0018` puts the blocking wait in the caller and gives it two
+/// engine-side inputs: `Plan::span` for the shortfall and this for the period
+/// to sleep. A plan is answerable only once *every* dynamic edge has reached
+/// the stamp, so the edge that decides when the wait ends is the one that
+/// publishes least often. Sleeping a period of the fastest edge on a path that
+/// also carries a 10 Hz map update wakes a hundred times per useful answer —
+/// which is the poll the prediction exists to avoid, arrived at from inside it.
+///
+/// The rates are 1 kHz / 200 Hz / 50 Hz / 10 Hz, the real span of a robot
+/// (an IMU down to a map update), and they are declared in *descending* order
+/// so an implementation that returns the first, the last, or the fastest each
+/// gives a different wrong answer.
+///
+/// Mutant: `current.max(mhz)` instead of `current.min(mhz)` — return the
+/// fastest. Applied: fails with `left: Ok(Some(1000000)), right:
+/// Ok(Some(10000))`; a waiter would then sleep 1 ms per re-check against an
+/// edge that publishes every 100 ms.
+/// Mutant B: return the first declared rate rather than folding. Applied: the
+/// same assertion fails with `Ok(Some(1000000))`.
+#[test]
+fn the_slowest_declared_rate_is_what_a_waiter_sleeps_on() {
+    let arena = rate_chain_arena([1_000_000, 200_000, 50_000, 10_000]);
+    let view = ArenaView::new(&arena);
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    assert_eq!(
+        plan.slowest_nominal_rate_mhz(&g),
+        Ok(Some(10_000)),
+        "10 Hz is 10000 mHz, and is the edge that decides when the wait ends"
+    );
+
+    // Control: a plan over a sub-path that excludes the 10 Hz edge answers
+    // differently, so the assertion above is about the fold and not about the
+    // arena having only one declared rate in it.
+    let mid = view.intern("f2").unwrap();
+    let short = compile_chain(&view, root, mid);
+    assert_eq!(short.slowest_nominal_rate_mhz(&g), Ok(Some(200_000)));
+}
+
+/// **`0` means undeclared and is skipped; a plan where nobody declares answers
+/// `None`.**
+///
+/// `EdgeRecord::nominal_rate_mhz` uses `0` for "not declared" — an edge sized
+/// by an explicit slot count states no rate — and `docs/PHASE5.md` §6's
+/// `TFT007` amendment makes that distinction load-bearing rather than
+/// cosmetic. Read as a rate, the sentinel is the minimum of every set it
+/// appears in and yields an infinite period, so **one** undeclared edge would
+/// silently disable the wait for the whole path.
+///
+/// `None` is a third answer, not a degenerate minimum: the caller falls back to
+/// a conservative period and says so once at startup (`0018` *Consequences*).
+/// Collapsing it to `Some(0)` would make "nobody declared" indistinguishable
+/// from "somebody declared 0 Hz", which is the same conflation from the other
+/// side.
+///
+/// Mutant: drop the `if mhz == 0 { continue; }` skip. Applied: the first
+/// assertion fails with `Ok(Some(0))` — a waiter computing `1e9 / 0`.
+/// Mutant B: seed the fold with `Some(u32::MAX)` instead of `None`. Applied:
+/// the all-undeclared assertion fails with `Ok(Some(4294967295))`, a declared
+/// 4.29 MHz nothing publishes at.
+#[test]
+fn an_undeclared_rate_is_skipped_and_an_undeclared_plan_is_none() {
+    // Two declared edges around an undeclared one: the skip must not stop the
+    // walk, or the 50 Hz edge behind it never contributes.
+    let arena = rate_chain_arena([200_000, 0, 50_000, 0]);
+    let view = ArenaView::new(&arena);
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+    assert_eq!(
+        plan.slowest_nominal_rate_mhz(&g),
+        Ok(Some(50_000)),
+        "an undeclared edge is skipped, not treated as the slowest thing here"
+    );
+
+    let bare = rate_chain_arena([0, 0, 0, 0]);
+    let bare_view = ArenaView::new(&bare);
+    let (bare_root, bare_leaf) = (
+        bare_view.intern("f0").unwrap(),
+        bare_view.intern("f4").unwrap(),
+    );
+    let bare_plan = compile_chain(&bare_view, bare_root, bare_leaf);
+    let bare_g = Guard::new(ArenaView::new(&bare));
+    assert_eq!(
+        bare_plan.slowest_nominal_rate_mhz(&bare_g),
+        Ok(None),
+        "no edge declared a rate, and that is not the same as declaring 0 Hz"
+    );
+}
+
+/// **The rate is readable before anything has ever been published.**
+///
+/// This is where the method parts company with `Plan::span`, deliberately. A
+/// declaration is a property of the topology; a window is a property of the
+/// stream. The caller asking how long to sleep is by definition asking *before*
+/// the data exists — that startup case is the entire reason `0018`'s loop
+/// exists — so returning `NoData` here would make the method unusable at the
+/// only moment it is needed.
+///
+/// The `span` assertion beside it is the control: the same plan, the same
+/// guard, and the empty rings *do* stop `span`, which is what makes the first
+/// assertion a statement about this method rather than about the fixture.
+///
+/// Mutant: implement `nominal_rate_mhz` through `Guard::window` (or add a
+/// `newest_stamp` probe) so it inherits the `NoData` refusal. Applied: the
+/// first assertion fails with `Err(NoData { edge: EdgeId(1) })`.
+#[test]
+fn a_declared_rate_does_not_wait_for_a_published_sample() {
+    let arena = rate_chain_arena([10_000, 0, 0, 0]);
+    let view = ArenaView::new(&arena);
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    assert_eq!(plan.slowest_nominal_rate_mhz(&g), Ok(Some(10_000)));
+    assert_eq!(
+        plan.span(&g),
+        Err(LookupError::NoData { edge: EdgeId(1) }),
+        "the rings really are empty, so the assertion above is not vacuous"
+    );
+}
+
+/// **A step naming an edge the guard's arena has no record for is reported, not
+/// skipped.**
+///
+/// This is the one documented arm of `slowest_nominal_rate_mhz` a *well-formed*
+/// arena cannot reach, and the fixture is built to say why rather than to hide
+/// it: `compile` already refuses an unknown edge, so a plan and the arena it was
+/// compiled against never disagree, and evaluating against a *different* arena
+/// is caught by `check_generation` whenever the two generations differ.
+/// [`short_edge_table_arena`] is the residue — same frames, same parent links,
+/// same generation, one fewer edge slot — and it is the only shape that reaches
+/// the `?`.
+///
+/// Contrived, and deliberately so: the arm is on the path a shim's timeout loop
+/// consults every iteration (`docs/decisions/0018`), and the failure a *timeout*
+/// API hides best is a call that quietly answers "nobody declared a rate" and
+/// sends the caller to a conservative sleep forever.
+///
+/// Mutant: swallow the error —
+/// `let Ok(mhz) = g.nominal_rate_mhz(*edge) else { continue };`. Applied
+/// (verified by editing `plan.rs` and running this test): fails with
+/// `left: Ok(Some(200000)), right: Err(UnknownEdge { edge: EdgeId(4) })`.
+#[test]
+fn a_step_past_the_end_of_the_edge_table_is_reported() {
+    let full = rate_chain_arena([200_000, 200_000, 200_000, 10_000]);
+    let full_view = ArenaView::new(&full);
+    let (root, leaf) = (
+        full_view.intern("f0").unwrap(),
+        full_view.intern("f4").unwrap(),
+    );
+    let plan = compile_chain(&full_view, root, leaf);
+
+    let short = short_edge_table_arena([200_000, 200_000, 200_000]);
+    let g = Guard::new(ArenaView::new(&short));
+
+    // Control: the two arenas really do agree on generation, so the assertion
+    // below is about `UnknownEdge` and not about `TopologyChanged` arriving
+    // first and making the test vacuous.
+    assert_eq!(
+        ArenaView::new(&short).topology().stable_generation(),
+        full_view.topology().stable_generation(),
+        "the fixture stopped exercising the arm it was built for"
+    );
+    assert_eq!(
+        plan.slowest_nominal_rate_mhz(&g),
+        Err(LookupError::UnknownEdge { edge: EdgeId(4) }),
+        "a step off the end of the edge table must not read as `undeclared`"
+    );
 }

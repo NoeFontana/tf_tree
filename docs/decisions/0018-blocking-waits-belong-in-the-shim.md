@@ -2,7 +2,14 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** _(filled in as work lands)_
+**Implementation:** step 1 landed as
+`Plan::slowest_nominal_rate_mhz` in `crates/tf_tree_core/src/plan.rs`, beside
+`Plan::span`, with the signature *Decision* now prints:
+`Result<Option<u32>, LookupError>`. That signature is an **amendment to this
+record**, made in place and argued at the code block below; the `Option<u32>`
+this record originally printed is repealed. Steps 2–5 are open; step 2's runnable
+doc test wants a `Tree` and a second thread, neither of which exists in
+`tf_tree_core`, so it belongs on the facade.
 
 ## Context
 
@@ -47,14 +54,25 @@ why this is affordable:
 impl Plan {
     /// The slowest declared nominal rate among this plan's dynamic edges, in
     /// millihertz, as declared on `EdgeCfg` and stored in
-    /// `EdgeRecord::nominal_rate_mhz`. `None` if no edge on the plan declared
-    /// one.
+    /// `EdgeRecord::nominal_rate_mhz`. `Ok(None)` if no edge on the plan
+    /// declared one.
     ///
     /// A caller sleeping until data arrives should sleep about one period of
     /// *this* edge, not of the fastest one.
-    pub fn slowest_nominal_rate_mhz(&self, g: &Guard) -> Option<u32>;
+    pub fn slowest_nominal_rate_mhz(&self, g: &Guard)
+        -> Result<Option<u32>, LookupError>;
 }
 ```
+
+> **This record first printed `-> Option<u32>`, and that was wrong on its own
+> terms.** Step 1 of the implementation plan below requires the method to call
+> `check_generation` "as `span` does", which is only meaningful if the verdict
+> reaches the caller; an infallible signature cannot carry `TopologyChanged` or
+> `ChildDetached`, and a waiter that swallowed either would spin to its deadline
+> against a plan that can never be satisfied — the one failure a *timeout* API
+> hides best. It also carries `UnknownEdge`. The signature above is the shipped
+> one and is the one to implement against; the `Option<u32>` form is repealed,
+> not merely annotated.
 
 **The wait, which is the shim's and is written once there:**
 
@@ -213,7 +231,7 @@ startup, and a shim that omits it is not a shim.
    over a fixture with edges at 10/50/200/1000 Hz asserting the 10 Hz answer.
    **Mutant:** return the fastest ⇒ fails. A second test: an edge declaring `0`
    (undeclared, per `TFT007`'s amendment) is skipped rather than treated as
-   0 Hz, and a plan where *no* edge declares returns `None`.
+   0 Hz, and a plan where *no* edge declares returns `Ok(None)`.
 2. Document `span` and the new method together as the inputs to a caller-side
    wait, with the loop from §*Decision* in the module docs as a runnable doc
    test on a tree seeded from another thread — verified by

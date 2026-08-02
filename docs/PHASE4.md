@@ -1182,7 +1182,18 @@ The diagnostic must be loud, rate-limited, and surfaced in `tf_tree doctor`, bec
 
 ### 5.5 Time domains and simulation
 
-If `use_sim_time` is true, the bridge tags every edge it declares with the `SimTime` domain and drives its clock from `/clock`; otherwise `SystemTime`. Phase 1's typed domains then do the rest: a consumer querying with the wrong domain gets `TimeDomainMismatch` instead of a plausible wrong answer.
+If `use_sim_time` is true, the bridge tags every edge it declares as `SimDomain` and drives its clock from `/clock`; otherwise `SystemDomain`. Phase 1's typed domains then do the rest: a consumer querying with the wrong domain gets `TimeDomainMismatch` instead of a plausible wrong answer.
+
+> **Amendment — the types exist; the bridge does not use them yet.** This section
+> first spelled them `SimTime`/`SystemTime`, names nothing ever had. The set is
+> uniformly `*Domain` and the tags are fixed: `SystemDomain` 0, `SensorDomain` 1,
+> `SimDomain` 2, `SteadyDomain` 3 ([`API.md`](./API.md) §2.5). **The paragraph
+> above is therefore true of a number and not yet of a name** —
+> `TopologyConfig::default_domain` is still a bare `u8` and
+> `tf_tree_bridge::config::parse_domain` still maps only `"system"` and
+> `"sensor"`, so a deployment that wants tag 2 writes `2`. Rewiring `parse_domain`
+> onto the four names is what makes this section true as written, and it is a
+> separate change.
 
 **NORMATIVE:** the bridge refuses to write to an edge whose declared domain differs from its own, and fails at startup rather than at first message. Sim and real transforms in one arena is a class of bug worth making impossible.
 
