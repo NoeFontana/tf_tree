@@ -212,15 +212,50 @@ impl Snapshot {
         let header = view.header();
         let topo = view.topology();
 
+        // **`Relaxed`, and it is the justified ordering rather than the cheap
+        // one.** `tf_tree_core::frame`'s `finish` does `frame_count.fetch_add`
+        // *first*, then `write_record`, then the Release publish into the intern
+        // table. An `Acquire` load here would therefore order this thread
+        // against everything the interner did *before* it took its id — and
+        // against nothing it did after, which is precisely the record about to
+        // be read. Acquire would read like a guarantee and buy none; the
+        // `name_hash` filter below is the actual guard.
         let frame_count = header.frame_count.load(Ordering::Relaxed);
         let mut frames = Vec::with_capacity(frame_count as usize);
         for id in 1..=frame_count {
+            // Three checks, the strictest set applied by any copy of this walk.
+            // There are four copies and they did not agree: this one,
+            // `tf_tree_c::unstable::tft_tree_frame_name`,
+            // `tf_tree_py::offline::frames_impl` and `tf_tree::frozen`'s
+            // manifest writer. Consolidating them onto a method on `Tree` — the
+            // one place `just loom` and `just miri` can see the walk — is filed
+            // rather than done here, because three of the four are other
+            // crates.
+            //
+            //  1. `FrameId::new` rejects 0, the root sentinel.
+            //  2. `id <= frame_count` — *this loop's bound*, and load-bearing
+            //     rather than incidental: `frame_record` bounds against
+            //     `max_frames`, which is `frame_count + 1 + frame_headroom`, so
+            //     walking to `max_frames` would hand back zeroed headroom slots
+            //     as though they were frames.
+            //  3. `name_hash != 0`, below.
             let Some(fid) = FrameId::new(id) else {
                 continue;
             };
             let Some(rec) = view.frame_record(fid) else {
                 continue;
             };
+            // **The count is bumped before the record is written**, so an
+            // interner in another process can be counted here one instant
+            // before its name exists and the slot still reads as zeros. A
+            // written record's `name_hash` is BLAKE3 of the name — non-zero
+            // even for the empty string — so a zero hash means "not written
+            // yet". Skipping it lists that frame one `doctor` run later;
+            // taking it prints a frame with an empty name, which reads as our
+            // bug rather than as a race lost by a microsecond.
+            if rec.name_hash == 0 {
+                continue;
+            }
             let n = rec.name_len as usize;
             let name = core::str::from_utf8(&rec.name[..n.min(rec.name.len())])
                 .unwrap_or("<invalid-utf8>")
@@ -635,26 +670,71 @@ pub fn check_unreachable(snap: &Snapshot) -> Vec<Finding> {
     )]
 }
 
+/// One edge's out-of-order evidence: how far its observed stream went
+/// backwards, and how often.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutOfOrderRun {
+    /// The edge the regressions were observed on.
+    pub edge: u32,
+    /// How many adjacent arrivals carried a stamp older than their predecessor.
+    pub regressions: usize,
+    /// The largest single step backwards, in nanoseconds. Always positive when
+    /// `regressions > 0`; saturates at [`i64::MAX`] rather than wrapping, since
+    /// a stamp is whatever an arbitrary publisher wrote.
+    pub worst_backstep_ns: i64,
+}
+
+/// The per-edge out-of-order evidence, in edge order. Empty when every observed
+/// stream is monotone.
+///
+/// **One producer, two consumers, and that is the point.**
+/// [`check_out_of_order`] reports this as `TFT018` and
+/// [`crate::checks::tft019`] attributes it to a clock step.
+/// `docs/PHASE5.md` §6's amendment requires the second to fire on *exactly* the
+/// first's evidence — "an attribution, not a second detector" — and a second
+/// scan of `obs` written to the same rule is precisely how that stops being
+/// true after one refactor.
+#[must_use]
+pub fn out_of_order_runs(obs: &Observations) -> Vec<OutOfOrderRun> {
+    let mut out = Vec::new();
+    for (edge, samples) in obs.by_edge() {
+        let mut regressions = 0usize;
+        let mut worst: i128 = 0;
+        for w in samples.windows(2) {
+            if w[1].stamp_ns < w[0].stamp_ns {
+                regressions += 1;
+                // In `i128`: two stamps at opposite ends of `i64` differ by more
+                // than `i64` holds, and both are values a publisher can write.
+                worst = worst.max(i128::from(w[0].stamp_ns) - i128::from(w[1].stamp_ns));
+            }
+        }
+        if regressions > 0 {
+            out.push(OutOfOrderRun {
+                edge,
+                regressions,
+                worst_backstep_ns: i64::try_from(worst).unwrap_or(i64::MAX),
+            });
+        }
+    }
+    out
+}
+
 /// (7) Stamps observed arriving out of monotonic order on an edge (a later
 /// arrival carried an older stamp than an earlier one).
 #[must_use]
 pub fn check_out_of_order(obs: &Observations) -> Vec<Finding> {
-    let mut out = Vec::new();
-    for (edge, samples) in obs.by_edge() {
-        let mut regressions = 0usize;
-        for w in samples.windows(2) {
-            if w[1].stamp_ns < w[0].stamp_ns {
-                regressions += 1;
-            }
-        }
-        if regressions > 0 {
-            out.push(Finding::error(
+    out_of_order_runs(obs)
+        .into_iter()
+        .map(|r| {
+            Finding::error(
                 Check::OutOfOrder,
-                format!("edge#{edge} saw {regressions} out-of-order stamp arrival(s)"),
-            ));
-        }
-    }
-    out
+                format!(
+                    "edge#{} saw {} out-of-order stamp arrival(s)",
+                    r.edge, r.regressions
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The observed publish rate (Hz) of a per-edge event slice, from its median
@@ -996,6 +1076,76 @@ mod tests {
             );
         }
         drop(writers);
+    }
+
+    /// **`Snapshot::capture` must not report a reserved headroom slot as a
+    /// frame.**
+    ///
+    /// `ArenaView::frame_record` bounds an id against `max_frames`, which is
+    /// `frame_count + 1 + frame_headroom` — *not* against `frame_count`. So the
+    /// `1..=frame_count` bound is the check, not a convenience: walking to
+    /// `max_frames` hands back zeroed reserved slots, which `frame_record`
+    /// returns happily and which would print as frames with an empty name.
+    /// `tf_tree_c::unstable::tft_tree_frame_name` shipped exactly that bug, and
+    /// the test that missed it used a zero-headroom fixture, which makes the two
+    /// bounds coincide. This one has headroom.
+    ///
+    /// **The two guards are redundant against *this* state, and no single
+    /// mutation fails this test — which is stated rather than hidden.** A
+    /// headroom slot is both out of `1..=frame_count` and zeroed, so either
+    /// check alone excludes it. Both are kept because they are justified
+    /// independently: the bound is the semantic one (`frame_count` is what a
+    /// frame id may reach), while `name_hash != 0` closes a *race* window the
+    /// bound cannot — `frame_count` is bumped **before** the record is written,
+    /// so an interner in another process can be counted one instant before its
+    /// name exists. That window needs two processes and is **not** asserted
+    /// anywhere here.
+    ///
+    /// Mutant: change the loop bound to `1..=header.max_frames`. Applied: still
+    /// `PASS` — the `name_hash` filter absorbs it, which is how it was found
+    /// that the bound alone is not what this test pins.
+    /// Mutant B: delete the `name_hash == 0` filter. Applied: still `PASS` —
+    /// the bound absorbs it. That is the pre-change state.
+    /// Mutant C: both together. Applied: `left: ["map", "odom", "base", "", "",
+    /// "", ""]` against `right: ["map", "odom", "base"]` — the four reserved
+    /// slots print as frames with an empty name, which is the failure this
+    /// guards.
+    #[test]
+    fn capture_does_not_report_reserved_frame_slots_as_frames() {
+        let tree = tf_tree::TreeBuilder::new()
+            .dynamic_edge(
+                "map",
+                "odom",
+                tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+            )
+            .dynamic_edge(
+                "odom",
+                "base",
+                tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+            )
+            .frame_headroom(4)
+            .build()
+            .expect("build");
+
+        let snap = Snapshot::capture(&tree);
+        let names: Vec<&str> = snap.frames.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["map", "odom", "base"],
+            "the four reserved headroom slots are not frames"
+        );
+
+        // Non-vacuity: a name interned at runtime *does* appear, so the bound
+        // excludes empty slots rather than everything past the declaration.
+        tree.frame("laser").expect("intern into the headroom");
+        let snap = Snapshot::capture(&tree);
+        assert_eq!(
+            snap.frames
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["map", "odom", "base", "laser"]
+        );
     }
 
     #[test]

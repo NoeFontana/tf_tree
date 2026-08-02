@@ -150,7 +150,15 @@ the publisher will not help; the data lost during the step is gone either way.
 On any other tag `TFT019` **skips and says which tag** rather than guessing —
 `Domain` is an open trait and a user-declared tag carries no way to state that
 its clock can step. There, `TFT018` alone is the answer and the publisher is the
-place to look.
+place to look. When *some* of the affected edges are on tag 0 and others are not,
+it fires on the first set and names the second in the report's `note:` lines,
+which is the only place a check that ran can say what it did not cover.
+
+**On a live arena `TFT019` does not run at all**, because `TFT018` does not:
+the push stream is reconstructed from a ring being written while it is read, so a
+slot at the old end can already hold the next lap's sample. Both say so. Diagnose
+a suspected clock step from a recording (`tf_tree doctor` over an ingested bag),
+not from `--attach`.
 
 The fix is a domain that cannot step. Anything published **at rate** should use a
 steady or PTP-disciplined domain rather than the system wall clock: declare the
@@ -354,7 +362,7 @@ Almost certainly a bug — topology should be near-static after startup.
 | `inconsistent-rate` | A frame published at a wildly varying rate | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
-| `TFT019` | The same rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Skips, naming the tag, on any other domain |
+| `TFT019` | The same rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Skips, naming the tag, on any other domain, and skips with `TFT018` on a live arena |
 
 ---
 

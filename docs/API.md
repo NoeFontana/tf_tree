@@ -626,7 +626,7 @@ authorized by this document alone.
 | 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them |
 | 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | **landed** — Rust (`Stamp::from_parts`, `from_timespec`), Python (`from_parts`, `from_ros`; duck-typed on `.sec`/`.nanosec`, no `rclpy` in the wheel) and C (`tft_stamp_from_parts`, `tft_stamp_from_timespec`, `TFT_ERR_BAD_STAMP`, ABI minor 3 → 4). One refusal table is asserted on both sides of the boundary |
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
-| 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | `PHASE5.md` §6 |
+| 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed** — `tf_tree_cli`; fires only on tag 0, skips naming the tag otherwise, inherits `TFT018`'s live-arena skip, and does not demote it |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 
 Items 2, 4, 8, 9 and 11 are additive and independent; 2, 8 and 9 have landed.

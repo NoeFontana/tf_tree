@@ -856,7 +856,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         let id = catalogue::Tft::parse(s).ok_or_else(|| {
             // Refused rather than ignored: a typo that silently suppresses
             // nothing leaves a gate that looks configured and is not.
-            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT018")
+            anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT019")
         })?;
         ids.insert(id);
     }
@@ -922,9 +922,15 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 /// `TFT007`'s is per-arena and computed from the snapshot: it appears only when
 /// the check compared *some* edges and not others, which is the one case where
 /// its `pass` covers less than it looks like it does.
+///
+/// `TFT019`'s is the same shape: it appears only when the check attributed some
+/// out-of-order edges to a wall-clock step and refused others, which is the one
+/// case where neither its findings nor a skip reason names the tags it declined
+/// to guess about.
 fn evidence_notes(live: bool, snap: &Snapshot, obs: &Observations) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
     notes.extend(checks::rate_coverage_note(snap, obs));
+    notes.extend(checks::clock_step_coverage_note(snap, obs, live));
     if live {
         notes.push(
             "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
@@ -1534,6 +1540,93 @@ mod tests {
         assert!(
             note.contains("compared 1 of 2"),
             "the note must state the coverage it reached the operator with: {note}"
+        );
+    }
+
+    /// **The `TFT019` coverage note reaches `Meta.notes` too, and is silent on a
+    /// live arena.**
+    ///
+    /// Same argument as the `TFT007` test above: `checks::clock_step_coverage_note`
+    /// is unit tested, but the line that *calls* it is not reachable from those
+    /// tests, and deleting it leaves a partially-attributed run reading as a
+    /// fully-attributed one. The `live` argument is passed here rather than
+    /// guarded at the call site, so the second half checks the argument is
+    /// actually threaded — on a live arena `TFT019` skipped outright and a note
+    /// about edges it "did not attribute" would describe a run that never
+    /// happened.
+    ///
+    /// Mutant: delete `notes.extend(checks::clock_step_coverage_note(snap, obs, live));`
+    /// from `evidence_notes`. Applied: the `expect` fires with "no TFT019
+    /// coverage note".
+    /// Mutant B: pass `false` for `live` at that call site. Applied: the live
+    /// assertion fails with "a live arena skipped TFT019 outright".
+    #[test]
+    fn the_clock_step_coverage_note_reaches_the_report_metadata() {
+        use doctor::{EdgeInfo, FrameInfo};
+        use tf_tree::InterpPolicy;
+        use tf_tree_bench::fixture::PushSample;
+
+        const MS: i64 = 1_000_000;
+        let dyn_edge = |id: u32, parent: u32, child: u32, domain: u8| EdgeInfo {
+            id,
+            parent,
+            child,
+            kind: EdgeKind::Dynamic,
+            capacity: 512,
+            interp: InterpPolicy::ScLerp,
+            domain,
+            head: 100,
+            claimed: true,
+            claiming: false,
+            owner_pid: 4711,
+            newest_stamp: Some(1_000_000_000),
+            nominal_rate_mhz: None,
+        };
+        let frame = |id: u32, name: &str, parent: u32, depth: u16| FrameInfo {
+            id,
+            name: name.to_owned(),
+            parent,
+            depth,
+            edge_of_child: 0,
+        };
+        // Edge 1 is on the wall clock and is attributed; edge 2 is on a steady
+        // clock and is refused — the one case neither a finding nor a skip
+        // reason can carry.
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base_link", 2, 2),
+            ],
+            edges: vec![dyn_edge(1, 1, 2, 0), dyn_edge(2, 2, 3, 3)],
+        };
+        let back = |edge: u32| {
+            [0, 100 * MS, 200 * MS, 150 * MS]
+                .into_iter()
+                .map(move |stamp_ns| PushSample {
+                    edge,
+                    writer_pid: 4711,
+                    stamp_ns,
+                    arrival_delay_ns: 0,
+                })
+        };
+        let obs = Observations::from_samples(back(1).chain(back(2)).collect());
+
+        let notes = evidence_notes(false, &snap, &obs);
+        let note = notes
+            .iter()
+            .find(|n| n.starts_with("TFT019"))
+            .expect("no TFT019 coverage note in Meta.notes: a partially attributed run would read as a fully attributed one");
+        assert!(
+            note.contains("1 of 2") && note.contains("edge#2 tag 3"),
+            "the note must name what it did not attribute, and its tag: {note}"
+        );
+
+        assert!(
+            !evidence_notes(true, &snap, &obs)
+                .iter()
+                .any(|n| n.starts_with("TFT019")),
+            "a live arena skipped TFT019 outright, so there is no coverage to disclose"
         );
     }
 
