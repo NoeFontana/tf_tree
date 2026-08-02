@@ -147,8 +147,9 @@ clock catches up — correct behaviour that looks exactly like a broken node.
 to make it from*: same evidence as `TFT018`, plus the domain tag, reported as a
 clock step rather than as a publisher fault. Restarting the publisher will not
 help; the data lost during the step is gone either way. Read to the end of this
-section before you reach for it on a running robot — today it has nothing to say
-there, and that is stated below rather than left to be discovered.
+section before you reach for it on a running robot — **the source it needs is a
+recording, not an attach**, and that is stated below rather than left to be
+discovered.
 
 **It fires on a run, not on one inversion.** A single stamp out of place on a
 wall-clock edge is a publisher fault, so `TFT019` needs a *burst*: at least eight
@@ -166,18 +167,34 @@ everything it did not attribute — the other tags, and any tag-0 edge whose
 rejections were too scattered — in the report's `note:` lines, which is the only
 place a check that ran can say what it did not cover.
 
-**On a live arena `TFT019` does not run at all**, because `TFT018` does not:
-the push stream is reconstructed from a ring being written while it is read, so a
-slot at the old end can already hold the next lap's sample. Both say so.
+**Point it at a recording. That is the source these two checks need:**
 
-**Read that skip as the whole of what `TFT019` can tell you about a deployment.**
-`tf_tree doctor` has exactly two sources — the built-in fixture and `--attach` —
-and no way to read a recording, so on a real system the live skip is the only
-outcome either `TFT018` or `TFT019` can produce. Neither is a check you can wait
-to see fire on a robot; **their silence there is not an all-clear**, it is the
-absence of a source. Giving `doctor` a file source is known work and is not done;
-until it is, **the command that diagnoses a clock step from a bag is
-`tf_tree ingest`, not `doctor`:**
+```
+tf_tree doctor --from-bag run.mcap
+```
+
+A recording is written in log order, so a stamp that went backwards is *in the
+file* at the position it arrived at — which is exactly what invariant 6 would
+have rejected and exactly what these two checks are about. The §3.2 ingest report
+goes to stderr, so `--json` still gives you a document to pipe.
+
+**Neither `--attach` nor `--from-file` can answer them, and the two fail
+differently.**
+
+* On a **live arena** the push stream is reconstructed from a ring being written
+  while it is read, so a slot at the old end can already hold the next lap's
+  sample — an inversion the publisher never made.
+* On a **frozen `.tft`** there is no writer and the read is exact, and it still
+  cannot answer: an arena's ring holds only the pushes the engine *accepted*.
+  `SampleRing::push` refuses an out-of-order stamp, so the arrival these checks
+  report was never stored. Running there would pass every `.tft` ever written.
+
+Both skips say so in the report. **Their silence on an arena is not an
+all-clear**, it is the absence of the evidence — which is why the skip reason
+names `--from-bag` rather than merely stating a limitation.
+
+`tf_tree ingest` remains the tool for a clock step **past** the reset threshold,
+because such a recording does not ingest at all and so never reaches `doctor`:
 
 ```
 tf_tree ingest --bag run.mcap

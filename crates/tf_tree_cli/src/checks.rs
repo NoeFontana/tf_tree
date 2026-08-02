@@ -32,10 +32,11 @@
 //! And the conditional ones, which depend on what the arena, the engine build
 //! and the host can supply:
 //!
-//! * **`TFT001`** (multi-publisher conflict) is skipped *on a live arena only*:
-//!   a ring remembers the current claim owner, not the sequence of processes
-//!   that wrote into it, so every reconstructed sample carries the same pid.
-//!   Against the fixture's recorded push stream it runs.
+//! * **`TFT001`** (multi-publisher conflict) is skipped wherever the push
+//!   stream carries no writer identity, which is everywhere but the fixture: a
+//!   ring remembers the current claim owner and not the sequence of processes
+//!   that wrote into it, and a recording's `/tf` messages are anonymous. See
+//!   [`PushStream`].
 //! * **`TFT005`** (stamps in the future) is skipped when the arena's stamps do
 //!   not share an epoch with the system clock — see [`Clock`].
 //! * **`TFT007`** (rate deviates from nominal) is skipped when **no** edge in
@@ -46,15 +47,15 @@
 //!   because a `0` means *undeclared* and not *0 Hz* — see [`tft007`].
 //! * **`TFT010`**/**`TFT016`** are skipped when the engine has no counters and
 //!   when the host is not Linux, respectively.
-//! * **`TFT018`** (out-of-order stamps) is skipped *on a live arena only*, for a
-//!   reason of its own rather than `TFT001`'s: the push stream is reconstructed
-//!   from a ring being written while it is read, so a slot at the old end can
-//!   already hold the next lap's sample — an inversion the publisher never made.
-//! * **`TFT019`** is skipped on a live arena — inheriting `TFT018`'s skip, since
-//!   it is `TFT018`'s evidence — and skipped when the edges that *did* go
-//!   backwards are in no wall-clock domain, naming their tags. It is an
-//!   attribution rather than a detector, so it can neither run without `TFT018`
-//!   nor guess about a tag `Domain`'s open trait let somebody else define.
+//! * **`TFT018`** (out-of-order stamps) is skipped wherever the push stream was
+//!   replayed from an arena's rings rather than recorded as it arrived, and the
+//!   two ways that happens fail it differently — see [`PushStream`]. It runs on
+//!   the fixture and on a recording (`doctor --from-bag`).
+//! * **`TFT019`** inherits exactly that, since it is `TFT018`'s evidence, and is
+//!   skipped in addition when the edges that *did* go backwards are in no
+//!   wall-clock domain, naming their tags. It is an attribution rather than a
+//!   detector, so it can neither run without `TFT018` nor guess about a tag
+//!   `Domain`'s open trait let somebody else define.
 //!
 //! [`tf_tree_bridge`]: https://docs.rs/tf_tree_bridge
 
@@ -308,6 +309,125 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
     out
 }
 
+/// How the push stream a check reads was obtained.
+///
+/// # This replaced a `live: bool`, and the bool was keying on the wrong fact
+///
+/// `TFT001`, `TFT018` and `TFT019` used to skip *iff the arena was live*. That
+/// happened to be right while `doctor` had two sources, and it stops being right
+/// the moment a third one exists, because "live" is not what any of the three
+/// checks actually needs. What they need is a property of the **stream**:
+///
+/// * `TFT001` needs a writer identity per sample.
+/// * `TFT018` needs the arrivals invariant 6 *rejected*.
+/// * `TFT011`'s Phase 1 half needs a per-sample arrival delay.
+///
+/// Keyed on liveness, a frozen `.tft` would have run `TFT018` and passed it
+/// **unconditionally** — see [`PushStream::RingsAtRest`] — which is the
+/// fabricated all-clear the whole catalogue is written to refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushStream {
+    /// Every attempted push, recorded as it happened, with the writer that made
+    /// it and the delay it arrived with. Only `tf_tree_bench::fixture` has this:
+    /// it is the publisher, so it can record the pushes the engine refused.
+    Observed,
+    /// Every transform a recording holds, replayed in the recording's own log
+    /// order (`doctor --from-bag`).
+    ///
+    /// Carries rejected arrivals — a bag is written in log order, so a stamp
+    /// that went backwards is *in the file* in the position it arrived at — and
+    /// carries neither a writer nor an arrival delay: a `/tf` message has no
+    /// publisher identity in it, and the recorder's log time is a different
+    /// clock from the publisher's stamp.
+    Recorded,
+    /// Reconstructed from an arena's rings with no writer attached: a frozen
+    /// `.tft` (`doctor --from-file`), or any other arena at rest.
+    ///
+    /// **This variant cannot show an inversion, and that is why `TFT018` skips
+    /// on it rather than passing.** `SampleRing::push` refuses a stamp older
+    /// than the ring's last, so a ring holds only *accepted* pushes; the
+    /// rejected arrival that `TFT018` exists to name left no trace in the arena
+    /// at all. Reading the window is exact here — nobody is writing — so the
+    /// result would be a guaranteed `pass`, which is worth strictly less than
+    /// saying why there is no answer.
+    RingsAtRest,
+    /// Reconstructed from the rings of an arena being written while it is read
+    /// (`doctor --attach`).
+    ///
+    /// Everything [`PushStream::RingsAtRest`] cannot supply, plus one it gets
+    /// *wrong*: the oldest slot of the retained window is the one being
+    /// overwritten, so a sample from the next lap can appear at the old end and
+    /// read as an inversion on a perfectly ordered publisher.
+    RingsUnderWriter,
+}
+
+impl PushStream {
+    /// Why this stream cannot name the process that pushed a sample (`TFT001`),
+    /// or `None` when it can.
+    ///
+    /// **The predicate and the reason are one function on purpose.** Two of them
+    /// is how a check ends up skipping for a reason that stopped being true, or
+    /// running with evidence it does not have; here a new variant cannot compile
+    /// without answering both at once.
+    #[must_use]
+    pub fn no_writer_identity(self) -> Option<&'static str> {
+        match self {
+            PushStream::Observed => None,
+            PushStream::Recorded => Some(
+                "a recording carries no publisher identity — a tf2_msgs/TFMessage has no sender \
+                 field and an MCAP channel names the topic, not the node — so two nodes \
+                 publishing one edge are indistinguishable from one. This is the check \
+                 docs/PHASE4.md §1.3 predicts a real stack will fail, and a bag cannot answer it",
+            ),
+            PushStream::RingsAtRest | PushStream::RingsUnderWriter => Some(
+                "this push stream was replayed from the rings, which remember the current claim \
+                 owner and not the sequence of writers, so every sample carries one pid",
+            ),
+        }
+    }
+
+    /// Why this stream cannot contain an arrival invariant 6 would have rejected
+    /// (`TFT018`, and therefore `TFT019`), or `None` when it can.
+    #[must_use]
+    pub fn no_rejected_arrivals(self) -> Option<&'static str> {
+        match self {
+            PushStream::Observed | PushStream::Recorded => None,
+            PushStream::RingsAtRest => Some(
+                "this push stream was replayed from an arena's rings, and a ring holds only the \
+                 pushes the engine accepted: SampleRing::push refuses a stamp older than the \
+                 last one, so an out-of-order arrival was rejected and left no trace to find. \
+                 Running here would pass unconditionally, which is a fabricated all-clear and \
+                 not a result. Point doctor at the recording instead (--from-bag), where the \
+                 arrivals are in the order they happened",
+            ),
+            PushStream::RingsUnderWriter => Some(
+                "this push stream was replayed from a ring that is being written while it is \
+                 read, so a slot at the old end can already hold the next lap's sample — which \
+                 reads as an inversion on a correctly ordered publisher. The rings also hold \
+                 only accepted pushes, so a real rejected arrival would be absent even without \
+                 the tearing. Freeze the arena and use --from-file, or point doctor at a \
+                 recording with --from-bag",
+            ),
+        }
+    }
+
+    /// Why this stream carries no per-sample arrival delay (`TFT011`'s Phase 1
+    /// `capacity × period` half), or `None` when it does.
+    #[must_use]
+    pub fn no_arrival_delays(self) -> Option<&'static str> {
+        match self {
+            PushStream::Observed => None,
+            PushStream::Recorded => Some(
+                "a recording's log time is the recorder's clock and its stamp is the \
+                 publisher's, so differencing them would report clock offset as publish latency",
+            ),
+            PushStream::RingsAtRest | PushStream::RingsUnderWriter => {
+                Some("an arena records no receipt time, so a replayed sample has no arrival delay")
+            }
+        }
+    }
+}
+
 /// Everything the catalogue runs against.
 pub struct Inputs<'a> {
     /// Captured topology, edges and claims.
@@ -333,9 +453,9 @@ pub struct Inputs<'a> {
     /// `Meta.notes`, and the two must be the same split rather than two walks
     /// that happen to agree.
     pub clock_step: &'a ClockStepEvidence,
-    /// Whether the push stream was reconstructed from a live arena rather than
-    /// recorded as it happened.
-    pub live: bool,
+    /// How the push stream in `obs` was obtained, which is what decides whether
+    /// `TFT001`, `TFT011`'s Phase 1 half, `TFT018` and `TFT019` have evidence.
+    pub stream: PushStream,
     /// Whether the engine compiled `docs/PHASE5.md` §5's counters in.
     pub counters: bool,
 }
@@ -396,13 +516,19 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
 }
 
 /// `TFT001` — more than one writer pid on one edge.
+///
+/// # It needs a writer identity per sample, and only the fixture has one
+///
+/// `docs/PHASE4.md` §1.3 predicts that real ROS stacks have two nodes publishing
+/// one edge and that `tf2` averages them silently, which makes this the check a
+/// stranger's recording is most wanted for — and the recording is exactly where
+/// it cannot run. A `tf2_msgs/TFMessage` carries no publisher identity; every
+/// message on `/tf` is anonymous by the time a recorder writes it, and MCAP's
+/// channel is the *topic*, not the node. So the skip reason names the missing
+/// evidence rather than the source, because the source is not the problem.
 fn tft001(inp: &Inputs<'_>) -> CheckOutcome {
-    if inp.live {
-        return CheckOutcome::skipped(
-            Tft::Tft001,
-            "a live arena's push stream is reconstructed from the rings, which remember the \
-             current claim owner and not the sequence of writers, so every sample carries one pid",
-        );
+    if let Some(why) = inp.stream.no_writer_identity() {
+        return CheckOutcome::skipped(Tft::Tft001, why);
     }
     CheckOutcome::ran(
         Tft::Tft001,
@@ -1100,22 +1226,26 @@ fn tft017(inp: &Inputs<'_>) -> CheckOutcome {
 /// of perfectly plausible stamps can still arrive backwards, and that is what
 /// breaks a consumer's interpolation.
 ///
-/// **Skipped on a live arena, and this is the one that would otherwise report a
-/// fault that never happened.** [`Observations::from_arena`] reconstructs the
-/// stream by walking the ring's retained window with relaxed loads and no
-/// re-check, while a publisher is writing into it. The oldest slot is the one
-/// being overwritten, so a sample from the *next* lap can appear at the old end
-/// of the window: the reconstructed stream jumps forward and then back, which is
-/// exactly the shape of this finding, on a perfectly monotone publisher. Before
-/// the id, this condition was silently not run on a live arena; now it says so.
+/// # It runs on a stream that was recorded, and skips on one that was replayed
+///
+/// The gate is [`PushStream::no_rejected_arrivals`], not liveness, and the two
+/// are not the same question. **An arena of any kind is the wrong evidence for
+/// this check**: `SampleRing::push` rejects a stamp older than the ring's last,
+/// so a ring holds only accepted pushes and [`Observations::from_arena`] can
+/// only ever reconstruct a non-decreasing sequence — on a live arena, on a
+/// frozen `.tft`, and on an arena built from a bag, which §3.1 additionally
+/// *sorts*. A live arena adds a second, opposite failure on top: the retained
+/// window is read with relaxed loads while a publisher writes into it, so a
+/// sample from the next lap can appear at the old end and read as an inversion
+/// the publisher never made.
+///
+/// So there are exactly two streams it can run against: the fixture's, which
+/// records the pushes the engine refused because the fixture *is* the publisher,
+/// and a recording's log order (`doctor --from-bag`), where a backwards stamp is
+/// in the file at the position it arrived at.
 fn tft018(inp: &Inputs<'_>) -> CheckOutcome {
-    if inp.live {
-        return CheckOutcome::skipped(
-            Tft::Tft018,
-            "a live arena's push stream is reconstructed from a ring that is being written \
-             while it is read, so a slot at the old end can already hold the next lap's \
-             sample — which reads as an inversion on a correctly ordered publisher",
-        );
+    if let Some(why) = inp.stream.no_rejected_arrivals() {
+        return CheckOutcome::skipped(Tft::Tft018, why);
     }
     CheckOutcome::ran(
         Tft::Tft018,
@@ -1251,12 +1381,12 @@ impl ClockStepEvidence {
     /// none of them is "ran, half blind"; this is the same gap
     /// [`rate_coverage_note`] exists to fill.
     ///
-    /// `live` is a parameter rather than a caller-side `if`: on a live arena the
-    /// check skipped outright, so a note listing edges it "did not attribute"
-    /// would describe a run that did not happen.
+    /// `stream` is a parameter rather than a caller-side `if`: wherever `TFT019`
+    /// skipped outright, a note listing edges it "did not attribute" would
+    /// describe a run that did not happen.
     #[must_use]
-    pub fn coverage_note(&self, live: bool) -> Option<String> {
-        if live {
+    pub fn coverage_note(&self, stream: PushStream) -> Option<String> {
+        if stream.no_rejected_arrivals().is_some() {
             return None;
         }
         // Nothing attributed and nothing diffuse: either `TFT018` found nothing
@@ -1386,23 +1516,27 @@ fn tag_refusal(tag: u8) -> &'static str {
 /// `TFT018` stays an error and keeps failing `doctor --exit-code`; this is a
 /// warn that explains it. Rejected pushes are lost data whatever caused them.
 ///
-/// # It cannot reach a verdict on a deployment today, and the skip says so
+/// # It reaches a verdict on a recording, and that is what `--from-bag` is for
 ///
-/// This check needs a *recorded* push stream, and `doctor` has exactly two
-/// sources — the built-in fixture and a live `--attach` (`crate::Source`). It
-/// skips on the second, so outside the fixture it never runs. That is a real
-/// limitation and not a caveat: a diagnostic whose silence reads as an
-/// all-clear is worse than no diagnostic, which is why the live skip reason
-/// states it in the report rather than leaving it to `docs/`. Wiring a third
-/// source is a feature (`Tree::open_frozen` already exists behind `shm`), not a
-/// fix, and it unblocks `TFT018` at the same time.
+/// This check needs a *recorded* push stream. Until `doctor` gained a recording
+/// source it had two — the built-in fixture and a live `--attach` — and it
+/// skipped on the second, so no run against real data could reach a verdict at
+/// all. `doctor --from-bag <recording.mcap>` is that third source: a bag is
+/// written in log order, so a stamp that went backwards is in the file at the
+/// position it arrived at, and both this check and `TFT018` run on it.
+///
+/// **A frozen `.tft` (`--from-file`) is not a substitute**, and the reason is
+/// worth stating because it is the obvious guess: a `.tft` is an *arena*, and an
+/// arena's rings hold only the pushes the engine accepted, so the rejected
+/// arrival this check attributes was never stored. See
+/// [`PushStream::RingsAtRest`].
 ///
 /// # Skips and passes
 ///
-/// * **Live arena** — skipped, inheriting `TFT018`'s skip rather than working
-///   around it. The reconstructed stream's inversions are an artifact of reading
-///   a ring while it is written, and attributing an artifact to a clock step
-///   would be a fabricated cause for a fabricated effect.
+/// * **A stream replayed from rings** — skipped, inheriting `TFT018`'s skip
+///   rather than working around it. There is nothing to attribute: on a live
+///   arena the only inversions are artifacts of reading a ring while it is
+///   written, and on an arena at rest there are none at all.
 /// * **No regressions at all** — `Pass`, not `Skipped`. This check's evidence is
 ///   `TFT018`'s and it is complete: every retained stream was examined and none
 ///   went backwards, so there is nothing to attribute and saying so is earned.
@@ -1413,18 +1547,13 @@ fn tag_refusal(tag: u8) -> &'static str {
 ///   would read as "no clock step", which is an assurance about clocks this
 ///   check is not able to give.
 fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
-    if inp.live {
+    if let Some(why) = inp.stream.no_rejected_arrivals() {
         return CheckOutcome::skipped(
             Tft::Tft019,
-            "inherited from TFT018, whose evidence this is: a live arena's push stream is \
-             reconstructed from a ring that is being written while it is read, so a slot at the \
-             old end can already hold the next lap's sample — attributing that artifact to a \
-             clock step would put a cause on an effect that never happened. Read this skip as \
-             the whole answer TFT019 has for a deployment: doctor's only sources are this \
-             attach and the built-in fixture, so it never sees the recorded push stream this \
-             check needs, and no doctor run on a real system can reach a verdict here. \
-             `tf_tree ingest --bag` diagnoses a backwards clock from a recording today — by a \
-             different rule (a per-edge --clock-reset-threshold), not by this check",
+            format!(
+                "inherited from TFT018, whose evidence this is — {why}. Attributing an \
+                 out-of-order arrival to a clock step needs one to exist in the stream first"
+            ),
         );
     }
     let ev = inp.clock_step;
@@ -1597,7 +1726,7 @@ mod tests {
             // thirty-odd call sites: `Inputs` borrows the split, and a test
             // process that exits after one assertion has nothing to reclaim.
             clock_step: Box::leak(Box::new(ClockStepEvidence::capture(snap, obs))),
-            live: false,
+            stream: PushStream::Observed,
             counters: true,
         }
     }
@@ -2233,7 +2362,7 @@ mod tests {
         // The half it did not attribute is disclosed, since neither the
         // findings nor a skip reason can carry it here.
         let note = ClockStepEvidence::capture(&snap, &obs)
-            .coverage_note(false)
+            .coverage_note(PushStream::Observed)
             .expect("a partial run discloses");
         assert!(
             note.contains("edge#2 tag 3") && note.contains("1 of 2"),
@@ -2255,7 +2384,7 @@ mod tests {
             other => panic!("expected a skip on non-wall-clock tags, got {other:?}"),
         }
         assert_eq!(
-            ClockStepEvidence::capture(&snap, &obs).coverage_note(false),
+            ClockStepEvidence::capture(&snap, &obs).coverage_note(PushStream::Observed),
             None,
             "the skip reason carries the whole disclosure here, so the note stays silent"
         );
@@ -2325,7 +2454,7 @@ mod tests {
         );
         // A pass that covers less than it looks like it does says so.
         let note = ClockStepEvidence::capture(&snap, &obs)
-            .coverage_note(false)
+            .coverage_note(PushStream::Observed)
             .expect("a diffuse wall-clock run is disclosed rather than silently passed");
         assert!(
             note.contains("edge#1 longest run 2")
@@ -2359,25 +2488,25 @@ mod tests {
     /// an NTP step would put a fabricated cause on a fabricated effect — worse
     /// than `TFT018`'s silence, because it names a culprit.
     ///
-    /// **And the skip is where the reachability limit is stated.** `doctor` has
-    /// two sources, the built-in fixture and a live `--attach`, so this skip is
-    /// the only outcome `TFT019` can produce on a deployment. An operator who
-    /// only ever meets a `skip` line has to be told that from the line itself —
-    /// a check whose silence reads as an all-clear is worse than no check.
+    /// **And the skip names the source that can answer instead.** An operator
+    /// who only ever meets a `skip` line has to be told where the evidence
+    /// lives — a check whose silence reads as an all-clear is worse than no
+    /// check.
     ///
-    /// Mutant: `if inp.live` -> `if false` in `tft019`. Applied: the `Skipped`
-    /// match panics with "expected a skip on a live arena, got Fired".
-    /// Mutant B: delete the "doctor's only sources are this attach and the
-    /// built-in fixture" sentence from the skip reason. Applied: the
-    /// reachability assertion fails — "the skip is the only outcome TFT019 can
-    /// produce on a deployment, so it has to say so".
+    /// Mutant: `if let Some(why) = inp.stream.no_rejected_arrivals()` ->
+    /// `if let Some(why) = None::<&str>` in `tft019`. Applied: the `Skipped`
+    /// match panics with "expected a skip on a replayed stream, got Fired".
+    /// Mutant B: delete the `--from-bag` sentence from
+    /// `PushStream::RingsUnderWriter`'s `no_rejected_arrivals` reason. Applied:
+    /// the second assertion fails — "the skip has to point at the source that
+    /// can answer".
     #[test]
-    fn tft019_inherits_tft018s_live_arena_skip() {
+    fn tft019_inherits_tft018s_replayed_stream_skip() {
         const MS: i64 = 1_000_000;
         let snap = chain_with_domains(0, 0);
         let obs = Observations::from_samples(stepped_back(1, 100 * MS));
         let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
-        inp.live = true;
+        inp.stream = PushStream::RingsUnderWriter;
 
         for o in [tft018(&inp), tft019(&inp)] {
             match &o.status {
@@ -2386,28 +2515,102 @@ mod tests {
                     "{} must name the artifact it refuses to report: {why}",
                     o.check.id()
                 ),
-                other => panic!("expected a skip on a live arena, got {other:?}"),
+                other => panic!("expected a skip on a replayed stream, got {other:?}"),
             }
         }
         match &tft019(&inp).status {
             Status::Skipped(why) => assert!(
-                why.contains("doctor's only sources are this attach and the built-in fixture")
-                    && why.contains("tf_tree ingest --bag"),
-                "the skip is the only outcome TFT019 can produce on a deployment, so it has to \
-                 say so — and point at the command that can answer the question: {why}"
+                why.contains("--from-bag"),
+                "the skip has to point at the source that can answer: {why}"
             ),
-            other => panic!("expected a skip on a live arena, got {other:?}"),
+            other => panic!("expected a skip on a replayed stream, got {other:?}"),
         }
         assert_eq!(
-            ClockStepEvidence::capture(&snap, &obs).coverage_note(true),
+            ClockStepEvidence::capture(&snap, &obs).coverage_note(PushStream::RingsUnderWriter),
             None,
             "a note about edges the check did not attribute would describe a run that did not \
              happen"
         );
 
-        // Non-vacuity: the same stream off a live arena is attributed.
-        inp.live = false;
+        // Non-vacuity: the same stream, recorded as it arrived, is attributed.
+        inp.stream = PushStream::Observed;
         assert_eq!(tft019(&inp).status, Status::Fired);
+    }
+
+    /// **A stream replayed from an arena at rest cannot show an inversion, so
+    /// `TFT018` skips there too rather than passing.**
+    ///
+    /// This is the finding that made [`PushStream`] a four-valued enum instead
+    /// of a `live: bool`. A frozen `.tft` has no concurrent writer, so the
+    /// live-arena skip reason — a torn window — does not apply to it, and keying
+    /// on liveness would have run the check and passed it. It would have passed
+    /// **every** `.tft`, because `SampleRing::push` rejects an out-of-order
+    /// stamp and a ring therefore holds only accepted pushes: the evidence is
+    /// absent from the arena, not merely hard to read. A guaranteed pass on the
+    /// exact fault a check exists to name is the fabricated all-clear this
+    /// catalogue refuses everywhere else.
+    ///
+    /// The stream below is deliberately the *same* inverted one the recorded
+    /// case fires on — it is not reachable from a real arena, and that is the
+    /// point: even handed the evidence, this variant must refuse it, because in
+    /// production it would never have it.
+    ///
+    /// Mutant: make `PushStream::RingsAtRest` return `None` from
+    /// `no_rejected_arrivals`. Applied: both `Skipped` matches panic with
+    /// "expected a skip on an arena at rest, got Fired".
+    #[test]
+    fn tft018_and_tft019_skip_on_an_arena_at_rest_rather_than_passing_vacuously() {
+        const MS: i64 = 1_000_000;
+        let snap = chain_with_domains(0, 0);
+        let obs = Observations::from_samples(stepped_back(1, 100 * MS));
+        let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
+        inp.stream = PushStream::RingsAtRest;
+
+        for o in [tft018(&inp), tft019(&inp)] {
+            match &o.status {
+                Status::Skipped(why) => assert!(
+                    why.contains("only the pushes the engine accepted")
+                        && why.contains("--from-bag"),
+                    "{} must say the evidence is absent and where to get it: {why}",
+                    o.check.id()
+                ),
+                other => panic!("expected a skip on an arena at rest, got {other:?}"),
+            }
+        }
+
+        // Non-vacuity: the same stream, read out of a recording, is judged.
+        inp.stream = PushStream::Recorded;
+        assert_eq!(tft018(&inp).status, Status::Fired);
+        assert_eq!(tft019(&inp).status, Status::Fired);
+    }
+
+    /// **`TFT001` skips on a recording because a bag has no publisher identity,
+    /// and the reason says which of the two facts is missing.**
+    ///
+    /// `docs/PHASE4.md` §1.3 makes multi-publisher conflict the falsifiable
+    /// prediction about real stacks, so this is the check a stranger's bag is
+    /// most wanted for — and it is the one a bag cannot answer. Saying "a live
+    /// arena's rings remember the current owner" there would be a true sentence
+    /// about the wrong source.
+    ///
+    /// Mutant: make `PushStream::Recorded` return the `RingsAtRest` reason from
+    /// `no_writer_identity`. Applied: the `PHASE4.md §1.3` assertion fails.
+    #[test]
+    fn tft001_skips_on_a_recording_for_the_recordings_own_reason() {
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let obs = Observations::from_samples(steady(1, 4, 10_000_000));
+        let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
+        inp.stream = PushStream::Recorded;
+        match &tft001(&inp).status {
+            Status::Skipped(why) => assert!(
+                why.contains("no publisher identity") && why.contains("PHASE4.md §1.3"),
+                "the reason must be the recording's own, not the ring's: {why}"
+            ),
+            other => panic!("expected a skip on a recording, got {other:?}"),
+        }
+        // Non-vacuity: the fixture's stream does carry pids and does run.
+        inp.stream = PushStream::Observed;
+        assert_eq!(tft001(&inp).status, Status::Pass);
     }
 
     /// **`TFT019` explains `TFT018`; it does not demote it.**
@@ -2545,8 +2748,9 @@ mod tests {
     /// this check's exact signature. Before the id, the live case was silently
     /// not run and the report said nothing about it.
     ///
-    /// Mutant: drop the `if inp.live` guard from `tft018`. Applied: the status
-    /// is `Fired` and the `Skipped` match panics.
+    /// Mutant: make `PushStream::RingsUnderWriter` return `None` from
+    /// `no_rejected_arrivals`. Applied: the status is `Fired` and the `Skipped`
+    /// match panics.
     #[test]
     fn tft018_skips_on_a_live_arena_and_says_so() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -2565,7 +2769,7 @@ mod tests {
             },
         ]);
         let mut inp = inputs(&snap, &obs, &[], Clock::Wall(0));
-        inp.live = true;
+        inp.stream = PushStream::RingsUnderWriter;
         match &tft018(&inp).status {
             Status::Skipped(why) => assert!(
                 why.contains("next lap"),
@@ -2574,7 +2778,7 @@ mod tests {
             other => panic!("expected a skip on a live arena, got {other:?}"),
         }
         // Non-vacuity: the same stream off a live arena does fire.
-        inp.live = false;
+        inp.stream = PushStream::Observed;
         assert_eq!(tft018(&inp).status, Status::Fired);
     }
 

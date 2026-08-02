@@ -25,6 +25,8 @@ pub mod catalogue;
 pub mod checks;
 pub mod doctor;
 pub mod hostfacts;
+/// `doctor`'s recording sources (`docs/PHASE5.md` §6): `--from-bag`, `--from-file`.
+pub mod recording;
 pub mod top;
 pub mod topology;
 pub mod web;
@@ -146,6 +148,34 @@ enum Command {
         /// changes the exit status, not the report.
         #[arg(long, value_name = "TFTNNN")]
         suppress: Vec<String>,
+        /// Diagnose an MCAP recording instead of the built-in fixture.
+        ///
+        /// **This is the one `doctor` invocation that needs nothing installed**:
+        /// point it at a bag you already have and it reports on the `/tf`
+        /// traffic in it. §2.2's wedge argument applied to the catalogue — the
+        /// user changes nothing about their robot.
+        ///
+        /// It is also the only source `TFT018` and `TFT019` can reach a verdict
+        /// on. A recording is written in log order, so a stamp that went
+        /// backwards is in the file at the position it arrived at; an arena
+        /// — live or frozen — holds only the pushes the engine accepted.
+        ///
+        /// The §3.2 ingest report is printed to **stderr**, so `--json` keeps
+        /// stdout parseable.
+        #[arg(long, value_name = "PATH")]
+        from_bag: Option<std::path::PathBuf>,
+        /// Diagnose a frozen `.tft` index (`docs/PHASE5.md` §2).
+        ///
+        /// §2.1 is NORMATIVE that a frozen arena is read by the identical code
+        /// as a live one, so every topology, occupancy and rate check runs
+        /// exactly as it does on an attach. `TFT018`/`TFT019` do **not**: a
+        /// `.tft` is an arena, and an arena never stored the rejected arrival
+        /// they are about. Use `--from-bag` for those.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        #[arg(long, value_name = "PATH", conflicts_with = "from_bag")]
+        from_file: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        ingest: IngestArgs,
     },
     /// Live view of an arena: rates, staleness, claims, participants, feed.
     ///
@@ -310,12 +340,26 @@ pub fn run() -> Result<()> {
             json,
             exit_code,
             suppress,
+            from_bag,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            from_file,
+            ingest,
         } => {
+            #[cfg(not(all(feature = "shm", target_os = "linux")))]
+            let from_file: Option<std::path::PathBuf> = None;
             if explain_version {
                 explain_format_version();
                 Ok(())
             } else {
-                cmd_doctor(live, json, exit_code, &suppress)
+                cmd_doctor(
+                    live,
+                    json,
+                    exit_code,
+                    &suppress,
+                    from_bag.as_deref(),
+                    from_file.as_deref(),
+                    &ingest,
+                )
             }
         }
         Command::Top {
@@ -564,7 +608,10 @@ const LIMIT_REMEDY: &str =
      \x20 Both bound what this reader will allocate for one chunk, so raise them\n\
      \x20 to what the recording actually needs rather than to the maximum.";
 
-fn ingest_err(e: tf_tree_ingest::IngestError, frames: &tf_tree_ingest::Frames) -> anyhow::Error {
+pub(crate) fn ingest_err(
+    e: tf_tree_ingest::IngestError,
+    frames: &tf_tree_ingest::Frames,
+) -> anyhow::Error {
     let text = tf_tree_ingest::describe(e, frames).to_string();
     match e {
         // **The two limit refusals get the flags, not the skip policy.** Under
@@ -643,27 +690,49 @@ type Live<'a> = &'a ();
 enum Source {
     /// The in-process benchmark fixture, with its recorded push stream.
     Fixture(Observations),
+    /// An MCAP recording, ingested in-process (`doctor --from-bag`), carrying
+    /// the transforms **in the recording's own log order**.
+    ///
+    /// `docs/PHASE5.md` §4.1 is NORMATIVE that there is no separate offline API,
+    /// and this obeys it literally: `tf_tree_ingest::run` hands back the
+    /// ordinary [`Tree`] that `tf_tree ingest` and `tf_tree freeze --from-bag`
+    /// already build. The [`Observations`] beside it are the one thing an arena
+    /// cannot supply — see [`checks::PushStream::RingsAtRest`].
+    Bag(Observations),
     /// A live arena somebody else is publishing into.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     Live,
+    /// A frozen `.tft` index (`doctor --from-file`), mapped read-only.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    Frozen,
 }
 
 impl Source {
     fn banner(&self) -> &'static str {
         match self {
             Source::Fixture(_) => "in-process fixture",
+            Source::Bag(_) => "MCAP recording",
             #[cfg(all(feature = "shm", target_os = "linux"))]
             Source::Live => "live arena",
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Frozen => "frozen .tft index",
         }
     }
 
-    /// Whether the push stream was reconstructed from the rings rather than
-    /// recorded as it happened — which is what makes `TFT001` unanswerable.
-    fn is_live(&self) -> bool {
+    /// How this source's push stream was obtained, which is what decides whether
+    /// `TFT001`, `TFT011`'s Phase 1 half, `TFT018` and `TFT019` have evidence.
+    ///
+    /// **This used to be an `is_live()`, and that was keying on the wrong
+    /// fact** — see [`checks::PushStream`]. A frozen arena is not live and still
+    /// cannot answer `TFT018`.
+    fn stream(&self) -> checks::PushStream {
         match self {
-            Source::Fixture(_) => false,
+            Source::Fixture(_) => checks::PushStream::Observed,
+            Source::Bag(_) => checks::PushStream::Recorded,
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            Source::Live => true,
+            Source::Live => checks::PushStream::RingsUnderWriter,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Frozen => checks::PushStream::RingsAtRest,
         }
     }
 }
@@ -693,6 +762,53 @@ fn source(live: Live<'_>) -> Result<(&'static Tree, Source)> {
     Ok((tree, Source::Fixture(Observations::from_samples(samples))))
 }
 
+/// `doctor`'s sources: the two `source` offers, plus the two recording ones.
+///
+/// Separate from [`source`] because only `doctor` has them. `tree`, `echo` and
+/// `top` are about *now* — a live view of an arena somebody is publishing into —
+/// and pointing them at a recording would be a different feature with a
+/// different argument surface. `doctor` is the one whose whole value is a
+/// verdict about data that already exists.
+///
+/// The tree is `Box::leak`ed for the same reason [`source`] leaks its own: the
+/// process inspects once and exits, and a frozen mapping or an ingested arena
+/// has nothing useful to do between the last `println!` and `exit`.
+fn doctor_source(
+    live: Live<'_>,
+    from_bag: Option<&std::path::Path>,
+    from_file: Option<&std::path::Path>,
+    ingest: &IngestArgs,
+) -> Result<(&'static Tree, Source)> {
+    let _ = from_file;
+    if let Some(bag) = from_bag {
+        let opts = ingest.to_options()?;
+        let ingested = recording::open_bag(bag, &opts)?;
+        // **To stderr, always.** `--json` writes a `tf_tree.doctor/1` document to
+        // stdout and a consumer parses it; the §3.2 report is the other half of
+        // what a stranger needs to know about their own file, and dropping it
+        // would hide "12 000 zero stamps were discarded" behind a clean-looking
+        // catalogue. Two streams is what lets both be true at once.
+        eprint!("{}", ingested.report.summary());
+        let tree: &'static Tree = Box::leak(Box::new(ingested.tree));
+        let snap = Snapshot::capture(tree);
+        let obs = recording::arrival_observations(bag, &opts, tree, &snap)?;
+        return Ok((tree, Source::Bag(obs)));
+    }
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    if let Some(path) = from_file {
+        let tree = Tree::open_frozen(path).map_err(|e| {
+            anyhow::anyhow!(
+                "{}: {e}\n\x20 If this is a recording rather than a frozen index, \
+                 use --from-bag.\n\x20 If it is a .tft this build cannot read, re-freeze it: \
+                 a .tft is a cache, not an archive (docs/PHASE5.md §2.4).",
+                path.display()
+            )
+        })?;
+        return Ok((Box::leak(Box::new(tree)), Source::Frozen));
+    }
+    source(live)
+}
+
 /// The push stream a command's checks run against.
 ///
 /// A live arena has no recorded push stream — nobody was watching when those
@@ -702,12 +818,13 @@ fn source(live: Live<'_>) -> Result<(&'static Tree, Source)> {
 /// checks all work, and the multi-writer check cannot fire because a ring cannot
 /// remember a writer that has been replaced.
 fn observations(tree: &Tree, src: &Source) -> Observations {
-    // Used only by the live arm, which does not exist without `shm`.
+    // Used only by the arms that replay from the rings, which do not exist
+    // without `shm`.
     let _ = tree;
     match src {
-        Source::Fixture(obs) => obs.clone(),
+        Source::Fixture(obs) | Source::Bag(obs) => obs.clone(),
         #[cfg(all(feature = "shm", target_os = "linux"))]
-        Source::Live => Observations::from_arena(tree, &Snapshot::capture(tree)),
+        Source::Live | Source::Frozen => Observations::from_arena(tree, &Snapshot::capture(tree)),
     }
 }
 
@@ -851,7 +968,16 @@ fn fmt_iso(iso: &Iso3) -> String {
 /// diagnostic that returns non-zero by default breaks `&&` in an operator's
 /// shell and gets wrapped in `|| true`, at which point the gate is worthless
 /// where it was wanted. §6 asks for the flag; the flag is the whole mechanism.
-fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_doctor(
+    live: Live<'_>,
+    json: bool,
+    exit_code: bool,
+    suppress: &[String],
+    from_bag: Option<&std::path::Path>,
+    from_file: Option<&std::path::Path>,
+    ingest: &IngestArgs,
+) -> Result<()> {
     let mut ids = std::collections::BTreeSet::new();
     for s in suppress {
         let id = catalogue::Tft::parse(s).ok_or_else(|| {
@@ -862,7 +988,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         ids.insert(id);
     }
 
-    let (tree, src) = source(live)?;
+    let (tree, src) = doctor_source(live, from_bag, from_file, ingest)?;
     let obs = observations(tree, &src);
     let snap = Snapshot::capture(tree);
     let stats = checks::collect_edge_stats(tree, &snap);
@@ -881,7 +1007,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         arena_bytes: tree.arena_size_bytes() as u64,
         occupancy: checks::occupancy_of(tree),
         clock_step: &clock_step,
-        live: src.is_live(),
+        stream: src.stream(),
         counters: tf_tree::counters_compiled_in(),
     };
     let report = checks::run(&inputs, &ids);
@@ -897,7 +1023,7 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
         now_nanos: clock.nanos(),
         clock_source: clock.label(),
         counters_compiled_in: tf_tree::counters_compiled_in(),
-        notes: evidence_notes(src.is_live(), &snap, &obs, &clock_step),
+        notes: evidence_notes(src.stream(), &snap, &obs, &clock_step),
     };
 
     if json {
@@ -914,16 +1040,19 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 
 /// Disclosures for a check that ran with one of its evidence sources missing.
 ///
-/// `TFT011` has two: the counters, which a live arena has, and the Phase 1
-/// `capacity x period` against observed publish latency, which needs a recorded
-/// push stream. A live arena's stream is reconstructed from the rings, where
-/// `arrival_delay_ns` is unknown and set to zero — and zero latency never
-/// exceeds any buffer span, so that half of the check is structurally silent.
-/// Reporting `pass` without saying so would claim a result it did not earn.
+/// `TFT011` has two: the counters, which any arena has, and the Phase 1
+/// `capacity x period` against observed publish latency, which needs a
+/// per-sample arrival delay. Only the fixture records one — a replayed ring has
+/// no receipt time and a recording's log time is the recorder's clock, not the
+/// publisher's — so everywhere else `arrival_delay_ns` is zero, and zero latency
+/// never exceeds any buffer span. That half of the check is then structurally
+/// silent, and reporting `pass` without saying so would claim a result it did
+/// not earn. [`checks::PushStream::no_arrival_delays`] is both the predicate and
+/// the sentence.
 ///
-/// `TFT015`'s disclosure is unconditional rather than live-only: the missing
-/// participants row is a gap in the engine, not in this run's evidence, so it
-/// applies to a fixture and a live arena alike.
+/// `TFT015`'s disclosure is unconditional rather than source-specific: the
+/// missing participants row is a gap in the engine, not in this run's evidence,
+/// so it applies to every source alike.
 ///
 /// `TFT007`'s is per-arena and computed from the snapshot: it appears only when
 /// the check compared *some* edges and not others, which is the one case where
@@ -935,20 +1064,19 @@ fn cmd_doctor(live: Live<'_>, json: bool, exit_code: bool, suppress: &[String]) 
 /// concentrated enough to be a step — which is the case where neither its
 /// findings nor a skip reason carries what it did not cover.
 fn evidence_notes(
-    live: bool,
+    stream: checks::PushStream,
     snap: &Snapshot,
     obs: &Observations,
     clock_step: &checks::ClockStepEvidence,
 ) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
     notes.extend(checks::rate_coverage_note(snap, obs));
-    notes.extend(clock_step.coverage_note(live));
-    if live {
-        notes.push(
-            "TFT011 ran on its counter evidence only: a live arena has no recorded publish \
-             latency, so the capacity-vs-latency half of the check cannot fire"
-                .to_owned(),
-        );
+    notes.extend(clock_step.coverage_note(stream));
+    if let Some(why) = stream.no_arrival_delays() {
+        notes.push(format!(
+            "TFT011 ran on its counter evidence only: {why}, so the capacity-vs-latency half \
+             of the check cannot fire"
+        ));
     }
     notes
 }
@@ -1545,7 +1673,7 @@ mod tests {
         );
 
         let notes = evidence_notes(
-            false,
+            checks::PushStream::Observed,
             &snap,
             &obs,
             &checks::ClockStepEvidence::capture(&snap, &obs),
@@ -1637,7 +1765,7 @@ mod tests {
         let obs = Observations::from_samples(back(1).chain(back(2)).collect());
         let ev = checks::ClockStepEvidence::capture(&snap, &obs);
 
-        let notes = evidence_notes(false, &snap, &obs, &ev);
+        let notes = evidence_notes(checks::PushStream::Observed, &snap, &obs, &ev);
         let note = notes
             .iter()
             .find(|n| n.starts_with("TFT019"))
@@ -1648,7 +1776,7 @@ mod tests {
         );
 
         assert!(
-            !evidence_notes(true, &snap, &obs, &ev)
+            !evidence_notes(checks::PushStream::RingsUnderWriter, &snap, &obs, &ev)
                 .iter()
                 .any(|n| n.starts_with("TFT019")),
             "a live arena skipped TFT019 outright, so there is no coverage to disclose"
