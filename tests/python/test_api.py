@@ -796,6 +796,25 @@ def test_lerpslerp_refuses_a_twist_rather_than_finite_differencing_it(tree):
     assert p.at(stamps, layout="quat").shape == (1, 7)
 
 
+def test_a_float_stamp_is_still_refused_with_the_measurement_under_a_layout(tree):
+    """§3 is NORMATIVE and does not have a per-layout exception.
+
+    The `layout=` path reaches the scalar case by falling *through* the array
+    cast rather than by an ``else``, exactly as the ``mat4`` path does, so a
+    ``float`` still meets the ``TypeError`` that carries the ULP number instead
+    of a ``BufferError`` about array dtypes. It is the same argument as
+    `at_into`'s "blame the argument the caller got wrong".
+
+    Mutant: dispatch on ``PyInt`` with an ``else`` for the array (so a float
+    falls into the array branch) => a ``BufferError`` is raised and both
+    assertions fail.
+    """
+    p = tree.plan("map", "base")
+    for layout in ("mat4", "quat", "affine32", "quat_twist"):
+        with pytest.raises(TypeError, match="238 ns"):
+            p.at(1.5, layout=layout)
+
+
 def test_an_unknown_layout_is_refused_and_lists_the_ones_that_exist(tree):
     """R4 has no silently-wrong default, so a typo is an error rather than a
     guess.

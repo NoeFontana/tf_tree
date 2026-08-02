@@ -836,7 +836,12 @@ impl PyPlan {
         layout: Layout,
     ) -> PyResult<Bound<'py, PyAny>> {
         let e = layout.elems();
-        if stamps.is_instance_of::<pyo3::types::PyInt>() {
+        if !stamps.is_instance_of::<pyo3::types::PyInt>() {
+            if let Ok(arr) = stamps.cast::<PyArray1<i64>>() {
+                return self.alloc_layout(py, arr, layout, e);
+            }
+        }
+        {
             // **A one-element batch, not a scalar kernel.** `docs/PHASE3.md`
             // §11.1 requires `at(t)` to equal `at([t])[0]` *bit-exactly*, and
             // the cheapest way to guarantee that is for there to be one
@@ -845,8 +850,14 @@ impl PyPlan {
             // what a second implementation *saves* on these three layouts was
             // not measured, because the reason not to have one is correctness
             // rather than cost.
+            //
+            // **Reached by falling through the array cast, not by an `else`**,
+            // so a `float` still meets `stamp_from_any`'s `TypeError` with the
+            // ULP measurement in it (§3) rather than a `BufferError` about
+            // array dtypes. `at`'s `mat4` path has that shape for the same
+            // reason and this must not diverge from it.
             let src = [stamp_from_any(stamps)?];
-            return if layout.is_f32() {
+            if layout.is_f32() {
                 let out = PyArray1::<f32>::zeros(py, [e], false);
                 // SAFETY: freshly allocated here, contiguous by construction,
                 // and no other reference to it exists.
@@ -859,12 +870,18 @@ impl PyPlan {
                 let dst = unsafe { out.as_slice_mut()? };
                 self.eval_f64(py, &src, layout, dst)?;
                 Ok(out.into_any())
-            };
+            }
         }
+    }
 
-        let stamps = stamps
-            .cast::<PyArray1<i64>>()
-            .map_err(|_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?;
+    /// [`Self::at_layout`]'s batch half: allocate `(n, elems)` and fill it.
+    fn alloc_layout<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyArray1<i64>>,
+        layout: Layout,
+        e: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
         if !stamps.is_c_contiguous() {
             return Err(BufferError::new_err(
                 "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
