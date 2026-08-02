@@ -29,7 +29,7 @@ use tf_tree_math::{log_so3, Interp, Iso3, LerpSlerp, ScLerp, Twist};
 use crate::arena_view::ArenaView;
 use crate::edge::EdgeKind;
 use crate::error::{EdgeId, FrameId, LookupError};
-use crate::layout::{write_affine32, write_mat4, write_quat, Layout};
+use crate::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 use crate::sample::ExtrapPolicy;
 use crate::sync::spin;
 use crate::topology::TopologyView;
@@ -842,10 +842,24 @@ impl Plan {
     ///   `V_S = −Ad(p)·V_p` and `Ad(S⁻¹) = Ad(p)`, so
     ///   `V' = Ad(p)·V_acc − Ad(p)·V_p = Ad(p)·(V_acc − V_p)`. Subtract first,
     ///   then rotate once.
-    fn fold_at_with_derivatives(&self, g: &Guard, t: i64) -> Result<(Iso3, Twist), LookupError> {
+    ///
+    /// # Why the sampler is a parameter
+    ///
+    /// The batch form of this fold resumes each edge's bracket search from a
+    /// cursor and the scalar form does not, and that is the *only* difference
+    /// between them. Passing the sampler in keeps the composition above — the
+    /// part that is easy to get subtly wrong and impossible to spot in a
+    /// result — in one place, rather than in two copies that could drift into
+    /// disagreeing about a velocity. `S` is a distinct type per call site, so
+    /// neither form pays for the other's existence.
+    #[inline]
+    fn fold_with_derivatives<S>(&self, mut sample: S) -> Result<(Iso3, Twist), LookupError>
+    where
+        S: FnMut(usize, EdgeId) -> Result<(Iso3, Twist), LookupError>,
+    {
         let mut acc = Iso3::IDENTITY;
         let mut vel = Twist::ZERO;
-        for step in self.steps() {
+        for (k, step) in self.steps().iter().enumerate() {
             match step {
                 Step::Static(m) => {
                     // Constant transform: no twist of its own, but the body
@@ -854,7 +868,7 @@ impl Plan {
                     acc = acc * *m;
                 }
                 Step::Dyn { edge, inverted } => {
-                    let (p, vp) = g.sample_with_twist(*edge, t, ExtrapPolicy::Error)?;
+                    let (p, vp) = sample(k, *edge)?;
                     if *inverted {
                         vel = p.adjoint(&vel.sub(vp));
                         acc = acc.mul_inv(&p);
@@ -866,6 +880,34 @@ impl Plan {
             }
         }
         Ok((acc, vel))
+    }
+
+    /// [`Self::fold_with_derivatives`] restarting every bracket search at the
+    /// window midpoint — the scalar `at_with_derivatives` path.
+    #[inline]
+    fn fold_at_with_derivatives(&self, g: &Guard, t: i64) -> Result<(Iso3, Twist), LookupError> {
+        self.fold_with_derivatives(|_, edge| g.sample_with_twist(edge, t, ExtrapPolicy::Error))
+    }
+
+    /// [`Self::fold_with_derivatives`] resuming each step's bracket search from
+    /// its own cursor — [`Self::fold_at_cursors`]'s counterpart, and the reason
+    /// a monotone [`Layout::QuatTwist`] batch costs `O(1)` amortized per stamp
+    /// instead of `O(log n)`.
+    ///
+    /// A cursor is a *hint*: the galloping search still hands the binary search
+    /// an interval that brackets `t`, so a stale one costs probes and cannot
+    /// change an answer. That is what lets this share every assertion the
+    /// cursor-less form has.
+    #[inline]
+    fn fold_at_with_derivatives_cursors(
+        &self,
+        g: &Guard,
+        t: i64,
+        cursors: &mut [u64; MAX_DEPTH],
+    ) -> Result<(Iso3, Twist), LookupError> {
+        self.fold_with_derivatives(|k, edge| {
+            g.sample_with_twist_from(edge, t, ExtrapPolicy::Error, &mut cursors[k])
+        })
     }
 
     /// Evaluate the plan at `t`, returning the pose **and its derivatives** —
@@ -1244,6 +1286,12 @@ impl Plan {
     /// `out` is a flat `f64` slice of at least `stamps.len() * layout.elems()`.
     /// Use [`Self::at_many_into_f32`] for [`Layout::Affine32`].
     ///
+    /// [`Layout::QuatTwist`] is the batch form of [`Self::at_with_derivatives`]
+    /// and folds through exactly that path, so the thirteen `f64` it writes per
+    /// stamp are the same bits the scalar call would produce — including its
+    /// refusals. It is the only layout here that can fail for a reason the pose
+    /// layouts cannot.
+    ///
     /// **`stamps` is raw nanoseconds, with the domain as the type parameter.**
     /// `Stamp<D>` is a newtype and not `repr(transparent)`, so a caller holding
     /// `&[i64]` — every FFI caller, and the NumPy path in particular — would
@@ -1259,6 +1307,23 @@ impl Plan {
     /// **before a single element is written**, so a rejected call leaves the
     /// caller's buffer untouched — `docs/PHASE3.md` §5.3 requires that, because
     /// a half-written output is worse than none: it looks like data.
+    ///
+    /// For [`Layout::QuatTwist`], additionally
+    /// [`LookupError::DerivativesUnavailable`] and [`LookupError::NoSegment`],
+    /// exactly as [`Self::at_with_derivatives`] returns them — a `LerpSlerp`
+    /// edge is refused rather than finite-differenced.
+    ///
+    /// **Only the two checks above are all-or-nothing.** Every other error is a
+    /// property of a *stamp*, so it can fire after `k` rows are already
+    /// written and the batch stops there, leaving `k` live rows and the rest as
+    /// the caller left them, with nothing in the buffer marking the boundary —
+    /// which is why the element index is worth recovering from the error
+    /// (`NoData`, `Extrapolation` and `SlotRecycled` name the edge and the
+    /// window). The distinction is not academic:
+    /// `DerivativesUnavailable` is a property of an *edge*, so it always fires
+    /// at element 0 and the buffer really is untouched, while
+    /// [`LookupError::NoSegment`] on the same layout depends on which segment
+    /// the stamp brackets and is not.
     ///
     /// Otherwise as [`Self::at`].
     pub fn at_many_into<D: Domain>(
@@ -1288,6 +1353,11 @@ impl Plan {
         match layout {
             Layout::Mat4 => self.fold_batch(g, stamps, write_mat4, n, out),
             Layout::Quat => self.fold_batch(g, stamps, write_quat, n, out),
+            // The one arm that does not go through `fold_batch`: it needs the
+            // twist, so it folds through `fold_at_with_derivatives` instead.
+            // See [`Self::fold_batch_with_twist`] for why that is a sibling and
+            // not a generic parameter on the existing loop.
+            Layout::QuatTwist => self.fold_batch_with_twist(g, stamps, n, out),
             // Unreachable: rejected by the `is_f32` check above. Returning the
             // same error rather than panicking keeps this crate free of a
             // panic path the workspace lints forbid, and a future f32 layout
@@ -1369,6 +1439,67 @@ impl Plan {
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
                 let iso = self.note(g, edge, self.fold_at(g, *s))?;
                 write(&iso, dst);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Layout::QuatTwist`]'s batch loop — [`Self::fold_batch`]'s sibling.
+    ///
+    /// # Why a sibling rather than a parameter on `fold_batch`
+    ///
+    /// `fold_batch` is generic over the *emitter*, not over the fold. This one
+    /// needs a different fold — [`Self::fold_at_with_derivatives`], which
+    /// returns `(Iso3, Twist)` — so making the existing loop serve both would
+    /// mean either a second closure the pose layouts pass as a no-op or a
+    /// branch on the layout inside the loop. Both put work into the scalar
+    /// batch path, which is the one path in this file whose per-element cost is
+    /// measured in nanoseconds. Duplicating twelve lines is the cheaper trade,
+    /// and the module doc for [`crate::layout`] already fixes it as the rule.
+    ///
+    /// # The monotone cursor, which this pays for exactly as `fold_batch` does
+    ///
+    /// Ascending stamps ride a resumable cursor per plan step, through
+    /// [`Self::fold_at_with_derivatives_cursors`], so the bracket search is
+    /// `O(1)` amortized rather than `O(log n)` per stamp per step. This layout
+    /// is the `n = 1024` ML/perception batch `docs/API.md` §3.3 exists for, and
+    /// leaving it as the one layout without a cursor made the flagship path the
+    /// slowest one.
+    ///
+    /// The cursor is only a *hint*: the galloping search still hands the binary
+    /// search an interval bracketing `t`, so the two branches below cannot
+    /// disagree about a number — which is why the monotone and non-monotone
+    /// paths are asserted bit-identical rather than merely close.
+    ///
+    /// # Why it calls the same fold `at_with_derivatives` does
+    ///
+    /// Bit-identity with the scalar call is the property that makes this a
+    /// *layout* and not a second implementation of derivatives. Anything else
+    /// here — a finite difference, a re-derived adjoint chain — would be a
+    /// second answer to the same question, and the first symptom would be two
+    /// bindings disagreeing about a velocity.
+    #[inline]
+    fn fold_batch_with_twist(
+        &self,
+        g: &Guard,
+        stamps: &[i64],
+        elems: usize,
+        out: &mut [f64],
+    ) -> Result<(), LookupError> {
+        // Hoisted for the same reason as in `fold_batch`: loop-invariant, and
+        // an O(plan length) scan (see [`Self::note`]).
+        let edge = self.first_dynamic_edge();
+        if stamps.windows(2).all(|w| w[0] <= w[1]) {
+            let mut cursors = [0u64; MAX_DEPTH];
+            for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
+                let r = self.fold_at_with_derivatives_cursors(g, *s, &mut cursors);
+                let (pose, twist) = self.note(g, edge, r)?;
+                write_quat_twist(&pose, &twist, dst);
+            }
+        } else {
+            for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
+                let (pose, twist) = self.note(g, edge, self.fold_at_with_derivatives(g, *s))?;
+                write_quat_twist(&pose, &twist, dst);
             }
         }
         Ok(())
@@ -2117,6 +2248,30 @@ impl<'a> Guard<'a> {
             .ok_or(LookupError::UnknownEdge { edge })?;
         match InterpPolicy::from_u8(interp) {
             InterpPolicy::ScLerp => ring.sample_with_twist(t, policy),
+            InterpPolicy::LerpSlerp => Err(LookupError::DerivativesUnavailable { edge, interp }),
+        }
+    }
+
+    /// [`Self::sample_with_twist`], resuming from `cursor` — the derivative
+    /// path's counterpart to [`Self::sample_from`].
+    ///
+    /// The refusal is checked here too, and before the ring is touched: a
+    /// `LerpSlerp` edge has no exact body twist whatever the search does, and
+    /// deciding that once per sampler rather than once per caller is what keeps
+    /// the batch layout's refusal identical to the scalar call's.
+    pub(crate) fn sample_with_twist_from(
+        &self,
+        edge: EdgeId,
+        t: i64,
+        policy: ExtrapPolicy,
+        cursor: &mut u64,
+    ) -> Result<(Iso3, Twist), LookupError> {
+        let (interp, ring) = self
+            .view
+            .sampler(edge)
+            .ok_or(LookupError::UnknownEdge { edge })?;
+        match InterpPolicy::from_u8(interp) {
+            InterpPolicy::ScLerp => ring.sample_with_twist_from(t, policy, cursor),
             InterpPolicy::LerpSlerp => Err(LookupError::DerivativesUnavailable { edge, interp }),
         }
     }

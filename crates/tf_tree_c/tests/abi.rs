@@ -149,8 +149,38 @@ fn an_unknown_layout_is_refused() {
     assert_eq!(tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ), 56);
     assert_eq!(tft_layout_size(TFT_LAYOUT_MAT4_ROW), 128);
     assert_eq!(tft_layout_size(TFT_LAYOUT_AFFINE12_ROW_F32), 48);
+    assert_eq!(tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ_TWIST6), 104);
     // Not a layout this build defines.
     assert_eq!(tft_layout_size(9999), 0);
+}
+
+/// **Appending the layout was a *minor* bump, not a major one.**
+///
+/// `the_abi_check_implements_the_rule_rather_than_restating_it` above already
+/// covers the rule itself — an older minor links, a newer one does not — for
+/// whatever the current version happens to be. What it cannot cover is *which
+/// number moved* when the enumerator was added, and that is the entire
+/// compatibility argument for shipping a layout instead of a function: bump the
+/// major and every existing C caller has to be rebuilt for a value they never
+/// name.
+///
+/// Read through the exported functions rather than the constants, because a
+/// constant comparison is a tautology the compiler folds away and these are
+/// what a linked caller actually observes.
+///
+/// Mutant: bump `TFT_ABI_VERSION_MAJOR` alongside the enumerator ⇒ fails here
+/// and nowhere else.
+#[test]
+fn the_layout_addition_moved_the_minor_and_not_the_major() {
+    assert_eq!(
+        tft_abi_version_major(),
+        0,
+        "no major bump for an appended enum"
+    );
+    assert!(
+        tft_abi_version_minor() >= 3,
+        "the appended layout is a minor bump"
+    );
 }
 
 /// **`tft_last_error` validates `struct_size`** (§3.6's Vulkan rule), so a

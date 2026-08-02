@@ -273,6 +273,149 @@ fn at_many_into_agrees_with_at_many_exactly() {
     }
 }
 
+/// **`Layout::QuatTwist` is `at_with_derivatives` in a buffer, not a second
+/// implementation of it** — `docs/API.md` §3.3, `docs/PHASE5.md` §4.4.
+///
+/// The layout exists so derivatives reach a batch caller without a fourth
+/// method. That is only true if the thirteen `f64` it writes are the *same
+/// bits* the scalar call produces: the moment the batch path derives a twist its
+/// own way — a finite difference, a re-composed adjoint chain — two bindings can
+/// disagree about a velocity, and neither one is obviously wrong to a user.
+/// Compared with `to_bits`, not a tolerance, for exactly that reason.
+///
+/// The first seven elements are also checked against `Layout::Quat` on the same
+/// stamps, which is the other half of the promise: a consumer that already
+/// parses a `(N, 7)` row can read a `(N, 13)` one by ignoring the tail.
+///
+/// **The stamps ascend, so the batch takes the monotone cursor branch while the
+/// scalar reference does not** — each `at_with_derivatives` below is on a fresh
+/// guard and restarts every bracket search at the window midpoint. So this is
+/// also the plan-level assertion that resuming a search cannot move a bit of a
+/// twist, which is what makes the cursor safe to pick from the *stamps* rather
+/// than from anything the caller asked for.
+///
+/// Mutant: emit `v` before `ω` in `write_quat_twist` ⇒ the tail assertions fail
+/// while the pose ones still pass. Mutant B: route `Layout::QuatTwist` through
+/// `fold_batch(.., write_quat, ..)` and zero the tail ⇒ the pose half still
+/// agrees and only the twist assertions catch it.
+#[test]
+fn quat_twist_rows_are_bit_identical_to_at_with_derivatives() {
+    use tf_tree::Layout;
+
+    let c = Chain::new(64, 1000);
+    let plan = c.tree.plan(c.base, c.map).unwrap();
+    let g = c.tree.guard();
+    let max_t = (c.n as i64 - 1) * c.dt;
+    // Off-grid stamps, so the interpolant and its derivative both actually run.
+    let stamps: Vec<Stamp> = (0..97).map(|k| ns((k as i64 * max_t) / 97 + 37)).collect();
+
+    let mut rows = vec![0.0f64; stamps.len() * Layout::QuatTwist.elems()];
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::QuatTwist, &mut rows)
+        .unwrap();
+
+    // The pose half, against the layout it claims to extend.
+    let mut quat = vec![0.0f64; stamps.len() * Layout::Quat.elems()];
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::Quat, &mut quat)
+        .unwrap();
+
+    let mut moving = 0usize;
+    for (i, s) in stamps.iter().enumerate() {
+        let row = &rows[i * 13..(i + 1) * 13];
+        assert_eq!(
+            &row[..7],
+            &quat[i * 7..(i + 1) * 7],
+            "row {i}: the pose half is not the Quat layout"
+        );
+
+        let want = plan.at_with_derivatives(&c.tree.guard(), *s).unwrap();
+        for (k, bits) in [
+            want.pose.q.w,
+            want.pose.q.x,
+            want.pose.q.y,
+            want.pose.q.z,
+            want.pose.t.x,
+            want.pose.t.y,
+            want.pose.t.z,
+            want.twist.omega.x,
+            want.twist.omega.y,
+            want.twist.omega.z,
+            want.twist.v.x,
+            want.twist.v.y,
+            want.twist.v.z,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                row[k].to_bits(),
+                bits.to_bits(),
+                "row {i} element {k}: the batch layout and the scalar call disagree"
+            );
+        }
+
+        if want.twist.omega.norm() > 1e-6 && want.twist.v.norm() > 1e-6 {
+            moving += 1;
+        }
+    }
+
+    // Non-vacuity: a fixture whose twist is zero everywhere would pass every
+    // assertion above against a layout that wrote six zeros.
+    assert!(
+        moving > 90,
+        "the fixture is not moving; only {moving} of {} rows had a live twist",
+        stamps.len()
+    );
+}
+
+/// The 13-element buffer is sized and rejected like every other layout.
+///
+/// `elems()` is the single place the stride comes from, so the interesting
+/// failure is not "13 is wrong" but "the check ran against a different number
+/// than the write did" — which is why the error's `need` is asserted and not
+/// merely that it failed.
+///
+/// Mutant, run: `Layout::QuatTwist => 7` in `elems()` ⇒ this test dies at
+/// `layout.rs`'s `write_quat_twist` with "index out of bounds: the len is 7 but
+/// the index is 7", **not** with a `BufferTooSmall` naming `need: 28`. That is
+/// the point rather than a wrinkle: 51 ≥ 28, so a shrunk `elems()` makes the
+/// size check *pass* and the write run off the end of the row it was sized for.
+/// `quat_twist_rows_are_bit_identical_to_at_with_derivatives` dies the same way.
+///
+/// So the `need` assertion below is not what kills this mutant — the panic is.
+/// It is here for the mutation in the other direction (`=> 26`, say), where the
+/// check would refuse a buffer that is in fact long enough and no bounds check
+/// would ever fire.
+#[test]
+fn a_short_quat_twist_buffer_is_refused_before_anything_is_written() {
+    use tf_tree::{Layout, LookupError};
+
+    let c = Chain::new(8, 1000);
+    let plan = c.tree.plan(c.base, c.map).unwrap();
+    let g = c.tree.guard();
+    let stamps: Vec<Stamp> = (0..4).map(|k| ns(k * 1000)).collect();
+
+    const SENTINEL: f64 = -12345.5;
+    let mut out = vec![SENTINEL; 4 * 13 - 1];
+    assert_eq!(
+        plan.at_many_into::<SystemDomain>(&g, &nanos(&stamps), Layout::QuatTwist, &mut out)
+            .unwrap_err(),
+        LookupError::BufferTooSmall { need: 52, got: 51 }
+    );
+    assert!(
+        out.iter().all(|v| *v == SENTINEL),
+        "the buffer was written before validation rejected the call"
+    );
+
+    // And it is an `f64` layout: the `f32` entry point must refuse it rather
+    // than writing thirteen 4-byte elements where thirteen 8-byte ones go.
+    let mut f32s = vec![0.0f32; 4 * 13];
+    assert_eq!(
+        plan.at_many_into_f32::<SystemDomain>(&g, &nanos(&stamps), Layout::QuatTwist, &mut f32s)
+            .unwrap_err(),
+        LookupError::WrongElementType
+    );
+}
+
 /// The non-monotone fallback must produce the same answers as the cursor path.
 ///
 /// Two loops, one shared kernel — but the *search* differs, and a cursor that
@@ -305,6 +448,82 @@ fn at_many_into_handles_unsorted_stamps() {
             "stamp {i} disagreed between the monotone and fallback paths"
         );
     }
+}
+
+/// The twist layout's two batch loops must agree, exactly as the pose layouts'
+/// do.
+///
+/// `Layout::QuatTwist` gained the monotone cursor branch, so it now has the
+/// same shape as `fold_batch`: ascending stamps gallop from a resumable cursor,
+/// anything else restarts each search. Feeding the same stamps forward and
+/// reversed puts one call down each branch, and the rows must come back
+/// element-for-element identical after un-reversing.
+///
+/// **Reversed is not a second gallop direction.** An earlier revision of this
+/// comment said the reversed order was what made `bracket_from`'s *downward*
+/// arm run; that is false, and was checked rather than reasoned about. The
+/// reversed call is non-monotone, so it takes the fallback arm, which calls
+/// `bracket` and never `bracket_from` — no gallop runs in either direction.
+/// Reversed is simply the cheapest input that is guaranteed non-monotone while
+/// still being a permutation of the forward one, which is what lets the rows be
+/// compared element for element. Injecting `panic!()` into `bracket_from`'s
+/// downward arm leaves this test **passing** and fails `tf_tree_core`'s
+/// `sample_from_agrees_with_sample_from_every_cursor` and
+/// `sample_with_twist_from_agrees_with_sample_with_twist_from_every_cursor` —
+/// that arm's coverage is there, in the `start in 0..21` sweep, and deleting it
+/// would leave the arm untested whatever this test says.
+///
+/// What this *does* pin is the upward arm the monotone batch really uses, and
+/// it pins it against an independent answer rather than against itself.
+/// Mutant, run: in `bracket_from`'s upward arm, hand `bracket` a lower bound of
+/// `hint + step` instead of `hint + step / 2` ⇒ fails, "stamp 0 element 0
+/// disagreed between the cursor and fallback loops", `13824777323826317557`
+/// against `...562`.
+///
+/// Mutant B, run: in `fold_batch_with_twist`, declare the `cursors` array
+/// *inside* the loop so every stamp restarts cold ⇒ still passes, because a
+/// cold cursor is a valid cursor. That is the shape of the limit here: the
+/// cursor is a hint, so no assertion about the *values* can see whether it
+/// advanced. The advance is pinned in `tf_tree_core`'s
+/// `sample_with_twist_from_agrees_with_sample_with_twist_from_every_cursor`.
+#[test]
+fn quat_twist_agrees_between_the_cursor_and_fallback_batch_loops() {
+    use tf_tree::Layout;
+
+    let c = Chain::new(32, 1000);
+    let plan = c.tree.plan(c.base, c.map).unwrap();
+    let g = c.tree.guard();
+    let max_t = (c.n as i64 - 1) * c.dt;
+
+    // Off-grid, so the interpolant and its derivative both actually run.
+    let sorted: Vec<Stamp> = (0..64).map(|k| ns((k as i64 * max_t) / 64 + 37)).collect();
+    let mut reversed = sorted.clone();
+    reversed.reverse();
+
+    let n = Layout::QuatTwist.elems();
+    let mut a = vec![0.0f64; sorted.len() * n];
+    let mut b = vec![0.0f64; sorted.len() * n];
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&sorted), Layout::QuatTwist, &mut a)
+        .unwrap();
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&reversed), Layout::QuatTwist, &mut b)
+        .unwrap();
+
+    for i in 0..sorted.len() {
+        let j = sorted.len() - 1 - i;
+        for k in 0..n {
+            assert_eq!(
+                a[i * n + k].to_bits(),
+                b[j * n + k].to_bits(),
+                "stamp {i} element {k} disagreed between the cursor and fallback loops"
+            );
+        }
+    }
+    // Non-vacuity: the twist tail must be live, or this compares zeros.
+    assert!(
+        a.chunks_exact(n)
+            .any(|r| r[7..].iter().any(|v| v.abs() > 1e-9)),
+        "the fixture's twist is zero everywhere"
+    );
 }
 
 /// Validation happens before a single element is written (`PHASE3.md` §5.3).

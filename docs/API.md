@@ -589,7 +589,7 @@ authorized by this document alone.
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | its own plan |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
-| 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | `PHASE5.md` §4 |
+| 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | `PHASE5.md` §4 — **core and C landed; Python outstanding** |
 | 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | `PHASE5.md` §4.2 |
 | 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | `PHASE5.md` §4 |
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
@@ -599,6 +599,16 @@ authorized by this document alone.
 Items 2, 4, 8, 9 and 11 are additive and independent. Items 1, 5 and 7 touch
 core and are the ones to sequence. Item 12 is gated by D21 and must not be
 started before `PHASE7.md` §0.0's four gates are met.
+
+**Row 7 is half delivered, and the half that is missing is named rather than
+implied.** `Layout::QuatTwist` exists in `tf_tree_core`, and the C ABI serves it
+from `tft_plan_at`, `tft_plan_at_many` and the C++ `layout_of<Quat7Twist6>`.
+**Python does not**: `tf_tree_py` still hard-codes `Layout::Mat4` and exposes no
+`layout=` parameter at all, so there is no argument for a caller to pass. That is
+not a line of glue — it needs its own buffer validation and its own GIL
+threshold (`PHASE3.md` §6.1), which is the same argument §3.3 makes for why a
+separate `at_d` was not worth it. It stays row 7, still landing in
+`PHASE5.md` §4.4 item 1.
 
 ---
 

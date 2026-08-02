@@ -87,7 +87,7 @@ pub use error::{
 };
 pub use layout::{
     tft_layout, TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_MAT4_COL, TFT_LAYOUT_MAT4_ROW,
-    TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW,
+    TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_WXYZ_TWIST6, TFT_LAYOUT_QVEC7_XYZW,
 };
 #[cfg(feature = "test-hooks")]
 pub use publisher::tft_test_push_unguarded;
@@ -124,7 +124,17 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// it is, instead of refusing it with `TFT_ERR_BAD_STRUCT_SIZE`. Until that
 /// landed, appending a field would have locked every older caller out of every
 /// call — which is the precise case §3.6 exists to prevent.
-pub const TFT_ABI_VERSION_MINOR: u32 = 2;
+///
+/// `2` → `3`: one appended `tft_layout` enumerator,
+/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`], carrying `at_with_derivatives` as a layout
+/// (`docs/API.md` §3.3) — accepted by [`tft_plan_at`] and [`tft_plan_at_many`],
+/// which is why it is in the frozen header rather than the unstable one. §3.6
+/// names this case explicitly: an older caller never spells the new value, and
+/// every entry point that takes a `tft_layout` rejects a discriminant it does
+/// not define rather than computing a size from it — so a `0.2` caller against
+/// a `0.3` library is unchanged in every byte it can observe. No struct grew,
+/// nothing moved, and no existing enumerator changed meaning.
+pub const TFT_ABI_VERSION_MINOR: u32 = 3;
 
 /// The library's major ABI version.
 #[no_mangle]
@@ -467,6 +477,15 @@ pub unsafe extern "C" fn tft_plan_free(plan: *mut tft_plan) {
 ///
 /// `out` must have room for at least `tft_layout_size(layout)` bytes.
 ///
+/// # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
+///
+/// Asking for that layout *is* asking for derivatives: the plan is evaluated
+/// with them and thirteen `f64` are written, pose then body twist. It is
+/// therefore the one layout this function can fail on for a reason the others
+/// cannot — `TFT_ERR_NO_DERIVATIVES` when an edge on the path interpolates with
+/// `LerpSlerp`, `TFT_ERR_NO_SEGMENT` when it has a pose at this stamp but no
+/// segment to differentiate. Nothing is written in either case.
+///
 /// # Safety
 ///
 /// `plan` must be a handle from `tft_plan_create` that has not been freed.
@@ -497,12 +516,26 @@ pub unsafe extern "C" fn tft_plan_at(
         let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
 
         let g = h.share.tree.guard();
-        match h.plan.at(&g, Stamp::<SystemDomain>::from_nanos(stamp)) {
-            Ok(iso) => {
-                layout::write(&iso, layout, dst);
-                TFT_OK
+        let t = Stamp::<SystemDomain>::from_nanos(stamp);
+        // Two evaluations, chosen once from the layout. A twist layout cannot
+        // be served by `plan.at`, and a pose layout must not pay for the
+        // adjoint chain `at_with_derivatives` runs per plan step.
+        if layout::carries_twist(layout) {
+            match h.plan.at_with_derivatives(&g, t) {
+                Ok(s) => {
+                    layout::write_twist6(&s.pose, &s.twist, dst);
+                    TFT_OK
+                }
+                Err(e) => record_lookup(e),
             }
-            Err(e) => record_lookup(e),
+        } else {
+            match h.plan.at(&g, t) {
+                Ok(iso) => {
+                    layout::write(&iso, layout, dst);
+                    TFT_OK
+                }
+                Err(e) => record_lookup(e),
+            }
         }
     })
 }
@@ -512,6 +545,30 @@ pub unsafe extern "C" fn tft_plan_at(
 /// `out_stride_bytes == 0` means tightly packed. A stride larger than the
 /// payload writes directly into an array of caller structs — §4.3 is why this
 /// parameter exists at all (`Sophus::SE3d` is usually *not* tightly packed).
+///
+/// # Partial writes
+///
+/// Evaluation stops at the first stamp that fails, and the elements already
+/// written stay written — a batch is not a transaction. `tft_last_error`'s
+/// `frame_b` carries the index that failed, so a caller knows exactly how many
+/// leading elements are live. Only the argument checks (NULL, stride, overflow,
+/// an unknown layout) are all-or-nothing.
+///
+/// # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
+///
+/// Accepted here as it is by [`tft_plan_at`], and with the same meaning: each
+/// element is thirteen `f64`, pose then body twist, evaluated with derivatives.
+/// `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on the
+/// first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT` depends
+/// on the stamp and can fire part-way through.
+///
+/// **Sort your stamps.** This layout is evaluated by the engine's batch fold,
+/// which rides a resumable cursor per plan step when the stamps are
+/// non-decreasing — an `O(1)` amortized bracket search instead of `O(log n)` per
+/// stamp per step. Unsorted stamps get the same answers and pay the searches.
+/// A tightly packed `out` (`out_stride_bytes` of `0` or 104, `f64`-aligned) is
+/// written in place with no intermediate copy; any other stride is evaluated in
+/// chunks and scattered, which restarts the cursor once per chunk.
 ///
 /// # Safety
 ///
@@ -581,39 +638,175 @@ pub unsafe extern "C" fn tft_plan_at_many(
         let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), span) };
 
         let g = h.share.tree.guard();
-        for (i, &t) in ts.iter().enumerate() {
-            match h.plan.at(&g, Stamp::<SystemDomain>::from_nanos(t)) {
-                Ok(iso) => {
-                    let off = i * stride;
-                    layout::write(&iso, layout, &mut dst[off..off + payload]);
+        // The layout decides which evaluation runs, **once**, outside the loop:
+        // two loops rather than one loop with a compare in it. The batch's whole
+        // purpose is per-element cost, and this file does not put a
+        // loop-invariant test on that path.
+        //
+        // The two bodies are deliberately not folded behind a closure. That was
+        // measured: `examples/abi_cost.rs` reports 189.5 ns/element for the
+        // form below and 199 ns for the closure form, ~5 %, because the closure
+        // stops LLVM hoisting the plan and guard loads out of the loop. Twelve
+        // duplicated lines is the cheaper trade, and the failure reporting —
+        // the part with an argument in it — is shared by `note_batch_failure`.
+        if layout::carries_twist(layout) {
+            // The twist layout goes through `Plan::at_many_into` — the *same*
+            // batch fold, and the same monotone cursor, the Rust and Python
+            // batch paths use. Evaluating it with a scalar `at_with_derivatives`
+            // per element, as this used to, cannot reach that branch and pays an
+            // independent `O(log n)` bracket search per stamp per plan step.
+            //
+            // It returns `false` for *any* failure and reports nothing, because
+            // `at_many_into` says only which error, never which element. The
+            // scalar loop below then re-runs the batch, reproduces the failure
+            // and reports the index — which is what keeps §4.3's promise that
+            // `frame_b` says how many leading elements are live. The rows it
+            // rewrites on the way are bit-identical to the ones already there
+            // (that is what the cursor being a *hint* means), so the buffer ends
+            // in the state the doc comment describes either way.
+            if twist_batch(&h.plan, &g, ts, dst, stride, payload) {
+                return TFT_OK;
+            }
+            for (i, &t) in ts.iter().enumerate() {
+                match h
+                    .plan
+                    .at_with_derivatives(&g, Stamp::<SystemDomain>::from_nanos(t))
+                {
+                    Ok(s) => {
+                        let off = i * stride;
+                        layout::write_twist6(&s.pose, &s.twist, &mut dst[off..off + payload]);
+                    }
+                    Err(e) => return note_batch_failure(i, t, e),
                 }
-                // Stop at the first failure. A partially written buffer is worse
-                // than none because it looks like data (PHASE3 §5.3's reasoning,
-                // applies identically here).
-                //
-                // `amend_error`, **not** `set_error`: the latter blanks the slot
-                // first, which would erase the edge id and the retained window
-                // `record_lookup` just recorded — leaving a batch caller with
-                // strictly less information than the equivalent single call, the
-                // exact loss §3.3 exists to prevent. Found by review.
-                //
-                // The index goes in `frame_b`, which no lookup error uses, so a
-                // caller learns *which element* failed as well as why, and
-                // `requested` keeps the stamp.
-                Err(e) => {
-                    let status = record_lookup(e);
-                    amend_error(|d| {
-                        d.frame_b = u32::try_from(i).unwrap_or(TFT_INVALID_ID);
-                        if d.requested == 0 {
-                            d.requested = t;
-                        }
-                    });
-                    return status;
+            }
+        } else {
+            for (i, &t) in ts.iter().enumerate() {
+                match h.plan.at(&g, Stamp::<SystemDomain>::from_nanos(t)) {
+                    Ok(iso) => {
+                        let off = i * stride;
+                        layout::write(&iso, layout, &mut dst[off..off + payload]);
+                    }
+                    Err(e) => return note_batch_failure(i, t, e),
                 }
             }
         }
         TFT_OK
     })
+}
+
+/// Evaluate `stamps` in [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] through
+/// [`tf_tree::Plan::at_many_into`], returning `false` if any element failed.
+///
+/// # Why this exists at all
+///
+/// `Layout::QuatTwist`'s batch fold rides a monotone cursor per plan step, so
+/// ascending stamps cost `O(1)` amortized in the bracket search instead of
+/// `O(log n)`. That is the reason the layout is a *batch* layout — it is
+/// `docs/API.md` §3.3's n = 1024 ML/perception row — and a per-element scalar
+/// call cannot reach it.
+///
+/// **Measured, and smaller than the complexity suggests.** On
+/// `tf_tree_bench`'s fixture — ten seconds of history, up to 1 kHz, n = 1024 —
+/// the cursor is worth 3.0 % (342 against 352 ns/element, in-process A/B of the
+/// two arms on the same stamps). On `examples/abi_cost.rs`'s 64-sample rings it
+/// is 1.4 % (240 → 237 ns/element, packed), because a binary search over 64
+/// L1-resident stamps is a handful of nanoseconds against ~240 of interpolation
+/// and adjoint composition. The win scales with ring depth, and the reason to
+/// take it is that it costs nothing: it *is* the Rust path.
+///
+/// # Two shapes, one fold
+///
+/// `at_many_into` writes thirteen **contiguous** `f64` per stamp into a Rust
+/// slice; §4.3's `out_stride_bytes` exists because a C caller's buffer is often
+/// neither contiguous nor `f64`-aligned.
+///
+/// * **Tightly packed and aligned** — a `Quat7Twist6[]`, or the `(N, 13)` array
+///   §3.3 is about, which is what the C++ wrapper passes: the caller's own
+///   memory *is* the output slice. No copy and no chunking, so one cursor runs
+///   the length of the batch.
+/// * **Anything else**: `CHUNK` rows at a time through a stack buffer, then
+///   scattered at the caller's stride. The cursor restarts once per chunk
+///   instead of once per stamp, which is 1/`CHUNK` of the searches the scalar
+///   loop paid.
+///
+/// `CHUNK` is deliberately small. The buffer is a plain array, so its zeroing
+/// is paid even by a batch of one: 32 rows is 3.3 KiB of stack and leaves under
+/// one probe per element of restart cost, where 512 would save a rounding error
+/// of search and charge every short batch 53 KiB.
+fn twist_batch(
+    plan: &tf_tree::Plan,
+    g: &tf_tree::Guard<'_>,
+    stamps: &[i64],
+    dst: &mut [u8],
+    stride: usize,
+    payload: usize,
+) -> bool {
+    /// `f64` per row — `Layout::QuatTwist::elems()`.
+    const ROW: usize = 13;
+    /// Rows per pass of the scatter path.
+    const CHUNK: usize = 32;
+    debug_assert_eq!(payload, ROW * 8, "the twist layout is thirteen f64");
+
+    if stride == payload && dst.as_ptr().align_offset(core::mem::align_of::<f64>()) == 0 {
+        // `dst.len()` is the span the caller's arguments were validated
+        // against — `(n-1) * stride + payload`, which with `stride == payload`
+        // is exactly `n * ROW` f64.
+        //
+        // SAFETY: `dst` is a live, uniquely borrowed `&mut [u8]` whose start is
+        // `f64`-aligned (tested immediately above) and whose length is `n *
+        // payload`, a multiple of eight. The reborrow below is the only access
+        // to those bytes while it lives, so the two slices never alias, and
+        // `f64` has no invalid bit patterns — whatever the caller left in the
+        // buffer is a valid, if meaningless, `f64`.
+        let rows = unsafe {
+            core::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f64>(), dst.len() / 8)
+        };
+        return plan
+            .at_many_into::<SystemDomain>(g, stamps, tf_tree::Layout::QuatTwist, rows)
+            .is_ok();
+    }
+
+    let mut scratch = [0.0f64; CHUNK * ROW];
+    for (c, part) in stamps.chunks(CHUNK).enumerate() {
+        let rows = &mut scratch[..part.len() * ROW];
+        if plan
+            .at_many_into::<SystemDomain>(g, part, tf_tree::Layout::QuatTwist, rows)
+            .is_err()
+        {
+            return false;
+        }
+        for (j, row) in rows.chunks_exact(ROW).enumerate() {
+            let off = (c * CHUNK + j) * stride;
+            layout::put_f64(&mut dst[off..off + payload], row);
+        }
+    }
+    true
+}
+
+/// Record the failure of element `i` of a batch, at stamp `t`.
+///
+/// Stops at the first failure, leaving the elements already written in place: a
+/// batch is not a transaction, and the caller learns the index from the error
+/// rather than from the buffer's contents.
+///
+/// `amend_error`, **not** `set_error`: the latter blanks the slot first, which
+/// would erase the edge id and the retained window `record_lookup` just
+/// recorded — leaving a batch caller with strictly less information than the
+/// equivalent single call, the exact loss §3.3 exists to prevent. Found by
+/// review.
+///
+/// The index goes in `frame_b`, which no lookup error uses, so a caller learns
+/// *which element* failed as well as why, and `requested` keeps the stamp.
+#[cold]
+fn note_batch_failure(i: usize, t: i64, e: tf_tree::LookupError) -> tft_status {
+    let status = record_lookup(e);
+    amend_error(|d| {
+        d.frame_b = u32::try_from(i).unwrap_or(TFT_INVALID_ID);
+        if d.requested == 0 {
+            d.requested = t;
+        }
+    });
+    status
 }
 
 /// The number of bytes one transform occupies in `layout`, or `0` if the
@@ -713,6 +906,74 @@ pub unsafe extern "C" fn tft_test_tree_create(out: *mut *mut tft_tree) -> tft_st
             }
             core::mem::forget(w);
         }
+        let h = Box::new(tft_tree {
+            magic: MAGIC_TREE,
+            share: Arc::new(TreeShare { tree }),
+        });
+        // SAFETY: `out` is non-null and the caller contracts it writable.
+        unsafe { core::ptr::write(out, Box::into_raw(h)) };
+        TFT_OK
+    })
+}
+
+/// Build a fixture tree whose dynamic edge interpolates with **`LerpSlerp`**:
+/// `map -> base`, 32 samples 10 ms apart.
+///
+/// A third fixture, because the refusal it exists to test cannot be reached
+/// from either of the others. [`tft_test_tree_create`]'s edges are `ScLerp`, so
+/// every derivative query against it succeeds — which is the right shape for
+/// the numeric tests and the wrong one for the only error a twist layout has
+/// that a pose layout does not. `LerpSlerp`'s body twist is an artifact of the
+/// interpolant rather than of the motion, so `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
+/// must come back `TFT_ERR_NO_DERIVATIVES` naming the edge instead of a
+/// plausible number, and there was previously no way to assert that through
+/// the C ABI at all.
+///
+/// # Safety
+///
+/// `out` must be NULL or point to a writable `*mut tft_tree`.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub unsafe extern "C" fn tft_test_lerpslerp_tree_create(out: *mut *mut tft_tree) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(64));
+        let Ok(tree) = tf_tree::TreeBuilder::new()
+            .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+            .dynamic_edge("map", "base", cfg)
+            .build()
+        else {
+            return TFT_ERR_INTERNAL;
+        };
+        let (Ok(p), Ok(c)) = (tree.frame("map"), tree.frame("base")) else {
+            return TFT_ERR_INTERNAL;
+        };
+        let Ok(w) = tree.claim(c, p) else {
+            return TFT_ERR_INTERNAL;
+        };
+        for i in 0..32i64 {
+            let f = i as f64;
+            if w.push(
+                i * 10_000_000,
+                &tf_tree::exp_se3([
+                    0.004 * f,
+                    -0.003 * f,
+                    0.002 * f,
+                    0.05 * f,
+                    -0.02 * f,
+                    0.01 * f,
+                ]),
+            )
+            .is_err()
+            {
+                return TFT_ERR_INTERNAL;
+            }
+        }
+        // Held for the life of the tree, exactly as `tft_test_tree_create`
+        // does: a released claim would let a lookup race a reaper.
+        core::mem::forget(w);
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
             share: Arc::new(TreeShare { tree }),

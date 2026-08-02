@@ -87,11 +87,20 @@ fn a_lookup_through_the_c_abi_returns_a_valid_rigid_transform() {
     }
 }
 
-/// **Every layout must agree about the transform**, differing only in how it is
-/// written. A disagreement here means one of the five is transposing or
-/// reordering something.
+/// **The four `f64` pose layouts must agree about the transform**, differing
+/// only in how it is written. A disagreement here means one of them is
+/// transposing or reordering something.
+///
+/// Four, not six, and the name says four because it used to say five and was
+/// wrong on both counts. `TFT_LAYOUT_AFFINE12_ROW_F32` is narrowed to `f32`, so
+/// it cannot be compared bit for bit against these; it is pinned instead against
+/// a hand-written pattern, in
+/// `layout::tests::affine12_is_f32_row_major_without_the_bottom_row`.
+/// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is a pose *and a twist*, and
+/// its pose half is asserted equal to `QVEC7_WXYZ` — byte for byte, from the
+/// same call — in `the_twist_layout_writes_the_pose_and_the_twist_contiguously`.
 #[test]
-fn all_five_layouts_describe_the_same_transform() {
+fn the_four_f64_pose_layouts_describe_the_same_transform() {
     let tree = Tree::new();
     let plan = tree.plan("map", "base");
     let stamp = 250_000_000;
@@ -519,6 +528,504 @@ fn derivatives_match_a_central_difference_of_the_pose() {
     assert!(
         fine < coarse / 3.0 || fine < 1e-9,
         "halving h must roughly quarter the error: {coarse:e} -> {fine:e}"
+    );
+}
+
+/// **`TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is the same numbers in one buffer** —
+/// `docs/API.md` §3.3's `(N, 13)` row, appended as a **minor** ABI bump
+/// (`docs/PHASE4.md` §3.6).
+///
+/// The whole claim of a layout — rather than a fourth entry point — is that it
+/// is a *re-encoding* and never a second computation. So this asserts the 104
+/// bytes against the 56-byte pose write and the 6-element twist buffer taken
+/// from the very same call, bit for bit. A tolerance would let a second
+/// implementation hide inside it.
+///
+/// Mutants, applied to the source, run and reverted. Both name `write_twist6`,
+/// which is where this write lives — `layout::write` has been pose-only since
+/// the round that split the two, so a mutant naming *its* twist arm could not be
+/// applied at all:
+///
+/// * `write_twist6` writes the pose half inline in `xyzw` order rather than
+///   delegating to `put_qvec7_wxyz` ⇒ fails, "the pose half is not QVEC7_WXYZ
+///   byte for byte". Delegation is the whole guard: an inline copy that happens
+///   to be right today is one edit from being the trap this module opens with.
+/// * `write_twist6` emits `v` before `ω` ⇒ fails, "twist slot 0 differs between
+///   out_pose's tail and out_twist", `4620749313291464668` against
+///   `4608340743733235298`.
+#[test]
+fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+    let at = 300_000_000i64;
+
+    assert_eq!(
+        tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ_TWIST6),
+        104,
+        "13 f64 — the size a C caller allocates from"
+    );
+
+    let mut row = [0u8; 104];
+    let mut twist = [0.0f64; 6];
+    // SAFETY: live plan; `row` is exactly `tft_layout_size` bytes and `twist`
+    // exactly `TFT_TWIST_BYTES`.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_with_derivatives(
+                p.0,
+                at,
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                row.as_mut_ptr().cast(),
+                twist.as_mut_ptr(),
+            )
+        },
+        TFT_OK
+    );
+
+    // The pose half against the layout it extends, from an independent call.
+    let mut pose = [0u8; 56];
+    // SAFETY: live plan, correctly sized buffer.
+    assert_eq!(
+        unsafe { tft_plan_at(p.0, at, TFT_LAYOUT_QVEC7_WXYZ, pose.as_mut_ptr().cast()) },
+        TFT_OK
+    );
+    assert_eq!(
+        &row[..56],
+        &pose[..],
+        "the pose half is not QVEC7_WXYZ byte for byte"
+    );
+
+    // The tail against `out_twist` from the same call — the two spellings of
+    // the same six numbers must not diverge.
+    for (i, v) in twist.iter().enumerate() {
+        assert_eq!(
+            read_f64(&row, 7 + i).to_bits(),
+            v.to_bits(),
+            "twist slot {i} differs between out_pose's tail and out_twist"
+        );
+    }
+    // Non-vacuity: the fixture must actually be moving, or six zeros would
+    // satisfy every assertion above.
+    assert!(
+        twist.iter().any(|v| v.abs() > 1e-9),
+        "the fixture's twist is zero; this test would pass against a stub"
+    );
+}
+
+/// **The stable batch entry points serve the twist layout, and every row they
+/// write is bit-identical to the scalar derivative call** — `docs/PHASE5.md`
+/// §4.4 item 1, which is NORMATIVE and says derivatives reach C.
+///
+/// This is the assertion the whole layout rests on. `tft_plan_at_many` is a
+/// different loop from `tft_plan_at_with_derivatives` — it strides, it batches,
+/// and it evaluates through `Plan::at_many_into` rather than one scalar call per
+/// element — so "the same numbers" is a claim about two independent code paths
+/// and not a tautology. Compared with `to_bits`, because a tolerance is exactly
+/// where a second implementation of a velocity would hide.
+///
+/// **Both of `twist_batch`'s shapes are exercised**, and they are genuinely
+/// different code: a tightly packed buffer is handed to `at_many_into` as the
+/// output slice itself, while a strided one is evaluated a chunk at a time and
+/// scattered. §4.3's whole reason for the stride parameter is writing into an
+/// array of caller structs, and a 13-element row is the widest payload the ABI
+/// has, so the offset arithmetic has the most room to be wrong.
+///
+/// Mutants, all applied to the source, run and reverted:
+///
+/// * `panic!()` as the first statement of
+///   `Plan::fold_at_with_derivatives_cursors` ⇒ **fails**, in
+///   `tft_plan_at_many`'s panic guard: `left: -99, right: 0`, i.e.
+///   `TFT_ERR_INTERNAL` where `TFT_OK` was expected. This is the mutant worth
+///   reading. With the same injection *and* `twist_batch` disabled — which is
+///   what this entry point did before this round, a scalar
+///   `at_with_derivatives` per element — the test passes. It is the only
+///   assertion available that the C batch reaches the cursor fold at all: a
+///   cursor is a hint and cannot change an answer, so nothing about the values
+///   below can distinguish the two.
+/// * drop the `stride == payload` test in `twist_batch`, so the strided call
+///   takes the packed arm ⇒ fails at element 1, "the strided batch row differs
+///   from the scalar call" — the packed arm writes rows 104 bytes apart into a
+///   buffer whose rows are 128 apart.
+/// * `layout::write_twist6` emits `v` before `ω` ⇒ fails at element 0. The batch
+///   rows come from `tf_tree_core::layout::write_quat_twist` and the reference
+///   from `write_twist6`, so the two orders are exactly what this compares.
+#[test]
+fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+
+    // Off-grid and ascending: the interpolant and its derivative both run, and
+    // the batch takes its monotone-cursor branch.
+    let stamps: Vec<i64> = (0..48).map(|k| 200_000_000 + k * 7_300_000).collect();
+
+    const STRIDE: usize = 128; // > 104, so the rows are not tightly packed
+    let mut rows = vec![0u8; stamps.len() * STRIDE];
+    // SAFETY: live plan; `stamps` is `len` readable i64 and `rows` holds
+    // `(len - 1) * STRIDE + 104` bytes, which is what the call touches.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_many(
+                p.0,
+                stamps.as_ptr(),
+                stamps.len(),
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                rows.as_mut_ptr().cast(),
+                STRIDE,
+            )
+        },
+        TFT_OK
+    );
+
+    // The same batch, tightly packed — the `Quat7Twist6[]` the C++ wrapper
+    // passes, and the only shape that reaches the zero-copy arm.
+    let mut packed = vec![0u8; stamps.len() * 104];
+    // SAFETY: live plan; `stamps` is `len` readable i64 and `packed` is exactly
+    // `len * 104` bytes, which is what a zero stride makes the call touch.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_many(
+                p.0,
+                stamps.as_ptr(),
+                stamps.len(),
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                packed.as_mut_ptr().cast(),
+                0,
+            )
+        },
+        TFT_OK
+    );
+
+    let mut moving = 0usize;
+    for (i, &s) in stamps.iter().enumerate() {
+        // The reference: the unstable scalar call, into its own buffers.
+        let mut pose = [0u8; 104];
+        let mut twist = [0.0f64; 6];
+        // SAFETY: live plan; both buffers are exactly the documented sizes.
+        assert_eq!(
+            unsafe {
+                tft_plan_at_with_derivatives(
+                    p.0,
+                    s,
+                    TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                    pose.as_mut_ptr().cast(),
+                    twist.as_mut_ptr(),
+                )
+            },
+            TFT_OK
+        );
+        let row = &rows[i * STRIDE..i * STRIDE + 104];
+        assert_eq!(
+            row,
+            &pose[..],
+            "element {i}: the strided batch row differs from the scalar call"
+        );
+        assert_eq!(
+            &packed[i * 104..(i + 1) * 104],
+            &pose[..],
+            "element {i}: the packed batch row differs from the scalar call"
+        );
+        // ...and the tail really is the twist, not merely equal to itself.
+        for (k, v) in twist.iter().enumerate() {
+            assert_eq!(
+                read_f64(row, 7 + k).to_bits(),
+                v.to_bits(),
+                "element {i} twist slot {k}"
+            );
+        }
+        if twist.iter().any(|v| v.abs() > 1e-9) {
+            moving += 1;
+        }
+    }
+    // Non-vacuity: a stationary fixture would satisfy all of the above against
+    // a layout that wrote six zeros.
+    assert_eq!(moving, stamps.len(), "the fixture is not moving");
+
+    // The scalar stable entry point serves it too, with the same bytes.
+    let mut one = [0u8; 104];
+    // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
+    assert_eq!(
+        unsafe {
+            tft_plan_at(
+                p.0,
+                stamps[3],
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                one.as_mut_ptr().cast(),
+            )
+        },
+        TFT_OK
+    );
+    assert_eq!(
+        &one[..],
+        &rows[3 * STRIDE..3 * STRIDE + 104],
+        "tft_plan_at and tft_plan_at_many disagree about the twist layout"
+    );
+}
+
+/// **A twist batch that fails part-way still names the element and keeps the
+/// rows before it** — the §4.3 contract, across the two-phase evaluation.
+///
+/// `tft_plan_at_many` serves this layout by handing the whole batch to
+/// `Plan::at_many_into`, which reports *which error* and never *which element*.
+/// So a failure falls back to the scalar loop, which reproduces it and reports
+/// the index. Everything a caller can observe has to come out the same as it
+/// would from a single-phase loop, and that is what this asserts: the status,
+/// `frame_b`, the live prefix, and the untouched tail.
+///
+/// Both shapes are run, because they fail in different places — the packed arm
+/// fails after `at_many_into` has already written rows into the caller's buffer,
+/// the strided one after it has written them into a stack chunk that is then
+/// discarded. The observable result must not be able to tell.
+///
+/// Mutants, applied to the source, run and reverted:
+///
+/// * `twist_batch`'s packed arm ignores the result and returns `true` ⇒ fails
+///   at "stride 0" with `left: 0, right: -13` — `TFT_OK` reported for a batch
+///   that did not evaluate.
+/// * `note_batch_failure` is passed `0` instead of `i` ⇒ fails at "stride 0: the
+///   failing index" with `left: 0, right: 2`.
+/// * delete the `if twist_batch(..) { return TFT_OK; }` early return, leaving
+///   only the scalar loop ⇒ **passes**, and that is the point: this test pins
+///   the contract the fast path must not change, not the fast path itself. The
+///   fast path is pinned by
+///   `the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call`.
+#[test]
+fn a_twist_batch_that_fails_part_way_reports_the_element_and_keeps_the_prefix() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+    // Two stamps inside the window, then one far outside it.
+    let stamps = [200_000_000i64, 207_300_000, i64::MAX / 2];
+
+    for stride in [0usize, 128] {
+        let step = if stride == 0 { 104 } else { stride };
+        let mut buf = vec![0xAAu8; stamps.len() * step];
+        // SAFETY: live plan; three readable stamps and `3 * step` writable
+        // bytes, which covers `(3-1) * step + 104` for either stride.
+        let rc = unsafe {
+            tft_plan_at_many(
+                p.0,
+                stamps.as_ptr(),
+                stamps.len(),
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                buf.as_mut_ptr().cast(),
+                stride,
+            )
+        };
+        assert_eq!(rc, TFT_ERR_EXTRAPOLATION, "stride {stride}");
+        let e = fetch_error();
+        assert_eq!(e.frame_b, 2, "stride {stride}: the failing index");
+        assert_ne!(
+            e.edge, TFT_INVALID_ID,
+            "stride {stride}: the edge must survive the fallback"
+        );
+
+        // The two elements before the failure are live, and equal to what the
+        // scalar call gives at the same stamps.
+        for (i, &s) in stamps[..2].iter().enumerate() {
+            let mut one = [0u8; 104];
+            // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
+            assert_eq!(
+                unsafe {
+                    tft_plan_at(
+                        p.0,
+                        s,
+                        TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                        one.as_mut_ptr().cast(),
+                    )
+                },
+                TFT_OK
+            );
+            assert_eq!(
+                &buf[i * step..i * step + 104],
+                &one[..],
+                "stride {stride}: element {i} should be live"
+            );
+        }
+        // ...and the failing element was not written at all.
+        assert_eq!(
+            &buf[2 * step..2 * step + 104],
+            &[0xAAu8; 104][..],
+            "stride {stride}: the failing element must not be written"
+        );
+    }
+}
+
+/// **A tightly packed but `f64`-misaligned `out` is still correct**, and is the
+/// reason `twist_batch`'s zero-copy arm tests alignment as well as stride.
+///
+/// A C caller's `void*` carries no alignment promise. `layout::write_twist6`
+/// never needed one — it stores through `f64::to_ne_bytes` into a byte slice —
+/// but the packed arm builds a `&mut [f64]` over the caller's memory, and a
+/// misaligned reference is Undefined Behaviour in Rust *even on a target whose
+/// loads would have worked*. So the alignment test is not defensive style; it is
+/// what decides which arm runs, and this is a caller that must take the other
+/// one.
+///
+/// The buffer is deliberately skewed to `addr % 8 == 4`, which is reachable in C
+/// from a `char` buffer, a packed struct, or an arena allocator.
+///
+/// Mutant, run: delete the `align_offset` test from `twist_batch` so this call
+/// takes the packed arm. Two distinct failures, and both were observed:
+///
+/// * Under `just c-abi-check`'s Miri pass — "Undefined Behavior: constructing
+///   invalid value of type `&mut [f64]`: encountered an unaligned reference
+///   (required 8 byte alignment but found 4)".
+/// * Under a plain `cargo nextest run` (the debug profile `just test` uses) —
+///   `SIGABRT`, "unsafe precondition(s) violated: `slice::from_raw_parts_mut`
+///   requires the pointer to be aligned and non-null". The standard library's
+///   own debug-assertion catches it before Miri is needed.
+///
+/// It survives **only** under `--release`, where `debug_assertions` is off and
+/// the UB goes unobserved on a target whose loads happen to work. That is the
+/// configuration Miri exists for here, and it is why the claim is stated against
+/// the arm that runs rather than against the values written.
+#[test]
+fn an_unaligned_packed_twist_batch_is_written_correctly() {
+    let t = Tree::new();
+    let p = t.plan("map", "sensor");
+    let stamps: Vec<i64> = (0..8).map(|k| 200_000_000 + k * 7_300_000).collect();
+
+    // Sixteen bytes of headroom, not eight: `skew` is at most 11 (up to 7 to
+    // reach an 8-boundary, then 4 past it), and a shorter tail is a three-byte
+    // overrun the allocator hides on most runs. Miri found exactly that.
+    let mut raw = vec![0xAAu8; stamps.len() * 104 + 16];
+    let base = raw.as_mut_ptr();
+    let skew = (8 - (base as usize % 8)) % 8 + 4;
+    // SAFETY: `skew <= 11` and `raw` has sixteen bytes of headroom past the payload.
+    let out = unsafe { base.add(skew) };
+    assert_eq!(
+        out as usize % 8,
+        4,
+        "the buffer must actually be misaligned"
+    );
+
+    // SAFETY: live plan; `stamps.len()` readable i64, and `out` has
+    // `stamps.len() * 104` writable bytes.
+    let rc = unsafe {
+        tft_plan_at_many(
+            p.0,
+            stamps.as_ptr(),
+            stamps.len(),
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            out.cast(),
+            0,
+        )
+    };
+    assert_eq!(rc, TFT_OK);
+
+    for (i, &s) in stamps.iter().enumerate() {
+        let mut one = [0u8; 104];
+        // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
+        assert_eq!(
+            unsafe {
+                tft_plan_at(
+                    p.0,
+                    s,
+                    TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                    one.as_mut_ptr().cast(),
+                )
+            },
+            TFT_OK
+        );
+        assert_eq!(
+            &raw[skew + i * 104..skew + (i + 1) * 104],
+            &one[..],
+            "element {i} of a misaligned packed batch"
+        );
+    }
+    // Non-vacuity: the rows must not all be the sentinel, and the twist tail
+    // must be live — six zeros would satisfy the comparison above against a
+    // layout that wrote nothing but a pose.
+    assert!(
+        (0..stamps.len())
+            .any(|i| (7..13).any(|k| read_f64(&raw[skew + i * 104..], k).abs() > 1e-9)),
+        "the fixture's twist is zero everywhere"
+    );
+}
+
+/// **A `LerpSlerp` edge refuses the twist layout with a *typed* status** —
+/// `TFT_ERR_NO_DERIVATIVES`, naming the edge, not `TFT_ERR_BAD_ENUM`.
+///
+/// `LerpSlerp`'s body twist is an artifact of the interpolant rather than of
+/// the motion, so it is refused rather than reported (`docs/PHASE4.md` §2.4).
+/// The *status* is the load-bearing part: `TFT_ERR_BAD_ENUM` would tell a
+/// caller their layout argument was invalid, sending them to fix a call that is
+/// correct, when the real answer is "declare this edge `ScLerp`". That
+/// distinction is the entire content of a typed error space (R5), and the two
+/// are one `record_lookup`-versus-`bad_enum` away from each other at every call
+/// site in the crate.
+///
+/// The buffer is checked untouched as well. `DerivativesUnavailable` is a
+/// property of the *edge*, so it fires on the first element and nothing is
+/// written — unlike the stamp-dependent errors, which can stop a batch part-way
+/// through.
+///
+/// Mutant, run: in `tft_plan_at`'s twist arm, replace `Err(e) => record_lookup(e)`
+/// with `Err(_) => bad_enum("layout")` ⇒ fails on the status assertion. The
+/// pose-layout call below is the non-vacuity guard: without it, a fixture whose
+/// plan simply did not resolve would satisfy every refusal assertion here.
+#[test]
+fn a_lerpslerp_edge_refuses_the_twist_layout_with_a_typed_status() {
+    let mut raw: *mut tft_tree = ptr::null_mut();
+    // SAFETY: `raw` is a live local.
+    assert_eq!(unsafe { tft_test_lerpslerp_tree_create(&mut raw) }, TFT_OK);
+    let t = Tree(raw);
+    let p = t.plan("map", "base");
+    let at = 155_000_000i64;
+
+    // Non-vacuity: the pose layouts work over this plan and this stamp, so the
+    // refusals below are about the derivative and not about the fixture.
+    let mut pose = [0u8; 56];
+    // SAFETY: live plan, 56-byte buffer for a 56-byte layout.
+    assert_eq!(
+        unsafe { tft_plan_at(p.0, at, TFT_LAYOUT_QVEC7_WXYZ, pose.as_mut_ptr().cast()) },
+        TFT_OK
+    );
+
+    const SENTINEL: u8 = 0xAA;
+    let mut row = [SENTINEL; 104];
+    // SAFETY: live plan; the buffer is the layout's full size, so a write that
+    // wrongly went ahead would be in bounds and visible rather than UB.
+    assert_eq!(
+        unsafe {
+            tft_plan_at(
+                p.0,
+                at,
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                row.as_mut_ptr().cast(),
+            )
+        },
+        TFT_ERR_NO_DERIVATIVES,
+        "a LerpSlerp edge must be a typed refusal, not a bad enum"
+    );
+    assert!(
+        row.iter().all(|b| *b == SENTINEL),
+        "a refused tft_plan_at wrote into the caller's buffer"
+    );
+    // The error names the offending edge, which is what turns the status into
+    // an action: it is the edge whose `InterpPolicy` has to change.
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_NO_DERIVATIVES);
+    assert_ne!(e.edge, TFT_INVALID_ID, "the refusal must name the edge");
+
+    let stamps = [at, at + 10_000_000];
+    let mut rows = [SENTINEL; 208];
+    // SAFETY: live plan, two readable i64, 2 x 104 writable bytes.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_many(
+                p.0,
+                stamps.as_ptr(),
+                stamps.len(),
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                rows.as_mut_ptr().cast(),
+                0,
+            )
+        },
+        TFT_ERR_NO_DERIVATIVES
+    );
+    assert!(
+        rows.iter().all(|b| *b == SENTINEL),
+        "a refused batch wrote into the caller's buffer"
     );
 }
 

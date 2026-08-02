@@ -64,6 +64,28 @@ fn at_many(c: &mut Criterion) {
         });
     });
 
+    // `Layout::QuatTwist` — the pose *and* its body twist, thirteen `f64` a row.
+    //
+    // It is the only layout here whose fold, sampler and monotone-cursor branch
+    // are all its own (`fold_batch_with_twist` / `sample_with_twist_from`), so it
+    // is the only one an A/B can regress without any row above noticing. The
+    // stamps are the same monotone 1024, so this row against `into_quat_1024` is
+    // what the derivatives cost: the same sampling work plus one adjoint per
+    // plan step, and no second bracket search.
+    let mut qt = vec![0.0f64; N * Layout::QuatTwist.elems()];
+    group.bench_function("into_quat_twist_1024", |b| {
+        b.iter(|| {
+            plan.at_many_into::<SystemDomain>(
+                &guard,
+                black_box(&nanos),
+                Layout::QuatTwist,
+                &mut qt,
+            )
+            .expect("at_many_into");
+            black_box(&qt);
+        });
+    });
+
     let mut aff = vec![0.0f32; N * Layout::Affine32.elems()];
     group.bench_function("into_affine32_1024", |b| {
         b.iter(|| {

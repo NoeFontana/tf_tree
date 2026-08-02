@@ -153,6 +153,57 @@ static void check_round_trip(void)
     CHECK(rc == TFT_OK, why());
     CHECK(twist[3] > 1.99 && twist[3] < 2.01, "2 m in 1 s is 2 m/s");
 
+    /*
+     * The appended layout — docs/API.md §3.3. Pose and twist in one row of 13,
+     * reachable from the *stable* header: a C caller who never defines
+     * TFT_ENABLE_UNSTABLE gets derivatives out of tft_plan_at and, batched, out
+     * of tft_plan_at_many. That reachability is the whole delta, so it is
+     * checked from C and not only from Rust.
+     */
+    {
+        double row[13];
+        double rows[2 * 13];
+        int64_t stamps[2];
+        size_t i;
+        CHECK(tft_layout_size(TFT_LAYOUT_QVEC7_WXYZ_TWIST6) == sizeof row,
+              "13 doubles");
+
+        /* The unstable scalar call, which can also split the two halves. */
+        for (i = 0; i < 13; i++) { row[i] = -12345.5; }
+        rc = tft_plan_at_with_derivatives(plan, 500000000,
+                                          TFT_LAYOUT_QVEC7_WXYZ_TWIST6, row, NULL);
+        CHECK(rc == TFT_OK, why());
+        for (i = 0; i < 7; i++) {
+            CHECK(row[i] == out[i], "the pose half is QVEC7_WXYZ");
+        }
+        CHECK(row[10] > 1.99 && row[10] < 2.01, "the tail's v.x is the same 2 m/s");
+
+        /* The stable scalar entry point: same bytes, no unstable header. */
+        {
+            double stable_row[13];
+            for (i = 0; i < 13; i++) { stable_row[i] = -12345.5; }
+            rc = tft_plan_at(plan, 500000000, TFT_LAYOUT_QVEC7_WXYZ_TWIST6, stable_row);
+            CHECK(rc == TFT_OK, why());
+            for (i = 0; i < 13; i++) {
+                CHECK(stable_row[i] == row[i],
+                      "tft_plan_at must produce the derivative call's bytes");
+            }
+        }
+
+        /* ...and the stable batch entry point, tightly packed. */
+        stamps[0] = 250000000;
+        stamps[1] = 500000000;
+        for (i = 0; i < 2 * 13; i++) { rows[i] = -12345.5; }
+        rc = tft_plan_at_many(plan, stamps, 2, TFT_LAYOUT_QVEC7_WXYZ_TWIST6, rows, 0);
+        CHECK(rc == TFT_OK, why());
+        for (i = 0; i < 13; i++) {
+            CHECK(rows[13 + i] == row[i], "the batch row must match the scalar call");
+        }
+        /* A quarter of the way along, and the velocity is the same constant. */
+        CHECK(rows[4] > 0.49 && rows[4] < 0.51, "interpolated translation at t=0.25s");
+        CHECK(rows[10] > 1.99 && rows[10] < 2.01, "the twist is constant along the segment");
+    }
+
     CHECK(tft_tree_frame_count(tree) == 3, "world/robot/tool");
     CHECK(tft_tree_edge_count(tree) == 2, "one dynamic, one static");
 

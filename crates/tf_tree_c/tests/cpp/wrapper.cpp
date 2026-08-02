@@ -97,6 +97,8 @@ static int failures = 0;
 
 static_assert(tf_tree::layout_of<tf_tree::Quat7>::value == TFT_LAYOUT_QVEC7_WXYZ, "");
 static_assert(tf_tree::layout_of<tf_tree::Mat4Row>::value == TFT_LAYOUT_MAT4_ROW, "");
+static_assert(tf_tree::layout_of<tf_tree::Quat7Twist6>::value == TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+              "");
 
 #ifdef TF_TREE_HAS_EIGEN
 // **The trap §4.2 exists to close.** `Eigen::Isometry3d` is column-major, so
@@ -194,8 +196,9 @@ static void check_success_does_not_touch_the_error_slot()
 
 static void check_payload_sizes_agree()
 {
-    const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ, TFT_LAYOUT_QVEC7_XYZW, TFT_LAYOUT_MAT4_COL,
-                              TFT_LAYOUT_MAT4_ROW, TFT_LAYOUT_AFFINE12_ROW_F32};
+    const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ,        TFT_LAYOUT_QVEC7_XYZW,
+                              TFT_LAYOUT_MAT4_COL,          TFT_LAYOUT_MAT4_ROW,
+                              TFT_LAYOUT_AFFINE12_ROW_F32,  TFT_LAYOUT_QVEC7_WXYZ_TWIST6};
     for (tft_layout l : all) {
         CHECK(tf_tree::payload_bytes(l) == tft_layout_size(l),
               "the header's compile-time payload size disagrees with the library's");
@@ -205,6 +208,61 @@ static void check_payload_sizes_agree()
     // a buffer for a layout this build does not implement.
     CHECK(tf_tree::payload_bytes(9999) == 0, "unknown layout, header");
     CHECK(tft_layout_size(9999) == 0, "unknown layout, library");
+}
+
+/// **`publishable` must agree with the library about which layouts are
+/// output-only**, or the `static_assert` in `push` is a compile error for a call
+/// that would have worked, or — far worse — absent for one that would not.
+///
+/// The predicate is a mirror of a decision made in `layout::read`, exactly as
+/// `payload_bytes` mirrors `tft_layout_size`, so it gets the same treatment: the
+/// header's compile-time answer is checked against the library's run-time one
+/// for every layout, rather than trusted.
+///
+/// The direction that matters is the second `CHECK`. `push` cannot be *called*
+/// with an unpublishable layout any more — that is the point of the change — so
+/// this drives `tft_publisher_push` directly, which is the only way left to ask
+/// the library what it thinks.
+///
+/// Mutant, run: `publishable` returns `true` for everything (and the two
+/// negative `static_assert`s above are removed, or they fail to compile first)
+/// ⇒ two failures, both "the header says publishable but the library refuses
+/// the layout" — one for each output-only layout. Reverse mutant: teach
+/// `layout::read` to accept the twist layout ⇒ the `else` arm fires instead.
+static void check_publishable_agrees_with_the_library()
+{
+    static_assert(!tf_tree::publishable(TFT_LAYOUT_QVEC7_WXYZ_TWIST6),
+                  "a twist is derived from the arena, never published into it");
+    static_assert(!tf_tree::publishable(TFT_LAYOUT_AFFINE12_ROW_F32),
+                  "the f32 affine encoding is an output encoding");
+    static_assert(tf_tree::publishable(TFT_LAYOUT_QVEC7_WXYZ), "the canonical layout publishes");
+
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_publishable_tree_create(&raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+    auto pub_r = tree.claim("robot", "world");
+    CHECK_R(pub_r, "claim");
+    tf_tree::Publisher pub = std::move(VALUE_OF(pub_r));
+
+    // Big enough for the widest payload, and a valid identity pose for the
+    // layouts that will actually read it — so a refusal is about the layout and
+    // not about the bytes.
+    double buf[16] = {};
+    buf[0] = 1.0;  // qw for the QVEC7 orders
+    const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ,       TFT_LAYOUT_QVEC7_XYZW,
+                              TFT_LAYOUT_MAT4_COL,         TFT_LAYOUT_MAT4_ROW,
+                              TFT_LAYOUT_AFFINE12_ROW_F32, TFT_LAYOUT_QVEC7_WXYZ_TWIST6};
+    std::int64_t stamp = 1;
+    for (tft_layout l : all) {
+        const tft_status s = tft_publisher_push(pub.raw(), stamp++, l, buf);
+        if (tf_tree::publishable(l)) {
+            CHECK(s != TFT_ERR_BAD_ENUM,
+                  "the header says publishable but the library refuses the layout");
+        } else {
+            CHECK(s == TFT_ERR_BAD_ENUM,
+                  "the header says unpublishable but the library accepts the layout");
+        }
+    }
 }
 
 #ifdef TF_TREE_HAS_EIGEN
@@ -450,6 +508,34 @@ static void check_batch()
     // first element n times would pass everything above.
     CHECK(std::fabs(out[0].tx - out[n - 1].tx) > 1e-9,
           "the batch must vary across elements, not repeat the first");
+
+    // **Derivatives reach C++ by type**, which is what makes them reach C++ at
+    // all: `layout_of<Quat7Twist6>` is the only thing that lets the templated
+    // `at`/`at_many` name the layout. Its pose half must be the `Quat7` batch's
+    // bytes — the tail is the only thing that is new.
+    {
+        std::vector<tf_tree::Quat7Twist6> d_out;
+        CHECK_CALL(plan.at_many(stamps, d_out), "at_many<Quat7Twist6>");
+        CHECK(d_out.size() == n, "sized from the input");
+        bool moving = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            CHECK(d_out[i].qw == out[i].qw && d_out[i].tx == out[i].tx,
+                  "the pose half must be the Quat7 batch, bit for bit");
+            if (std::fabs(d_out[i].vx) > 1e-9 || std::fabs(d_out[i].wz) > 1e-9) {
+                moving = true;
+            }
+        }
+        // Non-vacuity: six zeros would satisfy every assertion above.
+        CHECK(moving, "the fixture's twist is zero; this would pass against a stub");
+
+        // ...and the scalar form agrees with the batch, which is the claim the
+        // layout makes about being one computation and not two.
+        auto one_r = plan.at<tf_tree::Quat7Twist6>(stamps[7]);
+        CHECK_R(one_r, "at<Quat7Twist6>");
+        const tf_tree::Quat7Twist6 one = VALUE_OF(one_r);
+        CHECK(one.vx == d_out[7].vx && one.wz == d_out[7].wz && one.qw == d_out[7].qw,
+              "at<Quat7Twist6> and at_many<Quat7Twist6> must agree");
+    }
 
 #ifdef TF_TREE_HAS_EIGEN
     // §4.2's zero-copy claim: `sizeof(Eigen::Isometry3d)` is the payload, so the
@@ -728,6 +814,7 @@ int main()
 
     check_abi_guard_ran();
     check_payload_sizes_agree();
+    check_publishable_agrees_with_the_library();
 #ifdef TF_TREE_NO_EXCEPTIONS
     check_success_does_not_touch_the_error_slot();
 #endif
