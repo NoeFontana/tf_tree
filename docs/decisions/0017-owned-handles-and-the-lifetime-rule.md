@@ -190,9 +190,11 @@ meet it will have less context than the person who already got it wrong.
    `OwnedWriter`; delete `publisher::extend_to_static` — verified by
    `just c-header-check`, the ASan build in `just cpp-check`, and `just ros-test`
    for the bridge half.
-8. Crate-level docs: the lifetime rule, `Arc<Tree>` as the embedding idiom, and
-   the scoped-vs-owned guidance — verified by `cargo doc` and by
-   `#![deny(missing_docs)]`.
+8. Crate-level docs: the lifetime rule and the scoped-vs-owned guidance —
+   verified by `cargo doc` and by `#![deny(missing_docs)]`. **`Arc<Tree>` as the
+   embedding idiom was in this step and has already landed** on `tf_tree`'s
+   crate docs ahead of the rest (`docs/API.md` §6 row 2 records it); do not
+   write it a second time.
 
 ## Open questions
 

@@ -138,3 +138,134 @@ def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
     # And the parent is unharmed — it still owns the edge it claimed.
     pub.push(3_000, [1.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0])
     pub.release()
+
+
+@shm
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
+def test_a_forked_child_is_refused_by_the_introspection_calls_too(runtime_dir):
+    """**An empty list is the wrong way to say "you forked".**
+
+    `Tree.frames`, `Tree.edges` and `Plan.edges` walk the `ArenaView` rather
+    than evaluating through a `Guard`, so they do not inherit the refusal the
+    test above pins. `Tree::view` substitutes a one-frame, zero-edge poison
+    arena for a detached tree — which is right, because it makes reading the
+    vanished mapping impossible — and the consequence is that an unguarded walk
+    *succeeds*, returning `[]`. A `multiprocessing` worker would read that as a
+    corrupt or empty arena and go looking for the wrong bug;
+    `docs/PHASE5.md` §4.3 makes `fork` the expected way these users arrive.
+
+    The plan is compiled **before** the fork on purpose: `Tree.plan` refuses in
+    the child on its own, so compiling there would test the guard that already
+    exists instead of the one this pins.
+
+    Mutant: delete the `if tree.detached()` guard from ``frames_impl``,
+    ``edges_impl`` and ``plan_edges_impl`` (`crates/tf_tree_py/src/offline.rs`).
+    Applied: all three calls return `[]` in the child, which exits 12 instead of
+    0 — the codes are `or`-ed so the *first* unrefused call is the one reported,
+    and 13 or 14 alone would name the other two. The exit status is the only
+    channel here: an assertion raised inside a fork child is invisible to
+    pytest.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    with tree.publisher("base", "map") as pub:
+        pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+    plan = tree.plan("map", "base")
+    # The parent answers all three; the child must not.
+    assert tree.frames() and tree.edges() and plan.edges()
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — the child never returns to pytest
+        status = 0
+        for code, call in ((12, tree.frames), (13, tree.edges), (14, plan.edges)):
+            try:
+                call()
+                status = status or code  # answered instead of refusing
+            except tf_tree.TfTreeError:
+                pass
+            except Exception:
+                status = status or code + 100  # refused, but as the wrong type
+        os._exit(status)
+
+    _, wstatus = os.waitpid(pid, 0)
+    assert os.WIFEXITED(wstatus), (
+        "the child was killed by a signal, not refused: "
+        f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
+    )
+    assert os.WEXITSTATUS(wstatus) == 0
+
+
+@shm
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
+def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_dir):
+    """**All-zero is a spelling that already means something else.**
+
+    `Tree.instance_uuid` is `self.view().header().instance_uuid`, and
+    `Tree::view` substitutes the `alloc_zeroed` poison arena for a detached
+    tree — so before this guard the call returned `"0" * 32`, which is exactly
+    what `test_an_in_process_tree_has_no_instance_uuid` pins as the *in-process*
+    answer. Two peers comparing uuids to chase a split brain would have
+    concluded they had never shared an arena at all.
+
+    `__repr__` is the deliberate exception and the second half of this test: a
+    repr that raises breaks `print`, the REPL echo and every debugger pane,
+    which is where a fork victim is standing. It must not raise, and it must say
+    the word rather than print an instance the poison arena invented.
+
+    Exit codes, because an assertion in a fork child is invisible to pytest:
+    20 `instance_uuid` answered instead of refusing; 21 it raised the wrong
+    type; 22 `repr` raised at all; 23 `repr` did not name the fork; 24 `repr`
+    still showed an instance.
+
+    Three mutants, each applied to `crates/tf_tree_py/src/tree.rs`, built and
+    observed before being reverted:
+
+    * **A** — delete the `if self.inner.detached()` arm from
+      ``PyTree::instance_uuid``. Child exits **20**.
+    * **B** — delete ``__repr__``'s `if self.inner.detached()` test and keep
+      only the `else` body, so the repr describes the poison arena. Child exits
+      **23** (not 24: the poison header is `alloc_zeroed`, so that branch
+      suppresses the instance as if this were an in-process tree — which is the
+      indistinguishability the guard is for).
+    * **C** — make ``__repr__``'s detached arm print both, `" detached-by-fork
+      instance={…}"`. Child exits **24**. This is what makes 24 load-bearing;
+      without C it is unreachable, given B.
+
+    21 and 22 are not separately mutated: they exist to tell one failure apart
+    from another in the one channel a fork child has, not as guards of their own.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    parent_uuid = tree.instance_uuid()
+    assert parent_uuid != "0" * 32
+    assert parent_uuid[:8] in repr(tree)
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — the child never returns to pytest
+        status = 0
+        try:
+            tree.instance_uuid()
+            status = status or 20
+        except tf_tree.TfTreeError:
+            pass
+        except Exception:
+            status = status or 21
+        try:
+            text = repr(tree)
+        except Exception:
+            status = status or 22
+        else:
+            if "detached-by-fork" not in text:
+                status = status or 23
+            if "instance=" in text:
+                status = status or 24
+        os._exit(status)
+
+    _, wstatus = os.waitpid(pid, 0)
+    assert os.WIFEXITED(wstatus), (
+        "the child was killed by a signal, not refused: "
+        f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
+    )
+    assert os.WEXITSTATUS(wstatus) == 0

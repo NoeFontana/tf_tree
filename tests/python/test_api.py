@@ -531,3 +531,137 @@ def test_at_into_refuses_a_non_numpy_buffer_and_says_so(tree):
     mv = memoryview(bytearray(128)).cast("d", (4, 4))
     with pytest.raises(tf_tree.BufferError, match="numpy array"):
         p.at_into(1_500, mv)
+
+
+# ---------------------------------------------------------------------------
+# Introspection (`docs/PHASE5.md` §4.4 item 2, `docs/API.md` §3.2)
+# ---------------------------------------------------------------------------
+
+
+def test_frames_lists_every_declared_frame_in_declaration_order(tree):
+    """`TreeBuilder` interns names in edge-declaration order, parent then child.
+
+    So the order is not an accident of a hash table and is worth asserting: it
+    is what makes `frames()[0]` the root of a tree a user just built, which is
+    the first thing anyone prints.
+
+    The exact list is also what pins frame id 0 — the root sentinel — out of the
+    answer, so there is no separate sentinel test: any bound that reaches slot 0
+    changes this list.
+
+    Mutant: iterate `1..frame_count` instead of `1..=frame_count` in
+    ``frames_impl``. Applied: the last frame disappears and this fails with
+    ``['map', 'base'] != ['map', 'base', 'cam']`` — an off-by-one a set
+    comparison would catch only incidentally, through the count.
+    """
+    assert tree.frames() == ["map", "base", "cam"]
+
+
+def test_edges_are_parent_child_pairs_and_exclude_the_sentinel(tree):
+    """`(parent, child)` — `build`'s order, not `publisher`'s — and no slot 0.
+
+    **One exact-list assertion, deliberately, because it is what kills the
+    mutants.** A first revision of this file spread the property over three
+    tests (a sentinel test, a tuple-shape test, and this one); the review found
+    that the two extra tests killed nothing the equality below does not, while
+    their docstrings argued they were the only guard. They are folded in here
+    instead, because the argument is worth keeping and a second assertion of it
+    is not.
+
+    Order. An edge list silently reversed still builds a perfectly valid tree,
+    just upside down, so a test that only checked "two pairs of strings came
+    back" would pass against that bug. The rebuild below is the other half: the
+    rebuilt tree's `edges()` is derived the same way and would agree with itself
+    either way — it is the *frames* that give it away, since `map` is the root
+    of one tree and a leaf of the other.
+
+    The rebuild is **the graph only**, and this fixture is where that is safe:
+    every edge a `tf_tree.build` tree can hold is dynamic. `edges()` does not
+    report an edge's kind and `tf_tree.build` cannot declare a static one, so
+    the same round trip over a `.tft` or a peer-built arena silently converts
+    every static edge into an empty dynamic one. That limit is documented on
+    `Tree.edges`; it is not asserted here because no Python surface can build
+    the tree that would show it.
+
+    Sentinel. Frame id 0 is the root sentinel and edge id 0 is reserved
+    (`edge_count` is stored as *declared + 1* for that reason, an off-by-one
+    that has already cost `tf_tree_c::unstable` a test). **The loop bound is not
+    what protects the edge list, which is why that mutant needs two edits**: a
+    zeroed edge slot names frame 0 at both ends and `FrameId::new(0)` is `None`,
+    so ``named_edge_in`` declines it whatever the bound is. It is the `None`
+    *propagation* that is load-bearing, and the tempting refactor is precisely
+    to replace it with `Tree::edge_name`'s `"<root>"` fallback so that no entry
+    is ever dropped.
+
+    Mutants, all three run against this one assertion pair:
+
+    * swap to `(child, parent)` in ``named_edge_in`` — fails at index 0 with
+      ``('base', 'map') != ('map', 'base')``;
+    * `for raw in 0..count` in ``edges_impl`` **and** a `"<root>"` fallback in
+      ``named_edge_in`` — fails with a leading ``('<root>', '<root>')``. Either
+      edit alone changes nothing observable;
+    * append a per-edge sample count to the tuple in ``edges_impl``, the exact
+      shape `docs/PHASE5.md` §4.2's amendment refuses — fails on the tuple
+      arity.
+    """
+    assert tree.edges() == [("map", "base"), ("base", "cam")]
+    rebuilt = tf_tree.build(tree.edges())
+    assert rebuilt.edges() == tree.edges()
+    assert rebuilt.frames() == tree.frames()
+
+
+def test_plan_edges_names_the_edges_the_plan_samples(tree):
+    """One entry per `Step::Dyn`, in fold order.
+
+    Every edge a `tf_tree.build` tree can hold is dynamic — the binding has no
+    way to declare a static one — so here `len(plan.edges()) == plan.depth()`.
+    That equality is *not* the promise (a folded static run makes it strictly
+    less) and the docstring on `Plan.edges` says so; it is asserted because on
+    this tree it is exactly what "the plan samples every step" means.
+
+    Mutant: seed ``plan_edges_impl`` with `EdgeId(1)` before the loop — one edge
+    counted twice, which the exact-list comparison catches and a set comparison
+    would not. Applied: this test and the self-plan one below both fail.
+    """
+    p = tree.plan("map", "cam")
+    assert p.depth() == 2
+    assert p.edges() == [("map", "base"), ("base", "cam")]
+
+
+def test_plan_edges_report_identity_not_direction(tree):
+    """A plan and its reverse sample the same edges.
+
+    `Step::Dyn` carries an `inverted` flag and this deliberately does not report
+    it: the pair is the edge's *identity* — the same identity `Tree.edges()`
+    hands out — and `map -> cam` and `cam -> map` traverse one topology, not
+    two. Reporting the traversal direction instead would make
+    ``set(plan.edges()) <= set(tree.edges())`` false for half of all plans,
+    which is the property that makes this list joinable with the tree's at all.
+
+    Mutant: emit `(child, parent)` when `inverted` in ``plan_edges_impl``.
+    Applied: the two plans stop agreeing —
+    ``[('base', 'map'), ('cam', 'base')]`` against
+    ``[('base', 'cam'), ('map', 'base')]`` once sorted.
+    """
+    forward = tree.plan("map", "cam").edges()
+    backward = tree.plan("cam", "map").edges()
+    assert sorted(backward) == sorted(forward)
+    assert set(forward) <= set(tree.edges())
+
+
+def test_plan_edges_of_a_self_plan_is_empty(tree):
+    """`lookup(x, x)` compiles to a plan with no steps, so it samples nothing.
+
+    An empty list, not an error: the identity path is answerable at every stamp
+    precisely because there is nothing on it to sample. This is the same edge
+    case `Tree.span` returns `None` for, and the two agree.
+
+    Mutant: seed ``plan_edges_impl`` with `EdgeId(1)` before the loop. Applied:
+    ``[('map', 'base')] != []`` here, and the depth-2 test above fails too — a
+    plan that reports an edge it does not sample is the failure this pair of
+    tests brackets from both ends.
+    """
+    p = tree.plan("base", "base")
+    assert p.depth() == 0
+    assert p.edges() == []
+    assert tree.span("base", "base") is None

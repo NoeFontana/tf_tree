@@ -104,6 +104,21 @@ class Plan:
     def depth(self) -> int:
         """Folded depth of this path, in edges."""
 
+    def edges(self) -> list[tuple[str, str]]:
+        """The **dynamic** edges this plan samples, as `(parent, child)` pairs.
+
+        In fold order — the order the compositions happen, which is the order
+        the plan is.
+
+        Shorter than `depth()` when the path crosses a static edge. A static
+        edge (or a whole run of them) is folded into one constant transform at
+        compile time and its identity does not survive the fold, so a plan
+        cannot list what it no longer knows. Use `Tree.edges()` for the
+        topology; this is what *this path samples at evaluation time*.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()`.
+        """
+
 class Publisher:
     """A claimed edge. Use as a context manager; the claim releases on exit."""
 
@@ -186,11 +201,65 @@ class Tree:
         as `Plan.latest` does.
         """
 
+    def frames(self) -> list[str]:
+        """The frame names on this tree, in declaration order.
+
+        The cheap way to see what is in an arena without shelling out to
+        `tf_tree doctor`. Frame identity is append-only, so a name that appears
+        here will never be removed or renumbered — but on a *live* shared arena
+        a peer process can add one under you, so treat the list as a snapshot,
+        exactly as `Plan.latest` and `Tree.span` already are.
+
+        A name longer than 48 bytes was truncated when it was interned; the
+        stored form is what comes back.
+
+        **The list is not guaranteed to be free of duplicates.** If a peer
+        process stalls mid-intern and another rescues the slot, the loser's
+        record stays written but unreferenced, so the same name can appear at
+        two ids. Rare — it needs the rescue path — but it means `len()` is an
+        upper bound and `dict(zip(tree.frames(), ...))` can lose an entry.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()` — the child's
+        mapping is gone, so there is nothing to list.
+        """
+
+    def edges(self) -> list[tuple[str, str]]:
+        """The edges on this tree, as `(parent, child)` name pairs.
+
+        `(parent, child)` is the order `tf_tree.build` and `tf_tree.open(
+        create=...)` take. It is deliberately *not* `Tree.publisher`'s
+        `(child, parent)` order: an edge list silently reversed builds a tree
+        that is upside down and still perfectly valid.
+
+        **This is the parent/child graph, not a round trip.** The list does not
+        say whether an edge is static or dynamic, and `tf_tree.build` has no way
+        to declare a static one — so feeding it back reproduces the graph, but
+        every static edge comes back as a dynamic edge with no samples, and a
+        lookup crossing one raises `NoDataError` instead of returning the
+        constant it had. On a tree you built with `tf_tree.build` every edge is
+        already dynamic and the distinction cannot arise; on a `.tft` or on an
+        arena a Rust or C peer created, it can.
+
+        **Names only** — no rate, no jitter, no gaps, no sample count. Those are
+        `PHASE5.md` §4.2's `ds.edges()` and are held back until the counting
+        pass that can answer them honestly exists: a ring knows what it
+        *retained*, which is not what the publisher produced, and a rate derived
+        from the one and reported as the other is worse than no rate at all.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()`.
+        """
+
     def instance_uuid(self) -> str:
         """Which arena instance this is, as 32 hex characters.
 
         All-zero in-process. Two processes that resolved the same *name* can
         still hold different segments; this is what tells them apart.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()`, rather than
+        returning the all-zero value the child's poison mapping holds — which is
+        the spelling that means "in-process", so two peers chasing a split brain
+        would conclude they had never been shared. `repr()` does not raise; it
+        prints `detached-by-fork` in place of the instance.
         """
 
     def is_shared(self) -> bool:
