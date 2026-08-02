@@ -1,0 +1,45 @@
+# nextest configuration.
+#
+# **This file exists so that a hung test is a failure rather than a wedged run.**
+#
+# `docs/decisions/0019` added the workspace's first *waits* — `Open::await_open`
+# and `Tree::await_frames` — and their characteristic bug is not a wrong answer,
+# it is never returning. Without a `terminate-after`, the mutant that proves a
+# deadline works ("delete the deadline check") does not fail the suite: it hangs
+# it, which on a developer's machine looks like a slow build and in CI looks like
+# an infrastructure fault. `crates/tf_tree/tests/rendezvous.rs`'s
+# `a_frames_wait_for_a_name_nobody_will_intern_gives_up` had to bound *itself*
+# with a worker thread and `recv_timeout` for exactly this reason, and said so in
+# its own failure message. That workaround stays — a test should not depend on
+# the runner for its own liveness — but it should not have been the only thing
+# standing between a deadline bug and a stuck pipeline.
+#
+# **The numbers.** The slowest test in the workspace is ~14 s (the multi-process
+# rendezvous and shm cases; the ordinary unit tests are milliseconds). 60 s is
+# therefore ~4x the slowest legitimate test before nextest says anything at all,
+# and 180 s before it kills. Nothing under `cargo nextest` is intended to run for
+# minutes: `just shm-torture`'s 30-minute soak is a *binary*
+# (`./target/release/shm_torture`), and the nextest `torture` target is its
+# seconds-long self-test.
+#
+# If a test ever legitimately needs longer, give *that test* an override here
+# rather than raising the global period — the global one is a backstop against
+# bugs, and every second added to it is a second a hung CI job burns.
+
+[profile.default]
+# Warn at 60 s, terminate at 3 x 60 s. `terminate-after` is what turns a hang
+# into a reported failure; `period` alone only prints "SLOW".
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Fail the run if a test is left `#[ignore]`d without a reason reaching CI.
+# (Nextest reports these; this makes them visible in the summary rather than
+# silently skipped.)
+final-status-level = "slow"
+
+[profile.ci]
+# CI inherits the default timeouts. Retries are deliberately **not** enabled:
+# this workspace's tests are multi-process and shared-memory, and a retry that
+# turns a real race into a green run is precisely the failure `docs/PHASE2.md`
+# §11's crash matrix exists to catch. A flaky test here is a finding, not noise.
+slow-timeout = { period = "60s", terminate-after = 3 }
+fail-fast = false
