@@ -13,8 +13,9 @@
 //! merely unmeasured but unconstructible. A test that only asserted
 //! `tft_bridge_create` returned `TFT_OK` under a name would pass against
 //! `TreeBuilder::build_shared`, which publishes no rendezvous at all and which
-//! no second process can find. Reading the transform back through a *separate*
-//! attach is what distinguishes the two.
+//! no second process can find. Reading the transform back from **another
+//! process** — `src/bin/bridge_reader.rs`, spawned — is what distinguishes the
+//! two, and it is a real process for the reason that binary's own docs give.
 #![cfg(all(feature = "bridge", feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -218,13 +219,64 @@ fn text(p: *const c_char) -> String {
     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
-/// Attach to `name` **read-only**, exactly as a consumer process would.
+/// Attach to `name` **read-only**, in this process.
 fn attach(name: &str) -> Result<tf_tree::Tree, tf_tree::OpenError> {
     // `Open::new()`'s defaults are the consumer (`docs/decisions/0019` §2a):
     // read-only, never create. Spelling neither is the point — a consumer of a
     // bridge-filled arena is an ordinary consumer, which is the record's
     // "**no new consumer API**".
     tf_tree::Open::new().name(name)?.open()
+}
+
+/// Run `bridge_reader` as a **separate process** and return its one line.
+///
+/// `src/bin/bridge_reader.rs` says why a process rather than another `Open`
+/// here. The environment is passed explicitly rather than inherited: the parent
+/// sets `$TF_TREE_RUNTIME_DIR` with `set_var` inside [`scratch_dir`]'s
+/// `OnceLock`, and reading it back through `std::env` here is what makes the
+/// child's rendezvous provably the same one, with no shared state but those two
+/// strings and the name.
+fn read_in_a_second_process(name: &str, target: &str, source: &str, stamp: i64) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bridge_reader"))
+        .args([name, target, source, &stamp.to_string()])
+        .env("TF_TREE_RUNTIME_DIR", scratch_dir())
+        .env("TF_TREE_DOMAIN", "0")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("spawn bridge_reader");
+    assert!(
+        out.status.success(),
+        "bridge_reader exited {:?}",
+        out.status.code()
+    );
+    String::from_utf8(out.stdout)
+        .expect("bridge_reader's protocol is ASCII")
+        .trim_end()
+        .to_string()
+}
+
+/// The same lookup in **this** process, rendered the same way, so the two can be
+/// compared bit for bit rather than through two roundings.
+fn read_bits(tree: &tf_tree::Tree, target: &str, source: &str, stamp: i64) -> String {
+    let g = tree.guard();
+    let t = tree
+        .frame(target)
+        .expect("the target frame is in the arena");
+    let s = tree
+        .frame(source)
+        .expect("the source frame is in the arena");
+    let plan = tree.plan(t, s).expect("plan");
+    let iso = plan
+        .at(
+            &g,
+            tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(stamp),
+        )
+        .expect("the bridge's sample is retained at this stamp");
+    iso.to_bits()
+        .iter()
+        .map(|w| format!("{w:016x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Read `target <- source` at `stamp` through a plain `tf_tree::Tree`.
@@ -248,7 +300,7 @@ fn read(tree: &tf_tree::Tree, target: &str, source: &str, stamp: i64) -> [f64; 7
     ]
 }
 
-/// **A separate attach reads what the bridge wrote.** The property the whole
+/// **A separate process reads what the bridge wrote.** The property the whole
 /// record exists for.
 ///
 /// `docs/PHASE5.md` §9.1's *"one bridge plus N `tf_tree` consumers"* arm needs
@@ -257,23 +309,38 @@ fn read(tree: &tf_tree::Tree, target: &str, source: &str, stamp: i64) -> [f64; 7
 /// unconstructible — `just dds-bench` prints that gap above its own table on
 /// every run.
 ///
+/// **The reader is `src/bin/bridge_reader.rs`, spawned.** An earlier revision of
+/// this test carried this name over a second `tf_tree::Open` inside the test
+/// process. That attach was genuine — it resolves the rendezvous socket and
+/// receives the segment by fd passing, so it is not reading the bridge's own
+/// `Tree` — but "another process" is a claim about process boundaries, and the
+/// only thing that settles it is one. The child shares no address space, no
+/// mapping and no open file description with the bridge, and finds the arena
+/// from `$TF_TREE_RUNTIME_DIR`, `$TF_TREE_DOMAIN` and the name.
+///
+/// The in-process attach is kept and the two are compared **bit for bit**: it is
+/// now the control rather than the claim, and it is what turns "the child
+/// printed something plausible" into "the child read these bytes".
+///
 /// The attach is `tf_tree::Open` with its **defaults** — read-only, never
-/// create — because the record's claim is that a bridge becomes an ordinary
-/// producer of the arena Phase 2 already specified, with **no new consumer
-/// API**. If a consumer needed a bridge-specific call, that claim would be
-/// false.
+/// create — on both sides, because the record's claim is that a bridge becomes
+/// an ordinary producer of the arena Phase 2 already specified, with **no new
+/// consumer API**. The child links no `tf_tree_c` at all, which is the sharper
+/// half of that: if a consumer needed a bridge-specific call, it could not be
+/// written.
 ///
 /// Mutant: route the shared arm through `declared.builder().build_shared(name)`
 /// instead of `tf_tree::Open` ⇒ the create still returns `TFT_OK` (a
 /// `build_shared` name is a debug label, and no rendezvous is published), and
-/// this fails at the attach with *"a consumer must be able to find the bridge's
-/// arena: Rendezvous(ArenaAbsent)"*. That mutant is the reason this test reads
-/// through a second attach rather than through `tft_bridge_tree`.
+/// this fails with *"the second process could not read the bridge's arena:
+/// error no arena is serving and CreatePolicy::Never forbids creating one"*.
+/// That mutant is the reason this test reads from outside the process rather
+/// than through `tft_bridge_tree`.
 ///
 /// Mutant: drop `.layout_if_creating(builder)` ⇒ *"tft_bridge_create with an
-/// arena_name: -42 (shared arena "bridge-read" could not be created: no layout
-/// was supplied and the arena had to be created)"*. That the message arrives
-/// intact is the generic arm doing its job.
+/// arena_name: -42 (shared arena could not be created: no layout was supplied
+/// and the arena had to be created (arena_name "bridge-read"))"*. That the
+/// message arrives intact is the generic arm doing its job.
 #[test]
 fn a_second_process_reads_what_the_bridge_wrote() {
     let _scratch = Scratch::new();
@@ -287,9 +354,25 @@ fn a_second_process_reads_what_the_bridge_wrote() {
     });
     offer(&b, "odom", "base", 1_000 * MS, POSE);
 
+    // **The claim.** A process that was not there when the arena was made.
+    let line = read_in_a_second_process(name, "odom", "base", 1_000 * MS);
+    let child_bits = line.strip_prefix("ok ").unwrap_or_else(|| {
+        panic!("the second process could not read the bridge's arena: {line}");
+    });
+
+    // The control: the same lookup here, compared as bit patterns. A comparison
+    // that rounds is a comparison that can agree while the memory does not.
     let tree = attach(name).unwrap_or_else(|e| {
         panic!("a consumer must be able to find the bridge's arena: {e:?}");
     });
+    assert_eq!(
+        child_bits,
+        read_bits(&tree, "odom", "base", 1_000 * MS),
+        "the second process read different bytes than this one"
+    );
+
+    // And the bytes are the pose the bridge was handed, not merely a value two
+    // readers agree on.
     let got = read(&tree, "odom", "base", 1_000 * MS);
     assert!(
         (got[4] - POSE[4]).abs() < 1e-12
@@ -300,7 +383,18 @@ fn a_second_process_reads_what_the_bridge_wrote() {
 
     // The static edge is in the same arena, written by the builder rather than
     // by an offer — so this also rules out an arena that merely happens to hold
-    // one dynamic sample.
+    // one dynamic sample. Read from the second process too: the builder's half
+    // of the arena has to cross the boundary as well as the publisher's.
+    let lidar_line = read_in_a_second_process(name, "base", "lidar", 1_000 * MS);
+    assert!(
+        lidar_line.starts_with("ok "),
+        "the declared static edge must be readable from outside too: {lidar_line}"
+    );
+    assert_eq!(
+        lidar_line.strip_prefix("ok ").unwrap_or_default(),
+        read_bits(&tree, "base", "lidar", 1_000 * MS),
+        "the second process read a different static edge"
+    );
     let lidar = read(&tree, "base", "lidar", 1_000 * MS);
     assert!(
         (lidar[4] - 0.35).abs() < 1e-12,
@@ -332,10 +426,11 @@ fn a_second_process_reads_what_the_bridge_wrote() {
 ///
 /// Mutant: map `OpenError::ArenaAlreadyLive` onto the generic arm ⇒ the status
 /// still matches and the message assertion fails: *"the message must say the
-/// name is taken, not merely that something failed: shared arena "bridge-held"
-/// could not be created: an arena is already live at this rendezvous and
-/// require_create was set"*. That is the half keeping *"another bridge holds
-/// this name"* distinguishable from *"the runtime directory is unusable"*.
+/// name is taken, not merely that something failed: shared arena could not be
+/// created: an arena is already live at this rendezvous and require_create was
+/// set (arena_name "bridge-held")"*. That is the half keeping *"another bridge
+/// holds this name"* distinguishable from *"the runtime directory is
+/// unusable"*.
 #[test]
 fn a_second_bridge_on_a_held_name_is_refused() {
     let _scratch = Scratch::new();
@@ -383,9 +478,14 @@ fn a_second_bridge_on_a_held_name_is_refused() {
 ///
 /// Mutant: make the arm unconditional — `let arena_name = arena_name.or(Some(
 /// "default"))` before the match in `tft_bridge_create` ⇒ the attach below
-/// succeeds and the run reports *"panicked at
-/// crates/tf_tree_c/tests/bridge_shared.rs:366: a NULL arena_name must publish
-/// no rendezvous"*.
+/// succeeds and the run reports *"a NULL arena_name must publish no
+/// rendezvous"*.
+///
+/// **No line number, deliberately.** An earlier revision of this note cited one
+/// and it was wrong by 46 lines — a mutant note is re-run when the code under it
+/// changes, but a line number goes stale when anything *above* it changes, which
+/// is every edit to this file. The panic text is unique in the workspace and
+/// does not rot.
 #[test]
 fn a_null_arena_name_publishes_no_rendezvous() {
     let _scratch = Scratch::new();

@@ -2,7 +2,12 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** —
+**Implementation:** steps 0–2 landed on `feat/0015-bridge-shared-arena`
+(`Open::require_create` + `OpenError::ArenaAlreadyLive`; the `struct_size` prefix
+rule on `tft_bridge_options` with `arena_name` appended; `open_shared` refusing
+rather than downgrading, in both the `shm` and the no-`shm` build). **Steps 3–7
+are outstanding**, and so is the fork test the *Invariants to maintain* clause
+below demands — see the note under it.
 
 > **Moved `draft` → `ready` by
 > [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md), which resolves
@@ -252,6 +257,45 @@ not to. Fork poisoning, reaping and the claim leases apply to the bridge exactly
 as to any other participant, and the bridge's ingest thread is the one that
 created the arena — so `docs/decisions/0005` step 9's `atfork` rules apply to it
 unchanged and must be tested, not assumed.
+
+> **The fork test does not exist yet, and this is what it has to be.** Steps 0–2
+> landed without it, so the sentence above is currently an assumption — which is
+> the thing it forbids. Written out rather than left as a clause, because the
+> reason it did not land is a real constraint and not an oversight.
+>
+> *Half of it is already covered.* `BridgeInner` holds exactly two guarded
+> shapes: `Arc<Tree>` and one `tf_tree::OwnedWriter` per declared dynamic edge
+> (`tft_bridge_create` claims through `Tree::claim_owned`, per `0017`). That is
+> the same pair `crates/tf_tree_bench/src/bin/fork_child.rs`'s **`owned` mode**
+> already forks and checks — `0017` step 4 — so the Rust-level claim, that a
+> forked child is refused rather than reading a `MADV_DONTFORK` hole and that its
+> destructors do not release the parent's OFD lease, holds for the bridge by
+> construction.
+>
+> *The uncovered half is the C ABI layer above it*, and it is the half a ROS
+> node actually reaches: that `tft_bridge_offer`, `tft_bridge_get_stats` and
+> `tft_bridge_free` called on an inherited handle in a forked child **return a
+> status** — §3.4's panic guard turning `ChildDetached` into
+> `TFT_ERR_CHILD_DETACHED`, never a `SIGSEGV` and never an `abort()` — and that
+> the parent's bridge still applies an offer, and its arena is still readable
+> from a third process, after that child has exited.
+>
+> **It cannot live in `tf_tree_c`.** What has to be produced is `fork()` without
+> `exec` (`std::process::Command` always `exec`s, and a thread is not a process),
+> and the only primitive for that is `libc::fork`, which `tf_tree_c` does not
+> depend on. Adding it would put a second real `fork()` in the workspace against
+> `0005`'s recorded single exception, and add `libc` to the C ABI's dependency
+> graph — both of which are `0007` budget questions and therefore a decision
+> record, not a PR.
+>
+> **So it belongs in `crates/tf_tree_bench`**, as a fourth mode of the existing
+> `fork_child` binary — the file `0005` already grants the exception to and which
+> already carries the scratch rendezvous, the `exited`-versus-`signalled`
+> protocol and the parent re-validation this needs. The cost is one new crate
+> edge: an optional `tf_tree_c = { features = ["bridge", "shm"] }` behind a
+> `bridge` feature on `tf_tree_bench`, and a line in `just shm-check` beside the
+> `fork_child` build it already has. That edge is what makes this its own commit
+> rather than a rider on step 2.
 
 ## Implementation plan
 

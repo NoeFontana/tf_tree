@@ -1016,23 +1016,67 @@ fn open_shared(name: &str, builder: tf_tree::TreeBuilder) -> Result<tf_tree::Tre
         Ok(tree) => Ok(tree),
         // The one failure an operator will actually hit, and the one a generic
         // rendering would bury: another bridge is already serving this name.
-        //
-        // Kept short deliberately: `tft_error::set_message` truncates at
-        // `TFT_MESSAGE_LEN`, so a longer sentence would lose its own advice.
-        Err(OpenError::ArenaAlreadyLive) => Err(arena_unavailable(&format!(
-            "shared arena {name:?}: another participant already holds this rendezvous \
-             name, and a bridge will not join an arena it did not size \
-             (docs/decisions/0015). Stop it, or use a different arena_name."
-        ))),
+        Err(OpenError::ArenaAlreadyLive) => Err(arena_unavailable(&already_live_message(name))),
         // Everything else — an unusable or network runtime directory, a lock
         // file that will not open, no participant slots, a refused memfd, a
         // name this rendezvous will not take — arrives with its own text, and
         // that text is what separates "the runtime directory is unusable" from
         // the case above.
-        Err(e) => Err(arena_unavailable(&format!(
-            "shared arena {name:?} could not be created: {e}"
-        ))),
+        Err(e) => Err(arena_unavailable(&generic_failure_message(name, &e))),
     }
+}
+
+/// "Somebody else holds this name" — [`open_shared`]'s named arm.
+///
+/// A function rather than a `format!` in place so
+/// [`tests::both_named_messages_survive_the_longest_arena_name`] can measure it.
+/// Compiled under `test` as well as under `shm` because that test is the *only*
+/// thing that keeps its length honest and it must run in both builds.
+///
+/// **Kept short deliberately.** `tft_error::set_message` truncates at
+/// [`crate::TFT_MESSAGE_LEN`], `{name:?}` of a `MAX_NAME_LEN` name is 66 bytes,
+/// and this sentence then has four to spare — so a longer one would lose its own
+/// advice at exactly the arena name that made it interesting.
+#[cfg(any(test, all(feature = "shm", target_os = "linux")))]
+fn already_live_message(name: &str) -> String {
+    format!(
+        "shared arena {name:?}: another participant already holds this rendezvous \
+         name, and a bridge will not join an arena it did not size \
+         (docs/decisions/0015). Stop it, or use a different arena_name."
+    )
+}
+
+/// [`open_shared`]'s catch-all arm: **the condition first, the detail last.**
+///
+/// The order is the whole content of this function. `arena_name` arrives as an
+/// arbitrary-length C string and is only length-checked *by* the call that
+/// failed, so the name is the one part of this message that can be thousands of
+/// bytes long — and an earlier spelling put it first. A caller that passed a
+/// 400-byte name got 255 bytes of its own name back and no statement of what had
+/// gone wrong, which is the truncation that costs the most: an operator must
+/// always be able to tell *which* failure this was.
+///
+/// So the fixed clause leads, [`tf_tree::OpenError`]'s unbounded rendering comes
+/// second, and the name — the caller's own input, and the part they can
+/// reconstruct without help — is what the buffer eats into.
+#[cfg(any(test, all(feature = "shm", target_os = "linux")))]
+fn generic_failure_message(name: &str, detail: &dyn core::fmt::Display) -> String {
+    format!("shared arena could not be created: {detail} (arena_name {name:?})")
+}
+
+/// The `bridge`-without-`shm` refusal's text; see [`already_live_message`] for
+/// why it is a function and why it is compiled under `test` too.
+///
+/// **Short for the same reason, with eight bytes of slack** at `MAX_NAME_LEN`:
+/// a longer sentence would drop the rebuild command for exactly the operator who
+/// needs it.
+#[cfg(any(test, not(all(feature = "shm", target_os = "linux"))))]
+fn no_shm_message(name: &str) -> String {
+    format!(
+        "shared arena {name:?}: built without --features shm, so this library has no \
+         shared memory behind arena_name. Rebuild with \
+         `cargo build -p tf_tree_c --features bridge,shm`, or leave it NULL."
+    )
 }
 
 /// The `bridge`-without-`shm` build's answer, and it is a **refusal**.
@@ -1045,14 +1089,7 @@ fn open_shared(name: &str, builder: tf_tree::TreeBuilder) -> Result<tf_tree::Tre
 /// misconfiguration on the robot at all.
 #[cfg(not(all(feature = "shm", target_os = "linux")))]
 fn open_shared(name: &str, _builder: tf_tree::TreeBuilder) -> Result<tf_tree::Tree, tft_status> {
-    // Short on purpose: `tft_error::set_message` truncates at
-    // `TFT_MESSAGE_LEN`, and `arena_name` may be 64 bytes, so a longer sentence
-    // would drop the rebuild command for exactly the operator who needs it.
-    Err(arena_unavailable(&format!(
-        "shared arena {name:?}: built without --features shm, so this library has no \
-         shared memory behind arena_name. Rebuild with \
-         `cargo build -p tf_tree_c --features bridge,shm`, or leave it NULL."
-    )))
+    Err(arena_unavailable(&no_shm_message(name)))
 }
 
 /// Build a bridge over the topology described by `config_toml`, and the arena
@@ -2604,4 +2641,134 @@ fn bad_config(msg: &str) -> tft_status {
 fn arena_unavailable(msg: &str) -> tft_status {
     set_error(crate::TFT_ERR_ARENA_UNAVAILABLE, msg, |_| {});
     crate::TFT_ERR_ARENA_UNAVAILABLE
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the parts of §5 that are text rather than behaviour.
+    //!
+    //! They are here rather than in `tests/` because both messages must be
+    //! measured in **both** builds: `already_live_message` exists only under
+    //! `bridge,shm` and `no_shm_message` only under `bridge`-without-`shm`, so
+    //! no single integration target can see both. This module compiles in both,
+    //! which is why the two helpers carry `#[cfg(any(test, ...))]`.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use crate::TFT_MESSAGE_LEN;
+
+    /// `tf_tree_ipc::MAX_NAME_LEN`, mirrored.
+    ///
+    /// `tf_tree_ipc` is deliberately not a dependency of this crate — the C ABI
+    /// reaches the rendezvous only through the facade — so the value cannot be
+    /// imported. Under `shm` the test below binds this literal back to the real
+    /// one through `tf_tree::Open::name`, so a raised limit fails here rather
+    /// than silently making the measurement below optimistic.
+    const MAX_NAME_LEN: usize = 64;
+
+    /// The longest name a message can be asked to carry: every byte of a
+    /// maximum-length name, none of which `{:?}` escapes.
+    ///
+    /// A name of `"` or `\` bytes would render longer than 66, but the
+    /// rendezvous does not accept those — which is what the `shm` half of
+    /// [`the_message_budget_is_the_rendezvous_limit`] establishes rather than
+    /// assumes.
+    fn longest_name() -> String {
+        "x".repeat(MAX_NAME_LEN)
+    }
+
+    /// What `tft_error::set_message` will actually keep: it truncates at
+    /// `TFT_MESSAGE_LEN - 1` and writes the NUL itself.
+    fn fits_whole(msg: &str) -> bool {
+        crate::error::set_error(crate::TFT_ERR_ARENA_UNAVAILABLE, msg, |_| {});
+        crate::error::last_message() == msg
+    }
+
+    /// **Both named `arena_unavailable` messages survive the longest arena
+    /// name.**
+    ///
+    /// They fit with four and eight bytes to spare, and nothing pinned that. A
+    /// message that truncates at a 64-byte name is a diagnostic that fails
+    /// exactly when the name is the interesting part — the `arena_name` an
+    /// operator has to change is the last thing in one of them and the rebuild
+    /// command is the last thing in the other, so what a longer sentence would
+    /// drop is the advice, not the prose.
+    ///
+    /// The assertion is a **round trip through `set_message`**, not arithmetic
+    /// against `TFT_MESSAGE_LEN`: it is the truncation itself that must not
+    /// happen, and re-deriving the off-by-one here would be a second chance to
+    /// get it wrong.
+    ///
+    /// The slack is reported on failure so the next person editing either
+    /// sentence learns how much room there is rather than only that there is
+    /// none.
+    ///
+    /// **Neither half is `#[cfg]`-ed**, which is the point of the two helpers
+    /// carrying `test` in their own `cfg`: each message belongs to one build,
+    /// but both are *measurable* in either, so this runs whole under `just
+    /// test-rust`'s `bridge` line and `just shm-check`'s `bridge,shm` one alike.
+    #[test]
+    fn both_named_messages_survive_the_longest_arena_name() {
+        let name = longest_name();
+
+        let m = super::already_live_message(&name);
+        assert!(
+            fits_whole(&m),
+            "the 'name is already held' message truncates at MAX_NAME_LEN \
+             ({} bytes, budget {}): {m}",
+            m.len(),
+            TFT_MESSAGE_LEN - 1
+        );
+
+        let m = super::no_shm_message(&name);
+        assert!(
+            fits_whole(&m),
+            "the 'built without shm' message truncates at MAX_NAME_LEN \
+             ({} bytes, budget {}): {m}",
+            m.len(),
+            TFT_MESSAGE_LEN - 1
+        );
+    }
+
+    /// The catch-all arm's ordering: **the condition survives, the name is what
+    /// gets eaten.**
+    ///
+    /// `arena_name` is an arbitrary-length C string and is only length-checked
+    /// by the call that failed, so this arm can be handed a name far past
+    /// `MAX_NAME_LEN` — that *is* one of the failures it reports. With the name
+    /// first, a 400-byte one returned 255 bytes of the caller's own name and no
+    /// statement of what went wrong.
+    #[test]
+    fn the_catch_all_names_the_condition_even_under_an_absurd_arena_name() {
+        let name = "z".repeat(4000);
+        let msg = super::generic_failure_message(&name, &"longer than 64 bytes");
+        crate::error::set_error(crate::TFT_ERR_ARENA_UNAVAILABLE, &msg, |_| {});
+        let kept = crate::error::last_message();
+        assert!(
+            kept.starts_with("shared arena could not be created: longer than 64 bytes"),
+            "the fault must survive truncation, not the caller's own input: {kept}"
+        );
+        assert!(kept.len() < msg.len(), "this case must actually truncate");
+    }
+
+    /// The literal above is the rendezvous's, checked against the rendezvous.
+    ///
+    /// Only under `shm`, because the facade's `Open` is where the limit lives.
+    /// Two directions: `MAX_NAME_LEN` bytes is accepted, one more is not — so
+    /// neither raising nor lowering the real limit leaves the measurement above
+    /// describing a name that cannot occur.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[test]
+    fn the_message_budget_is_the_rendezvous_limit() {
+        assert!(
+            tf_tree::Open::new().name(&longest_name()).is_ok(),
+            "MAX_NAME_LEN is lower than {MAX_NAME_LEN}; the messages are measured against a \
+             name the rendezvous will not accept"
+        );
+        let over = "x".repeat(MAX_NAME_LEN + 1);
+        assert!(
+            tf_tree::Open::new().name(&over).is_err(),
+            "MAX_NAME_LEN is higher than {MAX_NAME_LEN}; the messages have less slack than \
+             both_named_messages_survive_the_longest_arena_name measures"
+        );
+    }
 }
