@@ -162,8 +162,9 @@ three independent precedents in the source.
 
 ### 2.3 Cross-crate inlining is part of the zero-cost claim
 
-A depth-3 lookup costs ~290 ns interpolating
-([`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)), and
+A depth-3 lookup costs ~193 ns interpolating
+([`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)'s
+re-baseline; the ~290 ns this line quoted was that record's draft reading), and
 `Plan::at` sits across a crate boundary from every consumer. Rust does not
 inline across crates without `#[inline]` or LTO, so without one of them the fold
 is a call per step.
@@ -487,8 +488,9 @@ make expensive to add.
 
 Float stamps; `asyncio`; any view into the arena; `pickle` of `Tree`/`Plan`/
 `Publisher`; keyword arguments on `at`, `at_into`, `latest`, `push` (measured:
-`METH_FASTCALL` is 29 ns cheaper — ~10% of a depth-3 budget at §3.4's corrected
-290 ns, and the "20%" `PHASE3.md` §4.2 states against the superseded 150 ns);
+`METH_FASTCALL` is 29 ns cheaper — ~15% of a depth-3 lookup at §3.4's
+re-baselined 193 ns, and the "20%" `PHASE3.md` §4.2 states against the
+superseded 150 ns budget);
 any logic with a branch in it that could live in Rust.
 
 Also refused, and this one gets asked: **`scipy.spatial.transform.Rotation`
@@ -544,24 +546,33 @@ be R4's failure in the time axis instead of the memory one.
 
 ### 3.4 The GIL threshold constant is calibrated against a benchmark that never ran
 
-**Flagged, not yet fixed.** `PHASE3.md` §6.1 sets
-`NS_PER_STEP_ESTIMATE = 55`, derived from the Phase 1 lookup benchmark.
-[`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md) shows that
-benchmark queried on-grid stamps, so `I::eval` never ran; the honest depth-3
-cost is ~290 ns, i.e. ~97 ns/step.
+**Fixed, in `0013`'s re-baseline commit, as this section requires below.**
+`PHASE3.md` §6.1 set `NS_PER_STEP_ESTIMATE = 55`, derived from the Phase 1
+lookup benchmark. [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)
+shows that benchmark queried on-grid stamps, so `I::eval` never ran.
 
-At 55 ns/step the release crossover is n ≈ 6; at 97 ns/step it is n ≈ 4.
+Re-measured off-grid, the constant is now **64 ns/step**.
+[`PHASE3.md`](./PHASE3.md) §6.1's amendment is the **single account** of it — the
+measurement, its band, its protocol, and the one element it moves — and this
+section is deliberately a pointer to that account and not a second copy of it.
+The ~290 ns / ~97 ns/step figure this section used to quote was `0013`'s draft
+reading, taken with `cargo bench --quick`; `0013`'s *Re-baseline* supersedes it.
 
-**Nothing is broken, and that is the interesting part.** §6.1's own claim was
+**Nothing was broken, and that is the interesting part.** §6.1's own claim was
 that "the exact constant does not need tuning; what matters is that neither
-branch is ever badly wrong", and a 1.8× error in the constant moves the
-crossover by two elements. The design absorbed a wrong input, which is the
-strongest evidence it is right.
+branch is ever badly wrong". The correction moves the depth-3 crossover by
+exactly one element; §6.1 prices that and a `const` assertion in
+`tf_tree_py::tree` keeps it checked. The design absorbed a wrong input, which is
+the strongest evidence it is right — now a checked statement rather than an
+assumed one.
 
 **NORMATIVE:** when `0013` re-baselines, `NS_PER_STEP_ESTIMATE` is re-derived
 from the new number in the same commit, and `PHASE3.md` §6.1 gains a line saying
 which measurement it came from. A constant with no cited source is how this
-happened.
+happened. This applies again to any later re-measurement `0013` ratifies.
+**§6.1 is where that line lives, and it is the only place the derivation is
+written down**: this section is the instruction, not a second account, and a
+third one is how the first two drifted.
 
 ---
 
@@ -741,18 +752,31 @@ authorized by this document alone.
 | 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | **landed** — `PHASE5.md` §4.4 item 1 in full: `plan.at(..., layout=...)` and `at_into` serve all four layouts, and both refusals the twist layout adds are typed — `DerivativesUnavailableError` for a `LerpSlerp` edge, `NoSegmentError` for a stamp with no segment. Python's `interp=` default moved to `"sclerp"` (§3), so a Python-built tree answers a twist without one |
 | 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python, Rust | §3.2, §2.6 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them. **Rust followed in row 4's commit**, as stable `Tree::frames` / `Tree::edges`, for §7 check 1's reason; `plan.edges()` has **no** Rust twin, and the gap is real rather than deferred by symmetry: `Plan::steps` gives a Rust caller the `Step::Dyn` edge ids, but nothing on the stable tier turns an `EdgeId` into a name pair — `Tree::edges` answers positionally, exactly as Python's does |
 | 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | **landed** — Rust (`Stamp::from_parts`, `from_timespec`), Python (`from_parts`, `from_ros`; duck-typed on `.sec`/`.nanosec`, no `rclpy` in the wheel) and C (`tft_stamp_from_parts`, `tft_stamp_from_timespec`, `TFT_ERR_BAD_STAMP`, ABI minor 3 → 4). One refusal table is asserted on both sides of the boundary |
-| 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
+| 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | **landed** — 55 → **64 ns/step**, in `0013`'s re-baseline commit as §3.4 requires. `PHASE3.md` §6.1's amendment is the single account of the measurement and of the one element it moves, pinned by a `const` assertion in `tf_tree_py::tree`; nothing here or in §3.4 restates it. `0013`'s two threshold questions stay open — this row is the constant, not the gate |
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed, and now reachable on real data** — `tf_tree_cli`; fires only on tag 0 and only on a run of at least 8 consecutive rejected arrivals (a threshold this implementation chose, not one §5.3 states), skips naming the tag otherwise, and does not demote `TFT018`. `doctor` gained two recording sources — `--from-bag <recording.mcap>` and `--from-file <index.tft>` — and `TFT019`/`TFT018` **run on the first and skip on the second**: the skip is re-keyed from liveness onto `checks::PushStream`, because a ring holds only the pushes `SampleRing::push` accepted, so an arena of any kind (live, frozen, or bag-built and §3.1-sorted) would have passed both checks unconditionally. `PHASE5.md` §6's last `TFT019` amendment records that its own predicted fix was the wrong one and why |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 
-**Nine of twelve rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9 and 11.** What
-is left is short and each piece is blocked on something nameable rather than
-merely unscheduled:
+**Ten of twelve rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10 and 11.**
+The two that have not are 6 and 12, and neither is merely unscheduled: row 6 is
+recorded-not-built on purpose, and row 12 is gated by D21. Two of the ten that
+landed — 3 and 10 — carry a caveat worth keeping, so they are in the list below
+as well. (This count is re-taken from the table above rather than carried
+forward. An earlier revision said "ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in
+part", which named eight rows and called them ten.)
 
+- **Row 3 has landed in full, and its benchmark row reports a failing gate.**
+  `embedding_cross_crate` measures **1.250–1.254×** against §9.2's 5% criterion.
+  That is the row working — it was built to report what it finds — but "landed"
+  here means the row exists, not that the number passes. What would close it is
+  `API.md` §2.3 item 2's LTO guidance in the *embedder's* profile, and the
+  `lto = "thin"` control at 0.994–0.996× is that stated as a measurement.
 - **Row 6** is recorded, not built, and is meant to stay that way
   ([`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md)).
-- **Row 10** belongs to `0013`'s re-baseline commit, which has not happened;
-  §3.4 is NORMATIVE that the constant moves in that same commit.
+- **Row 10 has landed, but `0013` has not.** The constant moved (55 → 64
+  ns/step) because §3.4 is NORMATIVE that it moves with the measurement. The
+  record it came from is still `draft`: its threshold questions are a policy
+  call, and a fourth question — which *call shape* a latency budget is written
+  against — was opened by the measurement itself.
 - **Row 12** is gated by D21 and must not be started before `PHASE7.md` §0.0's
   four gates are met.
 

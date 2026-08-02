@@ -351,45 +351,98 @@ State this plainly in the docs rather than marketing a zero-copy-to-GPU pipeline
 
 ### 6.1 The threshold is computed, not constant — NORMATIVE
 
-Releasing the GIL costs a measured 40 ns. A depth-3 lookup costs ~150 ns. So:
+Releasing the GIL costs a measured 40 ns. A depth-3 lookup costs ~193 ns
+(re-baselined; the ~150 ns this line carried was `PHASE1.md` §11.3's *budget*,
+and the amendment below is where the measurement is). So:
 
-- **Never release for a scalar lookup.** It would add 27% for parallelism nobody can use in a 150 ns window.
+- **Never release for a scalar lookup.** It would add ~21% for parallelism nobody can use in a 193 ns window.
 - **Always release when the work is long enough that holding it would stall other threads.**
 
 The rule is expressed in work, not in element count, because depth varies:
 
 ```rust
 const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
-const NS_PER_STEP_ESTIMATE: u64 = 55;
+const NS_PER_STEP_ESTIMATE: u64 = 64;
 
 let est = n as u64 * plan.depth() as u64 * NS_PER_STEP_ESTIMATE;
 if est >= GIL_RELEASE_THRESHOLD_NS { py.allow_threads(|| kernel()) } else { kernel() }
 ```
 
-For depth 3 this releases from about `n = 6`. The worst case where we do *not* release is under 1 µs of GIL retention — far below CPython's 5 ms switch interval, so no other thread notices. The worst case where we do release is a 4% overhead. Both sides of the threshold are cheap, which is why the exact constant does not need tuning; **what matters is that neither branch is ever badly wrong.**
+For depth 3 this releases from `n = 6` exactly, at the constant above. The worst case where we do *not* release is under 1 µs of GIL retention — far below CPython's 5 ms switch interval, so no other thread notices. The worst case where we do release is a 4% overhead. Both sides of the threshold are cheap, which is why the exact constant does not need tuning; **what matters is that neither branch is ever badly wrong.**
 
 Publish the constants and add a benchmark row proving the crossover behaves as predicted.
 
-> **Amendment — `NS_PER_STEP_ESTIMATE = 55` came from a benchmark that never
-> interpolated, and the paragraph above is why nothing broke.**
+> **Amendment — `NS_PER_STEP_ESTIMATE` is now 64, and this block is the single
+> account of where it came from.** Three documents used to hold a piece of this
+> arithmetic each ([`API.md`](./API.md) §3.4, this section, and
+> `tf_tree_py::tree`'s `release_the_gil`); they now cite this one.
 >
-> [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md) found that
-> the Phase 1 lookup benchmark queried **on-grid** stamps, so `I::eval` never
-> ran. The "~150 ns" depth-3 figure this section derives 55 ns/step from is
-> really **~290 ns**, i.e. **~97 ns/step** — a 1.8× error in the input.
+> **The measurement.** `benches/lookup.rs`, row `lookup/depth3/sclerp`, at the
+> off-grid stamp `fixture::QUERY_NS` — three *dynamic* steps, `ScLerp` (Python's
+> default interpolator since [`API.md`](./API.md) §3), criterion 0.5.1's default
+> sampling mode — a 3 s warm-up discarded, then 100 samples over a 5 s window —
+> and **no `--quick`**, `taskset -c 2`,
+> `[profile.bench]` (`lto = "thin"`, `codegen-units = 1`), nine runs alternated
+> against the on-grid binary on a shared 4-core EPYC-Milan VM that fails
+> `Fitness::probe`:
 >
-> It moves the depth-3 release crossover from `n ≈ 6` to `n ≈ 4`. That is the
-> whole consequence, and it is the strongest evidence available that this
-> section's design is right: it absorbed a wrong input and the behaviour on both
-> sides of the threshold stayed cheap. **The constant is not changed here**,
-> because changing it against a number `0013` has not yet re-baselined would
-> repeat the mistake in the other direction.
+> | | min | **median** | max |
+> | --- | --- | --- | --- |
+> | depth-3 `ScLerp`, off-grid | 190.4 ns | **192.7 ns** | 268.9 ns |
 >
-> **NORMATIVE ([`API.md`](./API.md) §3.4):** when `0013` re-baselines,
-> `NS_PER_STEP_ESTIMATE` is re-derived from the new number **in the same
-> commit**, and this section gains a line naming the measurement it came from.
-> A constant with no cited source is how this happened; a constant whose source
-> is a superseded benchmark is how it stayed hidden.
+> 192.7 / 3 = 64.2 → **64 ns/step**. The upper tail is this host's other
+> tenants — six of the nine runs land in 190–194 ns and the rest at 199, 210 and
+> 269 — so the derivation uses the median, and the whole band is reported rather
+> than the pretty part of it.
+> [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)'s
+> *Re-baseline* section is the full protocol, the other three rows, and the
+> second harness.
+>
+> **One caveat travels with the number.** The row above is the fold *inlined
+> into its caller*; the same fold behind an `#[inline(never)]` call measures
+> ~35 % more (`0013`, *Corroboration*), and `0013`'s open question 3 is which of
+> the two a latency budget means. **That question does not reach this constant**,
+> and the reason is not that the difference is small — at 86 ns/step the depth-3
+> crossover would be `n = 4` rather than `n = 6`. It is that the batch path this
+> threshold governs was measured end to end and is *already* above both call
+> shapes: 328 ns/elem for a pose row and 369 ns/elem for a twist row at depth 3,
+> against the 192 ns/elem `est` predicts. `tf_tree_py::tree`'s `release_the_gil`
+> documents that residual, and the error runs in the safe direction — `est` too
+> low releases the GIL later, never sooner.
+>
+> **The 55 it replaces was never a measurement**: it came from `PHASE1.md`
+> §11.3's 150 ns *budget*, and the benchmark that was supposed to confirm it
+> queried on-grid stamps, so `I::eval` never ran and the confirmation was of
+> something else. `0013` also supersedes its own draft figure of ~290 ns
+> (~97 ns/step): that reading was taken with `cargo bench --quick`, whose
+> warm-up-free two-sample estimate reports these sub-microsecond rows **46–71 %**
+> high on this host, row by row.
+>
+> **What it moves: one element.** The release crossover is the smallest `n` with
+> `n · depth · NS ≥ 1000`.
+>
+> | depth | at 55 | at **64** |
+> | --- | --- | --- |
+> | 1 | n = 19 | n = 16 |
+> | 3 | n = 7 | **n = 6** |
+> | 6 | n = 4 | n = 3 |
+>
+> So the paragraph above ("about `n = 6`" at depth 3) describes the *new*
+> constant exactly and the old one off by one. **This is the check `API.md` §3.4
+> asked for rather than an assumption that the change is invisible**: a 16 %
+> move in the input moves one element at the depth the design is anchored to, and
+> both branches on either side of it stay cheap — at `n = 5` the un-released
+> retention is ~1 µs estimated and ~1.6 µs measured through Python, three orders
+> of magnitude under the 5 ms switch interval; at `n = 6` the release costs 40 ns
+> against ≥1 µs. A `const` assertion in `tf_tree_py::tree` pins `n = 6` so this
+> table cannot drift from the code.
+>
+> **NORMATIVE, and now satisfied ([`API.md`](./API.md) §3.4):**
+> `NS_PER_STEP_ESTIMATE` is re-derived from `0013`'s re-baseline in the same
+> commit, and this section names the measurement it came from. A constant with no
+> cited source is how this happened; a constant whose source is a superseded
+> benchmark is how it stayed hidden. If `0013` ratifies a gate that re-measures
+> this row, the constant is re-derived again, here, in that commit.
 
 ### 6.2 Rules while the GIL is released — NORMATIVE
 

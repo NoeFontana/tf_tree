@@ -13,23 +13,31 @@ use tf_tree::{
 
 use crate::errors::{lookup_err, BufferError, FrameNotDeclaredError, TfTreeError};
 
-/// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~150 ns
-/// (`docs/PHASE3.md` §2). So releasing for a scalar would add 27% for
-/// parallelism nobody can use inside a 150 ns window, and *not* releasing for a
-/// large batch would stall other threads.
+/// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
+/// (`docs/PHASE3.md` §6.1's amendment — the re-baseline, not §2's superseded
+/// ~150 ns). So releasing for a scalar would add ~21% for parallelism nobody can
+/// use inside a 193 ns window, and *not* releasing for a large batch would stall
+/// other threads.
 ///
 /// The rule is expressed in estimated work rather than element count, because
-/// depth varies. Below the threshold the *estimated* worst case is just under
-/// 1 µs of GIL retention — in real nanoseconds it is about twice that, because
-/// the estimate is low by ~2×; see [`release_the_gil`], which does the
-/// arithmetic. Either way it is three orders of magnitude below CPython's 5 ms
-/// switch interval, so no other thread notices. Above the threshold the
-/// worst-case overhead is 40 ns against ≥1 µs estimated (≥2 µs real), so ≤4%.
-/// **Both sides are cheap, which is why the exact constant does not need
-/// tuning**; what matters is that neither branch is ever badly wrong.
+/// depth varies. Below the threshold the estimated worst case is just under
+/// 1 µs of GIL retention — three orders of magnitude below CPython's 5 ms switch
+/// interval, so no other thread notices. Above it the worst-case overhead is
+/// 40 ns against ≥1 µs, so ≤4%. **Both sides are cheap, which is why the exact
+/// constant does not need tuning**; what matters is that neither branch is ever
+/// badly wrong.
 pub(crate) const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
 /// Rough per-step cost used only to place the threshold above.
-const NS_PER_STEP_ESTIMATE: u64 = 55;
+///
+/// **64 ns/step, re-derived from a measurement rather than from a budget.**
+/// `docs/PHASE3.md` §6.1's amendment is the single account of where it comes
+/// from and what it moved; in one line, it is the median of nine pinned
+/// `benches/lookup.rs` runs of `lookup/depth3/sclerp` at the interpolating stamp
+/// `fixture::QUERY_NS` — 192.7 ns over three dynamic steps — taken in the commit
+/// that re-baselined that benchmark (`docs/decisions/0013`). The 55 it replaces
+/// came from `docs/PHASE1.md` §11.3's 150 ns *budget*, by way of a benchmark
+/// that queried on-grid stamps and never ran the interpolator.
+const NS_PER_STEP_ESTIMATE: u64 = 64;
 
 /// §6.1's rule, in one place so the two callers cannot drift apart.
 ///
@@ -46,40 +54,59 @@ const NS_PER_STEP_ESTIMATE: u64 = 55;
 /// **369 ns/elem** for `layout="quat_twist"`, best of five within a process.
 /// Treat both as indicative rather than as a gate — the host was **not quiet**
 /// and one of three repetitions was discarded as polluted; what they establish
-/// is the *magnitude*, which is what this decision turns on.
+/// is the *magnitude*, which is what this decision turns on. They are Python-side
+/// numbers and were not re-taken by the re-baseline below; the engine work they
+/// contain is the same fold it re-derived the constant from.
 ///
-/// Against `NS_PER_STEP_ESTIMATE`, which predicts 3 × 55 = 165 ns/elem, that is
-/// arithmetic rather than a second measurement:
+/// Against [`NS_PER_STEP_ESTIMATE`], which predicts 3 × 64 = 192 ns/elem:
 ///
 /// | layout | measured ns/elem | `est` says | ratio |
 /// | --- | --- | --- | --- |
-/// | `"quat"` | 328 | 165 | **2.0×** |
-/// | `"quat_twist"` | 369 | 165 | **2.2×** |
+/// | `"quat"` | 328 | 192 | **1.7×** |
+/// | `"quat_twist"` | 369 | 192 | **1.9×** |
 ///
-/// So the twist adds ~1.1× on top of a ~2× error the constant already carries
-/// on the pose row, and that ~2× is not news: `docs/API.md` §3.4 records the
-/// same thing from the other direction — 55 ns/step comes from a benchmark that
-/// queried on-grid stamps and so never interpolated
-/// (`docs/decisions/0013`), and the honest figure is ~97 ns/step. The 328 above
-/// is 109 ns/step, which agrees with it.
+/// So the twist adds ~1.1× on top of an under-estimate the constant already
+/// carries on the pose row, and correcting only the twist would correct the
+/// smaller of the two errors while leaving the larger.
 ///
-/// **The consequence is that §6.1's "just under 1 µs" worst case is really
-/// ~2 µs for a pose batch and ~2.2 µs for a twist one**, and the conclusion is
-/// unchanged for exactly the reason §6.1 gives: what matters is that neither
-/// branch is ever badly wrong, and 2.2 µs is still three orders of magnitude
-/// below CPython's 5 ms switch interval, so no other thread notices. A
-/// layout-dependent multiplier would correct the smaller of the two errors while
-/// leaving the larger, and would mean two numbers to re-derive when
-/// `docs/decisions/0013` re-baselines instead of one — and `docs/API.md` §3.4 is
-/// NORMATIVE that `NS_PER_STEP_ESTIMATE` is re-derived **from that measurement,
-/// in that commit**. Both rows above are for it to supersede.
+/// **That residual is expected and is not a second miscalibration.** `est` is a
+/// per-*step* estimate of the engine's fold, re-derived from the interpolating
+/// depth-3 lookup (`docs/PHASE3.md` §6.1's amendment — the one place this
+/// arithmetic is written down). A batch element through Python is that fold
+/// *plus* the layout write into the caller's buffer, so it costs more, and the
+/// error is in the safe direction: `est` too low releases the GIL later, never
+/// sooner. The largest batch that does *not* release at depth 3 is `n = 5`
+/// (`est` = 960 ns), which at the rates above really costs ~1.6 µs for a pose
+/// batch and ~1.8 µs for a twist one — still three orders of magnitude under
+/// CPython's 5 ms switch interval, which is §6.1's own criterion and the reason
+/// a layout multiplier would buy nothing.
 #[inline]
-fn release_the_gil(n: usize, depth: usize) -> bool {
+const fn release_the_gil(n: usize, depth: usize) -> bool {
     let est = (n as u64)
         .saturating_mul(depth as u64)
         .saturating_mul(NS_PER_STEP_ESTIMATE);
     est >= GIL_RELEASE_THRESHOLD_NS
 }
+
+/// The depth-3 crossover, pinned at compile time.
+///
+/// `docs/PHASE3.md` §6.1 states where the release begins for the depth the whole
+/// design is anchored to, and a constant re-derived from a re-baselined
+/// benchmark is exactly the kind of number that moves without anyone re-reading
+/// the sentence describing it. This is that sentence, checked by the compiler:
+/// at 64 ns/step a depth-3 batch releases from `n = 6` and not at `n = 5`.
+///
+/// It is an assertion rather than a `#[test]` on purpose — `tf_tree_py` is
+/// outside the cargo workspace, so `cargo nextest run --workspace` never sees
+/// its test targets, while *every* build of the crate (`just py-test`,
+/// `just py-lint`, the wheel jobs) evaluates this.
+///
+/// Mutant (applied, confirmed fatal): restore `NS_PER_STEP_ESTIMATE = 55` —
+/// `error[E0080]: evaluation panicked: the depth-3 GIL crossover moved`.
+const _: () = assert!(
+    release_the_gil(6, 3) && !release_the_gil(5, 3),
+    "the depth-3 GIL crossover moved; docs/PHASE3.md §6.1 says n = 6"
+);
 
 /// Parse the `layout=` keyword into the core's [`Layout`].
 ///

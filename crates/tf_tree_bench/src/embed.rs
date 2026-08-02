@@ -53,23 +53,26 @@
 //!    second `bench_function` beside `lookup/depth3/lerpslerp` would time two
 //!    out-of-crate columns and report 1.00×, the same failure the facade probe
 //!    above has.
-//! 2. **It queries an on-grid stamp.** `bench_pair` evaluates at
-//!    `Stamp::from_nanos(fixture::NOW_NS)`; `NOW_NS` is 9 900 000 000 ns and the
-//!    fixture's knots sit at `k * period_ns`, so that stamp is a knot on all
-//!    three dynamic edges of the depth-3 path (1 kHz, 200 Hz, 50 Hz) and
-//!    `I::eval` never runs — `docs/decisions/0013`'s defect. Both halves of this
-//!    ratio have to interpolate, or the boundary is priced against a shorter
-//!    body than the one an embedder calls; hence `stamp_ns`.
-//! 3. **Criterion estimates each benchmark on its own; this row needs the two
+//! 2. **Criterion estimates each benchmark on its own; this row needs the two
 //!    columns paired.** [`Run::boundary_ratio`] is the median of per-round
 //!    quotients taken back to back inside one round, and the *Honesty* section
 //!    below is why: the unpaired form did not resolve 5% on this host. Two
 //!    criterion estimates are two independent measurements, which is the shape
 //!    that was replaced.
 //!
-//! The profile is **not** offered as a fourth reason: `cargo bench` accepts
+//! **There used to be a third, and it has been fixed rather than kept:**
+//! `bench_pair` queried `fixture::NOW_NS`, a knot on all three dynamic edges of
+//! the depth-3 path, so `I::eval` never ran there — `docs/decisions/0013`'s
+//! defect, which `stamp_ns` below was written to avoid in advance. That file now
+//! queries `fixture::QUERY_NS` and interpolates like this one. It is recorded
+//! here because a reason that stops being true is how a list like this rots, and
+//! the two reasons above are unaffected: they are about *where the code is
+//! compiled* and *how the two columns are paired*, neither of which a stamp
+//! changes.
+//!
+//! The profile is **not** offered as a further reason: `cargo bench` accepts
 //! `--profile`, so a bench target could be built under `[profile.embedder]` too.
-//! The three above are the ones that decide it.
+//! The two above are the ones that decide it.
 //!
 //! **The in-crate body must also not be generic**, and that was found by
 //! measuring rather than by reading: the first version of
