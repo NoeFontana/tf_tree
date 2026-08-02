@@ -28,7 +28,14 @@ use crate::error::LookupError;
 use crate::sync::Ordering;
 
 /// What to do when the requested stamp is newer than every published sample.
+///
+/// `#[non_exhaustive]`: a caller *passes* one of these and only this crate
+/// dispatches on it, so a fourth policy cannot make an existing consumer
+/// silently wrong. Contrast [`crate::plan::InterpPolicy`], which downstream
+/// crates must map exhaustively onto something else and therefore stays
+/// exhaustive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ExtrapPolicy {
     /// Refuse: return [`LookupError::Extrapolation`]. The safe default for a
     /// control loop that must not act on invented data.

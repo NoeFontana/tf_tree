@@ -285,8 +285,8 @@ fn hist_json(buckets: &[Bucket]) -> String {
 
 fn edge_json(e: &EdgeSample, r: &EdgeRow) -> String {
     let kind = match e.kind {
-        tf_tree::EdgeKind::Static => "static",
-        tf_tree::EdgeKind::Dynamic => "dynamic",
+        tf_tree::unstable::EdgeKind::Static => "static",
+        tf_tree::unstable::EdgeKind::Dynamic => "dynamic",
         _ => "other",
     };
     format!(
@@ -1330,7 +1330,7 @@ mod tests {
         let mut e = crate::top::EdgeSample {
             id: 7,
             label: "he\"llo\\\nworld\u{1b}[2J".to_owned(),
-            kind: tf_tree::EdgeKind::Dynamic,
+            kind: tf_tree::unstable::EdgeKind::Dynamic,
             capacity: 8,
             head: 3,
             claimed: true,

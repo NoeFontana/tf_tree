@@ -1105,6 +1105,7 @@ name = "tf_tree"
 version = "0.2.0"
 dependencies = [
  "proptest",
+ "tf_tree",
  "tf_tree_arena",
  "tf_tree_core",
  "tf_tree_ipc",

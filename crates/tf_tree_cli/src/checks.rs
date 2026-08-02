@@ -61,9 +61,8 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
-use tf_tree::{
-    Domain, EdgeId, EdgeKind, SensorDomain, SimDomain, SteadyDomain, SystemDomain, Tree,
-};
+use tf_tree::unstable::EdgeKind;
+use tf_tree::{Domain, EdgeId, SensorDomain, SimDomain, SteadyDomain, SystemDomain, Tree};
 use tf_tree_bench::fixture::PushSample;
 
 use crate::catalogue::{CheckOutcome, Finding, Report, Tft};

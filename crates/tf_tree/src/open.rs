@@ -400,7 +400,7 @@ impl Drop for OwnerThread {
 fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenError> {
     // The assigner's own view of the lock file — see the closure below.
     let lock_probe = LivenessProbe::open(rv)?;
-    let view = tree.arena_view();
+    let view = tree.view();
     let header = view.header();
     let desc = SegmentDescriptor {
         format_version: header.format_version,
@@ -454,7 +454,7 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
             let _ = server.serve(
                 segment.as_fd(),
                 |_req| {
-                    let view = crate::ArenaView::new(&table_arena);
+                    let view = tf_tree_core::arena_view::ArenaView::new(&table_arena);
                     let table = view.participants();
                     // `granted` is a u64, so the shift below is defined only
                     // for the first 64 slots. The const assert at the top of

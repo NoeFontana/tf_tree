@@ -142,6 +142,15 @@ fn at_many_nonmonotone_matches_per_stamp() {
 
 /// `at_adaptive` emits a bounded knot set whose LerpSlerp reconstruction stays
 /// within tolerance across a curved trajectory.
+///
+/// # What was mutated
+///
+/// Widening the *request* to `ErrBound::new(1e9, 1e9)` ⇒ FAIL,
+/// `reconstruction err 1.5658096717891843e-2 > 2e-3 at q=157`. The same edit was
+/// then run against the pre-fix shape — `RECON_TOL` restored to
+/// `tol.rot_rad.max(tol.trans) * 2.0` — and this binary reported **11 tests run:
+/// 11 passed**, because the bound moved with the request. That is the defect,
+/// measured on both sides rather than asserted.
 #[test]
 fn at_adaptive_bounded_and_within_tol() {
     let c = Chain::new(64, 1000);
@@ -149,10 +158,7 @@ fn at_adaptive_bounded_and_within_tol() {
     let g = c.tree.guard();
     let max_t = (c.n as i64 - 1) * c.dt;
 
-    let tol = ErrBound {
-        rot_rad: 1e-3,
-        trans: 1e-3,
-    };
+    let tol = ErrBound::new(1e-3, 1e-3);
     let mut scratch = AdaptiveScratch::<SystemDomain>::new();
     let (stamps, poses) = plan
         .at_adaptive(&g, (ns(0), ns(max_t)), tol, &mut scratch)
@@ -171,8 +177,13 @@ fn at_adaptive_bounded_and_within_tol() {
 
     // Reconstruct at 400 probe stamps by LerpSlerp between bracketing knots and
     // compare to the exact plan evaluation. The bisection bounds midpoint error;
-    // allow a small factor for off-midpoint probes.
-    let tol_check = tol.rot_rad.max(tol.trans) * 2.0;
+    // `2 x` the requested tolerance allows for off-midpoint probes.
+    //
+    // **A literal, and that is the fix rather than the style.** This was
+    // `tol.rot_rad.max(tol.trans) * 2.0` — derived from the very value under
+    // test, so it moved with it and no request could ever be judged too loose.
+    // The doc comment above records both halves of the measurement.
+    const RECON_TOL: f64 = 2e-3;
     for k in 0..=400 {
         let q = (k as i64 * max_t) / 400;
         // Find bracket [i, j=i+1] with stamps[i] <= q < stamps[j] (or the last).
@@ -192,8 +203,8 @@ fn at_adaptive_bounded_and_within_tol() {
         let exact = plan.at(&g, ns(q)).unwrap();
         let e = max_err(approx, exact);
         assert!(
-            e <= tol_check,
-            "reconstruction err {e:e} > {tol_check:e} at q={q}"
+            e <= RECON_TOL,
+            "reconstruction err {e:e} > {RECON_TOL:e} at q={q}"
         );
     }
 }
@@ -206,10 +217,7 @@ fn at_adaptive_zero_tol_hits_cap() {
     let g = c.tree.guard();
     let max_t = (c.n as i64 - 1) * c.dt;
 
-    let tol = ErrBound {
-        rot_rad: 0.0,
-        trans: 0.0,
-    };
+    let tol = ErrBound::new(0.0, 0.0);
     let mut scratch = AdaptiveScratch::<SystemDomain>::new();
     let (stamps, _poses) = plan
         .at_adaptive(&g, (ns(0), ns(max_t)), tol, &mut scratch)

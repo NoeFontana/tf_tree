@@ -77,7 +77,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use tf_tree::{EdgeId, EdgeKind, Tree};
+use tf_tree::unstable::EdgeKind;
+use tf_tree::{EdgeId, Tree};
 
 use crate::catalogue::{Severity, Tft};
 // `OCCUPANCY_LIMIT` is imported rather than restated as a local `0.80`. A second
