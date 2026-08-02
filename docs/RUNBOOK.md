@@ -423,10 +423,26 @@ domain mismatch — different container mounts, or different `ROS_DOMAIN_ID`.
 
 ### `open()` created an arena when one was expected
 
-A consumer used the default `CreatePolicy::IfAbsent` and started before the
-publisher. Set `CreatePolicy::Never` on consumers in any supervised deployment,
-so they fail loudly instead of creating an empty arena a later publisher then
-refuses to join.
+**On a build carrying
+[`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) this
+should no longer be reachable, and that is the first thing to check.** `Open`'s
+defaults are now the *consumer* — `AttachMode::ReadOnly` plus
+`CreatePolicy::Never` — and the two are no longer independently settable into an
+incoherent pair: a read-only attach combined with any creating policy is refused
+with `OpenError::ReadOnlyCannotCreate`, before the runtime directory is even
+resolved. `tf_tree::open()` creates nothing.
+
+So a process that created an arena asked for it explicitly, with both
+`AttachMode::ReadWrite` and a `CreatePolicy` other than `Never`, and supplied
+the `TreeBuilder` that sized it. Find that call. Either it is a consumer that
+was written against the pre-`0019` defaults and still names them, in which case
+delete both and let it wait for the publisher with `Open::await_open`, or it is
+a second copy of a legitimate publisher, in which case it wants
+`Open::require_create(true)` — which turns "an arena is already live" into
+`OpenError::ArenaAlreadyLive` instead of a silent join.
+
+If the process genuinely predates `0019`, its `open()` did default to
+`CreatePolicy::IfAbsent` and would create on an empty machine; rebuild it.
 
 ### Rendezvous misbehaving on a shared filesystem
 

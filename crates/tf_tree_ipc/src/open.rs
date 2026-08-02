@@ -186,7 +186,17 @@ pub struct Open {
 /// Default `open_timeout` (§3.4).
 pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// First backoff interval. Doubles up to [`MAX_BACKOFF`].
+/// First backoff interval for *this* crate's handshake retry. Doubles up to
+/// [`MAX_BACKOFF`].
+///
+/// **Private, and deliberately so.** A revision of `docs/decisions/0019` §2b's
+/// branch widened this pair to `pub` so the facade's `Open::await_open` could
+/// share it. That is permanent public API on this crate bought for two numbers,
+/// and it bought no guarantee: `await_open` retries whole rendezvous
+/// *attempts*, each of which runs this loop inside it, so the two are nested
+/// loops over different work and are free to disagree. The facade now keeps its
+/// own pair in `tf_tree::tree`, and this one went back to being an
+/// implementation detail.
 const MIN_BACKOFF: Duration = Duration::from_micros(200);
 /// Backoff ceiling — small enough that a 5 s timeout still gives hundreds of
 /// attempts, so a takeover that completes in a millisecond is joined promptly.

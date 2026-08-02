@@ -242,7 +242,7 @@ pub use frozen::FrozenFileError;
 pub use tf_tree_arena::{FrozenError, FrozenHeader, ARENA_FILE_ALIGN};
 
 pub use tree::{
-    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, OwnedWriter,
+    AwaitError, BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, OwnedWriter,
     ReparentError, Tree, TreeBuilder,
 };
 

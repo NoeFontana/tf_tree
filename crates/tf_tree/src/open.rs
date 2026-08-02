@@ -36,7 +36,7 @@ use tf_tree_ipc::{
     SocketProbe, SystemEnv, DEFAULT_OPEN_TIMEOUT,
 };
 
-use crate::tree::{BuildError, Tree, TreeBuilder};
+use crate::tree::{BuildError, Tree, TreeBuilder, MAX_BACKOFF, MIN_BACKOFF};
 
 /// Re-exported so a caller does not have to depend on `tf_tree_ipc` directly
 /// just to name a policy `open()` already takes.
@@ -162,6 +162,34 @@ pub enum OpenError {
     /// with `create = Never` and get [`IpcError::ArenaAbsent`] instead of this.
     #[error("no layout was supplied and the arena had to be created")]
     NoLayoutToCreate,
+    /// [`AttachMode::ReadOnly`] was combined with a `create` policy other than
+    /// [`CreatePolicy::Never`] (`docs/decisions/0019` §2a).
+    ///
+    /// A read-only creator is incoherent on its face: it asks to bring an arena
+    /// into existence that it then cannot write, which is by definition the
+    /// empty arena a consumer publishes nothing into while looking healthy.
+    /// Refusing the combination removes that class by construction rather than
+    /// by advice — which is `docs/API.md` R6 carried one step further, from
+    /// *read-only is the default* to *read-only is the thing that cannot
+    /// create*.
+    ///
+    /// Reported **before** the runtime directory is resolved, so a
+    /// misconfiguration reports as itself rather than as whatever the machine
+    /// happens to be missing.
+    #[error("a read-only attach cannot create an arena: use CreatePolicy::Never, or AttachMode::ReadWrite")]
+    ReadOnlyCannotCreate,
+    /// [`Open::require_create`] was set and the rendezvous resolved to
+    /// [`OpenOutcome::Joined`] — somebody else's arena is already live.
+    ///
+    /// The refusal `docs/decisions/0019` §3 question 1 settles for the ROS
+    /// bridge, and `0015` depends on it: [`CreatePolicy`] has no
+    /// "create, or refuse if one is already live" variant, so a second bridge
+    /// would take the *join* path and start claiming edges in an arena it did
+    /// not size. The session is dropped before this is returned, so the
+    /// participant lock byte is released and the socket closed — a refused
+    /// attach leaves nothing behind.
+    #[error("an arena is already live at this rendezvous and require_create was set")]
+    ArenaAlreadyLive,
 }
 
 impl From<IpcError> for OpenError {
@@ -180,17 +208,22 @@ impl From<BuildError> for OpenError {
     }
 }
 
-/// Join the running arena, or create it.
+/// Join the running arena, read-only.
 ///
 /// Zero configuration: domain and name come from `$TF_TREE_DOMAIN` (else
 /// `$ROS_DOMAIN_ID`, else 0) and `$TF_TREE_NAME` (else `default`), and the
 /// runtime directory from `$TF_TREE_RUNTIME_DIR`, `$XDG_RUNTIME_DIR`, `/run`, or
 /// `/tmp` in that order.
 ///
+/// **This never creates anything.** [`Open::new`]'s defaults are the *consumer*
+/// (`docs/decisions/0019` §2a), so a process that means to bring the arena into
+/// existence says so with [`Open::create`] and [`Open::layout_if_creating`].
+///
 /// # Errors
 ///
-/// See [`OpenError`]. With the default `create = IfAbsent` and no layout, an
-/// absent arena is [`OpenError::NoLayoutToCreate`].
+/// See [`OpenError`]. On a machine where nothing is serving this is
+/// [`IpcError::ArenaAbsent`], fast — see [`Open::await_open`] for the consumer
+/// that would rather wait for the publisher to start.
 pub fn open() -> Result<Tree, OpenError> {
     Open::new().open()
 }
@@ -203,6 +236,7 @@ pub struct Open {
     create: CreatePolicy,
     timeout: Duration,
     layout: Option<TreeBuilder>,
+    require_create: bool,
 }
 
 impl Default for Open {
@@ -212,21 +246,37 @@ impl Default for Open {
 }
 
 impl Open {
-    /// Defaults: read-only, create-if-absent, the §3.4 timeout, env discovery.
+    /// Defaults: read-only, **never create**, the §3.4 timeout, env discovery.
     ///
     /// **`ReadOnly` is deliberate and differs from the Rust in-process default**
     /// (D18). A `PROT_READ` mapping makes a buggy consumer *incapable* of
     /// corrupting a robot's transform tree, enforced by the MMU rather than by
     /// convention, and most processes that open a tree are consumers.
+    ///
+    /// # Why `create` is [`CreatePolicy::Never`]
+    ///
+    /// It used to be [`CreatePolicy::IfAbsent`], which paired with the
+    /// `ReadOnly` above into a configuration that asks to create an arena it
+    /// cannot write — the one [`OpenError::ReadOnlyCannotCreate`] now rejects.
+    /// A builder whose own documented defaults are an error is a defect on its
+    /// own terms, so the defaults moved instead of the rule
+    /// (`docs/decisions/0019` §2a and its plan's step 1, which supersedes
+    /// `docs/decisions/0005` §3.2 and `docs/PHASE2.md` §3.2 on this one point).
+    ///
+    /// The defaults are therefore the *consumer*, and the error is reachable
+    /// only by writing both halves out explicitly. A creator names both:
+    /// [`Open::mode`] with [`AttachMode::ReadWrite`], [`Open::create`], and the
+    /// [`TreeBuilder`] that decision `0004` sizes the arena from.
     #[must_use]
     pub fn new() -> Open {
         Open {
             domain: None,
             name: None,
             mode: AttachMode::ReadOnly,
-            create: CreatePolicy::IfAbsent,
+            create: CreatePolicy::Never,
             timeout: DEFAULT_OPEN_TIMEOUT,
             layout: None,
+            require_create: false,
         }
     }
 
@@ -256,9 +306,37 @@ impl Open {
     }
 
     /// Whether to create the arena when none exists.
+    ///
+    /// Anything other than [`CreatePolicy::Never`] needs [`Open::mode`] set to
+    /// [`AttachMode::ReadWrite`]; the pair is [`OpenError::ReadOnlyCannotCreate`]
+    /// otherwise.
     #[must_use]
     pub fn create(mut self, create: CreatePolicy) -> Open {
         self.create = create;
+        self
+    }
+
+    /// Refuse to *join*: this process must be the one that creates the arena.
+    ///
+    /// [`CreatePolicy`] has three settings and none of them is "create, or
+    /// refuse if one is already live" — `IfAbsent` silently joins and `Always`
+    /// silently replaces. A process that owns an arena's topology needs the
+    /// missing fourth answer: `docs/decisions/0019` §3 question 1 settles it for
+    /// the ROS bridge of `0015`, where taking the join path would mean claiming
+    /// edges in an arena somebody else sized.
+    ///
+    /// With this set, [`OpenOutcome::Joined`] becomes
+    /// [`OpenError::ArenaAlreadyLive`] and the session is dropped before the
+    /// error is returned — so the participant lock byte is released and the
+    /// socket closed, and a refused attach is indistinguishable from one that
+    /// never happened.
+    ///
+    /// It does **not** change what `create` means. `Never` plus this is a
+    /// contradiction that reports as [`IpcError::ArenaAbsent`]: nothing to join
+    /// and nothing permitted to create.
+    #[must_use]
+    pub fn require_create(mut self, require: bool) -> Open {
+        self.require_create = require;
         self
     }
 
@@ -282,10 +360,132 @@ impl Open {
 
     /// Run §3.4 and produce a [`Tree`].
     ///
+    /// One attempt. A consumer that starts before its publisher wants
+    /// [`Open::await_open`].
+    ///
     /// # Errors
     ///
     /// See [`OpenError`].
-    pub fn open(self) -> Result<Tree, OpenError> {
+    pub fn open(mut self) -> Result<Tree, OpenError> {
+        let per_attempt = self.timeout;
+        self.attempt(per_attempt)
+    }
+
+    /// Run §3.4 repeatedly until an arena is there, or `timeout` runs out.
+    ///
+    /// **The first of `docs/decisions/0019` §2b's two waits**, and it exists
+    /// because [`CreatePolicy::Never`] against an absent arena fails *fast* by
+    /// design: a consumer racing its publisher's process *start* never obtains a
+    /// [`Tree`] at all, so it cannot reach [`Tree::await_frames`]. Two absences,
+    /// two names.
+    ///
+    /// # What is retried, and what is not
+    ///
+    /// Only [`IpcError::ArenaAbsent`] and [`IpcError::ArenaHeldButUnreachable`]
+    /// — "never started" and "not yet", which `docs/decisions/0018` puts on one
+    /// branch because a waiter cannot tell them apart and does the same thing
+    /// about both. **Every other error is terminal and returned verbatim.**
+    /// Retrying cannot change a `FORMAT_VERSION` disagreement, a layout hash
+    /// mismatch or a missing runtime directory, and burning the budget against
+    /// one would replace a precise message with a timeout.
+    ///
+    /// # There is no `Timeout` variant
+    ///
+    /// On expiry this returns the last retryable error it saw.
+    /// [`IpcError::ArenaHeldButUnreachable`] already names the holder slots and
+    /// the pid, and already means "I waited and it never resolved"; a second
+    /// spelling would carry strictly less. [`IpcError::ArenaAbsent`] likewise
+    /// says exactly what was true for the whole budget.
+    ///
+    /// # Granularity
+    ///
+    /// A bounded poll — `MIN_BACKOFF` doubling to `MAX_BACKOFF`, this crate's
+    /// own pair, shared with [`Tree::await_frames`] and defined once in
+    /// `crate::tree` — not a notification. `docs/decisions/0018`
+    /// records why there is no arena-resident primitive to wake on, and it
+    /// applies here with more force: topology settles once, at startup. So this
+    /// returns *later* than the arena appeared, by up to one backoff interval
+    /// plus scheduler granularity.
+    ///
+    /// [`Open::timeout`] is clamped to what is left of `timeout` on every
+    /// attempt, or a default `Open` would let one held-but-unreachable attempt
+    /// run the full [`DEFAULT_OPEN_TIMEOUT`] past the caller's deadline.
+    ///
+    /// # Errors
+    ///
+    /// See [`OpenError`].
+    pub fn await_open(mut self, timeout: Duration) -> Result<Tree, OpenError> {
+        let start = std::time::Instant::now();
+        let mut backoff = MIN_BACKOFF;
+        loop {
+            // Clamp to what the *caller's* budget has left. `Open::timeout`
+            // defaults to 5 s, so an unclamped attempt turns `await_open(1s)`
+            // into a five-second call.
+            //
+            // **Floored at `MIN_BACKOFF`, and that is not tidiness.** The
+            // handshake sets `SO_RCVTIMEO`/`SO_SNDTIMEO` from this value, and a
+            // zero `Duration` there is `EINVAL` — reported as
+            // `IpcError::ClientSocketSetup`, which is *terminal*, so a budget
+            // that ran out exactly on an iteration boundary would replace the
+            // rendezvous' real answer with a local socket error. The overrun
+            // this permits is 200 µs, well inside one scheduler tick.
+            let left = timeout.saturating_sub(start.elapsed());
+            let per_attempt = core::cmp::max(core::cmp::min(self.timeout, left), MIN_BACKOFF);
+            let err = match self.attempt(per_attempt) {
+                Ok(tree) => return Ok(tree),
+                Err(e) if is_retryable(e) => e,
+                // Terminal: a version, layout or configuration disagreement no
+                // amount of waiting alters.
+                Err(e) => return Err(e),
+            };
+            // Deadline **after** the work and **before** the sleep: an attempt
+            // that consumed the whole budget must report, not nap first.
+            if start.elapsed() >= timeout {
+                return Err(err);
+            }
+            // Never sleep past the caller's deadline.
+            let left = timeout.saturating_sub(start.elapsed());
+            std::thread::sleep(core::cmp::min(backoff, left));
+            backoff = core::cmp::min(backoff * 2, MAX_BACKOFF);
+        }
+    }
+
+    /// One pass of §3.4.
+    ///
+    /// `&mut self` so [`Open::await_open`] can call it repeatedly, and **the
+    /// layout is cloned rather than taken** — which is the difference between an
+    /// audit and a guarantee.
+    ///
+    /// The audit this replaces read: the only path that consumes the layout
+    /// returns either `Ok` (no retry) or [`OpenError::NoLayoutToCreate`], which
+    /// `is_retryable` classifies as terminal, so a second attempt never finds it
+    /// missing where the first found it present. That was **wrong**. On the same
+    /// `Created | TookOver` arm, `spawn_owner_server` returns
+    /// `OpenError::Rendezvous(IpcError::ArenaAbsent)` when `tree.shared_fd()` is
+    /// `None`, and `is_retryable` calls that **retryable** — so `await_open`
+    /// would loop with the layout already gone and report `NoLayoutToCreate`, a
+    /// diagnostic pointing at the caller for an internal invariant break.
+    ///
+    /// Unreachable today (a freshly `build_shared`-ed arena always has an fd),
+    /// which is precisely why a comment is the wrong instrument: nothing would
+    /// fail if the audit went stale again. Cloning removes the class instead of
+    /// re-auditing it, and it is what `&mut self` cost in the first place —
+    /// before `await_open` existed this method took `self` by value and simply
+    /// moved the layout out.
+    ///
+    /// The price is one [`TreeBuilder`] clone per *creating* attempt, next to a
+    /// `memfd_create`, an `mmap` and a socket bind. Consumers (`create =
+    /// Never`) never reach it, and a creating caller reaches it at most once —
+    /// `Created` either succeeds or fails terminally.
+    fn attempt(&mut self, per_attempt: Duration) -> Result<Tree, OpenError> {
+        // **Before `RuntimeDir::resolve()`, deliberately** (`docs/decisions/0019`
+        // plan step 1). This is a property of the arguments alone; checking it
+        // after would report a misconfigured builder as whatever the machine
+        // happens to be missing, which is a diagnostic pointing at the wrong
+        // process.
+        if self.mode == AttachMode::ReadOnly && self.create != CreatePolicy::Never {
+            return Err(OpenError::ReadOnlyCannotCreate);
+        }
         let rd = RuntimeDir::resolve().map_err(OpenError::Rendezvous)?;
         let domain = match self.domain {
             Some(d) => d,
@@ -309,17 +509,26 @@ impl Open {
             client_boot_id: boot_id().unwrap_or([0; 16]),
             client_name: name_bytes(),
         };
-        let mut probe = SocketProbe::new(request, self.timeout);
+        let mut probe = SocketProbe::new(request, per_attempt);
 
         let mut session = tf_tree_ipc::Open::new(rv.clone())
             .mode(request.mode)
             .create(self.create)
-            .timeout(self.timeout)
+            .timeout(per_attempt)
             .open(&mut probe)
             .map_err(OpenError::Rendezvous)?;
 
         match session.outcome() {
             OpenOutcome::Joined => {
+                if self.require_create {
+                    // Drop the whole session before returning. It holds this
+                    // process's participant lock byte and the connection whose
+                    // closure tells the owner we are gone (D17), so returning
+                    // the error while it lived would leave a slot taken and a
+                    // client the owner still counts.
+                    drop(session);
+                    return Err(OpenError::ArenaAlreadyLive);
+                }
                 let attached = session
                     .take_attached()
                     .ok_or(OpenError::Rendezvous(IpcError::ArenaAbsent))?;
@@ -335,7 +544,9 @@ impl Open {
                 Ok(tree)
             }
             OpenOutcome::Created | OpenOutcome::TookOver => {
-                let builder = self.layout.ok_or(OpenError::NoLayoutToCreate)?;
+                // `clone`, not `take` — see this method's doc comment. A retry
+                // must find the layout exactly as the first attempt found it.
+                let builder = self.layout.clone().ok_or(OpenError::NoLayoutToCreate)?;
                 let mut tree = builder.build_shared(rv.name().as_str())?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 tree.use_claim_leases(open_claim_lock(&rv)?);
@@ -345,6 +556,28 @@ impl Open {
             }
         }
     }
+}
+
+/// Whether [`Open::await_open`] should try again, or report this verbatim.
+///
+/// **Exactly two, and the list is the decision rather than a heuristic**
+/// (`docs/decisions/0019` plan step 2). Both describe the publisher-mid-start
+/// window: [`IpcError::ArenaAbsent`] is "nothing is there", and
+/// [`IpcError::ArenaHeldButUnreachable`] is "something took the ownership byte
+/// and has not begun serving". `docs/decisions/0018` puts "not yet" and "never
+/// started" on one branch because a waiter cannot distinguish them and does the
+/// same thing about both.
+///
+/// Everything else — a `FORMAT_VERSION` or layout-hash disagreement, a missing
+/// runtime directory, a mapping failure, a builder misconfiguration — is
+/// terminal. Retrying cannot change any of them, and burning the budget would
+/// hand the caller a timeout where it had a precise message.
+fn is_retryable(err: OpenError) -> bool {
+    matches!(
+        err,
+        OpenError::Rendezvous(IpcError::ArenaAbsent)
+            | OpenError::Rendezvous(IpcError::ArenaHeldButUnreachable { .. })
+    )
 }
 
 /// The owner's serving thread, and the handle that stops it.

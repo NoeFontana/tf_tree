@@ -19,6 +19,13 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 /// A scratch runtime directory, removed when the test ends.
+///
+/// **`set_var` is process-wide, and that is safe here only because `nextest`
+/// gives every test its own process.** Under plain `cargo test` these tests
+/// share one process and one environment, so two `Scratch`es would race and the
+/// loser would resolve the winner's rendezvous. Every recipe that runs this
+/// target uses `cargo nextest run`; a `cargo test` invocation of it is not
+/// supported and would fail intermittently rather than loudly.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -136,6 +143,490 @@ fn a_consumer_that_will_not_create_fails_fast_on_an_empty_machine() {
     assert!(
         line.contains("no arena"),
         "the error should name the absent arena: {line}"
+    );
+}
+
+/// **The zero-argument convenience still joins a served arena.**
+///
+/// `tf_tree::open()` is the call a README reader types and the only consumer of
+/// [`tf_tree::Open::new`]'s *defaults* anywhere in the workspace — every other
+/// caller names `mode` and `create` explicitly. `docs/decisions/0019` moved that
+/// `create` default from `IfAbsent` to `Never`, and nothing but this test would
+/// notice if the move had broken the join path.
+///
+/// Bit-for-bit, like `a_foreign_process_joins_and_reads_the_same_transform`:
+/// attaching to the wrong segment would still return `Ok`.
+///
+/// **Mutant: make `open()` pass `CreatePolicy::IfAbsent`** ⇒ still passes here
+/// (an arena is serving, so the join path is taken either way), which is why
+/// `a_read_only_attach_refuses_to_create` exists as well. **Mutant: break the
+/// free function's body** ⇒ the child reports `error ...` and this fails.
+#[test]
+fn the_free_open_joins_a_served_arena() {
+    let scratch = Scratch::new("free-open");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    let published = owner.line();
+    assert!(published.starts_with("owning "), "got {published}");
+    let owner_value = published.strip_prefix("owning ").unwrap().to_string();
+
+    let mut joiner = Kid::spawn(&scratch.0, &["open-free"]);
+    let joined = joiner.line();
+    assert!(
+        joined.starts_with("joined "),
+        "tf_tree::open() did not join a served arena: {joined}"
+    );
+    assert_eq!(
+        joined.strip_prefix("joined ").unwrap(),
+        owner_value,
+        "tf_tree::open() read a different transform than the owner published"
+    );
+}
+
+/// **`docs/decisions/0019` §2a: a read-only attach cannot create.**
+///
+/// **The `layout_if_creating` is load-bearing and the test is vacuous without
+/// it.** Without a layout, `ro` + a creating policy already failed, with
+/// `NoLayoutToCreate`, so an assertion on the *new* variant would pass against
+/// a build that never learned the rule. Supplying the builder is what makes the
+/// old code reach `OpenOutcome::Created`.
+///
+/// Both creating policies, because `Always` is a different branch of the
+/// rendezvous (it skips the split-brain yield) and only `IfAbsent` would be
+/// covered otherwise.
+///
+/// **Mutant: allow the combination** ⇒ the first open returns `Ok` and the
+/// re-open below finds a freshly created empty arena instead of `ArenaAbsent`.
+#[test]
+fn a_read_only_attach_refuses_to_create() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let _scratch = Scratch::new("ro-create");
+
+    let layout = || {
+        TreeBuilder::new()
+            .default_interp(InterpPolicy::LerpSlerp)
+            .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+    };
+
+    for policy in [CreatePolicy::IfAbsent, CreatePolicy::Always] {
+        let err = tf_tree::Open::new()
+            .mode(AttachMode::ReadOnly)
+            .create(policy)
+            .layout_if_creating(layout())
+            .open()
+            .err()
+            .expect("a read-only creator must be refused");
+        assert!(
+            matches!(err, tf_tree::OpenError::ReadOnlyCannotCreate),
+            "expected ReadOnlyCannotCreate for {policy:?}, got {err:?}"
+        );
+    }
+
+    // **And the machine is still empty.** The refusal has to happen before
+    // anything is created, not after — an error returned over a segment that
+    // now exists would leave the next `Never` consumer joining an empty arena
+    // and reporting itself healthy.
+    let err = tf_tree::Open::new()
+        .create(CreatePolicy::Never)
+        .open()
+        .err()
+        .expect("nothing should have been created");
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+        ),
+        "the refused open left an arena behind: {err:?}"
+    );
+}
+
+/// **`Open::require_create` refuses to join, and leaves nothing behind.**
+///
+/// `CreatePolicy` has no "create, or refuse if one is already live" setting, so
+/// a second arena owner — `docs/decisions/0015`'s ROS bridge is the caller this
+/// exists for — would otherwise take the *join* path and start claiming edges
+/// in an arena somebody else sized (`docs/decisions/0019` §3, question 1).
+///
+/// The second half is the part worth a test: a refusal that returned while its
+/// `Session` lived would leave this process's participant lock byte taken and a
+/// socket the owner still counts, so a bridge that retried a few times would
+/// exhaust the slot table.
+///
+/// **Mutant: return `ArenaAlreadyLive` without dropping the session** ⇒ slot 1
+/// reads held after the refusal and the second assertion fails.
+/// **Mutant: ignore `require_create`** ⇒ the open returns `Ok` and the first
+/// `expect` fails.
+#[test]
+fn require_create_refuses_a_live_arena_and_releases_its_slot() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("require-create");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "));
+
+    let err = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .require_create(true)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .open()
+        .err()
+        .expect("a second owner must not silently join");
+    assert!(
+        matches!(err, tf_tree::OpenError::ArenaAlreadyLive),
+        "expected ArenaAlreadyLive, got {err:?}"
+    );
+
+    // The owner holds slot 0. The refused attach was granted slot 1 and must
+    // have given it back.
+    let lock = tf_tree_ipc::LockFile::open(&scratch.0.join("0/default.lock")).unwrap();
+    assert!(
+        !lock.probe_participant(1).unwrap().held,
+        "the refused attach kept its participant lock byte"
+    );
+
+    // And an ordinary consumer is unaffected — the refusal is about this
+    // caller's intent, not about the arena.
+    let mut joiner = Kid::spawn(&scratch.0, &["join"]);
+    assert!(
+        joiner.line().starts_with("joined "),
+        "the refusal disturbed the arena"
+    );
+}
+
+/// A consumer that starts before its publisher waits, and the wait resolves.
+///
+/// `docs/decisions/0019` §2b's first wait. The owner is spawned ~200 ms after
+/// the wait begins, so `Ok` alone proves nothing — the elapsed lower bound is
+/// what says the call really waited rather than racing to a lucky attach.
+///
+/// **Mutant: classify `ArenaAbsent` as terminal** ⇒ `await_open` returns
+/// `Err(ArenaAbsent)` in microseconds and the `expect` fails.
+#[test]
+fn a_consumer_waits_for_an_arena_that_starts_late() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("late-start");
+    let dir = scratch.0.clone();
+
+    let (tx, rx) = mpsc::channel::<Kid>();
+    let spawner = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut owner = Kid::spawn(&dir, &["own"]);
+        assert!(
+            owner.line().starts_with("owning "),
+            "the owner did not start"
+        );
+        // Hand it back so it stays alive for the assertions below; dropping it
+        // here would kill the arena mid-test.
+        let _ = tx.send(owner);
+    });
+
+    let started = Instant::now();
+    let tree = tf_tree::Open::new()
+        .await_open(Duration::from_secs(20))
+        .expect("the wait should have outlasted a publisher 200 ms late");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the wait returned before the publisher could have started ({elapsed:?}) — \
+         it did not actually wait"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the wait took far longer than the publisher's 200 ms delay: {elapsed:?}"
+    );
+    assert!(!tree.is_writable(), "the default attach is read-only (D18)");
+
+    let owner = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the spawner thread never produced an owner");
+    drop(tree);
+    drop(owner);
+    spawner.join().expect("spawner thread");
+}
+
+/// A wait with no publisher at all gives up inside a bounded time.
+///
+/// **Run on a worker thread with a `recv_timeout` on the main one, and that is
+/// deliberate.** This repository has **no `.config/nextest.toml`**, so there is
+/// no `slow-timeout` / `terminate-after` to bound a test that never returns: an
+/// `await_open` that ignored its deadline would hang the whole suite instead of
+/// failing one test. The channel is this test supplying its own bound.
+///
+/// **Mutant: ignore the deadline** ⇒ the `recv_timeout` expires and this fails
+/// with the message below, rather than the run hanging.
+#[test]
+fn a_wait_for_an_arena_that_never_starts_gives_up() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let _scratch = Scratch::new("never-starts");
+
+    let budget = Duration::from_millis(300);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = tf_tree::Open::new().await_open(budget);
+        let _ = tx.send((outcome.err(), started.elapsed()));
+    });
+
+    let (err, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "await_open never returned: it ignored its deadline. There is no \
+         .config/nextest.toml in this repository, so nothing else would have \
+         bounded this",
+    );
+    let err = err.expect("an empty machine has no arena to open");
+
+    // **The last retryable error, verbatim — there is no `Timeout` variant.**
+    // `ArenaAbsent` already says exactly what was true for the whole budget,
+    // and a second spelling would carry strictly less.
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+                | tf_tree::OpenError::Rendezvous(
+                    tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. }
+                )
+        ),
+        "expected the last retryable rendezvous error, got {err:?}"
+    );
+    assert!(elapsed >= budget, "it gave up early: {elapsed:?}");
+    assert!(
+        elapsed < budget * 20,
+        "it overran its budget by more than the backoff can explain: {elapsed:?}"
+    );
+}
+
+/// **`docs/decisions/0019` §2b's second wait: a frame interned after the arena
+/// already exists.**
+///
+/// The owner declares `frame_headroom`, because the shared fixture declares
+/// none and a late intern into it fails `CapacityExceeded` — which would time
+/// the waiter out for a reason that has nothing to do with the wait.
+///
+/// The consumer's id must equal the *owner's*, which is what rules out the
+/// failure this method is shaped to avoid: a wait that interned the name itself
+/// and handed back an id for a frame nobody declared.
+///
+/// **This is the only test in the repository that pins the predicate.**
+/// `await_frames`'s `is_writable` guard fires before the predicate on every tree
+/// a default build can construct, so `tests/await_frames.rs` is blind to it; a
+/// read-only handle needs a live shared arena, and this is where one exists.
+/// `just shm-rendezvous` is therefore the predicate's entire gate.
+///
+/// **Mutant: build the predicate on `Tree::frame`** (`match self.frame(name)`,
+/// `is_writable` guard untouched) ⇒ verified. *"FAIL [0.009s] … the frame was
+/// interned well inside the budget: Frame(ReadOnly)"* — the read-only consumer
+/// is refused on the first probe and never resolves.
+/// `a_frames_wait_for_a_name_nobody_will_intern_gives_up` fails with it
+/// (*"left: Frame(ReadOnly), right: Timeout { … }"*), so the predicate has two
+/// killers, both in this file. The same mutant leaves
+/// `cargo nextest run -p tf_tree --test await_frames` at *"5 tests run: 5
+/// passed"*, which is the measurement that moved this note here.
+///
+/// # What this test does not cover, stated rather than implied
+///
+/// An earlier revision claimed *"drop the memoization or the deadline ⇒ caught
+/// by the elapsed bounds"*. **Both mutants pass**, measured:
+///
+/// - `if false && slot.is_some()` (memoization off) ⇒ *"15 tests run: 15
+///   passed"*, this test at 0.210 s against 0.217 s unmutated, and the plain
+///   `await_frames` target at *"5 tests run: 5 passed"*. It cannot be caught
+///   here, and it cannot be caught anywhere: `find_frame` is idempotent and
+///   frames are append-only, so re-probing a found name returns the same id for
+///   a few hundred nanoseconds of hashing. The memoization is a **cost**
+///   property with no observable behaviour, and this note says so instead of
+///   inventing a guard for it. If that ever needs pinning it wants a benchmark,
+///   not an assertion.
+/// - `if false && start.elapsed() >= timeout` (deadline off) ⇒ **this test still
+///   passes**. The frame arrives at 200 ms against a 20 s budget, so it never
+///   reaches the deadline at all. That gap is real and is now closed by
+///   `a_frames_wait_for_a_name_nobody_will_intern_gives_up` below — the only
+///   test in the run that mutant fails — which is where the deadline claim
+///   belongs.
+///
+/// What the elapsed bounds here *do* pin is that the call waited rather than
+/// racing to a lucky read — the same thing they pin in
+/// `a_consumer_waits_for_an_arena_that_starts_late`.
+///
+/// It also pins the **live** half of `ArenaBacking::is_frozen`, which
+/// `tests/frozen.rs` cannot: mutating `Mapped(_) => true` ⇒ verified, *"the
+/// frame was interned well inside the budget: FrozenTree"*.
+#[test]
+fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("late-frame");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own-headroom"]);
+    assert_eq!(owner.line(), "owning");
+
+    let consumer = tf_tree::Open::new()
+        .open()
+        .expect("join the arena the owner already created");
+    assert!(!consumer.is_writable(), "the default attach is read-only");
+    assert!(
+        consumer.frames().unwrap().iter().all(|n| n != "late_frame"),
+        "the frame under test was already interned before the wait began"
+    );
+
+    // Poke from a thread, ~200 ms in, so the wait below has something to wait
+    // for. Taking the pipe rather than calling `Kid::poke` leaves `owner`
+    // borrowable for `line()` afterwards.
+    let mut stdin = owner.0.stdin.take().expect("piped stdin");
+    let poker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = writeln!(stdin, "go");
+    });
+
+    let started = Instant::now();
+    let [late] = consumer
+        .await_frames(["late_frame"], Duration::from_secs(20))
+        .expect("the frame was interned well inside the budget");
+    let elapsed = started.elapsed();
+
+    poker.join().expect("poker thread");
+    let interned = owner.line();
+    let owner_id: u32 = interned
+        .strip_prefix("interned ")
+        .expect(&interned)
+        .parse()
+        .unwrap();
+
+    assert_eq!(
+        late.get(),
+        owner_id,
+        "the waiter resolved to a different id than the owner interned"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the wait returned before the owner could have interned ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the wait far outlasted the intern it was waiting for: {elapsed:?}"
+    );
+}
+
+/// **`AwaitError::Timeout`, which nothing else in any gate produces.**
+///
+/// Before this test the whole `if start.elapsed() >= timeout { … }` block in
+/// `Tree::await_frames` could be deleted and every suite stayed green —
+/// measured, `if false && start.elapsed() >= timeout` leaves `just test`'s
+/// `await_frames` target at *"5 tests run: 5 passed"*, and in
+/// `just shm-rendezvous` it fails **only** this test — *"15 tests run: 14
+/// passed, 1 failed"*, so the fourteen that predate it are all blind to the
+/// deadline. `docs/decisions/0019` §2b's second wait could hang a consumer
+/// forever with nothing to say so. Untested along with it: the
+/// first-missing-name hash, the `saturating_sub` clamp, and `all_interned::<0>`.
+///
+/// **The wait runs on a worker thread and the main thread bounds it with
+/// `recv_timeout`.** This repository has **no `.config/` directory at all** —
+/// verified, the root dotfiles are `.cargo`, `.claude`, `.git`, `.github`,
+/// `.gitignore`, and `find` reports no `nextest.toml` anywhere — so there is no
+/// `slow-timeout` or `terminate-after` profile setting, and a call that
+/// ignored its deadline would wedge the whole run instead of failing one test.
+/// The channel is this test supplying the bound nextest does not. It is the same
+/// shape `a_wait_for_an_arena_that_never_starts_gives_up` uses one wait over.
+///
+/// The `Tree` is built *inside* the thread rather than moved into it: `Scratch`
+/// has already put `TF_TREE_RUNTIME_DIR` in this process's environment, so the
+/// thread resolves the same rendezvous, and nothing has to be `Send`.
+///
+/// **`["map", …]` and not just the missing name.** `map` is in the fixture
+/// layout, so it resolves on the first probe and is memoized; the reported hash
+/// must then be the *second* name's. A `Timeout` that hashed `names[0]` would
+/// name a frame that is present, which is the most confusing answer available.
+///
+/// **Mutants, each applied, run, observed and reverted:**
+///
+/// - `if false && start.elapsed() >= timeout` (the deadline) ⇒ *"FAIL
+///   [30.008s] … await_frames never returned: it ignored its deadline. There is
+///   no .config/nextest.toml in this repository, so nothing else would have
+///   bounded this: Timeout"*. Thirty seconds and a named failure, not a hang.
+/// - `.next()` in place of `.find(|(_, slot)| slot.is_none())` (report
+///   `names[0]` rather than the first *missing* name) ⇒ *"the timeout named the
+///   wrong frame, or was not a timeout at all — left: Timeout { hash:
+///   10663285463286226064 }, right: Timeout { hash: 15926179251682185921 }"*.
+///   The left value is `map`'s hash, a frame that is present.
+/// - `if N == 0 { return None; }` at the head of `all_interned` ⇒ *"a
+///   zero-length request on a waitable tree must be answered without touching
+///   the arena — left: Err(Timeout { hash: 0 }), right: Ok([])"*. That `hash: 0`
+///   is the `map_or` fallback in the deadline branch, reached because no slot is
+///   missing — so this mutant also exercises the arm whose comment calls itself
+///   unreachable.
+#[test]
+fn a_frames_wait_for_a_name_nobody_will_intern_gives_up() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use tf_tree::AwaitError;
+    use tf_tree_core::frame::blake3_64;
+
+    /// Nothing in `rendezvous_child`'s fixture interns this, and nothing in this
+    /// test does either.
+    const MISSING: &str = "no_publisher_will_ever_declare_this";
+
+    let scratch = Scratch::new("frames-timeout");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(
+        owner.line().starts_with("owning "),
+        "the owner did not start"
+    );
+
+    let budget = Duration::from_millis(300);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let consumer = tf_tree::Open::new()
+            .open()
+            .expect("join the arena the owner is serving");
+        let writable = consumer.is_writable();
+        // **`all_interned::<0>` — reachable only from here.** The `N == 0` test
+        // in `tests/await_frames.rs` runs on a heap tree, so it is refused by
+        // the writable guard and the conversion helper is never called with an
+        // empty array anywhere else in the workspace.
+        let empty = consumer.await_frames([], Duration::from_millis(0));
+        let started = Instant::now();
+        let outcome = consumer.await_frames(["map", MISSING], budget);
+        let _ = tx.send((writable, empty, outcome, started.elapsed()));
+    });
+
+    let (writable, empty, outcome, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
+        "await_frames never returned: it ignored its deadline. There is no \
+         .config/nextest.toml in this repository, so nothing else would have \
+         bounded this",
+    );
+
+    assert!(!writable, "the default attach must be read-only (D18)");
+    assert_eq!(
+        empty,
+        Ok([]),
+        "a zero-length request on a waitable tree must be answered without \
+         touching the arena"
+    );
+
+    let err = outcome.expect_err("a name nobody interned must not resolve");
+    assert_eq!(
+        err,
+        AwaitError::Timeout {
+            hash: blake3_64(MISSING)
+        },
+        "the timeout named the wrong frame, or was not a timeout at all"
+    );
+    assert!(elapsed >= budget, "it gave up early: {elapsed:?}");
+    assert!(
+        elapsed < budget * 20,
+        "it overran its budget by more than the backoff can explain: {elapsed:?}"
     );
 }
 
