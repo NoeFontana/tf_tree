@@ -108,7 +108,8 @@ pub use tf_tree_core::edge::{EdgeKind, Publisher};
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, Layout};
 pub use tf_tree_core::plan::{
     AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
-    SensorDomain, SimTime, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
+    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
+    MAX_KNOTS,
 };
 pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH,

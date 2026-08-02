@@ -59,7 +59,7 @@ pub trait Domain: Copy {
     /// query's domain. Must be unique per domain.
     ///
     /// **Tags `0`–`3` are the built-ins** ([`SystemDomain`], [`SensorDomain`],
-    /// [`SimTime`], [`SteadyDomain`]); a user-declared domain picks a free tag
+    /// [`SimDomain`], [`SteadyDomain`]); a user-declared domain picks a free tag
     /// from `4` upwards. The trait is open on purpose — a driver with a
     /// PTP-disciplined clock declares `struct PtpDomain;` rather than pretending
     /// to be one of these (`docs/API.md` §2.5).
@@ -114,15 +114,21 @@ impl Domain for SensorDomain {
 /// rejections on a *wall-clock* tag as a clock step rather than a publisher
 /// fault; with only tag 0 available it must fire on sim edges too, or skip
 /// them by guessing. A tag of its own is what makes that check precise.
+///
+/// **Named `SimDomain`, not `SimTime`.** It is a domain, exactly as its three
+/// siblings are, and the `-Time` spelling `docs/PHASE4.md` §5.5 and
+/// `docs/PHASE7.md` §4 J9 first used was paired there with a `SystemTime` that
+/// has never existed under that name — so it was never this code's convention.
+/// Those documents now name this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SimTime;
-impl Domain for SimTime {
+pub struct SimDomain;
+impl Domain for SimDomain {
     const TAG: u8 = 2;
 }
 
 /// A steady, monotone clock (`CLOCK_MONOTONIC`-like), tag `3`.
 ///
-/// The companion to [`SimTime`], and the one `docs/API.md` §5.3 asks for by
+/// The companion to [`SimDomain`], and the one `docs/API.md` §5.3 asks for by
 /// name: *"a documentation line recommending a steady or PTP domain for
 /// anything published at rate"* had nothing to recommend, because until now
 /// there was no steady domain to name.
@@ -614,9 +620,10 @@ impl Plan {
     /// Evaluate the plan at nanosecond stamp `t`, sampling every dynamic edge at
     /// `t`. Assumes the caller has already validated generation and domain.
     ///
-    /// `#[inline]` for the reason given on [`Self::at`]: this is the fold, and a
-    /// downstream crate that inlines `at` and then *calls* this one has bought
-    /// nothing.
+    /// **`#[inline]` here is the load-bearing one** — see [`Self::at`] for the
+    /// measurement. This is the only cross-crate call a downstream caller
+    /// emitted before the attribute existed, because `at` is generic and was
+    /// already being inlined without it.
     #[inline]
     fn fold_at(&self, g: &Guard, t: i64) -> Result<Iso3, LookupError> {
         let mut acc = Iso3::IDENTITY;
@@ -671,21 +678,49 @@ impl Plan {
     /// * Any sampling error from an edge ([`LookupError::NoData`],
     ///   [`LookupError::Extrapolation`], …).
     ///
-    /// # Why `#[inline]` — it is part of the zero-cost claim
+    /// # Why `#[inline]` — and what was actually measured
     ///
-    /// This method sits **across a crate boundary from every consumer**, and
-    /// Rust does not inline across crates without `#[inline]` or LTO. A depth-3
-    /// interpolating lookup costs ~290 ns
-    /// (`docs/decisions/0013`); without the attribute a downstream crate emits a
-    /// call here, another into the fold, and another per sampled step.
+    /// `docs/API.md` §2.3 makes the attribute normative on this method, on the
+    /// fold, on `Guard::sample` and on the `Iso3` operators (the last already
+    /// carried it). Its stated reason — "Rust does not inline across crates
+    /// without `#[inline]` or LTO" — **is not why it helps here**, and the
+    /// generated code says so:
     ///
-    /// **This workspace's own `[profile.release]` sets `lto = "thin"` and
-    /// `codegen-units = 1`, which is exactly why nothing here had ever measured
-    /// the un-LTO'd path.** An embedder's profile is not ours: the default
-    /// `cargo build --release` in their repository has neither, and that is the
-    /// build the zero-cost claim is made to. `docs/API.md` §2.3 makes the
-    /// attribute normative on this method, on the fold, on `Guard::sample` and
-    /// on the `Iso3` operators — the last of which already carried it.
+    /// | downstream profile | before | after |
+    /// | --- | --- | --- |
+    /// | `lto = false`, `codegen-units = 16` (cargo's `--release` default) | 313 ns | 256 ns |
+    /// | `lto = "thin"`, `codegen-units = 1` (this workspace's own) | 217 ns | 207 ns |
+    ///
+    /// Depth-3 interpolating lookup, external crate, 20 M iterations, best of
+    /// five. The `objdump` of that caller explains the shape:
+    ///
+    /// | attribute placed on | caller `.text` | calls left in the caller |
+    /// | --- | --- | --- |
+    /// | nothing (the state before) | 106 B | 1 → `Plan::fold_at` |
+    /// | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
+    /// | `fold_at` alone | 62 B | 1 → `Plan::at` |
+    /// | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
+    /// | all six, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+    ///
+    /// **`at` is generic, so its MIR crossed the crate boundary anyway and a
+    /// downstream caller was already inlining it.** On its own the attribute
+    /// changes nothing. What it buys is LLVM's `inlinehint` on the *non-generic*
+    /// links: `fold_at` first — the one real cross-crate call there ever
+    /// was — then this method again, to stop the cost model halting at a
+    /// now-larger `at`, then `Guard::sample*` to remove the last one. Marking
+    /// fewer leaves a call in the middle; that is the claim the third and fourth
+    /// rows above test rather than assert.
+    ///
+    /// **The price is the caller's code size: 106 B → 1565 B at every embedder
+    /// call site**, ~15×. That is the trade, and it is why
+    /// `fold_at_with_derivatives`, `fold_latest` and `fold_latest_common` are
+    /// deliberately not marked.
+    ///
+    /// Note the second row of the first table: `lto = "thin"` does **not**
+    /// subsume the hint. This workspace's own profile still moves ~4.5%, so the
+    /// benchmark gate is not indifferent to this change — `just bench-ab` is
+    /// workspace-wide and was not run, and `docs/API.md` §2.3 item 3 (a gated
+    /// cross-crate row) is still the thing that would measure it continuously.
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
@@ -1112,10 +1147,7 @@ impl Plan {
             if mhz == 0 {
                 continue;
             }
-            slowest = Some(match slowest {
-                None => mhz,
-                Some(current) => current.min(mhz),
-            });
+            slowest = Some(slowest.map_or(mhz, |current| current.min(mhz)));
         }
         Ok(slowest)
     }
@@ -1975,10 +2007,12 @@ impl<'a> Guard<'a> {
 
     /// Sample edge `edge` at stamp `t`, dispatching on the edge's interp policy.
     ///
-    /// `#[inline]`, and so are its two siblings below, for the reason
-    /// [`Plan::at`] gives: they are the last non-generic links in the chain a
-    /// downstream crate has to inline through to reach the generic
-    /// `SampleRing::sample`, whose MIR is available to it anyway.
+    /// `#[inline]`, and so are its two siblings below: they are the last
+    /// non-generic links in the chain a downstream crate has to inline through
+    /// to reach the generic `SampleRing::sample`, whose MIR is available to it
+    /// anyway. [`Plan::at`]'s table measures what that is worth — without these
+    /// three the caller still emits one cross-crate call, to
+    /// [`Self::sample_hinted`].
     #[inline]
     pub(crate) fn sample(
         &self,

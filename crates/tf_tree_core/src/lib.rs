@@ -89,7 +89,8 @@ pub use participant::{ParticipantError, ParticipantRecord, ParticipantTable};
 #[cfg(not(loom))]
 pub use plan::{
     compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
-    SensorDomain, SimTime, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
+    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
+    MAX_KNOTS,
 };
 
 /// Maximum combined path depth of a compiled plan (used by the next PR). Real
