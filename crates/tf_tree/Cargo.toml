@@ -38,9 +38,24 @@ shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
 #
 # Turning it on inside this workspace is not a cost-free convenience: every
 # consumer that does so is a consumer whose build would break at a patch
-# release, and the list should stay short. Today it is `tf_tree_cli` (renders
-# arena tables), `tf_tree_c` (its own unstable header's introspection tier) and
-# `tf_tree_bench` (measures the arena).
+# release, and the list should stay short. Today it is **four**: `tf_tree_cli`
+# (renders arena tables), `tf_tree_c` (its own unstable header's introspection
+# tier), `tf_tree_bench` (measures the arena) and `tf_tree_py` (`offline.rs`
+# walks a frozen `.tft`'s tables). `just stable-tier-check` reads that list back
+# out of the `[dependencies]` entries and fails if this comment or
+# `docs/API.md` §6 row 4 disagrees with it — an earlier revision of this
+# paragraph said three, and nothing noticed.
+#
+# **This crate's own default feature set with `unstable` off — `counters` on,
+# nothing else — is compiled by `just stable-tier-check` and by no other
+# recipe.** `cargo build --workspace` unifies the four consumers' features into
+# the facade, so `--workspace`, `just build`, `just lint` and
+# `cargo nextest run --workspace` all compile `tf_tree` *with* `unstable`; only a
+# `-p tf_tree` selection does not. (`just ingest-check` compiles the facade
+# without `unstable` too, but with *no* features, because
+# `[workspace.dependencies]` sets `default-features = false` — a third
+# configuration, not the one `cargo add tf_tree` produces.) That recipe is the
+# gate, and CI runs it as its own job.
 unstable = []
 # A single injection point inside `Tree::claim`, between the arena CAS and the
 # lease `SETLK` (`docs/decisions/0005` §5). Off by default and absent from the
@@ -65,9 +80,11 @@ tf_tree_ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # **A dev-dependency on itself, so `unstable` is on for `cargo test` and off for
-# `cargo build`.** `tests/counters.rs`, `tests/behavior.rs`,
-# `tests/construction.rs` and `tests/frozen.rs` all read the arena back through
-# `Tree::arena_view`, which the `unstable` feature now gates. Without this line
+# `cargo build`.** Five test binaries read the arena back through
+# `Tree::arena_view`, which the `unstable` feature now gates —
+# `tests/counters.rs` (6 call sites), `tests/frozen.rs` (3),
+# `tests/behavior.rs` (2), `tests/construction.rs` (2) and
+# `tests/owned_writer.rs` (1), fourteen in total. Without this line
 # they would need `required-features = ["unstable"]` and would silently leave
 # `just test` — `cargo nextest run --workspace` builds default features, and a
 # test in no gate is worth nothing. Cargo unifies a dev-dependency's features
@@ -75,10 +92,20 @@ tf_tree_ipc = { workspace = true, optional = true }
 # are not built at all for `cargo build`, so this turns the feature on exactly
 # for the test profile.
 #
-# The cost is stated rather than hidden: **no host recipe compiles this crate's
-# test targets with `unstable` off**, so the off configuration is checked by
-# `cargo check -p tf_tree` / `just build`'s library pass and by every downstream
-# crate that does not enable it, not by a test.
+# The cost is stated rather than hidden, and the first statement of it was
+# wrong: **no host recipe compiles this crate's test targets with `unstable`
+# off, and `just build` does not compile the *library* that way either** —
+# `cargo build --workspace` unifies the feature in from `tf_tree_cli`,
+# `tf_tree_c` and `tf_tree_bench`. `just stable-tier-check` is what compiles it,
+# with `-p tf_tree --lib` under three feature sets, and its comment records the
+# mutation that proves it catches what `--workspace` does not.
+#
+# So: the library in the default tier is gated; this crate's *test targets* in
+# that tier are not, and cannot be while this line stands. Moving those
+# assertions behind `#[cfg(feature = "unstable")]` and deleting this line is the
+# alternative, and it is a real one — it would let `cargo nextest run -p tf_tree`
+# run the default tier — but it trades a compile-time guarantee for a set of
+# assertions that silently stop running if a `cfg` is misspelled.
 tf_tree = { path = ".", features = ["unstable"] }
 # The rendezvous tests probe the lock file directly, from outside the tree.
 tf_tree_ipc = { workspace = true }

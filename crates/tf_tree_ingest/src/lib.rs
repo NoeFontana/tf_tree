@@ -325,9 +325,17 @@ pub enum IngestError {
 /// An [`IngestError`] with the frame table needed to print its names.
 ///
 /// The same shape as [`tf_tree::Described`], and for the same reason: the error
-/// stays `Copy` and the names stay out of it.
+/// stays `Copy` and the names stay out of it (`docs/API.md` §R5).
+///
+/// **Its fields are private, as that type's now are.** They promised that this
+/// wrapper is *exactly* the pair `(error, frames)` forever, for no caller: the
+/// only construction site in the workspace is [`describe`] and the only use is
+/// `Display`. A caller who wants the [`IngestError`] back holds the one it
+/// passed in — it is `Copy`. Keeping them `pub` here after privatising them on
+/// `tf_tree::Described` would have left this doc comment's first line false,
+/// which is the second reason to change it rather than the first.
 #[derive(Clone, Copy, Debug)]
-pub struct Described<'a>(pub IngestError, pub &'a Frames);
+pub struct Described<'a>(IngestError, &'a Frames);
 
 impl core::fmt::Display for Described<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

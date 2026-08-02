@@ -167,6 +167,44 @@ jobs:
       - name: just ingest-check
         run: just ingest-check
 
+  # **`tf_tree` with `unstable` OFF — the tier every published consumer gets.**
+  #
+  # No other job compiles the facade's own default feature set with the feature
+  # off. `lint` and `test` both run `--workspace`, and
+  # cargo's resolver unifies features across a workspace build, so
+  # `tf_tree_cli`, `tf_tree_c` and `tf_tree_bench` each asking for
+  # `tf_tree/unstable` turns the feature on for the facade everywhere — in
+  # `cargo clippy --workspace`, in `cargo nextest run --workspace`, and in
+  # `cargo build --workspace --all-targets`. A `-p tf_tree` selection is the only
+  # one that does not, which is what `just stable-tier-check` is made of.
+  #
+  # **The recipe was made to fail before this job was written.** Reintroducing
+  # the branch's own defect — `self.arena_view()` where `frozen.rs` now calls
+  # `self.view()` — leaves `cargo check --workspace --all-targets` and
+  # `cargo check -p tf_tree --all-targets --features shm` both at exit 0, and
+  # makes this recipe's second line report
+  # `error[E0599]: no method named 'arena_view'`.
+  #
+  # Its own job rather than a step bolted onto `test` or `lint`, because it needs
+  # `clippy` (which `test`'s toolchain does not install) *and* `cargo-nextest`
+  # (which `lint`'s does not). Adding one binary to the other job is the
+  # cheaper-looking change and is exactly how a gate comes to fail on a missing
+  # tool instead of on the code.
+  stable-tier:
+    name: default features (no unstable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - name: just stable-tier-check
+        run: just stable-tier-check
+
   docs:
     name: docs
     runs-on: ubuntu-latest

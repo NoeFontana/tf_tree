@@ -53,6 +53,147 @@ test-doc:
 test-doc-error-codes:
     cargo +nightly test --doc -p tf_tree -p tf_tree_core
 
+# **`tf_tree` with `unstable` OFF — the configuration every published consumer
+# gets, and the one nothing else in this file compiles.**
+#
+# `docs/API.md` §2.6's tier split puts `tf_tree::unstable::*` and
+# `Tree::arena_view` behind a default-off feature. `cargo build --workspace`
+# cannot reach the tier that split is *for*: `tf_tree_cli`, `tf_tree_c` and
+# `tf_tree_bench` each declare `tf_tree = { features = ["unstable"] }`, the
+# resolver unifies features across a workspace build, so `--workspace` compiles
+# the facade **with** the feature, always. `-p tf_tree` is the only package
+# selection that does not, which is why every line below is `-p`.
+#
+# **Stated precisely, because the loose version is wrong.** What no other recipe
+# compiles is `tf_tree`'s *own default feature set* — `counters` on, `unstable`
+# off — and its `shm` variant. `just ingest-check` does compile the facade
+# without `unstable`, but with **no** features at all, because
+# `[workspace.dependencies]` declares `tf_tree = { default-features = false }`;
+# that is a third configuration, not the one `cargo add tf_tree` produces.
+#
+# **Verified to be a real gate, by breaking it.** Reverting the branch's own
+# `frozen.rs` fix — `self.view()` back to `self.arena_view()`, a crate-internal
+# call to a method the feature gates — is invisible to
+# `cargo check -p tf_tree --all-targets --features shm` and to
+# `cargo check --workspace --all-targets`: both print `Finished` and exit 0,
+# because a test target pulls the dev-dependency that turns the feature on. The
+# `--features shm` line below reports
+# `error[E0599]: no method named 'arena_view' found for reference '&Tree'`
+# at `crates/tf_tree/src/frozen.rs:239:25`.
+#
+# **What this covers is the library, not `tf_tree`'s test targets, and that is
+# stated rather than implied.** `crates/tf_tree/Cargo.toml` dev-depends on the
+# crate itself with `features = ["unstable"]`, so the arena-reading assertions in
+# `tests/{counters,behavior,construction,frozen,owned_writer}.rs` stay inside
+# `just test` — at the price that **no `tf_tree` test target is ever compiled
+# with the feature off**, and no recipe can change that while the dev-dependency
+# stands. The nearest available substitute is the last two lines: two workspace
+# crates that link the facade *without* the feature and have suites of their own,
+# so the tier gets a runtime pass even though the facade's own tests cannot give
+# it one.
+stable-tier-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The default set (`counters`), which is what `cargo add tf_tree` gives.
+    echo "==> the library, default features"
+    cargo clippy -p tf_tree --lib -- -D warnings
+    # **The one that catches the mutation above**, because `frozen.rs` and
+    # `open.rs` — the two modules that were reaching for the public spelling of
+    # an internal view — are `#[cfg(all(feature = "shm", target_os = "linux"))]`
+    # and are compiled by neither of the other two lines.
+    echo "==> the library, default features + shm"
+    cargo clippy -p tf_tree --lib --features shm -- -D warnings
+    # Not a hypothetical configuration: `[workspace.dependencies]` declares
+    # `tf_tree = { ..., default-features = false }`, so `tf_tree_ingest` and
+    # `tf_tree_bridge` already link this one.
+    echo "==> the library, no default features"
+    cargo clippy -p tf_tree --lib --no-default-features -- -D warnings
+    # **Rustdoc, on the stable tier alone.** CI's `docs` job builds
+    # `--all-features`, where a link into `tf_tree::unstable` resolves; from the
+    # tier a published consumer sees, the same link is broken. Nothing else
+    # renders these docs the way docs.rs will *not*.
+    echo "==> the stable tier's own documentation"
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p tf_tree
+    # **The waiver list, checked against the manifests rather than against
+    # itself.** `crates/tf_tree/Cargo.toml`'s `unstable` comment and
+    # `docs/API.md` §6 row 4 both enumerate who turns the feature on, and they
+    # disagreed on this branch — three against four. Neither is the source of
+    # truth; the `[dependencies]` entries are, so both are compared to them.
+    #
+    # **`[dependencies]` and `[dev-dependencies]` are counted separately**, and
+    # the awk section tracker is why. They are not the same fact: a shipped
+    # dependency is a consumer whose *release* breaks at a patch bump, a
+    # dev-dependency only breaks a test run. Lumping them together is what would
+    # make the number in the prose four or five depending on which document you
+    # read, which is the drift this check exists to stop.
+    echo "==> the recorded consumers of the unstable tier are the actual ones"
+    want="tf_tree_bench tf_tree_c tf_tree_cli tf_tree_py"
+    want_dev="tf_tree tf_tree_bridge"
+    scan() {
+        awk -v sect="$1" '
+            /^\[/ { s = $0 }
+            /^tf_tree = .*"unstable"/ { if (s == sect) print FILENAME }
+        ' crates/*/Cargo.toml \
+            | sed 's|^crates/||; s|/Cargo.toml$||' | sort -u | tr '\n' ' ' | sed 's/ *$//'
+    }
+    got=$(scan '[dependencies]')
+    got_dev=$(scan '[dev-dependencies]')
+    rc=0
+    if [ "$got" != "$want" ]; then
+        echo "[dependencies] on tf_tree/unstable: $got"
+        echo "the documents say:                  $want"
+        rc=1
+    fi
+    if [ "$got_dev" != "$want_dev" ]; then
+        echo "[dev-dependencies] on tf_tree/unstable: $got_dev"
+        echo "the documents say:                      $want_dev"
+        rc=1
+    fi
+    # **Both documents must name every shipped consumer — in the place that
+    # makes the claim, not anywhere in the file.** The first version of this
+    # check searched each file whole, and deleting `tf_tree_py` from
+    # `docs/API.md` §6 row 4 did not fail it: the name occurs a dozen other times
+    # in that document. So each side is narrowed to the passage that is actually
+    # asserting a list — §6's row 4, and the `#` comment block directly above
+    # `unstable = []`.
+    row=$(grep -m1 '^| 4 |' docs/API.md)
+    n=$(grep -n '^unstable = \[\]' crates/tf_tree/Cargo.toml | cut -d: -f1)
+    blk=$(sed -n "1,$((n - 1))p" crates/tf_tree/Cargo.toml | tac | awk "/^#/ {print; next} {exit}")
+    for c in $want; do
+        case "$row" in
+            *"\`$c\`"*) ;;
+            *) echo "docs/API.md §6 row 4 does not name $c"; rc=1 ;;
+        esac
+        case "$blk" in
+            *"\`$c\`"*) ;;
+            *) echo "crates/tf_tree/Cargo.toml's 'unstable' comment does not name $c"; rc=1 ;;
+        esac
+    done
+    [ "$rc" = 0 ] || exit 1
+    # **A runtime pass over the tier, from the only place one is available —
+    # and the two crates below are here for two different reasons.**
+    #
+    # `tf_tree_ingest` links the facade with **no features at all**:
+    # `[workspace.dependencies]` declares `tf_tree = { default-features = false }`,
+    # so `-p tf_tree_ingest` executes a suite through a facade built without
+    # `unstable`. That is the nearest thing in this repository to *running* the
+    # stable tier. It is **not** the same feature set as the first line above —
+    # `counters` is on there and off here — and `just ingest-check` already
+    # compiles this configuration, so what this line adds is the execution, not
+    # the compile.
+    #
+    # `tf_tree_bridge` is here for the opposite reason. Nothing else selects it
+    # with `-p`, and this branch broke exactly that: `config.rs`'s arena
+    # assertion left `cargo nextest run -p tf_tree_bridge` failing with
+    # `error[E0599]: no method named 'arena_view'` while `--workspace` stayed
+    # green, because the resolver unified the feature in from `tf_tree_cli`. Its
+    # `[dev-dependencies]` now asks for `unstable` in its own name, so this line
+    # builds the facade **with** the feature — it is a standalone-build check,
+    # not a stable-tier one, and calling it one would be the same kind of false
+    # self-description this recipe exists to end.
+    echo "==> the downstream suites, run under -p so nothing unifies for them"
+    cargo nextest run -p tf_tree_ingest -p tf_tree_bridge
+
 # Concurrency model checking under loom (reduced buffer capacities).
 loom:
     cargo xtask loom

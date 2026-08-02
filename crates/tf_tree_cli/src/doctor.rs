@@ -241,13 +241,21 @@ impl Snapshot {
         let mut frames = Vec::with_capacity(frame_count as usize);
         for id in 1..=frame_count {
             // Three checks, the strictest set applied by any copy of this walk.
-            // There are four copies and they did not agree: this one,
-            // `tf_tree_c::unstable::tft_tree_frame_name`,
-            // `tf_tree_py::offline::frames_impl` and `tf_tree::frozen`'s
-            // manifest writer. Consolidating them onto a method on `Tree` — the
-            // one place `just loom` and `just miri` can see the walk — is filed
-            // rather than done here, because three of the four are other
-            // crates.
+            // **The consolidation this comment used to file has happened**:
+            // `tf_tree::Tree::frames` now carries exactly these three, with the
+            // ordering argument stated once, in the crate `just loom` and
+            // `just miri` can see.
+            //
+            // This copy did not collapse onto it and will not: `Tree::frames`
+            // answers *names*, and a `FrameInfo` needs `parent`, `depth` and
+            // `edge_of_child` out of the topology block as well — `doctor` is
+            // the consumer the arena-shaped view exists for. What it stops
+            // being is a *divergent* copy: the three checks below and the
+            // `Relaxed` load above are now the facade's, verbatim, so a change
+            // to either has one obvious other place to go.
+            // `tf_tree_py::offline::frames_impl` and
+            // `tf_tree_c::unstable::tft_tree_frame_name` are still their own
+            // walks and can now forward.
             //
             //  1. `FrameId::new` rejects 0, the root sentinel.
             //  2. `id <= frame_count` — *this loop's bound*, and load-bearing

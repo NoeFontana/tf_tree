@@ -31,6 +31,17 @@ use tf_tree_math::Iso3;
 
 use crate::cache;
 
+/// A frame record's stored — and therefore possibly truncated — name.
+///
+/// `FrameRecord` keeps 48 bytes and a length; a longer name was cut at intern
+/// time and the cut is not recoverable here. `from_utf8_lossy` rather than a
+/// refusal, because a truncation can land mid-codepoint and a frame listing that
+/// fails on one bad byte tells the caller nothing about the other ninety frames.
+fn stored_name(bytes: &[u8], len: u8) -> String {
+    let n = (len as usize).min(bytes.len());
+    String::from_utf8_lossy(&bytes[..n]).into_owned()
+}
+
 /// Smallest power of two `>= n`, saturating at the largest `u32` power of two
 /// (`1 << 31`). `next_pow2(0) == 1`, so a dynamic ring is never zero-length (a
 /// zero capacity is what marks a *static* edge in the arena layout).
@@ -1170,6 +1181,166 @@ impl Tree {
         self.view().intern(name)
     }
 
+    /// Every interned frame's name, in [`FrameId`] order.
+    ///
+    /// The stable answer to "what is in this tree", and the plural of
+    /// [`Tree::frame`]. It is on the *stable* surface deliberately: an embedder
+    /// must not have to enable the `unstable` feature to ask what their own tree
+    /// contains, which is what gating `Tree::arena_view` would otherwise have
+    /// forced (`docs/API.md` §2.6, §7 check 1). Python has had `tree.frames()`
+    /// since §3.2 and this is its mirror.
+    ///
+    /// # Names only
+    ///
+    /// No rate, no jitter, no sample count. That is `docs/PHASE5.md` §4.2's
+    /// `ds.edges()` and it stays held back until §3's counting pass exists —
+    /// the same line the Python surface draws.
+    ///
+    /// # The snapshot is a snapshot
+    ///
+    /// On a live shared arena another process may intern a frame while this
+    /// walk runs, so the list is what was true at some instant inside the call,
+    /// exactly as [`crate::Plan::latest`] already is. Frames are append-only, so
+    /// what it *does* promise is that nothing in it will be removed or renamed;
+    /// a later call can only be longer.
+    ///
+    /// A slot whose id has been counted but whose record is not yet written is
+    /// skipped rather than reported with an empty name — see the walk's own
+    /// comments for what that filter is and, more importantly, what it is not.
+    ///
+    /// `frame_count` over-counts by one when a frame is abandoned mid-intern
+    /// (`tf_tree_core::frame`'s `finish`: the record "stays written but
+    /// unreferenced"), and that abandoned record carries a real name and a
+    /// non-zero hash, so it lands here at a second id. `len()` is therefore an
+    /// upper bound on the tree's frames, not the frame count.
+    ///
+    /// # Errors
+    ///
+    /// [`LookupError::ChildDetached`] on a tree inherited across a `fork()`.
+    /// Such a tree reads a one-frame poison arena, so answering would hand back
+    /// a plausible-looking short list instead of naming the fork.
+    pub fn frames(&self) -> Result<Vec<String>, LookupError> {
+        if self.detached() {
+            return Err(LookupError::ChildDetached);
+        }
+        let view = self.view();
+        // **`Relaxed`, and that is the justified ordering rather than the cheap
+        // one.** `tf_tree_core::frame`'s `finish` does `frame_count.fetch_add`
+        // *first*, then `write_record`, then the Release publish into the intern
+        // table. An `Acquire` load here would therefore order this thread
+        // against everything the interner did *before* it took its id — and
+        // against nothing it did after, which is precisely the record about to
+        // be read. Acquire would read like a guarantee and buy none.
+        //
+        // What no ordering available here buys is a race-free read.
+        // `FrameRecord`'s fields are plain integers and its publication edge is
+        // keyed by *name*, through the intern table; an enumeration keyed by id
+        // has no edge to acquire. The `name_hash` filter below is a filter on
+        // the value read, not the missing edge, and is not claimed to be one.
+        let count = view.header().frame_count.load(Ordering::Relaxed);
+        let mut out = Vec::with_capacity(count as usize);
+        for raw in 1..=count {
+            // Three checks — the strictest set any copy of this walk applied
+            // before this method existed, which is the point of the method:
+            //
+            //  1. `FrameId::new` rejects 0, the root sentinel.
+            //  2. `raw <= frame_count` — *this loop's bound*, and load-bearing
+            //     rather than incidental: `frame_record` bounds against
+            //     `max_frames`, which is `frame_count + 1 + frame_headroom`, so
+            //     walking further hands back zeroed headroom slots as frames.
+            //  3. `name_hash != 0`, below.
+            let Some(id) = FrameId::new(raw) else {
+                continue;
+            };
+            let Some(rec) = view.frame_record(id) else {
+                continue;
+            };
+            // **The count is bumped before the record is written**, so an
+            // interner in another process can be counted here one instant
+            // before its name exists and the slot still reads as zeros. A
+            // written record's `name_hash` is BLAKE3 of the name — non-zero
+            // even for `""` — so a zero hash means "not written yet". Skipping
+            // it lists that frame one call later; taking it prints a frame with
+            // an empty name, which reads as our bug rather than as a race lost
+            // by a microsecond.
+            if rec.name_hash == 0 {
+                continue;
+            }
+            out.push(stored_name(&rec.name, rec.name_len));
+        }
+        Ok(out)
+    }
+
+    /// Every declared edge as a `(parent, child)` name pair, in [`EdgeId`]
+    /// order.
+    ///
+    /// The stable mirror of Python's `tree.edges()` (`docs/API.md` §3.2), and
+    /// on the stable surface for [`Tree::frames`]'s reason.
+    ///
+    /// `(parent, child)` is [`TreeBuilder::dynamic_edge`]'s argument order, so
+    /// the list reads back the way it was written — but it rebuilds the *graph*
+    /// only: the pair does not report the edge's kind, and telling a static edge
+    /// from a dynamic one is `tf_tree::unstable::EdgeKind`'s job, which is
+    /// arena-shaped and therefore unstable (`docs/API.md` §2.6).
+    ///
+    /// The pair is read out of the [`EdgeId`]'s own record, which is the
+    /// *declared* topology. [`Tree::reparent`] moves a child under a new parent
+    /// without rewriting that record, so on a reparented tree this names the
+    /// edge's declaration and the live topology block names its current parent.
+    /// They can disagree, and every other listing in this workspace makes the
+    /// same choice: one answer that is wrong after a reparent beats two answers
+    /// that disagree with each other.
+    ///
+    /// # Names only
+    ///
+    /// See [`Tree::frames`] — the statistics half is `docs/PHASE5.md` §4.2's and
+    /// is held back on every surface, not just this one.
+    ///
+    /// # Errors
+    ///
+    /// [`LookupError::ChildDetached`] on a tree inherited across a `fork()`.
+    /// The poison arena such a tree reads has zero edges, so without this the
+    /// answer is a silent empty list.
+    pub fn edges(&self) -> Result<Vec<(String, String)>, LookupError> {
+        if self.detached() {
+            return Err(LookupError::ChildDetached);
+        }
+        let view = self.view();
+        // `edge_count` is stored as (declared edges + 1 sentinel), so the real
+        // ids are `1..edge_count` — `tf_tree_core::EdgeId`'s own doc comment,
+        // and the off-by-one that cost `tf_tree_c::unstable` a test.
+        //
+        // `Relaxed` needs no argument beyond `frames`': unlike `frame_count`
+        // there is no window at all. The edge table is sized and filled by
+        // `TreeBuilder` and `edge_count` is stored exactly once, before the
+        // arena is ever shared; nothing declares an edge at runtime.
+        let count = view.header().edge_count.load(Ordering::Relaxed);
+        let mut out = Vec::with_capacity(count.saturating_sub(1) as usize);
+        for raw in 1..=count {
+            // One observation of the record, not two: re-reading `view.edge`
+            // for the child could name a parent and a child that never belonged
+            // to the same edge.
+            let Some(rec) = view.edge(EdgeId(raw)) else {
+                continue;
+            };
+            // `None` from either endpoint means a slot whose record is still
+            // zeros, because a zeroed record names frame 0 and `FrameId::new(0)`
+            // declines. **That is what keeps the sentinel and any headroom slot
+            // out of this list**, not the loop bound, so the tempting "never
+            // drop an entry" fallback to a `<root>` placeholder would put
+            // `("", "")`-shaped noise in the answer instead.
+            let name = |f: u32| -> Option<String> {
+                let r = view.frame_record(FrameId::new(f)?)?;
+                Some(stored_name(&r.name, r.name_len))
+            };
+            let (Some(parent), Some(child)) = (name(rec.parent), name(rec.child)) else {
+                continue;
+            };
+            out.push((parent, child));
+        }
+        Ok(out)
+    }
+
     /// Re-parent an existing `child` frame under `new_parent`, reusing the child's
     /// already-declared edge (no new capacity is allocated). This is the only
     /// runtime topology mutation; it bumps the topology generation, invalidating
@@ -1931,7 +2102,12 @@ impl Tree {
 
     /// Whether the participant in `slot` is still running.
     ///
-    /// The kernel's answer for a tree obtained from [`crate::open`], a `/proc`
+    // `tf_tree::open` is deliberately *not* an intra-doc link here: it is
+    // `#[cfg(all(feature = "shm", target_os = "linux"))]`, so on the default
+    // feature set — which is what a `cargo add tf_tree` consumer renders, and
+    // what `just stable-tier-check` renders — the link has no target and
+    // `RUSTDOCFLAGS="-D warnings"` is an error rather than a broken anchor.
+    /// The kernel's answer for a tree obtained from `tf_tree::open`, a `/proc`
     /// inference otherwise (`docs/PHASE2.md` §5.1). Exposed because `doctor`
     /// and the reaper both need it, and because it is the one predicate whose
     /// two implementations differ in a way a test can see: a `SIGSTOP`ped

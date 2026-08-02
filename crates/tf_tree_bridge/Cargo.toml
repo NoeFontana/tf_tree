@@ -47,5 +47,22 @@ publish = false
 [dependencies]
 tf_tree.workspace = true
 
+# **`unstable` for the tests only — `docs/API.md` §2.6.**
+#
+# `config.rs`'s `a_declared_rate_hz_reaches_the_arena_and_capacity_declares_nothing`
+# asserts that a `rate_hz` in the operator's topology file arrives in the arena
+# as `EdgeRecord::nominal_rate_mhz`. That field is the arena's, reachable only
+# through `Tree::arena_view`, and no stable accessor answers it — `Tree::edges`
+# is names only (`docs/PHASE5.md` §4.2 holds the statistics half back).
+#
+# It is a **dev**-dependency, so it changes nothing a consumer of this crate
+# links, and the line above stays the shipped one. Without it this crate
+# compiled only because `cargo … --workspace` unifies the feature in from
+# `tf_tree_cli`: `cargo nextest run -p tf_tree_bridge` on its own failed with
+# `E0599: no method named 'arena_view'`, which is exactly the hole
+# `just stable-tier-check` exists to find, found by it.
+[dev-dependencies]
+tf_tree = { workspace = true, features = ["unstable"] }
+
 [lints]
 workspace = true

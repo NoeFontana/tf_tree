@@ -170,21 +170,21 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 /// enumerators already state independently — though not identically, which is
 /// the next paragraph.
 ///
-/// **That is a reason it is tolerable here, not a reason it is right here.**
-/// The facade has no public `Tree::frames`, and the amendment's argument says a
-/// third copy should have become the first shared one. Adding it is a change to
-/// `crates/tf_tree/src/tree.rs`, which is out of this change's scope; when the
-/// facade grows the method, this becomes a forwarder like `span_impl`.
+/// **That is a reason it was tolerable here, not a reason it is right here, and
+/// the condition it was waiting on has been met.** `tf_tree::Tree::frames` now
+/// exists on the *stable* tier (`docs/API.md` §2.6) and applies exactly the
+/// three checks below with the same `Relaxed` load and the same refusal on a
+/// detached tree — so this body should become
+/// `tree.frames().map_err(|_| detached_err())`, a forwarder like `span_impl`.
 ///
-/// **The four copies do not agree, which is the argument, not a footnote.**
-/// `tf_tree_c::unstable` (`tft_tree_frame_name`) checks `FrameId::new`,
-/// `id <= frame_count` and `name_hash != 0`, and loads the count `Acquire`;
-/// `tf_tree_cli`'s `Snapshot::capture` checks only `FrameId::new` and loads
-/// `Relaxed`, so `tf_tree doctor` can print a zeroed headroom slot as a frame
-/// with an empty name; this one applies all three and loads `Relaxed` for the
-/// reason stated at the load. Two of those three crates belong to other
-/// branches, so this copy is made the correct one and the consolidation onto
-/// `Tree` is filed rather than smuggled in here.
+/// **It has not been, and the reason is a gate rather than a doubt.** This crate
+/// is excluded from the workspace, so `just test`, `just lint` and
+/// `cargo nextest run --workspace` do not build it, and the suite that would
+/// catch a behavioural difference — `tests/python/test_api.py`, which pins the
+/// `('', '')` case this walk exists to avoid — runs only under `just py-test`,
+/// which needs a maturin venv. Changing a binding's behaviour in the one crate
+/// no host recipe compiles is the defect class this file's own history is made
+/// of, so the conversion is filed for a change that can run that suite.
 ///
 /// # The snapshot is a snapshot
 ///

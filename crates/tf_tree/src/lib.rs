@@ -71,6 +71,15 @@
 //! scheduled to change (`docs/PHASE5.md` §1). If you are reading transforms, you
 //! will never need it.
 //!
+//! **Gating a door is not the same as removing a room.** The question the gated
+//! `Tree::arena_view` used to be the only Rust answer to — *what is in this
+//! tree?* — is answered on the stable tier by [`Tree::frames`] and
+//! [`Tree::edges`], which mirror Python's `tree.frames()` / `tree.edges()`
+//! (`docs/API.md` §3.2). Names only: the statistics half is `docs/PHASE5.md`
+//! §4.2's and is held back on every surface until §3's counting pass. Enabling
+//! `unstable` buys the arena-shaped *spelling* of that answer — record fields,
+//! capacities, counters — not the answer itself.
+//!
 //! The three items that moved do not answer at the crate root any more, and this
 //! is what pins that — the doctest runs with the `unstable` feature *on* (this
 //! crate dev-depends on itself to enable it), so it asserts the split rather

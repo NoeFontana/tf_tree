@@ -410,17 +410,56 @@ refinement it can now make and has not yet made.
 > discuss ROS's `use_sim_time` — sim time the *concept*, not our type — the prose
 > is unchanged.
 
-### 2.6 Stability tiering — deferred, and the deferral is recorded
+### 2.6 Stability tiering — built; the split *is* the promise — NORMATIVE
 
-C has `tf_tree.h` and `tf_tree_unstable.h`; Rust has one tier, so everything
-`pub` reads as a stability promise — including `ArenaView`, which is re-exported
-from the facade for the CLI. The mirror (`tf_tree::unstable::*` behind a feature
-whose documentation *is* the waiver) is **deferred while the crate is private**.
+C has `tf_tree.h` and `tf_tree_unstable.h`; Rust has one visibility tier, so
+everything `pub` reads as a stability promise whether it was meant as one or
+not. **The deferral this section used to record has been taken up**: the mirror
+exists, as `tf_tree::unstable` behind a default-off `unstable` Cargo feature
+whose documentation *is* the waiver. A macro is what C had to spell it with
+because a header is text; a feature is what Rust has, because it is the only
+mechanism a **caller** has to write down.
 
-**What is not deferred**, because it costs a comment: a `# Stability` heading on
-`ArenaView` and the other CLI-facing exports stating they move behind `unstable`
-before any published tag. Then the move executes a documented plan instead of
-breaking someone.
+**The rule for what goes there is not "is it low-level".** It is *does its shape
+follow the arena layout*, and the reason is that `PHASE5.md` §1 changes that
+layout on purpose — `FORMAT_VERSION` to 3, plus regions Phase 6 fills. Anything
+shaped by it is scheduled to move by a document that already exists. `Plan`,
+`Guard` and `Stamp` are as low-level as anything in the crate and are **stable**,
+because their shape is the engine's contract rather than the arena's. Three items
+moved: `ArenaView`, `EdgeKind`, and `EdgeMeta` — the last because the audit found
+it was already *unusable* from the stable tier, being an input to a
+`tf_tree_core::compile` the facade never re-exported. `Tree::arena_view` is gated
+with them, because it is the door: a caller reaches every accessor on the
+returned value by inference without ever naming the type, so leaving the method
+stable would have made the split a spelling convention.
+
+**Gating the door must not remove the capability, and that is the other half of
+this section — NORMATIVE.** §7 check 1 asks of every surface whether all three
+*call* tiers are reachable, and "what is in this tree" is a tier-1 question.
+Python has answered it since §3.2 with `tree.frames()`, `tree.edges()` and
+`plan.edges()`; if the Rust answer were `arena_view`, an embedder
+would have had to sign the waiver to ask a question about their own data, which
+is backwards. So the facade carries **stable `Tree::frames` and `Tree::edges`**,
+mirroring the Python surface: names only, since §4.2's statistics half is held
+back on every surface until `PHASE5.md` §3's counting pass. What `unstable` gates
+is the arena-shaped *spelling* of an answer the stable tier already gives.
+
+**The waiver is not free and the consumer list is checked, not asserted.** Every
+crate that turns the feature on is one whose build may break at a patch release.
+`just stable-tier-check` reads the list back out of the `[dependencies]` entries
+and fails if this document's §6 row 4 or `crates/tf_tree/Cargo.toml` disagrees
+with it — `[dev-dependencies]` counted separately, because a test-only waiver is
+a different fact from a shipped one.
+
+**A tier nothing compiles is not a tier.** The default configuration — the one a
+`cargo add tf_tree` consumer gets — is invisible to `cargo build --workspace`,
+because the resolver unifies the feature in from the crates that ask for it.
+`just stable-tier-check` is therefore normative infrastructure rather than
+convenience: it is the only recipe that compiles the facade in *its own* default
+feature set with `unstable` off, and CI runs it as its own job. (`just
+ingest-check` reaches a nearby configuration — no `unstable`, but no features at
+all, because `[workspace.dependencies]` declares
+`tf_tree = { default-features = false }`.)
 
 ---
 
@@ -532,8 +571,11 @@ Both are specified in `PHASE4.md` §3–§4 and implemented. Restated here only
 where they carry a rule the other surfaces must also obey.
 
 **Two tiers of header, and the split is the stability promise.** `tf_tree.h` is
-semver'd; `tf_tree_unstable.h` is opt-in by macro and promises nothing. This is
-the model §2.6 defers for Rust.
+semver'd; `tf_tree_unstable.h` is opt-in by macro and promises nothing. §2.6 is
+the Rust mirror of it and is now built: a `tf_tree::unstable` module behind a
+default-off Cargo feature. The two surfaces spell the same promise with the only
+mechanism each language gives a *caller* to write down — a `#define` there, a
+feature there.
 
 **Every struct passed by pointer begins with `uint32_t struct_size`**, so fields
 append without a major bump and the callee rejects sizes it does not know. An
@@ -693,27 +735,20 @@ authorized by this document alone.
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
 | 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`) — one build, one profile, `tf_tree_bench` against `tf_tree_core::bench_probe` — gated at 5% on `boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`, and **reporting 1.250–1.254×, i.e. over §9.2's criterion**, with the `lto = "thin"` control at 0.994–0.996× beside it. The two-profile comparison is kept as an exploratory measurement, never gated |
-| 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on; three `compile_fail,E0432` doctests pin that the root no longer answers |
+| 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on — four, checked against the `[dependencies]` entries by `just stable-tier-check` rather than counted by hand; three `compile_fail,E0432` doctests pin that the root no longer answers. **Gating the door did not remove the capability**: stable `Tree::frames` and `Tree::edges` land with it, mirroring row 8's Python surface, so an embedder never signs the waiver to ask what is in their own tree (§7 check 1). the facade's own default feature set with the feature off is compiled by `just stable-tier-check` and by no other recipe, because `--workspace` unifies the feature in; CI runs it as its own job |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
 | 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | **landed** — `PHASE5.md` §4.4 item 1 in full: `plan.at(..., layout=...)` and `at_into` serve all four layouts, and both refusals the twist layout adds are typed — `DerivativesUnavailableError` for a `LerpSlerp` edge, `NoSegmentError` for a stamp with no segment. Python's `interp=` default moved to `"sclerp"` (§3), so a Python-built tree answers a twist without one |
-| 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them |
+| 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python, Rust | §3.2, §2.6 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them. **Rust followed in row 4's commit**, as stable `Tree::frames` / `Tree::edges`, for §7 check 1's reason; `plan.edges()` has **no** Rust twin, and the gap is real rather than deferred by symmetry: `Plan::steps` gives a Rust caller the `Step::Dyn` edge ids, but nothing on the stable tier turns an `EdgeId` into a name pair — `Tree::edges` answers positionally, exactly as Python's does |
 | 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | **landed** — Rust (`Stamp::from_parts`, `from_timespec`), Python (`from_parts`, `from_ros`; duck-typed on `.sec`/`.nanosec`, no `rclpy` in the wheel) and C (`tft_stamp_from_parts`, `tft_stamp_from_timespec`, `TFT_ERR_BAD_STAMP`, ABI minor 3 → 4). One refusal table is asserted on both sides of the boundary |
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed** — `tf_tree_cli`; fires only on tag 0 and only on a run of at least 8 consecutive rejected arrivals (a threshold this implementation chose, not one §5.3 states), skips naming the tag otherwise, inherits `TFT018`'s live-arena skip, and does not demote it. **Reachable only from the built-in fixture today**: `doctor`'s two sources are that fixture and a live `--attach`, and the check skips on the second, so on a deployment it never reaches a verdict — `PHASE5.md` §6's last `TFT019` amendment records what a file source would take |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 
-**Ten of twelve rows have landed: 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part.**
-What is left is short and each piece is blocked on something nameable rather
-than merely unscheduled:
+**Nine of twelve rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9 and 11.** What
+is left is short and each piece is blocked on something nameable rather than
+merely unscheduled:
 
-- **Row 3's remainder** — the LTO guidance and the cross-crate benchmark row
-  gated at 5%. `#[inline]` landed; the row that would have caught its one
-  *pessimization* automatically has not.
-- **Row 4** — the `# Stability` headings are written, and the
-  `tf_tree::unstable::*` mirror they promise is deferred only "while the crate
-  is private" (§2.6). **That deferral expires at the first published tag**, so
-  this is the one row here that is cheap now and permanently breaking later.
 - **Row 6** is recorded, not built, and is meant to stay that way
   ([`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md)).
 - **Row 10** belongs to `0013`'s re-baseline commit, which has not happened;
