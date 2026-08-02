@@ -76,8 +76,8 @@ use tf_tree::{Stamp, SystemDomain, Tree};
 
 pub use error::{
     tft_error, tft_last_error, tft_status, TFT_ERR_ABI_MISMATCH, TFT_ERR_ALREADY_CLAIMED,
-    TFT_ERR_BAD_CONFIG, TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE, TFT_ERR_BAD_STAMP,
-    TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED,
+    TFT_ERR_ARENA_UNAVAILABLE, TFT_ERR_BAD_CONFIG, TFT_ERR_BAD_ENUM, TFT_ERR_BAD_HANDLE,
+    TFT_ERR_BAD_STAMP, TFT_ERR_BAD_STRUCT_SIZE, TFT_ERR_BUFFER_TOO_SMALL, TFT_ERR_CHILD_DETACHED,
     TFT_ERR_CLAIM_REVOKED, TFT_ERR_DISCONNECTED, TFT_ERR_EXTRAPOLATION, TFT_ERR_INTERNAL,
     TFT_ERR_NON_MONOTONIC, TFT_ERR_NOT_A_ROTATION, TFT_ERR_NOT_DYNAMIC, TFT_ERR_NOT_FINITE,
     TFT_ERR_NO_DATA, TFT_ERR_NO_DERIVATIVES, TFT_ERR_NO_EDGE, TFT_ERR_NO_SEGMENT, TFT_ERR_NULL_ARG,
@@ -151,7 +151,23 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// `TFT_ERR_BAD_STAMP` rides along for the reason its own documentation gives:
 /// only the two new functions return it, so a `0.3` caller cannot receive a
 /// code it cannot name.
-pub const TFT_ABI_VERSION_MINOR: u32 = 4;
+///
+/// `4` → `5`: one appended field on `tft_bridge_options`, `arena_name`
+/// (`docs/decisions/0015`), and the one status code it can produce,
+/// [`TFT_ERR_ARENA_UNAVAILABLE`]. The append is a minor bump on the same terms
+/// as `1` → `2`'s: nothing moved, changed type or changed meaning, and
+/// `tft_bridge_create` now reads a shorter `tft_bridge_options` as the prefix it
+/// is instead of refusing it — the §3.6 rule that had, until this bump, an
+/// implementation for `tft_bridge_sample` alone.
+///
+/// **The new status code's argument is tighter than `TFT_ERR_BAD_STAMP`'s.**
+/// That one rests on an older caller never *calling* the two new functions;
+/// this one rests on an older caller being unable to *express* the request. The
+/// code is reachable only when `arena_name` is non-NULL, and a caller whose
+/// `struct_size` names the `0.4` layout has no such field — its bytes end where
+/// the field begins, and `read_options` zero-fills the rest. So a `0.4` caller
+/// provably cannot receive it, rather than merely being expected not to.
+pub const TFT_ABI_VERSION_MINOR: u32 = 5;
 
 /// The library's major ABI version.
 #[no_mangle]

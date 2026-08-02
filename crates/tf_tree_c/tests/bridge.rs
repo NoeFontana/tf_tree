@@ -79,6 +79,10 @@ impl Bridge {
             on_clock_reset,
             domain,
             tf_prefix: prefix.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+            // A private heap arena, which is what this whole file tests. The
+            // shared path needs `--features shm` and lives in
+            // `tests/bridge_shared.rs`.
+            arena_name: ptr::null(),
         };
         let mut b: *mut tft_bridge = ptr::null_mut();
         // SAFETY: NUL-terminated config, a live `opts`, `b` a live local.
@@ -1736,6 +1740,236 @@ fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
         "the pose came through the prefix intact: {got:?}"
     );
     assert_balanced(&b.stats());
+}
+
+/// **A caller built before `arena_name` existed still gets a bridge, and a heap
+/// arena** — `docs/decisions/0015` step 1, and the same §3.6 append rule one
+/// struct over.
+///
+/// `tft_bridge_create` used to validate `struct_size` with exact equality and
+/// then `read_unaligned` the whole struct, so this call was
+/// `TFT_ERR_BAD_STRUCT_SIZE` — every 0.4 caller locked out of the entry point by
+/// an appended field, which is the outage §3.6 exists to prevent. **This test
+/// fails against the code that shipped before the record.**
+///
+/// The fixture allocates **exactly** the old struct's bytes, for the reason
+/// `a_sample_from_before_the_receipt_clock_is_read_as_a_prefix` allocates its
+/// own tightly: a narrowed size check over a full-size struct would let a
+/// restored whole-struct read pass unnoticed, and only a real short allocation
+/// makes that read an overrun a sanitizer can see. `just c-abi-check`'s ASan row
+/// now runs this file with `bridge,shm`.
+///
+/// The prefix's **last** field is the one at risk of arriving at the wrong
+/// offset, so the assertion is on `tf_prefix`: a remap table that renames
+/// `odom` proves the pointer was read from where the old layout put it, not
+/// merely that the call returned `TFT_OK`.
+///
+/// Mutant: accept only the current size, by dropping `declared != v1` from
+/// `read_options`'s guard ⇒ *"an appended field must not lock an older caller
+/// out: a struct_size field names a size this build does not know; left: -3,
+/// right: 0"*.
+///
+/// Mutant: keep accepting the short struct but restore the whole-struct
+/// `core::ptr::read_unaligned` ⇒ under `just shm-check` this is
+/// *"SIGSEGV [ 1.107s] an_options_struct_from_before_the_arena_name_is_read_as_a_prefix"*
+/// — the garbage past the prefix lands in `arena_name` and is walked as a C
+/// string — and under `just c-abi-check`'s ASan row it is diagnosed properly:
+/// *"AddressSanitizer: heap-buffer-overflow … READ of size 32 at … is located 0
+/// bytes after 24-byte region"*. **The crash is luck; the ASan report is the
+/// gate.** Relaxing the size check without narrowing the read is the trap this
+/// pair of mutants exists to mark, and it is the same pair
+/// `a_sample_from_before_the_receipt_clock_is_read_as_a_prefix` carries.
+#[test]
+fn an_options_struct_from_before_the_arena_name_is_read_as_a_prefix() {
+    let toml = CString::new(TOPO).unwrap();
+    let prefix = CString::new("robot1").unwrap();
+    // Computed, never a literal: `offset_of!` of the appended field is where
+    // the old struct ended, on whatever pointer width this build has.
+    let v1_size = core::mem::offset_of!(tft_bridge_options, arena_name);
+    assert!(v1_size < core::mem::size_of::<tft_bridge_options>());
+
+    let mut short = vec![0u8; v1_size];
+    {
+        let full = tft_bridge_options {
+            struct_size: v1_size as u32,
+            authority: TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+            on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+            domain: 0,
+            tf_prefix: prefix.as_ptr(),
+            arena_name: ptr::null(),
+        };
+        // SAFETY: `full` is a live `tft_bridge_options` and `short` has exactly
+        // `v1_size` bytes, which is less than its size — a prefix copy.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                ptr::addr_of!(full).cast::<u8>(),
+                short.as_mut_ptr(),
+                v1_size,
+            );
+        }
+    }
+
+    let mut raw: *mut tft_bridge = ptr::null_mut();
+    // SAFETY: NUL-terminated config; `short` holds `v1_size` readable bytes and
+    // declares that size, which is what the ABI contracts; `raw` a live local.
+    let rc = unsafe {
+        tft_bridge_create(
+            toml.as_ptr(),
+            short.as_ptr().cast::<tft_bridge_options>(),
+            &mut raw,
+        )
+    };
+    assert_eq!(
+        rc,
+        TFT_OK,
+        "an appended field must not lock an older caller out: {}",
+        last_message()
+    );
+    let b = Bridge(raw);
+
+    assert!(
+        b.remaps()
+            .iter()
+            .any(|(from, to)| from == "odom" && to == "robot1/odom"),
+        "the prefix's last field must arrive at the old layout's offset, not be \
+         read from the appended one: {:?}",
+        b.remaps()
+    );
+
+    // **And it is a heap arena.** `arena_name` is the one field the copy leaves
+    // untouched, and the zero it is left at is NULL — the documented "private
+    // heap arena, as before". Had it been left undefined the create would have
+    // walked a garbage pointer as a C string instead of applying transforms.
+    // The wire carries the robot's own names; the arena knows the prefixed ones.
+    let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, None);
+    assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
+    let got = b
+        .tree()
+        .at("robot1/odom", "robot1/base", 1_000 * MS)
+        .expect("a bridge built from a prefix options struct writes like any other");
+    assert!(
+        (got[4] - POSE[4]).abs() < 1e-12,
+        "the pose came through: {got:?}"
+    );
+}
+
+/// **An options `struct_size` belonging to neither build is still refused.**
+///
+/// The prefix rule accepts *two* sizes and nothing else. A size in between is a
+/// build this library has never seen; a size larger is a newer caller against an
+/// older library, whose extra bytes this build cannot interpret and must not
+/// read. Both are `TFT_ERR_BAD_STRUCT_SIZE` **before** anything reads that far,
+/// which is what keeps `read_options`'s bounded copy in bounds.
+///
+/// Mutant: replace `read_options`'s guard with `declared > current` ⇒ the
+/// in-between size is accepted and *"a size between the two known layouts is
+/// not a layout: left: 0, right: -3"* fails.
+#[test]
+fn an_options_size_from_neither_build_is_refused() {
+    let toml = CString::new(TOPO).unwrap();
+    let current = core::mem::size_of::<tft_bridge_options>();
+    let v1_size = core::mem::offset_of!(tft_bridge_options, arena_name);
+    let template = tft_bridge_options {
+        struct_size: current as u32,
+        authority: TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+        domain: 0,
+        tf_prefix: ptr::null(),
+        arena_name: ptr::null(),
+    };
+
+    // Strictly between the two known layouts, so it is neither.
+    assert!(v1_size + 1 < current, "the append left room to be wrong in");
+    let between = tft_bridge_options {
+        struct_size: (v1_size + 1) as u32,
+        ..template
+    };
+    let mut b: *mut tft_bridge = ptr::null_mut();
+    // SAFETY: NUL-terminated config; `between` is a live full-size struct, so
+    // the declared size understates it and nothing can be read out of bounds.
+    let rc = unsafe { tft_bridge_create(toml.as_ptr(), &between, &mut b) };
+    assert_eq!(
+        rc, TFT_ERR_BAD_STRUCT_SIZE,
+        "a size between the two known layouts is not a layout"
+    );
+    assert!(b.is_null(), "a failed create must not hand out a handle");
+
+    // Larger than this build's: a newer caller against an older library.
+    let ahead = tft_bridge_options {
+        struct_size: (current + 8) as u32,
+        ..template
+    };
+    let mut b: *mut tft_bridge = ptr::null_mut();
+    // SAFETY: as above. The declared size overstates the struct, which is
+    // exactly what must be refused *before* anything reads that far.
+    let rc = unsafe { tft_bridge_create(toml.as_ptr(), &ahead, &mut b) };
+    assert_eq!(rc, TFT_ERR_BAD_STRUCT_SIZE);
+    assert!(b.is_null(), "a failed create must not hand out a handle");
+
+    // Zero, which is what an uninitialised `opts` most often holds.
+    let zero = tft_bridge_options {
+        struct_size: 0,
+        ..template
+    };
+    let mut b: *mut tft_bridge = ptr::null_mut();
+    // SAFETY: as above.
+    let rc = unsafe { tft_bridge_create(toml.as_ptr(), &zero, &mut b) };
+    assert_eq!(rc, TFT_ERR_BAD_STRUCT_SIZE);
+    assert!(b.is_null(), "a failed create must not hand out a handle");
+}
+
+/// **A `bridge`-without-`shm` build refuses a shared arena rather than ignoring
+/// it** — `docs/decisions/0015` *Failure*, the silent downgrade in its other
+/// costume.
+///
+/// `bridge` and `shm` are independent cargo features, so this configuration
+/// carries `arena_name` in its header with no `tf_tree::Open` behind it.
+/// Ignoring the field would start a bridge that fills a private heap arena while
+/// every consumer waits forever on a rendezvous that will never appear — reached
+/// through a *build* rather than a runtime fault, and the more likely of the two
+/// because it needs no misconfiguration on the robot at all.
+///
+/// **This test only exists in the `--features bridge` configuration**, which is
+/// `just test-rust`'s and `just lint`'s. Under `bridge,shm` the same request
+/// succeeds, and `tests/bridge_shared.rs` is where that is asserted.
+///
+/// Mutant: make `open_shared`'s no-`shm` arm ignore the field and fall through
+/// to `declared.builder().build()` ⇒ *"a shared arena with no shm behind it
+/// must refuse, not downgrade: left: 0, right: -42"*.
+#[cfg(not(all(feature = "shm", target_os = "linux")))]
+#[test]
+fn a_shared_arena_without_the_shm_feature_is_refused() {
+    let toml = CString::new(TOPO).unwrap();
+    let name = CString::new("bridge-without-shm").unwrap();
+    let opts = tft_bridge_options {
+        struct_size: core::mem::size_of::<tft_bridge_options>() as u32,
+        authority: TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+        domain: 0,
+        tf_prefix: ptr::null(),
+        arena_name: name.as_ptr(),
+    };
+    let mut b: *mut tft_bridge = ptr::null_mut();
+    // SAFETY: NUL-terminated config and name, a live full-size `opts`, `b` a
+    // live local.
+    let rc = unsafe { tft_bridge_create(toml.as_ptr(), &opts, &mut b) };
+    assert_eq!(
+        rc, TFT_ERR_ARENA_UNAVAILABLE,
+        "a shared arena with no shm behind it must refuse, not downgrade"
+    );
+    assert!(
+        b.is_null(),
+        "and it must not hand out a heap bridge instead"
+    );
+    let msg = last_message();
+    assert!(
+        msg.contains("shm"),
+        "the message must name the missing feature: {msg}"
+    );
+    assert!(
+        msg.contains("--features bridge,shm"),
+        "and the rebuild command: {msg}"
+    );
 }
 
 /// **A declared dynamic edge whose domain is not the bridge's is refused at

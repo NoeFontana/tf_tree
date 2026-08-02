@@ -61,3 +61,18 @@ required-features = ["test-hooks"]
 [[example]]
 name = "bridge_cost"
 required-features = ["bridge"]
+
+# The second **process** in `tests/bridge_shared.rs` — `docs/decisions/0015`'s
+# multi-process arm. `required-features` for the same reason as the two examples
+# above: `shm` is default-off, so a plain `--all-targets` build must not try it.
+#
+# It needs `shm` and not `bridge`: it is an ordinary `tf_tree` consumer and links
+# none of the C ABI, which is the record's *"no new consumer API"* being shown
+# rather than asserted. `just shm-check`'s
+# `cargo nextest run -p tf_tree_c --features bridge,shm` builds it (cargo builds
+# a package's binaries for its integration tests, which is also what defines
+# `CARGO_BIN_EXE_bridge_reader`), and the `clippy ... --features bridge,shm
+# --all-targets` line above it is what lints it.
+[[bin]]
+name = "bridge_reader"
+required-features = ["shm"]

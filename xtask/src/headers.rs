@@ -37,6 +37,28 @@
 //! `--check` then reports the unstable header as drifted. That is how the two
 //! codes added after review were caught. The list is therefore an inventory of
 //! the frozen surface, not merely documentation of one.
+//!
+//! # Why [`check_overlap`] exists as well
+//!
+//! The paragraph above is true only while the *committed* headers are the ones
+//! from before the omission. `TFT_ERR_ARENA_UNAVAILABLE` was added by
+//! `docs/decisions/0015`, left out of [`STABLE`], and regenerated — so both
+//! committed headers grew it in the same commit, `--check` saw no drift at all,
+//! and `just c-header-check`'s two-compiler matrix saw nothing either: an
+//! **identical** `#define` twice is legal C, and `tf_tree_unstable.h` includes
+//! `tf_tree.h`. The symbol shipped in both headers with a 28-line doc block
+//! duplicated behind it, and every gate passed.
+//!
+//! §3.1's two-tier split *is* the stability promise, so a partition that only
+//! holds by accident is not a promise. [`check_overlap`] reads the two generated
+//! headers back and fails if any symbol is **defined** in both — which is the
+//! omission's signature, whatever kind of item it is, and unlike
+//! [`check_partition`] it needs no list of item kinds to know about.
+//!
+//! It reads *definitions*, never references: `tf_tree_unstable.h` legitimately
+//! mentions `tft_status`, `tft_tree` and half the stable header in its own
+//! declarations, and including it in `tf_tree.h` is exactly how that is meant to
+//! work.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -94,6 +116,13 @@ const STABLE: &[&str] = &[
     // that never opted into `TFT_ENABLE_UNSTABLE` but can still receive it once
     // any stable entry point starts parsing config.
     "TFT_ERR_BAD_CONFIG",
+    // Same argument, one code over, and it is here because it was **missing**:
+    // added by `docs/decisions/0015` and left out of this list, so the
+    // complement below emitted it into the unstable header as well and both
+    // committed headers carried it. That was legal C — an identical `#define`
+    // twice — so the compile matrix passed. [`check_overlap`] is the check that
+    // now fails on it.
+    "TFT_ERR_ARENA_UNAVAILABLE",
     // Returned only by the two stamp converters below, and stable for the same
     // reason every other status code is: the library hands it *back*, so a
     // caller who never defines `TFT_ENABLE_UNSTABLE` must still be able to name
@@ -367,6 +396,14 @@ pub(crate) fn run(check: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Before either header is written or compared. A `--check` run that only
+    // diffed would pass on a duplicate that was committed together with the
+    // omission that produced it, which is precisely what happened.
+    if let Err(e) = check_overlap(&stable, &unstable) {
+        eprintln!("xtask headers: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let targets = [
         (include_dir.join("tf_tree.h"), stable),
@@ -666,10 +703,273 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// **No symbol may be defined by both generated headers.**
+///
+/// §3.1's split is the stability promise: a symbol in `tf_tree.h` can never be
+/// withdrawn, and one in `tf_tree_unstable.h` carries no promise at all. A
+/// symbol in *both* is in neither tier — it is unwithdrawable and unpromised at
+/// the same time — and it means the same thing every time: an entry missing from
+/// [`STABLE`], which the complement in [`config_for`] then emits into both.
+///
+/// This is checked on the **generated** text rather than on the committed files
+/// because the generated text is the authority; drift between the two is
+/// [`run`]'s own comparison, and a duplicate reaches the committed files only
+/// through here.
+///
+/// Nothing else can catch it. `--check` diffs each header against its own
+/// committed copy, and a duplicate committed *with* the omission that caused it
+/// makes both copies match. `just c-header-check`'s gcc/clang/g++/clang++ matrix
+/// compiles a translation unit that includes both, and an identical `#define`
+/// twice is legal C — not even under `-Wpedantic -Werror`.
+fn check_overlap(stable: &str, unstable: &str) -> Result<(), String> {
+    let in_stable = defined_symbols(stable);
+    let in_unstable = defined_symbols(unstable);
+    let both: Vec<&String> = in_stable.intersection(&in_unstable).collect();
+    if both.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "these symbols are defined by BOTH generated headers: {both:?}\n  \
+         docs/PHASE4.md §3.1 splits the surface in two and that split is the\n  \
+         stability promise, so a symbol cannot be in both tiers. This almost always\n  \
+         means the symbol is missing from STABLE in xtask/src/headers.rs: both\n  \
+         cbindgen configs are built by *complement*, so an unlisted item is excluded\n  \
+         from neither and lands in both files.\n  \
+         Add it to STABLE (or to UNSTABLE, if the frozen header is not where it\n  \
+         belongs) and regenerate."
+    ))
+}
+
+/// Every symbol a header **defines** — not the ones it merely mentions.
+///
+/// `tf_tree_unstable.h` includes `tf_tree.h` and names stable types all over its
+/// own declarations, so a scan that counted references would report the entire
+/// stable surface as an overlap. Four definition shapes cover everything the two
+/// headers contain, and all four sit at **column 0**: `cbindgen` indents every
+/// struct field, every enum variant and every continuation line of a wrapped
+/// declaration, so the column is what separates a definition from the inside of
+/// one.
+fn defined_symbols(header: &str) -> BTreeSet<String> {
+    let mut defs = BTreeSet::new();
+    for line in strip_comments(header).lines() {
+        if line.is_empty() || line.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let t = line.trim_end();
+        // 1. `#define NAME ...`
+        if let Some(rest) = t.strip_prefix("#define ") {
+            let name = ident_prefix(rest.trim_start());
+            if !name.is_empty() {
+                defs.insert(name);
+            }
+            continue;
+        }
+        // Any other preprocessor directive defines nothing.
+        if t.starts_with('#') {
+            continue;
+        }
+        // 2. `typedef <...> NAME;` and 3. the `} NAME;` closing a struct or enum
+        //    body opened by `typedef struct {`.
+        if t.starts_with("typedef") || t.starts_with('}') {
+            if let Some(name) = last_ident_before_semicolon(t) {
+                defs.insert(name);
+            }
+            continue;
+        }
+        // `extern "C" {` and its closing brace; neither declares anything.
+        if t.starts_with("extern") {
+            continue;
+        }
+        // 4. A function declaration: the identifier immediately before the first
+        //    `(`. Wrapped parameter lists continue on indented lines, which the
+        //    column-0 test above has already dropped.
+        if let Some(open) = t.find('(') {
+            let name = ident_suffix(&t[..open]);
+            if !name.is_empty() {
+                defs.insert(name);
+            }
+        }
+    }
+    defs
+}
+
+/// Blank out C comments, preserving both line structure and column positions —
+/// [`defined_symbols`] relies on the latter.
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_block = false;
+    for line in src.lines() {
+        let b = line.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if in_block {
+                if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    in_block = false;
+                    out.push_str("  ");
+                    i += 2;
+                } else {
+                    out.push(' ');
+                    i += 1;
+                }
+            } else if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                in_block = true;
+                out.push_str("  ");
+                i += 2;
+            } else if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                out.push_str(&" ".repeat(b.len() - i));
+                i = b.len();
+            } else {
+                out.push(char::from(b[i]));
+                i += 1;
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn ident_prefix(s: &str) -> String {
+    s.chars().take_while(|c| is_ident(*c)).collect()
+}
+
+fn ident_suffix(s: &str) -> String {
+    let tail: Vec<char> = s.chars().rev().take_while(|c| is_ident(*c)).collect();
+    tail.into_iter().rev().collect()
+}
+
+fn last_ident_before_semicolon(t: &str) -> Option<String> {
+    let name = ident_suffix(t.strip_suffix(';')?);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// The workspace root, from this crate's manifest directory.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The overlap check's own gate.
+    //!
+    //! It is here because [`check_overlap`] is a check that exists *because* a
+    //! check silently stopped checking, and a duplicate-detector that quietly
+    //! detected nothing would be the same failure one level up. These pin both
+    //! directions: the shapes it must see, and the references it must not
+    //! mistake for definitions.
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::{check_overlap, defined_symbols};
+
+    /// Every definition shape the two generated headers actually contain.
+    const SHAPES: &str = "\
+/*
+ * A banner comment naming TFT_NOT_A_DEFINITION.
+ */
+#ifndef TF_TREE_H
+#define TF_TREE_H
+
+#include <stdint.h>
+
+typedef struct tft_tree tft_tree;
+
+#define TFT_MESSAGE_LEN 256
+
+typedef int32_t tft_status;
+
+typedef struct {
+  uint32_t struct_size;
+  tft_status code;
+} tft_error;
+
+/**
+ * Doxy prose mentioning tft_plan_at and TFT_OK.
+ */
+tft_status tft_last_error(tft_error *out);
+
+tft_status tft_plan_at_many(const tft_plan *plan,
+                            const int64_t *stamps,
+                            size_t count);
+
+#endif  /* TF_TREE_H */
+";
+
+    #[test]
+    fn every_definition_shape_is_seen_and_no_reference_is() {
+        let got = defined_symbols(SHAPES);
+        for want in [
+            "TF_TREE_H",
+            "TFT_MESSAGE_LEN",
+            "tft_tree",
+            "tft_status",
+            "tft_error",
+            "tft_last_error",
+            "tft_plan_at_many",
+        ] {
+            assert!(got.contains(want), "{want} was not seen as a definition");
+        }
+        // Prose, parameter types and wrapped continuation lines are references.
+        for never in [
+            "TFT_NOT_A_DEFINITION",
+            "TFT_OK",
+            "tft_plan_at",
+            "tft_plan",
+            "stamps",
+            "count",
+            "out",
+            "struct_size",
+            "code",
+        ] {
+            assert!(
+                !got.contains(never),
+                "{never} is a reference, not a definition"
+            );
+        }
+    }
+
+    /// The regression this whole check exists for: a status code missing from
+    /// [`super::STABLE`] is emitted into both headers, and the duplicate is an
+    /// identical `#define` that no C compiler objects to.
+    #[test]
+    fn a_symbol_defined_by_both_headers_fails() {
+        let stable = "#define TFT_ERR_ARENA_UNAVAILABLE -42\n";
+        let unstable = "#include \"tf_tree.h\"\n#define TFT_ERR_ARENA_UNAVAILABLE -42\n";
+        let err = check_overlap(stable, unstable).unwrap_err();
+        assert!(
+            err.contains("TFT_ERR_ARENA_UNAVAILABLE"),
+            "the failure must name the symbol: {err}"
+        );
+    }
+
+    /// And the unstable header naming stable symbols — which it does on nearly
+    /// every line — is not an overlap.
+    #[test]
+    fn the_unstable_header_may_reference_the_stable_one() {
+        let stable = "typedef int32_t tft_status;\ntft_status tft_tree_open(tft_tree **out);\n";
+        let unstable = "#include \"tf_tree.h\"\n\
+                        tft_status tft_tree_frame_count(const tft_tree *tree);\n";
+        assert!(check_overlap(stable, unstable).is_ok());
+    }
+
+    /// The committed headers themselves, so the check is exercised against real
+    /// `cbindgen` output and not only against the fixture above.
+    #[test]
+    fn the_committed_headers_do_not_overlap() {
+        let inc = super::workspace_root().join("crates/tf_tree_c/include");
+        let stable = std::fs::read_to_string(inc.join("tf_tree.h")).unwrap();
+        let unstable = std::fs::read_to_string(inc.join("tf_tree_unstable.h")).unwrap();
+        if let Err(e) = check_overlap(&stable, &unstable) {
+            panic!("{e}");
+        }
+    }
 }

@@ -110,6 +110,40 @@ typedef struct {
    * `tf_prefix` remapping (§5.6), or NULL for none.
    */
   const char *tf_prefix;
+  /**
+   * Rendezvous name for a **shared** arena, or NULL for a private heap arena.
+   *
+   * When non-NULL the bridge publishes its arena under this name, and any
+   * process may attach read-only with
+   * [`tft_tree_open`](crate::tft_tree_open) / `tf_tree::open()`. **NULL is
+   * the default and preserves the previous behaviour exactly**
+   * (`docs/decisions/0015`).
+   *
+   * # This is not `domain`
+   *
+   * [`tft_bridge_options::domain`] is §5.5's *time* domain and has nothing to
+   * do with the rendezvous. The **rendezvous** domain comes from
+   * `$TF_TREE_DOMAIN`, else `$ROS_DOMAIN_ID`, else 0 — the convention two
+   * robots on one host already use, and the reason no name is derived from
+   * `tf_prefix` (`docs/decisions/0019` §3, answers 2 and 3). Two fields
+   * spelled "domain" in one header meaning different things is a
+   * documentation obligation, and this paragraph is it.
+   *
+   * # It can fail, and it never downgrades
+   *
+   * A shared build can fail where a heap build cannot: the name is already
+   * held by a live arena, the runtime directory is unusable, `memfd_create`
+   * is refused. All of those are
+   * [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) with a
+   * message that distinguishes them, and **none of them falls back to a heap
+   * arena** — a silent downgrade leaves every consumer waiting on a
+   * rendezvous that will never appear, which is the failure mode hardest to
+   * diagnose from the consumer's side.
+   *
+   * A library built **without** `--features shm` carries this field with
+   * nothing behind it and refuses a non-NULL value for the same reason.
+   */
+  const char *arena_name;
 } tft_bridge_options;
 #endif
 
@@ -240,6 +274,12 @@ typedef int32_t tft_bridge_reason;
 typedef struct {
   /**
    * `sizeof(tft_bridge_outcome)` in the caller's build (§3.6).
+   *
+   * **Exact equality, unlike `tft_bridge_options` and `tft_bridge_sample`.**
+   * This is an `out` parameter: accepting a short one means the callee must
+   * know which fields to skip *writing*, which is a different and larger
+   * design than reading a prefix. Do not "finish the job" by symmetry — see
+   * `read_options`.
    */
   uint32_t struct_size;
   /**
@@ -392,7 +432,8 @@ typedef struct {
  */
 typedef struct {
   /**
-   * `sizeof(tft_bridge_remap)` in the caller's build (§3.6).
+   * `sizeof(tft_bridge_remap)` in the caller's build (§3.6). Exact equality,
+   * for the reason [`tft_bridge_outcome::struct_size`] gives.
    */
   uint32_t struct_size;
   /**
@@ -444,7 +485,8 @@ typedef int32_t tft_bridge_jump_kind;
  */
 typedef struct {
   /**
-   * `sizeof(tft_bridge_stats)` in the caller's build (§3.6).
+   * `sizeof(tft_bridge_stats)` in the caller's build (§3.6). Exact equality,
+   * for the reason [`tft_bridge_outcome::struct_size`] gives.
    */
   uint32_t struct_size;
   /**
@@ -868,6 +910,24 @@ typedef int32_t tft_bridge_evidence;
  *
  * The thread that calls this **owns** the bridge; see the module docs.
  *
+ * # An older caller's options still work
+ *
+ * `opts->struct_size` selects the layout, and the layout that predates
+ * `arena_name` is accepted and read as the prefix it is — the §3.6 rule
+ * [`tft_bridge_offer`] already applies to `tft_bridge_sample`. A `0.4` caller
+ * therefore keeps the private heap arena it always had, with no source change
+ * and no recompile.
+ *
+ * # It can now block, for up to five seconds
+ *
+ * **Only when `opts->arena_name` is non-NULL.** The shared path goes through
+ * `tf_tree::Open`, whose rendezvous waits up to `DEFAULT_OPEN_TIMEOUT` (5 s) for
+ * an arena that is held but not yet reachable. That is a real change for §5.8's
+ * form 3, where this runs inside a constructor: a node that constructs its
+ * bridge on the executor thread will not spin that executor until this returns.
+ * A NULL `arena_name` — the default, and every pre-`0.5` caller — is exactly as
+ * prompt as before.
+ *
  * # Errors
  *
  * * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, **declares no edges**,
@@ -880,12 +940,22 @@ typedef int32_t tft_bridge_evidence;
  *   `opts->domain` (§5.5, NORMATIVE, and at startup by design).
  * * [`TFT_ERR_ALREADY_CLAIMED`](crate::TFT_ERR_ALREADY_CLAIMED) and the rest of
  *   the claim family — another participant holds a declared edge.
+ * * [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) — a
+ *   non-NULL `opts->arena_name` could not be served: another bridge already
+ *   holds the name, the runtime directory is unusable, the segment could not be
+ *   made — or this library was built without `--features shm`. The message
+ *   distinguishes them, and **there is no fallback to a heap arena**.
+ * * [`TFT_ERR_BAD_STRUCT_SIZE`] —
+ *   `opts->struct_size` is neither this build's size nor the one layout that
+ *   precedes it.
  *
  * # Safety
  *
  * `config_toml` must be NUL-terminated UTF-8. `opts` must be NULL or point to a
- * `tft_bridge_options` whose `struct_size` is set. `out` must be NULL or point
- * to a writable `*mut tft_bridge`.
+ * `tft_bridge_options` whose `struct_size` is set **and which has at least that
+ * many readable bytes** — the same contract [`tft_bridge_offer`] states for its
+ * sample, and it is what makes the narrowed read sound. `out` must be NULL or
+ * point to a writable `*mut tft_bridge`.
  */
 tft_status tft_bridge_create(const char *config_toml,
                              const tft_bridge_options *opts,

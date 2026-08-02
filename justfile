@@ -23,13 +23,21 @@ test-rust:
     #
     # **Counts, re-measured** — this comment said "nine entry points" and
     # "21 tests" and both were stale. `grep -c 'extern "C" fn' bridge.rs` is 10;
-    # `cargo nextest run -p tf_tree_c --features bridge` runs **60** tests
-    # against **31** without the feature, so the feature is worth **29** tests
+    # `cargo nextest run -p tf_tree_c --features bridge` runs **63** tests
+    # against **31** without the feature, so the feature is worth **32** tests
     # that `cargo nextest run --workspace` never runs.
     #
     # This is the same shape `shm-check` exists for, one crate over: a
     # default-off feature is invisible to `--workspace`, and a file nobody
     # compiles is not a checked file.
+    #
+    # **This line is `bridge`-without-`shm`, and since `docs/decisions/0015`
+    # that is a shipped configuration rather than only a build artifact**: it
+    # carries `tft_bridge_options::arena_name` with no `tf_tree::Open` behind
+    # it, and `a_shared_arena_without_the_shm_feature_is_refused` is
+    # `#[cfg]`-ed to exist *only* here. `bridge,shm` is `just shm-check`'s, for
+    # the ordinary reason `shm` is Linux-only and this recipe runs on the
+    # aarch64 matrix.
     cargo nextest run -p tf_tree_c --features bridge
 
 test-doc:
@@ -281,8 +289,17 @@ c-abi-check:
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_c/bridge,tf_tree_core/miri-soft-float \
         --test bridge
+    # **ASan, and `shm` is in this row on purpose.** `docs/decisions/0015`'s
+    # shared arm maps a `memfd`, binds a unix socket and spawns the owner
+    # thread; Miri can execute none of that, so the `--test bridge` row above
+    # runs the heap path only and ASan is the sole sanitizer that ever sees the
+    # shared one. It is also the checker that catches the trap the prefix rule
+    # keeps setting: a relaxed `struct_size` test whose read was not narrowed
+    # reads the whole current struct out of an older caller's shorter
+    # allocation, and `tests/bridge.rs` allocates those prefixes tightly so the
+    # overrun is real.
     RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
-        --features test-hooks,bridge --target x86_64-unknown-linux-gnu -Zbuild-std
+        --features test-hooks,bridge,shm --target x86_64-unknown-linux-gnu -Zbuild-std
 
 # **The committed C headers: drift check, then compile and run them.**
 #
@@ -1243,6 +1260,22 @@ shm-check:
     cargo clippy -p tf_tree_ipc --all-targets -- -D warnings
     cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree_cli --features shm --all-targets -- -D warnings
+    # **`docs/decisions/0015`: the bridge fills a shared arena, and until this
+    # line nothing in the repository built `bridge,shm` together.** They are
+    # independent cargo features, so `tft_bridge_options::arena_name` had a
+    # `tf_tree::Open` behind it in a configuration no recipe compiled — and
+    # `tests/bridge_shared.rs`, which is the whole point of the record (a second
+    # attach reading what the bridge wrote), is `#![cfg]`-ed out of every other
+    # one. Not `just test-rust`: `shm` is Linux-only and that recipe runs on the
+    # aarch64 matrix too. Not a new recipe either — a third feature-combination
+    # recipe is a third thing to forget, and this one already carries
+    # `-p tf_tree_cli --features shm --test attach` for exactly the same reason.
+    #
+    # The plain `--features bridge` clippy line in `just lint` stays: since the
+    # record, `bridge`-without-`shm` is a shipped configuration with its own
+    # refusal arm, so both halves need compiling.
+    cargo clippy -p tf_tree_c --features bridge,shm --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_c --features bridge,shm
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo build --features shm -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
