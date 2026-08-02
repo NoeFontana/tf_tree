@@ -766,14 +766,24 @@ impl Plan {
     ///
     /// So the boundary costs about a quarter of a depth-3 lookup at cargo's
     /// `--release` defaults, and `lto = "thin"` in the embedder's own profile
-    /// erases it. **It does not follow that these attributes are useless — the
-    /// first table above measures them taking the out-of-crate path from 313 ns
-    /// to 256 ns at that same profile** — nor that no `#[inline]` placement
-    /// could close the rest. An earlier revision of this paragraph asserted the
-    /// latter; nothing measured it, and removing `fold_at`'s attribute was
-    /// afterwards observed to *move* the ratio, which is the opposite of what
-    /// "no placement closes it" predicts. What is measured is a gap that
-    /// survives the five placements, and one setting that removes it.
+    /// erases it.
+    ///
+    /// **An earlier revision of this paragraph added "which no `#[inline]`
+    /// placement closes". That is removed, because the row's own toggle refutes
+    /// it.** Dropping this attribute from [`Self::fold_at`] and re-running the
+    /// recipe takes the ratio from 1.253 to **1.001** — inside the gate — by
+    /// making the in-crate column 6.7% slower (191.5 → 204.4 ns) and the
+    /// `lto = "thin"` control 6.9% slower (193.2 → 206.6 ns), while the
+    /// out-of-crate embedder column gets *faster* (239.9 → 203.9 ns). A
+    /// placement moves it; what no placement measured here does is improve
+    /// every column at once. Nothing is claimed about whether some other one
+    /// would.
+    ///
+    /// **Do not read 203.9 ns against the 256 ns in the first table.** Those are
+    /// different probes — the first is a throwaway 20 M-iteration loop, this one
+    /// is `just embed-cost`'s sweep over 1024 off-grid stamps — and only ratios
+    /// within one table are comparable. What both tables agree on is direction,
+    /// and the second is the one that runs on every change.
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;

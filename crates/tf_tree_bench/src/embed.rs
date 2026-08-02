@@ -78,6 +78,14 @@
 //! and the boundary gone. That is `docs/API.md` §2.3 item 2's LTO guidance
 //! measured against the thing it is guidance about.
 //!
+//! **The absolute columns drift with the host and the ratio does not**, which is
+//! the pairing argument arriving as evidence rather than as reasoning. A fifth
+//! run taken on a busier machine measured 245.3 ns out-of-crate and 196.7 ns
+//! in-crate — both about 2.5% above the table — for a ratio of **1.251**, inside
+//! the 1.250–1.254 the three quiet runs gave. That is why the row is denominated
+//! in the ratio and why `out_of_crate_ns` and `in_crate_ns` are gated at 5%
+//! rather than at something tighter.
+//!
 //! ## What this row does **not** say, measured rather than hedged
 //!
 //! An earlier revision of this file printed *"no `#[inline]` placement closes
@@ -133,7 +141,10 @@
 //!   whose noise floor exceeds its threshold is not a gate, and the previous
 //!   revision of this file printed `pass`/`fail` from an unpaired measurement
 //!   whose halves moved 8.7% between runs. Pairing is what bought the
-//!   resolution: the band is now about 1% wide against a 5% criterion.
+//!   resolution. Note what the test is: not "is the band narrower than 5%" but
+//!   "does the band reach the threshold". Across four runs the observed band was
+//!   1.0% to 4.4% wide and every one of them resolved, because 1.216–1.270 is
+//!   nowhere near 1.05. A band only has to be narrow when the ratio is close.
 //! * **Both halves of the exploratory pair must come from one source tree.**
 //!   `build.rs` digests the sources that determine the measured program into
 //!   [`SOURCE_ID`], and [`Pair::load`] refuses two runs that disagree. Without
@@ -157,11 +168,12 @@
 //! here; they are quoted to justify a design decision, which is a use a
 //! fitness-failing host is good enough for.
 //!
-//! The **resolution** is stated because the gate depends on it: the paired
-//! per-round ratio moved by about 1% within a run and about 0.4% between runs,
-//! against a 5% criterion. The unpaired numbers do not — the exploratory profile
-//! ratio moved between 1.188 and 1.235 across the same runs, which is why that
-//! one is not gated and this one is.
+//! The **resolution** is stated because the gate depends on it. Over four runs
+//! the paired ratio was 1.250, 1.253, 1.254, 1.254 — 0.3% between runs — with a
+//! within-run band of 1.0% to 4.4%. The unpaired numbers do not behave that way:
+//! the exploratory profile ratio moved between 1.188 and 1.235 over the same
+//! runs, four times the whole 5% allowance. That difference is the reason one of
+//! the two measurements is gated and the other is not.
 //!
 //! [`Plan::at`]: tf_tree::Plan::at
 

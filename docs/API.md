@@ -320,8 +320,12 @@ is a call per step.
 >
 > The verdict is `unresolved` rather than a pass or a fail whenever the observed
 > round-to-round band straddles the threshold. Pairing the two columns inside a
-> round is what makes 5% resolvable here at all: the band is ~1% wide, where the
-> unpaired two-process comparison moves by 4% between runs.
+> round is what makes 5% resolvable here at all. Across four runs the paired
+> ratio moved by 0.3% *between* runs (1.250, 1.253, 1.254, 1.254) with a
+> *within*-run band of 1.0% to 4.4%; every one of them still resolves the
+> criterion, because a band of 1.216–1.270 does not reach 1.05. The unpaired
+> two-process profile ratio moved 1.188 → 1.235 over the same runs, which is
+> four times the whole allowance and is why that one is not gated.
 >
 > Host, and it matters: a 4-physical-core AMD EPYC-Milan VM that fails
 > `Fitness::probe`, so the row is `unavailable` in this repository's own
