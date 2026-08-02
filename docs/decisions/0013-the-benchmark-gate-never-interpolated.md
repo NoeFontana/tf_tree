@@ -309,8 +309,11 @@ separate labelled row precisely because it is the best case.
   change. Anything quoting "150 ns at depth 3" — README, docs, talks — needs the
   same amendment, or it becomes the next stale claim of the kind this audit spent
   its time finding.
-- `bench_report_cli`'s existing assertion (`p50 > 0 && p50 < 1 ms`) still passes,
-  so no test had to change to land item 1 — confirmed by running it.
+- The existing `p50 > 0 && p50 < 1 ms` assertion still passes, so no test had to
+  change to land item 1 — confirmed by running it. (It lives in `report.rs`'s
+  `the_lookup_measurement_reports_every_sample_and_ordered_percentiles`, not in
+  `tests/bench_report_cli.rs` as this line first said; that file asserts the
+  CLI's argument handling and never reaches a percentile.)
 - **`PHASE3.md` §6.1's `NS_PER_STEP_ESTIMATE` moved with the re-baseline**, 55 →
   64 ns/step, because `API.md` §3.4 is NORMATIVE that it moves in this commit.
   That is a *consequence of the measurement*, not of the threshold choice, which
