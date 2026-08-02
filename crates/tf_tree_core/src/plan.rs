@@ -749,8 +749,41 @@ impl Plan {
     /// Note the second row of the first table: `lto = "thin"` does **not**
     /// subsume the hint. This workspace's own profile still moves ~4.5%, so the
     /// benchmark gate is not indifferent to this change — `just bench-ab` is
-    /// workspace-wide and was not run, and `docs/API.md` §2.3 item 3 (a gated
-    /// cross-crate row) is still the thing that would measure it continuously.
+    /// workspace-wide and was not run. `docs/API.md` §2.3 item 3 (a gated
+    /// cross-crate row) has since landed and does measure it continuously:
+    /// `just embed-cost`, and the `embedding_cross_crate` row of
+    /// `docs/PHASE5.md` §9.2's artifact.
+    ///
+    /// **That row reports a ratio over §9.2's 5% criterion, and it also reports
+    /// the control that says what does close it.** Both columns are the same
+    /// three lines behind `#[inline(never)]`, one compiled in `tf_tree_bench`
+    /// and one here; three consecutive runs, `taskset`-pinned, paired rounds:
+    ///
+    /// | downstream profile | out-of-crate | in-crate | ratio |
+    /// | --- | --- | --- | --- |
+    /// | `lto = false`, `codegen-units = 16` | 240.0–240.1 ns | 191.3–191.8 ns | **1.250–1.254** |
+    /// | `lto = "thin"`, `codegen-units = 1` | 193.0–195.0 ns | 194.2–196.2 ns | 0.994–0.996 |
+    ///
+    /// So the boundary costs about a quarter of a depth-3 lookup at cargo's
+    /// `--release` defaults, and `lto = "thin"` in the embedder's own profile
+    /// erases it.
+    ///
+    /// **An earlier revision of this paragraph added "which no `#[inline]`
+    /// placement closes". That is removed, because the row's own toggle refutes
+    /// it.** Dropping this attribute from `Plan::fold_at` and re-running the
+    /// recipe takes the ratio from 1.253 to **1.001** — inside the gate — by
+    /// making the in-crate column 6.7% slower (191.5 → 204.4 ns) and the
+    /// `lto = "thin"` control 6.9% slower (193.2 → 206.6 ns), while the
+    /// out-of-crate embedder column gets *faster* (239.9 → 203.9 ns). A
+    /// placement moves it; what no placement measured here does is improve
+    /// every column at once. Nothing is claimed about whether some other one
+    /// would.
+    ///
+    /// **Do not read 203.9 ns against the 256 ns in the first table.** Those are
+    /// different probes — the first is a throwaway 20 M-iteration loop, this one
+    /// is `just embed-cost`'s sweep over 1024 off-grid stamps — and only ratios
+    /// within one table are comparable. What both tables agree on is direction,
+    /// and the second is the one that runs on every change.
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;

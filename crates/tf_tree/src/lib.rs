@@ -94,6 +94,63 @@
 //! same refcount spelled in CPython's allocator. Three surfaces arrived here
 //! independently and none of them said so where an embedder would look
 //! (`docs/API.md` §2.2).
+//!
+//! # Set `lto = "thin"` and `codegen-units = 1` in your release profile
+//!
+//! ```toml
+//! [profile.release]
+//! lto = "thin"
+//! codegen-units = 1
+//! ```
+//!
+//! **This is worth about 25% of a depth-3 lookup, and it is not cargo-cult
+//! advice — it is a property of where this engine's code lives.** [`Plan::at`]
+//! sits across a crate boundary from every consumer, and it and the fold beneath
+//! it live one crate further down still, in `tf_tree_core`. Five functions on
+//! the evaluate path carry `#[inline]` for exactly that reason (`Plan::at`, the
+//! scalar fold, and the three [`Guard`] sampling entry points), but what an
+//! attribute buys depends on **your** profile, not on ours: cargo's
+//! `--release` defaults are `lto = false, codegen-units = 16`, and this
+//! workspace's are not, so every latency number this project publishes is taken
+//! under whole-program optimisation and your node's is not.
+//!
+//! Measured rather than asserted, because the last claim made here about this
+//! mechanism was wrong in a way only a probe could show. One program — a
+//! depth-3 `map <- imu_link` lookup, `LerpSlerp`, off-grid stamps so the
+//! interpolation runs, one lookup per non-inlinable call — built twice and
+//! pinned to one core, nine rounds each, three consecutive runs:
+//!
+//! | downstream profile | ns/lookup |
+//! | --- | --- |
+//! | `lto = false`, `codegen-units = 16` (cargo's `--release` default) | 240 |
+//! | `lto = "thin"`, `codegen-units = 1` | 193–195 |
+//!
+//! On a 4-physical-core AMD EPYC-Milan VM under moderate load, 2026-08-02, so
+//! read it as "about a quarter", not as three digits — the ratio itself moved
+//! between 1.19× and 1.24× across those runs.
+//!
+//! **The same runs also say *why*, which is the part that makes this advice
+//! rather than folklore.** They time a second, identical body compiled *inside*
+//! `tf_tree_core`, and compare it against the one outside:
+//!
+//! | downstream profile | from outside the engine | from inside it |
+//! | --- | --- | --- |
+//! | `lto = false`, `codegen-units = 16` | 240 ns | 191 ns |
+//! | `lto = "thin"`, `codegen-units = 1` | 193 ns | 194 ns |
+//!
+//! At cargo's defaults the crate boundary costs about a quarter of the lookup;
+//! with thin LTO it costs nothing measurable, because the boundary is gone at
+//! link time. `just embed-cost` in this repository re-measures both, and
+//! `docs/PHASE5.md` §9.2 makes the second one a standing, gated benchmark row so
+//! the next change to those attributes moves a number somebody sees.
+//!
+//! The cost of taking this advice is build time: thin LTO adds a link-time
+//! optimisation pass, and `codegen-units = 1` gives up intra-crate build
+//! parallelism. Both are compile-time costs and neither changes what the shipped
+//! binary computes. How the 25% splits between the two settings has **not** been
+//! measured here, so if your release builds are slow enough that you want to
+//! take only one of them, measure your own case rather than trusting a guess
+//! from this paragraph.
 
 mod cache;
 mod tree;

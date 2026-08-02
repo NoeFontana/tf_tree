@@ -85,6 +85,12 @@ fn main() -> Result<()> {
                  recorded as warmup_discarded_s) to change the discarded window."
             ),
             "--warmup" => opts.warmup = parse_duration(&value("--warmup")?)?,
+            // §9.2's embedding row arrives from outside, and this is the one
+            // row where that is a property of the measurement rather than a
+            // shortcut: it compares two builds of one program, and this tool is
+            // a single build. `just embed-cost` writes the pair; without the
+            // flag the row says so and names that recipe.
+            "--embed-cost" => opts.embed_cost = Some(PathBuf::from(value("--embed-cost")?)),
             // Still rejected, but **not** for the reason an earlier revision
             // gave. That one said §3 "is not implemented"; §3 landed (MCAP), and
             // `tf_tree ingest --bag` / `tf_tree freeze --from-bag` are how a
@@ -107,7 +113,7 @@ fn main() -> Result<()> {
             "-h" | "--help" => {
                 println!(
                     "usage: bench_report [--out DIR] [--consumers N] [--warmup 2s] \
-                     [--check-baseline results.json]"
+                     [--embed-cost DIR] [--check-baseline results.json]"
                 );
                 println!(
                     "  --duration and --bag are `docs/PHASE5.md` §9.1 spellings that would \

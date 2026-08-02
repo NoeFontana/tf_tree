@@ -1,9 +1,9 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-07-29T05:01:26Z",
+    "generated_utc": "2026-08-02T05:32:01Z",
     "schema": "tf_tree.bench-report/2",
-    "git_commit": "67cfa3ff4802565e8ad2f328d5ab4aa0a6685567",
+    "git_commit": "aca26e47d3494ea35f0f2e253ba80bf8df0fb910",
     "git_dirty": "false",
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
     "build_profile": "release",
@@ -21,7 +21,7 @@
     "kernel": "6.8.0-136-generic",
     "transparent_hugepage": "always [madvise] never",
     "perf_event_paranoid": "4",
-    "load_average": "0.44 1.30 2.00 1/518 3625196",
+    "load_average": "1.19 0.90 1.13 1/377 1476822",
     "container": "no",
     "ros_distro": "none (no ROS 2 in this run)",
     "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
@@ -35,7 +35,7 @@
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.01673640167364021,
+    "busy_fraction": 0.012448132780082943,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
@@ -136,6 +136,18 @@
       "reason": "",
       "reproduce": "cargo test -p tf_tree_bench --release --test differential",
       "tf_tree": {"max_deviation": {"value": 0.0000000000000002498001805406602, "unit": "rad or m", "drift": "lower_is_better", "tolerance": 9}, "compared": {"value": 47922, "unit": "queries", "drift": "informational", "tolerance": 0}, "tolerance": {"value": 0.000000000001, "unit": "rad or m", "drift": "informational", "tolerance": 0}},
+      "tf2": {}
+    },
+    {
+      "id": "embedding_cross_crate",
+      "title": "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)",
+      "note": "One build, one profile, two identical bodies. `out_of_crate_ns` times an `#[inline(never)]` depth-3 lookup compiled in `tf_tree_bench` — an embedder's position; `in_crate_ns` times the same three lines compiled in `tf_tree_core`, the crate that defines `Plan::at` and the fold. `boundary_ratio` is the median per-round quotient, paired so that machine noise common to both columns cancels. The profile is `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` defaults), which §9.2 requires: under this workspace's `lto = \"thin\"` the crate boundary is erased at link time and the comparison measures nothing. Depth 3, LerpSlerp, off-grid stamps so the interpolation actually runs. A probe in the `tf_tree` facade would NOT be in-crate and was measured not to be (241.5 vs 243.6 ns); `crates/tf_tree_bench/src/embed.rs` carries that table. There is no tf2 column: this row is `tf_tree` against itself.",
+      "timing_sensitive": true,
+      "needs_n_cores": false,
+      "status": "unavailable",
+      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reproduce": "just embed-cost",
+      "tf_tree": {},
       "tf2": {}
     }
   ],

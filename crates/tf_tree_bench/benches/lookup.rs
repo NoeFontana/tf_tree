@@ -5,6 +5,14 @@
 // rings — the depth-3 row is the one the go/no-go gate cares about (p50 < 150 ns
 // ScLerp / < 100 ns LerpSlerp). These runs are NOT the official gate: that needs
 // dedicated, core-pinned hardware.
+//
+// **This file is not `docs/PHASE5.md` §9.2's cross-crate row, and cannot be
+// extended into it.** That row needs a denominator compiled *inside*
+// `tf_tree_core`, and every body a bench target here compiles is codegen'd in
+// `tf_tree_bench`; it also needs both halves to interpolate, and `bench_pair`
+// below queries `fixture::NOW_NS`, which is a knot on all three dynamic edges of
+// the depth-3 path (`docs/decisions/0013`). `crates/tf_tree_bench/src/embed.rs`
+// states the three reasons in full, under "Why not `benches/lookup.rs`".
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

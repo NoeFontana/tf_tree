@@ -39,6 +39,16 @@ counters = []
 # every `sqrt`/`sin`/`cos` in the shipped binaries and the benchmarks — with
 # soft floats, silently invalidating the perf gate.
 miri-soft-float = ["libm/force-soft-floats", "tf_tree_math/miri-soft-float"]
+# **Default-off benchmark hook**, and the only thing it adds is `bench_probe`:
+# *one* `#[inline(never)]` wrapper around `Plan::at`, compiled *in this crate* so
+# `docs/PHASE5.md` §9.2's embedding row has an in-crate column to gate the
+# separate-crate one against. Its twin is `tf_tree_bench::embed::one` — the same
+# three lines compiled in the other crate — and the two living in two crates is
+# the entire experiment, not an accident of layout. No shipped crate enables it — `tf_tree`,
+# `tf_tree_c`, `tf_tree_py` and `tf_tree_cli` do not mention it — and it is the
+# same shape as `tf_tree_c`'s `test-hooks`, which exists so `abi_cost.rs` can
+# measure the `catch_unwind` boundary. `just embed-cost-check` is its gate.
+bench-probe = []
 
 [dependencies]
 tf_tree_math.workspace = true

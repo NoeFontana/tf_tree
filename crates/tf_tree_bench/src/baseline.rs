@@ -700,6 +700,127 @@ mod tests {
         );
     }
 
+    /// A report carrying only `docs/PHASE5.md` §9.2's embedding row, with the
+    /// metrics [`crate::embed::Run`] really builds.
+    fn embedding_report(out_of_crate_ns: f64, in_crate_ns: f64) -> Report {
+        let ratio = out_of_crate_ns / in_crate_ns;
+        let run = crate::embed::Run {
+            profile_dir: crate::embed::EMBEDDER_PROFILE.to_owned(),
+            source_id: "0123456789abcdef".to_owned(),
+            out_of_crate_ns,
+            in_crate_ns,
+            boundary_ratio: ratio,
+            ratio_lo: ratio * 0.999,
+            ratio_hi: ratio * 1.001,
+            out_of_crate_spread: 0.004,
+            in_crate_spread: 0.004,
+            rounds: crate::embed::ROUNDS,
+            lookups_per_round: 409_600,
+        };
+        let mut r = report_with(1.0, false);
+        r.rows[0].id = "embedding_cross_crate";
+        r.rows[0].timing_sensitive = true;
+        r.rows[0].tf_tree = run.metrics();
+        r
+    }
+
+    /// §9.2's 5% on the embedding row, through the real gate and the real
+    /// metrics — not a fixture that resembles them.
+    ///
+    /// The three cases are the three ways this row can move, and the middle one
+    /// is why every duration is gated rather than only the ratio §9.2 names.
+    ///
+    /// Mutant (applied, confirmed fatal): give `boundary_ratio` `tolerance`
+    /// `0.10` in `Run::metrics` — case 2 then passes and this test fails on its
+    /// assertion. Second mutant (applied, confirmed fatal): make
+    /// `out_of_crate_ns` and `in_crate_ns` `Metric::new(..)` (informational) —
+    /// case 3 passes and this fails there.
+    #[test]
+    fn the_embedding_row_is_gated_at_five_percent_in_every_direction() {
+        let base = baseline_of(&embedding_report(240.0, 200.0));
+
+        // 1. Both halves move 3% the same way: the ratio is unchanged and no
+        //    duration moved past the bound.
+        let quiet = compare(&base, &embedding_report(247.2, 206.0)).expect("baseline");
+        assert!(quiet.passed(), "a 3% shift in both halves: {quiet:?}");
+
+        // 2. The out-of-crate half loses ground against the in-crate one — the
+        //    exact shape a lost `#[inline]` on the cross-crate path has. The
+        //    ratio moves 5.3% while neither absolute number moves more than 5%.
+        let skewed = compare(&base, &embedding_report(240.0, 190.0)).expect("baseline");
+        assert!(!skewed.passed(), "a 5.3% ratio regression passed the gate");
+        assert!(
+            skewed.failures.iter().any(|f| f.contains("boundary_ratio")),
+            "the failure must name the ratio: {:?}",
+            skewed.failures
+        );
+
+        // 3. Both halves get 6% slower and the ratio does not move at all. A
+        //    row gated only on §9.2's quotient would call this clean.
+        let slower = compare(&base, &embedding_report(254.4, 212.0)).expect("baseline");
+        assert!(!slower.passed(), "6% slower on both sides passed the gate");
+        assert!(
+            slower
+                .failures
+                .iter()
+                .any(|f| f.contains("out_of_crate_ns"))
+                && slower.failures.iter().any(|f| f.contains("in_crate_ns")),
+            "both durations must be named: {:?}",
+            slower.failures
+        );
+    }
+
+    /// **`just bench-check` and `just bench-baseline-update` must pass
+    /// `bench_report` the same `--embed-cost`.** This is the failure that
+    /// results when they do not, and it is the reason both recipes depend on
+    /// `just embed-cost`.
+    ///
+    /// The baseline recipe records whatever the embedding row is on the cutting
+    /// host. If the check recipe then runs without the flag,
+    /// [`crate::report::embedding_row`] takes its `None` arm, the row is
+    /// [`Status::Unavailable`], and the one-directional status rule above
+    /// reports a withdrawn claim on **every** subsequent run, for ever, on any
+    /// host where the row resolves. It did not fire on the host this branch was
+    /// written on only because the fitness probe fails there and both sides
+    /// came out `unavailable` — an accident, not a design.
+    ///
+    /// The current row here is the production one, not a fixture: `Options`
+    /// with no `embed_cost` is exactly what a flagless `bench_report` has.
+    ///
+    /// Mutant: drop `--embed-cost` from `bench-check` in the `justfile`.
+    /// Nothing in this crate fails — a `justfile` is not compiled — so this
+    /// test is the record of the shape, and the assertions below are what a
+    /// reader is pointed at when the gate starts failing on the recipe rather
+    /// than on the code.
+    #[test]
+    fn a_baseline_that_measured_the_embedding_row_fails_a_check_that_did_not() {
+        let measured = embedding_report(240.0, 200.0);
+        let base = baseline_of(&measured);
+
+        let mut flagless = embedding_report(240.0, 200.0);
+        flagless.rows[0] =
+            crate::report::embedding_row(&crate::report::Options::default(), &measured.fitness)
+                .expect("the flagless row");
+        assert_eq!(
+            flagless.rows[0].status,
+            Status::Unavailable,
+            "a `bench_report` without --embed-cost must not claim this row"
+        );
+
+        let c = compare(&base, &flagless).expect("baseline");
+        assert!(
+            !c.passed(),
+            "a baseline that measured the row passed a check that could not"
+        );
+        assert!(
+            c.failures.iter().any(|f| {
+                f.contains("embedding_cross_crate") && f.contains("claim was withdrawn")
+            }),
+            "the failure must name the row and the withdrawal: {:?}",
+            c.failures
+        );
+    }
+
     /// A directional metric the baseline does not carry fails; an informational
     /// one does not.
     ///

@@ -32,6 +32,13 @@ tf2 = ["dep:tf_tree_tf2_sys"]
 # Phase 2 shared memory: the multi-process integration test and benchmark.
 # Linux-only; needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
 shm = ["tf_tree/shm"]
+# `docs/PHASE5.md` §9.2's embedding row needs an **in-crate** column, and the
+# crate in question is `tf_tree_core`. Default-off for the same reason
+# `tf_tree_core/bench-probe` is: nothing that ships enables it. `just
+# embed-cost-check` is what compiles, lints and tests this configuration —
+# `cargo nextest run --workspace` builds default features and therefore does
+# not, exactly like `shm`.
+embed-probe = ["tf_tree_core/bench-probe"]
 
 [dependencies]
 tf_tree.workspace = true
@@ -190,6 +197,25 @@ name = "counter_cost"
 [[bin]]
 name = "bench_report"
 path = "src/bin/bench_report.rs"
+
+# **PHASE5 §9.2's embedding row.** `required-features`, because the row's
+# in-crate column is `tf_tree_core::bench_probe` and that module is compiled
+# only under `tf_tree_core/bench-probe`. The out-of-crate column is ordinary code
+# here — the *point* is that the two bodies are identical and only their crate
+# differs — so the binary is useless without the feature and says so at build
+# time rather than by silently measuring one column twice.
+#
+# It is a `bin` rather than a criterion bench because the row is a *program*:
+# two columns timed back to back inside one round so the per-round quotients
+# pair, a JSON handshake between two processes built under two `[profile.*]`
+# sections, and provenance checks on the pair. Criterion estimates one routine
+# at a time and owns the process and the output. Not the profile — `cargo bench`
+# accepts `--profile`; `crates/tf_tree_bench/src/embed.rs` states the reasons
+# `benches/lookup.rs` cannot be extended into this row.
+[[bin]]
+name = "embed_cost"
+path = "src/bin/embed_cost.rs"
+required-features = ["embed-probe"]
 
 # **The A/B differ.** Deliberately no `required-features`: it reads two JSON
 # files and compares them, so it must build — and be testable — in the same

@@ -468,6 +468,65 @@ bench-report *ARGS:
 bench-report-shm *ARGS:
     cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
 
+# **`docs/PHASE5.md` §9.2's two embedding measurements.** One is gated.
+#
+# 1. **GATED, and it is §9.2's row.** Inside *one* build, at one profile, two
+#    identical `#[inline(never)]` depth-3 lookups are timed: one compiled in
+#    `tf_tree_bench` (an embedder's position), one in `tf_tree_core` (the crate
+#    that defines `Plan::at` and the fold). The difference is the crate boundary
+#    and nothing else. §9.2 requires the row be reported at an embedder's default
+#    profile, so it is read off the `[profile.embedder]` run; the
+#    `[profile.release]` run is printed as the control, where `lto = "thin"`
+#    erases the boundary at link time.
+# 2. **EXPLORATORY, and never gated.** The same out-of-crate column across the
+#    two profiles — what `docs/API.md` §2.3 item 2's LTO guidance is worth. Two
+#    processes seconds apart, so it carries the host's full between-run noise;
+#    `docs/PHASE1.md` §11.2's exploratory shape. It is printed and written to
+#    `target/embed-cost/`, and it does not enter `results.json`.
+#
+# `taskset -c 2`, for `cpp-bench`'s reason: an unpinned run migrates cores and
+# swings by far more than the 5% criterion allows. **It requires a CPU 2** — i.e.
+# at least three logical CPUs — and fails outright rather than silently
+# unpinning if there is none. Every run also reports its own round-to-round band,
+# and the gated verdict is `unresolved` — never a pass or a fail — when that band
+# straddles the 5% threshold, so a gate whose noise floor exceeds its threshold
+# reports `unavailable` instead of passing.
+#
+# **Build footprint, measured on this host: `--profile embedder` is a third
+# target directory beside `debug/` and `release/`, `166 MiB` — `rm -rf
+# target/embedder` then a clean `cargo build --profile embedder … --bin
+# embed_cost`, then `du -sh target/embedder`. The whole recipe, both builds and
+# both runs, took 10 s warm.** That is cheap enough that `bench-check` pays it;
+# see its comment.
+#
+# The output pair is left in `target/embed-cost/`. `bench-check` and
+# `bench-baseline-update` depend on this recipe and pass that directory with
+# `--embed-cost`; `just bench-report --embed-cost target/embed-cost` reads the
+# same pair by hand.
+embed-cost:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/embed-cost
+    mkdir -p "$out"
+    cargo build -q --profile embedder -p tf_tree_bench --features embed-probe --bin embed_cost
+    cargo build -q --release -p tf_tree_bench --features embed-probe --bin embed_cost
+    taskset -c 2 ./target/embedder/embed_cost --json "$out/embedder.json"
+    taskset -c 2 ./target/release/embed_cost --json "$out/release.json"
+    ./target/release/embed_cost --compare "$out"
+
+# **fmt / clippy / tests for the default-off `embed-probe` configuration.**
+#
+# `cargo nextest run --workspace` builds default features, so
+# `tf_tree_core::bench_probe` and everything in `tf_tree_bench::embed` that
+# drives it are compiled out of `just test` — exactly like `shm`. This is their
+# gate, and a new `embed-probe`-only test target belongs on this list in the
+# commit that adds it.
+embed-cost-check:
+    cargo fmt --check -p tf_tree_core -p tf_tree_bench
+    cargo clippy -p tf_tree_core --features bench-probe --all-targets -- -D warnings
+    cargo clippy -p tf_tree_bench --features embed-probe --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_bench --features embed-probe -E 'test(/embed/)'
+
 # **`docs/PHASE5.md` §10's "benchmark artifact as a regression gate".**
 #
 # Regenerates the report and compares it against
@@ -488,19 +547,40 @@ bench-report-shm *ARGS:
 #
 # `--out target/bench-report` and not `report/`: this is a check, and it should
 # not clobber a report somebody generated to look at.
-bench-check:
+#
+# **§9.2's embedding row is measured here, and it must be**, because
+# `bench-baseline-update` below measures it too. The baseline gate compares row
+# *status* in one direction only: a row that is `measured` in the committed
+# baseline and is not one now is a withdrawn claim and a hard failure
+# (`src/baseline.rs`). So a baseline cut with `--embed-cost` and a check run
+# without it is a gate that fails on the difference between two recipes, on any
+# host where the row resolves — it did not fire on this host only because the
+# fitness probe fails here and both sides came out `unavailable`. **The two
+# paths take the same flag; do not make one of them cheaper.**
+#
+# The cost is the `embed-cost` recipe's: a 166 MiB `target/embedder` tree and
+# 10 s, both measured — next to the minutes this suite already spends assembling
+# the report. `bench_report` still runs without the flag (`just bench-report`);
+# the row then says so and names `just embed-cost` rather than disappearing.
+bench-check: embed-cost
     cargo run --release -p tf_tree_bench --bin bench_report -- \
         --out target/bench-report \
+        --embed-cost target/embed-cost \
         --check-baseline crates/tf_tree_bench/baseline/results.json
 
 # Regenerate the committed baseline. **Run this deliberately, and put the diff
 # in the same commit as the change that causes it** — the diff is the record of
 # what moved and it is the only place a reviewer sees it.
 #
+# It depends on `embed-cost` for the same reason `bench-check` does, and the two
+# must keep agreeing: whatever the check can produce, the baseline must record,
+# or the status comparison fails on the recipe rather than on the code.
+#
 # `index.html` is not committed: it is a rendering of `results.json` and a second
 # copy that can disagree with the first.
-bench-baseline-update:
-    cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report
+bench-baseline-update: embed-cost
+    cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report \
+        --embed-cost target/embed-cost
     cp target/bench-report/results.json crates/tf_tree_bench/baseline/results.json
 
 # --- The performance suite (exploratory; NOT the `bench-check` gate) ---------

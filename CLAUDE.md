@@ -138,6 +138,7 @@ Everything goes through `just`; CI mirrors it 1:1.
 | `just build` | `cargo build --workspace --all-targets` |
 | `just test` | `cargo nextest run --workspace` + doctests. **`--workspace` builds default features**, so anything `#[cfg]`-ed on `shm` is compiled out of it — those targets are `just shm-check`'s, not this one's |
 | `just shm-check` | fmt/clippy/tests for everything behind the default-off `shm` feature, named target by target. A new `shm`-only test target belongs on that list in the commit that adds it |
+| `just embed-cost` / `embed-cost-check` | `docs/PHASE5.md` §9.2's two embedding measurements — the **gated** crate-boundary row and the **exploratory** profile comparison. `embed-cost-check` is the gate for the default-off `embed-probe` / `bench-probe` features, which `just test` compiles out exactly like `shm`. `embed-cost` builds a third target directory (`--profile embedder`, 166 MiB measured) and `just bench-check` / `just bench-baseline-update` both depend on it — they must, or the baseline gate fails on the difference between the two recipes rather than on the code |
 | `just test-doc-error-codes` | the `compile_fail,E0277` pins, on nightly — stable rustdoc ignores the error code, so `just test-doc` does not check them |
 | `just lint` | `cargo fmt --check`, `clippy -D warnings`, `cargo deny check` |
 | `just fmt` | auto-format + clippy `--fix` |
