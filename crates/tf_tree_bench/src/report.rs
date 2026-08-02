@@ -1590,6 +1590,13 @@ fn worse_entries(opts: &Options) -> Vec<Worse> {
 /// left to the reader: the overhead distribution is not the same shape as the
 /// measurement's, so a subtracted percentile would be a fabrication.
 ///
+/// **The query stamp is [`crate::fixture::QUERY_NS`], which interpolates.** It
+/// was [`crate::fixture::NOW_NS`], a knot on every dynamic grid, so this row —
+/// the one the report publishes as a lookup latency — timed `bracket` plus the
+/// seqlock read with `I::eval` never running (`docs/decisions/0013`). Reading
+/// any figure published before that change against one published after it is a
+/// comparison between two different measurements.
+///
 /// # Errors
 ///
 /// Any fixture failure.
@@ -1609,7 +1616,7 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
         .plan(target, source)
         .map_err(|e| anyhow!("compiling the map <- imu_link plan: {e:?}"))?;
     let guard = tree.guard();
-    let stamp: Stamp = Stamp::from_nanos(crate::fixture::NOW_NS);
+    let stamp: Stamp = Stamp::from_nanos(crate::fixture::QUERY_NS);
 
     // §9.3: warm, then discard, and state how long. Time-based rather than
     // iteration-based so the stated number is the one the report prints.

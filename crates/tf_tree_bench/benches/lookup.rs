@@ -2,17 +2,22 @@
 //
 // Setup (tree build, history population, plan compile, guard) happens outside the
 // timed closure, so each sample measures only plan evaluation against the seqlock
-// rings — the depth-3 row is the one the go/no-go gate cares about (p50 < 150 ns
-// ScLerp / < 100 ns LerpSlerp). These runs are NOT the official gate: that needs
-// dedicated, core-pinned hardware.
+// rings — the depth-3 row is the one the go/no-go gate cares about. These runs
+// are NOT the official gate: that needs dedicated, core-pinned hardware.
 //
-// **This file is not `docs/PHASE5.md` §9.2's cross-crate row, and cannot be
-// extended into it.** That row needs a denominator compiled *inside*
+// **The stamp is `fixture::QUERY_NS`, not `fixture::NOW_NS`, and that is the
+// whole subject of `docs/decisions/0013`.** `NOW_NS` is a knot on all four
+// dynamic grids, so every edge took `SampleRing::sample`'s exact-hit branch and
+// `I::eval` never ran: what this file used to report as "depth-3 lookup" was
+// `bracket` plus the seqlock read, with the interpolator — the thing the gate
+// exists to bound — absent. `QUERY_NS` is 500 µs off every grid; `fixture`'s
+// `the_latency_query_stamp_is_off_every_dynamic_grid` pins that.
+//
+// **This file is still not `docs/PHASE5.md` §9.2's cross-crate row, and cannot
+// be extended into it.** That row needs a denominator compiled *inside*
 // `tf_tree_core`, and every body a bench target here compiles is codegen'd in
-// `tf_tree_bench`; it also needs both halves to interpolate, and `bench_pair`
-// below queries `fixture::NOW_NS`, which is a knot on all three dynamic edges of
-// the depth-3 path (`docs/decisions/0013`). `crates/tf_tree_bench/src/embed.rs`
-// states the three reasons in full, under "Why not `benches/lookup.rs`".
+// `tf_tree_bench`. `crates/tf_tree_bench/src/embed.rs` states the reasons in
+// full, under "Why not `benches/lookup.rs`".
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -30,7 +35,7 @@ fn bench_pair(c: &mut Criterion, label: &str, target: &str, source: &str, interp
     let s = tree.frame(source).expect("source frame");
     let plan = tree.plan(t, s).expect("compile plan");
     let guard = tree.guard();
-    let stamp: Stamp = Stamp::from_nanos(fixture::NOW_NS);
+    let stamp: Stamp = Stamp::from_nanos(fixture::QUERY_NS);
 
     c.bench_function(label, |b| {
         b.iter(|| black_box(plan.at(&guard, black_box(stamp)).expect("eval")));

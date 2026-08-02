@@ -25,7 +25,30 @@ pub const HISTORY_SECS: f64 = 10.0;
 /// The lidar edge (10 Hz, 100 samples over 10 s) has the shortest reach; its
 /// newest stamp is `9.9 s`. Picking `9.9 s` as "now" keeps `At(now)` and
 /// `At(now − 100 ms)` valid on all four edges without extrapolation.
+///
+/// **It is a knot on all four grids, deliberately and permanently.** `9.9 s` is
+/// an exact multiple of every dynamic period here (20 ms, 5 ms, 1 ms, 100 ms),
+/// and [`spin_up`] publishes each edge from stamp `0`, so a query *at* `NOW_NS`
+/// takes `SampleRing::sample`'s exact-hit branch on every edge and the
+/// interpolator never runs. That is what made it the right anchor for a
+/// *history window* and the wrong stamp for a *latency* measurement
+/// (`docs/decisions/0013`). A latency benchmark queries [`QUERY_NS`]; do not
+/// "tidy" that offset away.
 pub const NOW_NS: i64 = 9_900_000_000;
+
+/// The stamp every **latency** benchmark queries: [`NOW_NS`] moved off all four
+/// sample grids, so `I::eval` actually runs.
+///
+/// 500 µs is off-grid for the 20 ms, 5 ms, 1 ms and 100 ms periods alike, and
+/// still inside every retained window (the newest 1 kHz sample is at 9.999 s,
+/// the newest 10 Hz sample at 9.9 s). The resulting interpolation fractions are
+/// 0.975 (50 Hz), 0.9 (200 Hz), 0.5 (1 kHz) and 0.995 (10 Hz) — non-zero on
+/// every edge, which is the whole property being bought.
+///
+/// The on-grid case is the *best* case, not the normal one: a consumer queries
+/// at a sensor stamp or a control tick, and landing exactly on a publisher's
+/// grid is the coincidence.
+pub const QUERY_NS: i64 = NOW_NS - 500_000;
 
 /// What an [`EdgeDef`] describes.
 #[derive(Clone, Copy, Debug)]
@@ -345,4 +368,88 @@ pub fn populated_tree() -> Result<(Tree, Vec<PushSample>)> {
         samples
     };
     Ok((tree, samples))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::{build_tree, DYNAMIC_EDGES, NOW_NS, QUERY_NS};
+    use crate::workload::dyn_steps;
+
+    /// The two stamps' relationship to the sample grids, asserted rather than
+    /// commented — `docs/decisions/0013` exists because the on-grid property was
+    /// a coincidence nobody had written down, and the fix is one subtraction that
+    /// a tidying pass would delete without noticing.
+    ///
+    /// [`super::spin_up`] publishes edge `k` at `0, period, 2·period, …`, so
+    /// "on the grid" is exactly "divisible by the period".
+    ///
+    /// Mutant (applied, confirmed fatal): `QUERY_NS = NOW_NS` — the second
+    /// assertion fires on the first edge, naming the 50 Hz period.
+    #[test]
+    fn the_latency_query_stamp_is_off_every_dynamic_grid() {
+        assert!(!DYNAMIC_EDGES.is_empty());
+        for &(parent, child, rate_hz) in DYNAMIC_EDGES {
+            let period_ns = (1e9 / rate_hz) as i64;
+            // The trap: NOW_NS is a knot on every grid, which is why it is not
+            // the stamp a latency benchmark may use.
+            assert_eq!(
+                NOW_NS % period_ns,
+                0,
+                "{parent}->{child}: NOW_NS is documented as on-grid at {rate_hz} Hz"
+            );
+            // The fix: QUERY_NS is not, so `I::eval` runs on every edge.
+            assert_ne!(
+                QUERY_NS % period_ns,
+                0,
+                "{parent}->{child}: QUERY_NS lands on the {rate_hz} Hz grid, so \
+                 that edge takes the exact-hit branch and never interpolates"
+            );
+            // …and it interpolates rather than extrapolates: NOW_NS is a knot on
+            // every grid and no later than each edge's newest sample, so a stamp
+            // inside `(NOW_NS − period, NOW_NS)` is bracketed by two stored
+            // samples on every edge.
+            assert!(
+                QUERY_NS < NOW_NS && QUERY_NS > NOW_NS - period_ns,
+                "{parent}->{child}: QUERY_NS must fall inside the segment ending \
+                 at NOW_NS, or that edge extrapolates instead of interpolating"
+            );
+        }
+    }
+
+    /// What each row of `benches/lookup.rs` actually compiles to.
+    ///
+    /// `docs/PHASE1.md` §11.3 is NORMATIVE that "every reported latency row must
+    /// state its dynamic-step count, not just its nominal depth" — the two
+    /// readings differ by ~2.8× — and the gate's row is the *three dynamic steps*
+    /// one. The `depth6` row is the interesting case: six edges, four of them
+    /// static, which fold to a single constant step, so it is **cheaper** than
+    /// `depth3` rather than twice as expensive. `docs/decisions/0013`'s
+    /// re-baseline reads a per-step cost out of the three rows together, and that
+    /// arithmetic is only valid if these shapes are what it assumes.
+    ///
+    /// Mutant (applied, confirmed fatal): declare `base_link -> sensor_arch`
+    /// dynamic instead of static in [`super::EDGES`] — *assertion `left == right`
+    /// failed: depth6: compiled step count, left: 4, right: 3*. The dynamic-count
+    /// assertion is not reached, because the step count is checked first.
+    #[test]
+    fn the_benched_paths_have_the_step_counts_the_baseline_assumes() {
+        let tree = build_tree().expect("fixture");
+        let plan_for = |target: &str, source: &str| {
+            let t = tree.frame(target).expect("target frame");
+            let s = tree.frame(source).expect("source frame");
+            tree.plan(t, s).expect("compile plan")
+        };
+        // (label, target, source, compiled steps, of which dynamic)
+        for (label, target, source, len, dyn_) in [
+            ("depth1", "odom", "map", 1, 1),
+            ("depth3", "imu_link", "map", 3, 3),
+            ("depth6", "camera_optical", "map", 3, 2),
+        ] {
+            let plan = plan_for(target, source);
+            assert_eq!(plan.len(), len, "{label}: compiled step count");
+            assert_eq!(dyn_steps(&plan), dyn_, "{label}: dynamic step count");
+        }
+    }
 }
