@@ -143,16 +143,12 @@ of these on an edge in the **`SystemDomain`** (wall clock, tag 0) is usually not
 a publisher fault at all: `CLOCK_REALTIME` is not monotone, and an NTP step or a
 leap second moves it backwards. Invariant 6 then rejects every stamp until the
 clock catches up — correct behaviour that looks exactly like a broken node.
-`doctor`'s `TFT019` makes that call for you: same evidence as `TFT018`, plus the
-domain tag, reported as a clock step rather than as a publisher fault. Restarting
-the publisher will not help; the data lost during the step is gone either way.
-
-On any other tag `TFT019` **skips and says which tag** rather than guessing —
-`Domain` is an open trait and a user-declared tag carries no way to state that
-its clock can step. There, `TFT018` alone is the answer and the publisher is the
-place to look. When *some* of the affected edges are on tag 0 and others are not,
-it fires on the first set and names the second in the report's `note:` lines,
-which is the only place a check that ran can say what it did not cover.
+`doctor`'s `TFT019` makes that call for you *when it has a recorded push stream
+to make it from*: same evidence as `TFT018`, plus the domain tag, reported as a
+clock step rather than as a publisher fault. Restarting the publisher will not
+help; the data lost during the step is gone either way. Read to the end of this
+section before you reach for it on a running robot — today it has nothing to say
+there, and that is stated below rather than left to be discovered.
 
 **It fires on a run, not on one inversion.** A single stamp out of place on a
 wall-clock edge is a publisher fault, so `TFT019` needs a *burst*: at least eight
@@ -161,14 +157,27 @@ periods, so 8 ms at 1 kHz or 80 ms at 100 Hz. Below that it passes and says so i
 a `note:` line, and `TFT018` still reports the rejected pushes. **Eight is this
 implementation's number, not the specification's.**
 
+On any other tag `TFT019` **skips and says which tag** rather than guessing —
+`Domain` is an open trait and a user-declared tag carries no way to state that
+its clock can step. There, `TFT018` alone is the answer and the publisher is the
+place to look. When *some* of the affected edges are on tag 0 and others are not,
+it fires on whichever of the tag-0 edges cleared the run length above, and names
+everything it did not attribute — the other tags, and any tag-0 edge whose
+rejections were too scattered — in the report's `note:` lines, which is the only
+place a check that ran can say what it did not cover.
+
 **On a live arena `TFT019` does not run at all**, because `TFT018` does not:
 the push stream is reconstructed from a ring being written while it is read, so a
 slot at the old end can already hold the next lap's sample. Both say so.
 
-That leaves `doctor` with nothing to say about a clock step on a running system,
-because `tf_tree doctor` has exactly two sources — the built-in fixture and
-`--attach` — and no way to read a recording. **The command that diagnoses a clock
-step from a bag is `tf_tree ingest`, not `doctor`:**
+**Read that skip as the whole of what `TFT019` can tell you about a deployment.**
+`tf_tree doctor` has exactly two sources — the built-in fixture and `--attach` —
+and no way to read a recording, so on a real system the live skip is the only
+outcome either `TFT018` or `TFT019` can produce. Neither is a check you can wait
+to see fire on a robot; **their silence there is not an all-clear**, it is the
+absence of a source. Giving `doctor` a file source is known work and is not done;
+until it is, **the command that diagnoses a clock step from a bag is
+`tf_tree ingest`, not `doctor`:**
 
 ```
 tf_tree ingest --bag run.mcap
@@ -391,7 +400,7 @@ Almost certainly a bug — topology should be near-static after startup.
 | `inconsistent-rate` | A frame published at a wildly varying rate | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
-| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena |
+| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena — which, `doctor` having no recording source, is the only outcome either of them has on a deployment |
 
 ---
 

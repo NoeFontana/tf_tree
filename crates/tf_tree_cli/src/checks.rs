@@ -329,7 +329,7 @@ pub struct Inputs<'a> {
     /// `TFT018`'s per-edge evidence, already split by domain tag and by whether
     /// its rejections are concentrated.
     ///
-    /// A field rather than a call inside [`tft019`] because
+    /// A field rather than a call inside `tft019` because
     /// [`ClockStepEvidence::coverage_note`] needs the same split for
     /// `Meta.notes`, and the two must be the same split rather than two walks
     /// that happen to agree.
@@ -1173,7 +1173,7 @@ const CLOCK_STEP_MIN_REJECTED_RUN: usize = 8;
 /// How `TFT019` split `TFT018`'s per-edge evidence: what it attributed to a
 /// wall-clock step, what was too diffuse to be one, and what it would not judge.
 ///
-/// **Captured once per `doctor` run and read twice** — by [`tft019`] and by
+/// **Captured once per `doctor` run and read twice** — by `tft019` and by
 /// [`ClockStepEvidence::coverage_note`]. That is why it is a field of [`Inputs`]
 /// rather than a call inside each reader: two captures could not disagree today,
 /// but the report would then be walking `obs` once per reader to answer one
@@ -1243,7 +1243,7 @@ impl ClockStepEvidence {
         ev
     }
 
-    /// The disclosure that pairs with [`tft019`]'s outcome: which edges its
+    /// The disclosure that pairs with `tft019`'s outcome: which edges its
     /// result does *not* cover.
     ///
     /// `None` when the outcome already carries the whole story — nothing was
@@ -1387,6 +1387,17 @@ fn tag_refusal(tag: u8) -> &'static str {
 /// `TFT018` stays an error and keeps failing `doctor --exit-code`; this is a
 /// warn that explains it. Rejected pushes are lost data whatever caused them.
 ///
+/// # It cannot reach a verdict on a deployment today, and the skip says so
+///
+/// This check needs a *recorded* push stream, and `doctor` has exactly two
+/// sources — the built-in fixture and a live `--attach` (`crate::Source`). It
+/// skips on the second, so outside the fixture it never runs. That is a real
+/// limitation and not a caveat: a diagnostic whose silence reads as an
+/// all-clear is worse than no diagnostic, which is why the live skip reason
+/// states it in the report rather than leaving it to `docs/`. Wiring a third
+/// source is a feature (`Tree::open_frozen` already exists behind `shm`), not a
+/// fix, and it unblocks `TFT018` at the same time.
+///
 /// # Skips and passes
 ///
 /// * **Live arena** — skipped, inheriting `TFT018`'s skip rather than working
@@ -1409,7 +1420,12 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
             "inherited from TFT018, whose evidence this is: a live arena's push stream is \
              reconstructed from a ring that is being written while it is read, so a slot at the \
              old end can already hold the next lap's sample — attributing that artifact to a \
-             clock step would put a cause on an effect that never happened",
+             clock step would put a cause on an effect that never happened. Read this skip as \
+             the whole answer TFT019 has for a deployment: doctor's only sources are this \
+             attach and the built-in fixture, so it never sees the recorded push stream this \
+             check needs, and no doctor run on a real system can reach a verdict here. \
+             `tf_tree ingest --bag` diagnoses a backwards clock from a recording today — by a \
+             different rule (a per-edge --clock-reset-threshold), not by this check",
         );
     }
     let ev = inp.clock_step;
@@ -2344,8 +2360,18 @@ mod tests {
     /// an NTP step would put a fabricated cause on a fabricated effect — worse
     /// than `TFT018`'s silence, because it names a culprit.
     ///
+    /// **And the skip is where the reachability limit is stated.** `doctor` has
+    /// two sources, the built-in fixture and a live `--attach`, so this skip is
+    /// the only outcome `TFT019` can produce on a deployment. An operator who
+    /// only ever meets a `skip` line has to be told that from the line itself —
+    /// a check whose silence reads as an all-clear is worse than no check.
+    ///
     /// Mutant: `if inp.live` -> `if false` in `tft019`. Applied: the `Skipped`
     /// match panics with "expected a skip on a live arena, got Fired".
+    /// Mutant B: delete the "doctor's only sources are this attach and the
+    /// built-in fixture" sentence from the skip reason. Applied: the
+    /// reachability assertion fails — "the skip is the only outcome TFT019 can
+    /// produce on a deployment, so it has to say so".
     #[test]
     fn tft019_inherits_tft018s_live_arena_skip() {
         const MS: i64 = 1_000_000;
@@ -2363,6 +2389,15 @@ mod tests {
                 ),
                 other => panic!("expected a skip on a live arena, got {other:?}"),
             }
+        }
+        match &tft019(&inp).status {
+            Status::Skipped(why) => assert!(
+                why.contains("doctor's only sources are this attach and the built-in fixture")
+                    && why.contains("tf_tree ingest --bag"),
+                "the skip is the only outcome TFT019 can produce on a deployment, so it has to \
+                 say so — and point at the command that can answer the question: {why}"
+            ),
+            other => panic!("expected a skip on a live arena, got {other:?}"),
         }
         assert_eq!(
             ClockStepEvidence::capture(&snap, &obs).coverage_note(true),
@@ -2433,11 +2468,24 @@ mod tests {
     /// a clock step on an edge it did not report as out of order, or the
     /// reverse.
     ///
-    /// Mutant: in `clock_step_evidence`, replace `doctor::out_of_order_runs(obs)`
-    /// with a local re-derivation over `obs.by_edge()` that uses `<=` instead of
-    /// `<`. Applied: `TFT018` still passes on the equal-stamps stream while
-    /// `TFT019` attributes it, and the `tft019` assertion fails with
-    /// `left: Fired`, `right: Pass` — the two had drifted apart by one
+    /// **The fixture is sized to the shipped threshold, and that is the whole
+    /// design of this test.** Invariant 6 *accepts* a repeated stamp — replay is
+    /// idempotent — so a stream of identical stamps is one the real producer
+    /// finds nothing in at all. A producer that had drifted by one character to
+    /// `<=` counts every repeat as a rejection, so the stream is
+    /// [`CLOCK_STEP_MIN_REJECTED_RUN`]` + 1` samples long: exactly enough for
+    /// the drifted count to clear [`CLOCK_STEP_MIN_REJECTED_RUN`] and be
+    /// *attributed*. A shorter stream is not equivalent — the drifted run would
+    /// land in `diffuse` instead, and the only thing left to notice it would be
+    /// the wording of a coverage note, which is not the invariant this pins.
+    ///
+    /// Mutant: in [`ClockStepEvidence::capture`], replace
+    /// `doctor::out_of_order_runs(obs)` with a local re-derivation over
+    /// `obs.by_edge()` — the body of [`doctor::out_of_order_runs`] copied in
+    /// with both of its `<` stamp tests written `<=`. Applied: `TFT018` still
+    /// passes on the equal-stamps stream, because it still calls the real
+    /// producer, while `TFT019` attributes it, and the `tft019` assertion fails
+    /// with `left: Fired`, `right: Pass` — the two had drifted apart by one
     /// character.
     #[test]
     fn tft019_considers_exactly_the_edges_tft018_fired_on() {
@@ -2445,23 +2493,28 @@ mod tests {
         let snap = chain_with_domains(0, 0);
         // Repeated stamps are *accepted* by invariant 6 — replay is idempotent —
         // so neither check may treat them as a regression.
-        let obs = Observations::from_samples(vec![
-            PushSample {
+        let repeats: Vec<PushSample> = (0..=CLOCK_STEP_MIN_REJECTED_RUN)
+            .map(|_| PushSample {
                 edge: 1,
                 writer_pid: 4711,
                 stamp_ns: 100 * MS,
                 arrival_delay_ns: 0,
-            },
-            PushSample {
-                edge: 1,
-                writer_pid: 4711,
-                stamp_ns: 100 * MS,
-                arrival_delay_ns: 0,
-            },
-        ]);
+            })
+            .collect();
+        assert!(
+            repeats.len() > CLOCK_STEP_MIN_REJECTED_RUN,
+            "a producer that counted repeats as rejections has to reach the attribution \
+             threshold on this fixture, or the drift shows up as a note instead of a firing"
+        );
+        let obs = Observations::from_samples(repeats);
         let inp = inputs(&snap, &obs, &[], Clock::Wall(0));
         assert_eq!(tft018(&inp).status, Status::Pass);
-        assert_eq!(tft019(&inp).status, Status::Pass);
+        assert_eq!(
+            tft019(&inp).status,
+            Status::Pass,
+            "the attribution must read invariant 6's rule from TFT018's producer, not a \
+             second copy of it"
+        );
 
         // And where TFT018 does fire, TFT019 considers exactly its edges.
         let mut events = stepped_back(1, 100 * MS);

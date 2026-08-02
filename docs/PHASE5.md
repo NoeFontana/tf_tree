@@ -1143,6 +1143,33 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > `TFT017`/`TFT018` amendment establishes: ids are a public contract, appending
 > is additive, and none is ever recycled or given a second meaning.
 >
+> > **Amendment — `TFT019` cannot fire on a deployment, and that is stated
+> > rather than discovered.** The check needs a *recorded* push stream, and
+> > `doctor` has exactly two sources: the built-in reference fixture and a live
+> > `--attach`. It skips on the second — the live-arena rule the third bullet
+> > above states — so outside the fixture it never reaches a verdict at all.
+> > **`TFT018` is in the same
+> > position for the same reason** — the live skip is where both of them stop.
+> >
+> > This is recorded as a limitation and not a caveat, because a diagnostic that
+> > silently never fires is worse than no diagnostic: its silence reads as an
+> > all-clear on the exact fault it was written to name. So it is said in the
+> > three places it can be met — the live skip reason in the report itself, this
+> > amendment, and `RUNBOOK.md`'s `NonMonotonicStamp` section — and none of them
+> > may be quietly dropped while the limitation stands.
+> >
+> > **What would lift it is a third `doctor` source, and that is a feature, not a
+> > fix.** `Tree::open_frozen` (§2.1, behind `shm`) already reads a `.tft` back
+> > through the ordinary `Tree` API, and `Observations::from_arena` already
+> > builds a push stream from any `Tree`'s rings — so a `doctor --from-file`
+> > needs a third `Source` variant whose "is this live" answer is **no** (a
+> > frozen file has no concurrent writer, which is the entire reason for the live
+> > skip) and a flag to select it, not new evidence machinery. It is deliberately
+> > *not* in this commit: it changes `doctor`'s input surface, and that is its own
+> > change with its own review. Until then, a backwards clock in a recording is
+> > diagnosed by `tf_tree ingest --bag`'s per-edge `--clock-reset-threshold`
+> > guard (§3), which is a different rule and not this check.
+>
 > **Paired with a documentation line, not just a check:** anything published at
 > rate should declare a steady or PTP domain rather than the system wall clock —
 > `SteadyDomain` (tag 3) since the amendment above, or, `Domain` being an open
