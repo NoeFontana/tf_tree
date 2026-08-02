@@ -44,7 +44,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use tf_tree::{EdgeKind, Tree};
+use tf_tree::unstable::EdgeKind;
+use tf_tree::Tree;
 use tf_tree_bench::fixture::PushSample;
 use tf_tree_bridge::names::NameNormalizer;
 use tf_tree_ingest::source::read_tf;

@@ -1304,7 +1304,7 @@ fn unclaimed_coverage_note(snap: &Snapshot) -> Option<String> {
     let dynamic = snap
         .edges
         .iter()
-        .filter(|e| e.kind == tf_tree::EdgeKind::Dynamic)
+        .filter(|e| e.kind == tf_tree::unstable::EdgeKind::Dynamic)
         .count();
     if dynamic == 0 || doctor::check_unclaimed_dynamic(snap).len() != dynamic {
         return None;
