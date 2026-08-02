@@ -147,8 +147,9 @@ clock catches up — correct behaviour that looks exactly like a broken node.
 to make it from*: same evidence as `TFT018`, plus the domain tag, reported as a
 clock step rather than as a publisher fault. Restarting the publisher will not
 help; the data lost during the step is gone either way. Read to the end of this
-section before you reach for it on a running robot — today it has nothing to say
-there, and that is stated below rather than left to be discovered.
+section before you reach for it on a running robot — **the source it needs is a
+recording, not an attach**, and that is stated below rather than left to be
+discovered.
 
 **It fires on a run, not on one inversion.** A single stamp out of place on a
 wall-clock edge is a publisher fault, so `TFT019` needs a *burst*: at least eight
@@ -166,18 +167,34 @@ everything it did not attribute — the other tags, and any tag-0 edge whose
 rejections were too scattered — in the report's `note:` lines, which is the only
 place a check that ran can say what it did not cover.
 
-**On a live arena `TFT019` does not run at all**, because `TFT018` does not:
-the push stream is reconstructed from a ring being written while it is read, so a
-slot at the old end can already hold the next lap's sample. Both say so.
+**Point it at a recording. That is the source these two checks need:**
 
-**Read that skip as the whole of what `TFT019` can tell you about a deployment.**
-`tf_tree doctor` has exactly two sources — the built-in fixture and `--attach` —
-and no way to read a recording, so on a real system the live skip is the only
-outcome either `TFT018` or `TFT019` can produce. Neither is a check you can wait
-to see fire on a robot; **their silence there is not an all-clear**, it is the
-absence of a source. Giving `doctor` a file source is known work and is not done;
-until it is, **the command that diagnoses a clock step from a bag is
-`tf_tree ingest`, not `doctor`:**
+```
+tf_tree doctor --from-bag run.mcap
+```
+
+A recording is written in log order, so a stamp that went backwards is *in the
+file* at the position it arrived at — which is exactly what invariant 6 would
+have rejected and exactly what these two checks are about. The §3.2 ingest report
+goes to stderr, so `--json` still gives you a document to pipe.
+
+**Neither `--attach` nor `--from-file` can answer them, and the two fail
+differently.**
+
+* On a **live arena** the push stream is reconstructed from a ring being written
+  while it is read, so a slot at the old end can already hold the next lap's
+  sample — an inversion the publisher never made.
+* On a **frozen `.tft`** there is no writer and the read is exact, and it still
+  cannot answer: an arena's ring holds only the pushes the engine *accepted*.
+  `SampleRing::push` refuses an out-of-order stamp, so the arrival these checks
+  report was never stored. Running there would pass every `.tft` ever written.
+
+Both skips say so in the report. **Their silence on an arena is not an
+all-clear**, it is the absence of the evidence — which is why the skip reason
+names `--from-bag` rather than merely stating a limitation.
+
+`tf_tree ingest` remains the tool for a clock step **past** the reset threshold,
+because such a recording does not ingest at all and so never reaches `doctor`:
 
 ```
 tf_tree ingest --bag run.mcap
@@ -312,6 +329,44 @@ conjure an empty arena and then report it healthy.
 recorded push stream — `multi-writer` cannot see a writer that has already been
 replaced, and `short-buffer` needs each sample's arrival lateness, which nothing
 in the arena records. Neither can fire on a live arena, so neither is claimed.
+
+### Why `doctor --from-bag` reports `TFT010` and `TFT011` as *not run*
+
+Because they have nothing to read, and saying so is the point.
+
+Both are built on the `docs/PHASE5.md` §5 counters, and those are incremented by
+**lookups**. An arena built from a recording has been written and never read —
+the ingest publishes into it and asks it nothing — so every counter is zero. A
+zero extrapolation count is also exactly what a healthy, heavily-used arena
+looks like, so a `pass` there would be an all-clear about instrumentation nobody
+had exercised. `doctor` skips instead and names the reason.
+
+**This is not specific to `--from-bag`.** The same skip appears on the built-in
+fixture, and on a live arena you attach to *before its first consumer has done a
+lookup* — which is the most likely moment to run `doctor` at bringup. Run one
+consumer, then re-run `doctor`, and both checks come back.
+
+To get a verdict on extrapolation, point `doctor` at the arena the consumers are
+actually using:
+
+```
+tf_tree doctor --attach          # after consumers have been running
+```
+
+`TFT011` is two checks under one id and skips only when both halves are blind;
+where one half still has evidence it runs and the report's `note:` lines say
+which half could not fire.
+
+### Why `doctor --from-bag` warns `TFT017` on every edge
+
+An arena built from a recording has **no writer at all** — the ingest's claims
+are released when it finishes — so *dynamic edge with no live writer* is true of
+every dynamic edge in it. The report says so in a `note:` line: the finding
+names the arena, not any edge in it.
+
+It is a warning rather than a skip on purpose. A fleet whose publishers have all
+stopped produces the identical arena state, and that is the fault this check
+exists to name. On a recording, ignore it; on an `--attach`, do not.
 
 ### Reading `tf_tree participants`
 

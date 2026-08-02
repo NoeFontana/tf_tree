@@ -1185,6 +1185,13 @@ shm-check:
     # `merge` closure that only exists under `shm`, so the build an operator
     # actually attaches with was compiled by clippy here and executed nowhere.
     cargo nextest run -p tf_tree_cli --features shm --test web
+    # **`doctor --from-file` (`docs/PHASE5.md` §6), which needs the frozen
+    # backend and therefore `--features shm`.** The `--from-bag` half of the
+    # same feature runs under `just test` — ingest needs no features — so
+    # without this line only one of `doctor`'s two recording sources would be
+    # gated, and the one left out is the one that carries the *skip* proving
+    # `TFT018`/`TFT019` do not pass vacuously on a `.tft`.
+    cargo nextest run -p tf_tree_cli --features shm --test doctor_frozen
     # **The frozen `.tft` arena (`docs/PHASE5.md` §2), which needs a real
     # mapping and therefore `--features shm`.** Without these two lines the
     # branch that introduced it had its centrepiece — §2.1's bit-for-bit proof

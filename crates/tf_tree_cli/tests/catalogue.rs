@@ -42,7 +42,7 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
         arena_bytes: tree.arena_size_bytes() as u64,
         occupancy: checks::occupancy_of(&tree),
         clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
-        live: false,
+        stream: checks::PushStream::Observed,
         counters: tf_tree::counters_compiled_in(),
     };
     let report = checks::run(&inputs, &BTreeSet::new());
@@ -300,7 +300,7 @@ capacity = 64
             arena_bytes: tree.arena_size_bytes() as u64,
             occupancy: checks::occupancy_of(&tree),
             clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
-            live: true,
+            stream: checks::PushStream::RingsUnderWriter,
             counters: tf_tree::counters_compiled_in(),
         },
         &BTreeSet::new(),
