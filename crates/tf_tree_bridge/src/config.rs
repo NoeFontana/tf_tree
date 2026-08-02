@@ -43,7 +43,7 @@
 //! ```toml
 //! [topology]
 //! interp = "sclerp"          # default for dynamic edges: sclerp | lerpslerp
-//! domain = "system"          # default: system | sensor | 0..=255
+//! domain = "system"          # default: system | sensor | sim | steady | 0..=255
 //! frames = ["map"]           # frames with no edge yet (lookup endpoints)
 //! frame_headroom = 8         # spare name slots for `Tree::frame()`
 //!
@@ -61,8 +61,17 @@
 //! history_secs = 10.0
 //! # capacity = 512           # …or say it outright. Not both.
 //! interp = "lerpslerp"       # optional per-edge overrides
-//! domain = 1
+//! domain = "sensor"          # …or a bare tag, for a user-declared domain
 //! ```
+//!
+//! **The `domain` lines above are not free-standing, and that example is not a
+//! config every bridge starts with.** [`TopologyConfig::check_domain`] refuses,
+//! at startup, any *dynamic* edge whose resolved domain differs from the tag
+//! the bridge itself stamps in — `ros/tf_tree_ros`'s `time_domain` parameter,
+//! reaching this crate as `tft_bridge_options::domain`. The one dynamic edge
+//! above overrides the file default to `"sensor"`, so that file starts a bridge
+//! only when that tag is `1`. Static edges are exempt: a constant carries no
+//! stamp for a domain to be wrong about.
 //!
 //! `rate_hz` does **two** things, and the second is why writing `capacity`
 //! instead is not a free simplification: it sizes the ring, and it is recorded
@@ -86,7 +95,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Iso3, Quat, TreeBuilder, Vec3};
+use tf_tree::{
+    Capacity, Domain, EdgeCfg, InterpPolicy, Iso3, Quat, SensorDomain, SimDomain, SteadyDomain,
+    SystemDomain, TreeBuilder, Vec3,
+};
 
 use crate::names::NameNormalizer;
 
@@ -180,6 +192,12 @@ pub struct TopologyConfig {
     /// Default interpolation for dynamic edges that do not override it.
     pub default_interp: InterpPolicy,
     /// Default time-domain tag for edges that do not override it.
+    ///
+    /// A `u8` and not one of the built-in domain *types*, because [`Domain`] is
+    /// an open trait: a user-declared domain picks a free tag from 4 upwards
+    /// (`docs/API.md` §2.5) and there is no type here to name it with. The four
+    /// built-ins are spellable by name in the file — `system`, `sensor`, `sim`,
+    /// `steady` — and resolve to their [`Domain::TAG`] at parse time.
     pub default_domain: u8,
     /// The edges, in file order.
     pub edges: Vec<EdgeConfig>,
@@ -191,7 +209,7 @@ impl Default for TopologyConfig {
             frames: Vec::new(),
             frame_headroom: 0,
             default_interp: InterpPolicy::ScLerp,
-            default_domain: 0,
+            default_domain: SystemDomain::TAG,
             edges: Vec::new(),
         }
     }
@@ -563,7 +581,9 @@ impl ConfigErrorKind {
             ConfigErrorKind::MissingKey => "missing required key",
             ConfigErrorKind::BadKind => "kind must be \"static\" or \"dynamic\"",
             ConfigErrorKind::BadInterp => "interp must be \"sclerp\" or \"lerpslerp\"",
-            ConfigErrorKind::BadDomain => "domain must be \"system\", \"sensor\" or 0..=255",
+            ConfigErrorKind::BadDomain => {
+                "domain must be \"system\", \"sensor\", \"sim\", \"steady\" or 0..=255"
+            }
             ConfigErrorKind::BadFrameName => {
                 "frame name is empty or holds a control character, quote or backslash"
             }
@@ -979,17 +999,28 @@ fn parse_interp<'a>(v: &Value<'a>, line: u32) -> Result<InterpPolicy, ConfigErro
     }
 }
 
-/// `domain = "system" | "sensor" | 0..=255`.
+/// `domain = "system" | "sensor" | "sim" | "steady" | 0..=255`.
 ///
-/// The names are the two the engine defines (`SystemDomain` = 0,
-/// `SensorDomain` = 1). §5.5's sim-time domain has **no engine name** — the
-/// tag space is `u8` and a deployment that wants a third domain picks a number
-/// — so an integer is accepted rather than inventing a name here that
-/// `tf_tree` does not know.
+/// The four names are the four built-ins, and each resolves through the
+/// engine's own [`Domain::TAG`] rather than through a literal repeated here:
+/// [`SystemDomain`] 0, [`SensorDomain`] 1, [`SimDomain`] 2, [`SteadyDomain`] 3.
+/// `docs/API.md` §2.5 is why the numbering is permanent — a tag is written into
+/// `EdgeRecord::domain` and into every recording already on disk — and going
+/// through the constants is what stops this file from being a second place it
+/// could be renumbered.
+///
+/// **The integer form stays, and it is not a legacy escape.** [`Domain`] is an
+/// open trait: a driver with a PTP-disciplined clock declares its own unit
+/// struct and picks a free tag from 4 upwards (`docs/API.md` §2.5), and this
+/// parser must not refuse a number just because it has no name for it. Naming
+/// the built-ins removes the case where an operator wanting *sim* time had to
+/// write `2`; it does not close the tag space.
 fn parse_domain<'a>(v: &Value<'a>, line: u32) -> Result<u8, ConfigError<'a>> {
     match v {
-        Value::Str("system") => Ok(0),
-        Value::Str("sensor") => Ok(1),
+        Value::Str("system") => Ok(SystemDomain::TAG),
+        Value::Str("sensor") => Ok(SensorDomain::TAG),
+        Value::Str("sim") => Ok(SimDomain::TAG),
+        Value::Str("steady") => Ok(SteadyDomain::TAG),
         Value::Str(s) => Err(ConfigError {
             line,
             kind: ConfigErrorKind::BadDomain,
@@ -1614,6 +1645,80 @@ capacity = 512
         let statics_only = "[topology]\ndomain = 1\n[[edge]]\nparent=\"a\"\nchild=\"b\"\nkind=\"static\"\npose=[1.0,0.0,0.0,0.0,0.0,0.0,0.0]\n";
         let c = TopologyConfig::parse(statics_only).unwrap();
         assert_eq!(c.check_domain(0), Ok(()), "a static edge has no clock");
+    }
+
+    /// **All four built-in domains are spellable by name**, at the file default
+    /// and as a per-edge override, and each resolves to the tag the *engine*
+    /// defines rather than to a literal this parser repeats.
+    ///
+    /// `docs/PHASE4.md` §5.5 opens by saying the bridge tags every edge it
+    /// declares `SimDomain` under `use_sim_time`. Until `"sim"` parsed, a
+    /// deployment that wanted tag 2 had to write `2` — the state that section's
+    /// amendment recorded as its own text being true of a number and not of a
+    /// name. The *derivation* from `use_sim_time` is still not implemented and
+    /// this test does not claim otherwise; §5.5's amendment tracks it.
+    ///
+    /// The last two rows are the reason the integer form is not a legacy
+    /// escape: [`Domain`] is an open trait and a user-declared domain picks a
+    /// free tag from 4 upwards (`docs/API.md` §2.5), so a parser that accepted
+    /// only the four names would refuse the case the trait is open *for*.
+    ///
+    /// Mutant: drop the `Value::Str("sim")` arm ⇒ `"sim"` falls into the
+    /// `Value::Str(s)` refusal and the row panics in the `unwrap_or_else`
+    /// (`domain must be "system", "sensor", "sim", "steady" or 0..=255: "sim"
+    /// for domain = "sim"`).
+    #[test]
+    fn every_built_in_domain_is_spellable_by_name() {
+        let cases: [(&str, u8); 6] = [
+            ("\"system\"", SystemDomain::TAG),
+            ("\"sensor\"", SensorDomain::TAG),
+            ("\"sim\"", SimDomain::TAG),
+            ("\"steady\"", SteadyDomain::TAG),
+            // A user-declared domain, which has no name to be spelled with.
+            ("4", 4),
+            ("255", 255),
+        ];
+        for (spelling, tag) in cases {
+            let text = format!(
+                "[topology]\ndomain = {spelling}\n\
+                 [[edge]]\nparent=\"a\"\nchild=\"b\"\nkind=\"dynamic\"\ncapacity=8\ndomain = {spelling}\n"
+            );
+            let c = TopologyConfig::parse(&text)
+                .unwrap_or_else(|e| panic!("{e} for domain = {spelling}"));
+            assert_eq!(c.default_domain, tag, "[topology] domain = {spelling}");
+            assert_eq!(c.edges[0].domain, Some(tag), "[[edge]] domain = {spelling}");
+            // …and the check §5.5 exists for reads the same tag.
+            assert_eq!(c.check_domain(tag), Ok(()), "domain = {spelling}");
+        }
+    }
+
+    /// **A domain spelling that is not one of the four is refused by name, not
+    /// silently taken as the default.** `"sim_time"` and `"wall"` are what an
+    /// operator reaches for; a parser that shrugged would tag their edges 0 and
+    /// hand the whole deployment to §5.5's bug class with no message.
+    ///
+    /// `256` is here because the numeric escape has a boundary: the tag space
+    /// is a `u8` and one past it is a typo, not a domain.
+    ///
+    /// Mutant: make the `Value::Str(s)` arm return `Ok(SystemDomain::TAG)` ⇒
+    /// `"sim_time"` parses and the first row panics on the `Ok(c)` arm of the
+    /// `match` below (`domain = "sim_time" parsed, as tag 0`).
+    #[test]
+    fn a_domain_that_is_not_a_built_in_name_is_refused_by_name() {
+        let cases = [
+            ("\"sim_time\"", "sim_time"),
+            ("\"wall\"", "wall"),
+            ("256", "domain"),
+        ];
+        for (spelling, at) in cases {
+            let text = format!("[topology]\ndomain = {spelling}\n");
+            let e = match TopologyConfig::parse(&text) {
+                Ok(c) => panic!("domain = {spelling} parsed, as tag {}", c.default_domain),
+                Err(e) => e,
+            };
+            assert_eq!(e.kind, ConfigErrorKind::BadDomain, "domain = {spelling}");
+            assert_eq!(e.at, at, "domain = {spelling}");
+        }
     }
 
     /// **Ring sizing resolves the way `Capacity` documents**, so a file that
