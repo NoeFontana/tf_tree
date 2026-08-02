@@ -97,6 +97,8 @@ static int failures = 0;
 
 static_assert(tf_tree::layout_of<tf_tree::Quat7>::value == TFT_LAYOUT_QVEC7_WXYZ, "");
 static_assert(tf_tree::layout_of<tf_tree::Mat4Row>::value == TFT_LAYOUT_MAT4_ROW, "");
+static_assert(tf_tree::layout_of<tf_tree::Quat7Twist6>::value == TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+              "");
 
 #ifdef TF_TREE_HAS_EIGEN
 // **The trap §4.2 exists to close.** `Eigen::Isometry3d` is column-major, so
@@ -451,6 +453,34 @@ static void check_batch()
     // first element n times would pass everything above.
     CHECK(std::fabs(out[0].tx - out[n - 1].tx) > 1e-9,
           "the batch must vary across elements, not repeat the first");
+
+    // **Derivatives reach C++ by type**, which is what makes them reach C++ at
+    // all: `layout_of<Quat7Twist6>` is the only thing that lets the templated
+    // `at`/`at_many` name the layout. Its pose half must be the `Quat7` batch's
+    // bytes — the tail is the only thing that is new.
+    {
+        std::vector<tf_tree::Quat7Twist6> d_out;
+        CHECK_CALL(plan.at_many(stamps, d_out), "at_many<Quat7Twist6>");
+        CHECK(d_out.size() == n, "sized from the input");
+        bool moving = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            CHECK(d_out[i].qw == out[i].qw && d_out[i].tx == out[i].tx,
+                  "the pose half must be the Quat7 batch, bit for bit");
+            if (std::fabs(d_out[i].vx) > 1e-9 || std::fabs(d_out[i].wz) > 1e-9) {
+                moving = true;
+            }
+        }
+        // Non-vacuity: six zeros would satisfy every assertion above.
+        CHECK(moving, "the fixture's twist is zero; this would pass against a stub");
+
+        // ...and the scalar form agrees with the batch, which is the claim the
+        // layout makes about being one computation and not two.
+        auto one_r = plan.at<tf_tree::Quat7Twist6>(stamps[7]);
+        CHECK_R(one_r, "at<Quat7Twist6>");
+        const tf_tree::Quat7Twist6 one = VALUE_OF(one_r);
+        CHECK(one.vx == d_out[7].vx && one.wz == d_out[7].wz && one.qw == d_out[7].qw,
+              "at<Quat7Twist6> and at_many<Quat7Twist6> must agree");
+    }
 
 #ifdef TF_TREE_HAS_EIGEN
     // §4.2's zero-copy claim: `sizeof(Eigen::Isometry3d)` is the payload, so the

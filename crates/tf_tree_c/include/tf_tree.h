@@ -69,12 +69,13 @@ typedef struct tft_publisher tft_publisher;
  *
  * `2` → `3`: one appended `tft_layout` enumerator,
  * [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`], carrying `at_with_derivatives` as a layout
- * (`docs/API.md` §3.3). §3.6 names this case explicitly: an older caller never
- * spells the new value, and every entry point that takes a `tft_layout`
- * rejects a discriminant it does not define rather than computing a size from
- * it — so a `0.2` caller against a `0.3` library is unchanged in every byte it
- * can observe. No struct grew, nothing moved, and no existing enumerator
- * changed meaning.
+ * (`docs/API.md` §3.3) — accepted by [`tft_plan_at`] and [`tft_plan_at_many`],
+ * which is why it is in the frozen header rather than the unstable one. §3.6
+ * names this case explicitly: an older caller never spells the new value, and
+ * every entry point that takes a `tft_layout` rejects a discriminant it does
+ * not define rather than computing a size from it — so a `0.2` caller against
+ * a `0.3` library is unchanged in every byte it can observe. No struct grew,
+ * nothing moved, and no existing enumerator changed meaning.
  */
 #define TFT_ABI_VERSION_MINOR 3
 
@@ -369,11 +370,21 @@ typedef struct {
  * names the value and every entry point rejects a discriminant it does not
  * know rather than computing a size from it.
  *
- * **Only `tft_plan_at_with_derivatives` accepts it.**
- * `tft_plan_at` and `tft_plan_at_many` evaluate a pose and have no twist to
- * put in the tail, so they refuse it with `TFT_ERR_BAD_ENUM` rather than
- * leaving six slots of whatever the caller's buffer held — which would be a
- * velocity to anything reading it.
+ * **Every evaluate entry point accepts it** — `tft_plan_at`,
+ * `tft_plan_at_many` and `tft_plan_at_with_derivatives`. Asking for this
+ * layout *is* asking for derivatives: the call evaluates the plan with them
+ * and writes thirteen `f64` per element, which is what makes
+ * `docs/PHASE5.md` §4.4's "carried to both bindings by the layout dispatch"
+ * true of the batch path and not only of the scalar one.
+ *
+ * It is the one layout whose emission can fail for a reason the pose layouts
+ * cannot: an edge interpolating with `LerpSlerp` has no exact body twist, so
+ * the call returns `TFT_ERR_NO_DERIVATIVES` naming the edge rather than a
+ * finite difference that would look like an answer. Nothing is written for
+ * that element or any after it.
+ *
+ * It is **not** readable — see [`read`]. A velocity is derived from the arena,
+ * never stored in it.
  */
 #define TFT_LAYOUT_QVEC7_WXYZ_TWIST6 5
 
@@ -476,6 +487,15 @@ void tft_plan_free(tft_plan *plan);
  *
  * `out` must have room for at least `tft_layout_size(layout)` bytes.
  *
+ * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
+ *
+ * Asking for that layout *is* asking for derivatives: the plan is evaluated
+ * with them and thirteen `f64` are written, pose then body twist. It is
+ * therefore the one layout this function can fail on for a reason the others
+ * cannot — `TFT_ERR_NO_DERIVATIVES` when an edge on the path interpolates with
+ * `LerpSlerp`, `TFT_ERR_NO_SEGMENT` when it has a pose at this stamp but no
+ * segment to differentiate. Nothing is written in either case.
+ *
  * # Safety
  *
  * `plan` must be a handle from `tft_plan_create` that has not been freed.
@@ -489,6 +509,22 @@ tft_status tft_plan_at(const tft_plan *plan, int64_t stamp, tft_layout layout, v
  * `out_stride_bytes == 0` means tightly packed. A stride larger than the
  * payload writes directly into an array of caller structs — §4.3 is why this
  * parameter exists at all (`Sophus::SE3d` is usually *not* tightly packed).
+ *
+ * # Partial writes
+ *
+ * Evaluation stops at the first stamp that fails, and the elements already
+ * written stay written — a batch is not a transaction. `tft_last_error`'s
+ * `frame_b` carries the index that failed, so a caller knows exactly how many
+ * leading elements are live. Only the argument checks (NULL, stride, overflow,
+ * an unknown layout) are all-or-nothing.
+ *
+ * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
+ *
+ * Accepted here as it is by [`tft_plan_at`], and with the same meaning: each
+ * element is thirteen `f64`, pose then body twist, evaluated with derivatives.
+ * `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on the
+ * first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT` depends
+ * on the stamp and can fire part-way through.
  *
  * # Safety
  *

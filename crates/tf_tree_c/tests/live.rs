@@ -595,45 +595,182 @@ fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
     );
 }
 
-/// **The pose-only entry points refuse the twist layout**, before they evaluate
-/// anything and without touching the caller's buffer.
+/// **The stable batch entry points serve the twist layout, and every row they
+/// write is bit-identical to the scalar derivative call** — `docs/PHASE5.md`
+/// §4.4 item 1, which is NORMATIVE and says derivatives reach C.
 ///
-/// `tft_plan_at` folds a pose. It has no twist, so filling the last six slots
-/// would mean either the caller's own stale bytes or a confident zero — a
-/// velocity either way to anything downstream, and undetectable by any check a
-/// C caller can run. `TFT_ERR_BAD_ENUM` is the right answer and the one an
-/// older caller already gets for a discriminant it does not know, which is why
-/// appending the enumerator is a minor bump at all.
+/// This is the assertion the whole layout rests on. `tft_plan_at_many` is a
+/// different loop from `tft_plan_at_with_derivatives` — it strides, it batches,
+/// and it now rides a monotone cursor through the bracket search — so "the same
+/// numbers" is a claim about two independent code paths and not a tautology.
+/// Compared with `to_bits`, because a tolerance is exactly where a second
+/// implementation of a velocity would hide.
 ///
-/// Mutant: delete the `carries_twist` guard in `tft_plan_at` ⇒ `write` still
-/// refuses and the status is still `TFT_ERR_BAD_ENUM`, but the sentinel
-/// assertion holds and the *lookup runs first*; delete the `write` return check
-/// as well and this fails outright with `TFT_OK` and a half-written row.
+/// A non-trivial stride is included: §4.3's whole reason for the parameter is
+/// writing into an array of caller structs, and a 13-element row is the widest
+/// payload the ABI has, so the offset arithmetic has the most room to be wrong.
+///
+/// Mutant: give `tft_plan_at_many`'s twist arm `h.plan.at(..)` and a zeroed
+/// tail ⇒ the tail comparisons fail. Mutant B: `write_twist6` writes `v` before
+/// `ω` ⇒ the same. Mutant C: drop the monotone-cursor branch from
+/// `fold_batch_with_twist` ⇒ still passes, because a cursor cannot change an
+/// answer — that branch is pinned in `tf_tree_core`, not here.
 #[test]
-fn the_pose_only_entry_points_refuse_the_twist_layout() {
+fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
     let t = Tree::new();
     let p = t.plan("map", "sensor");
 
-    const SENTINEL: u8 = 0xAA;
-    let mut row = [SENTINEL; 104];
-    // SAFETY: live plan; the buffer is the layout's full size, so a write that
-    // wrongly went ahead would be in bounds and therefore visible rather than UB.
+    // Off-grid and ascending: the interpolant and its derivative both run, and
+    // the batch takes its cursor branch.
+    let stamps: Vec<i64> = (0..48).map(|k| 200_000_000 + k * 7_300_000).collect();
+
+    const STRIDE: usize = 128; // > 104, so the rows are not tightly packed
+    let mut rows = vec![0u8; stamps.len() * STRIDE];
+    // SAFETY: live plan; `stamps` is `len` readable i64 and `rows` holds
+    // `(len - 1) * STRIDE + 104` bytes, which is what the call touches.
+    assert_eq!(
+        unsafe {
+            tft_plan_at_many(
+                p.0,
+                stamps.as_ptr(),
+                stamps.len(),
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                rows.as_mut_ptr().cast(),
+                STRIDE,
+            )
+        },
+        TFT_OK
+    );
+
+    let mut moving = 0usize;
+    for (i, &s) in stamps.iter().enumerate() {
+        // The reference: the unstable scalar call, into its own buffers.
+        let mut pose = [0u8; 104];
+        let mut twist = [0.0f64; 6];
+        // SAFETY: live plan; both buffers are exactly the documented sizes.
+        assert_eq!(
+            unsafe {
+                tft_plan_at_with_derivatives(
+                    p.0,
+                    s,
+                    TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                    pose.as_mut_ptr().cast(),
+                    twist.as_mut_ptr(),
+                )
+            },
+            TFT_OK
+        );
+        let row = &rows[i * STRIDE..i * STRIDE + 104];
+        assert_eq!(
+            row,
+            &pose[..],
+            "element {i}: the batch row differs from the scalar call"
+        );
+        // ...and the tail really is the twist, not merely equal to itself.
+        for (k, v) in twist.iter().enumerate() {
+            assert_eq!(
+                read_f64(row, 7 + k).to_bits(),
+                v.to_bits(),
+                "element {i} twist slot {k}"
+            );
+        }
+        if twist.iter().any(|v| v.abs() > 1e-9) {
+            moving += 1;
+        }
+    }
+    // Non-vacuity: a stationary fixture would satisfy all of the above against
+    // a layout that wrote six zeros.
+    assert_eq!(moving, stamps.len(), "the fixture is not moving");
+
+    // The scalar stable entry point serves it too, with the same bytes.
+    let mut one = [0u8; 104];
+    // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
     assert_eq!(
         unsafe {
             tft_plan_at(
                 p.0,
-                300_000_000,
+                stamps[3],
+                TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+                one.as_mut_ptr().cast(),
+            )
+        },
+        TFT_OK
+    );
+    assert_eq!(
+        &one[..],
+        &rows[3 * STRIDE..3 * STRIDE + 104],
+        "tft_plan_at and tft_plan_at_many disagree about the twist layout"
+    );
+}
+
+/// **A `LerpSlerp` edge refuses the twist layout with a *typed* status** —
+/// `TFT_ERR_NO_DERIVATIVES`, naming the edge, not `TFT_ERR_BAD_ENUM`.
+///
+/// `LerpSlerp`'s body twist is an artifact of the interpolant rather than of
+/// the motion, so it is refused rather than reported (`docs/PHASE4.md` §2.4).
+/// The *status* is the load-bearing part: `TFT_ERR_BAD_ENUM` would tell a
+/// caller their layout argument was invalid, sending them to fix a call that is
+/// correct, when the real answer is "declare this edge `ScLerp`". That
+/// distinction is the entire content of a typed error space (R5), and the two
+/// are one `record_lookup`-versus-`bad_enum` away from each other at every call
+/// site in the crate.
+///
+/// The buffer is checked untouched as well. `DerivativesUnavailable` is a
+/// property of the *edge*, so it fires on the first element and nothing is
+/// written — unlike the stamp-dependent errors, which can stop a batch part-way
+/// through.
+///
+/// Mutant, run: in `tft_plan_at`'s twist arm, replace `Err(e) => record_lookup(e)`
+/// with `Err(_) => bad_enum("layout")` ⇒ fails on the status assertion. The
+/// pose-layout call below is the non-vacuity guard: without it, a fixture whose
+/// plan simply did not resolve would satisfy every refusal assertion here.
+#[test]
+fn a_lerpslerp_edge_refuses_the_twist_layout_with_a_typed_status() {
+    let mut raw: *mut tft_tree = ptr::null_mut();
+    // SAFETY: `raw` is a live local.
+    assert_eq!(unsafe { tft_test_lerpslerp_tree_create(&mut raw) }, TFT_OK);
+    let t = Tree(raw);
+    let p = t.plan("map", "base");
+    let at = 155_000_000i64;
+
+    // Non-vacuity: the pose layouts work over this plan and this stamp, so the
+    // refusals below are about the derivative and not about the fixture.
+    let mut pose = [0u8; 56];
+    // SAFETY: live plan, 56-byte buffer for a 56-byte layout.
+    assert_eq!(
+        unsafe { tft_plan_at(p.0, at, TFT_LAYOUT_QVEC7_WXYZ, pose.as_mut_ptr().cast()) },
+        TFT_OK
+    );
+
+    const SENTINEL: u8 = 0xAA;
+    let mut row = [SENTINEL; 104];
+    // SAFETY: live plan; the buffer is the layout's full size, so a write that
+    // wrongly went ahead would be in bounds and visible rather than UB.
+    assert_eq!(
+        unsafe {
+            tft_plan_at(
+                p.0,
+                at,
                 TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
                 row.as_mut_ptr().cast(),
             )
         },
-        TFT_ERR_BAD_ENUM
+        TFT_ERR_NO_DERIVATIVES,
+        "a LerpSlerp edge must be a typed refusal, not a bad enum"
     );
-    assert!(row.iter().all(|b| *b == SENTINEL), "tft_plan_at wrote");
+    assert!(
+        row.iter().all(|b| *b == SENTINEL),
+        "a refused tft_plan_at wrote into the caller's buffer"
+    );
+    // The error names the offending edge, which is what turns the status into
+    // an action: it is the edge whose `InterpPolicy` has to change.
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_NO_DERIVATIVES);
+    assert_ne!(e.edge, TFT_INVALID_ID, "the refusal must name the edge");
 
-    let stamps = [300_000_000i64, 320_000_000];
+    let stamps = [at, at + 10_000_000];
     let mut rows = [SENTINEL; 208];
-    // SAFETY: live plan, `stamps` is two readable i64, `rows` is 2 × 104 bytes.
+    // SAFETY: live plan, two readable i64, 2 x 104 writable bytes.
     assert_eq!(
         unsafe {
             tft_plan_at_many(
@@ -645,11 +782,11 @@ fn the_pose_only_entry_points_refuse_the_twist_layout() {
                 0,
             )
         },
-        TFT_ERR_BAD_ENUM
+        TFT_ERR_NO_DERIVATIVES
     );
     assert!(
         rows.iter().all(|b| *b == SENTINEL),
-        "tft_plan_at_many wrote"
+        "a refused batch wrote into the caller's buffer"
     );
 }
 

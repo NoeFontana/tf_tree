@@ -45,13 +45,17 @@ pub const TFT_TWIST_BYTES: usize = 6 * 8;
 /// case that half is not written — asking for only the twist is a real request
 /// and costs the same as asking for both.
 ///
-/// **This is the only entry point that accepts
-/// [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`]**, which puts both halves in
-/// `out_pose` as one contiguous row of thirteen `f64` — `docs/API.md` §3.3's
-/// `(N, 13)` shape. Its tail holds exactly the six numbers `out_twist` would
-/// receive, so a caller wanting them together does not pay two buffers for it.
-/// `tft_plan_at` and `tft_plan_at_many` refuse that layout with
-/// `TFT_ERR_BAD_ENUM`: they fold a pose and have no twist to put in the tail.
+/// [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] puts both halves in `out_pose` as
+/// one contiguous row of thirteen `f64` — `docs/API.md` §3.3's `(N, 13)` shape.
+/// Its tail holds exactly the six numbers `out_twist` would receive, so a
+/// caller wanting them together does not pay two buffers for it.
+///
+/// **That layout is not exclusive to this function.** `tft_plan_at` and
+/// `tft_plan_at_many` accept it too, and both are in the *stable* header — this
+/// entry point is the only way to get pose and twist into two *separate*
+/// buffers, and the only one that will report a twist for a layout that carries
+/// none. If the 13-element row is what you want, the stable pair is where to
+/// get it, batched.
 ///
 /// # The twist is in the plan's *source* frame
 ///
@@ -111,16 +115,15 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
         if !out_pose.is_null() {
             // SAFETY: the caller contracts `n` writable bytes at `out_pose`.
             let dst = unsafe { core::slice::from_raw_parts_mut(out_pose.cast::<u8>(), n) };
-            // The twist is passed because this is the one entry point that has
-            // one: with `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` the caller gets pose and
-            // twist contiguous in a single 13-element row, which is what
-            // `docs/API.md` §3.3's `(N, 13)` shape means. Every other layout
-            // ignores the argument.
-            if !layout::write(&sample.pose, Some(&sample.twist), layout, dst) {
-                // Unreachable: `payload_bytes` accepted the discriminant, and
-                // the only layout `write` refuses is one needing a twist, which
-                // was supplied.
-                return bad_enum("layout");
+            // With `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` the caller gets pose and twist
+            // contiguous in a single 13-element row — `docs/API.md` §3.3's
+            // `(N, 13)` shape — instead of two buffers holding the same numbers.
+            // Every other layout writes the pose alone and ignores the twist,
+            // which is already in `out_twist` if the caller asked for it.
+            if layout::carries_twist(layout) {
+                layout::write_twist6(&sample.pose, &sample.twist, dst);
+            } else {
+                layout::write(&sample.pose, layout, dst);
             }
         }
         if !out_twist.is_null() {

@@ -48,11 +48,21 @@ pub const TFT_LAYOUT_AFFINE12_ROW_F32: tft_layout = 4;
 /// names the value and every entry point rejects a discriminant it does not
 /// know rather than computing a size from it.
 ///
-/// **Only `tft_plan_at_with_derivatives` accepts it.**
-/// `tft_plan_at` and `tft_plan_at_many` evaluate a pose and have no twist to
-/// put in the tail, so they refuse it with `TFT_ERR_BAD_ENUM` rather than
-/// leaving six slots of whatever the caller's buffer held — which would be a
-/// velocity to anything reading it.
+/// **Every evaluate entry point accepts it** — `tft_plan_at`,
+/// `tft_plan_at_many` and `tft_plan_at_with_derivatives`. Asking for this
+/// layout *is* asking for derivatives: the call evaluates the plan with them
+/// and writes thirteen `f64` per element, which is what makes
+/// `docs/PHASE5.md` §4.4's "carried to both bindings by the layout dispatch"
+/// true of the batch path and not only of the scalar one.
+///
+/// It is the one layout whose emission can fail for a reason the pose layouts
+/// cannot: an edge interpolating with `LerpSlerp` has no exact body twist, so
+/// the call returns `TFT_ERR_NO_DERIVATIVES` naming the edge rather than a
+/// finite difference that would look like an answer. Nothing is written for
+/// that element or any after it.
+///
+/// It is **not** readable — see [`read`]. A velocity is derived from the arena,
+/// never stored in it.
 pub const TFT_LAYOUT_QVEC7_WXYZ_TWIST6: tft_layout = 5;
 
 /// The number of **bytes** one transform occupies in `layout`, or `None` if the
@@ -71,14 +81,13 @@ pub fn payload_bytes(layout: tft_layout) -> Option<usize> {
     })
 }
 
-/// Whether `layout` includes a twist, and therefore cannot be written from a
-/// pose alone.
+/// Whether `layout` includes a twist, and therefore has to be evaluated with
+/// derivatives and written by [`write_twist6`] rather than [`write`].
 ///
-/// The predicate exists so the pose-only entry points can refuse *before* they
-/// evaluate anything, which is where a caller wants to hear about a layout
-/// mistake. [`write`] enforces the same rule a second time by refusing to write
-/// at all, because "three call sites remember to check" is the kind of invariant
-/// that survives until the fourth call site.
+/// Every entry point tests this **once**, outside its loop, and then runs the
+/// matching one of two bodies — the alternative, a test inside the writer, put
+/// a loop-invariant compare on the per-element path of a batch whose whole
+/// purpose is per-element cost.
 #[must_use]
 pub(crate) fn carries_twist(layout: tft_layout) -> bool {
     layout == TFT_LAYOUT_QVEC7_WXYZ_TWIST6
@@ -107,43 +116,31 @@ fn rot3(t: &Iso3) -> [f64; 9] {
     ]
 }
 
-/// Write `t` — and `twist`, for a layout that carries one — into `dst`.
+/// Write the pose `t` into `dst` in `layout`.
 ///
 /// `dst` must be at least [`payload_bytes`] long; the caller checks that, and
 /// this function's slicing would panic rather than overrun if it did not — which
 /// the panic guard turns into `TFT_ERR_INTERNAL` rather than an abort.
 ///
-/// # Why this returns a `bool` instead of just writing
+/// # A twist-carrying layout does not come here
 ///
-/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] has six slots a pose cannot fill. A version
-/// of this function that took only an `Iso3` would have to either leave them
-/// alone — handing the caller six `f64` of whatever was in their buffer,
-/// labelled as a velocity — or write zeros, which is a *claim that the body is
-/// stationary*. Both are silent and both are wrong, and neither is visible to
-/// any check a caller can run.
+/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] has six slots a pose cannot fill, and this
+/// function has no twist to fill them with. Its `_` arm would therefore write
+/// *nothing* for that discriminant, leaving the caller's own bytes where a
+/// velocity is supposed to be — which is undetectable, since they are finite,
+/// plausible and different every run.
 ///
-/// So the twist is an argument, and `false` means "this layout needs a twist and
-/// none was supplied". Callers turn that into `TFT_ERR_BAD_ENUM`. Nothing is
-/// written when it is returned, so a caller that ignores it still has an
-/// untouched buffer rather than a half-filled one — but `#[must_use]` means they
-/// cannot ignore it by accident.
-#[must_use]
-pub(crate) fn write(t: &Iso3, twist: Option<&Twist>, layout: tft_layout, dst: &mut [u8]) -> bool {
-    if carries_twist(layout) {
-        let Some(v) = twist else {
-            return false;
-        };
-        // The pose half **is** `QVEC7_WXYZ`, byte for byte, and is written by
-        // the same helper that arm uses — the `w`-first order this module's
-        // first trap is about gets exactly one home in this file.
-        let (pose, tail) = dst.split_at_mut(7 * 8);
-        put_qvec7_wxyz(t, pose);
-        put_f64(
-            tail,
-            &[v.omega.x, v.omega.y, v.omega.z, v.v.x, v.v.y, v.v.z],
-        );
-        return true;
-    }
+/// So the split is by function rather than by argument: every caller decides
+/// once, from [`carries_twist`], whether it is evaluating a pose or a pose and
+/// a twist, and the twist-carrying case goes to [`write_twist6`]. The
+/// `debug_assert` below is what keeps "decides once" from becoming "forgot
+/// once" — release builds pay nothing for it, and every path through here is
+/// covered by a test.
+pub(crate) fn write(t: &Iso3, layout: tft_layout, dst: &mut [u8]) {
+    debug_assert!(
+        !carries_twist(layout),
+        "a twist-carrying layout must go through `write_twist6`"
+    );
     match layout {
         TFT_LAYOUT_QVEC7_WXYZ => put_qvec7_wxyz(t, dst),
         TFT_LAYOUT_QVEC7_XYZW => {
@@ -189,10 +186,37 @@ pub(crate) fn write(t: &Iso3, twist: Option<&Twist>, layout: tft_layout, dst: &m
             }
         }
         // Unreachable: the caller validated the discriminant with
-        // `payload_bytes` before allocating a slice for it.
+        // `payload_bytes` before allocating a slice for it, and the one
+        // discriminant that would land here is the one the `debug_assert`
+        // above names.
         _ => {}
     }
-    true
+}
+
+/// Write `t` and `twist` into `dst` as [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`].
+///
+/// `dst` must be at least 104 bytes — [`payload_bytes`] for that layout.
+///
+/// The pose half **is** [`TFT_LAYOUT_QVEC7_WXYZ`], byte for byte, written by
+/// the same helper that arm uses: the `w`-first order this module's first trap
+/// is about gets exactly one home in this file. The tail is `[ω, v]`, the same
+/// six slots in the same order as `TFT_TWIST_BYTES`'s `out_twist`, so a caller
+/// reading either spelling reads the same numbers.
+#[inline]
+pub(crate) fn write_twist6(t: &Iso3, twist: &Twist, dst: &mut [u8]) {
+    let (pose, tail) = dst.split_at_mut(7 * 8);
+    put_qvec7_wxyz(t, pose);
+    put_f64(
+        tail,
+        &[
+            twist.omega.x,
+            twist.omega.y,
+            twist.omega.z,
+            twist.v.x,
+            twist.v.y,
+            twist.v.z,
+        ],
+    );
 }
 
 /// The canonical `[qw qx qy qz tx ty tz]` payload.
@@ -474,7 +498,7 @@ mod tests {
     fn qvec7_wxyz_is_w_first() {
         let t = rz90();
         let mut d = [0u8; 56];
-        assert!(write(&t, None, TFT_LAYOUT_QVEC7_WXYZ, &mut d));
+        write(&t, TFT_LAYOUT_QVEC7_WXYZ, &mut d);
         let c = core::f64::consts::FRAC_1_SQRT_2;
         assert!(close(read_f64(&d, 0), c), "slot 0 must be qw");
         assert!(close(read_f64(&d, 1), 0.0));
@@ -495,8 +519,8 @@ mod tests {
     fn qvec7_xyzw_is_w_last_and_differs_from_wxyz() {
         let t = rz90();
         let (mut a, mut b) = ([0u8; 56], [0u8; 56]);
-        assert!(write(&t, None, TFT_LAYOUT_QVEC7_WXYZ, &mut a));
-        assert!(write(&t, None, TFT_LAYOUT_QVEC7_XYZW, &mut b));
+        write(&t, TFT_LAYOUT_QVEC7_WXYZ, &mut a);
+        write(&t, TFT_LAYOUT_QVEC7_XYZW, &mut b);
         let c = core::f64::consts::FRAC_1_SQRT_2;
         assert!(close(read_f64(&b, 0), 0.0), "slot 0 must be qx");
         assert!(close(read_f64(&b, 1), 0.0));
@@ -515,7 +539,7 @@ mod tests {
     #[test]
     fn mat4_row_matches_a_hand_computed_pattern() {
         let mut d = [0u8; 128];
-        assert!(write(&rz90(), None, TFT_LAYOUT_MAT4_ROW, &mut d));
+        write(&rz90(), TFT_LAYOUT_MAT4_ROW, &mut d);
         let want = [
             0.0, -1.0, 0.0, 1.0, //
             1.0, 0.0, 0.0, 2.0, //
@@ -539,8 +563,8 @@ mod tests {
     #[test]
     fn mat4_col_is_the_transpose_and_moves_the_translation() {
         let (mut r, mut c) = ([0u8; 128], [0u8; 128]);
-        assert!(write(&rz90(), None, TFT_LAYOUT_MAT4_ROW, &mut r));
-        assert!(write(&rz90(), None, TFT_LAYOUT_MAT4_COL, &mut c));
+        write(&rz90(), TFT_LAYOUT_MAT4_ROW, &mut r);
+        write(&rz90(), TFT_LAYOUT_MAT4_COL, &mut c);
         let want = [
             0.0, 1.0, 0.0, 0.0, //
             -1.0, 0.0, 0.0, 0.0, //
@@ -570,7 +594,7 @@ mod tests {
     #[test]
     fn affine12_is_f32_row_major_without_the_bottom_row() {
         let mut d = [0u8; 48];
-        assert!(write(&rz90(), None, TFT_LAYOUT_AFFINE12_ROW_F32, &mut d));
+        write(&rz90(), TFT_LAYOUT_AFFINE12_ROW_F32, &mut d);
         let want: [f32; 12] = [
             0.0, -1.0, 0.0, 1.0, //
             1.0, 0.0, 0.0, 2.0, //
@@ -622,9 +646,9 @@ mod tests {
         let v = tf_tree::Twist::new(Vec3::new(0.11, -0.22, 0.33), Vec3::new(0.44, -0.55, 0.66));
 
         let mut pose_only = [0u8; 56];
-        assert!(write(&t, None, TFT_LAYOUT_QVEC7_WXYZ, &mut pose_only));
+        write(&t, TFT_LAYOUT_QVEC7_WXYZ, &mut pose_only);
         let mut d = [0u8; 104];
-        assert!(write(&t, Some(&v), TFT_LAYOUT_QVEC7_WXYZ_TWIST6, &mut d));
+        write_twist6(&t, &v, &mut d);
 
         assert_eq!(
             &d[..56],
@@ -643,34 +667,55 @@ mod tests {
         }
     }
 
-    /// **Without a twist, the twist layout writes nothing at all.**
+    /// **A pose write stays inside its own payload.** `write` in a 56-byte
+    /// layout must move 56 bytes and not one more, whatever the buffer it was
+    /// handed is long enough to hold.
     ///
-    /// This is the guard that keeps `tft_plan_at` — which folds a pose and has
-    /// no derivative — from emitting seven live elements followed by six slots
-    /// of the caller's own stale memory. Six `f64` labelled "velocity" that are
-    /// actually whatever the buffer held is not an error any caller can detect:
-    /// it is finite, it is plausible, and it changes run to run.
-    ///
-    /// Mutant: have `write` fill the tail with zeros and return `true` instead
-    /// ⇒ the sentinel assertion fails. Zeros are worse than garbage here, not
-    /// better: they are a specific and confident claim that the body is
-    /// stationary.
+    /// Mutant: `put_qvec7_wxyz` writing an eighth `f64` ⇒ the tail assertion
+    /// fails. It is a narrow claim and it is the one this shape can make — the
+    /// separate claim, that `write` is never *reached* with a twist layout, is
+    /// `the_pose_writer_refuses_a_twist_layout` below, because a `debug_assert`
+    /// is not observable from a call that does not trip it.
     #[test]
-    fn the_twist_layout_refuses_to_write_a_pose_alone() {
-        let mut d = [0xAAu8; 104];
-        assert!(
-            !write(&rz90(), None, TFT_LAYOUT_QVEC7_WXYZ_TWIST6, &mut d),
-            "a twist layout must refuse a pose-only write"
+    fn a_pose_write_stays_inside_its_own_payload() {
+        const SENTINEL: u8 = 0xAA;
+        let mut d = [SENTINEL; 104];
+        write(&rz90(), TFT_LAYOUT_QVEC7_WXYZ, &mut d);
+        assert_ne!(
+            &d[..56],
+            &[SENTINEL; 56][..],
+            "the pose half was not written"
         );
         assert!(
-            d.iter().all(|b| *b == 0xAA),
-            "a refused write still touched the caller's buffer"
+            d[56..].iter().all(|b| *b == SENTINEL),
+            "a 56-byte layout wrote past its payload"
         );
-        // Every other layout ignores the argument entirely, so passing `None`
-        // there is not a refusal — otherwise this test would be asserting that
-        // `write` refuses everything.
-        let mut ok = [0u8; 56];
-        assert!(write(&rz90(), None, TFT_LAYOUT_QVEC7_WXYZ, &mut ok));
+    }
+
+    /// **`write` refuses a twist-carrying layout rather than half-filling it.**
+    ///
+    /// The split into `write`/[`write_twist6`] means every caller decides once,
+    /// from [`carries_twist`], which one it needs. The `debug_assert` is what
+    /// catches a caller that forgot — and *a `debug_assert` nothing trips is a
+    /// `debug_assert` nobody has checked exists*, which is why this calls the
+    /// wrong function on purpose rather than trusting the attribute.
+    ///
+    /// Without the guard this call would fall through `write`'s `_` arm and
+    /// return having written **nothing**, leaving 104 bytes of the caller's own
+    /// memory for a C consumer to read as a pose and a velocity.
+    ///
+    /// `cfg(debug_assertions)` because that is exactly when the assert exists;
+    /// in a release build the guard is compiled out by design and there is
+    /// nothing here to observe.
+    ///
+    /// Mutant, run: delete the `debug_assert!` from `write` ⇒ this fails with
+    /// "test did not panic as expected".
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must go through `write_twist6`")]
+    fn the_pose_writer_refuses_a_twist_layout() {
+        let mut d = [0u8; 104];
+        write(&rz90(), TFT_LAYOUT_QVEC7_WXYZ_TWIST6, &mut d);
     }
 
     /// **Round-tripping through `QVEC7_WXYZ` must reproduce the arena's bits
@@ -679,7 +724,7 @@ mod tests {
     fn qvec7_wxyz_round_trips_bit_for_bit() {
         let t = tf_tree::exp_se3([0.3, -0.7, 0.2, 1.1, -0.5, 3.7]);
         let mut d = [0u8; 56];
-        assert!(write(&t, None, TFT_LAYOUT_QVEC7_WXYZ, &mut d));
+        write(&t, TFT_LAYOUT_QVEC7_WXYZ, &mut d);
         assert_eq!(read_f64(&d, 0).to_bits(), t.q.w.to_bits());
         assert_eq!(read_f64(&d, 3).to_bits(), t.q.z.to_bits());
         assert_eq!(read_f64(&d, 6).to_bits(), t.t.z.to_bits());
@@ -735,7 +780,7 @@ mod tests {
         );
 
         let mut d = [0u8; 128];
-        assert!(write(&t, None, TFT_LAYOUT_MAT4_ROW, &mut d));
+        write(&t, TFT_LAYOUT_MAT4_ROW, &mut d);
         for (r, row) in want.iter().enumerate() {
             for (c, expect) in row.iter().enumerate() {
                 let got = read_f64(&d, r * 4 + c);
@@ -747,7 +792,7 @@ mod tests {
         }
         // ...and the column-major form is still its transpose.
         let mut c4 = [0u8; 128];
-        assert!(write(&t, None, TFT_LAYOUT_MAT4_COL, &mut c4));
+        write(&t, TFT_LAYOUT_MAT4_COL, &mut c4);
         for r in 0..4 {
             for c in 0..4 {
                 assert!(close(read_f64(&d, r * 4 + c), read_f64(&c4, c * 4 + r)));
@@ -792,7 +837,7 @@ mod tests {
         ] {
             let n = payload_bytes(layout).unwrap();
             let mut buf = vec![0u8; n];
-            assert!(write(&t, None, layout, &mut buf));
+            write(&t, layout, &mut buf);
             let got = read(layout, &buf)
                 .expect("layout is readable")
                 .expect("a transform we just wrote must be accepted");
@@ -817,7 +862,7 @@ mod tests {
             Vec3::new(1.0, 2.0, 3.0),
         );
         let mut buf = [0u8; 56];
-        assert!(write(&t, None, TFT_LAYOUT_QVEC7_WXYZ, &mut buf));
+        write(&t, TFT_LAYOUT_QVEC7_WXYZ, &mut buf);
         let wrong = read(TFT_LAYOUT_QVEC7_XYZW, &buf).unwrap().unwrap();
         // Still a unit quaternion — that is the whole problem.
         assert!((wrong.q.norm() - 1.0).abs() < 1e-12);
@@ -842,7 +887,7 @@ mod tests {
             Vec3::new(1.0, 2.0, 3.0),
         );
         let mut buf = [0u8; 128];
-        assert!(write(&t, None, TFT_LAYOUT_MAT4_ROW, &mut buf));
+        write(&t, TFT_LAYOUT_MAT4_ROW, &mut buf);
         // Negate the first column: rows 0, 1, 2 at element 0, 4, 8.
         for i in [0usize, 4, 8] {
             let v = -read_f64(&buf, i);
@@ -865,7 +910,7 @@ mod tests {
             Vec3::new(1.0, 2.0, 3.0),
         );
         let mut buf = [0u8; 128];
-        assert!(write(&t, None, TFT_LAYOUT_MAT4_ROW, &mut buf));
+        write(&t, TFT_LAYOUT_MAT4_ROW, &mut buf);
         for r in 0..3 {
             for c in 0..3 {
                 let i = r * 4 + c;
@@ -891,7 +936,7 @@ mod tests {
         }
         let t = Iso3::new(q, Vec3::new(1.0, 2.0, 3.0));
         let mut buf = [0u8; 128];
-        assert!(write(&t, None, TFT_LAYOUT_MAT4_ROW, &mut buf));
+        write(&t, TFT_LAYOUT_MAT4_ROW, &mut buf);
         assert!(
             read(TFT_LAYOUT_MAT4_ROW, &buf).unwrap().is_ok(),
             "2000 unnormalized compositions must not trip the determinant check"
@@ -921,14 +966,14 @@ mod tests {
     #[test]
     fn non_finite_input_is_refused() {
         let mut buf = [0u8; 56];
-        assert!(write(&rz90(), None, TFT_LAYOUT_QVEC7_WXYZ, &mut buf));
+        write(&rz90(), TFT_LAYOUT_QVEC7_WXYZ, &mut buf);
         buf[4 * 8..5 * 8].copy_from_slice(&f64::NAN.to_ne_bytes());
         assert_eq!(
             read(TFT_LAYOUT_QVEC7_WXYZ, &buf).unwrap(),
             Err(ReadError::NotFinite)
         );
         let mut m = [0u8; 128];
-        assert!(write(&rz90(), None, TFT_LAYOUT_MAT4_ROW, &mut m));
+        write(&rz90(), TFT_LAYOUT_MAT4_ROW, &mut m);
         m[3 * 8..4 * 8].copy_from_slice(&f64::INFINITY.to_ne_bytes());
         assert_eq!(
             read(TFT_LAYOUT_MAT4_ROW, &m).unwrap(),

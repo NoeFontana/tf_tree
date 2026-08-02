@@ -287,6 +287,13 @@ fn at_many_into_agrees_with_at_many_exactly() {
 /// stamps, which is the other half of the promise: a consumer that already
 /// parses a `(N, 7)` row can read a `(N, 13)` one by ignoring the tail.
 ///
+/// **The stamps ascend, so the batch takes the monotone cursor branch while the
+/// scalar reference does not** — each `at_with_derivatives` below is on a fresh
+/// guard and restarts every bracket search at the window midpoint. So this is
+/// also the plan-level assertion that resuming a search cannot move a bit of a
+/// twist, which is what makes the cursor safe to pick from the *stamps* rather
+/// than from anything the caller asked for.
+///
 /// Mutant: emit `v` before `ω` in `write_quat_twist` ⇒ the tail assertions fail
 /// while the pose ones still pass. Mutant B: route `Layout::QuatTwist` through
 /// `fold_batch(.., write_quat, ..)` and zero the tail ⇒ the pose half still
@@ -433,6 +440,66 @@ fn at_many_into_handles_unsorted_stamps() {
             "stamp {i} disagreed between the monotone and fallback paths"
         );
     }
+}
+
+/// The twist layout's two batch loops must agree, exactly as the pose layouts'
+/// do.
+///
+/// `Layout::QuatTwist` gained the monotone cursor branch, so it now has the
+/// same shape as `fold_batch`: ascending stamps gallop from a resumable cursor,
+/// anything else restarts each search. Feeding the same stamps forward and
+/// reversed puts one call down each branch, and the rows must come back
+/// element-for-element identical after un-reversing.
+///
+/// Reversed rather than shuffled on purpose: it is the ordering that makes the
+/// *downward* gallop arm run, which is the arm no in-tree caller reaches (every
+/// cursor is seeded to `0`) and therefore the one that can rot unnoticed.
+///
+/// Mutant: in `fold_batch_with_twist`, hand `fold_at_with_derivatives_cursors`
+/// a `cursors` array declared *inside* the loop, so every stamp restarts cold
+/// ⇒ still passes, because a cold cursor is a valid cursor. Mutant B: seed the
+/// gallop from `newest` instead of `*cursor` ⇒ also passes. Both are the point:
+/// the cursor is a hint, and the only thing this test can pin is that the two
+/// branches never disagree. The *advance* is pinned in `tf_tree_core`'s
+/// `sample_with_twist_from_agrees_with_sample_with_twist_from_every_cursor`.
+#[test]
+fn quat_twist_agrees_between_the_cursor_and_fallback_batch_loops() {
+    use tf_tree::Layout;
+
+    let c = Chain::new(32, 1000);
+    let plan = c.tree.plan(c.base, c.map).unwrap();
+    let g = c.tree.guard();
+    let max_t = (c.n as i64 - 1) * c.dt;
+
+    // Off-grid, so the interpolant and its derivative both actually run.
+    let sorted: Vec<Stamp> = (0..64).map(|k| ns((k as i64 * max_t) / 64 + 37)).collect();
+    let mut reversed = sorted.clone();
+    reversed.reverse();
+
+    let n = Layout::QuatTwist.elems();
+    let mut a = vec![0.0f64; sorted.len() * n];
+    let mut b = vec![0.0f64; sorted.len() * n];
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&sorted), Layout::QuatTwist, &mut a)
+        .unwrap();
+    plan.at_many_into::<SystemDomain>(&g, &nanos(&reversed), Layout::QuatTwist, &mut b)
+        .unwrap();
+
+    for i in 0..sorted.len() {
+        let j = sorted.len() - 1 - i;
+        for k in 0..n {
+            assert_eq!(
+                a[i * n + k].to_bits(),
+                b[j * n + k].to_bits(),
+                "stamp {i} element {k} disagreed between the cursor and fallback loops"
+            );
+        }
+    }
+    // Non-vacuity: the twist tail must be live, or this compares zeros.
+    assert!(
+        a.chunks_exact(n)
+            .any(|r| r[7..].iter().any(|v| v.abs() > 1e-9)),
+        "the fixture's twist is zero everywhere"
+    );
 }
 
 /// Validation happens before a single element is written (`PHASE3.md` §5.3).

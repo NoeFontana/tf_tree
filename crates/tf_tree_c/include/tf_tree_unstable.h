@@ -1191,13 +1191,17 @@ tft_status tft_bridge_get_stats(tft_bridge *b, tft_bridge_stats *out);
  * case that half is not written — asking for only the twist is a real request
  * and costs the same as asking for both.
  *
- * **This is the only entry point that accepts
- * [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`]**, which puts both halves in
- * `out_pose` as one contiguous row of thirteen `f64` — `docs/API.md` §3.3's
- * `(N, 13)` shape. Its tail holds exactly the six numbers `out_twist` would
- * receive, so a caller wanting them together does not pay two buffers for it.
- * `tft_plan_at` and `tft_plan_at_many` refuse that layout with
- * `TFT_ERR_BAD_ENUM`: they fold a pose and have no twist to put in the tail.
+ * [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] puts both halves in `out_pose` as
+ * one contiguous row of thirteen `f64` — `docs/API.md` §3.3's `(N, 13)` shape.
+ * Its tail holds exactly the six numbers `out_twist` would receive, so a
+ * caller wanting them together does not pay two buffers for it.
+ *
+ * **That layout is not exclusive to this function.** `tft_plan_at` and
+ * `tft_plan_at_many` accept it too, and both are in the *stable* header — this
+ * entry point is the only way to get pose and twist into two *separate*
+ * buffers, and the only one that will report a twist for a layout that carries
+ * none. If the 13-element row is what you want, the stable pair is where to
+ * get it, batched.
  *
  * # The twist is in the plan's *source* frame
  *

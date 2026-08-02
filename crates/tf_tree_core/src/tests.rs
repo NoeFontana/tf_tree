@@ -289,6 +289,91 @@ fn sample_from_agrees_with_sample_from_every_cursor() {
     }
 }
 
+/// [`SampleRing::sample_with_twist_from`] must return exactly what
+/// [`SampleRing::sample_with_twist`] returns, from **any** starting cursor —
+/// the derivative path's half of the property above.
+///
+/// The two share `bracket_from`, so this is really asking whether the twist
+/// sampler still establishes that helper's precondition
+/// (`stamp[lo] <= t < stamp[hi]`) on the arm that reaches it.
+///
+/// The twist is compared bit-for-bit and not within a tolerance: a cursor is a
+/// hint and must not be able to move the last bit of an answer, because
+/// `at_many_into(QuatTwist)` picks the cursor branch from the *stamps* and a
+/// caller has no way to know which one ran.
+///
+/// The ring is deliberately wrapped (20 pushes into 16 slots), so the logical
+/// window does not start at 0 and the cursor clamp is exercised.
+///
+/// **Mutants, run rather than asserted.** Drop the `.clamp(lo_logical, newest)`
+/// in `bracket_from` ⇒ fails here, for the `start` values past the window.
+/// Delete the `*cursor = i` write-back in `sample_with_twist_from` ⇒ the
+/// equivalence loop still passes — a stale hint is still a hint, which is the
+/// whole safety argument for cursors — so the final block asserts the cursor
+/// *advances*, which is the only observable the write-back has.
+///
+/// One tempting mutant is **not** this test's: routing `t == t_new` through
+/// `seek` instead of taking the left limit at `newest - 1` breaks both callers
+/// identically, so an equivalence test cannot see it. It is killed by
+/// `at_the_newest_stamp_the_twist_is_the_left_limit`, which checks the value.
+#[test]
+fn sample_with_twist_from_agrees_with_sample_with_twist_from_every_cursor() {
+    let hr = HeapRing::new(16);
+    let ring = hr.ring();
+    for i in 0..20u64 {
+        ring.push(i as i64 * 100, &pose(i + 1)).unwrap();
+    }
+    // Off-knot stamps that walk out of the retained window at both ends
+    // (`retained` is 15, so the window is 500..=1900), plus the exact knots —
+    // including `t_new`, which is the one index this sampler reaches without a
+    // search.
+    let stamps = (300..=2000)
+        .step_by(7)
+        .chain([500, 900, 1000, 1300, 1900, 1899, 1901]);
+    for t in stamps {
+        let want = ring.sample_with_twist(t, ExtrapPolicy::Error);
+        for start in 0..21u64 {
+            let mut cursor = start;
+            let got = ring.sample_with_twist_from(t, ExtrapPolicy::Error, &mut cursor);
+            match (&got, &want) {
+                (Ok((gp, gv)), Ok((wp, wv))) => {
+                    assert_eq!(gp.to_bits(), wp.to_bits(), "pose t={t} start={start}");
+                    for (a, b) in [
+                        (gv.omega.x, wv.omega.x),
+                        (gv.omega.y, wv.omega.y),
+                        (gv.omega.z, wv.omega.z),
+                        (gv.v.x, wv.v.x),
+                        (gv.v.y, wv.v.y),
+                        (gv.v.z, wv.v.z),
+                    ] {
+                        assert_eq!(a.to_bits(), b.to_bits(), "twist t={t} start={start}");
+                    }
+                }
+                (Err(g), Err(w)) => assert_eq!(g, w, "t={t} start={start}"),
+                _ => panic!("t={t} start={start}: {got:?} vs {want:?}"),
+            }
+        }
+    }
+    // Non-vacuity: the fixture must actually interpolate somewhere, or every
+    // comparison above is between two copies of the same error.
+    assert!(ring.sample_with_twist(1234, ExtrapPolicy::Error).is_ok());
+
+    // The cursor must *move*, or the gallop restarts from `lo_logical` every
+    // call and the batch layout is paying for a search it does not get. Nothing
+    // above can see this: the answers are identical either way.
+    let mut cursor = 0u64;
+    let mut seen = [0u64; 3];
+    for (k, t) in [550i64, 1150, 1750].into_iter().enumerate() {
+        ring.sample_with_twist_from(t, ExtrapPolicy::Error, &mut cursor)
+            .unwrap();
+        seen[k] = cursor;
+    }
+    assert!(
+        seen[0] < seen[1] && seen[1] < seen[2],
+        "the cursor did not advance across an ascending sweep: {seen:?}"
+    );
+}
+
 // ---- claim / publisher --------------------------------------------------
 
 #[test]

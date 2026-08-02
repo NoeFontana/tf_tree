@@ -181,29 +181,9 @@ impl SampleRing<'_> {
             return self.read_slot((newest & self.mask) as usize);
         }
 
-        // Exponential (galloping) search for the last logical index whose stamp is
-        // <= t, resuming from `cursor`. Here t_old <= t < t_new, so the window
-        // endpoints already bracket `t`: stamp[lo_logical] <= t < stamp[newest].
-        let hint = (*cursor).clamp(lo_logical, newest);
-        let (lo, hi) = if self.stamp_at(hint) <= t {
-            // Gallop upward while the probe stays <= t.
-            let mut step = 1u64;
-            while hint + step < newest && self.stamp_at(hint + step) <= t {
-                step *= 2;
-            }
-            (hint + step / 2, (hint + step).min(newest))
-        } else {
-            // Gallop downward while the probe stays > t.
-            let mut step = 1u64;
-            while hint.saturating_sub(step) > lo_logical && self.stamp_at(hint - step) > t {
-                step *= 2;
-            }
-            (hint.saturating_sub(step).max(lo_logical), hint - step / 2)
-        };
-
-        // Binary search within the galloped bracket, branchless — see
-        // [`Self::bracket`]. Invariant: stamp[lo] <= t < stamp[hi].
-        let i = self.bracket(lo, hi, t);
+        // Here t_old <= t < t_new, so the window endpoints already bracket `t`
+        // and `bracket_from`'s precondition holds.
+        let i = self.bracket_from(lo_logical, newest, t, *cursor);
         *cursor = i;
         let t_i = self.stamp_at(i);
 
@@ -303,6 +283,64 @@ impl SampleRing<'_> {
         base
     }
 
+    /// [`Self::bracket`], but seeded from `hint` by an exponential (galloping)
+    /// search instead of restarted at the window midpoint.
+    ///
+    /// Caller guarantees the same precondition [`Self::bracket`] wants,
+    /// `stamp[lo_logical] <= t < stamp[newest]`, and it is what makes the
+    /// gallop safe to seed with anything: both arms exist only to hand
+    /// `bracket` a sub-interval that still brackets `t`, so a stale, clamped or
+    /// nonsensical `hint` costs probes and can never change the answer. That is
+    /// the property `Guard::cursor` relies on.
+    ///
+    /// # One implementation, two samplers
+    ///
+    /// [`Self::sample_from`] and [`Self::sample_with_twist_from`] both come
+    /// here. They differ in what they do with the bracket — one interpolates a
+    /// pose, the other also differentiates the segment — never in how they find
+    /// it. A second copy of this would be a second place for the
+    /// `saturating_sub` arithmetic in the downward arm to be wrong, and that
+    /// arm is unreachable from the in-tree callers (they seed cursors to `0`),
+    /// so a divergence would sit untested until somebody's stamps descended.
+    ///
+    /// # Why `inline(always)` and not `inline`
+    ///
+    /// **Measured, and the difference is not small.** This code used to be
+    /// written out inside `sample_from`, which is where `Plan::at`'s scalar
+    /// lookup reaches it through `Guard::sample_hinted`. Hoisting it behind a
+    /// plain `#[inline]` cost **12 %** on `examples/abi_cost.rs`'s depth-3
+    /// lookup — 188.5 -> 210 ns native, 194.6 -> 223 ns through the C ABI, over
+    /// three pinned runs each that agreed to 1 ns. `inline(always)` returns it
+    /// to 188.5 / 194.6, i.e. to the byte-for-byte inline form.
+    ///
+    /// The likely reason is that `sample_from` is generic over `I: Interp` and
+    /// this is not, so one shared body faces two monomorphized call sites and
+    /// the inliner declines. Whatever the mechanism, the attribute is load
+    /// bearing: **do not weaken it to `#[inline]`** without re-running that
+    /// example pinned, because nothing else in the suite will notice.
+    #[inline(always)]
+    fn bracket_from(&self, lo_logical: u64, newest: u64, t: i64, hint: u64) -> u64 {
+        let hint = hint.clamp(lo_logical, newest);
+        let (lo, hi) = if self.stamp_at(hint) <= t {
+            // Gallop upward while the probe stays <= t.
+            let mut step = 1u64;
+            while hint + step < newest && self.stamp_at(hint + step) <= t {
+                step *= 2;
+            }
+            (hint + step / 2, (hint + step).min(newest))
+        } else {
+            // Gallop downward while the probe stays > t.
+            let mut step = 1u64;
+            while hint.saturating_sub(step) > lo_logical && self.stamp_at(hint - step) > t {
+                step *= 2;
+            }
+            (hint.saturating_sub(step).max(lo_logical), hint - step / 2)
+        };
+        // Binary search within the galloped bracket, branchless — see
+        // [`Self::bracket`]. Invariant: stamp[lo] <= t < stamp[hi].
+        self.bracket(lo, hi, t)
+    }
+
     /// Sample at `t` **and** the body twist there, in units of 1/second —
     /// `docs/PHASE4.md` §2.3.
     ///
@@ -336,6 +374,62 @@ impl SampleRing<'_> {
         t: i64,
         policy: ExtrapPolicy,
     ) -> Result<(Iso3, Twist), LookupError> {
+        self.sample_with_twist_seeking(t, policy, |s, lo, hi, t| s.bracket(lo, hi, t))
+    }
+
+    /// [`Self::sample_with_twist`], resuming the bracket search from `cursor`
+    /// by the same galloping search [`Self::sample_from`] uses.
+    ///
+    /// This is [`Self::sample_from`]'s counterpart for the derivative path, and
+    /// it exists for the same reason: `Plan::at_many_into(Layout::QuatTwist)`
+    /// is the n = 1024 batch `docs/API.md` §3.3 is written for, and without it
+    /// that layout is the only one paying an `O(log n)` binary search per stamp
+    /// per plan step while every pose layout pays `O(1)` amortized.
+    ///
+    /// Only the *start* of the search differs; [`Self::bracket_from`] is shared
+    /// with `sample_from` and cannot return a different index than
+    /// [`Self::bracket`] would. `cursor` is updated to the lower bracket index
+    /// found, so the next call resumes there; seed it to `0` for the first.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::sample_with_twist`].
+    pub fn sample_with_twist_from(
+        &self,
+        t: i64,
+        policy: ExtrapPolicy,
+        cursor: &mut u64,
+    ) -> Result<(Iso3, Twist), LookupError> {
+        self.sample_with_twist_seeking(t, policy, |s, lo, hi, t| {
+            let i = s.bracket_from(lo, hi, t, *cursor);
+            *cursor = i;
+            i
+        })
+    }
+
+    /// The body of [`Self::sample_with_twist`] and
+    /// [`Self::sample_with_twist_from`], parameterized on how the bracket is
+    /// found.
+    ///
+    /// `seek` is a distinct type at each of the two call sites, so each gets
+    /// exactly the code it had — the cursor variant does not put a branch, a
+    /// pointer or a spare compare into the cursor-less one, which is the scalar
+    /// `at_with_derivatives` path.
+    ///
+    /// It is called only from the interpolating arm. The extrapolation arms and
+    /// the `t == t_new` left-limit arm reach their index without a search at
+    /// all, so a cursor passed through them is simply left where it was — still
+    /// a valid hint, since a wrong one cannot produce a wrong result.
+    #[inline]
+    fn sample_with_twist_seeking<F>(
+        &self,
+        t: i64,
+        policy: ExtrapPolicy,
+        seek: F,
+    ) -> Result<(Iso3, Twist), LookupError>
+    where
+        F: FnOnce(&Self, u64, u64, i64) -> u64,
+    {
         let h = self.head.load(Ordering::Acquire);
         if h == 0 {
             return Err(LookupError::NoData { edge: self.edge });
@@ -396,7 +490,7 @@ impl SampleRing<'_> {
         let i = if t == t_new {
             newest - 1
         } else {
-            self.bracket(lo_logical, newest, t)
+            seek(self, lo_logical, newest, t)
         };
         let t_i = self.stamp_at(i);
         let t_j = self.stamp_at(i + 1);
