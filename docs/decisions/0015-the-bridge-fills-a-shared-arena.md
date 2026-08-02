@@ -64,9 +64,30 @@ changes.**
 
 ### The ABI
 
-`tft_bridge_options` gains one field, at the end, guarded by the existing
-`struct_size` prefix rule (§3.6) so a caller built against the previous header
-keeps working unchanged:
+`tft_bridge_options` gains one field, at the end.
+
+> **Correction — the prefix rule §3.6 describes is implemented for exactly one
+> struct, and `tft_bridge_options` is not it.** This paragraph used to say the
+> field was "guarded by the existing `struct_size` prefix rule … so a caller
+> built against the previous header keeps working unchanged". `tft_bridge_create`
+> validates with **exact equality** (`crates/tf_tree_c/src/bridge.rs:890-893`)
+> and then reads the whole struct (`:896`). The rule exists for
+> `tft_bridge_sample` alone — frozen shadow struct at `:293-301`, compile-time
+> offset assertions at `:303-323`, bounded copy in `read_sample` at
+> `:1368-1402`. `tft_bridge_outcome`, `tft_bridge_remap` and `tft_bridge_stats`
+> are exact-equality too, and stay that way: they are `out` parameters, and
+> accepting a short one means the callee must know which fields to skip writing,
+> which is a different and larger design.
+>
+> So this record's **first** step is to *port* the rule, not to rely on it: a
+> `tft_bridge_options_v1` shadow struct with the same offset assertions, and a
+> `read_options` that narrows the copy to the declared size. **Relaxing `!=` to a
+> length test without narrowing the read is an out-of-bounds read**, in the one
+> crate whose entire `unsafe` budget is argument validation — `read_sample`'s own
+> doc comment is explicit that the narrowed copy *is* the safety argument.
+> `tft_bridge_create`'s safety contract widens from "whose `struct_size` is set"
+> to "…and which has at least that many readable bytes", matching
+> `tft_bridge_offer`'s.
 
 ```c
 typedef struct {
@@ -84,8 +105,42 @@ typedef struct {
 } tft_bridge_options;
 ```
 
-`tft_bridge_create` selects `build_shared(name)` over `build()` on that field
-alone. Everything downstream — the claims, the ingest pipeline, the counters,
+`tft_bridge_create` routes the same builder through `tf_tree::Open` instead of
+calling `build()`.
+
+> **Correction — `build_shared(name)` alone cannot do this.** This paragraph used
+> to say `tft_bridge_create` "selects `build_shared(name)` over `build()` on that
+> field alone". `TreeBuilder::build_shared` **publishes no rendezvous**:
+> `crates/tf_tree/src/tree.rs:373-376` is explicit that the name is a debug label
+> that appears in `/proc/<pid>/fd`, and that *"segments are not discoverable by
+> name — the fd is the capability"*. A second process could not find it. The path
+> that publishes is `Open::open`'s `Created`/`TookOver` arm
+> (`crates/tf_tree/src/open.rs:337-345`), which is `build_shared` **plus**
+> `use_ofd_liveness`, `use_claim_leases`, `spawn_owner_server` and
+> `hold_ownership`.
+
+The call is:
+
+```rust
+Open::new().name(arena_name)?
+    .mode(AttachMode::ReadWrite)
+    .create(CreatePolicy::IfAbsent)
+    .require_create(true)                              // see *Failure*
+    .layout_if_creating(ingest.declared().builder())
+    .open()
+```
+
+`layout_if_creating` is what preserves §5.6: the builder still comes from
+`ingest.declared()` and never from `config`, so a `tf_prefix`-rewritten topology
+sizes the arena, exactly as `bridge.rs:978-988` requires today.
+
+**`arena_name` is the rendezvous *name*; the rendezvous *domain* is not
+`tft_bridge_options.domain`.** That field is §5.5's *time* domain. The rendezvous
+domain comes from `$TF_TREE_DOMAIN`, else `$ROS_DOMAIN_ID`, else 0 — which is
+precisely [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3's
+resolution of question 2, and why no derivation from `tf_prefix` is needed. Two
+fields named "domain" in one header meaning different things is a documentation
+obligation, not an accident to be discovered. Everything downstream — the claims, the ingest pipeline, the counters,
 the outcome POD — is unchanged, because a `Tree` is a `Tree`.
 
 ### The rclcpp surface
@@ -106,8 +161,45 @@ Phase 2 already specified, rather than a special case.
 A shared build can fail where a heap build cannot — the name is taken, the
 runtime directory is unwritable, `memfd_create` is refused. Those are startup
 failures and join the ones `tft_bridge_create` already reports (domain, cycle,
-claim), with the existing status codes; there is no new error class and no
-runtime fallback to a heap arena. **A bridge asked for a shared arena that
+claim). **They need one new status code, and the bridge needs one new builder
+knob.**
+
+> **Correction — "no new error class" does not survive contact.** Nothing
+> existing means these: `TFT_ERR_BAD_CONFIG` is the topology *text*,
+> `TFT_ERR_TIME_DOMAIN` is §5.5's domain agreement, and the claim family is
+> per-edge with `frame_a`/`frame_b` in its detail. Collapsing them onto
+> `TFT_ERR_INTERNAL` — what `tft_tree_open` does today — leaves an operator
+> unable to tell "another bridge holds this name" from "the runtime directory is
+> on NFS" from "a bug", which is the diagnosis this section exists to protect.
+>
+> So: **`TFT_ERR_ARENA_UNAVAILABLE`**, one code with a specific `tft_error`
+> message, at the granularity `TFT_ERR_BAD_CONFIG` already uses for every way a
+> config can be wrong. Under §3.6 that is a **minor bump**, on the precedent
+> `TFT_ABI_VERSION_MINOR`'s own documentation sets for `TFT_ERR_BAD_STAMP` — and
+> the argument is tighter here, because the code is reachable only when
+> `arena_name` is non-NULL, which a caller whose `struct_size` names the previous
+> layout cannot set.
+>
+> **And `CreatePolicy` has no "create, or refuse if one is already live"
+> variant.** With plain `IfAbsent` a second bridge takes the *join* path,
+> attaches read-write, and starts claiming edges in somebody else's arena — the
+> fault [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3's
+> question 3 closes. `Never` forbids creating; `Always` is `--force-new` and
+> documents itself as "never take this path automatically". So
+> `Open::require_create(bool)` + `OpenError::ArenaAlreadyLive`, in
+> `crates/tf_tree/src/open.rs` where the session is already in hand.
+>
+> **A `bridge`-without-`shm` build must refuse, not ignore.** `bridge` and `shm`
+> are independent cargo features and **no recipe builds both together**;
+> `build_shared` and `tft_tree_open` are `#[cfg(feature = "shm")]`. Such a build
+> carries `arena_name` in its header with no `tf_tree::Open` behind it, and must
+> return `TFT_ERR_ARENA_UNAVAILABLE` naming the missing feature. Ignoring the
+> field is precisely the silent downgrade the rest of this section forbids,
+> reached by a *build configuration* rather than a runtime fault — and it is the
+> more likely of the two. `just shm-check` gains the `--features bridge,shm`
+> lines that make the combination compile at all.
+
+There is no runtime fallback to a heap arena. **A bridge asked for a shared arena that
 cannot make one must refuse to start**, because a silent downgrade would leave
 every consumer waiting on a rendezvous that will never appear, which is the
 failure mode hardest to diagnose from the consumer's side.
@@ -163,8 +255,15 @@ unchanged and must be tested, not assumed.
 
 ## Implementation plan
 
-1. **`tft_bridge_options.arena_name`**, `struct_size`-guarded, defaulting to
-   NULL; `tft_bridge_create` branches to `build_shared`. — verified by a new
+0. **`Open::require_create` + `OpenError::ArenaAlreadyLive`** — not in this
+   record's original seven, and required by them (see *Failure*). — verified by
+   `just shm-rendezvous` with a case asserting a second `require_create(true)`
+   open against a live arena fails and leaves the first serving.
+1. **Port the `struct_size` prefix rule to `tft_bridge_options`** — shadow
+   struct, offset assertions, a `read_options` that narrows the copy, and
+   *deletion* of the whole-struct `read_unaligned` — then append `arena_name`
+   defaulting to NULL; `tft_bridge_create` branches to the `Open` path of
+   *The ABI* above. — verified by a new
    `crates/tf_tree_c/tests/bridge.rs` case asserting a caller passing the
    *previous* `struct_size` still gets a heap arena, plus the existing 52 cases
    staying green.
@@ -183,8 +282,13 @@ unchanged and must be tested, not assumed.
    a bridge. — verified by `just dds-bench` reporting four arms at 0 % failure.
 6. **Delete `dds_report::MISSING_ARM`** and the paragraph in
    `docs/benchmarks/tf2.md` it mirrors, replacing both with the measured row. —
-   verified by the `crates/tf_tree_bench` test that pins the report's required
-   sections.
+   **the test this step used to name does not exist.** `dds_report.rs` has no
+   `mod tests` and nothing under `crates/tf_tree_bench/tests/` references
+   `MISSING_ARM`; the `REQUIRED_ROWS` machinery that sounds like it belongs to
+   `bench_report`, a different binary. The sentence is pinned by nothing, so
+   deleting it is unverified by construction. This step therefore *adds* the pin
+   as well: a test over `aggregate`'s rendered output asserting four arm labels
+   and the absence of `NOT MEASURED`.
 7. **Update `docs/PHASE4.md` §5.8 and `docs/PHASE5.md` §0.0's §9 row.** —
    verified by review.
 

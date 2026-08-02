@@ -440,17 +440,19 @@ A read-only participant asked for a frame nobody has declared yet. This is a
 startup-ordering problem, not a typo — and there are two distinct causes, which
 want opposite responses.
 
-**First, check the consumer is not the process that created the arena.** With
-`CreatePolicy::IfAbsent` — the default — a consumer that starts before any
-publisher creates an *empty* arena with a default layout, after which the
-publisher's own `layout_if_creating` never runs and the topology is permanently
-wrong. That consumer then looks healthy and finds nothing, forever.
-`CreatePolicy::Never`'s doc comment has named this hazard since Phase 2, and
+**First, check the consumer is not the process that created the arena.** A
+consumer that passes `CreatePolicy::IfAbsent` **and** a layout, and starts before
+any publisher, creates the arena itself — with *its* topology, permanently, since
+capacity and edges are fixed at creation. It then looks healthy and finds
+nothing, forever. `tf_tree participants` showing a single read-only participant
+on an arena with no edges is the signature.
 [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2 makes
-it unrepresentable: a read-only attach *implies* `CreatePolicy::Never`. On a
-build that predates that, pass it explicitly. `tf_tree participants` will show
-you a single read-only participant on an arena with no edges, which is the
-signature.
+it unrepresentable: a read-only attach *implies* `CreatePolicy::Never`, and the
+builder's own default is now `Never`. On a build that predates that, pass it
+explicitly. (An earlier revision of this row said the *default* silently created
+an empty arena. It did not — without a layout that combination fails
+`NoLayoutToCreate`. The hazard needed a caller that also passed
+`layout_if_creating`.)
 
 **Otherwise the publisher genuinely has not started yet, and the answer is to
 wait rather than to fail.** `Tree::await_frames(["map", "base_link"], deadline)`
