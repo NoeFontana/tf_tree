@@ -68,8 +68,7 @@ loom:
 # only one: that record's steps 6–7 have deleted `tf_tree_c`'s and
 # `tf_tree_py`'s `extend_to_static` helpers, so this recipe covers every
 # lifetime extension there is rather than one of three). That record names
-# `just miri`
-# as the verification for its step 2 — a gate the recipe could not perform while
+# `just miri` as the verification for its step 2 — a gate it could not perform while
 # the crate was excluded. It earned its place immediately: adding it caught a
 # real *"deallocating while item [SharedReadOnly …] is strongly protected"* in
 # the first version of that type, which no other gate in this repository could

@@ -56,8 +56,7 @@ version moves anyway.
 > replace two hand-rolled `extend_to_static` helpers in crates the Rust test
 > suite cannot instrument (`tf_tree_c`, `tf_tree_py`). **`0017` steps 6–7 have
 > deleted both**, so it is now the workspace's only lifetime extension rather
-> than one of three. The rule the
-> list is a snapshot of is
+> than one of three. The rule the list is a snapshot of is
 > [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md)'s criterion —
 > `unsafe` only at a boundary the compiler cannot see across — and the phases
 > after this one added `tf_tree_ipc`, `tf_tree_py` and `tf_tree_c` under it.
