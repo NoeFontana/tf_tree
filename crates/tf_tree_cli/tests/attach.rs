@@ -139,9 +139,22 @@ fn echo_attaches_and_resolves() {
 /// carries a note. A bare `pass` on either would be the lie by omission this
 /// asserts against.
 ///
+/// **And `TFT019` needs a third thing said, because this skip is all it ever
+/// says.** `doctor` has two sources — the built-in fixture and this attach — so
+/// on a deployment the live skip is the only outcome `TFT018` or `TFT019` can
+/// produce. A reader who meets a silent `TFT019` here must not read it as "the
+/// clock did not step"; the skip line itself is the only place that can be
+/// corrected, since `docs/` is not what an operator has open at 3 a.m. This is
+/// the end-to-end half of the unit assertion in
+/// `checks::tests::tft019_inherits_tft018s_live_arena_skip` — that one pins the
+/// string, this one pins that it survives into the printed report.
+///
 /// Mutant: return `Vec::new()` from `live_evidence_notes`. Applied: the
 /// `TFT011` note assertion fails while the rest still passes, which is the
 /// half-blind case going unreported.
+/// Mutant B: print only the first sentence of each `not run:` reason. Applied:
+/// the `TFT019` reachability assertion fails — the limitation is stated in the
+/// check and lost on the way to the operator.
 #[test]
 fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
     let scratch = Scratch::new("doctor");
@@ -167,6 +180,13 @@ fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
     assert!(
         out.contains("instance "),
         "doctor did not report which arena instance it looked at:\n{out}"
+    );
+    // This skip is every verdict TFT018/TFT019 have on a deployment, so it has
+    // to say that rather than let its silence read as an all-clear.
+    let not_run_reasons = out.split("not run:").nth(1).unwrap_or("");
+    assert!(
+        not_run_reasons.contains("doctor's only sources are this attach and the built-in fixture"),
+        "TFT019's skip must reach the operator saying it cannot reach a verdict here:\n{out}"
     );
     // `TFT014` resolves a claim through the *shared* arena's participant
     // table, which is the case a single-process test cannot reach. A leaked

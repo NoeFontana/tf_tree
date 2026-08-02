@@ -17,9 +17,9 @@
 //! layout: an id never changes meaning, never gets recycled, and is what
 //! `--json`, `--suppress` and every document refer to.
 //!
-//! # The catalogue is `TFT001`–`TFT018`
+//! # The catalogue is `TFT001`–`TFT019`
 //!
-//! §6's table lists sixteen; its amendment adds two. Mapping the seven Phase 1
+//! §6's table lists sixteen; its amendments add three. Mapping the seven Phase 1
 //! checks ([`crate::doctor`]) onto it goes:
 //!
 //! | Phase 1 check | Catalogue id |
@@ -30,6 +30,11 @@
 //! | `cycle`, `unreachable` | `TFT012` (both are "the topology walk does not reach everything") |
 //! | `unclaimed-dynamic` | `TFT017` |
 //! | `out-of-order` | `TFT018` |
+//!
+//! `TFT019` maps onto no Phase 1 check: it is an **attribution** of `TFT018`'s
+//! evidence, reading one more fact the arena already holds (`EdgeRecord::domain`)
+//! to say that a wall clock stepped rather than that a publisher misbehaved.
+//! Where `TFT018` says *what*, `TFT019` says *who*.
 //!
 //! **The last two got new ids rather than being folded into existing ones.**
 //! `TFT013` is *declared but never published*, which is not *published and then
@@ -48,7 +53,7 @@
 //! first revision in.
 //!
 //! Going the other way, some ids have no detection *here*: three cannot detect
-//! anything in any configuration, and five more depend on what this arena, this
+//! anything in any configuration, and seven more depend on what this arena, this
 //! engine build and this host can supply. Each is reported [`Status::Skipped`]
 //! with the reason stated in [`crate::checks`], never silently passed.
 //!
@@ -135,12 +140,15 @@ pub enum Tft {
     Tft017,
     /// Stamps arriving out of monotonic order on an edge.
     Tft018,
+    /// A wall-clock domain stepped backwards — [`Tft::Tft018`]'s cause, not a
+    /// publisher fault.
+    Tft019,
 }
 
 impl Tft {
     /// Every check, in id order. [`crate::checks::run`] walks this, so a new
     /// variant cannot be added and then silently never executed.
-    pub const ALL: [Tft; 18] = [
+    pub const ALL: [Tft; 19] = [
         Tft::Tft001,
         Tft::Tft002,
         Tft::Tft003,
@@ -159,6 +167,7 @@ impl Tft {
         Tft::Tft016,
         Tft::Tft017,
         Tft::Tft018,
+        Tft::Tft019,
     ];
 
     /// The stable identifier, e.g. `"TFT010"`. **Never changes.**
@@ -183,6 +192,7 @@ impl Tft {
             Tft::Tft016 => "TFT016",
             Tft::Tft017 => "TFT017",
             Tft::Tft018 => "TFT018",
+            Tft::Tft019 => "TFT019",
         }
     }
 
@@ -208,6 +218,7 @@ impl Tft {
             Tft::Tft016 => "transparent huge pages off, or RLIMIT_MEMLOCK below the arena size",
             Tft::Tft017 => "dynamic edge with no live writer",
             Tft::Tft018 => "stamps arriving out of order",
+            Tft::Tft019 => "a wall-clock domain stepped backwards",
         }
     }
 
@@ -231,7 +242,8 @@ impl Tft {
             | Tft::Tft011
             | Tft::Tft014
             | Tft::Tft015
-            | Tft::Tft017 => Severity::Warn,
+            | Tft::Tft017
+            | Tft::Tft019 => Severity::Warn,
             Tft::Tft013 | Tft::Tft016 => Severity::Info,
         }
     }
@@ -800,7 +812,11 @@ mod tests {
         // nothing is the failure mode worth refusing.
         assert_eq!(Tft::parse("TFT10"), None);
         assert_eq!(Tft::parse("10"), None);
-        assert_eq!(Tft::parse("TFT019"), None);
+        // One past the end of the catalogue, so this line moves every time the
+        // catalogue is appended to — which is the point: it is what proves
+        // `parse` is driven by `ALL` and not by a hand-written list that a new
+        // variant can be forgotten from.
+        assert_eq!(Tft::parse("TFT020"), None);
     }
 
     /// **A hostile frame name must not be able to break the JSON document.**

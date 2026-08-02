@@ -1220,7 +1220,7 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     s.push('\n');
     let _ = writeln!(
         s,
-        "  {}feed{} {}(newest last; run `tf_tree doctor` for the full TFT001-TFT018 catalogue){}",
+        "  {}feed{} {}(newest last; run `tf_tree doctor` for the full TFT001-TFT019 catalogue){}",
         p.bold, p.reset, p.dim, p.reset
     );
     if tick.feed.is_empty() {

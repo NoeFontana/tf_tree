@@ -620,19 +620,32 @@ authorized by this document alone.
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
 | 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **`#[inline]` landed** — five placements, measured; a sixth was measured as a *pessimization* and left off. LTO guidance and the gated bench row outstanding: Phase 5 bench artifact (`PHASE5.md` §9.2) |
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
-| 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | its own plan |
+| 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
 | 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | **landed** — `PHASE5.md` §4.4 item 1 in full: `plan.at(..., layout=...)` and `at_into` serve all four layouts, and both refusals the twist layout adds are typed — `DerivativesUnavailableError` for a `LerpSlerp` edge, `NoSegmentError` for a stamp with no segment. Python's `interp=` default moved to `"sclerp"` (§3), so a Python-built tree answers a twist without one |
 | 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them |
 | 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | **landed** — Rust (`Stamp::from_parts`, `from_timespec`), Python (`from_parts`, `from_ros`; duck-typed on `.sec`/`.nanosec`, no `rclpy` in the wheel) and C (`tft_stamp_from_parts`, `tft_stamp_from_timespec`, `TFT_ERR_BAD_STAMP`, ABI minor 3 → 4). One refusal table is asserted on both sides of the boundary |
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
-| 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | `PHASE5.md` §6 |
+| 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed** — `tf_tree_cli`; fires only on tag 0 and only on a run of at least 8 consecutive rejected arrivals (a threshold this implementation chose, not one §5.3 states), skips naming the tag otherwise, inherits `TFT018`'s live-arena skip, and does not demote it. **Reachable only from the built-in fixture today**: `doctor`'s two sources are that fixture and a live `--attach`, and the check skips on the second, so on a deployment it never reaches a verdict — `PHASE5.md` §6's last `TFT019` amendment records what a file source would take |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 
-Items 2, 4, 8, 9 and 11 are additive and independent; 2, 8 and 9 have landed.
-Items 1 and 7 have landed too. Item 5 touches core and is the one left to
-sequence. Item 12 is gated by D21 and must not be started before `PHASE7.md`
-§0.0's four gates are met.
+**Ten of twelve rows have landed: 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part.**
+What is left is short and each piece is blocked on something nameable rather
+than merely unscheduled:
+
+- **Row 3's remainder** — the LTO guidance and the cross-crate benchmark row
+  gated at 5%. `#[inline]` landed; the row that would have caught its one
+  *pessimization* automatically has not.
+- **Row 4** — the `# Stability` headings are written, and the
+  `tf_tree::unstable::*` mirror they promise is deferred only "while the crate
+  is private" (§2.6). **That deferral expires at the first published tag**, so
+  this is the one row here that is cheap now and permanently breaking later.
+- **Row 6** is recorded, not built, and is meant to stay that way
+  ([`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md)).
+- **Row 10** belongs to `0013`'s re-baseline commit, which has not happened;
+  §3.4 is NORMATIVE that the constant moves in that same commit.
+- **Row 12** is gated by D21 and must not be started before `PHASE7.md` §0.0's
+  four gates are met.
 
 **Row 7's Python half brought two things this section did not anticipate**,
 recorded here because the next reader will meet them. The `layout=` parameter is
