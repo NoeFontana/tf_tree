@@ -74,6 +74,21 @@ fn publish(_scratch: &Scratch) -> Tree {
     // The writer is leaked so the claim stays held for the duration: an edge
     // that reports UNCLAIMED would change what `tree` and `doctor` print.
     core::mem::forget(w);
+
+    // **One successful lookup, so this is an arena *in service* and not merely
+    // one somebody has published into.** The `docs/PHASE5.md` §5 counters are
+    // incremented by lookups, so without a consumer every counter reads zero —
+    // and `checks::no_counter_evidence` then correctly refuses to let `TFT010`
+    // and `TFT011`'s counter half report anything, which is not the state this
+    // file's `doctor` test is about. A live arena with no consumer is a real
+    // state and it is covered by the fixture and `--from-bag` paths; here the
+    // point is a deployment, where somebody is reading.
+    tree.lookup(
+        "base",
+        "map",
+        tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(1_000_000_000 + 15 * 10_000_000),
+    )
+    .expect("a lookup inside the published window");
     tree
 }
 
@@ -135,9 +150,15 @@ fn echo_attaches_and_resolves() {
 /// one degrade differently — which is why the report has two ways of saying so.
 /// `TFT001` loses its only evidence (a ring remembers the current claim owner,
 /// not the sequence of writers) and is reported *not run*. `TFT011` keeps its
-/// counter evidence and loses only the capacity-vs-latency half, so it runs and
-/// carries a note. A bare `pass` on either would be the lie by omission this
+/// counter evidence — `publish` performs a lookup, so this arena has been read
+/// as well as written — and loses only the capacity-vs-latency half, so it runs
+/// and carries a note. A bare `pass` on either would be the lie by omission this
 /// asserts against.
+///
+/// **The lookup in `publish` is load-bearing for that second half.** Without it
+/// the counters are all zero, `checks::no_counter_evidence` refuses both halves,
+/// and `TFT011` skips rather than disclosing — a different, also-correct
+/// outcome, and not the one this test is about.
 ///
 /// **And `TFT019` needs a third thing said, because an attach is not a source
 /// it can answer from.** A reader who meets a silent `TFT019` here must not read

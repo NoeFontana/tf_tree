@@ -158,3 +158,58 @@ fn a_recording_handed_to_from_file_is_pointed_at_from_bag() {
         "the error must name the file: {stderr}"
     );
 }
+
+/// **`--attach` and a recording flag are refused together, whichever side of
+/// the subcommand `--attach` is typed on.**
+///
+/// `doctor` reports on one arena. Left undeclared, `doctor_source` tested
+/// `from_bag` first and the live arena silently lost: `tf_tree --attach --name
+/// prod doctor --from-bag x.mcap` exited 0 with a clean report about `x.mcap`
+/// while the operator read it as a clean report about `prod`. That is the worst
+/// available failure — a true report about the wrong subject.
+///
+/// **Both orders are asserted, and that is the point of the test.** `clap`'s
+/// `conflicts_with` looked like the fix and is not: `--attach` is
+/// `global = true` on the root command, so when it is typed *before* the
+/// subcommand `clap` matches it against the root and the `doctor` matcher has no
+/// conflict to report. Declared only that way, the pre-subcommand spelling — the
+/// one every example in `docs/RUNBOOK.md` uses — still slipped through. The
+/// check is therefore in `doctor_source`, which sees both.
+///
+/// Mutant: delete the `anyhow::ensure!(other.is_empty(), ...)` block from
+/// `doctor_source`. Applied, and the `--attach` before `doctor` case failed on
+/// its exit status: the run succeeds and reports on the bag.
+#[test]
+fn attach_and_a_recording_source_are_mutually_exclusive_in_both_orders() {
+    let dir = Scratch::new("conflict");
+    let bag = dir.0.join("clean.mcap");
+    write_mcap(&bag, &small_recording()).unwrap();
+
+    for args in [
+        vec!["--attach", "--name", "doesnotexist", "doctor", "--from-bag"],
+        vec!["doctor", "--from-bag"],
+    ] {
+        let trailing = args[0] == "doctor";
+        let mut cmd = tf_tree();
+        cmd.args(&args).arg(&bag);
+        if trailing {
+            cmd.arg("--attach");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            !out.status.success(),
+            "{args:?} (trailing --attach: {trailing}) reported on the bag while naming a live \
+             arena:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--attach") && stderr.contains("--from-bag"),
+            "the error must name both flags: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("catalogue checks"),
+            "no report may be printed alongside the refusal"
+        );
+    }
+}

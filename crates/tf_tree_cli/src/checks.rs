@@ -11,7 +11,7 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — **three** unconditionally, and **seven** more depending on what the
+//! reason — **three** unconditionally, and **eight** more depending on what the
 //! arena, the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
@@ -45,8 +45,17 @@
 //!   `EdgeCfg::nominal_rate_hz`, and a topology file's `rate_hz` reaches it
 //!   through `TopologyConfig::builder`. An arena built without one still skips,
 //!   because a `0` means *undeclared* and not *0 Hz* — see [`tft007`].
-//! * **`TFT010`**/**`TFT016`** are skipped when the engine has no counters and
-//!   when the host is not Linux, respectively.
+//! * **`TFT010`** is skipped whenever the `docs/PHASE5.md` §5 counters carry no
+//!   verdict — see [`no_counter_evidence`], which is *two* conditions: an engine
+//!   built without the feature, and an arena that has served **no lookups**. The
+//!   second is the one a recording always meets and the reference fixture meets
+//!   too: those counters are incremented by lookups, and an arena nobody has
+//!   read reads exactly like a healthy one.
+//! * **`TFT011`** reports two independent pieces of evidence under one id — the
+//!   counters, and `capacity x period` against a per-sample arrival delay — and
+//!   skips only when *both* are blind, which is what a recording is. Where one
+//!   half survives it runs, and [`crate::evidence_notes`] discloses the other.
+//! * **`TFT016`** is skipped when the host is not Linux.
 //! * **`TFT018`** (out-of-order stamps) is skipped wherever the push stream was
 //!   replayed from an arena's rings rather than recorded as it arrived, and the
 //!   two ways that happens fail it differently — see [`PushStream`]. It runs on
@@ -426,6 +435,66 @@ impl PushStream {
             }
         }
     }
+}
+
+/// Why the `docs/PHASE5.md` §5 counters carry no verdict about an arena, or
+/// `None` when they do.
+///
+/// # A zero counter has two meanings and they are opposites
+///
+/// `EdgeCounters` are incremented by *lookups*. An arena nobody has looked
+/// anything up in therefore reads exactly like a perfectly healthy one: zero
+/// extrapolation errors, zero of everything. `TFT010` seeing that clean sheet
+/// and reporting `pass` is a **fabricated all-clear** — the same shape as
+/// `TFT007` comparing an observed rate against an undeclared zero, which §6's
+/// amendment already had to correct once.
+///
+/// It is not a property of `--from-bag`. A bag-built arena is merely the source
+/// where it is *guaranteed*: `tf_tree_ingest::run` pushes and never reads, so it
+/// hands back an arena that has served no lookups at all. The reference fixture
+/// does the same (`fixture::spin_up` publishes; nothing calls `Plan::at`), and a
+/// live arena at bringup, before its first consumer, is in the same state. So
+/// the predicate is read off **the evidence itself** rather than off the source
+/// — which is what keeps a fifth `Source` from silently reintroducing the bug,
+/// and what makes the answer right for a live arena nobody is reading yet.
+///
+/// # The threshold is "any lookup at all", not "enough lookups"
+///
+/// `lookups_ok + err_extrap_before + err_extrap_after` is incremented once per
+/// lookup that touched the edge, whichever way it went, so their sum over the
+/// arena is the number of lookups the counters have seen. One is enough to make
+/// a zero mean *zero* rather than *unknown*; asking for more would be this
+/// module inventing a significance threshold the spec does not state.
+///
+/// `counters` is [`tf_tree::counters_compiled_in`]. It comes first and keeps its
+/// own reason: a build with the feature off also reads zero everywhere, and
+/// "rebuild the engine" and "exercise the arena" are different instructions.
+#[must_use]
+pub fn no_counter_evidence(counters: bool, stats: &[EdgeStats]) -> Option<&'static str> {
+    if !counters {
+        return Some(
+            "the engine was built without the `counters` feature (PHASE5 §5.5), so every counter \
+             reads zero and \"no failures\" cannot be told from \"nothing counted\"",
+        );
+    }
+    let lookups: u64 = stats
+        .iter()
+        .map(|s| {
+            s.lookups_ok
+                .saturating_add(s.extrap_before)
+                .saturating_add(s.extrap_after)
+        })
+        .sum();
+    if lookups == 0 {
+        return Some(
+            "this arena has served no lookups — every EdgeCounter reads zero — so the counters \
+             cannot distinguish a healthy arena from an unexercised one, and a pass here would \
+             be an all-clear about nothing. An arena built from a recording (--from-bag, \
+             tf_tree ingest, tf_tree freeze) is written and never read, so it is always in this \
+             state; a live arena reaches it before its first consumer",
+        );
+    }
+    None
 }
 
 /// Everything the catalogue runs against.
@@ -922,13 +991,13 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT010` — an edge whose consumers keep asking outside its window.
+///
+/// Its evidence is *entirely* the §5 counters, so it skips whenever those carry
+/// no verdict — see [`no_counter_evidence`], which covers both a build without
+/// the feature and an arena nobody has looked anything up in.
 fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
-    if !inp.counters {
-        return CheckOutcome::skipped(
-            Tft::Tft010,
-            "the engine was built without the `counters` feature (PHASE5 §5.5), so every counter \
-             reads zero and \"no failures\" cannot be told from \"nothing counted\"",
-        );
+    if let Some(why) = no_counter_evidence(inp.counters, inp.stats) {
+        return CheckOutcome::skipped(Tft::Tft010, why);
     }
     let index = inp.snap.edge_index();
     let mut out = Vec::new();
@@ -987,11 +1056,33 @@ fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
 ///    undersized ring would send an operator to enlarge a buffer that is
 ///    already big enough.
 /// 2. The Phase 1 `short-buffer` finding — `capacity x median period` against
-///    the largest observed publish latency — which needs a recorded push stream
-///    and therefore only fires on the fixture.
+///    the largest observed publish latency — which needs a per-sample arrival
+///    delay and therefore only fires on the fixture
+///    ([`PushStream::no_arrival_delays`]).
+///
+/// # It skips only when *both* halves are blind, and that is the whole rule
+///
+/// Either half alone is a real result, so losing one is a disclosure
+/// ([`crate::evidence_notes`]) and not a skip. Losing both is not: an arena that
+/// has served no lookups and a stream with no arrival delays leave this function
+/// walking two empty sets and returning `pass`, which says "your rings are big
+/// enough" on evidence that could not have said otherwise. That is the
+/// fabricated all-clear [`no_counter_evidence`] exists to refuse, and a bag
+/// source hits it on both halves at once.
 fn tft011(inp: &Inputs<'_>) -> CheckOutcome {
+    let counters = no_counter_evidence(inp.counters, inp.stats);
+    let delays = inp.stream.no_arrival_delays();
+    if let (Some(a), Some(b)) = (counters, delays) {
+        return CheckOutcome::skipped(
+            Tft::Tft011,
+            format!(
+                "neither half of this check has evidence here. Its counter half: {a}. Its \
+                     capacity-vs-latency half: {b}"
+            ),
+        );
+    }
     let mut out = Vec::new();
-    if inp.counters {
+    if counters.is_none() {
         let index = inp.snap.edge_index();
         for st in inp.stats {
             if st.extrap_before == 0 || st.worst_extrap_gap_ns <= 0 {
@@ -3102,5 +3193,138 @@ mod tests {
         // would be a second, weaker statement of the same fact.
         let none = two_frame_snapshot(edge(1, 1, 2, 100));
         assert_eq!(rate_coverage_note(&none, &obs), None);
+    }
+
+    /// **An arena that has served no lookups must not read as a healthy one.**
+    ///
+    /// `TFT010`'s evidence is entirely the §5 counters, and those are
+    /// incremented by *lookups*. A bag-built arena has served none — `ingest`
+    /// pushes and never reads — so `extrap_before + extrap_after` is zero on
+    /// every edge, the finding loop never runs, and the check reported `pass`:
+    /// an all-clear on an extrapolation hotspot nothing could have detected.
+    /// It is the same defect `TFT007` had against an undeclared rate.
+    ///
+    /// The gate is on the evidence, not on the source, so the *second* half of
+    /// this test is the real one: one lookup anywhere in the arena makes a zero
+    /// mean zero, and the check must run again.
+    ///
+    /// Mutant: delete the `lookups == 0` arm of `no_counter_evidence`. Applied:
+    /// the first assertion fails with `Pass`.
+    #[test]
+    fn an_unexercised_counter_sheet_skips_tft010_rather_than_passing_it() {
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let obs = Observations::new();
+
+        let unexercised = [EdgeStats {
+            edge: 1,
+            ..EdgeStats::default()
+        }];
+        let inp = inputs(&snap, &obs, &unexercised, Clock::Wall(0));
+        match tft010(&inp).status {
+            Status::Skipped(why) => assert!(
+                why.contains("served no lookups"),
+                "the skip must name the reason a reader can act on: {why}"
+            ),
+            other => panic!("an arena nobody has read must not report a verdict: {other:?}"),
+        }
+
+        // One successful lookup and nothing else changes: the counters now
+        // distinguish "no failures" from "nothing counted", so the check runs.
+        let exercised = [EdgeStats {
+            edge: 1,
+            lookups_ok: 1,
+            ..EdgeStats::default()
+        }];
+        let inp = inputs(&snap, &obs, &exercised, Clock::Wall(0));
+        assert_eq!(
+            tft010(&inp).status,
+            Status::Pass,
+            "one lookup is enough to make a zero error count a real result"
+        );
+    }
+
+    /// **`TFT011` skips only when *both* of its halves are blind.**
+    ///
+    /// It reports two independent pieces of evidence under one id, so losing
+    /// one is a disclosure and losing both is a skip. A bag loses both at once
+    /// — no lookups have been served, and a recording carries no arrival delay
+    /// — and the `pass` that came out of that said "your rings are big enough"
+    /// after walking two empty sets.
+    ///
+    /// Mutant: make the guard `if counters.is_some() || delays.is_some()`.
+    /// Applied: the `Observed` case skips and the last assertion fails.
+    #[test]
+    fn tft011_skips_when_neither_half_has_evidence_and_runs_when_either_does() {
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let obs = Observations::new();
+        let unexercised = [EdgeStats {
+            edge: 1,
+            ..EdgeStats::default()
+        }];
+
+        // A recording: counters unexercised *and* no arrival delays.
+        let mut inp = inputs(&snap, &obs, &unexercised, Clock::Wall(0));
+        inp.stream = PushStream::Recorded;
+        match tft011(&inp).status {
+            Status::Skipped(why) => {
+                assert!(
+                    why.contains("served no lookups"),
+                    "the counter half's reason is missing: {why}"
+                );
+                assert!(
+                    why.contains("recorder's clock"),
+                    "the capacity-vs-latency half's reason is missing: {why}"
+                );
+            }
+            other => panic!("neither half had evidence and it still reported: {other:?}"),
+        }
+
+        // The fixture: counters unexercised, but the stream records an arrival
+        // delay per sample, so half two is a real result and the check runs.
+        let mut inp = inputs(&snap, &obs, &unexercised, Clock::Wall(0));
+        inp.stream = PushStream::Observed;
+        assert_eq!(tft011(&inp).status, Status::Pass);
+
+        // A live arena that has served lookups: half one is a real result.
+        let exercised = [EdgeStats {
+            edge: 1,
+            lookups_ok: 1,
+            ..EdgeStats::default()
+        }];
+        let mut inp = inputs(&snap, &obs, &exercised, Clock::Wall(0));
+        inp.stream = PushStream::RingsUnderWriter;
+        assert_eq!(tft011(&inp).status, Status::Pass);
+    }
+
+    /// **A build without `counters` keeps its own reason.**
+    ///
+    /// "Rebuild the engine with the feature on" and "exercise the arena" are
+    /// different instructions, and the feature check has to come first because
+    /// a build without counters also reads zero everywhere — reporting *that*
+    /// as "this arena has served no lookups" would send a reader to run a
+    /// consumer against an engine that will never count it.
+    ///
+    /// Mutant: swap the two arms of `no_counter_evidence`. Applied: the first
+    /// assertion fails.
+    #[test]
+    fn the_counters_feature_and_an_unexercised_arena_are_different_skips() {
+        let off = no_counter_evidence(false, &[]).expect("a build without counters has no verdict");
+        assert!(off.contains("`counters` feature"), "{off}");
+
+        let unexercised = [EdgeStats {
+            edge: 1,
+            ..EdgeStats::default()
+        }];
+        let on = no_counter_evidence(true, &unexercised).expect("zero counters carry no verdict");
+        assert!(on.contains("served no lookups"), "{on}");
+
+        // A failed lookup counts as exercise just as much as a successful one:
+        // it is the same increment site.
+        let failed = [EdgeStats {
+            edge: 1,
+            extrap_before: 1,
+            ..EdgeStats::default()
+        }];
+        assert_eq!(no_counter_evidence(true, &failed), None);
     }
 }

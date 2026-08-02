@@ -366,3 +366,189 @@ fn a_file_that_is_not_a_recording_is_refused_rather_than_silently_replaced() {
         "a refused source must not fall back to the fixture and report on it"
     );
 }
+
+/// **The counter checks skip on a bag-built arena instead of reporting a clean
+/// sheet.**
+///
+/// This is the fabricated all-clear that `--from-bag` shipped with.
+/// `tf_tree_ingest::run` pushes into an arena and never reads from it, so every
+/// `EdgeCounters` field is zero — and zero extrapolation errors is exactly what
+/// a *healthy, heavily-used* arena looks like. `TFT010` walked the empty set and
+/// reported `pass`; `TFT011`'s counter half did the same, while its other half
+/// was already structurally silent on a recording. A stranger's first run got
+/// two green rows about instrumentation nobody had exercised.
+///
+/// It is asserted through the binary rather than in `checks.rs` because the unit
+/// tests build their own `EdgeStats`: only a real ingest shows that the arena a
+/// recording produces is genuinely in this state.
+///
+/// **The reason is asserted per feature configuration, because there are two of
+/// them and `just ingest-check` runs both.** With `counters` off — the CLI's
+/// `--no-default-features` build — every counter reads zero for a *different*
+/// reason, and "rebuild the engine" and "exercise the arena" are different
+/// instructions. The document says which build it is, so the test reads it from
+/// the same document rather than from a `cfg`.
+///
+/// Mutant: restore `tft010`'s old guard — `if !inp.counters { skip }` — so an
+/// unexercised sheet runs. Applied, and this failed on
+/// `assert_eq!(status_of(&json, "TFT010"), "skipped")` with `pass`.
+#[test]
+fn a_bag_built_arena_skips_the_counter_checks_rather_than_passing_them() {
+    let dir = Scratch::new("counters");
+    let bag = dir.0.join("clean.mcap");
+    write_mcap(&bag, &small_recording()).unwrap();
+
+    let (json, stderr, ok) = doctor_json(&bag, &[]);
+    assert!(ok, "{json}\n{stderr}");
+
+    // The counter half's expected sentence, whichever build this is.
+    let counter_reason = if json.contains("\"counters_compiled_in\": true") {
+        "served no lookups"
+    } else {
+        "`counters` feature"
+    };
+
+    assert_eq!(
+        status_of(&json, "TFT010"),
+        "skipped",
+        "an arena nobody has looked anything up in cannot report an extrapolation hotspot:\n{json}"
+    );
+    let why = reason_of(&json, "TFT010");
+    assert!(
+        why.contains(counter_reason),
+        "the skip has to name the reason, not just decline: {why}"
+    );
+
+    assert_eq!(
+        status_of(&json, "TFT011"),
+        "skipped",
+        "neither of TFT011's halves has evidence on a recording:\n{json}"
+    );
+    let why = reason_of(&json, "TFT011");
+    assert!(
+        why.contains(counter_reason) && why.contains("recorder's clock"),
+        "both halves must say why they are blind: {why}"
+    );
+}
+
+/// **`TFT017` fires on every dynamic edge of a recording, and the report says
+/// that is what a recording looks like.**
+///
+/// An arena built from a bag has no writer at all — the ingest's claims are
+/// released when it returns — so this warn is guaranteed on every healthy
+/// recording anyone points `doctor` at. It stays a warn rather than becoming a
+/// skip because a fleet whose publishers have all stopped reaches the identical
+/// arena state, and falling silent there would delete the check's whole purpose;
+/// the disclosure in `Meta.notes` is what distinguishes the two.
+///
+/// Mutant: delete `notes.extend(unclaimed_coverage_note(snap));` from
+/// `evidence_notes`. Applied, and this failed on `no note explaining an
+/// all-unclaimed arena`.
+#[test]
+fn an_all_unclaimed_arena_is_warned_about_and_explained() {
+    let dir = Scratch::new("unclaimed");
+    let bag = dir.0.join("clean.mcap");
+    write_mcap(&bag, &small_recording()).unwrap();
+
+    let (json, stderr, ok) = doctor_json(&bag, &[]);
+    assert!(ok, "{json}\n{stderr}");
+    assert_eq!(status_of(&json, "TFT017"), "fired", "{json}");
+    assert!(
+        json.contains("dynamic edge(s), so it names this arena rather than any edge in it"),
+        "no note explaining an all-unclaimed arena:\n{json}"
+    );
+}
+
+/// **An ingest flag `doctor` cannot act on is refused, not ignored.**
+///
+/// `IngestArgs` is flattened into `doctor` so `--from-bag` takes the knobs
+/// `tf_tree ingest` takes. Undeclared, that made all eleven of them parse on
+/// every `doctor` invocation and then vanish: `doctor --tf-prefix robot1` exited
+/// 0 having applied no prefix to anything, and `doctor --from-file x.tft
+/// --max-memory 64` bounded nothing. The user's only signal was the output being
+/// wrong in a way they had no reason to look for.
+///
+/// Mutant: delete the `anyhow::ensure!` on `ingest.flags_set()` in
+/// `doctor_source`. Applied, and this failed on the exit status: the fixture's
+/// report prints and the run succeeds.
+#[test]
+fn an_ingest_flag_without_a_recording_is_refused() {
+    let out = tf_tree()
+        .arg("doctor")
+        .arg("--tf-prefix")
+        .arg("robot1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a flag that does nothing must not be accepted silently:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--tf-prefix") && stderr.contains("--from-bag"),
+        "the error must name the flag and the flag that would make it mean something: {stderr}"
+    );
+
+    // The same flag *with* a recording is accepted, so the rejection is about
+    // the missing source and not about the flag.
+    let dir = Scratch::new("prefixed");
+    let bag = dir.0.join("clean.mcap");
+    write_mcap(&bag, &small_recording()).unwrap();
+    let (json, stderr, ok) = doctor_json(&bag, &["--tf-prefix", "robot1"]);
+    assert!(ok, "{json}\n{stderr}");
+    assert!(
+        json.contains("robot1/"),
+        "the prefix reached the arena:\n{json}"
+    );
+}
+
+/// **A recording too large for `--max-memory` is refused, not truncated.**
+///
+/// `arrival_observations` holds one 24-byte sample per dynamic transform, all of
+/// them at once, because `TFT018`'s question is about the whole sequence. It is
+/// the only allocation in `doctor` that grows with the user's input, and
+/// `--max-memory` — already on the command line, already bounding pass two — is
+/// what bounds it.
+///
+/// Refusing rather than truncating is the point: a prefix of the arrival stream
+/// would let `TFT018` and `TFT019` report `pass` about the part they happened to
+/// fit, which is the same fabricated all-clear this source exists to remove.
+///
+/// Mutant: replace the `anyhow::ensure!(!overflowed, ...)` with `Ok(obs)`.
+/// Applied, and this failed on the exit status: the run succeeds and TFT018
+/// passes on the first sample.
+#[test]
+fn a_recording_that_will_not_fit_in_max_memory_is_refused() {
+    let dir = Scratch::new("bounded");
+    let bag = dir.0.join("clean.mcap");
+    write_mcap(&bag, &small_recording()).unwrap();
+
+    let out = tf_tree()
+        .arg("doctor")
+        .arg("--from-bag")
+        .arg(&bag)
+        .arg("--max-memory")
+        .arg("0")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--max-memory") && stderr.contains("TFT018"),
+        "the error must name the flag to raise and what a truncation would cost: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("catalogue checks"),
+        "no partial report may be printed alongside the refusal"
+    );
+
+    // The same recording at the default bound is fine, so the refusal is about
+    // the limit and not about the file.
+    let (json, stderr, ok) = doctor_json(&bag, &[]);
+    assert!(ok, "{json}\n{stderr}");
+}

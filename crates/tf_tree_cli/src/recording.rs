@@ -109,16 +109,34 @@ pub fn open_bag(bag: &Path, opts: &IngestOptions) -> Result<Ingested> {
 /// different clock from the publisher's stamp, so differencing them would report
 /// clock offset as publish latency.
 ///
+/// # It is bounded, by the same flag pass two is bounded by
+///
+/// One [`PushSample`] — `size_of` is 24 — per *dynamic, resolvable,
+/// non-zero-stamped* transform in the recording, all of them live at once
+/// because `TFT018`'s question is about the whole sequence. That makes it the
+/// allocation in `doctor` that scales with the recording's **length**: the
+/// others — [`Snapshot`], the per-edge stats — scale with the arena's frame and
+/// edge counts, which §3.1 has already sized and bounded before this runs.
+/// `max_bytes` is `--max-memory` in bytes, so the flag a user already has on the
+/// command line for pass two bounds pass three too.
+///
+/// **Exceeding it is an error, not a truncation.** A prefix of the arrival
+/// stream would let `TFT018` and `TFT019` report `pass` about the part they
+/// happened to see, which is the fabricated all-clear this whole source exists
+/// to remove; the error names the flag instead and the user raises it.
+///
 /// # Errors
 ///
-/// Any [`tf_tree_ingest::IngestError`] from re-reading the recording. It has
+/// Any [`tf_tree_ingest::IngestError`] from re-reading the recording — it has
 /// already been read twice by this point, so a failure here is a file that
-/// changed underneath the process.
+/// changed underneath the process — or the recording needing more than
+/// `max_bytes` of arrival stream.
 pub fn arrival_observations(
     bag: &Path,
     opts: &IngestOptions,
     tree: &Tree,
     snap: &Snapshot,
+    max_bytes: u64,
 ) -> Result<Observations> {
     // The arena's dynamic edges, keyed by the frame-id pair. Static edges are
     // absent on purpose: they are the one kind with no arrival order to judge.
@@ -140,6 +158,10 @@ pub fn arrival_observations(
     // the lookup on all of them.
     let mut resolved: BTreeMap<(String, String), Option<u32>> = BTreeMap::new();
     let mut obs = Observations::new();
+    // Rounded down, and `max` of 1 so a `--max-memory 0` still admits a single
+    // sample rather than refusing every recording including an empty one.
+    let cap = (max_bytes / core::mem::size_of::<PushSample>() as u64).max(1);
+    let mut overflowed = false;
 
     read_tf(bag, &opts.roles, opts.chunk_policy(), |rec| {
         if rec.is_static || rec.stamp_ns == 0 {
@@ -155,6 +177,16 @@ pub fn arrival_observations(
             }
         };
         if let Some(edge) = edge {
+            // Flagged rather than returned as an error: `read_tf`'s callback
+            // error type is `IngestError`, which is `Copy` and has no variant
+            // for this, and inventing one in `tf_tree_ingest` for a limit that
+            // is `doctor`'s alone would put a CLI concern in the library. The
+            // read runs to the end and the refusal is raised below, which also
+            // lets the message state the true count rather than the cap.
+            if obs.events.len() as u64 >= cap {
+                overflowed = true;
+                return Ok(());
+            }
             obs.record(PushSample {
                 edge,
                 writer_pid: 0,
@@ -167,6 +199,16 @@ pub fn arrival_observations(
     .map_err(|e| crate::ingest_err(e, &tf_tree_ingest::Frames::default()))
     .with_context(|| format!("re-reading {} for its arrival order", bag.display()))?;
 
+    anyhow::ensure!(
+        !overflowed,
+        "{} holds more dynamic transforms than --max-memory allows doctor to replay in arrival \
+         order: the cap is {cap} sample(s) at {} bytes each ({} MiB).\n\x20 Raise --max-memory. \
+         Reporting on the first {cap} would let TFT018 and TFT019 pass about a prefix of your \
+         recording, which is the all-clear --from-bag exists to remove.",
+        bag.display(),
+        core::mem::size_of::<PushSample>(),
+        max_bytes / (1024 * 1024),
+    );
     Ok(obs)
 }
 

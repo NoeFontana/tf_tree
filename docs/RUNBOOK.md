@@ -330,6 +330,44 @@ recorded push stream — `multi-writer` cannot see a writer that has already bee
 replaced, and `short-buffer` needs each sample's arrival lateness, which nothing
 in the arena records. Neither can fire on a live arena, so neither is claimed.
 
+### Why `doctor --from-bag` reports `TFT010` and `TFT011` as *not run*
+
+Because they have nothing to read, and saying so is the point.
+
+Both are built on the `docs/PHASE5.md` §5 counters, and those are incremented by
+**lookups**. An arena built from a recording has been written and never read —
+the ingest publishes into it and asks it nothing — so every counter is zero. A
+zero extrapolation count is also exactly what a healthy, heavily-used arena
+looks like, so a `pass` there would be an all-clear about instrumentation nobody
+had exercised. `doctor` skips instead and names the reason.
+
+**This is not specific to `--from-bag`.** The same skip appears on the built-in
+fixture, and on a live arena you attach to *before its first consumer has done a
+lookup* — which is the most likely moment to run `doctor` at bringup. Run one
+consumer, then re-run `doctor`, and both checks come back.
+
+To get a verdict on extrapolation, point `doctor` at the arena the consumers are
+actually using:
+
+```
+tf_tree doctor --attach          # after consumers have been running
+```
+
+`TFT011` is two checks under one id and skips only when both halves are blind;
+where one half still has evidence it runs and the report's `note:` lines say
+which half could not fire.
+
+### Why `doctor --from-bag` warns `TFT017` on every edge
+
+An arena built from a recording has **no writer at all** — the ingest's claims
+are released when it finishes — so *dynamic edge with no live writer* is true of
+every dynamic edge in it. The report says so in a `note:` line: the finding
+names the arena, not any edge in it.
+
+It is a warning rather than a skip on purpose. A fleet whose publishers have all
+stopped produces the identical arena state, and that is the fault this check
+exists to name. On a recording, ignore it; on an `--attach`, do not.
+
 ### Reading `tf_tree participants`
 
 | column | meaning |
