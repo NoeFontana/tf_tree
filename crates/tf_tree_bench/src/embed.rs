@@ -18,7 +18,7 @@
 //!
 //! # The gated row: one build, two crates
 //!
-//! This module's private `one` and [`tf_tree_core::bench_probe::depth3_lookup`] are the
+//! This module's private `one` and `tf_tree_core::bench_probe::depth3_lookup` are the
 //! same three lines with the same `#[inline(never)]`. The only difference
 //! between them is which crate the compiler put the body in, so the difference
 //! between their timings is the crate boundary and nothing else — no profile
@@ -40,9 +40,40 @@
 //! benchmark in this workspace, all of which sit outside `tf_tree_core` — would
 //! report ≈1.00× for ever while the real boundary went unmeasured.
 //!
+//! ## Why not `benches/lookup.rs`, which already times a depth-3 lookup
+//!
+//! It is the obvious reuse, and the reasons it cannot serve are properties of
+//! that file rather than preferences about this one. `benches/lookup.rs` carries
+//! a pointer back here so the question is answered where it is asked.
+//!
+//! 1. **It has no in-crate column and cannot grow one.** Every body a criterion
+//!    bench in `crates/tf_tree_bench/benches/` compiles is codegen'd in
+//!    `tf_tree_bench`. The denominator this row needs is a body compiled in
+//!    `tf_tree_core` — that is what `tf_tree_core::bench_probe` is — so a
+//!    second `bench_function` beside `lookup/depth3/lerpslerp` would time two
+//!    out-of-crate columns and report 1.00×, the same failure the facade probe
+//!    above has.
+//! 2. **It queries an on-grid stamp.** `bench_pair` evaluates at
+//!    `Stamp::from_nanos(fixture::NOW_NS)`; `NOW_NS` is 9 900 000 000 ns and the
+//!    fixture's knots sit at `k * period_ns`, so that stamp is a knot on all
+//!    three dynamic edges of the depth-3 path (1 kHz, 200 Hz, 50 Hz) and
+//!    `I::eval` never runs — `docs/decisions/0013`'s defect. Both halves of this
+//!    ratio have to interpolate, or the boundary is priced against a shorter
+//!    body than the one an embedder calls; hence `stamp_ns`.
+//! 3. **Criterion estimates each benchmark on its own; this row needs the two
+//!    columns paired.** [`Run::boundary_ratio`] is the median of per-round
+//!    quotients taken back to back inside one round, and the *Honesty* section
+//!    below is why: the unpaired form did not resolve 5% on this host. Two
+//!    criterion estimates are two independent measurements, which is the shape
+//!    that was replaced.
+//!
+//! The profile is **not** offered as a fourth reason: `cargo bench` accepts
+//! `--profile`, so a bench target could be built under `[profile.embedder]` too.
+//! The three above are the ones that decide it.
+//!
 //! **The in-crate body must also not be generic**, and that was found by
 //! measuring rather than by reading: the first version of
-//! [`tf_tree_core::bench_probe::depth3_lookup`] took `Stamp<D>` and the row
+//! `tf_tree_core::bench_probe::depth3_lookup` took `Stamp<D>` and the row
 //! reported **1.000×** (240.7 out-of-crate against 240.4 "in-crate"). A generic
 //! function is monomorphized in the crate that *calls* it, so both columns had
 //! been codegen'd in `tf_tree_bench` and the experiment had no independent
@@ -718,7 +749,7 @@ const fn stamp_ns(i: i64) -> i64 {
 /// One lookup per non-inlinable call, **compiled in `tf_tree_bench`** — an
 /// embedder's position, and the numerator of §9.2's ratio.
 ///
-/// The body is byte-identical to [`tf_tree_core::bench_probe::depth3_lookup`],
+/// The body is byte-identical to `tf_tree_core::bench_probe::depth3_lookup`,
 /// which is the denominator. That is the entire experiment: same three lines,
 /// same attribute, different crate.
 ///
@@ -742,9 +773,18 @@ fn one(plan: &Plan, g: &Guard, s: Stamp) -> f64 {
 ///
 /// This is what keeps a run's statement about its own build honest: the profile
 /// *directory* comes from `OUT_DIR` (see `build.rs`), and this maps that
-/// directory to the settings the manifest gives it. The two together are why the
-/// report can say `lto = false, codegen-units = 16` without anyone having
-/// retyped it.
+/// directory to the settings the manifest gives it.
+///
+/// **The report's `lto = false, codegen-units = 16` *is* retyped**, as prose,
+/// in one string constant — `crate::report`'s `EMBEDDING_NOTE`. What this
+/// function buys is not that the retyping was avoided but that it is *checked*:
+/// two tests read the manifest through here and fail if either profile stops
+/// saying what that note and this module's tables say it says
+/// (`the_row_note_states_the_settings_the_manifest_declares` in
+/// `crate::report`, and
+/// `the_two_profiles_still_say_what_this_module_says_they_say` below). One
+/// checked copy, not a derivation — and `just embed-cost`'s own output states
+/// neither setting, precisely so there is no second copy to keep true.
 ///
 /// A deliberately small TOML reader — the value is `[profile.<name>]`'s `lto`
 /// and `codegen-units`, and `tf_tree_bench` has no TOML dependency.

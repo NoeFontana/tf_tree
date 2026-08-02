@@ -20,7 +20,13 @@
 /// fresh report against the committed baseline.
 pub mod baseline;
 pub mod differential;
-/// `docs/PHASE5.md` §9.2's embedding row: the facade path an embedder compiles.
+// **Deliberately no `///` summary here**, unlike the modules around it. An outer
+// doc comment on a `mod` declaration is concatenated with the module file's own
+// `//!` docs and the whole block is then resolved in *this* module's scope, so
+// every intra-doc link in `embed.rs` — `SOURCE_ID`, `Pair::load`, `Run::verdict`
+// — becomes an unresolved-link warning. Measured: adding the summary back turns
+// 8 working links in that file into 8 `cargo doc` warnings. `embed.rs` opens
+// with a `//!` summary of its own, which is what the module index shows.
 pub mod embed;
 pub mod fixture;
 /// Multi-process evaluation harness: open-loop latency, CPU and PSS accounting.

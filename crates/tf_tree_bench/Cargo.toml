@@ -205,9 +205,13 @@ path = "src/bin/bench_report.rs"
 # differs — so the binary is useless without the feature and says so at build
 # time rather than by silently measuring one column twice.
 #
-# It is a `bin` rather than a criterion bench because it has to be built under a
-# named `[profile.*]` (§9.2: report the row at an embedder's default profile, not
-# this workspace's), and a criterion bench owns its own.
+# It is a `bin` rather than a criterion bench because the row is a *program*:
+# two columns timed back to back inside one round so the per-round quotients
+# pair, a JSON handshake between two processes built under two `[profile.*]`
+# sections, and provenance checks on the pair. Criterion estimates one routine
+# at a time and owns the process and the output. Not the profile — `cargo bench`
+# accepts `--profile`; `crates/tf_tree_bench/src/embed.rs` states the reasons
+# `benches/lookup.rs` cannot be extended into this row.
 [[bin]]
 name = "embed_cost"
 path = "src/bin/embed_cost.rs"

@@ -485,17 +485,22 @@ bench-report-shm *ARGS:
 #    `target/embed-cost/`, and it does not enter `results.json`.
 #
 # `taskset -c 2`, for `cpp-bench`'s reason: an unpinned run migrates cores and
-# swings by far more than the 5% criterion allows. Every run also reports its own
-# round-to-round band, and the gated verdict is `unresolved` — never a pass or a
-# fail — when that band straddles the 5% threshold.
+# swings by far more than the 5% criterion allows. **It requires a CPU 2** — i.e.
+# at least three logical CPUs — and fails outright rather than silently
+# unpinning if there is none. Every run also reports its own round-to-round band,
+# and the gated verdict is `unresolved` — never a pass or a fail — when that band
+# straddles the 5% threshold, so a gate whose noise floor exceeds its threshold
+# reports `unavailable` instead of passing.
 #
-# **Build footprint: `--profile embedder` is a third target directory beside
-# `debug/` and `release/`, measured at 293 MB on this host, plus one extra
-# release link.** That is why `bench-check` does not depend on this recipe; see
-# its comment.
+# **Build footprint, measured on this host: `--profile embedder` is a third
+# target directory beside `debug/` and `release/`, `166 MiB` — `rm -rf
+# target/embedder` then a clean `cargo build --profile embedder … --bin
+# embed_cost`, then `du -sh target/embedder`. The whole recipe, both builds and
+# both runs, took 10 s warm.** That is cheap enough that `bench-check` pays it;
+# see its comment.
 #
 # The output pair is left in `target/embed-cost/` for `bench-report`,
-# `bench-check-full` and `bench-baseline-update` to read with `--embed-cost`.
+# `bench-check` and `bench-baseline-update` to read with `--embed-cost`.
 embed-cost:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -541,21 +546,21 @@ embed-cost-check:
 # `--out target/bench-report` and not `report/`: this is a check, and it should
 # not clobber a report somebody generated to look at.
 #
-# **§9.2's embedding row is UNAVAILABLE here, deliberately.** It cannot be
-# measured from inside this tool — its in-crate column is `tf_tree_core`'s
-# default-off `bench_probe`, and §9.2 requires an embedder's profile while this
-# binary is built with the `lto = "thin"` one that erases the boundary. Producing
-# it costs a third target directory (293 MB, measured) plus an extra release
-# link, and this recipe is the one people run on every change. So the row prints
-# its reason and names `just embed-cost`; `just bench-check-full` is the same
-# gate with that cost paid.
-bench-check:
-    cargo run --release -p tf_tree_bench --bin bench_report -- \
-        --out target/bench-report \
-        --check-baseline crates/tf_tree_bench/baseline/results.json
-
-# `bench-check`, plus §9.2's embedding row. Same gate, one more build tree.
-bench-check-full: embed-cost
+# **§9.2's embedding row is measured here, and it must be**, because
+# `bench-baseline-update` below measures it too. The baseline gate compares row
+# *status* in one direction only: a row that is `measured` in the committed
+# baseline and is not one now is a withdrawn claim and a hard failure
+# (`src/baseline.rs`). So a baseline cut with `--embed-cost` and a check run
+# without it is a gate that fails on the difference between two recipes, on any
+# host where the row resolves — it did not fire on this host only because the
+# fitness probe fails here and both sides came out `unavailable`. **The two
+# paths take the same flag; do not make one of them cheaper.**
+#
+# The cost is the `embed-cost` recipe's: a 166 MiB `target/embedder` tree and
+# 10 s, both measured — next to the minutes this suite already spends assembling
+# the report. `bench_report` still runs without the flag (`just bench-report`);
+# the row then says so and names `just embed-cost` rather than disappearing.
+bench-check: embed-cost
     cargo run --release -p tf_tree_bench --bin bench_report -- \
         --out target/bench-report \
         --embed-cost target/embed-cost \
@@ -565,10 +570,9 @@ bench-check-full: embed-cost
 # in the same commit as the change that causes it** — the diff is the record of
 # what moved and it is the only place a reviewer sees it.
 #
-# It *does* depend on `embed-cost` (293 MB of build tree, see that recipe): a
-# baseline is cut rarely and on purpose, and a row missing from it can never be
-# gated. That is the opposite trade from `bench-check` above, which runs on
-# every change.
+# It depends on `embed-cost` for the same reason `bench-check` does, and the two
+# must keep agreeing: whatever the check can produce, the baseline must record,
+# or the status comparison fails on the recipe rather than on the code.
 #
 # `index.html` is not committed: it is a rendering of `results.json` and a second
 # copy that can disagree with the first.

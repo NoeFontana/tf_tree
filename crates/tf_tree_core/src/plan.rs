@@ -770,7 +770,7 @@ impl Plan {
     ///
     /// **An earlier revision of this paragraph added "which no `#[inline]`
     /// placement closes". That is removed, because the row's own toggle refutes
-    /// it.** Dropping this attribute from [`Self::fold_at`] and re-running the
+    /// it.** Dropping this attribute from `Plan::fold_at` and re-running the
     /// recipe takes the ratio from 1.253 to **1.001** — inside the gate — by
     /// making the in-crate column 6.7% slower (191.5 → 204.4 ns) and the
     /// `lto = "thin"` control 6.9% slower (193.2 → 206.6 ns), while the

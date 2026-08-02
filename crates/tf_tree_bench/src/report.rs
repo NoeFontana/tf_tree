@@ -1394,21 +1394,36 @@ pub fn assemble(opts: &Options) -> Result<Report> {
 /// and `docs/PHASE1.md` §11.2's exploratory measurements are the shape for that:
 /// `just embed-cost` prints it and writes it to `target/embed-cost/`, and
 /// nothing gates it.
-fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
+/// The embedding row's `note`, and **the one place this repository states what
+/// `[profile.embedder]` is**.
+///
+/// Module-level rather than local to [`embedding_row`] so that
+/// `the_row_note_states_the_settings_the_manifest_declares` can read the two
+/// settings back out of the workspace manifest with
+/// [`crate::embed::profile_settings_from_manifest`] and assert this prose still
+/// matches them. `just embed-cost`'s own output deliberately does not repeat
+/// them; a second copy is a second thing that can go stale.
+const EMBEDDING_NOTE: &str = "One build, one profile, two identical bodies. `out_of_crate_ns` \
+    times an `#[inline(never)]` depth-3 lookup compiled in `tf_tree_bench` — an embedder's \
+    position; `in_crate_ns` times the same three lines compiled in `tf_tree_core`, the \
+    crate that defines `Plan::at` and the fold. `boundary_ratio` is the median per-round \
+    quotient, paired so that machine noise common to both columns cancels. The profile \
+    is `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` \
+    defaults), which §9.2 requires: under this workspace's `lto = \"thin\"` the crate \
+    boundary is erased at link time and the comparison measures nothing. Depth 3, \
+    LerpSlerp, off-grid stamps so the interpolation actually runs. A probe in the \
+    `tf_tree` facade would NOT be in-crate and was measured not to be (241.5 vs 243.6 ns); \
+    `crates/tf_tree_bench/src/embed.rs` carries that table. There is no tf2 column: this \
+    row is `tf_tree` against itself.";
+
+/// `pub(crate)` for one reason: `crate::baseline`'s
+/// `a_baseline_that_measured_the_embedding_row_fails_a_check_that_did_not`
+/// builds the *real* `None`-arm row rather than a fixture that resembles it,
+/// which is the point of that test.
+pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
     const ID: &str = "embedding_cross_crate";
     const TITLE: &str = "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)";
-    const NOTE: &str = "One build, one profile, two identical bodies. `out_of_crate_ns` times \
-        an `#[inline(never)]` depth-3 lookup compiled in `tf_tree_bench` — an embedder's \
-        position; `in_crate_ns` times the same three lines compiled in `tf_tree_core`, the \
-        crate that defines `Plan::at` and the fold. `boundary_ratio` is the median per-round \
-        quotient, paired so that machine noise common to both columns cancels. The profile \
-        is `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` \
-        defaults), which §9.2 requires: under this workspace's `lto = \"thin\"` the crate \
-        boundary is erased at link time and the comparison measures nothing. Depth 3, \
-        LerpSlerp, off-grid stamps so the interpolation actually runs. A probe in the \
-        `tf_tree` facade would NOT be in-crate and was measured not to be (241.5 vs 243.6 ns); \
-        `crates/tf_tree_bench/src/embed.rs` carries that table. There is no tf2 column: this \
-        row is `tf_tree` against itself.";
+    const NOTE: &str = EMBEDDING_NOTE;
     const REPRODUCE: &str = "just embed-cost";
 
     let Some(dir) = opts.embed_cost.as_deref() else {
@@ -1421,9 +1436,11 @@ fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
              only under the default-off `bench-probe` feature, and it must be measured at \
              `[profile.embedder]` — this tool is built with `lto = \"thin\"`, which is \
              exactly what erases the boundary. It cannot measure the row from inside \
-             itself. `just embed-cost` builds and runs the probe and writes the pair; \
-             `just bench-check-full` and `just bench-baseline-update` pass it back in with \
-             --embed-cost"
+             itself. `just embed-cost` builds and runs the probe and writes the pair, and \
+             both `just bench-check` and `just bench-baseline-update` depend on that \
+             recipe and pass the directory back in with --embed-cost. Reaching this \
+             branch means `bench_report` was invoked directly without the flag, so the \
+             row is reported without a number rather than left out"
                 .to_owned(),
             REPRODUCE,
         ));
@@ -2864,5 +2881,47 @@ CPU part\t: 0xd0c
         assert_eq!(row.status, Status::Measured, "reason: {}", row.reason);
         assert!(!row.tf_tree.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The row's note names the two profiles' settings, and this is what keeps
+    /// that statement true rather than merely written down.
+    ///
+    /// The settings are stated in exactly one place in this repository —
+    /// [`EMBEDDING_NOTE`] — and read back here out of the workspace manifest by
+    /// the same function the `embed` module's own profile test uses. `just
+    /// embed-cost`'s printed output deliberately no longer repeats them.
+    ///
+    /// Mutant (applied, observed): set `[profile.embedder]`'s `codegen-units`
+    /// to `8` in the workspace manifest. Output pasted in the branch's fix
+    /// report; the assertion below fires with
+    /// `the row note does not state "lto = false, codegen-units = 8"`.
+    #[test]
+    fn the_row_note_states_the_settings_the_manifest_declares() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+        let (lto, cgu) =
+            crate::embed::profile_settings_from_manifest(&manifest, crate::embed::EMBEDDER_PROFILE)
+                .expect("[profile.embedder]");
+        let stated = format!("lto = {lto}, codegen-units = {cgu}");
+        assert!(
+            EMBEDDING_NOTE.contains(&stated),
+            "the row note does not state `{stated}`, which is what \
+             [profile.embedder] now declares"
+        );
+
+        // The note's other half: the control profile whose `lto` is the reason
+        // the row cannot be measured by this binary's own build.
+        let (rel_lto, _) = crate::embed::profile_settings_from_manifest(
+            &manifest,
+            crate::embed::REFERENCE_PROFILE,
+        )
+        .expect("[profile.release]");
+        let stated_rel = format!("lto = {rel_lto}");
+        assert!(
+            EMBEDDING_NOTE.contains(&stated_rel),
+            "the row note does not state `{stated_rel}`, which is what \
+             [profile.release] now declares"
+        );
     }
 }

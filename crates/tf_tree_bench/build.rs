@@ -115,8 +115,14 @@ const MEASURED_SOURCES: &[&str] = &[
 ///
 /// FNV-1a rather than a real hash: this is a collision check against accident,
 /// not against an adversary, and `tf_tree_bench`'s build script has no
-/// dependencies. Path names are hashed alongside contents so that moving a file
-/// changes the digest.
+/// dependencies.
+///
+/// Each file's **base name** is hashed alongside its contents — the base name
+/// and not the path, for the reason [`collect`] gives. So a rename changes the
+/// digest, and so does swapping two files' contents; *moving* a file to another
+/// directory under the same name does not, which is the deliberate half of that
+/// trade: two checkouts of one commit in different directories must agree, or
+/// the pairing check would fire on a worktree rather than on a stale half.
 fn emit_source_id() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

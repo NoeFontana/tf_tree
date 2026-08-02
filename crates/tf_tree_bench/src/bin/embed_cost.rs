@@ -106,13 +106,19 @@ fn report(pair: &Pair) {
          link time, so a ratio near 1.00 here is the mechanism working, not a passing gate.\n"
     );
 
+    // The two profiles' `lto` / `codegen-units` are deliberately **not** spelled
+    // out here. They are stated in exactly one place — the report row's note in
+    // `tf_tree_bench::report` — and a test reads them back out of the workspace
+    // manifest and checks that note against them. A second copy printed here
+    // would be a second thing to keep true, and the profile *directory* on each
+    // line below is already provenance `build.rs` derived rather than a label.
     println!("EXPLORATORY — what the embedder's own [profile.*] costs, not gated\n");
     println!(
-        "  out-of-crate at [profile.embedder] (lto=false, cgu=16) {:>8.1} ns",
+        "  out-of-crate at [profile.embedder] {:>8.1} ns",
         pair.embedder.out_of_crate_ns
     );
     println!(
-        "  out-of-crate at [profile.release]  (lto=thin,  cgu=1)  {:>8.1} ns",
+        "  out-of-crate at [profile.release]  {:>8.1} ns",
         pair.reference.out_of_crate_ns
     );
     println!(

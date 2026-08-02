@@ -770,6 +770,57 @@ mod tests {
         );
     }
 
+    /// **`just bench-check` and `just bench-baseline-update` must pass
+    /// `bench_report` the same `--embed-cost`.** This is the failure that
+    /// results when they do not, and it is the reason both recipes depend on
+    /// `just embed-cost`.
+    ///
+    /// The baseline recipe records whatever the embedding row is on the cutting
+    /// host. If the check recipe then runs without the flag,
+    /// [`crate::report::embedding_row`] takes its `None` arm, the row is
+    /// [`Status::Unavailable`], and the one-directional status rule above
+    /// reports a withdrawn claim on **every** subsequent run, for ever, on any
+    /// host where the row resolves. It did not fire on the host this branch was
+    /// written on only because the fitness probe fails there and both sides
+    /// came out `unavailable` — an accident, not a design.
+    ///
+    /// The current row here is the production one, not a fixture: `Options`
+    /// with no `embed_cost` is exactly what a flagless `bench_report` has.
+    ///
+    /// Mutant: drop `--embed-cost` from `bench-check` in the `justfile`.
+    /// Nothing in this crate fails — a `justfile` is not compiled — so this
+    /// test is the record of the shape, and the assertions below are what a
+    /// reader is pointed at when the gate starts failing on the recipe rather
+    /// than on the code.
+    #[test]
+    fn a_baseline_that_measured_the_embedding_row_fails_a_check_that_did_not() {
+        let measured = embedding_report(240.0, 200.0);
+        let base = baseline_of(&measured);
+
+        let mut flagless = embedding_report(240.0, 200.0);
+        flagless.rows[0] =
+            crate::report::embedding_row(&crate::report::Options::default(), &measured.fitness)
+                .expect("the flagless row");
+        assert_eq!(
+            flagless.rows[0].status,
+            Status::Unavailable,
+            "a `bench_report` without --embed-cost must not claim this row"
+        );
+
+        let c = compare(&base, &flagless).expect("baseline");
+        assert!(
+            !c.passed(),
+            "a baseline that measured the row passed a check that could not"
+        );
+        assert!(
+            c.failures.iter().any(|f| {
+                f.contains("embedding_cross_crate") && f.contains("claim was withdrawn")
+            }),
+            "the failure must name the row and the withdrawal: {:?}",
+            c.failures
+        );
+    }
+
     /// A directional metric the baseline does not carry fails; an informational
     /// one does not.
     ///
