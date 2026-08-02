@@ -588,20 +588,20 @@ authorized by this document alone.
 |---|---|---|---|---|
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | its own plan |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
-| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | Phase 5 bench artifact (`PHASE5.md` §9.2) |
+| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **`#[inline]` landed** — five placements, measured; a sixth was measured as a *pessimization* and left off. LTO guidance and the gated bench row outstanding: Phase 5 bench artifact (`PHASE5.md` §9.2) |
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | its own plan |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
 | 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | `PHASE5.md` §4 — **core and C landed; Python outstanding** |
-| 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | `PHASE5.md` §4.2 |
-| 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | `PHASE5.md` §4 |
+| 8 | `tree.frames()`, `tree.edges()`, `plan.edges()` | Python | §3.2 | **landed** — `tf_tree_py`; authorised by `PHASE5.md` §4.4 item 2, which is the *names* half. §4.2's `ds.edges()` statistics stay held back until §3's counting pass, and this row is not them |
+| 9 | `from_parts` / `from_timespec` / `from_ros` | Rust, Python, C | §5.1 | `PHASE5.md` §4 — **Rust landed** (`Stamp::from_parts`, `from_timespec`, both `const`, both `Option`); `from_ros` and the C half outstanding |
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | `0013`'s re-baseline commit |
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | `PHASE5.md` §6 |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 
-Items 2, 4, 8, 9 and 11 are additive and independent. Items 1, 5 and 7 touch
-core and are the ones to sequence. Item 12 is gated by D21 and must not be
-started before `PHASE7.md` §0.0's four gates are met.
+Items 2, 4, 8, 9 and 11 are additive and independent; 2 and 8 have landed.
+Items 1, 5 and 7 touch core and are the ones to sequence. Item 12 is gated by
+D21 and must not be started before `PHASE7.md` §0.0's four gates are met.
 
 **Row 7 is half delivered, and the half that is missing is named rather than
 implied.** `Layout::QuatTwist` exists in `tf_tree_core`, and the C ABI serves it

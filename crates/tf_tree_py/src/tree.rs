@@ -198,22 +198,43 @@ impl PyTree {
     /// name can still hold *different* segments if the owner was replaced
     /// between their `open()` calls; this is what tells them apart, and
     /// comparing names cannot.
-    fn instance_uuid(&self) -> String {
-        self.inner
-            .instance_uuid()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+    ///
+    /// # Errors
+    ///
+    /// [`detached_err`](crate::errors::detached_err) on a tree inherited across
+    /// a `fork()`. `Tree::instance_uuid` is `self.view().header().instance_uuid`
+    /// and [`Tree::view`](tf_tree::Tree) substitutes the zeroed poison arena for
+    /// a detached tree, so answering would report the one arena identity whose
+    /// entire job is to be comparable as *all-zero* — the spelling this binding
+    /// documents as "in-process". Two peers debugging a split brain would
+    /// conclude they were never shared. Same refusal as
+    /// [`frames`](Self::frames), for the same reason: a walk of the view names
+    /// the fork rather than describing the poison arena.
+    fn instance_uuid(&self) -> PyResult<String> {
+        if self.inner.detached() {
+            return Err(crate::errors::detached_err());
+        }
+        Ok(self.uuid_hex())
     }
 
     fn __repr__(&self) -> String {
-        let uuid = self.instance_uuid();
-        // Show the instance only when there is one. An all-zero field on an
-        // in-process tree is noise that reads like a bug.
-        let instance = if uuid.chars().all(|c| c == '0') {
-            String::new()
+        // **The one accessor that describes a detached tree instead of
+        // refusing, and deliberately.** A `__repr__` that raises breaks
+        // `print`, the REPL echo and every debugger pane — precisely where a
+        // fork victim is standing when they need to be told. So it does not
+        // raise; it says the word. `is_shared` and `is_writable` read the
+        // backing rather than the view, so they stay true either way.
+        let instance = if self.inner.detached() {
+            " detached-by-fork".to_string()
         } else {
-            format!(" instance={}", &uuid[..8])
+            let uuid = self.uuid_hex();
+            // Show the instance only when there is one. An all-zero field on an
+            // in-process tree is noise that reads like a bug.
+            if uuid.chars().all(|c| c == '0') {
+                String::new()
+            } else {
+                format!(" instance={}", &uuid[..8])
+            }
         };
         // `True`/`False`, not Rust's `true`/`false`. A repr is read by a Python
         // programmer, and lowercase booleans there look like a stringly-typed
@@ -251,6 +272,24 @@ impl PyTree {
         let slice = unsafe { out.as_slice_mut()? };
         tf_tree::write_mat4(&iso, slice);
         Ok(out)
+    }
+}
+
+impl PyTree {
+    /// The instance uuid as 32 lowercase hex characters.
+    ///
+    /// Outside the `#[pymethods]` block on purpose: everything inside one
+    /// becomes a Python method, and this is shared between
+    /// [`PyTree::instance_uuid`] — which refuses a detached tree — and
+    /// [`PyTree::__repr__`], which may not. It reads the header either way, so
+    /// **both callers check `detached()` first**; this is the formatting, not
+    /// the policy.
+    fn uuid_hex(&self) -> String {
+        self.inner
+            .instance_uuid()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 

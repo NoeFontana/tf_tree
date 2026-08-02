@@ -213,6 +213,12 @@ class Tree:
         A name longer than 48 bytes was truncated when it was interned; the
         stored form is what comes back.
 
+        **The list is not guaranteed to be free of duplicates.** If a peer
+        process stalls mid-intern and another rescues the slot, the loser's
+        record stays written but unreferenced, so the same name can appear at
+        two ids. Rare — it needs the rescue path — but it means `len()` is an
+        upper bound and `dict(zip(tree.frames(), ...))` can lose an entry.
+
         Raises `TfTreeError` on a tree inherited across a `fork()` — the child's
         mapping is gone, so there is nothing to list.
         """
@@ -248,6 +254,12 @@ class Tree:
 
         All-zero in-process. Two processes that resolved the same *name* can
         still hold different segments; this is what tells them apart.
+
+        Raises `TfTreeError` on a tree inherited across a `fork()`, rather than
+        returning the all-zero value the child's poison mapping holds — which is
+        the spelling that means "in-process", so two peers chasing a split brain
+        would conclude they had never been shared. `repr()` does not raise; it
+        prints `detached-by-fork` in place of the instance.
         """
 
     def is_shared(self) -> bool:

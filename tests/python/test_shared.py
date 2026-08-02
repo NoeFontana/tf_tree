@@ -194,3 +194,78 @@ def test_a_forked_child_is_refused_by_the_introspection_calls_too(runtime_dir):
         f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
     )
     assert os.WEXITSTATUS(wstatus) == 0
+
+
+@shm
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
+def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_dir):
+    """**All-zero is a spelling that already means something else.**
+
+    `Tree.instance_uuid` is `self.view().header().instance_uuid`, and
+    `Tree::view` substitutes the `alloc_zeroed` poison arena for a detached
+    tree — so before this guard the call returned `"0" * 32`, which is exactly
+    what `test_an_in_process_tree_has_no_instance_uuid` pins as the *in-process*
+    answer. Two peers comparing uuids to chase a split brain would have
+    concluded they had never shared an arena at all.
+
+    `__repr__` is the deliberate exception and the second half of this test: a
+    repr that raises breaks `print`, the REPL echo and every debugger pane,
+    which is where a fork victim is standing. It must not raise, and it must say
+    the word rather than print an instance the poison arena invented.
+
+    Exit codes, because an assertion in a fork child is invisible to pytest:
+    20 `instance_uuid` answered instead of refusing; 21 it raised the wrong
+    type; 22 `repr` raised at all; 23 `repr` did not name the fork; 24 `repr`
+    still showed an instance.
+
+    Three mutants, each applied to `crates/tf_tree_py/src/tree.rs`, built and
+    observed before being reverted:
+
+    * **A** — delete the `if self.inner.detached()` arm from
+      ``PyTree::instance_uuid``. Child exits **20**.
+    * **B** — delete ``__repr__``'s `if self.inner.detached()` test and keep
+      only the `else` body, so the repr describes the poison arena. Child exits
+      **23** (not 24: the poison header is `alloc_zeroed`, so that branch
+      suppresses the instance as if this were an in-process tree — which is the
+      indistinguishability the guard is for).
+    * **C** — make ``__repr__``'s detached arm print both, `" detached-by-fork
+      instance={…}"`. Child exits **24**. This is what makes 24 load-bearing;
+      without C it is unreachable, given B.
+
+    21 and 22 are not separately mutated: they exist to tell one failure apart
+    from another in the one channel a fork child has, not as guards of their own.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    parent_uuid = tree.instance_uuid()
+    assert parent_uuid != "0" * 32
+    assert parent_uuid[:8] in repr(tree)
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — the child never returns to pytest
+        status = 0
+        try:
+            tree.instance_uuid()
+            status = status or 20
+        except tf_tree.TfTreeError:
+            pass
+        except Exception:
+            status = status or 21
+        try:
+            text = repr(tree)
+        except Exception:
+            status = status or 22
+        else:
+            if "detached-by-fork" not in text:
+                status = status or 23
+            if "instance=" in text:
+                status = status or 24
+        os._exit(status)
+
+    _, wstatus = os.waitpid(pid, 0)
+    assert os.WIFEXITED(wstatus), (
+        "the child was killed by a signal, not refused: "
+        f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
+    )
+    assert os.WEXITSTATUS(wstatus) == 0

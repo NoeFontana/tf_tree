@@ -193,6 +193,21 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 /// what the list *does* promise is that nothing in it will ever be removed or
 /// renumbered.
 ///
+/// **It does *not* promise that a name appears once, and append-only is not
+/// what rules that out.** When a rescuer judges a stalled interner dead and
+/// publishes the same name first, the loser's id is abandoned:
+/// `tf_tree_core::frame`'s `finish` states that the record "stays written but
+/// unreferenced, and `frame_count` over-counts by one" — the deliberate trade,
+/// because giving the id back could alias two frames onto one record. That
+/// abandoned record was written by `FrameRecord::for_name`, so it carries the
+/// real name and a non-zero `name_hash`; it passes all three checks below and
+/// lands in this list at a second id. So `len()` of the result is an upper
+/// bound on the tree's frames and `dict(zip(frames, ...))` can silently drop an
+/// entry. It takes the A8 liveness-rescue path — a claimant that stalled long
+/// enough to be judged dead and then published anyway — so it is rare, not
+/// impossible, and it is stated here because the section above would otherwise
+/// read as exhaustive.
+///
 /// A tree inherited across a `fork()` has no snapshot to take: its mapping is
 /// gone (`MADV_DONTFORK`) and [`Tree::view`](tf_tree::Tree) substitutes a
 /// one-frame poison arena, which would make this answer `[]`. See the guard.
