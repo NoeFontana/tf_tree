@@ -701,23 +701,26 @@ mod tests {
     }
 
     /// A report carrying only `docs/PHASE5.md` §9.2's embedding row, with the
-    /// metrics [`crate::embed::Pair`] really builds.
-    fn embedding_report(embedder_ns: f64, reference_ns: f64) -> Report {
-        let mk = |dir: &str, ns: f64| crate::embed::Run {
-            profile_dir: dir.to_owned(),
-            ns_per_lookup: ns,
-            spread: 0.004,
+    /// metrics [`crate::embed::Run`] really builds.
+    fn embedding_report(out_of_crate_ns: f64, in_crate_ns: f64) -> Report {
+        let ratio = out_of_crate_ns / in_crate_ns;
+        let run = crate::embed::Run {
+            profile_dir: crate::embed::EMBEDDER_PROFILE.to_owned(),
+            source_id: "0123456789abcdef".to_owned(),
+            out_of_crate_ns,
+            in_crate_ns,
+            boundary_ratio: ratio,
+            ratio_lo: ratio * 0.999,
+            ratio_hi: ratio * 1.001,
+            out_of_crate_spread: 0.004,
+            in_crate_spread: 0.004,
             rounds: crate::embed::ROUNDS,
             lookups_per_round: 409_600,
-        };
-        let pair = crate::embed::Pair {
-            embedder: mk(crate::embed::EMBEDDER_PROFILE, embedder_ns),
-            reference: mk(crate::embed::REFERENCE_PROFILE, reference_ns),
         };
         let mut r = report_with(1.0, false);
         r.rows[0].id = "embedding_cross_crate";
         r.rows[0].timing_sensitive = true;
-        r.rows[0].tf_tree = pair.metrics();
+        r.rows[0].tf_tree = run.metrics();
         r
     }
 
@@ -727,11 +730,11 @@ mod tests {
     /// The three cases are the three ways this row can move, and the middle one
     /// is why every duration is gated rather than only the ratio §9.2 names.
     ///
-    /// Mutant (applied, confirmed fatal): give `ratio` `tolerance` `0.10` in
-    /// `Pair::metrics` — case 2 then passes and this test fails on its
-    /// assertion. Second mutant (applied, confirmed fatal): make `embedder_ns`
-    /// and `reference_ns` `Metric::new(..)` (informational) — case 3 passes and
-    /// this fails there.
+    /// Mutant (applied, confirmed fatal): give `boundary_ratio` `tolerance`
+    /// `0.10` in `Run::metrics` — case 2 then passes and this test fails on its
+    /// assertion. Second mutant (applied, confirmed fatal): make
+    /// `out_of_crate_ns` and `in_crate_ns` `Metric::new(..)` (informational) —
+    /// case 3 passes and this fails there.
     #[test]
     fn the_embedding_row_is_gated_at_five_percent_in_every_direction() {
         let base = baseline_of(&embedding_report(240.0, 200.0));
@@ -741,13 +744,13 @@ mod tests {
         let quiet = compare(&base, &embedding_report(247.2, 206.0)).expect("baseline");
         assert!(quiet.passed(), "a 3% shift in both halves: {quiet:?}");
 
-        // 2. The embedder's build loses ground against ours — the exact shape a
-        //    lost `#[inline]` on the cross-crate path has. The ratio moves 5.3%
-        //    while neither absolute number moves more than 5%.
+        // 2. The out-of-crate half loses ground against the in-crate one — the
+        //    exact shape a lost `#[inline]` on the cross-crate path has. The
+        //    ratio moves 5.3% while neither absolute number moves more than 5%.
         let skewed = compare(&base, &embedding_report(240.0, 190.0)).expect("baseline");
         assert!(!skewed.passed(), "a 5.3% ratio regression passed the gate");
         assert!(
-            skewed.failures.iter().any(|f| f.contains("ratio")),
+            skewed.failures.iter().any(|f| f.contains("boundary_ratio")),
             "the failure must name the ratio: {:?}",
             skewed.failures
         );
@@ -757,8 +760,11 @@ mod tests {
         let slower = compare(&base, &embedding_report(254.4, 212.0)).expect("baseline");
         assert!(!slower.passed(), "6% slower on both sides passed the gate");
         assert!(
-            slower.failures.iter().any(|f| f.contains("embedder_ns"))
-                && slower.failures.iter().any(|f| f.contains("reference_ns")),
+            slower
+                .failures
+                .iter()
+                .any(|f| f.contains("out_of_crate_ns"))
+                && slower.failures.iter().any(|f| f.contains("in_crate_ns")),
             "both durations must be named: {:?}",
             slower.failures
         );

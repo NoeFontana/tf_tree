@@ -1378,54 +1378,88 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     })
 }
 
-/// §9.2's last row: the facade from a separate crate, at an embedder's profile.
+/// §9.2's cross-crate row: the facade called from a separate crate against the
+/// identical body called from inside `tf_tree_core`.
 ///
 /// The measurement itself is [`crate::embed`]; this is only the row. The split
-/// is forced rather than stylistic — the row compares **two builds of one
-/// program**, and this binary is one build, so the numbers have to arrive from
-/// outside it. `just embed-cost` is what produces them.
+/// is forced rather than stylistic, and for two reasons. The row's in-crate
+/// column is `tf_tree_core::bench_probe`, compiled only under a default-off
+/// feature this tool does not enable; and §9.2 requires the row be reported at
+/// an **embedder's** profile, while this tool is built with `[profile.release]`
+/// — `lto = "thin"`, which erases the very boundary being measured. `just
+/// embed-cost` builds and runs it under both profiles and writes the pair.
 ///
-/// The note names both profiles by their settings, because a reader who is told
-/// only "the embedder profile" cannot tell whether the tool measured cargo's
-/// defaults or this workspace's. `crate::embed`'s tests read those settings back
-/// out of the workspace manifest, so the sentence stays true or the test fails.
+/// **The exploratory profile comparison is deliberately not a row here.** It is
+/// two processes seconds apart, carries the full between-run noise of the host,
+/// and `docs/PHASE1.md` §11.2's exploratory measurements are the shape for that:
+/// `just embed-cost` prints it and writes it to `target/embed-cost/`, and
+/// nothing gates it.
 fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
-    const NOTE: &str = "One program, built twice and pinned: the `embedder` column is \
-        `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` \
-        defaults, i.e. a user's node), the `reference` column is this workspace's \
-        `[profile.release]` (lto = \"thin\", codegen-units = 1), where the crate boundary \
-        is erased at link time. `ratio` is embedder/reference. Depth 3, LerpSlerp, \
-        off-grid stamps so the interpolation actually runs. The reference column is not a \
-        probe compiled inside the engine — `Plan::at` and the fold live in `tf_tree_core`, \
-        one crate below the facade — and `crates/tf_tree_bench/src/embed.rs` records what \
-        that substitution costs in both directions. There is no tf2 column: this row is \
-        `tf_tree` against itself.";
+    const ID: &str = "embedding_cross_crate";
+    const TITLE: &str = "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)";
+    const NOTE: &str = "One build, one profile, two identical bodies. `out_of_crate_ns` times \
+        an `#[inline(never)]` depth-3 lookup compiled in `tf_tree_bench` — an embedder's \
+        position; `in_crate_ns` times the same three lines compiled in `tf_tree_core`, the \
+        crate that defines `Plan::at` and the fold. `boundary_ratio` is the median per-round \
+        quotient, paired so that machine noise common to both columns cancels. The profile \
+        is `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` \
+        defaults), which §9.2 requires: under this workspace's `lto = \"thin\"` the crate \
+        boundary is erased at link time and the comparison measures nothing. Depth 3, \
+        LerpSlerp, off-grid stamps so the interpolation actually runs. A probe in the \
+        `tf_tree` facade would NOT be in-crate and was measured not to be (241.5 vs 243.6 ns); \
+        `crates/tf_tree_bench/src/embed.rs` carries that table. There is no tf2 column: this \
+        row is `tf_tree` against itself.";
     const REPRODUCE: &str = "just embed-cost";
 
     let Some(dir) = opts.embed_cost.as_deref() else {
         return Ok(Row::unavailable(
-            "embedding_cross_crate",
-            "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)",
+            ID,
+            TITLE,
             NOTE,
             true,
-            "this row compares two builds of one program, and this tool is one build of \
-             another — built, moreover, with the `lto = \"thin\"` profile that is exactly \
-             what hides the effect. It cannot measure the row from inside itself. \
-             `just embed-cost` builds the probe under both profiles and writes the pair; \
-             `just bench-check` passes it back in with --embed-cost"
+            "this row's in-crate column is `tf_tree_core::bench_probe`, which is compiled \
+             only under the default-off `bench-probe` feature, and it must be measured at \
+             `[profile.embedder]` — this tool is built with `lto = \"thin\"`, which is \
+             exactly what erases the boundary. It cannot measure the row from inside \
+             itself. `just embed-cost` builds and runs the probe and writes the pair; \
+             `just bench-check-full` and `just bench-baseline-update` pass it back in with \
+             --embed-cost"
                 .to_owned(),
             REPRODUCE,
         ));
     };
 
     // A pair that will not load is a measurement failure, not a row: the caller
-    // asked for this row by naming a directory.
+    // asked for this row by naming a directory. Loading the *pair* rather than
+    // the one half this row needs is what runs `Pair::load`'s two provenance
+    // checks — same source, two different profiles.
     let pair = crate::embed::Pair::load(dir)
         .with_context(|| format!("loading the embed_cost pair from {}", dir.display()))?;
+    let run = &pair.embedder;
+
+    // **The spread gates the verdict.** A band that straddles §9.2's threshold
+    // cannot answer it, and on this host that is the ordinary case rather than
+    // an exception — so it is reported as unavailable with the band, never
+    // rounded into a pass or a fail. This check is deliberately independent of
+    // the fitness probe: a quiet host can still produce a run too noisy to
+    // resolve 5%.
+    if run.verdict() == crate::embed::Verdict::Unresolved {
+        return Ok(Row::unavailable(
+            ID,
+            TITLE,
+            NOTE,
+            true,
+            format!(
+                "the pair was measured and cannot resolve §9.2's 5% criterion: {}",
+                run.verdict_line()
+            ),
+            REPRODUCE,
+        ));
+    }
 
     let mut row = Row::unavailable(
-        "embedding_cross_crate",
-        "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)",
+        ID,
+        TITLE,
         NOTE,
         true,
         format!(
@@ -1438,14 +1472,14 @@ fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
     match fitness.timing_status() {
         Status::Unavailable => {}
         status => {
-            row.tf_tree = pair.metrics();
+            row.tf_tree = run.metrics();
             row.status = status;
             row.reason = if status == Status::Indicative {
                 format!(
                     "INDICATIVE, not a claim: TF_TREE_BENCH_FORCE=1 overrode the fitness \
                      refusal. {} Measured here: {}",
                     fitness.reason_line(),
-                    pair.verdict()
+                    run.verdict_line()
                 )
             } else {
                 String::new()
@@ -2764,5 +2798,71 @@ CPU part\t: 0xd0c
             assert!(!lookup.reason.contains("consumers plus a publisher"));
             assert!(!lookup.reason.contains("no ROS 2 in this build"));
         }
+    }
+
+    /// A pair that cannot resolve §9.2's 5% is reported `unavailable`, on a
+    /// host that passes the fitness probe.
+    ///
+    /// **The spread is not advisory here.** A gate whose noise floor exceeds
+    /// its threshold is not a gate, so a run whose per-round band straddles
+    /// 1.05 gets no verdict at all — not a pass, not a fail, and no numbers a
+    /// baseline could later gate against.
+    ///
+    /// Mutant: delete the `Verdict::Unresolved` early return in
+    /// `embedding_row`. The straddling pair is then reported `measured` with
+    /// numbers, and the first two assertions fail.
+    #[test]
+    fn a_pair_that_cannot_resolve_five_percent_gets_no_verdict() {
+        let fit = skeleton(true, false).fitness;
+        assert_eq!(
+            fit.timing_status(),
+            Status::Measured,
+            "fixture must be fair"
+        );
+
+        let dir = std::env::temp_dir().join(format!("tf-tree-embed-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let write = |name: &str, profile: &str, lo: f64, hi: f64| {
+            let run = crate::embed::Run {
+                profile_dir: profile.to_owned(),
+                source_id: "0123456789abcdef".to_owned(),
+                out_of_crate_ns: 210.0,
+                in_crate_ns: 200.0,
+                boundary_ratio: 1.05,
+                ratio_lo: lo,
+                ratio_hi: hi,
+                out_of_crate_spread: 0.09,
+                in_crate_spread: 0.09,
+                rounds: crate::embed::ROUNDS,
+                lookups_per_round: 409_600,
+            };
+            std::fs::write(dir.join(format!("{name}.json")), run.to_json()).expect("write");
+        };
+        // Rounds landed on both sides of 1.05.
+        write("embedder", crate::embed::EMBEDDER_PROFILE, 1.01, 1.09);
+        write("release", crate::embed::REFERENCE_PROFILE, 1.01, 1.09);
+
+        let opts = Options {
+            embed_cost: Some(dir.clone()),
+            ..Options::default()
+        };
+        let row = embedding_row(&opts, &fit).expect("row");
+        assert_eq!(row.status, Status::Unavailable, "reason: {}", row.reason);
+        assert!(
+            row.tf_tree.is_empty(),
+            "an unresolved row must carry no numbers"
+        );
+        assert!(
+            row.reason.contains("cannot answer"),
+            "the reason must say the band could not resolve it: {}",
+            row.reason
+        );
+
+        // The same pair, measured tightly enough, is a claim.
+        write("embedder", crate::embed::EMBEDDER_PROFILE, 1.049, 1.05);
+        let row = embedding_row(&opts, &fit).expect("row");
+        assert_eq!(row.status, Status::Measured, "reason: {}", row.reason);
+        assert!(!row.tf_tree.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

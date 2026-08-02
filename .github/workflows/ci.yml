@@ -318,7 +318,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just,cargo-nextest
+      # `--workspace` builds default features, so `tf_tree_core/bench-probe` and
+      # the half of `tf_tree_bench::embed` that drives it are compiled out of
+      # `just test` — the same hole `shm` has, and this is its `shm-check`. It is
+      # a debug clippy/test pass over one crate; it does **not** build the
+      # `embedder` profile tree, which is why this job still runs `bench-check`
+      # and not `bench-check-full`.
+      - name: just embed-cost-check
+        run: just embed-cost-check
       - name: just bench-check
         run: just bench-check
       # The artifact itself, so a failing gate can be inspected rather than

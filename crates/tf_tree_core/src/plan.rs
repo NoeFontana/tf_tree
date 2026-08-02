@@ -752,10 +752,28 @@ impl Plan {
     /// workspace-wide and was not run. `docs/API.md` §2.3 item 3 (a gated
     /// cross-crate row) has since landed and does measure it continuously:
     /// `just embed-cost`, and the `embedding_cross_crate` row of
-    /// `docs/PHASE5.md` §9.2's artifact. It reports a ratio *over* §9.2's 5%
-    /// criterion — the crate boundary costs an embedder on cargo's `--release`
-    /// defaults about a quarter of a depth-3 lookup, which no `#[inline]`
-    /// placement closes and `lto = "thin"` in *their* profile does.
+    /// `docs/PHASE5.md` §9.2's artifact.
+    ///
+    /// **That row reports a ratio over §9.2's 5% criterion, and it also reports
+    /// the control that says what does close it.** Both columns are the same
+    /// three lines behind `#[inline(never)]`, one compiled in `tf_tree_bench`
+    /// and one here; three consecutive runs, `taskset`-pinned, paired rounds:
+    ///
+    /// | downstream profile | out-of-crate | in-crate | ratio |
+    /// | --- | --- | --- | --- |
+    /// | `lto = false`, `codegen-units = 16` | 240.0–240.1 ns | 191.3–191.8 ns | **1.250–1.254** |
+    /// | `lto = "thin"`, `codegen-units = 1` | 193.0–195.0 ns | 194.2–196.2 ns | 0.994–0.996 |
+    ///
+    /// So the boundary costs about a quarter of a depth-3 lookup at cargo's
+    /// `--release` defaults, and `lto = "thin"` in the embedder's own profile
+    /// erases it. **It does not follow that these attributes are useless — the
+    /// first table above measures them taking the out-of-crate path from 313 ns
+    /// to 256 ns at that same profile** — nor that no `#[inline]` placement
+    /// could close the rest. An earlier revision of this paragraph asserted the
+    /// latter; nothing measured it, and removing `fold_at`'s attribute was
+    /// afterwards observed to *move* the ratio, which is the opposite of what
+    /// "no placement closes it" predicts. What is measured is a gap that
+    /// survives the five placements, and one setting that removes it.
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;

@@ -1423,6 +1423,21 @@ Ship a container image and a small public sample recording so a stranger can run
 
 The last row is `tf_tree` against itself and belongs in this table anyway: it is the only measurement of the path an **embedder** actually compiles. `PHASE4.md` §7 gates the C ABI at 5% against native in-crate Rust, and nothing gates native *out-of-crate* Rust, which is what a user's node links. [`API.md`](./API.md) §2.3 makes the row and the gate normative, along with the `#[inline]` attributes and the LTO guidance that are how it is passed. Report it with the embedder's default profile, **not** this workspace's — `[profile.release]` here sets `lto = "thin"`, which is precisely what hides the effect.
 
+> **Amendment — there are two embedding measurements, and only the row above is gated.**
+>
+> Both are produced by `just embed-cost`; the design is `crates/tf_tree_bench/src/embed.rs`. They were separated because a first implementation shipped the second one under the first one's title, which answered "what does the embedder's profile cost" while claiming to answer "what does crossing the crate boundary cost".
+>
+> | | measurement | how | status |
+> |---|---|---|---|
+> | 1 | **the row above** — separate-crate vs in-crate, depth 3 | **one build, one profile**: two identical `#[inline(never)]` bodies, one compiled in `tf_tree_bench`, one in `tf_tree_core` (`bench_probe`, a default-off feature). Read off the `[profile.embedder]` run, as this section requires; the `[profile.release]` run is the control. | `embedding_cross_crate` in `results.json`, **gated at 5%** |
+> | 2 | **profile comparison** — the same out-of-crate body under `[profile.embedder]` against `[profile.release]` | two builds, two processes | **exploratory**, printed by `just embed-cost`, deliberately **not** in `results.json` and not gated — §11.2's shape |
+>
+> Row 1 is gated on `boundary_ratio`, `out_of_crate_ns` *and* `in_crate_ns`, not on the quotient alone: a change that moves both halves the same way would pass a ratio-only gate, and one that has been measured here moves the ratio the *wrong* way while regressing both absolute numbers. Row 2 is exploratory because it is two processes seconds apart: across three runs in which row 1 moved by 0.004, row 2 moved between 1.188 and 1.235.
+>
+> Row 1's verdict is `unresolved` — never a pass or a fail — when the observed round-to-round band straddles the 5% threshold. A gate whose noise floor exceeds its threshold is not a gate.
+>
+> **On the development host the criterion is NOT met: 1.250–1.254× across three runs** (out-of-crate 240.0 ns against in-crate 191.3 ns, `[profile.embedder]`), reported rather than engineered around. The control says what closes it: the identical comparison under `lto = "thin"` measures 0.994–0.996×. That host fails `Fitness::probe`, so the row is `unavailable` in the committed baseline and none of those figures is a claim in §9.3's sense.
+
 ### 9.3 Honesty requirements — NORMATIVE
 
 The first skeptical reader will look for a thumb on the scale, and finding one ends the project's credibility permanently.

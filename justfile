@@ -468,33 +468,57 @@ bench-report *ARGS:
 bench-report-shm *ARGS:
     cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
 
-# **`docs/PHASE5.md` §9.2's embedding row — the facade from a separate crate.**
+# **`docs/PHASE5.md` §9.2's two embedding measurements.** One is gated.
 #
-# One program, built twice and pinned. `[profile.embedder]` is cargo's
-# `--release` defaults spelled out (`lto = false, codegen-units = 16`), which is
-# what a user's node compiles; `[profile.release]` is this workspace's own
-# (`lto = "thin", codegen-units = 1`), which is what every other number in this
-# repository is taken under. §9.2 requires the row be reported with the first,
-# **not** the second, and the gap between them is the whole point:
-# `docs/API.md` §2.3 item 2's LTO guidance is the thing that closes it.
+# 1. **GATED, and it is §9.2's row.** Inside *one* build, at one profile, two
+#    identical `#[inline(never)]` depth-3 lookups are timed: one compiled in
+#    `tf_tree_bench` (an embedder's position), one in `tf_tree_core` (the crate
+#    that defines `Plan::at` and the fold). The difference is the crate boundary
+#    and nothing else. §9.2 requires the row be reported at an embedder's default
+#    profile, so it is read off the `[profile.embedder]` run; the
+#    `[profile.release]` run is printed as the control, where `lto = "thin"`
+#    erases the boundary at link time.
+# 2. **EXPLORATORY, and never gated.** The same out-of-crate column across the
+#    two profiles — what `docs/API.md` §2.3 item 2's LTO guidance is worth. Two
+#    processes seconds apart, so it carries the host's full between-run noise;
+#    `docs/PHASE1.md` §11.2's exploratory shape. It is printed and written to
+#    `target/embed-cost/`, and it does not enter `results.json`.
 #
 # `taskset -c 2`, for `cpp-bench`'s reason: an unpinned run migrates cores and
-# swings by far more than the 5 % criterion allows. Both runs land on the same
-# core, seconds apart, and each reports its own round-to-round spread — which is
-# what says whether the ratio between them is worth stating to three digits.
+# swings by far more than the 5% criterion allows. Every run also reports its own
+# round-to-round band, and the gated verdict is `unresolved` — never a pass or a
+# fail — when that band straddles the 5% threshold.
 #
-# The output pair is left in `target/embed-cost/` for `bench-report` and
-# `bench-check` to read with `--embed-cost`.
+# **Build footprint: `--profile embedder` is a third target directory beside
+# `debug/` and `release/`, measured at 293 MB on this host, plus one extra
+# release link.** That is why `bench-check` does not depend on this recipe; see
+# its comment.
+#
+# The output pair is left in `target/embed-cost/` for `bench-report`,
+# `bench-check-full` and `bench-baseline-update` to read with `--embed-cost`.
 embed-cost:
     #!/usr/bin/env bash
     set -euo pipefail
     out=target/embed-cost
     mkdir -p "$out"
-    cargo build -q --profile embedder -p tf_tree_bench --bin embed_cost
-    cargo build -q --release -p tf_tree_bench --bin embed_cost
+    cargo build -q --profile embedder -p tf_tree_bench --features embed-probe --bin embed_cost
+    cargo build -q --release -p tf_tree_bench --features embed-probe --bin embed_cost
     taskset -c 2 ./target/embedder/embed_cost --json "$out/embedder.json"
     taskset -c 2 ./target/release/embed_cost --json "$out/release.json"
     ./target/release/embed_cost --compare "$out"
+
+# **fmt / clippy / tests for the default-off `embed-probe` configuration.**
+#
+# `cargo nextest run --workspace` builds default features, so
+# `tf_tree_core::bench_probe` and everything in `tf_tree_bench::embed` that
+# drives it are compiled out of `just test` — exactly like `shm`. This is their
+# gate, and a new `embed-probe`-only test target belongs on this list in the
+# commit that adds it.
+embed-cost-check:
+    cargo fmt --check -p tf_tree_core -p tf_tree_bench
+    cargo clippy -p tf_tree_core --features bench-probe --all-targets -- -D warnings
+    cargo clippy -p tf_tree_bench --features embed-probe --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_bench --features embed-probe -E 'test(/embed/)'
 
 # **`docs/PHASE5.md` §10's "benchmark artifact as a regression gate".**
 #
@@ -517,12 +541,21 @@ embed-cost:
 # `--out target/bench-report` and not `report/`: this is a check, and it should
 # not clobber a report somebody generated to look at.
 #
-# It runs `embed-cost` first and hands the pair in, because §9.2's embedding row
-# is the one row this tool cannot measure from inside itself: it compares two
-# builds of one program, and `bench_report` is a single build — built, moreover,
-# with the profile that hides the effect. Without that dependency the row would
-# be permanently UNAVAILABLE in the gate that exists to hold it.
-bench-check: embed-cost
+# **§9.2's embedding row is UNAVAILABLE here, deliberately.** It cannot be
+# measured from inside this tool — its in-crate column is `tf_tree_core`'s
+# default-off `bench_probe`, and §9.2 requires an embedder's profile while this
+# binary is built with the `lto = "thin"` one that erases the boundary. Producing
+# it costs a third target directory (293 MB, measured) plus an extra release
+# link, and this recipe is the one people run on every change. So the row prints
+# its reason and names `just embed-cost`; `just bench-check-full` is the same
+# gate with that cost paid.
+bench-check:
+    cargo run --release -p tf_tree_bench --bin bench_report -- \
+        --out target/bench-report \
+        --check-baseline crates/tf_tree_bench/baseline/results.json
+
+# `bench-check`, plus §9.2's embedding row. Same gate, one more build tree.
+bench-check-full: embed-cost
     cargo run --release -p tf_tree_bench --bin bench_report -- \
         --out target/bench-report \
         --embed-cost target/embed-cost \
@@ -531,6 +564,11 @@ bench-check: embed-cost
 # Regenerate the committed baseline. **Run this deliberately, and put the diff
 # in the same commit as the change that causes it** — the diff is the record of
 # what moved and it is the only place a reviewer sees it.
+#
+# It *does* depend on `embed-cost` (293 MB of build tree, see that recipe): a
+# baseline is cut rarely and on purpose, and a row missing from it can never be
+# gated. That is the opposite trade from `bench-check` above, which runs on
+# every change.
 #
 # `index.html` is not committed: it is a rendering of `results.json` and a second
 # copy that can disagree with the first.

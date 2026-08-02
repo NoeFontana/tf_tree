@@ -266,38 +266,67 @@ is a call per step.
 > note that how that splits between the two settings was *not* measured.
 >
 > Item 3 is `crates/tf_tree_bench/src/embed.rs`, the `embed_cost` binary,
+> `just embed-cost`, and `PHASE5.md` §9.2's row `embedding_cross_crate` in the
+> benchmark artifact. **It is what this item asks for and not a substitute for
+> it: one build, one profile, two identical `#[inline(never)]` bodies, one
+> compiled in `tf_tree_bench` and one in `tf_tree_core`.** The in-crate half is
+> `tf_tree_core::bench_probe`, behind a default-off `bench-probe` feature — the
+> same pattern as `tf_tree_c`'s `test-hooks`, which exists so `abi_cost.rs` can
+> measure the ABI boundary this row's 5% is copied from.
+>
 > `[profile.embedder]` (cargo's `--release` defaults, spelled out field by field
-> so they cannot drift with this workspace's), `just embed-cost`, and
-> `PHASE5.md` §9.2's row `embedding_cross_crate` in the benchmark artifact — one
-> program, built twice and pinned, ratio `embedder / reference`.
+> so they cannot drift with this workspace's) is the profile the row is read at,
+> because §9.2 requires it. A **second, exploratory** measurement — the same
+> out-of-crate body under the two profiles — is printed beside it and is
+> deliberately not in `results.json`; `PHASE5.md` §9.2's amendment is the table
+> of which is which.
 >
-> **The measured ratio is 1.24–1.25×, so §9.2's 5% criterion is NOT met**, and
-> that is reported rather than engineered around. `#[inline]` does not close it:
-> a probe placed in `tf_tree_core::plan` — genuinely in-crate for the fold —
-> measured 199 ns against 244 ns out-of-crate at the embedder's profile, so the
-> crate boundary itself accounts for ~1.22× of it. What closes it is item 2's
-> guidance, applied in the embedder's own profile. §9.2 asks for both — "report
-> it with the embedder's default profile" and "the `#[inline]` attributes **and
-> the LTO guidance** that are how it is passed" — and only the second of those
-> two describes a passing row today.
+> **The measured ratio is 1.250–1.254×, so §9.2's 5% criterion is NOT met**, and
+> that is reported rather than engineered around. Three consecutive pinned runs,
+> paired rounds:
 >
-> Two things this row is careful about, because both were measured and neither is
-> obvious. **A probe in `tf_tree` is not in-crate** (241.5 vs 243.6 ns — the
-> facade re-exports the engine rather than containing it), so the reference
-> column is the same source under thin LTO rather than a probe in the engine
-> crate; that substitution overstates the boundary by ~3%, which is the direction
-> that cannot flatter us. And **`ratio`, `embedder_ns` and `reference_ns` are all
-> gated at 5%, not just the quotient §9.2 names**: dropping `#[inline]` from
-> `fold_at` moves the ratio *down* (measured: 1.236 → 1.006, because the
-> embedder's build gets faster while this workspace's gets 11.2% slower), so a
-> ratio-only gate would read that regression as an improvement. The gate fires on
-> `reference_ns`.
+> | downstream profile | out-of-crate | in-crate | ratio |
+> |---|---|---|---|
+> | `lto = false`, `codegen-units = 16` | 240.0–240.1 ns | 191.3–191.8 ns | **1.250–1.254** |
+> | `lto = "thin"`, `codegen-units = 1` | 193.0–195.0 ns | 194.2–196.2 ns | 0.994–0.996 |
 >
-> Host, and it matters: a loaded 4-physical-core AMD EPYC-Milan VM that fails
+> The second row is the control, and it is what item 2's guidance is worth
+> stated as a measurement rather than as advice: same host, same two bodies, one
+> profile setting different, boundary gone.
+>
+> **The earlier revision of this amendment said "no `#[inline]` placement closes
+> that; the embedder's profile does". The first half is refuted by this row's own
+> toggle and has been removed.** Removing `#[inline]` from `Plan::fold_at` and
+> re-running takes the ratio from 1.253 to **1.001** — a passing gate — by making
+> the in-crate column 6.7% slower and the `[profile.release]` control 6.9%
+> slower, while the out-of-crate embedder column gets 15% *faster* (240 → 204
+> ns). So a placement demonstrably moves it; what it does not do is improve
+> everything at once. Whether that trade is worth taking is not this row's call —
+> item 1 is normative and `just bench-ab` is workspace-wide and was not run for
+> it — and it is exactly the kind of question a standing row exists to surface.
+>
+> That toggle is also why **`boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`
+> are all gated at 5%, not just the quotient §9.2 names**: a ratio-only gate
+> reads the run above as a 20% improvement. `in_crate_ns` is the metric that
+> fires on it.
+>
+> Two method notes, both found by measuring. **A probe in `tf_tree` is not
+> in-crate** (241.5 vs 243.6 ns — the facade re-exports the engine rather than
+> containing it), which is why the in-crate half had to go into `tf_tree_core`.
+> And **the in-crate body must not be generic**: the first version took
+> `Stamp<D>`, was therefore monomorphized in the *calling* crate, and the row
+> reported 1.000× while both columns were out-of-crate. Making it concrete moved
+> the same measurement to 1.250×.
+>
+> The verdict is `unresolved` rather than a pass or a fail whenever the observed
+> round-to-round band straddles the threshold. Pairing the two columns inside a
+> round is what makes 5% resolvable here at all: the band is ~1% wide, where the
+> unpaired two-process comparison moves by 4% between runs.
+>
+> Host, and it matters: a 4-physical-core AMD EPYC-Milan VM that fails
 > `Fitness::probe`, so the row is `unavailable` in this repository's own
 > committed baseline and the numbers above are evidence for a design decision
-> rather than claims. The ratio moved between 1.236 and 1.249 across consecutive
-> runs — read it as "about a quarter".
+> rather than claims.
 
 ### 2.4 Two things that are not going to exist
 
@@ -659,7 +688,7 @@ authorized by this document alone.
 |---|---|---|---|---|
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
-| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`), gated at 5% on `ratio`, `embedder_ns` and `reference_ns` — and **reporting 1.24–1.25×, i.e. over §9.2's criterion**, which §2.3's second amendment states rather than hides |
+| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`) — one build, one profile, `tf_tree_bench` against `tf_tree_core::bench_probe` — gated at 5% on `boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`, and **reporting 1.250–1.254×, i.e. over §9.2's criterion**, with the `lto = "thin"` control at 0.994–0.996× beside it. The two-profile comparison is kept as an exploratory measurement, never gated |
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |

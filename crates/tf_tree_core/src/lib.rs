@@ -80,6 +80,13 @@ pub mod participant;
 // the concurrency core beneath it, not the plan layer.
 #[cfg(not(loom))]
 pub mod plan;
+// **Default-off, and no shipped configuration turns it on.** `docs/API.md` §2.3
+// item 3's gated row compares the facade path called from a separate crate
+// against the in-crate path, and the in-crate half has to be compiled here —
+// see the module's own docs for the measurement that rules out putting it in
+// the facade instead. Same pattern as `tf_tree_c`'s `test-hooks`.
+#[cfg(all(feature = "bench-probe", not(loom)))]
+pub mod bench_probe;
 #[cfg(not(loom))]
 pub mod topology;
 

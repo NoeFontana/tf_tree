@@ -1,26 +1,30 @@
-//! `docs/PHASE5.md` §9.2's embedding row: the facade from a separate crate.
+//! `docs/PHASE5.md` §9.2's embedding measurements.
 //!
-//! Two modes, because the row is two builds of this program:
+//! Two modes:
 //!
 //! ```text
 //! embed_cost --json target/embed-cost/embedder.json   # measure this build
-//! embed_cost --compare target/embed-cost              # print the row
+//! embed_cost --compare target/embed-cost              # print both measurements
 //! ```
 //!
-//! `just embed-cost` runs all three steps; run that rather than this. The
-//! measurement is only worth as much as the pinning and the profile flags the
-//! recipe supplies, and both are easy to leave off by hand.
+//! `just embed-cost` runs all of it; run that rather than this. The measurement
+//! is only worth as much as the pinning and the profile flags the recipe
+//! supplies, and both are easy to leave off by hand.
 //!
-//! The interesting design is in [`tf_tree_bench::embed`] — in particular why the
-//! reference column is a second *build* rather than a probe compiled inside the
-//! engine, and why there is exactly one loop shape.
+//! A single `--json` run already contains **§9.2's gated row**: the crate
+//! boundary is measured inside one build, by timing two identical bodies that
+//! differ only in which crate they were compiled in. `--compare` adds the
+//! **exploratory** half, which needs the second build: what the embedder's own
+//! `[profile.*]` costs. The design behind both is in
+//! [`tf_tree_bench::embed`] — in particular why the in-crate column has to live
+//! in `tf_tree_core` and why the profile comparison is not gated.
 // This binary's output *is* its result.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use tf_tree_bench::embed::{self, Pair};
+use tf_tree_bench::embed::{self, Pair, Run};
 
 fn main() -> Result<()> {
     let mut json: Option<PathBuf> = None;
@@ -49,25 +53,18 @@ fn main() -> Result<()> {
     }
 
     // A debug build of this probe measures a different program, and the whole
-    // row is a statement about generated code. Refusing is cheaper than
+    // measurement is a statement about generated code. Refusing is cheaper than
     // explaining the number later.
     if cfg!(debug_assertions) {
         bail!(
             "this is a debug build: debug_assertions are on, so the timing describes a \
-             program nobody ships. Run `just embed-cost`, which builds it twice with the \
-             two profiles the row compares."
+             program nobody ships. Run `just embed-cost`, which builds it with the two \
+             profiles these measurements need."
         );
     }
 
     let run = embed::measure()?;
-    println!(
-        "profile dir {:<10} {:>8.1} ns/lookup   spread {:.2}%   ({} rounds x {} lookups)",
-        run.profile_dir,
-        run.ns_per_lookup,
-        run.spread * 100.0,
-        run.rounds,
-        run.lookups_per_round
-    );
+    print_run(&run);
     if let Some(path) = json {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -80,25 +77,51 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// One build's own numbers: §9.2's gated row, for whichever profile this is.
+fn print_run(run: &Run) {
+    println!(
+        "profile dir {:<9} source {}   ({} rounds x {} lookups per column)",
+        run.profile_dir, run.source_id, run.rounds, run.lookups_per_round
+    );
+    println!(
+        "  out-of-crate (tf_tree_bench) {:>8.1} ns   spread {:>5.2}%",
+        run.out_of_crate_ns,
+        run.out_of_crate_spread * 100.0
+    );
+    println!(
+        "  in-crate     (tf_tree_core)  {:>8.1} ns   spread {:>5.2}%",
+        run.in_crate_ns,
+        run.in_crate_spread * 100.0
+    );
+    println!("  boundary: {}", run.verdict_line());
+}
+
 fn report(pair: &Pair) {
-    println!("docs/PHASE5.md §9.2 — facade Plan::at from a separate crate, depth 3\n");
-    println!("{:>34} {:>12} {:>10}", "profile", "ns/lookup", "spread");
+    println!("docs/PHASE5.md §9.2 — GATED: the crate boundary, one build per profile\n");
+    print_run(&pair.embedder);
+    println!("    ^ this is the gated row: §9.2 requires an embedder's default profile.\n");
+    print_run(&pair.reference);
     println!(
-        "{:>34} {:>12.1} {:>9.2}%",
-        "embedder (lto=false, cgu=16)",
-        pair.embedder.ns_per_lookup,
-        pair.embedder.spread * 100.0
+        "    ^ the control, not the row. Under `lto = \"thin\"` the boundary is erased at\n      \
+         link time, so a ratio near 1.00 here is the mechanism working, not a passing gate.\n"
+    );
+
+    println!("EXPLORATORY — what the embedder's own [profile.*] costs, not gated\n");
+    println!(
+        "  out-of-crate at [profile.embedder] (lto=false, cgu=16) {:>8.1} ns",
+        pair.embedder.out_of_crate_ns
     );
     println!(
-        "{:>34} {:>12.1} {:>9.2}%",
-        "reference (lto=thin, cgu=1)",
-        pair.reference.ns_per_lookup,
-        pair.reference.spread * 100.0
+        "  out-of-crate at [profile.release]  (lto=thin,  cgu=1)  {:>8.1} ns",
+        pair.reference.out_of_crate_ns
     );
-    println!("\n  {}", pair.verdict());
     println!(
-        "\n  The two spreads bound what this ratio is worth: a 5% criterion over halves \
-         that each move by more\n  than a percent or two between rounds is arithmetic, \
-         not a measurement."
+        "  ratio {:.3}x — `docs/API.md` §2.3 item 2's LTO guidance, priced.",
+        pair.profile_ratio()
+    );
+    println!(
+        "\n  This second comparison is two processes seconds apart and carries the host's\n  \
+         full between-run noise, so it informs and never gates: `docs/PHASE1.md` §11.2's\n  \
+         exploratory shape. Only the first block enters `results.json`."
     );
 }
