@@ -57,6 +57,19 @@ pub const MAX_ADAPTIVE_DEPTH: u32 = 16;
 pub trait Domain: Copy {
     /// The runtime tag stored on an edge's `domain` field and compared against a
     /// query's domain. Must be unique per domain.
+    ///
+    /// **Tags `0`–`3` are the built-ins** ([`SystemDomain`], [`SensorDomain`],
+    /// [`SimTime`], [`SteadyDomain`]); a user-declared domain picks a free tag
+    /// from `4` upwards. The trait is open on purpose — a driver with a
+    /// PTP-disciplined clock declares `struct PtpDomain;` rather than pretending
+    /// to be one of these (`docs/API.md` §2.5).
+    ///
+    /// **A tag is a permanent choice.** It is written into
+    /// `EdgeRecord::domain` at declaration time and read by every consumer and
+    /// every diagnostic; re-numbering one silently re-interprets every arena and
+    /// every recording already on disk. `docs/API.md` §5.2 is the argument that
+    /// a domain mistake is unfixable after the fact, and it applies to the
+    /// numbering as much as to the choice.
     const TAG: u8;
 }
 
@@ -74,6 +87,69 @@ pub struct SensorDomain;
 impl Domain for SensorDomain {
     const TAG: u8 = 1;
 }
+
+/// Simulated time — a `/clock` publisher, a bag replay, or a physics engine —
+/// tag `2`.
+///
+/// # Why this exists, given that [`Domain`] is an open trait
+///
+/// It is open so a driver with a PTP-disciplined clock can declare its own tag,
+/// and that is deliberate. But **two built-ins is close enough to a closed set
+/// that everything collapses onto tag 0**: a sim deployment and a steady-clock
+/// driver are both "not a sensor", so both take [`SystemDomain`] by default, and
+/// [`LookupError::TimeDomainMismatch`] then never fires for the two populations
+/// most exposed to the bug it exists to catch (`docs/API.md` §2.5).
+///
+/// The concrete failure this separates out: a node mixing `/clock`-driven sim
+/// time with a driver's steady time gets a tree wrong by however long the bag
+/// has been playing, and it is *well-formed* the whole time — the offset between
+/// two clock domains is not recoverable from one-way stamps
+/// (`docs/API.md` §5.2), so nothing downstream can notice and nothing after the
+/// fact can repair it. That asymmetry is the whole reason the domain is a type
+/// and not a convention (`docs/PROJECT.md` §5 D9).
+///
+/// **Sim time is not a wall clock**, which is a second, separable fact: it
+/// steps, loops and stops, but it does so because an operator asked it to.
+/// `docs/PHASE5.md` §6's `TFT019` reports a run of `NonMonotonicStamp`
+/// rejections on a *wall-clock* tag as a clock step rather than a publisher
+/// fault; with only tag 0 available it must fire on sim edges too, or skip
+/// them by guessing. A tag of its own is what makes that check precise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimTime;
+impl Domain for SimTime {
+    const TAG: u8 = 2;
+}
+
+/// A steady, monotone clock (`CLOCK_MONOTONIC`-like), tag `3`.
+///
+/// The companion to [`SimTime`], and the one `docs/API.md` §5.3 asks for by
+/// name: *"a documentation line recommending a steady or PTP domain for
+/// anything published at rate"* had nothing to recommend, because until now
+/// there was no steady domain to name.
+///
+/// A steady clock cannot step, which is exactly the property
+/// `docs/PHASE5.md` §6's `TFT019` needs and could not express. A run of
+/// `NonMonotonicStamp` rejections on a [`SystemDomain`] edge is very likely an
+/// NTP step or a leap second, and the publisher is not at fault; the same run on
+/// a `SteadyDomain` edge cannot be, so it is a real publisher defect. Collapsing
+/// both onto tag 0 turns the second case into the first and sends whoever meets
+/// it at 3 a.m. to restart a node that was never broken.
+///
+/// It carries no epoch guarantee at all: two processes' `CLOCK_MONOTONIC` values
+/// are unrelated across a reboot and, on some systems, across processes. That is
+/// not a defect of this domain but the reason it is a *separate* one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SteadyDomain;
+impl Domain for SteadyDomain {
+    const TAG: u8 = 3;
+}
+
+/// Nanoseconds in one second.
+///
+/// Named rather than written twice: [`Stamp::from_parts`] and
+/// [`Stamp::from_timespec`] both range-check against it and both multiply by it,
+/// and four literals with the same nine zeros is how one of them acquires eight.
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// A nanosecond timestamp in domain `D`.
 ///
@@ -95,6 +171,140 @@ impl<D: Domain> Stamp<D> {
     #[must_use]
     pub const fn nanos(self) -> i64 {
         self.0
+    }
+
+    /// Assemble a stamp from a `(seconds, nanoseconds)` pair — the shape
+    /// `builtin_interfaces/Time` (`{int32 sec, uint32 nanosec}`) and POSIX
+    /// `struct timespec` both have. Exact, and never a float
+    /// (`docs/API.md` §5.1, which is normative).
+    ///
+    /// # Why this exists at all, when the unit was never the imposition
+    ///
+    /// The ecosystem already agrees with int64 nanoseconds — `rclcpp::Time`
+    /// stores them, `rclpy.time.Time` is them, PTP is them. What a caller
+    /// resents is writing `stamp.sec * 10**9 + stamp.nanosec` in every node, and
+    /// what that hand-written line does is exactly what goes wrong here: it
+    /// wraps silently at the ends of `i64` and it accepts a malformed pair
+    /// without noticing. This is that line, written once, with both failures
+    /// reported.
+    ///
+    /// # Total, and what it refuses
+    ///
+    /// Total: defined for every `(i64, u32)` pair, no panic, no wrap, no
+    /// saturation. Two inputs have no correct answer and both return `None`:
+    ///
+    /// * **`nanos >= 1_000_000_000`.** Both source formats define the field as
+    ///   the sub-second remainder, so a value outside `[0, 1e9)` means the pair
+    ///   is not a `Time` — most often because a whole nanosecond count was put
+    ///   in the wrong field. Normalizing it (carrying the excess into the
+    ///   seconds) is *arithmetically* exact and is still the wrong answer:
+    ///   it converts a malformed message into a plausible stamp, which is
+    ///   precisely the class of silent wrongness `docs/API.md` R4 refuses in the
+    ///   memory axis and §5.2 refuses in the time axis. Saturating would be
+    ///   worse again.
+    /// * **`sec * 1e9 + nanos` outside `i64`.** `i64` nanoseconds reach ±292
+    ///   years, so this is unreachable for any real clock and reachable for
+    ///   every uninitialised `i64`. Wrapping would hand back a stamp on the
+    ///   other side of the epoch, which compares, interpolates and prints
+    ///   perfectly. The bound is tested against the *sum*, not against the
+    ///   product — see the body for the band of representable stamps a staged
+    ///   `checked_mul`/`checked_add` refuses.
+    ///
+    /// `None` deliberately does not say *which*: a caller acts identically on
+    /// both (reject the message), and a `Copy`, `String`-free error carrying the
+    /// distinction would be a new error type for a fact no consumer branches on
+    /// (`docs/PROJECT.md` §5 D11).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tf_tree_core::{Stamp, SystemDomain};
+    ///
+    /// let t = Stamp::<SystemDomain>::from_parts(1, 500_000_000).unwrap();
+    /// assert_eq!(t.nanos(), 1_500_000_000);
+    ///
+    /// // Pre-epoch stamps are exact too — the seconds go negative, the
+    /// // nanoseconds stay a positive remainder, exactly as `timespec` says.
+    /// let before = Stamp::<SystemDomain>::from_parts(-1, 250_000_000).unwrap();
+    /// assert_eq!(before.nanos(), -750_000_000);
+    ///
+    /// // A nanosecond field that is not a sub-second remainder is refused
+    /// // rather than carried into the seconds.
+    /// assert!(Stamp::<SystemDomain>::from_parts(1, 1_000_000_000).is_none());
+    ///
+    /// // ... and so is anything `i64` nanoseconds cannot hold.
+    /// assert!(Stamp::<SystemDomain>::from_parts(i64::MAX, 0).is_none());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn from_parts(sec: i64, nanos: u32) -> Option<Stamp<D>> {
+        if nanos as i64 >= NANOS_PER_SEC {
+            return None;
+        }
+        // **`i128`, not `checked_mul` then `checked_add`.** The staged form
+        // refuses a band of *representable* stamps at the negative end: for
+        // `sec = -9_223_372_037` the product alone is below `i64::MIN` while
+        // `product + nanos` is exactly `i64::MIN`, so a checked multiply
+        // rejects a pair the type can hold. `i64 * 1e9 + u32` cannot overflow
+        // `i128` for any input, so this branch is reached with the exact answer
+        // in hand and the only question left is whether it fits.
+        //
+        // Not `wrapping_*` or a debug-only overflow trap either: a release build
+        // must refuse exactly what a debug build refuses, or the check is a
+        // test-configuration artifact rather than a property of the API.
+        let total = sec as i128 * NANOS_PER_SEC as i128 + nanos as i128;
+        if total < i64::MIN as i128 || total > i64::MAX as i128 {
+            return None;
+        }
+        Some(Stamp(total as i64, PhantomData))
+    }
+
+    /// Assemble a stamp from the two fields of a POSIX `struct timespec`.
+    ///
+    /// # Why the fields and not the struct
+    ///
+    /// `tf_tree_core` is `no_std` and its whole dependency budget is
+    /// `libm` + `bytemuck` + `blake3` (`docs/PROJECT.md` §5), so there is no
+    /// `libc::timespec` to accept and adding `libc` to reach a two-field
+    /// conversion would spend the budget on a struct definition. Declaring our
+    /// own `#[repr(C)]` copy would be worse: it would be a type a caller has to
+    /// convert *into*, which is the conversion this method exists to remove.
+    ///
+    /// `tv_sec` is `time_t` and `tv_nsec` is `long`; both are `i64` on every
+    /// 64-bit target, so the call site is
+    /// `Stamp::from_timespec(ts.tv_sec, ts.tv_nsec)` with no cast. On a 32-bit
+    /// target they widen, which is lossless in both cases.
+    ///
+    /// # Total, and what it refuses
+    ///
+    /// Everything [`Self::from_parts`] refuses, plus a **negative `tv_nsec`**.
+    /// POSIX allows one only in a *relative* `timespec` (an interval passed to
+    /// `nanosleep`); an absolute time from `clock_gettime` always has
+    /// `tv_nsec` in `[0, 1e9)`. A relative interval converted as if it were an
+    /// absolute stamp is a whole category of wrong, and it is the one this
+    /// refusal catches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tf_tree_core::{SensorDomain, Stamp};
+    ///
+    /// // `clock_gettime(CLOCK_REALTIME, &ts)` gives exactly this pair.
+    /// let t = Stamp::<SensorDomain>::from_timespec(1_700_000_000, 123_456_789).unwrap();
+    /// assert_eq!(t.nanos(), 1_700_000_000_123_456_789);
+    ///
+    /// // A relative interval is not an absolute stamp.
+    /// assert!(Stamp::<SensorDomain>::from_timespec(0, -1).is_none());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn from_timespec(tv_sec: i64, tv_nsec: i64) -> Option<Stamp<D>> {
+        if tv_nsec < 0 || tv_nsec >= NANOS_PER_SEC {
+            return None;
+        }
+        // The range check above is what makes this cast lossless; it is not a
+        // truncation the caller has to trust us about.
+        Self::from_parts(tv_sec, tv_nsec as u32)
     }
 }
 
@@ -403,6 +613,11 @@ impl Plan {
 
     /// Evaluate the plan at nanosecond stamp `t`, sampling every dynamic edge at
     /// `t`. Assumes the caller has already validated generation and domain.
+    ///
+    /// `#[inline]` for the reason given on [`Self::at`]: this is the fold, and a
+    /// downstream crate that inlines `at` and then *calls* this one has bought
+    /// nothing.
+    #[inline]
     fn fold_at(&self, g: &Guard, t: i64) -> Result<Iso3, LookupError> {
         let mut acc = Iso3::IDENTITY;
         for (k, step) in self.steps().iter().enumerate() {
@@ -423,6 +638,7 @@ impl Plan {
 
     /// Like [`Self::fold_at`] but each dynamic step gallops from its own resumable
     /// cursor (`cursors[step_index]`), for a monotone stamp sweep.
+    #[inline]
     fn fold_at_cursors(
         &self,
         g: &Guard,
@@ -454,6 +670,23 @@ impl Plan {
     /// * [`LookupError::TimeDomainMismatch`] — `D` does not match the plan's edges.
     /// * Any sampling error from an edge ([`LookupError::NoData`],
     ///   [`LookupError::Extrapolation`], …).
+    ///
+    /// # Why `#[inline]` — it is part of the zero-cost claim
+    ///
+    /// This method sits **across a crate boundary from every consumer**, and
+    /// Rust does not inline across crates without `#[inline]` or LTO. A depth-3
+    /// interpolating lookup costs ~290 ns
+    /// (`docs/decisions/0013`); without the attribute a downstream crate emits a
+    /// call here, another into the fold, and another per sampled step.
+    ///
+    /// **This workspace's own `[profile.release]` sets `lto = "thin"` and
+    /// `codegen-units = 1`, which is exactly why nothing here had ever measured
+    /// the un-LTO'd path.** An embedder's profile is not ours: the default
+    /// `cargo build --release` in their repository has neither, and that is the
+    /// build the zero-cost claim is made to. `docs/API.md` §2.3 makes the
+    /// attribute normative on this method, on the fold, on `Guard::sample` and
+    /// on the `Iso3` operators — the last of which already carried it.
+    #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
         self.check_domain::<D>()?;
@@ -769,6 +1002,122 @@ impl Plan {
             });
         }
         Ok(span)
+    }
+
+    /// The **slowest** declared nominal publish rate among this plan's dynamic
+    /// edges, in milli-hertz, or `None` when no edge on the plan declares one
+    /// (`docs/decisions/0018`).
+    ///
+    /// Together with [`Self::span`] this is the whole engine-side input to a
+    /// caller's blocking wait. **There is no blocking primitive in the arena and
+    /// there is not going to be one**: every shared-memory wait requires the
+    /// waiter to register by *writing* a word the waker can see, and D18 makes
+    /// consumers attach `PROT_READ`, so that store is a `SIGSEGV` rather than an
+    /// error. Buying back ~1 ms of startup latency by spending an MMU-enforced
+    /// safety boundary is the wrong trade; `0018` records it, and records the
+    /// escalation path (the Phase 2 owner server, not a futex) so it is not
+    /// reinvented.
+    ///
+    /// The wait the shim writes, once, out of these two:
+    ///
+    /// ```text
+    /// loop {
+    ///     let g = tree.guard();
+    ///     match plan.span(&g)? {
+    ///         None                                  => return plan.at(&g, wanted),
+    ///         Some((_, newest)) if newest >= wanted  => return plan.at(&g, wanted),
+    ///         Some((_, newest)) => sleep(min(deadline_remaining,
+    ///                                        (wanted - newest) + one_period)),
+    ///     }
+    ///     if now >= deadline { return Err(Timeout) }
+    /// }
+    /// ```
+    ///
+    /// where `one_period` is `1e9 / (mhz / 1000)` nanoseconds from *this*
+    /// method. It is a **prediction, not a poll interval**: the shortfall is
+    /// known and the period is declared, so the typical wake count is one or
+    /// two. A naive 1 ms poll against a 10 Hz edge wakes a hundred times.
+    ///
+    /// # Slowest, and why the answer is a `min`
+    ///
+    /// A plan is answerable only when *every* dynamic edge on it has reached the
+    /// stamp, so the edge that decides when the wait ends is the one that
+    /// publishes least often. Sleeping a period of the fastest edge on a path
+    /// that also carries a 10 Hz map update wakes a hundred times per useful
+    /// answer — the poll this design exists to avoid, arrived at from inside the
+    /// prediction.
+    ///
+    /// # `0` is *undeclared*, and is skipped rather than treated as 0 Hz
+    ///
+    /// `EdgeRecord::nominal_rate_mhz` uses `0` as "not declared" — an edge whose
+    /// ring was sized by an explicit slot count states no rate. Reading the
+    /// sentinel as a rate makes it the minimum of every set it appears in and
+    /// yields an infinite period, so one undeclared edge would silently disable
+    /// the wait for the whole path. `docs/PHASE5.md` §6's `TFT007` amendment
+    /// makes the same distinction load-bearing for the rate check, and for the
+    /// same reason: comparing against zero fabricates a finding on every edge of
+    /// a correct arena.
+    ///
+    /// `None` — nobody declared — is therefore a real third answer and not a
+    /// degenerate minimum. A caller falls back to a conservative period and
+    /// **should say so once at startup** rather than silently, because a
+    /// mysteriously slow wait and a mysteriously busy one look identical from
+    /// outside (`0018` *Consequences*).
+    ///
+    /// # A declared rate may be an observed one
+    ///
+    /// `tf_tree topology --discover` measures a rate and writes it into the same
+    /// `rate_hz` this reads as a declaration, so a recording of a degraded
+    /// publisher declares the fault as nominal. Here the consequence is one
+    /// extra wake, which is why the ambiguity is tolerable in a wait and was not
+    /// tolerable for `TFT007` (`docs/PHASE5.md` §6).
+    ///
+    /// # Why it is generation-checked, and why it is not `NoData`
+    ///
+    /// It calls `check_generation` exactly as [`Self::span`] does, so a stale
+    /// plan reports [`LookupError::TopologyChanged`] and a fork-poisoned guard
+    /// reports [`LookupError::ChildDetached`]. A waiter that missed either would
+    /// spin until its deadline against a plan that can never be satisfied — the
+    /// one failure mode a *timeout* API hides best.
+    ///
+    /// It does **not** return [`LookupError::NoData`] for an edge that has never
+    /// published, which is where it deliberately parts company with
+    /// [`Self::span`]. A declaration is a property of the topology, not of the
+    /// stream: the caller asking how long to sleep is by definition asking
+    /// *before* the data exists, and that is the startup case this whole loop
+    /// was built for.
+    ///
+    /// # Errors
+    ///
+    /// [`LookupError::TopologyChanged`], [`LookupError::ChildDetached`], or
+    /// [`LookupError::UnknownEdge`] if a step names an edge this arena has no
+    /// record for.
+    //
+    // The signature `0018` prints in its *Decision* section is
+    // `-> Option<u32>`, which cannot carry the errors the same record's
+    // implementation plan (step 1) requires it to raise — "calling
+    // `check_generation` as `span` does" is only meaningful if the result
+    // reaches the caller. The `Result` wrapper is the self-consistent reading
+    // and matches `span`, the method it is documented beside and used with.
+    pub fn slowest_nominal_rate_mhz(&self, g: &Guard) -> Result<Option<u32>, LookupError> {
+        self.check_generation(g)?;
+        let mut slowest: Option<u32> = None;
+        for step in self.steps() {
+            let Step::Dyn { edge, .. } = step else {
+                // A static edge has no publisher and therefore no period; it
+                // constrains a wait exactly as much as it constrains `span`.
+                continue;
+            };
+            let mhz = g.nominal_rate_mhz(*edge)?;
+            if mhz == 0 {
+                continue;
+            }
+            slowest = Some(match slowest {
+                None => mhz,
+                Some(current) => current.min(mhz),
+            });
+        }
+        Ok(slowest)
     }
 
     /// Fold an all-static plan (no `Guard` sampling needed).
@@ -1625,6 +1974,12 @@ impl<'a> Guard<'a> {
     }
 
     /// Sample edge `edge` at stamp `t`, dispatching on the edge's interp policy.
+    ///
+    /// `#[inline]`, and so are its two siblings below, for the reason
+    /// [`Plan::at`] gives: they are the last non-generic links in the chain a
+    /// downstream crate has to inline through to reach the generic
+    /// `SampleRing::sample`, whose MIR is available to it anyway.
+    #[inline]
     pub(crate) fn sample(
         &self,
         edge: EdgeId,
@@ -1653,6 +2008,7 @@ impl<'a> Guard<'a> {
     /// The tag check is what keeps a mismatched hint cheap. `k` indexes the
     /// plan's step, and one guard may evaluate several plans, so the cursor is
     /// only trusted when it was last written by this same edge.
+    #[inline]
     pub(crate) fn sample_hinted(
         &self,
         k: usize,
@@ -1702,6 +2058,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Galloping variant of [`Self::sample`] resuming from `cursor`.
+    #[inline]
     pub(crate) fn sample_from(
         &self,
         edge: EdgeId,
@@ -1751,6 +2108,28 @@ impl<'a> Guard<'a> {
             // windows do not overlap".
             _ => Err(LookupError::NoData { edge }),
         }
+    }
+
+    /// An edge's declared nominal publish rate, in milli-hertz, `0` meaning
+    /// *undeclared*.
+    ///
+    /// The sentinel is passed through rather than folded into an `Option` here,
+    /// because this is the layer that reads the record and
+    /// [`Plan::slowest_nominal_rate_mhz`] is the layer that decides what
+    /// "undeclared" means for a wait. Two callers already disagree about that —
+    /// the wait skips it, `docs/PHASE5.md` §6's `TFT007` reports it as a skip
+    /// reason — so the interpretation does not belong on the read.
+    ///
+    /// Reads the edge *record*, not the ring: a rate is declared at
+    /// construction and does not depend on anything having been published, which
+    /// is why this cannot return [`LookupError::NoData`] the way
+    /// [`Self::window`] must.
+    pub(crate) fn nominal_rate_mhz(&self, edge: EdgeId) -> Result<u32, LookupError> {
+        Ok(self
+            .view
+            .edge(edge)
+            .ok_or(LookupError::UnknownEdge { edge })?
+            .nominal_rate_mhz)
     }
 }
 

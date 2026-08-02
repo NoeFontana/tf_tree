@@ -2,7 +2,16 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** _(filled in as work lands)_
+**Implementation:** step 1 landed as
+`Plan::slowest_nominal_rate_mhz` in `crates/tf_tree_core/src/plan.rs`, beside
+`Plan::span`. **Its signature is `Result<Option<u32>, LookupError>`, not the
+`Option<u32>` printed in *Decision* below** — the same record's step 1 requires
+it to call `check_generation` "as `span` does", which is only meaningful if the
+result reaches the caller, and a waiter that swallowed `TopologyChanged` or
+`ChildDetached` would spin to its deadline against a plan that can never be
+satisfied. The `Result` also carries `UnknownEdge`. Steps 2–5 are open; step 2's
+runnable doc test wants a `Tree` and a second thread, neither of which exists in
+`tf_tree_core`, so it belongs on the facade.
 
 ## Context
 
@@ -55,6 +64,9 @@ impl Plan {
     pub fn slowest_nominal_rate_mhz(&self, g: &Guard) -> Option<u32>;
 }
 ```
+
+*(As shipped: `-> Result<Option<u32>, LookupError>`. See **Implementation**
+above — this signature cannot carry the errors step 1 requires it to raise.)*
 
 **The wait, which is the shim's and is written once there:**
 

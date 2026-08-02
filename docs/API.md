@@ -165,6 +165,32 @@ is a call per step.
    ABI. Today the C ABI is measured against native and the native *embedding*
    path is not measured at all.
 
+> **Amendment — item 1 is done; items 2 and 3 are not, and item 1 went in
+> unmeasured.**
+>
+> `#[inline]` is on `Plan::at`, on both scalar folds (`fold_at` and
+> `fold_at_cursors`) and on the three `Guard` sampling entry points
+> (`sample`, `sample_hinted`, `sample_from`). Those six are the non-generic
+> links in the chain from a downstream `plan.at(&g, t)` to the generic
+> `SampleRing::sample`, whose MIR crosses the boundary anyway; marking fewer
+> leaves a call in the middle and buys nothing. The `Iso3` operators **already
+> carried it** — every method on `Iso3`, `Vec3` and `Quat`, and `impl Mul` — so
+> `tf_tree_math` was not touched.
+>
+> Deliberately *not* marked: `fold_at_with_derivatives`, `fold_latest`,
+> `fold_latest_common`. Each is large, none is on the measured hot path, and
+> `#[inline]` on a large body invites the caller's caller to grow at every site.
+>
+> **Not measured.** The A/B loop (`just bench-ab`) is workspace-wide and was not
+> run for this change. The expected effect on this workspace's own benchmarks is
+> nil, because `[profile.release]` already sets `lto = "thin"` — which is the
+> whole premise of this section: the number that would move is an embedder's,
+> and we do not have their build.
+>
+> Item 2 (the `lto`/`codegen-units` guidance in the crate docs) and item 3 (the
+> cross-crate benchmark row) are untouched. Item 3 is the one that would have
+> made "not measured" unnecessary.
+
 ### 2.4 Two things that are not going to exist
 
 Recorded here so they do not arrive later by adjacency.
@@ -202,6 +228,38 @@ beside the existing two, each a unit struct and a `TAG` — and until they exist
 table and may name them; §5.3's `doctor` check may not depend on them, and does
 not (`PHASE5.md` §6's `TFT019` amendment keys on the tag and discloses what it
 cannot yet distinguish).
+
+> **Amendment — the built-in set is four, and the tag mapping is settled. The
+> two paragraphs above describe the state this one leaves.**
+>
+> `SimTime` (tag `2`) and `SteadyDomain` (tag `3`) exist in
+> `tf_tree_core::plan`, re-exported through the `tf_tree` facade, each a unit
+> struct and a `TAG` exactly as this section asked for. Tags `0`–`3` are the
+> built-ins; a user-declared domain picks from `4` upwards, and the `Domain`
+> trait's own documentation now says so, because the numbering is as unfixable
+> after the fact as the choice (§5.2) — a tag is written into
+> `EdgeRecord::domain` at declaration time and read by every consumer and every
+> recording already on disk.
+>
+> **`EdgeRecord::domain` is an existing `u8` field**, so nothing here moves
+> `FORMAT_VERSION` or `layout_hash`. The cost was two unit structs.
+>
+> **What is settled and what is not.** `PHASE7.md` §4 J9 requires the tag
+> mapping to be settled before its read side can be specified, and it now is:
+> `sim` is 2, `steady` is 3, permanently. What is *not* done is the write side
+> **applying** it — `tf_tree_bridge`'s `TopologyConfig::default_domain` is still
+> a bare `u8` and its `parse_domain` still maps only `"system"` and `"sensor"`,
+> so `PHASE4.md` §5.5's *"the bridge tags every edge it declares with the
+> `SimTime` domain"* remains a statement about a number an operator chooses. A
+> deployment that wants tag 2 today writes `2`. Rewiring `parse_domain` is a
+> separate change and is the one that makes §5.5 true as written.
+>
+> `PHASE5.md` §6's `TFT019` is likewise unchanged and still fires only on tag 0.
+> That is now *correct rather than merely conservative*: a `SteadyDomain` edge
+> cannot have stepped, so a run of rejections there is a real publisher defect
+> and reporting it as a clock step would be the fabricated all-clear that
+> amendment refuses. Teaching `TFT019` that tag 3 is provably steady is a
+> refinement it can now make and has not yet made.
 
 ### 2.6 Stability tiering — deferred, and the deferral is recorded
 
@@ -364,6 +422,42 @@ tf_tree.from_ros(msg.header.stamp)   # exact; never via to_sec()
 examples. It already carries that warning in `tf_tree_py`; what it does not yet
 have is an exact sibling to be pointed at, which is what makes the warning
 actionable rather than merely true.
+
+> **Amendment — the Rust half ships, and it settles two shapes the other
+> surfaces have to mirror.**
+>
+> ```rust
+> Stamp::<D>::from_parts(sec: i64, nanos: u32)          -> Option<Stamp<D>>
+> Stamp::<D>::from_timespec(tv_sec: i64, tv_nsec: i64)  -> Option<Stamp<D>>
+> ```
+>
+> **`Option`, because "total" and "exact" are in tension with `Stamp` being a
+> bare `i64`.** Two inputs have no correct answer — a `nanos` outside
+> `[0, 1e9)`, and a sum outside `i64` — and both of the alternatives are the
+> silent wrongness this whole section exists to remove: normalising an
+> out-of-range nanosecond field converts a malformed message into a plausible
+> stamp, and wrapping the sum hands back a stamp on the other side of the epoch
+> that compares, interpolates and prints perfectly. `None` does not distinguish
+> them, because a caller rejects the message either way and a `Copy`,
+> `String`-free error carrying the distinction would be a new type for a fact no
+> consumer branches on (D11).
+>
+> Note the sum is what is range-checked, not the product: a staged
+> `checked_mul` then `checked_add` refuses a one-second band of *representable*
+> stamps at the negative end.
+>
+> **`from_timespec` takes the two fields, not a struct.** `tf_tree_core`'s
+> dependency budget is `libm` + `bytemuck` + `blake3`, so there is no
+> `libc::timespec` to accept and none may be added; declaring our own `#[repr(C)]`
+> copy would be worse, because it is a type the caller then has to convert
+> *into* — the conversion the method exists to remove. `time_t` and `long` are
+> both `i64` on a 64-bit target, so the call site is
+> `Stamp::from_timespec(ts.tv_sec, ts.tv_nsec)` with no cast. It adds exactly one
+> refusal over `from_parts`: a negative `tv_nsec`, which POSIX permits only in a
+> *relative* interval, so it means an interval is being converted as an instant.
+>
+> The Python `from_ros` and the C entry point are not built by this and inherit
+> the shape: exact, total, no float, and a refusal rather than a normalisation.
 
 ### 5.2 The epoch is the hard part, and it is what `Domain` is for
 
