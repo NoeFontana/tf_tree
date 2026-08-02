@@ -61,6 +61,24 @@ changes.
    `unsafe` is confined to argument validation rather than smeared through the
    engine.
 
+   > **Amended by [`0017`](./0017-owned-handles-and-the-lifetime-rule.md), which
+   > moved `tf_tree` to `#![deny(unsafe_code)]` with exactly one `#[allow]`.**
+   > The clause above was written as a prediction and it was wrong about one
+   > case: `EdgeWriter<'a>` cannot be stored, three consumers needed to store it,
+   > and two hand-rolled the lifetime extension in crates the Rust test suite,
+   > Miri and TSan cannot instrument — one of them as a
+   > `transmute::<EdgeWriter, Publisher>` that leaked a claim lease and bypassed
+   > the fork guard for the life of every Python publisher. The block is now
+   > written once, in `OwnedWriter`, beside the `ClaimLease` and fork-guard code
+   > whose invariants it depends on.
+   >
+   > **Rule 1 is what made that decidable, and it is unchanged.** This is not a
+   > fifth boundary and no new *kind* of `unsafe` was admitted; it is one named
+   > exception with a record behind it, which is exactly the shape rule 1 asks
+   > for. The reason the paragraph above gave is still the reason `tf_tree` gets
+   > `deny` and one greppable `#[allow]` rather than a blanket
+   > `#![allow(unsafe_code)]`.
+
 3. **Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
    relies on, and every crate with `unsafe` carries a module-level `// SAFETY:`
    block explaining the boundary.** Unchanged, and this is the rule that matters.

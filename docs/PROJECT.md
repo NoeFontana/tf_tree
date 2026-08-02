@@ -160,7 +160,7 @@ When a cargo feature is compiled out, the arena *regions* it would use stay decl
 - Reaching for `ArcSwap`, `Arc`, `Box`, `Vec`, or any pointer inside a structure that lives in the arena (D4)
 - Adding a `String` to an error type or a hot path
 - Adding a dependency to `tf_tree_core`
-- Writing `unsafe` anywhere that is not one of the four boundaries in [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md) — the arena's memory, the OS, a foreign runtime, a foreign caller
+- Writing `unsafe` anywhere that is not one of the four boundaries in [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md) — the arena's memory, the OS, a foreign runtime, a foreign caller — or a second time inside `tf_tree`, whose `#![deny(unsafe_code)]` carries exactly one `#[allow]`: `OwnedWriter`'s lifetime extension, granted by [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) and the only lifetime extension in the workspace
 - Weakening an atomic ordering because a test passes on x86-64 (the loom tests exist for this; aarch64 is a CI target)
 - Adding growth, resizing, or reallocation anywhere
 - Adding a second parent, a multi-parent edge, or a graph search to plan compilation

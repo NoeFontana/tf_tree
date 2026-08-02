@@ -1,0 +1,305 @@
+//! `Tree::claim_owned` / [`tf_tree::OwnedWriter`] — `docs/decisions/0017`
+//! steps 2 and 3.
+//!
+//! `OwnedWriter` exists because three consumers needed a writer that outlives
+//! the scope that made it and two built it by hand; the first hand-rolled
+//! version was a `transmute::<EdgeWriter, Publisher>` that kept only the first
+//! field, so it **leaked the claim lease** — making the edge permanently
+//! unclaimable and invisible to the reaper — and **bypassed the fork guard**.
+//! Every test in this file is one of those failure modes, written down.
+//!
+//! # Why the interesting half is `shm`-gated
+//!
+//! The claim *lease* is an OFD byte in the rendezvous lock file, and a heap tree
+//! has no lock file at all (`Tree::take_claim_lease` returns `None` for one).
+//! So the defect that shipped is only reproducible under
+//! `--features shm` on Linux, which is what `just shm-check` runs. The first
+//! test below is the part that holds everywhere: that the `Arc` field is really
+//! there and really keeps the tree alive.
+//!
+//! The `shm` tests each take their own scratch runtime directory and set
+//! `TF_TREE_RUNTIME_DIR` for the process, exactly as `tests/rendezvous.rs` does
+//! — which is sound because the suite runs under `cargo nextest`, one process
+//! per test.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::sync::Arc;
+
+use tf_tree::{Capacity, EdgeCfg, Iso3, TreeBuilder};
+
+/// A one-dynamic-edge layout, shared by every test here.
+fn layout() -> TreeBuilder {
+    TreeBuilder::new().dynamic_edge("odom", "base", EdgeCfg::new(Capacity::slots(64)))
+}
+
+/// **The `Arc` field is real, and it is what keeps the arena alive.**
+///
+/// The record's step 2 states the mutant as "drop the `Arc` field ⇒
+/// use-after-free under `just miri`", and that is true — but `just miri` covers
+/// `tf_tree_arena` and `tf_tree_core` only, so nothing in the current gate set
+/// would actually observe it. A UAF that no gate can see is not a test.
+///
+/// So this asserts the property *directly*, with a `Weak`: after the caller's
+/// handle is gone the tree must still be alive, and after the writer is gone it
+/// must not be. That is the same fact the UAF would be a consequence of, and it
+/// fails deterministically on a machine with no nightly toolchain.
+///
+/// The `push` between the two halves is not decoration: it is the operation that
+/// would be reading and writing the freed arena under the mutant, so its
+/// presence is what makes this test *also* a miri test the day the facade is
+/// added to that recipe.
+///
+/// Mutant: delete the `tree: Arc<Tree>` field from `OwnedWriter` (replace it
+/// with nothing, or with `PhantomData`) ⇒ the `strong_count` assertion fails at
+/// `1`, and past it the `upgrade` fails too, because the tree dies with the
+/// caller's handle and the `push` on the next line writes into a freed
+/// allocation.
+///
+/// Mutant B: `core::mem::forget(self)` in `OwnedWriter::release`, standing in
+/// for any destructor the owned shape might drop on the floor. Applied: the
+/// final `upgrade` assertion fails — and the two `shm` tests below fail with it,
+/// on the claim record and on the lease respectively, which is what says the
+/// three are covering different halves rather than the same one three times.
+#[test]
+fn an_owned_writer_keeps_its_tree_alive_by_itself() {
+    let tree = Arc::new(layout().build().expect("layout"));
+    let base = tree.frame("base").unwrap();
+    let odom = tree.frame("odom").unwrap();
+
+    // A non-owning observer of the same allocation. Nothing else in this test
+    // holds a strong reference except the writer.
+    let watch = Arc::downgrade(&tree);
+    assert_eq!(
+        Arc::strong_count(&tree),
+        1,
+        "the fixture already shares the tree, so the assertions below would \
+         pass without `OwnedWriter` holding anything"
+    );
+
+    let writer = tree.claim_owned(base, odom).expect("claim");
+    assert_eq!(
+        Arc::strong_count(&tree),
+        2,
+        "claim_owned did not take a strong reference"
+    );
+
+    drop(tree);
+    assert!(
+        watch.upgrade().is_some(),
+        "the tree died with the caller's handle: the writer is now pointing \
+         into a freed arena and the push below is a use-after-free"
+    );
+
+    // Exercise the arena while the writer is the only thing keeping it mapped.
+    writer.push(1_000, &Iso3::IDENTITY).expect("push");
+
+    writer.release();
+    assert!(
+        watch.upgrade().is_none(),
+        "releasing the writer left the tree alive, so `OwnedWriter` is leaking \
+         a strong reference and the arena outlives every handle to it"
+    );
+}
+
+/// `OwnedWriter` is `Send` and is not `Sync`, as `Publisher` is (D7).
+///
+/// The compile-time half — that `Sync` is *refused* — is a `compile_fail` doc
+/// test on the type itself, because a negative bound cannot be written here.
+/// This is the positive half plus the thread that proves `Send` is usable and
+/// not merely satisfied.
+///
+/// Mutant: add `unsafe impl Sync for OwnedWriter {}`. Applied: this test still
+/// passes and the `compile_fail` doc test on `OwnedWriter` fails — which is why
+/// both halves exist.
+#[test]
+fn an_owned_writer_moves_between_threads_but_is_never_shared() {
+    fn assert_send<T: Send>() {}
+    assert_send::<tf_tree::OwnedWriter>();
+
+    let tree = Arc::new(layout().build().expect("layout"));
+    let base = tree.frame("base").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let writer = tree.claim_owned(base, odom).expect("claim");
+
+    // The whole handle crosses the boundary, tree and all — the case the
+    // lifetime on `EdgeWriter<'a>` makes impossible without a scoped thread.
+    let joined = std::thread::spawn(move || {
+        writer
+            .push(2_000, &Iso3::IDENTITY)
+            .expect("push from another thread");
+        writer
+    })
+    .join()
+    .expect("join");
+
+    drop(joined);
+    // The claim was released on the other thread's value, so this one succeeds.
+    tree.claim(base, odom)
+        .expect("the edge is claimable again after the moved writer dropped");
+}
+
+/// A scratch runtime directory, removed when the test ends, so a failure cannot
+/// leave an arena behind in the shared `/tmp` location.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+struct Scratch(std::path::PathBuf);
+
+#[cfg(all(feature = "shm", target_os = "linux"))]
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let p = std::env::temp_dir().join(format!("tf_tree_owned-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        std::env::set_var("TF_TREE_RUNTIME_DIR", &p);
+        Scratch(p)
+    }
+
+    /// The rendezvous lock file for domain 0, name `default`.
+    fn lock_path(&self) -> std::path::PathBuf {
+        self.0.join("0/default.lock")
+    }
+}
+
+#[cfg(all(feature = "shm", target_os = "linux"))]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Open a second (or third) read-write handle onto the arena `keeper` created.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn join() -> tf_tree::Tree {
+    tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Never)
+        .open()
+        .expect("join the existing arena")
+}
+
+/// **Step 2, in its literal form: the edge is re-claimable from a fresh tree
+/// over the same arena.**
+///
+/// `keeper` creates the arena and does nothing else — it is here so that the
+/// *claimer*'s handle can be dropped without the segment going with it. That
+/// separation is the point: each `Tree` carries its own `mmap`, so dropping the
+/// claimer unmaps the region the writer's `ClaimRecord` reference points into
+/// while the region itself lives on in the keeper. A writer that did not hold
+/// its own `Arc` would then release its claim through an unmapped address.
+///
+/// The re-claim at the end is what proves the release actually happened. It is
+/// the assertion that would fail if `OwnedWriter` dropped the `EdgeWriter`'s
+/// guts on the floor the way the `transmute::<EdgeWriter, Publisher>` did.
+///
+/// Mutant: delete the `tree: Arc<Tree>` field ⇒ the `push` after
+/// `drop(claimer)` stores through a reference into a region that has just been
+/// `munmap`ped, so this test dies of `SIGSEGV` rather than failing an assertion.
+///
+/// Mutant B: `core::mem::forget(self)` in `OwnedWriter::release`, i.e. an owned
+/// writer that keeps the claim record. Applied: the final `claim` fails with
+/// `AlreadyClaimed(EdgeAlreadyClaimed { owner_slot: 1 })` — a stored publisher
+/// that has gone away and an edge nobody can take.
+#[test]
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn an_owned_writer_releases_a_shared_edge_for_the_next_claimer() {
+    let _scratch = Scratch::new("reclaim");
+
+    let keeper = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::IfAbsent)
+        .layout_if_creating(layout())
+        .open()
+        .expect("create the arena");
+
+    let claimer = Arc::new(join());
+    assert_ne!(
+        keeper.participant_slot(),
+        claimer.participant_slot(),
+        "both handles took the same slot, so this is one participant and the \
+         drop below would prove nothing"
+    );
+
+    let base = claimer.frame("base").unwrap();
+    let odom = claimer.frame("odom").unwrap();
+    let writer = claimer.claim_owned(base, odom).expect("claim");
+
+    // The caller's handle goes. Only the writer's own `Arc` is left.
+    drop(claimer);
+    writer.push(1_000, &Iso3::IDENTITY).expect("push");
+    writer.release();
+
+    let rejoined = join();
+    let base = rejoined.frame("base").unwrap();
+    let odom = rejoined.frame("odom").unwrap();
+    rejoined
+        .claim(base, odom)
+        .expect("the edge was not released: a stored writer leaked its claim");
+
+    drop(keeper);
+}
+
+/// **Step 3: dropping an `OwnedWriter` frees the edge's OFD byte.**
+///
+/// This is the shipped `tf_tree_py` defect reproduced as a test. The arena
+/// `ClaimRecord` and the kernel lease are two separate things, and releasing
+/// only the first looks completely healthy from inside the process: `push`
+/// works, a re-claim works, `doctor` says nothing. What is broken is
+/// *observability* — a leaked lease is indistinguishable from a live writer, so
+/// no reaper will ever collect the edge if this process dies badly.
+///
+/// The probe opens the lock file a **second time**, which is the only vantage
+/// point that can see the answer at all: OFD locks are self-blind, so the tree's
+/// own description reports every byte it holds as free. Without the second
+/// description this test would pass against a writer that released nothing.
+///
+/// Mutant: give `OwnedWriter` a `Publisher<'static>` field instead of an
+/// `EdgeWriter<'static>` — the exact shape of the `transmute` that shipped ⇒ the
+/// first assertion still passes, and the second fails with `held: true`, the
+/// edge locked for the life of the process.
+///
+/// Mutant B: `core::mem::forget(self)` in `OwnedWriter::release`, which reaches
+/// the same place by a route that does not need the type edited. Applied: the
+/// second assertion fails.
+#[test]
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn dropping_an_owned_writer_releases_the_claim_lease() {
+    let scratch = Scratch::new("lease");
+
+    let tree = Arc::new(
+        tf_tree::Open::new()
+            .mode(tf_tree::AttachMode::ReadWrite)
+            .create(tf_tree::CreatePolicy::IfAbsent)
+            .layout_if_creating(layout())
+            .open()
+            .expect("create the arena"),
+    );
+    let base = tree.frame("base").unwrap();
+    let odom = tree.frame("odom").unwrap();
+
+    let writer = tree.claim_owned(base, odom).expect("claim");
+    let edge = tree
+        .arena_view()
+        .topology()
+        .read_frame(base)
+        .expect("base is interned")
+        .2;
+    assert_ne!(
+        edge, 0,
+        "base has no edge, so the probe below names nothing"
+    );
+
+    let probe = tf_tree_ipc::LockFile::open(&scratch.lock_path()).expect("open the lock file");
+    assert!(
+        probe.probe_claim(edge).unwrap().held,
+        "claim_owned did not take the edge's lease — the arena record alone \
+         cannot tell a live holder from a dead one"
+    );
+
+    writer.release();
+    assert!(
+        !probe.probe_claim(edge).unwrap().held,
+        "the lease outlived the writer: the edge is now permanently unclaimable \
+         and no reaper can tell, which is the defect 0017 exists to remove"
+    );
+
+    drop(tree);
+}

@@ -57,7 +57,7 @@ the reason several orderings look the way they do.
 crates/tf_tree_math/    no_std; SE(3)/SO(3), quats, dual quats; #![forbid(unsafe_code)]
 crates/tf_tree_arena/   no_std+alloc; pointer-free arena + layout math (unsafe allowed)
 crates/tf_tree_core/    no_std+alloc; the engine; unsafe only in buffer.rs / arena_view.rs
-crates/tf_tree/         std facade; #![forbid(unsafe_code)]
+crates/tf_tree/         std facade; #![deny(unsafe_code)] + one #[allow]: OwnedWriter (0017)
 crates/tf_tree_ipc/     std; rendezvous, lock file, fd passing (unsafe: one atfork shim)
 crates/tf_tree_py/      PyO3 bindings; binds the Rust core directly, not the C ABI
 crates/tf_tree_bench/   criterion + tf2 differential harness
@@ -92,21 +92,21 @@ records why (typed errors and zero-copy buffers do not survive a C boundary).
   the arena's raw memory (`tf_tree_arena`, `tf_tree_core::{buffer, arena_view}`),
   the OS (`tf_tree_ipc`), a foreign runtime (`tf_tree_py`), and a foreign caller
   (`tf_tree_c`). A fifth kind needs a decision record.
-  `#![forbid(unsafe_code)]` stays on `tf_tree_math`, `tf_tree` and `tf_tree_cli`
-  — **the facade does not move**, because its provable safety is what lets a
-  reader trust the C ABI's `unsafe` is confined to argument validation.
+  `#![forbid(unsafe_code)]` stays on `tf_tree_math` and `tf_tree_cli`.
   Every `unsafe` block carries a `// SAFETY:` comment naming the invariant it
   relies on; every crate with `unsafe` carries a module `// SAFETY:` block and
   `#![deny(unsafe_op_in_unsafe_fn)]`.
-  > **Pending, and not yet true of the code:**
-  > [`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md) is
-  > `ready` and moves `tf_tree` from `forbid` to `deny` with **one** documented
-  > exception — `OwnedWriter`, the single place a lifetime is extended in the
-  > workspace, replacing two hand-rolled `extend_to_static` helpers (one of whose
-  > ancestors leaked a claim lease and bypassed the fork guard). This is the
-  > first exercise of `0007`'s budget as a *criterion*. Until that record's step
-  > 1 lands, the line above is the rule; step 1 changes the code and this line
-  > together.
+  **`tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]`**, granted by
+  [`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md): the
+  lifetime extension inside `OwnedWriter`, which is the single place a lifetime is
+  extended anywhere in the workspace. It replaced two hand-rolled
+  `extend_to_static` helpers, one of whose ancestors leaked a claim lease — so no
+  reaper would ever collect the edge — and bypassed the fork guard. That was the
+  first exercise of `0007`'s budget as a *criterion* rather than a crate list, and
+  the argument for it is that the facade is where an embedder looks. `deny` rather
+  than `forbid` so the exception is greppable: `rg 'allow\(unsafe_code\)'
+  crates/tf_tree/src` must return one line. **A second site there needs a new
+  record**, and so does a fifth kind of boundary.
 - **API shape is checked against [`docs/API.md`](./docs/API.md) §1 before it is
   written.** Six rules: three tiers always (R1); the hot tier never allocates,
   locks or converts (R2); integer-nanosecond stamps carrying a domain (R3);

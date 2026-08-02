@@ -1,4 +1,17 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+// `unsafe` boundary: **one lifetime extension, in [`OwnedWriter`], and nothing
+// else.** `EdgeWriter<'a>` borrows the `Tree`; `OwnedWriter` stores an
+// `Arc<Tree>` beside it and extends that borrow to `'static`, with the strong
+// reference — not a comment — as the thing that keeps the arena alive.
+// See `docs/decisions/0017`, which records why the facade takes the block
+// rather than each binding hand-rolling it (two did; one of them leaked a claim
+// lease and bypassed the fork guard for the life of every Python publisher).
+//
+// This is `deny` rather than `forbid` so that the one site can `#[allow]`
+// itself and be *visible* — `rg 'allow\(unsafe_code\)' crates/tf_tree/src`
+// returns it and should return nothing else. A second site is a new kind of
+// boundary and needs its own record (`docs/decisions/0007`).
+#![deny(unsafe_op_in_unsafe_fn)]
 //! `std` facade for the `tf_tree` transform engine.
 //!
 //! Re-exports the [`tf_tree_core`] engine and adds the ergonomic, allocating
@@ -93,8 +106,8 @@ pub use frozen::FrozenFileError;
 pub use tf_tree_arena::{FrozenError, FrozenHeader, ARENA_FILE_ALIGN};
 
 pub use tree::{
-    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, ReparentError, Tree,
-    TreeBuilder,
+    BuildError, Capacity, ClaimApiError, Described, EdgeCfg, EdgeWriter, OwnedWriter,
+    ReparentError, Tree, TreeBuilder,
 };
 
 /// Test scaffolding for `docs/decisions/0005` §5's CAS-to-lease window. Absent

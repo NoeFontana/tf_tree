@@ -2,7 +2,11 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** _(filled in as work lands)_
+**Implementation:** steps 1–5 landed — `OwnedWriter`, `Tree::claim_owned`, the
+crate attribute move, and the drop / lease / fork / `compile_fail` tests. Steps
+6–8 (the `tf_tree_py` and `tf_tree_c` migrations, and the crate-level docs) are
+outstanding, and until they land the two `extend_to_static` helpers this record
+exists to delete are still in the tree.
 
 ## Context
 

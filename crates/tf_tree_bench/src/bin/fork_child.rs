@@ -36,6 +36,18 @@
 //! check, and it is why the parent re-validates *itself* after the child is
 //! gone rather than only inspecting the child's exit code.
 //!
+//! # Modes
+//!
+//! `api` runs the child's checks and leaves via `_exit`, so no destructor runs.
+//! `drop` runs them too and then drops the tree and the writer explicitly.
+//! `owned` is `drop` with the writer claimed through
+//! [`tf_tree::Tree::claim_owned`] instead of `claim` — `docs/decisions/0017`
+//! step 4. That handle owns an `Arc<Tree>` and an `EdgeWriter<'static>`, so it
+//! is the one shape whose destructor could plausibly have lost a guard on the
+//! way to being owned: the hand-rolled ancestor `0017` exists to delete
+//! (`transmute::<EdgeWriter, Publisher>`) dropped both the claim lease and the
+//! fork-generation compare, and neither loss is visible from inside the child.
+//!
 //! # Output protocol
 //!
 //! One line: `child=<exited N|signalled N> parent_ok=<bool> note=<text>`.
@@ -54,11 +66,32 @@
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn main() {
     use std::io::Write;
+    use std::sync::Arc;
 
     use tf_tree::{
-        AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, LookupError, PushError, Stamp,
-        SystemDomain, TreeBuilder,
+        AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, Iso3, LookupError, PushError,
+        Stamp, SystemDomain, TreeBuilder,
     };
+
+    /// The two claim shapes, behind one `push`.
+    ///
+    /// A local enum rather than two copies of the body below: the child's checks
+    /// and the parent's re-validation are the assertions under test, and running
+    /// a *different* sequence for the owned writer would be testing a different
+    /// thing while claiming to compare.
+    enum Writer<'a> {
+        Scoped(tf_tree::EdgeWriter<'a>),
+        Owned(tf_tree::OwnedWriter),
+    }
+
+    impl Writer<'_> {
+        fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
+            match self {
+                Writer::Scoped(w) => w.push(stamp, iso),
+                Writer::Owned(w) => w.push(stamp, iso),
+            }
+        }
+    }
 
     // Exit codes the child uses. Distinct per assertion, so a failure names
     // itself without needing a channel back to the parent.
@@ -79,16 +112,25 @@ fn main() {
 
     let mode = std::env::args().nth(1).unwrap_or_default();
 
-    let tree = tf_tree::Open::new()
-        .mode(AttachMode::ReadWrite)
-        .create(CreatePolicy::IfAbsent)
-        .layout_if_creating(layout())
-        .open()
-        .expect("create the arena");
+    // `Arc` unconditionally, so the three modes differ in exactly one thing —
+    // which claim they take. `Tree`'s own methods are reached through `Deref`
+    // and behave identically; `claim_owned` is the one that needs the handle.
+    let tree = Arc::new(
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::IfAbsent)
+            .layout_if_creating(layout())
+            .open()
+            .expect("create the arena"),
+    );
 
     let child_frame = tree.frame("base").unwrap();
     let parent_frame = tree.frame("map").unwrap();
-    let writer = tree.claim(child_frame, parent_frame).expect("claim");
+    let writer = if mode == "owned" {
+        Writer::Owned(tree.claim_owned(child_frame, parent_frame).expect("claim"))
+    } else {
+        Writer::Scoped(tree.claim(child_frame, parent_frame).expect("claim"))
+    };
     let pose = tf_tree_math::exp_se3([0.0, 0.0, 0.2, 1.0, 2.0, 3.0]);
     writer.push(1_000, &pose).expect("push");
 
@@ -96,7 +138,15 @@ fn main() {
     // what the child holds is genuinely inherited rather than re-derived.
     let plan = tree.plan(parent_frame, child_frame).expect("plan");
     let slot = tree.participant_slot();
-    let edge = writer.edge().get();
+    // Read from the topology rather than from the writer: `OwnedWriter` exposes
+    // `push` and `release` and nothing else (`docs/decisions/0017`), and
+    // widening its surface so a test binary can ask a question the arena already
+    // answers would be the wrong way round.
+    let (_parent, _depth, edge, _gen) = tree
+        .arena_view()
+        .topology()
+        .read_frame(child_frame)
+        .expect("base is interned");
 
     // The fork generation as the parent last saw it. Everything the detachment
     // checks below rely on is downstream of this counter, but none of them can
@@ -147,11 +197,15 @@ fn main() {
             status = GEN_NOT_BUMPED_ONCE;
         }
 
-        if mode == "drop" {
-            // Run the destructors, which is the whole point of this mode: the
-            // child returns through normal scope exit so `Tree`, `EdgeWriter`
-            // and `Attachment` all drop. `_exit` below then skips only the
-            // runtime's own teardown.
+        if mode == "drop" || mode == "owned" {
+            // Run the destructors, which is the whole point of these modes: the
+            // child returns through normal scope exit so `Tree`, the writer and
+            // `Attachment` all drop. `_exit` below then skips only the runtime's
+            // own teardown.
+            //
+            // In `owned` mode the writer holds its own `Arc<Tree>`, so this is
+            // also the ordering check: the writer must stand itself down
+            // *before* the last handle to the mapping goes.
             drop(writer);
             drop(tree);
         }
