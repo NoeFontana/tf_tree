@@ -52,7 +52,7 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tf_tree::{InterpPolicy, Stamp};
 
 /// `results.json` schema identifier. Bump on any consumer-visible change.
@@ -90,6 +90,7 @@ pub const REQUIRED_ROWS: &[&str] = &[
     "tft_16_workers_rss",
     "tft_open_vs_bag_parse",
     "differential_agreement",
+    "embedding_cross_crate",
 ];
 
 /// Relative slack the regression gate allows on the differential row's
@@ -1060,6 +1061,14 @@ pub struct Options {
     pub lookup_samples: usize,
     /// Random queries for the differential row.
     pub differential_queries: usize,
+    /// Directory holding the two `embed_cost` runs (§9.2's last row).
+    ///
+    /// [`None`] is the ordinary case and not an omission: this binary is built
+    /// with one profile, and the row is a comparison *between* two, so it cannot
+    /// be measured from inside a single build of this tool. `just embed-cost`
+    /// produces the pair; without it the row is [`Status::Unavailable`] with
+    /// that as the reason.
+    pub embed_cost: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -1069,6 +1078,7 @@ impl Default for Options {
             warmup: Duration::from_secs(2),
             lookup_samples: 200_000,
             differential_queries: 50_000,
+            embed_cost: None,
         }
     }
 }
@@ -1357,6 +1367,8 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     };
     rows.push(agreement);
 
+    rows.push(embedding_row(opts, &fitness)?);
+
     Ok(Report {
         provenance: Provenance::collect(),
         fitness,
@@ -1364,6 +1376,83 @@ pub fn assemble(opts: &Options) -> Result<Report> {
         rows,
         worse: worse_entries(opts),
     })
+}
+
+/// §9.2's last row: the facade from a separate crate, at an embedder's profile.
+///
+/// The measurement itself is [`crate::embed`]; this is only the row. The split
+/// is forced rather than stylistic — the row compares **two builds of one
+/// program**, and this binary is one build, so the numbers have to arrive from
+/// outside it. `just embed-cost` is what produces them.
+///
+/// The note names both profiles by their settings, because a reader who is told
+/// only "the embedder profile" cannot tell whether the tool measured cargo's
+/// defaults or this workspace's. `crate::embed`'s tests read those settings back
+/// out of the workspace manifest, so the sentence stays true or the test fails.
+fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
+    const NOTE: &str = "One program, built twice and pinned: the `embedder` column is \
+        `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` \
+        defaults, i.e. a user's node), the `reference` column is this workspace's \
+        `[profile.release]` (lto = \"thin\", codegen-units = 1), where the crate boundary \
+        is erased at link time. `ratio` is embedder/reference. Depth 3, LerpSlerp, \
+        off-grid stamps so the interpolation actually runs. The reference column is not a \
+        probe compiled inside the engine — `Plan::at` and the fold live in `tf_tree_core`, \
+        one crate below the facade — and `crates/tf_tree_bench/src/embed.rs` records what \
+        that substitution costs in both directions. There is no tf2 column: this row is \
+        `tf_tree` against itself.";
+    const REPRODUCE: &str = "just embed-cost";
+
+    let Some(dir) = opts.embed_cost.as_deref() else {
+        return Ok(Row::unavailable(
+            "embedding_cross_crate",
+            "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)",
+            NOTE,
+            true,
+            "this row compares two builds of one program, and this tool is one build of \
+             another — built, moreover, with the `lto = \"thin\"` profile that is exactly \
+             what hides the effect. It cannot measure the row from inside itself. \
+             `just embed-cost` builds the probe under both profiles and writes the pair; \
+             `just bench-check` passes it back in with --embed-cost"
+                .to_owned(),
+            REPRODUCE,
+        ));
+    };
+
+    // A pair that will not load is a measurement failure, not a row: the caller
+    // asked for this row by naming a directory.
+    let pair = crate::embed::Pair::load(dir)
+        .with_context(|| format!("loading the embed_cost pair from {}", dir.display()))?;
+
+    let mut row = Row::unavailable(
+        "embedding_cross_crate",
+        "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)",
+        NOTE,
+        true,
+        format!(
+            "the pair was measured, but the host failed the fitness probe, so neither half \
+             of the ratio is a claim: {}",
+            fitness.reason_line()
+        ),
+        REPRODUCE,
+    );
+    match fitness.timing_status() {
+        Status::Unavailable => {}
+        status => {
+            row.tf_tree = pair.metrics();
+            row.status = status;
+            row.reason = if status == Status::Indicative {
+                format!(
+                    "INDICATIVE, not a claim: TF_TREE_BENCH_FORCE=1 overrode the fitness \
+                     refusal. {} Measured here: {}",
+                    fitness.reason_line(),
+                    pair.verdict()
+                )
+            } else {
+                String::new()
+            };
+        }
+    }
+    Ok(row)
 }
 
 /// §9.3's "report where `tf_tree` is worse, in the same table and not in a

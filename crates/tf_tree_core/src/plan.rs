@@ -749,8 +749,13 @@ impl Plan {
     /// Note the second row of the first table: `lto = "thin"` does **not**
     /// subsume the hint. This workspace's own profile still moves ~4.5%, so the
     /// benchmark gate is not indifferent to this change — `just bench-ab` is
-    /// workspace-wide and was not run, and `docs/API.md` §2.3 item 3 (a gated
-    /// cross-crate row) is still the thing that would measure it continuously.
+    /// workspace-wide and was not run. `docs/API.md` §2.3 item 3 (a gated
+    /// cross-crate row) has since landed and does measure it continuously:
+    /// `just embed-cost`, and the `embedding_cross_crate` row of
+    /// `docs/PHASE5.md` §9.2's artifact. It reports a ratio *over* §9.2's 5%
+    /// criterion — the crate boundary costs an embedder on cargo's `--release`
+    /// defaults about a quarter of a depth-3 lookup, which no `#[inline]`
+    /// placement closes and `lto = "thin"` in *their* profile does.
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;

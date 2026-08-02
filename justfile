@@ -468,6 +468,34 @@ bench-report *ARGS:
 bench-report-shm *ARGS:
     cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
 
+# **`docs/PHASE5.md` §9.2's embedding row — the facade from a separate crate.**
+#
+# One program, built twice and pinned. `[profile.embedder]` is cargo's
+# `--release` defaults spelled out (`lto = false, codegen-units = 16`), which is
+# what a user's node compiles; `[profile.release]` is this workspace's own
+# (`lto = "thin", codegen-units = 1`), which is what every other number in this
+# repository is taken under. §9.2 requires the row be reported with the first,
+# **not** the second, and the gap between them is the whole point:
+# `docs/API.md` §2.3 item 2's LTO guidance is the thing that closes it.
+#
+# `taskset -c 2`, for `cpp-bench`'s reason: an unpinned run migrates cores and
+# swings by far more than the 5 % criterion allows. Both runs land on the same
+# core, seconds apart, and each reports its own round-to-round spread — which is
+# what says whether the ratio between them is worth stating to three digits.
+#
+# The output pair is left in `target/embed-cost/` for `bench-report` and
+# `bench-check` to read with `--embed-cost`.
+embed-cost:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=target/embed-cost
+    mkdir -p "$out"
+    cargo build -q --profile embedder -p tf_tree_bench --bin embed_cost
+    cargo build -q --release -p tf_tree_bench --bin embed_cost
+    taskset -c 2 ./target/embedder/embed_cost --json "$out/embedder.json"
+    taskset -c 2 ./target/release/embed_cost --json "$out/release.json"
+    ./target/release/embed_cost --compare "$out"
+
 # **`docs/PHASE5.md` §10's "benchmark artifact as a regression gate".**
 #
 # Regenerates the report and compares it against
@@ -488,9 +516,16 @@ bench-report-shm *ARGS:
 #
 # `--out target/bench-report` and not `report/`: this is a check, and it should
 # not clobber a report somebody generated to look at.
-bench-check:
+#
+# It runs `embed-cost` first and hands the pair in, because §9.2's embedding row
+# is the one row this tool cannot measure from inside itself: it compares two
+# builds of one program, and `bench_report` is a single build — built, moreover,
+# with the profile that hides the effect. Without that dependency the row would
+# be permanently UNAVAILABLE in the gate that exists to hold it.
+bench-check: embed-cost
     cargo run --release -p tf_tree_bench --bin bench_report -- \
         --out target/bench-report \
+        --embed-cost target/embed-cost \
         --check-baseline crates/tf_tree_bench/baseline/results.json
 
 # Regenerate the committed baseline. **Run this deliberately, and put the diff
@@ -499,8 +534,9 @@ bench-check:
 #
 # `index.html` is not committed: it is a rendering of `results.json` and a second
 # copy that can disagree with the first.
-bench-baseline-update:
-    cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report
+bench-baseline-update: embed-cost
+    cargo run --release -p tf_tree_bench --bin bench_report -- --out target/bench-report \
+        --embed-cost target/embed-cost
     cp target/bench-report/results.json crates/tf_tree_bench/baseline/results.json
 
 # --- The performance suite (exploratory; NOT the `bench-check` gate) ---------

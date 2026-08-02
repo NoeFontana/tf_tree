@@ -161,3 +161,35 @@ codegen-units = 1
 inherits = "release"
 debug = "full"
 strip = "none"
+
+# **An embedder's `cargo build --release`, spelled out — `docs/PHASE5.md` §9.2's
+# last row and `docs/API.md` §2.3 item 3.**
+#
+# `Plan::at` sits across a crate boundary from every consumer, and what the
+# `#[inline]` attributes on that path buy depends on the *downstream* profile.
+# This workspace's `[profile.release]` sets `lto = "thin", codegen-units = 1`,
+# which is precisely what hides the effect: every number this repository
+# publishes is taken under whole-program optimisation, and a user's node is not.
+# So the embedding row is measured here, and `[profile.release]` is measured as
+# the contrast.
+#
+# **Every field cargo's own release defaults set is written out rather than
+# inherited**, `inherits` notwithstanding. Inheriting only `lto` and
+# `codegen-units` would make this profile track future edits to
+# `[profile.release]` — and then the row would silently stop describing the
+# thing it is named after. `inherits` is mandatory for a custom profile, so it
+# names `release` and then contradicts it field by field.
+# `crates/tf_tree_bench/src/embed.rs` carries a test that reads these values back
+# out of this file, so the report's statement about what it measured is checked
+# rather than asserted.
+[profile.embedder]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+debug = false
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+incremental = false
+panic = "unwind"

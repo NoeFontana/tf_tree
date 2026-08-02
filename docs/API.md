@@ -258,6 +258,47 @@ is a call per step.
 > gated cross-crate benchmark row) are untouched. The table above is item 3 done
 > once by hand; item 3 is doing it continuously.
 
+> **Amendment — items 2 and 3 have landed, and item 3's first act was to report
+> that its own gate is not met.**
+>
+> Item 2 is a section of `tf_tree`'s crate docs: set `lto = "thin"`,
+> `codegen-units = 1`, with the measured size of what it buys and an explicit
+> note that how that splits between the two settings was *not* measured.
+>
+> Item 3 is `crates/tf_tree_bench/src/embed.rs`, the `embed_cost` binary,
+> `[profile.embedder]` (cargo's `--release` defaults, spelled out field by field
+> so they cannot drift with this workspace's), `just embed-cost`, and
+> `PHASE5.md` §9.2's row `embedding_cross_crate` in the benchmark artifact — one
+> program, built twice and pinned, ratio `embedder / reference`.
+>
+> **The measured ratio is 1.24–1.25×, so §9.2's 5% criterion is NOT met**, and
+> that is reported rather than engineered around. `#[inline]` does not close it:
+> a probe placed in `tf_tree_core::plan` — genuinely in-crate for the fold —
+> measured 199 ns against 244 ns out-of-crate at the embedder's profile, so the
+> crate boundary itself accounts for ~1.22× of it. What closes it is item 2's
+> guidance, applied in the embedder's own profile. §9.2 asks for both — "report
+> it with the embedder's default profile" and "the `#[inline]` attributes **and
+> the LTO guidance** that are how it is passed" — and only the second of those
+> two describes a passing row today.
+>
+> Two things this row is careful about, because both were measured and neither is
+> obvious. **A probe in `tf_tree` is not in-crate** (241.5 vs 243.6 ns — the
+> facade re-exports the engine rather than containing it), so the reference
+> column is the same source under thin LTO rather than a probe in the engine
+> crate; that substitution overstates the boundary by ~3%, which is the direction
+> that cannot flatter us. And **`ratio`, `embedder_ns` and `reference_ns` are all
+> gated at 5%, not just the quotient §9.2 names**: dropping `#[inline]` from
+> `fold_at` moves the ratio *down* (measured: 1.236 → 1.006, because the
+> embedder's build gets faster while this workspace's gets 11.2% slower), so a
+> ratio-only gate would read that regression as an improvement. The gate fires on
+> `reference_ns`.
+>
+> Host, and it matters: a loaded 4-physical-core AMD EPYC-Milan VM that fails
+> `Fitness::probe`, so the row is `unavailable` in this repository's own
+> committed baseline and the numbers above are evidence for a design decision
+> rather than claims. The ratio moved between 1.236 and 1.249 across consecutive
+> runs — read it as "about a quarter".
+
 ### 2.4 Two things that are not going to exist
 
 Recorded here so they do not arrive later by adjacency.
@@ -618,7 +659,7 @@ authorized by this document alone.
 |---|---|---|---|---|
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
-| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **`#[inline]` landed** — five placements, measured; a sixth was measured as a *pessimization* and left off. LTO guidance and the gated bench row outstanding: Phase 5 bench artifact (`PHASE5.md` §9.2) |
+| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`), gated at 5% on `ratio`, `embedder_ns` and `reference_ns` — and **reporting 1.24–1.25×, i.e. over §9.2's criterion**, which §2.3's second amendment states rather than hides |
 | 4 | `# Stability` headings on CLI-facing exports; `unstable` tier deferred | Rust (docs only) | §2.6 | any time; blocks a published tag |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |

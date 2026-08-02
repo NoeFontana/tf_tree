@@ -191,6 +191,16 @@ name = "counter_cost"
 name = "bench_report"
 path = "src/bin/bench_report.rs"
 
+# **PHASE5 §9.2's embedding row.** No `required-features`: the whole point is
+# the path a plain `cargo add tf_tree` embedder compiles, so it must build in the
+# same default configuration `cargo nextest run --workspace` uses. It is a `bin`
+# rather than a criterion bench because the row is one program built under two
+# `[profile.*]` sections and compared across them, which a bench harness owning
+# its own profile cannot express.
+[[bin]]
+name = "embed_cost"
+path = "src/bin/embed_cost.rs"
+
 # **The A/B differ.** Deliberately no `required-features`: it reads two JSON
 # files and compares them, so it must build — and be testable — in the same
 # plain `--workspace` build the harnesses that need `shm` cannot appear in.

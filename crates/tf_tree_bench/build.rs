@@ -18,6 +18,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=DEP_TF_TREE_TF2_SHIM_RPATH");
+    emit_profile_dir();
 
     let Ok(lib_dir) = std::env::var("DEP_TF_TREE_TF2_SHIM_RPATH") else {
         return; // built without `--features tf2`
@@ -37,4 +38,46 @@ fn main() {
         println!("cargo:rustc-link-arg-{kind}=-Wl,--disable-new-dtags");
         println!("cargo:rustc-link-arg-{kind}=-Wl,-rpath,{lib_dir}");
     }
+}
+
+/// Bake the profile *directory* this crate was compiled into into its binaries.
+///
+/// `docs/PHASE5.md` §9.2's embedding row is two runs of the same program built
+/// under two different `[profile.*]` sections, and its whole value is that the
+/// two are not confused. Cargo tells a build script the opt-level and whether
+/// debug assertions are on, but not the profile *name*, and neither `lto` nor
+/// `codegen-units` — so a binary asked "which profile are you?" would otherwise
+/// have to be told by whoever ran it. That is a provenance field the tool cannot
+/// check and a reader has no reason to believe.
+///
+/// `OUT_DIR` carries it: cargo lays out `<target>/<profile-dir>/build/<pkg>/out`
+/// (with an extra `<triple>` component when cross-compiling), so the component
+/// immediately before `build` is the profile directory — `release` for
+/// `--release`, `embedder` for `--profile embedder`, `debug` for a dev build.
+/// It is a fact about where the object files went, not a label.
+///
+/// `crates/tf_tree_bench/src/embed.rs` maps that directory back to the profile's
+/// declared `lto` and `codegen-units` by reading the workspace manifest, so the
+/// chain from "this binary" to "`lto = false`, `codegen-units = 16`" has no
+/// unchecked link.
+fn emit_profile_dir() {
+    let dir = std::env::var("OUT_DIR").ok().and_then(|out| {
+        let path = std::path::PathBuf::from(out);
+        let parts: Vec<String> = path
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        parts
+            .iter()
+            .rposition(|c| c == "build")
+            .and_then(|i| i.checked_sub(1))
+            .map(|i| parts[i].clone())
+    });
+    // `unknown` rather than a panic: a panic here stops every target in this
+    // crate from building over a provenance string one binary reads, and that
+    // binary already refuses to report a run whose profile it cannot name.
+    println!(
+        "cargo:rustc-env=TF_TREE_BENCH_PROFILE_DIR={}",
+        dir.unwrap_or_else(|| "unknown".to_owned())
+    );
 }

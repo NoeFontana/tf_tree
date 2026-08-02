@@ -20,6 +20,8 @@
 /// fresh report against the committed baseline.
 pub mod baseline;
 pub mod differential;
+/// `docs/PHASE5.md` §9.2's embedding row: the facade path an embedder compiles.
+pub mod embed;
 pub mod fixture;
 /// Multi-process evaluation harness: open-loop latency, CPU and PSS accounting.
 pub mod mp;

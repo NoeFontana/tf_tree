@@ -1,10 +1,10 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-07-29T05:01:26Z",
+    "generated_utc": "2026-08-02T03:43:37Z",
     "schema": "tf_tree.bench-report/2",
-    "git_commit": "67cfa3ff4802565e8ad2f328d5ab4aa0a6685567",
-    "git_dirty": "false",
+    "git_commit": "c1d631963be0659b61fae57d58e2c298c460c657",
+    "git_dirty": "true",
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
     "build_profile": "release",
     "target": "x86_64",
@@ -21,7 +21,7 @@
     "kernel": "6.8.0-136-generic",
     "transparent_hugepage": "always [madvise] never",
     "perf_event_paranoid": "4",
-    "load_average": "0.44 1.30 2.00 1/518 3625196",
+    "load_average": "9.08 7.80 4.85 19/466 842623",
     "container": "no",
     "ros_distro": "none (no ROS 2 in this run)",
     "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
@@ -35,11 +35,11 @@
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.01673640167364021,
+    "busy_fraction": 0.99581589958159,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
-    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out"]
+    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "machine is 100% busy before the run starts (threshold 10%)", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out"]
   },
   "rows": [
     {
@@ -49,7 +49,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; machine is 100% busy before the run starts (threshold 10%); CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
       "reproduce": "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
       "tf_tree": {},
       "tf2": {}
@@ -73,7 +73,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; machine is 100% busy before the run starts (threshold 10%); CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
       "reproduce": "cargo bench -p tf_tree_bench --bench lookup (or this tool on a quiet, non-SMT, performance-governor host)",
       "tf_tree": {},
       "tf2": {}
@@ -85,7 +85,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. This row also needs the `shm` feature and a second process per consumer, and its tf2 counterpart needs a DDS round trip that no configuration here provides",
+      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; machine is 100% busy before the run starts (threshold 10%); CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. This row also needs the `shm` feature and a second process per consumer, and its tf2 counterpart needs a DDS round trip that no configuration here provides",
       "reproduce": "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
       "tf_tree": {},
       "tf2": {}
@@ -97,7 +97,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
+      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; machine is 100% busy before the run starts (threshold 10%); CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
       "reproduce": "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
       "tf_tree": {},
       "tf2": {}
@@ -136,6 +136,18 @@
       "reason": "",
       "reproduce": "cargo test -p tf_tree_bench --release --test differential",
       "tf_tree": {"max_deviation": {"value": 0.0000000000000002498001805406602, "unit": "rad or m", "drift": "lower_is_better", "tolerance": 9}, "compared": {"value": 47922, "unit": "queries", "drift": "informational", "tolerance": 0}, "tolerance": {"value": 0.000000000001, "unit": "rad or m", "drift": "informational", "tolerance": 0}},
+      "tf2": {}
+    },
+    {
+      "id": "embedding_cross_crate",
+      "title": "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)",
+      "note": "One program, built twice and pinned: the `embedder` column is `[profile.embedder]` (lto = false, codegen-units = 16 — cargo's `--release` defaults, i.e. a user's node), the `reference` column is this workspace's `[profile.release]` (lto = \"thin\", codegen-units = 1), where the crate boundary is erased at link time. `ratio` is embedder/reference. Depth 3, LerpSlerp, off-grid stamps so the interpolation actually runs. The reference column is not a probe compiled inside the engine — `Plan::at` and the fold live in `tf_tree_core`, one crate below the facade — and `crates/tf_tree_bench/src/embed.rs` records what that substitution costs in both directions. There is no tf2 column: this row is `tf_tree` against itself.",
+      "timing_sensitive": true,
+      "needs_n_cores": false,
+      "status": "unavailable",
+      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; machine is 100% busy before the run starts (threshold 10%); CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reproduce": "just embed-cost",
+      "tf_tree": {},
       "tf2": {}
     }
   ],

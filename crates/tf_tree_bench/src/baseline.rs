@@ -700,6 +700,70 @@ mod tests {
         );
     }
 
+    /// A report carrying only `docs/PHASE5.md` §9.2's embedding row, with the
+    /// metrics [`crate::embed::Pair`] really builds.
+    fn embedding_report(embedder_ns: f64, reference_ns: f64) -> Report {
+        let mk = |dir: &str, ns: f64| crate::embed::Run {
+            profile_dir: dir.to_owned(),
+            ns_per_lookup: ns,
+            spread: 0.004,
+            rounds: crate::embed::ROUNDS,
+            lookups_per_round: 409_600,
+        };
+        let pair = crate::embed::Pair {
+            embedder: mk(crate::embed::EMBEDDER_PROFILE, embedder_ns),
+            reference: mk(crate::embed::REFERENCE_PROFILE, reference_ns),
+        };
+        let mut r = report_with(1.0, false);
+        r.rows[0].id = "embedding_cross_crate";
+        r.rows[0].timing_sensitive = true;
+        r.rows[0].tf_tree = pair.metrics();
+        r
+    }
+
+    /// §9.2's 5% on the embedding row, through the real gate and the real
+    /// metrics — not a fixture that resembles them.
+    ///
+    /// The three cases are the three ways this row can move, and the middle one
+    /// is why every duration is gated rather than only the ratio §9.2 names.
+    ///
+    /// Mutant (applied, confirmed fatal): give `ratio` `tolerance` `0.10` in
+    /// `Pair::metrics` — case 2 then passes and this test fails on its
+    /// assertion. Second mutant (applied, confirmed fatal): make `embedder_ns`
+    /// and `reference_ns` `Metric::new(..)` (informational) — case 3 passes and
+    /// this fails there.
+    #[test]
+    fn the_embedding_row_is_gated_at_five_percent_in_every_direction() {
+        let base = baseline_of(&embedding_report(240.0, 200.0));
+
+        // 1. Both halves move 3% the same way: the ratio is unchanged and no
+        //    duration moved past the bound.
+        let quiet = compare(&base, &embedding_report(247.2, 206.0)).expect("baseline");
+        assert!(quiet.passed(), "a 3% shift in both halves: {quiet:?}");
+
+        // 2. The embedder's build loses ground against ours — the exact shape a
+        //    lost `#[inline]` on the cross-crate path has. The ratio moves 5.3%
+        //    while neither absolute number moves more than 5%.
+        let skewed = compare(&base, &embedding_report(240.0, 190.0)).expect("baseline");
+        assert!(!skewed.passed(), "a 5.3% ratio regression passed the gate");
+        assert!(
+            skewed.failures.iter().any(|f| f.contains("ratio")),
+            "the failure must name the ratio: {:?}",
+            skewed.failures
+        );
+
+        // 3. Both halves get 6% slower and the ratio does not move at all. A
+        //    row gated only on §9.2's quotient would call this clean.
+        let slower = compare(&base, &embedding_report(254.4, 212.0)).expect("baseline");
+        assert!(!slower.passed(), "6% slower on both sides passed the gate");
+        assert!(
+            slower.failures.iter().any(|f| f.contains("embedder_ns"))
+                && slower.failures.iter().any(|f| f.contains("reference_ns")),
+            "both durations must be named: {:?}",
+            slower.failures
+        );
+    }
+
     /// A directional metric the baseline does not carry fails; an informational
     /// one does not.
     ///
