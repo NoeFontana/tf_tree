@@ -58,7 +58,11 @@ unreachable_pub = "warn"
 unused_must_use = "deny"
 
 [dependencies]
-tf_tree = { path = "../tf_tree", version = "0.2.0", features = ["shm"] }
+# `"unstable"` — `docs/API.md` §2.6. `offline.rs` walks the frame and edge
+# tables of a frozen `.tft` through `Tree::arena_view`, which is now the Rust
+# unstable tier. The wheel is built and shipped from this workspace with the
+# engine, so it is a consumer that cannot skew from it.
+tf_tree = { path = "../tf_tree", version = "0.2.0", features = ["shm", "unstable"] }
 tf_tree_core = { path = "../tf_tree_core", version = "0.2.0" }
 tf_tree_math = { path = "../tf_tree_math", version = "0.2.0" }
 # 0.29 is the floor: `abi3t` / `abi3t-py315` and the free-threading story do not

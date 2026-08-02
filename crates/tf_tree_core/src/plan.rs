@@ -378,6 +378,23 @@ pub enum Query<D: Domain = SystemDomain> {
 /// [`tf_tree_math::Interp`]; this enum is the runtime selector stored in
 /// [`crate::edge::EdgeRecord::interp`] and dispatched when a [`Guard`] samples an
 /// edge.
+///
+/// # Deliberately *not* `#[non_exhaustive]`
+///
+/// Every other growable enum here carries it; this one does not, and the reason
+/// is that exhaustive matching is the point. Each consumer that names this type
+/// maps it onto something else — a `tft_interp` enumerator in the C ABI, a
+/// `domain`-style name in `tf_tree_bridge`'s config parser, a monomorphized
+/// [`tf_tree_math::Interp`] impl in the fold — and a catch-all arm in any of
+/// those has no honest body. `#[non_exhaustive]` would convert a compile error
+/// that says "teach me the new policy" into a silent wrong answer, which is a
+/// worse trade than a major version bump.
+///
+/// Forward compatibility in the direction that actually matters — an older
+/// binary reading a newer arena, where the two cannot be rebuilt together — is
+/// already handled: [`InterpPolicy::from_u8`] collapses an unknown discriminant
+/// onto the default rather than faulting. The same argument covers
+/// [`crate::edge::EdgeKind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum InterpPolicy {
@@ -417,7 +434,16 @@ impl InterpPolicy {
 /// (right)**, expressed in the plan's **source** frame — see
 /// [`Plan::at_with_derivatives`] for why that is the source and not the target,
 /// and [`tf_tree_math::twist`] for the convention generally.
+///
+/// `#[non_exhaustive]` because this struct is *produced by the engine and only
+/// read by a caller*, so growing it cannot make an existing consumer silently
+/// wrong — it can only stop one from writing a literal nothing outside this
+/// crate writes. [`Sample::accel`]'s own note already schedules the growth:
+/// Phase 6's cumulative B-splines are the first interpolant with a real second
+/// derivative, and a third derivative after them would otherwise be a major
+/// bump for a field nobody had to read.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Sample {
     /// The transform at the requested stamp — bit-identical to [`Plan::at`].
     pub pose: Iso3,
@@ -439,6 +465,13 @@ pub struct Sample {
 // ---------------------------------------------------------------------------
 
 /// One step of a compiled plan.
+///
+/// Not `#[non_exhaustive]`, for [`InterpPolicy`]'s reason rather than by
+/// oversight. The only thing a consumer does with [`Plan::steps`] is classify
+/// each step — "which edges does this plan sample?" is what
+/// `tf_tree_bench::workload`, `tf_tree_py::offline` and the derivative tests all
+/// ask — and a `_ =>` arm answers *no* for a step kind it has never seen. That
+/// under-counts silently, where a compile error names the file to fix.
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
     /// A constant transform composed directly (a folded static edge or a run of
@@ -1653,12 +1686,30 @@ fn within(tol: ErrBound, approx: &Iso3, exact: &Iso3) -> bool {
 }
 
 /// The per-component error tolerance for [`Plan::at_adaptive`].
+///
+/// `#[non_exhaustive]`, so build it with [`ErrBound::new`] rather than a struct
+/// literal. This is a caller-supplied *configuration* struct, and the crate
+/// already has one — `tf_tree::EdgeCfg` — that is `#[non_exhaustive]` with a
+/// constructor for exactly this reason: a tolerance is the shape that grows
+/// (a time bound, a per-axis split), and the attribute is free before a
+/// published tag and a major bump after it. A new field arrives with a default
+/// [`ErrBound::new`] picks, which is the answer a struct literal cannot give.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ErrBound {
     /// Maximum allowed rotation error, in radians.
     pub rot_rad: f64,
     /// Maximum allowed translation error, in the pose's length units.
     pub trans: f64,
+}
+
+impl ErrBound {
+    /// A tolerance of `rot_rad` radians and `trans` length units.
+    #[inline]
+    #[must_use]
+    pub const fn new(rot_rad: f64, trans: f64) -> ErrBound {
+        ErrBound { rot_rad, trans }
+    }
 }
 
 /// Caller-provided scratch storage for [`Plan::at_adaptive`], sized to hold the

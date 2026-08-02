@@ -37,7 +37,8 @@ use std::sync::atomic::Ordering;
 
 use pyo3::prelude::*;
 
-use tf_tree::{ArenaView, EdgeId, FrameId, LookupError, Plan, Step, Tree};
+use tf_tree::unstable::ArenaView;
+use tf_tree::{EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
 use crate::errors::{detached_err, lookup_err, NoDataError, TfTreeError};
 use crate::tree::PyTree;

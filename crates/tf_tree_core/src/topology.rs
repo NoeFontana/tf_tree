@@ -84,6 +84,14 @@ pub const TOPO_LOCK_SPIN_LIMIT: u32 = 1024;
 ///
 /// `Copy`, and it names the offending participant rather than allocating a
 /// message (`docs/PROJECT.md` §5).
+///
+/// The one error enum here that is **not** `#[non_exhaustive]`, and the
+/// exception is deliberate. Its only consumer is `impl From<TopoLockError> for
+/// tf_tree::ReparentError`, which must produce a variant carrying the same
+/// payload; a catch-all arm there has no `owner_slot` to report and so no
+/// honest body. Nor does this type reach a user — the facade converts it at the
+/// boundary, and `ReparentError`, which *is* what a caller sees, is
+/// `#[non_exhaustive]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopoLockError {
     /// The lock is held by a participant that the liveness predicate says is

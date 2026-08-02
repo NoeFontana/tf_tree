@@ -41,7 +41,14 @@ path = "src/bin/tft.rs"
 doc = false
 
 [dependencies]
-tf_tree.workspace = true
+# **`features = ["unstable"]`, unconditionally — `docs/API.md` §2.6.** This crate
+# is the reason that tier exists: `tree`, `doctor` and `top` render the arena's
+# own tables, so they need `Tree::arena_view` and `EdgeKind`, both of which are
+# shaped by a layout `docs/PHASE5.md` §1 changes on purpose. It is a plain
+# dependency feature rather than one of this crate's own `[features]` because
+# there is no build of this binary that does not want it, and a feature nobody
+# can turn off is a worse lie than no feature at all.
+tf_tree = { workspace = true, features = ["unstable"] }
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
 # The CLI operates on an in-process tree; Phase 1 has no cross-process attach

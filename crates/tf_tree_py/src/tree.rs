@@ -776,10 +776,7 @@ impl PyPlan {
             ));
         }
         let mut scratch = tf_tree::AdaptiveScratch::<SystemDomain>::new();
-        let tol = tf_tree::ErrBound {
-            rot_rad: ang,
-            trans: lin,
-        };
+        let tol = tf_tree::ErrBound::new(ang, lin);
         let g = self.tree().guard();
         let (stamps, poses) = self
             .plan

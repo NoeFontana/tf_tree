@@ -423,6 +423,22 @@ msrv:
             rc=1
         fi
     done
+    # **The prose too, because that is where the last drift was.** `README.md`
+    # said 1.85 while the manifest said 1.87 — the two arms above both passed,
+    # since neither had ever looked at a file a user reads. A floor stated only
+    # in a manifest is a floor stated nowhere: `cargo` enforces it, and the
+    # person deciding whether they can adopt the crate never opens `Cargo.toml`.
+    #
+    # Matched loosely (`**1.87**` anywhere in the file) rather than by line, so
+    # the sentence can be rewritten without breaking the gate; what may not
+    # change silently is the number.
+    echo "==> the number is stated where a user reads it, and still agrees"
+    for f in README.md SUPPORT.md crates/tf_tree/src/lib.rs; do
+        if ! grep -qF "**$want**" "$f"; then
+            echo "$f: does not state the MSRV as **$want**"
+            rc=1
+        fi
+    done
     exit $rc
 
 # Run the benchmark suite and the go/no-go gate.

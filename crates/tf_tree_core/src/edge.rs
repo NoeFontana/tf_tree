@@ -15,6 +15,12 @@ use crate::error::{ClaimError, EdgeId, PushError};
 use crate::sync::{AtomicI64, AtomicU64, Ordering};
 
 /// Discriminant stored in [`EdgeRecord::kind`].
+///
+/// Not `#[non_exhaustive]`: see [`crate::plan::InterpPolicy`] for the argument.
+/// Every consumer renders all three kinds (`tf_tree top`, `doctor`, the web
+/// view), and [`EdgeKind::from_u8`] already absorbs an unknown discriminant.
+/// Reachable from the `tf_tree` facade only as `tf_tree::unstable::EdgeKind`
+/// (`docs/API.md` §2.6), because its three values *are* an arena field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EdgeKind {

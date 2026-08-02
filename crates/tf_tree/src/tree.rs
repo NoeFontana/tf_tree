@@ -1111,7 +1111,13 @@ impl Tree {
         }
     }
 
-    fn view(&self) -> ArenaView<'_> {
+    /// The crate-internal view, and **the one this crate's own modules use**.
+    ///
+    /// [`Tree::arena_view`] is the public spelling of it and is gated on the
+    /// `unstable` feature (`docs/API.md` §2.6); `frozen.rs` and `open.rs` are
+    /// inside the facade and must not reach a public surface to do their work,
+    /// or the feature would be load-bearing for a default build.
+    pub(crate) fn view(&self) -> ArenaView<'_> {
         // The detached case first, and unconditionally: every accessor below
         // funnels through here, so this is the one place that has to be right
         // for a read of the vanished mapping to be impossible rather than
@@ -1517,6 +1523,15 @@ impl Tree {
     /// A read-only [`ArenaView`] over the backing arena, for diagnostics and
     /// inspection (the CLI `tree` and `doctor` commands).
     ///
+    /// # Stability
+    ///
+    /// **Unstable: behind the `unstable` feature, with [`ArenaView`] itself**
+    /// (`docs/API.md` §2.6, [`crate::unstable`]). It is gated rather than merely
+    /// documented because it is the *door*: a caller can reach every accessor on
+    /// the returned value through inference without ever naming the type, so
+    /// leaving this method on the stable surface would have made the tier split
+    /// a spelling convention instead of a promise.
+    ///
     /// The view exposes only the core read surface — frame/edge/claim records and
     /// the topology seqlock — and holds no mutation capability of its own (edges
     /// are still only mutated through [`Self::claim`]/[`Self::reparent`]). It is
@@ -1538,6 +1553,7 @@ impl Tree {
     /// also gates the §5 counters) and belongs in its own commit with its own
     /// `just loom` run.
     #[must_use]
+    #[cfg(feature = "unstable")]
     pub fn arena_view(&self) -> ArenaView<'_> {
         self.view()
     }
@@ -2345,7 +2361,22 @@ fn process_start_time() -> u64 {
 ///
 /// `Display` produces a human-readable message (the error itself stays `Copy` and
 /// allocation-free). Obtain one with [`Tree::describe`].
-pub struct Described<'a>(pub LookupError, pub &'a Tree);
+///
+/// # Both fields are private, and that is the change rather than the status quo
+///
+/// They were `pub`, which promised that this wrapper is *exactly* the pair
+/// `(error, tree)` forever — a promise nothing needed: the only construction
+/// site in the workspace is [`Tree::describe`], and the only use is `Display`.
+/// `docs/API.md` §R5 makes the prose layer explicitly separate from the error
+/// type, so a caller who wants the [`LookupError`] back holds the one it passed
+/// in; it is `Copy`.
+///
+/// The `'a` is correct under §2.1 and is not the [`EdgeWriter`] case: this is a
+/// per-format-call borrow that lives to the end of the `write!` it appears in,
+/// like a `std::fmt::Arguments`. Storing one in a struct is not something a
+/// user has any reason to do, and `Tree::describe`'s signature is what stops
+/// them trying.
+pub struct Described<'a>(LookupError, &'a Tree);
 
 impl fmt::Display for Described<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

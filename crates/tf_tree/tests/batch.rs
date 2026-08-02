@@ -149,10 +149,7 @@ fn at_adaptive_bounded_and_within_tol() {
     let g = c.tree.guard();
     let max_t = (c.n as i64 - 1) * c.dt;
 
-    let tol = ErrBound {
-        rot_rad: 1e-3,
-        trans: 1e-3,
-    };
+    let tol = ErrBound::new(1e-3, 1e-3);
     let mut scratch = AdaptiveScratch::<SystemDomain>::new();
     let (stamps, poses) = plan
         .at_adaptive(&g, (ns(0), ns(max_t)), tol, &mut scratch)
@@ -206,10 +203,7 @@ fn at_adaptive_zero_tol_hits_cap() {
     let g = c.tree.guard();
     let max_t = (c.n as i64 - 1) * c.dt;
 
-    let tol = ErrBound {
-        rot_rad: 0.0,
-        trans: 0.0,
-    };
+    let tol = ErrBound::new(0.0, 0.0);
     let mut scratch = AdaptiveScratch::<SystemDomain>::new();
     let (stamps, _poses) = plan
         .at_adaptive(&g, (ns(0), ns(max_t)), tol, &mut scratch)

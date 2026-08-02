@@ -23,7 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use std::sync::atomic::Ordering;
 
-use tf_tree::{EdgeId, EdgeKind, FrameId, InterpPolicy, Tree};
+use tf_tree::unstable::EdgeKind;
+use tf_tree::{EdgeId, FrameId, InterpPolicy, Tree};
 use tf_tree_bench::fixture::PushSample;
 
 /// Which of the seven diagnostics produced a finding.

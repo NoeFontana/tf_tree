@@ -189,7 +189,9 @@ Standing numbers and their caveats live in
 expectations, platform support, MSRV policy) ·
 [`SECURITY.md`](./SECURITY.md) · [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
 
-MSRV is **1.85**, enforced by a CI job that reads it from the manifest.
+MSRV is **1.87**. `just msrv` reads the number out of `[workspace.package]
+rust-version`, builds `--locked` on exactly that toolchain, and checks that
+every hand-written `rust-version` — and this line — still agrees with it.
 
 ## Licence
 

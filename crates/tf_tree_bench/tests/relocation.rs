@@ -30,7 +30,8 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 
-use tf_tree::{EdgeKind, Iso3, Stamp};
+use tf_tree::unstable::EdgeKind;
+use tf_tree::{Iso3, Stamp};
 use tf_tree_arena::Arena;
 use tf_tree_arena::ArenaHeader;
 use tf_tree_bench::fixture;

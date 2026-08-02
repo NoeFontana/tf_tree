@@ -28,6 +28,20 @@ counters = ["tf_tree_core/counters"]
 # Linux-only and off by default — the single-process build must not grow a
 # syscall dependency it never uses.
 shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
+# **`docs/API.md` §2.6's Rust mirror of `tf_tree_unstable.h`.** Off by default,
+# and the *documentation of this feature is the waiver*: `tf_tree::unstable::*`
+# and `Tree::arena_view` exist only when it is on, and nothing reachable through
+# it is covered by semver. C spells the same split as a second header plus
+# `#define TFT_ENABLE_UNSTABLE` (`docs/PHASE4.md` §3.1); a Cargo feature is the
+# nearest thing Rust has, because it is the only mechanism a *caller* has to
+# write down.
+#
+# Turning it on inside this workspace is not a cost-free convenience: every
+# consumer that does so is a consumer whose build would break at a patch
+# release, and the list should stay short. Today it is `tf_tree_cli` (renders
+# arena tables), `tf_tree_c` (its own unstable header's introspection tier) and
+# `tf_tree_bench` (measures the arena).
+unstable = []
 # A single injection point inside `Tree::claim`, between the arena CAS and the
 # lease `SETLK` (`docs/decisions/0005` §5). Off by default and absent from the
 # API entirely unless enabled: the window it exposes is one syscall wide and
@@ -50,6 +64,22 @@ thiserror.workspace = true
 tf_tree_ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# **A dev-dependency on itself, so `unstable` is on for `cargo test` and off for
+# `cargo build`.** `tests/counters.rs`, `tests/behavior.rs`,
+# `tests/construction.rs` and `tests/frozen.rs` all read the arena back through
+# `Tree::arena_view`, which the `unstable` feature now gates. Without this line
+# they would need `required-features = ["unstable"]` and would silently leave
+# `just test` — `cargo nextest run --workspace` builds default features, and a
+# test in no gate is worth nothing. Cargo unifies a dev-dependency's features
+# into the package's own build when a test target is built, and dev-dependencies
+# are not built at all for `cargo build`, so this turns the feature on exactly
+# for the test profile.
+#
+# The cost is stated rather than hidden: **no host recipe compiles this crate's
+# test targets with `unstable` off**, so the off configuration is checked by
+# `cargo check -p tf_tree` / `just build`'s library pass and by every downstream
+# crate that does not enable it, not by a test.
+tf_tree = { path = ".", features = ["unstable"] }
 # The rendezvous tests probe the lock file directly, from outside the tree.
 tf_tree_ipc = { workspace = true }
 proptest.workspace = true

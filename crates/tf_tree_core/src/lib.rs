@@ -20,6 +20,60 @@
 //! convenience API live in the `tf_tree` facade, which drives the primitives
 //! here.
 //!
+//! # Stability — this crate's `pub` surface is not the project's API
+//!
+//! **`tf_tree` is the stable surface; this is the engine underneath it.** The
+//! split is `docs/API.md` §2.6 applied one crate down: that section's problem is
+//! that Rust has a single visibility tier, so everything `pub` reads as a
+//! semver promise whether it was meant as one or not. The facade answers it with
+//! a `tf_tree::unstable` module behind a feature. This crate cannot — it is a
+//! dependency of the facade and has to be published for the facade to be — so it
+//! answers with a statement instead, which is the honest form of the same thing:
+//!
+//! * **What `tf_tree` re-exports is the promise.** [`plan`]'s `Plan`, `Guard`,
+//!   `Stamp`, `Query`, the [`error`] types, [`layout`] — those are the API, and
+//!   they are stable because their shape is the *engine's* contract.
+//! * **Everything else here is shaped by the arena**, and the arena is scheduled
+//!   to change: `docs/PHASE5.md` §1 bumps `FORMAT_VERSION` to 3 and adds regions
+//!   Phase 6 fills. [`arena_view`], [`buffer`], [`frame`], [`edge`]'s records,
+//!   [`participant`], [`counters`] and [`topology`] move with it. Depend on them
+//!   and expect to be rebuilt; that is what `tf_tree::unstable` says out loud
+//!   for the two of them the facade used to re-export.
+//!
+//! ## The `#[non_exhaustive]` rule this crate applies
+//!
+//! Stated once, because a pre-tag audit went type by type and the *decisions*
+//! are worth less than the rule that produced them. `#[non_exhaustive]` is free
+//! to add before a published tag and a major bump after, so the default is to
+//! add it — but not everywhere, because it is not free of consequence:
+//!
+//! > **It goes on a type the engine *produces* and a caller only *reads*, or one
+//! > a caller *builds through a constructor*. It does not go on a type a caller
+//! > must *dispatch on*.**
+//!
+//! The reason is what the forced `_ =>` arm does. On a produced type there is no
+//! arm, so growth costs a downstream crate nothing. On a dispatched type the arm
+//! has to have a body, and every honest body is a lie about a variant that did
+//! not exist when it was written — so the attribute converts a compile error
+//! saying "teach me the new case" into a silent wrong answer. A major version
+//! bump is the cheaper of those two.
+//!
+//! Carrying it: every error enum a caller sees, [`plan::Query`],
+//! [`layout::Layout`], [`plan::Sample`], [`plan::ErrBound`] (with
+//! [`plan::ErrBound::new`]), [`sample::ExtrapPolicy`]. Deliberately without it,
+//! each with the argument at the type: [`plan::InterpPolicy`], [`plan::Step`],
+//! [`edge::EdgeKind`], [`topology::TopoLockError`].
+//!
+//! **The `#[repr(C)]` arena records are deliberately not `#[non_exhaustive]`** —
+//! [`edge::EdgeRecord`], [`edge::ClaimRecord`], [`frame::FrameRecord`],
+//! [`participant::ParticipantRecord`], [`buffer::PoseSlot`],
+//! [`counters::EdgeCounters`], [`counters::ParticipantCounters`]. A field
+//! appended to one of those is not a source-compatibility event, it is a
+//! `FORMAT_VERSION` / `layout_hash` event, and that is already checked on every
+//! attach by a mechanism stronger than the type system. Marking them would claim
+//! a growth path the arena does not have while blocking the literal construction
+//! the builders use.
+//!
 //! # Load-bearing invariants
 //!
 //! 1. **Append-only identity.** `FrameId`/`EdgeId` are never reused; removal is

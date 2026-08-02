@@ -25,7 +25,11 @@ publish = false
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-tf_tree = { workspace = true }
+# `features = ["unstable"]` — `docs/API.md` §2.6. `src/unstable.rs`'s
+# introspection entry points read the arena tables through `Tree::arena_view`,
+# which is now Rust-side unstable. The two tiers line up exactly: this crate's
+# *stable* header needs nothing from it.
+tf_tree = { workspace = true, features = ["unstable"] }
 # Optional, behind `bridge`. `tf_tree_bridge` depends only on `tf_tree`, so this
 # adds no third-party code to the C ABI's dependency graph — but it is still
 # weight a C caller who only reads transforms should not link, which is why the

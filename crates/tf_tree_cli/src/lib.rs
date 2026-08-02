@@ -17,7 +17,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use tf_tree::{EdgeKind, Iso3, Stamp, Tree};
+use tf_tree::unstable::EdgeKind;
+use tf_tree::{Iso3, Stamp, Tree};
 use tf_tree_bench::fixture;
 
 pub mod catalogue;

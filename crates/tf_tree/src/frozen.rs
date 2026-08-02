@@ -236,7 +236,7 @@ impl Tree {
     /// which is the first thing to look at when an offline query comes back
     /// short.
     fn manifest(&self, source: Option<&str>, created_unix_ns: i64) -> Vec<u8> {
-        let view = self.arena_view();
+        let view = self.view();
         let header = view.header();
         let frames = header
             .frame_count

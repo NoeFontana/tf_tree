@@ -41,7 +41,11 @@ shm = ["tf_tree/shm"]
 embed-probe = ["tf_tree_core/bench-probe"]
 
 [dependencies]
-tf_tree.workspace = true
+# `features = ["unstable"]` — `docs/API.md` §2.6. The harnesses measure the
+# arena itself (`footprint`, `soak`, `shm_torture`, `contended_scaling`) and
+# reach it through `Tree::arena_view`. A benchmark crate is exactly the consumer
+# the unstable tier is for: `publish = false`, rebuilt with the engine.
+tf_tree = { workspace = true, features = ["unstable"] }
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
 anyhow.workspace = true

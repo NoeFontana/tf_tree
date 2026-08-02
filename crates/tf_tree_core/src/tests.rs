@@ -2255,3 +2255,30 @@ fn a_step_past_the_end_of_the_edge_table_is_reported() {
         "a step off the end of the edge table must not read as `undeclared`"
     );
 }
+
+/// `ErrBound::new` maps its first argument to `rot_rad` and its second to
+/// `trans`, and nothing else in the workspace can tell.
+///
+/// The constructor exists because `ErrBound` became `#[non_exhaustive]`
+/// (`docs/API.md` §7's audit), so every caller now goes through it. Both
+/// remaining call sites in this repository pass **equal** values —
+/// `tests/batch.rs` uses `(1e-3, 1e-3)` and `(0.0, 0.0)` — so a swapped
+/// mapping is invisible to them, and `tf_tree_py`'s `at_adaptive`, which does
+/// pass `(ang, lin)` distinctly, is outside the workspace and outside
+/// `just test`. Verified rather than assumed: with `ErrBound::new` mutated to
+/// `ErrBound { rot_rad: trans, trans: rot_rad }`, `cargo nextest run
+/// --workspace` reported *754 tests run: 754 passed* before this test existed.
+///
+/// Two unequal values, so the swap is observable.
+#[test]
+fn err_bound_new_assigns_rotation_first() {
+    let tol = crate::plan::ErrBound::new(0.25, 4.0);
+    assert_eq!(
+        tol.rot_rad, 0.25,
+        "the first argument is the rotation bound"
+    );
+    assert_eq!(
+        tol.trans, 4.0,
+        "the second argument is the translation bound"
+    );
+}

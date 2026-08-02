@@ -45,6 +45,72 @@
 //! # let _ = InterpPolicy::ScLerp;
 //! ```
 //!
+//! # Minimum supported Rust version
+//!
+//! **1.87**. It is declared in `[workspace.package] rust-version` and repeated
+//! here because a manifest is not somewhere a user reads: the person deciding
+//! whether they can adopt this crate opens the docs, and `cargo` refusing to
+//! build is a worse way to find out. `just msrv` builds `--locked` on exactly
+//! that toolchain and fails if this line, `README.md`, `SUPPORT.md` or any
+//! hand-written `rust-version` disagrees with the manifest.
+//!
+//! An MSRV bump is a minor-version bump pre-1.0 and a breaking change after —
+//! `SUPPORT.md` is the policy, including why each of the two steps so far was
+//! forced by a dependency rather than chosen.
+//!
+//! # Two stability tiers
+//!
+//! Everything at this crate's root is the **stable** surface: at a published tag
+//! each `pub` item is a semver promise. The `tf_tree::unstable` module — behind
+//! the default-off `unstable` feature, so it is absent from these docs unless
+//! that feature is on — is not, and enabling the feature is the waiver
+//! (`docs/API.md` §2.6). It mirrors the C ABI's `tf_tree.h` /
+//! `tf_tree_unstable.h` split, which is the same promise spelled as two headers.
+//!
+//! What lives there is what the *arena layout* shapes, because that layout is
+//! scheduled to change (`docs/PHASE5.md` §1). If you are reading transforms, you
+//! will never need it.
+//!
+//! The three items that moved do not answer at the crate root any more, and this
+//! is what pins that — the doctest runs with the `unstable` feature *on* (this
+//! crate dev-depends on itself to enable it), so it asserts the split rather
+//! than the feature being off:
+//!
+//! ```compile_fail,E0432
+//! use tf_tree::ArenaView;
+//! ```
+//! ```compile_fail,E0432
+//! use tf_tree::EdgeKind;
+//! ```
+//! ```compile_fail,E0432
+//! use tf_tree::EdgeMeta;
+//! ```
+//!
+//! Three blocks and not one `use tf_tree::{ArenaView, EdgeKind, EdgeMeta};`,
+//! because a single block passes as soon as *any* one of the three is absent —
+//! it would go on passing after a refactor put two of them back.
+//!
+//! `E0432` and not a bare `compile_fail`: an unpinned one passes when the
+//! snippet fails for *any* reason, and stable rustdoc ignores the code, so
+//! `just test-doc-error-codes` is this line's real gate (`justfile`).
+//!
+//! ## What the pre-tag audit left alone, and why
+//!
+//! The sweep behind the split asked `docs/API.md` §7 of every `pub` item here.
+//! Three moved; the rest stay, and two answers are worth recording because they
+//! look like omissions:
+//!
+//! * **[`EdgeWriter`] still carries a lifetime**, which §2.1 calls a violation.
+//!   It is a *known* one and it is not the bug: [`OwnedWriter`] is the storable
+//!   shape, and a scoped claim whose scope the borrow checker enforces is better
+//!   when it fits. §2.1 says so in terms.
+//! * **[`Described`]'s two fields became private.** They promised that the
+//!   `Display` wrapper is exactly `(error, tree)` forever, for no caller — the
+//!   only construction site in the workspace is [`Tree::describe`].
+//!
+//! `tf_tree_core`'s crate docs carry the rule the audit applied to
+//! `#[non_exhaustive]`, and the per-type arguments sit on the types.
+//!
 //! # `no_std` / `std` split
 //!
 //! Everything arena-generic — [`Plan`], [`Step`], [`Guard`], [`Stamp`],
@@ -220,47 +286,23 @@ mod open;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
 
+/// **The unstable tier — `docs/API.md` §2.6.** Enabling the `unstable` feature
+/// is the waiver; read the module's own documentation for what it waives.
+#[cfg(feature = "unstable")]
+pub mod unstable;
+
 // Re-export the core engine surface so downstream code depends only on `tf_tree`.
-
-/// Raw, read-only access to the arena's own tables.
-///
-/// # Stability
-///
-/// **This export is CLI-facing, and it moves behind an `unstable` feature
-/// before any published tag** (`docs/API.md` §2.6). C has two headers and the
-/// split *is* the promise; Rust has one visibility tier, so everything `pub`
-/// here reads as a stability commitment whether it was meant as one or not.
-/// This one was not: it exists so `tf_tree doctor` and `tf_tree top` can render
-/// what is in a segment without depending on `tf_tree_core` directly, and its
-/// shape follows the arena layout — which `docs/PHASE5.md` §1 is about to
-/// change on purpose.
-///
-/// The `tf_tree::unstable::*` mirror itself is **deferred while the crate is
-/// private** and is not to be built ahead of a reason to. The heading is not
-/// deferred, because it costs a comment and buys the difference between a move
-/// that executes a documented plan and a move that breaks somebody who had no
-/// way to know.
-pub use tf_tree_core::arena_view::ArenaView;
-
-/// Whether an edge is dynamic, static or tombstoned.
-///
-/// # Stability
-///
-/// **CLI-facing, and it moves behind `unstable` with [`ArenaView`]** — read
-/// that item's note for the argument. It is here for the same consumer and is
-/// reachable only through the same door: the value comes from an `EdgeRecord`,
-/// which is an [`ArenaView`] read. An embedder declares an edge's kind by
-/// calling [`TreeBuilder::static_edge`] or [`TreeBuilder::dynamic_edge`] and
-/// never names this type. ([`EdgeMeta`] carries one, but its only consumer is
-/// `tf_tree_core::compile`, which this facade does not re-export.)
-pub use tf_tree_core::edge::EdgeKind;
+//
+// Everything below is the **stable** tier: at a published tag each line is a
+// semver promise. `ArenaView`, `EdgeKind` and `EdgeMeta` used to be here and are
+// now in the `unstable` module — see it for the test that separates them, which
+// is "does its shape follow the arena layout", not "is it low-level".
 
 pub use tf_tree_core::edge::Publisher;
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 pub use tf_tree_core::plan::{
-    AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
-    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
-    MAX_KNOTS,
+    AdaptiveScratch, Domain, ErrBound, Guard, InterpPolicy, Plan, Query, Sample, SensorDomain,
+    SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
 };
 pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH,
