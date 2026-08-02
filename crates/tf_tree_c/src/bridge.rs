@@ -358,6 +358,12 @@ pub const TFT_BRIDGE_JUMP_FORWARD: tft_bridge_jump_kind = 2;
 #[derive(Clone, Copy)]
 pub struct tft_bridge_outcome {
     /// `sizeof(tft_bridge_outcome)` in the caller's build (§3.6).
+    ///
+    /// **Exact equality, unlike `tft_bridge_options` and `tft_bridge_sample`.**
+    /// This is an `out` parameter: accepting a short one means the callee must
+    /// know which fields to skip *writing*, which is a different and larger
+    /// design than reading a prefix. Do not "finish the job" by symmetry — see
+    /// `read_options`.
     pub struct_size: u32,
     /// One of the `TFT_BRIDGE_*` action codes.
     pub action: tft_bridge_action,
@@ -509,6 +515,142 @@ pub struct tft_bridge_options {
     pub domain: u32,
     /// `tf_prefix` remapping (§5.6), or NULL for none.
     pub tf_prefix: *const c_char,
+    /// Rendezvous name for a **shared** arena, or NULL for a private heap arena.
+    ///
+    /// When non-NULL the bridge publishes its arena under this name, and any
+    /// process may attach read-only with
+    /// [`tft_tree_open`](crate::tft_tree_open) / `tf_tree::open()`. **NULL is
+    /// the default and preserves the previous behaviour exactly**
+    /// (`docs/decisions/0015`).
+    ///
+    /// # This is not `domain`
+    ///
+    /// [`tft_bridge_options::domain`] is §5.5's *time* domain and has nothing to
+    /// do with the rendezvous. The **rendezvous** domain comes from
+    /// `$TF_TREE_DOMAIN`, else `$ROS_DOMAIN_ID`, else 0 — the convention two
+    /// robots on one host already use, and the reason no name is derived from
+    /// `tf_prefix` (`docs/decisions/0019` §3, answers 2 and 3). Two fields
+    /// spelled "domain" in one header meaning different things is a
+    /// documentation obligation, and this paragraph is it.
+    ///
+    /// # It can fail, and it never downgrades
+    ///
+    /// A shared build can fail where a heap build cannot: the name is already
+    /// held by a live arena, the runtime directory is unusable, `memfd_create`
+    /// is refused. All of those are
+    /// [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) with a
+    /// message that distinguishes them, and **none of them falls back to a heap
+    /// arena** — a silent downgrade leaves every consumer waiting on a
+    /// rendezvous that will never appear, which is the failure mode hardest to
+    /// diagnose from the consumer's side.
+    ///
+    /// A library built **without** `--features shm` carries this field with
+    /// nothing behind it and refuses a non-NULL value for the same reason.
+    pub arena_name: *const c_char,
+}
+
+/// `tft_bridge_options` as ABI **0.4** laid it out, before `arena_name`.
+///
+/// The same device as [`tft_bridge_sample_v1`] and for the same reason: so
+/// [`read_options`] can *compute* the size an older caller sends rather than
+/// hardcode one, and so the prefix rule stops being true at a compile error
+/// rather than at somebody's robot.
+///
+/// The `struct_size` prefix rule of `docs/PHASE4.md` §3.6 had, until
+/// `docs/decisions/0015`, exactly one implementation — `tft_bridge_sample`'s —
+/// while `tft_bridge_create` validated with exact equality and read the whole
+/// struct. Appending a field under those terms would have locked every 0.4
+/// caller out of the entry point, which is the case §3.6 exists to prevent.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct tft_bridge_options_v1 {
+    struct_size: u32,
+    authority: tft_bridge_authority,
+    on_clock_reset: tft_bridge_on_clock_reset,
+    domain: u32,
+    tf_prefix: *const c_char,
+}
+
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(
+        offset_of!(tft_bridge_options_v1, struct_size)
+            == offset_of!(tft_bridge_options, struct_size)
+    );
+    assert!(
+        offset_of!(tft_bridge_options_v1, authority) == offset_of!(tft_bridge_options, authority)
+    );
+    assert!(
+        offset_of!(tft_bridge_options_v1, on_clock_reset)
+            == offset_of!(tft_bridge_options, on_clock_reset)
+    );
+    assert!(offset_of!(tft_bridge_options_v1, domain) == offset_of!(tft_bridge_options, domain));
+    assert!(
+        offset_of!(tft_bridge_options_v1, tf_prefix) == offset_of!(tft_bridge_options, tf_prefix)
+    );
+    // The appended field begins exactly where the old struct ended, so a v1
+    // caller's bytes are a prefix of a current one's with nothing in between.
+    assert!(size_of::<tft_bridge_options_v1>() == offset_of!(tft_bridge_options, arena_name));
+    assert!(size_of::<tft_bridge_options_v1>() < size_of::<tft_bridge_options>());
+};
+
+/// Read a caller's [`tft_bridge_options`], accepting the layout that predates
+/// `arena_name` as a prefix of the current one.
+///
+/// `None` means the size belongs to neither build and the caller gets
+/// [`TFT_ERR_BAD_STRUCT_SIZE`](crate::TFT_ERR_BAD_STRUCT_SIZE).
+///
+/// **The bounded copy is the whole safety argument**, exactly as it is for
+/// [`read_sample`]: relaxing the old `!=` to a length test *without* narrowing
+/// the read would be an out-of-bounds read, in the one crate whose entire
+/// `unsafe` budget is argument validation. `copy_nonoverlapping` over `u8` also
+/// inherits `read_unaligned`'s tolerance of a misaligned caller pointer, because
+/// `u8` has alignment 1.
+///
+/// Unlike [`read_sample`] there is **no post-copy fixup**: the zero the copy
+/// leaves in `arena_name` is NULL, which is already the documented "a private
+/// heap arena, as before".
+///
+/// **Only `tft_bridge_options` gets this treatment.** `tft_bridge_outcome`,
+/// `tft_bridge_remap` and `tft_bridge_stats` stay exact-equality and should stay
+/// that way: they are `out` parameters, so accepting a short one means the
+/// callee must know which fields to skip *writing* — a different and larger
+/// design than reading a prefix, and not one to "finish the job" into by
+/// symmetry.
+///
+/// # Safety
+///
+/// `o` must be non-NULL and point to at least `declared` readable bytes.
+unsafe fn read_options(o: *const tft_bridge_options, declared: u32) -> Option<tft_bridge_options> {
+    let current = core::mem::size_of::<tft_bridge_options>();
+    let v1 = core::mem::size_of::<tft_bridge_options_v1>();
+    let declared = declared as usize;
+    if declared != current && declared != v1 {
+        return None;
+    }
+    // Every field the copy below may leave untouched needs a defined value, and
+    // for the one field that can be left untouched the default *is* the
+    // documented meaning: a NULL `arena_name` is a private heap arena.
+    let mut opts = tft_bridge_options {
+        struct_size: 0,
+        authority: TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
+        on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
+        domain: 0,
+        tf_prefix: core::ptr::null(),
+        arena_name: core::ptr::null(),
+    };
+    // SAFETY: `declared` is one of the two validated sizes and both are at most
+    // `size_of::<tft_bridge_options>()`, so the destination has room; the caller
+    // contracts `declared` readable bytes at `o`; the two regions cannot overlap
+    // because `opts` is a fresh local; `u8` imposes no alignment.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            o.cast::<u8>(),
+            core::ptr::addr_of_mut!(opts).cast::<u8>(),
+            declared,
+        );
+    }
+    Some(opts)
 }
 
 /// One row of §5.6's remap table: a frame name as it arrives, and the name the
@@ -522,7 +664,8 @@ pub struct tft_bridge_options {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct tft_bridge_remap {
-    /// `sizeof(tft_bridge_remap)` in the caller's build (§3.6).
+    /// `sizeof(tft_bridge_remap)` in the caller's build (§3.6). Exact equality,
+    /// for the reason [`tft_bridge_outcome::struct_size`] gives.
     pub struct_size: u32,
     /// The name as it appears on `/tf` — and in every launch file and RViz
     /// config on the robot.
@@ -554,7 +697,8 @@ pub struct tft_bridge_remap {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct tft_bridge_stats {
-    /// `sizeof(tft_bridge_stats)` in the caller's build (§3.6).
+    /// `sizeof(tft_bridge_stats)` in the caller's build (§3.6). Exact equality,
+    /// for the reason [`tft_bridge_outcome::struct_size`] gives.
     pub struct_size: u32,
     /// `TFMessage`es reported by [`tft_bridge_note_message`].
     pub messages: u64,
@@ -832,6 +976,85 @@ unsafe fn bridge_of<'a>(b: *mut tft_bridge) -> Result<&'a mut tft_bridge, tft_st
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+/// Create the **shared** arena `tft_bridge_options::arena_name` asks for, and
+/// publish it under that name.
+///
+/// # Why `tf_tree::Open` and not `TreeBuilder::build_shared`
+///
+/// `build_shared(name)` **publishes no rendezvous**: its name is a debug label
+/// that shows up in `/proc/<pid>/fd`, and the fd is the capability — segments
+/// are not discoverable by name. A second process could never find the arena, so
+/// the option would appear to work and deliver nothing. The path that publishes
+/// is [`tf_tree::Open::open`]'s `Created` arm, which is `build_shared` **plus**
+/// OFD liveness, claim leases, the owner server and ownership
+/// (`docs/decisions/0015`, *The ABI*).
+///
+/// # Why `require_create(true)`
+///
+/// [`tf_tree::CreatePolicy`] has no "create, or refuse if one is already live"
+/// setting: `IfAbsent` silently *joins*, which would have this bridge claiming
+/// edges in an arena somebody else sized, and `Always` is `--force-new` and
+/// documents itself as never to be taken automatically.
+/// `docs/decisions/0019` §3's question 3 settles it — a second bridge on a held
+/// name is a rendezvous refusal, and this is where it is refused.
+///
+/// The rendezvous **domain** is the environment's (`$TF_TREE_DOMAIN`, else
+/// `$ROS_DOMAIN_ID`, else 0) and is deliberately not
+/// `tft_bridge_options::domain`, which is §5.5's *time* domain.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn open_shared(name: &str, builder: tf_tree::TreeBuilder) -> Result<tf_tree::Tree, tft_status> {
+    use tf_tree::{AttachMode, CreatePolicy, Open, OpenError};
+
+    let opened = Open::new().name(name).and_then(|o| {
+        o.mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::IfAbsent)
+            .require_create(true)
+            .layout_if_creating(builder)
+            .open()
+    });
+    match opened {
+        Ok(tree) => Ok(tree),
+        // The one failure an operator will actually hit, and the one a generic
+        // rendering would bury: another bridge is already serving this name.
+        //
+        // Kept short deliberately: `tft_error::set_message` truncates at
+        // `TFT_MESSAGE_LEN`, so a longer sentence would lose its own advice.
+        Err(OpenError::ArenaAlreadyLive) => Err(arena_unavailable(&format!(
+            "shared arena {name:?}: another participant already holds this rendezvous \
+             name, and a bridge will not join an arena it did not size \
+             (docs/decisions/0015). Stop it, or use a different arena_name."
+        ))),
+        // Everything else — an unusable or network runtime directory, a lock
+        // file that will not open, no participant slots, a refused memfd, a
+        // name this rendezvous will not take — arrives with its own text, and
+        // that text is what separates "the runtime directory is unusable" from
+        // the case above.
+        Err(e) => Err(arena_unavailable(&format!(
+            "shared arena {name:?} could not be created: {e}"
+        ))),
+    }
+}
+
+/// The `bridge`-without-`shm` build's answer, and it is a **refusal**.
+///
+/// `bridge` and `shm` are independent cargo features, so this configuration
+/// carries `arena_name` in its header with no `tf_tree::Open` behind it.
+/// Ignoring the field would be exactly the silent downgrade
+/// `docs/decisions/0015` forbids, reached through a *build* rather than a
+/// runtime fault — and it is the more likely of the two, because it needs no
+/// misconfiguration on the robot at all.
+#[cfg(not(all(feature = "shm", target_os = "linux")))]
+fn open_shared(name: &str, _builder: tf_tree::TreeBuilder) -> Result<tf_tree::Tree, tft_status> {
+    // Short on purpose: `tft_error::set_message` truncates at
+    // `TFT_MESSAGE_LEN`, and `arena_name` may be 64 bytes, so a longer sentence
+    // would drop the rebuild command for exactly the operator who needs it.
+    Err(arena_unavailable(&format!(
+        "shared arena {name:?}: built without --features shm, so this library has no \
+         shared memory behind arena_name. Rebuild with \
+         `cargo build -p tf_tree_c --features bridge,shm`, or leave it NULL."
+    )))
+}
+
 /// Build a bridge over the topology described by `config_toml`, and the arena
 /// that topology declares.
 ///
@@ -847,6 +1070,24 @@ unsafe fn bridge_of<'a>(b: *mut tft_bridge) -> Result<&'a mut tft_bridge, tft_st
 ///
 /// The thread that calls this **owns** the bridge; see the module docs.
 ///
+/// # An older caller's options still work
+///
+/// `opts->struct_size` selects the layout, and the layout that predates
+/// `arena_name` is accepted and read as the prefix it is — the §3.6 rule
+/// [`tft_bridge_offer`] already applies to `tft_bridge_sample`. A `0.4` caller
+/// therefore keeps the private heap arena it always had, with no source change
+/// and no recompile.
+///
+/// # It can now block, for up to five seconds
+///
+/// **Only when `opts->arena_name` is non-NULL.** The shared path goes through
+/// `tf_tree::Open`, whose rendezvous waits up to `DEFAULT_OPEN_TIMEOUT` (5 s) for
+/// an arena that is held but not yet reachable. That is a real change for §5.8's
+/// form 3, where this runs inside a constructor: a node that constructs its
+/// bridge on the executor thread will not spin that executor until this returns.
+/// A NULL `arena_name` — the default, and every pre-`0.5` caller — is exactly as
+/// prompt as before.
+///
 /// # Errors
 ///
 /// * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, **declares no edges**,
@@ -859,12 +1100,22 @@ unsafe fn bridge_of<'a>(b: *mut tft_bridge) -> Result<&'a mut tft_bridge, tft_st
 ///   `opts->domain` (§5.5, NORMATIVE, and at startup by design).
 /// * [`TFT_ERR_ALREADY_CLAIMED`](crate::TFT_ERR_ALREADY_CLAIMED) and the rest of
 ///   the claim family — another participant holds a declared edge.
+/// * [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) — a
+///   non-NULL `opts->arena_name` could not be served: another bridge already
+///   holds the name, the runtime directory is unusable, the segment could not be
+///   made — or this library was built without `--features shm`. The message
+///   distinguishes them, and **there is no fallback to a heap arena**.
+/// * [`TFT_ERR_BAD_STRUCT_SIZE`] —
+///   `opts->struct_size` is neither this build's size nor the one layout that
+///   precedes it.
 ///
 /// # Safety
 ///
 /// `config_toml` must be NUL-terminated UTF-8. `opts` must be NULL or point to a
-/// `tft_bridge_options` whose `struct_size` is set. `out` must be NULL or point
-/// to a writable `*mut tft_bridge`.
+/// `tft_bridge_options` whose `struct_size` is set **and which has at least that
+/// many readable bytes** — the same contract [`tft_bridge_offer`] states for its
+/// sample, and it is what makes the narrowed read sound. `out` must be NULL or
+/// point to a writable `*mut tft_bridge`.
 #[no_mangle]
 pub unsafe extern "C" fn tft_bridge_create(
     config_toml: *const c_char,
@@ -884,16 +1135,16 @@ pub unsafe extern "C" fn tft_bridge_create(
         let (mut authority, mut on_reset, mut domain) =
             (AuthorityPolicy::FirstWriterWins, OnClockReset::Halt, 0u8);
         let mut prefix: Option<&str> = None;
+        let mut arena_name: Option<&str> = None;
         if !opts.is_null() {
             // SAFETY: the caller contracts a readable `tft_bridge_options` with
             // `struct_size` initialised; the field is read before anything else.
             let declared = unsafe { core::ptr::addr_of!((*opts).struct_size).read_unaligned() };
-            if declared as usize != core::mem::size_of::<tft_bridge_options>() {
+            // SAFETY: the caller contracts at least `declared` readable bytes at
+            // `opts`, and `read_options` copies no more than that.
+            let Some(o) = (unsafe { read_options(opts, declared) }) else {
                 return bad_struct_size("tft_bridge_options");
-            }
-            // SAFETY: `struct_size` matched this build's, so the whole struct is
-            // present and readable.
-            let o = unsafe { core::ptr::read_unaligned(opts) };
+            };
             authority = match o.authority {
                 TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS => AuthorityPolicy::FirstWriterWins,
                 TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS => AuthorityPolicy::LastWriterWins,
@@ -915,6 +1166,13 @@ pub unsafe extern "C" fn tft_bridge_create(
                     return bad_config("tf_prefix is not valid UTF-8");
                 };
                 prefix = Some(s);
+            }
+            if !o.arena_name.is_null() {
+                // SAFETY: the caller contracts a NUL-terminated C string.
+                let Ok(s) = (unsafe { core::ffi::CStr::from_ptr(o.arena_name) }).to_str() else {
+                    return bad_config("arena_name is not valid UTF-8");
+                };
+                arena_name = Some(s);
             }
         }
 
@@ -985,8 +1243,21 @@ pub unsafe extern "C" fn tft_bridge_create(
         // this process and this is it.
         let ingest = Ingest::with(&config, authority, on_reset, prefix);
         let declared = ingest.declared();
-        let Ok(tree) = declared.builder().build() else {
-            return bad_config("topology config: the declared topology does not build");
+        // **The same builder either way**, which is the paragraph above being
+        // obeyed on the shared path too: `layout_if_creating` takes
+        // `declared.builder()` and never `config`'s, so a `tf_prefix`-rewritten
+        // topology sizes the shared arena exactly as it sizes the heap one.
+        let tree = match arena_name {
+            None => {
+                let Ok(tree) = declared.builder().build() else {
+                    return bad_config("topology config: the declared topology does not build");
+                };
+                tree
+            }
+            Some(name) => match open_shared(name, declared.builder()) {
+                Ok(tree) => tree,
+                Err(rc) => return rc,
+            },
         };
 
         let share = Arc::new(TreeShare {
@@ -2322,4 +2593,15 @@ fn bad_struct_size(what: &str) -> tft_status {
 fn bad_config(msg: &str) -> tft_status {
     set_error(TFT_ERR_BAD_CONFIG, msg, |_| {});
     TFT_ERR_BAD_CONFIG
+}
+
+/// `docs/decisions/0015`'s startup refusal: a shared arena was asked for and
+/// could not be had, and there is no fallback to a heap one.
+///
+/// The message is the whole diagnostic — the status code says "the rendezvous",
+/// and only the text says *which* rendezvous fault — so every caller of this
+/// passes one specific enough to act on.
+fn arena_unavailable(msg: &str) -> tft_status {
+    set_error(crate::TFT_ERR_ARENA_UNAVAILABLE, msg, |_| {});
+    crate::TFT_ERR_ARENA_UNAVAILABLE
 }

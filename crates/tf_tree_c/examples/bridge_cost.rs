@@ -88,6 +88,9 @@ fn main() {
         on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
         domain: 0,
         tf_prefix: ptr::null(),
+        // A private heap arena: this measures the offer path, and a rendezvous
+        // would put a memfd and a socket in the middle of the number.
+        arena_name: ptr::null(),
     };
     let mut b: *mut tft_bridge = ptr::null_mut();
     // SAFETY: NUL-terminated config, a live `opts`, `b` a live local.

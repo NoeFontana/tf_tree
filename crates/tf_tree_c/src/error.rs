@@ -123,6 +123,31 @@ pub const TFT_ERR_BAD_CONFIG: tft_status = -40;
 /// reusing a code whose message names enums would send an operator looking at
 /// the wrong argument.
 pub const TFT_ERR_BAD_STAMP: tft_status = -41;
+/// A **shared** arena was asked for and could not be had: the rendezvous name is
+/// already held by a live arena, the runtime directory is unusable, the segment
+/// could not be created or mapped — or this library was built without
+/// `--features shm` and so has no shared-memory machinery behind the field at
+/// all. The message says which.
+///
+/// The code exists because nothing already meant this (`docs/decisions/0015`
+/// *Failure*): [`TFT_ERR_BAD_CONFIG`] is the topology *text*,
+/// [`TFT_ERR_TIME_DOMAIN`] is §5.5's domain agreement, and the claim family is
+/// per-edge with `frame_a`/`frame_b` in its detail — a rendezvous fault has no
+/// edge to name. Collapsing them onto [`TFT_ERR_INTERNAL`] would leave an
+/// operator unable to tell "another bridge holds this name" from "the runtime
+/// directory is unusable" from "a bug", which is the diagnosis the record exists
+/// to protect.
+///
+/// **Returned only by `tft_bridge_create`, and only when
+/// `tft_bridge_options::arena_name` is non-NULL**, which is what keeps adding it
+/// a minor bump under `docs/PHASE4.md` §3.6 — and is a tighter argument than
+/// [`TFT_ERR_BAD_STAMP`]'s: a caller whose `struct_size` names the 0.4 layout
+/// has no such field to set, so it *provably* cannot receive this code.
+///
+/// There is deliberately **no fallback to a private heap arena**. A bridge that
+/// downgraded silently would present, on every consumer, as a bridge that never
+/// started — forever.
+pub const TFT_ERR_ARENA_UNAVAILABLE: tft_status = -42;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
 
