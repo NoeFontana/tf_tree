@@ -1559,7 +1559,8 @@ All three share one implementation; only the lifecycle wrapper differs.
 > [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) adds one
 > optional field, `tft_bridge_options::arena_name`. Non-NULL, the bridge
 > publishes its arena under that rendezvous name and any process may attach to
-> it **read-only** with `tft_tree_open()` in C or `tf_tree::open()` in Rust —
+> it **read-only** with `tft_tree_open()` in C, `tf_tree::open()` in Rust or
+> `tf_tree.open()` in Python —
 > **no new consumer API**, which is the point: the bridge becomes an ordinary
 > producer of the arena `docs/PHASE2.md` already specified. NULL is the default
 > and preserves the previous behaviour exactly, which is what every caller

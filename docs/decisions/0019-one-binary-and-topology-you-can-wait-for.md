@@ -18,16 +18,33 @@ and are not scheduled.**
 - **Step 3** — split, and both halves are done. `RUNBOOK.md`'s
   `FrameNotDeclared` row — the live defect *Context* names — was fixed in
   **#137**, the PR that added this document, and `PHASE2.md` §13's runbook row
-  was rewritten with it. `FrameNotDeclared`'s own message stopped naming `tf_treed`
-  in **#139** (`crates/tf_tree_core/src/error.rs`), pinned by
-  `crates/tf_tree/tests/await_frames.rs`, which asserts the rendered description
-  offers `await_frames` as the remedy and does **not** contain the string
-  `tf_treed`.
+  was rewritten with it. The *rendered* description gained the `await_frames`
+  remedy in **#139** — in `crates/tf_tree/src/tree.rs`'s `Described` impl, the
+  `LookupError::UnknownFrame` arm, because the core enum carries no text at all
+  ([`API.md`](../API.md) §1 R5) — pinned by
+  `crates/tf_tree/tests/await_frames.rs`, which asserts the description offers
+  `await_frames` and does **not** contain the string `tf_treed`.
+
+  > **This step's own wording was wrong, and the header repeated it.** Step 3
+  > below says the message had to "stop naming `tf_treed`". **It never named
+  > it**: `git log -S"tf_treed"` returns nothing for either
+  > `crates/tf_tree_core/src/error.rs` or `crates/tf_tree/src/tree.rs`, and the
+  > pre-#139 arm read `unknown frame (name hash {hash:#018x})` — a bare hash and
+  > no remedy at all. `tf_treed` lived in `RUNBOOK.md`'s row and `PHASE2.md`
+  > §13's, which is the half #137 fixed. The `await_frames.rs` assertion that
+  > the string is absent is therefore **preventative**, not a regression pin,
+  > and an earlier revision of this header additionally cited the wrong file.
+  > Left in because a plan item that certifies a fix to something that was never
+  > broken is exactly the kind of claim this project keeps finding.
 - **Steps 4–5** — **#137**. `PHASE2.md` §9's superseding amendment and §0.0's
   rows, `PROJECT.md`'s Phase 2 notes, `PHASE4.md`'s two references, `0009`'s §9
   amendment, `docs/decisions/README.md`, and `0015` moved to `ready`. `rg
-  'tf_treed'` returns only references that name this record or describe it in the
-  past tense.
+  'tf_treed'` now returns nothing an operator is told to run: two module doc
+  comments describing what a *spec* said (`tf_tree_bridge/src/config.rs:15`
+  quotes `PHASE2.md` §9, `tf_tree_ipc/src/server.rs:8` is counterfactual), the
+  negative assertion at `await_frames.rs:132`, and this record. An earlier
+  revision of this line said "only references that name this record or describe
+  it in the past tense", which the first of those two is not.
 - **Steps 6–7** — **not built.** `tf_tree serve`, `--metrics-port` and the
   systemd/container examples. §4 puts them outside 0.1.0 deliberately, and the
   plan's closing sentence is the disposition: *"if steps 1–3 remove the pain,

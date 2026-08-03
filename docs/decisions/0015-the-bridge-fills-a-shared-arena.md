@@ -8,8 +8,12 @@
   **#139**, not in this record's own first PR: it is `0019`'s step 1 commit that
   carries it, because that commit was already rewriting `Open`'s defaults and the
   two changes touch the same twenty lines. (An earlier revision of this header
-  put step 0 on `feat/0015-bridge-shared-arena`; `git log -S require_create` puts
-  it on `feat/0019-await-and-ro-create`.)
+  put step 0 on `feat/0015-bridge-shared-arena`. `git log -S require_create`
+  returns **two** commits — `a39b40b` on `feat/0019-await-and-ro-create`, which
+  *defines* it, and `5fc3e90` on `feat/0015-bridge-shared-arena`, which *calls*
+  it from `open_shared`. The definition is the one that dates the step, and
+  restricting the search to `crates/tf_tree/src/open.rs` returns only the
+  first.)
 - **Steps 1–2** — **#141**, `feat/0015-bridge-shared-arena`: the `struct_size`
   prefix rule *ported* to `tft_bridge_options` with `arena_name` appended, and
   `open_shared` refusing rather than downgrading, in both the `shm` and the

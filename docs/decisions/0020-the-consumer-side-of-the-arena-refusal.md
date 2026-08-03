@@ -49,12 +49,16 @@ one sentence for every one of these:
 | `HandshakeRejected { NoParticipantSlots }` | raise `--participants`, or find the leak |
 | `OpenError::Map` — the segment arrived and could not be mapped | a bug, or a resource limit |
 
-Three `OpenError` variants are *not* in that table and should not be:
-`ReadOnlyCannotCreate`, `NoLayoutToCreate` and `ArenaAlreadyLive` are all
-unreachable through this entry point, because `tf_tree::open()` is
-`Open::new().open()` and `Open::new()`'s defaults are read-only plus
+**Four** of `OpenError`'s six variants are *not* in that table and should not
+be: `Build`, `ReadOnlyCannotCreate`, `NoLayoutToCreate` and `ArenaAlreadyLive`
+are all unreachable through this entry point, because `tf_tree::open()` is
+`Open::new().open()` and `Open::new()` defaults to read-only, which implies
 `CreatePolicy::Never` ([`0019`](./0019-one-binary-and-topology-you-can-wait-for.md)
-§2a). Fork poisoning is not in it either, and that is worth stating because it
+§2a states the rule; the default itself is recorded in that record's header and
+on `Open::new`'s doc comment). Each of the four is produced only inside a
+create-or-take-over arm that `Never` does not reach — `Build` by
+`builder.build_shared(...)` at `open.rs:547-553`, which is the one an earlier
+revision of this paragraph missed while calling the list exhaustive. Fork poisoning is not in it either, and that is worth stating because it
 is easy to assume otherwise: poisoning marks handles a child *inherited*, and a
 fresh `tf_tree::open()` in that child is an ordinary attach that succeeds —
 which is precisely the remedy `docs/PHASE3.md` §8 tells a Python user to
