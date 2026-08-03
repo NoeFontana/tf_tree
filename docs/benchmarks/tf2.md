@@ -1126,28 +1126,78 @@ That is deliberately generous to tf2 and is **not** what a deployed node pays:
 `mp_bench` says so in its own output ("this tf2 column is a FLOOR ... but no
 transport"). This is the run that pays it — one publisher, real DDS, the
 container's RMW, [`PHASE4.md`](../PHASE4.md) §5.2's QoS, 4 consumers, 100 Hz,
-100 ms query lag, 3 s warm-up discarded, 10 s measured, both arms on
-stock defaults.
+100 ms query lag, 3 s warm-up discarded, **15 s measured** (`SECONDS_MEASURED`;
+every `.out` in the run records `measured_s 15.0`), both arms on stock defaults.
 
 | arm | procs | consumers | svc p50 | svc p99 | svc p99.9 | CPU %/consumer | PSS |
 |---|---|---|---|---|---|---|---|
-| `tf2.processes` | 4 | 4 | 4.16 µs | 16.13 µs | 28.03 µs | 0.012% | **63.02 MiB** |
-| `tf2.composed` | 1 | 4 | 1.58 µs | 7.90 µs | 17.79 µs | 0.003% | 24.02 MiB |
-| `tf_tree.composed` | 1 | 4 | **0.83 µs** | 8.70 µs | **11.97 µs** | 0.004% | 24.81 MiB |
+| `tf2.processes` | 4 | 4 | 2.59 µs | 8.64 µs | 12.16 µs | 2.968% | 63.15 MiB |
+| `tf2.composed` | 1 | 4 | 1.43 µs | 6.21 µs | 10.50 µs | 0.644% | **24.04 MiB** |
+| `tf_tree.composed` | 1 | 4 | **0.77 µs** | **3.62 µs** | **6.18 µs** | 0.656% | 24.76 MiB |
+| `tf_tree.processes` | 5 | 4 | 0.90 µs | 8.96 µs | 16.90 µs | **0.725%** | 69.51 MiB |
+
+`procs` is the count the tool prints, so `tf_tree.processes` reads **5** and not
+`4+1`: the bridge is a process an operator supervises and it is counted like
+one.
 
 Against the ordinary ROS deployment (`tf2.processes`, one listener per node):
-**5.0x on p50, 2.3x on p99.9, 2.5x on memory.** CPU per consumer is at the
-resolution floor for all three arms at this consumer count — 0.003–0.012% of a
-core — so the earlier "4.7x on CPU" reading was over-read from three significant
-figures of a number near zero, and is withdrawn. `just contended-scaling`'s CPU
-column is the one with room to say something.
+**3.4x on p50** for the composed arm (2.59 / 0.77) and **4.1x on CPU** for the
+multi-process one (2.968 / 0.725). The multi-process arm's own p50 ratio is
+2.9x (2.59 / 0.90), and it is the weaker number for the reason two sections
+below: on this unpinned host that arm's p50 is wake-from-idle-dominated.
+
+**The 4.1x is the conservative pairing and is quoted deliberately.** It divides
+the *lowest* of the four `tf2.processes` CPU samples by the tf_tree row, so the
+arm being argued against gets its best run. The medians of the same four samples
+give 4.7x (3.384 / 0.7245). Take 4.1x as the floor of a one-host, four-run
+estimate rather than as the measurement.
+
+One run of four, all on this host within the hour; the row-to-row spread is in
+the CPU column and it is one-sided. `tf2.processes` measured
+2.968 / 3.064 / 5.163 / 3.703 %/consumer across the four — a 74 % spread;
+`tf_tree.processes` measured 0.725 / 0.724 / 0.728 / 0.710, a 2.5 % one. The tf2
+arm's variance is its four listener threads competing for four cores with the
+publisher; the tf_tree arm has one thread doing that work and it shows.
+
+**Two corrections to the previous version of this table, both mine and both
+changing what it says.**
+
+*The CPU column was measuring a sleeping thread.* `measure.hpp` read
+`/proc/self/schedstat`, which is the **main thread's** file — `mp.rs`'s
+`self_cpu_ns` says so in its own doc comment and sums `/proc/self/task/*`
+instead, and this header, which describes itself as a mirror of `mp.rs`, did
+not. Every arm here does its work on other threads. Measured on this host, two
+threads burning 4.004 s of CPU over a 2.003 s window moved
+`/proc/self/schedstat` by 0.000336 s. That is where "CPU per consumer is at the
+resolution floor for all three arms — 0.003–0.012%" came from: not a floor, an
+instrument pointed at the wrong thread. The withdrawal of the old "4.7x on CPU"
+reading is itself withdrawn; the column now reads 0.64–2.97% and 4.1x is
+measured.
+
+The replacement is `CLOCK_PROCESS_CPUTIME_ID`, not `mp.rs`'s task sum, because
+the task sum is a sum over **live** tasks and every consumer here reads its
+second sample after joining its query threads — so their CPU is subtracted and
+the `uint64_t` difference underflows. That was found in the field, in an attach
+process that printed `cpu_ns 18446744073701835266`. The two agree to 0.2 ms
+while the threads are alive (1.9481 s against 1.9479 s) and diverge completely
+once one exits (8.4117 s against 0.0004 s). **`mp.rs` carries the same latent
+hazard and has not been touched**; whether it is reachable there is a question
+for that harness.
+
+*The fourth row exists.* See below.
 
 `tf2.composed` is in the table because without it the comparison is a strawman:
 it is tf2's *best* case, one listener shared by four threads in one process.
-tf_tree leads it 1.9x at p50 and 1.5x at p99.9 at comparable memory — and
-**trails it at p99**, 8.70 µs against 7.90, which is a 4-core host with three
-runnable arms rather than a property of either engine, and is left in the table
-rather than dropped.
+Against it `tf_tree.composed` leads at every percentile in the table:
+**1.9x at p50** (1.43 / 0.77), **1.7x at p99** (6.21 / 3.62) and **1.7x at
+p99.9** (10.50 / 6.18), at comparable memory.
+
+> **This paragraph used to say tf_tree "trails it at p99, 8.70 µs against 7.90"
+> and led "1.5x at p99.9", and neither number is in the table above it.** They
+> were the previous revision's row, kept when the row was replaced — a
+> comparison stated against measurements the document had already deleted. All
+> three ratios above are recomputed from the two rows as printed. Where
+> `tf_tree.processes` does lose is stated below; it is not this.
 
 Both arms are the same executable with a different `--mode`, so the schedule, the
 query set, the warm-up window and the measurement code are literally the same
@@ -1155,14 +1205,122 @@ code. The publisher plan, the bridge's topology config and the query set are all
 *generated* from one workload entry, so §9.3's "identical data" is structural
 rather than promised.
 
-**What this comparison does not have, and why.** There is no multi-process
-tf_tree arm. `tft_bridge_create` builds its arena with `TreeBuilder::build()` —
-a **heap** arena — so no second process can attach to what the bridge fills.
-That is the arm the project's central claim is about, and closing it is
-[`0015`](../decisions/0015-the-bridge-fills-a-shared-arena.md), a draft decision
-record: `tft_bridge_options` gains an optional `arena_name` and the bridge
-becomes an ordinary producer of the arena Phase 2 already specified. The report
-prints this gap above its own table on every run until then.
+#### The fourth arm — `tf_tree.processes`
+
+Every version of this document before this one said there was no multi-process
+tf_tree arm, because `tft_bridge_create` built a **heap** arena no second process
+could attach to, and `dds_report` printed that gap above its own table on every
+run. [`0015`](../decisions/0015-the-bridge-fills-a-shared-arena.md) closed it:
+one `bench_consumer --mode tf_tree_bridge` process publishes its arena under
+`$TF_TREE_NAME`, four `--mode tf_tree_attach` processes join it read-only with
+`tft_tree_open()`, and none of them subscribes to `/tf`. It is §9.1's actual
+sentence — *"one bridge plus N `tf_tree` consumers"* — and it is the arm this
+project's central claim is about.
+
+**The bridge's cost is inside the row, not beside it.** The bridge process emits
+the same stats block as every other process in the arm with `consumers 0`, and
+the aggregator sums CPU and PSS across an arm and divides by the summed consumer
+count. So the 0.725% above is the whole arm, bridge included, amortized over the
+four consumers it serves. The breakdown over a 15 s window:
+
+| | fixed | per consumer | 4 consumers | 16 consumers (extrapolated) |
+|---|---|---|---|---|
+| `tf2.processes` CPU | — | 0.445 s | 1.78 s | 7.12 s |
+| `tf_tree.processes` CPU | 0.362 s (bridge) | 0.0186 s | 0.436 s | 0.66 s |
+
+**A marginal tf_tree consumer costs about 24x less CPU than a marginal tf2 one**
+(0.0186 s against 0.445 s), and the bridge's 0.362 s is paid once whatever N is.
+That is `PROJECT.md`'s O(1)-in-consumers argument, measured end to end over a
+real DDS for the first time. Break-even against tf2 is at roughly one consumer:
+the bridge costs less than a single tf2 listener does.
+
+**Every figure in this section is one run of four processes on one host**, and
+both means above are means of four. Two significant figures is what that
+supports; the ratio is "about 24x", not 23.9x, and the break-even is "about one
+consumer", not a number with a decimal point in it. The spread that justifies
+the caution is in the CPU column above.
+
+**Where it is worse, at N = 4.** Two places. The previous revision of this
+section named only the first, while its own table showed both:
+
+*Memory.* 69.51 MiB against 63.15. The arena is 1.3 MiB and shared; what
+dominates is that each of the five processes carries an rclcpp node and a DDS
+participant.
+
+> **A per-consumer PSS figure does not compare across these two arms, and this
+> paragraph used to be built out of one.** It divided each arm's total by its
+> consumer count and subtracted — "13.66 MiB against tf2's 15.79, a 2.13 MiB
+> saving" — which is confounded in the flattering direction by construction.
+> PSS divides each shared page by the number of processes mapping it, and these
+> arms map from a different number of processes: 4 for `tf2.processes`, 5 for
+> `tf_tree.processes`. The identical rclcpp text is therefore charged at S/4 to
+> a tf2 consumer and S/5 to a tf_tree one **before any architectural difference
+> exists**, and the quotient credits tf_tree with the difference. The totals are
+> exact and fair — PSS sums correctly across processes, which is the whole
+> reason this suite reports it — so the extrapolation has to come from them.
+
+Fit `total(P) = P·private + shared` to each stack's two arms, `P` being the
+process count, and read the marginal consumer off `private`:
+
+| | composed, P = 1 | processes | `private` | `shared` |
+|---|---|---|---|---|
+| `tf2` | 24.04 MiB | 63.15 MiB, P = 4 | (63.15 − 24.04)/3 = **13.04 MiB** | 24.04 − 13.04 = 11.00 MiB |
+| `tf_tree` | 24.76 MiB | 69.51 MiB, P = 5 | (69.51 − 24.76)/4 = **11.19 MiB** | 24.76 − 11.19 = 13.57 MiB |
+
+A marginal consumer therefore saves **≈1.85 MiB**, not 2.13, and the crossover —
+where `N·13.04 + 11.00` meets `(N+1)·11.19 + 13.57` — is at
+`(24.76 − 11.00)/1.85` ≈ **7.4 consumers**, not 7. This row is on the wrong side
+of it either way. **Treat both as approximate and single-run**: the fit has two
+points per stack and its `private` term is not purely per-process, because a
+composed process hosts four query threads where a `.processes` one hosts a
+single consumer, so per-consumer thread cost leaks into it. What the fit is good
+for is the direction and the order of magnitude, and both say the same thing the
+quotient did — this workload does not reach the crossover — with the thumb taken
+off the scale.
+
+The saving per consumer is small here because `robot` has 23 edges, so the tf2
+`Buffer` this replaces is itself small; a tree with thousands of edges of history
+moves that number and this one does not measure it.
+
+*Tail latency, on this host.* `tf_tree.processes` also loses to `tf2.processes`
+at **p99 (8.96 µs against 8.64)** and at **p99.9 (16.90 against 12.16)** in the
+table above. [`PHASE5.md`](../PHASE5.md) §9.3 requires that to be in the same
+table and not a footnote, so it is stated here rather than left for a reader to
+derive: memory is not the only column this arm is behind in. The section below
+argues those two numbers are the unpinned host's idle behaviour rather than the
+engine — and that argument is *why they need pinned hardware before anyone
+quotes them*, in either direction.
+
+The attach consumers also hold a full rclcpp node **on purpose**, subscribed to
+nothing. Dropping it would take ~14 MiB per process out of the row and measure
+"no rclcpp" rather than "no `/tf`", which is not the claim.
+
+#### The `svc` column of both `.processes` arms is wake-from-idle-dominated
+
+`tf_tree.processes` p50 measured **5.89 µs** on the first run of the day and
+**0.90, 0.95, 1.02 µs** on three consecutive ones. That is not the engine. The
+slow run's distribution is bimodal — p10 0.79 µs, 18.1% of samples under 1 µs,
+p50 5.89, p75 10.05 — which is the shape of a thread waking a cold core, not of
+a slower lookup.
+
+It was isolated rather than assumed. Same bridge, same **shared** arena, same
+rate, same queries, but the four query threads in **one** attach process instead
+of four — so the process is never idle — measured **1.00 µs p50** against
+`tf_tree.composed`'s 0.78 on a private heap arena. That rules out the memfd
+mapping, the page size and the attach path, and leaves the host's idle
+behaviour. The irony is exact: **the arm is penalised for the consumer doing so
+little that its core has time to go to sleep.** `tf2.processes` swings the same
+way and less far (2.59 → 11.07 µs across these runs) because a tf2 listener
+process is never idle — it is deserializing `/tf` the whole time.
+
+Both `.processes` rows' latency percentiles therefore need the pinned-hardware
+runbook below before they are quoted. **The `tf_tree.processes` CPU and PSS
+columns are steady across all four runs — 0.710–0.728 %/consumer, a 2.5 %
+spread — and are what this arm is for.** The `tf2.processes` CPU column is
+*not*: 2.968–5.163 across the same four, a 74 % spread, which is why the 4.1x
+above is quoted from the pairing that flatters tf2 and labelled conservative.
+This sentence used to say both columns were steady across all four runs, and
+the table two sections up refutes it.
 
 #### A bridge defect this harness found — and fixed
 
@@ -1261,9 +1419,18 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
   path additionally slides the queried window under a fixed stamp sweep, so it
   needs the moving-window handling `contended_scaling` has and `tf2_scaling` does
   not. Expect it to hurt both engines; the question is by how much each.
-* **tf_tree across processes over DDS.** `just dds-bench`'s tf_tree arm is a
-  composed container, because `tft_bridge_create` builds a heap arena. See the
-  transport section above; the fix is a decision record, not a benchmark.
+* ~~**tf_tree across processes over DDS.**~~ **Done** — `just dds-bench`'s
+  fourth arm, above: one bridge process publishing a shared arena and four
+  processes attached to it, 0% failures, with the bridge's CPU and PSS inside
+  the row. What is *not* done is its latency on pinned cores; both
+  `.processes` arms' `svc` percentiles are wake-from-idle-dominated on this
+  host, and the section above measures why rather than asserting it.
+* **The memory crossover, measured rather than extrapolated.** At N = 4
+  `tf_tree.processes` costs more PSS than `tf2.processes`, and the two-parameter
+  fit above puts the crossover near N = 7.4 — approximate, single-run, and from
+  two points per stack. Nothing has run it at N = 16, which is the count
+  [`PHASE5.md`](../PHASE5.md) §12 criterion 4 is stated at, and running it is
+  the only thing that settles the number.
 * **A second RMW.** `docker/tf2` carries one, so the DDS numbers' sensitivity to
   the middleware vendor is unmeasured. [`PHASE4.md`](../PHASE4.md) §0.0 already
   records the missing second RMW.

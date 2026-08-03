@@ -1069,12 +1069,17 @@ ros-test:
 # `tf2_ros::TransformListener` consumers against one publisher over the container's
 # real RMW, and the same query set through the ingest bridge.
 #
-# **It prints, every run, the arm it cannot measure and why**: the bridge builds a
-# heap arena, so there is no multi-process tf_tree arm until a decision record
-# gives it a shared one. §9.3 is normative that an honest gap beats a favourable
-# number nobody trusts.
+# **Four arms since `docs/decisions/0015`**, where there were three: the fourth is
+# one bridge process publishing a shared arena plus N processes attached to it
+# read-only, which is §9.1's actual sentence and the arm this project's central
+# claim is about. It used to be unconstructible — the bridge built a heap arena —
+# and the report printed that gap above its own table on every run instead. What
+# replaced the disclosure is an accounting rule: the bridge process reports
+# `consumers 0`, so its CPU and PSS land in the arm it serves rather than beside
+# it. `crates/tf_tree_bench/tests/dds_report_aggregate.rs` is what pins both.
 #
-# Env: WORKLOAD, CONSUMERS, SECONDS_MEASURED, WARMUP, HZ.
+# Env: WORKLOAD, CONSUMERS, SECONDS_MEASURED, WARMUP, HZ, BRIDGE_LINGER,
+# TF_TREE_NAME.
 #
 # N tf2 listeners over DDS against the bridge, on identical data and QoS.
 dds-bench *ENV:
