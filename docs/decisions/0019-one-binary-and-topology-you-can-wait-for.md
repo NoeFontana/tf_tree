@@ -2,7 +2,49 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** _(filled in as work lands)_
+**Implementation:** **steps 1–5 have landed. Steps 6–7 — the daemon — have not,
+and are not scheduled.**
+
+- **Steps 1–2** — **#139**, `feat/0019-await-and-ro-create`.
+  `OpenError::ReadOnlyCannotCreate`, checked before `RuntimeDir::resolve()`, with
+  `Open::new()`'s `create` default moved to `CreatePolicy::Never` in the same
+  change; `Open::await_open(Duration)`, `Tree::await_frames([&str; N], Duration)`
+  and `AwaitError`. `tf_tree_cli`'s `--create` was **kept and given
+  `requires = "rw"`**, not deleted — step 1 offered both and the flag is what
+  `tf_tree serve` grows into. The same PR carries `Open::require_create` +
+  `OpenError::ArenaAlreadyLive`, which belongs to
+  [`0015`](./0015-the-bridge-fills-a-shared-arena.md)'s step 0 rather than to any
+  step here; it rode along because it rewrites the same twenty lines of `Open`.
+- **Step 3** — split, and both halves are done. `RUNBOOK.md`'s
+  `FrameNotDeclared` row — the live defect *Context* names — was fixed in
+  **#137**, the PR that added this document, and `PHASE2.md` §13's runbook row
+  was rewritten with it. `FrameNotDeclared`'s own message stopped naming `tf_treed`
+  in **#139** (`crates/tf_tree_core/src/error.rs`), pinned by
+  `crates/tf_tree/tests/await_frames.rs`, which asserts the rendered description
+  offers `await_frames` as the remedy and does **not** contain the string
+  `tf_treed`.
+- **Steps 4–5** — **#137**. `PHASE2.md` §9's superseding amendment and §0.0's
+  rows, `PROJECT.md`'s Phase 2 notes, `PHASE4.md`'s two references, `0009`'s §9
+  amendment, `docs/decisions/README.md`, and `0015` moved to `ready`. `rg
+  'tf_treed'` returns only references that name this record or describe it in the
+  past tense.
+- **Steps 6–7** — **not built.** `tf_tree serve`, `--metrics-port` and the
+  systemd/container examples. §4 puts them outside 0.1.0 deliberately, and the
+  plan's closing sentence is the disposition: *"if steps 1–3 remove the pain,
+  they may never be urgent, which is the outcome this record is shaped to
+  allow."* Nothing in the workspace has grown a `serve` subcommand, and nothing
+  is waiting on one.
+
+**So this record stays `ready` and is not moved to `implemented`.**
+[`README.md`](./README.md) defines `implemented` as *"code shipped; PRs linked;
+document frozen"* and makes it the immutability lock: a document marked
+implemented is never edited to match reality, only superseded. Two of the seven
+steps have shipped no code, and this record deliberately declines to say whether
+they ever will — so freezing it now would mean that whoever eventually builds
+`tf_tree serve` finds its specification in a document they may not amend, for
+work this record scheduled and never cancelled. `ready` costs nothing and says
+the true thing: the *Implementation plan* is still a work breakdown, and steps
+6–7 are the part of it nobody has picked up.
 
 ## Context
 
@@ -157,8 +199,10 @@ public API for two numbers.
 Both are convenience on the facade over a poll loop; **no arena primitive, no
 notification mechanism, no futex** — `0018`'s argument applies unchanged and with
 more force, because topology settles once at startup. A bounded backoff is
-adequate — `MIN_BACKOFF` 200 µs doubling to `MAX_BACKOFF` 4 ms, the rendezvous'
-own (`crates/tf_tree_ipc/src/open.rs:190-193`) — and the budget is a `Duration`
+adequate — `MIN_BACKOFF` 200 µs doubling to `MAX_BACKOFF` 4 ms, the same two
+values the rendezvous picked (`crates/tf_tree_ipc/src/open.rs:200`, `:203`),
+restated in the facade rather than shared with it for the reason in the
+paragraph above — and the budget is a `Duration`
 the caller passes, matching `Open::timeout` rather than introducing this
 workspace's first public `Instant` deadline. `await_open` clamps `Open::timeout`
 to what is left, so one held-but-unreachable attempt cannot overrun the whole

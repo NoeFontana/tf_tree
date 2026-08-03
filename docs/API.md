@@ -755,16 +755,17 @@ authorized by this document alone.
 | 10 | `NS_PER_STEP_ESTIMATE` re-derived when `0013` re-baselines | Python | §3.4 | **landed** — 55 → **64 ns/step**, in `0013`'s re-baseline commit as §3.4 requires. `PHASE3.md` §6.1's amendment is the single account of the measurement and of the one element it moves, pinned by a `const` assertion in `tf_tree_py::tree`; nothing here or in §3.4 restates it. `0013`'s two threshold questions stay open — this row is the constant, not the gate |
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed, and now reachable on real data** — `tf_tree_cli`; fires only on tag 0 and only on a run of at least 8 consecutive rejected arrivals (a threshold this implementation chose, not one §5.3 states), skips naming the tag otherwise, and does not demote `TFT018`. `doctor` gained two recording sources — `--from-bag <recording.mcap>` and `--from-file <index.tft>` — and `TFT019`/`TFT018` **run on the first and skip on the second**: the skip is re-keyed from liveness onto `checks::PushStream`, because a ring holds only the pushes `SampleRing::push` accepted, so an arena of any kind (live, frozen, or bag-built and §3.1-sorted) would have passed both checks unconditionally. `PHASE5.md` §6's last `TFT019` amendment records that its own predicted fix was the wrong one and why |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
-| 13 | `tft_bridge_options::arena_name` + `TFT_ERR_ARENA_UNAVAILABLE` | C | [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) | **the ABI half landed** — `arena_name` appended under §3.6's `struct_size` prefix rule and `TFT_ERR_ARENA_UNAVAILABLE` added to the frozen header, ABI minor 4 → 5. A NULL `arena_name` is the private heap arena every pre-`0.5` caller already had; a non-NULL one is `tf_tree::Open` with `require_create(true)`, and a shared arena that cannot be had is a startup refusal with **no heap fallback**. `0015` steps 3–7 and its `atfork` test are outstanding, and the record says so under *Invariants to maintain* |
+| 13 | `tft_bridge_options::arena_name` + `TFT_ERR_ARENA_UNAVAILABLE` | C | [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) | **landed** — `arena_name` appended under §3.6's `struct_size` prefix rule and `TFT_ERR_ARENA_UNAVAILABLE` added to the frozen header, ABI minor 4 → 5. A NULL `arena_name` is the private heap arena every pre-`0.5` caller already had; a non-NULL one is `tf_tree::Open` with `require_create(true)`, and a shared arena that cannot be had is a startup refusal with **no heap fallback**. An earlier revision of this cell said "the ABI half landed" and that `0015` steps 3–7 were outstanding; all eight of that record's steps have since landed (#142, #143, and step 7's `PHASE4.md` §5.8 half). What is still outstanding there is the `atfork` test its *Invariants to maintain* clause demands and §9.2's N = 1…16 curve for the new benchmark arm — **neither of which is C API surface**, so neither holds this row open |
 
-**Ten of thirteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10 and 11.**
-The three that have not are 6, 12 and 13, and none is merely unscheduled: row 6
-is recorded-not-built on purpose, row 12 is gated by D21, and row 13's ABI half
-has landed while the rest of `0015` has not. Two of the ten that
-landed — 3 and 10 — carry a caveat worth keeping, so they are in the list below
-as well. (This count is re-taken from the table above rather than carried
-forward. An earlier revision said "ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in
-part", which named eight rows and called them ten.)
+**Eleven of thirteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11 and
+13.** The two that have not are 6 and 12, and neither is merely unscheduled: row
+6 is recorded-not-built on purpose and row 12 is gated by D21. Two of the eleven
+that landed — 3 and 10 — carry a caveat worth keeping, so they are in the list
+below as well. (This count is re-taken from the table above rather than carried
+forward, every time it changes. It has been wrong twice: an early revision said
+"ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named eight rows and
+called them ten; the revision after that kept row 13 out of the count after its
+record's remaining steps had landed.)
 
 - **Row 3 has landed in full, and its benchmark row reports a failing gate.**
   `embedding_cross_crate` measures **1.250–1.254×** against §9.2's 5% criterion.
