@@ -515,18 +515,37 @@ amendments to §5.8, §5.9 and §5.3 and are written where those sections are.
 - **`find_package(tf_tree CONFIG)` works from `colcon`, and the prebuilt path is
   the one that matters.** §4.4's "a ROS shop should not have to install rustup
   first" is exercised for real: `ros/build.sh` builds
-  `libtf_tree_c.a --features bridge`, installs the CMake package with
+  `libtf_tree_c.a --features bridge,shm`, installs the CMake package with
   `TF_TREE_PREBUILT_DIR` pointing at it, and colcon consumes the prefix. It
   links the **static** target deliberately — a rustc cdylib carries no
   `DT_SONAME`, so linking the shared one records the build-time absolute path in
   the package's `DT_NEEDED` and the colcon install tree cannot be moved.
 
-- **Two `.a`-shaped traps in the build, both silent.** `--features bridge` is
-  default-off, so a stale archive links with a wall of undefined `tft_bridge_*`
-  symbols two minutes into a colcon build; `ros/build.sh` checks for the symbol
-  up front. And the check itself was wrong on its first try: `nm … | grep -q`
-  under `set -o pipefail` reports failure when the symbol **is** present, because
-  `grep -q` exits early and `nm` dies of SIGPIPE.
+- **Three `.a`-shaped traps in the build, all silent.** Both features are
+  default-off and they fail in different places, which is why `ros/build.sh`
+  makes **one symbol check per feature** and says which one is missing rather
+  than "rebuild it".
+
+  1. Without `--features bridge` a stale archive links with a wall of undefined
+     `tft_bridge_*` symbols two minutes into a colcon build; the
+     `tft_bridge_offer` check catches it up front.
+  2. The check itself was wrong on its first try: `nm … | grep -q` under
+     `set -o pipefail` reports failure when the symbol **is** present, because
+     `grep -q` exits early and `nm` dies of SIGPIPE.
+  3. `TFT_HAVE_SHM` is not a macro the build can be asked for; it is one the
+     *artifact* answers. `tf_tree.h` hides `tft_tree_open` behind it and nothing
+     defined it, so `docs/decisions/0015`'s consumers could reach the entry point
+     they exist to call only by hand-typing the macro against an archive that may
+     not have the feature in it — compiles, then fails at link in the consumer,
+     naming a symbol the consumer never wrote. `crates/tf_tree_c/CMakeLists.txt`
+     now probes each resolved library with `nm` and propagates the answer per
+     target through `tf_treeConfig.cmake.in`; the `tft_tree_open` check in
+     `ros/build.sh` is the same question asked one step earlier, where the fix is
+     "rebuild with `shm`" rather than a `#error` out of `test_shared_arena.cpp`.
+     **Per target, and that is load-bearing**: one probe answering for both
+     exported targets is how a `bridge,shm` `.a` beside a `bridge`-only `.so` in
+     one `TF_TREE_PREBUILT_DIR` produced a package that announced
+     `TFT_HAVE_SHM=1` and then failed to link the shared target.
 
 ### What review found in the `rclcpp` half, and what it cost
 

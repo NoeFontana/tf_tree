@@ -158,33 +158,45 @@ TEST(BridgeNodeTest, an_unknown_authority_policy_is_refused_rather_than_defaulte
     std::invalid_argument);
 }
 
-/// An `arena_name` that is entirely whitespace is refused rather than published.
+/// An `arena_name` whose whitespace an operator cannot see is refused rather
+/// than published.
 ///
 /// This is the *only* content rule this layer applies to `arena_name`, and the
-/// reason is the one `BridgeNode`'s constructor gives at the parameter: empty
-/// means "no shared arena", so `""` and `" "` look identical in a launch file
-/// and mean opposite things, and by the time `" "` reaches C it is an ordinary
-/// valid single-component name that `tf_tree_ipc::ArenaName` accepts. Every
-/// other malformed name — too long, `../escape`, a NUL — is the ABI's to refuse
-/// and it does, with the name in the message.
+/// reason is the one `BridgeNode`'s constructor gives at the parameter: a
+/// consumer selects the arena by exact name, so two names that read the same in
+/// a launch file and resolve to different rendezvous are a consumer that waits
+/// forever with nothing in any log to say why. Both cases below are that:
+/// `""` versus `"  "` is "private arena" versus a published rendezvous nobody
+/// will guess, and `" spaced"` versus `"spaced"` is two arenas. `ArenaName`
+/// accepts all three of the non-empty ones — they are ordinary valid
+/// single-component names — so the ABI cannot make this call. Every other
+/// malformed name — too long, `../escape`, a NUL — is the ABI's to refuse and it
+/// does, with the name in the message.
 ///
-/// **Mutant:** delete the whitespace check in `BridgeNode`'s constructor. `" "`
-/// then reaches `tft_bridge_create`, which accepts it as a name, and the node
+/// **Mutant:** delete the whitespace check in `BridgeNode`'s constructor. Both
+/// names then reach `tft_bridge_create`, which accepts them, and the node
 /// constructs — nothing throws and `EXPECT_THROW` fails. Applied; it dies.
 /// (Should the surrounding environment make the *arena* unbuildable, the throw
 /// becomes a `BridgeError` instead, which `EXPECT_THROW` also reports as a
 /// failure because the type does not match. The test cannot pass with the check
 /// gone.)
-TEST(BridgeNodeTest, an_all_whitespace_arena_name_is_refused_rather_than_published)
+///
+/// **Mutant:** narrow the check back to "entirely whitespace"
+/// (`find_first_not_of(...) == std::string::npos`). The `"  "` case still dies;
+/// the `" spaced"` case survives, which is exactly the gap this widening
+/// closed. Applied; the surrounded name fails.
+TEST(BridgeNodeTest, an_unseeable_whitespace_arena_name_is_refused_rather_than_published)
 {
-  EXPECT_THROW(
-    std::make_shared<tf_tree_ros::BridgeNode>(
-      with(
-        {
-          rclcpp::Parameter("topology_config", std::string(kTopology)),
-          rclcpp::Parameter("arena_name", std::string("  ")),
-        })),
-    std::invalid_argument);
+  for (const std::string & name : {std::string("  "), std::string(" spaced")}) {
+    EXPECT_THROW(
+      std::make_shared<tf_tree_ros::BridgeNode>(
+        with(
+          {
+            rclcpp::Parameter("topology_config", std::string(kTopology)),
+            rclcpp::Parameter("arena_name", name),
+          })),
+      std::invalid_argument) << "arena_name=\"" << name << "\" was not refused";
+  }
 }
 
 }  // namespace

@@ -165,15 +165,22 @@ forms all inherit it.
 > leave form 3 — the form this project dogfoods — unable to publish an arena at
 > all.
 >
-> One rule is added at the parameter layer and only one: an `arena_name` that is
-> **entirely whitespace** is refused there, because empty means "no shared arena"
-> and `""` and `" "` are the same string to an operator and opposite
-> instructions to the bridge, while to C `" "` is an ordinary valid
-> single-component name that `ArenaName` accepts (measured, not assumed). Every
-> other malformed name — empty, over 64 bytes, `../escape` — is
-> `tf_tree_ipc::ArenaName`'s to refuse, and it arrives as a `BridgeError` naming
-> the name. A narrower rule at the ROS layer would make `tf_tree_ros` reject
-> names `$TF_TREE_NAME` and `tf_tree serve` accept.
+> One rule is added at the parameter layer and only one: an `arena_name` carrying
+> **whitespace an operator cannot see** — entirely whitespace, or whitespace at
+> either end — is refused there. Empty means "no shared arena", so `""` and `" "`
+> are the same string to an operator and opposite instructions to the bridge;
+> and a consumer selects by exact name, so `" foo"` and `"foo"` are the same
+> string to that same operator and *different rendezvous*. To C all of the
+> non-empty ones are ordinary valid single-component names that `ArenaName`
+> accepts (measured, not assumed), and the difference appears in no log line on
+> either side. **Refused, not trimmed**: this layer refuses what the ABI cannot
+> see rather than rewriting what the operator wrote. Every other malformed name —
+> over 64 bytes, `../escape` — is `tf_tree_ipc::ArenaName`'s to refuse, and it
+> arrives as a `BridgeError` naming the name. (An *empty* name is not in that
+> list: `BridgeHandle` maps `""` to a NULL `arena_name`, the ABI's spelling for
+> "private heap arena", so `ArenaName` never sees one from this package.) A
+> narrower rule at the ROS layer would make `tf_tree_ros` reject names
+> `$TF_TREE_NAME` and `tf_tree serve` accept.
 
 ### What a consumer does
 
@@ -373,11 +380,16 @@ unchanged and must be tested, not assumed.
    > so no `find_package(tf_tree CONFIG)` consumer — this ctest, `ros/tf_tree_ros`,
    > `just cmake-check` — could call the entry point this record's consumers
    > exist to call, except by hand-typing the macro against an archive that may
-   > not have the feature in it. `crates/tf_tree_c/CMakeLists.txt` now probes the
-   > resolved library with `nm` and propagates `TFT_HAVE_SHM=1` through
+   > not have the feature in it. `crates/tf_tree_c/CMakeLists.txt` now probes
+   > **each** resolved library with `nm` — the `.a` and the `.so` separately —
+   > and propagates a per-target `TFT_HAVE_SHM=1` through
    > `tf_treeConfig.cmake.in`, and `ros/build.sh` builds `--features bridge,shm`
-   > and checks one symbol per feature. None of that is in the seven steps; it is
-   > what step 4 turned out to rest on.
+   > and checks one symbol per feature. The "each" is not decoration: one probe
+   > answering for both exported targets made a `TF_TREE_PREBUILT_DIR` holding a
+   > `bridge,shm` `.a` beside a `bridge`-only `.so` announce `TFT_HAVE_SHM=1` and
+   > then fail to link the shared target, which is the link-time failure the
+   > probe exists to convert into a compile-time one. None of that is in the
+   > seven steps; it is what step 4 turned out to rest on.
 5. **`dds_bench` grows a `tf_tree.processes` arm**; `bench_consumer` gains
    `--mode tf_tree_attach` that calls `tf_tree::Tree::open()` instead of hosting
    a bridge. — verified by `just dds-bench` reporting four arms at 0 % failure.

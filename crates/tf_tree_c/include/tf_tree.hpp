@@ -456,10 +456,19 @@ struct AbiCheck {
 /// behind any `#ifdef`.**
 ///
 /// The first version was a Meyers singleton called from `Tree::open()`, which is
-/// itself `#ifdef TFT_HAVE_SHM` — a macro nothing in the build defines. So the
-/// check was unreachable in every shipped configuration, and a comment above it
-/// claimed "it runs before `main`", which a function-local static does not do
-/// even when it is called. §3.6 asks for a static initializer; this is one.
+/// itself `#ifdef TFT_HAVE_SHM` — and at the time, a macro nothing in the build
+/// defined. So the check was unreachable in every shipped configuration, and a
+/// comment above it claimed "it runs before `main`", which a function-local
+/// static does not do even when it is called. §3.6 asks for a static
+/// initializer; this is one.
+///
+/// (`TFT_HAVE_SHM` is no longer undefinable-in-practice: `docs/decisions/0015`
+/// made `crates/tf_tree_c/CMakeLists.txt` probe each resolved library for
+/// `tft_tree_open` and put the macro on the exported target that has it, so a
+/// `find_package(tf_tree CONFIG)` consumer of an `shm` build gets `Tree::open()`
+/// without hand-typing anything. That is why this paragraph is history rather
+/// than a reason to think the entry point is unreachable — but it is still not a
+/// place to put a check, because a build without `shm` compiles this header too.)
 ///
 /// C++17 `inline` gives exactly one object across all translation units, so the
 /// check runs once per program rather than once per TU, without a `.cpp` file

@@ -31,6 +31,7 @@ or the CMake package's nm probe did not find tft_tree_open in it. See ros/build.
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -78,25 +79,55 @@ constexpr double kLidarX = 0.35;
 
 constexpr int64_t kStamp = 1'000'000'000LL;
 
-/// A runtime directory nobody else can be using.
+/// A runtime directory nobody else can be using, created once by `main` and
+/// remembered here.
 ///
 /// **Isolation here is by directory, not by name.** The rendezvous is selected
-/// by `(runtime dir, domain, name)`, and ctests in this package run in
-/// parallel — as does whatever a developer has running on the same machine. A
-/// unique `$TF_TREE_RUNTIME_DIR` makes every one of those unreachable from this
-/// process and this process unreachable from them, whatever names collide. The
-/// arena names below are unique as well, but that is belt and braces: it is the
-/// directory that makes a live robot arena on this host impossible to touch.
-std::string scratch_dir()
+/// by `(runtime dir, domain, name)`. The ctests in this package do *not* run in
+/// parallel — `colcon test` invokes ctest without `-j` and the run is strictly
+/// sequential — so the thing this defends against is not a sibling suite; it is
+/// every *other process* on the machine: a developer's `tf_tree serve`, a
+/// previous run of this binary that a signal killed before its cleanup, a robot.
+/// A unique `$TF_TREE_RUNTIME_DIR` makes all of those unreachable from this
+/// process and this process unreachable from them, whatever names collide.
+///
+/// **`mkdtemp`, not the pid.** A pid is reused, and the loser of that race is
+/// this test reading a directory somebody else's dead run left behind — which is
+/// precisely the state the isolation exists to rule out, arrived at through the
+/// mechanism meant to prevent it.
+const std::string & scratch_dir()
 {
-  return "/tmp/tf_tree_ros_shared-" + std::to_string(::getpid());
+  static const std::string dir = [] {
+      std::string tmpl = "/tmp/tf_tree_ros_shared-XXXXXX";
+      if (::mkdtemp(tmpl.data()) == nullptr) {
+        // `main` calls this before `InitGoogleTest`, so there is no test to fail
+        // and no reporter to fail it into. Nothing this suite asserts means
+        // anything without an isolated runtime directory.
+        std::perror("mkdtemp(/tmp/tf_tree_ros_shared-XXXXXX)");
+        std::abort();
+      }
+      return tmpl;
+    }();
+  return dir;
 }
 
-/// `<suffix>` under this process, inside `tf_tree_ipc`'s 64-byte limit and a
-/// single path component.
-std::string arena_name(const char * suffix)
+/// **One arena name for the whole binary**, set into `$TF_TREE_NAME` by `main`.
+///
+/// Every test here creates its bridge under this name and destroys it before
+/// returning, and the run is sequential (see `scratch_dir`), so one name is
+/// enough. One name also makes the negative half of
+/// `the_arena_name_parameter_is_what_a_separate_attach_finds` mean something
+/// beyond itself: it asserts that nothing is live under this name at that point
+/// in the run, so a test that leaked its bridge fails *there*, naming the arena,
+/// rather than leaving whatever runs next to fail on a name it could not create.
+/// gtest runs tests in declaration order and that one is declared first, so its
+/// own negative half cannot be polluted by the positive halves below it — which
+/// is the requirement — and the leak assertion covers whatever is added above it.
+///
+/// Inside `tf_tree_ipc`'s 64-byte limit and a single path component.
+std::string arena_name()
 {
-  return "rosarena-" + std::to_string(::getpid()) + "-" + suffix;
+  return "rosarena-" + std::to_string(::getpid());
 }
 
 rclcpp::NodeOptions with(std::vector<rclcpp::Parameter> params)
@@ -137,16 +168,28 @@ tft_tree * open_within(std::chrono::milliseconds timeout)
   }
 }
 
-/// `tft_tree_open` once, expecting failure — the negative half, which must not
-/// spend a timeout proving a rendezvous that was never published is absent.
-bool opens_now()
+/// `tft_tree_open` once, **returning its status** — the negative half, which
+/// must not spend a timeout proving a rendezvous that was never published is
+/// absent.
+///
+/// The status is returned rather than reduced to a bool so the caller can say
+/// *which* failure it expects. "The open failed" is satisfied by a bad handle
+/// argument, an ABI mismatch, or a fork-poisoned process, none of which is
+/// evidence that no arena was published. `tft_tree_open` collapses every join
+/// failure onto `TFT_ERR_INTERNAL` — the collapse `docs/decisions/0015`'s
+/// *Failure* section describes and gave `tft_bridge_create` a code of its own to
+/// escape — so "arena absent" and "runtime directory unusable" are still one
+/// code here and the assertion cannot separate them. What it does separate is
+/// that code from every *other* way this call can fail, which is where the
+/// negative half was previously satisfiable for free.
+tft_status open_status_now()
 {
   tft_tree * tree = nullptr;
-  if (tft_tree_open(&tree) != TFT_OK) {
-    return false;
+  const tft_status rc = tft_tree_open(&tree);
+  if (rc == TFT_OK) {
+    tft_tree_free(tree);
   }
-  tft_tree_free(tree);
-  return true;
+  return rc;
 }
 
 /// Assert the attached handle is looking at *this* topology, by reading the
@@ -175,14 +218,18 @@ void expect_the_topology_is_there(tft_tree * tree)
 
 /// **The crux: the parameter is load-bearing.**
 ///
-/// Two `BridgeNode`s differing in one parameter, with the same name in
-/// `$TF_TREE_NAME` for both, and the negative first so it cannot be polluted by
-/// the positive. Without `arena_name` nothing is reachable under that name;
-/// with it, the attach succeeds and sees the topology.
+/// Two `BridgeNode`s differing in one parameter, against the one name in
+/// `$TF_TREE_NAME`, and the negative first so it cannot be polluted by the
+/// positive. Without `arena_name` nothing is reachable under that name; with it,
+/// the attach succeeds and sees the topology.
 ///
 /// Running both halves against **one** name is the whole design. A negative
 /// half that used a different name would assert only that an unused name is
 /// unused, which is true of any implementation whatsoever.
+///
+/// **Declared first, deliberately** — see `arena_name()`. Its negative half is
+/// the file's leak assertion, and a leak assertion is worth nothing if the
+/// thing it would catch has already made the positive halves fail.
 ///
 /// **Mutant:** in `BridgeNode`'s constructor, ignore the parameter — read it
 /// and then overwrite it, `o.arena_name = "";`. That is the node-layer half of
@@ -192,16 +239,16 @@ void expect_the_topology_is_there(tft_tree * tree)
 /// Applied; it dies.
 TEST(SharedArenaTest, the_arena_name_parameter_is_what_a_separate_attach_finds)
 {
-  const std::string name = arena_name("param");
-  ASSERT_EQ(::setenv("TF_TREE_NAME", name.c_str(), 1), 0);
+  const std::string name = arena_name();
 
   // 1. Today's default: no `arena_name` at all. The arena is private to the
   //    bridge's own process and there is nothing under the name to find.
   {
     auto node = std::make_shared<tf_tree_ros::BridgeNode>(with({}));
-    ASSERT_FALSE(opens_now())
+    ASSERT_EQ(open_status_now(), TFT_ERR_INTERNAL)
       << "a bridge with no arena_name published a rendezvous under " << name
-      << ". §5.8's form 3 exists to need no memfd, no lock file and no participant slot.";
+      << ", or joining one failed for a reason other than its absence. §5.8's form 3 exists to "
+      << "need no memfd, no lock file and no participant slot.";
   }
 
   // 2. The same node, plus the parameter.
@@ -214,7 +261,7 @@ TEST(SharedArenaTest, the_arena_name_parameter_is_what_a_separate_attach_finds)
       << "no rendezvous appeared under " << name << " within 10 s, so the arena_name parameter "
       << "reached no further than the node. $TF_TREE_RUNTIME_DIR=" << scratch_dir();
 
-    expect_the_topology_is_there(tree);
+    ASSERT_NO_FATAL_FAILURE(expect_the_topology_is_there(tree));
     tft_tree_free(tree);
   }
 }
@@ -237,8 +284,7 @@ TEST(SharedArenaTest, the_arena_name_parameter_is_what_a_separate_attach_finds)
 /// both die.
 TEST(SharedArenaTest, form_3_publishes_the_arena_through_the_options_field)
 {
-  const std::string name = arena_name("form3");
-  ASSERT_EQ(::setenv("TF_TREE_NAME", name.c_str(), 1), 0);
+  const std::string name = arena_name();
 
   auto node = std::make_shared<rclcpp::Node>("tf_tree_shared_arena_form3");
   tf_tree_ros::BridgeOptions o;
@@ -253,7 +299,7 @@ TEST(SharedArenaTest, form_3_publishes_the_arena_through_the_options_field)
     << "no rendezvous appeared under " << name << " within 10 s, so BridgeOptions::arena_name "
     << "reached no further than this struct. $TF_TREE_RUNTIME_DIR=" << scratch_dir();
 
-  expect_the_topology_is_there(tree);
+  ASSERT_NO_FATAL_FAILURE(expect_the_topology_is_there(tree));
   tft_tree_free(tree);
 }
 
@@ -263,19 +309,37 @@ TEST(SharedArenaTest, form_3_publishes_the_arena_through_the_options_field)
 ///
 /// The refusal itself is the C ABI's and `bridge_shared.rs` pins its status and
 /// its message. What is only checkable here is that it survives the two layers
-/// above it — that `BridgeHandle`'s constructor turns a failing
-/// `tft_bridge_create` into a `BridgeError` instead of a half-built handle, on
-/// the ingest thread, where the exception has to cross a `std::promise` to be
-/// seen at all.
+/// above it: `create_bridge()`'s `tft_status` is what crosses the `std::promise`
+/// out of the ingest thread (`bridge_handle.cpp`'s `run`), and the constructor
+/// — on the *calling* thread, having joined — is what turns a non-`TFT_OK` into
+/// a `BridgeError` instead of returning a half-built handle. Neither half is
+/// visible from the ABI's own tests, and the exception never crosses a thread
+/// boundary; the status does.
+///
+/// **The assertion is on the code, not the type.** `docs/API.md` §1 R5 makes the
+/// `tft_status` the contract and the message a diagnostic, and
+/// `docs/decisions/0015`'s *Failure* section spends four paragraphs arguing that
+/// "another bridge holds this name" had to be distinguishable from "the runtime
+/// directory is unusable" and from a bug — which is what
+/// `TFT_ERR_ARENA_UNAVAILABLE` exists for. A test that pinned only the C++
+/// exception *type* let that whole argument be undone for free.
 ///
 /// **Mutant:** in `BridgeHandle::run`, publish `TFT_OK` through the promise
-/// regardless of what `create_bridge()` returned. Nothing throws and
-/// `EXPECT_THROW` fails. (`test_ingest.cpp` carries the same mutant against a
-/// bad config; this is the arena-ownership path reaching the same code.)
+/// regardless of what `create_bridge()` returned. Nothing throws and the
+/// `FAIL()` below fires. Applied; it dies. (`test_ingest.cpp` carries the same
+/// mutant against a bad config, and dies too; this is the arena-ownership path
+/// reaching the same code.)
+///
+/// **Mutant:** in `crates/tf_tree_c/src/bridge.rs`, collapse the shared-arena
+/// refusal back onto `TFT_ERR_INTERNAL` — `fn arena_unavailable` is the one
+/// funnel every such refusal goes through. A `BridgeError` still crosses the
+/// promise and is still caught, so a type-only assertion survives this
+/// untouched; `e.status()` does not. Applied; it dies, reporting the message
+/// (which is unchanged, and is the point: R5's diagnostic was never the thing
+/// that identified the fault).
 TEST(SharedArenaTest, a_second_bridge_on_a_held_name_refuses_to_start)
 {
-  const std::string name = arena_name("held");
-  ASSERT_EQ(::setenv("TF_TREE_NAME", name.c_str(), 1), 0);
+  const std::string name = arena_name();
 
   auto node = std::make_shared<rclcpp::Node>("tf_tree_shared_arena_held");
   tf_tree_ros::BridgeOptions o;
@@ -286,13 +350,20 @@ TEST(SharedArenaTest, a_second_bridge_on_a_held_name_refuses_to_start)
   tf_tree_ros::BridgeHandle first(node.get(), o);
 
   auto second_node = std::make_shared<rclcpp::Node>("tf_tree_shared_arena_held_2");
-  EXPECT_THROW(tf_tree_ros::BridgeHandle(second_node.get(), o), tf_tree_ros::BridgeError);
+  try {
+    tf_tree_ros::BridgeHandle second(second_node.get(), o);
+    FAIL() << "a second bridge on the held name " << name << " started instead of refusing";
+  } catch (const tf_tree_ros::BridgeError & e) {
+    EXPECT_EQ(e.status(), TFT_ERR_ARENA_UNAVAILABLE)
+      << "the refusal crossed the promise, but not as the code an operator can act on: "
+      << e.what();
+  }
 
   // And the first is still the one serving: a refusal that tore down the
   // incumbent's rendezvous would be worse than one that joined.
   tft_tree * tree = open_within(10s);
   ASSERT_NE(tree, nullptr) << "the refused second bridge took the first one's arena with it";
-  expect_the_topology_is_there(tree);
+  ASSERT_NO_FATAL_FAILURE(expect_the_topology_is_there(tree));
   tft_tree_free(tree);
 }
 
@@ -300,16 +371,22 @@ TEST(SharedArenaTest, a_second_bridge_on_a_held_name_refuses_to_start)
 
 int main(int argc, char ** argv)
 {
-  // **Before `rclcpp::init` and before any test**, because the ingest thread
-  // reads these when it creates the bridge and `setenv` is process-wide.
+  // **All three of these, before `rclcpp::init` and before any test**, because
+  // the ingest thread reads them when it creates the bridge and `setenv` is
+  // process-wide. `setenv` after `rclcpp::init` races every `getenv` in every
+  // rclcpp and RMW thread the init spawned, which is undefined behaviour and not
+  // the kind that announces itself; `TF_TREE_NAME` used to be set from inside
+  // three `TEST` bodies, which is exactly that. There is one name (see
+  // `arena_name()`) precisely so that it can be set here with the other two.
+  //
   // `$TF_TREE_DOMAIN` is pinned rather than inherited: it falls back to
   // `$ROS_DOMAIN_ID`, which colcon and a developer's shell both set, and a
   // rendezvous that moved with it would make this test's isolation depend on
   // somebody else's environment.
   const std::string dir = scratch_dir();
-  std::filesystem::remove_all(dir);
   ::setenv("TF_TREE_RUNTIME_DIR", dir.c_str(), 1);
   ::setenv("TF_TREE_DOMAIN", "0", 1);
+  ::setenv("TF_TREE_NAME", arena_name().c_str(), 1);
 
   ::testing::InitGoogleTest(&argc, argv);
   rclcpp::init(argc, argv);
