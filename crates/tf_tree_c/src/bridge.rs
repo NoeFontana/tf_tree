@@ -1799,9 +1799,22 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                 // that could drift from it.
                 set(&mut inner.strings.detail, &crate::error::last_message());
                 o.detail = ptr(&inner.strings.detail);
-                // **This arm has no test, and it is not for want of trying.**
-                // Reaching it needs the arena to refuse a write the pipeline
-                // approved, and on a private heap arena that cannot happen:
+                // **This arm has a test now, and it took a shared arena and a
+                // `fork()` to get one.** `crates/tf_tree_bench/tests/fork.rs`'s
+                // `a_forked_child_is_refused_by_every_bridge_entry_point`
+                // reaches it through the third bullet below — the one this
+                // comment called "one refactor away from being reachable" — and
+                // asserts `action = TFT_BRIDGE_REJECTED` with
+                // `out.status = TFT_ERR_CHILD_DETACHED` while the return value
+                // is `TFT_OK`. `docs/decisions/0015`'s *Invariants* clause is
+                // what demanded it; that record's own description of this arm
+                // was wrong in two ways and carries the correction.
+                //
+                // The rest of this comment is why it stayed untested for so
+                // long, and it is still the right account of every *other* way
+                // in: reaching this arm needs the arena to refuse a write the
+                // pipeline approved, and on a private heap arena that cannot
+                // happen:
                 //
                 // * `PushError::NonMonotonicStamp` is dominated by the clock
                 //   guard, and `docs/decisions/0011` made that argument
@@ -1822,8 +1835,9 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                 //   `ingest.declared()` to disagree about an edge, and they are
                 //   built from the same object in `tft_bridge_create`.
                 //
-                // Deliberately kept anyway: the third case is one refactor away
-                // from being reachable, and it is exactly the failure a
+                // Deliberately kept anyway — and the third case turned out to
+                // need no refactor at all, only an arena a second process could
+                // attach to and a `fork()`. It is exactly the failure a
                 // deployment would present as "the bridge says applied and the
                 // lookups say no data". Breaking that invariant on purpose is
                 // how `a_tf_prefix_rewrites_the_declared_topology_and_the_arena

@@ -37,17 +37,18 @@ implemented document is never edited to match reality, only superseded — and t
 things this record is answerable for are still unbuilt. Neither is worth a
 superseding record; both are worth naming rather than dropping:
 
-1. **The fork test the *Invariants to maintain* clause demands.** That clause
-   makes `0005` step 9's `atfork` rules apply to the bridge and says they "must
-   be tested, not assumed"; the note under it writes out exactly what the test
-   has to be and which half of it `fork_child`'s `owned` mode already covers.
-   It is in none of the four PRs above, and the reason is a constraint rather
-   than an oversight: it needs a **fourth mode** of
-   `crates/tf_tree_bench/src/bin/fork_child.rs` (today `api`, `drop`, `owned`)
-   behind an optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
-   `tf_tree_bench` — a crate-graph change, which is why it is its own commit and
-   not a rider on any of these. Until it lands the clause is an assumption, which
-   is the thing it forbids.
+1. ~~**The fork test the *Invariants to maintain* clause demands.**~~ **Landed
+   in #146**, as its own commit for the reason this item gave: it needed a
+   fourth mode of `crates/tf_tree_bench/src/bin/fork_child.rs` behind an
+   optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
+   `tf_tree_bench`, which is a crate-graph change. The *Invariants* clause is
+   no longer an assumption.
+
+   It also found this record wrong twice about the thing it was demanding — the
+   panic guard is not the mechanism, and two of the three entry points do not
+   return a status — both corrected in the blockquote under that clause. **A
+   test written from this record's wording would have asserted the wrong
+   field.**
 2. **`docs/PHASE5.md` §9.2's *Scaling curve, N = 1…16* row, for the new arm.**
    `ros/dds_bench.sh` defaults `CONSUMERS` to 4, and 4 is the only value
    `tf_tree.processes` has ever run at. This record's *Consequences* claim that
@@ -347,11 +348,34 @@ unchanged and must be tested, not assumed.
 >
 > *The uncovered half is the C ABI layer above it*, and it is the half a ROS
 > node actually reaches: that `tft_bridge_offer`, `tft_bridge_get_stats` and
-> `tft_bridge_free` called on an inherited handle in a forked child **return a
-> status** — §3.4's panic guard turning `ChildDetached` into
-> `TFT_ERR_CHILD_DETACHED`, never a `SIGSEGV` and never an `abort()` — and that
-> the parent's bridge still applies an offer, and its arena is still readable
-> from a third process, after that child has exited.
+> `tft_bridge_free` called on an inherited handle in a forked child **come back
+> at all** — never a `SIGSEGV` and never an `abort()` — and that the parent's
+> bridge still applies an offer, and its arena is still readable from a third
+> process, after that child has exited.
+>
+> > **Two corrections, both found by writing the test.** This paragraph
+> > originally said the three calls "return a status — §3.4's panic guard
+> > turning `ChildDetached` into `TFT_ERR_CHILD_DETACHED`", and it was wrong
+> > about the mechanism and about two of the three entry points. A test written
+> > from its wording would have asserted the wrong field.
+> >
+> > *The panic guard is not what does this.* Removing `catch_unwind` from
+> > `guard()` entirely leaves the test passing: nothing panics in a forked
+> > child. `OwnedWriter::push` returns an ordinary
+> > `Err(PushError::ChildDetached)` and `publisher::map::push` maps it. The
+> > guard is an independent second defence that would matter only if a future
+> > detach path panicked instead of returning — which is worth having and is not
+> > this property.
+> >
+> > *"Each return a status" is false for two of the three.*
+> > `tft_bridge_free` returns **`void`**; all the child can be held to is
+> > returning, and the destructor half is observed from the parent — its lease
+> > still held, its rendezvous still serving. And `tft_bridge_offer` returns
+> > **`TFT_OK`**: the detachment arrives on the *outcome*
+> > (`action = TFT_BRIDGE_REJECTED`, `out.status = TFT_ERR_CHILD_DETACHED`),
+> > which is the documented split — the return value answers a different
+> > question from the outcome — so this paragraph was describing an entry point
+> > it had not re-read. Only `tft_bridge_get_stats` returns the code directly.
 >
 > **It cannot live in `tf_tree_c`.** What has to be produced is `fork()` without
 > `exec` (`std::process::Command` always `exec`s, and a thread is not a process),

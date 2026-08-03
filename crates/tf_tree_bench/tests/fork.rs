@@ -150,3 +150,91 @@ fn a_forked_child_stands_down_an_owned_writer_too() {
         "child=exited 0 parent_ok=true note=lookup:true,push:true,alive:true,serve:true,lease:true"
     );
 }
+
+/// **The C ABI across a `fork()`** — `docs/decisions/0015`'s *Invariants to
+/// maintain*, which says in as many words that this test does not exist and that
+/// the record is `ready` rather than `implemented` because of it.
+///
+/// The three tests above cover the Rust shapes a bridge is built out of:
+/// `BridgeInner` holds an `Arc<Tree>` and one `tf_tree::OwnedWriter` per declared
+/// dynamic edge, which is exactly the pair
+/// [`a_forked_child_stands_down_an_owned_writer_too`] forks. **The layer they say
+/// nothing about is the `extern "C"` one in front of it**, and that is the layer
+/// a robot reaches: an `rclcpp` node, or anything built on `multiprocessing`,
+/// whose start method on Linux is `fork`.
+///
+/// So the child here calls `tft_bridge_offer`, `tft_bridge_get_stats` and
+/// `tft_bridge_free` on a handle it inherited, and the assertion is `child=exited
+/// 0` — every one of them came back. `child=signalled 11` is the failure this is
+/// for, and it is the reason the harness decodes the wait status rather than
+/// comparing an exit code: a fault inside an `extern "C"` body leaves no exit
+/// code to compare.
+///
+/// `parent_ok=true` carries the second half:
+///
+/// * `offer:` — the parent's bridge still applies a transform, through the same
+///   entry point the child was refused at;
+/// * `read:` and `value:` — a **third** process attaches to the arena with
+///   `Open::new()`'s consumer defaults and reads back that post-fork transform,
+///   bit for bit against this process's own lookup;
+/// * `serve:` — a fresh attach still resolves the rendezvous socket, so the
+///   child's `tft_bridge_free` did not stop the parent's owner thread with the
+///   inherited shutdown `eventfd`;
+/// * `lease:` — the claim leases behind the bridge's `OwnedWriter`s are still
+///   held, probed from an independent open file description because an OFD lock
+///   is self-blind and nothing else can see a released one.
+///
+/// # Mutants this fails against
+///
+/// * **the detach check on the write path**, which is the mutant this test is
+///   worth having for: `if false && self.detached()` in `EdgeWriter::push`
+///   (`crates/tf_tree/src/tree.rs`), the one guard every bridge write goes
+///   through — `OwnedWriter::push` forwards to it and `write_sample` calls that.
+///   The child's offer then stores into the `MADV_DONTFORK` hole instead of
+///   returning. **Applied, observed:**
+///
+///   ```text
+///     left: "child=signalled 11 parent_ok=true note=offer:true,read:true,value:true,serve:true,lease:true"
+///    right: "child=exited 0 parent_ok=true note=offer:true,read:true,value:true,serve:true,lease:true"
+///   ```
+///
+///   **Every other field in that run says the system is healthy** — the parent
+///   went on to apply its own offer, a third process read it back bit for bit,
+///   the rendezvous still served and the lease was still held. Only `signalled`
+///   reports the fault, and a harness comparing an exit code would have had `11`
+///   to compare against nothing and gone green.
+/// * **the `ChildDetached` mapping.** Delete the `PushError::ChildDetached` arm
+///   from `crates/tf_tree_c/src/publisher.rs`'s `map::push`, so the catch-all
+///   `other` arm answers `TFT_ERR_INTERNAL` instead. **Applied, observed:**
+///   `child=exited 22` — `OFFER_STATUS_NOT_DETACHED`. The call still returned,
+///   the outcome still said `TFT_BRIDGE_REJECTED`, and a test that had checked
+///   only "it came back" would not have noticed the one status code a caller can
+///   branch on going missing.
+/// * **`tft_bridge_free`'s destructors** are *not* mutated here.
+///   [`a_forked_child_stands_down_an_owned_writer_too`] already covers the pair
+///   that `free` drops, and `free` returns `void`, so all this test can hold it
+///   to from the child's side is coming back at all. What it adds is the
+///   parent's `lease:` and `serve:` fields *after* a `free` in the child.
+///
+/// # And one mutant it does **not** fail against, on purpose
+///
+/// Removing the §3.4 panic guard entirely — `guard()` in
+/// `crates/tf_tree_c/src/error.rs` calling `body()` directly with no
+/// `catch_unwind` — leaves this test **passing**. Verified, not assumed.
+///
+/// That is worth writing down because `docs/decisions/0015` attributes this
+/// property to that guard ("§3.4's panic guard turning `ChildDetached` into
+/// `TFT_ERR_CHILD_DETACHED`"), and it is not what happens: nothing panics in the
+/// child. `OwnedWriter::push` returns an ordinary `Err(PushError::ChildDetached)`
+/// and `map::push` maps it. The panic guard is a *second*, independent defence
+/// that would matter only if some future detach path panicked instead of
+/// returning — which is why the two mutants above target the detach check and
+/// the error mapping, and not `catch_unwind`.
+#[cfg(feature = "bridge")]
+#[test]
+fn a_forked_child_is_refused_by_every_bridge_entry_point() {
+    assert_eq!(
+        run("bridge", "bridge"),
+        "child=exited 0 parent_ok=true note=offer:true,read:true,value:true,serve:true,lease:true"
+    );
+}

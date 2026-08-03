@@ -32,6 +32,21 @@ tf2 = ["dep:tf_tree_tf2_sys"]
 # Phase 2 shared memory: the multi-process integration test and benchmark.
 # Linux-only; needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
 shm = ["tf_tree/shm"]
+# **`docs/decisions/0015`'s *Invariants to maintain* — the C ABI half of the fork
+# test.** `fork_child`'s fourth mode drives `tft_bridge_offer`,
+# `tft_bridge_get_stats` and `tft_bridge_free` on a handle inherited across
+# `fork()`, which needs the seam itself and therefore this crate edge.
+#
+# **It costs `tf_tree_core`'s dependency budget nothing**, and that is a statement
+# about direction rather than a hope: the arrow points *from* the benchmark crate
+# *to* the C ABI, `tf_tree_bench` is `publish = false`, and nothing in
+# `crates/tf_tree_core` — or in `tf_tree`, or in `tf_tree_c` — gains a dependency
+# because a harness took one. `libc` is already here for the `fork()` itself.
+#
+# Implies `shm`: the property under test is a `MADV_DONTFORK` mapping the child
+# has no page of, and a private heap arena has no hole to fall into. Enabling
+# `bridge` without it would compile a mode that silently tests nothing.
+bridge = ["shm", "dep:tf_tree_c"]
 # `docs/PHASE5.md` §9.2's embedding row needs an **in-crate** column, and the
 # crate in question is `tf_tree_core`. Default-off for the same reason
 # `tf_tree_core/bench-probe` is: nothing that ships enables it. `just
@@ -58,6 +73,23 @@ tf_tree_ipc.workspace = true
 # Optional, and outside the workspace on purpose (see the root manifest): this
 # is the only edge that reaches ROS 2, and it is pulled in solely by `--features tf2`.
 tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
+# Optional, behind `bridge`, for `src/bin/fork_child.rs`'s fourth mode — the C
+# ABI half of `docs/decisions/0015`'s *Invariants to maintain*.
+#
+# **`features = ["bridge", "shm"]` on the dependency, not on the parent.** The
+# entry points under test are `tf_tree_c/bridge`'s and the arena they hold must
+# be a shared one, so both are properties this edge needs and neither is
+# something the workspace should acquire on its behalf: an optional dependency
+# that is not activated contributes no features at all, so a plain
+# `cargo build --workspace` and `cargo nextest run --workspace` still compile
+# `tf_tree_c` with its own defaults (both off) and compile this binary's fourth
+# mode out entirely — the same situation `shm` is already in, and `just test`'s
+# comment in the justfile says the same thing about the same build.
+#
+# A path dependency rather than a `workspace = true` one because `tf_tree_c` is
+# not in `[workspace.dependencies]`; it is nobody's published dependency, for the
+# reason its own manifest gives.
+tf_tree_c = { path = "../tf_tree_c", optional = true, features = ["bridge", "shm"] }
 
 # **Reading** the committed baseline (`src/baseline.rs`), and nothing else —
 # `results.json` is still *written* by hand, for the schema-stability reason
