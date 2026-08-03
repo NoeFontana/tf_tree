@@ -73,7 +73,7 @@ is outside the cargo workspace and outside every host recipe — `cargo fmt`,
 `clippy` and `nextest` cannot see it, exactly like `crates/tf_tree_tf2_sys`.
 **`just ros-build` and `just ros-test` are its entire gate** (both cover `tf_tree_bench_ros` too — `colcon --base-paths ros` picks up every package under `ros/`); run them after
 touching anything under `ros/`, and note that `just ros-test` also rebuilds
-`tf_tree_c --features bridge`, so a change on the Rust side of the seam is
+`tf_tree_c --features bridge,shm`, so a change on the Rust side of the seam is
 covered by it too. CI's `tf2` job runs `just ros-test` after `just tf2-check`. It reaches the engine only through
 `find_package(tf_tree CONFIG)` and `tf_tree_c`'s default-off `bridge` feature.
 
@@ -174,7 +174,7 @@ table, run locally, are the gate; a PR's checks are not.
 | `just bench-run` / `just bench-ab` | the A/B loop: run the suite, change the core, run again, get a per-row verdict. Non-zero exit on a regression past the tolerance the baseline itself recorded |
 | `just dds-bench` | `docs/PHASE5.md` §9.1 end-to-end over a real DDS, in the container. The only measurement here that includes the transport |
 | `just ros-build` / `just ros-test` | `ros/tf_tree_ros` in the container — nothing on the host can |
-| `just tf2-check` | the container-only crates: `tf_tree_tf2_sys`, and `tf_tree_c --features bridge` |
+| `just tf2-check` | the container-only crates: `tf_tree_tf2_sys`, and `tf_tree_c --features bridge,shm` — the feature set `ros/build.sh` builds, on the *container's* toolchain |
 
 Single test — Rust: `cargo nextest run -p tf_tree_math -- exp_log_roundtrip`.
 

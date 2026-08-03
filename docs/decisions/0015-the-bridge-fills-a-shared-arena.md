@@ -5,9 +5,12 @@
 **Implementation:** steps 0–2 landed on `feat/0015-bridge-shared-arena`
 (`Open::require_create` + `OpenError::ArenaAlreadyLive`; the `struct_size` prefix
 rule on `tft_bridge_options` with `arena_name` appended; `open_shared` refusing
-rather than downgrading, in both the `shm` and the no-`shm` build). **Steps 3–7
-are outstanding**, and so is the fork test the *Invariants to maintain* clause
-below demands — see the note under it.
+rather than downgrading, in both the `shm` and the no-`shm` build). Steps 3–4 are
+on `feat/0015-ros-arena-name` (`BridgeOptions::arena_name`, the `arena_name` node
+parameter, `test_shared_arena.cpp`, and the `TFT_HAVE_SHM` probe step 4 turned
+out to rest on — see the correction under step 4). **Steps 5–7 are outstanding**,
+and so is the fork test the *Invariants to maintain* clause below demands — see
+the note under it.
 
 > **Moved `draft` → `ready` by
 > [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md), which resolves
@@ -153,6 +156,31 @@ the outcome POD — is unchanged, because a `Tree` is a `Tree`.
 `tf_tree_ros::BridgeOptions` gains `std::string arena_name` (empty = heap), and
 `BridgeNode` a `arena_name` parameter, default `""`. §5.8's three deployment
 forms all inherit it.
+
+> **Correction — form 3 inherits the *field*, not the parameter.** Forms 1 and 2
+> are `BridgeNode` and get it from the ROS parameter; form 3 never constructs a
+> `BridgeNode` and has no parameters at all, so `BridgeOptions::arena_name` is
+> its whole surface. That is why `test_shared_arena.cpp` asserts both paths
+> separately: a `BridgeNode` that did something private with the name would
+> leave form 3 — the form this project dogfoods — unable to publish an arena at
+> all.
+>
+> One rule is added at the parameter layer and only one: an `arena_name` carrying
+> **whitespace an operator cannot see** — entirely whitespace, or whitespace at
+> either end — is refused there. Empty means "no shared arena", so `""` and `" "`
+> are the same string to an operator and opposite instructions to the bridge;
+> and a consumer selects by exact name, so `" foo"` and `"foo"` are the same
+> string to that same operator and *different rendezvous*. To C all of the
+> non-empty ones are ordinary valid single-component names that `ArenaName`
+> accepts (measured, not assumed), and the difference appears in no log line on
+> either side. **Refused, not trimmed**: this layer refuses what the ABI cannot
+> see rather than rewriting what the operator wrote. Every other malformed name —
+> over 64 bytes, `../escape` — is `tf_tree_ipc::ArenaName`'s to refuse, and it
+> arrives as a `BridgeError` naming the name. (An *empty* name is not in that
+> list: `BridgeHandle` maps `""` to a NULL `arena_name`, the ABI's spelling for
+> "private heap arena", so `ArenaName` never sees one from this package.) A
+> narrower rule at the ROS layer would make `tf_tree_ros` reject names
+> `$TF_TREE_NAME` and `tf_tree serve` accept.
 
 ### What a consumer does
 
@@ -321,6 +349,47 @@ unchanged and must be tested, not assumed.
    bridge wrote.** — verified by a new ctest that spawns the shipped
    `tf_tree_bridge` executable, publishes `/tf`, attaches with `tft_tree_open`
    and asserts a lookup matches; `just ros-test`.
+
+   > **Correction — this step names the wrong property, and a prerequisite it
+   > does not mention.**
+   >
+   > *The property.* "A second **process** reads what the bridge wrote" is step
+   > 2's, and step 2 discharged it:
+   > `crates/tf_tree_c/tests/bridge_shared.rs`'s
+   > `a_second_process_reads_what_the_bridge_wrote` spawns a real child that
+   > links no `tf_tree_c` at all and compares the bytes. Spawning
+   > `tf_tree_bridge` from a ctest would re-run that across a middleware and an
+   > ament install tree, and it would still not test the thing this step is
+   > actually for — **that the ROS parameter reaches
+   > `tft_bridge_options::arena_name`**. A bridge whose parameter was dropped on
+   > the floor publishes no rendezvous, so a spawned-executable test fails, but
+   > so does a much cheaper one. What no version of "attach and assert a lookup
+   > matches" catches on its own is the reverse: it passes just as well against
+   > an implementation that publishes *unconditionally*.
+   >
+   > So `ros/tf_tree_ros/test/test_shared_arena.cpp` is a **comparison**: the
+   > same node, topology and attach, once without the parameter (nothing is
+   > findable under the name) and once with it (the attach succeeds and reads
+   > the topology's static edge). Plus the same thing through
+   > `BridgeOptions::arena_name` for §5.8's form 3, which has no parameters at
+   > all, and the held-name refusal crossing `BridgeHandle`'s promise as a
+   > `BridgeError`.
+   >
+   > *The prerequisite.* `tf_tree.h` hides `tft_tree_open` behind
+   > `#if defined(TFT_HAVE_SHM)` and **nothing in the CMake package defined it**,
+   > so no `find_package(tf_tree CONFIG)` consumer — this ctest, `ros/tf_tree_ros`,
+   > `just cmake-check` — could call the entry point this record's consumers
+   > exist to call, except by hand-typing the macro against an archive that may
+   > not have the feature in it. `crates/tf_tree_c/CMakeLists.txt` now probes
+   > **each** resolved library with `nm` — the `.a` and the `.so` separately —
+   > and propagates a per-target `TFT_HAVE_SHM=1` through
+   > `tf_treeConfig.cmake.in`, and `ros/build.sh` builds `--features bridge,shm`
+   > and checks one symbol per feature. The "each" is not decoration: one probe
+   > answering for both exported targets made a `TF_TREE_PREBUILT_DIR` holding a
+   > `bridge,shm` `.a` beside a `bridge`-only `.so` announce `TFT_HAVE_SHM=1` and
+   > then fail to link the shared target, which is the link-time failure the
+   > probe exists to convert into a compile-time one. None of that is in the
+   > seven steps; it is what step 4 turned out to rest on.
 5. **`dds_bench` grows a `tf_tree.processes` arm**; `bench_consumer` gains
    `--mode tf_tree_attach` that calls `tf_tree::Tree::open()` instead of hosting
    a bridge. — verified by `just dds-bench` reporting four arms at 0 % failure.

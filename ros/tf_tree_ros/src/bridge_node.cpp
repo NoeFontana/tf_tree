@@ -105,6 +105,55 @@ BridgeNode::BridgeNode(const rclcpp::NodeOptions & options)
   o.tf_topic = declare_parameter<std::string>("tf_topic", "/tf");
   o.tf_static_topic = declare_parameter<std::string>("tf_static_topic", "/tf_static");
 
+  o.arena_name = declare_parameter<std::string>("arena_name", "");
+  // **One refusal here, and deliberately only one** — the same split the
+  // both-or-neither check above states: what stays at the parameter surface is
+  // what the ABI *cannot see*.
+  //
+  // The ABI is the single authority on whether a string is a usable arena name.
+  // `tf_tree_ipc::ArenaName` refuses an over-64-byte or multi-component name,
+  // `tft_bridge_create` reports that as `TFT_ERR_ARENA_UNAVAILABLE` with the
+  // name in the message, and `BridgeHandle` turns it into a `BridgeError` out of
+  // this constructor — so a bad name already refuses to start, with a better
+  // diagnosis than a second, narrower rule here could give. (An *empty* name
+  // never reaches `ArenaName` from this package at all: `BridgeHandle` maps `""`
+  // to a NULL `arena_name`, which is the ABI's spelling for "private heap
+  // arena".) Duplicating the ABI's rules would also make `tf_tree_ros` reject
+  // names that `$TF_TREE_NAME`, `tf_tree serve` and the C ABI all accept, which
+  // is one concept with two definitions and a config that works in one place and
+  // not another.
+  //
+  // What the ABI cannot see is *whitespace an operator cannot see either*, and
+  // there are two ways it bites. `arena_name: ""` and `arena_name: " "` are the
+  // same string in a launch file and opposite instructions to the bridge: the
+  // first is a private heap arena, the second is a published rendezvous named
+  // " " that no consumer will guess. And `arena_name: " foo"` and
+  // `arena_name: "foo"` are the same string to that same operator and *different
+  // rendezvous* — `ArenaName` accepts both — so a consumer setting
+  // `TF_TREE_NAME=foo` finds nothing, and the difference appears in no log line
+  // on either side. Both are the "waiting on a rendezvous that will never
+  // appear" failure `docs/decisions/0015` spends a paragraph on, reached by an
+  // invisible character.
+  //
+  // **Refused, not trimmed.** This layer's job is to refuse what the ABI cannot
+  // see, not to rewrite what the operator wrote: a silently trimmed name is a
+  // config that means something other than what it says, and the next reader has
+  // to know this rule exists to predict the rendezvous. So a name that is
+  // entirely whitespace, or that has whitespace at either end, is refused here —
+  // one condition, because it is one mistake — and every other name is the ABI's
+  // to judge.
+  if (!o.arena_name.empty() &&
+    (o.arena_name.find_first_not_of(" \t\n\r\f\v") != 0 ||
+    o.arena_name.find_last_not_of(" \t\n\r\f\v") != o.arena_name.size() - 1))
+  {
+    throw std::invalid_argument(
+            "arena_name has leading or trailing whitespace, or is entirely whitespace. A "
+            "consumer selects the arena by exact name, so \" foo\" and \"foo\" are different "
+            "rendezvous that read the same in a launch file. Leave it unset for a private "
+            "in-process arena, or give it a name a consumer can put in $TF_TREE_NAME "
+            "(docs/decisions/0015).");
+  }
+
   // §5.5, as far as a node can take it. The engine's typed domains are what
   // actually keep sim and real transforms apart, and the C ABI refuses at
   // startup if a declared edge disagrees with `time_domain` — so all that is

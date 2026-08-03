@@ -30,9 +30,14 @@ find_package(tf2_msgs REQUIRED)
 # be moved. Linking the staticlib into our own shared library is relocatable and
 # gives the process exactly one copy of the arena's globals.
 #
-# The staticlib must have been built `--features bridge`, or none of the nine §5
-# entry points is in it and this fails at link time with a list of missing
-# `tft_bridge_*` symbols. `just ros-build` builds it that way.
+# The staticlib must have been built `--features bridge,shm`, and the two fail
+# differently. Without `bridge` none of the nine §5 entry points is in it and
+# this fails at link time with a list of missing `tft_bridge_*` symbols. Without
+# `shm` there is no `tft_tree_open`, so the `nm` probe in `crates/tf_tree_c`'s
+# CMakeLists leaves `TFT_HAVE_SHM` off on the imported target and
+# `test/test_shared_arena.cpp` does not compile — by its own `#error`, which is
+# the loudest of the three because it is the one a green build could hide.
+# `just ros-build` builds it that way and checks one symbol per feature.
 find_package(tf_tree CONFIG REQUIRED)
 
 add_library(tf_tree_ros SHARED src/bridge_handle.cpp src/bridge_node.cpp)
@@ -114,6 +119,25 @@ if(BUILD_TESTING)
   ament_add_gtest(test_clock test/test_clock.cpp TIMEOUT 180)
   if(TARGET test_clock)
     target_link_libraries(test_clock tf_tree_ros ${rosgraph_msgs_TARGETS})
+  endif()
+
+  # `docs/decisions/0015`: the `arena_name` parameter, and the attach it exists
+  # to make possible. **Its own binary because it is the only test here that
+  # rewrites `$TF_TREE_RUNTIME_DIR`, `$TF_TREE_DOMAIN` and `$TF_TREE_NAME`** —
+  # process-wide state that selects which arena *any* `tft_tree_open` in the
+  # process resolves to, set once in its `main` before `rclcpp::init`. Sharing a
+  # binary with a suite that does not expect it would make that suite's arena
+  # depend on test ordering.
+  #
+  # The reason is the shared *process*, not concurrency: `colcon test` invokes
+  # ctest without `-j`, so the binaries in this package run strictly one after
+  # another. An earlier version of this comment and of the test's own said the
+  # ctests "run in parallel", which is false and would have been the wrong
+  # argument even where it is true — a separate binary is a separate `environ`
+  # whether or not two of them run at once.
+  ament_add_gtest(test_shared_arena test/test_shared_arena.cpp TIMEOUT 180)
+  if(TARGET test_shared_arena)
+    target_link_libraries(test_shared_arena tf_tree_ros)
   endif()
 
   # §5.8's amendment: form 3 attached to a node the caller is already spinning.

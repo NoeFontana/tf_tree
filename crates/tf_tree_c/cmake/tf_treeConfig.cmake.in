@@ -9,10 +9,42 @@ include(CMakeFindDependencyMacro)
 
 set_and_check(TF_TREE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
 
+# Whether each installed library was built `--features shm`, decided by the
+# `nm` probe in the CMakeLists at *package* configure time and baked in here.
+#
+# **It has to be baked in rather than re-probed, and it has to be here at all.**
+# `tf_tree.h` hides `tft_tree_open` behind `#if defined(TFT_HAVE_SHM)`, and this
+# config file builds its own IMPORTED targets from scratch — it does not import
+# an export set — so an INTERFACE property set only in the build tree reaches no
+# `find_package(tf_tree CONFIG)` consumer at all. That is the path
+# `ros/tf_tree_ros` and `just cmake-check` both take, i.e. every consumer that
+# matters. Baking is honest here because the libraries these describe are the
+# ones that were probed.
+#
+# **Two variables, because the two libraries are probed separately.** They agree
+# for every build that produced both from one `cargo build`; they can disagree
+# when `TF_TREE_PREBUILT_DIR` supplied a directory whose `.a` and `.so` came
+# from different feature sets, which nothing in that option's contract forbids.
+# One answer applied to both targets is how a consumer linking the shared target
+# got `undefined reference to 'tft_tree_open'` from a package that had just
+# announced `TFT_HAVE_SHM=1`.
+set(TF_TREE_HAVE_SHM_SHARED @TF_TREE_HAVE_SHM_SHARED@)
+set(TF_TREE_HAVE_SHM_STATIC @TF_TREE_HAVE_SHM_STATIC@)
+
 # **Exact filenames, both of them.** `NAMES tf_tree_c` walks
 # `CMAKE_FIND_LIBRARY_SUFFIXES` (`.so;.a` on Linux) and would happily match the
 # archive when no shared library is installed — declaring a `.a` a SHARED
 # IMPORTED target, which fails at link time with a message about the *consumer*.
+#
+# **These are cache variables and they are sticky**, which is a hazard this file
+# does not solve and should not surprise the next reader. A consumer that
+# re-points `CMAKE_PREFIX_PATH` at a *different* tf_tree prefix without clearing
+# its CMake cache keeps the previously-found paths — `find_library` skips
+# entirely when the variable is already set — and so links the old prefix's
+# libraries against this prefix's `TF_TREE_HAVE_SHM_*` answers. It is
+# pre-existing and general to the package rather than specific to the shm probe;
+# the fix is `rm -rf` the consumer's build directory, or
+# `-UTF_TREE_LIBRARY_SHARED -UTF_TREE_LIBRARY_STATIC`.
 find_library(TF_TREE_LIBRARY_SHARED NAMES libtf_tree_c.so
              PATHS "@PACKAGE_CMAKE_INSTALL_LIBDIR@" NO_DEFAULT_PATH)
 find_library(TF_TREE_LIBRARY_STATIC NAMES libtf_tree_c.a
@@ -24,6 +56,10 @@ if(TF_TREE_LIBRARY_SHARED AND NOT TARGET tf_tree::tf_tree)
       IMPORTED_LOCATION "${TF_TREE_LIBRARY_SHARED}"
       INTERFACE_INCLUDE_DIRECTORIES "${TF_TREE_INCLUDE_DIR}"
       INTERFACE_COMPILE_FEATURES cxx_std_17)
+  if(TF_TREE_HAVE_SHM_SHARED)
+    set_property(TARGET tf_tree::tf_tree APPEND
+                 PROPERTY INTERFACE_COMPILE_DEFINITIONS TFT_HAVE_SHM=1)
+  endif()
 endif()
 
 if(TF_TREE_LIBRARY_STATIC AND NOT TARGET tf_tree::tf_tree_static)
@@ -34,6 +70,10 @@ if(TF_TREE_LIBRARY_STATIC AND NOT TARGET tf_tree::tf_tree_static)
       INTERFACE_COMPILE_FEATURES cxx_std_17
       # A Rust staticlib carries none of its own system dependencies.
       INTERFACE_LINK_LIBRARIES "pthread;dl;m")
+  if(TF_TREE_HAVE_SHM_STATIC)
+    set_property(TARGET tf_tree::tf_tree_static APPEND
+                 PROPERTY INTERFACE_COMPILE_DEFINITIONS TFT_HAVE_SHM=1)
+  endif()
 endif()
 
 check_required_components(tf_tree)

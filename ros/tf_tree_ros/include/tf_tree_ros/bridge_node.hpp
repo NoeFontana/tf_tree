@@ -36,6 +36,14 @@ namespace tf_tree_ros
 /// | `time_domain` | int | `0` | §5.5's domain tag; every declared dynamic edge must agree |
 /// | `queue_depth` | int | `100` | §5.2's `KeepLast` depth on both topics |
 /// | `tf_topic` / `tf_static_topic` | string | `/tf`, `/tf_static` | for a namespaced or replayed stream |
+/// | `arena_name` | string | `""` | `docs/decisions/0015`: publish the arena under this rendezvous name so a **separate process** can attach; empty is a private in-process arena |
+///
+/// `arena_name` is the only parameter here that all three of §5.8's deployment
+/// forms do not reach the same way. Forms 1 and 2 are this node, so they get it
+/// from the parameter like every row above; **form 3 sets
+/// `BridgeOptions::arena_name` directly**, because it never constructs a
+/// `BridgeNode` and so has no parameters at all. The field is the surface; this
+/// parameter is one way of filling it.
 ///
 /// Exactly one of `topology_config_file` and `topology_config` must be set. The
 /// engine has no runtime edge declaration (§5.8's amendment, `docs/decisions/0004`,
