@@ -1298,6 +1298,25 @@ shm-check:
     # `shm-rendezvous` because it needs no second executable and no scratch
     # rendezvous beyond its own: the second process is a `fork` of the first.
     cargo nextest run -p tf_tree_bench --features shm --test fork
+    # **`docs/decisions/0015`'s *Invariants to maintain*: the same `fork()`, one
+    # layer up.** The line above runs `tests/fork.rs` with `bridge` **off**,
+    # which is a real configuration and stays covered — but it compiles
+    # `fork_child`'s fourth mode and this crate's whole `tf_tree_c` edge out, so
+    # under it the C ABI is forked by nothing. `bridge` implies `shm` in
+    # `crates/tf_tree_bench/Cargo.toml`, so `--features bridge` alone would do;
+    # both are named because every other line in this recipe names `shm` and one
+    # that did not would read as an oversight.
+    #
+    # The clippy line is not optional garnish: `just lint`'s `--workspace
+    # --all-targets` pass builds default features, so without it the fourth
+    # mode's `unsafe` blocks and its C interop are linted in **no** recipe at
+    # all. The `cargo build` line mirrors its `--features shm` sibling
+    # four lines up, for the same reason that one exists — the binary is the
+    # artifact three processes run, and a build failure should name the binary
+    # rather than surface as a missing `CARGO_BIN_EXE_fork_child`.
+    cargo clippy -p tf_tree_bench --features shm,bridge --all-targets -- -D warnings
+    cargo build --features shm,bridge -p tf_tree_bench --bin fork_child
+    cargo nextest run -p tf_tree_bench --features shm,bridge --test fork
     # §7.1 page population. `nextest` runs each test in its own process, which
     # this needs: the measurements are RSS and minor-fault deltas, and threads
     # sharing a process would read each other's.

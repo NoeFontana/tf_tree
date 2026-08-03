@@ -347,11 +347,34 @@ unchanged and must be tested, not assumed.
 >
 > *The uncovered half is the C ABI layer above it*, and it is the half a ROS
 > node actually reaches: that `tft_bridge_offer`, `tft_bridge_get_stats` and
-> `tft_bridge_free` called on an inherited handle in a forked child **return a
-> status** — §3.4's panic guard turning `ChildDetached` into
-> `TFT_ERR_CHILD_DETACHED`, never a `SIGSEGV` and never an `abort()` — and that
-> the parent's bridge still applies an offer, and its arena is still readable
-> from a third process, after that child has exited.
+> `tft_bridge_free` called on an inherited handle in a forked child **come back
+> at all** — never a `SIGSEGV` and never an `abort()` — and that the parent's
+> bridge still applies an offer, and its arena is still readable from a third
+> process, after that child has exited.
+>
+> > **Two corrections, both found by writing the test.** This paragraph
+> > originally said the three calls "return a status — §3.4's panic guard
+> > turning `ChildDetached` into `TFT_ERR_CHILD_DETACHED`", and it was wrong
+> > about the mechanism and about two of the three entry points. A test written
+> > from its wording would have asserted the wrong field.
+> >
+> > *The panic guard is not what does this.* Removing `catch_unwind` from
+> > `guard()` entirely leaves the test passing: nothing panics in a forked
+> > child. `OwnedWriter::push` returns an ordinary
+> > `Err(PushError::ChildDetached)` and `publisher::map::push` maps it. The
+> > guard is an independent second defence that would matter only if a future
+> > detach path panicked instead of returning — which is worth having and is not
+> > this property.
+> >
+> > *"Each return a status" is false for two of the three.*
+> > `tft_bridge_free` returns **`void`**; all the child can be held to is
+> > returning, and the destructor half is observed from the parent — its lease
+> > still held, its rendezvous still serving. And `tft_bridge_offer` returns
+> > **`TFT_OK`**: the detachment arrives on the *outcome*
+> > (`action = TFT_BRIDGE_REJECTED`, `out.status = TFT_ERR_CHILD_DETACHED`),
+> > which is the documented split — the return value answers a different
+> > question from the outcome — so this paragraph was describing an entry point
+> > it had not re-read. Only `tft_bridge_get_stats` returns the code directly.
 >
 > **It cannot live in `tf_tree_c`.** What has to be produced is `fork()` without
 > `exec` (`std::process::Command` always `exec`s, and a thread is not a process),
