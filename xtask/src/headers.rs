@@ -59,6 +59,35 @@
 //! mentions `tft_status`, `tft_tree` and half the stable header in its own
 //! declarations, and including it in `tf_tree.h` is exactly how that is meant to
 //! work.
+//!
+//! # And [`check_stable_is_complete`] for the opposite sign
+//!
+//! `check_overlap` catches a symbol in *both* headers. The same omission with
+//! the opposite sign — a [`STABLE`] entry in **neither** — makes the frozen
+//! header quietly *smaller*, and until it was added nothing caught that at all.
+//!
+//! Measured, by making `TFT_ERR_ARENA_UNAVAILABLE` `pub(crate)` and
+//! regenerating in the same run, which is exactly how the overlap defect shipped:
+//!
+//! ```text
+//! $ cargo run -p xtask -- headers        # regenerate, as the guilty commit did
+//! $ cargo run -p xtask -- headers --check
+//! xtask headers: both headers are up to date
+//! exit=0
+//! $ grep -c '#define TFT_ERR_ARENA_UNAVAILABLE' include/*.h
+//! 0
+//! ```
+//!
+//! Every gate green with the constant defined nowhere. `--check` compares each
+//! header against a copy regenerated with the same omission; `check_overlap`
+//! sees no intersection because there is nothing in either file to intersect;
+//! and [`check_partition`] filters entries without a lowercase character, so
+//! every screaming-case constant is exempt from its stale half by construction.
+//! The three doc-comment *references* to the code survive in both headers, so
+//! the frozen header is left documenting a status a caller cannot name.
+//!
+//! §3.1 calls the frozen header a promise that can never be withdrawn. This is
+//! the check that stops it being withdrawn by deleting a line.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -405,6 +434,13 @@ pub(crate) fn run(check: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // The other direction, and the one [`check_overlap`] cannot see: a symbol
+    // in **neither** header.
+    if let Err(e) = check_stable_is_complete(&stable) {
+        eprintln!("xtask headers: {e}");
+        return ExitCode::FAILURE;
+    }
+
     let targets = [
         (include_dir.join("tf_tree.h"), stable),
         (include_dir.join("tf_tree_unstable.h"), unstable),
@@ -737,6 +773,53 @@ fn check_overlap(stable: &str, unstable: &str) -> Result<(), String> {
          from neither and lands in both files.\n  \
          Add it to STABLE (or to UNSTABLE, if the frozen header is not where it\n  \
          belongs) and regenerate."
+    ))
+}
+
+/// Every [`STABLE`] entry is actually **defined** by the frozen header.
+///
+/// # The direction [`check_overlap`] cannot see
+///
+/// `check_overlap` catches a symbol in *both* headers. This catches one in
+/// **neither**, which is the same defect with the opposite sign and a worse
+/// consequence: the frozen header silently gets **smaller**.
+///
+/// [`check_partition`] does not cover it. That function scans the Rust source
+/// for `extern "C" fn` and its stale-entry half filters on
+/// `n.contains(char::is_lowercase)` — so `TFT_ERR_ARENA_UNAVAILABLE`,
+/// `TFT_ABI_VERSION_MINOR` and every other screaming-case constant is exempt by
+/// construction, and a *type* has no `extern "C" fn` to find at all. Delete a
+/// `pub const` from `tf_tree_c` and leave its name in [`STABLE`] and nothing
+/// notices: `cbindgen` emits it in neither file (the unstable config excludes it
+/// by complement, the stable one has nothing to emit), the two headers stay
+/// disjoint so `check_overlap` is silent, `--check` diffs both against copies
+/// regenerated with the same omission, and the compile matrix compiles a
+/// translation unit that no longer names it.
+///
+/// **That is a withdrawn stability promise, made by deleting a line.** §3.1 says
+/// the frozen header is the promise that can never be withdrawn; this is the
+/// check that makes withdrawing it require saying so.
+///
+/// Grounded in the generated artifact rather than in a second scan of the
+/// source, so it covers constants, types and functions with one rule — the same
+/// reason the `TFT_HAVE_SHM` probe in `crates/tf_tree_c/CMakeLists.txt` asks the
+/// library instead of trusting a list.
+fn check_stable_is_complete(stable_header: &str) -> Result<(), String> {
+    let defined = defined_symbols(stable_header);
+    let missing: Vec<&&str> = STABLE.iter().filter(|n| !defined.contains(**n)).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "these STABLE entries are defined by NEITHER generated header: {missing:?}\n  \
+         STABLE is the frozen tier (docs/PHASE4.md §3.1), and both cbindgen configs\n  \
+         are built by *complement* — so a name listed here that the crate no longer\n  \
+         exports is emitted nowhere, and the frozen header quietly gets smaller.\n  \
+         That is a stability promise withdrawn by deleting a line, which is the one\n  \
+         thing §3.1 says cannot happen.\n  \
+         Either the item still exists and its name changed (update the entry), or it\n  \
+         was removed on purpose — in which case removing it from STABLE is an ABI\n  \
+         break and needs the major bump and the record that go with one."
     ))
 }
 

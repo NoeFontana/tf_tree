@@ -75,4 +75,71 @@ cmake -S "$WORK/shared_src" -B "$WORK/shared_build" \
 cmake --build "$WORK/shared_build" >>"$WORK/log" 2>&1
 LD_LIBRARY_PATH="$WORK/prefix/lib" "$WORK/shared_build/consumer"
 
+# --- TFT_HAVE_SHM, both branches --------------------------------------------
+#
+# `tf_tree.h` hides `tft_tree_open` behind `#if defined(TFT_HAVE_SHM)`, and the
+# package decides that macro by probing the resolved library with `nm`
+# (`crates/tf_tree_c/CMakeLists.txt`). Until this arm existed **no host recipe
+# exercised the probe's positive branch at all** — everything above takes the
+# source-build path, which is a plain `cargo build --release` with default
+# features, so `shm` is off and the answer is always 0. The only place the
+# `=1` case ran was `ros/build.sh`, in the container, where a failure surfaces
+# as a `#error` in a ctest two minutes into a colcon build.
+#
+# Both branches are checked, because "off" is the answer that has to be *right*
+# rather than merely safe: a package that answered 0 for a library that does
+# have `shm` in it hides an entry point the caller paid for.
+echo "  TFT_HAVE_SHM off for a default-features build"
+if ! grep -q '^set(TF_TREE_HAVE_SHM_STATIC 0)' "$WORK/prefix/lib/cmake/tf_tree/tf_treeConfig.cmake"; then
+    echo "  FAIL: the source build has no shm in it, but the installed config does not say so" >&2
+    grep TF_TREE_HAVE_SHM "$WORK/prefix/lib/cmake/tf_tree/tf_treeConfig.cmake" >&2 || true
+    exit 1
+fi
+
+echo "  TFT_HAVE_SHM=1 from a --features bridge,shm prebuilt"
+cargo build --release -q -p tf_tree_c --features bridge,shm
+PREBUILT="${CARGO_TARGET_DIR:-$ROOT/target}/release"
+cmake -S "$ROOT/crates/tf_tree_c" -B "$WORK/shm_build" \
+      -DTF_TREE_PREBUILT_DIR="$PREBUILT" \
+      -DCMAKE_INSTALL_PREFIX="$WORK/shm_prefix" \
+      -DCMAKE_BUILD_TYPE=Release >>"$WORK/log" 2>&1
+cmake --install "$WORK/shm_build" >>"$WORK/log" 2>&1
+for v in STATIC SHARED; do
+    if ! grep -q "^set(TF_TREE_HAVE_SHM_$v 1)" "$WORK/shm_prefix/lib/cmake/tf_tree/tf_treeConfig.cmake"; then
+        echo "  FAIL: the prebuilt has tft_tree_open in it, but TF_TREE_HAVE_SHM_$v is not 1" >&2
+        grep TF_TREE_HAVE_SHM "$WORK/shm_prefix/lib/cmake/tf_tree/tf_treeConfig.cmake" >&2 || true
+        exit 1
+    fi
+done
+
+# The macro has to reach a *consumer*, which is the whole point: it is an
+# INTERFACE property on the imported targets, and an earlier revision set it in
+# the build tree only, where no `find_package` consumer could ever see it.
+mkdir -p "$WORK/shm_src"
+cat >"$WORK/shm_src/main.cpp" <<'EOF'
+#include <tf_tree.h>
+#if !defined(TFT_HAVE_SHM)
+#error "TFT_HAVE_SHM did not reach this consumer, so tft_tree_open is undeclared"
+#endif
+#include <cstdio>
+int main() {
+    // Its *address*, not a call: declaring it is what this arm tests, and
+    // calling it would need a live arena this harness has no business creating.
+    void *fn = reinterpret_cast<void *>(&tft_tree_open);
+    std::printf("shm consumer ok: tft_tree_open is declared and linkable (%p)\n", fn);
+    return fn == nullptr;
+}
+EOF
+cat >"$WORK/shm_src/CMakeLists.txt" <<'EOF'
+cmake_minimum_required(VERSION 3.16)
+project(tf_tree_shm_consumer LANGUAGES CXX)
+find_package(tf_tree CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE tf_tree::tf_tree_static)
+EOF
+cmake -S "$WORK/shm_src" -B "$WORK/shm_consumer" \
+      -DCMAKE_PREFIX_PATH="$WORK/shm_prefix" >>"$WORK/log" 2>&1
+cmake --build "$WORK/shm_consumer" >>"$WORK/log" 2>&1
+"$WORK/shm_consumer/consumer"
+
 echo "  cmake-check: OK"
