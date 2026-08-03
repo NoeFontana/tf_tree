@@ -15,16 +15,28 @@
 //!   second quantile implementation exists to disagree with the first), and emit
 //!   both the table and a [`tf_tree_bench::runstore`] run file.
 //!
-//! # The asymmetry this report must state, every time
+//! # The fourth arm, and how its extra process is paid for
 //!
-//! There is no multi-process tf_tree arm, because `tft_bridge_create` builds a
-//! **heap** arena and no second process can attach to it. That is a fact about
-//! the engine today, not a gap in the harness, and giving the bridge a shared
-//! arena is new C ABI surface — a decision record, per `CLAUDE.md`. §9.3 is
-//! normative about what to do meanwhile: *"If a row cannot be measured fairly,
-//! omit it and say why. An honest gap is worth more than a favourable number
-//! nobody trusts."* [`MISSING_ARM`] is that sentence, and it is printed in the
-//! table and carried in the JSON rather than left in a comment here.
+//! Until `docs/decisions/0015` landed, this file carried a `MISSING_ARM`
+//! constant printed above the table on every run: there was no multi-process
+//! tf_tree arm, because `tft_bridge_create` built a **heap** arena that no
+//! second process could attach to. That is fixed rather than reworded — the arm
+//! exists, and §9.3's *"if a row cannot be measured fairly, omit it and say
+//! why"* no longer applies to it.
+//!
+//! What replaces the disclosure is an accounting rule, because the new arm runs
+//! **N+1** processes to the tf2 arm's N and a table that let the extra one in
+//! for free would be worse than the three-arm table it replaced. [`aggregate`]
+//! groups processes by the arm label parsed out of the file name and sums
+//! `cpu_ns` and `pss_kib` across every process in the group, dividing CPU by the
+//! **summed** `consumers` count. The bridge process reports `consumers 0`, so
+//! its whole cost lands in the arm it serves, amortized over exactly the
+//! consumers it serves. Nothing about that is special-cased for this arm; it is
+//! the shape the aggregator already had.
+//!
+//! `tests/dds_report_aggregate.rs` is what keeps the arm from silently
+//! disappearing — and what keeps a "NOT MEASURED" sentence from silently coming
+//! back.
 // This binary's output IS its result.
 #![allow(
     clippy::unwrap_used,
@@ -51,17 +63,6 @@ use tf_tree_bench::workload::{self, EdgeDecl};
 /// more than a handful of chains per cycle is not the shape being modelled, and
 /// `recorded` would otherwise hand 256 pairs to every arm.
 const MAX_PAIRS: usize = 8;
-
-/// The sentence this report is required to print, because the comparison is
-/// incomplete in a specific and nameable way.
-const MISSING_ARM: &str = "\
-NOT MEASURED — tf_tree across processes. `tft_bridge_create` builds its arena with
-TreeBuilder::build(), a HEAP arena, so no second process can attach to what the bridge
-fills. The tf_tree arm below is therefore a composed container (bridge + N consumer
-threads in one process, PHASE4 §5.8 form 3), and the tf2 arm is run BOTH ways so the
-comparison has a control: N separate listener processes, which is the ordinary ROS
-deployment, and one composed process, which is tf2's best case. Giving the bridge a
-shared arena is new C ABI surface and CLAUDE.md routes that to a decision record.";
 
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -291,9 +292,12 @@ fn aggregate(args: &[String]) -> Result<()> {
     let json = flag(args, "--json").map(PathBuf::from);
     let workload = flag(args, "--workload").unwrap_or_else(|| "robot".to_owned());
 
-    // Files are named `<arm>.<consumers>.<index>.out`, written by the shell
-    // driver. Grouping on the name rather than on the contents keeps the driver
-    // and this in step through one convention instead of a second protocol.
+    // Files are named `<arm>.<index>.out`, written by the shell driver — the
+    // label is everything before the last `.` of the stem, so an arm label may
+    // itself contain dots (`tf_tree.processes` does). Grouping on the name
+    // rather than on the contents keeps the driver and this in step through one
+    // convention instead of a second protocol, and it is what puts a bridge
+    // process and the consumers it serves in the same row.
     let mut arms: BTreeMap<String, Arm> = BTreeMap::new();
     let entries = std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?;
     for e in entries {
@@ -332,8 +336,6 @@ fn aggregate(args: &[String]) -> Result<()> {
 
     println!("tf_tree vs tf2, end to end over a real DDS  [workload: {workload}]");
     println!("=====================================================================");
-    println!("{MISSING_ARM}");
-    println!();
     println!(
         "{:<26} {:>6} {:>6} | {:>9} {:>9} {:>10} | {:>10} | {:>9} {:>9} {:>7}",
         "arm",
@@ -455,8 +457,37 @@ fn aggregate(args: &[String]) -> Result<()> {
     println!("PSS sums across processes and counts each shared page once — summed RSS would");
     println!("count one shared arena n times over.");
     println!();
-    println!("Both arms query the same pairs at the same rate with the same 100 ms lag, from one");
-    println!("publisher, with PHASE4 §5.2's QoS. The warm-up window is discarded and reported.");
+    println!("Every arm queries the same pairs at the same rate with the same 100 ms lag, from");
+    println!("one publisher, with PHASE4 §5.2's QoS. The warm-up window is discarded and");
+    println!("reported. The four arms are the same executable with a different --mode.");
+    println!();
+    println!("READ `tf_tree.processes` WITH THESE THREE FACTS (PHASE5 §9.3):");
+    println!("  * Its `procs` count is N+1: one bridge process plus N attached consumers. The");
+    println!("    bridge reports `consumers 0`, so its CPU and PSS are summed INTO this row and");
+    println!("    divided by the consumers it serves — never left beside the table. It is also");
+    println!("    a real operational cost tf2 does not have: one more process to supervise,");
+    println!("    plus a memfd, a rendezvous entry and a participant slot.");
+    println!("  * Its consumers do no deserialization and hold no per-node cache, and that is");
+    println!("    the architecture under test rather than a shortcut in the harness: the");
+    println!("    bridge in the same row pays that cost once for all of them. Query count,");
+    println!("    rate, lag, warm-up and measured window are identical to every other arm.");
+    println!("  * Each of its consumers still constructs and spins a full rclcpp node with a");
+    println!("    DDS participant, exactly like a `tf2.processes` consumer, and subscribes to");
+    println!("    nothing. Dropping the participant would move ~14 MiB per process out of the");
+    println!("    row and measure `no rclcpp` rather than `no /tf`.");
+    println!();
+    println!("AND ONE ABOUT THE `svc` COLUMN OF *BOTH* `.processes` ARMS. Their query threads");
+    println!("wake at --hz on a host whose cores are free to idle between ticks, so the p50");
+    println!("carries a wake-from-idle that neither composed arm pays. It is bimodal and it");
+    println!("moves run to run: measured here, tf_tree.processes p50 was 5.89 us on a loaded");
+    println!("host and 0.90-1.02 us on three consecutive idle ones, with 18% of samples at");
+    println!("composed speed in the slow run. The same four threads querying the same shared");
+    println!("arena from ONE attach process, which is therefore never idle, measured 1.00 us.");
+    println!("So it is the host's idle behaviour and not the attach path — and it hits the");
+    println!("consumer that does LEAST work hardest. tf2.processes swings the same way (2.59");
+    println!("to 11.07 us across these runs). Pin the cores (docs/benchmarks/tf2.md's runbook)");
+    println!("before quoting either. The CPU and PSS columns are far steadier and are what");
+    println!("this arm exists to measure.");
 
     if let Some(path) = &json {
         run.write(path)?;
