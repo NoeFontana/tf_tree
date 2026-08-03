@@ -334,6 +334,18 @@ tft_status BridgeHandle::create_bridge()
   o.on_clock_reset = static_cast<tft_bridge_on_clock_reset>(opts_.on_clock_reset);
   o.domain = opts_.time_domain;
   o.tf_prefix = opts_.tf_prefix.empty() ? nullptr : opts_.tf_prefix.c_str();
+  // `docs/decisions/0015`. Empty means NULL means a private heap arena, exactly
+  // as for `tf_prefix` above — the ABI has one spelling for "not set" and this
+  // is where the C++ one is translated into it.
+  //
+  // `o.struct_size = sizeof o` above already covers this field: the header is
+  // committed and drift-checked (`just c-header-check`), `arena_name` is in it
+  // (`tf_tree_unstable.h:146`), so `sizeof(tft_bridge_options)` here is the
+  // current layout and `tft_bridge_create` reads the whole struct rather than a
+  // prefix of it. Nothing about the §3.6 prefix rule has to be thought about on
+  // this side; it exists for a caller compiled against an *older* header, which
+  // this package never is — it is built against the archive it links.
+  o.arena_name = opts_.arena_name.empty() ? nullptr : opts_.arena_name.c_str();
 
   tft_status rc = tft_bridge_create(opts_.topology_toml.c_str(), &o, &bridge_);
   if (rc != TFT_OK) {

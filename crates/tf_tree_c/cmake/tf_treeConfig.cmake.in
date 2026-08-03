@@ -9,6 +9,19 @@ include(CMakeFindDependencyMacro)
 
 set_and_check(TF_TREE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
 
+# Whether the installed library was built `--features shm`, decided by the
+# `nm` probe in the CMakeLists at *package* configure time and baked in here.
+#
+# **It has to be baked in rather than re-probed, and it has to be here at all.**
+# `tf_tree.h` hides `tft_tree_open` behind `#if defined(TFT_HAVE_SHM)`, and this
+# config file builds its own IMPORTED targets from scratch — it does not import
+# an export set — so an INTERFACE property set only in the build tree reaches no
+# `find_package(tf_tree CONFIG)` consumer at all. That is the path
+# `ros/tf_tree_ros` and `just cmake-check` both take, i.e. every consumer that
+# matters. Baking is honest here because the library this describes is the one
+# that was probed.
+set(TF_TREE_HAVE_SHM @TF_TREE_HAVE_SHM@)
+
 # **Exact filenames, both of them.** `NAMES tf_tree_c` walks
 # `CMAKE_FIND_LIBRARY_SUFFIXES` (`.so;.a` on Linux) and would happily match the
 # archive when no shared library is installed — declaring a `.a` a SHARED
@@ -24,6 +37,10 @@ if(TF_TREE_LIBRARY_SHARED AND NOT TARGET tf_tree::tf_tree)
       IMPORTED_LOCATION "${TF_TREE_LIBRARY_SHARED}"
       INTERFACE_INCLUDE_DIRECTORIES "${TF_TREE_INCLUDE_DIR}"
       INTERFACE_COMPILE_FEATURES cxx_std_17)
+  if(TF_TREE_HAVE_SHM)
+    set_property(TARGET tf_tree::tf_tree APPEND
+                 PROPERTY INTERFACE_COMPILE_DEFINITIONS TFT_HAVE_SHM=1)
+  endif()
 endif()
 
 if(TF_TREE_LIBRARY_STATIC AND NOT TARGET tf_tree::tf_tree_static)
@@ -34,6 +51,10 @@ if(TF_TREE_LIBRARY_STATIC AND NOT TARGET tf_tree::tf_tree_static)
       INTERFACE_COMPILE_FEATURES cxx_std_17
       # A Rust staticlib carries none of its own system dependencies.
       INTERFACE_LINK_LIBRARIES "pthread;dl;m")
+  if(TF_TREE_HAVE_SHM)
+    set_property(TARGET tf_tree::tf_tree_static APPEND
+                 PROPERTY INTERFACE_COMPILE_DEFINITIONS TFT_HAVE_SHM=1)
+  endif()
 endif()
 
 check_required_components(tf_tree)

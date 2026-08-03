@@ -105,6 +105,39 @@ BridgeNode::BridgeNode(const rclcpp::NodeOptions & options)
   o.tf_topic = declare_parameter<std::string>("tf_topic", "/tf");
   o.tf_static_topic = declare_parameter<std::string>("tf_static_topic", "/tf_static");
 
+  o.arena_name = declare_parameter<std::string>("arena_name", "");
+  // **One refusal here, and deliberately only one** — the same split the
+  // both-or-neither check above states: what stays at the parameter surface is
+  // what the ABI *cannot see*.
+  //
+  // The ABI is the single authority on whether a string is a usable arena name.
+  // `tf_tree_ipc::ArenaName` refuses an empty, over-64-byte or multi-component
+  // name, `tft_bridge_create` reports that as `TFT_ERR_ARENA_UNAVAILABLE` with
+  // the name in the message, and `BridgeHandle` turns it into a `BridgeError`
+  // out of this constructor — so a bad name already refuses to start, with a
+  // better diagnosis than a second, narrower rule here could give. Duplicating
+  // that rule would also make `tf_tree_ros` reject names that `$TF_TREE_NAME`,
+  // `tf_tree serve` and the C ABI all accept, which is one concept with two
+  // definitions and a config that works in one place and not another.
+  //
+  // What the ABI cannot see is *this layer's* convention that empty means "no
+  // shared arena at all". `arena_name: ""` and `arena_name: " "` are the same
+  // string to an operator reading a launch file and opposite instructions to
+  // the bridge: the first is a private heap arena, the second is a published
+  // rendezvous named " " that every consumer will fail to guess — the "waiting
+  // on a rendezvous that will never appear" failure `docs/decisions/0015`
+  // spends a paragraph on. By the time it reaches C it is an ordinary valid
+  // name and nothing downstream can recover the intent, exactly like "neither
+  // parameter set" above. So a name that is entirely whitespace is refused
+  // here, and every other name is the ABI's to judge.
+  if (!o.arena_name.empty() &&
+    o.arena_name.find_first_not_of(" \t\n\r\f\v") == std::string::npos)
+  {
+    throw std::invalid_argument(
+            "arena_name is entirely whitespace. Leave it unset for a private in-process arena, "
+            "or give it a name a consumer can put in $TF_TREE_NAME (docs/decisions/0015).");
+  }
+
   // §5.5, as far as a node can take it. The engine's typed domains are what
   // actually keep sim and real transforms apart, and the C ABI refuses at
   // startup if a declared edge disagrees with `time_domain` — so all that is

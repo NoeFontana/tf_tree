@@ -158,6 +158,35 @@ TEST(BridgeNodeTest, an_unknown_authority_policy_is_refused_rather_than_defaulte
     std::invalid_argument);
 }
 
+/// An `arena_name` that is entirely whitespace is refused rather than published.
+///
+/// This is the *only* content rule this layer applies to `arena_name`, and the
+/// reason is the one `BridgeNode`'s constructor gives at the parameter: empty
+/// means "no shared arena", so `""` and `" "` look identical in a launch file
+/// and mean opposite things, and by the time `" "` reaches C it is an ordinary
+/// valid single-component name that `tf_tree_ipc::ArenaName` accepts. Every
+/// other malformed name — too long, `../escape`, a NUL — is the ABI's to refuse
+/// and it does, with the name in the message.
+///
+/// **Mutant:** delete the whitespace check in `BridgeNode`'s constructor. `" "`
+/// then reaches `tft_bridge_create`, which accepts it as a name, and the node
+/// constructs — nothing throws and `EXPECT_THROW` fails. Applied; it dies.
+/// (Should the surrounding environment make the *arena* unbuildable, the throw
+/// becomes a `BridgeError` instead, which `EXPECT_THROW` also reports as a
+/// failure because the type does not match. The test cannot pass with the check
+/// gone.)
+TEST(BridgeNodeTest, an_all_whitespace_arena_name_is_refused_rather_than_published)
+{
+  EXPECT_THROW(
+    std::make_shared<tf_tree_ros::BridgeNode>(
+      with(
+        {
+          rclcpp::Parameter("topology_config", std::string(kTopology)),
+          rclcpp::Parameter("arena_name", std::string("  ")),
+        })),
+    std::invalid_argument);
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)

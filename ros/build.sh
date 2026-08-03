@@ -7,10 +7,20 @@
 #
 # Three steps, and the first two are the ones that are easy to get wrong:
 #
-#   1. `cargo build -p tf_tree_c --features bridge`. **Without `--features
-#      bridge` the nine §5 entry points are not in the archive** and the colcon
-#      link fails with a list of undefined `tft_bridge_*` symbols — the feature
-#      is default-off (see `just test`'s comment for why that keeps biting).
+#   1. `cargo build -p tf_tree_c --features bridge,shm`. **Two default-off
+#      features, and a different failure for each** (see `just test`'s comment
+#      for why default-off keeps biting):
+#
+#        * without `bridge` the nine §5 entry points are not in the archive and
+#          the colcon link fails with a list of undefined `tft_bridge_*` symbols;
+#        * without `shm` there is no `tft_tree_open`, so `docs/decisions/0015`'s
+#          `arena_name` has no `tf_tree::Open` behind it, `tft_bridge_create`
+#          *refuses* a non-NULL one, and the CMake package leaves `TFT_HAVE_SHM`
+#          undefined — which is what `test_shared_arena.cpp`'s `#error` reports,
+#          loudly, rather than skipping.
+#
+#      The symbol check below asks for one symbol from each and says which
+#      feature is missing, because "rebuild it" is not actionable without that.
 #   2. Configure, build and *install* `crates/tf_tree_c`'s CMake package into a
 #      prefix. `find_package(tf_tree CONFIG)` needs the installed
 #      `tf_treeConfig.cmake`, which only exists after `cmake --install`;
@@ -37,15 +47,22 @@ fi
 
 mkdir -p "$OUT"
 
-echo "==> 1/3  libtf_tree_c.a --features bridge"
-cargo build --release -q -p tf_tree_c --features bridge
+echo "==> 1/3  libtf_tree_c.a --features bridge,shm"
+cargo build --release -q -p tf_tree_c --features bridge,shm
 LIBDIR="${CARGO_TARGET_DIR:-$ROOT/target}/release"
 if [ ! -f "$LIBDIR/libtf_tree_c.a" ]; then
     echo "  FAIL: no $LIBDIR/libtf_tree_c.a" >&2
     exit 1
 fi
-# The check that catches a stale archive built without the feature, *before*
+# The check that catches a stale archive built without a feature, *before*
 # colcon spends two minutes reaching the same conclusion in linker output.
+#
+# **One symbol per feature, and a message that says which.** `tft_bridge_offer`
+# is `bridge`; `tft_tree_open` is `shm`. An operator told only "rebuild it" has
+# to go and read this script to find out what to rebuild it with, and the two
+# features fail in completely different places — a missing `bridge` is a link
+# error, a missing `shm` is a `TFT_HAVE_SHM` that never gets defined and a
+# `test_shared_arena.cpp` that will not compile.
 #
 # Not `nm ... | grep -q`: under `set -o pipefail`, `grep -q` exits on the first
 # match, `nm` then dies of SIGPIPE, and the pipeline's status is 141 — so the
@@ -56,6 +73,16 @@ case "$symbols" in
     *)
         echo "  FAIL: $LIBDIR/libtf_tree_c.a has no tft_bridge_offer." >&2
         echo "        It was built without --features bridge; remove it and re-run." >&2
+        exit 1
+        ;;
+esac
+case "$symbols" in
+    *" T tft_tree_open"*) ;;
+    *)
+        echo "  FAIL: $LIBDIR/libtf_tree_c.a has no tft_tree_open." >&2
+        echo "        It was built without --features shm, so docs/decisions/0015's" >&2
+        echo "        arena_name has nothing behind it and the CMake package will" >&2
+        echo "        leave TFT_HAVE_SHM undefined; remove it and re-run." >&2
         exit 1
         ;;
 esac

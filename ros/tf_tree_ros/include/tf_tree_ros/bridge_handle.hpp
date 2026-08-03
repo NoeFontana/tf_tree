@@ -93,6 +93,32 @@ struct BridgeOptions
 
   std::string tf_topic = "/tf";
   std::string tf_static_topic = "/tf_static";
+
+  /// Rendezvous name for a **shared** arena, or empty for a private heap one
+  /// (`docs/decisions/0015`).
+  ///
+  /// Empty is the default and is exactly today's behaviour: the bridge builds
+  /// an ordinary heap arena that only this process can reach, which is what
+  /// §5.8's form 3 — a bridge composed alongside its only consumer — wants.
+  ///
+  /// Non-empty is what makes a **separate process** able to attach: the bridge
+  /// publishes its arena under this name and any consumer joins it read-only
+  /// with `tf_tree::open()`, `tft_tree_open()` or `tf_tree.open()`, with no
+  /// bridge-specific API on either side. That is §9.1's *"one bridge plus N
+  /// `tf_tree` consumers"* arm, and it is unconstructible with this left empty.
+  ///
+  /// **It is not `time_domain`, and it does not carry a domain at all.** The
+  /// *rendezvous* domain comes from `$TF_TREE_DOMAIN`, else `$ROS_DOMAIN_ID`,
+  /// else 0 — the convention two robots on one host already use
+  /// (`docs/decisions/0019` §3). A consumer therefore needs this name and the
+  /// same domain, and nothing else.
+  ///
+  /// It can fail where an empty one cannot — the name is already held by a live
+  /// arena, the runtime directory is unusable, the library was built without
+  /// `--features shm` — and every one of those is a `BridgeError` out of the
+  /// constructor. **There is no fallback to a heap arena**: a silent downgrade
+  /// leaves every consumer waiting on a rendezvous that will never appear.
+  std::string arena_name;
 };
 
 /// The most recent §5.4 authority conflict, with both publishers named.

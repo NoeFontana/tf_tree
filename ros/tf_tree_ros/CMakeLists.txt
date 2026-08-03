@@ -116,6 +116,18 @@ if(BUILD_TESTING)
     target_link_libraries(test_clock tf_tree_ros ${rosgraph_msgs_TARGETS})
   endif()
 
+  # `docs/decisions/0015`: the `arena_name` parameter, and the attach it exists
+  # to make possible. **Its own binary because it is the only test here that
+  # rewrites `$TF_TREE_RUNTIME_DIR`, `$TF_TREE_DOMAIN` and `$TF_TREE_NAME`** —
+  # process-wide state that selects which arena *any* `tft_tree_open` in the
+  # process resolves to, set once in its `main` before `rclcpp::init`. Sharing a
+  # binary with a suite that does not expect it would make that suite's arena
+  # depend on test ordering.
+  ament_add_gtest(test_shared_arena test/test_shared_arena.cpp TIMEOUT 180)
+  if(TARGET test_shared_arena)
+    target_link_libraries(test_shared_arena tf_tree_ros)
+  endif()
+
   # §5.8's amendment: form 3 attached to a node the caller is already spinning.
   # Its own binary because the mutant it exists for kills the *process* rather
   # than failing an assertion — `add_callback_group` throws on the ingest

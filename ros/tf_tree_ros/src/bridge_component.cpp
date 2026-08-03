@@ -12,11 +12,13 @@
 // including for `transient_local` `/tf_static` and for a late-joining
 // subscription, both of which have historically been exceptions — but
 // intra-process communication is **off by default when loading a component**.
-// It has to be asked for:
-//
-//     ros2 component load /ComponentManager tf_tree_ros tf_tree_ros::BridgeNode \
-//         --extra-arguments use_intra_process_comms:=true
-//
+// It has to be asked for. (Block comment, not `//`: the shell continuation is a
+// trailing backslash, which splices a `//` comment into the next line and made
+// `-Wcomment` fire on every build of this file.)
+/*
+      ros2 component load /ComponentManager tf_tree_ros tf_tree_ros::BridgeNode \
+          --extra-arguments use_intra_process_comms:=true
+*/
 // Without it the composed form pays exactly the deserialization cost §5.9 says
 // the bridge is the one component that still pays, and the reason for composing
 // it is gone.

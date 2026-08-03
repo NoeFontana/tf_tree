@@ -114,6 +114,87 @@ if(NOT _tf_tree_static AND TF_TREE_BUILD_FROM_SOURCE)
   endif()
 endif()
 
+# --- does this library have `shm` in it? ------------------------------------
+
+# `tf_tree.h` hides `tft_tree_open` behind `#if defined(TFT_HAVE_SHM)` and
+# **nothing defined it**, so the only way a consumer reached the shared-arena
+# entry point was to hand-type the macro — against an archive that may well have
+# been built without `--features shm`. That compiles and then fails at link, in
+# the consumer, naming a symbol the consumer never wrote. The macro has to come
+# from the artifact.
+#
+# So: ask the resolved library whether it defines `tft_tree_open`, and put
+# `TFT_HAVE_SHM=1` on the exported targets only when it does.
+#
+# **Off is the safe answer, and that is why every uncertain case takes it.** With
+# the definition off a consumer that calls `tft_tree_open` gets a *compile*
+# error naming that identifier; with it wrongly on, a link error naming a mangled
+# symbol. The three cases that cannot be probed:
+#
+#   * corrosion (`_tf_tree_corrosion`): the library does not exist at configure
+#     time and CMake does not choose its feature set — `corrosion_import_crate`
+#     is called with no `FEATURES`, so cargo's defaults apply and `shm` is
+#     default-off. Off here is therefore *accurate*, not merely conservative; if
+#     this branch ever grows a `FEATURES` argument, this is the line that has to
+#     grow with it.
+#   * the cargo-fallback branch: same, one step further out — the path in
+#     `_tf_tree_static` is a promise, not a file, until `cmake --build` runs, and
+#     that build is a plain `cargo build --release` with default features.
+#   * no `nm`: nothing to ask.
+#
+# In practice the probe fires for `TF_TREE_PREBUILT_DIR`, which is the path
+# `ros/build.sh` and every packaged deployment take.
+set(TF_TREE_HAVE_SHM 0)
+
+set(_tf_tree_probe "")
+if(_tf_tree_static AND EXISTS "${_tf_tree_static}")
+  set(_tf_tree_probe "${_tf_tree_static}")
+elseif(_tf_tree_shared AND EXISTS "${_tf_tree_shared}")
+  set(_tf_tree_probe "${_tf_tree_shared}")
+endif()
+
+if(_tf_tree_corrosion)
+  message(STATUS "tf_tree: corrosion source build, feature set not chosen here; TFT_HAVE_SHM off")
+elseif(NOT _tf_tree_probe)
+  message(STATUS "tf_tree: no library to probe yet (source build); TFT_HAVE_SHM off")
+else()
+  # `CMAKE_NM` is set by CMakeFindBinUtils for the enabled languages; a
+  # toolchain file may override it, and honouring that is the point of looking
+  # there first.
+  set(_tf_tree_nm "${CMAKE_NM}")
+  if(NOT _tf_tree_nm)
+    find_program(TF_TREE_NM NAMES nm)
+    set(_tf_tree_nm "${TF_TREE_NM}")
+  endif()
+  if(NOT _tf_tree_nm)
+    message(STATUS
+        "tf_tree: no nm found, cannot tell whether ${_tf_tree_probe} has shm in it; "
+        "TFT_HAVE_SHM off. A consumer calling tft_tree_open will fail to compile "
+        "rather than fail to link.")
+  else()
+    execute_process(
+        COMMAND "${_tf_tree_nm}" --defined-only "${_tf_tree_probe}"
+        OUTPUT_VARIABLE _tf_tree_syms
+        ERROR_VARIABLE _tf_tree_nm_err
+        RESULT_VARIABLE _tf_tree_nm_rc)
+    # The trailing newline class matters: it is what keeps this from matching a
+    # hypothetical `tft_tree_open_v2`, which would be exactly the wrong answer.
+    if(NOT _tf_tree_nm_rc EQUAL 0)
+      message(STATUS "tf_tree: ${_tf_tree_nm} failed on ${_tf_tree_probe}; TFT_HAVE_SHM off")
+    elseif(_tf_tree_syms MATCHES " T tft_tree_open[\r\n]")
+      set(TF_TREE_HAVE_SHM 1)
+    endif()
+  endif()
+endif()
+
+if(TF_TREE_HAVE_SHM)
+  message(STATUS "tf_tree: ${_tf_tree_probe} defines tft_tree_open; TFT_HAVE_SHM=1")
+elseif(_tf_tree_probe)
+  message(STATUS
+      "tf_tree: ${_tf_tree_probe} does not define tft_tree_open (built without "
+      "--features shm); TFT_HAVE_SHM off")
+endif()
+
 # --- the exported targets ---------------------------------------------------
 
 if(NOT _tf_tree_corrosion)
@@ -140,6 +221,15 @@ if(NOT _tf_tree_corrosion)
 
   add_library(tf_tree::tf_tree ALIAS tf_tree_shared)
   add_library(tf_tree::tf_tree_static ALIAS tf_tree_static)
+
+  # **Both targets**: they are resolved by two separate `find_library` calls but
+  # they are two builds of one crate, and a consumer that links the static one
+  # must see the same header surface as one that links the shared one.
+  if(TF_TREE_HAVE_SHM)
+    foreach(_t tf_tree_static tf_tree_shared)
+      set_property(TARGET ${_t} APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS TFT_HAVE_SHM=1)
+    endforeach()
+  endif()
 endif()
 
 # --- installation and find_package(tf_tree CONFIG) --------------------------
