@@ -101,6 +101,21 @@ const STABLE: &[&str] = &[
     "tft_abi_version_major",
     "tft_abi_version_minor",
     "tft_check_abi",
+    // The three opaque handle typedefs. They are emitted by `HANDLE_DECLS`
+    // rather than by cbindgen and are in `OPAQUE`, which both configs exclude —
+    // so listing them here changes *generation* not at all (verified: the two
+    // headers are byte-identical before and after). What it changes is
+    // `check_stable_is_complete`'s reach: without them, deleting
+    // `typedef struct tft_tree tft_tree;` from `HANDLE_DECLS` and regenerating
+    // in the same run leaves `--check` at exit 0, and the frozen header has
+    // silently lost the type every entry point in it takes. `just
+    // c-header-check` does catch that one, as `unknown type name 'tft_tree'` —
+    // but a check that depends on a C compiler noticing is not the inventory
+    // this list is supposed to be. `tft_bridge` is deliberately NOT here: it is
+    // declared in the *unstable* header.
+    "tft_tree",
+    "tft_plan",
+    "tft_publisher",
     // Errors — §3.3.
     "tft_status",
     "tft_error",
@@ -278,6 +293,11 @@ const UNSTABLE: &[&str] = &[
 /// filter; these are not, because C type names here are lowercase by
 /// convention.
 const TIER_TYPES: &[&str] = &[
+    // The opaque handles: typedefs from `HANDLE_DECLS`, with no `extern "C" fn`
+    // of their own for `check_partition`'s stale half to find.
+    "tft_tree",
+    "tft_plan",
+    "tft_publisher",
     "tft_status",
     "tft_error",
     "tft_layout",
@@ -811,7 +831,7 @@ fn check_stable_is_complete(stable_header: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "these STABLE entries are defined by NEITHER generated header: {missing:?}\n  \
+        "these STABLE entries are defined by neither header — checked against the\n  generated STABLE one, which the complement construction makes equivalent: {missing:?}\n  \
          STABLE is the frozen tier (docs/PHASE4.md §3.1), and both cbindgen configs\n  \
          are built by *complement* — so a name listed here that the crate no longer\n  \
          exports is emitted nowhere, and the frozen header quietly gets smaller.\n  \
@@ -1054,5 +1074,59 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         if let Err(e) = check_overlap(&stable, &unstable) {
             panic!("{e}");
         }
+    }
+
+    /// The completeness check's own gate, for the same reason the overlap
+    /// tests above exist: it was added *because* three checks each missed the
+    /// same omission, and one that quietly missed it too would be the failure
+    /// repeating a third time.
+    #[test]
+    fn a_stable_entry_the_header_does_not_define_is_caught() {
+        // One real STABLE entry present, one absent. `TFT_ERR_NULL_ARG` is a
+        // `#define`, which is the shape the whole check exists for — a
+        // screaming-case constant is exempt from `check_partition`'s stale half
+        // by construction.
+        let header = "#define TFT_ERR_NULL_ARG -1\n";
+        match super::check_stable_is_complete(header) {
+            Ok(()) => panic!("a header defining one of 60+ STABLE entries must not pass"),
+            Err(e) => assert!(
+                e.contains("TFT_OK"),
+                "the message must name what is missing, got: {e}"
+            ),
+        }
+    }
+
+    /// And it passes on a header that defines everything listed — the direction
+    /// that keeps it from being a check that always fails.
+    #[test]
+    fn the_committed_stable_header_defines_every_stable_entry() {
+        let inc = super::workspace_root().join("crates/tf_tree_c/include");
+        let stable = std::fs::read_to_string(inc.join("tf_tree.h")).unwrap();
+        if let Err(e) = super::check_stable_is_complete(&stable) {
+            panic!("{e}");
+        }
+    }
+
+    /// **The one shape [`defined_symbols`] cannot see**, pinned so that the
+    /// first `#[repr(C)] pub enum` added to a tier list meets it here rather
+    /// than as a mystery failure.
+    ///
+    /// cbindgen indents enum variants, and the column-0 rule that separates a
+    /// definition from the inside of one drops them. No entry in `STABLE` or
+    /// `UNSTABLE` is of that shape today — every one is a `#define`, a
+    /// `typedef`, or a function — so the completeness check is vacuous for
+    /// nothing currently listed. Adding a variant name to a tier list would
+    /// give it a false failure, and would give [`check_overlap`] a blind spot.
+    #[test]
+    fn enum_variants_are_not_definitions_to_this_scanner() {
+        let header = "typedef enum {\n  TFT_KIND_A = 0,\n} tft_kind;\n";
+        let defs = defined_symbols(header);
+        assert!(defs.contains("tft_kind"), "the typedef itself must be seen");
+        assert!(
+            !defs.contains("TFT_KIND_A"),
+            "if this starts passing, defined_symbols grew a fifth shape and both \
+             check_overlap and check_stable_is_complete widened with it — update \
+             their docs, which say four"
+        );
     }
 }

@@ -86,28 +86,61 @@ LD_LIBRARY_PATH="$WORK/prefix/lib" "$WORK/shared_build/consumer"
 # `=1` case ran was `ros/build.sh`, in the container, where a failure surfaces
 # as a `#error` in a ctest two minutes into a colcon build.
 #
-# Both branches are checked, because "off" is the answer that has to be *right*
-# rather than merely safe: a package that answered 0 for a library that does
-# have `shm` in it hides an entry point the caller paid for.
-echo "  TFT_HAVE_SHM off for a default-features build"
-if ! grep -q '^set(TF_TREE_HAVE_SHM_STATIC 0)' "$WORK/prefix/lib/cmake/tf_tree/tf_treeConfig.cmake"; then
-    echo "  FAIL: the source build has no shm in it, but the installed config does not say so" >&2
-    grep TF_TREE_HAVE_SHM "$WORK/prefix/lib/cmake/tf_tree/tf_treeConfig.cmake" >&2 || true
-    exit 1
-fi
-
-echo "  TFT_HAVE_SHM=1 from a --features bridge,shm prebuilt"
-cargo build --release -q -p tf_tree_c --features bridge,shm
-PREBUILT="${CARGO_TARGET_DIR:-$ROOT/target}/release"
+# **The prebuilt directory is deliberately MIXED**, and that is what makes this
+# arm test the probe rather than test that a file was absent. The source-build
+# path cannot do it: `_tf_tree_static` there is a path under the build tree that
+# does not exist at configure time, so `tf_tree_probe_shm` returns at its
+# `NOT EXISTS` guard and `nm` is never run at all —
+#
+#     tf_tree: .../build/cargo/release/libtf_tree_c.a does not exist at
+#              configure time; TFT_HAVE_SHM off for it
+#
+# — so asserting 0 against that prefix pins "there was no library to look at",
+# not "nm looked and found no tft_tree_open". An earlier revision of this arm
+# did exactly that and claimed the stronger thing.
+#
+# One directory holding an **shm `.a` beside a default-features `.so`** fixes
+# both halves at once: `nm` runs on each, has to answer 1 for one and 0 for the
+# other, and the two answers must land on their own targets. That is also the
+# only shape that catches a regression to #142's reviewed defect — one probe
+# applied to both targets — which a directory built from a single `cargo build`
+# cannot see, because there both answers are 1 either way.
+echo "  TFT_HAVE_SHM: nm answers per artifact, on a mixed prebuilt"
+MIX=$WORK/mixed
+mkdir -p "$MIX"
+cargo build --release -q -p tf_tree_c --features bridge,shm --target-dir "$WORK/cargo-shm"
+cargo build --release -q -p tf_tree_c --target-dir "$WORK/cargo-plain"
+cp "$WORK/cargo-shm/release/libtf_tree_c.a" "$MIX/"
+cp "$WORK/cargo-plain/release/libtf_tree_c.so" "$MIX/"
 cmake -S "$ROOT/crates/tf_tree_c" -B "$WORK/shm_build" \
-      -DTF_TREE_PREBUILT_DIR="$PREBUILT" \
+      -DTF_TREE_PREBUILT_DIR="$MIX" \
       -DCMAKE_INSTALL_PREFIX="$WORK/shm_prefix" \
       -DCMAKE_BUILD_TYPE=Release >>"$WORK/log" 2>&1
 cmake --install "$WORK/shm_build" >>"$WORK/log" 2>&1
+CFG=$WORK/shm_prefix/lib/cmake/tf_tree/tf_treeConfig.cmake
+# STATIC 1 and SHARED 0, from one directory: the `1` proves `nm` found the
+# symbol in a real archive, the `0` proves it *looked* and did not find it in a
+# real shared library, and the pair proves the answers are per artifact.
+for want in "TF_TREE_HAVE_SHM_STATIC 1" "TF_TREE_HAVE_SHM_SHARED 0"; do
+    if ! grep -q "^set($want)" "$CFG"; then
+        echo "  FAIL: expected 'set($want)' from the mixed prebuilt" >&2
+        echo "        (shm .a beside a default-features .so; the probe must answer per artifact)" >&2
+        grep TF_TREE_HAVE_SHM "$CFG" >&2 || true
+        exit 1
+    fi
+done
+
+# And the ordinary case, where both artifacts come from one build: both 1.
+echo "  TFT_HAVE_SHM=1 from a --features bridge,shm prebuilt"
+cmake -S "$ROOT/crates/tf_tree_c" -B "$WORK/shm_build2" \
+      -DTF_TREE_PREBUILT_DIR="$WORK/cargo-shm/release" \
+      -DCMAKE_INSTALL_PREFIX="$WORK/shm_prefix" \
+      -DCMAKE_BUILD_TYPE=Release >>"$WORK/log" 2>&1
+cmake --install "$WORK/shm_build2" >>"$WORK/log" 2>&1
 for v in STATIC SHARED; do
-    if ! grep -q "^set(TF_TREE_HAVE_SHM_$v 1)" "$WORK/shm_prefix/lib/cmake/tf_tree/tf_treeConfig.cmake"; then
+    if ! grep -q "^set(TF_TREE_HAVE_SHM_$v 1)" "$CFG"; then
         echo "  FAIL: the prebuilt has tft_tree_open in it, but TF_TREE_HAVE_SHM_$v is not 1" >&2
-        grep TF_TREE_HAVE_SHM "$WORK/shm_prefix/lib/cmake/tf_tree/tf_treeConfig.cmake" >&2 || true
+        grep TF_TREE_HAVE_SHM "$CFG" >&2 || true
         exit 1
     fi
 done
