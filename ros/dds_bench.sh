@@ -24,7 +24,15 @@
 # **The bridge process runs only during its own arm.** It is launched by
 # `run_processes_arm` and waited on there, so its ingest CPU never contends with
 # the tf2 engines it is being compared against — which would break §9.3's
-# "identical everything else" in the one direction that flatters tf_tree.
+# "identical everything else" in the one direction that flatters tf_tree. An
+# interrupted run takes every process it launched with it (`cleanup`, on
+# `EXIT INT TERM`); without that the same violation arrives one run later, from
+# a bridge that outlived the `^C` that stopped its arm.
+#
+# **Arm order is fixed and is a disclosed confound.** The arms run in the order
+# below, after a 3 s discovery settle, so the last one meets the warmest cache
+# and the most settled discovery. Nothing here corrects for it; `dds_report`
+# prints the order under its own table so a reader can weigh it.
 #
 # §9.3's honesty rules are discharged mechanically rather than by care:
 #   * identical data — one publisher, generated from one workload entry;
@@ -73,6 +81,24 @@ export TF_TREE_RUNTIME_DIR=$RUNDIR
 export TF_TREE_DOMAIN=0
 export TF_TREE_NAME=${TF_TREE_NAME:-ddsbench}
 
+# **The rendezvous socket path is at the mercy of how deep this checkout is.**
+# `tf_tree_ipc` builds `<runtime_dir>/<domain>/<name>.sock` and a
+# `sockaddr_un.sun_path` holds 108 bytes including the NUL, so a `$ROOT` a
+# little over 90 characters deep makes the arm unrunnable. The library refuses
+# with a typed `SocketPathTooLong` naming both numbers, so the failure is never
+# silent — but it surfaces inside `tft_bridge_create` as one status code among
+# several, after a build and three other arms have run. Checked here instead,
+# where the remedy (clone somewhere shorter, or point `$TF_TREE_RUNTIME_DIR`
+# at one) is obvious and costs nothing.
+SOCKET_PATH="$TF_TREE_RUNTIME_DIR/$TF_TREE_DOMAIN/$TF_TREE_NAME.sock"
+if [ "${#SOCKET_PATH}" -ge 108 ]; then
+    echo "dds_bench: the rendezvous socket path is ${#SOCKET_PATH} bytes and sun_path holds" >&2
+    echo "  107 plus a NUL: $SOCKET_PATH" >&2
+    echo "  The tf_tree.processes arm cannot run from a checkout this deep. Either clone" >&2
+    echo "  somewhere shorter or set TF_TREE_RUNTIME_DIR to a short directory." >&2
+    exit 1
+fi
+
 # How long the bridge keeps serving after its own measured window closes.
 #
 # Its consumers cannot start warming up until the rendezvous exists, so their
@@ -115,6 +141,30 @@ set -u
 
 echo "==> ROS ${ROS_DISTRO:-unknown}, RMW ${RMW_IMPLEMENTATION:-<rmw default>}"
 
+# Everything this script has launched and not yet reaped.
+#
+# **An orphaned arm is not merely untidy, it is the next run's confound.** The
+# trap used to kill the publisher alone, so a `^C` during `run_processes_arm`
+# left a bridge ingesting `/tf` for up to `warmup + seconds + linger` seconds
+# after this script exited. Re-run immediately — which is exactly what somebody
+# who just interrupted a run does — and that bridge is still deserializing while
+# the *next* run's `tf2.processes` arm is being measured against it. This file's
+# own header claims the arms never contend, on the strength of the bridge being
+# launched and waited on inside its own arm; that claim is only structural if an
+# interrupted run takes its processes with it.
+ARM_PIDS=()
+
+cleanup() {
+    trap - EXIT INT TERM
+    if [ -n "${PUB:-}" ]; then
+        kill "$PUB" 2>/dev/null || true
+    fi
+    if [ "${#ARM_PIDS[@]}" -ne 0 ]; then
+        kill "${ARM_PIDS[@]}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
 run_arm() {
     local label=$1 mode=$2 procs=$3 cons=$4
     echo "==> arm $label: $procs process(es) x $cons consumer(s)"
@@ -128,11 +178,13 @@ run_arm() {
             --seconds "$SECONDS_MEASURED" --warmup "$WARMUP" \
             > "$RES/$label.$i.out" 2> "$RES/$label.$i.err" &
         pids+=($!)
+        ARM_PIDS+=($!)
     done
     local failed=0
     for p in "${pids[@]}"; do
         wait "$p" || failed=1
     done
+    ARM_PIDS=()
     if [ "$failed" -ne 0 ]; then
         echo "  a consumer in arm $label exited non-zero; its stderr:" >&2
         cat "$RES/$label".*.err >&2
@@ -166,6 +218,7 @@ run_processes_arm() {
         --linger "$BRIDGE_LINGER" \
         > "$RES/$label.0.out" 2> "$RES/$label.0.err" &
     pids+=($!)
+    ARM_PIDS+=($!)
     for i in $(seq 1 "$procs"); do
         "$BIN/bench_consumer" --mode tf_tree_attach \
             --queries "$CFG/queries.txt" \
@@ -173,11 +226,13 @@ run_processes_arm() {
             --seconds "$SECONDS_MEASURED" --warmup "$WARMUP" \
             > "$RES/$label.$i.out" 2> "$RES/$label.$i.err" &
         pids+=($!)
+        ARM_PIDS+=($!)
     done
     local failed=0
     for p in "${pids[@]}"; do
         wait "$p" || failed=1
     done
+    ARM_PIDS=()
     if [ "$failed" -ne 0 ]; then
         echo "  a process in arm $label exited non-zero; its stderr:" >&2
         cat "$RES/$label".*.err >&2
@@ -189,7 +244,6 @@ echo "==> publisher for ${PUB_SECONDS}s"
 "$BIN/tf_publisher" --plan "$CFG/plan.txt" --seconds "$PUB_SECONDS" \
     > "$RES/publisher.log" 2>&1 &
 PUB=$!
-trap 'kill $PUB 2>/dev/null || true' EXIT
 # Let discovery settle and `/tf_static` be latched before the first consumer
 # joins. A consumer that starts inside discovery measures discovery.
 sleep 3
@@ -201,7 +255,7 @@ run_processes_arm "tf_tree.processes" "$CONSUMERS"
 
 kill $PUB 2>/dev/null || true
 wait $PUB 2>/dev/null || true
-trap - EXIT
+trap - EXIT INT TERM
 
 echo
 cargo run --release -q -p tf_tree_bench --bin dds_report -- \

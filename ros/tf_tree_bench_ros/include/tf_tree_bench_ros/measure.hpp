@@ -7,10 +7,13 @@
 //     `mp::Histogram`'s, so the Rust aggregator (`dds_report`) decodes what
 //     these nodes print with `Histogram::decode` and no second implementation
 //     of quantiles exists to disagree with the first.
-//   * `ProcStats` reads `schedstat` and `smaps_rollup` for the reasons `mp.rs`
-//     documents at length: `/proc/self/stat`'s utime/stime are 10 ms ticks and
-//     report 0.0% for everything measured here, and summed RSS double-counts
-//     every shared page, which is precisely the quantity under test.
+//   * `ProcStats` reports whole-process CPU time and `smaps_rollup`'s `Pss` for
+//     the reasons `mp.rs` documents at length: `/proc/self/stat`'s utime/stime
+//     are 10 ms ticks and report 0.0% for everything measured here, and summed
+//     RSS double-counts every shared page, which is precisely the quantity
+//     under test. **The CPU half is `CLOCK_PROCESS_CPUTIME_ID`, not
+//     `schedstat`** — this line said `schedstat` and was contradicted five
+//     lines below by the paragraph explaining why it no longer is.
 //
 // **The mirroring was broken in `ProcStats`, and the break was the CPU column.**
 // `mp.rs`'s `self_cpu_ns` says why in its own doc comment — *"the process-level
@@ -21,7 +24,12 @@
 // Measured on this host, two threads burning 4.004 s of CPU over a 2.003 s
 // window moved `/proc/self/schedstat` by 0.000336 s. That is the instrument
 // reporting the main thread's sleep, and it is why every CPU %/consumer in
-// `docs/benchmarks/tf2.md` came out between 0.003 % and 0.012 %.
+// **§9.1's `just dds-bench` table** in `docs/benchmarks/tf2.md` came out
+// between 0.003 % and 0.012 %. That scope is the whole of the claim: the same
+// document carries CPU columns from two other instruments that never read
+// `schedstat` and were never affected — `mp_bench`'s 0.229/0.108 %/consumer
+// and `mp_compare.py`'s 0.16–3.8 % — so a reader comparing those against this
+// range is comparing three harnesses, not one before and after.
 //
 // It matters most for the arm that made it visible: `tf_tree.processes` charges
 // a whole bridge *process* to the arm it serves, and a bridge whose ingest

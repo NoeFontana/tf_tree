@@ -303,6 +303,14 @@ ThreadResult tf_tree_consumer_loop(
 }
 
 /// Compile one plan per query pair, or explain which pair the arena refused.
+///
+/// **Frees what it compiled before it returns false**, so `out` is empty on
+/// failure and neither caller has to remember. Both used to `return 1` on this
+/// path with the plans compiled so far still in the vector — right beside the
+/// attach path's `tft_tree_free(tree)`, which made the asymmetry read as an
+/// oversight rather than as a decision about a process that is exiting anyway.
+/// It is a benchmark and the leak was harmless; owning the plans in one place
+/// is a line shorter than explaining that twice.
 bool compile_plans(
   tft_tree * tree, const std::vector<Pair> & pairs, std::vector<tft_plan *> & out)
 {
@@ -313,6 +321,8 @@ bool compile_plans(
       fprintf(
         stderr, "bench_consumer: cannot plan %s <- %s (status %d)\n",
         p.target.c_str(), p.source.c_str(), static_cast<int>(s));
+      for (auto * done : out) {tft_plan_free(done);}
+      out.clear();
       return false;
     }
     out.push_back(plan);
@@ -362,6 +372,12 @@ void measure_tf_tree_consumers(
 
 /// The bridge's own account of what it ingested. A run whose bridge dropped
 /// everything would otherwise report beautiful latencies for an empty arena.
+///
+/// **That sentence is now true rather than aspirational.** These three numbers
+/// were parsed by `dds_report` and written to `results.json` and gated
+/// *nothing*: an arm whose bridge received zero transforms printed a clean row
+/// and exit 0. `dds_report::check_structure` refuses it, so the counter the
+/// comment above describes is the one that stops the run.
 void print_bridge_stats(const tf_tree_ros::BridgeHandle & bridge)
 {
   const auto st = bridge.stats();

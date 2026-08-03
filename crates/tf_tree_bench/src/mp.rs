@@ -171,6 +171,35 @@ impl Histogram {
         self.max
     }
 
+    /// Fraction of observations strictly below `ns`, in `0.0..=1.0`.
+    ///
+    /// The inverse question to [`Histogram::quantile`], and it exists because a
+    /// *bimodal* distribution is not describable by quantiles alone: a p50 says
+    /// where the middle sample landed, not that half the samples landed a
+    /// decade away from it. `dds_report` uses it to state, from a run's own
+    /// data, how much of a `.processes` arm's `svc` column is at composed
+    /// speed — see `docs/benchmarks/tf2.md` for the worked example.
+    ///
+    /// **Bucket resolution, and it rounds against the caller.** A bucket is
+    /// counted whole when its floor is below `ns`, so the answer can overstate
+    /// by at most one bucket's share — the buckets are 128-per-octave, so under
+    /// 0.8% of a value. `0.0` for an empty histogram, which is the honest
+    /// answer to "how many of no samples were fast".
+    #[must_use]
+    pub fn fraction_below(&self, ns: u64) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        let mut seen = 0u64;
+        for (i, &c) in self.counts.iter().enumerate() {
+            if Self::bucket_floor(i) >= ns {
+                break;
+            }
+            seen += u64::from(c);
+        }
+        seen as f64 / self.total as f64
+    }
+
     /// Encode as a compact `bucket:count` line for a child to print.
     #[must_use]
     pub fn encode(&self) -> String {
@@ -496,6 +525,52 @@ mod tests {
         h.record(1_000_000);
         assert!(h.quantile(0.5) <= 1_000_000);
         assert_eq!(h.max(), 1_000_000);
+    }
+
+    /// `fraction_below` sees the shape a quantile cannot: bimodality.
+    ///
+    /// The fixture is the distribution `dds_report` exists to describe — 30% of
+    /// samples at composed speed, 70% a decade slower. Its p50 is in the slow
+    /// mode and says nothing about the fast one; `fraction_below` reports the
+    /// fast one directly.
+    ///
+    /// Mutant: `if Self::bucket_floor(i) > ns` (`>=` → `>`) in
+    /// `fraction_below`. The exact-boundary case below then counts the bucket
+    /// holding 1000 itself and reports 0.4 where 0.3 is true.
+    #[test]
+    fn fraction_below_reports_the_fast_mode_a_quantile_hides() {
+        let mut h = Histogram::new();
+        for _ in 0..300 {
+            h.record(800);
+        }
+        for _ in 0..700 {
+            h.record(9_000);
+        }
+        // The p50 lands in the slow mode and is silent about the other 30%.
+        assert!(h.quantile(0.50) > 5_000, "p50 {}", h.quantile(0.50));
+        assert!(
+            (h.fraction_below(1_000) - 0.30).abs() < 0.001,
+            "fraction below 1 us: {}",
+            h.fraction_below(1_000)
+        );
+        // Strictly below: 1000 is a bucket floor here, so the bucket holding
+        // the 1000s must not be counted.
+        let mut exact = Histogram::new();
+        for _ in 0..300 {
+            exact.record(800);
+        }
+        for _ in 0..100 {
+            exact.record(1_000);
+        }
+        for _ in 0..600 {
+            exact.record(9_000);
+        }
+        assert!(
+            (exact.fraction_below(1_000) - 0.30).abs() < 0.001,
+            "1000 ns is not below 1000 ns: {}",
+            exact.fraction_below(1_000)
+        );
+        assert_eq!(Histogram::new().fraction_below(1_000), 0.0);
     }
 
     #[test]

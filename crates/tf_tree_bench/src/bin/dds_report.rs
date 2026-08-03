@@ -37,6 +37,36 @@
 //! `tests/dds_report_aggregate.rs` is what keeps the arm from silently
 //! disappearing — and what keeps a "NOT MEASURED" sentence from silently coming
 //! back.
+//!
+//! # What this tool refuses to print
+//!
+//! Three of the four ways this table could lie are structural rather than
+//! numeric, and all three used to produce a *better-looking* row than the truth:
+//!
+//! * a `.out` truncated before its `cpu_ns` / `pss_kib` lines — [`parse_proc`]
+//!   read the absent field as a zero and charged the arm nothing for the
+//!   process;
+//! * a `tf_tree.processes` arm with no `consumers 0` process in it, i.e. an arm
+//!   whose bridge never ran, which is the whole cost the arm exists to account
+//!   for ([`check_structure`]);
+//! * a bridge that ran and received nothing, which serves fast lookups over an
+//!   arena nobody wrote ([`check_structure`] again).
+//!
+//! The fourth is numeric and is the `<-- FAILING` flag, which now also fires on
+//! an arm with *no* lookups at all: `fail_pct` is `NaN` there and `NaN > 5.0` is
+//! false, so the flag whose comment says it exists to stop an empty row printing
+//! the best latencies did not fire for the emptiest row there is.
+//!
+//! # Nothing here is remembered from another run
+//!
+//! The disclosure under the table about the `.processes` arms' bimodal `svc`
+//! column is computed from the histograms of the run being reported. An earlier
+//! revision printed five literal microsecond values from one past run as
+//! "measured here" — on somebody else's host that is a false statement about
+//! their machine, printed above their own table, and it replaced a disclosure
+//! that had been permanently true. `docs/benchmarks/tf2.md` is where a worked
+//! example with its control belongs; this tool states the shape of the run in
+//! front of it.
 // This binary's output IS its result.
 #![allow(
     clippy::unwrap_used,
@@ -208,14 +238,26 @@ fn write(path: &Path, text: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// One consumer process's parsed output.
+///
+/// **`cpu_ns` and `pss_kib` are `Option`, and that is the whole point.** They
+/// used to be `u64` filled by a parser that returns `0` for a line it never
+/// saw, so a truncated `.out` — a process killed between its histograms and its
+/// stats block, a full disk, a driver that stopped waiting — was
+/// indistinguishable from a process that used no CPU and mapped no memory. The
+/// resulting row is not merely wrong, it is wrong in the flattering direction
+/// and it inverts the disclosure §9.3 requires: [`parse_proc`] measured a
+/// bridge file truncated after its histograms at **0.146 %/consumer against a
+/// true 0.847**, and a PSS that put `tf_tree.processes` on the winning side of
+/// the memory comparison it actually loses. `procs`, `fail%` and the exit
+/// status were all clean.
 #[derive(Default)]
 struct Proc {
     service: Histogram,
     cycle: Histogram,
     ok: u64,
     err: u64,
-    cpu_ns: u64,
-    pss_kib: u64,
+    cpu_ns: Option<u64>,
+    pss_kib: Option<u64>,
     consumers: usize,
     warmup_s: f64,
     measured_s: f64,
@@ -223,7 +265,12 @@ struct Proc {
     bridge_dropped: u64,
 }
 
-fn parse_proc(text: &str) -> Result<Proc> {
+/// Parse one process's `.out`, refusing one that is missing a cost field.
+///
+/// Takes the path rather than the text alone so the refusal names the file an
+/// operator has to go and look at; the two stats lines are the last thing
+/// `bench_consumer` prints, so their absence is nearly always truncation.
+fn parse_proc(path: &Path, text: &str) -> Result<Proc> {
     let mut p = Proc {
         service: Histogram::new(),
         cycle: Histogram::new(),
@@ -259,14 +306,29 @@ fn parse_proc(text: &str) -> Result<Proc> {
                     _ => {}
                 }
             }
-            Some("cpu_ns") => p.cpu_ns = num(it.next()),
-            Some("pss_kib") => p.pss_kib = num(it.next()),
+            Some("cpu_ns") => p.cpu_ns = it.next().and_then(|v| v.parse().ok()),
+            Some("pss_kib") => p.pss_kib = it.next().and_then(|v| v.parse().ok()),
             Some("consumers") => p.consumers = num(it.next()) as usize,
             Some("warmup_s") => p.warmup_s = fnum(it.next()),
             Some("measured_s") => p.measured_s = fnum(it.next()),
             Some("bridge_transforms") => p.bridge_transforms = num(it.next()),
             Some("bridge_dropped") => p.bridge_dropped = num(it.next()),
             _ => {}
+        }
+    }
+    for (field, present) in [
+        ("cpu_ns", p.cpu_ns.is_some()),
+        ("pss_kib", p.pss_kib.is_some()),
+    ] {
+        if !present {
+            bail!(
+                "{} has no `{field}` line. That file is truncated — `bench_consumer` prints \
+                 `cpu_ns` and `pss_kib` last, after every histogram — and a missing cost \
+                 field is NOT a zero one. Aggregating it would charge this arm nothing for \
+                 the process, which is the one direction a benchmark must never round. Its \
+                 `.err` file says why it stopped.",
+                path.display()
+            );
         }
     }
     Ok(p)
@@ -284,6 +346,61 @@ struct Arm {
     label: String,
     engine: String,
     procs: Vec<Proc>,
+}
+
+impl Arm {
+    /// The `tf_tree.processes` shape: one bridge process plus N attached
+    /// consumers.
+    ///
+    /// Matched on the label rather than on the contents because it is what the
+    /// contents are checked *against* — `check_structure` asks whether an arm
+    /// that is supposed to have a bridge has one, and an arm identified by
+    /// having a bridge could not be asked. `tf2.processes` ends in the same
+    /// word and has no bridge by construction, so the engine is part of the
+    /// test.
+    fn is_bridge_and_attach(&self) -> bool {
+        self.engine == "tf_tree" && self.label.ends_with(".processes")
+    }
+}
+
+/// The two invariants the fairness argument rests on, checked rather than
+/// assumed.
+///
+/// Both are about the same thing: an arm whose whole claim is "one process pays
+/// the deserialization for all of them" is only comparable if that process ran
+/// and did the work. Neither is visible in any column — an arm missing its
+/// bridge prints a *better* row, and an arm whose bridge ingested nothing
+/// prints the best latencies in the table over an arena nobody wrote.
+fn check_structure(arms: &BTreeMap<String, Arm>) -> Result<()> {
+    for arm in arms.values() {
+        if !arm.is_bridge_and_attach() {
+            continue;
+        }
+        if !arm.procs.iter().any(|p| p.consumers == 0) {
+            bail!(
+                "arm `{}` has {} process(es) and not one of them reports `consumers 0`, so \
+                 no bridge ran in it. Its consumers attached to an arena somebody else \
+                 filled, or to none — either way the row would show N processes doing \
+                 tf_tree's work with tf2's ingest cost charged to nobody, which is the \
+                 single most flattering row this table can print.",
+                arm.label,
+                arm.procs.len()
+            );
+        }
+        let transforms: u64 = arm.procs.iter().map(|p| p.bridge_transforms).sum();
+        if transforms == 0 {
+            bail!(
+                "arm `{}` ran a bridge that received 0 transforms. Every lookup it served \
+                 came from an arena nothing was writing, so its `svc` column is the cost of \
+                 reading stale memory and its `fail%` is whatever the static edges happen to \
+                 answer. `bridge_transforms` has been printed since this arm existed and \
+                 gated nothing until now; the bridge's `.err` file says whether it saw `/tf` \
+                 at all.",
+                arm.label
+            );
+        }
+    }
+    Ok(())
 }
 
 fn aggregate(args: &[String]) -> Result<()> {
@@ -324,7 +441,7 @@ fn aggregate(args: &[String]) -> Result<()> {
                 procs: Vec::new(),
             })
             .procs
-            .push(parse_proc(&text)?);
+            .push(parse_proc(&path, &text)?);
     }
 
     if arms.is_empty() {
@@ -333,6 +450,12 @@ fn aggregate(args: &[String]) -> Result<()> {
             dir.display()
         );
     }
+
+    // **Before a single row is printed.** A structural fault found halfway
+    // through the loop below would leave an operator reading three good rows
+    // and an error, which is exactly the shape somebody quotes the good rows
+    // from.
+    check_structure(&arms)?;
 
     println!("tf_tree vs tf2, end to end over a real DDS  [workload: {workload}]");
     println!("=====================================================================");
@@ -356,6 +479,17 @@ fn aggregate(args: &[String]) -> Result<()> {
 
     let mut run = Run::begin(1);
 
+    /// The reference point the wake-from-idle disclosure below is stated
+    /// against: a fixed round number, not a remembered measurement. Every
+    /// composed arm this suite has produced sits under it and every wake-from-
+    /// idle sample sits well over it, so "fraction under 1 µs" separates the
+    /// two modes without needing to know either one's value in advance.
+    const FAST_MODE_NS: u64 = 1_000;
+    // `(label, svc p50 ns, fraction of svc samples under FAST_MODE_NS)`, for
+    // the arms that run one consumer per process. Collected while the rows are
+    // folded so the disclosure after the table is this run's own arithmetic.
+    let mut idle_shape: Vec<(String, u64, f64)> = Vec::new();
+
     for arm in arms.values() {
         let mut service = Histogram::new();
         let mut cycle = Histogram::new();
@@ -365,16 +499,24 @@ fn aggregate(args: &[String]) -> Result<()> {
         let mut warmup_s = 0.0f64;
         let (mut bt, mut bd) = (0u64, 0u64);
         for p in &arm.procs {
+            // `parse_proc` refuses a file missing either, so this cannot fall
+            // back to a zero that would charge the arm nothing.
+            let (Some(p_cpu_ns), Some(p_pss_kib)) = (p.cpu_ns, p.pss_kib) else {
+                unreachable!("parse_proc returns no Proc with an absent cost field")
+            };
             service.merge(&p.service);
             cycle.merge(&p.cycle);
             ok += p.ok;
             err += p.err;
-            cpu_ns += p.cpu_ns;
+            cpu_ns += p_cpu_ns;
             // PSS is a level per process; summing across processes is correct
             // precisely because PSS already divides each shared page by its
             // mapper count. That is the whole reason `mp.rs` uses it and not
             // RSS: summed RSS counts one shared arena once per consumer.
-            pss_kib += p.pss_kib;
+            //
+            // It is also why a per-consumer PSS figure does NOT compare across
+            // arms with different process counts — see the footer.
+            pss_kib += p_pss_kib;
             consumers += p.consumers;
             measured_s = measured_s.max(p.measured_s);
             warmup_s = warmup_s.max(p.warmup_s);
@@ -398,7 +540,26 @@ fn aggregate(args: &[String]) -> Result<()> {
         // A row where nearly every lookup failed is not a fast row, it is an
         // empty one — and without this flag it would print the best latencies
         // in the table.
-        let flag = if fail_pct > 5.0 { " <-- FAILING" } else { "" };
+        //
+        // **`total == 0` is the case the comment above described and the test
+        // did not cover.** With no lookups at all `fail_pct` is `NaN`, every
+        // comparison against `NaN` is false, and the flag whose entire purpose
+        // is "an empty row must not print the best latencies" did not fire for
+        // the emptiest row possible. An arm whose consumers all timed out on
+        // `--attach-timeout` reaches exactly that state.
+        let flag = if total == 0 || fail_pct > 5.0 {
+            " <-- FAILING"
+        } else {
+            ""
+        };
+
+        if arm.label.ends_with(".processes") {
+            idle_shape.push((
+                arm.label.clone(),
+                service.quantile(0.50),
+                service.fraction_below(FAST_MODE_NS),
+            ));
+        }
 
         println!(
             "{:<26} {:>6} {:>6} | {:>9.2} {:>9.2} {:>10.2} | {:>10.1} | {:>9.3} {:>9.2} \
@@ -455,11 +616,21 @@ fn aggregate(args: &[String]) -> Result<()> {
     println!("time and on an idle machine is mostly scheduler wakeup. CPU is per consumer, so a");
     println!("column that stays flat as consumers rise is the O(1)-in-consumers claim holding.");
     println!("PSS sums across processes and counts each shared page once — summed RSS would");
-    println!("count one shared arena n times over.");
+    println!("count one shared arena n times over. The COLUMN is comparable across arms; a PSS");
+    println!("PER CONSUMER derived from it is NOT, because PSS divides each shared page by its");
+    println!("mapper count and these arms have different process counts (4 against 5), so the");
+    println!("same rclcpp text is charged at S/4 to one and S/5 to the other before any");
+    println!("architectural difference. Extrapolate from the totals, not from a quotient.");
     println!();
     println!("Every arm queries the same pairs at the same rate with the same 100 ms lag, from");
     println!("one publisher, with PHASE4 §5.2's QoS. The warm-up window is discarded and");
     println!("reported. The four arms are the same executable with a different --mode.");
+    println!();
+    println!("ARM ORDER IS A CONFOUND AND IT IS NOT RANDOMISED. ros/dds_bench.sh runs them in a");
+    println!("fixed sequence — tf2.processes, tf2.composed, tf_tree.composed, tf_tree.processes");
+    println!("— after a 3 s discovery settle, so the last arm meets the warmest cache, the");
+    println!("settled DDS discovery and whatever thermal state the first three left. Nothing");
+    println!("here corrects for it; it is disclosed so a reader can weigh it.");
     println!();
     println!("READ `tf_tree.processes` WITH THESE THREE FACTS (PHASE5 §9.3):");
     println!("  * Its `procs` count is N+1: one bridge process plus N attached consumers. The");
@@ -476,18 +647,26 @@ fn aggregate(args: &[String]) -> Result<()> {
     println!("    nothing. Dropping the participant would move ~14 MiB per process out of the");
     println!("    row and measure `no rclcpp` rather than `no /tf`.");
     println!();
-    println!("AND ONE ABOUT THE `svc` COLUMN OF *BOTH* `.processes` ARMS. Their query threads");
-    println!("wake at --hz on a host whose cores are free to idle between ticks, so the p50");
-    println!("carries a wake-from-idle that neither composed arm pays. It is bimodal and it");
-    println!("moves run to run: measured here, tf_tree.processes p50 was 5.89 us on a loaded");
-    println!("host and 0.90-1.02 us on three consecutive idle ones, with 18% of samples at");
-    println!("composed speed in the slow run. The same four threads querying the same shared");
-    println!("arena from ONE attach process, which is therefore never idle, measured 1.00 us.");
-    println!("So it is the host's idle behaviour and not the attach path — and it hits the");
-    println!("consumer that does LEAST work hardest. tf2.processes swings the same way (2.59");
-    println!("to 11.07 us across these runs). Pin the cores (docs/benchmarks/tf2.md's runbook)");
-    println!("before quoting either. The CPU and PSS columns are far steadier and are what");
-    println!("this arm exists to measure.");
+    println!("AND ONE ABOUT THE `svc` COLUMN OF *BOTH* `.processes` ARMS, COMPUTED FROM THIS");
+    println!("RUN AND NOT REMEMBERED FROM ANOTHER. Their query threads wake at --hz on a host");
+    println!("whose cores are free to idle between ticks, so the p50 carries a wake-from-idle");
+    println!("that neither composed arm pays. The distribution is bimodal, so the p50 alone");
+    println!("does not describe it — this run's own split:");
+    for (label, p50_ns, fast) in &idle_shape {
+        println!(
+            "  {label:<20} svc p50 {:>7.2} us, {:>5.1}% of its samples under {:.2} us",
+            *p50_ns as f64 / 1000.0,
+            fast * 100.0,
+            FAST_MODE_NS as f64 / 1000.0,
+        );
+    }
+    println!("A large fast fraction under a p50 far above that threshold is two modes, not a");
+    println!("slow engine, and it hits the consumer that does LEAST work hardest — an idle");
+    println!("core is what a cheap consumer earns. It moves from run to run. Pin the cores");
+    println!("(docs/benchmarks/tf2.md's runbook) before quoting either p50; that document");
+    println!("carries the worked example, including the control that isolates the host's idle");
+    println!("behaviour from the attach path. The CPU and PSS columns are what this arm exists");
+    println!("to measure, and this tool sees one run and can say nothing about their spread.");
 
     if let Some(path) = &json {
         run.write(path)?;

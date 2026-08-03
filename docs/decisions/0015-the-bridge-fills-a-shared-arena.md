@@ -8,9 +8,16 @@ rule on `tft_bridge_options` with `arena_name` appended; `open_shared` refusing
 rather than downgrading, in both the `shm` and the no-`shm` build). Steps 3–4 are
 on `feat/0015-ros-arena-name` (`BridgeOptions::arena_name`, the `arena_name` node
 parameter, `test_shared_arena.cpp`, and the `TFT_HAVE_SHM` probe step 4 turned
-out to rest on — see the correction under step 4). **Steps 5–7 are outstanding**,
-and so is the fork test the *Invariants to maintain* clause below demands — see
-the note under it.
+out to rest on — see the correction under step 4). Steps 5–6 are on
+`feat/0015-dds-processes-arm` (`bench_consumer --mode tf_tree_bridge` /
+`--mode tf_tree_attach`, the fourth `just dds-bench` arm, the deletion of
+`dds_report::MISSING_ARM` and the `tests/dds_report_aggregate.rs` pin step 6
+turned out to need), together with **step 7's `docs/PHASE5.md` §0.0 half**: that
+row asserted this arm could not exist and called this record a draft, and
+`CLAUDE.md` names §0.0 the authoritative status table, so it could not be left
+saying so on `main`. **Steps 0–6 are implemented.** What is outstanding is step
+7's `docs/PHASE4.md` §5.8 pass, and the fork test the *Invariants to maintain*
+clause below demands — see the note under it.
 
 > **Moved `draft` → `ready` by
 > [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md), which resolves
