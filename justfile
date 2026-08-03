@@ -1310,10 +1310,14 @@ shm-check:
     # The clippy line is not optional garnish: `just lint`'s `--workspace
     # --all-targets` pass builds default features, so without it the fourth
     # mode's `unsafe` blocks and its C interop are linted in **no** recipe at
-    # all. The `cargo build` line mirrors its `--features shm` sibling
-    # four lines up, for the same reason that one exists — the binary is the
-    # artifact three processes run, and a build failure should name the binary
-    # rather than surface as a missing `CARGO_BIN_EXE_fork_child`.
+    # all — that one is coverage.
+    #
+    # The `cargo build` line adds **no coverage** and is not pretending to: the
+    # `nextest` line below must build the binary anyway, to set
+    # `CARGO_BIN_EXE_fork_child`. It is here for the message — a build failure
+    # naming the binary beats one surfacing as a missing environment variable
+    # three processes later — and it mirrors its `--features shm` sibling four
+    # lines up for the same reason.
     cargo clippy -p tf_tree_bench --features shm,bridge --all-targets -- -D warnings
     cargo build --features shm,bridge -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm,bridge --test fork

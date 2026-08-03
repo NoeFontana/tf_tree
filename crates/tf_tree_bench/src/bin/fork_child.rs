@@ -463,6 +463,27 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         // this process also carries the owner-server thread — the child never
         // touches it, which is half of what is under test, and every path out of
         // the child branch ends in `libc::_exit`.
+        //
+        // **This child allocates, and `main`'s sibling comment says its child
+        // does not — so the difference is named here rather than left as a
+        // silent divergence.** Three of the calls under test allocate on the
+        // path they are being tested on: `offer()` builds two `CString`s,
+        // `tft_bridge_offer`'s rejected arm goes through
+        // `error::last_message()` (a `Vec<u8>` and a `String`), and
+        // `tft_bridge_free` drops a `BTreeMap<String, OwnedWriter>`. There is no
+        // way to test those three entry points without reaching their
+        // allocations — that *is* the surface a forked ROS node touches.
+        //
+        // The invariant relied on: **glibc registers `pthread_atfork` handlers
+        // that reinitialise the malloc arena in the child**, so `malloc` is
+        // usable after `fork()` in a single-threaded child even though POSIX
+        // does not list it as async-signal-safe. That is a glibc guarantee and
+        // not a POSIX one, and it is the reason this is written down. The
+        // pre-existing `drop` and `owned` modes already free in the child, so
+        // this widens an accepted deviation rather than opening a new one;
+        // `0005` step 9 is silent on allocation. A child on a libc without that
+        // guarantee would need the three calls split across three `fork()`s
+        // with the assertions moved to the parent.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
 
@@ -570,8 +591,19 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         let read_ok = !their_bits.is_empty() && ours.as_ref().map(bits_of) == Some(their_bits);
         // And the bytes are the pose that was offered, not merely a value two
         // readers agree on.
+        //
+        // **The rotation as well as the translation.** `POSE`'s doc says its
+        // 30° yaw is there "so a read-back that returns identity … fails rather
+        // than coincidentally passing" — and this check tested only `t` for its
+        // first revision, so the one component put there to make identity fail
+        // was the one component nothing looked at. `read_ok` cannot stand in:
+        // both readers would agree on the same wrong rotation.
         let value_ok = ours.is_some_and(|iso| {
-            (iso.t.x - POSE[4]).abs() < 1e-12
+            (iso.q.w - POSE[0]).abs() < 1e-12
+                && (iso.q.x - POSE[1]).abs() < 1e-12
+                && (iso.q.y - POSE[2]).abs() < 1e-12
+                && (iso.q.z - POSE[3]).abs() < 1e-12
+                && (iso.t.x - POSE[4]).abs() < 1e-12
                 && (iso.t.y - POSE[5]).abs() < 1e-12
                 && (iso.t.z - POSE[6]).abs() < 1e-12
         });

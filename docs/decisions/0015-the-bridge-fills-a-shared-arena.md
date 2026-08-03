@@ -37,17 +37,18 @@ implemented document is never edited to match reality, only superseded — and t
 things this record is answerable for are still unbuilt. Neither is worth a
 superseding record; both are worth naming rather than dropping:
 
-1. **The fork test the *Invariants to maintain* clause demands.** That clause
-   makes `0005` step 9's `atfork` rules apply to the bridge and says they "must
-   be tested, not assumed"; the note under it writes out exactly what the test
-   has to be and which half of it `fork_child`'s `owned` mode already covers.
-   It is in none of the four PRs above, and the reason is a constraint rather
-   than an oversight: it needs a **fourth mode** of
-   `crates/tf_tree_bench/src/bin/fork_child.rs` (today `api`, `drop`, `owned`)
-   behind an optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
-   `tf_tree_bench` — a crate-graph change, which is why it is its own commit and
-   not a rider on any of these. Until it lands the clause is an assumption, which
-   is the thing it forbids.
+1. ~~**The fork test the *Invariants to maintain* clause demands.**~~ **Landed
+   in #146**, as its own commit for the reason this item gave: it needed a
+   fourth mode of `crates/tf_tree_bench/src/bin/fork_child.rs` behind an
+   optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
+   `tf_tree_bench`, which is a crate-graph change. The *Invariants* clause is
+   no longer an assumption.
+
+   It also found this record wrong twice about the thing it was demanding — the
+   panic guard is not the mechanism, and two of the three entry points do not
+   return a status — both corrected in the blockquote under that clause. **A
+   test written from this record's wording would have asserted the wrong
+   field.**
 2. **`docs/PHASE5.md` §9.2's *Scaling curve, N = 1…16* row, for the new arm.**
    `ros/dds_bench.sh` defaults `CONSUMERS` to 4, and 4 is the only value
    `tf_tree.processes` has ever run at. This record's *Consequences* claim that

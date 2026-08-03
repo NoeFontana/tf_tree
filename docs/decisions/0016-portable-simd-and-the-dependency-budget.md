@@ -187,8 +187,230 @@ Alternatives considered:
    record does not presume the answer.
 2. **Does autovectorisation get there for free?** Step 3 is deliberately ordered
    before the dependency is relied on. Nobody has read the asm yet.
+   **Answered — the asm has now been read; see the *Amendment* below. The short
+   version is "no, and not for the reason this record assumed", and it moves the
+   headline number.**
 3. **Is `num-complex` acceptable as an unused transitive?** It is pulled in
    unconditionally and nothing here uses complex numbers.
 4. **What replaces Miri's coverage of the wide path?** Miri selects scalar, so
    the shipped arithmetic on an AVX2 host is unverified by it. Step 5 is the
    proposal; whether a per-tier differential is sufficient needs review.
+
+---
+
+## Amendment — open question 2, answered by reading the asm
+
+**Status unchanged: this record is still `draft`, and questions 1, 3 and 4 are
+still open.** What follows answers question 2 only.
+
+**Measured on:** AMD EPYC-Milan, 4 physical / 8 logical, SMT on, `taskset -c 2`.
+This host fails `docs/PHASE5.md` §9.2's fitness probe, so nothing below is a
+multi-process comparison; every number is a single-process criterion row or a
+best-of-N in-process loop, which is the class this repository has used credibly
+all along.
+**Reproduce:** `taskset -c 2 cargo run --release -p tf_tree_bench --example autovec_probe`,
+then again with `RUSTFLAGS="-C no-vectorize-slp -C no-vectorize-loops"`.
+**Tooling:** `cargo asm` is not installed here and could not be, so the asm is
+`objdump -d` of the linked bench binary plus `cargo rustc -- --emit asm` for the
+per-CGU view. **A methodology note, because it cost an hour and would cost the
+next reader the same:** under `lto = "thin"` rustc defers the vectorisers to the
+LTO backend, so `cargo rustc --release -- --emit asm` on this workspace reports
+**zero** vector instructions in code that is heavily vectorised once linked. The
+`--emit asm` view is only truthful under `[profile.embedder]` (`lto = false`);
+for `[profile.release]` the linked binary must be disassembled. Both were done,
+and they agree.
+
+### 1. What the asm shows
+
+**There is no loop across stamps for anything to vectorise.** In the linked
+release binary, `Plan::at_many_into`'s monotone branch is a single loop whose
+backedge spans ~12.4 kB of code and whose body is **one complete plan fold** —
+`fold_at_cursors`, `Guard::sample_from`, the galloping bracket search, two
+seqlock `read_slot`s and one `Interp::eval`, all inlined, one stamp per
+iteration. The four batch entry points differ only in the emitter. This is the
+first thing the record got wrong by not looking: it speaks of "the `Interp::eval`
+inner loop reached from `Plan::at_many`" as though such a loop existed. It does
+not. `Interp::eval` is called once per (stamp × dynamic step), from inside a
+seqlock.
+
+**The arithmetic is nevertheless already vectorised — by the SLP vectoriser,
+within a single `eval`, at two lanes.** Counting `Plan::at_many_into` in the
+linked `[profile.release]` binary:
+
+| | instructions | packed FP arith | scalar FP arith | shuffles | stack frame |
+|---|---|---|---|---|---|
+| as built | 2460 | **480** | 76 | 227 | 0x380 |
+| `-C no-vectorize-slp` | 2785 | 0 | 882 | 0 | 0x300 |
+
+**Every one of those 480 packed operations is `%xmm`.** There is no `ymm` or
+`zmm` anywhere in the engine — the only AVX in the whole binary belongs to
+blake3's and `memchr`'s hand-written runtime-dispatched kernels. The reason is
+that nothing in this workspace sets `-C target-cpu`: `.cargo/config.toml` carries
+only aliases, no recipe in the `justfile` sets `RUSTFLAGS` for a release build,
+and the default `x86_64-unknown-linux-gnu` baseline is SSE2. So the compiler's
+ceiling here is **two** `f64` lanes, permanently, and no amount of loop shaping
+raises it. That is the real content of "`pulp` gives 4 lanes": not *SIMD versus
+scalar*, but *runtime dispatch versus a baseline compile target*.
+
+The same shape holds one level down. `ScLerp::eval` compiles to 107 packed and
+135 scalar FP operations plus 54 shuffles; `LerpSlerp::eval` to 47 packed, 82
+scalar, 19 shuffles, with `libm::acos` left as an out-of-line call on the
+large-arc branch.
+
+### 2. Why it is not vectorised across stamps — the blockers, named
+
+In descending order of how immovable they are. The first four are properties of
+the *engine*, not of the arithmetic, and **`pulp` does not remove any of them**:
+
+1. `crates/tf_tree_core/src/sample.rs:151` and `:207` — `self.head.load(Ordering::Acquire)`.
+   LLVM's `LoopVectorizationLegality` rejects any loop containing a non-simple
+   (atomic or volatile) load outright. Two of them bracket every sample.
+2. `crates/tf_tree_core/src/buffer.rs:328`–`:349` — `read_slot`'s seqlock: an
+   inner retry loop with a data-dependent trip count, and `fence(Ordering::Acquire)`
+   at `:343`, which is an unconditional barrier for the optimiser. Reached twice
+   per interpolated sample.
+3. `crates/tf_tree_core/src/plan.rs:1501` (and `:1329`) — the `?` on
+   `Result<Iso3, LookupError>`. A data-dependent early exit; the loop vectoriser
+   wants a countable loop with a single latch exit, and early-exit vectorisation
+   is off by default.
+4. `crates/tf_tree_core/src/sample.rs:193` → `bracket_from`, whose probe
+   addresses come from `stamp_at` at `sample.rs:219` — an inner loop with a
+   data-dependent trip count over gathered, serially dependent loads.
+5. Only then, inside the arithmetic itself:
+   `crates/tf_tree_math/src/interp.rs:122`–`:127` (the two endpoint shortcuts),
+   `:170` (the degenerate-input early return), `:176`–`:186` (the threshold
+   branch) and `:190`–`:193` (`libm::acos` / `libm::sin`, opaque calls with no
+   vector form).
+
+Blocker 5 is the only one this record ever contemplated, and it is the only one
+that is genuinely removable.
+
+### 3. What is reachable for free — measured, not argued
+
+The cheap test §14 asks for. `crates/tf_tree_bench/examples/autovec_probe.rs`
+times four shapes of the *same* interpolation over the same 1024 pose pairs, one
+200 Hz tick apart on a body turning at 180 °/s so the series branch is the one
+taken. The harness asserts every variant is **bit-identical** to
+`LerpSlerp::eval` on that data before it reports a timing — it is (0.000e0
+absolute), so these are four spellings of one function and not four functions.
+Best of 7 × 20 000 rounds, ns/element; the noise floor is the 1.5% spread of the
+row that no flag changes (D):
+
+| shape | as built | `-C no-vectorize-slp` | + `-C no-vectorize-loops` | what the compiler did |
+|---|---|---|---|---|
+| **A** `LerpSlerp::eval` in a loop | **17.91** | 19.26 | 19.37 | SLP only, ×2, *within* one eval |
+| **A'** `ScLerp::eval` in a loop | **44.73** | 46.49 | 46.66 | SLP only |
+| **B** branch-free, array-of-structs | **11.94** | 12.00 | 17.86 | **loop-vectorised across stamps, ×2** |
+| **C** branch-free, structure-of-arrays | **10.65** | 10.70 | 20.24 | **loop-vectorised across stamps, ×2** |
+| **D** `[f64; 4]` blocks | 19.32 | 19.21 | 19.03 | nothing |
+
+Three things fall out, and the third is the one that matters.
+
+- **Autovectorisation across stamps works, with no dependency and no `unsafe`.**
+  B and C are unaffected by disabling SLP and collapse by 1.49× and 1.90× when
+  the *loop* vectoriser is disabled, which is what proves they are widened across
+  `i` rather than within an element. 17.91 → 10.65 ns is a **1.68×** on the
+  interpolation arithmetic, reached by deleting blocker 5 and nothing else.
+- **It is unreachable from where the engine stands.** B and C are loops that do
+  *only* arithmetic. Getting one requires splitting the fused fold — locate and
+  read every stamp's bracket first, interpolate second — which buffers 2N `Iso3`
+  (128 KiB at N = 1024, against this host's 32 KiB L1d) and is exactly the
+  footprint trade §12 measured as the thing that decides this engine's speed.
+  That restructure is not in this record, is not costed by it, and **is a
+  prerequisite for step 4 as much as for step 3**: `pulp` cannot vectorise a loop
+  containing a seqlock either. The record's implementation plan reads as though
+  step 3 and step 4 were alternatives at the same site. They are not; step 4
+  silently assumes step 3's restructure already happened.
+- **Step 3's literal instruction is a pessimisation.** "Shape the batch
+  interpolation loop over `[f64; 4]`" is variant D. It vectorises not at all —
+  no flag moves it — and it is **8% slower than the shipped scalar loop**. The
+  `[f64; 4]` blocking that was supposed to give the vectoriser a known trip count
+  instead gives it four live accumulator arrays and a two-pass body it will not
+  fuse. Do not spend a day on it; it has been spent.
+
+### 4. The finding that inverts this record's premise
+
+The premise is that interpolation is arithmetic-bound and under-served by a
+2-lane ALU, so widening it is the lever. The asm says it is already 2-lane. The
+measurement says the 2 lanes are **costing** us.
+
+`at_many`, criterion, `taskset -c 2`, 1 s warm-up / 3 s measurement, µs per 1024
+elements, best of the point estimates. "SLP suppressed" is the best across **five
+distinct builds** — `-C no-vectorize-slp`, that plus `-C no-vectorize-loops`, and
+`-C llvm-args=-slp-threshold=` at 50, 200 and 5000 — which is what rules out code
+alignment as the explanation; a layout fluke does not reproduce across five
+codegens. Run-to-run spread on the tight rows is ±0.3%; two rows show occasional
++8% excursions, so nothing under ~3% below is claimed as a result.
+
+| row | SLP on (best of 3) | SLP suppressed (best of 8 / 5 builds) | Δ |
+|---|---|---|---|
+| `monotone_1024` | 307.0 | 260.0 | **−15.3%** |
+| `into_mat4_1024` | 285.8 | 254.7 | **−10.9%** |
+| `into_quat_1024` | 282.7 | 255.0 | **−9.8%** |
+| `into_affine32_1024` | 285.9 | 255.0 | **−10.8%** |
+| `two_pass_mat4_1024` | 294.2 | 263.2 | **−10.5%** |
+| `into_quat_twist_1024` | 349.3 | 340.4 | −2.5% |
+
+And on the *scalar* path, which this record correctly says batch SIMD would never
+help — `lookup`, ns, best of 3:
+
+| row | SLP on | SLP suppressed | Δ |
+|---|---|---|---|
+| `depth3/lerpslerp` | 145.94 | 124.34 | **−14.8%** |
+| `depth3/sclerp` | 189.91 | 190.57 | +0.3% |
+| `depth1/sclerp` | 68.17 | 68.41 | +0.4% |
+| `depth6/sclerp` | 133.35 | 133.39 | +0.0% |
+
+**The counts say what the mechanism is not.** Turning SLP off *raises* the
+instruction count of `Plan::at_many_into` (2460 → 2785) and *raises* the spill
+count (117 → 145 stores, 139 → 206 reloads), and it is still 10–15% faster. So
+this is not register pressure and not code size. The only class that shrinks to
+zero is the 227 `shufpd`/`unpckhpd`/`unpcklpd` needed to get `Quat` and `Vec3`
+components into and out of lane pairs — 227 shuffles bought in exchange for 326
+fewer FP operations. That trade is consistent with shuffles being port-limited
+where the FP arithmetic is not, but this host has neither `perf` nor `valgrind`
+available, so **the port explanation is the shape the counts are consistent with,
+not a measured one**, and it is written down here as a hypothesis for whoever has
+a machine with counters.
+
+Why `at_many` under `ScLerp` moves 10–15% while `lookup/depth3/sclerp` under the
+same policy does not move at all is **not explained**. The two go through
+different folds (`fold_at_cursors` versus `fold_at`) and the `lookup` bench asks
+for one fixed stamp forever while `at_many` sweeps 1024, so both the code and the
+cache behaviour differ. Stating a cause here would be the exact failure §14 names
+as a rule. It is recorded as unexplained.
+
+### 5. What this does to the cost/benefit
+
+The framing in open question 1 — *"31% of per-step interpolation cost, on
+`at_many` only, against `tf_tree_math` going from 2 dependencies to 11"* —
+survives as an order of magnitude but three of its terms are now wrong:
+
+- **"31%" is not on the table for `pulp` any more than for the compiler.** The
+  22.2 ns is not scalar; it is 2-lane SLP with the shuffles already paid. What a
+  wider ALU can win over *today's* code is the 1.68× that variant C shows, and
+  only after a loop split neither this record nor `pulp` provides. Against the
+  72.5 ns step that is ~9 ns, ~12% — not 31%.
+- **The `x86-v3` advantage is real but it is an advantage over the *build
+  target*, not over the *compiler*.** Anyone weighing nine dependencies should
+  first be told that `-C target-cpu=x86-64-v3` is free, costs nothing in the
+  budget, and buys the same 4 lanes for code that is already being vectorised —
+  at the price of a binary that `SIGILL`s on pre-2013 hardware, which is exactly
+  the trade `pulp`'s runtime detection exists to avoid. That comparison belongs
+  in the decision and was missing from it.
+- **There is a cheaper lever in front of this one, and it is subtraction.**
+  Suppressing SLP is worth 10–15% on `at_many` and 14.8% on the `LerpSlerp`
+  scalar lookup — comparable to what the dependency is being considered for, on
+  more paths, for no crates. **This amendment does not propose taking it**, and
+  no code was changed: there is no stable per-function way to say it, and putting
+  `-C no-vectorize-slp` in `.cargo/config.toml` would apply to this workspace's
+  builds and not to an embedder's, which would make every number this repository
+  publishes describe a binary no consumer builds — the precise failure
+  `[profile.embedder]` and `docs/PHASE5.md` §9.2 exist to prevent. It is recorded
+  because it is larger than the thing being bought and because it means the
+  premise "the arithmetic is not vectorised" was false.
+
+**What this amendment does not do.** It does not close this record, change its
+status, or touch questions 1, 3 or 4. It answers question 2: *no, autovectorisation
+does not get there for free — but the reason is the engine's loop, not the
+arithmetic, and that same reason blocks `pulp`.*
