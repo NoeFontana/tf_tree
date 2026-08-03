@@ -2,22 +2,59 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** steps 0–2 landed on `feat/0015-bridge-shared-arena`
-(`Open::require_create` + `OpenError::ArenaAlreadyLive`; the `struct_size` prefix
-rule on `tft_bridge_options` with `arena_name` appended; `open_shared` refusing
-rather than downgrading, in both the `shm` and the no-`shm` build). Steps 3–4 are
-on `feat/0015-ros-arena-name` (`BridgeOptions::arena_name`, the `arena_name` node
-parameter, `test_shared_arena.cpp`, and the `TFT_HAVE_SHM` probe step 4 turned
-out to rest on — see the correction under step 4). Steps 5–6 are on
-`feat/0015-dds-processes-arm` (`bench_consumer --mode tf_tree_bridge` /
-`--mode tf_tree_attach`, the fourth `just dds-bench` arm, the deletion of
-`dds_report::MISSING_ARM` and the `tests/dds_report_aggregate.rs` pin step 6
-turned out to need), together with **step 7's `docs/PHASE5.md` §0.0 half**: that
-row asserted this arm could not exist and called this record a draft, and
-`CLAUDE.md` names §0.0 the authoritative status table, so it could not be left
-saying so on `main`. **Steps 0–6 are implemented.** What is outstanding is step
-7's `docs/PHASE4.md` §5.8 pass, and the fork test the *Invariants to maintain*
-clause below demands — see the note under it.
+**Implementation:** **all eight numbered steps have landed**, across four PRs.
+
+- **Step 0** — `Open::require_create` + `OpenError::ArenaAlreadyLive` — landed in
+  **#139**, not in this record's own first PR: it is `0019`'s step 1 commit that
+  carries it, because that commit was already rewriting `Open`'s defaults and the
+  two changes touch the same twenty lines. (An earlier revision of this header
+  put step 0 on `feat/0015-bridge-shared-arena`. `git log -S require_create`
+  returns **two** commits — `a39b40b` on `feat/0019-await-and-ro-create`, which
+  *defines* it, and `5fc3e90` on `feat/0015-bridge-shared-arena`, which *calls*
+  it from `open_shared`. The definition is the one that dates the step, and
+  restricting the search to `crates/tf_tree/src/open.rs` returns only the
+  first.)
+- **Steps 1–2** — **#141**, `feat/0015-bridge-shared-arena`: the `struct_size`
+  prefix rule *ported* to `tft_bridge_options` with `arena_name` appended, and
+  `open_shared` refusing rather than downgrading, in both the `shm` and the
+  no-`shm` build.
+- **Steps 3–4** — **#142**, `feat/0015-ros-arena-name`:
+  `BridgeOptions::arena_name`, the `arena_name` node parameter,
+  `test_shared_arena.cpp`, and the `TFT_HAVE_SHM` probe step 4 turned out to rest
+  on — see the correction under step 4.
+- **Steps 5–6** — **#143**, `feat/0015-dds-processes-arm`:
+  `bench_consumer --mode tf_tree_bridge` / `--mode tf_tree_attach`, the fourth
+  `just dds-bench` arm, the deletion of `dds_report::MISSING_ARM` and the
+  `tests/dds_report_aggregate.rs` pin step 6 turned out to need.
+- **Step 7** — split. Its `docs/PHASE5.md` §0.0 half went with **#143**, because
+  that row asserted this arm could not exist and called this record a draft, and
+  `CLAUDE.md` names §0.0 the authoritative status table, so it could not be left
+  saying so on `main`. Its `docs/PHASE4.md` §5.8 half is this PR.
+
+**And the record stays `ready`, not `implemented`.** `implemented` is this
+folder's immutability lock — [`README.md`](./README.md)'s *Gates* say an
+implemented document is never edited to match reality, only superseded — and two
+things this record is answerable for are still unbuilt. Neither is worth a
+superseding record; both are worth naming rather than dropping:
+
+1. **The fork test the *Invariants to maintain* clause demands.** That clause
+   makes `0005` step 9's `atfork` rules apply to the bridge and says they "must
+   be tested, not assumed"; the note under it writes out exactly what the test
+   has to be and which half of it `fork_child`'s `owned` mode already covers.
+   It is in none of the four PRs above, and the reason is a constraint rather
+   than an oversight: it needs a **fourth mode** of
+   `crates/tf_tree_bench/src/bin/fork_child.rs` (today `api`, `drop`, `owned`)
+   behind an optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
+   `tf_tree_bench` — a crate-graph change, which is why it is its own commit and
+   not a rider on any of these. Until it lands the clause is an assumption, which
+   is the thing it forbids.
+2. **`docs/PHASE5.md` §9.2's *Scaling curve, N = 1…16* row, for the new arm.**
+   `ros/dds_bench.sh` defaults `CONSUMERS` to 4, and 4 is the only value
+   `tf_tree.processes` has ever run at. This record's *Consequences* claim that
+   §9.2's *total RSS across N consumers* row "becomes measurable" for a
+   bridge-filled arena, and measurable at one point is what has been shown. The
+   arm is what makes the sweep possible; the sweep is still owed, and
+   `docs/benchmarks/tf2.md` says so where it extrapolates from N = 4 to N = 16.
 
 > **Moved `draft` → `ready` by
 > [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md), which resolves
@@ -293,10 +330,11 @@ as to any other participant, and the bridge's ingest thread is the one that
 created the arena — so `docs/decisions/0005` step 9's `atfork` rules apply to it
 unchanged and must be tested, not assumed.
 
-> **The fork test does not exist yet, and this is what it has to be.** Steps 0–2
-> landed without it, so the sentence above is currently an assumption — which is
-> the thing it forbids. Written out rather than left as a clause, because the
-> reason it did not land is a real constraint and not an oversight.
+> **The fork test does not exist yet, and this is what it has to be.** Every one
+> of the eight steps landed without it, so the sentence above is still an
+> assumption — which is the thing it forbids, and it is why this record is
+> `ready` and not `implemented`. Written out rather than left as a clause,
+> because the reason it did not land is a real constraint and not an oversight.
 >
 > *Half of it is already covered.* `BridgeInner` holds exactly two guarded
 > shapes: `Arc<Tree>` and one `tf_tree::OwnedWriter` per declared dynamic edge

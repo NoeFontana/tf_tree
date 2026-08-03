@@ -1544,6 +1544,61 @@ All three share one implementation; only the lifecycle wrapper differs.
 > and the whole binary gone. Measured, which is why that test is a binary of its
 > own.
 
+> **Amendment — the three forms are lifecycle wrappers, and *where the arena
+> lives* is a second axis all three of them now choose on.**
+>
+> As written, every form fills an arena no other process can see.
+> `tft_bridge_create` built it with `TreeBuilder::build()` — a private heap
+> allocation — so [`PHASE5.md`](./PHASE5.md) §9.1's actual sentence, *"one
+> bridge plus N `tf_tree` consumers"*, could only ever mean N consumers
+> **composed into the bridge's own process**. That is form 2 or form 3 and
+> nothing else, which makes the deployment a robot most often wants — the bridge
+> supervised as its own process, its consumers as theirs — the one this section
+> could not describe.
+>
+> [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) adds one
+> optional field, `tft_bridge_options::arena_name`. Non-NULL, the bridge
+> publishes its arena under that rendezvous name and any process may attach to
+> it **read-only** with `tft_tree_open()` in C, `tf_tree::open()` in Rust or
+> `tf_tree.open()` in Python —
+> **no new consumer API**, which is the point: the bridge becomes an ordinary
+> producer of the arena `docs/PHASE2.md` already specified. NULL is the default
+> and preserves the previous behaviour exactly, which is what every caller
+> compiled against ABI 0.4 keeps getting.
+>
+> **So this is not a fourth deployment form.** The lifecycle wrapper is
+> unchanged in all three; what the field changes is who can map what the bridge
+> writes. The three forms above and the two arena shapes compose, and a
+> deployment picks one of each.
+>
+> **How each form reaches the field is not uniform, and the difference is
+> structural rather than an oversight.** Forms 1 and 2 are `BridgeNode`, so they
+> take it from the `arena_name` **ROS parameter**, default `""`. Form 3
+> constructs no node and has no parameters at all, so
+> `BridgeOptions::arena_name` (empty = private heap arena) is its whole surface.
+> That is why `ros/tf_tree_ros/test/test_shared_arena.cpp` asserts the two paths
+> separately: a `BridgeNode` that did something private with the name would
+> leave form 3 — the one this section calls "lowest friction … which, for
+> dogfooding, is us" — unable to publish an arena at all, and every test that
+> went through a node would still pass.
+>
+> One content rule is applied at the parameter layer and only one: an
+> `arena_name` whose whitespace an operator cannot see — entirely whitespace, or
+> whitespace at either end — is **refused, not trimmed**, because `""` and
+> `" "` are the same string to an operator and opposite instructions to the
+> bridge, and `"foo"` and `" foo"` are the same string to that operator and two
+> different rendezvous. Every other malformed name (over 64 bytes, `../escape`)
+> is `tf_tree_ipc::ArenaName`'s to refuse and arrives as a `BridgeError` naming
+> it. An empty string is not one of them: `BridgeHandle` maps `""` to a NULL
+> `arena_name`, the ABI's spelling for "private heap arena".
+>
+> **A bridge asked for a shared arena it cannot have refuses to start.** One
+> status — `TFT_ERR_ARENA_UNAVAILABLE`, ABI minor 4 → 5 — and **no fallback to a
+> heap arena**, including in a `bridge`-without-`shm` build, where the field is
+> in the header with no `tf_tree::Open` behind it and ignoring it would be the
+> same silent downgrade reached through a build configuration. A downgrade
+> presents, from every consumer's side, as a bridge that never came up.
+
 ### 5.9 Executor and backpressure
 
 Dedicated `SingleThreadedExecutor` on its own thread, with optional CPU affinity and `SCHED_FIFO` priority (both off by default; document the `ulimit`/capability requirements). The bridge is the one component that still pays `tf2`'s deserialization cost, so it should be measured and isolated, not spread across a shared executor where it will be blamed for someone else's latency.
