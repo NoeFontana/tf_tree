@@ -44,6 +44,8 @@ pub mod shm_util;
 pub mod workload;
 
 #[cfg(feature = "tf2")]
+pub mod ratio;
+#[cfg(feature = "tf2")]
 pub mod replay_tf2;
 #[cfg(feature = "tf2")]
 pub mod tf2;
