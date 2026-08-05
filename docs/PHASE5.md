@@ -1573,6 +1573,12 @@ The **core budget** is split the same way and for the same reason. "Above the co
 
 A debug build is the one check that reaches everything, because it is not a slower program but a different one.
 
+**The `Ratio` axis has its first row, and it is the tf2 comparison.** `lookup_ratio_vs_tf2` times a depth-3 hot lookup on both engines in one process, `LerpSlerp` on both sides, the arms interleaved within every round with the leading arm alternating, and reports the **median per-round quotient** rather than the quotient of two medians. Measured on the development host: **2.47× with a band of 2.457–2.532 (3.0% wide)** — on the same host, in the same run, whose absolute latencies are `unavailable` because the fitness probe fails. That contrast is the justification for the axis existing.
+
+Two things about it are stated in the row's own note and repeated here because they bound the claim. The tf2 column goes through `tf_tree_tf2_sys` and therefore **flatters `tf_tree`** by the residual FFI boundary, ~21 ns / 8% at this depth; the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is 2.7×. And `ns_per_lookup` on either side is reported but **never gated** — it is an absolute duration, and this host cannot claim one.
+
+**There are two committed baselines**, `results.json` and `results-tf2.json`, checked by `just bench-check` and `just tf2-bench-check`. They are not interchangeable: the status comparison is one-directional, so a single baseline cut with `--features tf2` would make the default recipe fail on every host without ROS 2 — on the difference between two recipes rather than on the code, which is the trap `bench-check` already documents for `--embed-cost`. Each recipe checks the baseline cut by the matching build, and `bench_report` names the right regeneration recipe in its failure message.
+
 The JSON keeps its `timing_sensitive` field with its original meaning (*this row reports an absolute duration*), so `tf_tree.bench-report/2` does not change shape. Each rule carries a test with a verified mutant in `report.rs`.
 
 ---

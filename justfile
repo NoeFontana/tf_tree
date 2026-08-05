@@ -1032,6 +1032,41 @@ profile-cachegrind workload="robot":
 # would leave `bridge,shm` — `ros/build.sh` step 1, `docs/decisions/0015`'s
 # combination — compiled by no linting recipe on either side.
 #
+# **The §9.2 artifact with the tf2 columns compiled in, and its own baseline.**
+#
+# `just bench-check` builds without `--features tf2`, so every row needing a
+# `tf2::BufferCore` is `unavailable` there for a *build* reason — correctly, and
+# it says so. That leaves the project's central performance claim gated by
+# nothing, which is what this pair fixes.
+#
+# **Two baselines, not one, and they must not be merged.** The status comparison
+# is one-directional: a row `measured` in the committed baseline and not
+# `measured` now is a withdrawn claim and a hard failure. A single baseline cut
+# with `tf2` would therefore make `just bench-check` fail on every host without
+# ROS 2 — on the difference between two recipes rather than on the code, which is
+# exactly the trap `bench-check`'s own comment documents for `--embed-cost`.
+# So each recipe checks the baseline cut by the matching build.
+#
+# `lookup_ratio_vs_tf2` is the row that resolves here and nowhere else. It is a
+# `Sensitivity::Ratio` row, so the fitness probe's timing verdict does not reach
+# it: the arms are interleaved within every round, which is what makes ~2.5x
+# resolvable to a ~3% band on a host whose absolute latencies are unusable.
+tf2-bench-report *ARGS:
+    ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- {{ARGS}}'
+
+# The tf2-side regression gate. Container-only, like everything else here.
+tf2-bench-check:
+    ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- \
+        --out target/tf2-bench-report \
+        --check-baseline crates/tf_tree_bench/baseline/results-tf2.json'
+
+# Regenerate the tf2-side baseline. Same rule as `bench-baseline-update`: run it
+# deliberately, and put the diff in the commit that causes it.
+tf2-bench-baseline-update:
+    ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- \
+        --out target/tf2-bench-report'
+    cp target/tf2-bench-report/results.json crates/tf_tree_bench/baseline/results-tf2.json
+
 # fmt + clippy + unit tests for the tf2 bridge, in the container. `lint` and `test` cannot see it.
 tf2-check:
     ./docker/tf2/run.sh 'set -euo pipefail; \

@@ -91,7 +91,20 @@ pub const REQUIRED_ROWS: &[&str] = &[
     "tft_open_vs_bag_parse",
     "differential_agreement",
     "embedding_cross_crate",
+    "lookup_ratio_vs_tf2",
 ];
+
+/// Relative slack the regression gate allows on the tf2 ratio row, as a
+/// fraction of the committed baseline.
+///
+/// Wider than it looks necessary, and deliberately: the measured within-run band
+/// is ~3%, but the *between-build* movement of a ratio also carries whatever the
+/// container's toolchain does to either arm, and the row exists to catch an
+/// engine regression rather than to police a codegen difference. 15% below the
+/// baseline ratio is a real regression at this magnitude — 2.46x would have to
+/// fall past 2.09x, which is nearly to the floor itself.
+#[cfg(feature = "tf2")]
+const RATIO_SLACK: f64 = 0.15;
 
 /// Relative slack the regression gate allows on the differential row's
 /// `max_deviation`, as a fraction of the committed baseline: `9.0` means the
@@ -1616,6 +1629,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     rows.push(agreement);
 
     rows.push(embedding_row(opts, &fitness)?);
+    rows.push(ratio_row(&fitness));
 
     Ok(Report {
         provenance: Provenance::collect(),
@@ -1645,6 +1659,113 @@ pub fn assemble(opts: &Options) -> Result<Report> {
 /// The embedding row's `note`, and **the one place this repository states what
 /// `[profile.embedder]` is**.
 ///
+/// What the two columns of the tf2 ratio row mean, and what they do not.
+const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides (tf2's \
+    policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the \
+    MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back \
+    to back inside every round and the leading arm alternates, so drift common to both \
+    cancels and no arm always gets the colder cache. That pairing is what makes this \
+    resolvable where an absolute is not. The two engines are checked to agree on every \
+    stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and \
+    therefore FLATTERS tf_tree** by the residual FFI boundary, ~21 ns / 8% at this depth; \
+    the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is \
+    2.7x. The floor is set well under both for that reason: this row catches an engine \
+    regression, it does not publish the headline. `ns_per_lookup` on either side is \
+    REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. \
+    Single-threaded and uncontended, which is both engines' best case; the contended \
+    comparison, where tf2 anti-scales, is `just tf2-scaling`.";
+
+/// The depth-3 tf2 ratio, and the first row on the `Ratio` axis.
+///
+/// **This is the row a 4-core host can actually gate.** Every other tf2
+/// comparison in §9.2 reports an absolute duration, and this host cannot produce
+/// one: the fitness probe fails on SMT, an unreadable governor and four physical
+/// cores, so all of them come out `unavailable` and the project's central
+/// performance claim is gated by nothing. A quotient of two arms measured inside
+/// one round is a different statistic — measured here, the within-run band is
+/// ~3% wide on the same host whose absolute latencies are unusable.
+///
+/// It is `unavailable` without the `tf2` feature, which needs a ROS 2 install,
+/// so `just bench-report` on a bare host still reports the gap rather than the
+/// number. `just tf2-check`'s container is where it resolves.
+fn ratio_row(fitness: &Fitness) -> Row {
+    const ID: &str = "lookup_ratio_vs_tf2";
+    const TITLE: &str = "Depth-3 hot lookup, tf_tree vs tf2 (paired ratio)";
+    const REPRODUCE: &str = "just tf2-bench (the ratio resolves only where ROS 2 is installed; \
+         `docker/tf2/run.sh` is that place on this host)";
+
+    #[cfg(not(feature = "tf2"))]
+    {
+        let _ = fitness;
+        Row::unavailable(
+            ID,
+            TITLE,
+            RATIO_NOTE,
+            Sensitivity::Ratio,
+            "this row times `tf2::BufferCore` in-process, which needs a ROS 2 install this \
+             build does not have — `tf_tree_bench` was compiled without `--features tf2`. \
+             It is the build and not the host: a ratio is measurable here, and the fitness \
+             probe's timing verdict does not reach it"
+                .to_owned(),
+            REPRODUCE,
+        )
+    }
+
+    #[cfg(feature = "tf2")]
+    {
+        let mut row = Row::unavailable(
+            ID,
+            TITLE,
+            RATIO_NOTE,
+            Sensitivity::Ratio,
+            String::new(),
+            REPRODUCE,
+        );
+        let run = match crate::ratio::measure() {
+            Ok(r) => r,
+            Err(e) => {
+                row.reason = format!("the paired measurement could not be taken: {e}");
+                return row;
+            }
+        };
+        // A band that straddles the floor has not answered, and saying so beats
+        // resolving it by taking the median — `embed.rs`'s rule, and the reason
+        // a gate whose noise exceeds its threshold reports rather than passes.
+        if run.verdict() == crate::ratio::Verdict::Unresolved {
+            row.reason = format!(
+                "the pair was measured and cannot resolve the {:.1}x floor: {}",
+                crate::ratio::FLOOR,
+                run.verdict_line()
+            );
+            return row;
+        }
+        row.status = fitness.ratio_status();
+        row.reason = match row.status {
+            Status::Measured => String::new(),
+            Status::Indicative => format!(
+                "INDICATIVE, not a claim: TF_TREE_BENCH_FORCE=1 overrode the refusal. {}",
+                fitness.ratio_reason_line()
+            ),
+            Status::Unavailable => format!(
+                "the pair was measured, but this host cannot produce a trustworthy ratio: {}",
+                fitness.ratio_reason_line()
+            ),
+        };
+        if row.status != Status::Unavailable {
+            row.tf_tree = vec![
+                Metric::new("speedup_vs_tf2", run.ratio, "x").higher_is_better(RATIO_SLACK),
+                Metric::new("ratio_lo", run.ratio_lo, "x"),
+                Metric::new("ratio_hi", run.ratio_hi, "x"),
+                Metric::new("floor", crate::ratio::FLOOR, "x"),
+                Metric::new("ns_per_lookup", run.tf_tree_ns, "ns"),
+                Metric::new("agreed", run.agreed as f64, "queries"),
+            ];
+            row.tf2 = vec![Metric::new("ns_per_lookup", run.tf2_ns, "ns")];
+        }
+        row
+    }
+}
+
 /// Module-level rather than local to [`embedding_row`] so that
 /// `the_row_note_states_the_settings_the_manifest_declares` can read the two
 /// settings back out of the workspace manifest with

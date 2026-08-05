@@ -1,16 +1,16 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-08-05T22:50:35Z",
+    "generated_utc": "2026-08-05T22:51:24Z",
     "schema": "tf_tree.bench-report/2",
     "git_commit": "3ee0446dbcd929b1922274ee66f30c83b6805962",
     "git_dirty": "true",
-    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "build_profile": "release",
     "target": "x86_64",
     "counters_feature": "true",
     "shm_feature": "false",
-    "tf2_feature": "false",
+    "tf2_feature": "true",
     "format_version": "3",
     "layout_hash": "0x3D104195",
     "interp_policy": "LerpSlerp (tf2's policy)",
@@ -21,10 +21,10 @@
     "kernel": "6.8.0-136-generic",
     "transparent_hugepage": "always [madvise] never",
     "perf_event_paranoid": "4",
-    "load_average": "2.02 1.00 0.57 1/376 2225155",
-    "container": "no",
-    "ros_distro": "none (no ROS 2 in this run)",
-    "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
+    "load_average": "1.48 1.01 0.60 2/403 242",
+    "container": "yes (/.dockerenv present)",
+    "ros_distro": "lyrical",
+    "tf2_version": "the tf2 shipped with ROS 2 lyrical",
     "rmw_implementation": "none — no middleware is in any measurement here; both engines are driven in-process from the same loop",
     "dds_qos": "not applicable — no DDS in this configuration (see rmw_implementation)",
     "executor_config": "not applicable — no rclcpp executor; the harness drives both engines directly"
@@ -37,7 +37,7 @@
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.008298755186721962,
+    "busy_fraction": 0.033333333333333326,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
@@ -51,7 +51,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
       "reproduce": "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
       "tf_tree": {},
       "tf2": {}
@@ -87,7 +87,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. This row also needs the `shm` feature and a second process per consumer, and its tf2 counterpart needs a DDS round trip that no configuration here provides",
+      "reason": "the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. This row also needs the `shm` feature and a second process per consumer, and its tf2 counterpart needs a DDS round trip that no configuration here provides",
       "reproduce": "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
       "tf_tree": {},
       "tf2": {}
@@ -99,7 +99,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
+      "reason": "the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
       "reproduce": "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
       "tf_tree": {},
       "tf2": {}
@@ -138,7 +138,7 @@
       "reason": "",
       "reproduce": "cargo test -p tf_tree_bench --release --test differential",
       "tf_tree": {"max_deviation": {"value": 0.0000000000000002498001805406602, "unit": "rad or m", "drift": "lower_is_better", "tolerance": 9}, "compared": {"value": 47922, "unit": "queries", "drift": "informational", "tolerance": 0}, "tolerance": {"value": 0.000000000001, "unit": "rad or m", "drift": "informational", "tolerance": 0}},
-      "tf2": {}
+      "tf2": {"max_deviation": {"value": 0.000000000000002450677444825646, "unit": "rad or m", "drift": "lower_is_better", "tolerance": 9}, "compared": {"value": 47922, "unit": "queries", "drift": "informational", "tolerance": 0}, "tolerance": {"value": 0.000000000001, "unit": "rad or m", "drift": "informational", "tolerance": 0}}
     },
     {
       "id": "embedding_cross_crate",
@@ -147,7 +147,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "this row's in-crate column is `tf_tree_core::bench_probe`, which is compiled only under the default-off `bench-probe` feature, and it must be measured at `[profile.embedder]` — this tool is built with `lto = \"thin\"`, which is exactly what erases the boundary. It cannot measure the row from inside itself. `just embed-cost` builds and runs the probe and writes the pair, and both `just bench-check` and `just bench-baseline-update` depend on that recipe and pass the directory back in with --embed-cost. Reaching this branch means `bench_report` was invoked directly without the flag, so the row is reported without a number rather than left out",
       "reproduce": "just embed-cost",
       "tf_tree": {},
       "tf2": {}
@@ -158,11 +158,11 @@
       "note": "Both engines in one process, `LerpSlerp` on both sides (tf2's policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back to back inside every round and the leading arm alternates, so drift common to both cancels and no arm always gets the colder cache. That pairing is what makes this resolvable where an absolute is not. The two engines are checked to agree on every stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and therefore FLATTERS tf_tree** by the residual FFI boundary, ~21 ns / 8% at this depth; the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is 2.7x. The floor is set well under both for that reason: this row catches an engine regression, it does not publish the headline. `ns_per_lookup` on either side is REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. Single-threaded and uncontended, which is both engines' best case; the contended comparison, where tf2 anti-scales, is `just tf2-scaling`.",
       "timing_sensitive": false,
       "needs_n_cores": false,
-      "status": "unavailable",
-      "reason": "this row times `tf2::BufferCore` in-process, which needs a ROS 2 install this build does not have — `tf_tree_bench` was compiled without `--features tf2`. It is the build and not the host: a ratio is measurable here, and the fitness probe's timing verdict does not reach it",
+      "status": "measured",
+      "reason": "",
       "reproduce": "just tf2-bench (the ratio resolves only where ROS 2 is installed; `docker/tf2/run.sh` is that place on this host)",
-      "tf_tree": {},
-      "tf2": {}
+      "tf_tree": {"speedup_vs_tf2": {"value": 2.471824573399635, "unit": "x", "drift": "higher_is_better", "tolerance": 0.15}, "ratio_lo": {"value": 2.456887934832608, "unit": "x", "drift": "informational", "tolerance": 0}, "ratio_hi": {"value": 2.5320135862277864, "unit": "x", "drift": "informational", "tolerance": 0}, "floor": {"value": 2, "unit": "x", "drift": "informational", "tolerance": 0}, "ns_per_lookup": {"value": 201.46005859375, "unit": "ns", "drift": "informational", "tolerance": 0}, "agreed": {"value": 256, "unit": "queries", "drift": "informational", "tolerance": 0}},
+      "tf2": {"ns_per_lookup": {"value": 498.229296875, "unit": "ns", "drift": "informational", "tolerance": 0}}
     }
   ],
   "where_we_are_worse": [

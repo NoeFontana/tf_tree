@@ -252,7 +252,11 @@ fn ref_sample(stream: &[(i64, Iso3)], t: i64) -> Iso3 {
 
 /// The disagreement between two poses: `max(rotation-angle error, translation
 /// error)`.
-fn pose_error(x: &Iso3, y: &Iso3) -> f64 {
+///
+/// `pub(crate)` so [`crate::ratio`] can make the same check with the same metric
+/// before it times anything: a ratio between two arms answering different
+/// questions is not a measurement, and "same" has to mean what it means here.
+pub(crate) fn pose_error(x: &Iso3, y: &Iso3) -> f64 {
     let dq = x.q.conjugate() * y.q;
     let rot = log_so3(dq).norm();
     let trans = x.t.sub(y.t).norm();

@@ -226,10 +226,20 @@ fn main() -> Result<()> {
             for f in &cmp.failures {
                 eprintln!("  - {f}");
             }
+            // Name the recipe that regenerates *this* baseline. There are two,
+            // one per build, and they are not interchangeable: a baseline cut
+            // with `--features tf2` checked against a build without it fails
+            // every row it measured, on the difference between two recipes
+            // rather than on the code. Telling a reader to run the wrong one is
+            // how that happens.
+            let recipe = if path.to_string_lossy().contains("results-tf2") {
+                "just tf2-bench-baseline-update"
+            } else {
+                "just bench-baseline-update"
+            };
             eprintln!(
                 "\nIf the change is intended, regenerate the baseline with \
-                 `just bench-baseline-update` and put the diff in the commit that \
-                 causes it."
+                 `{recipe}` and put the diff in the commit that causes it."
             );
             bail!(
                 "{} regression(s) against the committed baseline",
