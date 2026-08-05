@@ -329,7 +329,44 @@ impl ProcStats {
 /// `/proc/<pid>/schedstat` field 1 is time-on-cpu in nanoseconds. Summed over
 /// `task/*` so a threaded consumer is counted whole; the process-level file
 /// covers only the main thread.
+///
+/// # The task sum loses a thread's CPU when that thread exits
+///
+/// `task/*` lists **live** threads, so a thread's `sum_exec_runtime` leaves the
+/// total the moment it is joined. `docs/benchmarks/tf2.md` records this being
+/// found in `measure.hpp`, where an unsaturated `uint64_t` difference printed
+/// `cpu_ns 18446744073701835266`, and left open "whether it is reachable
+/// [in `mp.rs`]". **It is not, today** — nothing that reads [`ProcStats::cpu_ns`]
+/// spawns a thread (`load_child` and `mp_consumer` are single-threaded, and
+/// `soak` reads only `pss_kib`, inside a live `thread::scope`) — and
+/// [`ProcStats::since`] saturates, so the failure here would be a plausible
+/// **zero** rather than an absurd number. That is the worse of the two to read.
+///
+/// Measured on this host, two threads burning 1 s each:
+///
+/// | instrument | threads alive | after `join()` |
+/// | --- | --- | --- |
+/// | `/proc/self/schedstat` (process-level) | 0.001 s | 0.001 s |
+/// | sum over `task/*` | 0.999 s | **0.001 s** |
+/// | `/proc/self/stat` `utime + stime` | 0.990 s | **2.000 s** |
+///
+/// So the process-level `schedstat` really is main-thread-only, as the paragraph
+/// above says; the task sum is exact while every thread lives and collapses
+/// afterwards; and `stat` is the only always-correct reading available without
+/// `unsafe` — this crate is `#![forbid(unsafe_code)]`, which rules out
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, the fix `measure.hpp` could take.
+///
+/// **So the two are cross-checked rather than one being chosen.** `stat` is
+/// complete but quantised to 10 ms; the task sum is exact but can only
+/// under-report. When `stat` exceeds the task sum by more than two clock ticks,
+/// the task sum has provably lost a thread and the coarse-but-correct number is
+/// returned instead. A coarse number beats a precise wrong one, and this way the
+/// 10 ms floor — which this workload cannot afford, at ~4 ms of CPU per 6-second
+/// window — is paid only when the alternative is a number that is simply false.
 fn self_cpu_ns() -> u64 {
+    // Always read: it is the completeness reference for the cross-check below.
+    let stat_ns = stat_cpu_ns();
+
     if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
         let mut ns = 0u64;
         let mut any = false;
@@ -341,14 +378,27 @@ fn self_cpu_ns() -> u64 {
                 any = true;
             }
         }
-        if any {
+        // Two ticks of slack, not zero: `stat` rounds *up* to whole USER_HZ
+        // ticks, so on a quiet single-threaded process it routinely reads a few
+        // milliseconds above the exact sum. One tick of slack would flip to the
+        // coarse instrument on quantisation alone.
+        if any && stat_ns <= ns.saturating_add(2 * TICK_NS) {
             return ns;
+        }
+        if any {
+            // The task sum lost a thread. `stat` still has it.
+            return stat_ns;
         }
     }
     // CONFIG_SCHEDSTATS=n. Fall back to 10 ms ticks, which is worse but is not
     // nothing, rather than reporting zero and looking like an answer.
-    stat_cpu_ns()
+    stat_ns
 }
+
+/// One USER_HZ clock tick in nanoseconds. `USER_HZ` is 100 on every Linux
+/// target this harness runs on, and reading it properly is `sysconf(_SC_CLK_TCK)`
+/// — which needs `unsafe`, which this crate forbids.
+const TICK_NS: u64 = 10_000_000;
 
 /// Field 1 of a `schedstat` file: time on cpu, in nanoseconds.
 fn schedstat_ns(path: &std::path::Path) -> Option<u64> {
@@ -676,6 +726,51 @@ mod tests {
         assert!(
             d.cpu_ns < 500_000_000,
             "3 ms of spinning read as {} ns of CPU — implausible, check the units",
+            d.cpu_ns
+        );
+    }
+
+    /// A thread's CPU must not vanish from the reading when the thread is
+    /// joined.
+    ///
+    /// `task/*` lists live threads only, so the exact instrument collapses here
+    /// — measured, two threads burning 1 s each: 0.999 s while alive, 0.001 s
+    /// after `join()`. `since()` saturates, so the failure is a plausible zero
+    /// rather than the absurd `18446744073701835266` the same defect printed in
+    /// `measure.hpp`. The cross-check against `/proc/self/stat` is what catches
+    /// it, at the cost of that reading's 10 ms quantisation.
+    ///
+    /// Mutant: delete the `if any { return stat_ns; }` arm in `self_cpu_ns`
+    /// (so the task sum is returned unconditionally) — verified to fail this
+    /// test, reporting ~0 s of CPU for ~0.4 s burned.
+    #[test]
+    fn cpu_time_survives_a_thread_exiting() {
+        if !std::path::Path::new("/proc/self/schedstat").exists() {
+            return;
+        }
+        let burn = Duration::from_millis(200);
+        let before = ProcStats::read();
+        let hs: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    let mut x = 0u64;
+                    while start.elapsed() < burn {
+                        x = x.wrapping_add(std::hint::black_box(1));
+                    }
+                    std::hint::black_box(x);
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        // Both threads have exited. Their ~400 ms of CPU must still be visible.
+        let d = ProcStats::read().since(before);
+        assert!(
+            d.cpu_ns >= 200_000_000,
+            "two threads burned ~400 ms of CPU and then exited; the reading is \
+             {} ns, so their time left the counter with them",
             d.cpu_ns
         );
     }
