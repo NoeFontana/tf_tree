@@ -911,21 +911,44 @@ an in-arena reapable lock (A2), the sample writer forces slot parity rather than
 incrementing it (A5), the header carries a full 16-byte boot id (A7), and the
 interning spin is bounded with takeover of a provably-dead claimant (A8).
 
-What is **still** missing is the *lifecycle*, listed in
-[`PHASE2.md`](../PHASE2.md) §0.0 and scoped by decision
-[`0005`](../decisions/0005-the-shared-memory-seam.md):
+**The three lifecycle gaps this section used to list have all been closed, and
+the list is replaced rather than annotated** — it described a state of the code
+that has not been true since decision
+[`0005`](../decisions/0005-the-shared-memory-seam.md) landed, and a "still
+missing" list that is wrong on every row is worse than no list. For the record,
+it read:
 
-- Segments are handed over by **fd inheritance**; the §3.7 `SOCK_SEQPACKET` +
-  `SCM_RIGHTS` handshake is not implemented, so a process that is not a child
-  cannot attach at all and `tf_tree::open()` does not exist yet.
-- **Liveness** comes from a `/proc` heuristic that fails safe (unknown ⇒ alive),
-  not from `F_OFD_GETLK` (§5.1).
-- **Nothing reaps** (§6.3): `edge::reap` exists and is called only by tests, so a
-  participant that dies holding a claim leaks that edge until the arena does.
+> - Segments are handed over by **fd inheritance**; the §3.7 `SOCK_SEQPACKET` +
+>   `SCM_RIGHTS` handshake is not implemented, so a process that is not a child
+>   cannot attach at all and `tf_tree::open()` does not exist yet.
+> - **Liveness** comes from a `/proc` heuristic that fails safe (unknown ⇒ alive),
+>   not from `F_OFD_GETLK` (§5.1).
+> - **Nothing reaps** (§6.3): `edge::reap` exists and is called only by tests, so a
+>   participant that dies holding a claim leaks that edge until the arena does.
 
-Those are crash-*recovery* properties rather than
-correctness-under-normal-operation properties, and none of the numbers above
-depend on them — but they must be in place before this is production-safe.
+Each of the three, checked against the code:
+
+- **§3.7's handshake is implemented.** `crates/tf_tree_ipc/src/lib.rs:55` marks
+  the `SOCK_SEQPACKET` + `SCM_RIGHTS` transport implemented, and `client.rs`'s
+  header describes receiving the segment fd as ancillary data and keeping the
+  socket open. A process that is not a child attaches.
+- **`tf_tree::open()` exists**, at `crates/tf_tree/src/open.rs:227`, with the
+  builder form at `:369` and `Tree::open_frozen` at `frozen.rs:119`.
+- **Liveness is the kernel's answer about a file lock**, not a `/proc`
+  heuristic — OFD locks via `fcntl`, which `tf_tree_ipc`'s module docs record as
+  a deliberate, documented deviation from §2's "no `libc` crate" because
+  `rustix` 1.1 has no OFD locking. This is what lets a `SIGSTOP`ped publisher
+  keep its claims while a dead one is reclaimed.
+- **Reaping is wired.** `Tree::reap_dead` (`tree.rs:2349`) and
+  `Tree::reap_participant` (`:2362`) are public, and `edge::reap`
+  (`tf_tree_core/src/edge.rs:399`) is reached through them rather than from
+  tests alone.
+
+`PHASE2.md` §0.0 remains the authoritative status table; what is still open
+there is the tooling half (`tf_tree_record`, the long-running fault harness) and
+`tf_tree serve` ([`0019`](../decisions/0019-one-binary-and-topology-you-can-wait-for.md)
+steps 6–7, deliberately unscheduled), not the lifecycle. None of the numbers
+above depended on any of it either way.
 
 ## The performance suite: contention, scale, duration, and the transport
 
@@ -1204,9 +1227,39 @@ second sample after joining its query threads — so their CPU is subtracted and
 the `uint64_t` difference underflows. That was found in the field, in an attach
 process that printed `cpu_ns 18446744073701835266`. The two agree to 0.2 ms
 while the threads are alive (1.9481 s against 1.9479 s) and diverge completely
-once one exits (8.4117 s against 0.0004 s). **`mp.rs` carries the same latent
-hazard and has not been touched**; whether it is reachable there is a question
-for that harness.
+once one exits (8.4117 s against 0.0004 s). **`mp.rs` carried the same latent
+hazard**, and whether it was reachable there was left as a question for that
+harness. It is now answered: **no, and it is fixed anyway.**
+
+Not reachable, because nothing that reads `ProcStats::cpu_ns` spawns a thread —
+`load_child` and `mp_consumer` are single-threaded, and `soak` reads only
+`pss_kib`, from inside a live `thread::scope`. And `ProcStats::since` saturates,
+so the failure mode here was never the absurd `18446744073701835266`; it was a
+plausible **zero**, which is the worse of the two to read past.
+
+Fixed anyway, because the trap should not be left for the next harness. Measured
+on this host, two threads burning 1 s each:
+
+| instrument | threads alive | after `join()` |
+|---|---|---|
+| `/proc/self/schedstat` (process-level) | 0.001 s | 0.001 s |
+| sum over `task/*` — what `mp.rs` read | 0.999 s | **0.001 s** |
+| `/proc/self/stat` `utime + stime` | 0.990 s | **2.000 s** |
+
+The process-level `schedstat` really is main-thread-only, as `mp.rs` always
+said; the task sum is exact while every thread lives and collapses afterwards;
+and `stat` is the only always-correct reading available here, at 10 ms
+quantisation. `measure.hpp`'s fix — `CLOCK_PROCESS_CPUTIME_ID` — is **not
+available to `mp.rs`**: `tf_tree_bench` is `#![forbid(unsafe_code)]` and
+`clock_gettime` needs `unsafe`.
+
+So the two are cross-checked rather than one being chosen. `stat` is read
+alongside the task sum, and when it exceeds the sum by more than two clock ticks
+the sum has provably lost a thread, so the coarse-but-correct number is returned
+instead. The 10 ms floor this workload cannot afford — ~4 ms of CPU per
+6-second window — is paid only when the alternative is a number that is false.
+`mp::tests::cpu_time_survives_a_thread_exiting` pins it, and its mutant
+(returning the task sum unconditionally) reports 0.34 ms for 400 ms burned.
 
 *The fourth row exists.* See below.
 
