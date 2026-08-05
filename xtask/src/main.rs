@@ -110,14 +110,24 @@ fn run_bench_gate() -> ExitCode {
     println!("{}", if differential { "PASS" } else { "FAIL" });
 
     // 3. The hardware-dependent criteria — reported honestly, never faked.
+    //
+    // The thresholds are `docs/PHASE1.md` §11.3's, as re-cut by decision 0013:
+    // 300/220 ns rather than 150/100 (the old pair was set before anything had
+    // measured interpolation, against a fixture whose query stamp was on-grid
+    // for all four dynamic rates), and 1->4 threads rather than 1->8 (8 threads
+    // on 4 physical cores can pass 6x only through SMT, so the old row was not
+    // a gate on any host this project has).
     println!(
-        "[gate]        depth-3 hot p50 < 150 ns (ScLerp) / < 100 ns (LerpSlerp) ... UNAVAILABLE"
+        "[gate]        depth-3 hot p50 < 300 ns (ScLerp) / < 220 ns (LerpSlerp), inlined ... UNAVAILABLE"
     );
     println!("                  reason: p50 latency needs dedicated, core-pinned hardware;");
     println!("                  measure indicatively with `cargo bench -p tf_tree_bench --bench lookup`.");
-    println!("[gate]        read throughput scales >= 6x from 1 to 8 threads ... UNAVAILABLE");
+    println!("[gate]        read throughput scales >= 2.5x from 1 to 4 threads ... UNAVAILABLE");
     println!("                  reason: needs pinned cores + concurrent writers;");
     println!("                  measure indicatively with `cargo bench -p tf_tree_bench --bench read_scaling`.");
+    println!("[gate]        tf_tree's 1->4 scaling factor >= 5x tf2's ... UNAVAILABLE");
+    println!("                  reason: needs ROS 2 and pinned cores in one run;");
+    println!("                  run `just tf2-scaling` in the container for indicative numbers.");
     // 4. The tf2 differential — decisive wherever ROS 2 is reachable. Unlike the
     //    latency rows this is a *correctness* comparison, so it does not need
     //    pinned hardware: run it whenever we can, report honestly when we can't.
@@ -148,6 +158,8 @@ fn run_bench_gate() -> ExitCode {
 
     println!("\nSummary: the correctness gates (zero-alloc, differentials) are decisive here;");
     println!("the latency/scaling rows require dedicated hardware and are NOT claimed passed.");
+    println!("Thresholds are PHASE1 §11.3 as re-cut by decision 0013; the 1->8 thread");
+    println!(">= 6x figure it replaces is retained there as informational (measured 5.35-5.62x).");
 
     if benches_built && zero_alloc && differential && tf2.unwrap_or(true) {
         ExitCode::SUCCESS
