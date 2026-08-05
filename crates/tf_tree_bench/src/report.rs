@@ -245,6 +245,59 @@ impl Status {
     }
 }
 
+/// What kind of host fitness a row's numbers actually depend on.
+///
+/// **One boolean could not answer this, and pretending it could is what left
+/// rows unavailable for reasons that were not about them.** An absolute
+/// duration, a paired ratio and a resident-memory figure fail for different
+/// facts about a machine, so they are asked different questions:
+///
+/// - a **frequency governor** moves an absolute latency and cancels out of a
+///   ratio measured by interleaving both engines inside one round;
+/// - **SMT** makes a per-thread duration depend on the sibling, and again
+///   cancels when the two arms are interleaved on the same thread;
+/// - a **busy machine** does *not* cancel out of a cross-engine ratio, and this
+///   is the exception worth knowing: cancellation needs the disturbance to land
+///   on both arms alike, and these arms are asymmetric by construction —
+///   `tf2::BufferCore` locks on every lookup and `tf_tree` does not, so load adds
+///   lock-holder preemption and convoying to one arm only. It inflates the
+///   quotient in our favour rather than adding noise to it;
+/// - **PSS does not involve a clock at all** — it is proportional set size read
+///   out of `/proc`, and neither the governor nor a noisy neighbour changes how
+///   many pages a process has resident. What it does need is to be *readable*:
+///   `smaps_rollup` is absent on non-Linux and on some hardened containers, and
+///   a silent zero there would be a false PASS.
+///
+/// What every one of them *does* depend on is being a release build, because a
+/// debug build is a different program rather than a slower one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sensitivity {
+    /// The same inputs give the same answer on any host — a differential
+    /// deviation, or arithmetic on the arena layout. Nothing to check.
+    HostIndependent,
+    /// An absolute duration. Needs a trustworthy clock *and* a quiet machine:
+    /// every check in [`Fitness::reasons`] applies.
+    AbsoluteTiming,
+    /// A ratio between two engines measured by interleaving them within each
+    /// round and taking the median of per-round quotients. Common-mode drift —
+    /// governor, SMT — lands on both arms and divides out, which is why
+    /// `just cpp-bench`'s gate went from flapping to a stable 1.006× when it
+    /// started interleaving. A debug build and a busy machine still invalidate
+    /// it; see the type's own docs for why load is not common-mode here.
+    ///
+    /// **No row constructs this yet.** It is the mechanism the `PHASE5.md` §9.2
+    /// tf2-comparison rows are intended to move onto, so that a 4-core host can
+    /// gate a *ratio* against tf2 even where it cannot gate either side's
+    /// absolute latency. `embedding_cross_crate` is the nearest existing
+    /// candidate and deliberately is **not** one: §9.2 gates its two absolute
+    /// durations as well as their quotient, so it needs the stricter axis.
+    Ratio,
+    /// Resident or proportional memory. Not a timing measurement, so the timing
+    /// checks do not apply to it — but it does require that Pss be readable at
+    /// all, which [`Fitness::memory_reasons`] carries.
+    Memory,
+}
+
 /// One §9.2 row.
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -255,8 +308,8 @@ pub struct Row {
     /// What the two columns mean for *this* row, since they are not always
     /// "the same measurement on two engines".
     pub note: String,
-    /// Whether a number here is only meaningful on a quiet, uncontended host.
-    pub timing_sensitive: bool,
+    /// Which host facts this row's numbers actually depend on.
+    pub sensitivity: Sensitivity,
     /// Whether this row runs `consumers` processes or threads at once, and so
     /// needs the core budget rather than (or as well as) a trustworthy clock.
     pub needs_n_cores: bool,
@@ -279,7 +332,7 @@ impl Row {
         id: &'static str,
         title: &'static str,
         note: &str,
-        timing_sensitive: bool,
+        sensitivity: Sensitivity,
         reason: String,
         reproduce: &'static str,
     ) -> Row {
@@ -287,7 +340,7 @@ impl Row {
             id,
             title,
             note: note.to_owned(),
-            timing_sensitive,
+            sensitivity,
             needs_n_cores: false,
             status: Status::Unavailable,
             reason,
@@ -302,6 +355,27 @@ impl Row {
     pub fn n_way(mut self) -> Row {
         self.needs_n_cores = true;
         self
+    }
+
+    /// Whether this row reports an absolute duration.
+    ///
+    /// Kept as the JSON field of the same name so `tf_tree.bench-report/2` does
+    /// not change shape: it means exactly what it always meant, and the two
+    /// non-timing sensitivities were previously spelled `false` here alongside
+    /// [`Sensitivity::HostIndependent`].
+    #[must_use]
+    pub fn timing_sensitive(&self) -> bool {
+        matches!(self.sensitivity, Sensitivity::AbsoluteTiming)
+    }
+
+    /// The status this row should carry on `fitness`, from its sensitivity.
+    ///
+    /// The core budget is applied on top by the caller when [`Row::needs_n_cores`]
+    /// is set; it is a separate question from whether the number is trustworthy.
+    #[must_use]
+    pub fn status_on(&self, fitness: &Fitness) -> Status {
+        let (fair, _, _) = fitness.axis(self.sensitivity);
+        Fitness::status_from(fair, fitness.forced)
     }
 }
 
@@ -336,13 +410,34 @@ pub struct Fitness {
     /// release build, quiet machine, no SMT, `performance` governor. Says
     /// nothing about whether the host is big enough for the comparison.
     pub fair_for_timing: bool,
+    /// True when this host can produce a trustworthy *ratio* between two
+    /// engines measured by interleaving them within a round.
+    ///
+    /// Strictly weaker than [`Fitness::fair_for_timing`], and deliberately so:
+    /// the governor, SMT and the machine's load all land on both arms of an
+    /// interleaved pair and divide out, so none of them invalidates a quotient
+    /// the way each invalidates an absolute duration.
+    pub fair_for_ratios: bool,
+    /// True when this host can produce a trustworthy *memory* figure.
+    ///
+    /// Also strictly weaker than [`Fitness::fair_for_timing`]. PSS is read out
+    /// of `/proc`, involves no clock, and does not move because a neighbour is
+    /// busy or the governor is unreadable.
+    pub fair_for_memory: bool,
     /// True when the host has at least `consumers + 1` physical cores. Says
     /// nothing about whether a clock reading here would be trustworthy.
     pub enough_cores: bool,
     /// Whether `TF_TREE_BENCH_FORCE=1` was set.
     pub forced: bool,
     /// One string per failed *timing* check, each naming the measured fact.
+    ///
+    /// This is the widest of the three lists; [`Fitness::ratio_reasons`] and
+    /// [`Fitness::memory_reasons`] are subsets of it.
     pub reasons: Vec<String>,
+    /// The subset of [`Fitness::reasons`] that also invalidates a ratio.
+    pub ratio_reasons: Vec<String>,
+    /// The subset of [`Fitness::reasons`] that also invalidates a memory figure.
+    pub memory_reasons: Vec<String>,
     /// Why the core budget is short, when it is.
     pub core_reason: Option<String>,
     /// Consumer count the probe was asked about.
@@ -381,6 +476,12 @@ impl Fitness {
             // program. Checking it here means the CLI path (`cargo run` defaults
             // to debug) cannot quietly publish debug latencies.
             cfg!(debug_assertions),
+            // Whether a Pss figure can be obtained at all. `self_pss_kib`
+            // returns 0 when `smaps_rollup` is unreadable, and a silent 0 is a
+            // false PASS of exactly the kind the physical-core fallback below
+            // refuses to make: it would leave `fair_for_memory` true and let a
+            // memory row publish zeros as a claim.
+            crate::mp::self_pss_kib() > 0,
         )
     }
 
@@ -401,16 +502,38 @@ impl Fitness {
         busy: f64,
         governors: Option<Vec<String>>,
         debug_build: bool,
+        pss_readable: bool,
     ) -> Fitness {
+        // Each failing check is collected into the bucket naming *which kinds of
+        // claim it invalidates*, and the three verdicts are unions of buckets.
+        // Writing it this way is what stops the axes drifting apart: a new check
+        // has to state its reach to be added at all.
         let mut reasons = Vec::new();
+        // Invalidates everything. A debug build is a different program: its
+        // latencies, its quotients and its resident footprint all describe
+        // something nobody ships.
+        let mut universal = Vec::new();
+        // Invalidates a duration *and* a quotient, but not a page count.
+        let mut timing_and_ratio = Vec::new();
+        // Invalidates a page count only.
+        let mut memory_only = Vec::new();
 
-        if debug_build {
-            reasons.push(
-                "built with debug assertions on; latency here measures the debug \
-                 build, not the shipped one"
+        if !pss_readable {
+            memory_only.push(
+                "/proc/self/smaps_rollup is unreadable, so Pss cannot be measured on this \
+                 host at all"
                     .to_owned(),
             );
         }
+
+        if debug_build {
+            universal.push(
+                "built with debug assertions on; this measures the debug build, \
+                 not the shipped one"
+                    .to_owned(),
+            );
+        }
+        reasons.extend(universal.iter().cloned());
 
         // Falling back to `logical` *silently* is the one thing this must not
         // do. It makes `logical > physical` vacuously false, so the SMT reason
@@ -457,9 +580,21 @@ impl Fitness {
             ));
         }
 
+        // Load is the one timing check that does **not** divide out of a
+        // cross-engine quotient, and it fails in the direction that flatters us.
+        // Interleaving cancels a disturbance only when it lands on both arms the
+        // same way, and these two arms are asymmetric by construction:
+        // `tf2::BufferCore` takes a mutex on every lookup and `tf_tree`'s read
+        // path takes none. Under load the tf2 arm additionally suffers
+        // preemption while holding that lock, and the convoy behind it, which
+        // the tf_tree arm has no equivalent of — so a busy host does not add
+        // noise to the ratio, it *inflates* it. That is precisely the thumb on
+        // the scale §9.3 exists to catch, so `busy` reaches the ratio axis.
         if busy > crate::mp::QUIET_ENOUGH {
-            reasons.push(format!(
-                "machine is {:.0}% busy before the run starts (threshold {:.0}%)",
+            timing_and_ratio.push(format!(
+                "machine is {:.0}% busy before the run starts (threshold {:.0}%); a \
+                 cross-engine ratio does not divide this out, because only one of the \
+                 two arms takes a lock",
                 busy * 100.0,
                 crate::mp::QUIET_ENOUGH * 100.0
             ));
@@ -479,10 +614,28 @@ impl Fitness {
             ),
         }
 
+        // The unions. `reasons` is every check that reaches a duration, which is
+        // all three buckets except the memory-only one.
+        reasons.extend(timing_and_ratio.iter().cloned());
+        let ratio_reasons: Vec<String> = universal
+            .iter()
+            .chain(timing_and_ratio.iter())
+            .cloned()
+            .collect();
+        let memory_reasons: Vec<String> = universal
+            .iter()
+            .chain(memory_only.iter())
+            .cloned()
+            .collect();
+
         Fitness {
             fair_for_timing: reasons.is_empty(),
+            fair_for_ratios: ratio_reasons.is_empty(),
+            fair_for_memory: memory_reasons.is_empty(),
             enough_cores: core_reason.is_none(),
             forced: std::env::var_os("TF_TREE_BENCH_FORCE").is_some(),
+            ratio_reasons,
+            memory_reasons,
             reasons,
             core_reason,
             consumers,
@@ -499,9 +652,52 @@ impl Fitness {
     /// and one process, so a 4-core host is no obstacle to it.
     #[must_use]
     pub fn timing_status(&self) -> Status {
-        if self.fair_for_timing {
+        Fitness::status_from(self.fair_for_timing, self.forced)
+    }
+
+    /// The one place a [`Sensitivity`] is mapped to the verdict it rests on.
+    ///
+    /// Returns `(is_fair, how the row is described in a refusal, why it failed)`.
+    /// Every consumer goes through here — [`Row::status_on`] and both arms of
+    /// `Report::validate` — so that adding a `Sensitivity` variant is a single
+    /// non-exhaustive-match error rather than three places to remember.
+    #[must_use]
+    pub fn axis(&self, sensitivity: Sensitivity) -> (bool, &'static str, String) {
+        match sensitivity {
+            Sensitivity::HostIndependent => (true, "host independent", String::new()),
+            Sensitivity::AbsoluteTiming => {
+                (self.fair_for_timing, "timing sensitive", self.reason_line())
+            }
+            Sensitivity::Ratio => (
+                self.fair_for_ratios,
+                "an interleaved ratio",
+                self.ratio_reason_line(),
+            ),
+            Sensitivity::Memory => (
+                self.fair_for_memory,
+                "a memory figure",
+                self.memory_reason_line(),
+            ),
+        }
+    }
+
+    /// The status an interleaved two-engine ratio row should carry.
+    #[must_use]
+    pub fn ratio_status(&self) -> Status {
+        Fitness::status_from(self.fair_for_ratios, self.forced)
+    }
+
+    /// The status a resident/proportional memory row should carry.
+    #[must_use]
+    pub fn memory_status(&self) -> Status {
+        Fitness::status_from(self.fair_for_memory, self.forced)
+    }
+
+    /// The shared `fair → Measured, forced → Indicative, else Unavailable` rule.
+    fn status_from(fair: bool, forced: bool) -> Status {
+        if fair {
             Status::Measured
-        } else if self.forced {
+        } else if forced {
             Status::Indicative
         } else {
             Status::Unavailable
@@ -515,6 +711,26 @@ impl Fitness {
             "host passed every fitness check".to_owned()
         } else {
             self.reasons.join("; ")
+        }
+    }
+
+    /// [`Fitness::reason_line`] for a ratio row.
+    #[must_use]
+    pub fn ratio_reason_line(&self) -> String {
+        if self.ratio_reasons.is_empty() {
+            "host can measure an interleaved ratio".to_owned()
+        } else {
+            self.ratio_reasons.join("; ")
+        }
+    }
+
+    /// [`Fitness::reason_line`] for a memory row.
+    #[must_use]
+    pub fn memory_reason_line(&self) -> String {
+        if self.memory_reasons.is_empty() {
+            "host can measure resident memory".to_owned()
+        } else {
+            self.memory_reasons.join("; ")
         }
     }
 }
@@ -748,19 +964,36 @@ impl Report {
                     if r.tf_tree.is_empty() && r.tf2.is_empty() {
                         bad.push(format!("row `{}` is `measured` with no numbers", r.id));
                     }
-                    // The rule the whole module exists for.
-                    if r.timing_sensitive && !self.fitness.fair_for_timing {
+                    // The rule the whole module exists for. Each sensitivity is
+                    // checked against the axis it actually rests on, so a row
+                    // can no longer be refused for a fact that does not reach
+                    // it — nor claim `measured` on a host that fails the one
+                    // that does.
+                    let (fair, axis, why) = self.fitness.axis(r.sensitivity);
+                    if !fair {
                         bad.push(format!(
-                            "row `{}` is timing sensitive and claims `measured`, but the host \
-                             failed the fitness probe: {}",
+                            "row `{}` is {axis} and claims `measured`, but the host \
+                             failed the fitness probe: {why}",
                             r.id,
-                            self.fitness.reason_line()
                         ));
                     }
                     // The second half of the same rule. An N-way row on a host
                     // with fewer cores than consumers measures the scheduler,
                     // and that is true even where the clock is perfect.
-                    if r.needs_n_cores && !self.fitness.enough_cores {
+                    //
+                    // **Except for a memory row, and that exception is the
+                    // point.** "Above the core count the rows measure the
+                    // scheduler" is a statement about throughput and latency.
+                    // Sixteen workers mapping one `.tft` on four cores share
+                    // exactly the pages they would share on sixteen: Pss is
+                    // decided by the page tables, not by who is running. §12
+                    // gate 4 — total Pss within 1.2x of one worker — is the
+                    // wedge's central claim and it was unmeasurable here only
+                    // because it was being asked a question about cores that it
+                    // does not depend on.
+                    let core_budget_applies =
+                        r.needs_n_cores && r.sensitivity != Sensitivity::Memory;
+                    if core_budget_applies && !self.fitness.enough_cores {
                         bad.push(format!(
                             "row `{}` runs {} consumers and claims `measured`, but {}",
                             r.id,
@@ -773,7 +1006,12 @@ impl Report {
                     }
                 }
                 Status::Indicative => {
-                    if self.fitness.fair_for_timing {
+                    // Per-axis for the same reason `measured` is: a memory row
+                    // labelled `indicative` on a host whose only failing checks
+                    // are about the clock is hiding a number that was never in
+                    // doubt.
+                    let (fair, _, _) = self.fitness.axis(r.sensitivity);
+                    if fair {
                         bad.push(format!(
                             "row `{}` is `indicative` on a host that passed the fitness probe; \
                              an indicative label there hides a usable number",
@@ -847,6 +1085,19 @@ impl Report {
             "    \"fair_for_timing\": {},",
             self.fitness.fair_for_timing
         );
+        // The other two axes are published too, or the split is invisible in the
+        // artifact and a reader cannot tell why a memory row was measured on a
+        // host whose `fair_for_timing` is false.
+        let _ = writeln!(
+            s,
+            "    \"fair_for_ratios\": {},",
+            self.fitness.fair_for_ratios
+        );
+        let _ = writeln!(
+            s,
+            "    \"fair_for_memory\": {},",
+            self.fitness.fair_for_memory
+        );
         let _ = writeln!(s, "    \"enough_cores\": {},", self.fitness.enough_cores);
         let _ = writeln!(
             s,
@@ -889,7 +1140,7 @@ impl Report {
             let _ = writeln!(s, "      \"id\": {},", jstr(r.id));
             let _ = writeln!(s, "      \"title\": {},", jstr(r.title));
             let _ = writeln!(s, "      \"note\": {},", jstr(&r.note));
-            let _ = writeln!(s, "      \"timing_sensitive\": {},", r.timing_sensitive);
+            let _ = writeln!(s, "      \"timing_sensitive\": {},", r.timing_sensitive());
             let _ = writeln!(s, "      \"needs_n_cores\": {},", r.needs_n_cores);
             let _ = writeln!(s, "      \"status\": {},", jstr(r.status.as_str()));
             let _ = writeln!(s, "      \"reason\": {},", jstr(&r.reason));
@@ -1179,7 +1430,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "cpu_per_consumer",
             "CPU per consumer at steady state (%CPU)",
             "Both stacks, N consumers plus one publisher, steady state.",
-            true,
+            Sensitivity::AbsoluteTiming,
             host_reason.clone(),
             "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
         )
@@ -1192,7 +1443,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "Total RSS across N consumers (MB)",
             "Both stacks, summed Pss from /proc/*/smaps_rollup. Memory is exact even on a \
          loaded machine, so this row's gap is the missing tf2 column, not the host.",
-            false,
+            Sensitivity::Memory,
             "the tf_tree column is measurable here, but the tf2 column needs a ROS 2 install \
          this report cannot reach in-process; running both halves from one tool would \
          mean linking tf2 into it. `just mp-bench-tf2` runs both in the container and \
@@ -1217,7 +1468,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
         "lookup_latency",
         "Lookup latency, depth 3, hot path (p50, p99, p99.9)",
         LOOKUP_NOTE,
-        true,
+        Sensitivity::AbsoluteTiming,
         format!(
             "this row is single-threaded and in-process, so the only thing between it \
              and a number is the host, and the host failed the fitness probe: {}",
@@ -1249,7 +1500,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "publish_to_visible",
             "Publish -> visible-to-consumer (p50, p99.9)",
             "Both stacks, publisher process to consumer process.",
-            true,
+            Sensitivity::AbsoluteTiming,
             format!(
                 "{host_reason}. This row also needs the `shm` feature and a second process \
              per consumer, and its tf2 counterpart needs a DDS round trip that no \
@@ -1265,7 +1516,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "scaling_curve",
             "Scaling curve, N = 1..16 (throughput, CPU)",
             "Both stacks. The claim under test is that reads scale with threads.",
-            true,
+            Sensitivity::AbsoluteTiming,
             // The 5.35-5.62x figure is attributed to the host `docs/PHASE5.md` §0.0
             // recorded it on, not to whatever host is running this binary — quoting
             // somebody else's number as if it came from here is the exact move §9.3
@@ -1287,7 +1538,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "tft_16_workers_rss",
             "Frozen .tft: 16 dataloader workers, total RSS vs 16 bag parses (MB)",
             "The wedge's central claim (§12 gate 4: total Pss within 1.2x of one worker).",
-            false,
+            Sensitivity::Memory,
             frozen_row_reason("mapping one .tft from sixteen worker processes"),
             "just bench-report-shm on >= 16 physical cores, with a .tft built by \
              `tf_tree freeze --from-bag` from a representative recording",
@@ -1299,7 +1550,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
         "tft_open_vs_bag_parse",
         ".tft open time vs bag parse time (ms)",
         "§12 gate 2 wants open under 10 ms for a 233 MB index.",
-        true,
+        Sensitivity::AbsoluteTiming,
         frozen_row_reason("timing `Tree::open_frozen` against a 233 MB index"),
         "just bench-report-shm against a .tft built by `tf_tree freeze --from-bag` from a \
          recording large enough to produce §12 gate 2's 233 MB index",
@@ -1347,7 +1598,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
                quaternion sign flip cannot pass. Not timing sensitive: the same \
                inputs give the same disagreement on any host."
             .to_owned(),
-        timing_sensitive: false,
+        sensitivity: Sensitivity::HostIndependent,
         needs_n_cores: false,
         status: Status::Measured,
         reason: String::new(),
@@ -1428,7 +1679,7 @@ pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
             ID,
             TITLE,
             NOTE,
-            true,
+            Sensitivity::AbsoluteTiming,
             "this row's in-crate column is `tf_tree_core::bench_probe`, which is compiled \
              only under the default-off `bench-probe` feature, and it must be measured at \
              `[profile.embedder]` — this tool is built with `lto = \"thin\"`, which is \
@@ -1462,7 +1713,7 @@ pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
             ID,
             TITLE,
             NOTE,
-            true,
+            Sensitivity::AbsoluteTiming,
             format!(
                 "the pair was measured and cannot resolve §9.2's 5% criterion: {}",
                 run.verdict_line()
@@ -1475,7 +1726,7 @@ pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
         ID,
         TITLE,
         NOTE,
-        true,
+        Sensitivity::AbsoluteTiming,
         format!(
             "the pair was measured, but the host failed the fitness probe, so neither half \
              of the ratio is a claim: {}",
@@ -1503,6 +1754,68 @@ pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
     Ok(row)
 }
 
+/// Pss actually held by an idle arena of §9.3's stated geometry, and the arena's
+/// own view of what it reserved.
+///
+/// Returns `(resident_bytes, reserved_bytes)`, or [`None`] where the figure
+/// cannot be trusted — no `smaps_rollup` (not Linux, or a kernel built without
+/// it), or a delta that came out non-positive because whole-process Pss moved
+/// under the measurement.
+///
+/// **This is a delta of a whole-process counter, and that is its limitation.**
+/// Pss is reported in whole KiB and the reads themselves allocate, so the result
+/// is quantised to pages and carries a page or two of slack. That is far below
+/// the difference it exists to settle — megabytes of reservation against
+/// whatever an untouched arena really holds — but it is not a byte-exact
+/// instrument, and a future reader should not treat it as one. The exact tool
+/// would be `mincore(2)` over the arena's own range; it needs a raw pointer and
+/// an `unsafe` block at a boundary `CLAUDE.md`'s budget does not currently name,
+/// so it is a decision record rather than a patch.
+///
+/// The tree is built and then held across the second read: dropping it first
+/// would measure the allocator returning memory, which is a different question.
+fn measure_idle_arena_resident() -> Option<(f64, f64)> {
+    use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
+
+    // 64 frames and 32 dynamic edges at 1024 slots each — the geometry
+    // `from_totals` is asked about above, built for real rather than computed.
+    const DYNAMIC_EDGES: u32 = 32;
+    const SLOTS_PER_EDGE: u32 = 1024;
+    const FRAMES: u32 = 64;
+    const EDGE_SLOTS: u32 = 64;
+
+    let mut b = TreeBuilder::new().frame("root");
+    let mut names = Vec::with_capacity(DYNAMIC_EDGES as usize);
+    for i in 0..DYNAMIC_EDGES {
+        names.push(format!("f{i}"));
+    }
+    for name in &names {
+        b = b.dynamic_edge("root", name, EdgeCfg::new(Capacity::slots(SLOTS_PER_EDGE)));
+    }
+    // Headroom to the stated totals: the declared frames and edges above are
+    // fewer than the geometry names, and the reservation is what is under test.
+    let b = b
+        .frame_headroom(FRAMES - DYNAMIC_EDGES - 1)
+        .edge_headroom(EDGE_SLOTS - DYNAMIC_EDGES);
+
+    // Warm the reader once so its own buffer is already allocated and does not
+    // land inside the delta.
+    let _ = crate::mp::self_pss_kib();
+    let before = crate::mp::self_pss_kib();
+    let tree = b.build().ok()?;
+    let after = crate::mp::self_pss_kib();
+
+    let reserved = tree.arena_size_bytes() as f64;
+    // Hold it across the read above — see the doc comment.
+    std::hint::black_box(&tree);
+    drop(tree);
+
+    if before == 0 || after <= before {
+        return None;
+    }
+    Some(((after - before) as f64 * 1024.0, reserved))
+}
+
 /// §9.3's "report where `tf_tree` is worse, in the same table and not in a
 /// footnote" — the four costs it names, with a number wherever the cost has one.
 fn worse_entries(opts: &Options) -> Vec<Worse> {
@@ -1515,25 +1828,105 @@ fn worse_entries(opts: &Options) -> Vec<Worse> {
     let floor_bytes = tf_tree_arena::ArenaLayout::from_totals(FRAMES, EDGES, SLOTS)
         .map(|l| l.total_size() as f64);
 
+    // The *resident* half of the same claim. `total_size()` is the mapping — the
+    // last region's `offset + size` — and a mapping need not be a footprint,
+    // because pages become resident when they are touched. Saying "an idle tree
+    // costs its full size from the first second" without ever weighing one is
+    // the kind of unfalsifiable statement §9.3 exists to stop, and this is the
+    // row where `tf_tree` looks worst, so it is the last one that should rest on
+    // arithmetic.
+    //
+    // **The measurement confirms the claim rather than softening it**, which was
+    // not the expected result: an idle arena comes out ~100% resident, because
+    // `alloc_zeroed` at 64-byte alignment zero-fills by hand instead of reaching
+    // `calloc`. The number is kept — and the cause named in the statement —
+    // precisely because a row that turned out worse than hoped is the one a
+    // reader has most reason to want measured.
+    let resident = measure_idle_arena_resident();
+
+    // The measured half is stated only when it exists. A statement that asserts
+    // a measurement's *result* while the measurement returned `None` — no
+    // `smaps_rollup`, or a delta that came out non-positive — would be a claim
+    // with nothing behind it, in the one section whose whole job is not to make
+    // those.
+    let measured_half = match resident {
+        Some((resident_bytes, arena_bytes)) => format!(
+            "`idle_arena_resident_bytes` is the measured Pss an idle arena of that \
+             geometry actually costs, and it was added expecting to shrink this row: \
+             reserving address space is not the same as holding pages, and the pose \
+             region of an arena nobody has published into has never been read or \
+             written. It does not shrink it — the arena comes out {:.0}% resident \
+             ({resident_bytes:.0} B held against {arena_bytes:.0} B reserved by the \
+             arena actually built). So the claim above is no longer arithmetic; it is \
+             measured, and it stands. The cause is the allocator path and not the \
+             design: `HeapArena` asks for 64-byte alignment (`PoseSlot` is one cache \
+             line), and Rust's `alloc_zeroed` reaches `calloc` only when alignment is \
+             at most 16, falling back to `posix_memalign` plus an explicit zero-fill \
+             above it — which touches every page. Measured directly at this size: 4 KiB \
+             resident at align 16, 2356 KiB at align 64. Most of this row is therefore \
+             recoverable rather than inherent; see decision 0021. \
+             `idle_arena_resident_bytes` is a delta of a *whole-process* Pss counter \
+             across building one tree, quantised to 4 KiB pages, so it also carries \
+             the tree's own non-arena allocations and can land a little either side of \
+             the arena's size. The order of magnitude is the finding; the third digit \
+             is not.",
+            resident_bytes / arena_bytes * 100.0
+        ),
+        None => "`idle_arena_resident_bytes` is absent: Pss could not be measured on \
+             this host (no readable /proc/self/smaps_rollup, or a non-positive delta), \
+             so how much of the reservation is actually resident is unmeasured here \
+             rather than assumed. `just bench-report` on Linux fills it in."
+            .to_owned(),
+    };
+
     let mut floor = Worse {
         id: "arena_memory_floor",
         topic: "Arena memory floor",
         statement: format!(
             "A tf_tree arena is fixed-capacity and allocated up front, so an idle tree \
-             costs its full size from the first second. A tf2 BufferCore starts near \
+             reserves its full size from the first second. A tf2 BufferCore starts near \
              empty and grows into whatever the stream actually contains, so on a robot \
-             that publishes far less than it declared, tf2 uses less memory and tf_tree \
+             that publishes far less than it declared, tf2 reserves less and tf_tree \
              is simply worse. The figure is for {FRAMES} frames, {EDGES} edge slots and \
-             {SLOTS} sample slots; it is arithmetic on the layout, not a measurement, \
-             and it does not depend on this host."
+             {SLOTS} sample slots. `idle_arena_bytes` is arithmetic on the layout — what \
+             the arena *reserves* — and does not depend on this host. {measured_half}"
         ),
         metrics: Vec::new(),
     };
+    // The arithmetic and the measurement are independent facts, so they are
+    // emitted independently: a `from_totals` failure must not discard a Pss
+    // figure that was obtained, and vice versa.
     if let Ok(bytes) = floor_bytes {
-        floor.metrics = vec![
-            Metric::new("idle_arena_bytes", bytes, "B"),
-            Metric::new("idle_arena_mib", bytes / (1024.0 * 1024.0), "MiB"),
-        ];
+        floor
+            .metrics
+            .push(Metric::new("idle_arena_bytes", bytes, "B"));
+        floor.metrics.push(Metric::new(
+            "idle_arena_mib",
+            bytes / (1024.0 * 1024.0),
+            "MiB",
+        ));
+    }
+    if let Some((resident_bytes, arena_bytes)) = resident {
+        floor.metrics.push(Metric::new(
+            "idle_arena_resident_bytes",
+            resident_bytes,
+            "B",
+        ));
+        // Both sides of this quotient describe the arena the measurement
+        // actually built. Dividing the measured residency by `from_totals`'s
+        // arithmetic would mix two different arenas — they differ by a few KiB
+        // of region rounding — and print a ratio whose numerator and
+        // denominator never met.
+        floor.metrics.push(Metric::new(
+            "idle_arena_measured_reserved_bytes",
+            arena_bytes,
+            "B",
+        ));
+        floor.metrics.push(Metric::new(
+            "idle_arena_resident_fraction",
+            resident_bytes / arena_bytes,
+            "of measured reserved",
+        ));
     }
 
     vec![
@@ -1982,7 +2375,7 @@ mod tests {
                     id,
                     "title",
                     "note",
-                    true,
+                    Sensitivity::AbsoluteTiming,
                     "a stated reason".to_owned(),
                     "just something",
                 )
@@ -2001,6 +2394,12 @@ mod tests {
             provenance: Provenance { facts: Vec::new() },
             fitness: Fitness {
                 fair_for_timing: fair,
+                // The skeleton's failing check is a *timing* one, so the ratio
+                // and memory axes stay fair even when `fair` is false. That is
+                // the split under test: a host can be unfit to time and still
+                // fit to weigh.
+                fair_for_ratios: true,
+                fair_for_memory: true,
                 // The skeleton's rows are not marked `n_way`, so the core budget
                 // is out of the picture and each test isolates one rule.
                 enough_cores: true,
@@ -2011,6 +2410,8 @@ mod tests {
                 } else {
                     vec!["4 physical cores for 16 consumers".to_owned()]
                 },
+                ratio_reasons: Vec::new(),
+                memory_reasons: Vec::new(),
                 consumers: 16,
                 busy_fraction: 0.01,
                 physical_cores: 4,
@@ -2149,9 +2550,9 @@ mod tests {
     /// The other half of the same rule, and the reason `Fitness` carries two
     /// verdicts: an N-way row on a host with fewer cores than consumers measures
     /// the scheduler even when the clock is beyond reproach. The fixture sets
-    /// `fair_for_timing: true` and `timing_sensitive: false` precisely so that
-    /// only the core budget can produce the failure — otherwise the test would
-    /// pass off the back of the timing rule and prove nothing.
+    /// `fair_for_timing: true` and [`Sensitivity::HostIndependent`] precisely so
+    /// that only the core budget can produce the failure — otherwise the test
+    /// would pass off the back of the timing rule and prove nothing.
     ///
     /// Mutant: delete the `r.needs_n_cores && !self.fitness.enough_cores` arm in
     /// `validate` — this test fails.
@@ -2163,7 +2564,7 @@ mod tests {
             Some("4 physical cores for 16 consumers plus a publisher (17 needed)".to_owned());
         let row = &mut r.rows[0];
         row.needs_n_cores = true;
-        row.timing_sensitive = false;
+        row.sensitivity = Sensitivity::HostIndependent;
         row.status = Status::Measured;
         row.reason = String::new();
         row.tf_tree = vec![Metric::new("cpu_pct", 3.0, "%").lower_is_better(0.20)];
@@ -2180,6 +2581,200 @@ mod tests {
         r.fitness.enough_cores = true;
         r.fitness.core_reason = None;
         assert_eq!(r.validate(), Ok(()));
+    }
+
+    /// A memory row is not a timing row, and refusing it for a timing reason is
+    /// how §12 gate 4 came to be unmeasurable on a host that could always have
+    /// weighed it. The skeleton fails every *timing* check; a `Memory` row on it
+    /// must still be allowed to claim `measured`.
+    ///
+    /// Mutant: in `validate`'s `Status::Measured` arm, change the
+    /// `Sensitivity::Memory` branch to read `self.fitness.fair_for_timing`
+    /// instead of `self.fitness.fair_for_memory` — this test fails.
+    #[test]
+    fn a_memory_row_is_measurable_on_a_host_that_only_fails_the_timing_checks() {
+        let mut r = skeleton(false, false);
+        assert!(!r.fitness.fair_for_timing, "fixture must be unfit to time");
+        assert!(r.fitness.fair_for_memory, "fixture must be fit to weigh");
+
+        let row = &mut r.rows[0];
+        row.sensitivity = Sensitivity::Memory;
+        row.status = Status::Measured;
+        row.reason = String::new();
+        row.tf_tree = vec![Metric::new("pss_kib", 4096.0, "KiB").lower_is_better(0.20)];
+        assert_eq!(r.validate(), Ok(()));
+
+        // And the converse, so this is not vacuous: the same row on a host whose
+        // *memory* axis failed — a debug build — is refused.
+        r.fitness.fair_for_memory = false;
+        r.fitness.memory_reasons = vec!["built with debug assertions on".to_owned()];
+        let errs = r
+            .validate()
+            .expect_err("a debug build must refuse a memory claim");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("a memory figure") && e.contains("debug assertions")),
+            "{errs:?}"
+        );
+    }
+
+    /// The core budget is a statement about the scheduler, and Pss is not
+    /// scheduled. Sixteen workers mapping one `.tft` share the same pages on
+    /// four cores as on sixteen, so `needs_n_cores` must not reach a memory row.
+    ///
+    /// The fixture sets `fair_for_timing: true` so that only the core-budget
+    /// rule could produce a failure here, exactly as
+    /// `an_n_way_row_cannot_claim_measured_without_the_cores` does.
+    ///
+    /// Mutant: drop the `&& r.sensitivity != Sensitivity::Memory` conjunct from
+    /// `core_budget_applies` in `validate` — this test fails.
+    #[test]
+    fn a_memory_row_does_not_need_the_core_budget() {
+        let mut r = skeleton(true, false);
+        r.fitness.enough_cores = false;
+        r.fitness.core_reason =
+            Some("4 physical cores for 16 consumers plus a publisher (17 needed)".to_owned());
+
+        let row = &mut r.rows[0];
+        row.needs_n_cores = true;
+        row.sensitivity = Sensitivity::Memory;
+        row.status = Status::Measured;
+        row.reason = String::new();
+        row.tf_tree = vec![Metric::new("total_pss_kib", 65536.0, "KiB").lower_is_better(0.20)];
+        assert_eq!(r.validate(), Ok(()));
+
+        // Not vacuous: the identical row that reports a *duration* instead is
+        // still refused by the same short core budget.
+        r.rows[0].sensitivity = Sensitivity::AbsoluteTiming;
+        let errs = r
+            .validate()
+            .expect_err("a timing row must still want the cores");
+        assert!(
+            errs.iter().any(|e| e.contains("runs 16 consumers")),
+            "{errs:?}"
+        );
+    }
+
+    /// The classification itself: which measured facts about a host invalidate
+    /// which kind of claim.
+    ///
+    /// SMT and an unreadable governor are common-mode: they land on both arms of
+    /// an interleaved pair and divide out, and neither moves a page count. A
+    /// **busy machine does not**, and that is the interesting row — the two arms
+    /// are asymmetric (only tf2 takes a lock), so load inflates the quotient
+    /// instead of cancelling. A debug build reaches everything, and an
+    /// unreadable `smaps_rollup` reaches memory alone.
+    ///
+    /// Mutant: set `fair_for_ratios: reasons.is_empty()` in `assess` (i.e. fold
+    /// the axes back into one boolean) — this test fails on the first block.
+    #[test]
+    fn each_host_check_reaches_only_the_axes_it_bears_on() {
+        // SMT on (8 logical over 4 physical) and an unreadable governor, on a
+        // quiet machine: both are common-mode between two interleaved arms.
+        let clock_only = Fitness::assess(2, 8, Some(4), 0.0, None, false, true);
+        assert!(
+            !clock_only.fair_for_timing,
+            "reasons: {:?}",
+            clock_only.reasons
+        );
+        assert!(
+            clock_only.fair_for_ratios,
+            "an interleaved ratio divides these out: {:?}",
+            clock_only.ratio_reasons
+        );
+        assert!(
+            clock_only.fair_for_memory,
+            "Pss involves no clock: {:?}",
+            clock_only.memory_reasons
+        );
+        assert!(
+            clock_only.reasons.len() >= 2,
+            "expected the SMT and governor reasons: {:?}",
+            clock_only.reasons
+        );
+
+        // Load is the timing check that *does* reach a cross-engine ratio, and
+        // it fails in the flattering direction, so it must not be waved through.
+        let busy = Fitness::assess(
+            2,
+            4,
+            Some(4),
+            0.9,
+            Some(vec!["performance".to_owned()]),
+            false,
+            true,
+        );
+        assert!(!busy.fair_for_timing, "{:?}", busy.reasons);
+        assert!(
+            !busy.fair_for_ratios,
+            "load does not cancel between a locking engine and a lock-free one: {:?}",
+            busy.ratio_reasons
+        );
+        assert!(
+            busy.fair_for_memory,
+            "a busy machine does not change a page count: {:?}",
+            busy.memory_reasons
+        );
+
+        // An unreadable smaps_rollup reaches the memory axis and nothing else.
+        // Without this, `self_pss_kib`'s silent 0 would let a memory row publish
+        // zeros as a measurement.
+        let no_pss = Fitness::assess(
+            2,
+            4,
+            Some(4),
+            0.0,
+            Some(vec!["performance".to_owned()]),
+            false,
+            false,
+        );
+        assert!(no_pss.fair_for_timing, "{:?}", no_pss.reasons);
+        assert!(no_pss.fair_for_ratios, "{:?}", no_pss.ratio_reasons);
+        assert!(
+            !no_pss.fair_for_memory,
+            "a Pss figure that cannot be read is not a Pss figure"
+        );
+        assert!(
+            no_pss
+                .memory_reasons
+                .iter()
+                .any(|r| r.contains("smaps_rollup")),
+            "{:?}",
+            no_pss.memory_reasons
+        );
+
+        // A debug build is a different program, so it reaches all three.
+        let debug = Fitness::assess(
+            2,
+            4,
+            Some(4),
+            0.0,
+            Some(vec!["performance".to_owned()]),
+            true,
+            true,
+        );
+        assert!(!debug.fair_for_timing);
+        assert!(!debug.fair_for_ratios, "{:?}", debug.ratio_reasons);
+        assert!(!debug.fair_for_memory, "{:?}", debug.memory_reasons);
+        assert!(
+            debug.ratio_reasons.iter().any(|r| r.contains("debug")),
+            "{:?}",
+            debug.ratio_reasons
+        );
+
+        // And a host that passes everything passes all three.
+        let good = Fitness::assess(
+            2,
+            4,
+            Some(4),
+            0.0,
+            Some(vec!["performance".to_owned()]),
+            false,
+            true,
+        );
+        assert!(good.fair_for_timing, "{:?}", good.reasons);
+        assert!(good.fair_for_ratios);
+        assert!(good.fair_for_memory);
     }
 
     /// A required row may be unavailable, but it may not be dropped, and an
@@ -2676,6 +3271,7 @@ CPU part\t: 0xd0c
             0.01,
             Some(vec!["performance".to_owned(); 8]),
             false,
+            true,
         );
         assert!(ok.fair_for_timing, "{:?}", ok.reasons);
         assert!(ok.enough_cores, "{:?}", ok.core_reason);
@@ -2689,6 +3285,7 @@ CPU part\t: 0xd0c
             0.01,
             Some(vec!["performance".to_owned(); 8]),
             false,
+            true,
         );
         assert!(!blind.physical_cores_known);
         assert!(
@@ -2717,6 +3314,7 @@ CPU part\t: 0xd0c
             0.01,
             Some(vec!["performance".to_owned(); 8]),
             false,
+            true,
         );
         assert!(
             smt.reasons.iter().any(|r| r.contains("SMT is on")),
@@ -2744,6 +3342,7 @@ CPU part\t: 0xd0c
             0.01,
             Some(vec!["performance".to_owned(); 8]),
             false,
+            true,
         );
         assert!(
             !f.enough_cores,
@@ -2910,7 +3509,7 @@ CPU part\t: 0xd0c
             .find(|row| row.id == "differential_agreement")
             .expect("differential row");
         assert_eq!(diff.status, Status::Measured);
-        assert!(!diff.timing_sensitive);
+        assert!(!diff.timing_sensitive());
         let compared = diff
             .tf_tree
             .iter()

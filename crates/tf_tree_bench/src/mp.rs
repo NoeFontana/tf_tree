@@ -378,7 +378,7 @@ fn stat_cpu_ns() -> u64 {
 }
 
 /// Proportional set size of this process, in KiB.
-fn self_pss_kib() -> u64 {
+pub(crate) fn self_pss_kib() -> u64 {
     let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
         return 0;
     };

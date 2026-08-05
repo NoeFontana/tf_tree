@@ -1,9 +1,8 @@
 # 0013: The benchmark gate never interpolated, and what §11.3's numbers should be
 
-**Status:** draft — items 1 and 2 of the *Decision* have landed (see the process
-note below); item 3 (the §11.3 thresholds) is untouched, and there are **four**
-open questions, of which questions 1 and 2 are the threshold pair that blocks
-`ready`
+**Status:** ready — items 1 and 2 of the *Decision* have landed (see the process
+note below); all four open questions are resolved in *Resolution* at the end of
+this record, and item 3 (the §11.3 thresholds) is the remaining work
 **Owner:** @NoeFontana
 **Implementation:** `crates/tf_tree_bench` (`fixture::QUERY_NS`, both call sites,
 one test), `crates/tf_tree_py` (`NS_PER_STEP_ESTIMATE` 55 → 64, per `API.md`
@@ -478,29 +477,167 @@ separate labelled row precisely because it is the best case.
    98 % disk. **On a host that passes `Fitness::probe` this step is real and is
    still owed**, and it is the step that turns these numbers into a baseline
    rather than a record.
-3. Amend `docs/PHASE1.md` §11.3 per whichever of (a)/(b) is ratified — verified
-   by `just bench` passing the gate it now states. ⛔ Blocked on the questions
-   below.
+3. ✅ **Amend `docs/PHASE1.md` §11.3** per *Resolution*: the two absolute ceilings
+   with the on-grid history beside them, the regression clause, the NORMATIVE
+   call-shape sentence, and the re-cut third criterion — verified by reading it
+   against *Resolution* and by `xtask`'s gate line no longer naming 150/100.
+4. ✅ **Update `xtask/src/main.rs`'s printed gate line** to the new numbers and to
+   the 1→4 scaling criterion, keeping `UNAVAILABLE` where the host cannot decide
+   a row — verified by `cargo xtask bench-gate` output.
+5. ✅ **Add the `depth3/sclerp/exact_hit` row** to `benches/lookup.rs`, labelled as
+   the on-grid best case — verified by `cargo bench -p tf_tree_bench --bench
+   lookup` listing it, and by its ~4.7× gap to the off-grid row.
+6. ⛔ **Re-baseline on a host that passes `Fitness::probe`.** Still owed, and still
+   not this host; see step 2's note.
+
+## Resolution
+
+All four questions are answered here from the numbers already in this record.
+Nothing below rests on a measurement that has not been taken.
+
+### Q3 first, because it decides what the other numbers mean: **the budget is
+written against the inlined call shape.**
+
+Question 2 cannot be answered before this one, and this one turns out to have a
+better answer than the choice it was posed as.
+
+*Corroboration from a second harness* measures the same depth-3 `LerpSlerp` fold
+at **147.6 ns** inlined and **200.3 ns** behind `#[inline(never)]` — the call
+alone is ~51.5 ns, which is larger than the headroom question 2 is about. Two
+reasons settle it for the inlined shape:
+
+1. **It is what §11.1's harness already measures.** The primary re-baseline gives
+   `depth3/lerpslerp` a median of 151.8 ns, against the second harness's 147.6 ns
+   inlined and 200.3 ns not — so the fixture rows this gate is stated over are
+   the inlined shape. Choosing the other one would mean every number in the
+   *Re-baseline* table is the wrong baseline for the gate written from it, and a
+   re-measurement nobody has taken. **A threshold set against a number that does
+   not exist yet is how this record's original 150 ns came about.**
+2. **The boundary already has its own gate, and it is a better one.**
+   `PHASE5.md` §9.2's `embedding_cross_crate` row measures exactly the
+   out-of-crate, non-inlined cost and gates it at **5 %** — currently reporting
+   1.250–1.254× and therefore *failing*. Folding that same cost into §11.3 would
+   put two independent quantities behind one number, so a movement could not be
+   attributed to either: the engine got slower, or the boundary did, and the gate
+   could not say which. **§11.3 gates the engine; §9.2 gates the boundary.**
+
+This is a change from the direction the plan for this work first proposed, which
+was `#[inline(never)]` on the argument that it is the shape an embedder gets. It
+is the shape an embedder gets — and that is §9.2's row, measured there, against
+a criterion written for it.
+
+**NORMATIVE:** every latency row §11.3 gates is measured with the fold inlined
+into its caller, as `benches/lookup.rs` measures it today. A row measured behind
+a non-inlinable call is a `PHASE5.md` §9.2 row and is stated there.
+
+### Q1: **both (a) and (b)**, with different jobs
+
+They were posed as alternatives and they are not. Each covers the other's blind
+spot:
+
+- **(a) an absolute ceiling** — what the engine may cost, ever. It catches a
+  catastrophic regression that (b) would absorb if a baseline were regenerated
+  carelessly, and it is the number a reader wants when asking "is this fast?".
+- **(b) regression-from-baseline** — the gate that actually bites, at 25 %
+  per percentile. `bench_report`'s `lookup_latency` row already implements
+  exactly this (`LATENCY_SLACK = 0.25`), so (b) is not new machinery; ratifying
+  it makes §11.3 agree with what the tool has been doing.
+
+### Q2: **≤ 300 ns ScLerp, ≤ 220 ns LerpSlerp, stated per interpolator**
+
+The medians are 192.7 and 151.8, but **the ceiling has to clear the band, not the
+median**, and the bands are 190.4–268.9 and 146.2–190.4 over nine runs each. A
+ceiling at the 250/200 the *Decision* sketched would sit **below** ScLerp's
+observed maximum of 268.9 — it would fail roughly one run in nine on an
+unchanged engine, and a gate that flaps is a gate people learn to ignore
+(`justfile`'s performance-suite header makes the same argument for the same
+reason).
+
+So the ceiling is set ~1.12× above each observed maximum: **300 ns** over 268.9,
+**220 ns** over 190.4. Per interpolator, because they are not the same
+measurement — the ScLerp/LerpSlerp gap is 1.27× off-grid and was 1.00× on-grid,
+and one number for the slower one would leave `LerpSlerp` ungated in practice.
+
+**This is not a loosening of a gate that was being met.** The 150/100 figures
+were chosen before anything had measured interpolation, and the row they were
+checked against took the exact-hit branch on all four dynamic edges — it timed
+`bracket` plus a seqlock read. The old number was never about this work, so this
+is the first setting of the threshold, not a concession.
+
+### Q4: **yes — keep `depth3/sclerp/exact_hit` as a labelled row**
+
+The objection recorded against it is real: a benchmark row that exists is a row
+the baseline gate then has to carry. It loses to what the row buys. The 4.7×
+between the on-grid and off-grid regimes is the exact property that hid this
+defect for the life of the gate, and a labelled row makes it a documented
+characteristic instead of a trap waiting for the next person who picks a round
+stamp. It is gated like any other row; if it moves, that is worth knowing too.
+
+### And the third criterion, folded in here because it is the same gate
+
+`PHASE1.md` §11.3's third criterion — *"read throughput scales at least 6× from
+1 to 8 threads"* — **cannot be evaluated on any host this project has.** Eight
+threads on four physical cores can only pass 6× through SMT, which is why the
+measured 5.35–5.62× (criterion benches) and 5.73× / 5.20× (`contended_scaling`,
+pinned, with four writers) are neither a pass nor a fail. It has never been a
+gate; it has been an `UNAVAILABLE` line.
+
+It is re-cut to what a four-core host can decide, in two parts:
+
+1. **tf_tree scales ≥ 2.5× from 1 to 4 threads** on ≥ 4 physical cores. Measured
+   2.79× (recorded stream) and 3.09× (fixture), so it passes with margin and a
+   regression to 2× fails it. Perfect scaling here is 4×, and the remaining core
+   is running the writers and the OS.
+2. **tf_tree's 1→4 scaling factor is ≥ 5× tf2's** over the same sweep. Measured
+   2.79 / 0.36 = **7.75×**. This is a `Sensitivity::Ratio` row.
+
+Part 2 is the one that carries the argument. §11.3's own prose says the criterion
+exists because *"if tf_tree scales cleanly, the value proposition is your
+perception nodes stop contending"* — and the decisive fact is not where tf_tree
+lands against an absolute, it is that **tf2 goes backwards** (0.31× at 8 threads,
+reproduced by a pure C++ control with our binding deleted). A ratio states that
+and an absolute cannot.
+
+The 8-thread ≥ 6× figure is **retained as informational**, with its measured
+5.35–5.62× and an explicit note that it is unmeasurable below 8 physical cores.
+It is not deleted: it is the number to re-take if this project ever gets that
+host.
+
+### Verification of the ratified numbers
+
+Run at ratification, `cargo bench -p tf_tree_bench --bench lookup`, this host,
+short measurement window (1 s warm-up / 3 s), criterion's median column:
+
+| Row | Measured | Record's earlier figure | Ceiling | |
+| --- | --- | --- | --- | --- |
+| `lookup/depth1/sclerp` | 68.17 ns | 69.6 (68.2–74.6) | — | — |
+| `lookup/depth3/sclerp` | **193.76 ns** | 192.7 (190.4–268.9) | ≤ 300 ns | **PASS** |
+| `lookup/depth3/lerpslerp` | **146.97 ns** | 151.8 (146.2–190.4) | ≤ 220 ns | **PASS** |
+| `lookup/depth6/sclerp` | 133.10 ns | 134.5 (132.9–165.3) | — | — |
+| `lookup/depth3/sclerp/exact_hit` | **40.11 ns** | 40.8 on-grid | not a gate row | — |
+
+Every row reproduces the *Re-baseline* table it was set from, and the new
+`exact_hit` row reproduces the on-grid figure this record was written about:
+193.76 / 40.11 = **4.83×** between the two regimes, against the 4.7× recorded
+earlier.
+
+**The re-cut ceilings therefore pass on this host**, which is the point of
+re-cutting them — the gate is now one that can be met and can fail, rather than
+one that had never measured the work it named. These numbers remain *indicative*:
+the host fails `Fitness::probe` (4 physical cores, SMT on, unreadable governor),
+so they are not claims, and step 6 below is still owed.
 
 ## Open questions
 
-1. **(a) or (b)** — absolute re-cut, or regression-from-baseline? Blocks `ready`.
-2. If (a): what headroom over the measured **192.7 ns ScLerp / 151.8 ns
-   LerpSlerp** (medians; bands 190–269 and 146–190), and is the budget stated
-   per-interpolator or once for the slower one? Note the band, not just the
-   median: a budget cut within ~10 % of the median would fail on this host's
-   noise alone.
-3. **Which call shape is the budget written against?** *Corroboration from a
-   second harness* measures the same depth-3 `LerpSlerp` fold at **147.6 ns**
-   inlined into its caller and **200.3 ns** behind an `#[inline(never)]` call —
-   ~51.5 ns for the call alone, on one host in one afternoon. §11.3 does
-   not say which of the two it means, and the difference is larger than the
-   headroom question 2 is about, so answering 2 without answering this one
-   would produce a number whose meaning depends on how the gate's own loop was
-   written. Raised by the measurement, not by the threshold choice.
-4. Should the on-grid case survive as its own labelled benchmark row
-   (`depth3/sclerp/exact_hit`) to keep the best case visible? Cheap, and it makes
-   the ~4.7× difference between the two regimes a documented property rather than
-   a trap. **Still open** — the re-baseline commit deliberately did not add rows,
-   because a benchmark row that exists is a row the baseline gate then has to
-   carry.
+**None. All four are answered in *Resolution* above**, and the record is `ready`.
+For the reader who arrives at this heading first:
+
+1. *(a) or (b)?* — **both**, with different jobs: an absolute ceiling for what
+   the engine may ever cost, and regression-from-baseline as the gate that bites.
+2. *What headroom?* — **≤ 300 ns ScLerp / ≤ 220 ns LerpSlerp**, per interpolator,
+   set ~1.12× above each *observed maximum* (268.9 and 190.4) rather than above
+   the median, so it cannot flap on an unchanged engine.
+3. *Which call shape?* — **inlined**, because that is what §11.1's harness
+   already measures and because `PHASE5.md` §9.2's `embedding_cross_crate` gates
+   the non-inlined boundary separately and better.
+4. *Keep the on-grid row?* — **yes**, as a labelled `depth3/sclerp/exact_hit`.

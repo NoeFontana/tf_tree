@@ -481,7 +481,7 @@ mod tests {
                 id: "differential_agreement",
                 title: "t",
                 note: String::new(),
-                timing_sensitive: false,
+                sensitivity: crate::report::Sensitivity::HostIndependent,
                 needs_n_cores: false,
                 status: Status::Measured,
                 reason: String::new(),
@@ -719,7 +719,7 @@ mod tests {
         };
         let mut r = report_with(1.0, false);
         r.rows[0].id = "embedding_cross_crate";
-        r.rows[0].timing_sensitive = true;
+        r.rows[0].sensitivity = crate::report::Sensitivity::AbsoluteTiming;
         r.rows[0].tf_tree = run.metrics();
         r
     }

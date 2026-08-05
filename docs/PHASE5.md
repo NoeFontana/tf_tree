@@ -1556,6 +1556,25 @@ The first skeptical reader will look for a thumb on the scale, and finding one e
 
 If a row cannot be measured fairly, omit it and say why. An honest gap is worth more than a favourable number nobody trusts.
 
+**Amendment — "fairly" is three questions, not one.** As first implemented, one `Fitness::probe` verdict governed every row, so a row was refused whenever *any* check failed, whatever that check was about. That is wrong in one direction and it is the expensive direction: it withholds numbers the host could always have produced, and it prints a reason that is not the row's reason — which is precisely what the bullet above forbids. `Report::validate` now asks each row the question its numbers actually rest on (`report::Sensitivity`):
+
+| Row reports | Fails on | Survives |
+|---|---|---|
+| An **absolute duration** (`AbsoluteTiming`) | every check: debug build, SMT, busy machine, governor, unknown core count | — |
+| An **interleaved ratio** (`Ratio`) | a debug build, **and a busy machine** | governor, SMT — they land on both arms of a within-round interleave and divide out |
+| **Resident memory** (`Memory`) | a debug build, an unreadable `smaps_rollup` | every timing check; Pss is read from `/proc` and involves no clock |
+| A **host-independent** figure (`HostIndependent`) | nothing | — |
+
+**Load is not common-mode between these two engines, and the exception matters.** Interleaving cancels a disturbance only when it lands on both arms alike, and these arms are asymmetric by construction: `tf2::BufferCore` takes a mutex on every lookup and `tf_tree`'s read path takes none. Under load the tf2 arm additionally pays lock-holder preemption and the convoy behind it, which the tf_tree arm has no equivalent of — so a busy host does not add noise to the quotient, it **inflates it in our favour**. That is the thumb on the scale this section exists to catch, so `busy` reaches the ratio axis even though the governor and SMT do not.
+
+Likewise, a memory row requires that Pss be *readable*. `self_pss_kib` returns `0` when `/proc/self/smaps_rollup` is absent (non-Linux, some hardened containers), and a silent zero would leave the memory axis fair while a row published zeros as a claim — the same false-PASS-by-silent-fallback the physical-core count already refuses to make.
+
+The **core budget** is split the same way and for the same reason. "Above the core count the rows measure the scheduler" is a statement about throughput and latency; sixteen workers mapping one `.tft` on four cores share exactly the pages they would share on sixteen. So `needs_n_cores` no longer reaches a `Memory` row — which is what makes **§12 gate 4 measurable on a 4-core host at all**, having been blocked by a question it does not depend on.
+
+A debug build is the one check that reaches everything, because it is not a slower program but a different one.
+
+The JSON keeps its `timing_sensitive` field with its original meaning (*this row reports an absolute duration*), so `tf_tree.bench-report/2` does not change shape. Each rule carries a test with a verified mutant in `report.rs`.
+
 ---
 
 ## 10. Open-source readiness
