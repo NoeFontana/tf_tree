@@ -645,10 +645,34 @@ into itself, so the answer was "96.6% of mispredicts are in `fold_at`". True,
 and useless, because `fold_at` *is* the hot path. The `profiling` profile
 (release codegen, debuginfo kept) is what makes the table above possible.
 
-Per-*line* attribution is still not working: `cg_annotate --auto=yes` in this
-image emits no annotated source even with the debuginfo present. That is the
-next thing to fix before any of the optimisations above should be attempted,
-because picking a line to change without it is guessing.
+**Per-*line* attribution works, and the paragraph that used to stand here saying
+it did not was wrong.** It read: *"`cg_annotate --auto=yes` in this image emits
+no annotated source even with the debuginfo present. That is the next thing to
+fix before any of the optimisations above should be attempted."* Re-run
+2026-08-04 in the same image, `just profile-lookup`'s exact command at
+`n = 20000`: 2547 lines of output, of which 2318 are annotated source, covering
+`plan.rs`, `sample.rs`, `buffer.rs`, `arena_view.rs`, `interp.rs`, `iso3.rs` and
+`quat.rs` with per-line `Ir` / `Bcm` / `D1mr`. `cg_annotate` is 3.26.0 here and
+reports `Annotation: on` in its own metadata block.
+
+**The document already contradicted the claim two paragraphs later** — *"Optimisations
+tried and rejected"* below opens by citing per-line evidence (*"per-line profiling
+puts two lines of `interp.rs` at ~9% of all instructions"*), which is not a
+sentence anybody could write without the annotation working. That contradiction
+is what makes this a stale line rather than a disputed measurement; whichever run
+produced the original observation, it does not describe this image now.
+
+One caveat that is not stale: `--auto=yes` is **deprecated** in `cg_annotate`
+3.26 (`--annotate` is the current spelling, and the two are documented as
+identical). It still works, and it is not what the original paragraph was about.
+
+The genuinely broken recipe is the *other* one. `just profile-cachegrind` runs on
+the **host**, and the host has no `valgrind` — the recipe's own
+`command -v valgrind` guard catches it and says so. `just profile-lookup` and
+`just footprint` go through `docker/tf2/run.sh`, and the image installs
+`valgrind` for exactly this reason (`docker/tf2/Dockerfile:15-24`). So the
+per-line path that works is the containerised one, and a host-side
+`profile-cachegrind` needs `valgrind` installed before it can be run at all.
 
 ### Optimisations tried and rejected
 

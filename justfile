@@ -982,7 +982,15 @@ profile workload="fleet_16" seconds="20":
 profile-cachegrind workload="robot":
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v valgrind >/dev/null || { echo "valgrind is not installed" >&2; exit 1; }
+    if ! command -v valgrind >/dev/null; then
+        echo "valgrind is not installed on this host, so this recipe cannot run." >&2
+        echo "Two ways past it:" >&2
+        echo "  sudo apt-get install valgrind      # then re-run this recipe" >&2
+        echo "  just profile-lookup                # per-line, in docker/tf2, which ships valgrind" >&2
+        echo "The container path is pinned to \`footprint\`'s one query; this recipe is" >&2
+        echo "the one that takes a --workload. They are not substitutes for each other." >&2
+        exit 1
+    fi
     cargo build --profile profiling -q -p tf_tree_bench --bin soak
     mkdir -p target/profile
     valgrind --tool=cachegrind --branch-sim=yes --cache-sim=yes \
