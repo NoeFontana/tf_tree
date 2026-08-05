@@ -381,7 +381,7 @@ impl Run {
             // reads it, and a half-populated `Fitness` would be a value that
             // looks measured and is not. The provenance facts carry what a
             // reader needs.
-            fitness: Fitness::assess(0, 1, None, 0.0, None, false),
+            fitness: Fitness::assess(0, 1, None, 0.0, None, false, true),
             rows,
         })
     }
