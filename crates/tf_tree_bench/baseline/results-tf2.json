@@ -1,10 +1,10 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-08-05T22:51:24Z",
+    "generated_utc": "2026-08-12T22:04:55Z",
     "schema": "tf_tree.bench-report/2",
-    "git_commit": "3ee0446dbcd929b1922274ee66f30c83b6805962",
-    "git_dirty": "true",
+    "git_commit": "f032e6f69b6c8c5fb4e6cacebc0cd00b4b52e115",
+    "git_dirty": "false",
     "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "build_profile": "release",
     "target": "x86_64",
@@ -21,7 +21,7 @@
     "kernel": "6.8.0-136-generic",
     "transparent_hugepage": "always [madvise] never",
     "perf_event_paranoid": "4",
-    "load_average": "1.48 1.01 0.60 2/403 242",
+    "load_average": "0.33 0.12 0.04 2/396 106",
     "container": "yes (/.dockerenv present)",
     "ros_distro": "lyrical",
     "tf2_version": "the tf2 shipped with ROS 2 lyrical",
@@ -37,7 +37,7 @@
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.033333333333333326,
+    "busy_fraction": 0.025000000000000022,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
@@ -161,8 +161,8 @@
       "status": "measured",
       "reason": "",
       "reproduce": "just tf2-bench (the ratio resolves only where ROS 2 is installed; `docker/tf2/run.sh` is that place on this host)",
-      "tf_tree": {"speedup_vs_tf2": {"value": 2.471824573399635, "unit": "x", "drift": "higher_is_better", "tolerance": 0.15}, "ratio_lo": {"value": 2.456887934832608, "unit": "x", "drift": "informational", "tolerance": 0}, "ratio_hi": {"value": 2.5320135862277864, "unit": "x", "drift": "informational", "tolerance": 0}, "floor": {"value": 2, "unit": "x", "drift": "informational", "tolerance": 0}, "ns_per_lookup": {"value": 201.46005859375, "unit": "ns", "drift": "informational", "tolerance": 0}, "agreed": {"value": 256, "unit": "queries", "drift": "informational", "tolerance": 0}},
-      "tf2": {"ns_per_lookup": {"value": 498.229296875, "unit": "ns", "drift": "informational", "tolerance": 0}}
+      "tf_tree": {"speedup_vs_tf2": {"value": 2.49059008509242, "unit": "x", "drift": "higher_is_better", "tolerance": 0.15}, "ratio_lo": {"value": 2.4217942147819156, "unit": "x", "drift": "informational", "tolerance": 0}, "ratio_hi": {"value": 2.8324455630435748, "unit": "x", "drift": "informational", "tolerance": 0}, "floor": {"value": 2, "unit": "x", "drift": "informational", "tolerance": 0}, "ns_per_lookup": {"value": 203.853515625, "unit": "ns", "drift": "informational", "tolerance": 0}, "agreed": {"value": 256, "unit": "queries", "drift": "informational", "tolerance": 0}},
+      "tf2": {"ns_per_lookup": {"value": 505.52314453125, "unit": "ns", "drift": "informational", "tolerance": 0}}
     }
   ],
   "where_we_are_worse": [
