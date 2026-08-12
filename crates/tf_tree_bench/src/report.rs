@@ -671,9 +671,18 @@ impl Fitness {
     /// The one place a [`Sensitivity`] is mapped to the verdict it rests on.
     ///
     /// Returns `(is_fair, how the row is described in a refusal, why it failed)`.
-    /// Every consumer goes through here — [`Row::status_on`] and both arms of
-    /// `Report::validate` — so that adding a `Sensitivity` variant is a single
-    /// non-exhaustive-match error rather than three places to remember.
+    /// This is the only `match` on [`Sensitivity`] that decides fitness, so
+    /// adding a variant is one non-exhaustive-match error rather than three
+    /// places to remember. Both arms of `Report::validate` and [`Row::status_on`]
+    /// call it.
+    ///
+    /// **`status_on` and [`Fitness::memory_status`] currently have no caller.**
+    /// `ratio_row` reaches for [`Fitness::ratio_status`] directly and the two
+    /// `Memory` rows are unavailable for build reasons before fitness is
+    /// consulted, so neither path runs yet. They are kept rather than deleted
+    /// because they are the shape the memory rows need the moment those
+    /// resolve — but that means the single-match property above is *enforced*
+    /// only for the axes `validate` actually exercises.
     #[must_use]
     pub fn axis(&self, sensitivity: Sensitivity) -> (bool, &'static str, String) {
         match sensitivity {
@@ -1631,12 +1640,15 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     rows.push(embedding_row(opts, &fitness)?);
     rows.push(ratio_row(&fitness));
 
+    // Built before the struct takes ownership of `fitness`: the resident-memory
+    // entry is gated on the memory axis, so it has to see the verdict.
+    let worse = worse_entries(opts, &fitness);
     Ok(Report {
         provenance: Provenance::collect(),
         fitness,
         warmup_discarded_s: opts.warmup.as_secs_f64(),
         rows,
-        worse: worse_entries(opts),
+        worse,
     })
 }
 
@@ -1731,13 +1743,33 @@ fn ratio_row(fitness: &Fitness) -> Row {
         // A band that straddles the floor has not answered, and saying so beats
         // resolving it by taking the median — `embed.rs`'s rule, and the reason
         // a gate whose noise exceeds its threshold reports rather than passes.
-        if run.verdict() == crate::ratio::Verdict::Unresolved {
-            row.reason = format!(
-                "the pair was measured and cannot resolve the {:.1}x floor: {}",
-                crate::ratio::FLOOR,
-                run.verdict_line()
-            );
-            return row;
+        // **Both non-`Above` verdicts stop here, and the `Below` arm is the one
+        // that matters.** An earlier revision special-cased only `Unresolved`,
+        // so a band lying entirely *under* the floor — `tf_tree` slower than the
+        // multiple this row exists to gate — fell through and was published as a
+        // clean `measured` row, with `floor` sitting next to a failing
+        // `speedup_vs_tf2` and nothing saying so. The less severe outcome was
+        // loud and the severe one was silent. Only the baseline's 15% slack
+        // would have caught it, and `just tf2-bench-baseline-update` bypasses
+        // that by construction.
+        match run.verdict() {
+            crate::ratio::Verdict::Above => {}
+            crate::ratio::Verdict::Unresolved => {
+                row.reason = format!(
+                    "the pair was measured and cannot resolve the {:.1}x floor: {}",
+                    crate::ratio::FLOOR,
+                    run.verdict_line()
+                );
+                return row;
+            }
+            crate::ratio::Verdict::Below => {
+                row.reason = format!(
+                    "the pair was measured and is BELOW the {:.1}x floor this row gates: {}",
+                    crate::ratio::FLOOR,
+                    run.verdict_line()
+                );
+                return row;
+            }
         }
         row.status = fitness.ratio_status();
         row.reason = match row.status {
@@ -1939,7 +1971,7 @@ fn measure_idle_arena_resident() -> Option<(f64, f64)> {
 
 /// §9.3's "report where `tf_tree` is worse, in the same table and not in a
 /// footnote" — the four costs it names, with a number wherever the cost has one.
-fn worse_entries(opts: &Options) -> Vec<Worse> {
+fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     // A deployment-shaped arena: 64 frames, 64 edge slots, 32 dynamic edges at
     // 1024 samples each. `from_totals` reproduces the same region geometry from
     // the totals, which is all a size statement needs.
@@ -2027,6 +2059,15 @@ fn worse_entries(opts: &Options) -> Vec<Worse> {
             "MiB",
         ));
     }
+    // The memory axis reaches here too. `Worse` entries carry no `Sensitivity`
+    // and `Report::validate` does not inspect them, so without this guard a
+    // debug build would publish a resident-page figure that the same report's
+    // `fair_for_memory: false` declares untrustworthy.
+    let resident = if fitness.fair_for_memory {
+        resident
+    } else {
+        None
+    };
     if let Some((resident_bytes, arena_bytes)) = resident {
         floor.metrics.push(Metric::new(
             "idle_arena_resident_bytes",

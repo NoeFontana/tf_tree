@@ -56,6 +56,15 @@ status=0
 "$OUT" "$STREAM" "$@" || status=$?
 
 # Closing the coproc's stdin is what tells the owner to release the arena.
-exec {OWNER[1]}>&-
-wait "$OWNER_PID" 2>/dev/null || true
+#
+# Guarded, and `|| true` on every step: bash unsets the fd array when a coproc
+# has already exited, so a bare `exec {OWNER[1]}>&-` fails with "ambiguous
+# redirect" and — under `set -e` — takes the script down *before* `exit
+# "$status"` runs. An owner that died mid-run would then be reported as a
+# generic 1 instead of the harness's real result, which is the one number this
+# script exists to return.
+if [ -n "${OWNER[1]:-}" ]; then
+    exec {OWNER[1]}>&- || true
+fi
+wait "${OWNER_PID:-}" 2>/dev/null || true
 exit "$status"

@@ -1514,6 +1514,25 @@ versions:
 tf2-native-control:
     ./docker/tf2/run.sh 'bash docker/tf2/native_scaling.sh'
 
+# **The depth-3 ratio with no Rust binding on either arm.**
+#
+# `just tf2-bench-check`'s `lookup_ratio_vs_tf2` row puts tf2 behind
+# `tf_tree_tf2_sys`, which charges it the residual FFI boundary and therefore
+# flatters `tf_tree`. This runs the other direction: tf2 native C++, `tf_tree`
+# through its C ABI as a shared library, both interleaved in one process so the
+# quotient still resolves on a host that cannot time either arm absolutely.
+#
+# Three processes, because `tft_tree_open` attaches and cannot create (D18):
+# `native_arena` serves the fixture over the rendezvous and dumps the identical
+# `.tfstream` the C++ side feeds to tf2. The script wires them together.
+#
+# **Neither this nor the Rust row is "the" answer — they bracket it.**
+# `docs/benchmarks/tf2.md` states the bracket, the unpaired point estimate, and
+# what is still owed to close it. Not gated: it is not wired into
+# `bench_report`, so no baseline carries it yet.
+tf2-native-ratio *ARGS:
+    ./docker/tf2/run.sh 'bash docker/tf2/native_ratio.sh {{ARGS}}'
+
 # ---------------------------------------------------------------------------
 # Python bindings (docs/PHASE3.md). `tf_tree_py` is excluded from the workspace
 # because it links libpython, so none of this is reachable from `just test`.
