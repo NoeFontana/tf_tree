@@ -156,6 +156,15 @@ required-features = ["tf2"]
 name = "footprint"
 path = "src/bin/footprint.rs"
 
+# The arena owner for `docker/tf2/native_ratio.sh`. It serves the fixture over
+# the rendezvous — `tft_tree_open` attaches and cannot create (D18) — so the C++
+# harness can measure `tf_tree` through the C ABI against a native tf2, with no
+# Rust binding on either arm. Needs `shm` for the same reason `shm_child` does.
+[[bin]]
+name = "native_arena"
+path = "src/bin/native_arena.rs"
+required-features = ["shm"]
+
 # Reader child for the multi-process test and benchmark. It attaches to a shared
 # arena over an inherited fd, so it must be a separate executable.
 [[bin]]
