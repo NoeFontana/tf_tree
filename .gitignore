@@ -200,6 +200,13 @@ logs/
 
 # Container build artifacts (docker/tf2/run.sh redirects CARGO_TARGET_DIR here).
 /target/tf2-docker/
+# `crates/tf_tree_py` is outside the workspace (it links libpython), so cargo
+# gives it its own `target/` — which the anchored `/target/` rule above does NOT
+# cover. It was invisible here only because a developer's *global* gitignore
+# happened to carry a bare `target/`; the tf2 container has no such file, so
+# every baseline cut in it recorded `git_dirty: true` and lost the provenance
+# guarantee the artifact exists to make. Found by exactly that.
+/crates/*/target/
 
 # colcon's build/install/log trees and the find_package(tf_tree) prefix, for
 # `ros/tf_tree_ros` (`just ros-build`). Already covered by the `/target/` rule
