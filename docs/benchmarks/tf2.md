@@ -138,6 +138,44 @@ reported against the native C++ figure**, which has no binding in it at all.
 
 The honest headline is therefore **~2.7x**, not the 3.3x first reported.
 
+### The binding cuts both ways, and the honest answer is a bracket
+
+Every ratio above this line puts tf2 behind `tf_tree_tf2_sys`. Bias 3 prices that
+boundary at ~21 ns and calls it irreducible *for a Rust harness* — which is true,
+and which is why the single-threaded headline is quoted against the native C++
+figure. `docker/tf2/native_ratio.sh` closes the loop: **both engines in one C++
+process**, tf2 called natively, `tf_tree` through its C ABI as a shared library.
+An arena owner (`native_arena`) serves the fixture over the rendezvous and dumps
+the identical `.tfstream`, because `tft_tree_open` attaches and cannot create
+(D18); both engines are checked to agree on all 256 stamps before either is
+timed, at a max deviation of **2.05e-15**.
+
+| Harness | tf_tree | tf2 | Ratio | Who pays the boundary |
+|---|---|---|---|---|
+| Rust (`ratio.rs`) | 201.5 ns (native Rust) | 498.2 ns (via binding) | **2.47×** | tf2, +10% |
+| C++ (`native_ratio.cpp`) | 306.7 ns (via C ABI) | 452.9 ns (native) | **1.48×** | tf_tree, +52% |
+| Neither, unpaired | 201.5 ns | 452.9 ns | **2.25×** | nobody |
+
+**The true figure is bracketed by the first two, and the third is the best point
+estimate.** It is unpaired — the two numbers come from different processes — so it
+carries this host's run-to-run spread and is not gate material; but each half is
+measured in its own native environment with no FFI in it, and it lands close to
+the 2.7× the depth-3 recorded-stream row reports independently.
+
+**The C ABI's 52% is the finding here, and it contradicts a gate.**
+[`PHASE4.md`](../PHASE4.md) §7 gate 1 records `tft_plan_at` at **1.020× native
+Rust**, and that measurement is `examples/abi_cost.rs` — Rust calling the ABI
+*from inside the same build*, where the linker still sees across the call. A C++
+caller against `libtf_tree_c.so` does not, and pays 52% on the same host and the
+same fixture. Both numbers are real; they are answers to different questions, and
+§7 gate 1 does not currently say which one it is asking. Two candidate causes are
+not separated by this run — the cross-`.so` call, and the fact that the C++ arm
+reads a shared `memfd` arena where the Rust arm reads a heap one. The
+`MAP_SHARED` row above (213 ns against 217 ns in-process) argues it is not the
+mapping, but that was a different loop, so it is an argument rather than a
+measurement. **Separating them is owed**, and until it is, the C++ arm should be
+read as "what a C++ embedder gets today", not as "what the engine costs".
+
 ### Where the win comes from
 
 tf_tree compiles the topology walk **once** into a `Plan` and thereafter only
