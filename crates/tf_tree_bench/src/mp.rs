@@ -748,6 +748,11 @@ mod tests {
         if !std::path::Path::new("/proc/self/schedstat").exists() {
             return;
         }
+        // 200 ms of wall clock per thread, asserted at 100 ms of CPU total —
+        // a 4x margin, because on a CPU-quota'd container or a single-vCPU host
+        // two spinning threads do not collectively receive 400 ms of CPU in
+        // 200 ms of wall clock, and the post-join reading floors to 10 ms ticks.
+        // The mutant this test targets reports ~0.34 ms, so 4x still kills it.
         let burn = Duration::from_millis(200);
         let before = ProcStats::read();
         let hs: Vec<_> = (0..2)
@@ -768,7 +773,7 @@ mod tests {
         // Both threads have exited. Their ~400 ms of CPU must still be visible.
         let d = ProcStats::read().since(before);
         assert!(
-            d.cpu_ns >= 200_000_000,
+            d.cpu_ns >= 100_000_000,
             "two threads burned ~400 ms of CPU and then exited; the reading is \
              {} ns, so their time left the counter with them",
             d.cpu_ns

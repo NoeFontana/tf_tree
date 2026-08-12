@@ -52,24 +52,32 @@ use crate::tf2::Tf2Fixture;
 /// The floor this row gates: `tf_tree` must be at least this many times faster
 /// than `tf2` on a depth-3 hot lookup.
 ///
-/// Measured through the binding at roughly 3×, and the binding-free figure is
-/// 2.7× (`docs/benchmarks/tf2.md`). **2.0 is deliberately below both.** The row
-/// is a regression detector for the engine; the residual FFI boundary is worth
-/// ~8% to the tf2 arm and no in-process harness can remove it, so a floor set
-/// close to the measurement would be gating the shim.
+/// This row measures 2.47× and the floor is 2.0, so a ~19% margin. The margin
+/// has to clear the *bias*, not the noise: the tf2 arm here pays the Rust
+/// binding, worth ~10% (498.2 ns against 452.9 ns measured natively), so the
+/// unbiased figure for this fixture is [`UNBIASED_ESTIMATE`] and the floor sits
+/// under that. A floor above it could be passed by the binding alone.
 pub const FLOOR: f64 = 2.0;
 
-/// `docs/benchmarks/tf2.md`'s binding-free headline, from
-/// `docker/tf2/native_scaling.cpp` — the same load with the Rust binding removed
-/// outright.
-const BINDING_FREE_HEADLINE: f64 = 2.7;
+/// The same fixture with **no binding on either arm**: `tf_tree` native Rust
+/// (201.5 ns) against `tf2` native C++ (452.9 ns), from
+/// `docker/tf2/native_ratio.sh`.
+///
+/// **This used to be 2.7 and that was the wrong number.** 2.7× is `tf2.md`'s
+/// *recorded-stream* row — a different fixture and a different loop shape — and
+/// using it here made the check below assert a relationship between two
+/// measurements that were never taken together. The figure for this fixture is
+/// 2.25×, and it is unpaired (the two halves come from different processes), so
+/// it is a point estimate rather than a gate. That is exactly what it is used
+/// for: bounding [`FLOOR`], not being one.
+const UNBIASED_ESTIMATE: f64 = 2.25;
 
-/// [`FLOOR`] must stay under the binding-free headline, or this row is gating
-/// the residual FFI cost rather than the engine.
+/// [`FLOOR`] must stay under the unbiased estimate, or this row could be passed
+/// by the binding's bias rather than by the engine.
 ///
 /// A compile-time check and not a test, because it is a relationship between two
 /// constants: there is nothing to run.
-const _: () = assert!(FLOOR < BINDING_FREE_HEADLINE);
+const _: () = assert!(FLOOR < UNBIASED_ESTIMATE);
 
 /// Rounds of the interleaved pair. Odd, so the median is an observation.
 pub const ROUNDS: usize = 9;
@@ -294,8 +302,13 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
 
     // Warm both arms: tf2's buffer walks the topology per call and populates its
     // own caches, and ours faults in the rings.
+    // `sweeps * per_sweep`, not `per_sweep`: one call to `sweep_ours` is
+    // `sweeps` passes over the table, so dividing by the table alone overshot
+    // the documented warmup by 40x and made `measure_with`'s loop counts unable
+    // to bound the cost — which is the whole reason that escape hatch exists.
     let per_sweep = stamps.len();
-    for _ in 0..warmup.div_ceil(per_sweep.max(1)) {
+    let per_call = sweeps.saturating_mul(per_sweep).max(1);
+    for _ in 0..warmup.div_ceil(per_call) {
         std::hint::black_box(sweep_ours());
         std::hint::black_box(sweep_theirs());
     }

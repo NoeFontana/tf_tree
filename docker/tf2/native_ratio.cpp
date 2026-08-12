@@ -184,6 +184,20 @@ int main(int argc, char **argv) {
   const int rounds = argc > 4 ? std::atoi(argv[4]) : 9;
   const int sweeps = argc > 5 ? std::atoi(argv[5]) : 40;
 
+  // `atoi` maps anything unparseable to 0, and the script forwards "$@"
+  // straight here. `rounds <= 0` leaves `ratios` empty and `min_element` then
+  // dereferences `end()`; `sweeps <= 0` makes `per_round` zero and every timing
+  // divide by it. Both are refusals, not clamps: a run that silently measured
+  // something other than what was asked for is the failure this whole file is
+  // written to avoid.
+  if (rounds <= 0 || sweeps <= 0) {
+    std::fprintf(stderr,
+                 "rounds and sweeps must both be positive (got %d and %d); "
+                 "non-numeric arguments parse as 0\n",
+                 rounds, sweeps);
+    return 2;
+  }
+
   if (tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR) != TFT_OK) {
     std::fprintf(stderr, "tft_check_abi failed: header and library disagree\n");
     return 1;
