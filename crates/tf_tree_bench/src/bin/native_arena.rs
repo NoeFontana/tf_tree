@@ -20,7 +20,14 @@
 //! inside one build; a C++ caller against `libtf_tree_c.so` pays **+52%** on the
 //! same host and fixture (306.7 ns against 201.5 ns). Neither ratio is therefore
 //! "the" answer — they bracket it, and `docs/benchmarks/tf2.md` states the
-//! bracket and what is still owed to close it.
+//! bracket.
+//!
+//! **That 52% is now split, and it is the linker rather than the mapping.**
+//! `just abi-split` ([`tf_tree_bench::backing`]) measures the middle arm — the
+//! same native Rust API on the same `MAP_SHARED` memfd this binary serves — and
+//! puts the backing at **<= 9.6 ns** of the ~105.5 ns gap, worst case over nine
+//! runs. At least 91% is the shared-library boundary. So the arena this binary
+//! hands the C++ side is not what makes it slower; the call into it is.
 //!
 //! **Both arms must still be in one process**, because the pairing is what makes
 //! the number resolvable at all: interleaving within a round is why the ratio
