@@ -12,9 +12,15 @@
 //!
 //! The fix is to put both engines in one **C++** process: tf2 natively, and
 //! `tf_tree` through its C ABI. That reverses the direction of the residual
-//! cost — `tft_plan_at` is a measured **1.020×** native Rust (`PHASE4.md` §7
-//! gate 1), so the 2% is now charged to *us* and the resulting ratio is a
-//! conservative lower bound rather than a flattering upper one.
+//! cost — it is charged to *us*, so the ratio is a lower bound rather than a
+//! flattering upper one.
+//!
+//! **How much it costs is larger than `PHASE4.md` §7 gate 1 would suggest.**
+//! That gate records `tft_plan_at` at 1.020× native Rust, measured from Rust
+//! inside one build; a C++ caller against `libtf_tree_c.so` pays **+52%** on the
+//! same host and fixture (306.7 ns against 201.5 ns). Neither ratio is therefore
+//! "the" answer — they bracket it, and `docs/benchmarks/tf2.md` states the
+//! bracket and what is still owed to close it.
 //!
 //! **Both arms must still be in one process**, because the pairing is what makes
 //! the number resolvable at all: interleaving within a round is why the ratio
