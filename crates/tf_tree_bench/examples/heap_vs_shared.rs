@@ -19,6 +19,23 @@
 //! which `relocation.rs` proves for *correctness*, holds for latency too — and a
 //! concurrent cross-core publisher at 100 Hz costs 0.7 ns.
 //!
+//! # This example cannot carry the mapping claim, and should not be cited for it
+//!
+//! The conclusion above is right, but the measurement under it has
+//! `docs/decisions/0013`'s defect. It queries the single stamp `1_500_000_000`
+//! against samples laid down at `1_000_000 + i * 1_000_000` — an **exact grid
+//! hit** at `i = 1499` — so `SampleRing::sample` takes its exact-hit branch,
+//! `I::eval` never runs, and all four rows are `bracket` plus a seqlock read.
+//! A mapping, if it costs anything, costs it on the loads the interpolation
+//! issues; this never issues them. The 51 ns figures are also far below the
+//! ~200 ns the §11.1 fixture measures off-grid, which is the tell.
+//!
+//! **`crates/tf_tree_bench/src/backing.rs` is the measurement that carries it**
+//! (`just abi-split`): the §11.1 fixture, off-grid, paired and interleaved,
+//! reporting the shared mapping at <= 9.6 ns worst-case over nine runs, ~1.8 ns
+//! typically. This example is retained for the two rows that one does not
+//! cover: the read-only *attached* mapping, and the concurrent-writer row.
+//!
 //! So the ~2.7 us a Python consumer sees in the multi-process benchmark is the
 //! **deployment environment**: separate processes, descheduled between ticks,
 //! reading through caches that another process has been evicting. It is not the

@@ -28,10 +28,20 @@
 //
 // Two differences separate the two figures and **this run does not tell them
 // apart**: the cross-`.so` call itself, and the fact that the arena here is a
-// shared `memfd` mapping rather than a heap one. `tf2.md` measured `MAP_SHARED`
-// at 213 ns against 217 ns in-process, which argues the mapping is not the
-// cause — but that was a different loop, so it is an argument and not a
-// measurement. Separating them is a named next step, not a claim made here.
+// shared `memfd` mapping rather than a heap one.
+//
+// **They have since been told apart, elsewhere.** `just abi-split`
+// (`crates/tf_tree_bench/src/backing.rs`) runs the middle arm — the same native
+// Rust API and the same off-grid sweep, on the same `MAP_SHARED` memfd
+// `native_arena` serves this program — paired and interleaved. It puts the
+// backing at **<= 9.6 ns** of the ~105.5 ns gap (worst of nine runs; ~1.8 ns
+// typically), so **at least 91% of the +52% is the shared-library boundary**.
+// The mapping is not the cause, which is what `tf2.md`'s 213-vs-217 row always
+// argued; that row just could not carry it (unpaired, two harnesses, effect
+// smaller than the spread).
+//
+// What is still not paired is the boundary half itself: it is a subtraction
+// against a figure from another run rather than a third arm in this program.
 //
 // The consequence for the reader: **neither this ratio nor the Rust one is
 // "the" answer.** They bracket it. See `docs/benchmarks/tf2.md`.

@@ -168,13 +168,63 @@ Rust**, and that measurement is `examples/abi_cost.rs` — Rust calling the ABI
 *from inside the same build*, where the linker still sees across the call. A C++
 caller against `libtf_tree_c.so` does not, and pays 52% on the same host and the
 same fixture. Both numbers are real; they are answers to different questions, and
-§7 gate 1 does not currently say which one it is asking. Two candidate causes are
-not separated by this run — the cross-`.so` call, and the fact that the C++ arm
-reads a shared `memfd` arena where the Rust arm reads a heap one. The
-`MAP_SHARED` row above (213 ns against 217 ns in-process) argues it is not the
-mapping, but that was a different loop, so it is an argument rather than a
-measurement. **Separating them is owed**, and until it is, the C++ arm should be
-read as "what a C++ embedder gets today", not as "what the engine costs".
+§7 gate 1 does not currently say which one it is asking.
+
+#### The 52% is the boundary, not the mapping (measured)
+
+That run moved two variables at once — the cross-`.so` call, and the fact that
+the C++ arm reads a shared `memfd` arena where the Rust arm reads a heap one —
+and separating them used to be owed here. `just abi-split`
+(`crates/tf_tree_bench/src/backing.rs`) is the middle arm that separates them:
+the same native Rust API and the same off-grid §11.1 sweep, on the same `memfd`
+backing the C++ side reads. Paired and interleaved, so it resolves on this host.
+
+| Arm | API | Arena | ns/lookup |
+|---|---|---|---|
+| H | native Rust | heap | 201.2 |
+| S | native Rust | `MAP_SHARED` memfd | 203.4 |
+| C | C++ → `libtf_tree_c.so` | `MAP_SHARED` memfd | 306.7 |
+
+Over **nine** runs the backing quotient's median sat in **1.0066–1.0112×** — a
+remarkably tight spread for this host — while the band's upper edge ranged
+1.0099× to **1.0476×**. So of the ~**105.5 ns** the C++ arm costs over native
+Rust:
+
+- **arena backing: ≤ 9.6 ns** — from the *worst* band observed, not the best.
+  The point estimate is around 1.8 ns and the sign does not resolve reliably:
+  two of nine runs put it at 1.4 ns and 2.2 ns, the other seven had bands
+  containing 1.0. That is the expected shape for a ~2 ns effect measured at
+  ~200 ns on a 4-core SMT host, and it does not matter, because the bound is
+  what the subtraction needs and the bound is two orders of magnitude under the
+  residue.
+- **library boundary: ≥ 96 ns** — the residue.
+
+**At least 91% of the gap is the boundary**, and on the typical run ~98%.
+`MAP_SHARED` costs a lookup
+approximately nothing, which is what the two earlier arguments claimed — but
+neither had established it, and it is worth saying why, because both were
+defective in the direction that flattered the conclusion:
+
+- The **213 ns against 217 ns** row further down is two different harnesses in
+  two different processes compared as medians. It is unpaired, and this host's
+  run-to-run spread (~4%) is larger than the effect.
+- **`examples/heap_vs_shared`** (51.1 ns against 51.3 ns) is paired, but it
+  queries the single stamp `1_500_000_000` against samples laid down at
+  `1_000_000 + i * 1_000_000` — an exact grid hit at `i = 1499`. That is
+  [`0013`](../decisions/0013-the-benchmark-gate-never-interpolated.md)'s defect
+  exactly: `I::eval` never runs, so it compares `bracket` plus a seqlock read. If
+  a mapping costs anything it costs it on the loads the interpolation issues, and
+  that measurement never issues them.
+
+The conclusion survives both, but it now rests on a run that interpolates.
+
+The boundary row is a subtraction against a figure recorded on another day, not a
+paired measurement, and `just abi-split` prints it labelled that way. Closing
+*that* gap needs the C++ harness to grow a third arm; the attribution is safe
+enough at 95% that it has not been worth the format change. Until then the C++
+arm should still be read as "what a C++ embedder gets today", not as "what the
+engine costs" — but we now know the difference is the linker, and therefore that
+LTO or a static link is where it would be recovered.
 
 ### Where the win comes from
 
@@ -518,9 +568,15 @@ Two things worth noting against the thread table above. Multi-**process** scalin
 at 4 (3.31x) is slightly *better* than multi-thread scaling at 4 (2.79-3.09x):
 separate address spaces share no allocator, no TLS and no false-shared cache
 lines. And per-lookup cost at one process is 213 ns against the 217 ns
-`cost_model` measures in-process for the same three-dynamic-step chain — **there
-is no penalty for the arena being shared.** That is the single most important
-number here: `MAP_SHARED` costs nothing per lookup.
+`cost_model` measures in-process for the same three-dynamic-step chain, which
+points at there being no penalty for the arena being shared.
+
+**On its own that comparison does not carry the claim**, and it used to be
+asserted here as though it did. It is two harnesses in two processes compared as
+medians — unpaired, against a run-to-run spread (~4%) larger than the effect. The
+claim is true and is now measured properly by `just abi-split`, which runs both
+backings paired in one process on an off-grid sweep: the shared mapping costs
+**≤ 9.6 ns** across nine runs, and ~1.8 ns typically. See "The 52% is the boundary, not the mapping" above.
 
 The memory columns need care, and getting them wrong would have flattered the
 design in the wrong place. Summing each process's RSS **double-counts** the

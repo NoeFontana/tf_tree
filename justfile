@@ -1337,6 +1337,16 @@ shm-check:
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo build --features shm -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
+    # **`src/backing.rs`'s unit tests, which run in no other recipe.** The module
+    # is `#[cfg]`-ed on `shm` — it compares a heap arena against `build_shared`,
+    # so without the feature there is no second backing — and `just test`'s
+    # `--workspace` builds default features, so its tests would otherwise be
+    # compiled by the clippy line above and executed nowhere. They are the guards
+    # that stop `just abi-split` reading a point estimate off a band that
+    # contains the null, which is the failure mode the module exists to avoid.
+    # `--lib` and not the whole package: the integration targets are named
+    # individually, on purpose.
+    cargo nextest run -p tf_tree_bench --features shm --lib
     # Fork poisoning (`docs/decisions/0005` step 9). Separate from
     # `shm-rendezvous` because it needs no second executable and no scratch
     # rendezvous beyond its own: the second process is a `fork` of the first.
@@ -1532,6 +1542,29 @@ tf2-native-control:
 # `bench_report`, so no baseline carries it yet.
 tf2-native-ratio *ARGS:
     ./docker/tf2/run.sh 'bash docker/tf2/native_ratio.sh {{ARGS}}'
+
+# **Splitting `tf2-native-ratio`'s +52% into the two things it changed at once.**
+#
+# The C++ arm above measures 306.7 ns where native Rust measures 201.5 ns, and it
+# moved two variables together: the call crosses a shared-library boundary the
+# linker cannot see across, *and* the arena is a `MAP_SHARED` memfd rather than a
+# private heap allocation. `docs/benchmarks/tf2.md` called separating them owed.
+#
+# This is the middle arm — same native Rust API, same off-grid §11.1 sweep, on
+# the same `memfd` backing the C++ side reads — so what it reports is the mapping
+# alone and the residue is the boundary. Paired and interleaved for `ratio.rs`'s
+# reason, with load genuinely common-mode here: both arms are the same engine on
+# the same read path, so unlike the tf2 quotient there is no lock on one side
+# only.
+#
+# **No container**, unlike everything else in this section: there is no tf2 in
+# it. Runs on the host, needs only `shm`.
+#
+# Not gated, and the reason is in the output rather than hidden: the backing half
+# is measured, the boundary half is a subtraction against a figure from another
+# run, so the tool prints which row is which.
+abi-split:
+    cargo run --release -p tf_tree_bench --features shm --bin arena_backing
 
 # ---------------------------------------------------------------------------
 # Python bindings (docs/PHASE3.md). `tf_tree_py` is excluded from the workspace

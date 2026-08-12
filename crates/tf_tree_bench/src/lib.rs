@@ -31,6 +31,8 @@
 // from 22 warnings to 0. Nothing is lost from the module index: every one of
 // these files opens with a `//!` summary of its own, which is what the index
 // shows.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub mod backing;
 pub mod baseline;
 pub mod differential;
 pub mod embed;

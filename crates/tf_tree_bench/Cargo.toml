@@ -165,6 +165,15 @@ name = "native_arena"
 path = "src/bin/native_arena.rs"
 required-features = ["shm"]
 
+# `docs/benchmarks/tf2.md`'s owed split: the middle arm between native Rust on a
+# heap arena and a C++ caller on a `memfd` one. Needs `shm` because the arm under
+# test *is* `build_shared` — without the feature there is no second backing to
+# compare against and the binary would measure a heap arena twice.
+[[bin]]
+name = "arena_backing"
+path = "src/bin/arena_backing.rs"
+required-features = ["shm"]
+
 # Reader child for the multi-process test and benchmark. It attaches to a shared
 # arena over an inherited fd, so it must be a separate executable.
 [[bin]]
