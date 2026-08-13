@@ -65,11 +65,19 @@
 //! than the inference: paying that guard once per batch instead of once per
 //! element recovers 41 of the 99.5 ns.
 //!
-//! **This does not resolve `PHASE4.md` §7 gate 1, it sharpens it.** That gate
-//! measures 1.020x on a *heap* tree in-process, and `Tree::guard` takes a
-//! different path on a shared arena (`tf_tree/src/tree.rs:1984` — a
-//! fork-generation check a heap arena skips). The gate therefore prices a
-//! configuration no `shm` consumer uses. Fixing that is a decision record.
+//! **The guard is not specific to a shared arena, and assuming it was cost a
+//! second wrong turn.** The obvious next move was to blame the fork check
+//! `Tree::guard` adds only when `is_shared()` (`tf_tree/src/tree.rs:1984`) —
+//! which would have meant `PHASE4.md` §7 gate 1's 1.020× was honest for a heap
+//! tree and blind to shared ones. [`guard_cost_both`] priced that branch at
+//! **+2.1 ns** (counters off) and **−8.4 ns** (counters on): noise. A per-call
+//! guard costs ~17 ns on *both* backings, and Phase 5's diagnostic counters
+//! roughly double it.
+//!
+//! **§7 gate 1 is simply failing.** `examples/abi_cost.rs` measures 1.34–1.46×
+//! against its 1.05 gate on a heap tree and prints `FAIL` — it had just never
+//! been run, appearing in no recipe and no workflow. `just abi-cost` now runs
+//! it; `docs/PHASE4.md` §7 records the state and `0022` carries the question.
 //!
 //! # Method
 //!
@@ -485,6 +493,171 @@ pub fn measure_attached(name: &str, rounds: usize, sweeps: usize, warmup: usize)
         ns.push(d);
     }
     Ok(median(&mut ns))
+}
+
+/// What acquiring a [`tf_tree::Guard`] **per lookup** costs, against hoisting
+/// one out of the loop, on a tree the caller supplies.
+///
+/// # Why this is the measurement `0022` question 4 asks for
+///
+/// `0022` records the C ABI at +99.5 ns on a shared arena and attributes it to
+/// `tft_plan_at` building a guard per call. That attribution rests on one piece
+/// of evidence — `tft_plan_at_many`, which pays the guard once per batch,
+/// recovering 41 ns — and on reading `tf_tree_c/src/lib.rs:684`. It is a good
+/// inference. It is still an inference, and the last two attributions in this
+/// area were both wrong.
+///
+/// This measures the guard directly, in **safe Rust with no C ABI anywhere near
+/// it**, by running the identical `Plan::at` sweep twice: once with a hoisted
+/// guard and once acquiring one inside the loop. Run it on a heap tree and on a
+/// shared one and the difference between the two answers is the cost of the
+/// `is_shared()` branch in `Tree::guard` (`tf_tree/src/tree.rs:1984`) — which is
+/// precisely what question 4 proposes to move per-tree.
+///
+/// Returns `(hoisted_ns, per_call_ns)`. Paired and interleaved like everything
+/// else here, so the difference resolves on this host.
+///
+/// # Errors
+///
+/// If the pair cannot be planned or a timed round measures a non-duration.
+pub fn measure_guard_cost(
+    tree: &Tree,
+    rounds: usize,
+    sweeps: usize,
+    warmup: usize,
+) -> Result<(f64, f64)> {
+    if rounds == 0 || sweeps == 0 {
+        bail!("rounds and sweeps must both be non-zero; got {rounds} and {sweeps}");
+    }
+    let plan = plan_for(tree)?;
+    let stamps: Vec<Stamp> = (0..STAMPS as i64)
+        .map(|i| Stamp::from_nanos(stamp_ns(i)))
+        .collect();
+
+    // The hoisted arm acquires one guard for the whole sweep — what `ratio.rs`,
+    // `measure_attached` and every in-process Rust consumer do.
+    let hoisted = || {
+        let g = tree.guard();
+        let mut acc = 0.0f64;
+        for _ in 0..sweeps {
+            for &s in &stamps {
+                if let Ok(v) = plan.at(&g, std::hint::black_box(s)) {
+                    acc += v.t.x;
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
+    // The per-call arm acquires and drops one inside the loop — what
+    // `tft_plan_at` is structurally forced to do, because the C signature has
+    // nowhere to put a guard between calls. Everything else is identical, so
+    // the difference is the guard and nothing else.
+    let per_call = || {
+        let mut acc = 0.0f64;
+        for _ in 0..sweeps {
+            for &s in &stamps {
+                let g = tree.guard();
+                if let Ok(v) = plan.at(&g, std::hint::black_box(s)) {
+                    acc += v.t.x;
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
+
+    let per_sweep = stamps.len();
+    let per_call_n = sweeps.saturating_mul(per_sweep).max(1);
+    for _ in 0..warmup.div_ceil(per_call_n) {
+        std::hint::black_box(hoisted());
+        std::hint::black_box(per_call());
+    }
+
+    let per_round = (sweeps * per_sweep) as f64;
+    let mut h_ns = Vec::with_capacity(rounds);
+    let mut p_ns = Vec::with_capacity(rounds);
+    for r in 0..rounds {
+        // Alternate the leading arm, for the reason the rest of this module
+        // does: a fixed order hands one arm the colder cache every round.
+        let (h, p) = if r % 2 == 0 {
+            let t0 = std::time::Instant::now();
+            let _ = hoisted();
+            let h = t0.elapsed().as_nanos() as f64 / per_round;
+            let t1 = std::time::Instant::now();
+            let _ = per_call();
+            (h, t1.elapsed().as_nanos() as f64 / per_round)
+        } else {
+            let t1 = std::time::Instant::now();
+            let _ = per_call();
+            let p = t1.elapsed().as_nanos() as f64 / per_round;
+            let t0 = std::time::Instant::now();
+            let _ = hoisted();
+            (t0.elapsed().as_nanos() as f64 / per_round, p)
+        };
+        if h <= 0.0 || p <= 0.0 {
+            bail!("a timed round measured {h} / {p} ns per lookup, which is not a duration");
+        }
+        h_ns.push(h);
+        p_ns.push(p);
+    }
+    Ok((median(&mut h_ns), median(&mut p_ns)))
+}
+
+/// One guard-cost row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuardCost {
+    /// ns/lookup with one guard hoisted out of the sweep.
+    pub hoisted_ns: f64,
+    /// ns/lookup acquiring a guard inside the loop.
+    pub per_call_ns: f64,
+}
+
+impl GuardCost {
+    /// What one `Tree::guard()` costs a lookup, in nanoseconds.
+    #[must_use]
+    pub fn guard_ns(&self) -> f64 {
+        self.per_call_ns - self.hoisted_ns
+    }
+}
+
+/// [`measure_guard_cost`] on a heap arena and on a shared one, in that order.
+///
+/// **This is the measurement that closed `0022`'s original question 4.** That
+/// question asked whether `Tree::guard`'s `is_shared()` fork check could move
+/// per-tree, on the theory that it was what made a shared arena expensive. The
+/// shared row minus the heap row prices that branch at **+2.1 ns** with counters
+/// off and **−8.4 ns** with them on — noise in both directions, so the premise
+/// was false and no code was written against it.
+///
+/// What the rows *did* find is that a per-call guard costs ~17 ns, and that
+/// Phase 5's diagnostic counters roughly double it (+35.4 / +27.0 ns with them
+/// on). That is `0022`'s question 1 and the largest uncontested win on the
+/// board.
+///
+/// # Errors
+///
+/// If either fixture cannot be built or populated, or a sweep fails.
+pub fn guard_cost_both(
+    rounds: usize,
+    sweeps: usize,
+    warmup: usize,
+) -> Result<(GuardCost, GuardCost)> {
+    let heap = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
+    let shm = build_shared_fixture()?;
+    let (_hw, _hp) = crate::fixture::spin_up(&heap)?;
+    let (_sw, _sp) = crate::fixture::spin_up(&shm)?;
+
+    let (hh, hp) = measure_guard_cost(&heap, rounds, sweeps, warmup)?;
+    let (sh, sp) = measure_guard_cost(&shm, rounds, sweeps, warmup)?;
+    Ok((
+        GuardCost {
+            hoisted_ns: hh,
+            per_call_ns: hp,
+        },
+        GuardCost {
+            hoisted_ns: sh,
+            per_call_ns: sp,
+        },
+    ))
 }
 
 /// The fixture topology on a `MAP_SHARED` `memfd`.
