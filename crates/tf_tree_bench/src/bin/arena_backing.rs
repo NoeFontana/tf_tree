@@ -1,17 +1,27 @@
-//! Split the C ABI's measured +52% into the two things that changed at once.
+//! Where the C ABI's measured +52% over native Rust actually goes.
 //!
 //! `docs/benchmarks/tf2.md` reports a C++ caller against `libtf_tree_c.so` at
-//! **306.7 ns** where native Rust measures **201.5 ns**, and records that the
-//! run changed two variables together: the call crosses a shared-library
-//! boundary, *and* the arena is a `MAP_SHARED` `memfd` rather than a private
-//! heap allocation. It calls separating them owed.
+//! **306.7 ns** where native Rust measures ~**201.5 ns**, on a run that changed
+//! two variables together: the call crosses a shared-library boundary, *and* the
+//! arena is a `MAP_SHARED` `memfd` rather than a private heap allocation.
 //!
-//! [`tf_tree_bench::backing`] is the missing middle arm — the same native Rust
-//! API and the same loop, on the same `memfd` backing the C++ side reads — so
-//! the difference it reports is the mapping alone, and whatever the C++ arm
-//! costs beyond it is the boundary.
+//! **Neither is the cause.** [`tf_tree_bench::backing`] measures the mapping
+//! (<= 9.6 ns, paired) and — with `--attach` — the cross-process read-only
+//! attach (-0.7 ns). The link mode was measured separately by building
+//! `tests/cpp/bench.cpp` against the `.a` and the `.so`: 245.4 against 244.4 ns.
+//! What is left is the C ABI's own per-call work, ~99.5 ns of it, which
+//! `tft_plan_at_many` partly amortizes (302.0 -> 261.0 ns).
 //!
-//! Run it with `just abi-split`, which prints both halves.
+//! **The residue row below is a subtraction, not a measurement**, and that is
+//! exactly how this binary first led to a wrong conclusion: an earlier version
+//! measured the mapping, found it free, and attributed everything else to the
+//! linker without measuring the linker. The row is labelled in the output for
+//! that reason.
+//!
+//! ```text
+//! just abi-split                       # the paired heap-vs-memfd rungs
+//! arena_backing --attach <name>        # plus the cross-process rung
+//! ```
 
 #![allow(clippy::print_stdout)]
 
@@ -20,14 +30,31 @@ use anyhow::Result;
 /// The C++ arm from `docker/tf2/native_ratio.sh`, for the subtraction.
 ///
 /// A literal, and that is a real weakness rather than a shortcut: it is a
-/// figure from a different run on a different day, so the arithmetic below is a
-/// decomposition of *recorded* numbers and not a paired measurement of the
-/// boundary. The mapping half — the half this binary actually measures — is
-/// paired. The line printed under the split says so, because a reader who
-/// takes the second row for a measured one would be over-trusting it.
+/// figure from a different run on a different day, so the residue below is a
+/// decomposition of *recorded* numbers rather than a measurement. Treating that
+/// residue as if it had been measured is precisely how this file's first version
+/// concluded "it is the linker", which is wrong by a factor of ~100. The rungs
+/// this binary measures itself are paired; the output says which is which.
 const CPP_ABI_NS: f64 = 306.7;
 
 fn main() -> Result<()> {
+    // `--attach NAME` is the cross-process rung of the ladder, and it needs an
+    // arena somebody else is already serving (`native_arena --name NAME`), so it
+    // cannot be folded into the default run.
+    let mut attach: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--attach" => {
+                attach = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--attach wants an arena name"))?,
+                );
+            }
+            other => anyhow::bail!("unknown argument `{other}`"),
+        }
+    }
+
     let run = tf_tree_bench::backing::measure()?;
     println!("{}", run.verdict_line());
 
@@ -54,15 +81,44 @@ fn main() -> Result<()> {
         ),
     }
     println!(
-        "  library boundary (this -> C++)  >={boundary_min:6.1} ns   the residue, against \
+        "  everything else                 >={boundary_min:6.1} ns   the residue, against \
          {CPP_ABI_NS:.1} ns recorded in docs/benchmarks/tf2.md"
     );
     println!();
     println!(
-        "  {:.0}% of the gap is the boundary at minimum. The backing row is paired; the \
-         boundary row is not — it subtracts a figure from another run on another day, so it \
-         is an attribution rather than a measurement.",
+        "  {:.0}% of the gap is NOT the arena backing. It is also not the link mode (the .a\n  \
+         and the .so measure 245.4 against 244.4 ns) and not the cross-process attach (-0.7\n  \
+         ns, see --attach). It is the C ABI's per-call work: tft_plan_at builds a Guard on\n  \
+         every call where the Rust arm hoists one, and tft_plan_at_many recovers 41 ns of it.\n  \
+         The backing row is measured and paired; this residue row is a subtraction.",
         100.0 * boundary_min / total
     );
+
+    if let Some(name) = attach {
+        // Same rounds/sweeps as the paired run, so the two `Rust native` rungs
+        // are the same loop and differ only in which process built the arena.
+        let ns = tf_tree_bench::backing::measure_attached(
+            &name,
+            tf_tree_bench::backing::ROUNDS,
+            40,
+            60_000,
+        )?;
+        println!();
+        println!("cross-process rung, attached read-only to `{name}`:");
+        println!(
+            "  H  Rust native, heap,     in-process     {:7.1} ns",
+            run.heap_ns
+        );
+        println!(
+            "  S  Rust native, memfd RW, in-process     {:7.1} ns",
+            run.shm_ns
+        );
+        println!("  A  Rust native, memfd RO, cross-process  {ns:7.1} ns");
+        println!(
+            "  attaching costs {:+.1} ns against the in-process shared arena — and this is \
+             native Rust, so no C ABI is involved in it.",
+            ns - run.shm_ns
+        );
+    }
     Ok(())
 }
