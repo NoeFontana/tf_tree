@@ -135,7 +135,14 @@ fn main() {
 ///   is a real cost of fixed-capacity, never-reallocating rings, and it belongs
 ///   in the comparison rather than averaged out of it.
 fn mem_tf_tree() {
+    // Two instruments, matching `docker/tf2/native_footprint.cpp` field for
+    // field. `mallinfo2` is what the engines can be compared on identically
+    // (C++ `operator new` bottoms out in `malloc`); **Pss is what an operator
+    // sees in `top`**, and `mallinfo2` cannot see it, because an allocator can
+    // hold address space it has not faulted. That difference is the entire
+    // subject of decision `0021`, so a table with only the first would hide it.
     let before = heap_in_use();
+    let pss_before = tf_tree_bench::mp::self_pss_kib();
     let tree = {
         let (tree, samples) = fixture::populated_tree().expect("build fixture");
         // The harness's own recorded push stream is ~300 KiB of `PushSample` and
@@ -145,12 +152,15 @@ fn mem_tf_tree() {
         tree
     };
     let after = heap_in_use();
+    let pss_after = tf_tree_bench::mp::self_pss_kib();
 
     let samples = fixture_sample_count();
     let arena = tree.arena_size_bytes();
     let slots = tree.arena_view().header().pose_slots as usize;
     println!("engine\ttf_tree");
     println!("heap_bytes\t{}", after - before);
+    println!("pss_kib_delta\t{}", pss_after.saturating_sub(pss_before));
+    println!("pss_kib_total\t{pss_after}");
     println!("arena_bytes\t{arena}");
     println!("declared_slots\t{slots}");
     println!("samples_stored\t{samples}");

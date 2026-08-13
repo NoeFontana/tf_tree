@@ -153,13 +153,29 @@ fn pose(p: &Iso3) -> String {
 fn main() -> Result<()> {
     let mut name = "tf2_native".to_owned();
     let mut stream = PathBuf::from("target/native/fixture.tfstream");
+    let mut dump_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--name" => name = args.next().context("--name wants a value")?,
             "--stream" => stream = PathBuf::from(args.next().context("--stream wants a value")?),
+            // Write the `.tfstream` and exit, serving no arena.
+            //
+            // `docker/tf2/native_footprint.cpp` needs the *data* and not the
+            // rendezvous: it weighs a `tf2::BufferCore` against a separate Rust
+            // process, and there is no tf_tree arena in that comparison at all.
+            // `dump_stream` regenerates every pose from `fixture::dynamic_pose`
+            // and never reads the tree, so this path is the same bytes by
+            // construction rather than by a second implementation.
+            "--dump-only" => dump_only = true,
             other => anyhow::bail!("unknown argument `{other}`"),
         }
+    }
+
+    if dump_only {
+        let wrote = dump_stream(&stream)?;
+        println!("dumped {} {}", stream.display(), wrote);
+        return Ok(());
     }
 
     // `require_create(true)`: if an arena of this name is already served, the

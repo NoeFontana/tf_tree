@@ -38,6 +38,7 @@ must not blur the two.
 | `tf_tree_bench/src/bin/embed_cost.rs` | `just embed-cost-check` | PHASE5 §9.2 embedding cost |
 | `xtask bench-gate` | `just bench` | PHASE1 §11.3 criteria |
 | `tf_tree_bench/src/bin/frozen_workers.rs` | `just gate4` | PHASE5 §12 gate 4: 16 workers on one `.tft`, total Pss ≤ 1.2× one worker. **PASSES at 1.024×** |
+| `docker/tf2/native_footprint.cpp` | `just tf2-native-footprint` | The memory comparison with no binding on either side. Not a pass/fail gate — it refuses to print a quotient if the two arms stored different sample counts |
 | `tf_tree_bench/src/backing.rs` | `just abi-split` | not a gate — reports the ABI ladder; listed here because PHASE4 §7 cites its guard rows |
 
 ## Probes — findings recorded, re-runnable on demand
