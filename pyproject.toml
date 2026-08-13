@@ -35,7 +35,7 @@ dependencies = ["numpy>=2.2.6"]
 [dependency-groups]
 # Floors from `docs/PHASE3.md` §10.1. Each is there for a reason recorded in
 # that section, not merely because it is current.
-dev = ["maturin>=1.14.1,<2.0", "pytest>=9.1.1", "ruff>=0.16", "pyright>=1.1.411"]
+dev = ["maturin>=1.14.1,<2.0", "pytest>=9.1.1", "ruff>=0.16.2", "pyright>=1.1.411"]
 
 [tool.maturin]
 manifest-path = "crates/tf_tree_py/Cargo.toml"
