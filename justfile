@@ -266,6 +266,29 @@ miri:
 # ASan needs `-Zbuild-std` so the standard library is instrumented too; without
 # it a use-after-free inside `Box::from_raw` is invisible.
 #
+# **Every runnable artifact is either gated by a recipe or registered as a probe.**
+#
+# This exists because `examples/abi_cost.rs` — which *is* PHASE4 §7 gate
+# criterion 1 — was executed by no recipe and no workflow for months while
+# `docs/PHASE4.md` recorded its number as a PASS and the example itself printed
+# FAIL. A document cited a number that nothing re-derived. An audit found the
+# same shape in roughly a dozen other places.
+#
+# The rule is deliberately weak, because a strong one would be wrong: most of
+# these artifacts are one-off diagnostic probes and running them in CI would be
+# waste. It requires only that an artifact nothing executes be **declared** in
+# `docs/benchmarks/EVIDENCE.md` — as a gate (with its recipe) or a probe (with
+# what it established). A new artifact a document starts citing, with neither,
+# fails here.
+#
+# It does NOT check that a probe's recorded number is still true. That is what
+# makes it a probe. It checks that somebody can find out.
+#
+# A script rather than an inline recipe, like `cpp-check`: it needs `cargo
+# metadata` and multi-line text processing that `just`'s parser mangles.
+evidence-audit:
+    ./scripts/evidence-audit.sh
+
 # **PHASE4 §7 gate criterion 1: `tft_plan_at` within 5 % of native Rust.**
 #
 # This recipe exists because the gate did not have one. `examples/abi_cost.rs`
@@ -579,6 +602,11 @@ doc:
     RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p xtask
 
 lint: py-compile
+    # **First, because it is the cheapest and it caught a real one.** PHASE4 §7
+    # gate criterion 1 was recorded as PASS for months while the benchmark that
+    # produces it ran in no recipe at all. This fails if a runnable artifact is
+    # neither executed nor declared in `docs/benchmarks/EVIDENCE.md`.
+    ./scripts/evidence-audit.sh
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
