@@ -2,15 +2,20 @@
 //!
 //! # The question this exists to answer
 //!
-//! `docs/benchmarks/tf2.md`'s bracket ends on an owed measurement. A C++ caller
+//! `docs/benchmarks/tf2.md`'s bracket ended on an owed measurement. A C++ caller
 //! against `libtf_tree_c.so` measures **306.7 ns** on the depth-3 fixture where
 //! native Rust measures **201.5 ns** — **+52%** — and
 //! [`PHASE4.md`](../../../docs/PHASE4.md) §7 gate 1 records the same ABI at
-//! **1.020×**. Both are real; they answer different questions. But the 52% run
-//! changed *two* things at once against its Rust comparand:
+//! **1.020×**. Both are real. The 52% run changed *two* things at once against
+//! its Rust comparand:
 //!
 //! 1. the call crosses a shared-library boundary the linker cannot see across;
 //! 2. the arena is a `MAP_SHARED` `memfd` rather than a private heap allocation.
+//!
+//! **The answer turned out to be neither of them** — see the ladder below. This
+//! module measures rung 2 (and, with [`measure_attached`], the cross-process
+//! rung), which is what made the elimination possible; the culprit is the C
+//! ABI's per-call `Guard`.
 //!
 //! `tf2.md` argued from a neighbouring row that it is not the mapping, and
 //! called that *an argument rather than a measurement*. It is worth being
@@ -35,24 +40,36 @@
 //! Neither is wrong about its own subject; neither settles this one. This
 //! module runs the §11.1 fixture, off-grid, paired, on both backings.
 //!
-//! # Why this is the whole decomposition
-//!
-//! The two costs are additive over three arms, and only one of them is new:
+//! # The ladder, and the wrong turn taken on the way up it
 //!
 //! ```text
-//!   H  native Rust API, heap arena          <- ratio.rs's tf_tree arm, 201.5 ns
-//!   S  native Rust API, memfd arena         <- THIS MODULE
-//!   C  C++ -> libtf_tree_c.so, memfd arena  <- native_ratio.cpp, 306.7 ns
-//!
-//!   backing cost   = S - H   (same API and loop; only the mapping differs)
-//!   boundary cost  = C - S   (same arena and fixture; only the call differs)
+//!   H  native Rust API, heap arena, in-process         200.7 ns
+//!   S  native Rust API, memfd arena, in-process RW     203.2 ns  <- measure()
+//!   A  native Rust API, memfd arena, RO cross-process  202.5 ns  <- measure_attached()
+//!   C  C ABI (tft_plan_at), same arena as A            302.0 ns
+//!   C' C ABI (tft_plan_at_many), same arena as A       261.0 ns
 //! ```
 //!
-//! `S` is the arm nobody had measured, which is the only reason the 52% was
-//! undecomposed. Note that `C - S` still bundles the `.so` hop with the C ABI's
-//! *shape* — the opaque handle, the out-parameter, the `catch_unwind`. §7 gate 1
-//! prices that shape at 1.020× when the linker can see across it, so the residue
-//! is attributable to the boundary rather than to the signature.
+//! **The first version of this module had only `H` and `S`, and that was enough
+//! to reach a wrong answer.** It measured the mapping, found it ~free, and
+//! attributed the entire residue to the shared-library boundary — a subtraction
+//! presented as a finding. Building `tests/cpp/bench.cpp` against
+//! `libtf_tree_c.a` and `libtf_tree_c.so` prices that boundary at **245.4
+//! against 244.4 ns**, or 0.4%. The residue was never the linker.
+//!
+//! With `A` in place the ladder is unambiguous: the mapping costs <= 9.6 ns, the
+//! cross-process read-only attach costs -0.7 ns, the link mode ~1 ns, and the
+//! remaining **+99.5 ns (+49%) is the C ABI's own per-call work** —
+//! `tft_plan_at` constructs a `Guard` on every call (`tf_tree_c/src/lib.rs:684`)
+//! where the Rust arm hoists one out of the loop. `C'` is the evidence rather
+//! than the inference: paying that guard once per batch instead of once per
+//! element recovers 41 of the 99.5 ns.
+//!
+//! **This does not resolve `PHASE4.md` §7 gate 1, it sharpens it.** That gate
+//! measures 1.020x on a *heap* tree in-process, and `Tree::guard` takes a
+//! different path on a shared arena (`tf_tree/src/tree.rs:1984` — a
+//! fork-generation check a heap arena skips). The gate therefore prices a
+//! configuration no `shm` consumer uses. Fixing that is a decision record.
 //!
 //! # Method
 //!
@@ -382,6 +399,92 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         lookups_per_round: per_round,
         agreed,
     })
+}
+
+/// Time the same sweep against an arena **another process is serving**,
+/// attached read-only through the rendezvous.
+///
+/// # Why this arm exists
+///
+/// It is the one that decides whether the C ABI is implicated at all. The
+/// ladder up to the C++ figure has four rungs, and until this function existed
+/// two of them moved together:
+///
+/// ```text
+///   H  Rust native, heap,          in-process     201.2 ns
+///   S  Rust native, memfd RW,      in-process     203.4 ns
+///   A  Rust native, memfd RO,      cross-process  <- this function
+///   C  C ABI,       memfd RO,      cross-process  348.1 ns
+/// ```
+///
+/// If `A` lands near `C`, the cost is the cross-process read-only attach and
+/// the C ABI is innocent — which would make `PHASE4.md` §7 gate 1's 1.020× the
+/// honest figure for the ABI after all, and move the whole question to the
+/// attach path. If `A` lands near `S`, the ABI is doing something on attached
+/// trees that it does not do on heap ones.
+///
+/// Unpaired, unavoidably: the two comparands are in different processes, so
+/// there is no interleaving available. It is reported against `S` from the same
+/// invocation to keep the host constant, and the difference being measured
+/// (~145 ns) is far outside this host's ~4% run-to-run spread, which is what
+/// makes an unpaired reading usable here where it would not be for the ~2 ns
+/// backing effect.
+///
+/// # Errors
+///
+/// If no arena of that name is being served, the pair cannot be planned, or a
+/// timed round measures a non-duration.
+pub fn measure_attached(name: &str, rounds: usize, sweeps: usize, warmup: usize) -> Result<f64> {
+    if rounds == 0 || sweeps == 0 {
+        bail!("rounds and sweeps must both be non-zero; got {rounds} and {sweeps}");
+    }
+    // `CreatePolicy::Never`: this arm is only meaningful against an arena
+    // somebody else built. Creating one here would silently measure an
+    // in-process arena and report it as a cross-process number.
+    let tree = tf_tree::Open::new()
+        .name(name)
+        .map_err(|e| anyhow!("`{name}` is not a usable arena name: {e:?}"))?
+        .mode(tf_tree::AttachMode::ReadOnly)
+        .create(tf_tree::CreatePolicy::Never)
+        .open()
+        .map_err(|e| anyhow!("attaching read-only to a served arena named `{name}`: {e:?}"))?;
+
+    let plan = plan_for(&tree)?;
+    let guard = tree.guard();
+    let stamps: Vec<Stamp> = (0..STAMPS as i64)
+        .map(|i| Stamp::from_nanos(stamp_ns(i)))
+        .collect();
+
+    let sweep = || {
+        let mut acc = 0.0f64;
+        for _ in 0..sweeps {
+            for &s in &stamps {
+                if let Ok(v) = plan.at(&guard, std::hint::black_box(s)) {
+                    acc += v.t.x;
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
+
+    let per_sweep = stamps.len();
+    let per_call = sweeps.saturating_mul(per_sweep).max(1);
+    for _ in 0..warmup.div_ceil(per_call) {
+        std::hint::black_box(sweep());
+    }
+
+    let per_round = (sweeps * per_sweep) as f64;
+    let mut ns = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let t0 = std::time::Instant::now();
+        let _ = sweep();
+        let d = t0.elapsed().as_nanos() as f64 / per_round;
+        if d <= 0.0 {
+            bail!("a timed round measured {d} ns per lookup, which is not a duration");
+        }
+        ns.push(d);
+    }
+    Ok(median(&mut ns))
 }
 
 /// The fixture topology on a `MAP_SHARED` `memfd`.

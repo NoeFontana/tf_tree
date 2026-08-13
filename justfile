@@ -1564,7 +1564,25 @@ tf2-native-ratio *ARGS:
 # is measured, the boundary half is a subtraction against a figure from another
 # run, so the tool prints which row is which.
 abi-split:
-    cargo run --release -p tf_tree_bench --features shm --bin arena_backing
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -q --features shm -p tf_tree_bench --bin arena_backing --bin native_arena
+    # The cross-process rung needs an arena somebody else is serving, and
+    # `native_arena` is the owner that serves one. Short runtime dir by
+    # necessity: the attach socket path must fit `sun_path`'s 108 bytes.
+    rt=$(mktemp -d /tmp/tft-abi-split.XXXXXX); trap 'rm -rf "$rt"' EXIT
+    export TF_TREE_RUNTIME_DIR="$rt" TF_TREE_NAME=abi_split
+    coproc OWNER { ./target/release/native_arena --name abi_split --stream "$rt/fx.tfstream"; }
+    read -r -u "${OWNER[0]}" line || { echo "the arena owner exited before it was ready" >&2; exit 1; }
+    case "$line" in ready\ *) : ;; *) echo "unexpected owner greeting: $line" >&2; exit 1 ;; esac
+    status=0
+    ./target/release/arena_backing --attach abi_split || status=$?
+    # Guarded, and `|| true` on every step: bash unsets the fd array when a
+    # coproc has already exited, so a bare close fails with "ambiguous redirect"
+    # and — under `set -e` — takes the script down before `exit "$status"` runs.
+    if [ -n "${OWNER[1]:-}" ]; then exec {OWNER[1]}>&- || true; fi
+    wait "${OWNER_PID:-}" 2>/dev/null || true
+    exit "$status"
 
 # ---------------------------------------------------------------------------
 # Python bindings (docs/PHASE3.md). `tf_tree_py` is excluded from the workspace

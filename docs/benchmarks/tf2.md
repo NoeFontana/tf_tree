@@ -170,40 +170,58 @@ caller against `libtf_tree_c.so` does not, and pays 52% on the same host and the
 same fixture. Both numbers are real; they are answers to different questions, and
 §7 gate 1 does not currently say which one it is asking.
 
-#### The 52% is the boundary, not the mapping (measured)
+#### Where the 52% actually goes: the C ABI's per-call work
 
 That run moved two variables at once — the cross-`.so` call, and the fact that
 the C++ arm reads a shared `memfd` arena where the Rust arm reads a heap one —
-and separating them used to be owed here. `just abi-split`
-(`crates/tf_tree_bench/src/backing.rs`) is the middle arm that separates them:
-the same native Rust API and the same off-grid §11.1 sweep, on the same `memfd`
-backing the C++ side reads. Paired and interleaved, so it resolves on this host.
+and separating them was owed here. It is now done, and the answer is **neither**
+of them.
 
-| Arm | API | Arena | ns/lookup |
+**A first version of this section said "it is the linker, not the mapping" and
+that was wrong.** It reached the boundary by subtraction — measuring the mapping,
+finding it ~free, and attributing the whole residue to the `.so`. Nothing had
+measured the `.so`. Running the *same* `tests/cpp/bench.cpp` source against
+`libtf_tree_c.a` and against `libtf_tree_c.so` settles it: **245.4 ns against
+244.4 ns**, a difference of 0.4%. A subtraction is not a measurement, and this
+is the second time in this document that lesson has had to be relearned.
+
+The full ladder, every rung on the same §11.1 fixture and the same off-grid
+sweep, `imu_link ← map`:
+
+| Rung | API | Arena | ns/lookup |
 |---|---|---|---|
-| H | native Rust | heap | 201.2 |
-| S | native Rust | `MAP_SHARED` memfd | 203.4 |
-| C | C++ → `libtf_tree_c.so` | `MAP_SHARED` memfd | 306.7 |
+| H | native Rust | heap, in-process | 200.7 |
+| S | native Rust | `MAP_SHARED` memfd, in-process RW | 203.2 |
+| A | native Rust | memfd, **read-only, cross-process** | **202.5** |
+| C | **C ABI** (`tft_plan_at`) | same arena as A | **302.0** |
+| C′ | **C ABI** (`tft_plan_at_many`) | same arena as A | **261.0** |
 
-Over **nine** runs the backing quotient's median sat in **1.0066–1.0112×** — a
-remarkably tight spread for this host — while the band's upper edge ranged
-1.0099× to **1.0476×**. So of the ~**105.5 ns** the C++ arm costs over native
-Rust:
+Read down the Rust rungs: the shared mapping costs **≤ 9.6 ns** (paired over
+nine runs, median quotient 1.0066–1.0112×, point estimate ~1.8 ns), and
+attaching read-only *from another process* costs **−0.7 ns** — nothing. Link
+mode costs ~1 ns. Then the C ABI costs **+99.5 ns, or +49%**, on the identical
+arena.
 
-- **arena backing: ≤ 9.6 ns** — from the *worst* band observed, not the best.
-  The point estimate is around 1.8 ns and the sign does not resolve reliably:
-  two of nine runs put it at 1.4 ns and 2.2 ns, the other seven had bands
-  containing 1.0. That is the expected shape for a ~2 ns effect measured at
-  ~200 ns on a 4-core SMT host, and it does not matter, because the bound is
-  what the subtraction needs and the bound is two orders of magnitude under the
-  residue.
-- **library boundary: ≥ 96 ns** — the residue.
+**So it is the ABI, and specifically it is per-call work the Rust API lets you
+hoist.** `tft_plan_at` builds a `Guard` on every call (`lib.rs:684`), inside a
+`catch_unwind`, after validating the handle; the Rust arm acquires one guard and
+reuses it across all 10,240 lookups. `tft_plan_at_many` — which pays the guard
+once per batch rather than once per element — recovers **41 ns** of the 99.5,
+which is the direct evidence for that attribution rather than an inference from
+reading the source.
 
-**At least 91% of the gap is the boundary**, and on the typical run ~98%.
-`MAP_SHARED` costs a lookup
-approximately nothing, which is what the two earlier arguments claimed — but
-neither had established it, and it is worth saying why, because both were
-defective in the direction that flattered the conclusion:
+**This sharpens the contradiction with §7 gate 1 rather than resolving it.**
+`examples/abi_cost.rs` measures 1.020× and it is a fair comparison — but on a
+*heap* tree, in-process. `Tree::guard` takes a different path on a shared arena
+(`tree.rs:1984`: a fork-generation check that a heap arena skips), so the gate
+measures a configuration **no `shm` consumer uses**. The ABI is ~2% for an
+embedder with a private arena and ~49% for one attached to a shared one, and
+gate 1 only sees the first. That is a gate defect, not a benchmark disagreement,
+and it needs a decision record rather than a number.
+
+`MAP_SHARED` costing a lookup approximately nothing is what the two earlier
+arguments claimed — and they were right, but neither had established it, and
+both were defective in the direction that flattered the conclusion:
 
 - The **213 ns against 217 ns** row further down is two different harnesses in
   two different processes compared as medians. It is unpaired, and this host's
@@ -218,13 +236,23 @@ defective in the direction that flattered the conclusion:
 
 The conclusion survives both, but it now rests on a run that interpolates.
 
-The boundary row is a subtraction against a figure recorded on another day, not a
-paired measurement, and `just abi-split` prints it labelled that way. Closing
-*that* gap needs the C++ harness to grow a third arm; the attribution is safe
-enough at 95% that it has not been worth the format change. Until then the C++
-arm should still be read as "what a C++ embedder gets today", not as "what the
-engine costs" — but we now know the difference is the linker, and therefore that
-LTO or a static link is where it would be recovered.
+**What a C++ embedder should do about it today**, in order of leverage:
+
+1. **Use `tft_plan_at_many` on any hot path.** It is the only lever that exists
+   now, and it is worth 41 ns of the 99.5 at a batch of 256. Sort the stamps —
+   the header says so, and the cursor is what the batch path is for.
+2. **Do not switch link mode expecting a win.** Static and shared measure within
+   0.4%, so LTO across the `.so` is not where this is recovered. That sentence
+   used to say the opposite here.
+3. Note that a private (non-`shm`) arena does not pay this at all: §7 gate 1's
+   1.020× is the honest figure for that configuration.
+
+The structural fix is for the C tier to be able to hold a guard across calls, the
+way the Rust tier does — [`docs/API.md`](../API.md) §1 R2 says the hot tier never
+allocates, locks or converts, and a per-call guard on a shared arena is the tier
+failing its own rule. That is new public API, so it is a decision record and not
+a patch. Until it exists, the C++ arm should be read as "what a C++ embedder gets
+today", not as "what the engine costs".
 
 ### Where the win comes from
 

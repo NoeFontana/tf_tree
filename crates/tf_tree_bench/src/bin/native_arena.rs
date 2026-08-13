@@ -22,12 +22,17 @@
 //! "the" answer — they bracket it, and `docs/benchmarks/tf2.md` states the
 //! bracket.
 //!
-//! **That 52% is now split, and it is the linker rather than the mapping.**
-//! `just abi-split` ([`tf_tree_bench::backing`]) measures the middle arm — the
-//! same native Rust API on the same `MAP_SHARED` memfd this binary serves — and
-//! puts the backing at **<= 9.6 ns** of the ~105.5 ns gap, worst case over nine
-//! runs. At least 91% is the shared-library boundary. So the arena this binary
-//! hands the C++ side is not what makes it slower; the call into it is.
+//! **That 52% is now split, and it is neither the mapping nor the linker.**
+//! `just abi-split` ([`tf_tree_bench::backing`]) walks the whole ladder on the
+//! arena this binary serves: the shared mapping costs <= 9.6 ns, attaching to it
+//! read-only from another process costs -0.7 ns, and static-versus-shared
+//! linkage costs ~1 ns (`tests/cpp/bench.cpp` built both ways: 245.4 against
+//! 244.4 ns). What is left is **+99.5 ns, or +49%, in the C ABI itself** —
+//! `tft_plan_at` builds a `Guard` per call where the Rust arm hoists one, and
+//! `tft_plan_at_many` recovers 41 ns of it by paying that once per batch.
+//!
+//! So the arena this binary hands the C++ side is not what makes it slower, and
+//! neither is the link; the per-call shape of the ABI is.
 //!
 //! **Both arms must still be in one process**, because the pairing is what makes
 //! the number resolvable at all: interleaving within a round is why the ratio
