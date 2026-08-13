@@ -289,6 +289,29 @@ miri:
 evidence-audit:
     ./scripts/evidence-audit.sh
 
+# **PHASE5 §12 gate criterion 4: 16 workers sharing one `.tft`, total Pss within
+# 1.2x of one worker — the project's central memory claim, which nothing had
+# ever run.**
+#
+# `just bench-report`'s `tft_16_workers_rss` row has always been UNAVAILABLE for
+# two reasons, and both dissolved: the report binary is built without `shm` so it
+# has no `Tree::open_frozen` to call (still true — hence a separate binary), and
+# the core budget refused sixteen consumers on four cores (retired by
+# `report.rs`'s `Sensitivity::Memory` axis — Pss is not a timing measurement, and
+# sixteen workers mapping one file share exactly the pages they would share on
+# sixteen cores).
+#
+# **Needs no quiet host and no core parity**, unlike everything else in this
+# file's benchmark section. It does need ~340 MiB of disk and ~1 GiB of RAM.
+#
+# The `.tft` has to be large or the gate is arithmetic about process overhead
+# rather than about sharing: with p MiB private per worker, the criterion needs
+# S >= 74p. The default shape (64 robots x 40 s, 338 MiB) is chosen for that,
+# and it is why §12 gate 2 speaks of a "233 MB index".
+gate4:
+    cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
+    ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
+
 # **PHASE4 §7 gate criterion 1: `tft_plan_at` within 5 % of native Rust.**
 #
 # This recipe exists because the gate did not have one. `examples/abi_cost.rs`

@@ -174,6 +174,16 @@ name = "arena_backing"
 path = "src/bin/arena_backing.rs"
 required-features = ["shm"]
 
+# **PHASE5 §12 gate 4**, which nothing had ever run: 16 workers sharing one
+# `.tft`, total Pss within 1.2x of one worker. Needs `shm` because the frozen
+# backend (`Tree::open_frozen`, `Tree::freeze_to`) is `#[cfg]`-ed on it — which
+# is also why `just bench-report` has always printed this row UNAVAILABLE.
+# Re-execs itself as the worker, so it is one binary rather than two.
+[[bin]]
+name = "frozen_workers"
+path = "src/bin/frozen_workers.rs"
+required-features = ["shm"]
+
 # Reader child for the multi-process test and benchmark. It attaches to a shared
 # arena over an inherited fd, so it must be a separate executable.
 [[bin]]
