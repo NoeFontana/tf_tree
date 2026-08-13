@@ -1,0 +1,190 @@
+# 0022: the C ABI builds a guard per call, and §7 gate 1 has been failing unwatched
+
+**Status:** draft
+**Owner:** @NoeFontana
+**Implementation:** (filled in as work lands)
+
+## Context
+
+`docs/PHASE4.md` §7 gate 1 records `tft_plan_at` at **1.020× native Rust** and
+calls it a PASS. `docs/benchmarks/tf2.md` records a C++ caller at **306.7 ns**
+where native Rust measures **201.5 ns** on the same host and fixture — **+52%**.
+Both numbers are correctly measured. They disagree because they are measured on
+**different arena backings**, and the gate is measuring the one no shared-memory
+consumer uses.
+
+`just abi-split` (`crates/tf_tree_bench/src/backing.rs`) walks the whole ladder
+on one fixture — the §11.1 topology, `imu_link ← map`, off-grid stamps so
+`I::eval` actually runs:
+
+| Rung | API | Arena | ns/lookup |
+|---|---|---|---|
+| H | native Rust | heap, in-process | 200.7 |
+| S | native Rust | `MAP_SHARED` memfd, in-process RW | 203.2 |
+| A | native Rust | memfd, read-only, **cross-process** | 202.5 |
+| C | **`tft_plan_at`** | same arena as A | **302.0** |
+| C′ | **`tft_plan_at_many`** | same arena as A | **261.0** |
+
+Every candidate except one is eliminated by measurement, not by argument:
+
+- **the mapping**: ≤ 9.6 ns, paired over nine runs (median quotient
+  1.0066–1.0112×, point estimate ~1.8 ns);
+- **the cross-process read-only attach**: −0.7 ns;
+- **the link mode**: ~1 ns — `crates/tf_tree_c/tests/cpp/bench.cpp`, the same
+  source built against `libtf_tree_c.a` and `libtf_tree_c.so`, measures **245.4
+  against 244.4 ns**.
+
+What remains is **+99.5 ns, or +49%, inside the C ABI**, on an arena where native
+Rust costs 202.5 ns.
+
+### The mechanism, measured
+
+`tft_plan_at` builds a `Guard` on every call:
+
+```rust
+// crates/tf_tree_c/src/lib.rs:684
+let g = h.share.tree.guard();
+```
+
+and the Rust API does not have to — `ratio.rs`, `backing.rs` and every
+in-process consumer acquire one guard and reuse it for a whole sweep. The C
+signature has nowhere to keep one between calls, so the ABI has no choice.
+
+`backing::guard_cost_both` prices that directly, in **safe Rust with no C ABI in
+the loop at all**: the same `Plan::at` sweep run twice, once with a hoisted
+guard and once acquiring one inside the loop.
+
+| build | heap arena | memfd arena |
+|---|---|---|
+| `counters` on (default) | **+35.4 ns** | **+27.0 ns** |
+| `counters` off | +16.8 ns | +18.9 ns |
+
+Two things follow, and the second one kills this record's first draft.
+
+1. **A per-call guard costs ~17 ns, and Phase 5's diagnostic counters roughly
+   double it.** `de658da` put a counter flush in `Guard`'s destructor. It was
+   measured for what counters cost a *publish*; nothing re-measured a hot path
+   that builds a guard per *lookup*.
+2. **The backing is irrelevant to it.** Heap and memfd are within noise of each
+   other in both builds.
+
+### §7 gate criterion 1 is failing, and that is the actual headline
+
+While measuring the above, `examples/abi_cost.rs` was run — and it prints
+**FAIL**. `tft_plan_at` measures **1.34–1.46×** against its 1.05 gate (four
+pinned runs: 1.335, 1.414, 1.460, 1.461; ~60 ns absolute, stable).
+
+`docs/PHASE4.md` recorded **1.020×, PASS**. Both readings are honest; the
+recorded one is simply years-stale, because **`abi_cost.rs` was executed by no
+recipe and no workflow** — it appeared in exactly one `justfile` comment. `just
+abi-cost` now runs it, and `docs/PHASE4.md` §7 records the failing state.
+
+So the original framing of this record — "the gate measures a heap tree, which
+is the wrong configuration" — was itself wrong in an interesting way. The gate
+measures the right thing. It just was not running, and on a heap tree the ABI
+is 1.46×, not 1.02×. There is no configuration in which the current number is
+2%.
+## What this record already got wrong
+
+Recorded because the failure is instructive and cost two commits.
+
+The first attempt measured the mapping (rungs H and S), found it ~free,
+and **attributed the entire 105 ns residue to the shared-library boundary** —
+publishing "at least 91% of the gap is the boundary" in `tf2.md`, in a commit
+message, and in three source files. Nothing had measured the boundary. It was a
+subtraction dressed as a finding, and it was wrong by roughly a factor of 100.
+
+The check that caught it was cheap and should have come first: compile one
+existing benchmark two ways and compare. It took four minutes.
+
+This is the same failure mode `tf2.md` already documents twice — the withdrawn
+4.7× CPU reading and the stale `.tft` reasons — and the same one that the
+`heap_vs_shared` and 213-vs-217 priors fell into. **A residue is a hypothesis.**
+
+## Decision
+
+*(draft — nothing below is authorized)*
+
+Give the C tier a way to hold a guard across calls, so that the hot path can
+express what the Rust tier expresses. `docs/API.md` §1 **R2** — *the hot tier
+never allocates, locks or converts* — is the rule the current shape fails: a
+per-call guard acquisition on a shared arena is per-call synchronization work in
+the tier that promises none.
+
+Sketch, to be settled by the questions below:
+
+```c
+tft_status tft_guard_acquire(const tft_tree *tree, tft_guard **out);
+tft_status tft_plan_at_guarded(const tft_plan *plan, const tft_guard *g,
+                               int64_t stamp, tft_layout layout, void *out);
+void       tft_guard_release(tft_guard *g);
+```
+
+Separately, and independently of whether the above is built: **§7 gate 1 must
+state which backing it measures**, and should gain a shared-arena row. A gate
+that passes at 1.020× while every `shm` consumer pays 1.49× is not measuring the
+product.
+
+## Open questions
+
+**Question 4 of the first draft is answered and closed.** It asked whether the
+`is_shared()` fork check in `Tree::guard` could move per-tree, on the theory
+that it was what made a shared arena expensive. It is not: the branch measures
+**+2.1 ns** with counters off and **−8.4 ns** with them on — noise in both
+directions. Measuring it cost twenty minutes and saved designing against a
+premise that was false. It is recorded rather than deleted for that reason.
+
+1. **Should `Guard`'s counter flush be conditional on the guard having done
+   enough work to be worth counting?** This is the largest measured, uncontested
+   win on the board: ~18 ns of the ~35 ns per-call guard, recoverable without
+   any new API surface, in a destructor that already early-returns on two other
+   conditions (`n == 0`, `!is_writable()`). It costs the diagnostic counters
+   some fidelity on single-lookup guards, and `docs/PHASE5.md` §5 is what says
+   whether that is acceptable. **This is the first thing to settle**, because it
+   helps every consumer including Rust and needs no decision about the C tier at
+   all.
+2. **Is a guard handle sound to expose?** `Guard<'_>` borrows the tree, and
+   `0017` is explicit that lifetime extension in the bindings is what is being
+   removed, not added. A `tft_guard` outliving its `tft_tree` is a use-after-free
+   a C caller writes trivially. Does this need `OwnedWriter`'s treatment, a
+   generation check, or refusal?
+3. **How long may a guard be held?** A guard pins a topology generation. A C
+   consumer holding one across a `select()` loop would silently read a stale
+   topology after a declaration — which per-call acquisition currently makes
+   impossible. Is there a bounded-lifetime rule, and can it be enforced rather
+   than documented?
+4. **Is `tft_plan_at_many` sufficient instead?** It needs no new type, raises no
+   lifetime question, and already exists; it recovers 41 ns at a batch of 256.
+   With question 1 done, the residual per-call guard is ~17 ns. Is that worth a
+   new handle in the ABI, or is the honest answer "batch your lookups" plus a
+   documentation change?
+5. **What is the rest of the ~60 ns?** The guard explains ~35 of it. The
+   remainder is handle validation, `catch_unwind`, and the un-inlinable call —
+   `abi_cost.rs` already prices those three for the *publish* path (+17.0,
+   +1.3, +0.7 ns) and finds validation dominant. The equivalent breakdown for
+   the lookup path does not exist and should, before anything is designed
+   around the remainder.
+
+## Implementation plan
+
+None. This record is `draft`; `docs/decisions/README.md` forbids starting.
+
+When it moves to `ready`, the order is question 1 (the counter flush — largest
+measured win, no API surface, helps Rust consumers too), then question 5 (price
+the remaining ~25 ns before designing around it), and only then questions 2–4,
+which are the ones that add public API.
+
+**Nothing in this record authorizes a `tft_guard` handle.** Two attributions in
+this area have already been wrong — the shared-library boundary, and the fork
+check — and both were wrong because a residue was treated as a finding. The
+handle is the expensive answer; it should be reached last and only against a
+measured remainder.
+
+## Related
+
+- `docs/PHASE4.md` §7, *§7 gate criterion 1 is failing* — the failing gate and
+  why nothing caught it.
+- `docs/benchmarks/tf2.md`, *Where the 52% actually goes* — the full ladder, and
+  the two eliminations (backing, link mode) that led here.
+- `just abi-cost` — the gate, which now has a recipe.
+- `just abi-split` — the ladder and the guard-cost rows.

@@ -94,6 +94,33 @@ fn main() -> Result<()> {
         100.0 * boundary_min / total
     );
 
+    // What a per-call guard costs on each backing, with no C ABI anywhere in
+    // the loop. This is what `tft_plan_at` is forced into by its signature, and
+    // it is also what refuted `0022`'s first question 4: the heap and shared
+    // rows are within noise of each other, so the `is_shared()` fork check is
+    // not the differentiator it was assumed to be.
+    let (heap_g, shm_g) = tf_tree_bench::backing::guard_cost_both(run.rounds, 40, 60_000)?;
+    println!();
+    println!("Tree::guard() per lookup vs hoisted (safe Rust, no C ABI):");
+    println!(
+        "  heap arena     hoisted {:6.1} ns   per-call {:6.1} ns   guard costs {:+6.1} ns",
+        heap_g.hoisted_ns,
+        heap_g.per_call_ns,
+        heap_g.guard_ns()
+    );
+    println!(
+        "  memfd arena    hoisted {:6.1} ns   per-call {:6.1} ns   guard costs {:+6.1} ns",
+        shm_g.hoisted_ns,
+        shm_g.per_call_ns,
+        shm_g.guard_ns()
+    );
+    println!(
+        "  the is_shared() fork check costs {:+.1} ns per lookup — noise, so it is NOT what\n  \
+         makes a shared arena expensive. Build with --no-default-features to drop `counters`:\n  \
+         that halves the guard (+16.8 / +18.9 ns), and is 0022's question 1.",
+        shm_g.guard_ns() - heap_g.guard_ns()
+    );
+
     if let Some(name) = attach {
         // Same rounds/sweeps as the paired run, so the two `Rust native` rungs
         // are the same loop and differ only in which process built the arena.

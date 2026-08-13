@@ -210,14 +210,23 @@ once per batch rather than once per element — recovers **41 ns** of the 99.5,
 which is the direct evidence for that attribution rather than an inference from
 reading the source.
 
-**This sharpens the contradiction with §7 gate 1 rather than resolving it.**
-`examples/abi_cost.rs` measures 1.020× and it is a fair comparison — but on a
-*heap* tree, in-process. `Tree::guard` takes a different path on a shared arena
-(`tree.rs:1984`: a fork-generation check that a heap arena skips), so the gate
-measures a configuration **no `shm` consumer uses**. The ABI is ~2% for an
-embedder with a private arena and ~49% for one attached to a shared one, and
-gate 1 only sees the first. That is a gate defect, not a benchmark disagreement,
-and it needs a decision record rather than a number.
+**And §7 gate 1 turns out to be failing, which is the larger finding.** The
+tempting explanation was that the guard is expensive only on a shared arena —
+`Tree::guard` adds a fork check when `is_shared()` (`tree.rs:1984`) — making the
+gate's 1.020× honest for heap trees and blind to shared ones. Measured, that
+branch is worth **+2.1 ns** (counters off) and **−8.4 ns** (counters on): noise.
+The per-call guard costs ~17 ns on *both* backings, and Phase 5's diagnostic
+counters roughly double it (+35.4 heap / +27.0 memfd).
+
+Running `examples/abi_cost.rs` — which is what gate 1 *is* — settles it: on a
+plain heap tree it measures **1.34–1.46× against a 1.05 gate and prints FAIL**.
+The 1.020× in `docs/PHASE4.md` was real when written and has been stale since,
+because **the example is executed by no recipe and no workflow**; it appeared in
+one `justfile` comment. `just abi-cost` now runs it. There is no configuration
+in which the ABI currently costs 2% on this path.
+
+`docs/PHASE4.md` §7 records the failing gate; `docs/decisions/0022` carries the
+open question, whose first item is the counter flush rather than any new API.
 
 `MAP_SHARED` costing a lookup approximately nothing is what the two earlier
 arguments claimed — and they were right, but neither had established it, and

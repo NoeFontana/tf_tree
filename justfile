@@ -266,6 +266,28 @@ miri:
 # ASan needs `-Zbuild-std` so the standard library is instrumented too; without
 # it a use-after-free inside `Box::from_raw` is invisible.
 #
+# **PHASE4 §7 gate criterion 1: `tft_plan_at` within 5 % of native Rust.**
+#
+# This recipe exists because the gate did not have one. `examples/abi_cost.rs`
+# was named in a comment and executed by nothing — no recipe, no workflow — so
+# `docs/PHASE4.md` carried "1.020×, PASS" as a frozen historical reading while
+# the example itself had started printing FAIL. It measures 1.34–1.46× today.
+# A gate nothing runs is not a gate, which is the lesson this file already
+# learned for `just lint` and `just test` (see the header on 1:1 CI mirroring)
+# and had not yet applied to §7.
+#
+# **Pinned**, for `cpp-bench`'s reason: an unpinned run migrates cores and swings
+# by more than the gate allows.
+#
+# Exit status is deliberately NOT the gate today, because the gate is failing and
+# a red recipe that everyone learns to skip is worse than a loud one. The example
+# prints its own PASS/FAIL per row; `docs/PHASE4.md` §7 records the state and
+# `docs/decisions/0022` carries the open question. **Wire the exit status in the
+# commit that fixes the regression**, not before.
+abi-cost:
+    cargo build --release -q -p tf_tree_c --features test-hooks --example abi_cost
+    taskset -c 2 ./target/release/examples/abi_cost
+
 # The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
 c-abi-check:
     MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
