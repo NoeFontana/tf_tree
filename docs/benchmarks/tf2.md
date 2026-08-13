@@ -466,6 +466,47 @@ it as using almost nothing.
 stating plainly, because the arena design invites the assumption that it would
 win here, and it does not.
 
+#### Measured again with no binding on either side, and one row moved
+
+The table above puts tf2 behind `tf_tree_tf2_sys`, so the process being weighed
+is a Rust binary linking tf2. `just tf2-native-footprint`
+(`docker/tf2/native_footprint.cpp`) removes that: a C++ program linking only
+`libtf2`, against `footprint`'s unchanged `mem-tf_tree` mode, two processes, the
+same `.tfstream` and the same two instruments.
+
+| | tf_tree (Rust) | tf2 (native C++) | ratio |
+|---|---|---|---|
+| `heap_bytes` | 1 411 136 | 1 419 792 | 1.006 |
+| bytes per stored sample | 111.2 | 112.7 | 1.013 |
+| **`pss_kib` delta** | **1 752** | **1 324** | **0.756** |
+| bytes per *declared slot* | **73.5** | n/a | — |
+
+**The binding was not inflating tf2's memory.** Native C++ measures 112.7 B per
+stored sample against the binding's 112.8 — so the tie reported above was
+honest, and this is a confirmation rather than a correction.
+
+**But the two instruments disagree in direction, and that is the finding.**
+`heap_bytes` is a tie; **Pss — the number an operator reads in `top` — is not:
+tf_tree holds 1 752 KiB against tf2's 1 324, a 1.32× loss.** `mallinfo2` cannot
+see this, because an allocator can hold address space it has not faulted:
+tf_tree's arena is *one* allocation that is ~100% resident, while tf2's many
+small ones are not all faulted in. That residency is
+[`0021`](../decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)
+— `alloc_zeroed` above 16-byte alignment falls back to `posix_memalign` plus an
+explicit zero-fill that touches every page — and this row is the one it has to
+move.
+
+`heap_bytes` is exact and bit-identical across runs; `pss_kib` is a
+page-quantised whole-process delta, stable to ~3% (1704–1752 over five runs).
+
+**And the achievable figure is in the last row.** tf_tree holds 111.2 B per
+stored sample but its *declared-slot* cost is 73.5 B: this fixture reserves
+19 072 slots for 12 600 samples, a factor of 1.51. Right-sized, tf_tree would
+hold **73.5 B/sample against tf2's 112.7 — 1.53×** rather than 1.01×. That is
+the same 1.56× density this document already claimed two paragraphs down; what
+is new is that it is now measured against a native tf2 in one place, with both
+figures printed side by side.
+
 The two per-sample figures differ because tf_tree's rings are sized by *declared
 capacity*, not by what is stored: `Capacity::history` rounds each ring up to a
 power of two, so a 1 kHz edge over 10 s asks for 10,000 slots and reserves

@@ -1613,6 +1613,30 @@ tf2-native-control:
 # `docs/benchmarks/tf2.md` states the bracket, the unpaired point estimate, and
 # what is still owed to close it. Not gated: it is not wired into
 # `bench_report`, so no baseline carries it yet.
+# **The memory comparison with no binding on either side.**
+#
+# Every other memory row in this repository puts tf2 behind the Rust binding
+# `tf_tree_tf2_sys`, so the process being weighed carries a Rust runtime, a Rust
+# allocator and the shim on top of tf2. The one exception, `just dds-bench`, is
+# dominated by rclcpp nodes at ~14 MiB each rather than by either engine. And
+# `docker/tf2/native_ratio.cpp` — built precisely to remove cross-language bias
+# from the *timing* comparison — measures no memory at all.
+#
+# This runs two processes: a C++ program linking only `libtf2`, and `footprint`'s
+# unchanged `mem-tf_tree` mode. Two instruments each — `mallinfo2` (which
+# compares the engines on identical terms, since C++ `operator new` bottoms out
+# in `malloc`) and Pss (which is what an operator sees in `top`, and which
+# `mallinfo2` cannot see).
+#
+# **Needs no idle machine.** Neither instrument is a clock.
+#
+# It prints what tf_tree costs as measured *and* what it would cost right-sized,
+# because those differ by 1.5x and the gap is declared capacity nobody published
+# into. It refuses to print a quotient if the two arms stored different sample
+# counts.
+tf2-native-footprint:
+    ./docker/tf2/run.sh 'bash docker/tf2/native_footprint.sh'
+
 tf2-native-ratio *ARGS:
     ./docker/tf2/run.sh 'bash docker/tf2/native_ratio.sh {{ARGS}}'
 
