@@ -289,6 +289,25 @@ miri:
 evidence-audit:
     ./scripts/evidence-audit.sh
 
+# **PHASE2 §12's attach rows**, which had never been measured.
+#
+# §12's table asks for "attach time, cold and warm" (p50) and "first access after
+# attach, per-edge population on vs off" (p99.9, both). `benches/` had neither,
+# and `report.rs`'s `attach_latency` — a required `where_we_are_worse` entry —
+# carried no number at all. An honesty section that cannot regress is not doing
+# the job.
+#
+# **The `population off` arm is deliberately absent**: `populate_hot()` is
+# unconditional inside `attach_shared_inner`, and manufacturing an `off` arm out
+# of some other code path would be worse than saying so. It arrives with `0022`'s
+# B2-prime, which is the change that gives the attach path a policy at all.
+#
+# Pinned, and needs no idle host beyond that: ~100 us against a ~4% run-to-run
+# spread is not a measurement this machine struggles with.
+attach-bench:
+    cargo build --release -q --features shm -p tf_tree_bench --bin attach_bench
+    taskset -c 2 ./target/release/attach_bench
+
 # **PHASE5 §12 gate criterion 4: 16 workers sharing one `.tft`, total Pss within
 # 1.2x of one worker — the project's central memory claim, which nothing had
 # ever run.**

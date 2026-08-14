@@ -184,6 +184,14 @@ name = "frozen_workers"
 path = "src/bin/frozen_workers.rs"
 required-features = ["shm"]
 
+# **PHASE2 §12's attach rows**, which had never been measured — and the number
+# `report.rs`'s `attach_latency` entry has been missing since it was written.
+# Needs `shm` because attaching *is* the thing under test.
+[[bin]]
+name = "attach_bench"
+path = "src/bin/attach_bench.rs"
+required-features = ["shm"]
+
 # Reader child for the multi-process test and benchmark. It attaches to a shared
 # arena over an inherited fd, so it must be a separate executable.
 [[bin]]
