@@ -130,7 +130,7 @@ fn catalogue_sweep(run: &mut Run) {
         "compile",
         "build ms",
         "arena MiB",
-        "RSS/arena"
+        "Pss/arena"
     );
     println!(
         "{:<14} {:>7} {:>7} {:>6} | {:>29} | {:>9} |",
@@ -144,6 +144,7 @@ fn catalogue_sweep(run: &mut Run) {
             continue;
         };
 
+        // Pss, despite the local names — see the `rss_over_arena` note below.
         let rss_before = ProcStats::read().pss_kib;
         let t0 = Instant::now();
         let built = match w.build(InterpPolicy::LerpSlerp, Backing::Heap) {
@@ -210,6 +211,16 @@ fn catalogue_sweep(run: &mut Run) {
                     Metric::new("arena_bytes", built.shape.arena_bytes as f64, "B")
                         .lower_is_better(0.01),
                 )
+                // **The id says `rss` and the instrument is Pss.** It is not a
+                // typo and it is not fixed here: `Metric` ids are the join keys
+                // `bench_ab` and the baseline differ compare on
+                // (`runstore::Run::key`, and duplicates are refused), so
+                // renaming one silently un-compares every run file written
+                // before the rename and reads as a *vanished row* to the
+                // baseline gate — a hard failure by design. The column header
+                // and the docs say Pss; the id is frozen. Pss is the right
+                // instrument either way: it divides shared pages by their
+                // mapper count, which summed RSS does not.
                 .metric(Metric::new("rss_over_arena", rss_ratio, "x"))
                 .metric(Metric::new("dyn_steps", steps as f64, "steps")),
         );
