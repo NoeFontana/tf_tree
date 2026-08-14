@@ -2101,7 +2101,20 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  the lock file, receive the segment fd over a unix socket, map it, and \
                  validate the header. A tf2 consumer constructs a buffer in-process and \
                  is ready immediately. The cost is paid once per process, but it is real, \
-                 and it is a cost tf2 does not have."
+                 and it is a cost tf2 does not have. **Measured, at last: ~97.5 us p50 on \
+                 the §11.1 fixture** (`just attach-bench`, 201 attach/lookup cycles, \
+                 ReadOnly; cold 114-153 us, p99.9 ~157-181 us). This entry carried no \
+                 number at all until then, which made it an honesty section that could \
+                 not regress. Almost all of it is `populate_hot`: the arena is 1 401 472 B \
+                 = 342 pages and 97.5 us / 342 is ~285 ns per page, which is what \
+                 `MADV_POPULATE_WRITE` costs. That is `docs/PHASE2.md` §7.1 buying its \
+                 guarantee — and the guarantee holds, because the **first** lookup after \
+                 attach is 130 ns p50, indistinguishable from a steady-state one. The \
+                 cost is real and it is in the right place: at attach, not in the loop. \
+                 The metric list below stays empty for the same build reason the .tft \
+                 rows are unavailable — attaching needs `shm`, which this binary is not \
+                 built with — so the figures above are stated with their recipe rather \
+                 than gated here."
                 .to_owned(),
             metrics: Vec::new(),
         },

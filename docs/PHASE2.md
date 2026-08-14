@@ -889,14 +889,14 @@ The Phase 1 24-frame robot tree, plus: 1 writer process (4 dynamic edges as in P
 | Benchmark | Report |
 |---|---|
 | depth-3 cross-process lookup, warm | p50, p99, p99.9 vs the Phase 1 in-process baseline |
-| first access after attach, per-edge population on vs off | p99.9, both |
+| first access after attach, per-edge population on vs off | p99.9, both | **Half done — `just attach-bench`.** With population **on** (the shipped path): first lookup after attach **130 ns p50, ~1.3 us p99.9**, indistinguishable from a steady-state lookup — which is the guarantee §7.1 exists to buy, now demonstrated rather than asserted. The **off** arm is absent and deliberately so: `populate_hot()` is unconditional inside `attach_shared_inner`, and manufacturing an "off" arm out of a different code path would measure something else. It arrives with `docs/decisions/0022`'s B2-prime, the change that gives the attach path a policy. |
 | THP `madvise` vs `never` | p50, p99.9, both |
 | aggregate read throughput, 1→16 consumer processes | scaling curve |
 | **CPU per consumer at 1 kHz × 20 edges, vs ROS 2 `/tf`** | %CPU per consumer, both |
 | **total RSS across 16 consumers, vs ROS 2 `/tf`** | MB, both |
 | publish → visible-to-consumer latency, vs ROS 2 `/tf` | p50, p99.9, both |
 | `SIGKILL` writer → claim reapable → re-claimed | p50, p99 |
-| attach time, cold and warm | p50 |
+| attach time, cold and warm | p50 | **Done — `just attach-bench`.** **97.5 us p50** on the §11.1 fixture, cold 114–153 us, p99.9 157–181 us, over 201 cycles. Almost all of it is population: the arena is 342 pages and 97.5 us / 342 is ~285 ns/page, which is what `MADV_POPULATE_WRITE` costs. "Cold" is the first cycle — fresh VMA and page tables — and **not** a cold page cache, which needs root to arrange. |
 | `open()` when the arena exists vs when creating | p50, both |
 | owner kill → new owner serving | p50, p99 |
 | lookup latency across an ownership migration | p99.9 during vs steady-state |
