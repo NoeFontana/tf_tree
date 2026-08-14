@@ -619,6 +619,66 @@ impl GuardCost {
     }
 }
 
+/// What each backing actually holds *resident* for the same declared arena.
+///
+/// # Why this exists
+///
+/// `0021` made the heap arena demand-faulted, so declared-but-unpublished slots
+/// now cost it no resident memory. The shared path never had that defect —
+/// a `memfd` is demand-faulted by construction — but it has a different one:
+/// `MappedArena::populate_hot` deliberately pre-faults **every declared slot**
+/// (`mapped.rs:394-396`, `stamp_slots * 8` and `pose_slots * 64`) so that an
+/// attaching reader takes no page fault inside a lookup.
+///
+/// That is a real latency guarantee and `docs/PHASE2.md` §7.1 is NORMATIVE about
+/// it. It is also, on an over-declared arena, the entire remaining resident
+/// gap — and nothing had measured how large. `scale_sweep`, which reports
+/// `rss_over_arena`, builds `Backing::Heap` only.
+///
+/// The §11.1 fixture declares 19 072 slots and publishes 12 600, a factor of
+/// 1.51, so it is already the §9.3 case ("a robot that publishes far less than
+/// it declared") at modest scale.
+///
+/// Returns `(heap_kib, shm_kib, arena_bytes)`.
+///
+/// # Method, and its one real limitation
+///
+/// Pss is a **whole-process level**, not a counter, so each figure is a delta
+/// across building one arena and the two are taken in sequence in one process.
+/// Each tree is dropped before the next is built. A delta still carries the
+/// tree's own non-arena allocations — the same caveat `report.rs`'s
+/// `measure_idle_arena_resident` states — so the order of magnitude is the
+/// finding and the third digit is not.
+///
+/// # Errors
+///
+/// If either fixture cannot be built or populated.
+pub fn residency_both() -> Result<(u64, u64, usize)> {
+    let heap_kib = {
+        let before = crate::mp::self_pss_kib();
+        let tree = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
+        let (w, p) = crate::fixture::spin_up(&tree)?;
+        let after = crate::mp::self_pss_kib();
+        // Dropped *after* the reading, or the pages would be gone before it.
+        let bytes = tree.arena_size_bytes();
+        drop(w);
+        drop(p);
+        drop(tree);
+        (after.saturating_sub(before), bytes)
+    };
+    let shm_kib = {
+        let before = crate::mp::self_pss_kib();
+        let tree = build_shared_fixture()?;
+        let (w, p) = crate::fixture::spin_up(&tree)?;
+        let after = crate::mp::self_pss_kib();
+        drop(w);
+        drop(p);
+        drop(tree);
+        after.saturating_sub(before)
+    };
+    Ok((heap_kib.0, shm_kib, heap_kib.1))
+}
+
 /// [`measure_guard_cost`] on a heap arena and on a shared one, in that order.
 ///
 /// **This is the measurement that closed `0022`'s original question 4.** That
