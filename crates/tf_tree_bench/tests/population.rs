@@ -59,11 +59,39 @@ fn charged(build: impl FnOnce() -> Tree) -> (usize, usize) {
 /// Measured before this landed, with `MAP_POPULATE`: **66.3 MiB charged against
 /// 66.1 MiB declared, 100%**. After: **3.8 MiB, 6%**.
 ///
-/// The residue is not slack in the accounting — it is `MADV_HUGEPAGE` (§7.2).
-/// Populating any part of a 2 MiB-aligned range under THP faults in the whole
-/// huge page, so a handful of small live regions round up to a couple of huge
-/// pages. That is the trade §7.2 makes deliberately, and it is why the bound
-/// below is a fraction of the arena rather than a multiple of the live bytes.
+/// **The residue is not `MADV_HUGEPAGE`, and this comment used to say it was.**
+/// It claimed that populating any part of a 2 MiB-aligned range under THP faults
+/// in the whole huge page, so small live regions round up. Three measurements
+/// refute it:
+///
+/// * **Transparent huge pages are not granted here at all.** The arena is a
+///   `memfd` mapped `MAP_SHARED`, which is *shmem* and is governed by
+///   `transparent_hugepage/shmem_enabled` — `[never]` on this host — not by
+///   `transparent_hugepage/enabled`. `/proc/vmstat` agrees: `thp_file_alloc 0`
+///   **and** `thp_file_fallback 0`, so nothing has ever asked and been refused
+///   either. `docs/PHASE5.md` §2.3 records the same finding independently, and
+///   `TFT016` was fixed to read the right sysfs file because of it.
+/// * **The residue scales linearly with headroom**, which a huge-page round-up
+///   cannot do. Measured at 50k/100k/200k/400k units of headroom: 1.05, 1.95,
+///   3.75, 7.34 MB — doubling the headroom doubles the residue, ~19 B per unit.
+///   A 2 MiB round-up would be a step function, not a line.
+/// * **About half of it appears on the *heap* path too**, where `populate_hot`
+///   does not exist. Same headroom, `build()` against `build_shared()`: 2.04 MB
+///   against 3.76 MB at 200k. So at least that half is not population of any
+///   kind — it is the builder's own `O(max_frames + max_edges)` temporaries,
+///   freed before the second reading but still resident in the process heap,
+///   which `charged()` cannot separate because it reads whole-process RSS.
+///
+/// **The remaining ~10 B/unit that is specific to the shared path is not
+/// attributed here.** It is small, it is bounded by the assertion below, and
+/// guessing at it is what produced the sentence this replaced. Re-run the
+/// experiment by varying `edge_headroom`/`frame_headroom` and comparing `build`
+/// with `build_shared`.
+///
+/// None of this weakens the test: the bound is a fraction of the arena because
+/// the residue is dominated by costs that scale with *declared* size, whatever
+/// their origin, and the property under test is that the headroom *pages* are
+/// not faulted.
 ///
 /// Mutant: restore `MapFlags::POPULATE` in `unsafe_map` ⇒ 100% charged.
 #[test]

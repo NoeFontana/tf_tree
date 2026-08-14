@@ -94,6 +94,29 @@ fn main() -> Result<()> {
         100.0 * boundary_min / total
     );
 
+    // **Residency, since `0021`.** The heap arena is now demand-faulted, so
+    // declared-but-unpublished slots cost it nothing; the shared one pre-faults
+    // every declared slot in `populate_hot`. This prices that difference, which
+    // is the whole remaining resident gap on an over-declared arena and which
+    // nothing measured before — `scale_sweep`'s `rss_over_arena` is heap-only.
+    let (heap_kib, shm_kib, arena_bytes) = tf_tree_bench::backing::residency_both()?;
+    let declared_kib = arena_bytes as f64 / 1024.0;
+    println!();
+    println!("resident Pss for the same declared arena ({declared_kib:.0} KiB reserved):");
+    println!(
+        "  heap arena     {heap_kib:6} KiB   {:.0}% of what it declares",
+        heap_kib as f64 * 1024.0 / arena_bytes as f64 * 100.0
+    );
+    println!(
+        "  memfd arena    {shm_kib:6} KiB   {:.0}% — populate_hot pre-faults every declared slot",
+        shm_kib as f64 * 1024.0 / arena_bytes as f64 * 100.0
+    );
+    println!(
+        "  the shared path holds {:+} KiB more for the same data. That is PHASE2 §7.1's\n  \
+         latency guarantee priced: no page fault inside a lookup, paid for in residency.",
+        shm_kib as i64 - heap_kib as i64
+    );
+
     // What a per-call guard costs on each backing, with no C ABI anywhere in
     // the loop. This is what `tft_plan_at` is forced into by its signature, and
     // it is also what refuted `0022`'s first question 4: the heap and shared
