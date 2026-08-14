@@ -2,19 +2,25 @@
 //!
 //! # SAFETY (module invariant)
 //!
-//! A [`HeapArena`] owns exactly one allocation obtained from
-//! [`alloc_zeroed`] with a 64-byte-aligned [`Layout`] of `len` bytes, where
-//! `len == ArenaLayout::total_size()`. The following hold for the whole lifetime
-//! of the value:
+//! A [`HeapArena`] owns exactly one allocation obtained from [`alloc_zeroed`]
+//! with a **16-byte**-aligned [`Layout`] of `len + 63` bytes, where
+//! `len == ArenaLayout::total_size()`, out of which a 64-byte-aligned arena base
+//! is carved by hand. The following hold for the whole lifetime of the value:
 //!
 //! * `ptr` is non-null, 64-byte aligned, and points to `len` valid, owned bytes.
-//! * The allocation is freed exactly once, in [`Drop`], with the identical
-//!   [`Layout`] recorded in `alloc_layout`.
+//! * `alloc_ptr` is the allocation's own base, at most 63 bytes below `ptr`.
+//! * The allocation is freed exactly once, in [`Drop`], **with `alloc_ptr` and
+//!   the identical [`Layout`] recorded in `alloc_layout`** — never with `ptr`,
+//!   which is generally not the pointer the allocator handed out. This is the
+//!   one way to get [`0021`] wrong and it is undefined behaviour, so
+//!   `tests/heap_alignment.rs` exercises the whole lifecycle under Miri.
 //! * `HeapArena` exposes only the raw base pointer and length; all typed access
 //!   to the bytes happens through the atomic protocols in `tf_tree_core`, which
 //!   is why sharing the handle across threads (`Send + Sync`) is sound.
 //!
 //! Every `unsafe` block below cites which of these invariants it relies on.
+//!
+//! [`0021`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md
 
 use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use core::ptr::NonNull;
@@ -23,7 +29,30 @@ use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
 use crate::layout::{layout_hash, ArenaLayout};
 
 /// Byte alignment of the arena base and of [`ArenaHeader`].
+///
+/// Load-bearing: `PoseSlot` is `#[repr(C, align(64))]` and exactly one cache
+/// line, and every concurrency number in this repository rests on two slots
+/// never sharing one. It is **obtained** by hand rather than requested from the
+/// allocator — see [`CALLOC_ALIGN`] — but it is not negotiable.
 const ARENA_ALIGN: usize = 64;
+
+/// The alignment actually requested from the allocator.
+///
+/// Must stay **at or below `MIN_ALIGN`** for the target (16 on every 64-bit
+/// platform this builds for), because that is the condition under which Rust's
+/// `System` allocator routes [`alloc_zeroed`] to `calloc` rather than to
+/// `posix_memalign` plus an explicit zero-fill. The fill is what touches every
+/// page; `calloc` at this size returns fresh `mmap` pages that stay
+/// demand-faulted. `docs/decisions/0021` carries the measurement — 4 KiB
+/// resident against 2356 KiB for the same bytes, differing only in this
+/// constant.
+///
+/// **Raising this to 64 would silently undo the whole fix** and nothing in the
+/// type system would notice, which is why `tests/heap_alignment.rs` asserts the
+/// residency property and not merely the alignment.
+const CALLOC_ALIGN: usize = 16;
+
+const _: () = assert!(CALLOC_ALIGN <= ARENA_ALIGN);
 
 /// A flat, pointer-free byte arena.
 ///
@@ -49,8 +78,22 @@ pub unsafe trait Arena: Send + Sync {
 /// Phase 2 adds `MappedArena` (`memfd` + `mmap`) as the only new backend; the
 /// rest of the stack is written against [`Arena`] and never learns which it has.
 pub struct HeapArena {
+    /// The **arena base**: 64-byte aligned, `len` bytes, what [`Arena::base`]
+    /// returns. Up to `ARENA_ALIGN - 1` bytes *above* [`Self::alloc_ptr`].
     ptr: NonNull<u8>,
     len: usize,
+    /// The **allocation's own base**, and the only pointer [`dealloc`] may be
+    /// given.
+    ///
+    /// Distinct from `ptr` since [`0021`]: the arena is over-allocated at an
+    /// alignment `alloc_zeroed` will route to `calloc` and then aligned by hand,
+    /// so these two differ whenever the allocator did not already return a
+    /// 64-byte-aligned block. **Freeing `ptr` would be undefined behaviour**;
+    /// `tests/heap_alignment.rs` runs the whole lifecycle under Miri because a
+    /// passing suite alone cannot see that mistake.
+    ///
+    /// [`0021`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md
+    alloc_ptr: NonNull<u8>,
     alloc_layout: Layout,
 }
 
@@ -86,22 +129,56 @@ impl HeapArena {
 
         let size = layout.total_size();
 
-        // SAFETY: `ARENA_ALIGN` (64) is a non-zero power of two, and `size` is a
-        // multiple of 64 and at least 256 (the header region), so rounding it up
-        // to the alignment cannot overflow `isize::MAX` for any arena we build.
-        let alloc_layout = unsafe { Layout::from_size_align_unchecked(size, ARENA_ALIGN) };
+        // **Over-allocate at `CALLOC_ALIGN` and align to 64 by hand.** Asking
+        // the allocator for 64-byte alignment directly costs ~293x the resident
+        // memory, and `docs/decisions/0021` is the measurement: Rust's
+        // `alloc_zeroed` reaches `calloc` only when the requested alignment is
+        // at most `MIN_ALIGN`, and above that falls back to `posix_memalign`
+        // followed by an explicit zero-fill — which *touches every page*.
+        // `calloc` for an allocation this size hands back fresh `mmap` pages the
+        // kernel already guarantees to be zero and never materialises until
+        // touched. Measured at the §9.3 geometry: **4 KiB resident at align 16,
+        // 2356 KiB at align 64.**
+        //
+        // SAFETY: `CALLOC_ALIGN` (16) is a non-zero power of two; `size` is a
+        // multiple of 64 and at least 256, and `size + ARENA_ALIGN - 1` cannot
+        // overflow `isize::MAX` because `ArenaLayout::new` already refuses any
+        // `total_size` above `u32::MAX`.
+        let alloc_layout =
+            unsafe { Layout::from_size_align_unchecked(size + ARENA_ALIGN - 1, CALLOC_ALIGN) };
 
         // SAFETY: `alloc_layout` has non-zero size (>= 256), satisfying
         // `alloc_zeroed`'s precondition. Nullness is checked immediately below.
         let raw = unsafe { alloc_zeroed(alloc_layout) };
-        let ptr = match NonNull::new(raw) {
+        let alloc_ptr = match NonNull::new(raw) {
             Some(p) => p,
             None => handle_alloc_error(alloc_layout),
         };
 
+        // The offset to the next 64-byte boundary, which is at most
+        // `ARENA_ALIGN - 1` and is exactly the slack requested above.
+        //
+        // `addr()` arithmetic rather than `<*mut u8>::align_offset`: Miri is
+        // permitted to return `usize::MAX` from `align_offset` on any call, on
+        // purpose, so that code cannot come to depend on it succeeding — and
+        // this crate is one `just miri` runs. Deriving the pointer with `add`
+        // keeps provenance from `raw`, which the strict-provenance model
+        // requires and which casting through an integer would lose.
+        let offset = alloc_ptr.as_ptr().addr().wrapping_neg() % ARENA_ALIGN;
+
+        // SAFETY: `offset < ARENA_ALIGN` and the allocation is
+        // `size + ARENA_ALIGN - 1` bytes, so `base` and the `size` bytes after
+        // it lie inside the same allocation; provenance is inherited from `raw`.
+        let base = unsafe { alloc_ptr.as_ptr().add(offset) };
+
+        // SAFETY: `base` is `alloc_ptr` (non-null) advanced within its own
+        // allocation, so it is non-null.
+        let ptr = unsafe { NonNull::new_unchecked(base) };
+
         let arena = HeapArena {
             ptr,
             len: size,
+            alloc_ptr,
             alloc_layout,
         };
         arena.write_header(layout, creator_pid, owner_start_time, boot_id);
@@ -148,10 +225,12 @@ impl HeapArena {
 
 impl Drop for HeapArena {
     fn drop(&mut self) {
-        // SAFETY: `ptr` and `alloc_layout` are exactly the pointer and layout
-        // returned/used by `alloc_zeroed` in `new`; the allocation is still owned
-        // by `self` and is freed here exactly once.
-        unsafe { dealloc(self.ptr.as_ptr(), self.alloc_layout) }
+        // SAFETY: **`alloc_ptr`, not `ptr`.** `alloc_ptr` and `alloc_layout` are
+        // exactly the pointer and layout returned/used by `alloc_zeroed` in
+        // `new`; `ptr` is that pointer advanced by up to 63 bytes to reach a
+        // 64-byte boundary, and freeing it would be undefined behaviour. The
+        // allocation is still owned by `self` and is freed here exactly once.
+        unsafe { dealloc(self.alloc_ptr.as_ptr(), self.alloc_layout) }
     }
 }
 

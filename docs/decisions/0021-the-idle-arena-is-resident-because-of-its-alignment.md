@@ -1,8 +1,8 @@
 # 0021: the idle arena is resident because of its alignment, not its design
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** implemented — `crates/tf_tree_arena/src/heap.rs`, `crates/tf_tree_arena/tests/heap_alignment.rs`
 
 ## Context
 
@@ -172,3 +172,60 @@ which is at most 63. `+ 64` would also be correct and wastes one more byte.
    `MappedArena` and so probably not, but it was not measured for this record and
    `PHASE5.md` §12 gate 4 is stated about exactly this kind of sharing. Settle it
    with the same instrument before that gate is claimed.
+
+## Resolution — measured after implementing
+
+The three open questions, answered.
+
+**1. Conditional on size? No — always offset.** The leaning in the question was
+right and for the reason it gave: `M_MMAP_THRESHOLD` is a glibc tunable, 128 KiB
+by default and *dynamic* (it adapts to the freeing pattern at run time), so "the
+size where this starts helping" is not a constant this crate could branch on
+correctly. One code path, 63 bytes, no threshold to test or to get wrong. The
+smallest geometry in `tests/heap_alignment.rs` is a 1-frame/1-edge/1-slot arena
+and pays those 63 bytes; nothing about that is worth a second path.
+
+**2. Relied on, or observed? Observed — and the report keeps measuring it.**
+`calloc`'s laziness is not promised for any particular allocation, and musl may
+differ from glibc. Correctness does not depend on it: a libc that memsets anyway
+costs exactly what was already being paid. The *benefit* does depend on it, so
+`arena_memory_floor` reports `idle_arena_resident_fraction` as a measurement on
+the host that ran it, rather than the docs asserting a constant. That row is the
+gate on this question.
+
+**3. Does `FrozenArena` share the defect? No.** It is `mmap`-backed like
+`MappedArena`, whose pages are demand-faulted by construction, and §12 gate 4 has
+since been measured directly (`just gate4`): 16 workers on one 338 MiB `.tft`
+cost 1.024× one worker, with **0.37 MiB private per worker**. A 100%-resident
+private copy per process would have made that ratio ~16. The gate settles it.
+
+### What it actually bought
+
+| | before | after |
+|---|---|---|
+| `idle_arena_resident_bytes` (§9.3 geometry) | 2 408 448 B | **24 576 B** |
+| `idle_arena_resident_fraction` | 1.0000 | **0.0102** |
+| `scale_sweep` `rss_over_arena`, fleet_16 | 1.001 | **0.672** |
+| `scale_sweep` `rss_over_arena`, fleet_64 | 1.008 | **0.678** |
+| `scale_sweep` `rss_over_arena`, humanoid | 0.094 | **0.026** |
+| Pss delta, §11.1 fixture, native-vs-native | 1 752 KiB | **1 272 KiB** |
+
+**The last row is the one that mattered.** `just tf2-native-footprint` had tf2 at
+1 332 KiB and `tf_tree` at 1 752 — the only instrument on which tf_tree lost, and
+the one an operator actually reads. It is now **1 272 against 1 332**, so the
+sign is reversed. `heap_bytes` did not move (1 411 136, bit-identical), which is
+the cross-check that this changed residency and not allocation.
+
+The saving on the fixture was **464 KiB against a prediction of 466 KiB** — the
+6 472 declared-but-never-published slots at 72 B. Predicting the figure before
+measuring it is the only reason to trust that the mechanism is understood.
+
+**No timing change, proven not asserted.** `just bench-ab` over the whole
+`scale_sweep` catalogue: *"78 compared: 19 info, 58 noise, 1 unmeasured. No
+regression."* `just bench-check` PASS. The change is allocation-time only and
+touches no read path.
+
+**Miri is the gate that matters here.** `dealloc` must be given the allocation's
+own pointer, not the offset one. Mutating `Drop` to free `self.ptr` passes all
+four tests natively and aborts under Miri with *"deallocating 0x… which does not
+point to the beginning of an object"* — run, not assumed.

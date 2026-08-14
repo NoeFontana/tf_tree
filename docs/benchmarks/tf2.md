@@ -478,23 +478,29 @@ same `.tfstream` and the same two instruments.
 |---|---|---|---|
 | `heap_bytes` | 1 411 136 | 1 419 792 | 1.006 |
 | bytes per stored sample | 111.2 | 112.7 | 1.013 |
-| **`pss_kib` delta** | **1 752** | **1 324** | **0.756** |
+| **`pss_kib` delta** | **1 272** | 1 332 | **1.047** |
 | bytes per *declared slot* | **73.5** | n/a | — |
 
 **The binding was not inflating tf2's memory.** Native C++ measures 112.7 B per
 stored sample against the binding's 112.8 — so the tie reported above was
 honest, and this is a confirmation rather than a correction.
 
-**But the two instruments disagree in direction, and that is the finding.**
-`heap_bytes` is a tie; **Pss — the number an operator reads in `top` — is not:
-tf_tree holds 1 752 KiB against tf2's 1 324, a 1.32× loss.** `mallinfo2` cannot
-see this, because an allocator can hold address space it has not faulted:
-tf_tree's arena is *one* allocation that is ~100% resident, while tf2's many
-small ones are not all faulted in. That residency is
+**The two instruments used to disagree in direction, and fixing that is what
+`0021` did.** When this comparison was first built `heap_bytes` was a tie while
+Pss — the number an operator reads in `top` — was a **1.32× loss**: 1 752 KiB
+against 1 324. `mallinfo2` cannot see residency, and tf_tree's arena is *one*
+allocation that was ~100% resident because `alloc_zeroed` above 16-byte
+alignment falls back to `posix_memalign` plus an explicit zero-fill touching
+every page.
+
 [`0021`](../decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)
-— `alloc_zeroed` above 16-byte alignment falls back to `posix_memalign` plus an
-explicit zero-fill that touches every page — and this row is the one it has to
-move.
+over-allocates at 16 and aligns to 64 by hand, so `calloc` returns
+demand-faulted pages. **The row is now 1 272 against 1 332 — the sign is
+reversed**, and `heap_bytes` did not move by a single byte, which is the
+cross-check that this changed residency rather than allocation. The 464 KiB
+saving was predicted at 466 KiB beforehand (6 472 declared-but-never-published
+slots × 72 B); predicting it first is the only reason to believe the mechanism
+is understood.
 
 `heap_bytes` is exact and bit-identical across runs; `pss_kib` is a
 page-quantised whole-process delta, stable to ~3% (1704–1752 over five runs).
