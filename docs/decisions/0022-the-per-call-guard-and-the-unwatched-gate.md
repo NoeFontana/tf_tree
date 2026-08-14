@@ -101,6 +101,33 @@ This is the same failure mode `tf2.md` already documents twice — the withdrawn
 4.7× CPU reading and the stale `.tft` reasons — and the same one that the
 `heap_vs_shared` and 213-vs-217 priors fell into. **A residue is a hypothesis.**
 
+## Amendment — this record's headline number is under review
+
+**`abi_cost.rs`'s native baseline turned out to be unstable, and the "+60 ns,
+mostly the guard" figure above rests on it.** Building the per-rung ladder §7
+gate 1 needed moved the native comparand from **133 ns to ~190 ns** while the ABI
+arm stayed at 194–196 in every variant. Bisected to the mere presence of a second
+`Tree::guard()` call site in the binary — not the `#[inline(never)]` arm, and not
+which tree is guarded.
+
+Measured within one build, where the subtractions are valid, the ABI costs
+**about +6 ns**: guard per call ~+2.5, handle and layout checks ~+2, the
+un-inlinable call ~+0.5, the panic guard ~+0.6. Roughly half is the guard, so
+this record's *direction* survives — but its magnitude does not, and "§7 gate 1
+is failing" is retracted (`docs/PHASE4.md` §7).
+
+**What is NOT explained away** is the C++/`memfd` result: 302 ns against native
+Rust's 202 on the §11.1 fixture over a shared arena. `abi_cost` does not
+reproduce a gap of that size in-process on a heap tree, and the Rust comparand in
+`backing.rs` measured ~200 — the *unspecialised* value — so that one is not the
+same artifact. Something about the C++/shared-arena configuration is still
+unaccounted for.
+
+**So question 5 is answered for the in-process case and reopened for the
+cross-process one, and no `tft_guard` handle should be designed until the second
+is understood.** Designing against a 100 ns gap that turns out to be a
+measurement artifact would be the fifth such mistake in this area.
+
 ## Decision
 
 *(draft — nothing below is authorized)*

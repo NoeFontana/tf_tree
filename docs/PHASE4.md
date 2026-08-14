@@ -23,7 +23,7 @@
 | §5 ROS 2 ingest bridge | **Done, except §5.9's affinity knobs and §6.3's replay rows.** The `rclcpp` half is `ros/tf_tree_ros`, an `ament_cmake` package (not a cargo crate, not under `crates/` — it needs a middleware) reaching the engine only through `find_package(tf_tree CONFIG)`: §5.8 form 3 `BridgeHandle`, forms 2 and 1 from one `rclcpp_components_register_node`, §5.2's QoS on a dedicated callback group *and* its negotiated read-back and incompatibility warning, §5.3's GID attribution, §5.4's both-publishers diagnostic, §5.6's startup remap log. Gated by `just ros-build` / `just ros-test` — 7 ctest binaries, 21 tests, every one of them with an applied mutant — by the two artifact checks `ros/build.sh` makes for forms 1 and 2, and now by the `tf2` CI job, which runs `just ros-test` after `just tf2-check`. §5.2, §5.4, §5.7 and §5.8 carry **clarifications** and §5.4, §5.8 and §5.9 are **amended**; see their sections and the findings below. **§5.5's clock-reset rule was redesigned twice and its live form is [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)'s amendment, not [`0011`](./decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md)'s** — the quorum is deleted, the authoritative `rcl` jump callback is the primary signal, and §5.3 gains an amendment because the quorum's corroboration floor had made attribution a correctness dependency. The row below records what the Rust half already was. |
 | §5, Rust half (history; the row above is the live status) | **Done, and superseded by the row above — do not read this one as an open item.** §5.8's amendment is implemented and the `rclcpp` half is UNBLOCKED — the topology config format, `TopologyConfig::builder`, the `--discover` collector, `Action::StaticVerified` (`DeclareStatic` reinterpreted as *verify against the declared constant*) and `Action::UndeclaredEdge` + `BridgeStats::dropped_undeclared` are in `tf_tree_bridge`, driven end to end over `testdata/tfstream/indoor_atelier.tfstream` by `tf_tree topology --discover`. What remains of §5 is `rclcpp` alone. The decision half — §5.4 authority, §5.5 clock resets and domains, §5.6 frame names, §5.7 static semantics, §5.9 counters, and the pipeline that orders them — is `tf_tree_bridge`, a **workspace member whose only dependency is `tf_tree` itself** (added by the amendment's work, so a config can produce a `TreeBuilder`), so `just test` and `just lint` cover it on every host. **The C seam that `rclcpp` calls is now written too**: `crates/tf_tree_c/src/bridge.rs`, behind a default-off `bridge` feature, nine `extern "C"` entry points in `docs/PHASE4.md` §3.1's *unstable* tier. `tft_bridge_offer` runs names → declared? → kind → static → authority → clock **and the arena write**, and reports a POD outcome whose `const char *` diagnostics are borrowed from the handle; `tft_bridge_attribute` is §5.3's GID → node cache, Rust-side and unit-tested. **§5.6's `tf_prefix` works** — it rewrites the declared topology and the arena as well as the wire — and its remap table crosses the boundary as `tft_bridge_get_remap`, so the *"log the resulting mapping table at startup"* clause is obeyable from C; see below. Gated by `cargo nextest run -p tf_tree_c --features bridge` (21 tests) and `cargo clippy -p tf_tree_c --features bridge --all-targets`, **both now in `just test` and `just lint`** rather than only in `+nightly` recipes, by the Miri row `just c-abi-check` gained, and by `just c-header-check`, which builds with `--features test-hooks,bridge` and compiles the smoke test with `-DTFT_HAVE_BRIDGE` so the generated declarations are exercised from C. What remains of §5 is subscriptions, QoS and the three deployment-form shells — `rclcpp` and nothing else. |
 | §6 test plan | Follows its section; §6.3's QoS test is **amended** (as specified it cannot pass) |
-| §7 benchmarks and gate | **Partial, and gate criterion 1 is FAILING.** `examples/abi_cost.rs` covers rows 1 and 2. `tft_plan_at` measured **1.020× native (PASS)** when it was written and measures **1.34–1.46× (FAIL)** today — see *§7 gate criterion 1 is failing* below. `catch_unwind` costs **+0.6 ns on a real, non-inlinable call**. `examples/bridge_cost.rs` reports the bridge row's per-offer half — one accepted `/tf` transform through every §5 table *and* the arena write, at 20 dynamic edges. It is **not** gate criterion 3: that compares the bridge against a `tf2` consumer and needs a fair comparison machine, which this host is not. Gate criterion 4 (Miri + ASan clean) passes via `just c-abi-check`. Criteria 3 and 6 cannot be honestly produced here — see below. |
+| §7 benchmarks and gate | **Partial, and gate criterion 1 is NOT EVALUABLE** — its denominator swings 43% on unrelated edits to the same binary, so neither the 1.020× it once recorded nor the 1.34–1.46× FAIL that replaced it is a statement about the ABI. See *§7 gate criterion 1 cannot be evaluated* below. The ABI's own cost is stable at **+6 ns**. `examples/abi_cost.rs` covers rows 1 and 2. `tft_plan_at`'s ladder is measured; the ratio is not usable. `catch_unwind` costs **+0.6 ns on a real, non-inlinable call**. `examples/bridge_cost.rs` reports the bridge row's per-offer half — one accepted `/tf` transform through every §5 table *and* the arena write, at 20 dynamic edges. It is **not** gate criterion 3: that compares the bridge against a `tf2` consumer and needs a fair comparison machine, which this host is not. Gate criterion 4 (Miri + ASan clean) passes via `just c-abi-check`. Criteria 3 and 6 cannot be honestly produced here — see below. |
 | §1 operational criteria | **Open, and not satisfiable by code.** Gates Phase 7. |
 
 ### What §3 turned up that the spec did not anticipate
@@ -55,7 +55,62 @@
   every one of those mistakes. §3.7's 5 % gate is about `tft_plan_at`, which is
   the subject of the section immediately below.
 
-### §7 gate criterion 1 is failing, and this document said it passed
+### §7 gate criterion 1 cannot be evaluated: its denominator is unstable
+
+**This section said "gate criterion 1 is failing at 1.34–1.46×" and that was
+measuring an artifact.** Retracted, with the measurement that retracts it.
+
+`examples/abi_cost.rs` now walks the whole ladder between native Rust and
+`tft_plan_at`, one rung per thing the ABI does that native does not, every rung a
+subtraction inside one build:
+
+| rung | ns/lookup |
+|---|---|
+| native Rust (+ mat4 write) | 189.1 |
+| + guard built per call | 191.7 |
+| + not inlined | 192.2 |
+| the ABI, no panic guard | 194.2 |
+| `tft_plan_at` | 194.8 |
+
+**Building that ladder moved the baseline.** Before it existed this file had
+exactly one call site of `Tree::guard()` and the native arm measured **133 ns**,
+giving 1.42–1.46× and a FAIL. Adding a second, wholly independent arm moved the
+baseline to **~190 ns** and the ratio to ~1.03×. **The ABI arm did not move:
+194–196 ns in every variant measured, the original included.**
+
+So the 43% swing is entirely in the comparand. With one guard call site LLVM can
+specialise the hoisted-guard loop — plausibly eliding `Guard::drop` bookkeeping
+nothing observes — and with two it cannot. Bisected: it is the second
+`Tree::guard()` call site, not the `#[inline(never)]` arm and not which tree is
+guarded; a separate, identically-populated tree does not restore the 133 ns.
+
+**Neither reading is a statement about the C ABI, and the gate as written cannot
+gate.** A criterion whose denominator moves 43% on unrelated edits to the same
+binary is not measuring the thing it names. That is a defect in the gate's
+construction. Fixing it means either pinning the comparand against
+specialisation, or gating the ABI's *absolute* cost — which is stable to ~1% —
+rather than a quotient. Both are §7 changes and belong in a decision record.
+
+**What is stable is the decomposition**, because every rung shares a build: the
+ABI costs **about +6 ns**, roughly half of it the per-call `Guard`, the rest
+split between handle/layout validation, the un-inlinable call and the panic
+guard — each a nanosecond or two. That is a very different picture from "+60 ns,
+mostly the guard", and it is the one supported by measurement.
+
+**This does not clear the C++/`memfd` result**, which is a separate
+configuration and remains unexplained: `docs/benchmarks/tf2.md` measures a C++
+caller at 302 ns against native Rust's 202 on the §11.1 fixture over a shared
+arena, and `abi_cost` does not reproduce a gap of that size in-process on a heap
+tree. `docs/decisions/0022` carries that, and its premise now needs re-checking
+against this finding before anything is designed on it.
+
+### What the old text said, kept because the process failure is the lesson
+
+*The paragraphs below are the retracted text, kept because the half that still
+holds is the more important half: **the gate was executed by nothing.** That is
+why a stale reading survived, and it is also why the artifact went unnoticed —
+a benchmark nobody runs is a benchmark nobody sanity-checks. `just abi-cost`
+fixes that part and it stands.*
 
 **`tft_plan_at` measures 1.34–1.46× native against a 1.05 gate.** Four
 consecutive pinned runs: 1.335, 1.414, 1.460, 1.461. The absolute overhead is
