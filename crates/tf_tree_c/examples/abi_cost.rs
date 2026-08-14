@@ -166,11 +166,129 @@ fn main() {
         acc
     });
 
+    // --- the ladder between them, so §7 gate 1's gap is attributed ---
+    //
+    // `docs/PHASE4.md` §7 gate criterion 1 is FAILING, and until this ladder
+    // existed only about half the gap was accounted for. Each rung below adds
+    // exactly one of the things the ABI does that native Rust does not, in the
+    // order the ABI does them, so every difference is a subtraction rather than
+    // an inference. `docs/decisions/0022`'s implementation plan asks for exactly
+    // this before any `tft_guard` handle is designed.
+
+    // 1. The guard, per call. Native Rust hoists one out of the loop; the C
+    //    signature has nowhere to keep one between calls, so `tft_plan_at` must
+    //    build one every time (`lib.rs`, `h.share.tree.guard()`).
+    // **Its own buffer, and this is not tidiness.** The first version of this
+    // ladder reused `nbuf` here and in `opaque_at` below. Letting it escape into
+    // an `#[inline(never)]` function forced it to memory for *every* arm
+    // including the native baseline, which went 133 -> 190 ns and made the gate
+    // appear to pass at 1.03x. The instrument had moved the thing it measures.
+    let mut lbuf = [0.0f64; 16];
+    let per_call_guard_ns = bench(|| {
+        let mut acc = 0.0;
+        for &t in &stamps {
+            let g = native.guard();
+            let iso = nplan
+                .at(
+                    &g,
+                    tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(black_box(t)),
+                )
+                .unwrap();
+            tf_tree::write_mat4(&iso, &mut lbuf);
+            acc += lbuf[0];
+        }
+        acc
+    });
+
+    // 2. The same, behind a call rustc cannot inline. Isolates the boundary
+    //    itself from everything the ABI does inside it.
+    #[inline(never)]
+    fn opaque_at(plan: &tf_tree::Plan, tree: &tf_tree::Tree, t: i64, buf: &mut [f64; 16]) -> f64 {
+        let g = tree.guard();
+        let iso = plan
+            .at(&g, tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(t))
+            .unwrap();
+        tf_tree::write_mat4(&iso, buf);
+        buf[0]
+    }
+    let mut obuf = [0.0f64; 16];
+    let opaque_ns = bench(|| {
+        let mut acc = 0.0;
+        for &t in &stamps {
+            acc += opaque_at(&nplan, &native, black_box(t), &mut obuf);
+        }
+        acc
+    });
+
+    // 3. The ABI's own body with `catch_unwind` removed and nothing else
+    //    changed, so the panic guard is a subtraction on a real,
+    //    non-inlinable call. `tft_guarded_noop` above measures an *inlined*
+    //    body and answers a different question.
+    let unguarded_ns = bench(|| {
+        let mut acc = 0.0;
+        for &t in &stamps {
+            // SAFETY: live plan, and `cbuf` is exactly `tft_layout_size(MAT4_ROW)`.
+            let rc = unsafe {
+                tft_test_plan_at_unguarded(
+                    plan,
+                    black_box(t),
+                    TFT_LAYOUT_MAT4_ROW,
+                    cbuf.as_mut_ptr().cast(),
+                )
+            };
+            debug_assert_eq!(rc, TFT_OK);
+            acc += cbuf[0] as f64;
+        }
+        acc
+    });
+
     let ratio = abi_ns / native_ns;
     println!("{:>28} {:>10}", "path", "ns/lookup");
     println!("{:>28} {native_ns:>10.1}", "native Rust (+ mat4 write)");
+    println!("{:>28} {per_call_guard_ns:>10.1}", "+ guard built per call");
+    println!("{:>28} {opaque_ns:>10.1}", "+ not inlined");
+    println!("{:>28} {unguarded_ns:>10.1}", "the ABI, no panic guard");
     println!("{:>28} {abi_ns:>10.1}", "tft_plan_at");
     println!("\n  ratio {ratio:.3}x   (gate: < 1.05)");
+    println!(
+        "\n  the guard, per call:    {:+5.1} ns   what the C signature cannot hoist",
+        per_call_guard_ns - native_ns
+    );
+    println!(
+        "  an opaque call:         {:+5.1} ns   the boundary itself",
+        opaque_ns - per_call_guard_ns
+    );
+    println!(
+        "  handle + layout checks: {:+5.1} ns   magic word, null, enum, slice build",
+        unguarded_ns - opaque_ns
+    );
+    println!(
+        "  the panic guard:        {:+5.1} ns   catch_unwind + clear_error, real call",
+        abi_ns - unguarded_ns
+    );
+    println!(
+        "  total {:+.1} ns ({:.2}x), of which {:.0}% is the per-call guard.",
+        abi_ns - native_ns,
+        ratio,
+        (per_call_guard_ns - native_ns) / (abi_ns - native_ns) * 100.0
+    );
+    println!(
+        "\n  READ THE RATIO WITH CARE — THIS GATE'S DENOMINATOR IS UNSTABLE.\n\n  \
+         Before the four rungs above existed this file had exactly one call site of\n  \
+         `Tree::guard()`, the native baseline measured 133 ns, the ratio was\n  \
+         1.42-1.46x and it printed FAIL. Adding a second, wholly independent arm\n  \
+         moved that baseline to ~190 ns and the ratio to ~1.03x. The ABI arm did\n  \
+         not move: 194-196 ns in every variant measured, the original included.\n\n  \
+         The 43% swing is entirely in the comparand. With one guard call site LLVM\n  \
+         can specialise the hoisted-guard loop — plausibly eliding `Guard::drop`\n  \
+         bookkeeping that nothing observes — and with two it cannot. Neither the\n  \
+         old FAIL nor this PASS is a statement about the C ABI. A ratio gate whose\n  \
+         denominator moves 43% on unrelated edits to the same binary cannot gate\n  \
+         anything, and that is a defect in the gate rather than in either engine.\n\n  \
+         What IS stable is the decomposition above: every rung is a subtraction\n  \
+         inside one build, and they say the ABI costs about +6 ns over a native\n  \
+         baseline that has not been over-specialised. See `docs/PHASE4.md` §7."
+    );
     println!(
         "  {}",
         if ratio < 1.05 {
