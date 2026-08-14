@@ -527,8 +527,20 @@ naive expectation that a C++ `std::map` engine must be allocating on reads is
 simply wrong when the caller passes prebuilt string handles. But tf2 allocates
 and frees **once per published transform**, forever. A robot publishing ten
 dynamic edges at 1 kHz puts 10,000 malloc/free pairs per second through the
-allocator; tf_tree puts through zero, and its 96 lifetime allocations all happen
+allocator; tf_tree puts through zero, and its lifetime allocations all happen
 before the first lookup.
+
+**This paragraph used to say "its 96 lifetime allocations" and the table above
+says 108; the two never agreed and nothing reconciled them.** Re-measured under
+`memcheck`: they are *different modes* of `footprint`. `lookup-tf_tree` builds
+the full §11.1 fixture and compiles a plan — **108 allocations**. `push-tf_tree`
+builds a one-dynamic-edge tree — **94**. Neither figure was wrong; the prose was
+quoting the push mode's number against the lookup mode's table.
+
+What both modes actually establish is stronger than either count, and it is the
+claim worth making: the totals are **identical at N = 0 and N = 10 000** —
+108 against 108, and 94 against 94. Not "few allocations per operation":
+*none*.
 
 That figure was 2.00 before bias 4 was found and fixed — the extra one was the
 shim's, not tf2's. The remaining one is genuine: tf2 stores each transform in a
@@ -620,7 +632,7 @@ history. N consumers therefore cost N buffers, N deserialization pipelines and
 N-way DDS fan-out — and the copies drift apart in time, because each is updated
 by its own callback thread. tf_tree maps one arena N times.
 
-| Processes | Aggregate M/s | ns/lookup | vs 1 proc | Unique resident | tf2 history would be |
+| Processes | Aggregate M/s | ns/lookup | vs 1 proc | Unique resident | tf2 history would be *(arithmetic)* |
 |---|---|---|---|---|---|
 | 1 | 4.66 | 213 | 1.00x | 3.5 MiB | 1.4 MiB |
 | 2 | 9.04 | 219 | 1.94x | 5.7 MiB | 2.7 MiB |
@@ -643,6 +655,20 @@ go looking for.
 One inference, flagged as such because this host's `perf_event_paranoid` forbids
 the counters that would confirm it: because the arena is *shared*, N processes
 touch the **same cache lines**, so the cache footprint of transform data is
+**The `tf2 history would be` column is arithmetic and no tf2 process has ever
+run behind it** — it is `n x 1 421 392 B`, the `footprint` figure multiplied out
+(`shm_scaling.rs:189`). It is kept because the extrapolation is the honest shape
+of the argument, but `just tf2-native-footprint` now measures a native C++ tf2
+in its own process, so the multiplicand is at least a measured one. Replacing
+the column with per-N measurements is straightforward and unbuilt.
+
+Also: **`Unique resident` is Pss-derived, not RSS**, despite the metric ids in
+`scale_sweep.rs` and `soak.rs` saying `rss`. Those ids are the join keys
+`bench_ab` and the baseline differ compare on, so they are frozen — renaming one
+un-compares every run file written before the rename and reads as a vanished row
+to the gate. The instrument was always Pss; only the labels were wrong, and the
+labels are fixed.
+
 independent of consumer count. tf2's N private buffers would be N x 1.4 MB of
 distinct lines — 5.6 MB at four consumers, past many L3s. This is consistent with
 the 4-process row costing only 21% more per lookup than one process, but it is
@@ -1316,14 +1342,14 @@ the working set (256 rings is 18 MiB of first-touched pages), not false sharing 
 40 s, 24-frame fixture (10 s of retained history), 2 reader threads, 4 writer
 threads, snapshots every 10 s:
 
-| interval | Mlookup/s | p50 | p99.9 | publish→visible p50 | ring laps | RSS | declined |
+| interval | Mlookup/s | p50 | p99.9 | publish→visible p50 | ring laps | Pss | declined |
 |---|---|---|---|---|---|---|---|
 | 0 | 5.18 | 280 ns | 470 ns | 191 ns | 1.0 | 2636 KiB | 131 ppm |
 | 1 | 5.22 | 280 ns | 460 ns | 191 ns | 1.0 | 2636 KiB | 130 ppm |
 | 2 | 5.04 | 280 ns | 470 ns | 200 ns | 1.0 | 2656 KiB | 137 ppm |
 | 3 | 5.24 | 280 ns | 470 ns | 191 ns | 1.0 | 2656 KiB | 130 ppm |
 
-No drift: p99.9 ends at 1.00x its first interval, RSS grows 20 KiB, and the rings
+No drift: p99.9 ends at 1.00x its first interval, Pss grows 20 KiB, and the rings
 lapped 3.9 times — which the harness *asserts*, because a soak that never lapped
 a ring did not exercise the path it exists for and must fail rather than print a
 clean table. Laps are `interval / retained`, both read from the arena, so the
