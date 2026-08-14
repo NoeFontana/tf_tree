@@ -2005,24 +2005,25 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     let measured_half = match resident {
         Some((resident_bytes, arena_bytes)) => format!(
             "`idle_arena_resident_bytes` is the measured Pss an idle arena of that \
-             geometry actually costs, and it was added expecting to shrink this row: \
-             reserving address space is not the same as holding pages, and the pose \
-             region of an arena nobody has published into has never been read or \
-             written. It does not shrink it — the arena comes out {:.0}% resident \
+             geometry actually costs, and it is now {:.1}% of what the arena reserves \
              ({resident_bytes:.0} B held against {arena_bytes:.0} B reserved by the \
-             arena actually built). So the claim above is no longer arithmetic; it is \
-             measured, and it stands. The cause is the allocator path and not the \
-             design: `HeapArena` asks for 64-byte alignment (`PoseSlot` is one cache \
-             line), and Rust's `alloc_zeroed` reaches `calloc` only when alignment is \
-             at most 16, falling back to `posix_memalign` plus an explicit zero-fill \
-             above it — which touches every page. Measured directly at this size: 4 KiB \
-             resident at align 16, 2356 KiB at align 64. Most of this row is therefore \
-             recoverable rather than inherent; see decision 0021. \
+             arena actually built). **This row used to say the opposite.** The \
+             measurement was added expecting the resident figure to come out far below \
+             the reserved one, found the arena ~100% resident instead, and stood on \
+             that. Decision 0021 then found the cause — `HeapArena` asked the allocator \
+             for 64-byte alignment (`PoseSlot` is one cache line), and Rust's \
+             `alloc_zeroed` reaches `calloc` only at alignment <= 16, falling back above \
+             it to `posix_memalign` plus an explicit zero-fill that touches every page. \
+             The arena is now over-allocated at 16 and aligned to 64 by hand, so \
+             `calloc` returns demand-faulted pages the kernel already guarantees to be \
+             zero. The reservation is unchanged and this entry stands on the \
+             reservation: address space is still a cost tf2 does not pay, a \
+             fixed-capacity arena still cannot grow, and a machine under strict \
+             overcommit is still constrained. What is gone is the *residency*. \
              `idle_arena_resident_bytes` is a delta of a *whole-process* Pss counter \
              across building one tree, quantised to 4 KiB pages, so it also carries \
-             the tree's own non-arena allocations and can land a little either side of \
-             the arena's size. The order of magnitude is the finding; the third digit \
-             is not.",
+             the tree's own non-arena allocations — which is most of what is left. The \
+             order of magnitude is the finding; the third digit is not.",
             resident_bytes / arena_bytes * 100.0
         ),
         None => "`idle_arena_resident_bytes` is absent: Pss could not be measured on \
