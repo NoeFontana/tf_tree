@@ -1161,6 +1161,7 @@ dependencies = [
  "anyhow",
  "clap",
  "tf_tree",
+ "tf_tree_arena",
  "tf_tree_bench",
  "tf_tree_bridge",
  "tf_tree_core",

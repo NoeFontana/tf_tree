@@ -94,6 +94,12 @@ counters = ["tf_tree/counters"]
 shm = ["tf_tree/shm", "dep:tf_tree_ipc", "tf_tree_ingest/shm"]
 
 [dev-dependencies]
+# `sizing.rs`'s four constants are claims about `ArenaLayout`'s regions, and the
+# test that keeps them true differences two real layouts instead of trusting the
+# comment beside them. A dev-dependency rather than a dependency: the CLI itself
+# needs only the arithmetic, and reaching the arena crate from the binary would
+# put a layout type on a surface `tf_tree` deliberately does not export.
+tf_tree_arena.workspace = true
 # The `fixture` feature writes the synthetic recordings `tests/ingest.rs` runs
 # the binary against. Off in the normal build (it fabricates recordings), on
 # here, which is the only place a fabricated recording belongs.

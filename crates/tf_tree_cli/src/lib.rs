@@ -27,6 +27,7 @@ pub mod doctor;
 pub mod hostfacts;
 /// `doctor`'s recording sources (`docs/PHASE5.md` §6): `--from-bag`, `--from-file`.
 pub mod recording;
+pub mod sizing;
 pub mod top;
 pub mod topology;
 pub mod web;
@@ -1208,6 +1209,9 @@ fn cmd_doctor(
         counters_compiled_in: tf_tree::counters_compiled_in(),
         // The same call `tft010` and `tft011` make, so a skip and its
         // disclosure cannot disagree about whether the counters said anything.
+        // The same edges the checks ran against, so the header's byte figures
+        // and any capacity finding below describe one arena rather than two.
+        rings: sizing::Rings::from_edges(snap.edges.iter().map(|e| (e.capacity, e.occupancy()))),
         notes: evidence_notes(
             src.stream(),
             &snap,

@@ -706,6 +706,7 @@ mod tests {
             topic: "attach latency",
             statement: String::from("we are slower to attach"),
             metrics: Vec::new(),
+            metrics_absent_because: Some(String::from("this fixture states no numbers")),
         });
         let c = compare(&base, &worse).expect("baseline");
         assert!(!c.passed(), "an ungated new `worse` entry passed");

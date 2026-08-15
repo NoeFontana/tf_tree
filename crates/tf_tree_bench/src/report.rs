@@ -27,8 +27,10 @@
 //! * [`Report::validate`] refuses to emit a report whose rows overclaim: a
 //!   timing row cannot be [`Status::Measured`] on a host that failed the
 //!   fitness probe, an unavailable row must carry a reason *and* the command
-//!   that would produce it elsewhere, and §9.3's four "where we are worse"
-//!   topics must all be present. The binary treats a validation failure as a
+//!   that would produce it elsewhere, §9.3's four "where we are worse"
+//!   topics must all be present, and each of those must carry either a number
+//!   or a stated reason it has none ([`Worse::metrics_absent_because`] — an
+//!   honesty section that cannot regress is the failure it is written against). The binary treats a validation failure as a
 //!   hard error, so the failure mode is "no report" rather than "a flattering
 //!   report".
 //! * [`Status::Indicative`] exists because `TF_TREE_BENCH_FORCE=1` already
@@ -406,6 +408,27 @@ pub struct Worse {
     pub statement: String,
     /// Numbers, where the cost is measurable rather than operational.
     pub metrics: Vec<Metric>,
+    /// Why [`Self::metrics`] is empty — required whenever it is.
+    ///
+    /// **An honesty section that cannot regress is the problem this field
+    /// exists to close.** Two of the four §9.3 entries carried
+    /// `metrics: Vec::new()` for their whole life, and an empty vector is
+    /// indistinguishable from an oversight: nobody reading the report can tell
+    /// "this cost has no number *because*..." from "somebody forgot". Both
+    /// readings are bad, and only one of them is true of any given entry.
+    ///
+    /// [`Report::validate`] enforces the pair in both directions — empty
+    /// metrics need a reason, and a reason beside metrics is a contradiction —
+    /// so this is the same structural honesty [`Row::unavailable`] already has,
+    /// applied to the section whose job is to be quotable against us.
+    ///
+    /// Two shapes of reason are legitimate, and the entries here use one each:
+    /// the cost is measured *elsewhere*, by a recipe this binary cannot run
+    /// (`bridge_supervision`); or the cost is genuinely not denominated in
+    /// nanoseconds or bytes at all (`format_bump_cost`). "Nobody has got round
+    /// to it" is not one of them — that is what `attach_latency` used to be,
+    /// and the answer was to go and measure it.
+    pub metrics_absent_because: Option<String>,
 }
 
 /// Whether this host can produce a timing number that means anything.
@@ -1089,6 +1112,21 @@ impl Report {
             if w.statement.trim().is_empty() {
                 bad.push(format!("`worse` entry `{}` states nothing", w.id));
             }
+            match (
+                w.metrics.is_empty(),
+                w.metrics_absent_because.as_deref().map(str::trim),
+            ) {
+                (true, None | Some("")) => bad.push(format!(
+                    "`worse` entry `{}` carries no metrics and no                      `metrics_absent_because`. §9.3's section is the one a reader is                      entitled to quote against us, and an entry with an empty metric                      list reads as an oversight whether or not it is one. Either give                      it a number, or say — in the entry — why the cost has none",
+                    w.id
+                )),
+                (false, Some(_)) => bad.push(format!(
+                    "`worse` entry `{}` carries {} metric(s) *and* a reason they are                      absent. One of the two is wrong, and a reader has no way to tell                      which",
+                    w.id,
+                    w.metrics.len()
+                )),
+                _ => {}
+            }
         }
 
         if bad.is_empty() {
@@ -1197,7 +1235,15 @@ impl Report {
             let _ = writeln!(s, "      \"id\": {},", jstr(w.id));
             let _ = writeln!(s, "      \"topic\": {},", jstr(w.topic));
             let _ = writeln!(s, "      \"statement\": {},", jstr(&w.statement));
-            let _ = writeln!(s, "      \"metrics\": {}", jmetrics(&w.metrics));
+            let _ = writeln!(s, "      \"metrics\": {},", jmetrics(&w.metrics));
+            match &w.metrics_absent_because {
+                Some(why) => {
+                    let _ = writeln!(s, "      \"metrics_absent_because\": {}", jstr(why));
+                }
+                None => {
+                    let _ = writeln!(s, "      \"metrics_absent_because\": null");
+                }
+            }
             s.push_str(if i + 1 == self.worse.len() {
                 "    }\n"
             } else {
@@ -1297,7 +1343,17 @@ impl Report {
                 } else {
                     format!("<br>{}", cell_html(&w.metrics))
                 },
-                esc_html(&w.statement)
+                // The reason is rendered *with* the statement, not below the
+                // table: an explanation of why a cost has no number is only
+                // worth anything next to the place the number would have been.
+                match &w.metrics_absent_because {
+                    None => esc_html(&w.statement),
+                    Some(why) => format!(
+                        "{}<br><em>No metric here: {}</em>",
+                        esc_html(&w.statement),
+                        esc_html(why)
+                    ),
+                }
             );
         }
         s.push_str("</table>\n");
@@ -2069,6 +2125,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
              the arena *reserves* — and does not depend on this host. {measured_half}"
         ),
         metrics: Vec::new(),
+        metrics_absent_because: None,
     };
     // The arithmetic and the measurement are independent facts, so they are
     // emitted independently: a `from_totals` failure must not discard a Pss
@@ -2115,6 +2172,18 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         ));
     }
 
+    // Both sources of this row's numbers can fail — `from_totals` on an
+    // arithmetic overflow, Pss on a host without `smaps_rollup` or on a build
+    // the memory axis calls unfair — and if both do, the entry has to say so
+    // rather than present an empty list. Set here rather than up with the
+    // statement because only this point knows whether anything was pushed.
+    if floor.metrics.is_empty() {
+        floor.metrics_absent_because = Some(
+            "neither half landed on this run: `ArenaLayout::from_totals` did not return a              layout for the stated geometry, and the Pss measurement was unavailable or              was withheld because this host failed the memory axis of the fitness probe.              The reservation arithmetic is host-independent, so this state is a bug or a              hostile /proc, not a property of the machine — `just bench-report` on any              Linux host that passes `Fitness::probe` fills both in."
+                .to_owned(),
+        );
+    }
+
     vec![
         floor,
         Worse {
@@ -2133,13 +2202,18 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  `MADV_POPULATE_WRITE` costs. That is `docs/PHASE2.md` §7.1 buying its \
                  guarantee — and the guarantee holds, because the **first** lookup after \
                  attach is 130 ns p50, indistinguishable from a steady-state one. The \
-                 cost is real and it is in the right place: at attach, not in the loop. \
-                 The metric list below stays empty for the same build reason the .tft \
-                 rows are unavailable — attaching needs `shm`, which this binary is not \
-                 built with — so the figures above are stated with their recipe rather \
-                 than gated here."
+                 cost is real and it is in the right place: at attach, not in the loop."
                 .to_owned(),
             metrics: Vec::new(),
+            metrics_absent_because: Some(
+                "the figure is `just attach-bench`'s: a separate binary that opens a live \
+                 shared arena over the §11.1 fixture and times the rendezvous. This report \
+                 is produced in one process that never attaches — there is nothing here to \
+                 attach *to* — so the number is stated above with its recipe rather than \
+                 re-measured and gated here. It is a real measurement in the wrong binary, \
+                 not a missing one."
+                    .to_owned(),
+            ),
         },
         Worse {
             id: "format_bump_cost",
@@ -2150,10 +2224,31 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  not attach, by design. `docs/PHASE5.md` §1 bumps v2 to v3 for exactly \
                  this reason — to break it once. tf2 has no shared binary layout and no \
                  equivalent event. `tf_tree doctor --explain-version` prints what an \
-                 operator meeting the refusal needs.",
+                 operator meeting the refusal needs. **This cost is qualitative, and \
+                 that is a finding rather than an omission** — see below.",
                 tf_tree::arena_format_version()
             ),
             metrics: Vec::new(),
+            metrics_absent_because: Some(
+                "this cost is not denominated in nanoseconds or bytes, and no run of this \
+                 benchmark on any host would produce it. Its units are *participants* and \
+                 *coordination*: every process sharing an arena must be rebuilt and \
+                 restarted together, so the quantity is the size of a fleet and the length \
+                 of the window in which it can all be down — properties of a deployment, \
+                 not of a machine. There is no distribution to sample either, because the \
+                 refusal is deterministic and total: a mismatched participant does not \
+                 attach at all, so there is no latency, no failure rate and no tail to \
+                 measure. The one number in reach — how long a single participant takes to \
+                 restart — would be worse than none, because it is precisely the *together* \
+                 that costs, and quoting a per-process figure would understate it while \
+                 looking rigorous. What would genuinely quantify this is operating \
+                 evidence from a deployment that has lived through a bump (how long the \
+                 fleet was mixed, what it cost to hold it down), which is the same class of \
+                 evidence `docs/PROJECT.md` D21 gates PHASE7 on and which this project does \
+                 not have. Until then the honest artifact is the sentence, plus the version \
+                 this build refuses to attach across, which is stated above."
+                    .to_owned(),
+            ),
         },
         Worse {
             id: "bridge_supervision",
@@ -2163,10 +2258,42 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  to fill: the ROS 2 ingest bridge is a process that must be started, \
                  supervised, restarted and monitored. With tf2 there is no such process — \
                  every node subscribes to /tf directly. That is one more thing to page \
-                 somebody about at 3 a.m., and it is the honest cost of the shared arena.",
+                 somebody about at 3 a.m., and it is the honest cost of the shared arena. \
+                 **It has been measured, over a real DDS**, by `just dds-bench` — one run, \
+                 four consumers, a 15 s window, on this project's unpinned host \
+                 (`docs/benchmarks/tf2.md`, the `tf_tree.processes` arm): the bridge \
+                 process burns **0.362 s of CPU in 15 s, about 2.4% of one core**, and it \
+                 burns it whatever N is. Against it a marginal tf_tree consumer costs \
+                 0.0186 s and a marginal tf2 listener 0.445 s over the same window, so the \
+                 supervision cost pays for itself at **roughly one consumer** — the bridge \
+                 is cheaper than the single tf2 listener it replaces. Two significant \
+                 figures is what one run of four processes supports. Memory is the half \
+                 that stays unattributed: `dds_report` sums Pss across an arm and the \
+                 bridge is the process in it reporting `consumers 0`, so its footprint is \
+                 inside the arm total (69.51 MiB over five processes, against tf2's 63.15 \
+                 over four) and is **not** the 6.36 MiB difference — Pss divides a shared \
+                 page by the number of processes mapping it, and those two arms map from \
+                 four and five, so the difference is confounded before any bridge exists. \
+                 What the CPU column shows is the operational shape of this trade: a fixed \
+                 cost you must supervise, bought against a per-consumer cost you do not.",
                 opts.consumers
             ),
             metrics: Vec::new(),
+            metrics_absent_because: Some(
+                "the number above exists, and it belongs to a different artifact. It takes \
+                 ROS 2, a real DDS and five processes — `just dds-bench`, inside \
+                 `docker/tf2` — and `bench_report` runs in one process on the host, where \
+                 `rclcpp` is not linked and `ros/` is not even in the cargo workspace. That \
+                 is the same reason the `.tft` rows in the table above are `unavailable` \
+                 rather than guessed. Carrying the figure here as a `Metric` would be worse \
+                 than leaving it out: metrics in this file are what `crate::baseline` \
+                 compares run to run on one host, so a constant transcribed from another \
+                 host's container run would sit in the gate looking measured and never move \
+                 — a row that cannot regress, in the section whose entire purpose is to be \
+                 the row that can. `dds_report` gates it where it is produced; this entry \
+                 states it with its recipe."
+                    .to_owned(),
+            ),
         },
     ]
 }
@@ -2613,6 +2740,7 @@ mod tests {
                 topic: "topic",
                 statement: "a stated cost".to_owned(),
                 metrics: Vec::new(),
+                metrics_absent_because: Some("a stated reason".to_owned()),
             })
             .collect();
         Report {
@@ -3096,6 +3224,66 @@ mod tests {
             errs.iter().any(|e| e.contains(REQUIRED_WORSE[1])),
             "the violation must name the offending entry: {errs:?}"
         );
+    }
+
+    /// A §9.3 entry with no numbers must say why it has none, and one with
+    /// numbers must not claim it has none.
+    ///
+    /// **This is the rule that closes the hole two of the four entries sat in.**
+    /// `bridge_supervision` and `format_bump_cost` carried `metrics: Vec::new()`
+    /// from the day they were written, and nothing could tell that state apart
+    /// from an oversight — which is exactly the shape of failure this whole
+    /// module is built against, except pointed at the section that is supposed
+    /// to be quotable against us. An entry that cannot regress is not an honest
+    /// entry; an entry that explains why it cannot is.
+    ///
+    /// Mutants, each applied and confirmed to make this test fail: delete the
+    /// `(true, None | Some(""))` arm from `validate` (the first half validates
+    /// `Ok`); delete the `(false, Some(_))` arm (the second half does).
+    #[test]
+    fn a_worse_entry_with_no_numbers_must_say_why() {
+        let mut r = skeleton(false, false);
+        r.worse[0].metrics_absent_because = None;
+        let errs = r
+            .validate()
+            .expect_err("an unexplained empty metric list must fail");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(REQUIRED_WORSE[0]) && e.contains("metrics_absent_because")),
+            "the violation must name the entry and the missing field: {errs:?}"
+        );
+
+        // Whitespace is not an explanation, for the same reason `"   "` is not
+        // a statement two tests above.
+        let mut r = skeleton(false, false);
+        r.worse[0].metrics_absent_because = Some("  ".to_owned());
+        assert!(r.validate().is_err(), "a blank reason must not satisfy it");
+
+        // And the contradiction: numbers *and* a reason they are absent. One of
+        // the two is stale, and the report cannot say which.
+        let mut r = skeleton(false, false);
+        r.worse[0].metrics = vec![Metric::new("bytes", 1.0, "B")];
+        let errs = r
+            .validate()
+            .expect_err("metrics beside a reason they are absent must fail");
+        assert!(
+            errs.iter().any(|e| e.contains("One of the two is wrong")),
+            "{errs:?}"
+        );
+
+        // The real report satisfies the rule on this host — which is the point
+        // of the field, not an incidental check: `worse_entries` is where the
+        // four entries are actually written.
+        let opts = Options::default();
+        for w in worse_entries(&opts, &Fitness::probe(opts.consumers)) {
+            assert_eq!(
+                w.metrics.is_empty(),
+                w.metrics_absent_because.is_some(),
+                "`{}` must carry numbers or a reason it has none, never both and never \
+                 neither",
+                w.id
+            );
+        }
     }
 
     /// The remaining §9.3 row rules, each isolated so a failure names one cause:
