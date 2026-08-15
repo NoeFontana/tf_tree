@@ -83,7 +83,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 
 use tf_tree_bench::mp::Histogram;
-use tf_tree_bench::report::Metric;
+use tf_tree_bench::report::{Fact, Metric};
 use tf_tree_bench::runstore::{Run, RunRow};
 use tf_tree_bench::workload::{self, EdgeDecl};
 
@@ -103,7 +103,11 @@ fn main() -> Result<()> {
             eprintln!(
                 "usage:\n  \
                  dds_report emit-config --workload NAME --out DIR\n  \
-                 dds_report aggregate --dir DIR [--json PATH]\n\n\
+                 dds_report aggregate --dir DIR [--ros-out DIR] [--json PATH]\n\n\
+                 --ros-out is ros/build.sh's $OUT (target/ros): the CMake caches of the\n  \
+                 build that produced the arms. REQUIRED with --json, because a run file\n  \
+                 that cannot state how the measured programs were built compares cleanly\n  \
+                 against one built any other way.\n\n\
                  Driven by `just dds-bench`; see ros/dds_bench.sh."
             );
             std::process::exit(2);
@@ -231,6 +235,135 @@ fn emit_config(args: &[String]) -> Result<()> {
 
 fn write(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// the build that produced the arms — not the one that produced this binary
+// ---------------------------------------------------------------------------
+
+/// How the programs whose `.out` files this tool reads were **built**.
+///
+/// # Why this is not [`tf_tree_bench::report::Provenance`]'s job
+///
+/// Every other harness in this crate measures itself, so the `build_profile` and
+/// `build_lto` facts `Run::begin` collects describe the binary that took the
+/// numbers. This one is the exception and it is the exception in the direction
+/// that matters: `dds_report aggregate` is a **parser**. It runs at `--release`
+/// because `ros/dds_bench.sh` says `cargo run --release`, and it would report
+/// `release` / `"thin"` no matter what `ros/build.sh` compiled the arms with.
+/// So a run file carrying only those two facts refuses a comparison in which the
+/// *aggregator's* profile changed — which cannot affect a single number in it —
+/// and accepts one in which every measured process was rebuilt `-O0`.
+///
+/// The three facts here are read out of the CMake caches of the build that
+/// produced `$BIN/bench_consumer`, and land in [`BUILD_CRITICAL_FACTS`], so two
+/// dds run files whose arms were built differently refuse each other exactly as
+/// two `scale_sweep` files at different profiles do.
+///
+/// [`BUILD_CRITICAL_FACTS`]: tf_tree_bench::runstore::BUILD_CRITICAL_FACTS
+struct MeasuredBuild {
+    /// `CMAKE_BUILD_TYPE` of `tf_tree_bench_ros`: the query loop, the histogram
+    /// code and — for the two tf2 arms — the whole engine under test.
+    cxx_build_type: String,
+    /// The cargo profile *directory* `libtf_tree_c.a` was taken from, i.e. the
+    /// basename of the `TF_TREE_PREBUILT_DIR` the CMake package was configured
+    /// with. For the two `tf_tree` arms this is where the engine actually is;
+    /// `CMAKE_BUILD_TYPE` says nothing about it, because the archive is
+    /// pre-built and merely linked in.
+    c_abi_profile: String,
+    /// What that profile *means* today, from the workspace manifest — the same
+    /// argument `runstore::BUILD_CRITICAL_FACTS` makes for carrying `build_lto`
+    /// beside `build_profile`: an edit to `[profile.release]` changes what a
+    /// stable profile name compiled without changing the name.
+    c_abi_lto: String,
+}
+
+/// Read one variable out of a `CMakeCache.txt`.
+///
+/// The cache's line format is `NAME:TYPE=VALUE`, and the type is not part of the
+/// identity — but splitting on `=` alone would match `CMAKE_BUILD_TYPE-ADVANCED`
+/// and every `//`-comment line that happens to contain one, so the name is taken
+/// from before the `:` and compared whole.
+fn cmake_cache_var(path: &Path, key: &str) -> Result<String> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading {} — that is `ros/build.sh`'s output tree, so either it has not run \
+             in this checkout or --ros-out points somewhere else",
+            path.display()
+        )
+    })?;
+    for line in text.lines() {
+        let Some((decl, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some((name, _ty)) = decl.split_once(':') else {
+            continue;
+        };
+        if name.trim() == key {
+            let value = value.trim();
+            if value.is_empty() {
+                bail!(
+                    "{} sets `{key}` to the empty string. For CMAKE_BUILD_TYPE that is not a \
+                     detail — it means no optimization flags were added at all, and the arms \
+                     were measured at -O0 while the table reports them as an engine comparison.",
+                    path.display()
+                );
+            }
+            return Ok(value.to_owned());
+        }
+    }
+    bail!(
+        "{} has no `{key}` entry. A run file that cannot state how the measured programs \
+         were built must not be written; see MeasuredBuild.",
+        path.display()
+    )
+}
+
+impl MeasuredBuild {
+    /// Read `ros/build.sh`'s two CMake caches under its `$OUT` directory.
+    ///
+    /// Two caches because the two halves are configured separately and can drift
+    /// apart: step 3 (`colcon build`) compiles the C++, step 2 packages an
+    /// archive step 1 built. `ros/build.sh` sets both to Release today; nothing
+    /// but this reading would notice if one of them stopped.
+    fn read(ros_out: &Path) -> Result<MeasuredBuild> {
+        let cxx_build_type = cmake_cache_var(
+            &ros_out.join("build/tf_tree_bench_ros/CMakeCache.txt"),
+            "CMAKE_BUILD_TYPE",
+        )?;
+        let prebuilt = cmake_cache_var(
+            &ros_out.join("tf_tree-build/CMakeCache.txt"),
+            "TF_TREE_PREBUILT_DIR",
+        )?;
+        // `<target>/<profile-dir>/libtf_tree_c.a`, so the directory name *is*
+        // the profile — the same identity `report.rs` records as
+        // `build_profile`, and deliberately the same spelling so a reader
+        // comparing the two facts is comparing like with like.
+        let c_abi_profile = Path::new(&prebuilt)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                anyhow!("TF_TREE_PREBUILT_DIR is {prebuilt:?}, which names no profile directory")
+            })?
+            .to_owned();
+        // Read from the manifest rather than assumed, for the reason
+        // `embed::lto_for_profile_dir`'s own tests give: `[profile.*]` sections
+        // inherit, and the answer for `release` is not the answer for a profile
+        // that inherits from it.
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "reading the workspace manifest {} to find out what `{c_abi_profile}` means",
+                manifest_path.display()
+            )
+        })?;
+        let c_abi_lto = tf_tree_bench::embed::lto_for_profile_dir(&manifest, &c_abi_profile);
+        Ok(MeasuredBuild {
+            cxx_build_type,
+            c_abi_profile,
+            c_abi_lto,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +542,28 @@ fn aggregate(args: &[String]) -> Result<()> {
     let json = flag(args, "--json").map(PathBuf::from);
     let workload = flag(args, "--workload").unwrap_or_else(|| "robot".to_owned());
 
+    // **Required with `--json`, and only with it.** The table on stdout is a
+    // one-shot: nobody diffs two of them, and an operator reading it has the
+    // build in front of them. The run file is the opposite — it is the schema
+    // `bench_ab` compares two of, months apart, and a comparable artifact that
+    // cannot say what it measured is the exact hazard `runstore`'s build facts
+    // exist for. Refusing here rather than writing the file with the facts
+    // missing keeps `absent` in a run file meaning "predates the gate" instead
+    // of "the driver forgot a flag".
+    let measured = match (&json, flag(args, "--ros-out")) {
+        (_, Some(dir)) => Some(MeasuredBuild::read(Path::new(&dir))?),
+        (None, None) => None,
+        (Some(path), None) => bail!(
+            "refusing to write {} without --ros-out. A run file is compared against another \
+             run file, and the `build_profile` this binary records is its OWN — it parses \
+             `.out` files, it does not measure. Without the arms' build in the file, a \
+             Release run and a -O0 run compare cleanly and the differ prints per-row \
+             verdicts over them. Pass `--ros-out $ROOT/target/ros` (ros/build.sh's $OUT); \
+             ros/dds_bench.sh does.",
+            path.display()
+        ),
+    };
+
     // Files are named `<arm>.<index>.out`, written by the shell driver — the
     // label is everything before the last `.` of the stem, so an arm label may
     // itself contain dots (`tf_tree.processes` does). Grouping on the name
@@ -459,6 +614,14 @@ fn aggregate(args: &[String]) -> Result<()> {
 
     println!("tf_tree vs tf2, end to end over a real DDS  [workload: {workload}]");
     println!("=====================================================================");
+    // Above the table, because it is the first thing that makes the table
+    // quotable: two of these runs are only comparable if this line matches.
+    if let Some(m) = &measured {
+        println!(
+            "arms built: C++ {} | libtf_tree_c.a from target/{} (lto = {})",
+            m.cxx_build_type, m.c_abi_profile, m.c_abi_lto
+        );
+    }
     println!(
         "{:<26} {:>6} {:>6} | {:>9} {:>9} {:>10} | {:>10} | {:>9} {:>9} {:>7}",
         "arm",
@@ -478,6 +641,25 @@ fn aggregate(args: &[String]) -> Result<()> {
     );
 
     let mut run = Run::begin(1);
+    if let Some(m) = &measured {
+        // Pushed onto the provenance `Run::begin` already collected rather than
+        // replacing `build_profile`: that fact is still true — it is what parsed
+        // these files — and a fact that is true is not improved by overwriting
+        // it with a different true fact under the same name. These three sit
+        // beside it and are what `BUILD_CRITICAL_FACTS` refuses on.
+        run.provenance.facts.push(Fact {
+            key: "dds_cxx_build_type",
+            value: m.cxx_build_type.clone(),
+        });
+        run.provenance.facts.push(Fact {
+            key: "dds_c_abi_profile",
+            value: m.c_abi_profile.clone(),
+        });
+        run.provenance.facts.push(Fact {
+            key: "dds_c_abi_lto",
+            value: m.c_abi_lto.clone(),
+        });
+    }
 
     /// The reference point the wake-from-idle disclosure below is stated
     /// against: a fixed round number, not a remembered measurement. Every

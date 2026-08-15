@@ -42,6 +42,27 @@
 //! `[profile.embedder]` leaves standing — so there is nothing worth reading and
 //! [`render`] prints no table at all. See [`Diff::comparable`].
 //!
+//! # Which emitted artifacts this covers, and which need nothing
+//!
+//! The refusal above lives in [`diff`], not in a harness, so it covers every
+//! emitter that writes a [`Run`] — for free and without a per-binary opt-in.
+//! The full list, audited rather than assumed, because "a residue is a
+//! hypothesis" applies to coverage as much as to nanoseconds:
+//!
+//! | emitter | comparable artifact | refuses a cross-profile comparison |
+//! |---|---|---|
+//! | `bin/contended_scaling.rs`, `bin/scale_sweep.rs`, `bin/soak.rs` | a [`Run`], via `--json`; `just bench-run` writes two of them per commit and `just bench-ab` compares them | yes — [`diff`], and their provenance is truthful because each binary measures **itself** |
+//! | `bin/dds_report.rs` | a [`Run`], via `aggregate --json` | yes, but only since it started reading `--ros-out`: it is the one emitter that measures *other* programs, so `build_profile` alone described a parser. See [`BUILD_CRITICAL_FACTS`]'s `dds_*` section |
+//! | `bin/bench_report.rs` | `results.json`, compared against the committed baseline by `just bench-check` | yes — [`crate::baseline::PORTABLE_FACTS`] carries `build_profile`, and a mismatch is a gate failure |
+//! | `bin/embed_cost.rs` | `embedder.json` + `release.json`, compared **to each other** | yes — [`crate::embed::Pair::load`] refuses two runs of the same `profile_dir`, or two of different `source_id` |
+//! | `bin/native_arena.rs` | a `.tfstream` | **not applicable, and deliberately given no machinery**: it is the *input* both engines replay, not a measurement. Two of them differing is a fixture change, which `dump_stream`'s own comment covers |
+//! | every other `bin/` | stdout only | **not applicable**: nothing diffs two runs of `footprint`, `attach_bench`, `counter_cost`, `shm_scaling`, `tf2_scaling`, `mp_bench`, `shm_torture`, `frozen_workers`, `arena_backing`, `abi_attached` or `tf2_ratio`. They print a result an operator reads once. A one-shot report is not made safer by refusing to be a thing it is not |
+//!
+//! The last row is the one worth stating explicitly, because the alternative
+//! reading — "add the check everywhere, it is cheap" — costs a reader of each of
+//! those binaries a paragraph explaining a comparison that never happens. If one
+//! of them grows a `--json`, it grows a [`Run`] and this covers it.
+//!
 //! # Schema
 //!
 //! Emitted by hand, for the reason `report.rs` gives for doing the same: the
@@ -113,7 +134,33 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
 /// `[profile.embedder]` or `[profile.release]` changes what a profile *means*
 /// while leaving its name alone, which is exactly the change nobody would think
 /// to regenerate a comparison for.
-pub const BUILD_CRITICAL_FACTS: &[&str] = &["build_profile", "build_lto"];
+///
+/// # The three `dds_*` keys, and why a generic list names a specific harness
+///
+/// The first two facts describe **the binary that called [`Run::begin`]**, which
+/// for every harness here is also the binary that took the measurement — except
+/// one. `bin/dds_report.rs` does not measure anything: it parses the `.out`
+/// files of C++ processes that `ros/build.sh` built, so its own `build_profile`
+/// is a true statement about a program that ran a parser. A dds run file
+/// carrying only those two facts refuses on a change to the *aggregator* and
+/// waves through a change to the *arms*, which is the comparison it exists to
+/// make. `dds_report` therefore reads the build that produced the arms out of
+/// the CMake caches that built them and pushes it here, and those keys have to
+/// be on this list or they are decoration.
+///
+/// Naming them here rather than inventing a per-harness list is deliberate and
+/// costs the other harnesses nothing: [`diff`] compares `a.fact(k)` against
+/// `b.fact(k)`, and two `scale_sweep` runs both have `None` for all three, which
+/// is agreement. It is only *one* side being absent that refuses — a dds run
+/// from before this gate against one from after — and that is the correct
+/// reading rather than a regression.
+pub const BUILD_CRITICAL_FACTS: &[&str] = &[
+    "build_profile",
+    "build_lto",
+    "dds_cxx_build_type",
+    "dds_c_abi_profile",
+    "dds_c_abi_lto",
+];
 
 /// One measurement point: a harness, a workload, an engine, and a position in
 /// whatever the harness sweeps.

@@ -440,6 +440,255 @@ fn an_arm_that_performed_no_lookups_is_flagged_failing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The run file states the build of the ARMS, not of the aggregator
+// ---------------------------------------------------------------------------
+
+/// A `ros/build.sh` output tree, with the two CMake caches `--ros-out` reads.
+///
+/// Written by hand rather than by running `ros/build.sh`: that needs the
+/// container, and what is under test is the reading, not the building. The
+/// format is CMake's own (`NAME:TYPE=VALUE`) and was checked against the real
+/// `target/ros/build/tf_tree_bench_ros/CMakeCache.txt` this repository produces.
+/// The decoys are deliberate — an `-ADVANCED` twin and a comment line containing
+/// the variable's name are both present in a real cache, and a parser that split
+/// on `=` alone would return one of them.
+fn write_ros_out(dir: &Path, build_type: &str, prebuilt_profile: &str) {
+    let bench = dir.join("build/tf_tree_bench_ros");
+    let pkg = dir.join("tf_tree-build");
+    std::fs::create_dir_all(&bench).unwrap();
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        bench.join("CMakeCache.txt"),
+        format!(
+            "# This is the CMakeCache file.\n\
+             //Choose the type of build, options are: None Debug Release\n\
+             CMAKE_BUILD_TYPE:STRING={build_type}\n\
+             CMAKE_BUILD_TYPE-ADVANCED:INTERNAL=1\n\
+             CMAKE_CXX_STANDARD:STRING=17\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("CMakeCache.txt"),
+        format!(
+            "# This is the CMakeCache file.\n\
+             CMAKE_BUILD_TYPE:STRING={build_type}\n\
+             //Directory holding a pre-built libtf_tree_c.a\n\
+             TF_TREE_PREBUILT_DIR:PATH=/work/target/tf2-docker/{prebuilt_profile}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A cargo profile directory guaranteed to differ from the one *this* test
+/// binary was built into.
+///
+/// The same rule as `runstore.rs`'s `differing_value`, which this mirrors rather
+/// than imports (it is private to that crate's unit tests): **a test about build
+/// facts must not hardcode one.** Hardcoding `embedder` here would assert
+/// "the arms' profile is not the aggregator's" and pass — until somebody runs
+/// the suite under `--profile embedder`, where the two would agree and the
+/// assertion would be vacuous rather than failing.
+fn a_profile_this_build_is_not() -> &'static str {
+    if tf_tree_bench::embed::PROFILE_DIR == "embedder" {
+        "release"
+    } else {
+        "embedder"
+    }
+}
+
+fn run_with(dir: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_dds_report"))
+        .args(["aggregate", "--dir"])
+        .arg(dir)
+        .args(extra)
+        .output()
+        .expect("spawning dds_report")
+}
+
+/// **Gate.** `--json` without `--ros-out` writes nothing.
+///
+/// A dds run file is the schema `bench_ab` compares two of, and the
+/// `build_profile` `Run::begin` collects here is the *aggregator's* — this
+/// binary parses `.out` files, it measures nothing. Writing the file without the
+/// arms' build in it is what lets a Release run and a `-O0` run compare cleanly,
+/// and it is worse than a missing file because the missing fact reads as
+/// "predates the gate" forever after.
+///
+/// Mutant (applied, observed): change the `(Some(path), None)` arm of
+/// `aggregate`'s `match` to `(Some(_), None) => None`, i.e. write the file with
+/// no arms' build. This test fails on the exit-status assertion — the run
+/// succeeds and `results.json` appears.
+#[test]
+fn a_run_file_without_the_arms_build_is_refused_rather_than_written() {
+    let scratch = Scratch::new("json-needs-ros-out");
+    write_four_arms(scratch.path());
+    let json = scratch.path().join("results.json");
+
+    let out = run_with(scratch.path(), &["--json", json.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        !out.status.success(),
+        "aggregate wrote a run file with no statement of how the arms were built"
+    );
+    assert!(
+        stderr.contains("--ros-out"),
+        "the refusal must name the flag that fixes it:\n{stderr}"
+    );
+    assert!(
+        !json.exists(),
+        "the refusal still left a run file behind: {}",
+        json.display()
+    );
+}
+
+/// **Gate.** The three `dds_*` facts describe the arms, and are read rather than
+/// assumed.
+///
+/// The fixture's profile directory is one this build is not, so a version of
+/// `MeasuredBuild::read` that reported the aggregator's own profile would fail
+/// here rather than coincidentally agree.
+///
+/// Mutant (applied, observed): in `MeasuredBuild::read`, replace `c_abi_profile`
+/// with `tf_tree_bench::embed::PROFILE_DIR.to_owned()` — the plausible
+/// "the archive is built beside us" assumption. This test fails with
+/// `left: "debug", right: "embedder"` under `just test`.
+#[test]
+fn the_run_file_records_the_arms_build_and_not_the_aggregators() {
+    let scratch = Scratch::new("arms-build");
+    write_four_arms(scratch.path());
+    let ros_out = scratch.path().join("ros");
+    let profile = a_profile_this_build_is_not();
+    write_ros_out(&ros_out, "RelWithDebInfo", profile);
+    let json = scratch.path().join("results.json");
+
+    let out = run_with(
+        scratch.path(),
+        &[
+            "--ros-out",
+            ros_out.to_str().unwrap(),
+            "--json",
+            json.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "aggregate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let text = std::fs::read_to_string(&json).unwrap();
+    let run = tf_tree_bench::runstore::Run::parse(&text).expect("the run file parses");
+    assert_eq!(run.fact("dds_cxx_build_type"), Some("RelWithDebInfo"));
+    assert_eq!(run.fact("dds_c_abi_profile"), Some(profile));
+    assert_ne!(
+        run.fact("dds_c_abi_profile"),
+        run.fact("build_profile"),
+        "the arms' profile and the aggregator's are different facts and the file must \
+         carry both"
+    );
+
+    // Computed from the manifest at test time, never spelled: `[profile.*]`
+    // sections inherit, and what `embedder` means is a property of the manifest
+    // in front of us rather than of what it said when this test was written.
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
+            .unwrap();
+    assert_eq!(
+        run.fact("dds_c_abi_lto"),
+        Some(tf_tree_bench::embed::lto_for_profile_dir(&manifest, profile).as_str())
+    );
+
+    // And the header line an operator reads carries the same three.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("arms built: C++ RelWithDebInfo"),
+        "the table must say what it is a table of:\n{stdout}"
+    );
+}
+
+/// Aggregate the same four arms against a given `ros/build.sh` output tree.
+fn run_file_for(scratch: &Scratch, tag: &str, build_type: &str, profile: &str) -> RunFile {
+    let ros_out = scratch.path().join(format!("ros-{tag}"));
+    write_ros_out(&ros_out, build_type, profile);
+    let json = scratch.path().join(format!("results-{tag}.json"));
+    let out = run_with(
+        scratch.path(),
+        &[
+            "--ros-out",
+            ros_out.to_str().unwrap(),
+            "--json",
+            json.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "aggregate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tf_tree_bench::runstore::Run::parse(&std::fs::read_to_string(&json).unwrap()).unwrap()
+}
+
+type RunFile = tf_tree_bench::runstore::Run;
+
+/// **Gate.** Two dds runs whose arms were built differently refuse each other.
+///
+/// This is the whole point of the two above: the facts exist so that
+/// `runstore::diff` — which `bench_ab` is a thin shell over — declines to print
+/// verdicts over arms built two ways. Before the `dds_*` keys existed this pair
+/// compared cleanly and printed a full per-row table, because the only build
+/// facts in the file described the parser, and the parser was `--release` in
+/// both.
+///
+/// **One axis at a time**, so each key carries its own weight rather than
+/// hiding behind another. The exception is stated rather than papered over:
+/// `dds_c_abi_lto` is a function of `dds_c_abi_profile` and one manifest, so
+/// they cannot be varied independently here — that pair is exactly the
+/// `build_profile` / `build_lto` relationship, and `build_lto` earns its place
+/// against a *manifest* edit, which no fixture in this file can make.
+///
+/// Mutant (applied, observed): delete all three `dds_*` keys from
+/// `runstore::BUILD_CRITICAL_FACTS`. Both cases below fail on `!comparable()`
+/// and `render` prints the table.
+///
+/// Mutant (applied, observed, and the reason this test varies one axis at a
+/// time): delete only `"dds_cxx_build_type"` and `"dds_c_abi_profile"`, leaving
+/// `dds_c_abi_lto`. An earlier version of this test varied both axes together
+/// (`Release`/`release` against `Debug`/`debug`) and **passed** under that
+/// mutation, because the surviving key moved too. It now fails.
+#[test]
+fn two_dds_runs_whose_arms_were_built_differently_do_not_compare() {
+    let scratch = Scratch::new("cross-build");
+    write_four_arms(scratch.path());
+
+    let base = run_file_for(&scratch, "base", "Release", "release");
+    for (tag, other) in [
+        (
+            "the C++ arms' build type",
+            run_file_for(&scratch, "cxx", "Debug", "release"),
+        ),
+        (
+            "the archive the tf_tree arms linked",
+            run_file_for(&scratch, "abi", "Release", "debug"),
+        ),
+    ] {
+        let d = tf_tree_bench::runstore::diff(&base, &other);
+        assert!(
+            !d.comparable(),
+            "{tag} changed and the two runs compared cleanly anyway; \
+             mismatch was {:?}",
+            d.build_mismatch
+        );
+        let text = tf_tree_bench::runstore::render(&d);
+        assert!(text.contains("REFUSED"), "{tag}:\n{text}");
+        assert!(
+            !text.contains("row / metric"),
+            "{tag}: the delta table must not be printed for an incomparable pair:\n{text}"
+        );
+    }
+}
+
 /// The `tf_tree.processes` row, split into the columns `aggregate` prints.
 struct Row {
     line: String,
