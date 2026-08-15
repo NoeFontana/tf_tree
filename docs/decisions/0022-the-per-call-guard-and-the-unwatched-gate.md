@@ -101,7 +101,56 @@ This is the same failure mode `tf2.md` already documents twice — the withdrawn
 4.7× CPU reading and the stale `.tft` reasons — and the same one that the
 `heap_vs_shared` and 213-vs-217 priors fell into. **A residue is a hypothesis.**
 
-## Amendment 2 — the premise is restored, and the mechanism is not what it said
+## Amendment 3 — question 5 is CLOSED, and this record's original premise was right
+
+The full ladder, measured at `[profile.embedder]` (`lto = false`, a real
+boundary) on the §11.1 fixture over a shared arena, three runs, `just
+abi-attached`:
+
+| rung | ns | Δ |
+|---|---|---|
+| native Rust, guard hoisted | 242 | — |
+| **+ guard built per call** | **290** | **+48** |
+| + the 56-byte `QVEC7` store the ABI must make | 289 | ~0 |
+| the ABI, no panic guard | 296 | +7 |
+| `tft_plan_at`, from Rust | 297 | +1 |
+| `tft_plan_at`, from C++ | 302 | — |
+
+**Question 5 is answered: there is no unexplained residue.** The per-call `Guard`
+is **~48 ns of ~56**, about 85%. Handle and layout validation plus the
+un-inlinable call are ~7 ns together; the layout store and the panic guard are
+noise. A native Rust caller that builds a guard per lookup costs **the same as
+going through the C ABI** — so the ABI adds essentially nothing beyond forcing
+that shape.
+
+**This corrects amendment 2, which said the guard was "a third, not all of it".**
+That measured +19 ns at the workspace `release` profile, where thin LTO inlines
+`Tree::guard` and shrinks the very thing being priced. At a real boundary it is
++48. The rule this record keeps relearning applies to its own amendments:
+a number carried across build profiles answers a different question.
+
+**So this record's original premise and conclusion were right, and the two
+amendments walking them back were wrong** — the first because it mistook an
+LTO-erased baseline for the real one, the second because it priced the guard in
+the same erased build. What was genuinely wrong throughout is the *title*: the
+problem is not that "the C tier" cannot hold a guard, it is that **nothing
+non-inlined** can, and the C ABI is simply the surface where that is forced.
+
+### What this authorizes, and what it still does not
+
+A way to hold a guard across calls would recover **~48 of the ~56 ns**, which is
+85% of what a C or C++ embedder pays over native Rust on this fixture. That is
+now a measured target rather than an inferred one, and question 5 no longer
+blocks the design.
+
+**Questions 1–4 still do.** In particular the soundness question (2) — a
+`tft_guard` outliving its `tft_tree` is a use-after-free a C caller writes
+trivially, and `0017` is explicit that lifetime extension in the bindings is
+what is being removed — and the staleness question (3), since a held guard pins
+a topology generation. `tft_plan_at_many` remains the lever that exists today
+and needs no new type.
+
+## Amendment 2 — superseded by amendment 3; kept for the reasoning error
 
 `just abi-attached` calls `tft_plan_at` **from Rust**, on the same shared arena a
 C++ probe measures at 302 ns, under two build profiles:

@@ -305,8 +305,8 @@ evidence-audit:
 abi-attached:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release -q --features bridge -p tf_tree_bench --bin abi_attached
-    RUSTFLAGS="--cfg abi_boundary_real" cargo build --profile embedder -q --features bridge -p tf_tree_bench --bin abi_attached
+    cargo build --release -q --features abi-probe -p tf_tree_bench --bin abi_attached
+    cargo build --profile embedder -q --features abi-probe -p tf_tree_bench --bin abi_attached
     cargo build --release -q --features shm -p tf_tree_bench --bin native_arena
     rt=$(mktemp -d /tmp/tft-abi-attached.XXXXXX); trap 'rm -rf "$rt"' EXIT
     export TF_TREE_RUNTIME_DIR="$rt" TF_TREE_NAME=abi_attached
@@ -1473,6 +1473,11 @@ shm-check:
     # `--lib` and not the whole package: the integration targets are named
     # individually, on purpose.
     cargo nextest run -p tf_tree_bench --features shm --lib
+    # `abi-probe` = `bridge` + `tf_tree_c/test-hooks`, the only configuration in
+    # which `abi_attached` compiles. Without this line the binary that measures
+    # the C ABI boundary is linted by nothing — the same hole `just lint`'s
+    # feature-named clippy passes exist to close.
+    cargo clippy -p tf_tree_bench --features abi-probe --all-targets -- -D warnings
     # Fork poisoning (`docs/decisions/0005` step 9). Separate from
     # `shm-rendezvous` because it needs no second executable and no scratch
     # rendezvous beyond its own: the second process is a `fork` of the first.

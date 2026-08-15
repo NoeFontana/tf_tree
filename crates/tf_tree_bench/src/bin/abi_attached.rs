@@ -49,7 +49,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 
 use tf_tree::{AttachMode, CreatePolicy, Open, Stamp, SystemDomain};
-use tf_tree_c::{tft_plan_at, tft_plan_create, tft_tree_open, TFT_LAYOUT_QVEC7_WXYZ, TFT_OK};
+use tf_tree_c::{
+    tft_plan_at, tft_plan_create, tft_test_plan_at_unguarded, tft_tree_open, TFT_LAYOUT_QVEC7_WXYZ,
+    TFT_OK,
+};
 
 const TARGET: &str = "imu_link";
 const SOURCE: &str = "map";
@@ -181,12 +184,81 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
+    // --- the rungs between them ------------------------------------------
+    //
+    // `abi_cost` prices these too, but with `lto = "thin"` erasing the boundary
+    // and on a 3-edge tree that fits in L1 — where they total ~3 ns. At a real
+    // boundary on this fixture they are the ~35 ns `0022` question 5 leaves
+    // open, so they are measured here rather than carried across.
+
+    // 1. The guard, per call — what the C signature cannot hoist.
+    let sweep_guard = || {
+        let mut acc = 0.0f64;
+        for _ in 0..SWEEPS {
+            for &st in &stamps {
+                let g = tree.guard();
+                if let Ok(v) = plan.at(&g, std::hint::black_box(st)) {
+                    acc += v.t.x;
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
+
+    // 2. The same, plus the 56-byte `QVEC7_WXYZ` store the ABI must make and a
+    //    native caller never does: Rust returns an `Iso3` the caller consumes
+    //    from registers.
+    let mut wbuf = [0.0f64; 7];
+    let mut sweep_write = || {
+        let mut acc = 0.0f64;
+        for _ in 0..SWEEPS {
+            for &st in &stamps {
+                let g = tree.guard();
+                if let Ok(v) = plan.at(&g, std::hint::black_box(st)) {
+                    wbuf = [v.q.w, v.q.x, v.q.y, v.q.z, v.t.x, v.t.y, v.t.z];
+                    acc += wbuf[4];
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
+
+    // 3. The ABI's own body without `catch_unwind`, so the panic guard is a
+    //    subtraction on a real, non-inlinable call.
+    let mut ubuf = [0.0f64; 7];
+    let mut sweep_unguarded = || {
+        let mut acc = 0.0f64;
+        for _ in 0..SWEEPS {
+            for &n in &raw {
+                // SAFETY: live plan; `ubuf` is exactly the layout's payload.
+                let rc = unsafe {
+                    tft_test_plan_at_unguarded(
+                        cplan,
+                        std::hint::black_box(n),
+                        TFT_LAYOUT_QVEC7_WXYZ,
+                        ubuf.as_mut_ptr().cast(),
+                    )
+                };
+                if rc == TFT_OK {
+                    acc += ubuf[4];
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
+
     let per_round = (SWEEPS * stamps.len()) as f64;
     let per_call = SWEEPS * stamps.len();
     for _ in 0..WARMUP.div_ceil(per_call) {
         std::hint::black_box(sweep_rust());
+        std::hint::black_box(sweep_guard());
+        std::hint::black_box(sweep_write());
+        std::hint::black_box(sweep_unguarded());
         std::hint::black_box(sweep_abi());
     }
+    let mut g_ns = Vec::with_capacity(ROUNDS);
+    let mut w_ns = Vec::with_capacity(ROUNDS);
+    let mut u_ns = Vec::with_capacity(ROUNDS);
 
     let mut r_ns = Vec::with_capacity(ROUNDS);
     let mut a_ns = Vec::with_capacity(ROUNDS);
@@ -208,7 +280,27 @@ fn main() -> Result<()> {
         };
         r_ns.push(a);
         a_ns.push(b);
+        // The intermediate rungs are not part of the alternating pair above —
+        // they only ever appear as differences against their neighbours, so a
+        // fixed order costs them nothing the subtraction does not remove.
+        let t = std::time::Instant::now();
+        let _ = sweep_guard();
+        g_ns.push(t.elapsed().as_nanos() as f64 / per_round);
+        let t = std::time::Instant::now();
+        let _ = sweep_write();
+        w_ns.push(t.elapsed().as_nanos() as f64 / per_round);
+        let t = std::time::Instant::now();
+        let _ = sweep_unguarded();
+        u_ns.push(t.elapsed().as_nanos() as f64 / per_round);
     }
+    g_ns.sort_by(f64::total_cmp);
+    w_ns.sort_by(f64::total_cmp);
+    u_ns.sort_by(f64::total_cmp);
+    let (gd, wr, un) = (
+        g_ns[g_ns.len() / 2],
+        w_ns[w_ns.len() / 2],
+        u_ns[u_ns.len() / 2],
+    );
     r_ns.sort_by(f64::total_cmp);
     a_ns.sort_by(f64::total_cmp);
     let rust = r_ns[r_ns.len() / 2];
@@ -222,8 +314,20 @@ fn main() -> Result<()> {
     println!();
     println!("  native Rust, guard hoisted        {rust:7.1} ns");
     println!(
+        "  + guard built per call            {gd:7.1} ns   ({:+.1})",
+        gd - rust
+    );
+    println!(
+        "  + the 56-byte QVEC7 store         {wr:7.1} ns   ({:+.1})",
+        wr - gd
+    );
+    println!(
+        "  the ABI, no panic guard           {un:7.1} ns   ({:+.1})",
+        un - wr
+    );
+    println!(
         "  tft_plan_at, called from Rust     {abi:7.1} ns   ({:+.1})",
-        abi - rust
+        abi - un
     );
     println!(
         "  tft_plan_at, called from C++      {:7.1} ns   (recorded, docs/benchmarks/tf2.md)",

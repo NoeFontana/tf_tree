@@ -70,6 +70,14 @@ Rust binary under two profiles:
 | `release` (`lto = "thin"`) | 200.5 | 225.8 (+25) | 302.0 |
 | **`embedder` (`lto = false`)** | 241.3 | **298.4 (+57)** | **302.0 (+61)** |
 
+**The decomposition, at that real boundary** (`just abi-attached`, three runs):
+native Rust with the guard hoisted 242 ns; **+48 ns for building the guard per
+call**; ~0 for the 56-byte `QVEC7` store; +7 for handle/layout validation and
+the un-inlinable call; +1 for the panic guard. **The per-call `Guard` is ~85% of
+what the ABI costs**, and a native Rust caller that guards per lookup costs the
+same as going through the ABI — so the ABI adds essentially nothing beyond
+forcing that shape. `docs/decisions/0022` amendment 3 carries it.
+
 **At a real boundary a Rust caller and a C++ caller agree to within 4 ns**, which
 settles two things at once: the ABI costs about **+57 ns** on this fixture, and
 that cost is the *boundary*, not the language. `docs/benchmarks/tf2.md`'s C++
