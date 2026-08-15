@@ -54,6 +54,12 @@ bridge = ["shm", "dep:tf_tree_c"]
 # `cargo nextest run --workspace` builds default features and therefore does
 # not, exactly like `shm`.
 embed-probe = ["tf_tree_core/bench-probe"]
+# **The C ABI boundary probe.** `abi_attached` needs `tft_test_plan_at_unguarded`
+# to price `catch_unwind` by subtraction on a real, non-inlinable call, and that
+# lives behind `tf_tree_c/test-hooks`. Its own feature rather than widening
+# `bridge`, because `bridge` is a *shipped* configuration (`docs/decisions/0015`)
+# and must not drag test hooks into anything that builds it.
+abi-probe = ["bridge", "tf_tree_c/test-hooks"]
 
 [dependencies]
 # `features = ["unstable"]` — `docs/API.md` §2.6. The harnesses measure the
@@ -191,7 +197,7 @@ required-features = ["shm"]
 [[bin]]
 name = "abi_attached"
 path = "src/bin/abi_attached.rs"
-required-features = ["bridge"]
+required-features = ["abi-probe"]
 
 # **PHASE2 §12's attach rows**, which had never been measured — and the number
 # `report.rs`'s `attach_latency` entry has been missing since it was written.
