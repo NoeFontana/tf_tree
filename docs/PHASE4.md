@@ -55,60 +55,109 @@
   every one of those mistakes. §3.7's 5 % gate is about `tft_plan_at`, which is
   the subject of the section immediately below.
 
-### §7 gate criterion 1 is measured in a build that erases what it measures
+### §7 gate criterion 1: what it measures now, and why it could not before
 
-**`examples/abi_cost.rs` is compiled at the workspace `release` profile, which is
-`lto = "thin"` — so `tft_plan_at` is inlined into its Rust caller and the C
-boundary the gate exists to price is not there.** `report.rs`'s §9.2 embedding
-row already knew this and says it in those words; nothing applied it here.
+**Current state, `just abi-cost`, `[profile.embedder]` (`lto = false`), twelve
+pinned runs.** The criterion is measured as four quotients on one interleaved
+ladder rather than as the single ratio §7's gate table still names;
+[`docs/decisions/0023`](./decisions/0023-the-gate-that-could-not-gate.md) is the
+**draft** that would make that wording change, and until it is `ready` the table
+below is a measurement, not an amendment.
 
-Measured on the §11.1 fixture over a shared arena, `just abi-attached`, the same
-Rust binary under two profiles:
+| row | what it is | measured | allowance |
+|---|---|---|---|
+| **R1** | `tft_plan_at` over native in the shape the C signature forces | **1.025–1.038×** | < 1.10 |
+| **R2** | the panic guard (`catch_unwind`) | 0.999–1.006× | < 1.05 |
+| **R3** | a guard per lookup, over one hoisted out of the loop | 1.059–1.075× | < 1.25 |
+| **C** | the control: rung 1's structural twin | 0.992–1.002× | 1 ± 0.02 |
+| — | *for reference*, §7-as-written: `tft_plan_at` over a hoisted guard | 1.098–1.108× | not gated |
+
+All four pass. `just abi-cost` now **exits non-zero** when they do not — the
+recipe used to say "wire the exit status in the commit that fixes the
+regression", and the regression turned out to be in the instrument.
+
+**Two things had to be fixed before any of that meant anything.**
+
+**1. It was built at the workspace `release` profile, which is `lto = "thin"` —
+so `tft_plan_at` was inlined into its Rust caller and the C boundary the gate
+exists to price was not in the binary.** `report.rs`'s §9.2 embedding row already
+said this in those words; nothing had applied it here. `just abi-cost` now builds
+the example twice and gates only the `embedder` arm. **The erasure was worth
+about half the answer**: the same ABI prices at **1.016–1.019×** with the
+boundary gone and **1.025–1.038×** with it present.
+
+That is the smaller version of a difference `just abi-attached` measured on a
+shared arena, where it is much larger:
 
 | profile | native Rust | Rust → ABI | C++ → ABI |
 |---|---|---|---|
 | `release` (`lto = "thin"`) | 200.5 | 225.8 (+25) | 302.0 |
 | **`embedder` (`lto = false`)** | 241.3 | **298.4 (+57)** | **302.0 (+61)** |
 
-**The decomposition, at that real boundary** (`just abi-attached`, three runs):
-native Rust with the guard hoisted 242 ns; **+48 ns for building the guard per
-call**; ~0 for the 56-byte `QVEC7` store; +7 for handle/layout validation and
-the un-inlinable call; +1 for the panic guard. **The per-call `Guard` is ~85% of
-what the ABI costs**, and a native Rust caller that guards per lookup costs the
-same as going through the ABI — so the ABI adds essentially nothing beyond
-forcing that shape. `docs/decisions/0022` amendment 3 carries it.
-
-**And "the guard" has since been taken apart**, by the same recipe at the same
-profile (`0022` amendment 4). Of the ~45 ns: `Tree::view()` +3.7, `Guard::new`
-+4.8, the whole fork-safety half — `detached()`, `is_shared()`,
-`with_fork_check` — +6.7, the cold bracket-search cursor ~4.8, and ~16 ns still
-unattributed. **`tf_tree_ipc::fork::generation` itself costs 0.2 ns**, which was
-the leading hypothesis and is now refuted; `#[inline]` on `Tree::guard` and
-halving the guard's 208 bytes were each applied, measured, found to move nothing,
-and reverted. The §7 numbers above do not change — this is a decomposition of the
-+48 row, not a correction of it — but two things follow for anyone reading this
-section for a lever: there is **no cheap structural fix worth more than ~7 ns**,
-and the counter-flush win `0022` question 1 was carrying (~18 ns) is not
-available on this fixture, because the arena is attached read-only and the flush
-early-returns.
-
 **At a real boundary a Rust caller and a C++ caller agree to within 4 ns**, which
-settles two things at once: the ABI costs about **+57 ns** on this fixture, and
-that cost is the *boundary*, not the language. `docs/benchmarks/tf2.md`'s C++
-figure was never a C++ artifact.
+settles two things at once: the ABI's cost is the *boundary*, not the language,
+and `docs/benchmarks/tf2.md`'s C++ figure was never a C++ artifact.
 
-It also explains the instability recorded below. With the call inlined, both arms
-of gate 1 collapse into one optimisable blob, so the ratio turns on how well LLVM
-specialises it — which is why adding an unrelated second `Tree::guard()` call
-site moved the native baseline 133 → 190 and the verdict FAIL → PASS. Neither
-number was about the ABI.
+**2. The denominator was at LLVM's discretion**, which is the defect recorded in
+the section below: an unrelated second `Tree::guard()` call site moved the native
+baseline 133 → 190 ns (43%) and the verdict FAIL → PASS while the ABI arm never
+moved. Every native comparand in `abi_cost.rs` is now `#[inline(never)]` with
+`black_box` on the stamp in and the scalar out, and the ladder carries a
+permanent **control row** — a structural twin of rung 1, separate symbol,
+separate call site — that goes red if a call site ever specialises a comparand
+again.
 
-**What gate 1 needs is to be built at `[profile.embedder]`**, exactly as §9.2's
-embedding row is, and re-cut against a figure taken there. That is a §7 change
-and belongs in a decision record; until it lands, `just abi-cost`'s ratio should
-be read as "the ABI with the boundary erased", which is nobody's deployment.
+**The pin was verified rather than assumed, by re-running the edit that broke the
+old gate.** An extra unrelated `Tree::guard()` call site was added, measured,
+and reverted:
+
+| | R1 | R3 | control | absolute baseline |
+|---|---|---|---|---|
+| before | 1.028–1.032 | 1.064–1.075 | 0.992–1.002 | 241–243 ns |
+| with the extra call site | 1.025–1.029 | 1.059–1.065 | 0.997–0.998 | 217 ns |
+| after reverting it | 1.032–1.034 | 1.063 | 1.000–1.002 | 247–248 ns |
+
+**The ratios moved by at most 0.4 percentage points. The absolute baseline moved
+14% — and reverting the edit did not bring it back**, which is what says that
+14% was the host (a neighbouring project was building) and not the edit. Compare
+the old, unpinned gate under the same class of edit: 43%, and a flipped verdict.
+This is also why the criterion stays a ratio: `report.rs`'s `Fitness` refuses
+`Sensitivity::AbsoluteTiming` on this host, and `fair_for_ratios` is the weaker
+axis that survives precisely because drift lands on both arms of an interleaved
+pair.
+
+**Why rungs rather than one quotient.** R1 is the C *ABI* — handle validation,
+layout dispatch, output slice, landing pad. R3 is the C *signature*, which has
+nowhere to keep a guard between calls. Different owners (R1 is `tf_tree_c`'s, R3
+is `0022`'s) and different futures (`0022` intends to lower R3; nothing intends
+to lower R1). A single quotient moves when either moves and tells you neither.
+
+**And "the guard" has since been taken apart**, by `just abi-attached` at the
+same profile (`0022` amendment 4). Of the ~45 ns it costs on a shared arena:
+`Tree::view()` +3.7, `Guard::new` +4.8, the whole fork-safety half —
+`detached()`, `is_shared()`, `with_fork_check` — +6.7, the cold bracket-search
+cursor ~4.8, and ~16 ns still unattributed. **`tf_tree_ipc::fork::generation`
+itself costs 0.2 ns**, which was the leading hypothesis and is now refuted;
+`#[inline]` on `Tree::guard` and halving the guard's 208 bytes were each applied,
+measured, found to move nothing, and reverted. Two things follow for anyone
+reading this section for a lever: there is **no cheap structural fix worth more
+than ~7 ns**, and the counter-flush win `0022` question 1 was carrying (~18 ns)
+is not available on that fixture, because the arena is attached read-only and the
+flush early-returns.
+
+**One number here is not reconciled and is flagged rather than explained**: the
+per-call guard costs ~45 ns on the attached shared arena and **~16 ns** on
+`abi_cost`'s three-edge heap tree, both at `[profile.embedder]`. That is
+`0022`'s to resolve, and `0023` open question 3 asks whether §7 should be gating
+the dearer configuration.
 
 ### The instability that led here, kept because it is how the LTO problem surfaced
+
+*Retained as history. The two fixes it asks for — pinning the comparand, and a
+decision record — are the section above and
+[`0023`](./decisions/0023-the-gate-that-could-not-gate.md). Its ladder table
+below is a `release`-profile reading of the pre-pin shape and should not be
+compared against the current numbers.*
 
 **This section said "gate criterion 1 is failing at 1.34–1.46×" and that was
 measuring an artifact.** Retracted, with the measurement that retracts it.
@@ -1902,6 +1951,12 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
 **Gate:**
 
 1. C ABI within **5%** of native for depth-3 lookup.
+   *Measured by `just abi-cost`. §0.0 records what this criterion actually gates
+   today — four quotients on an interleaved ladder at `[profile.embedder]`,
+   because at the workspace `release` profile the boundary is inlined away and
+   because the single quotient's denominator moved 43% on an unrelated edit.
+   Rewriting this line is [`0023`](./decisions/0023-the-gate-that-could-not-gate.md),
+   **draft**; it is not rewritten here until that record is `ready`.*
 2. C++ wrapper within **2%** of the C ABI (it is inline code; anything more means it is not).
 3. Bridge steady-state CPU **below one `tf2` consumer's** — the whole architectural claim is that this cost is paid once instead of N times.
 4. Zero ASan/UBSan findings across the C and C++ suites.

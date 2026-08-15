@@ -365,27 +365,45 @@ gate4:
     cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
     ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
 
-# **PHASE4 §7 gate criterion 1: `tft_plan_at` within 5 % of native Rust.**
+# **PHASE4 §7 gate criterion 1: what the C ABI costs a caller.**
 #
 # This recipe exists because the gate did not have one. `examples/abi_cost.rs`
 # was named in a comment and executed by nothing — no recipe, no workflow — so
 # `docs/PHASE4.md` carried "1.020×, PASS" as a frozen historical reading while
-# the example itself had started printing FAIL. It measures 1.34–1.46× today.
-# A gate nothing runs is not a gate, which is the lesson this file already
-# learned for `just lint` and `just test` (see the header on 1:1 CI mirroring)
-# and had not yet applied to §7.
+# the example itself had started printing FAIL.
+#
+# **Two builds, and the second one is the gate.** The workspace `release`
+# profile is `lto = "thin"`, which inlines `tft_plan_at` into this Rust caller —
+# so the boundary the gate exists to price is *not in that binary*.
+# `report.rs`'s §9.2 embedding row already says thin LTO "is exactly what erases
+# the boundary"; nothing had applied it to §7. `[profile.embedder]` is
+# `lto = false` and is the honest one, and `just embed-cost` builds there for the
+# same reason. The `release` run is kept because the contrast between the two is
+# the finding, and because deleting it would leave nobody able to check the
+# claim.
 #
 # **Pinned**, for `cpp-bench`'s reason: an unpinned run migrates cores and swings
 # by more than the gate allows.
 #
-# Exit status is deliberately NOT the gate today, because the gate is failing and
-# a red recipe that everyone learns to skip is worse than a loud one. The example
-# prints its own PASS/FAIL per row; `docs/PHASE4.md` §7 records the state and
-# `docs/decisions/0022` carries the open question. **Wire the exit status in the
-# commit that fixes the regression**, not before.
+# **Exit status is now the gate** — at the `embedder` profile only. It was not,
+# and the recipe said "wire it in the commit that fixes the regression": this is
+# that commit. What made the old criterion ungateable was its denominator, an
+# inlined loop that moved 43% when an unrelated second `Tree::guard()` call site
+# was added to the same file. The comparands are pinned now
+# (`#[inline(never)]` + `black_box`) and the binary carries a standing control
+# row that fails if the pin ever stops holding. The three rungs it gates and
+# their allowances are `docs/decisions/0023` — draft, so read them as a proposal
+# a human ratifies by merging it.
 abi-cost:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo build --release -q -p tf_tree_c --features test-hooks --example abi_cost
-    taskset -c 2 ./target/release/examples/abi_cost
+    cargo build --profile embedder -q -p tf_tree_c --features test-hooks --example abi_cost
+    echo "=== release profile (lto = \"thin\" — the boundary is ERASED; contrast only) ==="
+    taskset -c 2 ./target/release/examples/abi_cost release
+    echo
+    echo "=== embedder profile (lto = false — a REAL boundary; THIS one gates) ==="
+    taskset -c 2 ./target/embedder/examples/abi_cost embedder
 
 # The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
 c-abi-check:

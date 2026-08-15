@@ -32,7 +32,7 @@ must not blur the two.
 
 | Artifact | Recipe | Criterion |
 |---|---|---|
-| `tf_tree_c/examples/abi_cost.rs` | `just abi-cost` | PHASE4 §7 gate 1: `tft_plan_at` < 1.05× native. **Currently FAILING at 1.34–1.46×** — see PHASE4 §7 |
+| `tf_tree_c/examples/abi_cost.rs` | `just abi-cost` | PHASE4 §7 gate 1, re-cut by `0023` (**draft**): four quotients on one interleaved ladder at `[profile.embedder]` — R1 the ABI < 1.10 (**1.025–1.038**), R2 the panic guard < 1.05, R3 the per-call guard < 1.25, and a control at 1 ± 0.02. **All PASS**, and the recipe now exits non-zero when they do not. The `release` arm it also runs is a contrast, not a gate: `lto = "thin"` inlines `tft_plan_at` away |
 | `tf_tree_c/tests/cpp/bench.cpp` | `just cpp-bench` | PHASE4 §7 gate 2: C++ wrapper < 1.02× the raw C ABI |
 | `tf_tree_bench/src/bin/bench_report.rs` | `just bench-check` / `just tf2-bench-check` | PHASE5 §10 regression gate against the committed baselines |
 | `tf_tree_bench/src/bin/embed_cost.rs` | `just embed-cost-check` | PHASE5 §9.2 embedding cost |
