@@ -442,7 +442,12 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
 ///
 /// If no arena of that name is being served, the pair cannot be planned, or a
 /// timed round measures a non-duration.
-pub fn measure_attached(name: &str, rounds: usize, sweeps: usize, warmup: usize) -> Result<f64> {
+pub fn measure_attached(
+    name: &str,
+    rounds: usize,
+    sweeps: usize,
+    warmup: usize,
+) -> Result<(f64, f64)> {
     if rounds == 0 || sweeps == 0 {
         bail!("rounds and sweeps must both be non-zero; got {rounds} and {sweeps}");
     }
@@ -474,25 +479,64 @@ pub fn measure_attached(name: &str, rounds: usize, sweeps: usize, warmup: usize)
         }
         std::hint::black_box(acc)
     };
+    // **The same sweep with the guard acquired per lookup** — the shape
+    // `tft_plan_at` is forced into, on the *exact* arena the C++ probe measures
+    // at 302 ns. This is the arm that decides whether the C ABI's +100 ns there
+    // is the guard or something else, and it is measured here rather than
+    // inferred from a different fixture: the guard costs +2.5 ns on
+    // `abi_cost`'s 3-edge tree and +27-35 ns on this one, so a figure carried
+    // across fixtures would answer the wrong question.
+    //
+    // Note this arena is attached **read-only**, and `Guard::drop` early-returns
+    // when `!view.is_writable()` — so the counter flush that doubles the guard
+    // on a writable arena is not paid here at all.
+    let sweep_per_call = || {
+        let mut acc = 0.0f64;
+        for _ in 0..sweeps {
+            for &s in &stamps {
+                let g = tree.guard();
+                if let Ok(v) = plan.at(&g, std::hint::black_box(s)) {
+                    acc += v.t.x;
+                }
+            }
+        }
+        std::hint::black_box(acc)
+    };
 
     let per_sweep = stamps.len();
     let per_call = sweeps.saturating_mul(per_sweep).max(1);
     for _ in 0..warmup.div_ceil(per_call) {
         std::hint::black_box(sweep());
+        std::hint::black_box(sweep_per_call());
     }
 
     let per_round = (sweeps * per_sweep) as f64;
     let mut ns = Vec::with_capacity(rounds);
-    for _ in 0..rounds {
-        let t0 = std::time::Instant::now();
-        let _ = sweep();
-        let d = t0.elapsed().as_nanos() as f64 / per_round;
-        if d <= 0.0 {
-            bail!("a timed round measured {d} ns per lookup, which is not a duration");
+    let mut pc = Vec::with_capacity(rounds);
+    for r in 0..rounds {
+        // Interleaved and alternating, like every other pair in this module.
+        let (a, b) = if r % 2 == 0 {
+            let t0 = std::time::Instant::now();
+            let _ = sweep();
+            let a = t0.elapsed().as_nanos() as f64 / per_round;
+            let t1 = std::time::Instant::now();
+            let _ = sweep_per_call();
+            (a, t1.elapsed().as_nanos() as f64 / per_round)
+        } else {
+            let t1 = std::time::Instant::now();
+            let _ = sweep_per_call();
+            let b = t1.elapsed().as_nanos() as f64 / per_round;
+            let t0 = std::time::Instant::now();
+            let _ = sweep();
+            (t0.elapsed().as_nanos() as f64 / per_round, b)
+        };
+        if a <= 0.0 || b <= 0.0 {
+            bail!("a timed round measured {a} / {b} ns per lookup, which is not a duration");
         }
-        ns.push(d);
+        ns.push(a);
+        pc.push(b);
     }
-    Ok(median(&mut ns))
+    Ok((median(&mut ns), median(&mut pc)))
 }
 
 /// What acquiring a [`tf_tree::Guard`] **per lookup** costs, against hoisting

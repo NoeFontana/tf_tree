@@ -289,6 +289,40 @@ miri:
 evidence-audit:
     ./scripts/evidence-audit.sh
 
+# **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
+#
+# Four candidates for that gap are eliminated by measurement — the memfd mapping
+# (<= 9.6 ns), the cross-process read-only attach (-0.2 ns), static-vs-shared
+# linkage (~1 ns) and the per-call `Guard` on this arena (+19.3 ns) — leaving
+# ~81 ns unattributed. `just abi-cost` does not reproduce it: its full ABI costs
+# +2.3 ns over a native arm that also guards per call, on a 3-edge tree.
+#
+# The remaining variable is the **caller**. This calls `tft_plan_at` from Rust on
+# the same arena, in the same process, against the same stamps, so the ABI is the
+# only thing that changes between the two arms. Lands near 302 and the cost is
+# the ABI on this fixture; lands near 220 and it is the C++ side, and `0022` is
+# aimed at the wrong thing.
+abi-attached:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -q --features bridge -p tf_tree_bench --bin abi_attached
+    RUSTFLAGS="--cfg abi_boundary_real" cargo build --profile embedder -q --features bridge -p tf_tree_bench --bin abi_attached
+    cargo build --release -q --features shm -p tf_tree_bench --bin native_arena
+    rt=$(mktemp -d /tmp/tft-abi-attached.XXXXXX); trap 'rm -rf "$rt"' EXIT
+    export TF_TREE_RUNTIME_DIR="$rt" TF_TREE_NAME=abi_attached
+    coproc OWNER { ./target/release/native_arena --name abi_attached --stream "$rt/fx.tfstream"; }
+    read -r -u "${OWNER[0]}" line || { echo "the arena owner exited before it was ready" >&2; exit 1; }
+    case "$line" in ready\ *) : ;; *) echo "unexpected owner greeting: $line" >&2; exit 1 ;; esac
+    status=0
+    echo "=== release profile (lto = \"thin\" — the boundary is ERASED) ==="
+    taskset -c 2 ./target/release/abi_attached abi_attached || status=$?
+    echo
+    echo "=== embedder profile (lto = false — a REAL boundary) ==="
+    taskset -c 2 ./target/embedder/abi_attached abi_attached --boundary-real || status=$?
+    if [ -n "${OWNER[1]:-}" ]; then exec {OWNER[1]}>&- || true; fi
+    wait "${OWNER_PID:-}" 2>/dev/null || true
+    exit "$status"
+
 # **PHASE2 §12's attach rows**, which had never been measured.
 #
 # §12's table asks for "attach time, cold and warm" (p50) and "first access after
