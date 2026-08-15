@@ -101,7 +101,41 @@ This is the same failure mode `tf2.md` already documents twice — the withdrawn
 4.7× CPU reading and the stale `.tft` reasons — and the same one that the
 `heap_vs_shared` and 213-vs-217 priors fell into. **A residue is a hypothesis.**
 
-## Amendment — this record's headline number is under review
+## Amendment 2 — the premise is restored, and the mechanism is not what it said
+
+`just abi-attached` calls `tft_plan_at` **from Rust**, on the same shared arena a
+C++ probe measures at 302 ns, under two build profiles:
+
+| profile | native Rust | Rust → ABI | C++ → ABI |
+|---|---|---|---|
+| `release` (`lto = "thin"`) | 200.5 | 225.8 (+25) | 302.0 |
+| **`embedder` (`lto = false`)** | 241.3 | **298.4 (+57)** | **302.0 (+61)** |
+
+**A Rust caller and a C++ caller agree to within 4 ns at a real boundary.** So:
+
+- **The gap is real** — about **+57 ns** on the §11.1 fixture — and amendment 1's
+  worry that it was all baseline specialisation is wrong. The premise stands.
+- **It is not "the C tier"**, and this record's title is misleading. A
+  *non-inlined Rust* caller pays the same thing. The cost is the boundary, and
+  what makes `abi_cost` report +2.3 ns is that the workspace `release` profile
+  is `lto = "thin"` and inlines the ABI call into it.
+- **The per-call `Guard` is ~19 ns of the ~57**, measured on this exact arena
+  (`just abi-split`'s cross-process rung: hoisted 200.6, per-call 220.0). So the
+  guard is **a third of it, not all of it**, and a `tft_guard` handle would
+  recover at most that third.
+
+**What the other ~38 ns is remains unmeasured**, and question 5 stays open on it.
+Candidates in order of size to check: the 56-byte `QVEC7` layout write a Rust
+caller never makes; handle and layout validation; the un-inlinable call itself.
+`abi_cost`'s ladder prices those at ~+3 ns *combined* — but it does so with the
+boundary erased and on an L1-resident 3-edge tree, so that number answers a
+different question and must not be carried across.
+
+**Nothing here authorizes the handle.** It would address a third of a gap whose
+remaining two thirds are unattributed, and this record has now had two amendments
+for exactly that kind of reasoning.
+
+## Amendment 1 — this record's headline number is under review
 
 **`abi_cost.rs`'s native baseline turned out to be unstable, and the "+60 ns,
 mostly the guard" figure above rests on it.** Building the per-rung ladder §7

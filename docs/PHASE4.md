@@ -55,7 +55,38 @@
   every one of those mistakes. §3.7's 5 % gate is about `tft_plan_at`, which is
   the subject of the section immediately below.
 
-### §7 gate criterion 1 cannot be evaluated: its denominator is unstable
+### §7 gate criterion 1 is measured in a build that erases what it measures
+
+**`examples/abi_cost.rs` is compiled at the workspace `release` profile, which is
+`lto = "thin"` — so `tft_plan_at` is inlined into its Rust caller and the C
+boundary the gate exists to price is not there.** `report.rs`'s §9.2 embedding
+row already knew this and says it in those words; nothing applied it here.
+
+Measured on the §11.1 fixture over a shared arena, `just abi-attached`, the same
+Rust binary under two profiles:
+
+| profile | native Rust | Rust → ABI | C++ → ABI |
+|---|---|---|---|
+| `release` (`lto = "thin"`) | 200.5 | 225.8 (+25) | 302.0 |
+| **`embedder` (`lto = false`)** | 241.3 | **298.4 (+57)** | **302.0 (+61)** |
+
+**At a real boundary a Rust caller and a C++ caller agree to within 4 ns**, which
+settles two things at once: the ABI costs about **+57 ns** on this fixture, and
+that cost is the *boundary*, not the language. `docs/benchmarks/tf2.md`'s C++
+figure was never a C++ artifact.
+
+It also explains the instability recorded below. With the call inlined, both arms
+of gate 1 collapse into one optimisable blob, so the ratio turns on how well LLVM
+specialises it — which is why adding an unrelated second `Tree::guard()` call
+site moved the native baseline 133 → 190 and the verdict FAIL → PASS. Neither
+number was about the ABI.
+
+**What gate 1 needs is to be built at `[profile.embedder]`**, exactly as §9.2's
+embedding row is, and re-cut against a figure taken there. That is a §7 change
+and belongs in a decision record; until it lands, `just abi-cost`'s ratio should
+be read as "the ABI with the boundary erased", which is nobody's deployment.
+
+### The instability that led here, kept because it is how the LTO problem surfaced
 
 **This section said "gate criterion 1 is failing at 1.34–1.46×" and that was
 measuring an artifact.** Retracted, with the measurement that retracts it.

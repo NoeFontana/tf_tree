@@ -184,6 +184,15 @@ name = "frozen_workers"
 path = "src/bin/frozen_workers.rs"
 required-features = ["shm"]
 
+# **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
+# Calls `tft_plan_at` from Rust on the same arena a C++ probe measures at 302 ns,
+# so the caller is the only variable left. Needs `bridge` (which implies `shm`
+# and pulls `tf_tree_c`).
+[[bin]]
+name = "abi_attached"
+path = "src/bin/abi_attached.rs"
+required-features = ["bridge"]
+
 # **PHASE2 §12's attach rows**, which had never been measured — and the number
 # `report.rs`'s `attach_latency` entry has been missing since it was written.
 # Needs `shm` because attaching *is* the thing under test.

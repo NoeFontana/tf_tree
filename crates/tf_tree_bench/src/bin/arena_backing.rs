@@ -147,7 +147,7 @@ fn main() -> Result<()> {
     if let Some(name) = attach {
         // Same rounds/sweeps as the paired run, so the two `Rust native` rungs
         // are the same loop and differ only in which process built the arena.
-        let ns = tf_tree_bench::backing::measure_attached(
+        let (ns, per_call_ns) = tf_tree_bench::backing::measure_attached(
             &name,
             tf_tree_bench::backing::ROUNDS,
             40,
@@ -168,6 +168,18 @@ fn main() -> Result<()> {
             "  attaching costs {:+.1} ns against the in-process shared arena — and this is \
              native Rust, so no C ABI is involved in it.",
             ns - run.shm_ns
+        );
+        println!();
+        println!(
+            "  A  with the guard acquired PER LOOKUP     {per_call_ns:7.1} ns  ({:+.1} ns)",
+            per_call_ns - ns
+        );
+        println!(
+            "  that is the shape tft_plan_at is forced into, on the exact arena a C++\n  \
+             caller measures at 302.0 ns. Native Rust here is {ns:.1}; the guard accounts\n  \
+             for {:.0}% of the {:.0} ns between them.",
+            (per_call_ns - ns) / (302.0 - ns) * 100.0,
+            302.0 - ns
         );
     }
     Ok(())
