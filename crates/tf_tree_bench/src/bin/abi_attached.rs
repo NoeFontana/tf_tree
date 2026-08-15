@@ -117,19 +117,56 @@ fn stamp_ns(i: i64) -> i64 {
 }
 
 fn main() -> Result<()> {
-    // `--boundary-real` is passed by `just abi-attached` for the
-    // `[profile.embedder]` build only. A flag rather than a `cfg!`: the profile's
-    // `lto` setting is not visible to `cfg!`, and a custom `--cfg` would need
-    // `check-cfg` plumbing kept in sync with the recipe for no gain. The recipe
-    // is the single place that knows which build it just made.
+    // **The profile is measured here, not asserted by the caller.**
+    //
+    // `--boundary-real` used to *be* the answer: `just abi-attached` passed it
+    // to the `[profile.embedder]` build and withheld it from the `release` one,
+    // and this binary believed whichever it got. That put the most load-bearing
+    // fact about a boundary measurement — whether the boundary was in the binary
+    // at all — in a shell script, where swapping two lines would silently label
+    // the LTO-erased run as the real one. `build.rs` reads the profile directory
+    // out of `OUT_DIR` and `embed::lto_for_profile_dir` maps it to the `lto` the
+    // workspace manifest declares, so both halves are now facts about this
+    // executable.
+    //
+    // The flag is still accepted, and is now a *claim that is checked*: a
+    // mismatch against the measured profile is an error rather than a wrong
+    // label on a right-looking table. That is what makes the recipe's two lines
+    // unswappable.
     let mut name = "abi_attached".to_owned();
-    let mut boundary_real = false;
+    let mut claimed_real = false;
     for a in std::env::args().skip(1) {
         if a == "--boundary-real" {
-            boundary_real = true;
+            claimed_real = true;
         } else {
             name = a;
         }
+    }
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"),
+    )
+    .context("reading the workspace manifest to find out what profile this binary is")?;
+    let lto =
+        tf_tree_bench::embed::lto_for_profile_dir(&manifest, tf_tree_bench::embed::PROFILE_DIR);
+    // Anything but a declared `false` leaves LTO able to inline across the crate
+    // boundary. `starts_with` rather than `==` because the "cargo's default"
+    // spelling is `false (…)`; see `lto_for_profile_dir`. An `unknown (…)` value
+    // is correctly *not* a real boundary: a run that cannot name its own LTO
+    // setting has not earned the claim.
+    let boundary_real = lto.starts_with("false");
+    if claimed_real != boundary_real {
+        bail!(
+            "{} `--boundary-real`, but this binary was built into `target/{}/`, whose \
+             profile declares `lto = {lto}` — so the crate boundary is {}. The flag is a \
+             claim about the build and this binary measures the build; the two must agree.",
+            if claimed_real {
+                "the caller passed"
+            } else {
+                "the caller did not pass"
+            },
+            tf_tree_bench::embed::PROFILE_DIR,
+            if boundary_real { "REAL" } else { "ERASED" },
+        );
     }
 
     // --- the Rust arm: attach through the facade, hoist a guard -------------
@@ -713,9 +750,16 @@ fn main() -> Result<()> {
     // Rust caller gets `tft_plan_at` *inlined*, which no foreign caller ever
     // does. `[profile.embedder]` is `lto = false` and is the one that measures a
     // real boundary.
+    // The profile travels with the numbers, on the same page as the numbers.
+    // Every table above is a boundary measurement and a boundary measurement
+    // read without its profile is the error `docs/PHASE4.md` §0.0 records twice.
+    println!(
+        "  build: target/{}/  (the workspace manifest declares lto = {lto} for it)",
+        tf_tree_bench::embed::PROFILE_DIR
+    );
     if !boundary_real {
         println!(
-            "  Built with lto = \"thin\": THIS RUN CANNOT ANSWER THE QUESTION. The ABI call is\n  \
+            "  Built with LTO on: THIS RUN CANNOT ANSWER THE QUESTION. The ABI call is\n  \
              inlined into the Rust caller, which is not something a C or C++ embedder can\n  \
              get. Re-run at `--profile embedder` (lto = false); `just abi-attached` does\n  \
              both and prints them together."

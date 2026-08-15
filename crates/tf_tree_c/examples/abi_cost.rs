@@ -324,6 +324,32 @@ fn native_per_call_guard_twin(
     black_box(buf[15])
 }
 
+/// The cargo profile directory this executable is running out of, if it is
+/// running out of one.
+///
+/// Cargo lays an example out at `<target>/[<triple>/]<profile-dir>/examples/`,
+/// so the path component immediately before `examples` is the profile
+/// directory — `release` for `--release`, `embedder` for `--profile embedder`.
+/// The optional `<triple>` component when cross-compiling is why this searches
+/// for `examples` from the right rather than counting from `target`.
+///
+/// This is the same fact `tf_tree_bench`'s `build.rs` gets from `OUT_DIR`, read
+/// a weaker way: `OUT_DIR` is what cargo told the build, while this is where the
+/// file ended up, so a copied binary answers `None` here and `build.rs`'s answer
+/// would have travelled with it. `None` is the honest reply for a copied
+/// binary — it is *why* an unverified `embedder` claim is not allowed to gate —
+/// and the weaker mechanism is the right trade for a published crate that
+/// should not grow a build script to serve one benchmark example.
+fn profile_dir_of_this_binary() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let parts: Vec<String> = exe
+        .iter()
+        .map(|c| c.to_string_lossy().into_owned())
+        .collect();
+    let i = parts.iter().rposition(|c| c == "examples")?;
+    parts.get(i.checked_sub(1)?).cloned()
+}
+
 fn main() {
     // The C-side handles.
     let mut tree: *mut tft_tree = ptr::null_mut();
@@ -377,23 +403,53 @@ fn main() {
         .map(|i| 10_000_000 + ((i * 7919) % 600_000_000) as i64)
         .collect();
 
-    // **The profile is half of a boundary measurement**, so it is printed and
-    // it comes from the caller rather than being guessed. `just abi-cost` runs
-    // this binary twice and passes `release` and `embedder`; run by hand with no
-    // argument it says so rather than implying a boundary it cannot vouch for.
-    let profile = std::env::args()
+    // **The profile is half of a boundary measurement**, so it is printed — and
+    // since it also decides *whether this run gates at all* (see the exit-status
+    // comment far below), argv[1] is a claim that gets checked against where
+    // cargo actually put this binary.
+    //
+    // It used to be only a claim. `just abi-cost` builds twice and passes
+    // `release` to one and `embedder` to the other, and the binary believed
+    // whichever string it got; swapping the two lines of that recipe would have
+    // moved the gate onto the `lto = "thin"` run — the one where rustc inlines
+    // `tft_plan_at` into its Rust caller, so the boundary being priced is not in
+    // the binary — and nothing in the output would have said so. That is the
+    // same shape as the two wrong attributions `docs/PHASE4.md` §0.0 records.
+    //
+    // `tf_tree_c` is a published crate and does not get a `build.rs` for this
+    // (`tf_tree_bench`'s bakes `OUT_DIR`'s profile directory in, which is the
+    // better fact when it is available). `current_exe` is the version that costs
+    // the shipped crate nothing: cargo lays an example out at
+    // `<target>/[<triple>/]<profile-dir>/examples/<name>`, so the component
+    // before `examples` is the profile directory.
+    let claimed = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "unstated".to_owned());
-    let boundary_real = profile == "embedder";
+    let measured = profile_dir_of_this_binary();
+    if let Some(m) = &measured {
+        assert!(
+            *m == claimed,
+            "argv[1] claims this binary was built at `{claimed}`, but it is running from \
+             `.../{m}/examples/`. The profile decides whether this run gates and what its \
+             ratios mean, so a wrong label here is worse than no measurement."
+        );
+    }
+    // A binary copied out of its target directory cannot vouch for its profile,
+    // and an unvouched `embedder` must not gate: an unverifiable claim is not
+    // evidence. `boundary_real` therefore needs *both* halves.
+    let boundary_real = claimed == "embedder" && measured.is_some();
+    let profile = claimed;
 
     println!("C ABI overhead — PHASE4 §7");
     println!("==========================");
     println!("{N} lookups/round, {ROUNDS} interleaved rounds, depth 3");
     println!(
         "profile: {profile}{}",
-        match profile.as_str() {
-            "embedder" => "  (lto = false — the C boundary is REAL)",
-            "release" => "  (lto = \"thin\" — the C boundary is ERASED; not the gate)",
+        match (profile.as_str(), measured.is_some()) {
+            ("embedder", true) => "  (lto = false — the C boundary is REAL; verified)",
+            ("embedder", false) =>
+                "  (claimed, UNVERIFIED — not run from a target dir, so it does not gate)",
+            ("release", _) => "  (lto = \"thin\" — the C boundary is ERASED; not the gate)",
             _ => "  (pass `release` or `embedder` as argv[1]; the profile decides what this means)",
         }
     );

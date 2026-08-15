@@ -81,7 +81,14 @@ pub const BASELINE_PATH: &str = "crates/tf_tree_bench/baseline/results.json";
 ///   deliberate, so it should be a deliberate baseline regeneration too.
 /// * `interp_policy` — a different interpolator is a different `max_deviation`.
 /// * `build_profile` — a debug latency number is not comparable to a release
-///   one, and `Fitness` already refuses to call debug timings claims.
+///   one, and `Fitness` already refuses to call debug timings claims. **Since
+///   the fact became the measured profile *directory* rather than a
+///   `cfg!(debug_assertions)` guess, this row also catches the case it was
+///   silently blind to**: a report generated under `--profile embedder`
+///   (`lto = false`) used to call itself `release` and compare cleanly against a
+///   baseline taken under `lto = "thin"`, which is the same class of error
+///   `docs/PHASE4.md` §0.0 records twice. It now reads `embedder` and fails
+///   here.
 /// * `counters_feature` / `shm_feature` / `tf2_feature` — each adds rows or
 ///   changes the read path. `just bench-report-shm` therefore does **not**
 ///   check against the default build's baseline; it needs its own, and there is
@@ -92,6 +99,17 @@ pub const BASELINE_PATH: &str = "crates/tf_tree_bench/baseline/results.json";
 /// arch a hard mismatch would mean the aarch64 job could never run this gate at
 /// all. Cross-arch value drift is instead absorbed by the per-metric tolerances,
 /// which is what they are for.
+///
+/// `build_lto` is **not** here either, and that is a judgement rather than an
+/// oversight. It is in [`crate::runstore::BUILD_CRITICAL_FACTS`], where the
+/// comparison is between two files both produced minutes ago and adding a fact
+/// costs nothing. Here the other side is a *committed* file, and the `(None, _)`
+/// arm of the loop over this list turns any newly added key into
+/// "the baseline predates this gate and must be regenerated" — a full suite
+/// re-run and a diff of every number in the artifact, to gate a fact that is
+/// today a pure function of `build_profile`, which is already on this list and
+/// already fails. Add it in the commit that regenerates the baseline for some
+/// other reason.
 pub const PORTABLE_FACTS: &[&str] = &[
     "format_version",
     "layout_hash",

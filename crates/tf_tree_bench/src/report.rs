@@ -802,14 +802,28 @@ impl Provenance {
             "rustc",
             capture("rustc", &["--version"]).unwrap_or_else(unknown),
         );
-        push(
-            "build_profile",
-            if cfg!(debug_assertions) {
-                "debug".to_owned()
-            } else {
-                "release".to_owned()
-            },
-        );
+        // **The profile directory, measured, not `cfg!(debug_assertions)`.**
+        //
+        // This field used to be a two-valued guess: debug assertions on meant
+        // "debug" and off meant "release". Under `--profile embedder` — the
+        // profile every boundary measurement in this repository is taken at,
+        // because it is the one whose `lto = false` leaves the boundary in the
+        // binary — debug assertions are also off, so the guess printed
+        // `release`. Two runs answering *different questions* therefore carried
+        // *identical* provenance, and `baseline::PORTABLE_FACTS` and
+        // `runstore::BUILD_CRITICAL_FACTS` both compare this key, so both would
+        // have compared them and said nothing.
+        //
+        // `build.rs` reads the directory cargo actually built into out of
+        // `OUT_DIR`; see its comment for why that is a fact rather than a label.
+        push("build_profile", crate::embed::PROFILE_DIR.to_owned());
+        // The half that says what the profile *means*. `build_profile` is the
+        // join key — it is what a comparison matches on — and `build_lto` is
+        // the reason the join key matters: thin LTO inlines across a crate
+        // boundary, so a boundary priced under it is a boundary that was not
+        // there. Recorded beside the profile so a reader of `results.json` does
+        // not have to know this workspace's `[profile.*]` sections by heart.
+        push("build_lto", build_lto());
         push("target", std::env::consts::ARCH.to_owned());
         push("counters_feature", cfg!(feature = "counters").to_string());
         push("shm_feature", cfg!(feature = "shm").to_string());
@@ -2384,6 +2398,32 @@ fn unknown() -> String {
     "unknown".to_owned()
 }
 
+/// The `lto` setting of the profile this binary was built into.
+///
+/// Read out of the workspace manifest at run time rather than baked at build
+/// time, because the parser lives in [`crate::embed`] and a build script cannot
+/// call it — and a second copy of a TOML reader is a second thing that can
+/// disagree with the first. `CARGO_MANIFEST_DIR` is a *compile-time* constant,
+/// so this resolves against the source tree this binary was built from, not
+/// against wherever it happens to be run.
+///
+/// The failure arm names the path it could not read. A benchmark binary copied
+/// out of its checkout is the case that reaches it, and it must be
+/// distinguishable from "the profile declares no LTO", which
+/// [`crate::embed::lto_for_profile_dir`] spells differently again.
+fn build_lto() -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Cargo.toml");
+    match std::fs::read_to_string(&manifest) {
+        Ok(text) => crate::embed::lto_for_profile_dir(&text, crate::embed::PROFILE_DIR),
+        Err(e) => format!(
+            "unknown (the workspace manifest at {} could not be read: {e})",
+            manifest.display()
+        ),
+    }
+}
+
 fn git(args: &str) -> Option<String> {
     capture("git", &args.split(' ').collect::<Vec<_>>())
 }
@@ -3823,6 +3863,61 @@ CPU part\t: 0xd0c
             EMBEDDING_NOTE.contains(&stated_rel),
             "the row note does not state `{stated_rel}`, which is what \
              [profile.release] now declares"
+        );
+    }
+
+    /// `build_profile` names the directory cargo built into, not a two-valued
+    /// guess from `cfg!(debug_assertions)`.
+    ///
+    /// The guess is what let a `--profile embedder` run — the profile every
+    /// boundary measurement here is taken at, because `lto = false` is the only
+    /// setting that leaves the boundary in the binary — call itself `release`
+    /// and compare cleanly against a thin-LTO baseline.
+    ///
+    /// Mutant (applied, observed): replace the `push("build_profile", …)` value
+    /// with the literal `"release".to_owned()`. This test fails under `cargo
+    /// nextest` with `left: "release", right: "debug"`.
+    ///
+    /// **What this test does not catch**, stated because a note nobody checked
+    /// is how this repository got six wrong attributions: reinstating the old
+    /// `cfg!(debug_assertions)` spelling passes here, because under `cargo
+    /// nextest` both spellings say `debug`. It fails only when the tests
+    /// themselves are built at a third profile
+    /// (`cargo nextest run -p tf_tree_bench --cargo-profile embedder -E
+    /// 'test(build_profile)'` — run, and observed to fail with
+    /// `left: "release", right: "embedder"`). The mutation that fires here is
+    /// the hardcode; the mutation that fires there is the guess.
+    #[test]
+    fn the_build_profile_fact_is_the_directory_cargo_built_into() {
+        let p = Provenance::collect();
+        assert_eq!(
+            p.get("build_profile"),
+            Some(crate::embed::PROFILE_DIR),
+            "the provenance profile must be the one `build.rs` measured"
+        );
+    }
+
+    /// And the profile's *meaning* travels beside its name.
+    ///
+    /// A reader of `results.json` should not have to know this workspace's
+    /// `[profile.*]` sections by heart to know whether the crate boundary was
+    /// inlined away, so `build_lto` is emitted from the manifest for whichever
+    /// profile `build_profile` names.
+    ///
+    /// Mutant (applied, observed): make `build_lto()` ask
+    /// `lto_for_profile_dir` about `crate::embed::REFERENCE_PROFILE` instead of
+    /// `PROFILE_DIR`. This test fails under `cargo nextest` with
+    /// `left: Some("\"thin\"")`, right the `dev` profile's default `false (…)`.
+    #[test]
+    fn the_build_lto_fact_is_the_one_the_manifest_declares_for_that_profile() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+        let p = Provenance::collect();
+        let dir = p.get("build_profile").expect("build_profile");
+        assert_eq!(
+            p.get("build_lto"),
+            Some(crate::embed::lto_for_profile_dir(&manifest, dir).as_str())
         );
     }
 }

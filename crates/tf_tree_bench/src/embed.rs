@@ -796,6 +796,25 @@ fn one(plan: &Plan, g: &Guard, s: Stamp) -> f64 {
 ///
 /// The section missing, or either key missing from it.
 pub fn profile_settings_from_manifest(manifest: &str, profile: &str) -> Result<(String, String)> {
+    Ok((
+        profile_key(manifest, profile, "lto")?,
+        profile_key(manifest, profile, "codegen-units")?,
+    ))
+}
+
+/// One key out of one `[profile.*]` section of the workspace manifest.
+///
+/// Split out of [`profile_settings_from_manifest`] so [`lto_for_profile_dir`]
+/// can ask for `lto` alone: a profile that declares no `codegen-units` still has
+/// an `lto`, and the provenance block needs the second question answered even
+/// when the first has no answer. Behaviour for the two-key caller is unchanged —
+/// it is the same reader, called twice.
+///
+/// # Errors
+///
+/// The section missing, or the key missing from it. The two are distinguished in
+/// the message because [`lto_for_profile_dir`] reports them differently.
+pub fn profile_key(manifest: &str, profile: &str, key: &str) -> Result<String> {
     let header = format!("[profile.{profile}]");
     let body = manifest
         .split(&header)
@@ -804,14 +823,62 @@ pub fn profile_settings_from_manifest(manifest: &str, profile: &str) -> Result<(
     // Stop at the next section header so a key from a later profile cannot be
     // read as this one's.
     let body = body.split("\n[").next().unwrap_or(body);
-    let key = |k: &str| -> Result<String> {
-        body.lines()
-            .map(str::trim)
-            .find_map(|l| l.strip_prefix(k)?.trim().strip_prefix('=').map(str::trim))
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("{header} declares no `{k}`"))
+    body.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(key)?.trim().strip_prefix('=').map(str::trim))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{header} declares no `{key}`"))
+}
+
+/// Whether the workspace manifest declares a `[profile.<profile>]` at all.
+#[must_use]
+pub fn profile_section_exists(manifest: &str, profile: &str) -> bool {
+    manifest.contains(&format!("[profile.{profile}]"))
+}
+
+/// The `lto` setting behind a *profile directory*, spelled for a provenance
+/// block.
+///
+/// # Why a directory and not a profile name
+///
+/// A binary can measure which directory cargo put it in — `build.rs` reads it
+/// out of `OUT_DIR`, and [`PROFILE_DIR`] is the result. It cannot measure the
+/// profile *name*: cargo does not hand one to a build script. So the directory
+/// is the fact and the section name is derived from it, which costs two
+/// irregularities, both handled here:
+///
+/// * `[profile.dev]` builds into `debug/`, so the directory `debug` is asked
+///   about `dev`.
+/// * `[profile.bench]` builds into `release/` *alongside* `[profile.release]`,
+///   so the directory `release` is genuinely ambiguous. This reports
+///   `[profile.release]`'s setting, and
+///   `the_two_profiles_that_share_the_release_directory_agree_about_lto` below
+///   fails if the two sections ever stop agreeing — which is the only way that
+///   ambiguity could produce a wrong answer rather than a merely imprecise one.
+///
+/// # Why a `String` and not a `bool`
+///
+/// `lto` is `false`, `true`, `"thin"` or `"fat"`, and the difference between
+/// `"thin"` and `"fat"` is not nothing. More importantly the "we do not know"
+/// arms are spelled out rather than defaulted silently: a provenance block that
+/// prints `false` when it *guessed* `false` is the exact failure this whole
+/// module exists to prevent. Cargo's default for an undeclared `lto` is `false`,
+/// and that is what is reported — but it says so.
+#[must_use]
+pub fn lto_for_profile_dir(manifest: &str, profile_dir: &str) -> String {
+    let profile = if profile_dir == "debug" {
+        "dev"
+    } else {
+        profile_dir
     };
-    Ok((key("lto")?, key("codegen-units")?))
+    if let Ok(v) = profile_key(manifest, profile, "lto") {
+        return v;
+    }
+    if profile_section_exists(manifest, profile) {
+        format!("false (cargo's default; [profile.{profile}] declares no `lto`)")
+    } else {
+        format!("unknown (the workspace manifest has no [profile.{profile}])")
+    }
 }
 
 #[cfg(test)]
@@ -1048,6 +1115,60 @@ mod tests {
     #[test]
     fn a_missing_profile_is_an_error_not_a_default() {
         assert!(profile_settings_from_manifest(&manifest(), "no-such-profile").is_err());
+    }
+
+    /// A profile *directory* is not a profile *name*, and the two places they
+    /// differ are the two places a provenance block could quietly lie.
+    ///
+    /// Mutant (applied, observed): delete the `profile_dir == "debug"` arm of
+    /// [`lto_for_profile_dir`], so a debug build asks about a `[profile.debug]`
+    /// that does not exist. This test fails on the `debug` assertion with
+    /// `unknown (the workspace manifest has no [profile.debug])`, and
+    /// `report::tests::the_build_lto_fact_is_the_one_the_manifest_declares_for_that_profile`
+    /// keeps passing — it compares against this same function, so it cannot
+    /// catch this and is not the check that does.
+    #[test]
+    fn a_profile_directory_maps_to_the_section_that_built_it() {
+        let m = manifest();
+        assert_eq!(lto_for_profile_dir(&m, EMBEDDER_PROFILE), "false");
+        assert_eq!(lto_for_profile_dir(&m, REFERENCE_PROFILE), "\"thin\"");
+        // `[profile.dev]` builds into `debug/` and declares no `lto`, so this is
+        // both irregularities at once: the name mapping, and cargo's default.
+        assert_eq!(
+            lto_for_profile_dir(&m, "debug"),
+            "false (cargo's default; [profile.dev] declares no `lto`)"
+        );
+        // And a directory nothing declares says so rather than defaulting to
+        // `false`, which would read as "LTO is off" — the claim that makes a
+        // boundary measurement believable.
+        let unknown = lto_for_profile_dir(&m, "no-such-dir");
+        assert!(unknown.starts_with("unknown"), "{unknown}");
+    }
+
+    /// `[profile.bench]` and `[profile.release]` share the `release/` directory,
+    /// so that directory cannot identify which of the two produced a binary.
+    ///
+    /// That ambiguity is harmless only while the two agree about `lto`, which is
+    /// what this checks. If they ever diverge, [`lto_for_profile_dir`] starts
+    /// reporting `[profile.release]`'s answer for `cargo bench` binaries and a
+    /// provenance block goes quietly wrong — so this test is the thing standing
+    /// between that comment and a lie.
+    ///
+    /// Mutant (applied, observed): set `[profile.bench]`'s `lto` to `false` in
+    /// the workspace manifest. This test fails with
+    /// `[profile.bench] and [profile.release] share target/release/ …
+    /// left: "false", right: "\"thin\""`.
+    #[test]
+    fn the_two_profiles_that_share_the_release_directory_agree_about_lto() {
+        let m = manifest();
+        assert_eq!(
+            profile_key(&m, "bench", "lto").expect("[profile.bench] lto"),
+            profile_key(&m, REFERENCE_PROFILE, "lto").expect("[profile.release] lto"),
+            "[profile.bench] and [profile.release] share target/release/, so a binary \
+             built into it cannot say which one it came from. While they agree about \
+             `lto` that does not matter; the moment they disagree, `lto_for_profile_dir` \
+             reports the wrong one and says nothing about it"
+        );
     }
 
     /// The reader must not read a later section's keys as this profile's.
