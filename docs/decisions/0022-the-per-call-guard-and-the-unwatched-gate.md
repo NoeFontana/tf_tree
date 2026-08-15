@@ -101,6 +101,97 @@ This is the same failure mode `tf2.md` already documents twice — the withdrawn
 4.7× CPU reading and the stale `.tft` reasons — and the same one that the
 `heap_vs_shared` and 213-vs-217 priors fell into. **A residue is a hypothesis.**
 
+## Amendment 4 — what is *inside* the 48 ns, and the three things it is not
+
+Amendment 3 closed question 5 with "the per-call `Guard` is ~48 of ~56 ns" and
+left that as the actionable finding. It is not one: "the guard" names a
+constructor, not a cost. This amendment takes it apart, at
+`[profile.embedder]` (`lto = false`, a real boundary), on the same §11.1 fixture
+over the same shared arena, with new arms in
+`crates/tf_tree_bench/src/bin/abi_attached.rs` — `just abi-attached`, six runs,
+`taskset -c 2`. Every arm below is a **difference between two loops of identical
+shape**, not a subtraction from a total.
+
+| part | ns | how it was isolated |
+|---|---|---|
+| `tf_tree_ipc::fork::generation()` | **+0.2** | the same loop with and without the call |
+| `Tree::view()` | +3.7 | a view built per iteration, over the empty loop |
+| `Guard::new(view)` | +4.8 | over the view arm |
+| the rest of `Tree::guard` — `detached()`, `is_shared()`, `with_fork_check` | +6.7 | over `Guard::new` |
+| **= build + drop a guard, in isolation** | **15.1** | |
+| the same, on `Plan::at`'s critical path | ~22 | arm `E`: guard built and dropped per call, plan *evaluated* through the hoisted one |
+| the cold bracket-search cursor | ~4.8 | arm `B` − `A`: hoisted guard, stamps in a fixed permutation instead of in order |
+| **still unattributed** | **~16** | |
+| **rung 1, for reference** | **43–47** | |
+
+Run-to-run spread on rung 1 across those six runs is 43.0–46.9 ns, so treat every
+figure above as ±2 and nothing here as a three-significant-figure claim.
+
+**The leading hypothesis was wrong.** `fork::generation` was the obvious suspect
+— a cross-crate call that thin LTO inlines and `[profile.embedder]` does not, which
+would have explained the 19-vs-48 gap between the profiles exactly. It costs
+**0.2 ns**. It is `#[inline]`, so its MIR crosses the crate boundary and it is
+inlined at `lto = false` too. **There is nothing to fix there, and no decision
+record about a fork-safety mechanism is needed** — which was the outcome most
+worth establishing, because that mechanism is the one thing here that is load
+bearing for correctness (`docs/decisions/0005` step 9; `tf_tree_ipc::fork`'s
+module header).
+
+**Two further candidates were killed by changing them and finding the number did
+not move.** Both changes were reverted; they are recorded because each is the
+next thing somebody would try:
+
+* **`#[inline]` on `Tree::guard`.** Rung 1 measured 43.2 ns against a 43.0–46.9
+  spread without it, and the ABI arm 298 against 294–297. The guard is not
+  paying for the *call*, so letting a caller inline it recovers nothing — and an
+  embedder in C could not use it anyway.
+* **The size of the `Guard`.** It is **208 bytes**, 128 of them the
+  `[Cell<u64>; MAX_DEPTH]` cursor, on a fixture whose plan is three steps deep.
+  Cutting `MAX_DEPTH` 16 → 8 made it 144 bytes and moved *nothing*: rung 1 44.3,
+  isolated build+drop 15.0, arm `E` 21.1, cursor 5.0 — every one inside the
+  spread. **Zeroing that array is not what a guard costs**, so "shrink the
+  cursor to the plan's depth" is off the board as a performance argument.
+
+**The whole fork-safety half of `Tree::guard` is 6.7 ns, ~15% of rung 1.** That
+is the *entire* prize available from touching it, and it is not the relaxed load
+— the load is 0.2 — it is the branching and the extra `Option<(u64, fn() -> u64)>`
+the guard then carries. Making it free would leave 36 of the 43 ns in place. **A
+decision record proposing to weaken or move the fork check now has to argue
+against that number.**
+
+### What is still unattributed, and deliberately so
+
+~16 ns — evaluating through a *fresh* guard, beyond the cold cursor. The
+plausible reading is that a guard materialised per iteration cannot have its
+fields held in registers across `Plan::at` the way a hoisted one can. **That is
+written down as a hypothesis and nothing in this record depends on it**, because
+it is exactly what the three refuted candidates above also sounded like. One
+known asymmetry to fold in before anyone tries again: the isolated build+drop arm
+never performs a lookup, so its `Guard::drop` takes the `n == 0` early return,
+while a real guard's drop reaches the `is_writable` one.
+
+### What this changes for the questions below
+
+**Question 1 — the conditional counter flush — loses its number and needs a new
+one.** It is stated below as "~18 ns of the ~35 ns per-call guard", carried from
+a measurement taken at the workspace `release` profile. At a real boundary the
+guard's *whole* drop path is inside the 15.1 ns isolated figure alongside
+`view()`, `Guard::new` and the fork check, and this arena is attached read-only
+so the flush early-returns before touching a counter at all. Note also that `Guard::note_ok`, the per-lookup half of the counters, is paid
+identically by the hoisted arm and the per-call arm, so it cannot appear in rung
+1 at all. **The 18 ns is not a figure for this fixture** and question 1 should
+not be started against it. What would replace it is `tf_tree_bench`'s
+`counter_cost` binary (`cargo run --profile embedder -p tf_tree_bench --bin
+counter_cost`, both ways on the `counters` feature) — it has no recipe today, and
+`docs/benchmarks/EVIDENCE.md` already says it should get one when this record
+moves to `ready`.
+
+**Questions 2–4 are untouched.** The prize for holding a guard across calls is
+still ~43–47 of the ~55 ns, because that is rung 1 and rung 1 did not move. What
+this amendment removes is the hope of getting it back *without* a held guard: the
+three cheap structural fixes are measured and none of them is worth more than
+~7 ns.
+
 ## Amendment 3 — question 5 is CLOSED, and this record's original premise was right
 
 The full ladder, measured at `[profile.embedder]` (`lto = false`, a real
@@ -245,14 +336,20 @@ directions. Measuring it cost twenty minutes and saved designing against a
 premise that was false. It is recorded rather than deleted for that reason.
 
 1. **Should `Guard`'s counter flush be conditional on the guard having done
-   enough work to be worth counting?** This is the largest measured, uncontested
-   win on the board: ~18 ns of the ~35 ns per-call guard, recoverable without
+   enough work to be worth counting?** **Amendment 4 withdraws this question's
+   number.** It read "the largest measured, uncontested win on the board: ~18 ns
+   of the ~35 ns per-call guard" — a figure taken at the workspace `release`
+   profile, on an arena where the flush could run. On the `[profile.embedder]`
+   ladder this record now uses, the arena is read-only and the flush
+   early-returns, so that win is not available on this fixture and needs
+   re-measuring before the question is started. The rest of the question stands:
+   recoverable without
    any new API surface, in a destructor that already early-returns on two other
    conditions (`n == 0`, `!is_writable()`). It costs the diagnostic counters
    some fidelity on single-lookup guards, and `docs/PHASE5.md` §5 is what says
-   whether that is acceptable. **This is the first thing to settle**, because it
+   whether that is acceptable. It stays first in the order below because it
    helps every consumer including Rust and needs no decision about the C tier at
-   all.
+   all — but "first" now means "measure it first", not "implement it first".
 2. **Is a guard handle sound to expose?** `Guard<'_>` borrows the tree, and
    `0017` is explicit that lifetime extension in the bindings is what is being
    removed, not added. A `tft_guard` outliving its `tft_tree` is a use-after-free

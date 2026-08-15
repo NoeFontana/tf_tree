@@ -78,6 +78,20 @@ what the ABI costs**, and a native Rust caller that guards per lookup costs the
 same as going through the ABI — so the ABI adds essentially nothing beyond
 forcing that shape. `docs/decisions/0022` amendment 3 carries it.
 
+**And "the guard" has since been taken apart**, by the same recipe at the same
+profile (`0022` amendment 4). Of the ~45 ns: `Tree::view()` +3.7, `Guard::new`
++4.8, the whole fork-safety half — `detached()`, `is_shared()`,
+`with_fork_check` — +6.7, the cold bracket-search cursor ~4.8, and ~16 ns still
+unattributed. **`tf_tree_ipc::fork::generation` itself costs 0.2 ns**, which was
+the leading hypothesis and is now refuted; `#[inline]` on `Tree::guard` and
+halving the guard's 208 bytes were each applied, measured, found to move nothing,
+and reverted. The §7 numbers above do not change — this is a decomposition of the
++48 row, not a correction of it — but two things follow for anyone reading this
+section for a lever: there is **no cheap structural fix worth more than ~7 ns**,
+and the counter-flush win `0022` question 1 was carrying (~18 ns) is not
+available on this fixture, because the arena is attached read-only and the flush
+early-returns.
+
 **At a real boundary a Rust caller and a C++ caller agree to within 4 ns**, which
 settles two things at once: the ABI costs about **+57 ns** on this fixture, and
 that cost is the *boundary*, not the language. `docs/benchmarks/tf2.md`'s C++

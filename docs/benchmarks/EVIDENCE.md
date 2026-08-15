@@ -37,7 +37,7 @@ must not blur the two.
 | `tf_tree_bench/src/bin/bench_report.rs` | `just bench-check` / `just tf2-bench-check` | PHASE5 §10 regression gate against the committed baselines |
 | `tf_tree_bench/src/bin/embed_cost.rs` | `just embed-cost-check` | PHASE5 §9.2 embedding cost |
 | `xtask bench-gate` | `just bench` | PHASE1 §11.3 criteria |
-| `tf_tree_bench/src/bin/abi_attached.rs` | `just abi-attached` | Whether the C ABI's cost is the boundary or the language. Answer: the boundary — Rust and C++ agree to 4 ns at `lto = false` |
+| `tf_tree_bench/src/bin/abi_attached.rs` | `just abi-attached` | Whether the C ABI's cost is the boundary or the language. Answer: the boundary — Rust and C++ agree to 4 ns at `lto = false`. **Also decomposes the per-call `Guard`** (`0022` amendment 4): `fork::generation` +0.2, `Tree::view` +3.7, `Guard::new` +4.8, the fork-safety half +6.7, the cold cursor ~4.8, ~16 unattributed. Reports; does not gate |
 | `tf_tree_bench/src/bin/attach_bench.rs` | `just attach-bench` | PHASE2 §12's attach rows. Reports; does not gate. Supplies `attach_latency`'s figure |
 | `tf_tree_bench/src/bin/frozen_workers.rs` | `just gate4` | PHASE5 §12 gate 4: 16 workers on one `.tft`, total Pss ≤ 1.2× one worker. **PASSES at 1.024×** |
 | `docker/tf2/native_footprint.cpp` | `just tf2-native-footprint` | The memory comparison with no binding on either side. Not a pass/fail gate — it refuses to print a quotient if the two arms stored different sample counts |
