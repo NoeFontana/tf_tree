@@ -1042,6 +1042,40 @@ mod tests {
         );
     }
 
+    /// A value for `key` guaranteed to differ from whatever *this* build
+    /// recorded, chosen from the realistic alternatives rather than invented.
+    ///
+    /// **A test about build facts must not hardcode one.**
+    /// `a_profile_that_changed_its_lto_without_changing_its_name_is_refused`
+    /// originally set `build_lto` to `"thin"` and asserted a mismatch. That
+    /// passed under `just test` — debug, where lto is off — and **failed under
+    /// `just tf2-check`, which runs `--release`**: there the real value *is*
+    /// `"thin"`, so the two agreed, no mismatch was detected, and the assertion
+    /// fired. The bug was in the test, not the differ.
+    ///
+    /// It is worth naming what caught it: the failing configuration is
+    /// `--features tf2 --release`, which only the container recipe compiles.
+    /// `just test` builds default features in debug and cannot see it. That is
+    /// the same shape as every other feature-gated hole this repository has
+    /// found, and it is why the container gate is not optional.
+    fn differing_value(r: &Run, key: &str) -> String {
+        let real = r
+            .provenance
+            .facts
+            .iter()
+            .find(|f| f.key == key)
+            .map_or("", |f| f.value.as_str());
+        match key {
+            // `lto` is a TOML scalar as written in the manifest, so a quoted
+            // `"thin"` and a bare `false` are the two shapes in play.
+            "build_lto" if real == "false" => "\"thin\"".to_owned(),
+            "build_lto" => "false".to_owned(),
+            // Profile *directory* names. `embedder` unless we are already there.
+            _ if real == "embedder" => "release".to_owned(),
+            _ => "embedder".to_owned(),
+        }
+    }
+
     /// A run taken at `--profile embedder` and a run taken at `--release`
     /// measure different programs — thin LTO inlines across the crate boundary
     /// the embedder profile leaves standing — so there is no comparison to make.
@@ -1054,9 +1088,10 @@ mod tests {
     fn two_runs_built_at_different_profiles_refuse_to_be_compared() {
         let mut a = run(vec![row("n=1", 1.0, 0.1)]);
         let b = run(vec![row("n=1", 1.0, 0.1)]);
+        let other = differing_value(&b, "build_profile");
         for f in &mut a.provenance.facts {
             if f.key == "build_profile" {
-                f.value = "embedder".to_owned();
+                f.value.clone_from(&other);
             }
         }
 
@@ -1093,9 +1128,10 @@ mod tests {
     fn a_profile_that_changed_its_lto_without_changing_its_name_is_refused() {
         let mut a = run(vec![row("n=1", 1.0, 0.1)]);
         let b = run(vec![row("n=1", 1.0, 0.1)]);
+        let other = differing_value(&b, "build_lto");
         for f in &mut a.provenance.facts {
             if f.key == "build_lto" {
-                f.value = "\"thin\"".to_owned();
+                f.value.clone_from(&other);
             }
         }
         let d = diff(&a, &b);
