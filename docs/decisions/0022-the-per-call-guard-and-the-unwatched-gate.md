@@ -192,6 +192,55 @@ this amendment removes is the hope of getting it back *without* a held guard: th
 three cheap structural fixes are measured and none of them is worth more than
 ~7 ns.
 
+## Amendment 5 — question 1 is CLOSED, and the answer is that nobody pays it
+
+`just guard-cost` runs the 2x2 question 1 needs — {release, embedder} x
+{counters on, off} — on **writable** arenas, which is the only configuration
+where `Guard::drop` reaches the flush at all:
+
+| profile | counters | heap | memfd |
+|---|---|---|---|
+| `release` (`lto = "thin"`) | on / off | +33.8 / +17.0 ns | +25.5 / +18.4 ns |
+| **`embedder`** (`lto = false`) | **on / off** | **+50.3 / +34.4 ns** | **+51.6 / +35.8 ns** |
+
+**At a real boundary the counter flush costs ~16 ns per guard drop**, consistent
+across both backings (15.9 and 15.8). Amendment 4 withdrew the earlier ~18 ns
+figure; this restores it, at a stated profile, and on the arena kind where it is
+actually paid.
+
+### And that is why question 1 is closed rather than answered
+
+The flush is only reached when **both** conditions hold: a guard is built *per
+call*, and the arena is *writable* (`Guard::drop` early-returns on
+`!self.view.is_writable()`, `plan.rs`). No shipped configuration is both:
+
+- **A C or C++ consumer attaches read-only.** `tft_tree_open` maps the arena
+  read-only — the header states it twice ("The arena is mapped read-only, so
+  nothing can be claimed for writing"; "the attach is **read-only**") and it is
+  D18's whole point, the MMU being what stops a consumer corrupting a robot's
+  tree. So the tier that is *forced* into per-call guards never reaches the
+  flush. **Question 1's win for the C ABI is exactly zero.**
+- **A Rust consumer hoists the guard**, so the flush is paid once per batch and
+  amortises to nothing. That is independently what `counter_cost` finds for
+  §5.7: no measurable difference at the hoisted cadence, at any thread count at
+  or below the CPU count.
+
+So making the flush conditional would buy nothing anyone currently pays, at the
+cost of making the §5 counters lie about the one workload that would trigger
+it — a read-write participant doing per-call lookups, which is a shape the
+engine does not encourage and the C tier cannot express.
+
+**Question 1 is withdrawn as a proposal.** What it was reaching for is real —
+~16 ns — but it is inside the ~35 ns a *counter-free* per-call guard already
+costs at a real boundary, and that residue is question 5's territory, not
+question 1's.
+
+**One consequence worth stating for the remaining design.** The per-call guard
+costs ~35 ns at `[profile.embedder]` with counters compiled out entirely. So a
+`tft_guard` handle's ceiling is that ~35 ns, not the ~50 ns the counters-on row
+suggests — the C tier never pays the counter half, and pricing the handle
+against the wrong row would overstate its value by 40%.
+
 ## Amendment 3 — question 5 is CLOSED, and this record's original premise was right
 
 The full ladder, measured at `[profile.embedder]` (`lto = false`, a real

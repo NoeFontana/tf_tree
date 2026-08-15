@@ -289,6 +289,33 @@ miri:
 evidence-audit:
     ./scripts/evidence-audit.sh
 
+# **What the diagnostic counters cost a guard — `docs/decisions/0022` question 1.**
+#
+# The 2x2 that question needs: {release, embedder} x {counters on, off}. All four
+# matter, and three of them mislead on their own:
+#
+#   * at `release` (lto = "thin") `Tree::guard` is inlined and the whole cost
+#     shrinks — that profile answers a different question;
+#   * with a *hoisted* guard the flush amortises to nothing, which is what
+#     `counter_cost` already measures and why it finds no contention;
+#   * only a **per-call guard on a WRITABLE arena** pays the flush at all, since
+#     `Guard::drop` early-returns on `!is_writable()`.
+#
+# Both arenas here are writable, so this is the dear configuration on purpose.
+guard-cost:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for prof in release embedder; do
+      for feat in "--features shm" "--no-default-features --features shm"; do
+        case "$feat" in *no-default*) c=off ;; *) c=on ;; esac
+        cargo build --profile "$prof" -q $feat -p tf_tree_bench --bin arena_backing
+        # `--profile release` builds into target/release, not target/profile-release.
+        dir=$([ "$prof" = release ] && echo release || echo "$prof")
+        echo "--- profile=$prof counters=$c"
+        taskset -c 2 "./target/$dir/arena_backing" 2>/dev/null | grep -E "^  (heap|memfd) arena"
+      done
+    done
+
 # **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
 #
 # Four candidates for that gap are eliminated by measurement — the memfd mapping
