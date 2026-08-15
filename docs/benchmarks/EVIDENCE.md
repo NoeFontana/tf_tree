@@ -84,6 +84,18 @@ now records that the diagnostic counters roughly double the per-call `Guard`
 default, not history, and `0022` question 1 turns on it. It should become a gate
 when `0022` moves to `ready`.
 
+**Update: `0022` is now `ready`, and the trigger above fired without the
+promotion happening — deliberately.** Question 1 was closed by *withdrawal*
+(amendment 5): the flush is only reached by a per-call guard on a *writable*
+arena, and no shipped configuration is both, so the ~16 ns it would recover is
+paid by nobody. `just guard-cost` now measures the 2×2 that establishes that, and
+it is registered in the table above. What `counter_cost` still carries is the
+§5.7 claim that counters cost a *hoisted* guard nothing at any thread count at or
+below the CPU count — worth a gate on its own terms, and unblocked, but no longer
+owed by `0022`. Recording the non-promotion here rather than deleting the
+paragraph, because "a trigger fired and nothing happened" is exactly the shape of
+failure this file exists to catch.
+
 ## What `just evidence-audit` checks
 
 For every `example`/`bin`/`bench` target in the workspace: if it is **not**

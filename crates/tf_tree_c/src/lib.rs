@@ -719,8 +719,12 @@ pub unsafe extern "C" fn tft_plan_at(
 /// This matters now because `docs/PHASE4.md` §7 gate criterion 1 is **failing**
 /// (1.34–1.46× against a 1.05 gate) and only about half the gap is attributed:
 /// the per-call `Guard` explains ~35 ns of ~60. `docs/decisions/0022`'s
-/// implementation plan says to price the remainder *before* designing a
-/// `tft_guard` handle around it, and this is what makes that possible.
+/// implementation plan said to price the remainder *before* designing a
+/// `tft_guard` handle around it, and this is what made that possible. It was
+/// priced (that record's amendment 3: no unexplained residue) and **the handle
+/// was then declined** — the answer to the per-call guard is
+/// [`tft_plan_at_many`], one guard per batch. This hook keeps its job: R2 in
+/// `abi_cost.rs` is a standing gate, not a one-off investigation.
 ///
 /// Behind `test-hooks`, which nothing that ships enables.
 ///

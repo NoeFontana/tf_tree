@@ -328,8 +328,13 @@ because **the example is executed by no recipe and no workflow**; it appeared in
 one `justfile` comment. `just abi-cost` now runs it. There is no configuration
 in which the ABI currently costs 2% on this path.
 
-`docs/PHASE4.md` §7 records the failing gate; `docs/decisions/0022` carries the
-open question, whose first item is the counter flush rather than any new API.
+`docs/PHASE4.md` §7 records the failing gate; `docs/decisions/0022` carried the
+open question and has since closed it. **Its answer is the first item of the
+guidance below, not a new API**: `tft_plan_at_many` pays one guard per batch and
+recovers ~41 of the 43–47 ns the per-call guard costs, so the proposed
+`tft_guard` handle is declined. The counter flush, which that record's first item
+used to be, is withdrawn too — a C consumer attaches read-only and never reaches
+it.
 
 `MAP_SHARED` costing a lookup approximately nothing is what the two earlier
 arguments claimed — and they were right, but neither had established it, and

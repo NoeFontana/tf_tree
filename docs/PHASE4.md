@@ -129,8 +129,13 @@ pair.
 **Why rungs rather than one quotient.** R1 is the C *ABI* — handle validation,
 layout dispatch, output slice, landing pad. R3 is the C *signature*, which has
 nowhere to keep a guard between calls. Different owners (R1 is `tf_tree_c`'s, R3
-is `0022`'s) and different futures (`0022` intends to lower R3; nothing intends
-to lower R1). A single quotient moves when either moves and tells you neither.
+is `0022`'s). **That sentence used to continue "and different futures — `0022`
+intends to lower R3; nothing intends to lower R1". It no longer holds:** `0022`
+is `ready` and *declines* the `tft_guard` handle, answering the per-call guard
+with `tft_plan_at_many` (one guard per batch, ~41 ns of a ~302 ns scalar call at
+n = 256) rather than with new API. Both rungs are now regression detectors that
+nobody plans to move, which is a better thing for a gate to be. A single quotient
+moves when either moves and tells you neither.
 
 **And "the guard" has since been taken apart**, by `just abi-attached` at the
 same profile (`0022` amendment 4). Of the ~45 ns it costs on a shared arena:
@@ -145,11 +150,21 @@ than ~7 ns**, and the counter-flush win `0022` question 1 was carrying (~18 ns)
 is not available on that fixture, because the arena is attached read-only and the
 flush early-returns.
 
-**One number here is not reconciled and is flagged rather than explained**: the
+**One number here was flagged as unreconciled and now is reconciled**: the
 per-call guard costs ~45 ns on the attached shared arena and **~16 ns** on
-`abi_cost`'s three-edge heap tree, both at `[profile.embedder]`. That is
-`0022`'s to resolve, and `0023` open question 3 asks whether §7 should be gating
-the dearer configuration.
+`abi_cost`'s three-edge heap tree, both at `[profile.embedder]`. It is **the
+fixture, not the backing** — `just guard-cost` prices heap against memfd on one
+fixture in one binary at ~1.4 ns apart (34.4 / 35.8, counters off), while
+changing the fixture at fixed backing moves 16 → 34.4. The mechanism is that a
+fresh `Guard`'s cursor is the `EdgeId(0)` sentinel, so every step restarts its
+bracket search cold, and `docs/design/fast-path.md` §12 measures that as a cache
+cliff in the *stamp* array: worth ~17 ns/sample at capacity 16384 (§11.1's 1 kHz
+edge, 128 KiB of stamps against this host's 32 KiB L1d) and near nothing at
+capacity 256 (2 KiB). Predicted difference ~17 ns, measured ~18. `0023` open
+question 3 carries the consequence — that §7 should gate the dearer fixture —
+with the caveat that the 16-versus-34.4 pair is still two binaries rather than
+one interleaved measurement. **§7's gate list is unchanged until `0023` is
+ratified.**
 
 ### The instability that led here, kept because it is how the LTO problem surfaced
 
@@ -253,9 +268,14 @@ i.e. noise. A draft decision record proposed moving that branch per-tree; the
 measurement refuted its premise before any code was written, which is what the
 measurement was for.
 
-`docs/decisions/0022` carries the open question — the C tier has no way to hold
-a guard across calls, which is `docs/API.md` §1 R2 failing in that tier. This
-section records the failing gate; it does not authorize a fix.
+`docs/decisions/0022` carried the open question — the C tier has no way to hold
+a guard across calls — and has since **closed it by declining the handle**: the
+answer is `tft_plan_at_many`, which pays one guard per batch and recovers ~41 of
+the 43–47 ns the guard costs. That record also withdraws the `docs/API.md` §1 R2
+framing this paragraph used to end on ("R2 failing in that tier"): building a
+guard allocates nothing and takes no lock — since A1 it is one acquire load plus
+a zeroed cursor — so R2 is not the rule that decides it. This section records the
+gate; the fix it does not authorize is now a fix nobody is asking for.
 
 ### §7 gate criterion 2 — closed. The `-fno-exceptions` shortfall was NRVO
 

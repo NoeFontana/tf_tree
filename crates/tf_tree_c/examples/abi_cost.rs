@@ -126,17 +126,30 @@ const PANIC_GUARD: f64 = 1.05;
 /// This is not the ABI's cost, it is the *signature's*, and it is
 /// `docs/decisions/0022`'s subject. It is gated anyway because it is the larger
 /// of the two and because `0022`'s whole argument rests on its size: at
-/// `[profile.embedder]` the guard is ~45 ns on a shared arena (`just
+/// `[profile.embedder]` the guard is ~45 ns on the §11.1 fixture (`just
 /// abi-attached`) and **~16 ns here** — measured 1.059–1.075 across nine runs on
-/// a three-edge heap tree, which is ~6.5% of a ~245 ns lookup. The two figures
-/// are not in conflict and the difference is worth knowing: `abi-attached`
-/// guards an arena attached read-only across a process boundary, this guards a
-/// heap tree in-process, and whatever makes the shared case ~3x dearer is
-/// `0022`'s to find.
+/// a three-edge heap tree, which is ~6.5% of a ~245 ns lookup.
+///
+/// **This comment used to guess that the difference was the shared arena
+/// ("whatever makes the shared case ~3x dearer is `0022`'s to find"). It is
+/// not, and the guess is retracted.** `just guard-cost` measures both backings
+/// on the *same* fixture in one binary at this profile: heap +34.4 ns, memfd
+/// +35.8 ns, counters off. The backing is worth ~1.4 ns; the **fixture** is
+/// worth the rest. The mechanism is that a fresh `Guard`'s cursor is the
+/// `EdgeId(0)` sentinel, so every step restarts its bracket search at the window
+/// midpoint, and `docs/design/fast-path.md` §12 measures that as a cache cliff
+/// in the *stamp* array — flat below L1d, ~17 ns/sample at capacity 16384, which
+/// is what §11.1's 1 kHz edge is. The tree built below has 256-slot rings, i.e.
+/// 2 KiB of stamps per edge: it sits on the flat part of that curve, so it
+/// prices `Guard`'s constructor and almost none of the cold search a real robot
+/// pays. `docs/decisions/0023` open question 3 is the proposal to gate the §11.1
+/// fixture instead, and the 1.25 below is an allowance for *this* numerator.
 ///
 /// The allowance is set to catch a *regression* rather than to assert a target —
 /// if `Guard` acquires new per-construction work, this is the row that moves.
-/// It is the row `0022` intends to *lower*, and lowering it is the win.
+/// **It is not a row anybody intends to lower:** `0022` is `ready` and declines
+/// the `tft_guard` handle, answering the per-call guard with `tft_plan_at_many`
+/// (~41 ns of a ~302 ns scalar call at n = 256) rather than with new API.
 const PER_CALL_GUARD: f64 = 1.25;
 
 /// **C — the control**, and the reason this file can gate at all. Two

@@ -1,8 +1,18 @@
 # 0022: the C ABI builds a guard per call, and §7 gate 1 has been failing unwatched
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** none, and none is planned. **The decision is to build
+nothing** — see *Decision*. The measurement half of this record has all landed
+(`just abi-cost`, `just abi-split`, `just abi-attached`, `just guard-cost`), and
+the one documentation change it owes is named in *Implementation plan*.
+
+**Why `ready` and not `implemented`.** `README.md`'s lifecycle defines
+`implemented` as *code shipped, PRs linked, document frozen*; there is no code
+and freezing the document would be wrong, because this decision has a stated
+reopening condition (`PHASE7.md`, below) and the record has to stay editable to
+receive it. Zero open questions is what makes it `ready`: questions 1 and 5 were
+answered by measurement (amendments 3 and 5), and 2–4 are closed by declining.
 
 ## Context
 
@@ -353,15 +363,12 @@ measurement artifact would be the fifth such mistake in this area.
 
 ## Decision
 
-*(draft — nothing below is authorized)*
+**Do not build a `tft_guard` handle.** Questions 2, 3 and 4 are closed by
+*declining* the design, not by answering its soundness and staleness questions:
+the thing those questions would buy is already bought by an API that exists.
 
-Give the C tier a way to hold a guard across calls, so that the hot path can
-express what the Rust tier expresses. `docs/API.md` §1 **R2** — *the hot tier
-never allocates, locks or converts* — is the rule the current shape fails: a
-per-call guard acquisition on a shared arena is per-call synchronization work in
-the tier that promises none.
-
-Sketch, to be settled by the questions below:
+What is declined is the first draft's sketch, kept here so it is clear what was
+on the table:
 
 ```c
 tft_status tft_guard_acquire(const tft_tree *tree, tft_guard **out);
@@ -370,12 +377,169 @@ tft_status tft_plan_at_guarded(const tft_plan *plan, const tft_guard *g,
 void       tft_guard_release(tft_guard *g);
 ```
 
-Separately, and independently of whether the above is built: **§7 gate 1 must
-state which backing it measures**, and should gain a shared-arena row. A gate
-that passes at 1.020× while every `shm` consumer pays 1.49× is not measuring the
-product.
+### 1. `tft_plan_at_many` already collects essentially the whole prize
+
+The batch entry point pays **one** guard per batch instead of one per element, so
+it recovers `guard × (1 − 1/n)` of the per-call guard by construction. Measured
+on the same §11.1 fixture, the same `imu_link ← map` plan and the same shared
+arena as everything else in this record:
+
+| what | ns | where |
+|---|---|---|
+| `tft_plan_at`, C++ caller | 302.0 | rung C, *Context* |
+| `tft_plan_at_many`, n = 256 | 261.0 | rung C′ |
+| **recovered by batching** | **41.0** | |
+| the whole per-call guard, `[profile.embedder]` | **43–47** | amendment 4, rung 1 |
+| the whole C++-over-native gap | ~56–60 | amendment 3 |
+
+**Batching recovers ~41 of the 43–47 ns the guard costs — around 90% of it, and
+at n = 256 the arithmetic says it should be 99.6%.** The two figures come from
+two harnesses and are not a paired measurement of one quantity, so read the
+agreement as "the same size", not as three significant figures; the honest
+statement is that **a `tft_guard` handle's remaining prize over `tft_plan_at_many`
+is 0–7 ns, which is inside this host's spread on rung 1 alone (43.0–46.9).**
+
+**Both of this record's guard figures were checked against the conclusion, not
+one of them.** Amendment 5's counters-free, in-process, writable number is
+**~35 ns** (34.4 heap / 35.8 memfd) rather than rung 1's 43–47, and it is the
+smaller of the two — so taking it instead makes batching's 41 ns *exceed* the
+whole guard, which is arithmetically impossible for a mechanism that pays one
+guard per batch and therefore just says the two harnesses differ by a few
+nanoseconds. **The conclusion does not depend on which is used**, and picking the
+larger one is the choice that flatters the declined handle, not this decision.
+
+Two profile facts, because this record has been burned twice by carrying a number
+across builds. The 302.0/261.0 pair is a C++ caller against
+`target/release/libtf_tree_c.a` — the workspace's thin LTO cannot cross into
+`g++`, so **that boundary is real**, and amendment 2's control confirms it: the
+C++ arm reads 302.0 under *both* workspace profiles. Rung 1's 43–47 ns is
+`[profile.embedder]` (`lto = false`).
+
+**What batching does not cover, stated plainly.** `tft_plan_at_many` wants stamps
+in order — the cursor is what the batch path is for — and at n = 1 it recovers
+nothing at all. So this argument is exactly as strong as the claim that a caller
+who cares about 35–45 ns can batch, which is the next point.
+
+### 2. The caller who cannot batch is not paying enough to care
+
+The cost is per *lookup*. A caller doing enough lookups for 35–45 ns each to add
+up to anything is, by definition, in a position to hand them over as an array:
+a planner scoring trajectories, a point transform over a scan, a node
+re-expressing a batch of detections. That caller batches.
+
+The caller who genuinely cannot batch is doing **one lookup per control cycle**.
+Against a 1–10 ms period, 45 ns is 0.0045%–0.00045% of the cycle. There is no
+control loop that is feasible at 1.000000 ms and infeasible at 1.000045 ms.
+
+### 3. The handle costs precisely what `0017` spent seven steps removing
+
+`Guard<'_>` borrows the tree. A `tft_guard` outliving its `tft_tree` is a
+use-after-free a C caller writes in one line, and the machinery to prevent it is
+machinery this project has already built and already regretted needing:
+[`0017`](./0017-owned-handles-and-the-lifetime-rule.md) deleted **both**
+hand-rolled `extend_to_static` helpers, one of which had leaked a claim lease for
+the life of every Python publisher and bypassed the fork guard. `OwnedWriter`
+exists because a lifetime extension in a binding is a defect factory; adding a
+second one — to a *read* path, for 0–7 ns — inverts that record's whole argument.
+`API.md` §2.1's rule ("no type a user stores carries a lifetime") would force the
+handle to own an `Arc<Tree>`, which is a second refcounted handle in the ABI
+whose only job is to make a 45 ns saving safe.
+
+Question 3's staleness objection compounds it: a held guard pins a topology
+generation, so a C consumer holding one across a `select()` loop reads a stale
+topology after a declaration, and per-call acquisition is what makes that
+impossible today. Answering that needs a bounded-lifetime rule that is *enforced*
+rather than documented, and nobody has proposed one.
+
+### 4. The first draft's `API.md` R2 argument is withdrawn
+
+It read: "a per-call guard acquisition on a shared arena is per-call
+synchronization work in the tier that promises none". **That overstates what a
+guard is.** `Guard::new` allocates nothing, takes no lock and waits for nothing:
+since A1 collapsed the topology seqlock into one packed word, pinning a
+generation is a **single acquire load** (`TopologyView::stable_generation` →
+`generation` → one `load(Acquire)`), and the rest of the constructor zeroes a
+cursor array. R2 is not violated by the current shape. The cost is real and
+measured, but it is *work*, not *synchronization*, and a rule about the former
+does not decide this.
+
+### The alternative, kept on the shelf rather than lost
+
+If the cost ever has to be recovered, **do not start from a new public type.**
+Start from caching the guard inside the **existing** `tft_plan` handle, with
+revalidation against the topology generation on each call:
+
+- **No new public type and no caller-visible lifetime.** `tft_plan` already ties
+  to its `tft_tree`; the ABI's soundness story does not change at all, which is
+  what makes this cheaper than the handle by more than the ~45 ns it is chasing.
+- **Revalidation answers question 3 directly** rather than documenting around it.
+  The cached guard's pinned generation is compared against
+  `header.topo`'s current one — **one acquire load per call**, the same load
+  `Guard::new` already performs — and a mismatch rebuilds the guard. A stale
+  topology is then not merely detected, it is *impossible*, which is strictly
+  better than what a held `tft_guard` could promise.
+- **What it costs is one acquire load instead of ~15 ns of construction**
+  (amendment 4's isolated build+drop), plus whatever the warm cursor is worth on
+  the fixture — which, per `0023` and `docs/design/fast-path.md` §12, is the
+  larger half on a realistic ring and near zero on a toy one.
+- **The difficulty is self-referential storage** — a `Guard<'a>` stored beside
+  the `Arc<Tree>` it borrows — and that difficulty is *internal to `tf_tree_c`*.
+  It is the same shape `OwnedWriter` solves for the write path, so the precedent
+  and the `// SAFETY:` argument already exist. It would still be a decision
+  record, because `0007`'s budget is a criterion and this adds an `unsafe` site
+  to the C ABI's crate.
+
+This is written down because it is the design somebody will re-derive, and
+because it is strictly better than the declined one on every axis this record
+weighed.
+
+### What reopens this decision
+
+**`docs/PHASE7.md`'s `tf2`-shaped shim is inherently scalar.**
+`lookupTransform(target, source, t)` takes one stamp and returns one transform;
+there is no batch spelling of it, and §2 puts the shim "header-only over the C
+ABI", so a migrating node's forty call sites each pay a per-call guard. §1's
+whole argument is that such a node keeps its call sites and converts *one* hot
+loop — meaning the shim's steady state is precisely the caller point 2 above
+dismisses, in bulk.
+
+That does **not** reopen anything today: PHASE7 is gated by D21, its §0.0 lists
+four gates and none is met, and answering a design question from that document
+rather than from Phase 4's surprise log is the exact failure the gate exists to
+prevent. But if those gates open, **this decision is to be re-taken, and the
+shelf alternative above is where it starts** — a plan-cached guard costs a
+`lookupTransform` shim nothing to adopt, because the shim already holds the plan.
+
+### The §7 half of the first draft, now superseded
+
+The first draft also asked that **§7 gate 1 state which backing it measures**.
+That is right and has been overtaken:
+[`0023`](./0023-the-gate-that-could-not-gate.md) re-cuts criterion 1 into three
+rungs at a stated profile, and its open question 3 is exactly which fixture R3
+should gate. The demand belongs to that record now, not this one. What this
+record contributes to it is that **the backing is not the variable** — heap and
+memfd differ by ~1.4 ns at `[profile.embedder]` (amendment 5) — so "add a
+shared-arena row" was the wrong ask; "gate a realistic *fixture*" is the right
+one.
 
 ## Open questions
+
+**None. All five are closed**, and the five closures are of three different
+kinds — worth distinguishing, because "closed" has meant something different each
+time:
+
+| # | subject | closed by | kind |
+|---|---|---|---|
+| 1 | the conditional counter flush | amendment 5 | **withdrawn**: ~16 ns is real, but no shipped configuration reaches the flush |
+| 2 | is a guard handle sound to expose? | *Decision* §3 | **declined**: not asked, because the handle is not built |
+| 3 | how long may a guard be held? | *Decision* §3 | **declined**, and answered anyway by the shelf alternative's revalidation |
+| 4 | is `tft_plan_at_many` sufficient instead? | *Decision* §1–2 | **answered: yes** — 41 of 43–47 ns, and the caller who cannot batch is not paying enough to care |
+| 5 | what is the rest of the ~60 ns? | amendment 3 | **measured**: there is no unexplained residue |
+
+Question 4 is the one that decided the record. The others are its consequences.
+The text of all five is kept below, unedited apart from the closure notes each
+already carried, because two of them record refuted hypotheses that are worth
+more than the answers.
 
 **Question 4 of the first draft is answered and closed.** It asked whether the
 `is_shared()` fork check in `Tree::guard` could move per-tree, on the theory
@@ -423,18 +587,31 @@ premise that was false. It is recorded rather than deleted for that reason.
 
 ## Implementation plan
 
-None. This record is `draft`; `docs/decisions/README.md` forbids starting.
+**No engine, ABI or arena change. One documentation change, and it is the whole
+plan:**
 
-When it moves to `ready`, the order is question 1 (the counter flush — largest
-measured win, no API surface, helps Rust consumers too), then question 5 (price
-the remaining ~25 ns before designing around it), and only then questions 2–4,
-which are the ones that add public API.
+1. **Say "batch" where a C or C++ embedder looks.** `docs/benchmarks/tf2.md`
+   already leads its guidance with *"use `tft_plan_at_many` on any hot path"*;
+   the same sentence belongs on `tft_plan_at`'s own doc comment in
+   `crates/tf_tree_c/include/tf_tree.h` and on `tf_tree.hpp`'s `Plan::at`, with
+   the number attached (one guard per batch, ~41 ns of a ~302 ns scalar call at
+   n = 256) and with the caveat that the stamps want to be in order. Verified by
+   `just c-header-check` and by the sentence naming a measurement rather than an
+   adjective. **A reader who reaches `tft_plan_at` and never learns that
+   `tft_plan_at_many` exists is the only way this decision goes wrong**, since
+   the decision *is* "batching is the answer".
 
-**Nothing in this record authorizes a `tft_guard` handle.** Two attributions in
-this area have already been wrong — the shared-library boundary, and the fork
-check — and both were wrong because a residue was treated as a finding. The
-handle is the expensive answer; it should be reached last and only against a
-measured remainder.
+Everything else this record produced is already merged: `just abi-cost`,
+`just abi-split`, `just abi-attached` and `just guard-cost`, plus the corrections
+in `docs/PHASE4.md` §7 and `docs/benchmarks/tf2.md`.
+
+**Nothing in this record authorizes a `tft_guard` handle, and now nothing in it
+ever will** — reopening runs through *What reopens this decision*, i.e. through
+D21's gates and a new record, not through this one. Three attributions in this
+area have already been wrong — the shared-library boundary, the fork check, and
+(in `0023`) the backing — and each was wrong because a residue was treated as a
+finding. The handle was always the expensive answer to a gap whose cheap answer
+shipped in Phase 4.
 
 ## Related
 
@@ -444,3 +621,14 @@ measured remainder.
   the two eliminations (backing, link mode) that led here.
 - `just abi-cost` — the gate, which now has a recipe.
 - `just abi-split` — the ladder and the guard-cost rows.
+- [`0017`](./0017-owned-handles-and-the-lifetime-rule.md) — why a second
+  lifetime extension in a binding is the cost the declined handle actually
+  carries, and what the first one did before it was found.
+- [`0023`](./0023-the-gate-that-could-not-gate.md) — inherits the "state which
+  backing" demand as a question about the *fixture*, and gates R3, the row this
+  record no longer intends to lower.
+- `docs/PHASE7.md` §0.0 and §2 — the gated shim, and the reason it is the one
+  consumer that would reopen this.
+- **The amendments above *Decision* are in the order 4, 5, 3, 2, 1** — appended
+  as they were written, not sorted. Amendments 1 and 2 are wrong and say so;
+  read them for the reasoning error, not the numbers.
