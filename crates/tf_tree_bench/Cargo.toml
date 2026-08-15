@@ -353,3 +353,14 @@ path = "src/bin/soak.rs"
 [[bin]]
 name = "dds_report"
 path = "src/bin/dds_report.rs"
+
+# **Which consumer build does the gated headline ratio speak for?**
+# `just tf2-bench-report` builds the gated row with `cargo run --release`, i.e.
+# this workspace's `lto = "thin"`; a `cargo add tf_tree` consumer gets cargo's
+# release defaults, which `[profile.embedder]` spells out and which do not
+# enable LTO. Same paired harness as `ratio.rs`, one row, built twice —
+# `just tf2-ratio-profiles`. `required-features` for `tf2_scaling`'s reason.
+[[bin]]
+name = "tf2_ratio"
+path = "src/bin/tf2_ratio.rs"
+required-features = ["tf2"]

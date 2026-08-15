@@ -178,17 +178,28 @@ the identical `.tfstream`, because `tft_tree_open` attaches and cannot create
 (D18); both engines are checked to agree on all 256 stamps before either is
 timed, at a max deviation of **2.05e-15**.
 
-| Harness | tf_tree | tf2 | Ratio | Who pays the boundary |
-|---|---|---|---|---|
-| Rust (`ratio.rs`) | 201.5 ns (native Rust) | 498.2 ns (via binding) | **2.47×** | tf2, +10% |
-| C++ (`native_ratio.cpp`) | 306.7 ns (via C ABI) | 452.9 ns (native) | **1.48×** | tf_tree, +52% |
-| Neither, unpaired | 201.5 ns | 452.9 ns | **2.25×** | nobody |
+**The table now carries a profile column, and it is not decoration** — see
+[the section after it](#the-bracket-has-a-second-axis-and-it-is-the-consumers-profile).
+Every Rust-side `tf_tree` number here is taken under this workspace's
+`[profile.release]` (`lto = "thin"`); a consumer's `cargo build --release` is
+`lto = false` and measures a different arm. The tf2 columns have no Rust profile
+to speak of on the native rows, and are measured invariant under it on the
+binding row.
+
+| Harness | tf_tree profile | tf_tree | tf2 | Ratio | Who pays the boundary |
+|---|---|---|---|---|---|
+| Rust (`ratio.rs`) | `release`, `lto = "thin"` | 201.5 ns (native Rust) | 498.2 ns (via binding) | **2.47×** | tf2, +10% |
+| C++ (`native_ratio.cpp`) | `release`, `lto = "thin"` | 306.7 ns (via C ABI) | 452.9 ns (native) | **1.48×** | tf_tree, +52% |
+| Neither, unpaired | `release`, `lto = "thin"` | 201.5 ns | 452.9 ns | **2.25×** | nobody |
+| Neither, unpaired | `embedder`, `lto = false` | 244.2 ns | 439.2 ns | **1.80×** | nobody |
 
 **The true figure is bracketed by the first two, and the third is the best point
-estimate.** It is unpaired — the two numbers come from different processes — so it
-carries this host's run-to-run spread and is not gate material; but each half is
-measured in its own native environment with no FFI in it, and it lands close to
-the 2.7× the depth-3 recorded-stream row reports independently.
+estimate** *for a build like this workspace's*. It is unpaired — the two numbers
+come from different processes — so it carries this host's run-to-run spread and is
+not gate material; but each half is measured in its own native environment with no
+FFI in it, and it lands close to the 2.7× the depth-3 recorded-stream row reports
+independently. **The fourth row is the same construction for the build a consumer
+actually gets, and it is the one that does not clear 2.0.**
 
 **Correcting bias 3 from ~21 ns to 45.3 ns does not move the gate.**
 `crates/tf_tree_bench/src/ratio.rs` gates on `FLOOR = 2.0`, bounded by
@@ -197,6 +208,62 @@ Rust against 452.9 ns native C++, with **no binding on either arm**. Bias 3 is
 the price of the binding, so it does not appear in either half of that quotient.
 It is the *first* row (2.47×) that carries the binding, and that row is reported,
 never gated, for exactly this reason.
+
+### The bracket has a second axis, and it is the consumer's profile
+
+Everything above holds `tf_tree`'s build constant at this workspace's
+`[profile.release]` without saying so, and that turns out to be load-bearing.
+**Cargo applies the top-level package's profile to the whole dependency graph**,
+so a consumer who runs `cargo add tf_tree` and builds `--release` compiles the
+engine under *cargo's* release defaults — which set no LTO.
+`[profile.embedder]` in the workspace manifest is those defaults written out
+field by field, and it exists because `docs/API.md` §2.3 item 3 already priced
+this: thin LTO inlines `Plan::at` across the `tf_tree` crate boundary into the
+caller and `lto = false` does not.
+
+`just tf2-ratio-profiles` builds `ratio.rs`'s paired harness twice and runs both,
+in `docker/tf2`, `taskset -c 2`, one session (2026-08-15):
+
+| build | `lto` | tf_tree | tf2 (via binding) | **paired ratio** | band |
+|---|---|---|---|---|---|
+| `[profile.release]` — what the gate is measured in | `"thin"` | 201.6 ns | 504.4 ns | **2.490×** | 2.452–2.547 |
+| `[profile.profiling]` — control, inherits `release`, only debuginfo differs | `"thin"` | 200.4 ns | 494.7 ns | 2.468× | 2.408–2.485 |
+| `[profile.embedder]` — cargo's release defaults, i.e. a consumer | `false` | 244.2 ns | 506.1 ns | **2.075×** | 2.063–2.080 |
+
+Two controls make this readable as evidence rather than as two numbers from two
+processes:
+
+* **The tf2 column holds: 504.4 → 506.1 ns, +0.34%.** That arm is an
+  `extern "C"` call into a C++ shim that no Rust LTO setting can inline into, so
+  it *should* be invariant across the two builds, and it was checked rather than
+  assumed. The tf_tree column moves +21.1% and is the entire difference.
+* **`[profile.profiling]` is the axis that should not matter.** It inherits
+  `[profile.release]` and differs only in debuginfo; it lands on the LTO arm
+  (0.6% from it), not the embedder one. So the number tracks `lto`, not "a
+  profile whose name is not `release`". Taking that control also caught a wrong
+  build fact: `embed::lto_for_profile_dir` did not follow `inherits` and had been
+  reporting `false (cargo's default; …)` for `profiling`, whose `lto` is in fact
+  `"thin"`. Fixed, with a test, in the same commit.
+
+**What this costs the gate.** `ratio.rs`'s floor of 2.0 is justified by sitting
+under the unbiased estimate, so that the ~10% the binding hands tf2 cannot pass
+the row on its own. At `[profile.embedder]` the unbiased estimate is 439.2 /
+244.2 = **1.80×** (1.86× against the older 452.9 ns tf2 half), and 1.80 is
+*below* the floor. The row still passes there at a paired 2.075×, which is the
+problem rather than the reassurance: it passes on binding bias.
+
+**The floor was not lowered**, and the reasoning is in `FLOOR`'s doc comment.
+The short version: the gate is measured by `just tf2-bench-check`, which builds
+`--release` in this workspace, so it always *was* a statement about this
+workspace's build; that is honest as a regression detector, which is the only
+thing it ever claimed to be, and it is not a consumer-facing guarantee. The
+consumer-facing headline stays the ~2.7× recorded-stream row, whose provenance is
+its own. Widening the gate to speak for a consumer's build would change what the
+floor means, and by `CLAUDE.md`'s rule that is a decision record — the shape it
+would take is a second gated row at `[profile.embedder]` with its own floor under
+1.80, since `runstore::BUILD_CRITICAL_FACTS` already refuses to score two
+profiles against one baseline. Nothing is drafted yet; this section is the
+measurement such a record would rest on.
 
 **The C ABI's 52% is the finding here, and it contradicts a gate.**
 [`PHASE4.md`](../PHASE4.md) §7 gate 1 records `tft_plan_at` at **1.020× native

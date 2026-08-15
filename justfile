@@ -1238,6 +1238,40 @@ tf2-bench-baseline-update:
         --out target/tf2-bench-report'
     cp target/tf2-bench-report/results.json crates/tf_tree_bench/baseline/results-tf2.json
 
+# **Which consumer build does the gated ratio speak for? Both, measured.**
+#
+# `tf2-bench-check` above builds with `cargo run --release`, so its
+# `lookup_ratio_vs_tf2` row is taken under *this workspace's*
+# `[profile.release]` — `lto = "thin"`, which inlines `Plan::at` across the
+# `tf_tree` crate boundary into the harness. A consumer does not get that build:
+# cargo applies the **top-level** package's profile to the whole dependency
+# graph, and cargo's own release defaults set no LTO. `[profile.embedder]` is
+# those defaults written out field by field.
+#
+# So this runs the same paired harness twice, once per profile, and prints both.
+# **Read the tf2 column, not just the quotient**: that arm goes through
+# `tf_tree_tf2_sys`' C++ shim, which no Rust LTO setting can inline into, so it
+# should barely move between the two builds. If it does move, the two runs are
+# not comparable and the quotient of quotients means nothing.
+#
+# Pinned to one core, for `cpp-bench`'s reason: an unpinned run migrates and
+# swings the absolute columns, which are the thing being compared across runs
+# here (the within-run quotient survives migration; a cross-run column does not).
+#
+# Not gated and deliberately not wired into `bench_report`: `bench_report`'s
+# baseline is per-profile by construction (`runstore::BUILD_CRITICAL_FACTS`
+# refuses to compare across `build_profile`), so a second profile is a second
+# baseline, and nothing yet says which one the project claims.
+tf2-ratio-profiles:
+    ./docker/tf2/run.sh 'set -euo pipefail; \
+        cargo build --release -q -p tf_tree_bench --features tf2 --bin tf2_ratio; \
+        cargo build --profile embedder -q -p tf_tree_bench --features tf2 --bin tf2_ratio; \
+        echo "=== [profile.release] — lto = \"thin\": THIS workspace, not a consumer ==="; \
+        taskset -c 2 ./target/tf2-docker/release/tf2_ratio; \
+        echo; \
+        echo "=== [profile.embedder] — lto = false: cargo release defaults, what a consumer gets ==="; \
+        taskset -c 2 ./target/tf2-docker/embedder/tf2_ratio'
+
 # fmt + clippy + unit tests for the tf2 bridge, in the container. `lint` and `test` cannot see it.
 tf2-check:
     ./docker/tf2/run.sh 'set -euo pipefail; \

@@ -1682,10 +1682,10 @@ pub fn assemble(opts: &Options) -> Result<Report> {
 /// and `docs/PHASE1.md` §11.2's exploratory measurements are the shape for that:
 /// `just embed-cost` prints it and writes it to `target/embed-cost/`, and
 /// nothing gates it.
-/// The embedding row's `note`, and **the one place this repository states what
-/// `[profile.embedder]` is**.
-///
 /// What the two columns of the tf2 ratio row mean, and what they do not.
+///
+/// (The stray first paragraph this doc comment used to open with belonged to
+/// [`EMBEDDING_NOTE`] and described a different constant.)
 const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides (tf2's \
     policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the \
     MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back \
@@ -1693,10 +1693,19 @@ const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides
     cancels and no arm always gets the colder cache. That pairing is what makes this \
     resolvable where an absolute is not. The two engines are checked to agree on every \
     stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and \
-    therefore FLATTERS tf_tree** by the residual FFI boundary, ~21 ns / 8% at this depth; \
+    therefore FLATTERS tf_tree** by the residual FFI boundary, 45.3 ns / 10% at this depth \
+    (498.2 ns through the binding against 452.9 ns native — this figure used to read \
+    `~21 ns / 8%` here, which `docs/benchmarks/tf2.md` withdrew for having no derivation, \
+    and the correction had reached `ratio.rs` but not this string); \
     the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is \
     2.7x. The floor is set well under both for that reason: this row catches an engine \
-    regression, it does not publish the headline. `ns_per_lookup` on either side is \
+    regression, it does not publish the headline. **The floor speaks for the build in this \
+    report's `build_profile` / `build_lto` provenance fields, and `just tf2-bench-check` \
+    sets those to `release` / `\"thin\"` — NOT to what a `cargo add tf_tree` consumer \
+    compiles, which is cargo's release defaults (no LTO) and measures 244 ns rather than \
+    202 on this arm, a paired 2.07x rather than 2.49x. `just tf2-ratio-profiles` is that \
+    measurement and `ratio.rs`'s FLOOR doc comment is why it does not move the constant.** \
+    `ns_per_lookup` on either side is \
     REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. \
     Single-threaded and uncontended, which is both engines' best case; the contended \
     comparison, where tf2 anti-scales, is `just tf2-scaling`.";
