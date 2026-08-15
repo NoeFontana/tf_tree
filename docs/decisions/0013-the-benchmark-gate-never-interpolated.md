@@ -20,8 +20,13 @@ one test), `crates/tf_tree_py` (`NS_PER_STEP_ESTIMATE` 55 → 64, per `API.md`
 > is correct and is not being backed out for process reasons, but the sequence
 > was wrong and the record should not read as though the gate had been passed.
 >
-> Item 3 — `PHASE1.md` §11.3's thresholds — is untouched, and the *Open
-> questions* are open. The record stays `draft`.
+> Item 3 — `PHASE1.md` §11.3's thresholds — was untouched and the *Open
+> questions* were open **when this note was written, and both have since
+> changed**: the four questions are answered in *Resolution*, §11.3 is amended,
+> and the record is `ready` (the header above is the current status). The note is
+> kept in the past tense rather than deleted, because what it records is the
+> sequence — items 1 and 2 landing ahead of the gate — and that is history, not
+> status.
 
 ## Context
 
@@ -360,7 +365,12 @@ question 3.
 
 ## Decision
 
-*(draft — this is the recommendation, not yet ratified)*
+*Ratified. The three items below are the recommendation as it was posed; item 3
+was the open one and **its answer is in [*Resolution*](#resolution)**, which is
+what `PHASE1.md` §11.3 now carries. The two readings (a)/(b) sketched under item
+3 are kept as written because *Resolution*'s Q1 answers them by name — it takes
+**both**, with different jobs — and striking them would leave that answer with
+nothing to refer to.*
 
 1. **Fix the stamp at both call sites.** ✅ **Done.** `report.rs`'s
    `measure_lookup_latency` and `benches/lookup.rs` take `fixture::QUERY_NS`
@@ -374,12 +384,15 @@ question 3.
    `lookup_latency` is `unavailable` on this host either way.
 3. **Amend `docs/PHASE1.md` §11.3** to budgets justified by the measurement, with
    the on-grid history recorded inline so the loosening is not mistaken for a
-   concession to a regression. ⛔ **Not done, and deliberately not done by the
-   re-baseline commit** — it is *Open questions* 1–3 below, and §11.3 is
-   normative.
+   concession to a regression. ✅ **Done at ratification**, deliberately *not* by
+   the re-baseline commit — §11.3 is normative, so it waited for the answers in
+   *Resolution*: ≤ 300 ns ScLerp / ≤ 220 ns LerpSlerp with the 25 % baseline
+   clause, the NORMATIVE inlined-call-shape sentence, and the re-cut 1→4 scaling
+   criterion.
 
-Item 3 is the part that needs a decision. Two defensible readings, restated
-against the measured numbers rather than the draft ones:
+Item 3 was the part that needed a decision. Two defensible readings were posed,
+restated against the measured numbers rather than the draft ones — *Resolution*'s
+Q1 takes both:
 
 - **(a) Re-cut the budget to the measured cost.** Depth-3 p50 ≤ 250 ns ScLerp /
   ≤ 200 ns LerpSlerp would be ~1.3× headroom over the 192.7 / 151.8 measured
@@ -391,8 +404,10 @@ against the measured numbers rather than the draft ones:
 
 ### What each reading would do to the existing rows
 
-Nothing in this table has been changed; it is what the ratification would change,
-priced.
+This table priced the two readings *before* ratification, and it is left in that
+tense: the "under (a)" column is what landed for the rows §11.3 owns, the
+"under (b)" column is what landed for the baseline clause, because Q1 took both.
+It is the pricing the decision was made on, not a description of the tree today.
 
 | Consumer of §11.3's numbers | under (a) | under (b) |
 | --- | --- | --- |

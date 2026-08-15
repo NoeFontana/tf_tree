@@ -27,8 +27,12 @@
 //! **The tf2 column goes through `tf_tree_tf2_sys`, so it flatters `tf_tree`.**
 //! `docs/benchmarks/tf2.md` found four measurement biases and priced them; three
 //! are removed, and the one that cannot be is the residual FFI boundary —
-//! cross-TU, no inlining, one extra copy — worth **~21 ns (8%)** to tf2 at this
-//! depth. An in-process Rust harness cannot delete it: the only thing that does
+//! cross-TU, no inlining, one extra copy — worth **45.3 ns (10%)** to tf2 at this
+//! depth: 498.2 ns through the binding against 452.9 ns native, a subtraction
+//! between two rows of that document's bracket table. (This line used to say
+//! "~21 ns (8%)", which contradicted [`FLOOR`]'s own doc comment two screens
+//! down; `tf2.md` withdrew the 21 because nothing derived it.)
+//! An in-process Rust harness cannot delete it: the only thing that does
 //! is `docker/tf2/native_scaling.cpp`, which is the same load with the binding
 //! removed outright, and that is where the honest **2.7×** headline comes from
 //! rather than from here.

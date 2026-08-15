@@ -98,7 +98,7 @@ number 4.
 |---|---|---|---|
 | 1 | `CString::new` x2 per call in the Rust binding | **63-65 ns (14-18%)** | code review |
 | 2 | `const char*` -> two `std::string` temporaries at the C++ call site | **~17 ns (7%)** | native C++ control |
-| 3 | Residual FFI boundary (cross-TU, no inlining, extra copy) | ~21 ns (8%) | native C++ control |
+| 3 | Residual FFI boundary (cross-TU, no inlining, extra copy) | **45.3 ns (10%)** | native C++ control |
 | 4 | `setTransform` authority passed as a string *literal* | **~8 ns + 1 malloc/free per publish** | `just footprint` |
 
 Bias 4 was found last and is the only one so far that ran the *other* way — it
@@ -127,6 +127,33 @@ silently regress — `tf2/lookupTransform_alloc` re-measures the naive binding, 
 Bias 3 is irreducible for any FFI comparison, so **the single-threaded ratio is
 reported against the native C++ figure**, which has no binding in it at all.
 
+**Where the 45.3 ns comes from, and why this row used to say ~21 ns (8%).** The
+figure is a subtraction between two rows of this document's own bracket table
+below: the same depth-3 pair, the same 256 stamps, tf2 at **498.2 ns through
+`tf_tree_tf2_sys`** (the Rust harness row) against **452.9 ns called natively**
+(the C++ harness row) — 45.3 ns, or 10.0% of the native figure. The earlier
+~21 ns (8%) had **no derivation recorded anywhere in this document**, disagreed
+with the bracket table by a factor of two, and nothing reconciled the two; it is
+withdrawn rather than explained, because guessing at how a number was obtained is
+how the wrong attributions in this file's history started.
+
+Independent support for the order of magnitude, from a different measurement
+entirely: [`0022`](../decisions/0022-the-per-call-guard-and-the-unwatched-gate.md)
+amendment 3 prices a **non-inlined call boundary on this same fixture** at
+**~55 ns** (native Rust with the guard hoisted, 242 ns, against `tft_plan_at`
+called across `libtf_tree_c.so`, 297 ns), measured at `[profile.embedder]`
+(`lto = false`) precisely so LTO could not erase the boundary being priced. That
+is our own C ABI rather than tf2's, so it is not the same boundary and is not
+offered as a second measurement of it — but a cross-TU, un-inlinable call with
+one argument marshalling step costs tens of nanoseconds on this host, which is
+the 45 and not the 21.
+
+What would falsify the 45.3: a paired run of the two harnesses in one process, or
+any pair of tf2 rows on this fixture whose binding-versus-native difference is not
+~45 ns. Both bracket-table halves are unpaired point estimates from different
+processes, so the figure carries this host's run-to-run spread; it is documentary,
+and — see below — it is deliberately **not** what `ratio.rs`'s floor rests on.
+
 ### Steady-state lookup
 
 1024 queries per iteration, stamps swept across the history window.
@@ -141,7 +168,8 @@ The honest headline is therefore **~2.7x**, not the 3.3x first reported.
 ### The binding cuts both ways, and the honest answer is a bracket
 
 Every ratio above this line puts tf2 behind `tf_tree_tf2_sys`. Bias 3 prices that
-boundary at ~21 ns and calls it irreducible *for a Rust harness* — which is true,
+boundary at 45.3 ns — 10% — **by subtracting the first two rows of the table just
+below**, and calls it irreducible *for a Rust harness* — which is true,
 and which is why the single-threaded headline is quoted against the native C++
 figure. `docker/tf2/native_ratio.sh` closes the loop: **both engines in one C++
 process**, tf2 called natively, `tf_tree` through its C ABI as a shared library.
@@ -161,6 +189,14 @@ estimate.** It is unpaired — the two numbers come from different processes —
 carries this host's run-to-run spread and is not gate material; but each half is
 measured in its own native environment with no FFI in it, and it lands close to
 the 2.7× the depth-3 recorded-stream row reports independently.
+
+**Correcting bias 3 from ~21 ns to 45.3 ns does not move the gate.**
+`crates/tf_tree_bench/src/ratio.rs` gates on `FLOOR = 2.0`, bounded by
+`UNBIASED_ESTIMATE = 2.25`, and that constant is row 3 above — 201.5 ns native
+Rust against 452.9 ns native C++, with **no binding on either arm**. Bias 3 is
+the price of the binding, so it does not appear in either half of that quotient.
+It is the *first* row (2.47×) that carries the binding, and that row is reported,
+never gated, for exactly this reason.
 
 **The C ABI's 52% is the finding here, and it contradicts a gate.**
 [`PHASE4.md`](../PHASE4.md) §7 gate 1 records `tft_plan_at` at **1.020× native
