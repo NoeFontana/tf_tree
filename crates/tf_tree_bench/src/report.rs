@@ -1757,10 +1757,22 @@ const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides
     2.7x. The floor is set well under both for that reason: this row catches an engine \
     regression, it does not publish the headline. **The floor speaks for the build in this \
     report's `build_profile` / `build_lto` provenance fields, and `just tf2-bench-check` \
-    sets those to `release` / `\"thin\"` — NOT to what a `cargo add tf_tree` consumer \
-    compiles, which is cargo's release defaults (no LTO) and measures 244 ns rather than \
-    202 on this arm, a paired 2.07x rather than 2.49x. `just tf2-ratio-profiles` is that \
-    measurement and `ratio.rs`'s FLOOR doc comment is why it does not move the constant.** \
+    sets those to `release` / `\"thin\"` — NOT to what a consumer compiles, which is \
+    cargo's release defaults (no LTO) and measures 244 ns rather than 202 on this arm, a \
+    paired 2.07x rather than 2.49x. `just tf2-ratio-profiles` is that measurement.** \
+    That build is not a hypothetical and not an approximation: `[profile.*]` is honoured \
+    only in a workspace root, and the published crates declare none, so `cargo add \
+    tf_tree` AND `cargo install tf_tree_cli` both get `lto = false, codegen-units = 16` \
+    — `[profile.embedder]` on both knobs. **The 2.49x is reachable only by building inside \
+    this repository.** `docs/decisions/0025` is why there is nevertheless no second gated \
+    row for it, and the reason is a measurement rather than a preference: across three \
+    repeats the consumer median is stable (2.047-2.088) but its BAND STRADDLES THE FLOOR \
+    in two of the three, so `ratio.rs` returns `Unresolved` there. A threshold cannot be \
+    derived from a band that contains it, and one chosen low enough to pass would be a \
+    gate that always passes — worse than no gate, because it reads as evidence. With the \
+    binding bias above removed as well the consumer estimate is ~1.80x, under the floor; \
+    that is `UNBIASED_ESTIMATE_DEFAULT_RELEASE`, it is `pub` so a reader can reach it, and \
+    `ratio.rs`'s FLOOR doc comment is why it does not move the constant. \
     `ns_per_lookup` on either side is \
     REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. \
     Single-threaded and uncontended, which is both engines' best case; the contended \

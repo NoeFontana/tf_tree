@@ -171,6 +171,26 @@ const UNBIASED_ESTIMATE: f64 = 2.25;
 /// that [`FLOOR`]'s prose is checkable arithmetic rather than a claim, via
 /// `the_floor_is_bounded_at_one_profile_and_not_the_other` below.
 ///
+/// # Why there is no second gated row at this profile
+///
+/// `docs/decisions/0025`, and the reason is measured rather than argued. That
+/// build is what every consumer gets — `[profile.*]` is honoured only in a
+/// workspace root and the published crates declare none, so `cargo add tf_tree`
+/// and `cargo install tf_tree_cli` both land on `lto = false,
+/// codegen-units = 16`, which is `[profile.embedder]` on both knobs. That is a
+/// strong argument for gating it, and it lost to one fact:
+///
+/// **Across three repeats the consumer row's band straddles [`FLOOR`] in two of
+/// them** — medians 2.088 / 2.083 / 2.047, stable to 2%, but bands
+/// 2.080–2.137, **1.975**–2.563 and **1.923**–2.340. [`Run::verdict`] compares
+/// the band and not the median, so it answers `Unresolved` there, correctly.
+///
+/// A threshold cannot be derived from a band that contains it. One set low
+/// enough to pass anyway would be chosen rather than derived — and a gate that
+/// always passes is worse than no gate, because it reads as evidence. The
+/// precondition for revisiting is therefore concrete: a host on which this row
+/// resolves across repeated runs.
+///
 /// `pub` where [`UNBIASED_ESTIMATE`] is private, and the asymmetry is the point
 /// rather than an oversight: the private one is machinery, consumed by the
 /// compile-time assertion below and by nothing else, while this one is the
