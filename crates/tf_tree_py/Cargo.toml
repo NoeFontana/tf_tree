@@ -32,9 +32,14 @@ description = "PyO3 bindings for tf_tree (docs/PHASE3.md)"
 # **It is not cosmetic here, and that is easy to miss**: `lib.rs` exports
 # `tf_tree.__version__` as `env!("CARGO_PKG_VERSION")`, which is *this* field,
 # while the version pip reports for the same wheel comes from
-# `pyproject.toml`'s. Two manifests, one user-visible number each, and nothing
-# compares them — so a bump applied to one and not the other ships a wheel whose
-# `__version__` contradicts its own metadata.
+# `pyproject.toml`'s. Two manifests, one user-visible number each, so a bump
+# applied to one and not the other ships a wheel whose `__version__`
+# contradicts its own metadata. What stops that — the only thing that does — is
+# `tests/python/test_version.py::test_version_matches_the_installed_distribution`,
+# which compares the compiled-in string against `importlib.metadata`. It needs
+# the wheel *installed* to have anything to compare, so it skips under a bare
+# `cargo test` and only bites in `just py-test`. Bump this field and
+# `pyproject.toml` in the same commit.
 version = "0.0.1"
 edition = "2021"
 # Tracks the workspace floor by hand: this crate is outside the workspace (it

@@ -18,13 +18,20 @@ final home. Use :meth:`Plan.at_into` to supply that home yourself.
 **Identifying a build.** A benchmark number or a bug report has to say which
 build produced it, and three values do that::
 
-    tf_tree.__version__                     # the wheel, as a str
+    tf_tree.__version__                     # the extension build, as a str
     tf_tree.arena_format_version()          # the header's set of fields
     f"0x{tf_tree.arena_layout_hash():08X}"  # the geometry, as tft prints it
 
 They are three because they fail independently: the right version can still
 refuse to attach, because the arena it was pointed at was written by a
 different geometry. The last two are what every participant compares on attach.
+
+``__version__`` is compiled in from ``crates/tf_tree_py/Cargo.toml``, and it is
+*not* the canonical answer for the wheel: ``importlib.metadata.version`` is,
+and it reads ``pyproject.toml``. ``tests/python/test_version.py`` asserts the
+two agree, so a disagreement is a stale wheel or a half-applied bump rather
+than two right answers — which is the attribution this whole trio exists to
+get right.
 """
 
 from ._core import (

@@ -372,6 +372,7 @@ def build(
     *,
     capacity: int = ...,
     interp: Literal["sclerp", "lerpslerp"] = ...,
+    frame_headroom: int = ...,
 ) -> Tree:
     """An in-process tree from `(parent, child)` edges.
 
@@ -411,6 +412,7 @@ def open_arena(
     create: list[tuple[str, str]] | None = ...,
     capacity: int = ...,
     interp: Literal["sclerp", "lerpslerp"] = ...,
+    frame_headroom: int = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
 
@@ -511,7 +513,7 @@ def has_shared_memory() -> bool:
     """Whether this build can share a tree between processes."""
 
 __version__: str
-"""This wheel's version, compiled in from the crate manifest.
+"""This extension's version, compiled in from the crate manifest.
 
 `importlib.metadata.version("tf_tree")` is the canonical answer and reads a
 different file — `pyproject.toml`'s `[project] version` against this one's
