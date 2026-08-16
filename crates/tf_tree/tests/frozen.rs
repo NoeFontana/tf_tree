@@ -197,7 +197,17 @@ fn a_frozen_lookup_is_bit_identical_to_the_live_one() {
 /// `Guard`-accumulated denominator and flushes on drop, so the guard is dropped
 /// before the freeze; `err_extrap_after` is an error-path counter and needs a
 /// query past the newest sample to move at all.
+///
+/// **Gated whole, and it is the only test in this crate whose gate had to be
+/// paid for in the justfile.** All three arena reads are load-bearing — the
+/// edge id comes out of the topology block, and the before/after counter values
+/// out of `edge_counters` — so nothing survives with `unstable` off. This target
+/// carries `required-features = ["shm"]`, so unlike the other gated tests it is
+/// *not* reached by `cargo nextest run --workspace`, which builds without `shm`.
+/// `just shm-check` runs it with `--features shm,unstable` for that reason, and
+/// says so where the line is.
 #[test]
+#[cfg(feature = "unstable")]
 fn freezing_carries_the_counter_regions() {
     let live = fixture();
 

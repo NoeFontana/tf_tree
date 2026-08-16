@@ -310,15 +310,17 @@ fn dropping_an_owned_writer_releases_the_claim_lease() {
     let odom = tree.frame("odom").unwrap();
 
     let writer = tree.claim_owned(base, odom).expect("claim");
-    let edge = tree
-        .arena_view()
-        .topology()
-        .read_frame(base)
-        .expect("base is interned")
-        .2;
+    // **`OwnedWriter::edge`, not a topology read through `arena_view`.** It is
+    // the stable-tier spelling of the same `EdgeId`, and its own docstring is
+    // the argument for preferring it: a caller who cannot ask the writer has to
+    // re-derive the id from a seqlock topology read that can fail, and then has
+    // no cross-check that the two agree. Asking the writer also keeps this test
+    // outside the `unstable` gate that the rest of this suite's arena readers
+    // now carry, so it goes on running in the tier a packager builds.
+    let edge = writer.edge().get();
     assert_ne!(
         edge, 0,
-        "base has no edge, so the probe below names nothing"
+        "the writer names edge 0, the sentinel, so the probe below names nothing"
     );
 
     let probe = tf_tree_ipc::LockFile::open(&scratch.lock_path()).expect("open the lock file");
