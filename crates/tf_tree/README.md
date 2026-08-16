@@ -132,7 +132,17 @@ means.
 
 Not everything in the repository ships to crates.io: the `tf_tree` CLI, the C
 ABI and C++ wrapper, the MCAP ingest, the ROS 2 bridge and the Python bindings
-are all built from source. `cargo install tf_tree` installs no binary.
+are all built from source. `cargo install tf_tree` installs no command, and it
+does not fail either: it exits 0 after `warning: none of the package's binaries
+are available for install using the selected features`, naming `--features shm`
+as what the one bin target here needs. That target is
+`tf_tree_rendezvous_child`, the helper `tests/rendezvous.rs` spawns to prove a
+*second process* joins the arena, so `cargo install tf_tree --features shm` does
+put it in your `bin/`. It is not a tool and nothing about it is stable. It
+carries the crate's name because `rendezvous_child` is not a name this crate
+should own in a shared `bin/`; it installs at all because every way to install
+*nothing* trades a compile-time guarantee in that test for a path resolved at
+run time. `Cargo.toml` has the measurement.
 
 ## Where the rest of it is
 

@@ -168,10 +168,28 @@ crates:
   build-from-source in this release, and `freeze` and `participants` are
   build-from-source *with* `--features shm` on Linux, which is the only
   configuration in which those two subcommands exist at all.
-  `cargo install tf_tree` installs nothing; `tf_tree` on crates.io is a library.
+  `tf_tree` on crates.io is a library: `cargo install tf_tree` installs no
+  command. It does not fail, either — on cargo 1.95.0 it exits **0** after
+  `warning: none of the package's binaries are available for install using the
+  selected features`, so a script that installs the crate and then looks for a
+  `tf_tree` on `PATH` gets a green build and a missing command.
 - **`tf_tree_c` — the C ABI — is not published either**, so the C header, the
   C++ wrapper and the CMake package are build-from-source too, as are both
   `ros/` packages (they need `rclcpp`, which only exists inside `docker/tf2`).
+
+**And in the other direction: two of the published crates do carry a binary,
+both multi-process test helpers rather than anything to run.** `cargo install
+tf_tree_ipc` installs `tf_tree_ipc_child`; `cargo install tf_tree --features
+shm` installs `tf_tree_rendezvous_child`. (The plain `cargo install tf_tree`
+above installs neither — that target is behind the feature.) Each is named for
+its crate because the names they had, `ipc_child` and `rendezvous_child`, are
+names neither crate has any business owning in a shared `~/.cargo/bin`, and
+crates.io is one-way: a version can be yanked, never deleted. That they install
+at all is a residue rather than an oversight — each is spawned by its own test
+through `CARGO_BIN_EXE_*`, a compile-time guarantee, and every way to install
+*nothing* trades that for a path resolved at run time, in the two most
+process-dependent test suites in the repository. Both manifests carry the
+measurements.
 
 ### Absent, deliberately
 
