@@ -1667,6 +1667,49 @@ for is the direction and the order of magnitude, and both say the same thing the
 quotient did — this workload does not reach the crossover — with the thumb taken
 off the scale.
 
+### The curve, measured — the fit was right about the crossover and wrong about what it is worth
+
+`CONSUMERS=8`, `12` and `16`, one run each, same container and same recipe:
+
+| N | `tf2.processes` | `tf_tree.processes` | delta | tf2 per consumer | tf_tree per consumer |
+|---|---|---|---|---|---|
+| 4 | 63.15 MiB | 69.51 MiB | **+6.36** | 15.79 | 17.38 |
+| 8 | 113.96 MiB | 113.80 MiB | −0.16 | 14.25 | 14.23 |
+| 12 | 167.41 MiB | 168.39 MiB | +0.97 | 13.95 | 14.03 |
+| 16 | 226.59 MiB | **219.06 MiB** | **−7.54** | 14.16 | 13.69 |
+
+**The crossover is real and the fit located it correctly.** The sign flips
+between N = 4 and N = 8, against a fitted 7.4 — which is a better showing than
+two points per stack had any right to give.
+
+**The magnitude is the part the fit oversold, and it is oversold in the
+direction that flatters us.** "tf_tree wins above 7.4 consumers" reads as a
+threshold beyond which there is a win. What the curve actually shows is that
+**the two stacks are indistinguishable from N = 8 to N = 12** — −0.16 and +0.97
+MiB on totals of 114 and 168, well inside the run-to-run spread that a
+single-run measurement cannot resolve — and that the first difference clearly
+outside that spread is N = 16's 7.54 MiB, **3.3%**. Note also that the delta is
+not monotonic: it goes −0.16, +0.97, −7.54. One run per point cannot say whether
+that is noise around a slowly-widening gap or something structural, and the
+honest reading is the per-consumer columns rather than the deltas.
+
+Those columns are where the mechanism shows. **tf_tree's marginal consumer gets
+cheaper with N (17.38 → 14.23 → 14.03 → 13.69 MiB) while tf2's is flat (15.79 →
+14.25 → 13.95 → 14.16).** That is the shape the fit predicted for the right
+reason: tf_tree pays one *fixed* extra process — the bridge, with its own rclcpp
+node and DDS participant — and amortises it, while its marginal consumer is
+genuinely cheaper because it holds no per-node history. At N = 4 the fixed cost
+dominates and tf_tree loses by 10%; by N = 16 it is spread thin enough that the
+cheaper margin shows through.
+
+**None of this is an arena difference.** The `composed` arms put both stacks in
+one process, and there tf_tree is worse by **+1.04, +0.80, +0.75 MiB** at N = 8,
+12, 16 — small, stable, and shrinking as N grows. That ~1 MiB is the arena. Every
+other megabyte in the table is rclcpp and DDS, which both stacks pay identically
+per process, which is why the whole comparison is dominated by *process count*
+and not by transform storage. Reporting this row as an arena result would be the
+error the `bridge_supervision` entry exists to name.
+
 The saving per consumer is small here because `robot` has 23 edges, so the tf2
 `Buffer` this replaces is itself small; a tree with thousands of edges of history
 moves that number and this one does not measure it.
@@ -1814,12 +1857,12 @@ repository; Autoware's datasets and TUM RGB-D state no clear license at all.
   the row. What is *not* done is its latency on pinned cores; both
   `.processes` arms' `svc` percentiles are wake-from-idle-dominated on this
   host, and the section above measures why rather than asserting it.
-* **The memory crossover, measured rather than extrapolated.** At N = 4
-  `tf_tree.processes` costs more PSS than `tf2.processes`, and the two-parameter
-  fit above puts the crossover near N = 7.4 — approximate, single-run, and from
-  two points per stack. Nothing has run it at N = 16, which is the count
-  [`PHASE5.md`](../PHASE5.md) §12 criterion 4 is stated at, and running it is
-  the only thing that settles the number.
+* ~~**The memory crossover, measured rather than extrapolated.**~~ **Done** —
+  the curve is above, at N = 8, 12 and 16. The fit's crossover near 7.4 was
+  right; its implied *magnitude* was not, and the correction is in that section.
+  What remains open is **spread**: every point is one run, the delta is not
+  monotonic across them, and nothing here can say whether N = 16's 7.54 MiB is a
+  widening gap or a lucky run. Repeat each N before quoting the number.
 * **A second RMW.** `docker/tf2` carries one, so the DDS numbers' sensitivity to
   the middleware vendor is unmeasured. [`PHASE4.md`](../PHASE4.md) §0.0 already
   records the missing second RMW.

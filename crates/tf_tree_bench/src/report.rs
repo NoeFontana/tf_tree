@@ -2287,6 +2287,17 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  over four) and is **not** the 6.36 MiB difference — Pss divides a shared \
                  page by the number of processes mapping it, and those two arms map from \
                  four and five, so the difference is confounded before any bridge exists. \
+                 **The curve settles what that one point could not.** Run at N = 8, 12 and \
+                 16 as well, the arm totals are 113.80/113.96, 168.39/167.41 and \
+                 219.06/226.59 MiB (tf_tree/tf2): the sign flips between 4 and 8, the two \
+                 stacks are indistinguishable from 8 to 12, and by 16 tf_tree is 3.3% \
+                 ahead. The mechanism is visible in the per-consumer column — tf_tree's \
+                 marginal consumer falls 17.38 -> 13.69 MiB across the sweep while tf2's \
+                 stays flat near 14.2 — which is this entry's cost seen from the other \
+                 side: **one fixed process, amortised.** It is still not an arena result. \
+                 The `composed` arms put both stacks in one process and differ by only \
+                 0.75-1.04 MiB; everything else in those totals is rclcpp and DDS, paid \
+                 identically per process by both. \
                  What the CPU column shows is the operational shape of this trade: a fixed \
                  cost you must supervise, bought against a per-consumer cost you do not.",
                 opts.consumers
