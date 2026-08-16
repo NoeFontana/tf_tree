@@ -25,6 +25,10 @@ fn last_error() -> Option<tft_error> {
 }
 
 #[cfg(feature = "test-hooks")]
+// `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
+// on one target and a no-op on the other; see `src/error.rs` for the full
+// note. The allow is the fix — deleting the cast breaks x86_64.
+#[allow(clippy::unnecessary_cast)]
 fn message(e: &tft_error) -> String {
     let bytes: Vec<u8> = e
         .message

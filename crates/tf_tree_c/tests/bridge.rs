@@ -286,6 +286,10 @@ fn text(p: *const c_char) -> String {
     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
+// `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
+// on one target and a no-op on the other; see `src/error.rs` for the full
+// note. The allow is the fix — deleting the cast breaks x86_64.
+#[allow(clippy::unnecessary_cast)]
 fn last_message() -> String {
     let mut e = tft_error {
         struct_size: core::mem::size_of::<tft_error>() as u32,
