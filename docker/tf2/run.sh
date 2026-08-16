@@ -23,12 +23,29 @@ fi
 TTY_FLAGS=()
 if [ -t 0 ] && [ -t 1 ]; then TTY_FLAGS=(-it); fi
 
+# **`ROS_HOME` is set below because `-u` leaves the container with no passwd
+# entry, and therefore no `$HOME`.** `rcl_logging_spdlog` falls back to
+# `$HOME/.ros/log`, which resolves to `//.ros/log` and fails with EACCES — all
+# seven `tf_tree_ros` ctests abort with "failed to configure logging" before
+# running a line of their own code.
+#
+# It never fired on a developer machine, and that is exactly why it survived:
+# UID 1000 *does* have an entry in this image (`/home/ubuntu`), so `just
+# ros-test` passes locally. It failed on the first CI run this repository has
+# had since 2026-07-23, whose runner UID has none. Reproduced in one command:
+#   docker run --rm -u 4242:4242 <image> bash -lc 'echo $HOME'   ->  /
+#
+# `/tmp` rather than somewhere under `/work`: the bind mount is owned by the
+# host user, so a container UID that does not own it cannot write there either
+# — measured, `mkdir` under `/work/target` as 4242 is EACCES too. A test run's
+# logs are ephemeral, so a container-local path is the right home for them.
 # Match the host UID so files the container writes into the bind mount stay
 # editable on the host.
 exec docker run --rm "${TTY_FLAGS[@]}" \
     -v "$REPO_ROOT":/work \
     -e CARGO_TARGET_DIR=/work/target/tf2-docker \
     -e CARGO_HOME=/work/target/tf2-docker/cargo-home \
+    -e ROS_HOME=/tmp/.ros \
     -u "$(id -u):$(id -g)" \
     -w /work \
     "$IMAGE" \
