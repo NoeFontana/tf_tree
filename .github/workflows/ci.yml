@@ -232,14 +232,25 @@ jobs:
 
   # **`tf_tree` with `unstable` OFF — the tier every published consumer gets.**
   #
-  # No other job compiles the facade's own default feature set with the feature
-  # off. `lint` and `test` both run `--workspace`, and
-  # cargo's resolver unifies features across a workspace build, so
-  # `tf_tree_cli`, `tf_tree_c` and `tf_tree_bench` each asking for
-  # `tf_tree/unstable` turns the feature on for the facade everywhere — in
+  # No `--workspace` job compiles the facade's own default feature set with the
+  # feature off. `lint` and `test` both run `--workspace`, and cargo's resolver
+  # unifies features across a workspace build, so `tf_tree_cli`, `tf_tree_c`,
+  # `tf_tree_bench` and `tf_tree_py` — **four**, not three — each asking for
+  # `tf_tree/unstable` turns the feature on for the facade everywhere: in
   # `cargo clippy --workspace`, in `cargo nextest run --workspace`, and in
-  # `cargo build --workspace --all-targets`. A `-p tf_tree` selection is the only
-  # one that does not, which is what `just stable-tier-check` is made of.
+  # `cargo build --workspace --all-targets`. A `-p tf_tree` selection is what
+  # does not, which is what `just stable-tier-check` is made of.
+  #
+  # Note "no `--workspace` job" and not "no other job": `just miri` and
+  # `just test-doc-error-codes` are `-p tf_tree` selections too and do reach
+  # `FEATURES=counters,default`. What is unique here is the *set* of stable-tier
+  # checks — three clippy configurations, the tier's own rustdoc, the consumer
+  # scan and the test-count floor. `docs/API.md` §2.6 carries the measurement.
+  #
+  # This list is prose and nothing reads it: the recipe's scan compares
+  # `docs/API.md` §6 row 4 and `crates/tf_tree/Cargo.toml`'s `unstable` comment
+  # against the manifests, and never this file. That is exactly how it came to
+  # say three.
   #
   # **The recipe was made to fail before this job was written.** Reintroducing
   # the branch's own defect — `self.arena_view()` where `frozen.rs` now calls

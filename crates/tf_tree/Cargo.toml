@@ -128,32 +128,138 @@ tf_tree_ipc = { workspace = true, optional = true }
 # target is part of this package, so `feature = "unstable"` resolves against the
 # crate's own feature set with nothing declared here at all. `tests/counters.rs`
 # is gated whole (every test in it reads a counter through the view);
-# `behavior.rs`, `construction.rs` and `frozen.rs` gate one test each; and
-# `behavior.rs`'s `span_names_the_edge_that_has_never_published` gates only the
-# assertion that resolves an `EdgeId` back to its frame pair, so the rest of it
-# runs in both tiers. `owned_writer.rs` needed no gate: it now asks
-# `OwnedWriter::edge` for the id it was deriving from a topology read, which is
-# the same fact on the stable tier.
+# `behavior.rs`, `construction.rs` and `frozen.rs` gate one test each.
+#
+# **Two assertions needed no gate at all**, because the fact they were reading
+# out of the arena has a stable-tier spelling, and taking it is strictly better
+# than gating: a gated assertion is one that *decays* on the tier a published
+# consumer gets. `span_names_the_edge_that_has_never_published` resolves its
+# `EdgeId` back to a frame pair through `Tree::edges`, which reads the same
+# `EdgeRecord` the view does, and `owned_writer.rs` asks `OwnedWriter::edge` for
+# the id it was deriving from a topology read and then cross-checks it against
+# `Tree::edges`. Twelve `.arena_view()` call sites are left in the suite —
+# `counters.rs` 6, `frozen.rs` 3, `construction.rs` 2, `behavior.rs` 1 — and all
+# twelve are gated. (The "fourteen" above counts main's state before this
+# change, and stays right about it.)
 #
 # **This also fixes the second cost the old comment recorded**, which was that
 # no recipe could compile these test targets with `unstable` off while that line
 # stood. `cargo nextest run -p tf_tree` now does, and it is the shape
 # `cargo test` on the tarball gets. The price is the one the old comment named
 # as the objection: a compile-time guarantee traded for `cfg`s that would
-# silently stop running if misspelled. That is what `just stable-tier-check`'s
-# `[dev-dependencies]` scan now guards from the other side — it asserts this
-# section does *not* re-acquire the self-dependency — and what the test-count
-# comparison in the commit that made this change checked directly: 825 tests
-# under `--workspace` before and after, 77 under `-p tf_tree --lib --tests`
-# before against 70 after with the feature off and 77 with it on.
+# silently stop running if misspelled.
+#
+# **What guards the first half of that trade is `just stable-tier-check`'s
+# `[dev-dependencies]` scan, and it is worth being exact about how**, because it
+# does not work the way "assert the line is absent" would. The scan collects
+# every `crates/*/Cargo.toml` whose `[dev-dependencies]` carry
+# `tf_tree = ... "unstable"` and compares that *set* to a recorded one, which
+# since 0.0.1 is `tf_tree_bridge` alone. So it asserts a positive — these crates
+# do turn the feature on for their tests — and re-acquiring the line here fails
+# it as a **name the record does not carry**, in the same breath as adding an
+# undocumented consumer would. Two things follow that a "guards the absence"
+# reading would miss: a self dev-dependency written *without*
+# `features = ["unstable"]` is invisible to it, and updating `want_dev` in the
+# justfile makes it accept the line again. It is a record-agrees-with-reality
+# check, not a prohibition.
+#
+# **The second half of the trade — the `cfg`s themselves — no manifest scan can
+# reach, but `just lint` already does, and the objection the old comment raised
+# against `cfg`s turns out not to survive measurement.** It said a misspelt
+# `#[cfg(feature = "unstable")]` would compile to a silently absent test in
+# every configuration. It does not: `[workspace.lints.rust]` sets
+# `unexpected_cfgs` to `warn`, every member inherits it, and `just lint` runs
+# clippy with `-D warnings`, so a feature name that is not declared is a build
+# error naming the file and line. Measured on this branch by writing the typo in
+# and running the workspace pass verbatim —
+# `cargo clippy --workspace --all-targets -- -D warnings` — which exited 101
+# with `error: unexpected `cfg` condition value: `unstabel``, `-D
+# unexpected-cfgs implied by -D warnings`, and `could not compile `tf_tree`
+# (test "counters")`. It fires even though the cfg evaluates false and the
+# target compiles to an empty crate, because check-cfg is about the value being
+# declared, not about the branch being taken.
+#
+# **That lint is necessary and it is not sufficient, and the difference is the
+# reason `tests/feature_gates.rs` exists.** `unexpected_cfgs` is a *warning* by
+# default; only `-D warnings` promotes it, and `just lint` is the sole recipe
+# that passes it. With the same typo in place, `cargo nextest run --workspace`
+# reported *"820 tests run: 820 passed"* at exit 0 — five tests gone, every test
+# recipe green, and a packager compiling the tarball told nothing at all. So the
+# `cfg` half of the trade carries its own guard: `tests/feature_gates.rs` scans
+# these five sources with `include_str!` and fails the *build* on a feature name
+# this crate does not declare, or on a file that loses a gate it is supposed to
+# have. It holds no `#[test]`, so it moves none of the counts below, and being a
+# `const` assertion it fires wherever the target is compiled rather than only
+# where `-D warnings` reaches. Re-measured on this branch with that file in the
+# tree: the same typo now takes `cargo nextest run --workspace` to exit 101,
+# `error: could not compile `tf_tree` (test "feature_gates")`.
+#
+# What neither reaches is a target that stops being *run* at all — a `cfg` that
+# still matches, a recipe line that quietly drops. That is a test-count floor's
+# job, and it belongs in `just`, not here. And what a misspelling escapes in the
+# other direction is the *manifest* scan, which is a different check doing a
+# different job — see the paragraph above.
+#
+# What additionally checked the gating at the time was the test-count comparison
+# in the commit that made this change: 825 tests under `--workspace` before and
+# after, 77 under `-p tf_tree --lib --tests` before against 70 after with the
+# feature off and 77 with it on. Re-measured on this branch,
+# `cargo nextest list -p tf_tree --lib --tests` still reports 70 and
+# `--features unstable` 77 — the seven being `counters.rs` whole, plus one test
+# each in `construction.rs` and `behavior.rs`.
 # The rendezvous tests probe the lock file directly, from outside the tree.
 tf_tree_ipc = { workspace = true }
 proptest.workspace = true
 
 # The rendezvous is a between-processes claim, so `tests/rendezvous.rs` needs a
 # real second process rather than a thread.
+#
+# **This crate is published, so this target's name is a name `cargo install`
+# writes into `~/.cargo/bin`** — and `required-features` narrows *which*
+# installs, not whether. Measured: `cargo install --path crates/tf_tree
+# --features shm --root <scratch> --no-track` printed `Installing <scratch>/bin/
+# tf_tree_rendezvous_child` and left a 788936-byte executable there. The default
+# install is clean but *quiet*, which is the half worth writing down — `cargo
+# install --path crates/tf_tree` with no features exits **0**, installs nothing,
+# and only warns: *"none of the package's binaries are available for install
+# using the selected features"*, naming this target and `shm`. Nothing downstream
+# can branch on that exit code, so `CHANGELOG.md` and `README.md` spell the
+# behaviour out instead. (Measured on cargo 1.95.0; an earlier revision of this
+# comment said `exits 2`, which is what makes the exit code worth stating at all
+# rather than describing the install as "failing".) Anyone who wants the
+# shared-memory half, which is most of the reason to reach for this crate, turns
+# `shm` on and gets the test helper with it. `rendezvous_child` is a name this
+# crate has no business owning in a shared `bin/`, and crates.io is one-way: a
+# version can be yanked, never deleted. Hence the crate's own name here, while
+# the *file* keeps the short one — it sits next to `tests/rendezvous.rs` and is
+# named for it, and renaming a target is a one-line diff where moving a file is
+# not. Same shape as `tf_tree_ipc`'s `tf_tree_ipc_child`, one crate over, for
+# the same reason.
+#
+# **The residue — one binary under `--features shm` — is chosen, not
+# overlooked**, and `CHANGELOG.md`'s *What is and is not published* and
+# `README.md`'s *Version* say so in those words rather than claiming a clean
+# install. The deeper fix that would install *nothing* is to move the helper
+# into a `publish = false` crate and have the test find it via
+# `current_exe()`'s directory. It is rejected here on a measurement, not a
+# preference: `just shm-rendezvous` is exactly one command, `cargo nextest run
+# -p tf_tree --features shm,test-hooks --test rendezvous`, and a package
+# selection builds no other package's executables. Asking that build what it
+# produced —
+#     cargo build -p tf_tree --features shm,test-hooks --all-targets \
+#         --message-format=json | grep -o '"executable":"[^"]*"'
+# — lists twelve integration-test binaries, the lib's unit-test binary, and this
+# helper (`target/debug/tf_tree_rendezvous_child` and its `deps/` copy), and
+# nothing else. A helper in a sibling crate would not be in that list, so the
+# spawn would fail at *run* time on a path that was never built: the same
+# regression `tf_tree_ipc`'s manifest records for `required-features` (7 tests,
+# `NotFound` on spawn), traded for a tidier sentence in a release note.
+# `env!("CARGO_BIN_EXE_…")` is a compile-time guarantee and this is the
+# repository's most delicate test; keeping the guarantee is worth an honest
+# sentence about one oddly-named binary.
 [[bin]]
-name = "rendezvous_child"
+name = "tf_tree_rendezvous_child"
+path = "src/bin/rendezvous_child.rs"
 required-features = ["shm"]
 
 [[test]]

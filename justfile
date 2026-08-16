@@ -72,18 +72,39 @@ test-doc-error-codes:
 #
 # `docs/API.md` §2.6's tier split puts `tf_tree::unstable::*` and
 # `Tree::arena_view` behind a default-off feature. `cargo build --workspace`
-# cannot reach the tier that split is *for*: `tf_tree_cli`, `tf_tree_c` and
-# `tf_tree_bench` each declare `tf_tree = { features = ["unstable"] }`, the
-# resolver unifies features across a workspace build, so `--workspace` compiles
-# the facade **with** the feature, always. `-p tf_tree` is the only package
-# selection that does not, which is why every line below is `-p`.
+# cannot reach the tier that split is *for*: `tf_tree_cli`, `tf_tree_c`,
+# `tf_tree_bench` and `tf_tree_py` each declare
+# `tf_tree = { features = ["unstable"] }`, the resolver unifies features across a
+# workspace build, so `--workspace` compiles the facade **with** the feature,
+# always. `-p tf_tree` is the only package selection that does not, which is why
+# every line below is `-p`. (Four, not three. The scan at the bottom of this
+# recipe compares `docs/API.md` §6 row 4 and the manifest's `unstable` comment
+# against the manifests — it does **not** read this header, which is how this
+# sentence shipped naming three: `crates/tf_tree_py/Cargo.toml` already carried
+# `features = ["shm", "unstable"]` on the day it was written.)
 #
-# **Stated precisely, because the loose version is wrong.** What no other recipe
-# compiles is `tf_tree`'s *own default feature set* — `counters` on, `unstable`
-# off — and its `shm` variant. `just ingest-check` does compile the facade
-# without `unstable`, but with **no** features at all, because
-# `[workspace.dependencies]` declares `tf_tree = { default-features = false }`;
-# that is a third configuration, not the one `cargo add tf_tree` produces.
+# **Stated precisely, because the loose version is wrong — and the loose version
+# used to be here.** It claimed no other recipe compiles `tf_tree`'s own default
+# feature set or its `shm` variant. Both halves are false, measured with
+# `cargo tree -e features -f '{p} FEATURES={f}'`:
+#
+#     -p tf_tree                                      FEATURES=counters,default
+#     -p tf_tree --features tf_tree_core/miri-soft-float  FEATURES=counters,default
+#     -p tf_tree --features shm                       FEATURES=counters,default,shm
+#
+# so `just miri` (`-p tf_tree --features tf_tree_core/miri-soft-float --lib
+# --test owned_writer`) and `just test-doc-error-codes` (`--doc -p tf_tree -p
+# tf_tree_core`) both reach the default set, and `just shm-check`, `just tsan`
+# and `just shm-rendezvous` all reach the `shm` variant. `just ingest-check`
+# reaches a third configuration, no features at all, because
+# `[workspace.dependencies]` declares `tf_tree = { default-features = false }`.
+#
+# What is genuinely unique to this recipe is narrower and worth keeping for its
+# own sake: the **whole set of stable-tier checks in one place** — clippy on
+# three configurations, the tier's own rustdoc (`just doc` renders the facade at
+# `--all-features`, where a link into `tf_tree::unstable` resolves and here it
+# does not), the consumer-list scan, and the test-count floor. `docs/API.md`
+# §2.6 states the corrected version; do not re-derive it here.
 #
 # **Verified to be a real gate, by breaking it.** Reverting the branch's own
 # `frozen.rs` fix — `self.view()` back to `self.arena_view()`, a crate-internal
@@ -95,16 +116,24 @@ test-doc-error-codes:
 # `error[E0599]: no method named 'arena_view' found for reference '&Tree'`
 # at `crates/tf_tree/src/frozen.rs:239:25`.
 #
-# **What this covers is the library, not `tf_tree`'s test targets, and that is
-# stated rather than implied.** `crates/tf_tree/Cargo.toml` dev-depends on the
-# crate itself with `features = ["unstable"]`, so the arena-reading assertions in
-# `tests/{counters,behavior,construction,frozen,owned_writer}.rs` stay inside
-# `just test` — at the price that **no `tf_tree` test target is ever compiled
-# with the feature off**, and no recipe can change that while the dev-dependency
-# stands. The nearest available substitute is the last two lines: two workspace
-# crates that link the facade *without* the feature and have suites of their own,
-# so the tier gets a runtime pass even though the facade's own tests cannot give
-# it one.
+# **What this covers is the library, not `tf_tree`'s test targets** — every
+# clippy line below is `--lib`, deliberately. The rest of that sentence used to
+# read that no `tf_tree` test target could *ever* be compiled with the feature
+# off, because the manifest dev-depended on the crate itself with
+# `features = ["unstable"]` and unification made the choice for every recipe.
+# 0.0.1 deleted that line (the manifest's `[dev-dependencies]` comment records
+# why: it does not survive `cargo package`), so the constraint is gone —
+# `cargo nextest list -p tf_tree --lib --tests` reports **70** tests where
+# `--features unstable` reports **77**. The seven are `tests/counters.rs` whole
+# plus one test each in `construction.rs` and `behavior.rs`: they carry
+# `#[cfg(feature = "unstable")]` at the call site now, so on the stable tier they
+# do not exist rather than failing to compile.
+#
+# That does not make this recipe cover them — `--lib` still means `--lib` — but
+# it does mean the honest claim is now "this recipe chose not to", not "nothing
+# can". The last two lines stay the runtime pass over the tier: two workspace
+# crates that link the facade and have suites of their own, for the two
+# different reasons recorded where they are.
 stable-tier-check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -140,9 +169,18 @@ stable-tier-check:
     # dev-dependency only breaks a test run. Lumping them together is what would
     # make the number in the prose four or five depending on which document you
     # read, which is the drift this check exists to stop.
+    #
+    # **`want_dev` lost `tf_tree` in 0.0.1** — `crates/tf_tree/Cargo.toml` no
+    # longer dev-depends on itself, so the scan yields `tf_tree_bridge` alone and
+    # this list has to say so or the recipe fails on its own record. Since these
+    # are exact-set comparisons, keeping `tf_tree` off `want_dev` is also what
+    # makes re-acquiring that line fail here: it would come back as a name the
+    # documents do not carry. What that does *not* cover is the other half of the
+    # trade the manifest describes — a misspelled `#[cfg(feature = "unstable")]`
+    # at a call site silently drops a test and no scan of a manifest can see it.
     echo "==> the recorded consumers of the unstable tier are the actual ones"
     want="tf_tree_bench tf_tree_c tf_tree_cli tf_tree_py"
-    want_dev="tf_tree tf_tree_bridge"
+    want_dev="tf_tree_bridge"
     scan() {
         awk -v sect="$1" '
             /^\[/ { s = $0 }
@@ -207,6 +245,27 @@ stable-tier-check:
     # self-description this recipe exists to end.
     echo "==> the downstream suites, run under -p so nothing unifies for them"
     cargo nextest run -p tf_tree_ingest -p tf_tree_bridge
+    # **A floor on each tier's test count, because a `cfg` is a silent switch and
+    # the two guards above it cannot see the failure this one catches.**
+    #
+    # `tests/feature_gates.rs` fails to *compile* on a misspelt feature name, and
+    # the manifest scan above fails on an undocumented consumer. Neither can see
+    # a target that stops being **run** — a gate that still matches, a `--test`
+    # line quietly dropped from a recipe, a `required-features` that stops being
+    # satisfied. Nothing inside the crate can: only the runner knows what it ran.
+    #
+    # Measured at 0.0.1: 70 with `unstable` off, 77 with it on, the seven being
+    # `tests/counters.rs` whole plus one test each in `construction.rs` and
+    # `behavior.rs`. A floor rather than an equality, so adding tests does not
+    # need an edit here.
+    #
+    # `2>/dev/null` also swallows a compile error, which yields 0 and trips the
+    # floor. That is the direction you want it to fail in.
+    echo "==> the tier still lists the tests it is supposed to"
+    have=$(cargo nextest list -p tf_tree 2>/dev/null | wc -l)
+    [ "$have" -ge 70 ] || { echo "the stable tier lists $have tests, was 70 at 0.0.1"; exit 1; }
+    have=$(cargo nextest list -p tf_tree --features unstable 2>/dev/null | wc -l)
+    [ "$have" -ge 77 ] || { echo "the unstable tier lists $have tests, was 77 at 0.0.1"; exit 1; }
 
 # Concurrency model checking under loom (reduced buffer capacities).
 loom:
@@ -1615,7 +1674,21 @@ shm-check:
     # PRs, and it is why a new shm-only target belongs here in the same commit
     # that adds it.
     cargo nextest run -p tf_tree_arena --features shm
-    cargo nextest run -p tf_tree --features shm --test frozen
+    # **`unstable` on the line below buys exactly one test, and without it that
+    # test runs nowhere.** `freezing_carries_the_counter_regions` (§2's
+    # counter-region carry-over) is `#[cfg(feature = "unstable")]` — all three of
+    # its arena reads go through `Tree::arena_view`, so there is no stable-tier
+    # spelling of it. Every *other* `unstable`-gated test in this crate is reached
+    # by `cargo nextest run --workspace`, where the resolver unifies the feature
+    # in from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`; this target
+    # carries `required-features = ["shm"]`, so `--workspace` skips it whole and
+    # this line is the only one that can run it. Until 0.0.1 the facade's
+    # self-dev-dependency turned the feature on here for free; deleting it (see
+    # `crates/tf_tree/Cargo.toml`) took the test out of every recipe at once and
+    # `--features shm` alone would leave it there. Measured:
+    # `cargo nextest list -p tf_tree --features shm --test frozen` lists 8 tests,
+    # `--features shm,unstable` lists 9.
+    cargo nextest run -p tf_tree --features shm,unstable --test frozen
     # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
     # paragraphs above being obeyed rather than restated.** Half of
     # `tests/owned_writer.rs` is `#[cfg(all(feature = "shm", target_os =
