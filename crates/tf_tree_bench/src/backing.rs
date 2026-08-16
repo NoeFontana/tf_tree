@@ -570,10 +570,40 @@ pub fn measure_guard_cost(
     sweeps: usize,
     warmup: usize,
 ) -> Result<(f64, f64)> {
+    measure_guard_cost_between(tree, TARGET, SOURCE, rounds, sweeps, warmup)
+}
+
+/// [`measure_guard_cost`] over a named frame pair, for a fixture that is not
+/// §11.1's.
+///
+/// The pair is a parameter because [`guard_cost_fixture_pair`] measures a
+/// three-edge tree that has no `imu_link` — asking for one does not fail
+/// cleanly, it tries to *intern* the name and comes back `CapacityExceeded`,
+/// which reads as a layout bug rather than a wrong frame.
+///
+/// # Errors
+///
+/// If the pair cannot be planned or a timed round measures a non-duration.
+pub fn measure_guard_cost_between(
+    tree: &Tree,
+    target: &str,
+    source: &str,
+    rounds: usize,
+    sweeps: usize,
+    warmup: usize,
+) -> Result<(f64, f64)> {
     if rounds == 0 || sweeps == 0 {
         bail!("rounds and sweeps must both be non-zero; got {rounds} and {sweeps}");
     }
-    let plan = plan_for(tree)?;
+    let t = tree
+        .frame(target)
+        .map_err(|e| anyhow!("fixture frame `{target}` is missing: {e:?}"))?;
+    let sf = tree
+        .frame(source)
+        .map_err(|e| anyhow!("fixture frame `{source}` is missing: {e:?}"))?;
+    let plan = tree
+        .plan(t, sf)
+        .map_err(|e| anyhow!("compiling the {source} <- {target} plan: {e:?}"))?;
     let stamps: Vec<Stamp> = (0..STAMPS as i64)
         .map(|i| Stamp::from_nanos(stamp_ns(i)))
         .collect();
@@ -762,6 +792,114 @@ pub fn guard_cost_both(
             per_call_ns: sp,
         },
     ))
+}
+
+/// A three-edge, 256-slot heap tree — a byte-for-byte match of the fixture
+/// `crates/tf_tree_c/examples/abi_cost.rs` builds, and the one whose R3 row
+/// `docs/decisions/0023` §7 gates.
+///
+/// It exists here so the toy fixture and the §11.1 one can be measured **in one
+/// binary, one profile, interleaved**, which is the measurement `0023` open
+/// question 3 names as the thing that would make its recommendation airtight.
+/// Two arrays of 256 stamps are 2 KiB each and sit wholly in L1d on this host;
+/// §11.1's 1 kHz edge searches 128 KiB, which is 4x it. That contrast is the
+/// whole hypothesis.
+fn build_three_edge_tree() -> Result<Tree> {
+    let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(256));
+    let mount = tf_tree_math::exp_se3([0.3, -0.7, 0.2, 0.11, -0.05, 0.37]);
+    let tree = tf_tree::TreeBuilder::new()
+        .dynamic_edge("map", "odom", cfg)
+        .dynamic_edge("odom", "base", cfg)
+        .static_edge("base", "sensor", &mount)
+        .build()
+        .map_err(|e| anyhow!("building the three-edge tree: {e:?}"))?;
+    for (parent, child, k) in [("map", "odom", 1.0f64), ("odom", "base", 2.0)] {
+        let p = tree
+            .frame(parent)
+            .map_err(|e| anyhow!("frame `{parent}`: {e:?}"))?;
+        let c = tree
+            .frame(child)
+            .map_err(|e| anyhow!("frame `{child}`: {e:?}"))?;
+        let w = tree
+            .claim(c, p)
+            .map_err(|e| anyhow!("claiming {child}: {e:?}"))?;
+        for i in 0..64i64 {
+            let f = i as f64;
+            w.push(
+                i * 10_000_000,
+                &tf_tree_math::exp_se3([
+                    0.004 * k * f,
+                    -0.003 * f,
+                    0.002 * k * f,
+                    0.05 * f,
+                    -0.02 * k * f,
+                    0.01 * f,
+                ]),
+            )
+            .map_err(|e| anyhow!("publishing to {child}: {e:?}"))?;
+        }
+        core::mem::forget(w);
+    }
+    Ok(tree)
+}
+
+/// **`docs/decisions/0023` open question 3's falsifier.** The per-call guard on
+/// the three-edge fixture and on §11.1's, measured in one binary at one profile,
+/// with the two fixtures interleaved round by round.
+///
+/// # What this is for
+///
+/// `0023` recommends moving §7's R3 criterion off the three-edge fixture and
+/// onto §11.1's, on the argument that R3 prices the bracket cursor and the
+/// cursor's cost is a **working-set** effect in the stamp array: 2 KiB sits on
+/// the flat part of `docs/design/fast-path.md` §12's curve, 128 KiB sits past
+/// the L1d cliff. The evidence was 16 ns against 34.4 ns — **from two different
+/// binaries**, which is an inference and not a measurement, and this repository
+/// has been wrong three times about exactly that kind of comparison.
+///
+/// So this pairs them. Both fixtures are heap-backed (the backing is worth
+/// ~1.4 ns by `0022` amendment 5 and is not the variable), both are swept by the
+/// identical code, and the fixture order alternates every round so neither
+/// always meets the colder cache. If the paired difference does not reproduce
+/// ~18 ns, question 3's recommendation is **withdrawn rather than argued**.
+///
+/// Returns the per-call guard cost on each, in ns/lookup: `(three_edge,
+/// phase11_1)`. Deliberately two plain differences rather than two [`GuardCost`]
+/// values — this measures the *difference* per round and takes the median of
+/// those, so there is no single hoisted figure to put in the struct, and filling
+/// one with a zero would be a number that reads as measured.
+///
+/// # Errors
+///
+/// If either fixture cannot be built or populated, or a sweep fails.
+pub fn guard_cost_fixture_pair(rounds: usize, sweeps: usize, warmup: usize) -> Result<(f64, f64)> {
+    let small = build_three_edge_tree()?;
+    let big = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
+    let (_w, _s) = crate::fixture::spin_up(&big)?;
+
+    // The three-edge tree's own chain, `map` -> `sensor`; it has no `imu_link`.
+    let small_round = |t: &Tree, sweeps: usize, warmup: usize| {
+        measure_guard_cost_between(t, "sensor", "map", 1, sweeps, warmup)
+    };
+    let mut small_acc = Vec::with_capacity(rounds);
+    let mut big_acc = Vec::with_capacity(rounds);
+    for r in 0..rounds {
+        // One round each, alternating which fixture leads. `measure_guard_cost`
+        // is already paired *within* a fixture (hoisted against per-call, with
+        // its own alternation), so this adds the outer pairing and nothing else.
+        let (a, b) = if r % 2 == 0 {
+            let a = small_round(&small, sweeps, if r == 0 { warmup } else { 0 })?;
+            let b = measure_guard_cost(&big, 1, sweeps, if r == 0 { warmup } else { 0 })?;
+            (a, b)
+        } else {
+            let b = measure_guard_cost(&big, 1, sweeps, 0)?;
+            let a = small_round(&small, sweeps, 0)?;
+            (a, b)
+        };
+        small_acc.push(a.1 - a.0);
+        big_acc.push(b.1 - b.0);
+    }
+    Ok((median(&mut small_acc), median(&mut big_acc)))
 }
 
 /// The fixture topology on a `MAP_SHARED` `memfd`.

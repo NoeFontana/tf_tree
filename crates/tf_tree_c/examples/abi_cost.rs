@@ -142,8 +142,27 @@ const PANIC_GUARD: f64 = 1.05;
 /// is what §11.1's 1 kHz edge is. The tree built below has 256-slot rings, i.e.
 /// 2 KiB of stamps per edge: it sits on the flat part of that curve, so it
 /// prices `Guard`'s constructor and almost none of the cold search a real robot
-/// pays. `docs/decisions/0023` open question 3 is the proposal to gate the §11.1
-/// fixture instead, and the 1.25 below is an allowance for *this* numerator.
+/// pays.
+///
+/// **That reading has since been measured paired, and it holds — with more in it
+/// than the argument accounted for.** `just abi-split`'s *0023 q3* block builds
+/// this file's three-edge tree beside the §11.1 fixture in one binary at this
+/// profile, both heap-backed, alternating which leads each round: **15.6–18.7 ns
+/// here against 48.2–62.5 ns there, a paired difference of 30–44 ns over three
+/// runs.** The three-edge column reproduces the ~16 ns above tightly; the
+/// predicted difference was ~18 ns and the measured one is roughly double, so
+/// the stamp-array cliff explains perhaps half of the fixture effect and **the
+/// rest is not attributed** — deliberately, because attributing it by
+/// subtraction is the mistake this file's neighbourhood has already made
+/// several times.
+///
+/// **`docs/PHASE4.md` §7 now measures R3 on the §11.1 fixture, and the 1.25
+/// below did not move with it.** 1.25 is an allowance for *this* numerator and
+/// carrying it across would be setting a threshold by transcription; §11.1's
+/// figures also span 14.3 ns run to run, which is not a spread a threshold
+/// should be derived from on this host. So R3 is **reported and not gated**
+/// until a host that can resolve it exists. The constant below still gates the
+/// three-edge row, which is what it was derived for.
 ///
 /// The allowance is set to catch a *regression* rather than to assert a target —
 /// if `Guard` acquires new per-construction work, this is the row that moves.

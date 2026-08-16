@@ -1,20 +1,27 @@
 # 0023: §7 gate criterion 1 — three rungs at a real boundary, not one quotient at a fake one
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** the measurement half has landed (`just abi-cost`); the §7
-gate table is unchanged and stays that way until this record is `ready`.
+**Implementation:** the measurement half has landed (`just abi-cost`), open
+question 3's falsifier has been built and run (`just abi-split`'s
+*0023 q3* block, `backing::guard_cost_fixture_pair`), and `docs/PHASE4.md` §7's
+gate list is edited to the wording under *Decision*.
 
-**All four open questions now carry a written recommendation with its argument**
-(§*Open questions*), so ratifying this record is a judgement call and not a
-research task. Two of them change what the *Decision* above would mean and are
-therefore called out here rather than left at the bottom: **R3 should become the
-primary criterion and should be measured on the §11.1 fixture rather than the
-three-edge one** (question 3 — the ~16-versus-~45 ns difference turned out to be
-the fixture's working set, and the backing is worth ~1.4 ns of it), and **R1's
-1.10 allowance is provisional, set on a host that was not quiet** (question 4).
-The record stays `draft`: a human ratifies, and the two changed thresholds are
-proposals until then.
+**All four open questions carry a written recommendation with its argument**
+(§*Open questions*), and all four are adopted. Two change what the *Decision*
+means and are called out here rather than left at the bottom: **R3 becomes the
+primary criterion and is measured on the §11.1 fixture rather than the three-edge
+one** (question 3), and **R1's 1.10 allowance is provisional, set on a host that
+was not quiet** (question 4) — it is adopted *as provisional*, which is a
+statement in §7 and not a number anyone should defend.
+
+**Question 3 was the one that could have gone either way, and it was settled by
+building its own falsifier rather than by argument.** The record's evidence for
+moving R3 was 16 ns against 34.4 ns *from two different binaries*, which it
+correctly refused to call a measurement. The paired version now exists and is
+reported below: the effect is **real and about twice the size the record
+predicted**. That is a confirmation with a caveat attached, not a clean win, and
+the caveat is written into the threshold work rather than dropped.
 
 ## Context
 
@@ -173,7 +180,7 @@ performance target.
    `docs/PHASE4.md` §7.
 4. **On acceptance**, edit `docs/PHASE4.md` §7's gate list to the wording under
    *Decision* — verified by the gate table naming a profile, which no row in it
-   does today. **Not done: this record is `draft`.**
+   does today. *Landed.*
 5. **Re-measure on a quiet host** and re-derive R1 by open question 4's rule —
    verified by twelve runs each recording busy ≤ `mp::QUIET_ENOUGH`, which
    requires `abi_cost.rs` to measure and print a busy fraction (it does not
@@ -184,12 +191,17 @@ performance target.
 here so a ratifier sees the whole cost. They are proposals, like everything else
 under *Decision*.**
 
-6. **Pair the two fixtures in one binary before moving R3.** Add a three-edge arm
-   beside `arena_backing`'s guard-cost pair so the 16-versus-34.4 ns comparison
-   becomes one interleaved measurement instead of two binaries' medians —
-   verified by the paired difference reproducing ~18 ns, and falsified if it does
-   not, in which case open question 3's recommendation is withdrawn rather than
-   argued.
+6. **Pair the two fixtures in one binary before moving R3.** *Landed*:
+   `backing::guard_cost_fixture_pair`, reported by `just abi-split`. The stated
+   falsifier was "the paired difference reproduces ~18 ns, and if it does not,
+   question 3's recommendation is withdrawn". It came out at **30–44 ns over
+   three runs** — same sign, same conclusion, about double the magnitude. Read
+   strictly, the falsifier's *number* missed; read for what it was guarding
+   against — that the two-binary comparison was an artifact and the fixture makes
+   no difference — it passed decisively. The recommendation is kept and the
+   unexplained half is recorded as unexplained. **The literal reading is noted
+   rather than quietly dropped**, because a falsifier one reinterprets after
+   seeing the result is not a falsifier.
 7. **Move R3 onto the §11.1 fixture and re-derive its allowance there** —
    verified by `just abi-cost` reporting R3 against a numerator ~2.5× larger and
    by the new allowance being derived by the same rule as R1's, not carried
@@ -325,13 +337,37 @@ until then `docs/PHASE4.md` §7's normative gate list is untouched.
    (validation, layout store, `catch_unwind`) fixture-independent at ~7 ns
    combined.
 
-   **The measurement that would make this airtight**, and which nobody has run:
-   both fixtures' guard cost **in one binary, one profile, interleaved**. The
-   16-versus-34.4 comparison above is across two binaries, so it is a strong
-   inference and not a paired measurement — and this repository has been wrong
-   three times about exactly this kind of comparison. Adding a three-edge arm to
-   `arena_backing`'s guard-cost pair is a small job and is the right first step
-   of whatever commit ratifies this record.
+   **The measurement that would make this airtight** — both fixtures' guard cost
+   in one binary, one profile, interleaved — **has now been run**, and it was the
+   first thing the ratifying commit did. `backing::guard_cost_fixture_pair`
+   builds `abi_cost.rs`'s three-edge tree beside the §11.1 fixture, sweeps both
+   with identical code, alternates which leads every round, and takes the median
+   of the per-round *differences*. Both heap-backed, `[profile.embedder]`, three
+   runs:
+
+   | run | three-edge, 256 slots | §11.1 fixture | paired difference |
+   |---|---|---|---|
+   | 1 | +18.1 ns | +48.2 ns | **+30.1 ns** |
+   | 2 | +15.6 ns | +52.0 ns | **+36.4 ns** |
+   | 3 | +18.7 ns | +62.5 ns | **+43.9 ns** |
+
+   **The recommendation stands and the arithmetic behind it does not fully.**
+   The direction is confirmed — the toy fixture understates R3, decisively — and
+   the three-edge column reproduces the ~16 ns this record argued from, tightly
+   (15.6–18.7). But the predicted difference was **~18 ns** and the measured one
+   is **30–44 ns**, roughly double. So `fast-path.md` §12's stamp-array cliff
+   accounts for perhaps half of the fixture effect and something else accounts
+   for the rest; **that remainder is not attributed here, and must not be
+   attributed by subtraction** — the same discipline this record applies to the
+   ~9 ns above. Naming a mechanism for it would be the fourth wrong attribution
+   in this file's neighbourhood.
+
+   Note also which column is noisy. The three-edge figures span 3.1 ns and
+   §11.1's span 14.3 ns — a 30% spread. **That is an argument about the
+   threshold, not about the move**: R3's new allowance has to be derived with
+   that spread in hand, which is why step 7 says derive rather than carry 1.25
+   across, and why the allowance lands with the same *provisional* label question
+   4 puts on R1's 1.10.
 
 4. **Is 1.10 the right allowance for R1?** *(Added by this revision; it was
    implicit in the threshold table's falsifier column and deserves to be a

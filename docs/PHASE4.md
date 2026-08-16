@@ -1970,13 +1970,54 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
 
 **Gate:**
 
-1. C ABI within **5%** of native for depth-3 lookup.
-   *Measured by `just abi-cost`. §0.0 records what this criterion actually gates
-   today — four quotients on an interleaved ladder at `[profile.embedder]`,
-   because at the workspace `release` profile the boundary is inlined away and
-   because the single quotient's denominator moved 43% on an unrelated edit.
-   Rewriting this line is [`0023`](./decisions/0023-the-gate-that-could-not-gate.md),
-   **draft**; it is not rewritten here until that record is `ready`.*
+1. **C ABI, measured at `[profile.embedder]` (`lto = false`) by `just abi-cost`,
+   on an interleaved five-arm ladder** — four quotients, each differing from its
+   comparand by exactly one thing:
+
+   | | quotient | allowance | what it prices |
+   |---|---|---|---|
+   | **R3** *(primary)* | a guard per lookup / one hoisted out of the loop | *see below* | the per-call `Guard` the C signature forces |
+   | R1 | `tft_plan_at` / native with the guard per call | **< 1.10**, provisional | the boundary itself: handle validation, layout dispatch, the output slice |
+   | R2 | `tft_plan_at` / the ABI without the panic guard | **< 1.05** | `catch_unwind` |
+   | **C** *(control)* | a structural twin of R1's denominator / that denominator | **within ±0.02 of 1** | the instrument. If these disagree, the run is red before any rung is believed |
+
+   **Why a profile is named, which no other row here does.** The workspace
+   `release` profile is `lto = "thin"`, which inlines `tft_plan_at` into a Rust
+   caller — so the boundary this criterion exists to price is not present in the
+   binary pricing it. `[profile.embedder]` is `lto = false`, which is also cargo's
+   release defaults and therefore what a consumer builds. The `release` run is
+   still produced, as a labelled contrast, and does not gate.
+
+   **Why R3 is primary rather than R1.** R1 is ~6–9 ns on a ~245 ns lookup — a
+   health check. R3 is the per-call guard, which
+   [`0022`](./decisions/0022-the-per-call-guard-and-the-unwatched-gate.md) prices
+   at ~85% of what a C++ caller pays over native Rust. A gate whose headline is
+   R1 points the reader at the smaller term. R1 keeps the per-call guard in its
+   *denominator* so that the two rows move independently, which is the
+   diagnosability the previous single quotient lacked.
+
+   **R3 is measured on the §11.1 fixture, and its allowance is not yet set.**
+   The three-edge tree it used to be measured on fits in L1d and understates it:
+   paired and interleaved in one binary, the per-call guard is 15.6–18.7 ns there
+   against 48.2–62.5 ns on §11.1's, a difference of **30–44 ns**
+   ([`0023`](./decisions/0023-the-gate-that-could-not-gate.md) question 3, which
+   predicted ~18 and got double). §11.1 is the fixture the benchmark suite, the
+   tf2 differential and the CLI demo already share, and its 1 kHz edge is an
+   ordinary IMU. **The 1.25 that applied to the toy fixture is not carried
+   across**, because it was set against a ~16 ns numerator; the new allowance is
+   derived on a host that can resolve a 14 ns spread, and until then R3 is
+   **reported and not gated**.
+
+   **R1's 1.10 is provisional and labelled so deliberately.** It was set on a
+   host with SMT on, an unreadable governor and four physical cores. It is a
+   real bound, it is not a defended one, and it is re-derived on a quiet host by
+   `0023`'s implementation step 5.
+
+   *Rewritten from "C ABI within **5%** of native for depth-3 lookup" by
+   [`0023`](./decisions/0023-the-gate-that-could-not-gate.md), `ready`. The old
+   line gated nothing for two compounding reasons, both recorded in §0.0: the
+   profile erased the boundary, and the single quotient's denominator moved 43%
+   on an unrelated edit to the same binary.*
 2. C++ wrapper within **2%** of the C ABI (it is inline code; anything more means it is not).
 3. Bridge steady-state CPU **below one `tf2` consumer's** — the whole architectural claim is that this cost is paid once instead of N times.
 4. Zero ASan/UBSan findings across the C and C++ suites.

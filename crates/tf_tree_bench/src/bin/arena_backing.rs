@@ -108,12 +108,18 @@ fn main() -> Result<()> {
         heap_kib as f64 * 1024.0 / arena_bytes as f64 * 100.0
     );
     println!(
-        "  memfd arena    {shm_kib:6} KiB   {:.0}% — populate_hot pre-faults every declared slot",
+        "  memfd arena    {shm_kib:6} KiB   {:.0}% — every edge here is claimed, so every ring is warm",
         shm_kib as f64 * 1024.0 / arena_bytes as f64 * 100.0
     );
     println!(
         "  the shared path holds {:+} KiB more for the same data. That is PHASE2 §7.1's\n  \
-         latency guarantee priced: no page fault inside a lookup, paid for in residency.",
+         latency guarantee priced: no page fault inside a lookup, paid for in residency.\n  \
+         **Read the 100% as a property of THIS fixture, not of the arena.** Since\n  \
+         `docs/decisions/0024` rings are populated per-edge, at claim and at plan — not\n  \
+         wholesale at attach — and `spin_up` claims every edge the fixture declares, so\n  \
+         there is nothing here left cold. A process that uses a subset of a shared arena\n  \
+         is charged for that subset: 19.5% of a 64-edge arena when it takes up four\n  \
+         (`crates/tf_tree_bench/tests/population.rs`).",
         shm_kib as i64 - heap_kib as i64
     );
 
@@ -142,6 +148,25 @@ fn main() -> Result<()> {
          makes a shared arena expensive. Build with --no-default-features to drop `counters`:\n  \
          that halves the guard (+16.8 / +18.9 ns), and is 0022's question 1.",
         shm_g.guard_ns() - heap_g.guard_ns()
+    );
+
+    // `docs/decisions/0023` open question 3's falsifier: the same guard cost on
+    // the three-edge fixture `abi_cost.rs` gates R3 on, against §11.1's, in one
+    // binary with the two interleaved. The claim under test is that the toy
+    // fixture understates R3 because the cursor's cost is a stamp-array
+    // working-set effect, and the evidence for it was 16 vs 34.4 ns from two
+    // different binaries.
+    let (small_g, big_g) = tf_tree_bench::backing::guard_cost_fixture_pair(run.rounds, 40, 60_000)?;
+    println!();
+    println!("0023 q3 — per-call guard by FIXTURE, paired and interleaved, both heap:");
+    println!("  three-edge, 256 slots (abi_cost.rs's tree)   guard costs {small_g:+6.1} ns");
+    println!("  the §11.1 fixture                            guard costs {big_g:+6.1} ns");
+    println!(
+        "  paired difference {:+.1} ns. 0023 q3 predicts ~+18 ns from the stamp array\n  \
+         crossing L1d (2 KiB searched against 128 KiB); the unpaired figures it\n  \
+         argued from were 16 and 34.4 ns. A difference near zero REFUTES the\n  \
+         working-set reading and withdraws q3's recommendation to move R3.",
+        big_g - small_g
     );
 
     if let Some(name) = attach {
