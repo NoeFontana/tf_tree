@@ -5,6 +5,19 @@
 **Implementation:** **steps 1–5 have landed. Steps 6–7 — the daemon — have not,
 and are not scheduled.**
 
+> **Read every `0.1.0` below as "the first release".** This record was written
+> before the first release had a number and used `0.1.0` as a name for it —
+> eight times: in the steps 6–7 bullet, in *Context*'s "being weighed for", in
+> §4's heading and its two sentences, and on plan steps 6, 7 and the line under
+> them. **The first release is numbered `0.0.1`.** The wording is left standing
+> rather than rewritten because §4 and the plan are the thing that was decided,
+> and what was decided was a *scope boundary* — which of the seven steps the
+> project ships before it tags anything — not a version number. That boundary
+> has not moved: steps 6–7 are still unbuilt, still outside it, and still
+> nothing is waiting on them. A future record that needs to name a release
+> should name a milestone instead, which is the correction that cannot go stale
+> a second time.
+
 - **Steps 1–2** — **#139**, `feat/0019-await-and-ro-create`.
   `OpenError::ReadOnlyCannotCreate`, checked before `RuntimeDir::resolve()`, with
   `Open::new()`'s `create` default moved to `CreatePolicy::Never` in the same

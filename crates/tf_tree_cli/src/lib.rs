@@ -5,14 +5,23 @@
 //! Printing to stdout/stderr is this crate's whole job, so the workspace
 //! `print_stdout`/`print_stderr` lints are allowed here.
 //!
-//! # Phase 1 scope: in-process only
+//! # Four sources, and the fixture is only the one you get by naming none
 //!
-//! Phase 1 has no cross-process attach — that arrives in Phase 2 (shared memory).
-//! So every subcommand operates on an **in-process** tree: it builds the shared
-//! mobile-robot [`tf_tree_bench::fixture`], populates its history, and inspects
-//! *that*. When Phase 2 lands, the same commands will attach to a live external
-//! arena instead of building one; the `doctor` checks in [`doctor`] already take a
-//! captured snapshot, so only the capture source changes.
+//! A bare invocation builds the mobile-robot [`tf_tree_bench::fixture`] in
+//! process and inspects *that*, which is what keeps every subcommand runnable on
+//! a machine with nothing deployed. The other three are named on the command
+//! line: a live arena (`--attach`), an MCAP recording (`doctor --from-bag`,
+//! `tf_tree ingest`) and a frozen `.tft` index (`doctor --from-file`). The
+//! middle one needs nothing installed — `docs/PHASE5.md` §2.2's wedge — and the
+//! other two are Linux-plus-`--features shm` builds, because that is where the
+//! mapping code is.
+//!
+//! What the Phase 1 design got right is the shape, and it is why adding those
+//! three cost no new checks: everything downstream reads a captured
+//! [`doctor::Snapshot`], so a source is a capture and never a code path through
+//! the catalogue. Where the sources are *not* interchangeable, `checks::PushStream`
+//! says so per source rather than per check — a ring holds only the pushes the
+//! engine accepted, so no arena, live or frozen, can answer `TFT018`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -40,8 +49,13 @@ use doctor::{Observations, Snapshot};
 
 /// `tf_tree` — inspect and debug a transform tree.
 ///
-/// Phase 1 operates on an in-process fixture tree; live external attach arrives
-/// in Phase 2 (shared memory).
+/// Name no source and every subcommand builds an in-process fixture, so this
+/// binary answers on a machine with nothing deployed. The sources that are
+/// somebody's real data: `doctor --from-bag <recording.mcap>` and `tf_tree
+/// ingest`, which need nothing installed and read a file you already have;
+/// `--attach`, which maps a live arena read-only; and `doctor --from-file
+/// <index.tft>`, which maps a frozen one. The last two exist only in a Linux
+/// build with `--features shm`.
 #[derive(Parser)]
 #[command(name = "tf_tree", version, about)]
 struct Cli {
@@ -339,7 +353,10 @@ enum Command {
 ///
 /// # Errors
 ///
-/// Surfaces any failure building or inspecting the in-process fixture tree.
+/// Surfaces any failure obtaining or inspecting the tree this invocation names —
+/// building the fixture, attaching to a live arena, ingesting a recording, or
+/// mapping a frozen `.tft` — plus the refusals `doctor_source` raises before any
+/// of that, which are about the *command line* rather than about an arena.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -1014,11 +1031,10 @@ fn observations(tree: &Tree, src: &mut Source) -> Observations {
 
 /// `tf_tree tree` — render the topology.
 ///
-/// Each command leaks its fixture tree (`Box::leak`) so the live [`Publisher`]s,
-/// which borrow the tree, can be held for the duration of the inspection without
-/// a self-referential owner. The process inspects once and exits, so the single
-/// intentional leak is harmless and keeps the borrow checker satisfied with no
-/// `unsafe`.
+/// The tree comes from [`source`], which is a fixture only when nothing else was
+/// named, and that is also where the argument for leaking it lives. This used to
+/// carry its own copy of that argument saying "its fixture tree"; a second copy
+/// is a second thing to keep true, and this one had stopped being.
 fn cmd_tree(live: Live<'_>) -> Result<()> {
     let (tree, mut src) = source(live)?;
     let obs = observations(tree, &mut src);
