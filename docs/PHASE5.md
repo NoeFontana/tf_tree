@@ -89,9 +89,11 @@ Per D28, every user of this phase changes nothing about their robot. They point 
   fails on it (5.35–5.62× against ≥ 6×). The `.tft` rows — 16-worker total Pss,
   open time vs bag parse — *are* measurable here. §9.3 already prescribes the
   right response: omit a row that cannot be measured fairly and say why.
-- **GitHub Actions has produced no run since 2026-07-23.** Every gate claimed
-  in this document must be run locally through `just` and the arch stated,
-  because a green check on a PR is not evidence.
+- **CI produced no run between 2026-07-23 and 2026-08-16**, and runs again
+  since. Every gate claimed in this document is still run locally through
+  `just` with the arch stated: CI covers what its jobs cover, and this
+  document's benchmark rows in particular are host-dependent in ways no runner
+  settles.
 
 ---
 

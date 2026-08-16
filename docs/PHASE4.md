@@ -809,8 +809,11 @@ mutant could delete for free.
 
 - **`just ros-build` / `just ros-test` were in no CI job**, while CLAUDE.md
   called them "its entire gate". The `tf2` job already builds the image; it now
-  runs `just ros-test` too. (CI has produced no run since 2026-07-23, so this is
-  about the recipe mirror being wrong, not about a red check.)
+  runs `just ros-test` too. (CI produced no run between 2026-07-23 and
+  2026-08-16, so this was about the recipe mirror being wrong rather than about
+  a red check. The job runs now, and it caught one: the container had no
+  writable `ROS_HOME`, which aborted all seven `tf_tree_ros` ctests before they
+  reached their own code.)
 
 Two smaller ones: `test_ingest` was the only binary on the real `/tf` and now
 takes a topic per test like the other three, so a `ros2 bag play` on the build
