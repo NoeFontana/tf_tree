@@ -29,7 +29,7 @@ answered `serde` with 200, which is the control that makes the 404s below mean
 | `tf-tree` | crates.io index | 404 — free (crates.io treats `-` and `_` as colliding, so both spellings had to be checked) |
 | `tf_tree_math`, `tf_tree_arena`, `tf_tree_core`, `tf_tree_ipc`, `tf_tree_c` | crates.io index | 404 — free |
 | `numpy` (control) | PyPI | **200** — the probe works |
-| `tf_tree` / `tf-tree` | PyPI | 404 — free (PEP 503 normalises both to `tf-tree`) |
+| `tf_tree` / `tf-tree` | PyPI | 404 — **unregistered, and that turned out not to mean available.** See the correction below |
 
 Reproduce:
 
@@ -39,6 +39,39 @@ curl -s -o /dev/null -w '%{http_code}\n' https://index.crates.io/tf/_t/tf_tree  
 curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/numpy/json         # 200
 curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/tf-tree/json       # 404
 ```
+
+## Correction (2026-08-16): the PyPI probe was right and the inference was wrong
+
+**`tf_tree` could not be registered on PyPI.** The upload was refused as too
+similar to an existing project, and the distribution is now **`transform_tree`**.
+The *import* name is unchanged — `import tf_tree` — which is an ordinary split
+(`pillow`/`PIL`, `beautifulsoup4`/`bs4`, `scikit-learn`/`sklearn`) and keeps the
+symmetry with the crate name, the C ABI and every doc example. crates.io is
+unaffected: `tf_tree` is still free there and is still the crate name.
+
+**The measurement above was not wrong; the conclusion drawn from it was.**
+`https://pypi.org/pypi/tf-tree/json` really does return 404, and it still does
+today — verified again while writing this. What that probe answers is *"is this
+name registered?"*. What the decision needed was *"will PyPI accept this name?"*,
+and those are different questions, because PyPI applies a **similarity check at
+upload time** that no availability probe can see. The neighbour it collides with
+is **`tftree`**, which exists (HTTP 200): the check strips separators, so
+`tf_tree` → `tf-tree` → `tftree`.
+
+The general form is worth keeping, because it is the same shape as two other
+errors in this repository's history: **an absence measured at one layer was read
+as permission from another.** A 404 on the registry's read API is evidence about
+the index; admission is a property of the *upload* path, which nothing here
+exercised. The probe that would have answered the real question did not exist
+short of attempting an upload.
+
+Reproduce both halves:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/tf-tree/json     # 404 — unregistered
+curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/tftree/json      # 200 — the neighbour
+```
+
 
 Availability is a snapshot, not a reservation. Neither registry holds a name for
 anyone, so the only thing that secures these is publishing.

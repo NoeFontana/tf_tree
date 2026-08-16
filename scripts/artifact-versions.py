@@ -433,6 +433,56 @@ def check_recipe_references() -> str:
     )
 
 
+def check_distribution_name() -> str:
+    """The PyPI distribution name, wherever it is written by hand.
+
+    It is **not** the import name, and that split is the reason this check
+    exists. `tf_tree` could not be registered on PyPI — it is refused as too
+    close to the existing `tftree`, because the similarity check strips
+    separators — so the distribution is `transform_tree` while the module stays
+    `tf_tree` (`docs/decisions/0008`'s correction records the measurement).
+
+    Two consequences a reader will not expect, and each is a place to drift:
+    `importlib.metadata.version(...)` takes the *distribution* name, so
+    `tests/python/test_version.py` must ask for `transform_tree`; and a wheel is
+    named after the distribution, so the globs that unpack one must match it.
+    Neither is checked by anything else — `test_version.py` would fail with
+    `PackageNotFoundError` at some later date, and the justfile globs would
+    silently select nothing and assert on an empty list.
+    """
+    dist = load_toml("pyproject.toml")["project"]["name"]
+
+    probe = Path("tests/python/test_version.py").read_text(encoding="utf-8")
+    for asked in re.findall(r"importlib\.metadata\.version\(\s*\"([^\"]+)\"", probe):
+        if asked != dist:
+            fail(
+                f"tests/python/test_version.py asks importlib.metadata for "
+                f'"{asked}", but pyproject.toml [project] name is "{dist}". '
+                f"That query is what pins the wheel's version to the crate's."
+            )
+
+    justfile = Path("justfile").read_text(encoding="utf-8")
+    # Executable lines only. A comment may legitimately quote a historical
+    # filename — the recipe that unpacks a wheel carries one naming the
+    # `tf_tree-0.1.0` wheel that existed before this rename — and a gate that
+    # fails on prose about the past is a gate people edit the prose to silence.
+    stale = [
+        line.strip()
+        for line in justfile.splitlines()
+        if "target/wheels/" in line
+        and "*" in line
+        and not line.strip().startswith("#")
+        and f"{dist}-" not in line
+    ]
+    for line in stale:
+        fail(
+            f"a justfile wheel glob does not name the distribution "
+            f'"{dist}": {line}'
+        )
+
+    return f'the PyPI distribution is "{dist}"; the module it installs is tf_tree'
+
+
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
     lines = [
@@ -440,6 +490,7 @@ def main() -> int:
         check_publishable(authority),
         check_changelog(authority),
         check_recipe_references(),
+        check_distribution_name(),
     ]
 
     if failures:

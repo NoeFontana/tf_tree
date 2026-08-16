@@ -3,7 +3,7 @@ requires = ["maturin>=1.14.1,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tf_tree"
+name = "transform_tree"
 # The wheel's version, and a hand-kept copy of `[workspace.package] version` in
 # the root `Cargo.toml`, which carries the argument for the number. maturin
 # reads it from here rather than from `crates/tf_tree_py/Cargo.toml`, so this is
@@ -12,7 +12,7 @@ name = "tf_tree"
 #
 # `0.0.1` does not mean to Python what it means to cargo. PEP 440 has no
 # equivalent of cargo's rule that every `0.0.x` is incompatible with every
-# other, so `pip install -U tf_tree` will move a user from `0.0.1` to `0.0.2`
+# other, so `pip install -U transform_tree` will move a user from `0.0.1` to `0.0.2`
 # without being asked twice. The wheel's compatibility promise is therefore
 # written down — in `CHANGELOG.md` and `SUPPORT.md` — rather than encoded in
 # the number, and it is the same promise the crates make: none.

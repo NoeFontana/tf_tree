@@ -2075,7 +2075,7 @@ py-lint:
 #
 # **It was not fixed by making this recipe install**, and the reason is the two
 # recipes directly below. `py-mp-bench` and `py-vs-tf2` call it and then unpack
-# `crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl` by hand into a
+# `crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl` by hand into a
 # container. Replacing `maturin build` with `maturin develop` leaves that path
 # unwritten and breaks both; doing both would mutate the host's `.venv` as a
 # side effect of running a benchmark inside a container, which is a worse
@@ -2094,7 +2094,7 @@ py-wheel:
     # a rebuild does not restore. Both consumers now `assert len(w) == 1` and
     # print what they unpacked, so the invariant this line creates is checked
     # where it is relied on rather than assumed.
-    rm -f crates/tf_tree_py/target/wheels/tf_tree-*.whl
+    rm -f crates/tf_tree_py/target/wheels/transform_tree-*.whl
     VIRTUAL_ENV=.venv .venv/bin/maturin build --release
 
 # N Python consumer nodes on one shared arena, against N private `tf2_ros`
@@ -2114,7 +2114,7 @@ py-mp-bench:
     # whichever build the filesystem happens to return first.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
-        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
+        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/mp_compare.py'
 
 # tf_tree's Python API against tf2_ros's, in the ROS container (PHASE3 §12.1).
@@ -2130,5 +2130,5 @@ py-vs-tf2:
     # the container's system site-packages untouched.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
-        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
+        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/tf2_ros_compare.py'

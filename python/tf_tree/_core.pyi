@@ -515,7 +515,7 @@ def has_shared_memory() -> bool:
 __version__: str
 """This extension's version, compiled in from the crate manifest.
 
-`importlib.metadata.version("tf_tree")` is the canonical answer and reads a
+`importlib.metadata.version("transform_tree")` is the canonical answer and reads a
 different file — `pyproject.toml`'s `[project] version` against this one's
 `Cargo.toml`. `tests/python/test_version.py` asserts the two agree, which is
 the only thing that keeps them from drifting.
