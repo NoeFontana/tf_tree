@@ -89,7 +89,7 @@
 //! `__version__` is exempt because that check skips underscore-prefixed names
 //! on both sides, and it keeps the dunder spelling because it is what a user
 //! types and what a bug-report template asks for. It is **not** the canonical
-//! answer — `importlib.metadata.version("tf_tree")` is, and it reads
+//! answer — `importlib.metadata.version("transform_tree")` is, and it reads
 //! `pyproject.toml`'s `[project] version` while this one reads the crate
 //! manifest. Two files, so they can disagree; `tests/python/test_version.py`
 //! asserts they do not.

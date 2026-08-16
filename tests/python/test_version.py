@@ -56,7 +56,7 @@ def test_version_matches_the_installed_distribution():
     what a hand-copied string would have left behind.
     """
     try:
-        dist = importlib.metadata.version("tf_tree")
+        dist = importlib.metadata.version("transform_tree")
     except importlib.metadata.PackageNotFoundError:
         pytest.skip("tf_tree is not installed as a distribution; nothing to compare")
     assert tf_tree.__version__ == dist, (

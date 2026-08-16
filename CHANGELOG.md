@@ -13,7 +13,7 @@ API, in the Python API, in the C ABI, and in the arena format. Pin exactly.
 Two consequences worth naming rather than leaving to be discovered:
 
 - **PyPI does not have that rule.** PEP 440 gives `0.0.x` no special meaning, so
-  `pip install -U tf_tree` will move you from `0.0.1` to `0.0.2` without asking.
+  `pip install -U transform_tree` will move you from `0.0.1` to `0.0.2` without asking.
   Pin the wheel yourself if the promise above matters to you.
 - **`SUPPORT.md`'s "an MSRV bump is a minor-version bump pre-1.0" rule does not
   apply on the `0.0.x` line** — there is no minor slot for it to occupy. The

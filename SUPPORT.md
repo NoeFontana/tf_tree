@@ -138,7 +138,7 @@ that is actually running.
 
   One asymmetry, because it would otherwise be discovered by a user: **PyPI does
   not have cargo's rule.** PEP 440 gives `0.0.x` no special meaning, so
-  `pip install -U tf_tree` will move someone from `0.0.1` to `0.0.2` without
+  `pip install -U transform_tree` will move someone from `0.0.1` to `0.0.2` without
   asking, and the wheel's "no compatibility between releases" promise is carried
   by `CHANGELOG.md` and by this document instead of by the version number.
   Pin the wheel exactly if that matters to you.

@@ -1592,7 +1592,7 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` with a real disclosure address.
 - **A stated support policy**, honestly scoped. A small-team infrastructure project dies from unanswered issues more often than from bad design. Say what is supported, what is best-effort, and what the response expectation is. Under-promising is fine; silence is not.
 - **MSRV policy** and a CI matrix pinning it.
-- Documentation site (mdBook): a first-five-minutes path that works — `pip install tf_tree`, three lines, a real result — before any architecture prose.
+- Documentation site (mdBook): a first-five-minutes path that works — `pip install transform_tree`, three lines, a real result — before any architecture prose.
 - CI: the full Phase 1–5 suites on `x86_64` and `aarch64`, ASan/UBSan/TSan, Miri, loom, the nightly `shm_torture`, the benchmark artifact as a regression gate.
 - Release automation: `cargo-dist` or equivalent, maturin wheels per Phase 3 §10, PEP 740 attestations, signed tags.
 
