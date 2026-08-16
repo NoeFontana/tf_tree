@@ -8,11 +8,11 @@
 //! cannot be `SIGKILL`ed out from under its locks, and (unlike classic POSIX
 //! locks) the interesting failure is not one a single process can stage.
 //!
-//! So these tests spawn `ipc_child`, which opens the lock file **by path** and
-//! parks holding a lock until it is killed. Opening by path rather than
-//! inheriting a descriptor is load-bearing: OFD locks belong to an open file
-//! description, so a child holding the parent's inherited fd would conflict with
-//! nobody and every assertion here would pass vacuously.
+//! So these tests spawn `src/bin/ipc_child.rs`, which opens the lock file **by
+//! path** and parks holding a lock until it is killed. Opening by path rather
+//! than inheriting a descriptor is load-bearing: OFD locks belong to an open
+//! file description, so a child holding the parent's inherited fd would conflict
+//! with nobody and every assertion here would pass vacuously.
 //!
 //! `docs/PHASE2.md` §11.2 scenario 9 — split-brain — is the important one, and
 //! per Appendix A it exists before the code it tests is finished.
@@ -65,20 +65,24 @@ impl EnvLookup for Fixed {
     }
 }
 
-/// A spawned `ipc_child`, killed on drop so a failing assertion cannot leave a
+/// A spawned helper, killed on drop so a failing assertion cannot leave a
 /// process holding a lock in `/tmp` forever.
 struct Kid(Child, Option<BufReader<std::process::ChildStdout>>);
 
 impl Kid {
     fn spawn(args: &[&str]) -> Kid {
-        let exe = env!("CARGO_BIN_EXE_ipc_child");
+        // The bin target carries the crate's name, not the file's: this crate is
+        // published, and `ipc_child` in someone's `~/.cargo/bin` is a collision
+        // waiting to happen. The manifest argues it; the source stays
+        // `src/bin/ipc_child.rs`.
+        let exe = env!("CARGO_BIN_EXE_tf_tree_ipc_child");
         let child = Command::new(exe)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn ipc_child");
+            .expect("spawn the ipc child helper");
         Kid(child, None)
     }
 
@@ -385,7 +389,7 @@ fn the_paths_on_disk_are_the_specified_ones() {
 // §3.7 attach handshake
 // ---------------------------------------------------------------------------
 
-/// A request that matches what `ipc_child serve` publishes.
+/// A request that matches what the helper's `serve` mode publishes.
 fn good_request() -> tf_tree_ipc::HelloRequest {
     tf_tree_ipc::HelloRequest {
         format_version: 2,
