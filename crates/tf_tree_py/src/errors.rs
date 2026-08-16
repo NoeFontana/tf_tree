@@ -18,16 +18,26 @@
 //! Every id that reaches a Python message therefore goes through
 //! [`edge_label`] / [`frame_label`], which resolve against the arena the caller
 //! is holding. That capability was already in the binding —
-//! [`crate::offline::named_edge`] has resolved edge ids for `Tree.edges` and
+//! [`crate::offline::named_edge_in`] has resolved edge ids for `Tree.edges` and
 //! for `span`'s no-data path since `docs/PHASE5.md` §4.2 — and the routing is
 //! what was missing, not the resolution.
+//!
+//! **Two arms deliberately do not resolve**, and they are the ones where
+//! resolution can only ever fail: `FrameOutOfRange` and the out-of-range half of
+//! `UnknownEdge` say the id is out of range *once*, rather than pairing a
+//! fallback that says "no record at that index" with a sentence that says the
+//! same thing again.
 
 use pyo3::prelude::*;
 use pyo3::{create_exception, exceptions::PyException};
 
-use tf_tree::{ClaimApiError, EdgeId, FrameId, InterpPolicy, LookupError, PushError, Tree};
+use tf_tree::unstable::ArenaView;
+use tf_tree::{
+    BuildError, ClaimApiError, EdgeId, FrameError, FrameId, InterpPolicy, LookupError, OpenError,
+    PushError, Tree,
+};
 
-use crate::offline::{named_edge, named_frame};
+use crate::offline::{named_edge_in, named_frame_in};
 use crate::tree::interp_name;
 
 create_exception!(
@@ -134,26 +144,64 @@ pub(crate) fn edge_label_of(parent: &str, child: &str) -> String {
 ///
 /// # The fallback says *why*, and that is the whole point of having one
 ///
-/// `None` from [`named_edge`] means the arena has no usable record at that
-/// index — the id is past the edge table, or names a zeroed slot. Printing
-/// `EdgeId(7)` there would be the defect this function exists to remove, and
-/// printing nothing would lose the one fact still known. So the id appears as
-/// `#7`, marked as an index rather than dressed up as a value, next to the
-/// reason it could not be named. A fork-detached tree gets its own reason
-/// because it is the one case where the *arena* is fine and the *handle* is
-/// not: `Tree::view` substitutes a zeroed poison arena in the child, so every
+/// `None` from [`named_edge_in`] means the arena has no usable record at that
+/// index — the id is past the edge table, or an endpoint names a zeroed slot.
+/// Printing `EdgeId(7)` there would be the defect this function exists to
+/// remove, and printing nothing would lose the one fact still known. So the id
+/// appears as `#7`, marked as an index rather than dressed up as a value, next
+/// to the reason it could not be named. A fork-detached tree gets its own
+/// reason because it is the one case where the *arena* is fine and the *handle*
+/// is not: `Tree::view` substitutes a zeroed poison arena in the child, so every
 /// name would read absent and "no record" would be a lie.
+///
+/// # `_in`, and why every caller here should prefer it
+///
+/// [`ArenaView`] is what actually resolves a name, and `Tree::view` rebuilds one
+/// per call — `detached()`, `as_participant`, `with_liveness`, `is_writable`.
+/// One message can name three frames ([`LookupError::Disconnected`]), so
+/// [`lookup_err`] takes a single view for the whole message and these two
+/// convenience wrappers exist for the callers that hold a `&Tree` and nothing
+/// else.
 pub(crate) fn edge_label(tree: &Tree, edge: EdgeId) -> String {
-    match named_edge(tree, edge) {
+    edge_label_in(tree, &tree.arena_view(), edge)
+}
+
+/// [`edge_label`] against a view the caller already holds.
+fn edge_label_in(tree: &Tree, view: &ArenaView<'_>, edge: EdgeId) -> String {
+    match named_edge_in(view, edge) {
         Some((parent, child)) => edge_label_of(&parent, &child),
         None => format!("edge #{} ({})", edge.get(), nameless(tree)),
     }
 }
 
 /// A frame id as the caller's own name, quoted, with the same fallback.
+///
+/// **Bare, so it reads inside a sentence that supplies its own noun** — `no path
+/// from "world_a" to "sensor_c"`. A message that wants the noun spelled out uses
+/// [`frame_phrase_in`], which is not the same string with a prefix: the fallback
+/// already begins `frame #7`, and prefixing that produced `frame frame #7 (name
+/// unavailable: ...)`.
 pub(crate) fn frame_label(tree: &Tree, frame: FrameId) -> String {
-    match named_frame(tree, frame) {
+    frame_label_in(tree, &tree.arena_view(), frame)
+}
+
+/// [`frame_label`] against a view the caller already holds.
+fn frame_label_in(tree: &Tree, view: &ArenaView<'_>, frame: FrameId) -> String {
+    match named_frame_in(view, frame) {
         Some(name) => format!("{name:?}"),
+        None => format!("frame #{} ({})", frame.get(), nameless(tree)),
+    }
+}
+
+/// [`frame_label_in`] with the noun, for a sentence whose subject is the frame.
+///
+/// One function rather than a caller-side `format!("frame {}", ...)`, because
+/// the two branches need *different* prefixes and only one of them is `frame `:
+/// the resolved branch is a bare quoted name and the fallback already names
+/// itself. That is the whole defect this exists to prevent, and it shipped.
+fn frame_phrase_in(tree: &Tree, view: &ArenaView<'_>, frame: FrameId) -> String {
+    match named_frame_in(view, frame) {
+        Some(name) => format!("frame {name:?}"),
         None => format!("frame #{} ({})", frame.get(), nameless(tree)),
     }
 }
@@ -162,21 +210,347 @@ pub(crate) fn frame_label(tree: &Tree, frame: FrameId) -> String {
 ///
 /// **One spelling of a sentence that had five.** `Tree.plan`, `Tree.publisher`,
 /// `Tree.span` and the module-level `push` each wrote
-/// `format!("no frame named {name:?}")` inline, and `Tree.lookup` — which
-/// cannot resolve the name itself, so it reaches this through
-/// [`lookup_err`]'s `UnknownFrame` arm — wrote a sixth, different one about a
-/// hash. `docs/PROJECT.md` §6 is about paths, and this is the same failure in
-/// prose: five copies of a remedy drift, and the drift is invisible because no
-/// test reads two of them at once.
+/// `format!("no frame named {name:?}")` inline, and `Tree.lookup` wrote a
+/// sixth, different one about a hash. `docs/PROJECT.md` §6 is about paths, and
+/// this is the same failure in prose: five copies of a remedy drift, and the
+/// drift is invisible because no test reads two of them at once.
+///
+/// It has no callers outside this module now, and that is the point rather than
+/// an accident: those five sites all resolve their names through
+/// [`resolve_frame`], and `Tree.lookup`'s hash arm through
+/// [`unknown_frame_err`], so the sentence is reached rather than repeated.
 ///
 /// The remedy is here rather than in the `docs/PHASE3.md` §4.4 class docstring
 /// because a Python traceback shows the message and not the class docstring.
-pub(crate) fn frame_not_declared(name: &str) -> PyErr {
+fn frame_not_declared(name: &str) -> PyErr {
     FrameNotDeclaredError::new_err(format!(
         "no frame named {name:?} in this arena; if the name is spelled right, \
          its publisher has not declared it yet — wait for one, or declare it \
          on the builder that creates the arena"
     ))
+}
+
+/// Resolve a frame name for an entry point that holds one, **without interning**.
+///
+/// # `find_frame`, not `Tree::frame`, and the difference is a write
+///
+/// [`Tree::frame`] is not a read. Its last line on a writable tree is
+/// `self.view().intern(name)`, which publishes a new `FrameRecord` into the
+/// shared arena with a `compare_exchange` — so resolving a *typo* through it
+/// spends a frame slot, permanently: ids are append-only and never recycled
+/// (`docs/PROJECT.md` §5 D10). On an arena with headroom (the ROS ingest bridge
+/// reserves eight, `tf_tree_bridge::config`) a loop of misspelled reads from one
+/// `rw` participant exhausts it for *every* participant, and the bridge's own
+/// legitimate `Tree::frame` then fails `CapacityExceeded`. `find_frame` is the
+/// read-only half of the same probe and is what a query path wants.
+///
+/// It goes unnoticed on a tree with no headroom — `frame_headroom=0`, which is
+/// the default and was the only setting the Python surface had — because the
+/// intern then fails `intern_core`'s capacity pre-check before it touches
+/// anything. So the write is invisible on the trees a test builds and permanent
+/// on the arenas Python is pointed at.
+///
+/// # Errors
+///
+/// [`FrameNotDeclaredError`] for a name this arena has never interned, and the
+/// base `TfTreeError` for the two failures that are *not* an absent name —
+/// see [`unknown_frame_err`], which spells them.
+pub(crate) fn resolve_frame(tree: &Tree, name: &str) -> PyResult<FrameId> {
+    if tree.detached() {
+        return Err(detached_err());
+    }
+    match tree.arena_view().find_frame(name) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Err(frame_not_declared(name)),
+        Err(e) => Err(unresolvable_name(name, e)),
+    }
+}
+
+/// Attribute a `LookupError::UnknownFrame` to one of the names the caller typed.
+///
+/// # Why the entry point does this and [`lookup_err`] cannot
+///
+/// `UnknownFrame` carries a BLAKE3 prefix and BLAKE3 does not invert, so the
+/// error itself has nothing a caller can search their source for. `Tree.lookup`
+/// takes the two names as `&str`, so it can ask the arena about each one.
+///
+/// # The three answers, and why they are not one
+///
+/// `Tree::lookup`'s `find` maps `Ok(None) | Err(_)` onto `UnknownFrame`
+/// (`crates/tf_tree/src/tree.rs`), so this probe sees the same three outcomes
+/// the engine collapsed — and they want opposite remedies:
+///
+/// * `Ok(None)` — never interned. Wait for the publisher, or declare it.
+/// * `FrameHashCollision` — **a different name already occupies this name's
+///   64-bit hash slot**, so this name can never be interned in this arena and
+///   waiting is exactly the wrong advice. Renaming either frame is the fix.
+/// * `InternContended` — a publisher is mid-intern behind an anonymous view;
+///   the name is arriving. Retry.
+///
+/// An earlier revision sent all three through the "has not been declared yet;
+/// wait for one" sentence, and its comment claimed a collision fell through to
+/// the hash message instead — the routing and the comment were each wrong about
+/// the other.
+///
+/// `None` back from the walk means both names resolve *now*, which is the race
+/// the caller lost by a microsecond: a peer interned the name between the engine's
+/// probe and this one. There is nothing to blame, so [`lookup_err`] reports the
+/// hash it was given.
+pub(crate) fn unknown_frame_err(tree: &Tree, names: [&str; 2], e: LookupError) -> PyErr {
+    let view = tree.arena_view();
+    for name in names {
+        match view.find_frame(name) {
+            Ok(Some(_)) => continue,
+            Ok(None) => return frame_not_declared(name),
+            Err(err) => return unresolvable_name(name, err),
+        }
+    }
+    lookup_err(tree, e)
+}
+
+/// The two ways a name fails to resolve that are *not* "it was never declared".
+///
+/// Both raise the base `TfTreeError` rather than [`FrameNotDeclaredError`],
+/// which is `docs/API.md` R5 read strictly: the exception *type* is the
+/// contract, and a caller catching `FrameNotDeclaredError` around a lookup is
+/// catching "this name is absent". Neither of these is that — one says the name
+/// cannot exist here, the other says it is on its way.
+fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
+    match e {
+        FrameError::FrameHashCollision { hash } => TfTreeError::new_err(format!(
+            "{name:?} cannot be resolved in this arena: another frame name \
+             already occupies its 64-bit hash slot ({hash:#x}). This is not a \
+             race and waiting will not clear it — rename either frame. \
+             (tf_tree_core puts the odds at ~3e-12 for ten thousand frames, \
+             and detects it rather than aliasing the two names.)"
+        )),
+        FrameError::InternContended => TfTreeError::new_err(format!(
+            "{name:?} is being interned right now by a participant this arena \
+             cannot identify, so no id can be read for it yet and no reader can \
+             judge whether that publisher is still alive. Retry"
+        )),
+        // `find_frame` returns only the two above — it never inserts, so it has
+        // no capacity to exceed and no fork guard of its own. The arms below
+        // are here because `FrameError` is `#[non_exhaustive]` and because the
+        // two remaining variants have a *correct* answer rather than a
+        // catch-all one: `ReadOnly` means the same thing as `Ok(None)` (the
+        // name is absent and this participant may not declare it — its own doc
+        // comment insists on that reading), and `CapacityExceeded` means it can
+        // never be declared here either.
+        FrameError::ReadOnly | FrameError::CapacityExceeded => frame_not_declared(name),
+        FrameError::ChildDetached => detached_err(),
+        other => TfTreeError::new_err(format!(
+            "{name:?} could not be resolved, and this binding has no message \
+             for the reason. That is a bug in tf_tree_py's error layer, not in \
+             your program; please report it with this line: {other:?}"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Creating an arena
+// ---------------------------------------------------------------------------
+
+/// Map a failed `tf_tree.build(...)` onto Python, in the caller's own names.
+///
+/// # The two entry points every program calls first shipped five Debug dumps
+///
+/// `BuildError`'s `thiserror` attributes are `#[error("topology error: {0:?}")]`
+/// and four more like it, forwarded here as `format!("{e}")` — so
+/// `tf_tree.build([("a","b"),("b","a")])`, which is a *typo-grade* mistake,
+/// raised `topology error: WouldCreateCycle { child: FrameId(1) }`. That is both
+/// things this module exists to keep out of a Python message at once, on the
+/// call that runs before anything else in the program.
+///
+/// # Where the names come from, since the arena does not exist
+///
+/// There is no tree to resolve ids against — that is the whole difference from
+/// [`lookup_err`] — but the caller passed the topology in *as strings*, so the
+/// binding has every name it needs and reads them back out of that list. It
+/// deliberately does **not** reconstruct the builder's id assignment (first-seen
+/// order over `frames` then each edge's endpoints) to turn a `FrameId` into a
+/// name: that order is an internal detail whose own comment says it "only
+/// affects id assignment, not correctness", and a message that names the wrong
+/// frame is worse than one that names none.
+///
+/// So the cycle is found in the caller's list rather than read out of the error,
+/// which is also the only way to *show* it — the error carries one frame and a
+/// cycle is a chain.
+///
+/// # Errors it cannot name
+///
+/// Three of `BuildError`'s variants describe the arena rather than the edge
+/// list, and they say so in words instead of dumping the struct that carries
+/// the detail. The exception is `Shm`, which follows [`crate::offline`]'s
+/// `FrozenError::Arena` precedent for the identical reason: `ShmError` has no
+/// `Display`, fifteen variants and several struct-shaped ones, so enumerating it
+/// here would re-spell `tf_tree_arena`'s reasons in a file that cannot see them
+/// change. Labelling the discriminant as raw is the honest option.
+pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError) -> PyErr {
+    TfTreeError::new_err(match e {
+        // Named from the list, not from the hash the error carries: the hash is
+        // BLAKE3 of the child name and does not invert, while `build`'s own
+        // duplicate check walks the edges in this order and stops at the same
+        // pair this scan does.
+        BuildError::DuplicateEdge { child } => match duplicate_child(edges) {
+            // Both parents, not just the child: the caller has to find *which
+            // two pairs* collide, and in a list of forty edges the child's name
+            // alone appears in both of them.
+            Some((name, first, second)) => format!(
+                "two edges declare {name:?} as their child — {} and {}. A frame \
+                 has exactly one parent, which is what makes this a tree, so \
+                 one of the two pairs has to go",
+                edge_label_of(first, name),
+                edge_label_of(second, name),
+            ),
+            None => format!(
+                "two edges declare the same child (its name hashes to \
+                 {child:#018x}), and a frame has exactly one parent"
+            ),
+        },
+        BuildError::TooManyFrames | BuildError::TooManyEdges => format!(
+            "this edge list is too large for the u32 id space: {} pairs",
+            edges.len()
+        ),
+        // `WouldCreateCycle` is the only member of `TopologyError` a caller can
+        // provoke from here — the other two are index failures against an arena
+        // this call just sized from these names — so the discriminator is
+        // whether the caller's own list contains a cycle, and that also answers
+        // *which* one. No `tf_tree_core` import buys anything the list does not
+        // already say.
+        BuildError::Topology(_) => match cycle_through(edges) {
+            Some(chain) => format!(
+                "this edge list is not a tree: {chain}. Every frame has exactly \
+                 one parent and no frame may be its own ancestor"
+            ),
+            None => "the topology could not be wired from this edge list, and \
+                     no cycle is visible in it. That is a bug in tf_tree rather \
+                     than in your call — every name here is interned before any \
+                     edge is wired"
+                .to_owned(),
+        },
+        // Reachable only as a genuine hash collision: `build` interns every name
+        // in the list before wiring anything, into a table it sized from that
+        // same list, so there is no capacity to exceed and no peer to contend
+        // with. Neither name is recoverable — the error carries the hash and
+        // BLAKE3 does not invert — so this says which *pair of names* is at
+        // fault by describing them, and does not pretend to pick one.
+        BuildError::Frame(FrameError::FrameHashCollision { hash }) => format!(
+            "two of the frame names in this edge list collide on the same \
+             64-bit hash ({hash:#x}), so they cannot both be interned. Rename \
+             either — tf_tree_core puts the odds at ~3e-12 for ten thousand \
+             frames, and detects the collision rather than aliasing the two \
+             names onto one frame"
+        ),
+        BuildError::Frame(_) => "a frame name in this edge list could not be interned. Every \
+             name here goes into a table sized from this same list, so a \
+             collision is the only cause a caller can produce; anything else is \
+             a bug in tf_tree"
+            .to_owned(),
+        // Size, and only size. `LayoutError`'s other two members are a capacity
+        // that is not a power of two — unreachable, because `Capacity::slots`
+        // rounds *up* before the layout ever sees it — and a capacity-count
+        // mismatch, which is `TreeBuilder`'s own bookkeeping.
+        BuildError::Layout(_) => format!(
+            "{} edges at capacity={capacity} do not form a valid arena layout. \
+             Every region offset in an arena header is a u32, so the whole \
+             arena has to fit in 4 GiB — lower capacity=, or declare fewer \
+             edges",
+            edges.len()
+        ),
+        BuildError::Participant(_) => "this process could not take a slot in the arena's \
+             participant table: every slot is occupied and the count is fixed \
+             when the arena is created. A peer has to exit, or be reaped, first"
+            .to_owned(),
+        #[cfg(target_os = "linux")]
+        BuildError::Shm(inner) => format!(
+            "the shared-memory segment for this arena could not be created, \
+             sized, mapped or sealed. The engine's reason, raw: {inner:?}"
+        ),
+        other => format!(
+            "tf_tree could not build this tree, and this binding has no message \
+             for the reason. That is a bug in tf_tree_py's error layer, not in \
+             your program; please report it with this line: {other:?}"
+        ),
+    })
+}
+
+/// Map a failed `tf_tree.open(...)` onto Python — [`build_err`]'s other half.
+///
+/// Every arm of `OpenError` except two is already a sentence, so this forwards
+/// their `Display`; the two are the ones that wrap a *different* error type.
+/// `Build` is the whole of [`build_err`] — `open(create=[...])` is the second
+/// entry point a program calls first, and it reaches every one of those five
+/// Debug dumps through one `From` impl.
+pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) -> PyErr {
+    match e {
+        OpenError::Build(inner) => build_err(edges, capacity, inner),
+        // `#[error("{0:?}")]`, and the same argument as `BuildError::Shm`.
+        OpenError::Map(inner) => TfTreeError::new_err(format!(
+            "the arena's shared-memory segment was handed over but could not be \
+             mapped. The engine's reason, raw: {inner:?}"
+        )),
+        // `Rendezvous`, `NoLayoutToCreate`, `ReadOnlyCannotCreate`,
+        // `ArenaAlreadyLive` — prose already, and `IpcError`'s `Display` is the
+        // one place that knows what a runtime directory or a refused handshake
+        // means. Re-spelling it here would be a second copy that stops agreeing
+        // with the first.
+        other => TfTreeError::new_err(format!("{other}")),
+    }
+}
+
+/// The first child two edges declare, as `(child, first parent, second parent)`.
+///
+/// Declaration order, which is `TreeBuilder::build`'s: it walks the same list in
+/// the same direction and stops at the same pair, so the name this reports is
+/// the one the error was raised about even though the error carries only a hash.
+fn duplicate_child(edges: &[(String, String)]) -> Option<(&str, &str, &str)> {
+    let mut first: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::with_capacity(edges.len());
+    for (parent, child) in edges {
+        match first.insert(child.as_str(), parent.as_str()) {
+            Some(earlier) => return Some((child.as_str(), earlier, parent.as_str())),
+            None => continue,
+        }
+    }
+    None
+}
+
+/// A cycle in the caller's edge list, spelled the way the list reads.
+///
+/// `"base" is under "sensor", which is under "base"` — the chain, because one
+/// frame id is not a cycle and the caller has to see which pairs close it.
+///
+/// The walk is `child -> parent` and it stops at the frame it started from, so
+/// what comes back is the cycle itself rather than the tail that leads into one.
+/// A list with a duplicate child cannot get here: `build` rejects that first,
+/// which is what makes a single `parent` per child well defined.
+fn cycle_through(edges: &[(String, String)]) -> Option<String> {
+    let parent: std::collections::HashMap<&str, &str> = edges
+        .iter()
+        .map(|(p, c)| (c.as_str(), p.as_str()))
+        .collect();
+    for (_, start) in edges {
+        let mut chain: Vec<String> = Vec::new();
+        let mut at = start.as_str();
+        // Bounded by the number of distinct children: a walk longer than that
+        // has revisited something, and the `== start` test below is what says
+        // the revisited node is *this* one.
+        for _ in 0..parent.len() {
+            let Some(&up) = parent.get(at) else { break };
+            chain.push(format!("{up:?}"));
+            if up == start.as_str() {
+                // `"b" is under "a", which is under "b"` — the first link needs
+                // the verb and the rest need the comma, so this is not one join.
+                return Some(format!(
+                    "{start:?} is under {}",
+                    chain.join(", which is under ")
+                ));
+            }
+            at = up;
+        }
+    }
+    None
 }
 
 /// Why an id could not be turned into a name.
@@ -234,6 +608,14 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
 /// one — so this parameter cost no plumbing, which is a fair summary of why the
 /// ids were being printed raw: nothing was in the way.
 ///
+/// **One [`ArenaView`] serves the whole message.** `Disconnected` names three
+/// frames, and a per-label view made `Tree::view` re-run `detached()`,
+/// `as_participant`, `with_liveness` and `is_writable` three times (four, with
+/// the fallback's) to answer one question about one arena. It is an error path,
+/// so this is tidiness rather than a measured win — but the `_in` split existed
+/// already, for the enumerators, and not using it here was an oversight rather
+/// than a trade.
+///
 /// # The variants are enumerated, and the wildcard below is the compiler's
 ///
 /// Every arm is spelled out even where two share a sentence, so that the
@@ -265,6 +647,7 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
 /// information a build in this state has, but it is now labelled as the
 /// binding's bug rather than presented as the answer.
 pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
+    let view = tree.arena_view();
     match e {
         LookupError::Extrapolation {
             edge,
@@ -274,7 +657,7 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
         } => ExtrapolationError::new_err(format!(
             "{}: stamp {requested} ns is outside the retained history \
              [{oldest}, {newest}] ns",
-            edge_label(tree, edge)
+            edge_label_in(tree, &view, edge)
         )),
         LookupError::Disconnected {
             target,
@@ -282,18 +665,24 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             cut_at,
         } => DisconnectedError::new_err(format!(
             "no path from {} to {}; the chain stops at {}",
-            frame_label(tree, source),
-            frame_label(tree, target),
-            frame_label(tree, cut_at),
+            frame_label_in(tree, &view, source),
+            frame_label_in(tree, &view, target),
+            frame_label_in(tree, &view, cut_at),
         )),
         LookupError::NoData { edge } => NoDataError::new_err(format!(
             "{} has no samples yet",
-            edge_label(tree, edge)
+            edge_label_in(tree, &view, edge)
         )),
         LookupError::TopologyChanged { plan, current } => TopologyChangedError::new_err(format!(
             "this plan was compiled at topology generation {plan}, the tree is \
              now at {current}; call tree.plan(...) again"
         )),
+        // **The last resort, and the entry points that can do better do.**
+        // `UnknownFrame` carries a BLAKE3 prefix and BLAKE3 does not invert, so
+        // there is no name to recover *here*; `PyTree::lookup` — the one caller
+        // that still has both names as strings — attributes the failure itself
+        // and reaches this only when neither name is the missing one, which
+        // means a peer interned it between the two reads.
         LookupError::UnknownFrame { hash } => {
             FrameNotDeclaredError::new_err(format!(
                 "no frame with hash {hash:#x} in this arena; if the name is spelled right, its publisher has not declared it yet — wait for one, or declare it on the builder that creates the arena"
@@ -317,7 +706,7 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             DerivativesUnavailableError::new_err(format!(
                 "{} declares {}, which has no exact derivative; use \
                  layout='quat' or declare the edge interp='sclerp'",
-                edge_label(tree, edge),
+                edge_label_in(tree, &view, edge),
                 stored_interp(interp),
             ))
         }
@@ -334,7 +723,7 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             "{} has a pose at this stamp but no segment to differentiate: it \
              retains one sample, or the two bracketing samples carry equal \
              stamps. Publish another sample, or use layout='quat'",
-            edge_label(tree, edge)
+            edge_label_in(tree, &view, edge)
         )),
         // Routed through the shared spelling so a fork victim gets the same
         // sentence whether it arrived through `lookup` or through `frames`.
@@ -375,12 +764,12 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             "the ring on {} lapped this reader mid-read: the samples being \
              interpolated were overwritten before the read finished. Retry, or \
              give the edge more capacity when the arena is built",
-            edge_label(tree, edge)
+            edge_label_in(tree, &view, edge)
         )),
         LookupError::SlotContended { edge } => TfTreeError::new_err(format!(
             "a slot on {} stayed mid-write for the whole retry budget, so no \
              consistent sample could be read. Retry",
-            edge_label(tree, edge)
+            edge_label_in(tree, &view, edge)
         )),
         // The two time-domain refusals (D9). Domains are stamped as small
         // integers in the arena and the Python surface has no name for them
@@ -399,12 +788,36 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             "{} is in time domain {got} and the rest of the path is in domain \
              {expected}; no single stamp addresses both, so the path is \
              refused rather than sampled with the wrong clock",
-            edge_label(tree, edge)
+            edge_label_in(tree, &view, edge)
         )),
-        LookupError::UnknownEdge { edge } => TfTreeError::new_err(format!(
-            "{} names no usable edge in this arena",
-            edge_label(tree, edge)
-        )),
+        // **Not routed through [`edge_label_in`], for the reason the
+        // `FrameOutOfRange` arm below gives**: its fallback would produce
+        // `edge #7 (name unavailable: this arena holds no record at that index)
+        // names no usable edge in this arena`, which is one fact said three
+        // times. The two causes want different sentences anyway, and only one
+        // of them can be named.
+        LookupError::UnknownEdge { edge } => TfTreeError::new_err(
+            match named_edge_in(&view, edge) {
+                // `Plan::sampler` answers `None` for an edge whose capacity is
+                // zero as well as for one past the table, so a *named* edge
+                // here is a dynamic step over a static or tombstoned record —
+                // the arena changed under a compiled plan.
+                Some((parent, child)) => format!(
+                    "{} carries no sample ring, so the step that names it \
+                     cannot be evaluated: this arena records the edge as static \
+                     or tombstoned. Re-compile with tree.plan(...)",
+                    edge_label_of(&parent, &child)
+                ),
+                // Nothing to name, and the id being out of range *is* the whole
+                // answer, so it is stated once.
+                None if tree.detached() => return detached_err(),
+                None => format!(
+                    "edge id {} is past the end of this arena's edge table, so \
+                     the plan naming it was compiled against a different arena",
+                    edge.get()
+                ),
+            },
+        ),
         // The one id deliberately *not* sent through `frame_label`: this error
         // means the id is out of range for the frame table, so resolving it can
         // only ever produce the fallback, and `frame #99 (name unavailable:
@@ -414,10 +827,13 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             "frame id {} is out of range for this arena's frame table",
             frame.get()
         )),
+        // [`frame_phrase_in`] and not `format!("frame {}", frame_label(..))`:
+        // the fallback branch already begins `frame #7`, and prefixing it gave
+        // `frame frame #7 (name unavailable: ...)`.
         LookupError::MissingEdge { child } => TfTreeError::new_err(format!(
-            "frame {} has a parent in the topology but no edge records the \
-             link, so the path through it cannot be evaluated",
-            frame_label(tree, child)
+            "{} has a parent in the topology but no edge records the link, so \
+             the path through it cannot be evaluated",
+            frame_phrase_in(tree, &view, child)
         )),
         // Not reachable from Python today — the binding picks the entry point
         // from `layout=` itself and never crosses the f32/f64 pair — which is
@@ -488,10 +904,23 @@ pub(crate) fn push_msg(edge: &str, e: PushError) -> String {
         // Equal stamps are *accepted* (invariant 6), so the message says
         // "older than", not "not newer than" — a caller who reads the stricter
         // sentence goes looking for a de-duplication bug that is not there.
+        //
+        // **The variant name is back, and it is a search key rather than a
+        // dump.** `docs/RUNBOOK.md`'s section on this failure is *headed* with
+        // it, and that section is the one that says a burst on a wall-clock
+        // edge is usually a `CLOCK_REALTIME` step and not the publisher's
+        // fault. Scrubbing the word left an operator holding a sentence with no
+        // token in it that finds the page explaining it — which is the same
+        // mistake as printing `EdgeId(3)`, in the other direction: an id nobody
+        // can use, replaced by prose nobody can look up. The braces stay off,
+        // because it is the heading that has to be findable, not the struct.
         PushError::NonMonotonicStamp { last, got } => format!(
             "{edge}: stamp {got} ns is older than the newest published stamp \
              {last} ns. Stamps are non-decreasing per edge; equal stamps are \
-             accepted and the newer value wins"
+             accepted and the newer value wins. A burst of these on a \
+             wall-clock edge is usually a clock step rather than a publisher \
+             fault — `tf_tree doctor`'s TFT018/TFT019 make that call, and \
+             docs/RUNBOOK.md's NonMonotonicStamp section is the procedure"
         ),
         PushError::ClaimRevoked { .. } => format!(
             "{edge}: this writer's claim was revoked — a reaper judged the \
