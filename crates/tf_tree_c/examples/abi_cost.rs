@@ -614,8 +614,18 @@ fn main() {
         verdict(r_panic < PANIC_GUARD)
     );
     println!(
-        "  R3  a guard per lookup, vs hoisted     {r_guard:.3}x   (allow < {PER_CALL_GUARD:.2})   {}",
+        "  R3  a guard per lookup, vs hoisted     {r_guard:.3}x   (allow < {PER_CALL_GUARD:.2})   {}   [three-edge tree]",
         verdict(r_guard < PER_CALL_GUARD)
+    );
+    println!(
+        "      ^ THIS R3 IS NOT §7's. `docs/PHASE4.md` §7 makes R3 the primary\n      \
+         criterion and measures it on the §11.1 fixture, where the per-call guard\n      \
+         is 48-63 ns against 16-19 ns here — the three-edge rings are 2 KiB of\n      \
+         stamps and sit in L1d, so they price Guard's constructor and almost none\n      \
+         of the cold bracket search a robot pays (`just abi-split`, 0023 q3).\n      \
+         §7's R3 is REPORTED, NOT GATED: 1.25 was derived against this numerator\n      \
+         and carrying it across would be transcription, not derivation. The row\n      \
+         above still gates THIS fixture, which is what 1.25 is for."
     );
     println!(
         "  C   the control against rung 1         {r_control:.3}x   (allow 1 +- {:.2})   {}",
