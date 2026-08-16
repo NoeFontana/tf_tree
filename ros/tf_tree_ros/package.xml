@@ -2,7 +2,9 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>tf_tree_ros</name>
-  <version>0.1.0</version>
+  <!-- Hand-kept copy of the root Cargo.toml's [workspace.package] version;
+       that file carries the argument for the number. -->
+  <version>0.0.1</version>
   <description>
     The tf_tree ROS 2 ingest bridge (docs/PHASE4.md §5): subscribes /tf and
     /tf_static and writes into a tf_tree arena. Ingress only — it never

@@ -11,7 +11,13 @@
 # entry point `just cmake-check` proves for an ordinary C++ consumer.
 
 cmake_minimum_required(VERSION 3.16)
-project(tf_tree_ros VERSION 0.1.0 LANGUAGES CXX)
+# The version is a hand-kept copy of `[workspace.package] version` in the root
+# `Cargo.toml`, which carries the argument for the number. One version across
+# the repository including the unpublished packages, because a package that
+# versions itself independently is a package whose number stops meaning
+# anything. Unlike `rust-version`, nothing compares these copies — `just msrv`
+# checks that field alone — so this is the convention, not a gate.
+project(tf_tree_ros VERSION 0.0.1 LANGUAGES CXX)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)

@@ -18,7 +18,12 @@
 [package]
 name = "tf_tree_tf2_sys"
 description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential and benchmark harnesses."
-version = "0.2.0"
+# Outside the workspace, so this is a hand-kept copy of `[workspace.package]
+# version` — the root `Cargo.toml` carries the argument for the number. Kept in
+# step even though this crate is `publish = false`: it path-depends on
+# `tf_tree_math` with a version requirement, and `^0.0.1` matches only `0.0.1`,
+# so a stale number here does not resolve — it fails to build.
+version = "0.0.1"
 edition = "2021"
 # Outside the workspace, so this cannot inherit `[workspace.package]
 # rust-version` and has to repeat it. It is not free to differ: this crate path-
@@ -58,7 +63,7 @@ unreachable_pub = "warn"
 unused_must_use = "deny"
 
 [dependencies]
-tf_tree_math = { path = "../tf_tree_math", version = "0.2.0" }
+tf_tree_math = { path = "../tf_tree_math", version = "0.0.1" }
 
 [build-dependencies]
 cc = "1"
