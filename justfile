@@ -772,6 +772,23 @@ ingest-check:
 #   `#[cfg(all(feature = "shm", target_os = "linux"))]`. They resolve in the
 #   build docs.rs performs, and de-linking them would trade two working links in
 #   the rendered documentation for a clean run of a command that is not the gate.
+#
+# **And the two excluded crates, which no `-p` here can name.** Both are in the
+# root manifest's `exclude`, so `cargo doc --no-deps -p tf_tree_py` answers
+# *"package ID specification `tf_tree_py` did not match any packages"* and the
+# only spelling that reaches either is `--manifest-path`:
+#
+# * `tf_tree_py` — the crate whose documentation a PyPI user reads, and the one
+#   this recipe would most like to cover. It is gated by `just py-lint`, whose
+#   rustdoc line carries the argument for living there: the `--manifest-path`
+#   form works fine from here, but PyO3's build script needs an interpreter and
+#   `py-*` is what owns one.
+# * `tf_tree_tf2_sys` — rustdoc for it runs in **no** recipe. It needs ROS 2
+#   headers, so the only recipe that could carry it is `just tf2-check`'s
+#   container invocation, and it is `publish = false` behind
+#   `tf_tree_bench --features tf2`, so nothing it says renders on docs.rs. That
+#   is a smaller hole than `tf_tree_py`'s was, and it is stated here rather than
+#   left to be rediscovered.
 doc:
     RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo doc --no-deps --all-features \
         -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
@@ -787,6 +804,12 @@ lint: py-compile
     # produces it ran in no recipe at all. This fails if a runnable artifact is
     # neither executed nor declared in `docs/benchmarks/EVIDENCE.md`.
     ./scripts/evidence-audit.sh
+    # Second, for the same reason and at the same price — 0.09 s, no network,
+    # no compilation. It fails on a version that moved in one of the nine files
+    # that carry one and not the others, and on a document or a workflow that
+    # names a recipe this file does not define. See `just artifact-versions`
+    # for the three findings it was written for.
+    ./scripts/artifact-versions.py
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
@@ -906,6 +929,48 @@ msrv:
         fi
     done
     exit $rc
+
+# **The repository checked against itself: one version everywhere, and no
+# document that names a recipe which does not exist.**
+#
+# Third of the family that starts with `just msrv` and `just evidence-audit`,
+# and it exists because three independent readings of this release found the
+# same defect in three different places — shipped text contradicting a document
+# that same text names as authoritative. The README's status table against the
+# `§0.0` tables it calls the source of truth; the CLI's `--help`, still saying
+# "live external attach arrives in Phase 2" two phases after it arrived; and a
+# README quickstart that said `just py-wheel` was "build + install" when the
+# recipe only built, so the documented first five minutes ended in
+# `ImportError`. None of the three is a property of the code, which is why no
+# test caught any of them.
+#
+# **The version half is the gap `just msrv` leaves.** That recipe does exactly
+# this for one field: it reads `rust-version` out of the manifest and fails if a
+# hand-written copy — or the README's prose — disagrees. There was no equivalent
+# for `version`, and **nine** files carry a hand-kept copy of it: two manifests
+# outside `[workspace]` (they cannot inherit), `pyproject.toml`, three
+# `CMakeLists.txt` and two `package.xml`. `crates/tf_tree_c/CMakeLists.txt`'s
+# own comment said as much — "Unlike `rust-version`, nothing compares these
+# copies … this is the convention, not a gate" — and this is that sentence
+# stopping being true.
+#
+# **What it deliberately does not check is the README's status table**, which is
+# where the first of the three findings was. No cheap rule separates a stale row
+# from a differently-worded true one, and `docs/PHASE5.md` §10's point about the
+# benchmark baseline applies here: a gate that flaps is a gate people learn to
+# pass by editing the gate. So every rule in the script was measured over the
+# whole corpus before it was written down and narrowed until it had no false
+# positives — the recipe-reference arm resolves 242 references across 19
+# documents and 49 across 3 workflows, and the single finding it produced on the
+# tree it was written against was `just quickstart`, which did not exist yet.
+# `docs/decisions/` is out of its scope for the same reason: a `ready` record is
+# a dated artifact, and renaming a recipe must not force an edit to history.
+#
+# Wired into `just lint` (0.09 s, no network, three runs byte-identical).
+
+# One version across the repository, and no document naming a recipe that is not there.
+artifact-versions:
+    ./scripts/artifact-versions.py
 
 # Run the benchmark suite and the go/no-go gate.
 bench:
@@ -1688,6 +1753,10 @@ shm-check:
     # `--features shm` alone would leave it there. Measured:
     # `cargo nextest list -p tf_tree --features shm --test frozen` lists 8 tests,
     # `--features shm,unstable` lists 9.
+    #
+    # The clippy line at the top of this recipe stays `--features shm` alone on
+    # purpose: that is what compiles this crate's test targets with `unstable`
+    # *off*, the shape a packager building the tarball gets.
     cargo nextest run -p tf_tree --features shm,unstable --test frozen
     # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
     # paragraphs above being obeyed rather than restated.** Half of
@@ -1900,6 +1969,37 @@ abi-split:
 # and §7.3 requires the suite to pass on both.
 # ---------------------------------------------------------------------------
 
+# **A clean clone to a working Python REPL in one command — and it fails loudly
+# if the README's own snippet stops printing what the README says it prints.**
+#
+# `README.md`'s "First five minutes" tells a reader to run this and then
+# `.venv/bin/python`. The last step below executes *that* snippet: it is read
+# out of `README.md` rather than copied into a script, and its output is
+# compared against the `# ->` marker in the snippet itself. So there is no
+# second copy of the quickstart to drift (`docs/PROJECT.md` §6) and no expected
+# value written down anywhere but the README. The failure it replaces is the
+# one that shipped — the README said `just py-wheel` installed the extension,
+# `py-wheel` only builds it, and nothing anywhere ran the five minutes.
+#
+# **It depends on `py-setup` rather than carrying a lighter path of its own**,
+# and the temptation was real: `py-setup` installs *two* interpreters, and a
+# reader who has not yet decided they care pays for the free-threaded one up
+# front. What settles it is what happens next. A leaner venv would be a second
+# spelling of "the Python environment" (§6 again), and everything the reader
+# reaches for after the REPL — `just py-test`, `just py-lint`,
+# `just py-test-freethreaded` — assumes `py-setup`'s. A quickstart whose reward
+# for succeeding is that the next recipe fails is not a quickstart.
+#
+# The install line is deliberately the same one `py-test` runs, so a broken
+# install is never something only newcomers see.
+
+# Clean clone -> a Python REPL with the extension installed, verified end to end.
+quickstart: py-setup
+    VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q
+    .venv/bin/python scripts/quickstart_smoke.py
+    @echo ""
+    @echo "==> next: .venv/bin/python   (the extension is installed in that interpreter)"
+
 # Create both venvs and install the toolchain.
 py-setup:
     uv python install 3.14 3.14t
@@ -1919,10 +2019,44 @@ py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
     .venv-t/bin/python -m pytest tests/python -q
 
-# fmt + lint for both languages of the binding.
+# fmt + lint for both languages of the binding, plus the Rust half's rustdoc.
 py-lint:
     cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
     PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
+    # **Rustdoc for the one crate no other recipe compiles the documentation of.**
+    # `just doc` names its packages with `-p`, and this crate is in the root
+    # manifest's `exclude`, so from the root `cargo doc --no-deps -p tf_tree_py`
+    # answers *"package ID specification `tf_tree_py` did not match any
+    # packages"*. Until this line, fmt, clippy, ruff, ruff format and pyright
+    # were the whole of the crate's gate and none of them is rustdoc — for the
+    # crate whose rendered documentation is the one a PyPI user reads. The 0.0.1
+    # release prep found **three** broken intra-doc links here, by running this
+    # command by hand.
+    #
+    # **The reason it is here and not in `just doc` is the interpreter, not
+    # reachability** — the "an excluded crate is structurally out of `just doc`'s
+    # reach" argument is too strong, and was tested rather than inherited: the
+    # `--manifest-path` form below runs perfectly well from the workspace root.
+    # What it needs is a Python, because PyO3's build script runs one. Measured:
+    # with `PYO3_PYTHON` pointed at a venv that does not exist it exits 101
+    # (*"failed to run the Python interpreter at ..."*), and with the variable
+    # unset it quietly *succeeds* against the host's `python3` — 3.12 here, not
+    # the venv's 3.14 — rebuilding pyo3/pyo3-ffi/numpy for that configuration in
+    # 2.6 s, and 2.7 s again to come back. So a copy in `just doc` would either
+    # fail on any machine without a venv, or document a different interpreter
+    # than the one the bindings are tested on, and would thrash one target
+    # directory between two PyO3 configurations whenever the two recipes
+    # alternate. CI already splits the same way: the `docs` job that runs
+    # `just doc` provisions no interpreter, while the `python` job runs
+    # `just py-setup` immediately before this recipe.
+    #
+    # Verified to be a real gate, by breaking it: a `[NoSuchItem]` intra-doc link
+    # added to the top of `crates/tf_tree_py/src/lib.rs` (and restored
+    # byte-for-byte afterwards) gives *"error: unresolved link to `NoSuchItem`"*
+    # and *"error: could not document `tf_tree_py`"*, exit 101. Warm it costs
+    # 0.09 s, which is why it is a line in this recipe and not a recipe of its own.
+    PYO3_PYTHON=$PWD/.venv/bin/python RUSTDOCFLAGS="-D warnings" cargo doc \
+        --manifest-path crates/tf_tree_py/Cargo.toml --no-deps
     .venv/bin/ruff check python tests/python crates/tf_tree_bench/python
     .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python
     # `--strict` over the package and its stubs (PHASE3 §9). Not over
@@ -1931,8 +2065,36 @@ py-lint:
     # green is a gate nobody runs.
     .venv/bin/pyright python
 
-# Build a release wheel.
+# **Builds a wheel. Does not install one — `just quickstart` is what installs.**
+#
+# That sentence is here because its absence shipped a bug: `README.md`
+# documented this recipe as "maturin build + install into .venv", so the
+# quickstart it was part of ended in `ImportError`. The README now points at
+# `just quickstart`, and this comment is the other half of making that stay
+# true.
+#
+# **It was not fixed by making this recipe install**, and the reason is the two
+# recipes directly below. `py-mp-bench` and `py-vs-tf2` call it and then unpack
+# `crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl` by hand into a
+# container. Replacing `maturin build` with `maturin develop` leaves that path
+# unwritten and breaks both; doing both would mutate the host's `.venv` as a
+# side effect of running a benchmark inside a container, which is a worse
+# surprise than the one being fixed. One recipe, one artifact.
+
+# Build a release wheel (it does not install; `just quickstart` does that).
 py-wheel:
+    # **Clear the previous build first, because the two recipes below index
+    # into a glob.** Measured while writing this: after the release bumped the
+    # version, `crates/tf_tree_py/target/wheels/` held `tf_tree-0.1.0-…whl`
+    # *and* `tf_tree-0.0.1-…whl`, and `glob.glob(…)[0]` is filesystem order,
+    # not sorted — so which build those benchmarks measured was luck. It
+    # happened to pick the new one on the machine this was found on, which is
+    # the worst kind of passing. `target/` is where disposable artifacts live
+    # and `cargo clean` removes the directory outright, so nothing is lost that
+    # a rebuild does not restore. Both consumers now `assert len(w) == 1` and
+    # print what they unpacked, so the invariant this line creates is checked
+    # where it is relied on rather than assumed.
+    rm -f crates/tf_tree_py/target/wheels/tf_tree-*.whl
     VIRTUAL_ENV=.venv .venv/bin/maturin build --release
 
 # N Python consumer nodes on one shared arena, against N private `tf2_ros`
@@ -1946,9 +2108,13 @@ py-wheel:
 # RUN THIS ON AN IDLE MACHINE.
 py-mp-bench:
     just py-wheel
+    # The unpack asserts a single wheel instead of taking `glob(...)[0]`; see
+    # `py-wheel` for the stale-wheel it was measured against. A second wheel
+    # means somebody built one by hand, and stopping beats benchmarking
+    # whichever build the filesystem happens to return first.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
-        python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")[0]).extractall(\"target/pywheel\")"; \
+        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/mp_compare.py'
 
 # tf_tree's Python API against tf2_ros's, in the ROS container (PHASE3 §12.1).
@@ -1964,5 +2130,5 @@ py-vs-tf2:
     # the container's system site-packages untouched.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
-        python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")[0]).extractall(\"target/pywheel\")"; \
+        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/tf2_ros_compare.py'
