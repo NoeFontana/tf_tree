@@ -336,6 +336,12 @@ const TEST_ONLY: &[&str] = &[
     "tft_test_panic",
     "tft_guarded_noop",
     "tft_test_push_unguarded",
+    // `docs/PHASE4.md` §7 gate criterion 1's R2 rung: the same body as
+    // `tft_plan_at` with `catch_unwind` removed, so the guard's cost is a
+    // subtraction rather than an estimate. It is `#[cfg(feature =
+    // "test-hooks")]` and deliberately does *not* catch unwinds, which is
+    // precisely why it must never reach a shipped header.
+    "tft_test_plan_at_unguarded",
 ];
 
 /// The handle types, declared by hand rather than generated.
