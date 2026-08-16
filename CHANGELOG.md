@@ -1,0 +1,256 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+**Versioning, stated before anything else, because `0.0.x` is not ordinary
+semver.** Cargo treats every `0.0.x` release as incompatible with every other:
+`^0.0.1` — which is what a bare `tf_tree = "0.0.1"` means — matches `0.0.1` and
+nothing else. That is deliberate and it is the whole promise. **Nothing in this
+release is stable. Every release may break every other**, in the public Rust
+API, in the Python API, in the C ABI, and in the arena format. Pin exactly.
+
+Two consequences worth naming rather than leaving to be discovered:
+
+- **PyPI does not have that rule.** PEP 440 gives `0.0.x` no special meaning, so
+  `pip install -U tf_tree` will move you from `0.0.1` to `0.0.2` without asking.
+  Pin the wheel yourself if the promise above matters to you.
+- **`SUPPORT.md`'s "an MSRV bump is a minor-version bump pre-1.0" rule does not
+  apply on the `0.0.x` line** — there is no minor slot for it to occupy. The
+  argument, and why the resolver already enforces what that rule was written to
+  enforce, is in the root `Cargo.toml`'s comment on `[workspace.package]
+  version` and in `SUPPORT.md`'s MSRV section.
+
+The single source of truth for what is implemented is the status tables in
+`docs/` — `## 0.0 Implementation status` at the head of `PHASE2.md`, `PHASE4.md`
+and `PHASE5.md`, and `## 0.0 Status` in `PHASE7.md`. `PHASE1.md` has none because
+Phase 1 is implemented whole; `PHASE3.md` has none because it records deviations
+inline, in the section each one belongs to — §5.5's buffer-protocol steps are the
+example. Where this file and one of those disagree, they are right and this file
+is a bug.
+
+---
+
+## [0.0.1] — unreleased
+
+First publish. The date goes in with the tag; until then nothing has been
+uploaded to crates.io or PyPI.
+
+Everything below is *Added*, because there is no previous release for anything
+to be changed, deprecated, removed or fixed relative to.
+
+### Added — the engine (Phase 1, `docs/PHASE1.md`)
+
+- A pointer-free, fixed-capacity, `#[repr(C)]` transform arena. No growth, no
+  realloc, no `Arc`/`Box`/`Vec` inside an arena structure; `FrameId` and
+  `EdgeId` are append-only and tombstoned rather than recycled.
+- Lock-free reads: per-edge seqlock sample rings, one writer per edge.
+- Compiled lookup plans — `Plan` is resolved once and evaluated many times, and
+  evaluation allocates nothing, takes no lock and converts nothing.
+- `tf_tree_math`: `no_std`, `#![forbid(unsafe_code)]` SE(3)/SO(3), quaternion and
+  dual-quaternion math. Two interpolators, ScLerp (default) and LerpSlerp.
+- Integer-nanosecond stamps carrying a clock domain in the type, so mixing a
+  sensor clock with a host clock is a compile error rather than a silent wrong
+  answer. Cross-domain lookup is an error until Phase 8 supplies alignment.
+- `Copy` error types that name the offending edge. No `String` in an error type
+  or on a hot path anywhere in the workspace.
+- Builder-time edge declaration
+  (`docs/decisions/0004-builder-time-edge-declaration.md`), which is what sizes
+  the arena.
+
+### Added — shared memory between processes, Linux only (Phase 2, `docs/PHASE2.md`)
+
+Behind the default-off `shm` feature; see *Absent* for the one part of this that
+is specified and not wired up.
+
+- A `memfd_create`-backed, sealed, `MAP_SHARED` arena, and a zero-diff read path
+  proven by a relocation gate — the same bytes answer the same at a different
+  address in a different process.
+- Discovery and rendezvous: `tf_tree::open()`, a lock file whose byte 0 is
+  ownership, and an attach protocol over `SOCK_SEQPACKET` + `SCM_RIGHTS` served
+  by a thread rather than a daemon.
+- A participant registry, liveness derived from `F_OFD_GETLK`, edge claims held
+  as OFD leases so a dead writer's claim is observable, and reaping by any
+  read-write participant.
+- Fork poisoning: a `pthread_atfork` counter, with five destructors guarded, so
+  a tree inherited across `fork()` refuses rather than corrupting.
+- Per-edge page population at take-up. `docs/PHASE2.md` §0.0 records the
+  measurement: 66.3 MiB → 3.8 MiB resident on an over-provisioned arena.
+
+### Added — Python bindings (Phase 3, `docs/PHASE3.md`)
+
+Published as the `tf_tree` wheel. The bindings go straight to Rust through PyO3,
+not through the C ABI, because typed errors and zero-copy buffers do not survive
+a C boundary (`docs/PHASE3.md` §0).
+
+- `tf_tree.open()`, batch lookup with NumPy in and NumPy out and no intermediate
+  allocation, and `at_into` writing directly into a caller-owned NumPy array
+  (only a NumPy array — see *Partial*).
+- The GIL is released above a measured work threshold rather than always or
+  never.
+- Free-threaded CPython is supported: the module is `#[pymodule(gil_used =
+  false)]`, which is what emits the `Py_MOD_GIL_NOT_USED` slot, so importing it
+  does not silently re-enable the GIL for the whole process — the failure mode
+  that has no error, no warning and no failed import. Wheels are `abi3` for GIL
+  builds plus version-specific `cp314t`; `3.13t` is deliberately absent and
+  `abi3t` awaits CPython 3.15.
+- Hand-written `.pyi` stubs and `py.typed`, checked under strict pyright.
+
+### Added — C, C++ and ROS 2 (Phase 4, `docs/PHASE4.md`)
+
+Of this group, only `at_with_derivatives` reaches a published artifact — it is
+part of the `tf_tree` crate. The C ABI, the C++ wrapper and the ROS 2 package are
+build-from-source; see *What is and is not published*.
+
+- A two-tier C ABI: `tf_tree.h` (stable) and `tf_tree_unstable.h` (opt-in behind
+  `#define TFT_ENABLE_UNSTABLE`), at ABI version 0.5, which is versioned
+  independently of this crate version. Handle model, `Copy` error identifiers, a
+  panic guard at every boundary, and all five pose layouts in both directions —
+  reading needs matrix→quaternion, which needs Shepperd's four-branch method and
+  a determinant check, because a reflection and a scaled rotation both convert
+  silently into a *valid, different* answer.
+- A header-only C++ wrapper, `tf_tree.hpp`, with Eigen and Sophus interop, both
+  error modes (exceptions and `-fno-exceptions`), and a CMake package a consumer
+  reaches with `find_package(tf_tree CONFIG)`.
+- `sample_with_derivatives` / `at_with_derivatives`, pulled forward from Phase 6
+  because ScLerp already computes the twist.
+- `ros/tf_tree_ros`: a one-way `/tf` and `/tf_static` → arena ingest bridge, as
+  an `ament_cmake` package. Ingress only — **it never writes to `/tf`**, which is
+  the Phase 7 line and not an oversight.
+
+### Added — offline, observability (Phase 5, `docs/PHASE5.md`)
+
+- **`FORMAT_VERSION = 3`**, `layout_hash 0x3D104195` (`tf_tree doctor
+  --explain-version` prints both). The Phase 6 spline regions are already
+  declared in the header, absent, so that format break happens once rather than
+  again in Phase 6.
+- **Frozen `.tft` arenas**: `Tree::freeze_to`, `Tree::open_frozen`, `tf_tree
+  freeze`, and `Tree.freeze()` from Python. The arena bytes as a memory-mapped
+  file, so sixteen dataloader workers share one copy. A frozen tree answers
+  bit-for-bit identically to the live one it came from, and `docs/PHASE5.md` §2
+  records that as tested rather than intended — by `crates/tf_tree/tests/frozen.rs`,
+  which is compiled only under `--features shm` and so runs in `just shm-check`,
+  not in `just test`.
+- **Bag ingestion, MCAP only** — `tf_tree ingest --bag`, `tf_tree freeze
+  --from-bag`, and `tf_tree_ingest` as a library. Two passes with a
+  spill-to-run-file for recordings larger than the memory cap; zstd and lz4
+  chunks decode through pure-Rust codecs, so a rosbag2 or Foxglove recording
+  ingests with no C build step. A truncated recording is read up to the cut and
+  reported as truncated rather than refused, because a SIGKILLed recorder is how
+  bags in the field end.
+- **Offline Python API**: `tf_tree.open_file()` returns the ordinary `Tree`, so
+  there is no parallel offline surface to learn.
+- **Diagnostic counters**, default-on behind the `counters` feature, with the
+  arena regions declared whether or not the feature is compiled in — so turning
+  them off does not fork `layout_hash`.
+- **A diagnostics catalogue, `TFT001`–`TFT019`**, behind `tf_tree doctor`, with
+  `--json` (schema `tf_tree.doctor/1`), `--exit-code`, `--suppress`, and
+  `--from-bag` / `--from-file` so a recording or a frozen index can be diagnosed
+  without a running robot. Sixteen of the nineteen can detect something; the
+  other three say they cannot rather than passing (see *Partial*).
+- **`tf_tree top`**: attaches read-only, refuses `--rw`, and renders per-edge
+  rate/staleness/occupancy/writer, the participant list, a rolling event feed and
+  a per-edge inter-arrival histogram. `--web` serves the same data over a
+  hand-rolled HTTP/1.1 loop on `std::net::TcpListener` with a `default-src 'none'`
+  CSP — no new dependency, no CDN.
+
+### What is and is not published
+
+**Published to crates.io:** `tf_tree`, `tf_tree_core`, `tf_tree_math`,
+`tf_tree_arena`, `tf_tree_ipc`. **Published to PyPI:** the `tf_tree` wheel.
+
+**Everything else in the repository is `publish = false`**, and two of those are
+worth calling out because a reader will otherwise assume they arrive with the
+crates:
+
+- **`tf_tree_cli` — the `tf_tree` / `tft` binary — is not published.** So
+  `tf_tree tree`, `echo`, `doctor`, `top`, `bench`, `ingest` and `topology` are
+  build-from-source in this release, and `freeze` and `participants` are
+  build-from-source *with* `--features shm` on Linux, which is the only
+  configuration in which those two subcommands exist at all.
+  `cargo install tf_tree` installs nothing; `tf_tree` on crates.io is a library.
+- **`tf_tree_c` — the C ABI — is not published either**, so the C header, the
+  C++ wrapper and the CMake package are build-from-source too, as are both
+  `ros/` packages (they need `rclcpp`, which only exists inside `docker/tf2`).
+
+### Absent, deliberately
+
+Each of these is a decision with an argument behind it, not a gap waiting to be
+filled in a patch release.
+
+- **A `tf2_ros::Buffer`-compatible shim, and arena → `/tf` egress.** That is
+  Phase 7, and D21 gates it on operating evidence rather than scheduling it.
+  `docs/PHASE7.md` §0.0 lists four gates and none is met. That document is a
+  requirements artifact; its existence is not permission to build it.
+- **Cross-host operation.** Phase 8. Interest-based replication, a delta-coded
+  wire format, and clock-domain alignment with reported uncertainty. A
+  cross-domain lookup is an error today for exactly this reason.
+- **Continuous-time interpolation — cumulative B-splines with analytic
+  derivatives.** Phase 6. The arena header already reserves its regions
+  (`docs/PHASE5.md` §1.2), which is why this release's format break is the only
+  one Phase 6 needs.
+- **Visualization.** `docs/PHASE5.md` §8 is a section about not building
+  something, with the argument recorded. This is the finished state, not a gap.
+- **ROS 1.** There is no path and there will not be one.
+- **rosbag2 `.db3` (sqlite3) ingestion.** Refused on a measured dependency
+  finding — `rusqlite` vendors C, `prsqlite` records no licence on the crates.io
+  index so `cargo deny` refuses it outright, and the remaining readers are header
+  parsers. A `.db3` handed to `tf_tree ingest` is *diagnosed* as one, with the
+  `ros2 bag convert` remedy, rather than reported as a corrupt MCAP.
+- **`tf_tree serve`, and a recorder.** `docs/PHASE2.md` §9 is superseded by
+  `docs/decisions/0019`; keeping an owner alive is the operator's job in this
+  release, which is what D16 says it should be.
+
+### Partial, and stated rather than papered over
+
+- **Ownership migration when the arena's owner dies (`docs/PHASE2.md` §3.5).**
+  The lock-file protocol exists and is tested; **nothing triggers it.** No
+  participant watches its client socket for `HUP`. Observable consequence: kill
+  the owner and every already-attached process keeps serving lookups exactly as
+  specified, but **no new process can join** — it wins the ownership byte, meets
+  the split-brain check against the survivors, backs off, and times out with
+  `ArenaHeldButUnreachable`, for as long as any survivor lives.
+- **Three diagnostic checks cannot detect anything in any configuration, and
+  report that instead of passing:** `TFT002` and `TFT003` (owned by
+  `tf_tree_bridge::StaticStore`, whose state is process-local) and `TFT004` (no
+  arena receipt time is recorded). Eight more skip conditionally, on evidence
+  rather than on capability, and each says which condition it hit.
+- **`at_into` acquires its output buffer by casting to `numpy.ndarray`, not
+  through the buffer protocol** (`docs/PHASE3.md` §5.5's status note). So a
+  `memoryview`, or a pinned `torch`/`cupyx` allocation that is not a NumPy array,
+  is **refused whatever its layout** — with an error saying so and suggesting
+  `np.asarray(...)`, not a wrong answer.
+- **`freeze_from_arrays`** — building a frozen index straight from NumPy arrays
+  — is not implemented. Unlike the `.db3` row above this is a schedule and not a
+  decision: it needs no dependency and no format change.
+- **Phase 4's exit criterion is operational and is open.** A real node on real
+  hardware for a sustained period, and a written log of every surprise. No amount
+  of code closes it, and it is what gates Phase 7.
+- **`docs/PHASE4.md` §7's benchmark gate criterion 1** is measured as four
+  quotients on an interleaved ladder rather than the single ratio its own table
+  names, because the single ratio's denominator moved 43% on edits that did not
+  touch it. That section records all four as passing, over twelve pinned runs;
+  `docs/decisions/0023` is the record that would change the wording.
+
+### Platforms
+
+- **Linux `x86_64`** is where this is developed and gated.
+- **Linux `aarch64`** is a target and not yet evidence: the CI matrix rows exist
+  and have never executed.
+- **macOS and Windows** get a Python wheel with the single-process engine only —
+  no shared memory, no `.tft`, no `tf_tree top` — and nothing tests it. See
+  `SUPPORT.md`.
+
+### A note on the gate
+
+**GitHub Actions has produced no run for this repository since 2026-07-23**, so
+nothing in this release was verified by a workflow. What backs it is the `just`
+recipes, run locally on `x86_64` Linux, and the `## 0.0 Implementation status`
+tables those runs are recorded in — which is what the note at the top of this
+file means by naming those tables as the source of truth.
+`.github/workflows/ci.yml`'s header carries the evidence for the outage and the
+diagnosis. Do not read a green check as verification.
+
+<!-- The tag does not exist until the release commit creates it, so this link
+     404s until then. That is the accurate state, not a broken link to fix. -->
+[0.0.1]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.1
