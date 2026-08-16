@@ -976,7 +976,7 @@ Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers 
 - [ ] `shm_torture` runs 30 minutes nightly, clean, under ASan
 - [ ] `HeapArena` / `MappedArena` replay produces **bit-identical** results (§10)
 - [ ] §12.3 gate met, or a written explanation of which criterion failed and by how much
-- [ ] `tf_tree serve` ships with a systemd unit and a container example (§9, superseded by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md); not 0.1.0 scope)
+- [ ] `tf_tree serve` ships with a systemd unit and a container example (§9, superseded by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md); not first-release scope)
 - [x] `docs/RUNBOOK.md` complete; every row maps to a `doctor` check (rows for unimplemented Phase 2 errors are marked as such)
 - [~] `docs/PHASE3.md` written and carrying §14 forward; the measured numbers land with §12
 
