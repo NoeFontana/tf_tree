@@ -1,0 +1,310 @@
+# Surprise log entry — `docs/PHASE4.md` §1.2, filed against `docs/PHASE7.md` §4.
+#
+# This form exists because the surprise log is the only activity that can move
+# D21, and until now there was no way for anyone outside the repository to add
+# to it. Its fields are the J-table's columns, in order: the question, what tf2
+# does, what tf_tree did, the proposed answer, and which row it belongs to. An
+# entry filed through it should be transcribable into `docs/PHASE7.md` §4
+# without re-typing anything.
+#
+# The J-row dropdown below is a *copy* of that table. §4 says of itself "Rows
+# will be added"; when one is, add it here in the same commit. A dropdown that
+# has fallen behind the table files a new observation against the wrong row,
+# which is worse than the "no row fits" answer it displaces — a wrong row reads
+# as corroboration.
+#
+# Labels this form sets: surprise-log, needs-triage. See config.yml for the
+# roster and for what GitHub does with a label the repository does not have.
+name: Surprise log entry
+description: tf_tree did something you did not expect, or tf2 does it differently. This is the log that gates Phase 7.
+title: "[surprise] "
+labels: ["surprise-log", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This is the most valuable issue in the tracker, and that is not a courtesy.**
+
+        [`docs/PHASE4.md` §1](https://github.com/NoeFontana/tf_tree/blob/main/docs/PHASE4.md#1-what-phase-4-must-prove)
+        asks for "a written log of every surprise — API friction, missing operations,
+        confusing errors, deployment papercuts", and says that log "*is* the design input
+        for Phase 7 and is more valuable than the code".
+        [`docs/PHASE7.md` §4](https://github.com/NoeFontana/tf_tree/blob/main/docs/PHASE7.md#4-the-semantic-judgments)
+        is where each entry lands: a table of the semantic judgements a `tf2`-shaped
+        compatibility layer would have to make, stated as **questions** with an evidence
+        column. Every entry is filed against one of those rows or opens a new one.
+
+        Filing against a row is not answering it. A row answered from `PHASE7.md` instead
+        of from this log is a guess shipped as a compatibility promise, which is the exact
+        failure the gate exists to prevent. **What your report supplies is the evidence.**
+
+        You do not need to have read `PHASE7.md` to use this form. Describe what happened
+        and leave the row to triage.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of surprise is this?
+      description: >-
+        The middle four are `PHASE4.md` §1.2's own list. The first is what `PHASE7.md` §4's
+        table is made of; the last is the falsifiable prediction §1.3 makes about real ROS
+        stacks, and a confirmation of it is a gate criterion in its own right.
+      options:
+        - A semantic difference — tf2 and tf_tree answer the same question differently
+        - API friction — the operation exists, but getting to it was awkward
+        - A missing operation — there was no way to ask for what I needed
+        - A confusing error — it refused, and the message did not tell me what to change
+        - A deployment papercut — building, installing, attaching, or wiring it up
+        - Multi-publisher detection fired on my system (§1.3)
+    validations:
+      required: true
+
+  - type: textarea
+    id: asked
+    attributes:
+      label: What did you ask for?
+      description: >-
+        The call, as it appears in code you actually ran — not a paraphrase. Frame names,
+        the stamp, and how the tree was built or attached, if they are part of the story.
+      placeholder: |
+        // tf2, for comparison
+        auto T = buffer.lookupTransform("map", "camera_optical", tf2::TimePointZero);
+
+        // tf_tree
+        let stamp = Stamp::<SystemDomain>::from_nanos(1_723_000_000_000_000_000);
+        let iso = tree.lookup("map", "camera_optical", stamp)?;
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What did tf_tree do?
+      description: >-
+        The actual result. If it was an error, give the identifier verbatim
+        (`LookupError::Extrapolation`, `TFT_ERR_…`, a `TFTNNN` id) — errors here are `Copy`
+        identifiers and the prose around them is a separate layer, so the identifier is the
+        part that means something.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tf2_behaviour
+    attributes:
+      label: What does tf2 do in the same situation?
+      description: >-
+        Same frames, same stamps, same input. Leave this empty if tf2 is not involved
+        (a papercut, a missing operation) — but if the report is about a semantic
+        difference, this field is the difference.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: differential
+    attributes:
+      label: Did you run both, on the same input?
+      description: >-
+        J1 in the table says "**Differential-test, do not reason about it**" about tf2's own
+        `Time(0)`, and that caution generalises. A remembered answer is still worth filing;
+        it is worth less than a measured one, and saying which costs you nothing and saves
+        triage a wrong conclusion.
+      options:
+        - I ran both, on the same input, and compared the outputs
+        - I ran tf_tree only — the tf2 half is from memory or from its documentation
+        - I ran tf2 only — the tf_tree half is what I expected, not what I observed
+        - tf2 is not involved in this one
+    validations:
+      required: true
+
+  - type: textarea
+    id: judgement
+    attributes:
+      label: Which one is correct, and why?
+      description: >-
+        Your judgement, not a guess at ours. "tf2 is wrong here and I want tf_tree's answer"
+        is a useful answer; so is "tf2 is wrong and I still need bug-compatibility, because
+        forty call sites depend on it". §1 of `PHASE7.md` says the shim is a ramp and that
+        bit-compatibility in the cases where tf2 is wrong is a **non-goal** — so the cases
+        where you need it anyway are exactly the ones worth hearing about.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: jrow
+    attributes:
+      label: Does a row in `PHASE7.md` §4 already cover this?
+      description: >-
+        [The table](https://github.com/NoeFontana/tf_tree/blob/main/docs/PHASE7.md#4-the-semantic-judgments)
+        is the authoritative copy and may have rows this list does not. "No row fits" is a
+        real answer and the one that improves the table — §4 says new rows are how it
+        becomes trustworthy.
+      options:
+        - J1 — Time(0) / "latest available" semantics
+        - J2 — canTransform / lookupTransform with a timeout
+        - J3 — a frame or edge that was never declared (tf_tree declares at build time)
+        - J4 — two publishers on one edge (tf2 blends them silently; tf_tree refuses)
+        - J5 — which exception type, and its message text
+        - J6 — cache_time, or how much history an edge keeps
+        - J7 — extrapolation past the end of the buffer
+        - J8 — one Buffer shared across executors or callback groups
+        - J9 — which time domain a query uses (sim vs system vs steady)
+        - J10 — leading-slash frame names
+        - J11 — setTransform, i.e. publishing through the Buffer you read from
+        - No row in §4 fits this, or the row is not in the list above
+        - I have not read §4 — please file it for me
+    validations:
+      required: true
+
+  - type: textarea
+    id: jrow_why
+    attributes:
+      label: Why that row, or why none of them?
+      description: >-
+        One or two sentences. If you picked "no row fits", say what the new row's *question*
+        would be — a row is a question, not an answer.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: ours_or_theirs
+    attributes:
+      label: Is this about tf2's behaviour, or about tf_tree's own design?
+      description: >-
+        `PHASE4.md` §1.2 routes these differently, and it matters to how long you wait.
+        An entry about tf2's behaviour is evidence for a J-row, needs a differential test,
+        and waits for the gate along with the rest of Phase 7.
+        An entry about *our* design is "decidable without waiting" and gets its own
+        [decision record](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/README.md)
+        instead of sitting in a gated document — records 0017 and 0018 are both of that
+        kind. Guessing here is fine; triage will re-route.
+      options:
+        - About tf2's behaviour — the difference is the report
+        - About tf_tree's own design — tf2 does not come into it
+        - Both, or I cannot tell them apart
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ### Where you were running it
+
+        These are not boilerplate. Three of the four gates in `PHASE7.md` §0.0 are about
+        *where* the evidence came from rather than what it says — a real node on real
+        hardware, run continuously; a pre-existing bug found on a real stack; users who
+        adopted nothing and only read bags. The fields below are what lets a report count
+        towards one.
+
+  - type: input
+    id: version
+    attributes:
+      label: tf_tree version
+      description: >-
+        `tf_tree --version`, or the crate version from your `Cargo.lock` / `pip show tf_tree`.
+        A git SHA is better than a version if you built from a checkout.
+      placeholder: "0.0.1 (or: git 1a2b3c4)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surfaces
+    attributes:
+      label: How are you using tf_tree?
+      description: Select every one that applies.
+      multiple: true
+      options:
+        - Rust, single process, in-memory tree
+        - Rust, attached to a shared-memory arena
+        - Python bindings
+        - C ABI (`tf_tree_c`) or the C++ header
+        - The ROS 2 ingest bridge (`ros/tf_tree_ros`)
+        - Offline only — a bag, a `.tft` index, or `tf_tree doctor`; I have adopted nothing
+        - Benchmarks or the differential harness
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: What was it running on?
+      description: >-
+        `PHASE4.md` §1.1's gate is "a real node, on real hardware, for ≥ 2 weeks continuous".
+        A synthetic reproduction is still worth filing — it just answers a different question,
+        and conflating the two is how a gate gets declared met by a test suite.
+      options:
+        - A real robot or vehicle, in continuous operation
+        - A real robot or vehicle, a bring-up or test run
+        - A workstation, replaying real recorded data
+        - A workstation, synthetic data or a test I wrote
+    validations:
+      required: true
+
+  - type: input
+    id: uptime
+    attributes:
+      label: How long had it been running when this happened?
+      description: Roughly. "Ten seconds after start" and "day nine" are different bugs.
+      placeholder: "~4 hours; it had restarted twice that morning"
+    validations:
+      required: false
+
+  - type: input
+    id: ros
+    attributes:
+      label: ROS distro and RMW, if any
+      description: >-
+        The RMW matters and is usually the thing nobody writes down. This project has only
+        ever tested one, so a report from a second is worth more than most.
+      placeholder: "jazzy, rmw_cyclonedds_cpp"
+    validations:
+      required: false
+
+  - type: input
+    id: platform
+    attributes:
+      label: Architecture and kernel
+      description: "Output of `uname -srm`."
+      placeholder: "Linux 6.8.0-136-generic x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`tf_tree doctor --json` output"
+      description: >-
+        Optional, and genuinely optional: `tf_tree_cli` is `publish = false`, so the binary
+        comes from a checkout rather than from `cargo install`, and plenty of reporters will
+        not have it. If you do:
+        `cargo run -p tf_tree_cli --features shm --bin tf_tree -- --attach --name <arena> doctor --json`.
+        **Check the `"source"` field before pasting** — `--attach` only exists in a build with
+        the `shm` feature, and without it `doctor` reports on its own built-in fixture and
+        says so (`"source": "in-process fixture"`), which is a clean bill of health about our
+        test data rather than about your system. `doctor --from-bag <recording.mcap>` needs
+        neither an arena nor an `shm` build — point it at a bag you already have.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, a topology file, a bag you can share, the thing you tried first that did not work.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: routing
+    attributes:
+      label: Before you file
+      options:
+        - label: >-
+            This is not a security report. Memory unsafety reachable from safe Rust, and
+            anything an untrusted bag or arena header can cause, go to the address in
+            SECURITY.md instead of into a public issue.
+          required: true
+        - label: I can re-run this and collect more evidence if asked.
+          required: false
