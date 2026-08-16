@@ -7,6 +7,7 @@
 #![cfg(feature = "test-hooks")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use core::ffi::c_char;
 use core::ptr;
 
 use tf_tree_c::*;
@@ -1107,15 +1108,19 @@ fn introspection_reports_the_tree_and_refuses_to_truncate() {
     // this asserting 3 is what caught the raw field leaking through.
     assert_eq!(unsafe { tft_tree_edge_count(t.0) }, 3);
 
-    let mut buf = [0i8; 64];
-    let name_of = |id: u32, buf: &mut [i8; 64]| -> tft_status {
+    let mut buf: [c_char; 64] = [0; 64];
+    let name_of = |id: u32, buf: &mut [c_char; 64]| -> tft_status {
         // SAFETY: live handle; `buf` has 64 writable bytes.
         unsafe { tft_tree_frame_name(t.0, id, buf.as_mut_ptr(), buf.len()) }
     };
     // Frame 0 is the root sentinel, not the first frame.
     assert_eq!(name_of(0, &mut buf), TFT_ERR_UNKNOWN_FRAME);
 
-    let read_name = |buf: &[i8; 64]| -> String {
+    // `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
+    // on one target and a no-op on the other; see `src/error.rs` for the full
+    // note. The allow is the fix — deleting the cast breaks x86_64.
+    #[allow(clippy::unnecessary_cast)]
+    let read_name = |buf: &[c_char; 64]| -> String {
         buf.iter()
             .take_while(|&&c| c != 0)
             .map(|&c| c as u8 as char)
@@ -1127,7 +1132,7 @@ fn introspection_reports_the_tree_and_refuses_to_truncate() {
     assert_eq!(read_name(&buf), "sensor", "...and run through the count");
 
     // "sensor" needs 7 bytes with its NUL; 6 is one short.
-    let mut small = [0i8; 6];
+    let mut small: [c_char; 6] = [0; 6];
     // SAFETY: live handle; `small` has 6 writable bytes, which is the point.
     let rc = unsafe { tft_tree_frame_name(t.0, 4, small.as_mut_ptr(), small.len()) };
     assert_eq!(rc, TFT_ERR_BUFFER_TOO_SMALL);

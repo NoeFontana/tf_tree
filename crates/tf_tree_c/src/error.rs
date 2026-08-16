@@ -211,6 +211,18 @@ impl tft_error {
 
     /// Copy `text` into `message`, truncating at the buffer and always leaving a
     /// NUL. ASCII only, so truncation cannot split a multi-byte sequence.
+    // **`c_char` is `i8` on x86_64 and `u8` on aarch64, so exactly one of the
+    // two casts below is a no-op on any given target** — and `-D warnings`
+    // turns `clippy::unnecessary_cast` into a build error on whichever target
+    // that is. Removing the cast fixes the lint on one architecture and breaks
+    // compilation on the other, so the allow is the fix rather than a
+    // suppression of one.
+    //
+    // Found by the first `ubuntu-24.04-arm` job this repository has ever run
+    // (2026-08-16). It had been latent since the C ABI landed: GitHub Actions
+    // produced no run here between 2026-07-23 and the repository being made
+    // public, and the aarch64 rows had never executed even before that.
+    #[allow(clippy::unnecessary_cast)]
     fn set_message(&mut self, text: &str) {
         let bytes = text.as_bytes();
         let n = bytes.len().min(TFT_MESSAGE_LEN - 1);
@@ -267,6 +279,9 @@ pub(crate) fn amend_error(fill: impl FnOnce(&mut tft_error)) {
 /// `TFT_BRIDGE_REJECTED` outcome does exactly that. Allocates, and is therefore
 /// only ever called on a failure path.
 #[cfg(feature = "bridge")]
+// See `set_message` for why this cast carries an allow rather than being
+// removed: `c_char` signedness is target-dependent.
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn last_message() -> String {
     LAST_ERROR.with(|slot| {
         slot.try_borrow().map_or_else(
