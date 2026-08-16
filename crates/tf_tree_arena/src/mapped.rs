@@ -352,12 +352,31 @@ impl MappedArena {
     /// | claim table | `edge_count` records |
     /// | participant table | all (8 KiB, and every liveness check walks it) |
     /// | edge table | `edge_count` records |
-    /// | stamp + pose arenas | all — under `0004` they are sized to the declared rings exactly |
+    /// | stamp + pose arenas | **none — see below** |
     /// | edge counters | `edge_count` records — written by `Guard::drop` on every read batch |
     /// | participant counters | all (8 KiB) — same path, keyed by the reader's own slot |
     ///
     /// The headroom tails are what this leaves cold, and they are the whole
     /// win: on the measured arena above, 66 MiB of it.
+    ///
+    /// # Why the two ring arenas are not populated here
+    ///
+    /// They used to be, in full — `stamp_slots * 8` and `pose_slots * 64`, on
+    /// the stated grounds that `0004` sizes them to the declared rings exactly.
+    /// That is true and it is the wrong granularity: §7.1 is NORMATIVE that
+    /// population is **per-edge**, and "every declared ring" is per-*arena*. The
+    /// rings are 99.8% of a large arena, so the over-approximation is very
+    /// nearly the whole cost — a process that attaches to a 200-edge arena and
+    /// reads five of those edges was charged for all 200 forever.
+    ///
+    /// So the rings moved to the two moments an edge is actually taken up:
+    /// `Tree::claim` for the writer's, and plan compilation for a reader's. Both
+    /// are off the query path by D3, so §7.1's guarantee — no page fault inside
+    /// a lookup — is preserved for the *reason* it is stated rather than by
+    /// populating everything and hoping. The extents cannot be computed here:
+    /// they come from `EdgeRecord`'s `stamp_off`/`pose_off`/`capacity`, and
+    /// `EdgeRecord` lives in `tf_tree_core`, which depends on this crate.
+    /// `ArenaView::ring_extents` is the other half of this and names it back.
     ///
     /// Frames interned *after* this runs fault once, which is correct — that is
     /// a rare path, and pre-faulting a 200 000-frame table on the chance that
@@ -388,8 +407,8 @@ impl MappedArena {
             h.max_participants as usize * 128,
         );
         self.populate(h.edge_table_off as usize, edges * 128);
-        self.populate(h.stamp_arena_off as usize, h.stamp_slots as usize * 8);
-        self.populate(h.pose_arena_off as usize, h.pose_slots as usize * 64);
+        // The stamp and pose arenas are deliberately absent — see the doc
+        // comment. Per-edge, at claim and at plan, driven from the facade.
 
         // v3's counter regions (`docs/PHASE5.md` §5.2). These are not
         // diagnostics-only pages that a `top` invocation happens to touch:

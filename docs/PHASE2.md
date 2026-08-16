@@ -699,8 +699,8 @@ A minor page fault costs single-digit microseconds. The Phase 1 gate is a **150 
 But §3.8 makes the default layout deliberately generous so that zero-configuration startup works, and `MAP_POPULATE` over a 600 MiB address space would fault in — and charge — hundreds of megabytes nobody declared. The two requirements are reconciled by populating at **declaration** granularity:
 
 - `mmap` **without** `MAP_POPULATE`. Untouched regions of a memfd cost nothing (measured, §3.8).
-- At `declare_dynamic`, `madvise(MADV_POPULATE_WRITE)` (Linux ≥ 5.14, measured working) over that edge's stamp and pose ranges. On older kernels, fall back to an explicit zeroing write.
-- On attach, populate the header, frame table, topology blocks, and edge table — small, always touched, always hot.
+- At the moment an edge is **taken up**, `madvise(MADV_POPULATE_WRITE|READ)` (Linux ≥ 5.14, measured working) over that edge's stamp and pose ranges. On older kernels, fall back to touching one byte per page. **Amended by [`0024`](./decisions/0024-population-is-per-edge-at-take-up.md);** this bullet used to say "at `declare_dynamic`", and [`0004`](./decisions/0004-builder-time-edge-declaration.md) deleted that function when it moved declaration to build time. The two moments that replace it are `Tree::claim` for a writer and plan compilation for a reader, both off the query path by D3. Populating every declared ring at attach instead — which is what the code did while this bullet named a dead function — is *per-arena* population, which the title of this section forbids, and it charged every reader for every edge on the vehicle: measured at **5.2×** on a process using 4 of 64 declared edges.
+- On attach, populate the header, frame table, topology blocks, claim table, participant table, edge table and both counter regions — small, always touched, always hot. **Not the two ring arenas:** they are 99.8% of a large arena and are the previous bullet's business.
 
 **`MADV_WILLNEED` does not work here** (measured: zero change in charged pages on a memfd). Do not substitute it.
 

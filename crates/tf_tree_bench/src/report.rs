@@ -2193,16 +2193,29 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  the lock file, receive the segment fd over a unix socket, map it, and \
                  validate the header. A tf2 consumer constructs a buffer in-process and \
                  is ready immediately. The cost is paid once per process, but it is real, \
-                 and it is a cost tf2 does not have. **Measured, at last: ~97.5 us p50 on \
-                 the §11.1 fixture** (`just attach-bench`, 201 attach/lookup cycles, \
-                 ReadOnly; cold 114-153 us, p99.9 ~157-181 us). This entry carried no \
-                 number at all until then, which made it an honesty section that could \
-                 not regress. Almost all of it is `populate_hot`: the arena is 1 401 472 B \
-                 = 342 pages and 97.5 us / 342 is ~285 ns per page, which is what \
-                 `MADV_POPULATE_WRITE` costs. That is `docs/PHASE2.md` §7.1 buying its \
-                 guarantee — and the guarantee holds, because the **first** lookup after \
-                 attach is 130 ns p50, indistinguishable from a steady-state one. The \
-                 cost is real and it is in the right place: at attach, not in the loop."
+                 and it is a cost tf2 does not have. **Measured on the §11.1 fixture** \
+                 (`just attach-bench`, 201 attach/lookup cycles, ReadOnly). This entry \
+                 carried no number at all until it was built, which made it an honesty \
+                 section that could not regress. \
+                 \
+                 **The number improved 8x and that must not be read as the cost going \
+                 away.** Attach was ~97.5 us p50, almost all of it `populate_hot`; it is \
+                 now **12.4 us p50** (cold ~16.8 us, p99.9 ~25.6 us) because \
+                 `docs/decisions/0024` moved ring population out of attach and onto the \
+                 moment an edge is taken up. The cost *moved*: first plan compile went \
+                 550 ns to **84.3 us** on this fixture, whose plan walks essentially every \
+                 edge. Summed, 100.3 us before against 96.7 us after — on the fixture that \
+                 gains no memory from the change, a wash. What tf2 does not pay is still \
+                 what tf2 does not pay; it is now itemised at two line items instead of \
+                 one, and a reader quoting only the first would be quoting a 8x \
+                 improvement that this fixture did not deliver. \
+                 \
+                 §7.1's guarantee holds throughout: the **first** lookup after attach is \
+                 130 ns p50 before and after, indistinguishable from a steady-state one, \
+                 and the fault *count* is zero. Recompiling a plan whose pages are already \
+                 resident costs 1.33 us, which is what bounds the topology-change path — a \
+                 `reparent` invalidates every cached plan, so that figure is the one \
+                 standing between a reparent and a fault storm across every reader."
                 .to_owned(),
             metrics: Vec::new(),
             metrics_absent_because: Some(

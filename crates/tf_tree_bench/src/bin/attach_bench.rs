@@ -15,7 +15,9 @@
 //! # What attaching actually is
 //!
 //! `Tree::attach_shared` maps the segment, validates the header, claims a
-//! participant slot and calls `populate_hot()`. That last step is the one §7.1
+//! participant slot and calls `populate_hot()` — which since
+//! `docs/decisions/0024` warms the tables and *not* the two ring arenas, so the
+//! rings show up in the `plan compile` row instead. That last step is the one §7.1
 //! is NORMATIVE about: it pre-faults every region a reader touches so that no
 //! page fault lands *inside* a lookup. So attach is where tf_tree pays what tf2
 //! does not — a tf2 consumer constructs a `BufferCore` in-process and is ready
@@ -28,9 +30,6 @@
 //! `attach_shared_inner` (`tf_tree/src/tree.rs:2133`). Getting the "off" arm
 //! would take one of:
 //!
-//! * a population policy on the attach path — which is exactly what `0022`'s
-//!   B2-prime proposes, so the arm arrives with that change rather than ahead
-//!   of it;
 //! * `madvise(MADV_DONTNEED)` over the mapping between attach and first access,
 //!   which would need the arena's base pointer and length — `ArenaView` exposes
 //!   neither, and widening it for a benchmark is the wrong trade;
@@ -40,6 +39,17 @@
 //! Reporting the "on" arm alone and saying so is better than inventing an "off"
 //! arm out of a different code path. The row stays owed; it is no longer owed
 //! *and* unmeasurable, because the cost it would be compared against is here.
+//!
+//! **An earlier revision listed a third route and said the "off" arm would
+//! arrive with `docs/decisions/0024`. It did not, and the prediction was
+//! wrong in a way worth keeping.** `0024` moved ring population from attach to
+//! the moment an edge is taken up, which does give the attach path a policy —
+//! but it is not a *toggle*. There is still no `populate: false`, because there
+//! is still no case that wants one: population is now scoped to what the process
+//! actually reads, so the thing an "off" arm would have argued for is the
+//! default. What `0024` did give this file is the decomposition, and it is
+//! better than the row asked for: `attach` and `plan compile (first)` bracket
+//! what population costs and say which half of the process pays it.
 //!
 //! # "Cold" is only as cold as this host allows
 //!
@@ -77,6 +87,7 @@ fn main() -> Result<()> {
 
     let mut attach_ns = Vec::with_capacity(CYCLES);
     let mut plan_ns = Vec::with_capacity(CYCLES);
+    let mut replan_ns = Vec::with_capacity(CYCLES);
     let mut first_at_ns = Vec::with_capacity(CYCLES);
 
     for _ in 0..CYCLES {
@@ -125,7 +136,50 @@ fn main() -> Result<()> {
         drop(tree);
     }
 
-    report(&attach_ns, &plan_ns, &first_at_ns);
+    // **A separate pass, not a fourth timer inside the loop above.** It was
+    // written that way first and the loop stopped measuring what it had been
+    // measuring: `first lookup after attach` went 130 ns p50 to 210 ns, five
+    // runs to three, with *no engine change at all* — bisected by reverting
+    // every engine file and re-running, at which point the row stayed at 210.
+    // An extra compile per iteration is enough to leave the branch predictor and
+    // caches in a different state for the next iteration's lookup, and moving it
+    // after the timed region does not help because the damage lands on the
+    // iteration that follows. So the loop above is byte-identical to what it was
+    // before this row existed, and this pass pays for its own attaches.
+    for _ in 0..CYCLES {
+        let dup = fd
+            .try_clone_to_owned()
+            .context("duplicating the segment fd")?;
+        let tree = Tree::attach_shared(dup, AttachMode::ReadOnly)
+            .map_err(|e| anyhow!("attaching: {e:?}"))?;
+        let target = tree
+            .frame(TARGET)
+            .map_err(|e| anyhow!("frame `{TARGET}`: {e:?}"))?;
+        let source = tree
+            .frame(SOURCE)
+            .map_err(|e| anyhow!("frame `{SOURCE}`: {e:?}"))?;
+        let _ = tree
+            .plan(target, source)
+            .map_err(|e| anyhow!("compiling {SOURCE} <- {TARGET}: {e:?}"))?;
+        // Compiling the *same* path a second time in the same process. Since
+        // population became per-edge this is the row that prices the risk the
+        // change introduces: a topology change invalidates every cached plan, so
+        // the next lookup recompiles, and recompiling now re-populates. If
+        // `madvise(MADV_POPULATE_READ)` over resident pages were expensive, a
+        // `reparent` would put that cost in front of the next lookup on every
+        // reader in the system. The compile work itself is identical between the
+        // two, so the difference is the population and nothing else.
+        let t1b = std::time::Instant::now();
+        let _ = tree
+            .plan(target, source)
+            .map_err(|e| anyhow!("recompiling {SOURCE} <- {TARGET}: {e:?}"))?;
+        let pw = t1b.elapsed().as_nanos();
+
+        replan_ns.push(pw as f64);
+        drop(tree);
+    }
+
+    report(&attach_ns, &plan_ns, &replan_ns, &first_at_ns);
     Ok(())
 }
 
@@ -158,7 +212,7 @@ fn build_owner() -> Result<Tree> {
     Ok(tree)
 }
 
-fn report(attach: &[f64], plan: &[f64], first: &[f64]) {
+fn report(attach: &[f64], plan: &[f64], replan: &[f64], first: &[f64]) {
     println!("PHASE2 §12 — attach time, and first access after attach");
     println!("  §11.1 fixture on a memfd, {CYCLES} attach/lookup cycles, ReadOnly");
     println!();
@@ -167,7 +221,8 @@ fn report(attach: &[f64], plan: &[f64], first: &[f64]) {
         "", "cold", "p50", "p99", "p99.9"
     );
     row("attach (map+validate+populate)", attach);
-    row("plan compile", plan);
+    row("plan compile (first, populates)", plan);
+    row("plan compile (repeat, warm)", replan);
     row("first lookup after attach", first);
 
     println!();

@@ -1781,6 +1781,12 @@ impl Tree {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let lease = self.take_claim_lease(eid, claim_rec, epoch, owner)?;
 
+        // §7.1's per-edge population, writer half. This is the moment the edge
+        // is taken up, and it is off the publish path — `push` is what must not
+        // fault, and it now cannot, for the first lap and every lap after.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        self.populate_edge_rings(eid);
+
         Ok(EdgeWriter {
             publisher: Publisher::new(ring, claim_rec, epoch, owner),
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -1956,7 +1962,80 @@ impl Tree {
         }
         let view = self.view();
         let topo = view.topology();
-        compile(&topo, |eid| edge_meta(&view, eid), target, source)
+        // §7.1's per-edge population, reader half, done from `compile`'s own
+        // edge callback — which `compile` invokes for exactly the edges it
+        // walks. Compilation is off the query path by D3 (`Plan::at` is the hot
+        // tier and this is not it), so the guarantee that matters — no fault
+        // *inside* a lookup — is preserved by warming here rather than by
+        // warming every ring in the arena at attach.
+        //
+        // `Tree::lookup` reaches this through `cache::get_or_compile`, which
+        // calls `plan` on a miss and nothing on a hit, so a reader pays once per
+        // path per process and the cached path is untouched.
+        //
+        // # Why this hangs off the callback instead of walking the returned plan
+        //
+        // Not style, and it was not predicted. `Plan` is a `[Step; MAX_DEPTH]`,
+        // about 2 KiB by value, and this method is a tail expression so the
+        // compiler builds the result straight into the caller's slot. Binding it
+        // to a local in order to iterate `plan.steps()` costs a copy of all of
+        // it, and that copy is worth **80 ns on `first lookup after attach`**:
+        // 210 ns p50 against a 130 ns baseline, five runs to three, on the one
+        // row §7.1 exists to protect. The cause was isolated by applying the
+        // restructure *with the old population behaviour*, where it reproduced
+        // in full — so it is the binding, not the populating. `Result::inspect`
+        // is not an escape: it takes `self` by value and moves the same 2 KiB.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let edge_meta = |eid| {
+            self.populate_edge_rings(eid);
+            edge_meta(&view, eid)
+        };
+        #[cfg(not(all(feature = "shm", target_os = "linux")))]
+        let edge_meta = |eid| edge_meta(&view, eid);
+
+        compile(&topo, edge_meta, target, source)
+    }
+
+    /// Fault in one dynamic edge's two rings (`docs/PHASE2.md` §7.1).
+    ///
+    /// # Why this is per-edge and not per-arena
+    ///
+    /// §7.1 is NORMATIVE that population happens at *declaration* granularity,
+    /// **per-edge**. `populate_hot` used to over-approximate that for the rings
+    /// by warming the whole stamp and pose arenas, on the true-but-irrelevant
+    /// grounds that `0004` sizes them to the declared rings exactly. The rings
+    /// are 99.8% of a large arena, so that over-approximation was very nearly
+    /// the entire resident cost: a process attached to a 200-edge arena that
+    /// reads five edges was charged for two hundred, permanently.
+    ///
+    /// This is the correction, and the win does not expire the way a
+    /// *used-prefix* scheme's would. A prefix scheme saves only until the ring
+    /// laps — every slot becomes used once `head` reaches `capacity`, so at
+    /// 10 Hz into a 16 384-slot ring the saving lasts 27 minutes and is zero
+    /// after. Keying on *which edges this process touches* saves forever,
+    /// because a process that never plans an edge never plans it.
+    ///
+    /// # Only a shared mapping
+    ///
+    /// A `HeapArena` is ordinary anonymous memory with no populate concept, and
+    /// a `.tft` deliberately populates nothing at all — [`Tree::open_frozen`]
+    /// states that case: a dataloader worker seeks to the four pages its batch
+    /// needs and the win is precisely that the rest costs nothing across sixteen
+    /// workers. Matching on the backing keeps that decision intact rather than
+    /// quietly reversing it for every frozen reader that compiles a plan.
+    ///
+    /// Idempotent and cheap to repeat: `madvise(MADV_POPULATE_*)` over pages
+    /// that are already resident is a walk, not a fault.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fn populate_edge_rings(&self, eid: EdgeId) {
+        let ArenaBacking::Mapped(arena) = &self.arena else {
+            return;
+        };
+        if let Some(extents) = self.view().ring_extents(eid) {
+            for (off, len) in extents {
+                arena.populate(off, len);
+            }
+        }
     }
 
     /// A fresh [`Guard`] pinning the current topology generation for a batch of
