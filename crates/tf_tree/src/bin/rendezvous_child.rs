@@ -8,16 +8,21 @@
 //! Output is line-oriented on stdout and flushed before parking, so the parent
 //! never has to guess whether a step has happened.
 //!
+//! The bin target is `tf_tree_rendezvous_child`, not this file's name: the crate
+//! is published, and under `--features shm` this binary lands in the installing
+//! user's `bin/` (the manifest argues it, and says why installing nothing costs
+//! more). Its argv:
+//!
 //! ```text
-//! rendezvous_child own    -> "owning <transform>", then parks serving
-//! rendezvous_child join   -> "joined <transform>" | "error <display>"   (read-only)
-//! rendezvous_child join-rw -> as above, but registers in the arena table
-//! rendezvous_child open-free -> as `join`, but through the zero-argument `tf_tree::open()`
-//! rendezvous_child own-headroom -> "owning", then on stdin: "interned <frame id>"
-//! rendezvous_child peer-alive <slot> -> "alive <bool>", then parks
-//! rendezvous_child own-claiming      -> "claimed <edge>", then parks holding it
-//! rendezvous_child join-claiming     -> "claimed <edge>", then parks holding it
-//! rendezvous_child own-reap          -> "claimed", then on stdin: "reaped <n> still_ours <b>"
+//! own           -> "owning <transform>", then parks serving
+//! join          -> "joined <transform>" | "error <display>"   (read-only)
+//! join-rw       -> as above, but registers in the arena table
+//! open-free     -> as `join`, but through the zero-argument `tf_tree::open()`
+//! own-headroom  -> "owning", then on stdin: "interned <frame id>"
+//! peer-alive <slot> -> "alive <bool>", then parks
+//! own-claiming  -> "claimed <edge>", then parks holding it
+//! join-claiming -> "claimed <edge>", then parks holding it
+//! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -233,7 +238,7 @@ fn main() {
                 std::thread::park();
             }
         }
-        other => panic!("unknown mode {other}"),
+        other => panic!("tf_tree_rendezvous_child: unknown mode {other}"),
     }
 }
 
