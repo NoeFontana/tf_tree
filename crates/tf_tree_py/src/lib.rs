@@ -46,6 +46,54 @@
 //! accepting that input would produce interpolation errors users would blame on
 //! the interpolator.
 //!
+//! # Build identity: `__version__`, and two numbers that are not it
+//!
+//! A benchmark number or a bug report has to name the build it came from, and
+//! nothing here answered that — `tf_tree.__version__` raised `AttributeError`.
+//! Three values answer it now, and they are three because they fail
+//! independently: a wheel can be exactly the version the reporter says it is
+//! and still refuse to attach, because the arena it was pointed at was written
+//! by a different *geometry*.
+//!
+//! * `__version__` is `env!("CARGO_PKG_VERSION")`, read from this crate's
+//!   manifest at compile time. Never a literal in this file: a hand-copied
+//!   string is wrong exactly once — on the release where somebody bumped the
+//!   manifest and not this line — and it is wrong *silently*, which is worse
+//!   than having no version at all, because a report carrying it is
+//!   mis-attributed rather than un-attributed.
+//! * `arena_format_version` and `arena_layout_hash` are the two words every
+//!   participant compares on attach (`docs/PHASE5.md` §1): the *set of fields*
+//!   and the *geometry*. They come from the facade's `arena_format_version` /
+//!   `arena_layout_hash`, under those same names — `tf_tree_arena` is not a
+//!   dependency of this crate and must not become one to answer a diagnostic,
+//!   and a second spelling of an existing path is what `docs/PROJECT.md` §6
+//!   forbids.
+//!
+//! The three names above are code spans and not intra-doc links on purpose.
+//! `#[pyfunction]` expands to a private item, so an intra-doc link to one
+//! resolves to nothing and `cargo doc` fails it as a broken link under this
+//! repository's `-D warnings` — measured, not predicted: linking all three is
+//! what this paragraph was added to stop happening twice. They are Python
+//! attributes anyway; the Rust function is an implementation detail of the
+//! module they are attached to.
+//!
+//! **The two are functions rather than module constants, and that is forced
+//! rather than chosen.** `tests/python/test_stubs.py` is what keeps the
+//! hand-written `.pyi` from rotting, and it compares this module's public names
+//! against the stub's `ClassDef`s and `FunctionDef`s. A module-level
+//! `FORMAT_VERSION: int` is an *assignment* in the stub, invisible to that
+//! comparison — it would be the one name in the whole surface that nothing
+//! checks exists. `has_shared_memory` is the precedent already here: a
+//! compile-time-constant fact about the build, exposed as a nullary function.
+//!
+//! `__version__` is exempt because that check skips underscore-prefixed names
+//! on both sides, and it keeps the dunder spelling because it is what a user
+//! types and what a bug-report template asks for. It is **not** the canonical
+//! answer — `importlib.metadata.version("tf_tree")` is, and it reads
+//! `pyproject.toml`'s `[project] version` while this one reads the crate
+//! manifest. Two files, so they can disagree; `tests/python/test_version.py`
+//! asserts they do not.
+//!
 //! # No views into the arena (§5.1)
 //!
 //! Nothing here hands Python a buffer that aliases arena memory. An edge's
@@ -192,9 +240,46 @@ fn has_shared_memory() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// This build's arena format version — the *set of fields* in the header.
+///
+/// [`tf_tree::arena_format_version`], unchanged and not recomputed. It is 3 as
+/// of `docs/PHASE5.md` §1, and a different one is never compatible: there is no
+/// conversion layer, so every participant is rebuilt from one commit and
+/// restarted together.
+///
+/// Costs no arena and takes no lock, which is the point — it answers on a
+/// machine where nothing is running and on one where everything is wedged.
+#[pyfunction]
+fn arena_format_version() -> u32 {
+    tf_tree::arena_format_version()
+}
+
+/// This build's arena layout hash — the *geometry*, as distinct from the
+/// format version's set of fields.
+///
+/// [`tf_tree::arena_layout_hash`], unchanged. Both words are checked on attach
+/// and a mismatch on either is refused, but they mean different things: two
+/// builds agreeing on the version and disagreeing on the hash disagree about
+/// *where* things are, which is worse than disagreeing about what they are.
+///
+/// Returned as an `int`, not a hex string: it is compared, not read. A caller
+/// who wants it in a report writes `f"0x{tf_tree.arena_layout_hash():08X}"` —
+/// note the literal `0x`, because Python's `{:#010X}` produces `0X…` and would
+/// not match what `tft doctor --explain-version` prints, which is the string
+/// the report is going to be diffed against.
+#[pyfunction]
+fn arena_layout_hash() -> u32 {
+    tf_tree::arena_layout_hash()
+}
+
 /// `tf_tree` — a transform tree engine.
 #[pymodule(gil_used = false)]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Compile-time, from this crate's manifest. See the module docs: the
+    // alternative is a literal that is silently wrong for one release.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_function(wrap_pyfunction!(arena_format_version, m)?)?;
+    m.add_function(wrap_pyfunction!(arena_layout_hash, m)?)?;
     m.add_function(wrap_pyfunction!(from_sec, m)?)?;
     m.add_function(wrap_pyfunction!(from_parts, m)?)?;
     m.add_function(wrap_pyfunction!(from_ros, m)?)?;
