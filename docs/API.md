@@ -552,6 +552,18 @@ All of these run at tier 1 or tier 2 frequency, so R2 is not in tension:
   `tree.span()` already ship; `tree.edges()` is the offline `ds.edges()` of
   `PHASE5.md` §4.2, which that section's amendment holds back until §3's
   counting pass exists — the *names* half of it does not wait on that.)
+- **build identity: `__version__`, `arena_format_version()`,
+  `arena_layout_hash()`.** A benchmark number or a bug report that cannot be
+  attributed to a build is worth very little, and `tf_tree.__version__` raised
+  `AttributeError` until these landed, in the first release. Three values
+  because they fail independently: the right version can still refuse to
+  attach, because the arena it was pointed at was written by a different
+  *geometry*. The last two are the two words every participant already compares
+  on attach (`PHASE5.md` §1), re-exported from the facade under the facade's own
+  names — this crate does not gain a `tf_tree_arena` dependency to answer a
+  diagnostic. Import frequency is below even tier 1 and neither call reaches an
+  arena, so R2 is not in tension by the letter either; row 14 has the rest,
+  including why the two are functions and not module constants.
 
 ### 3.3 Parity deltas to close
 
@@ -796,16 +808,17 @@ authorized by this document alone.
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed, and now reachable on real data** — `tf_tree_cli`; fires only on tag 0 and only on a run of at least 8 consecutive rejected arrivals (a threshold this implementation chose, not one §5.3 states), skips naming the tag otherwise, and does not demote `TFT018`. `doctor` gained two recording sources — `--from-bag <recording.mcap>` and `--from-file <index.tft>` — and `TFT019`/`TFT018` **run on the first and skip on the second**: the skip is re-keyed from liveness onto `checks::PushStream`, because a ring holds only the pushes `SampleRing::push` accepted, so an arena of any kind (live, frozen, or bag-built and §3.1-sorted) would have passed both checks unconditionally. `PHASE5.md` §6's last `TFT019` amendment records that its own predicted fix was the wrong one and why |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 | 13 | `tft_bridge_options::arena_name` + `TFT_ERR_ARENA_UNAVAILABLE` | C | [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) | **landed** — `arena_name` appended under §3.6's `struct_size` prefix rule and `TFT_ERR_ARENA_UNAVAILABLE` added to the frozen header, ABI minor 4 → 5. A NULL `arena_name` is the private heap arena every pre-`0.5` caller already had; a non-NULL one is `tf_tree::Open` with `require_create(true)`, and a shared arena that cannot be had is a startup refusal with **no heap fallback**. An earlier revision of this cell said "the ABI half landed" and that `0015` steps 3–7 were outstanding; all eight of that record's steps have since landed — #139, #141, #142, #143 and step 7's `PHASE4.md` §5.8 half; that cell's own C surface was complete at #141. What is still outstanding there is the `atfork` test its *Invariants to maintain* clause demands and §9.2's N = 1…16 curve for the new benchmark arm — **neither of which is C API surface**, so neither holds this row open |
+| 14 | `__version__`, `arena_format_version()`, `arena_layout_hash()` on the Python module | Python | §3.2 | **landed** — `tf_tree_py`. `__version__` is `env!("CARGO_PKG_VERSION")` and never a literal: a hand-copied string is wrong exactly once, on the release where somebody bumps the manifest and not the line, and it is wrong *silently* — a report carrying it is mis-attributed rather than un-attributed, which is worse than having no version at all. The other two re-export the facade's own `arena_format_version` / `arena_layout_hash` under the facade's own names, so no second spelling of an existing path exists (`PROJECT.md` §6) and `tf_tree_arena` does not become a dependency of the binding to answer a diagnostic. All three run at import frequency, and neither of the two calls touches an arena or takes a lock — they bottom out in `tf_tree_arena::FORMAT_VERSION` and in `layout_hash`, which is a `const fn` — so R2 is not in tension. **The two are functions rather than module constants, and that is forced rather than chosen:** `tests/python/test_stubs.py` is what keeps the hand-written `.pyi` from rotting, and it collects the stub's `ClassDef`s and `FunctionDef`s only (`test_stubs.py:36`) while skipping underscore-prefixed names on both sides (`:50`). A module-level `FORMAT_VERSION: int` is an `AnnAssign`, invisible to that comparison — it would be the one name in the surface whose existence nothing checks. `has_shared_memory` is the precedent: a compile-time-constant fact about the build, exposed as a nullary function. `__version__` is exempt by that same underscore skip and keeps the dunder because it is what a bug-report template asks for; it is not the canonical answer — `importlib.metadata.version("tf_tree")` is, it reads `pyproject.toml` where this one reads the crate manifest, and `tests/python/test_version.py` is the only thing that stops the two files drifting |
 
-**Eleven of thirteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11 and
-13.** The two that have not are 6 and 12, and neither is merely unscheduled: row
-6 is recorded-not-built on purpose and row 12 is gated by D21. Two of the eleven
-that landed — 3 and 10 — carry a caveat worth keeping, so they are in the list
-below as well. (This count is re-taken from the table above rather than carried
-forward, every time it changes. It has been wrong twice: an early revision said
-"ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named eight rows and
-called them ten; the revision after that kept row 13 out of the count after its
-record's remaining steps had landed.)
+**Twelve of fourteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13
+and 14.** The two that have not are 6 and 12, and neither is merely unscheduled:
+row 6 is recorded-not-built on purpose and row 12 is gated by D21. Two of the
+twelve that landed — 3 and 10 — carry a caveat worth keeping, so they are in the
+list below as well. (This count is re-taken from the table above rather than
+carried forward, every time it changes. It has been wrong twice: an early
+revision said "ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named
+eight rows and called them ten; the revision after that kept row 13 out of the
+count after its record's remaining steps had landed.)
 
 - **Row 3 has landed in full, and its benchmark row reports a failing gate.**
   `embedding_cross_crate` measures **1.250–1.254×** against §9.2's 5% criterion.
