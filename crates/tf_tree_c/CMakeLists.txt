@@ -22,7 +22,13 @@
 # fallback should not be "read the manual".
 
 cmake_minimum_required(VERSION 3.16)
-project(tf_tree VERSION 0.1.0 LANGUAGES C CXX)
+# The version here is a hand-kept copy of `[workspace.package] version` in the
+# root `Cargo.toml`, which carries the argument for the number. It is the
+# version a consumer's `find_package(tf_tree 0.0.1 CONFIG REQUIRED)` matches
+# against, so it must not drift from the library it is describing — and it is
+# **not** the ABI version, which `TFT_ABI_VERSION_MAJOR`/`_MINOR` carry (0.5 as
+# of this commit) and `docs/PHASE4.md` §3 versions independently of the crate.
+project(tf_tree VERSION 0.0.1 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
