@@ -84,6 +84,17 @@
 #![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 
+// **The crates.io front page, wired to the doctest harness.** `README.md`'s one
+// fence is `text` — the two paths under the runtime directory — and a `rust`
+// example here would need a live Linux arena, so there is nothing to run today.
+// The module is what makes sure that stays a choice rather than an accident: no
+// recipe parses a README, so an example added later would be published
+// documentation that nothing compiles. `cfg(doctest)` keeps it out of `cargo
+// doc`, which renders the module docs above.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 mod client;
 mod error;
 pub mod fork;

@@ -29,6 +29,16 @@
 //! * The small-angle series threshold for the `V`/`V⁻¹` coefficients is
 //!   `θ < 0.1` with four series terms, not the `1e-8` most libraries use.
 
+// **The crates.io front page, compiled.** `README.md`'s `rust` fence — the
+// three conventions written as assertions — is a doctest *here and nowhere
+// else*: no recipe parses a README, so without this the published front page
+// could go on demonstrating an API that no longer exists with every gate green.
+// `cfg(doctest)` is what keeps it from also duplicating the module docs above:
+// the module exists for `cargo test --doc` and does not exist for `cargo doc`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 pub mod dualquat;
 pub mod interp;
 pub mod iso3;

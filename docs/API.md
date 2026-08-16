@@ -455,12 +455,52 @@ a different fact from a shipped one.
 **A tier nothing compiles is not a tier.** The default configuration — the one a
 `cargo add tf_tree` consumer gets — is invisible to `cargo build --workspace`,
 because the resolver unifies the feature in from the crates that ask for it.
-`just stable-tier-check` is therefore normative infrastructure rather than
-convenience: it is the only recipe that compiles the facade in *its own* default
-feature set with `unstable` off, and CI runs it as its own job. (`just
-ingest-check` reaches a nearby configuration — no `unstable`, but no features at
-all, because `[workspace.dependencies]` declares
-`tf_tree = { default-features = false }`.)
+That half is permanent, and it is measurable rather than folklore:
+
+```
+$ cargo tree -p tf_tree -f '{p} FEATURES=[{f}]' --depth 0
+tf_tree v0.0.1 (…/crates/tf_tree) FEATURES=[counters,default]
+
+$ cargo tree --workspace -e features -f '{p} FEATURES=[{f}]' | grep '^tf_tree v'
+tf_tree v0.0.1 (…/crates/tf_tree) FEATURES=[counters,default,unstable]
+```
+
+**What changed at 0.0.1 is the other half — how many recipes reach it.** The
+facade used to carry a `tf_tree = { path = ".", features = ["unstable"] }`
+dev-dependency, which turned the feature on for every one of its own test
+targets; `just stable-tier-check`'s `--lib` lines were then genuinely the only
+place the default tier compiled. That line does not survive `cargo package` and
+was deleted, so *every* `-p tf_tree` selection now resolves to
+`counters,default` — including the test targets, and including two recipes that
+were not written with this tier in mind: `just miri`'s
+`-p tf_tree --lib --test owned_writer` and `just test-doc-error-codes`'
+`--doc -p tf_tree -p tf_tree_core`. Both were run through the first command
+above and print `FEATURES=[counters,default]`. `cargo nextest list -p tf_tree
+--lib --tests` counts 70 tests against 77 with `--features unstable`, which is
+the same fact from the target side.
+
+`just stable-tier-check` remains the *gate*, and CI runs it as its own job: it is
+the recipe that names the configuration on purpose, puts the `shm` and
+no-default-features variants beside it, and renders the tier's own rustdoc — that
+last line is still unique, because `just doc` renders the facade at
+`--all-features`, where a link into `tf_tree::unstable` resolves and a published
+consumer's does not. What is no longer unique is the *compiling*: the `shm`
+variant falls out of `just shm-check`'s
+`cargo clippy -p tf_tree --features shm --all-targets` the same way
+(`FEATURES=[counters,default,shm]`), and the no-features configuration out of
+`just ingest-check`, whose facade is a dependency at `FEATURES=[]` because
+`[workspace.dependencies]` declares `tf_tree = { default-features = false }` —
+a third configuration, not the one `cargo add tf_tree` produces. A recipe that
+reaches a configuration on its way somewhere else is not a gate for it; it is
+how a break gets noticed by the wrong error message.
+
+**One warning about how much of that the check itself defends.** The consumer
+list above is compared to the `[dependencies]` entries, name by name, in both
+this document's §6 row 4 and the manifest comment — but only the *names*: the
+recipe greps row 4 for each of `tf_tree_bench`, `tf_tree_c`, `tf_tree_cli` and
+`tf_tree_py` and asserts nothing about the prose around them. Which recipes
+compile which feature set is exactly the kind of sentence that stays green while
+going stale, and it is the sentence that did.
 
 ---
 
@@ -746,7 +786,7 @@ authorized by this document alone.
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
 | 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`) — one build, one profile, `tf_tree_bench` against `tf_tree_core::bench_probe` — gated at 5% on `boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`, and **reporting 1.250–1.254×, i.e. over §9.2's criterion**, with the `lto = "thin"` control at 0.994–0.996× beside it. The two-profile comparison is kept as an exploratory measurement, never gated |
-| 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on — four, checked against the `[dependencies]` entries by `just stable-tier-check` rather than counted by hand; three `compile_fail,E0432` doctests pin that the root no longer answers. **Gating the door did not remove the capability**: stable `Tree::frames` and `Tree::edges` land with it, mirroring row 8's Python surface, so an embedder never signs the waiver to ask what is in their own tree (§7 check 1). the facade's own default feature set with the feature off is compiled by `just stable-tier-check` and by no other recipe, because `--workspace` unifies the feature in; CI runs it as its own job |
+| 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on — four, checked against the `[dependencies]` entries by `just stable-tier-check` rather than counted by hand; three `compile_fail,E0432` doctests pin that the root no longer answers. **Gating the door did not remove the capability**: stable `Tree::frames` and `Tree::edges` land with it, mirroring row 8's Python surface, so an embedder never signs the waiver to ask what is in their own tree (§7 check 1). the facade's own default feature set with the feature off is what **no `--workspace` command compiles**, because the resolver unifies the feature in from those four — measured with `cargo tree -f '{p} FEATURES=[{f}]'`, §2.6. `just stable-tier-check` is the gate for it and CI runs it as its own job; since 0.0.1 deleted the facade's self-dev-dependency it is no longer the *only* recipe that reaches the configuration, because every `-p tf_tree` selection now does — `just miri` and `just test-doc-error-codes` included |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
 | 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | **landed** — `PHASE5.md` §4.4 item 1 in full: `plan.at(..., layout=...)` and `at_into` serve all four layouts, and both refusals the twist layout adds are typed — `DerivativesUnavailableError` for a `LerpSlerp` edge, `NoSegmentError` for a stamp with no segment. Python's `interp=` default moved to `"sclerp"` (§3), so a Python-built tree answers a twist without one |

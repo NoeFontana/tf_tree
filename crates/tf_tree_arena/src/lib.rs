@@ -24,6 +24,16 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// **The crates.io front page, wired to the doctest harness.** `README.md` has
+// no `rust` fence today and should not grow one lightly — it spends its length
+// telling a reader to depend on `tf_tree` instead. This is here so that the
+// first example anyone does add is *run*: no recipe parses a README, so a front
+// page can go stale against the API it demonstrates with every gate green.
+// `cfg(doctest)` keeps it out of `cargo doc`, which renders the docs above.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 // Private: it exports exactly one public item, and that item is re-exported at
 // the crate root. A `pub mod` here would render in rustdoc as a module whose
 // only content is a type readers already found as `tf_tree_arena::ShmError`.

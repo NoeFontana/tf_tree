@@ -107,6 +107,16 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+// **The crates.io front page, wired to the doctest harness.** `README.md` has
+// no `rust` fence today — it is a page about *not* depending on this crate
+// unless you are `no_std` — but nothing parses a README, so an example added
+// there later would be the one piece of published documentation no recipe
+// compiles. This makes the first one a doctest. `cfg(doctest)` keeps it out of
+// `cargo doc`, which renders the module docs above.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 pub mod buffer;
 /// Consumer-side diagnostic counters (`docs/PHASE5.md` §5).
 pub mod counters;
