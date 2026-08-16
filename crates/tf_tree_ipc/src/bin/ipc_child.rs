@@ -16,14 +16,18 @@
 //! line is flushed before the child blocks, so the parent never has to guess
 //! whether a lock has been taken yet.
 //!
+//! The bin target is `tf_tree_ipc_child`, not this file's name: the crate is
+//! published, and a helper called `ipc_child` has no business claiming that name
+//! in anybody's `~/.cargo/bin` (the manifest argues it). Its argv:
+//!
 //! ```text
-//! ipc_child hold-ownership   <lock> [ms]     -> "won" | "lost", then parks
-//! ipc_child hold-participant <lock> <slot>   -> "held <slot>" | "lost", then parks
-//! ipc_child probe            <lock> <slot>   -> "ownership <held> <pid> participants <mask>"
-//! ipc_child hold-claim       <lock> <edge>   -> "held <edge>" | "lost", then parks
-//! ipc_child open             <lock-dir>      -> "<outcome> <slot>" | "error <display>"
-//! ipc_child serve            <sock> <size>   -> "serving", then serves until killed
-//! ipc_child attach           <sock>          -> "attached <slot> <size> <uuid>" | "error <display>"
+//! hold-ownership   <lock> [ms]     -> "won" | "lost", then parks
+//! hold-participant <lock> <slot>   -> "held <slot>" | "lost", then parks
+//! probe            <lock> <slot>   -> "ownership <held> <pid> participants <mask>"
+//! hold-claim       <lock> <edge>   -> "held <edge>" | "lost", then parks
+//! open             <lock-dir>      -> "<outcome> <slot>" | "error <display>"
+//! serve            <sock> <size>   -> "serving", then serves until killed
+//! attach           <sock>          -> "attached <slot> <size> <uuid>" | "error <display>"
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -65,7 +69,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: ipc_child <mode> <path> [slot]");
+        eprintln!("usage: tf_tree_ipc_child <mode> <path> [slot]");
         std::process::exit(2);
     }
     let mode = args[1].as_str();
@@ -222,7 +226,7 @@ fn main() {
             }
         }
         other => {
-            eprintln!("ipc_child: unknown mode {other:?}");
+            eprintln!("tf_tree_ipc_child: unknown mode {other:?}");
             std::process::exit(2);
         }
     }
@@ -240,6 +244,6 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("ipc_child: Linux only (docs/PHASE2.md §2)");
+    eprintln!("tf_tree_ipc_child: Linux only (docs/PHASE2.md §2)");
     std::process::exit(2);
 }
