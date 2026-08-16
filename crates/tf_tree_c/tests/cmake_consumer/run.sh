@@ -132,11 +132,28 @@ done
 
 # And the ordinary case, where both artifacts come from one build: both 1.
 echo "  TFT_HAVE_SHM=1 from a --features bridge,shm prebuilt"
+#
+# **Its own prefix, and that is load-bearing rather than tidiness.** This block
+# used to install over `$WORK/shm_prefix`, the prefix the mixed build above had
+# just written, and `install(FILES)` skips a copy when the destination is not
+# older than the source *and* the sizes match. The two configs differ in exactly
+# one character — `set(TF_TREE_HAVE_SHM_SHARED 0)` against `... 1)` — so they
+# are the same size, and CMake printed `-- Up-to-date:` and copied nothing. The
+# loop below then re-read the *mixed* build's config and asserted `0` where it
+# wanted `1`.
+#
+# It failed by the clock rather than by the code: with enough elapsed time
+# between the two installs the source wins the timestamp comparison and the copy
+# happens, so this passed on a warm developer machine and failed on a cold CI
+# runner. Worse than the flake, while it was passing it was asserting against a
+# file this block had not produced, so it could not have caught a regression in
+# the probe it exists to check.
 cmake -S "$ROOT/crates/tf_tree_c" -B "$WORK/shm_build2" \
       -DTF_TREE_PREBUILT_DIR="$WORK/cargo-shm/release" \
-      -DCMAKE_INSTALL_PREFIX="$WORK/shm_prefix" \
+      -DCMAKE_INSTALL_PREFIX="$WORK/shm_prefix2" \
       -DCMAKE_BUILD_TYPE=Release >>"$WORK/log" 2>&1
 cmake --install "$WORK/shm_build2" >>"$WORK/log" 2>&1
+CFG=$WORK/shm_prefix2/lib/cmake/tf_tree/tf_treeConfig.cmake
 for v in STATIC SHARED; do
     if ! grep -q "^set(TF_TREE_HAVE_SHM_$v 1)" "$CFG"; then
         echo "  FAIL: the prebuilt has tft_tree_open in it, but TF_TREE_HAVE_SHM_$v is not 1" >&2
@@ -171,7 +188,7 @@ add_executable(consumer main.cpp)
 target_link_libraries(consumer PRIVATE tf_tree::tf_tree_static)
 EOF
 cmake -S "$WORK/shm_src" -B "$WORK/shm_consumer" \
-      -DCMAKE_PREFIX_PATH="$WORK/shm_prefix" >>"$WORK/log" 2>&1
+      -DCMAKE_PREFIX_PATH="$WORK/shm_prefix2" >>"$WORK/log" 2>&1
 cmake --build "$WORK/shm_consumer" >>"$WORK/log" 2>&1
 "$WORK/shm_consumer/consumer"
 
