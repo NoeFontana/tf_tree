@@ -872,8 +872,9 @@ audit:
 # **The MSRV floor, on the host rather than only in CI.**
 #
 # `SUPPORT.md` calls the floor "enforced, not intended", and until this recipe
-# existed the only thing enforcing it was CI's `msrv` job — which has produced no
-# run since 2026-07-23. A floor whose only gate is a workflow nobody is running is
+# existed the only thing enforcing it was CI's `msrv` job — which produced no run
+# between 2026-07-23 and 2026-08-16. A floor whose only gate is a workflow that
+# may stop running without anyone noticing is
 # back to being intended, which is the exact failure that took `rust-version` from
 # 1.83 to 1.85: the number looked authoritative and nothing had ever compiled
 # against it.

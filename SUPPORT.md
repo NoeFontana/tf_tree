@@ -30,14 +30,15 @@ closed if none arrives.
   container-only ones (`ros-build`, `ros-test`, `tf2-check`, `dds-bench`)
   included. `CLAUDE.md` records that `just loom` on x86-64 is currently the
   *whole* weak-memory defence.
-- **Linux, `aarch64` — the target, and not yet the evidence.** The shared-memory
-  layer targets it and `.github/workflows/ci.yml`'s `test` and `shm` matrices
-  name `ubuntu-24.04-arm` rows for it. **Those rows have never executed**, not
-  once: Actions has produced no run of any workflow for this repository since
-  2026-07-23, and that file's header carries the API evidence and the caveat
-  that the *cause* is inferred rather than read. So aarch64 here is a
-  configuration, not a measurement. A bug against it is in scope and triaged on
-  the table above; the matrix row is not a claim that anything was checked.
+- **Linux, `aarch64` — supported, and now measured.** `ci.yml`'s `test` and
+  `shm` matrices carry `ubuntu-24.04-arm` rows, and **as of 2026-08-16 they
+  execute and pass.** They had never run once before that, and the first ones
+  that did found a real defect the whole life of the project had hidden:
+  `c_char` is `i8` on `x86_64` and `u8` on `aarch64`, which made six casts
+  unnecessary on one target and two buffer declarations outright type errors on
+  the other. That is what the rows are for. What they are *not* is a
+  weak-memory proof — `just loom` remains the argument for every atomic
+  ordering, and aarch64 execution corroborates it rather than replacing it.
   **These two bullets were one line reading "`x86_64` and `aarch64`", hedged
   with "'configured to' is the accurate verb right now — see the note at the end
   of this section". There was no note at the end of this section.** A caveat has
@@ -90,7 +91,7 @@ closed if none arrives.
   the suite that would run against the result is `ci.yml`'s `python` job, which
   is `runs-on: ubuntu-latest` and builds its own extension with maturin. No test
   here has ever run on macOS or Windows, no non-Linux job exists in `ci.yml` at
-  all, and neither workflow has executed since 2026-07-23. Treat these as
+  all, and no wheel has ever been smoke-tested. Treat these as
   convenience builds. A bug report against one is welcome and answered
   best-effort; a patch is more welcome still.
 
@@ -173,8 +174,9 @@ that is actually running.
   run on `stable`, not on the MSRV toolchain — lint output is not part of the
   compatibility promise.
 
-**CI has produced no run since 2026-07-23.** Until that is fixed, treat a green
-check on a pull request as unverified and gate locally with `just`.
+**CI produced no run between 2026-07-23 and 2026-08-16**, and now does again —
+making the repository public restored it. Gate locally with `just` before
+pushing; treat a green check as covering what its jobs cover and no more.
 
 ## Contributing
 

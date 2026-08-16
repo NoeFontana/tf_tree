@@ -81,8 +81,9 @@ this one — [`PHASE2.md`](./docs/PHASE2.md#00-implementation-status),
 [`PHASE5.md`](./docs/PHASE5.md#00-implementation-status). If this table and one
 of those disagree, the phase document is right and this is stale.
 
-**GitHub Actions has produced no run since 2026-07-23.** A green check on a pull
-request is not evidence. Gate locally with `just`.
+**CI runs again as of 2026-08-16**, after a gap since 2026-07-23 that ended
+when this repository was made public. A green check is evidence once more — of
+what the jobs cover. Gate locally with `just` first; CI is the second opinion.
 
 ## First five minutes, with no data at all
 

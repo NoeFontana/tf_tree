@@ -261,11 +261,17 @@ filled in a patch release.
 
 ### A note on the gate
 
-**GitHub Actions has produced no run for this repository since 2026-07-23**, so
-nothing in this release was verified by a workflow. What backs it is the `just`
-recipes, run locally on `x86_64` Linux, and the `## 0.0 Implementation status`
-tables those runs are recorded in — which is what the note at the top of this
-file means by naming those tables as the source of truth.
+**GitHub Actions produced no run for this repository between 2026-07-23 and
+2026-08-16**, so most of this release was verified by the `just` recipes run
+locally on `x86_64` Linux, and by the `## 0.0 Implementation status` tables
+those runs are recorded in — which is what the note at the top of this file
+means by naming those tables as the source of truth.
+
+Making the repository public restored CI, and the first runs found three latent
+defects that had been invisible for the project's whole life: `c_char`
+signedness on `aarch64`, an exported symbol in no header tier, and a container
+with no writable `ROS_HOME`. The `ubuntu-24.04-arm` rows now execute and pass
+for the first time.
 `.github/workflows/ci.yml`'s header carries the evidence for the outage and the
 diagnosis. Do not read a green check as verification.
 

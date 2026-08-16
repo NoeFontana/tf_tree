@@ -677,9 +677,12 @@ drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
 verified to import and run on 3.14.
 
-**`.github/workflows/wheels.yml` has never executed.** GitHub Actions has
-produced no run for this repository since 2026-07-23, which is an account- or
-org-level problem rather than a syntax one. Its YAML parses and every maturin
+**`.github/workflows/wheels.yml` has still never executed**, and that is now
+for a different reason than it was. Actions produced no run for this repository
+between 2026-07-23 and 2026-08-16 — an account-level state on private
+repositories, confirmed when making this one public restored runs immediately.
+It runs again, but `wheels.yml` triggers only on a `v*` tag, and no tag has been
+pushed. Its YAML parses and every maturin
 invocation in it was run by hand on this host for the rows this host can build,
 but the cross-platform rows — musllinux, macOS, Windows, aarch64 — are
 unproven. Treat the first real run as a first run.
