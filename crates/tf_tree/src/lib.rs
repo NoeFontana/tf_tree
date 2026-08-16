@@ -232,6 +232,21 @@
 //! take only one of them, measure your own case rather than trusting a guess
 //! from this paragraph.
 
+// **The crates.io front page, compiled.** `README.md`'s `rust` fence is the
+// example a stranger reads first, and no recipe parses a README — the next
+// signature change to `claim`, `plan`, `Capacity::history` or the `Described`
+// wording would break the published page with every gate green. `cfg(doctest)`
+// keeps it out of `cargo doc`, which already renders the module docs above, and
+// off the crate root, whose `//!` block carries intra-doc links a README cannot.
+//
+// It gates the *API*, not the *output*: the fence's `// -> x = 0.5` and its
+// two-line extrapolation message are comments, and a doctest does not read
+// stdout. Turning them into asserts would gate those too, at some cost to how
+// the front page reads; that trade has not been made.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 mod cache;
 mod tree;
 

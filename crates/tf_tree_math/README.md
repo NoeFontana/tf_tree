@@ -28,6 +28,35 @@ something popular.
    `log_se3` returns the twist `ξ = [ω, v]` of the right-multiplied increment
    and `exp_se3` consumes the same ordering.
 
+Three of them, spelled as assertions — a convention stated in prose is a
+convention nothing checks, and this block is a doctest:
+
+```rust
+use core::f64::consts::FRAC_1_SQRT_2;
+use tf_tree_math::{Iso3, Quat, Vec3};
+
+// Convention 2 — `w` first. This is a 90° yaw written `[w, x, y, z]`: the
+// scalar leads. An Eigen caller with the same four numbers in Eigen's order
+// gets a different rotation, which is the whole reason the list exists.
+let yaw90 = Quat::new(FRAC_1_SQRT_2, 0.0, 0.0, FRAC_1_SQRT_2);
+
+// Convention 3 — active. The rotation moves the vector inside a fixed frame,
+// so x̂ goes to ŷ. (A passive reading would send it to −ŷ.)
+let v = yaw90.rotate(Vec3::new(1.0, 0.0, 0.0));
+assert!(v.x.abs() < 1e-15 && (v.y - 1.0).abs() < 1e-15);
+
+// Convention 4 — `a * b` is `T_a_x * T_x_b`, so the right operand's parent is
+// the left operand's child: odom←base composed with base←sensor.
+let t_odom_base = Iso3::new(yaw90, Vec3::new(2.0, 0.0, 0.0));
+let t_base_sensor = Iso3::new(Quat::IDENTITY, Vec3::new(1.0, 0.0, 0.0));
+let t_odom_sensor = t_odom_base * t_base_sensor;
+
+// The sensor is 1 m along *base's* x, and base's x points along odom's y — so
+// it lands at (2, 1, 0), not (3, 0, 0). Swapping the operands gives the latter.
+assert!((t_odom_sensor.t.x - 2.0).abs() < 1e-15);
+assert!((t_odom_sensor.t.y - 1.0).abs() < 1e-15);
+```
+
 ## Numerics, and where the constants came from
 
 * `log_so3` goes through the quaternion (`2·atan2(‖q_v‖, q_w)`) and never
