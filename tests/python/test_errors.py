@@ -38,9 +38,21 @@ import numpy as np
 import pytest
 import tf_tree
 
+# One predicate for the two Linux-only paths this file touches, because it *is*
+# one predicate: `has_shared_memory()` is `cfg!(target_os = "linux")`, and the
+# served arena and the frozen `.tft` are both `#[cfg(all(feature = "shm",
+# target_os = "linux"))]` in the facade. The reason names both — it used to say
+# only "share a tree between processes", which is not why a `.tft` row skips.
+#
+# A mark rather than a `pytestmark`: every other test here is a prose assertion
+# that never opens an arena, and off-Linux those are the ones worth running.
+# Unguarded, the three below *fail* there rather than skip — `open_file` and
+# `Tree.freeze` refuse with a message naming the platform (`SUPPORT.md`, "What
+# is not supported") — and bury the rest of the file's signal. `test_frozen.py`
+# made the same argument for its whole module.
 shm = pytest.mark.skipif(
     not tf_tree.has_shared_memory(),
-    reason="this build cannot share a tree between processes",
+    reason="needs the mmap-backed arena: shared trees and .tft files are Linux-only",
 )
 
 # `EdgeId(3)`, `FrameId(7)` — a Rust newtype id as `Debug` writes it.
@@ -433,6 +445,7 @@ def test_a_stale_id_degrades_to_an_index_and_a_reason_not_to_a_debug_dump():
     assert "frame #" not in msg, msg
 
 
+@shm
 def test_a_damaged_tft_is_described_and_not_dumped(tmp_path):
     """The one error enum in this binding that *can* be matched exhaustively.
 
