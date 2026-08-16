@@ -575,29 +575,30 @@ fn span_names_the_edge_that_has_never_published() {
     // It must name the *silent* edge, not merely fail: a `span` that reported
     // whichever edge it looked at first would satisfy a bare `matches!`.
     //
-    // Resolving the `EdgeId` back to its (parent, child) pair is the only half
-    // that needs the arena, so it is the only half gated — the error's *shape*
-    // is checked either way below. With `unstable` off this test is genuinely
-    // weaker (it is the bare `matches!` the paragraph above warns about) and
-    // that is the trade: a weaker assertion in the tier a packager builds, the
-    // full one everywhere the feature is on, which is every recipe that runs
-    // this target.
-    #[cfg(feature = "unstable")]
-    {
-        let view = tree.arena_view();
-        let named = match err {
-            LookupError::NoData { edge } => view.edge(edge).map(|r| (r.parent, r.child)),
-            _ => None,
-        };
-        assert_eq!(
-            named,
-            Some((odom.get(), base.get())),
-            "expected NoData naming odom -> base, got {err:?}"
-        );
-    }
-    assert!(
-        matches!(err, LookupError::NoData { .. }),
-        "expected NoData, got {err:?}"
+    // **The resolution goes through `Tree::edges`, not `arena_view`, so that
+    // there is one assertion here and not two of different strengths.** Both
+    // read the same `EdgeRecord`'s `parent`/`child` — `edges()` is the stable
+    // tier's spelling of it — but the view exists only under `unstable`, so
+    // gating this half would leave the bare `matches!` standing alone in the
+    // tier a packager builds: a `span` that named the wrong edge would then be
+    // caught everywhere *except* there, which is precisely backwards.
+    //
+    // `edges()` lists declared edges in `EdgeId` order, skipping slots whose
+    // record is still zeros; a `TreeBuilder` tree has no such slot, and the
+    // length check below is what turns "`EdgeId` order" into "index `id - 1`"
+    // rather than leaving it a guess.
+    let edges = tree.edges().unwrap();
+    assert_eq!(edges.len(), 2, "both declared edges are listed: {edges:?}");
+    let named = match err {
+        LookupError::NoData { edge } => edges
+            .get(edge.get().wrapping_sub(1) as usize)
+            .map(|(p, c)| (p.as_str(), c.as_str())),
+        _ => None,
+    };
+    assert_eq!(
+        named,
+        Some(("odom", "base")),
+        "expected NoData naming odom -> base, got {err:?}"
     );
 }
 
