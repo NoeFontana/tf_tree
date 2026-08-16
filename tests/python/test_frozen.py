@@ -214,13 +214,24 @@ def test_span_names_the_frames_of_the_edge_that_has_never_published():
 
     And the answer has to be *actionable*: an ``EdgeId(2)`` is not, because the
     Python surface exposes no way to turn an edge id back into the names the
-    caller typed. So `span_impl` resolves the two frame names on this error path.
+    caller typed.
 
-    Mutant: drop the ``LookupError::NoData`` arm in ``span_impl`` and let it fall
-    through to ``lookup_err``. The exception type is unchanged and the first
-    assertion still passes — the name assertions are what fail. Mutant:
-    ``continue`` past an empty ring in ``Plan::span`` instead of propagating;
-    this then gets a tuple instead of an exception.
+    **This test used to be the only place that was true**, and its mutant note
+    used to say so. Since ``lookup_err`` grew ``edge_label``, *every* message
+    resolves ids — ``tests/python/test_errors.py`` is the general check — so
+    what is left for ``span_impl``'s own arm is the phrase that places the
+    silent edge **on the path that was asked for**, which is the half of §4.2's
+    question an edge named on its own does not answer.
+
+    Mutant: drop the ``LookupError::NoData`` arm in ``span_impl`` and let it
+    fall through to ``lookup_err``. **Applied and run**: ``1 failed, 139
+    passed`` — the type and the two name assertions still pass, because
+    ``lookup_err`` names the edge too now (``edge "base_link" -> "lidar" has no
+    samples yet``), and ``"on the path from"`` is the one that fails. That third
+    assertion is what makes this a test of ``span_impl`` rather than of the
+    shared layer.
+    Mutant: ``continue`` past an empty ring in ``Plan::span`` instead of
+    propagating; this then gets a tuple instead of an exception.
     """
     t = tf_tree.build(EDGES, capacity=64)
     stamps = np.arange(N, dtype=np.int64) * STEP
@@ -239,6 +250,9 @@ def test_span_names_the_frames_of_the_edge_that_has_never_published():
     # can only come from the edge record.
     assert '"base_link" -> "lidar"' in msg, msg
     assert "EdgeId" not in msg, msg
+    # `span_impl`'s own contribution, and the only assertion here that
+    # `lookup_err`'s shared arm does not already satisfy.
+    assert "on the path from" in msg, msg
 
 
 def test_open_file_of_a_missing_path_raises_filenotfound(tmp_path):

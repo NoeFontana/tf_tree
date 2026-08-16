@@ -11,7 +11,10 @@ use tf_tree::{
     AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree,
 };
 
-use crate::errors::{lookup_err, BufferError, FrameNotDeclaredError, TfTreeError};
+use crate::errors::{
+    claim_err, edge_label_of, frame_not_declared, lookup_err, push_err, push_msg, BufferError,
+    TfTreeError,
+};
 
 /// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
 /// (`docs/PHASE3.md` §6.1's amendment — the re-baseline, not §2's superseded
@@ -185,12 +188,15 @@ impl PyTree {
         let t = this
             .inner
             .frame(target)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {target:?}")))?;
+            .map_err(|_| frame_not_declared(target))?;
         let s = this
             .inner
             .frame(source)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {source:?}")))?;
-        let plan = this.inner.plan(t, s).map_err(lookup_err)?;
+            .map_err(|_| frame_not_declared(source))?;
+        let plan = this
+            .inner
+            .plan(t, s)
+            .map_err(|e| lookup_err(&this.inner, e))?;
         Ok(PyPlan {
             plan: Box::new(plan),
             // The refcount that makes the borrow real.
@@ -211,11 +217,11 @@ impl PyTree {
         let c = this
             .inner
             .frame(child)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {child:?}")))?;
+            .map_err(|_| frame_not_declared(child))?;
         let p = this
             .inner
             .frame(parent)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {parent:?}")))?;
+            .map_err(|_| frame_not_declared(parent))?;
         // `claim_owned`, not `claim`: this crate no longer extends a lifetime
         // itself. `docs/decisions/0017` step 6 — the writer that comes back owns
         // its `Arc<Tree>`, so the arena outlives it by construction and the
@@ -223,9 +229,10 @@ impl PyTree {
         let writer = this
             .inner
             .claim_owned(c, p)
-            .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+            .map_err(|e| claim_err(&this.inner, parent, child, e))?;
 
         Ok(PyPublisher {
+            edge: edge_label_of(parent, child),
             inner: Mutex::new(Some(writer)),
         })
     }
@@ -374,7 +381,31 @@ impl PyTree {
         let iso = self
             .inner
             .lookup(target, source, Stamp::<SystemDomain>::from_nanos(stamp_ns))
-            .map_err(lookup_err)?;
+            // **The one arm that has to be caught at the call site**, because it
+            // is the one whose identity the error cannot carry:
+            // `LookupError::UnknownFrame` holds a BLAKE3 prefix, BLAKE3 does not
+            // invert, and `lookup_err` has nothing else to work with. *Here*
+            // both names are in scope — this is the entry point that takes them
+            // as strings — so the message can name the one that is missing
+            // instead of a hash the caller cannot search their source for.
+            // `Tree::frame` is two hash probes on a path that has already
+            // failed.
+            .map_err(|e| match e {
+                tf_tree::LookupError::UnknownFrame { .. } => {
+                    match [target, source]
+                        .into_iter()
+                        .find(|n| self.inner.frame(n).is_err())
+                    {
+                        Some(name) => frame_not_declared(name),
+                        // Both names resolve, so the failure is the 64-bit hash
+                        // collision `find` reports as `UnknownFrame` too, or a
+                        // peer interned the name between the two calls. Neither
+                        // has a name to blame; fall back to the hash.
+                        None => lookup_err(&self.inner, e),
+                    }
+                }
+                other => lookup_err(&self.inner, other),
+            })?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
         let slice = unsafe { out.as_slice_mut()? };
@@ -564,7 +595,7 @@ impl PyPlan {
         let iso = self
             .plan
             .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
-            .map_err(lookup_err)?;
+            .map_err(|e| lookup_err(self.tree(), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated by us, so nothing else holds a reference and
         // the slice is exactly 16 contiguous f64.
@@ -720,7 +751,7 @@ impl PyPlan {
             let iso = self
                 .plan
                 .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
-                .map_err(lookup_err)?;
+                .map_err(|e| lookup_err(self.tree(), e))?;
             // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
             // slice is exactly 16 writable f64. Aliasing remains the caller's
             // to avoid, as it was before — `as_slice_mut` documents that, and
@@ -765,7 +796,10 @@ impl PyPlan {
     /// The most recent transform on this path.
     fn latest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let g = self.tree().guard();
-        let iso = self.plan.latest(&g).map_err(lookup_err)?;
+        let iso = self
+            .plan
+            .latest(&g)
+            .map_err(|e| lookup_err(self.tree(), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
         let slice = unsafe { out.as_slice_mut()? };
@@ -813,7 +847,7 @@ impl PyPlan {
                 tol,
                 &mut scratch,
             )
-            .map_err(lookup_err)?;
+            .map_err(|e| lookup_err(self.tree(), e))?;
 
         let k = stamps.len();
         let out_s = PyArray1::<i64>::zeros(py, [k], false);
@@ -916,7 +950,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(lookup_err)
+        res.map_err(|e| lookup_err(tree, e))
     }
 
     /// [`PyPlan::at`]'s `layout=` path: allocate the right shape and fill it.
@@ -1092,7 +1126,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(lookup_err)
+        res.map_err(|e| lookup_err(tree, e))
     }
 
     /// [`Self::eval_f64`] for the one `f32` layout.
@@ -1114,7 +1148,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(lookup_err)
+        res.map_err(|e| lookup_err(tree, e))
     }
 }
 
@@ -1136,6 +1170,19 @@ impl PyPlan {
 /// lifetime of its own.
 #[pyclass(name = "Publisher", module = "tf_tree")]
 pub struct PyPublisher {
+    /// How a failed `push` names this edge: `edge "map" -> "base"`.
+    ///
+    /// **The caller's own two strings, captured at claim time, rather than the
+    /// `EdgeId` the writer carries.** Resolving that id back through the arena
+    /// would reach the same pair by a longer route — and would reach the
+    /// *stored* names, which `FrameRecord` truncates at 48 bytes, so a long
+    /// name would come back cut in a message whose whole job is to be
+    /// greppable against the caller's source.
+    ///
+    /// One `String`, allocated once per claim and never per push — a claim is a
+    /// setup call, and `push` only *reads* this field, on the error path. So it
+    /// is not the allocation `docs/API.md` R2 is about.
+    edge: String,
     /// `None` after `__exit__` or `release()`, so a use-after-release is a
     /// clear Python error rather than a claim held past its scope.
     ///
@@ -1191,8 +1238,7 @@ impl PyPublisher {
         let iso = iso_from_quat7(&quat7)?;
         let g = self.lock()?;
         let p = g.as_ref().ok_or_else(released)?;
-        p.push(stamp_ns, &iso)
-            .map_err(|e| TfTreeError::new_err(format!("{e:?}")))
+        p.push(stamp_ns, &iso).map_err(|e| push_err(&self.edge, e))
     }
 
     /// Publish a whole batch: `(N,)` stamps and `(N, 7)` poses.
@@ -1232,8 +1278,13 @@ impl PyPublisher {
             p.push(*stamp, &iso).map_err(|e| {
                 // Name the index: a rejected sample partway through a batch is
                 // otherwise indistinguishable from a rejected batch, and the
-                // samples before it *were* published.
-                TfTreeError::new_err(format!("sample {i} (stamp {stamp}): {e:?}"))
+                // samples before it *were* published. Prefixed rather than
+                // re-worded, so the sentence after the colon is the same one a
+                // scalar `push` produces for the same failure.
+                TfTreeError::new_err(format!(
+                    "sample {i} (stamp {stamp}): {}",
+                    push_msg(&self.edge, e)
+                ))
             })?;
         }
         Ok(())
@@ -1430,6 +1481,25 @@ fn interp_from_str(name: &str) -> PyResult<InterpPolicy> {
     }
 }
 
+/// [`interp_from_str`] backwards, for the one error that has to name a policy.
+///
+/// Kept adjacent to its inverse rather than next to its caller, because the two
+/// are a pair: a spelling added to one and not the other is how
+/// `DerivativesUnavailableError` came to say `interpolation policy 1` — a
+/// number the caller never typed and cannot pass back — while the constructor
+/// two lines up knew the word for it all along.
+///
+/// `InterpPolicy` is deliberately not `#[non_exhaustive]` (see its doc comment
+/// in `tf_tree_core::plan`), so a third policy is a compile error here. That is
+/// the whole reason it can be exhaustive when [`crate::errors::lookup_err`]
+/// cannot.
+pub(crate) fn interp_name(policy: InterpPolicy) -> &'static str {
+    match policy {
+        InterpPolicy::ScLerp => "sclerp",
+        InterpPolicy::LerpSlerp => "lerpslerp",
+    }
+}
+
 /// Build an in-process tree from a simple edge list.
 ///
 /// Topology is builder-time (decision `0004`), so there is no `declare_*` on a
@@ -1497,11 +1567,11 @@ pub fn push(
     let c = tree
         .inner
         .frame(child)
-        .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {child:?}")))?;
+        .map_err(|_| frame_not_declared(child))?;
     let p = tree
         .inner
         .frame(parent)
-        .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {parent:?}")))?;
+        .map_err(|_| frame_not_declared(parent))?;
     let iso = tf_tree::Iso3::new(
         tf_tree::Quat {
             w: quat7[0],
@@ -1514,10 +1584,10 @@ pub fn push(
     let publisher = tree
         .inner
         .claim(c, p)
-        .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+        .map_err(|e| claim_err(&tree.inner, parent, child, e))?;
     publisher
         .push(stamp_ns, &iso)
-        .map_err(|e| TfTreeError::new_err(format!("{e:?}")))
+        .map_err(|e| push_err(&edge_label_of(parent, child), e))
 }
 
 /// Attach to a running arena (`docs/PHASE3.md` §4.1).
