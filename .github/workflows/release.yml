@@ -209,16 +209,34 @@ jobs:
       - name: assert every tarball carries its licences
         run: |
           set -euo pipefail
+          # **No `grep -q` on a pipe here, deliberately.** Under `pipefail`,
+          # `grep -q` exits the moment it matches, `tar` then dies of SIGPIPE,
+          # and the pipeline reports 141 — so `if ! …` reads a *successful*
+          # match as a failure and skips its own error message. The first
+          # revision of this step did exactly that and failed with no output at
+          # all, which is worse than the bug it was checking for. One listing
+          # into a variable, matched with `case`, has no pipe and no early exit.
           for c in tf_tree_math tf_tree_arena tf_tree_ipc tf_tree_core tf_tree; do
-            for f in LICENSE-MIT LICENSE-APACHE NOTICE README.md; do
-              if ! tar tzf "target/package/${c}-"*.crate | grep -q "/${f}$"; then
-                echo "::error::${c} tarball is missing ${f}" >&2
-                exit 1
-              fi
-            done
-            if [ "$(tar xzOf "target/package/${c}-"*.crate --wildcards "*/LICENSE-MIT" | wc -c)" -lt 1000 ]; then
-              echo "::error::${c}'s LICENSE-MIT is too small to be the licence text" >&2
+            crate=$(echo target/package/${c}-*.crate)
+            if [ ! -f "$crate" ]; then
+              echo "::error::no .crate built for ${c} (looked for target/package/${c}-*.crate)" >&2
               exit 1
             fi
+            listing=$(tar tzf "$crate")
+            for f in LICENSE-MIT LICENSE-APACHE NOTICE README.md; do
+              case "$listing" in
+                *"/${f}"*) ;;
+                *) echo "::error::${c} tarball is missing ${f}" >&2; exit 1 ;;
+              esac
+            done
+            # The licences are symlinks in the source tree and `cargo package`
+            # dereferences them; a Windows checkout without `core.symlinks`
+            # would ship a ~17-byte file holding a path instead. Assert bytes.
+            bytes=$(tar xzOf "$crate" --wildcards "*/LICENSE-MIT" | wc -c)
+            if [ "$bytes" -lt 1000 ]; then
+              echo "::error::${c}'s LICENSE-MIT is ${bytes} bytes, too small to be the licence text" >&2
+              exit 1
+            fi
+            echo "  ${c}: licences present, LICENSE-MIT ${bytes} bytes"
           done
           echo "all five tarballs carry LICENSE-MIT, LICENSE-APACHE, NOTICE and README.md"
