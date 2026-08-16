@@ -1,0 +1,224 @@
+# crates.io publication, by OIDC rather than by a stored token.
+#
+# **Why this is its own file and not a job in `wheels.yml`**, which is where the
+# PyPI publish lives and where a sibling project keeps both: a crates.io Trusted
+# Publisher is scoped to a *workflow filename*. Whatever runs in this file may
+# mint a token that can publish five crates. `wheels.yml` is a seven-row build
+# matrix that downloads artifacts produced by other jobs; this file checks out
+# the tag, runs the repository's own gates, and publishes. The smaller surface is
+# the one to hand the credential to.
+#
+# **This workflow has never executed**, and neither has any other in this
+# repository — GitHub Actions has produced no run since 2026-07-23 (`ci.yml`'s
+# header carries the diagnosis: an account-level Actions state on *private*
+# repositories, inferred from which repositories stopped rather than read from an
+# API this token can reach). The `pull_request` trigger below exists to make the
+# first tag push less of a leap: it exercises everything except the upload.
+#
+# **The first 0.0.1 publish cannot come from here.** RFC 3691: "A Trusted
+# Publisher Configuration can only be created after an initial manual publishing
+# of a crate" — crates.io has no equivalent of PyPI's pending publisher. So each
+# of the five crates is published once by hand with a token, the Trusted
+# Publisher is configured per crate afterwards, and this workflow serves 0.0.2
+# onward. See `CONTRIBUTING.md` for the one-time sequence.
+name: release
+
+on:
+  # Tag pushes publish. `v*` matches `wheels.yml`, so one tag drives both.
+  push:
+    tags: ["v*"]
+  # Exercise the whole path except the upload whenever this file or the
+  # manifests it publishes change. A release workflow that is first run on the
+  # day it matters is a release workflow nobody has tested.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false # never cancel a publish mid-flight
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Refuse a tag whose number disagrees with the tree it points at. Neither
+  # crates.io nor PyPI permits re-uploading a version, so a mismatch caught after
+  # the upload costs a patch bump and leaves a wrong artifact in the index
+  # forever.
+  verify:
+    name: verify tag, versions, and gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - uses: actions/setup-python@v7
+        with:
+          # `scripts/artifact-versions.py` needs `tomllib`, i.e. 3.11+.
+          python-version: "3.13"
+
+      # **`just artifact-versions`, not a transcription of it.** That recipe
+      # already asserts the seventeen hand-kept version sites agree, that the
+      # publishable set is exactly the five crates below, and that CHANGELOG.md
+      # carries a section for the current version. Re-spelling any of it here
+      # would be a second copy to drift (`docs/PROJECT.md` §6).
+      - name: just artifact-versions
+        run: just artifact-versions
+
+      # The one thing that recipe cannot know: which tag it is being run for.
+      - name: assert the tag matches the version it claims
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          # `[workspace.package] version` is the one number every publishable
+          # crate inherits; `just artifact-versions` above has already asserted
+          # that the other sixteen sites agree with it, so reading it here is
+          # reading all of them.
+          ws="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          echo "tag=${tag} workspace=${ws}"
+          if [[ "$tag" != "$ws" ]]; then
+            echo "::error::tag v${tag} does not match the workspace version ${ws}" >&2
+            exit 1
+          fi
+
+      # A tag publishes irreversibly, so the gates run again here rather than
+      # being trusted from the pull request that produced the commit — a tag can
+      # be pushed at a commit no pull request ever gated, and nothing about a tag
+      # proves otherwise.
+      #
+      # Tag-only, deliberately: on a pull request `ci.yml` is already running
+      # exactly these two recipes against the same merge commit, and a second
+      # full run would buy nothing. What the pull-request path is for is the
+      # `dry-run` job below, which `ci.yml` does *not* cover.
+      - name: just lint
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: just lint
+      - name: just test
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: just test
+
+  # OIDC: no CARGO_REGISTRY_TOKEN in repository secrets. The token minted below
+  # lives ~30 minutes and is revoked by the action's post step.
+  #
+  # **Requires a Trusted Publisher configured per crate** at
+  # https://crates.io/me/trusted-publishers — crates.io scopes publishers per
+  # crate, unlike PyPI's per-project scope, so all five are configured
+  # separately with owner `NoeFontana`, repository `tf_tree`, workflow
+  # `release.yml`, environment `crates-io`.
+  #
+  # **The `environment:` gate is real here, and this diverges from the sibling
+  # project deliberately.** That repository omits it because GitHub enforces
+  # environment protection rules on private repositories only under paid tiers,
+  # so on a free-tier private repo the gate implies a checkpoint that does not
+  # exist — worse than no gate. `tf_tree` is public, where protection rules are
+  # enforced at no cost, which is the condition that comment names for revisiting
+  # it. Configure the environment to be reachable only from `v*` tags.
+  publish:
+    name: publish to crates.io
+    needs: [verify]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write # mint the crates.io token
+      contents: read # actions/checkout
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # No `Swatinem/rust-cache` on purpose: `cargo publish` packs each crate
+      # from a clean state into its own scratch directory, so a cached `target/`
+      # is dead weight.
+
+      - name: mint a short-lived crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # Topological order over the workspace's internal graph. Three leaves,
+      # then the two that depend on them:
+      #
+      #   tf_tree_math   (leaf)
+      #   tf_tree_arena  (leaf)
+      #   tf_tree_ipc    (leaf)
+      #   tf_tree_core   -> math, arena
+      #   tf_tree        -> core, math, arena, ipc
+      #
+      # Sequential, and it has to be: each crate's intra-workspace requirement
+      # names the version being published, so `cargo publish -p tf_tree_core`
+      # cannot resolve until `tf_tree_math` and `tf_tree_arena` are live on the
+      # index. Modern cargo blocks until the index reflects each upload, so no
+      # sleep is needed. Measured locally: the single-crate form fails with "no
+      # matching package named `tf_tree_arena`" until its dependency lands, which
+      # is this ordering being enforced rather than a defect.
+      #
+      # `--locked` so the published tarball is built from the committed
+      # `Cargo.lock` and not from whatever the index resolved that morning.
+      - name: cargo publish tf_tree_math
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
+        run: cargo publish --locked -p tf_tree_math
+      - name: cargo publish tf_tree_arena
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
+        run: cargo publish --locked -p tf_tree_arena
+      - name: cargo publish tf_tree_ipc
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
+        run: cargo publish --locked -p tf_tree_ipc
+      - name: cargo publish tf_tree_core
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
+        run: cargo publish --locked -p tf_tree_core
+      - name: cargo publish tf_tree
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
+        run: cargo publish --locked -p tf_tree
+
+  # On a pull request there is no tag and nothing to upload, so the same five
+  # crates are packaged and verified instead. This is what makes the `publish`
+  # job above something other than untested code on the day it first matters.
+  #
+  # The multi-package form is deliberate: the single-crate form cannot resolve
+  # `tf_tree_core` or `tf_tree` while their siblings are absent from the index,
+  # so `-p a -p b ...` — which builds one temporary registry for the set — is the
+  # only shape in which all five can be verified before the first publish.
+  dry-run:
+    name: package all five (no upload)
+    needs: [verify]
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo publish --dry-run
+        run: |
+          cargo publish --dry-run --locked \
+            -p tf_tree_math -p tf_tree_arena -p tf_tree_ipc \
+            -p tf_tree_core -p tf_tree
+      # The licence texts reach a vendoring consumer only if they are inside the
+      # tarball; they are symlinks in the source tree and `cargo package`
+      # dereferences them. A Windows checkout without `core.symlinks` would ship
+      # a 17-byte file holding a path instead, so this asserts the bytes.
+      - name: assert every tarball carries its licences
+        run: |
+          set -euo pipefail
+          for c in tf_tree_math tf_tree_arena tf_tree_ipc tf_tree_core tf_tree; do
+            for f in LICENSE-MIT LICENSE-APACHE NOTICE README.md; do
+              if ! tar tzf "target/package/${c}-"*.crate | grep -q "/${f}$"; then
+                echo "::error::${c} tarball is missing ${f}" >&2
+                exit 1
+              fi
+            done
+            if [ "$(tar xzOf "target/package/${c}-"*.crate --wildcards "*/LICENSE-MIT" | wc -c)" -lt 1000 ]; then
+              echo "::error::${c}'s LICENSE-MIT is too small to be the licence text" >&2
+              exit 1
+            fi
+          done
+          echo "all five tarballs carry LICENSE-MIT, LICENSE-APACHE, NOTICE and README.md"
