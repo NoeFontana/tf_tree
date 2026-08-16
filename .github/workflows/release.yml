@@ -197,9 +197,18 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo publish --dry-run
+      # **`cargo package`, not `cargo publish --dry-run`, and the difference is
+      # not cosmetic.** Both build a temporary registry so the five resolve
+      # against each other, and both compile every crate from its own tarball —
+      # but `--dry-run` *removes the `.crate` files when it finishes*, leaving
+      # only the extracted directories. The step below asserts on the shipped
+      # artifact, so it needs the artifact to still exist. Measured: after
+      # `--dry-run`, `target/package/` holds `tf_tree-0.0.1/`, `tmp-crate` and
+      # `tmp-registry` and no `*.crate` at all; after `cargo package`, all five
+      # `.crate` files are there.
+      - name: cargo package (builds and verifies all five)
         run: |
-          cargo publish --dry-run --locked \
+          cargo package --locked \
             -p tf_tree_math -p tf_tree_arena -p tf_tree_ipc \
             -p tf_tree_core -p tf_tree
       # The licence texts reach a vendoring consumer only if they are inside the
