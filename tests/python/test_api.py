@@ -821,9 +821,12 @@ def test_the_default_interp_is_the_engines_own(tree):
     apart and neither could most of this file.
 
     Mutant: restore ``interp = "lerpslerp"`` in ``build``'s ``#[pyo3(signature
-    = ...)]`` => ``DerivativesUnavailableError: edge EdgeId(1) declares
-    interpolation policy 1, which has no exact derivative`` out of the first
-    assertion, which short-circuits the rest. The second half was checked
+    = ...)]`` => ``DerivativesUnavailableError: edge "map" -> "base" declares
+    interp='lerpslerp', which has no exact derivative`` out of the first
+    assertion, which short-circuits the rest. (That message read ``edge
+    EdgeId(1) declares interpolation policy 1`` when this note was written; the
+    prose layer resolves both now, and it is the same failure.)
+    The second half was checked
     separately under the same mutant build: both trees then produce
     ``[0.92387953, 0, 0, 0.38268343, 1, 0, 0]`` and ``np.allclose`` is ``True``,
     so ``assert not`` would have failed too.

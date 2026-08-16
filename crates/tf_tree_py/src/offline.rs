@@ -40,7 +40,7 @@ use pyo3::prelude::*;
 use tf_tree::unstable::ArenaView;
 use tf_tree::{EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
-use crate::errors::{detached_err, lookup_err, NoDataError, TfTreeError};
+use crate::errors::{detached_err, edge_label, lookup_err, NoDataError, TfTreeError};
 use crate::tree::PyTree;
 
 /// Open a frozen `.tft` and read it through the ordinary `Tree` (§4.1).
@@ -95,36 +95,40 @@ pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
 /// # Errors
 ///
 /// Everything `Plan::span` reports, mapped by [`lookup_err`] — except
-/// `LookupError::NoData`, which is re-raised **naming the two frames** rather
-/// than an `EdgeId`. §4.2's premise is that this query answers "why did my
-/// lookup fail at t", and `EdgeId(2)` does not: the Python surface exposes no
-/// way to turn an edge id back into the names the caller typed.
+/// `LookupError::NoData`, which is re-raised with **where on the path** the
+/// silent edge sits. §4.2's premise is that this query answers "why did my
+/// lookup fail at t", and an edge named on its own does not finish the
+/// sentence: `map -> lidar` is what the caller asked for, `base_link -> lidar`
+/// is what is silent, and the message has to join the two.
+///
+/// This arm used to exist to resolve the *names* as well, because `lookup_err`
+/// printed `EdgeId(2)`. It no longer does — every arm of it goes through
+/// [`edge_label`] now — so what is left here is only the path phrasing, and
+/// falling through would lose that and nothing else.
 pub(crate) fn span_impl(tree: &Tree, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
-    let t = tree.frame(target).map_err(|_| {
-        crate::errors::FrameNotDeclaredError::new_err(format!("no frame named {target:?}"))
-    })?;
-    let s = tree.frame(source).map_err(|_| {
-        crate::errors::FrameNotDeclaredError::new_err(format!("no frame named {source:?}"))
-    })?;
-    let plan = tree.plan(t, s).map_err(lookup_err)?;
+    let t = tree
+        .frame(target)
+        .map_err(|_| crate::errors::frame_not_declared(target))?;
+    let s = tree
+        .frame(source)
+        .map_err(|_| crate::errors::frame_not_declared(source))?;
+    let plan = tree.plan(t, s).map_err(|e| lookup_err(tree, e))?;
     plan.span(&tree.guard()).map_err(|e| match e {
-        LookupError::NoData { edge } => match named_edge(tree, edge) {
-            Some((parent, child)) => NoDataError::new_err(format!(
-                "edge {parent:?} -> {child:?} on the path from {source:?} to \
-                 {target:?} has no samples, so the path is not answerable at any \
-                 stamp"
-            )),
-            None => lookup_err(e),
-        },
-        other => lookup_err(other),
+        LookupError::NoData { edge } => NoDataError::new_err(format!(
+            "{} on the path from {source:?} to {target:?} has no samples, so \
+             the path is not answerable at any stamp",
+            edge_label(tree, edge)
+        )),
+        other => lookup_err(tree, other),
     })
 }
 
 /// `(parent, child)` frame names for an edge, or `None` if either is missing.
 ///
-/// Only ever called on an error path, so the two `String`s it allocates are not
-/// a hot-path allocation — the rule they would otherwise violate.
-fn named_edge(tree: &Tree, edge: EdgeId) -> Option<(String, String)> {
+/// Only ever called on an error path or a listing, so the two `String`s it
+/// allocates are not a hot-path allocation — the rule they would otherwise
+/// violate.
+pub(crate) fn named_edge(tree: &Tree, edge: EdgeId) -> Option<(String, String)> {
     named_edge_in(&tree.arena_view(), edge)
 }
 
@@ -137,11 +141,24 @@ fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)>
     // One observation of the record: re-reading `view.edge(edge)` for the child
     // could name a parent and a child that never belonged to the same edge.
     let rec = view.edge(edge)?;
-    let name = |raw: u32| -> Option<String> {
-        let r = view.frame_record(FrameId::new(raw)?)?;
-        Some(stored_name(&r.name, r.name_len))
-    };
+    let name = |raw: u32| named_frame_in(view, FrameId::new(raw)?);
     Some((name(rec.parent)?, name(rec.child)?))
+}
+
+/// One frame's stored name, or `None` if this arena has no record at that id.
+///
+/// The single-frame half of [`named_edge`], split out rather than duplicated
+/// because the error layer needs it alone: `LookupError::Disconnected` carries
+/// three `FrameId`s and no edge at all, and spelling them `FrameId(4)` is the
+/// defect [`crate::errors`] exists to keep out of Python.
+pub(crate) fn named_frame(tree: &Tree, frame: FrameId) -> Option<String> {
+    named_frame_in(&tree.arena_view(), frame)
+}
+
+/// [`named_frame`] against a view the caller already holds.
+fn named_frame_in(view: &ArenaView<'_>, frame: FrameId) -> Option<String> {
+    let rec = view.frame_record(frame)?;
+    Some(stored_name(&rec.name, rec.name_len))
 }
 
 /// A frame record's stored — and therefore possibly truncated — name.
@@ -534,7 +551,58 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                      {expected}. Re-freeze the source recording — a .tft is a cache, not \
                      an archive (`tf_tree doctor --explain-version`)"
                 ),
-                other => format!("could not be opened as a .tft: {other:?}"),
+                // **The rest of `FrozenError`, enumerated, because it can be.**
+                // Unlike `LookupError` and `FrozenFileError` below, `FrozenError`
+                // is *not* `#[non_exhaustive]` — so this match is exhaustive and
+                // a tenth variant is a compile error here rather than a
+                // `SizeMismatch { actual: 4096, expected: 8192 }` shown to a
+                // Python user as if it were a sentence. Nine variants, and only
+                // the three above had prose; the five arms below are the other
+                // six.
+                //
+                // None of them says "re-freeze the recording", which is the
+                // remedy the three above carry. Those three mean *wrong build*
+                // and re-freezing is the fix; these mean damaged file, wrong
+                // permissions or no memory, and sending someone to re-run an
+                // hour of bag ingest for a truncated write is worse advice than
+                // none.
+                FrozenError::Truncated => {
+                    "ends before a structure its own header promises — the write \
+                     was interrupted, or the file is still being written"
+                        .to_owned()
+                }
+                FrozenError::HeaderInconsistent => {
+                    "has a header whose offsets do not describe a consistent \
+                     file: a region runs past the end, the arena is misaligned, \
+                     or the manifest overlaps something. The file is corrupt"
+                        .to_owned()
+                }
+                FrozenError::SizeMismatch { actual, expected } => format!(
+                    "is {actual} bytes but its header says {expected}; the file is \
+                     truncated or has been appended to"
+                ),
+                // The errno is carried through rather than described, because
+                // `EACCES` and `ENOMEM` on the same call want different
+                // responses and only the number distinguishes them.
+                FrozenError::Io(errno) | FrozenError::Map(errno) => format!(
+                    "could not be read or mapped: {}",
+                    std::io::Error::from_raw_os_error(errno.raw_os_error())
+                ),
+                // **The one arm that still shows a `Debug`, and it says so.**
+                // `ShmError` is the arena-header check a `memfd` attach makes;
+                // it has no `Display`, fifteen variants, and several of them are
+                // struct-shaped (`SizeMismatch { actual, expected }`), so its
+                // `Debug` is a dump and not a sentence. Enumerating a second
+                // enum from this module would be re-spelling `check.rs`'s
+                // reasons in a place that cannot see them change. Labelling the
+                // dump as raw is the honest option: the reader is looking at a
+                // corrupt file and the discriminant is the only handle anyone
+                // has on which check failed.
+                FrozenError::Arena(inner) => format!(
+                    "contains an arena image whose header did not validate; the \
+                     file is corrupt, or was written by a build with a different \
+                     arena layout. The engine's reason, raw: {inner:?}"
+                ),
             };
             TfTreeError::new_err(format!("{shown}: {detail}"))
         }
