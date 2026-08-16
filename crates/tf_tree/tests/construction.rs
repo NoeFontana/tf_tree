@@ -204,7 +204,14 @@ fn capacity_rounds_to_power_of_two() {
 /// Mutant B: `mhz.round() as u32` -> `mhz as u32` in `EdgeCfg::nominal_rate_hz`.
 /// Applied: the 19.9999 Hz assertion fails with `left: 19999, right: 20000` —
 /// an edge the operator declared at 20 Hz, off by a milli-hertz forever.
+///
+/// Gated whole: `nominal_rate_mhz` is a field of the arena's `EdgeRecord` and
+/// the builder is the only thing that ever writes it, so reading it back
+/// through `ArenaView` *is* the test — there is no stable-tier accessor and a
+/// version of this without one would assert that `build()` returned `Ok`. It
+/// runs under `cargo nextest run --workspace`, where `unstable` is unified in.
 #[test]
+#[cfg(feature = "unstable")]
 fn a_declared_nominal_rate_reaches_the_edge_record() {
     let tree = TreeBuilder::new()
         .dynamic_edge(
