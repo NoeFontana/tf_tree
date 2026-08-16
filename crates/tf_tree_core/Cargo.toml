@@ -1,6 +1,9 @@
 [package]
 name = "tf_tree_core"
 description = "no_std+alloc single-process transform tree engine: interning, topology, arena buffers, plans."
+# Per-crate front page for crates.io; see `tf_tree_math`'s manifest for why this
+# is not inherited from the workspace.
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

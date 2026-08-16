@@ -1,6 +1,9 @@
 [package]
 name = "tf_tree_arena"
 description = "no_std+alloc pointer-free arena abstraction and layout math for tf_tree."
+# Per-crate front page for crates.io; see `tf_tree_math`'s manifest for why this
+# is not inherited from the workspace.
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +12,11 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
+# Inherited unchanged, and `data-structures` was considered and rejected. It
+# would be accurate — this *is* a pointer-free relocatable data structure — but
+# it advertises a general-purpose arena to people who want one, and this crate's
+# own README tells them to depend on `tf_tree` instead. A category is a
+# recruitment channel, not a description.
 categories.workspace = true
 
 [lints]
