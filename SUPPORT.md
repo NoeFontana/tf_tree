@@ -25,23 +25,77 @@ closed if none arrives.
 
 ## What is supported
 
-- **Linux, `x86_64` and `aarch64`.** These are what CI is configured to cover
-  and what the shared-memory implementation targets. "Configured to" is the
-  accurate verb right now — see the note at the end of this section.
+- **Linux, `x86_64`.** The architecture the project is developed and gated on:
+  every `just` recipe in `CLAUDE.md`'s command table runs on it, the
+  container-only ones (`ros-build`, `ros-test`, `tf2-check`, `dds-bench`)
+  included. `CLAUDE.md` records that `just loom` on x86-64 is currently the
+  *whole* weak-memory defence.
+- **Linux, `aarch64` — the target, and not yet the evidence.** The shared-memory
+  layer targets it and `.github/workflows/ci.yml`'s `test` and `shm` matrices
+  name `ubuntu-24.04-arm` rows for it. **Those rows have never executed**, not
+  once: Actions has produced no run of any workflow for this repository since
+  2026-07-23, and that file's header carries the API evidence and the caveat
+  that the *cause* is inferred rather than read. So aarch64 here is a
+  configuration, not a measurement. A bug against it is in scope and triaged on
+  the table above; the matrix row is not a claim that anything was checked.
+  **These two bullets were one line reading "`x86_64` and `aarch64`", hedged
+  with "'configured to' is the accurate verb right now — see the note at the end
+  of this section". There was no note at the end of this section.** A caveat has
+  to sit next to the claim it qualifies, or it is not a caveat.
 - **The current release**, and only it. Pre-1.0 there are no backports and no
   long-term-support branch. Reports against an older version will be asked to
-  reproduce on the current one.
+  reproduce on the current one. On the `0.0.x` line "the current release" is a
+  stronger statement than usual: cargo treats every `0.0.x` as incompatible with
+  every other (`^0.0.1` matches `0.0.1` alone), so nothing is promised to carry
+  across a release and `CHANGELOG.md` says so at the top.
 - **The public API of `tf_tree`, `tf_tree_core`, `tf_tree_math`,
-  `tf_tree_arena` and `tf_tree_ipc`**, plus the Python bindings and the C ABI, at
-  the maturity each is documented at. Crates marked `publish = false` in their
-  manifests are internal and carry no API stability promise at all.
+  `tf_tree_arena` and `tf_tree_ipc`** — the five crates that are published — plus
+  the Python bindings, at the maturity each is documented at. Crates marked
+  `publish = false` in their manifests are internal and carry no API stability
+  promise at all.
+- **The C ABI's stable tier**, `crates/tf_tree_c/include/tf_tree.h`, versioned by
+  `TFT_ABI_VERSION_MAJOR`/`_MINOR` independently of the crate version. This one
+  needs saying separately because `tf_tree_c` is itself `publish = false` — the
+  header is built from source, and the bullet above would otherwise disclaim it.
+  `tf_tree_unstable.h`, behind `#define TFT_ENABLE_UNSTABLE`, is the opposite: the
+  opt-in *is* the waiver, and nothing reachable through it is covered.
 
 ## What is not supported
 
-- **macOS and Windows.** The single-process engine is portable and much of it
-  compiles there, but nothing is tested on either and the entire shared-memory
-  layer is Linux-only. Patches welcome; a bug report against an untested
-  platform will be labelled and left.
+- **macOS and Windows — best-effort, and a wheel is built for both.** This is
+  the one entry that needs a longer answer than the heading, because the
+  repository *does* produce artifacts for these platforms and an unqualified
+  "not supported" would be false. An earlier revision of this bullet was exactly
+  that: it said "nothing is tested on either" — true — and left the reader to
+  discover `.github/workflows/wheels.yml` building `macos-latest`, `macos-13`
+  and `windows-latest` rows.
+
+  **What exists.** `wheels.yml` builds macOS (`aarch64`, `x86_64`) and Windows
+  (`x64`) wheels alongside the Linux ones, and `crates/tf_tree_py` is written to
+  degrade on those platforms rather than fail to compile:
+  `tf_tree.has_shared_memory()` returns `False` off Linux, and `open_file()` /
+  `Tree.freeze()` refuse a `.tft` with a message naming the platform instead of
+  vanishing and raising `AttributeError` somewhere unrelated. The engine in
+  those wheels is the **single-process** one, and that is structural rather than
+  promised: `cargo tree -p tf_tree --features shm --target
+  aarch64-apple-darwin` shows `tf_tree_ipc` — the entire rendezvous, lock-file
+  and fd-passing layer — absent from the graph, because it is declared under
+  `[target.'cfg(target_os = "linux")'.dependencies]`, and every `MappedArena`
+  item in `tf_tree_arena` is `#[cfg(all(feature = "shm", target_os = "linux"))]`.
+  So on macOS and Windows there is no `tf_tree.open()` joining another process,
+  no frozen `.tft`, and no `tf_tree top`.
+
+  **What does not exist is any evidence that the artifact works.** Nothing in
+  this repository tests a wheel — `wheels.yml` builds and, on a tag, publishes;
+  the suite that would run against the result is `ci.yml`'s `python` job, which
+  is `runs-on: ubuntu-latest` and builds its own extension with maturin. No test
+  here has ever run on macOS or Windows, no non-Linux job exists in `ci.yml` at
+  all, and neither workflow has executed since 2026-07-23. Treat these as
+  convenience builds. A bug report against one is welcome and answered
+  best-effort; a patch is more welcome still.
+
+  The C ABI, the C++ wrapper and the ROS 2 bridge are **Linux-only in practice**
+  — no workflow and no `just` recipe builds any of them anywhere else.
 - **ROS 1.** There is no ROS 1 path and there will not be one.
 - **Anything behind a phase that `docs/`'s status tables mark as not
   implemented.** Those tables are the source of truth, not the README and not
@@ -59,13 +113,35 @@ The minimum supported Rust version is **1.87**, declared in the workspace
 manifest's `[workspace.package] rust-version` and inherited by every workspace
 member. Two crates are deliberately *outside* the workspace and therefore cannot
 inherit it — `tf_tree_py` (built by maturin) and `tf_tree_tf2_sys` (builds only
-where ROS 2 is installed) — so each repeats the number by hand. CI's `msrv` job
+where ROS 2 is installed) — so each repeats the number by hand. `just msrv`
 compares every hand-written `rust-version` in the repository against the
 workspace's and fails on disagreement, because the number that nothing checks is
-the number that drifts.
+the number that drifts. CI's `msrv` job runs the same steps — but see the third
+bullet below, and the note that closes this section: the local recipe is the one
+that is actually running.
 
 - **An MSRV bump is a minor-version bump** pre-1.0, and a breaking change after
-  1.0. It is never a patch release.
+  1.0. It is never a patch release. **This rule is suspended for the whole
+  `0.0.x` line, and the suspension is a real cost rather than a convenience.**
+  Under `0.0.x` cargo treats every release as incompatible with every other —
+  `^0.0.1`, which is what a bare `tf_tree = "0.0.1"` means, matches `0.0.1` and
+  nothing else — so there is no minor slot left for the rule to occupy and the
+  only field that can move is the patch, which is precisely what the rule
+  forbids. What resolves the deadlock rather than merely dodging it: the rule
+  exists to stop the floor moving under a dependant who resolved by a range, and
+  on `0.0.x` no range spans two releases, so the resolver is already enforcing
+  what the rule was written to enforce. **A `0.0.x` release may therefore raise
+  the MSRV**, and this bullet comes back into force at `0.1.0`, where a minor
+  slot exists again. The root `Cargo.toml`'s comment on `[workspace.package]
+  version` states the same thing from the other side; that field and this bullet
+  must not be changed independently.
+
+  One asymmetry, because it would otherwise be discovered by a user: **PyPI does
+  not have cargo's rule.** PEP 440 gives `0.0.x` no special meaning, so
+  `pip install -U tf_tree` will move someone from `0.0.1` to `0.0.2` without
+  asking, and the wheel's "no compatibility between releases" promise is carried
+  by `CHANGELOG.md` and by this document instead of by the version number.
+  Pin the wheel exactly if that matters to you.
 - **MSRV is raised only for a reason that is written down** in the commit that
   raises it — a language or standard-library feature that removes real
   complexity, or a dependency that has already moved. "The toolchain moved on" is
