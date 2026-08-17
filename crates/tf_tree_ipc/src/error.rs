@@ -13,6 +13,7 @@
 //! because the symptom an operator sees ("it will not start") is identical for
 //! all of them.
 
+use crate::HelloStatus;
 use core::fmt;
 
 use rustix::io::Errno;
@@ -399,9 +400,8 @@ impl fmt::Display for IpcError {
                 f,
                 "the arena owner refused this attach: {status:?} \
                  (owner format_version {owner_format_version}, \
-                 layout_hash 0x{owner_layout_hash:08X}). \
-                 A LayoutMismatch means this binary was built against a different \
-                 record layout than the running arena — rebuild both from the same source"
+                 layout_hash 0x{owner_layout_hash:08X}). {}",
+                rejection_advice(status)
             ),
             IpcError::RejectionCarriedFd { status } => write!(
                 f,
@@ -509,6 +509,61 @@ impl fmt::Display for IpcError {
                 ),
             },
             IpcError::Proc(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// What to do about a refused attach, for the status that was actually
+/// returned.
+///
+/// **One arm per status, because the alternative was measured and it misleads.**
+/// This used to be a single sentence appended to every rejection explaining what
+/// a `LayoutMismatch` means. A torture run that exhausted the participant table
+/// therefore printed, thousands of times:
+///
+/// ```text
+/// the arena owner refused this attach: NoParticipantSlots (owner format_version 3,
+/// layout_hash 0x3D104195). A LayoutMismatch means this binary was built against a
+/// different record layout than the running arena — rebuild both from the same source
+/// ```
+///
+/// The status is right there and it is not `LayoutMismatch`, but the advice is
+/// the longest and last thing on the line, so it reads as the diagnosis and
+/// points the operator at their build. Prose that explains a status the caller
+/// did not get is worse than no prose: it costs a rebuild before anyone rereads
+/// the word in front of it.
+fn rejection_advice(status: HelloStatus) -> &'static str {
+    match status {
+        // Reachable only from a rejection, which `Ok` is not — but the match is
+        // total so the compiler tells the next person who adds a status that
+        // this list needs a line.
+        HelloStatus::Ok => "this was not a refusal",
+        HelloStatus::VersionMismatch => {
+            "this binary speaks a different arena FORMAT_VERSION than the running owner; \
+             both sides must be built from the same release"
+        }
+        HelloStatus::LayoutMismatch => {
+            "same version, different record layout: this binary was built against a \
+             different arena layout than the running owner — rebuild both from the same source"
+        }
+        HelloStatus::BootIdMismatch => {
+            "the arena records a different boot id than this host is running, so it \
+             outlived a reboot; nothing in it is alive and it should be removed"
+        }
+        HelloStatus::NoParticipantSlots => {
+            "every participant slot is taken. If the participants are real, raise the \
+             arena's participant limit, which needs an owner restart; if they are not, \
+             the slots are held by records of processes that died — `tf_tree participants` \
+             prints one line per slot and marks those `stale`"
+        }
+        HelloStatus::ModeNotPermitted => {
+            "this attach asked for read-write on an arena the owner will not let it write; \
+             attach read-only, which is the consumer default"
+        }
+        HelloStatus::Malformed => {
+            "the owner could not decode this attach request, or refused it for a reason \
+             this build has no name for — the two are indistinguishable on the wire, so \
+             check that both sides are the same release before reading it as corruption"
         }
     }
 }
