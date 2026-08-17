@@ -48,7 +48,19 @@ jobs:
           - { os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
           - { os: macos-latest, target: aarch64, manylinux: auto }
-          - { os: macos-13, target: x86_64, manylinux: auto }
+          # **`macos-15-intel`, not `macos-13`.** The macOS 13 image was retired
+          # on 2025-12-04; a job requesting it does not fail, it **queues
+          # forever** against a label no runner carries. That is how it
+          # presented here — the `v0.0.2` wheel matrix sat with one row
+          # `queued` and no runner assigned while every other row had long
+          # since passed, holding the PyPI publish (which `needs` the whole
+          # matrix) indefinitely.
+          #
+          # `macos-15-intel` is the successor and **the last x86_64 macOS image
+          # Actions will offer** — GitHub retires the architecture entirely in
+          # autumn 2027. When that lands, this row goes away and macOS is
+          # arm64-only; `macos-latest` above already covers Apple Silicon.
+          - { os: macos-15-intel, target: x86_64, manylinux: auto }
           - { os: windows-latest, target: x64, manylinux: auto }
     steps:
       - uses: actions/checkout@v7
@@ -138,9 +150,20 @@ jobs:
   # Publishing, not by `maturin build` — maturin adopting them for its own
   # releases is precedent for the workflow shape, not a feature inherited by
   # building with it (§10, corrected in #25).
+  # **A tag *or* a manual dispatch, and the second is a recovery path rather
+  # than a convenience.** crates.io and PyPI publish from the same tag but not
+  # atomically: `release.yml` succeeded for `v0.0.2` while this matrix was still
+  # blocked on a retired runner label, so crates.io had 0.0.2 and PyPI had
+  # nothing, with no way to finish the release short of burning a version
+  # number or moving a tag that a published crate records the sha of.
+  #
+  # `workflow_dispatch` is already privileged — it needs write access — and the
+  # `pypi` environment gates it on top, so allowing it to publish adds no path
+  # an untrusted actor can take. What it adds is the ability to complete a
+  # half-published release from the same commit.
   publish:
     needs: [abi3, freethreaded, sdist]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
