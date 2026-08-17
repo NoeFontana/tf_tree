@@ -64,7 +64,11 @@ below explains why a row there may legitimately read `UNAVAILABLE`.
 
 ## Status
 
-**Nothing is published yet** — not on crates.io, not on PyPI. Build from source.
+**On crates.io from 0.0.1; on PyPI from 0.0.2.** The five engine crates are
+published — `cargo add tf_tree`. The Python wheel starts at 0.0.2, because the
+0.0.1 commit did not compile off Linux and no wheel for it exists or can; see
+[`CHANGELOG.md`](./CHANGELOG.md). **`0.0.x` promises nothing between releases** —
+cargo treats every one as incompatible with every other, so pin exactly.
 
 | Phase | What it is | Status |
 |---|---|---|
@@ -120,8 +124,11 @@ Two things surprise people, both deliberate:
   copy" here means no *intermediate* allocation — use `Plan.at_into` to supply
   the destination.
 
-Rust is `cargo add tf_tree` once published; until then, a path dependency on
-`crates/tf_tree`. `just` alone lists everything the repository can do.
+Rust is `cargo add tf_tree`; Python is `pip install transform_tree` — the
+distribution name differs from the import name, because PyPI refuses `tf_tree`
+as too close to the existing `tftree` ([`0008`](./docs/decisions/0008-the-name-tf-tree.md)
+records the measurement). `import tf_tree` either way. `just` alone lists
+everything the repository can do.
 
 ## Is this a `tf2` replacement?
 

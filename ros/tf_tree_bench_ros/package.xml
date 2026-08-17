@@ -4,7 +4,7 @@
   <name>tf_tree_bench_ros</name>
   <!-- Hand-kept copy of the root Cargo.toml's [workspace.package] version;
        that file carries the argument for the number. -->
-  <version>0.0.1</version>
+  <version>0.0.2</version>
   <description>
     The end-to-end comparison `docs/PHASE5.md` §9.1 specifies: N tf2 consumers
     over a real DDS against a bridge plus N tf_tree consumers, on identical
