@@ -24,7 +24,12 @@ over the README, and over this file.
 - **Phase 5: partial.** `FORMAT_VERSION = 3` **landed** (`layout_hash`
   `0x3D10_4195`); frozen `.tft`, MCAP ingest, counters, `tf_tree top` done;
   catalogue detects 16 of 19.
-- **Version 0.0.1**, unpublished. MSRV **1.87**.
+- **Published** to crates.io and PyPI since 2026-08-17, on the `0.0.x` line —
+  cargo treats every `0.0.x` as incompatible with every other, so *every release
+  may break every other* and that is the whole promise. The number itself is not
+  repeated here because nothing would gate it: read `[workspace.package]
+  version`, which `just artifact-versions` holds every other site to. MSRV
+  **1.87**.
 
 ## Read before changing X
 
@@ -162,15 +167,15 @@ second opinion, not the first.
 |---|---|
 | `just build` | `cargo build --workspace --all-targets` |
 | `just test` | nextest `--workspace` + doctests + ingest-check. **Builds default features**, so anything `#[cfg]`-ed on `shm` is compiled out — that is `just shm-check`'s job |
-| `just lint` | `cargo fmt --check` + **six** `clippy -D warnings` passes (workspace, then five naming a feature the workspace pass compiles out) + the version drift gate. **Not** `cargo deny` — that is `just audit` |
+| `just lint` | `cargo fmt --check` + **six** `clippy -D warnings` passes (workspace, then five naming a feature the workspace pass compiles out), behind three dependencies: `py-compile` (skips loudly with no `.venv`), then `evidence-audit` and `artifact-versions`, which cost under a second between them and are the only place either runs. **Not** `cargo deny` — that is `just audit` |
 | `just shm-check` | fmt/clippy/tests for the default-off `shm` feature, named target by target. A new `shm`-only target belongs on that list in the commit that adds it |
 | `just stable-tier-check` | compiles `tf_tree`'s default tier with `unstable` **off** — the configuration `--workspace` unifies away |
 | `just artifact-versions` | version-skew gate: every hand-kept version site agrees, the publishable set is the five named crates, `CHANGELOG.md` has the current section, every `just <recipe>` reference in docs and workflows resolves |
-| `just quickstart` | clean clone → working Python, ending by running the README snippet and asserting its output |
+| `just quickstart` | `py-setup` → `maturin develop` → runs the README snippet and asserts its output. **Not** a clean clone; it builds both venvs from scratch but reuses the checkout |
 | `just doc` | rustdoc, warnings denied, three lines (nine crates at `--all-features --cfg docsrs`; `tf_tree_bench` at `shm,embed-probe`; `xtask`) |
 | `just py-test` / `py-lint` | Python on two interpreters; `py-lint` also carries `tf_tree_py`'s rustdoc, which `just doc` structurally cannot reach (excluded crate) |
-| `just msrv` | `--locked` build on the declared floor + every hand-written `rust-version` |
-| `just loom` / `miri` / `tsan` | concurrency model checking / UB / thread sanitizer |
+| `just msrv` | **three** arms: a `--locked` `cargo +<floor>` build, every hand-written `rust-version`, and the floor as stated in the prose a user reads (`README.md`, `SUPPORT.md`, `lib.rs`) — the third exists because the first two both passed while README said 1.85 and the manifest said 1.87 |
+| `just loom` / `miri` / `tsan` | concurrency model checking / UB / thread sanitizer. `miri` appends to `$MIRIFLAGS`; CI sets `-Zmiri-strict-provenance` there, so CI is the stricter run of the same recipe |
 | `just audit` | `cargo deny check` |
 | `just bench` / `bench-check` / `bench-baseline-update` | suite + go/no-go gate against the committed baseline |
 | `just embed-cost` / `embed-cost-check` | PHASE5 §9.2's two embedding measurements; `bench-check` depends on it |

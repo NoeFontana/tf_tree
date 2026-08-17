@@ -1,18 +1,35 @@
 name: nightly
 
-# `docs/PHASE5.md` §10's CI list asks for two things that do not belong on a
-# pull request: the `shm_torture` soak (`docs/PHASE2.md` §13 spells it "30
-# minutes nightly, clean, under ASan") and the sanitizer suites, which need a
-# nightly toolchain and `-Zbuild-std` and therefore take tens of minutes.
+# **Why these jobs are nightly and not per-PR.** `docs/PHASE5.md` §10's CI list
+# asks for two things that do not belong on a pull request: the `shm_torture`
+# soak (`docs/PHASE2.md` §13 spells it "30 minutes nightly, clean, under ASan")
+# and the sanitizer suites, which need a nightly toolchain and `-Zbuild-std` and
+# therefore take tens of minutes. `tf2-differential` and `tf2-replay` are here
+# for the same reason — minutes of container work each — and `cpp-check` because
+# it builds the header-only wrapper twice under two sanitizers. None of them is
+# cheap enough to sit between a contributor and a merge; all of them are things
+# that must not be allowed to rot.
 #
-# **This workflow has produced zero runs, and the schedule is not why.** No run
-# of any user workflow has been produced for this repository since 2026-07-23,
-# scheduled or otherwise. `ci.yml`'s header carries the diagnosis: the same
-# account's private repositories all stopped at once while its public ones kept
-# running, which is an account-level Actions billing state and not something
-# this file can change. Every job below is a thin wrapper around a `just`
-# recipe, and the recipe run locally — on a stated architecture — is the gate.
-# That is why the recipes came first and the jobs second.
+# **This file ran for the first time on 2026-08-17, and two of the five jobs it
+# had then failed.** That is the entry that matters, and it replaces the
+# paragraph that used to be here: from 2026-07-23 to 2026-08-16 no user workflow on this
+# repository produced a run at all — an account-level Actions state on private
+# repositories, confirmed rather than inferred when making the repository public
+# restored runs immediately — so every job below had been written, reviewed and
+# never once executed. The first execution is what found the two failures.
+#
+# The history is kept because the conclusion drawn from it is still the design of
+# this file: every job here is a thin wrapper that *invokes* a `just` recipe
+# rather than restating its commands, and the recipe run locally, on a stated
+# architecture, is the gate this workflow corroborates. That ordering — recipes
+# first, jobs second — is what made those three-and-a-half weeks cost corroboration
+# rather than the ability to check anything at all, and it is why a job here is
+# never allowed to grow a command that no recipe contains.
+#
+# What a green tick here is now evidence of: that these recipes passed on a
+# GitHub-hosted x86-64 runner, once, on the tree that was scheduled. Nothing
+# about aarch64 (`ci.yml` has those rows) and nothing about a run that did not
+# happen — a schedule that stops firing still looks exactly like one that passes.
 
 on:
   schedule:
@@ -89,8 +106,12 @@ jobs:
   # tolerance, both host-independent. Excluding them from PRs and then not
   # running them anywhere left the migration-credibility claim ungated.
   #
-  # `tf2-bench`, `tf2-scaling` and `dds-bench` stay out on purpose: those are
-  # timings, and a shared runner cannot produce one meaningfully.
+  # `tf2-bench`, `tf2-bench-check`, `tf2-scaling` and `dds-bench` stay out on
+  # purpose: those are timings, and a shared runner cannot produce one
+  # meaningfully. `tf2-bench-check` is named even though "check" makes it sound
+  # like the others here — it compares against `results-tf2.json`, so it is a
+  # regression gate over *timings*, and a container's timings on a borrowed
+  # runner are the denominator problem this project has already been bitten by.
   tf2-differential:
     name: tf2 differential + replay (container)
     runs-on: ubuntu-latest
@@ -123,3 +144,48 @@ jobs:
         run: just cpp-deps
       - name: just cpp-check
         run: just cpp-check
+
+  # **PHASE5 §12's sharing gate, which ran in no workflow.**
+  # `docs/benchmarks/EVIDENCE.md` registers `frozen_workers.rs` as a gate with a
+  # recipe and records "PASSES at 1.024×"; `just gate4` was that recipe and
+  # nothing invoked it, so the register's one gate row had the same shape as the
+  # `abi_cost` failure the register was created to prevent — a recorded PASS that
+  # nothing re-derived.
+  #
+  # **Nightly and not per-PR, and the reason is the profile, not the runtime.**
+  # The measurement itself is nearly free, and it is a *memory* measurement, so
+  # unlike everything in `bench-check` it does not care what else is on the host —
+  # the recipe says as much ("needs no quiet host and no core parity"). The 338
+  # MiB index is deleted first, because a reused one measures nothing about the
+  # cost of producing it:
+  #
+  #     $ rm -f target/gate4/workers.tft && \
+  #       /usr/bin/time -f "%e s  maxrss %M KB" just gate4
+  #     gate 4: 235.4 MiB / 229.9 MiB = 1.024x against 1.2x — PASS
+  #     1.92 s  maxrss 635688 KB
+  #
+  # matching EVIDENCE.md's 1.024× to three digits. What is not free is getting
+  # there: `frozen_workers` is a `--release` build of `tf_tree_bench --features
+  # shm`, and no pull-request job produces one — `ci.yml`'s `shm` job is a debug
+  # nextest pass. Adding minutes of release compilation to every PR to re-derive a
+  # ratio with 15 % of headroom is the wrong trade; a night is the right one.
+  #
+  # Its own job rather than a step on `torture`, which already has that release
+  # tree: a 1.9-second gate must not be reported behind a 30-minute soak, and it
+  # must not go unrun on a night the soak fails early.
+  #
+  # ~340 MiB of disk for the index and ~620 MiB peak RSS, both well inside a
+  # hosted runner.
+  gate4:
+    name: gate4 (16 workers share one .tft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just gate4
+        run: just gate4

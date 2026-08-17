@@ -1,49 +1,34 @@
-# **Read this before reading a tick. CI DOES NOT RUN. This file is a plan.**
+# **Every job in this file is a thin wrapper around a `just` recipe, and that
+# shape is the point of the file.** The recipe run locally, on a stated
+# architecture, is the first gate; this workflow is the second opinion. A job
+# that re-spells a recipe's lines instead of invoking it is a defect here, not a
+# style preference — `just lint`'s `-p tf_tree_c --features test-hooks` clippy
+# row once lived in no workflow at all because a job had transcribed five of six
+# lines, and the `msrv` job below carries a longer version of the same story.
 #
-# GitHub Actions has produced **no run of this workflow since 2026-07-23**, and
-# that is a measurement, not an impression. Re-checked against the API on
-# 2026-08-02:
+# **CI is real again, and what it found on its return is why it is worth
+# running.** Actions produced no run for this repository between 2026-07-23 and
+# 2026-08-16 — an account-level state on private repositories, confirmed rather
+# than inferred when making the repository public restored runs immediately, and
+# visible throughout in that GitHub-managed Dependabot runs never stopped while
+# *user* workflows did. Not one job in this file had ever executed. The first
+# runs after it returned found three latent bugs that no local gate had ever
+# been in a position to see: `c_char` signedness on aarch64 (`i8` vs `u8`, six
+# casts and two hard type errors), an exported symbol in no header tier, and a
+# container with no writable `ROS_HOME`. The first-ever run of `nightly.yml`, on
+# 2026-08-17, found two more.
 #
-#   gh api repos/NoeFontana/tf_tree/actions/workflows/ci.yml/runs
-#     -> total_count 4; created_at 2026-07-23T23:09-23:10Z; conclusion: failure x4
-#   gh api repos/NoeFontana/tf_tree/events
-#     -> PushEvent refs/heads/main, latest 2026-08-02T05:45:19Z
+# So a green check is evidence again — **but only of what the jobs cover.** The
+# outage is over; the reason the recipes came first is not. `just` is still what
+# gates a change before it is pushed, and everything that a shared runner cannot
+# measure honestly (`bench-check`'s pinned probe below, every timing recipe in
+# the justfile) is still gated on a host, by hand.
 #
-# So: pushes to `main` — the event the trigger below names — are arriving daily
-# and producing nothing. All four historical runs also **failed**, and their job
-# names (`lint-rust`, `test-rust`, `docs-rust`, `lint-py`, `test-py`,
-# `build-wheel`) belong to a template-era revision of this file. Not one job in
-# the file as it stands today — `lint`, `msrv`, `bindings`, `test`, `docs`,
-# `c-abi`, `c-surface`, `python`, `miri`, `tf2`, `shm`, `loom`, `bench-gate` —
-# has ever executed once.
-#
-# **What is ruled out, and what is inferred.** Ruled out by evidence: the
-# workflow is `active` (workflows API), the trigger matches the events being
-# received (above), the runner labels exist — `ubuntu-24.04-arm` became
-# available on private repositories on 2026-01-29 and is free-tier eligible —
-# and Actions itself still schedules work here, because "Dependabot Updates"
-# runs keep completing (latest 2026-08-02). Inferred, and it is inference:
-# **every** private repository on this account stopped producing user-workflow
-# runs at the same time (`tf_tree` 2026-07-23, `loop` 2026-07-23, `jepa-core`
-# 2026-07-24) while **every** active public one kept running (`vernier`,
-# `rust-python-template`, `locus-tag` all 2026-08-01). Private minutes are
-# metered and public ones are not, so the signature is an account-level Actions
-# billing/quota state. It is not confirmed: this token gets HTTP 403 from both
-# `/users/NoeFontana/settings/billing/actions` and the repository's
-# `actions/permissions`, so the cause has not been read directly — only its
-# shape. **Nothing in this file can fix it either way**, and no change to it
-# should be read as having done so.
-#
-# So: the gate is the `just` recipe, run locally, on a stated architecture. Every
-# job here is deliberately a thin wrapper around one, so that the day runs
-# resume, CI and a developer's terminal are running the same commands rather
-# than two drifting transcriptions of them.
-#
-# **The `ubuntu-24.04-arm` rows have never executed.** They are named in the
-# `test` and `shm` matrices below, and `CLAUDE.md` cites "the aarch64 CI target"
-# as one of the two defences against a weakened atomic ordering. That defence is
-# currently inert: on this repository the aarch64 rows are YAML and nothing
-# else. `just loom` is the half that still runs, and it runs on x86-64.
+# **On aarch64, specifically.** The `ubuntu-24.04-arm` rows in the `test` and
+# `shm` matrices had never executed in the life of the project; they now run and
+# pass. That is *execution*, not a weak-memory proof. aarch64 reorders more than
+# x86-64, so it can surface a missing barrier — a green run is not evidence one
+# is absent. `just loom` remains the argument; these rows are corroboration.
 name: CI
 
 on:
@@ -80,10 +65,20 @@ jobs:
   #
   # `just lint` depends on `py-compile`, which skips loudly when there is no
   # `.venv` — correct here, because the `bindings` job below is that gate and
-  # needs only an interpreter.
+  # needs only an interpreter. It also depends on `evidence-audit` and
+  # `artifact-versions`, which is why neither has a job of its own: 0.81 s and
+  # 0.09 s respectively, and both are pure text checks over the checkout.
   #
-  # `cargo deny check` stays as the action rather than `just audit`: the action
-  # supplies the binary, and the recipe is one line either way.
+  # **`just audit`, not `EmbarkStudios/cargo-deny-action`.** The old note here
+  # said the action stays because it supplies the binary and the recipe is one
+  # line either way. The first half stopped being a reason once this job grew a
+  # `taiki-e/install-action` step, which lists `cargo-deny` among its tools
+  # (checked against that repository's `TOOLS.md`, the same way the `c-surface`
+  # job below establishes that `cbindgen` is *not* in it). The second half was
+  # never a reason at all: one line is exactly how long `cargo fmt --all --
+  # --check` is, and that line drifting out of a job is the defect this file
+  # keeps finding. `deny.toml` is the configuration either way; what changes is
+  # that a contributor's `just audit` and this step are now the same command.
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -95,34 +90,58 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just,cargo-deny
       - name: just lint
         run: just lint
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
+      - name: just audit
+        run: just audit
 
   # **The MSRV floor, enforced rather than intended** (`SUPPORT.md`, and
   # `docs/PHASE5.md` §10's "MSRV policy and a CI matrix pinning it").
   #
-  # `rust-version = "1.83"` in the workspace manifest is a promise to every
-  # downstream that this builds on 1.83. Nothing in the other jobs checks it:
-  # they all run `stable`, where a 1.85-only method compiles perfectly and the
+  # `rust-version` in the workspace manifest is a promise to every downstream
+  # that this builds on that floor. Nothing in the other jobs checks it: they all
+  # run `stable`, where a newer-than-floor method compiles perfectly and the
   # breakage is discovered by a user on an older toolchain.
   #
-  # `--lib --bins` and not `test`: the promise is that what a downstream *links*
-  # builds on the floor. Dev-dependencies (criterion, proptest, nextest) set
-  # their own, higher MSRVs, and chasing theirs would raise ours for no benefit
-  # to anyone depending on this.
+  # **This job used to transcribe `just msrv` instead of running it, and the
+  # transcription was both short and wrong.**
   #
-  # The committed `Cargo.lock` is used as-is, deliberately. The floor is a
-  # property of the dependency versions we actually ship, and a transitive crate
-  # that needs a newer toolchain is exactly the drift this job exists to catch —
-  # re-resolving here would hide it behind whatever the resolver felt like
-  # picking that morning. That is not hypothetical: this job was written at
-  # `rust-version = "1.83"` and `constant_time_eq 0.4.2` (via `blake3`) failed to
-  # parse on 1.83, which is how the floor became 1.85.
+  # Short: the recipe has three arms and this job had two. The missing one greps
+  # the prose a user actually reads — `README.md`, `SUPPORT.md`,
+  # `crates/tf_tree/src/lib.rs` — for the floor, and it exists *because* README
+  # said 1.85 while the manifest said 1.87 and both of the arms that were here
+  # passed anyway. That arm therefore ran in no workflow at all.
+  #
+  # Wrong: the recipe builds with `cargo "+$want"`; the transcription dropped the
+  # `+` and ran a bare `cargo build`. `rust-toolchain.toml` in this repository
+  # pins `channel = "stable"`, and a directory's `rust-toolchain.toml` beats
+  # `rustup default`, which is all `dtolnay/rust-toolchain` sets (its `action.yml`
+  # runs `rustup default <toolchain>` and exports no `RUSTUP_TOOLCHAIN`). Measured
+  # in the repository root:
+  #
+  #     $ rustup show active-toolchain -v
+  #     stable-x86_64-unknown-linux-gnu
+  #     active because: overridden by '/home/dev/src/tf_tree/rust-toolchain.toml'
+  #
+  # So the one step that was supposed to compile on the floor would have compiled
+  # on `stable` — a green msrv job proving nothing about the MSRV. `cargo +1.87`
+  # is unambiguous under every rustup precedence rule, and it is what the recipe
+  # already spelled.
+  #
+  # What survives here is the one thing the recipe cannot do for itself: the
+  # floor's toolchain has to exist before `cargo +$want` can use it, and the
+  # recipe deliberately *fails* rather than falling back to `stable` when it does
+  # not. So the version is still read from the manifest — never hardcoded, which
+  # would drift from `rust-version` and pass while the promise was broken — and
+  # handed to `dtolnay/rust-toolchain`, whose `rustup toolchain install` leaves it
+  # named `<floor>-<triple>` for the recipe's `rustup toolchain list` check to
+  # find. Everything after that is `just msrv`.
+  #
+  # The rest of the argument lives with the recipe, where a developer running it
+  # will read it: `--lib --bins` and not `test`, the committed `Cargo.lock` used
+  # as-is, and why the two workspace-excluded crates are compared rather than
+  # compiled.
   msrv:
     name: msrv
     runs-on: ubuntu-latest
@@ -134,37 +153,15 @@ jobs:
           v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
           test -n "$v" || { echo "no rust-version in Cargo.toml"; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      # Pinned from the manifest, not written twice: a hardcoded version here
-      # would drift from `rust-version` and pass while the promise was broken.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      - name: cargo build on the MSRV toolchain
-        run: cargo build --workspace --lib --bins --locked
-      # `cargo build --workspace` cannot see `crates/tf_tree_py` or
-      # `crates/tf_tree_tf2_sys`: both are excluded from the workspace, so both
-      # spell `rust-version` by hand, and neither was checked by anything. That
-      # is the same defect the job above exists for — a floor that looks
-      # authoritative, is never compiled against, and drifts. `tf_tree_py` is the
-      # one that matters most, because the wheel is what an end user installs.
-      #
-      # Compared rather than compiled: `tf_tree_tf2_sys` needs a ROS 2 install
-      # that no runner here has, so building it is not an option and agreeing
-      # with the workspace floor is the strongest check available.
-      - name: every hand-written rust-version agrees with the workspace
-        run: |
-          want='${{ steps.msrv.outputs.version }}'
-          rc=0
-          for m in crates/*/Cargo.toml xtask/Cargo.toml; do
-            got=$(grep -m1 '^rust-version *=' "$m" | cut -d'"' -f2)
-            [ -n "$got" ] || continue
-            if [ "$got" != "$want" ]; then
-              echo "::error file=$m::declares rust-version $got, workspace declares $want"
-              rc=1
-            fi
-          done
-          exit $rc
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just msrv
+        run: just msrv
 
   # `crates/tf_tree_py` is excluded from the workspace, so `cargo clippy
   # --workspace` above never compiles it. That gap shipped a real bug: a
@@ -324,7 +321,7 @@ jobs:
   #
   # This job previously spelled its own `cargo doc` line, covering six of the
   # workspace's eleven members and omitting `tf_tree_c`, `tf_tree_ingest`,
-  # `tf_tree_bridge`, `tf_tree_bench` and `xtask`. Since it has never executed,
+  # `tf_tree_bridge`, `tf_tree_bench` and `xtask`. It had never executed, so
   # none of it was enforced anywhere, and `cargo doc --no-deps --workspace` had
   # accumulated **80** warnings — 44 unresolved intra-doc links, 35 public items
   # linking to private ones, one redundant explicit target. All 80 are fixed and
@@ -461,6 +458,32 @@ jobs:
           tool: just
       - name: just py-setup
         run: just py-setup
+      # **`just quickstart` — the README's documented first five minutes, which
+      # ran in no workflow.** CLAUDE.md's command table lists it as a gate; it
+      # was one only for whoever typed it. It executes the `## First five
+      # minutes` snippet *out of `README.md`* and compares stdout against the
+      # `# ->` marker in the snippet itself, so it fails when an API change makes
+      # the documentation a reader follows stop working — which is a per-PR
+      # concern, not a nightly one, because the documentation drifts on the same
+      # commits the API does.
+      #
+      # It is here, in this job, rather than in one of its own, because that is
+      # what makes it nearly free. Cold it needs uv, two CPython interpreters and
+      # a from-scratch `maturin develop` — all of which this job has already paid
+      # for by the step above. Measured on x86-64 with those already in place:
+      #
+      #     $ /usr/bin/time -f "%e s" just quickstart
+      #     0.72 s          (warm; the smoke script alone is 0.10 s)
+      #
+      # and 7.11 s from no `.venv`/`.venv-t` at all with uv's download cache
+      # warm, which is the closest local approximation of a cold runner and still
+      # an underestimate of one.
+      #
+      # Before `just py-lint` and `just py-test` deliberately: it is the step a
+      # newcomer's experience depends on, and putting it after the suite would
+      # mean a broken quickstart is only ever reported behind a test failure.
+      - name: just quickstart
+        run: just quickstart
       - name: just py-lint
         run: just py-lint
       - name: just py-test
@@ -468,42 +491,44 @@ jobs:
       - name: just py-test-freethreaded
         run: just py-test-freethreaded
 
-  # **This job is deliberately NOT `just miri`, and the difference is a real
-  # one: it adds `-Zmiri-strict-provenance`, which the recipe does not set.**
-  # So a green `just miri` on a developer's machine does not imply a green job
-  # here — CI is the stricter of the two. Left as-is rather than reconciled,
-  # because reconciling it means choosing which side moves and neither choice is
-  # free: dropping the flag here weakens the only provenance check in the
-  # repository, and adding it to the recipe is a change to a gate that has to be
-  # run on both architectures before it can be claimed. It is recorded so the
-  # next reader knows the two are not the same command.
+  # **CI is the stricter of the two runs, and it now gets there by adding a flag
+  # to the recipe rather than by retyping the recipe.**
+  #
+  # This job used to spell both `cargo miri test` lines out again so it could put
+  # `-Zmiri-strict-provenance` in front of them, and the reason it had to was one
+  # word in the justfile: the second line assigned `MIRIFLAGS=` outright, so
+  # anything the environment set was discarded and there was no way to ask for
+  # provenance checking without losing `-Zmiri-disable-isolation`. The recipe now
+  # appends to `${MIRIFLAGS:-}` instead, so the flag can be set here, at the job
+  # level, and the recipe stays the single spelling of *which* targets are
+  # interpreted under Miri. Which matters: `docs/decisions/0017` says a second
+  # `unsafe` in `tf_tree` adds its target to that `--test` list, and under the old
+  # arrangement it would have been added in one place and silently not run in the
+  # other.
+  #
+  # A green `just miri` on a developer's machine still does not imply a green job
+  # here — `MIRIFLAGS` is unset locally and provenance checking is off. That
+  # asymmetry is deliberate and unchanged; what changed is that it is now the only
+  # difference between the two, instead of one difference among however many a
+  # transcription had accumulated.
   miri:
     name: miri
     runs-on: ubuntu-latest
+    # Both of the recipe's lines, and only this job sets it. The recipe appends
+    # its own `-Zmiri-disable-isolation` to whatever is here.
+    env:
+      MIRIFLAGS: "-Zmiri-strict-provenance"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      # For the `test-doc-error-codes` step at the end of this job — the only
-      # nightly command here that is not `miri` itself.
       - uses: taiki-e/install-action@v2
         with:
           tool: just
       - uses: Swatinem/rust-cache@v2
-      - name: cargo miri test
-        env:
-          MIRIFLAGS: "-Zmiri-strict-provenance"
-        run: cargo +nightly miri test -p tf_tree_arena -p tf_tree_core --features tf_tree_core/miri-soft-float
-      # The facade's one `unsafe` — `OwnedWriter`'s lifetime extension
-      # (`docs/decisions/0017`). `-Zmiri-disable-isolation` because building a
-      # `Tree` reads `/proc` for the boot id and the process start time; see the
-      # `miri` recipe in the justfile for why this is two targets and not the
-      # whole crate.
-      - name: cargo miri test (facade)
-        env:
-          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-disable-isolation"
-        run: cargo +nightly miri test -p tf_tree --features tf_tree_core/miri-soft-float --lib --test owned_writer
+      - name: just miri
+        run: just miri
       # The two `compile_fail,E0277` pins. Stable rustdoc parses the error code
       # and ignores it, so `just test-doc` cannot enforce them; this job already
       # has the nightly toolchain that can. Seconds, and it is here rather than
@@ -593,9 +618,10 @@ jobs:
           just shm-rendezvous
 
   # Spelled as the recipe rather than as its body. It is one line either way,
-  # and with the aarch64 rows above not executing, this is currently the whole
-  # of the weak-memory defence — it should be impossible for it to drift from
-  # what a developer runs.
+  # and it is the *argument* half of the weak-memory defence — the aarch64 rows
+  # above now execute and pass, but a green run on hardware corroborates an
+  # ordering claim and does not prove one. This is the model checker, so it
+  # should be impossible for it to drift from what a developer runs.
   loom:
     name: loom
     runs-on: ubuntu-latest
@@ -617,9 +643,13 @@ jobs:
   # construction (`crates/tf_tree_bench/src/baseline.rs`), so an extra
   # architecture would re-run the same one host-independent claim.
   #
-  # **A green tick here is not evidence and must not be read as one.** No run of
-  # this workflow has been produced for this repository since 2026-07-23; the
-  # gate is `just bench-check`, run locally on the arch stated in the PR.
+  # **A green tick here is not evidence of a performance claim**, and that is
+  # true now that runs happen rather than in spite of it. A shared runner's
+  # neighbours are not observable from inside it, so a timing measured here
+  # answers a different question from the one the baseline was cut against; the
+  # gate is `just bench-check`, run locally on the arch stated in the PR. See the
+  # `bench-check` step below for why this job cannot pass on a hosted runner at
+  # all today.
   bench-gate:
     name: benchmark regression gate
     runs-on: ubuntu-latest
@@ -643,24 +673,30 @@ jobs:
         run: just embed-cost-check
       # `bench-check` depends on `just embed-cost`, so this step also builds the
       # `[profile.embedder]` tree (166 MiB, ~10 s measured locally) and runs the
-      # probe under `taskset -c 2`. **That needs a runner with at least three
-      # logical CPUs, and this repository has none.** GitHub's standard Linux
-      # runner is 4 vCPU for a *public* repository and **2 vCPU for a private
-      # one** (docs.github.com's hosted-runner spec table); `tf_tree` is private,
-      # so CPU 2 does not exist and `taskset -c 2` will fail here on every run.
-      # Changing the label does not help: `ubuntu-24.04-arm` is 2 vCPU on a
-      # private repository too.
+      # probe under `taskset -c 2` — which needs a runner with at least three
+      # logical CPUs.
       #
-      # That is recorded rather than fixed, and deliberately: the alternatives
-      # are to unpin the probe — an unpinned run cannot resolve §9.2's 5 %, so
-      # the row would stop being a measurement — or to pick the CPU dynamically,
-      # which changes the conditions the committed baseline in
-      # `crates/tf_tree_bench/baseline/results.json` was cut under and so is a
-      # benchmarking decision, not a CI one. Until one of those is taken, **this
-      # job cannot pass on a GitHub-hosted runner** and `just bench-check`, run
-      # locally on a stated host, is the gate. The dependency itself is not
-      # optional: `bench-baseline-update` records the row, and a baseline row the
-      # check cannot produce is a permanent failure.
+      # **This comment used to say the job could not pass on a hosted runner, and
+      # execution refuted it.** The argument was that GitHub's standard Linux
+      # runner is 4 vCPU for a public repository and 2 for a private one, and
+      # `tf_tree` was private, so CPU 2 would not exist. `tf_tree` is public now —
+      # that is how the Actions outage was confirmed — and the prediction was
+      # tested rather than re-reasoned about:
+      #
+      #     gh run view --job 95381266134   # ci.yml run 32027957136, 2026-08-17
+      #     just embed-cost-check  success
+      #     just bench-check       success   (embedder 323.5 ns, release 250.0 ns)
+      #
+      # `taskset -c 2` ran and the pin held. The refuted expectation is left in
+      # place rather than deleted because it is the reason the probe is pinned at
+      # all: if this repository ever goes private again the row stops being
+      # producible, and the fix is *not* to unpin (an unpinned run cannot resolve
+      # §9.2's 5 %) nor to pick the CPU dynamically (that changes the conditions
+      # `crates/tf_tree_bench/baseline/results.json` was cut under, which is a
+      # benchmarking decision and not a CI one).
+      #
+      # The dependency itself is not optional: `bench-baseline-update` records the
+      # row, and a baseline row the check cannot produce is a permanent failure.
       - name: just bench-check
         run: just bench-check
       # The artifact itself, so a failing gate can be inspected rather than

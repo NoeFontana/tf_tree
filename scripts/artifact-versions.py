@@ -423,8 +423,8 @@ def check_recipe_references() -> str:
                 if token not in recipes:
                     fail(
                         f"{rel}:{lineno}: runs `just {token}`, which is not a recipe.\n"
-                        f"    CI mirrors these recipes 1:1 and has produced no "
-                        f"run since 2026-07-23, so nothing else would notice."
+                        f"    CI mirrors these recipes 1:1, so this is a job that "
+                        f"will fail on `error: Justfile does not contain recipe`."
                     )
 
     return (
