@@ -623,11 +623,20 @@ write the signatures the question forks.
    resolves to a different frame, and `edges()` returning a self-loop — and
    explicitly **not** the refuted stronger claim that a full-name `lookup` resolves
    to the truncated frame. — verified by the record existing with a runnable
-   reproduction, not by code.
+   reproduction, not by code. **Landed as
+   [`0027`](./0027-the-48-byte-frame-name-store.md)**, which re-ran both
+   reproductions independently rather than inheriting them and decides for a
+   refusal at `intern`.
 7. **(Not blocked.)** A `PHASE5.md` §12 amendment or a record attaching the worker
    language and start method to gate 4's 1.024×, with the `p` table and the
    `S ≥ 74p` minimums. — verified by the amendment quoting the measured p values and
-   the spawned-Python failure at 1.248×.
+   the spawned-Python failure at 1.248×. **Landed as an amendment inside
+   `PHASE5.md` §12 gate 4**, on the argument that nothing is being decided — the
+   criterion, the harness and the 1.024× all stand — so the qualification belongs
+   beside the number it qualifies. It re-measured the whole table on gate 4's
+   *own* fixture rather than on this corpus: spawned-Python `p` = 13.44 MiB there,
+   and the gate's own file fails its own criterion at **1.785×** with a Python
+   worker. Also resolves this record's open question 3.
 
 ## What would make this ready
 
@@ -666,6 +675,15 @@ genuinely independent of the fork this record decides; step 5 is not.
 3. **Where does the gate-4 scope finding land** — a §12 amendment, or its own
    record? It is a bigger claim than this one and burying it here would be the
    wrong home for it.
+
+   **Resolved: a `PHASE5.md` §12 amendment**, landed with step 7. Size is not the
+   criterion for a record; deciding something is. Nothing about gate 4 is being
+   decided — the criterion stands, the harness is right, and 1.024× reproduced on
+   re-measurement — so what the finding adds is scope to an existing number, and a
+   qualification that does not sit beside the number it qualifies does not do its
+   job. `0023` and `0025` are records because each *changed* a gate; a proposal to
+   give criterion 4 a second worker arm would be one too, and the amendment names
+   that as the thing it does not do.
 4. **Is there a requester for a single-file corpus?** There is none today. If one
    appears, this record reopens — and the argument has to start by refuting the
    **peak-RSS** arithmetic (~0.6 MB/episode measured, ~60 GB extrapolated at 10⁵)
