@@ -656,8 +656,11 @@ mod imp {
         // forever — measured on this host at 256.0 per round with every child
         // locked out of the arena and the last write 28 minutes old. That is a
         // green run over a dead arena, and it is strictly worse than the red one
-        // the same wedge produced on CI, where the four rings froze without an
-        // overlap. This is the check that does not care which way they fell.
+        // the same wedge produced on CI. Both faces of that coin were run on
+        // `ubuntu-latest` at the same seed on identical code — 256.00 composed
+        // reads a round and 2.02 — so which one a nightly gets says nothing
+        // about the arena (`RoundHealth`). This is the check that does not care
+        // which way they fell.
         //
         // Half the rounds, not all of them: `--kill-hz` guarantees stretches
         // with no writer on a given edge, and that is the state under test.
@@ -870,11 +873,48 @@ mod imp {
     /// scoring the full 256 composed reads per round out of four dead rings
     /// whose windows happened to overlap. The run would have printed `PASS`.
     ///
-    /// The same wedge on the GitHub runner froze the four rings *without* an
+    /// On the GitHub runner the same wedge froze the four rings *without* an
     /// overlap, so the composed count went to ~0 and the read floor caught it —
-    /// which is the only reason anybody looked. A gate that depends on which way
-    /// four dead rings happen to fall is not a gate, so everything below is
-    /// checked on every round and reported whether the run passes or fails.
+    /// which is the only reason anybody looked.
+    ///
+    /// # Which way four dead rings fall is a coin flip, and both faces were run
+    ///
+    /// Two 30-minute nightlies on `ubuntu-latest`, same seed
+    /// (`8107906721580384257`), and `git diff 817ce70 a3bc7f2 --
+    /// crates/tf_tree/src/open.rs crates/tf_tree_bench/
+    /// crates/tf_tree_core/src/participant.rs` is **empty** — the same engine,
+    /// the same harness, the same workload:
+    ///
+    /// ```text
+    /// 817ce70  wedged  FAIL   21756 composed / 10763 rounds =   2.02 a round
+    /// a3bc7f2  wedged  PASS 2751232 composed / 10747 rounds = 256.00 a round
+    /// adeb158  healthy PASS 2752957 composed / 10757 rounds = 255.92 a round
+    /// ```
+    ///
+    /// The first two were wedged and differ only in whether the frozen windows
+    /// intersected. The third is the same nightly with the owner-side fix in.
+    ///
+    /// **And the perfect score is the tell, not the reassurance.** 2 751 232 is
+    /// 10 747 x 256 *exactly*, and the failing run's 688 832 single-edge reads
+    /// are 10 763 x 64 exactly: across an hour of CI neither wedged run missed a
+    /// single read. The healthy run on the same runner missed 835 of 2 753 792,
+    /// because a writer moves the ring between the window probe and the read —
+    /// as it does here, 5 to 25 misses in every 25 600. A hundred per cent is
+    /// not what a well-tortured arena looks like; it is what nothing moving
+    /// looks like.
+    ///
+    /// Locally only the overlapping face reproduces: seven attempts — four seeds
+    /// at `--kill-hz 6`, the nightly's seed under `taskset -c 0-3` (which froze
+    /// with a 689 ms intersection), and `--kill-hz 2 --duration 150s` on the
+    /// theory that survivors killed half a second apart would freeze their edges
+    /// further apart than a ring is wide (`overlap=100% window=327ms`, so that
+    /// theory is refuted) — all froze *with* an overlap and scored ~256.
+    ///
+    /// Which is the argument for what follows. A gate that depends on which way
+    /// four dead rings happen to fall is not a gate — the same defect went green
+    /// and red on the same runner over two runs — so everything below is checked
+    /// on every round and reported whether the run passes or fails, and none of
+    /// it asks how the windows landed.
     #[derive(Default, Clone, Copy)]
     struct RoundHealth {
         /// How many chain edges reported a window at all. Fewer than
@@ -895,7 +935,17 @@ mod imp {
         chain_ok: u64,
         /// `now - newest` for the *freshest* chain edge, ns. This is the number
         /// that says whether anybody is still writing.
-        freshest_age: i64,
+        ///
+        /// **`None`, not a sentinel, when no edge reported a window at all.**
+        /// This was `i64::MAX` for that case and the sentinel was summed into
+        /// the run's average like a measurement: `--duration 3s --children 2
+        /// --readers-only` printed `freshest=709490156681ms` — twenty-two years
+        /// — and the failure diagnosis below it said the freshest edge was
+        /// `9223372036855 ms` old. Both are `i64::MAX` wearing a unit. A harness
+        /// whose whole subject is "a number that cannot tell a live arena from a
+        /// dead one" must not invent one, so the rounds with nothing to measure
+        /// are counted separately and left out of the mean.
+        freshest_age: Option<i64>,
         /// Chain edges whose claim word names a participant that is still
         /// alive / is already dead / is free.
         writers_live: u64,
@@ -920,8 +970,11 @@ mod imp {
         /// held edge is written every ~2.5 ms. A hundredfold slowdown still
         /// leaves the freshest edge a quarter of a second old. What this is
         /// written against is minutes, not milliseconds.
+        /// A round where no edge has ever been written is **not** live: an arena
+        /// nobody has published to yet is exactly the vacuous state this check
+        /// exists to refuse, so `None` fails the conjunction.
         fn arena_is_live(self) -> bool {
-            self.writers_live > 0 && self.freshest_age < 1_000_000_000
+            self.writers_live > 0 && self.freshest_age.is_some_and(|age| age < 1_000_000_000)
         }
     }
 
@@ -937,6 +990,13 @@ mod imp {
         gap_sum: i64,
         gap_max: i64,
         laggard: [u64; CHAIN.len()],
+        /// **Denominators, not `rounds`.** Both of the averages below are over
+        /// the rounds that had something to average: a round where no edge had
+        /// ever been written contributes no age, and a round whose windows
+        /// intersected contributes no gap. Dividing either by `rounds` reports a
+        /// mean of a set that includes members it never measured.
+        gap_rounds: u64,
+        freshest_rounds: u64,
         freshest_sum: i64,
         freshest_max: i64,
         writers_live_sum: u64,
@@ -958,6 +1018,7 @@ mod imp {
                 self.overlap += 1;
                 self.width_sum += h.width;
             } else if h.windows == CHAIN.len() {
+                self.gap_rounds += 1;
                 self.gap_sum += h.gap;
                 self.gap_max = self.gap_max.max(h.gap);
                 self.laggard[h.laggard.min(CHAIN.len() - 1)] += 1;
@@ -966,12 +1027,39 @@ mod imp {
                 self.live_rounds += 1;
             }
             self.chain_ok += h.chain_ok;
-            self.freshest_sum += h.freshest_age;
-            self.freshest_max = self.freshest_max.max(h.freshest_age);
+            if let Some(age) = h.freshest_age {
+                self.freshest_rounds += 1;
+                self.freshest_sum += age;
+                self.freshest_max = self.freshest_max.max(age);
+            }
             self.writers_live_sum += h.writers_live;
             self.writers_dead_sum += h.writers_dead;
             self.slots_registered_max = self.slots_registered_max.max(h.slots_registered);
             self.slots_alive_min = self.slots_alive_min.min(h.slots_alive);
+        }
+
+        /// Milliseconds, or `n/a` when the quantity was never observed.
+        ///
+        /// A mean over zero samples is not zero and it is not `i64::MAX`; it is
+        /// nothing, and a diagnostic that says so is worth more than one that
+        /// prints a plausible number. `n/a` on `freshest` means no chain edge
+        /// was ever written; on `gap` it means the windows always intersected.
+        fn mean_ms(sum: i64, n: u64) -> String {
+            if n == 0 {
+                "n/a".to_string()
+            } else {
+                format!("{:.0}ms", sum as f64 / n as f64 / 1e6)
+            }
+        }
+
+        /// The same, for a maximum: `n/a` unless at least one round contributed
+        /// one.
+        fn max_ms(v: i64, n: u64) -> String {
+            if n == 0 {
+                "n/a".to_string()
+            } else {
+                format!("{:.0}ms", v as f64 / 1e6)
+            }
         }
 
         /// The one-line periodic summary. **One space after the prefix**, not
@@ -981,14 +1069,14 @@ mod imp {
             let r = self.rounds.max(1) as f64;
             format!(
                 "shm_torture: t={:.0}s rounds={} composed={}/{} overlap={:.0}% \
-                 window={:.0}ms freshest={:.0}ms writers={:.1}/4 slots={}reg/{}alive live={:.0}%",
+                 window={} freshest={} writers={:.1}/4 slots={}reg/{}alive live={:.0}%",
                 elapsed.as_secs_f64(),
                 self.rounds,
                 self.chain_ok,
                 self.rounds * 256,
                 100.0 * self.overlap as f64 / r,
-                self.width_sum as f64 / self.overlap.max(1) as f64 / 1e6,
-                self.freshest_sum as f64 / r / 1e6,
+                Self::mean_ms(self.width_sum, self.overlap),
+                Self::mean_ms(self.freshest_sum, self.freshest_rounds),
                 self.writers_live_sum as f64 / r,
                 self.slots_registered_max,
                 if self.slots_alive_min == u64::MAX {
@@ -1003,19 +1091,28 @@ mod imp {
         /// The sentence a failing run should not make the next person derive.
         fn diagnosis(&self) -> String {
             let r = self.rounds.max(1) as f64;
-            let worst = self
-                .laggard
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, n)| **n)
-                .map_or(0, |(i, _)| i);
-            let (parent, child) = CHAIN[worst];
+            // `n/a` rather than the array's default winner. With no
+            // non-overlapping round, `laggard` is all zeroes and `max_by_key`
+            // still returns an index — `arm->tool`, the last maximum — so the
+            // sentence would name an edge that held nothing back on a run where
+            // the windows always intersected.
+            let worst = if self.gap_rounds == 0 {
+                "n/a".to_string()
+            } else {
+                let (i, _) = self
+                    .laggard
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, n)| **n)
+                    .unwrap_or((0, &0));
+                format!("{}->{}", CHAIN[i].0, CHAIN[i].1)
+            };
             format!(
                 "the four chain windows intersected on {}/{} rounds ({:.1}%); on {} rounds an \
                  edge had never been written at all. When they did not intersect the nearest \
-                 pair was {:.0} ms apart (worst {:.0} ms) and the edge holding the \
-                 intersection back was most often {parent}->{child}. Averaged over the run \
-                 the freshest of the four edges was {:.0} ms old (worst {:.0} ms) and {:.2} of \
+                 pair was {} apart (worst {}) and the edge holding the \
+                 intersection back was most often {worst}. Averaged over the run \
+                 the freshest of the four edges was {} old (worst {}) and {:.2} of \
                  the 4 chain edges had a *live* writer; {} participant slot(s) held a LIVE \
                  record at the high-water mark while as few as {} were alive by the kernel's \
                  answer",
@@ -1023,10 +1120,10 @@ mod imp {
                 self.rounds,
                 100.0 * self.overlap as f64 / r,
                 self.short,
-                self.gap_sum as f64 / (self.rounds - self.overlap).max(1) as f64 / 1e6,
-                self.gap_max as f64 / 1e6,
-                self.freshest_sum as f64 / r / 1e6,
-                self.freshest_max as f64 / 1e6,
+                Self::mean_ms(self.gap_sum, self.gap_rounds),
+                Self::max_ms(self.gap_max, self.gap_rounds),
+                Self::mean_ms(self.freshest_sum, self.freshest_rounds),
+                Self::max_ms(self.freshest_max, self.freshest_rounds),
                 self.writers_live_sum as f64 / r,
                 self.slots_registered_max,
                 if self.slots_alive_min == u64::MAX {
@@ -1115,11 +1212,7 @@ mod imp {
         // reads themselves take long enough for a writer to move.
         health.windows = windows.len();
         let now = now_nanos();
-        health.freshest_age = windows
-            .iter()
-            .map(|w| now.saturating_sub(w.newest))
-            .min()
-            .unwrap_or(i64::MAX);
+        health.freshest_age = windows.iter().map(|w| now.saturating_sub(w.newest)).min();
         census(tree, health);
         // `let Some(..)` rather than `expect`: both are `None` only when no edge
         // reported a window at all, in which case there is no laggard to name
@@ -1298,11 +1391,31 @@ mod imp {
         // code path, and the failure it prevents is silent by construction: a
         // wedged arena reads exactly like a healthy one. `arena_is_live` catches
         // the *consequence* a round at a time; this names the cause.
+        // **Polled, not sampled once, and the difference is a flaky gate.**
+        // Reclamation is asynchronous by construction: the child's socket closes
+        // when the kernel tears the process down, and the owner's serving thread
+        // performs the `LIVE -> FREE` CAS when it is next scheduled and sees the
+        // hangup. `drive` waits 100 ms after the last `wait()` before calling
+        // this, which is generous on an idle host and is a *scheduling*
+        // assumption on a loaded four-vCPU runner — and the failure it would
+        // produce is the worst kind, a red nightly naming a defect that is not
+        // there. A real leak never clears, so re-probing costs a genuinely
+        // failing run two seconds and buys a check that does not depend on when
+        // a thread woke up.
         let table = view.participants();
         let mut leaked = Vec::new();
-        for slot in 0..table.capacity() as u32 {
-            if slot != me && table.identity(slot).is_some() && !tree.participant_alive(slot) {
-                leaked.push(slot);
+        for attempt in 0..9 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            leaked.clear();
+            for slot in 0..table.capacity() as u32 {
+                if slot != me && table.identity(slot).is_some() && !tree.participant_alive(slot) {
+                    leaked.push(slot);
+                }
+            }
+            if leaked.is_empty() {
+                break;
             }
         }
         if !leaked.is_empty() {
@@ -1312,7 +1425,9 @@ mod imp {
                  refuses a slot whose record reads LIVE, and `register_at` only fills a FREE \
                  one, so no process can ever be granted them again. `docs/PHASE2.md` §11.4 \
                  requires that participant slots never leak and §5 requires that liveness \
-                 come from the lock byte, never from `state`.",
+                 come from the lock byte, never from `state`. Still held two seconds after \
+                 the last child was reaped, so this is not the owner's hangup callback \
+                 running late.",
                 leaked.len(),
                 table.capacity(),
                 &leaked[..leaked.len().min(8)],
