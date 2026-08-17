@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree};
 
 #[cfg(target_os = "linux")]
+use crate::errors::open_err;
+#[cfg(target_os = "linux")]
 use tf_tree::AttachMode;
 
 use crate::errors::{
-    build_err, claim_err, edge_label_of, lookup_err, open_err, push_err, push_msg, resolve_frame,
+    build_err, claim_err, edge_label_of, lookup_err, push_err, push_msg, resolve_frame,
     unknown_frame_err, BufferError, TfTreeError,
 };
 

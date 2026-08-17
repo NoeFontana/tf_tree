@@ -180,6 +180,41 @@ jobs:
   # `transmute::<EdgeWriter, Publisher>` gives **4 errors here and 0 from
   # `cargo clippy --workspace`**, because the workspace does not compile this
   # crate at all — an error confined to it is invisible, however loud.
+  # **The same crate, on the platforms the wheel matrix ships to.**
+  #
+  # `tf_tree_py` always enables `shm`, but the facade gates its whole
+  # shared-arena surface on `#[cfg(all(feature = "shm", target_os = "linux"))]`
+  # — so it is the *target*, not the feature, that decides whether `Open`,
+  # `AttachMode`, `CreatePolicy` and `OpenError` exist. An unconditional import
+  # of any of them compiles here and fails everywhere else.
+  #
+  # That is not hypothetical: it shipped. Both macOS and both Windows rows of
+  # `wheels.yml` failed on the `v0.0.1` tag with `E0432`/`E0433`, which was the
+  # first time that workflow had ever run — it triggers only on `v*`, so the
+  # binding had never once been compiled off Linux. 0.0.1 has no wheel and
+  # cannot have one.
+  #
+  # `cargo check` on native runners rather than a cross-compile from Linux:
+  # blake3's build script needs a C toolchain for the target, so a cross-check
+  # dies in a dependency before reaching this crate. Native runners have one.
+  # It is a check, not a build — no Python, no linking, no wheel.
+  bindings-non-linux:
+    name: python bindings compile (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (tf_tree_py)
+        run: cargo check --manifest-path crates/tf_tree_py/Cargo.toml --features pyo3/extension-module,pyo3/abi3-py39
+
   bindings:
     name: python bindings compile
     runs-on: ubuntu-latest
