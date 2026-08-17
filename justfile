@@ -2101,11 +2101,21 @@ quickstart: py-setup
     @echo "==> next: .venv/bin/python   (the extension is installed in that interpreter)"
 
 # Create both venvs and install the toolchain.
+#
+# **`--allow-existing`, because this recipe is a dependency and `just` re-runs a
+# dependency per invocation.** `quickstart` depends on `py-setup`, so a caller
+# that runs `just py-setup` and then `just quickstart` runs it twice — and
+# `uv venv` on an existing directory is a hard error ("A virtual environment
+# already exists at: .venv"), not a no-op. That is how it presented: ci.yml's
+# `python` job does exactly that sequence and died on the second one. `--clear`
+# would also work and is wrong, because it deletes and rebuilds both venvs on
+# every call for no gain; `--allow-existing` reuses the directory and the
+# `uv pip install` lines below still bring the toolchain up to date.
 py-setup:
     uv python install 3.14 3.14t
-    uv venv --python 3.14 .venv
+    uv venv --python 3.14 --allow-existing .venv
     VIRTUAL_ENV=.venv uv pip install -q maturin numpy pytest ruff pyright
-    uv venv --python 3.14t .venv-t
+    uv venv --python 3.14t --allow-existing .venv-t
     VIRTUAL_ENV=.venv-t uv pip install -q maturin numpy pytest
 
 # Build the extension into the GIL venv and run the suite.
