@@ -178,6 +178,44 @@ fn an_injected_run_that_detects_nothing_says_so() {
 /// restoring `observe`'s old hill-climbing aim leaves this green at 12 967
 /// composed reads. The aiming was never what made the harness vacuous; the
 /// rendezvous was. See [`shm_torture`'s `attach_observer`].
+///
+/// # Why eight seconds used to be load-bearing, and is not any more
+///
+/// Until 2026-08-17 a `SIGKILL`ed participant left its record `LIVE` for ever
+/// and the arena's owner would never grant that slot again, so a run at
+/// `--kill-hz 6` with 6 children exhausted the 64-slot table after about 57
+/// kills — `t ≈ 9.5 s`. **This case runs for 8.** The margin was measured, not
+/// estimated: this exact invocation against the unfixed engine ends having made
+/// 50 kills with 47 slots leaked and 4 alive, so 52 of the 64 are gone and the
+/// wedge is **12 slots — two seconds — away**. And it is worth being precise
+/// about what it would have done past that margin, because the answer is not
+/// "fail on the read floor": four rings whose writers are
+/// all gone still answer every lookup inside the window they froze with, so the
+/// composed count stays at the full 256 a round and the run reports a perfect
+/// score over a dead arena. Measured on this host at `--duration 60s`, before
+/// the fix: `writers=0.0/4 freshest=25670ms composed=25600/25600`, with 8193
+/// `NoParticipantSlots` refusals on stderr. The 30-minute nightly is what
+/// finally showed it, and only because on that runner the four rings happened
+/// to freeze *without* overlapping.
+///
+/// Two things changed, and neither is this test's duration. The owner now reaps
+/// a dead participant's record on hangup, which is what `docs/PHASE2.md` §3.9
+/// always said it did — measured after: 728 kills over 120 s with the
+/// registered-slot count flat at 5 of 64. And `shm_torture` now checks on every
+/// round that some chain edge has a *live* writer and that the freshest sample
+/// is recent, failing a run that spends most of itself quiescent, so a
+/// regression of the first cannot hide the way it hid before. `check_recovery`
+/// reports leaked slots by name on top of that.
+///
+/// The two are independent, and this case is the place that shows it. Run the
+/// current harness against the *unfixed* engine (measured, in a scratch copy of
+/// the tree with `open.rs` reverted): it exits 1 on `1 recovery failure(s)` —
+/// "47 of 64 participant slot(s) hold a LIVE record for a process the kernel
+/// says is dead" — while reporting `composed=13056/13056` and `live=96%`. So the
+/// harness half fails an engine that leaks even when the run was, for its whole
+/// eight seconds, genuinely healthy. That is the intended relationship: this
+/// test goes green again only when the engine stops leaking, not when the
+/// duration is tuned back under the margin.
 #[test]
 fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
     let out = torture(&[
