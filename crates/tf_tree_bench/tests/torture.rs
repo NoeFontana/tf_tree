@@ -195,13 +195,19 @@ fn an_injected_run_that_detects_nothing_says_so() {
 /// score over a dead arena. Measured on this host at `--duration 60s`, before
 /// the fix: `writers=0.0/4 freshest=25670ms composed=25600/25600`, with 8193
 /// `NoParticipantSlots` refusals on stderr. The 30-minute nightly is what
-/// finally showed it, and only because on that runner the four rings happened
-/// to freeze *without* overlapping.
+/// finally showed it, and only because on that runner the four rings froze
+/// *without* overlapping — which is a coin flip and not a property of the
+/// runner: two nightlies at the same seed on identical code (`817ce70`,
+/// `a3bc7f2`) came back `2.02` and `256.00` composed reads a round, one red and
+/// one green over the same dead arena. See `RoundHealth`'s doc comment in the
+/// binary for both runs and for why a *perfect* score is the tell.
 ///
 /// Two things changed, and neither is this test's duration. The owner now reaps
 /// a dead participant's record on hangup, which is what `docs/PHASE2.md` §3.9
 /// always said it did — measured after: 728 kills over 120 s with the
-/// registered-slot count flat at 5 of 64. And `shm_torture` now checks on every
+/// registered-slot count flat at 5 of 64, and then the 30-minute nightly itself,
+/// green on `ubuntu-latest` at `adeb158` with 10 756 kills, `slots=5reg/4alive`
+/// in every one of its 107 health lines and `live` never below 86%. And `shm_torture` now checks on every
 /// round that some chain edge has a *live* writer and that the freshest sample
 /// is recent, failing a run that spends most of itself quiescent, so a
 /// regression of the first cannot hide the way it hid before. `check_recovery`
