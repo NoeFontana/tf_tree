@@ -74,7 +74,15 @@ use tf_tree_bench::workload::{self, Backing, Built};
 /// threshold raised without anyone reading the table.
 const DRIFT_FACTOR: f64 = 3.0;
 
-/// How much RSS may grow between the first and last interval, in KiB.
+/// How much resident memory may grow between the first and last interval, in
+/// KiB.
+///
+/// **Measured as Pss, not RSS**, here and in `rss_kib` below. The names are kept
+/// because they are serialised into `tf_tree.bench-run/1` and are the join keys
+/// `bench_ab` compares on, so renaming them would un-compare every run file
+/// written before the rename. Pss is the correct instrument: it divides each
+/// shared page by the number of processes mapping it, which is what makes a
+/// growth figure meaningful for an arena several processes hold.
 ///
 /// 8 MiB. The arena is fixed-capacity, so the true expectation is zero growth;
 /// the allowance covers the histogram and the per-interval bookkeeping this
@@ -233,7 +241,7 @@ fn main() {
         "vis p50",
         "vis p99.9",
         "wraps",
-        "RSS KiB",
+        "Pss KiB",
         "declined"
     );
     println!("  (`declined` is per interval, in parts per million of that interval's lookups)");

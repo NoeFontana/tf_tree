@@ -487,6 +487,16 @@ pub struct Meta {
     /// leave a `pass` that was never earned, which is the one thing this
     /// report's shape exists to prevent.
     pub notes: Vec<String>,
+    /// What the declared ring capacities reserve, in slots and in bytes.
+    ///
+    /// A *display*, not a check: over-declaring costs no resident memory since
+    /// [`0021`](../../../docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md),
+    /// so there is no threshold here that would be honest to fire on, and a new
+    /// `TFT0xx` would be an addition to `docs/PHASE5.md` §6's catalogue — a spec
+    /// change, not a rendering choice. What an operator was missing is the
+    /// arithmetic, and arithmetic belongs in the header next to the frame and
+    /// edge counts.
+    pub rings: crate::sizing::Rings,
 }
 
 /// Render the human-readable report — the default output.
@@ -507,6 +517,8 @@ pub fn render_human(report: &Report, meta: &Meta) -> String {
         "  arena format_version {} layout_hash 0x{:08X}  {} frames, {} edges",
         meta.format_version, meta.layout_hash, meta.frames, meta.edges
     );
+    let _ = writeln!(s, "  {}", meta.rings.line());
+    let _ = writeln!(s, "  {}", crate::sizing::FORMULA);
     let _ = writeln!(
         s,
         "  reference clock {} ns ({})",
@@ -598,7 +610,13 @@ pub const JSON_SCHEMA: &str = "tf_tree.doctor/1";
 ///   "counters_compiled_in": bool,
 ///   "notes": [ string ],              // checks that ran with evidence missing
 ///   "arena": { "format_version": u32, "layout_hash": "0x........",
-///              "instance": string|null, "frames": u32, "edges": u32 },
+///              "instance": string|null, "frames": u32, "edges": u32,
+///              // declared-vs-used ring capacity; `rounding_slack_*_max` is an
+///              // upper bound, because the pre-next_pow2 request is not stored
+///              "rings": { "edges": u32, "declared_slots": u64, "declared_bytes": u64,
+///                         "used_slots": u64, "used_bytes": u64,
+///                         "rounding_slack_slots_max": u64,
+///                         "rounding_slack_bytes_max": u64, "bytes_per_slot": u64 } },
 ///   "summary": { "error": u32, "warn": u32, "info": u32,
 ///                "passed": u32, "fired": u32, "not_run": u32, "suppressed": u32 },
 ///   "checks": [ { "id": "TFT001", "title": string, "severity": "error",
@@ -660,7 +678,26 @@ pub fn render_json(report: &Report, meta: &Meta) -> String {
         }
     }
     let _ = writeln!(s, "    \"frames\": {},", meta.frames);
-    let _ = writeln!(s, "    \"edges\": {}", meta.edges);
+    let _ = writeln!(s, "    \"edges\": {},", meta.edges);
+    let r = &meta.rings;
+    let _ = writeln!(s, "    \"rings\": {{");
+    let _ = writeln!(s, "      \"edges\": {},", r.edges);
+    let _ = writeln!(s, "      \"declared_slots\": {},", r.reserved_slots);
+    let _ = writeln!(s, "      \"declared_bytes\": {},", r.reserved_bytes());
+    let _ = writeln!(s, "      \"used_slots\": {},", r.used_slots);
+    let _ = writeln!(s, "      \"used_bytes\": {},", r.used_bytes());
+    let _ = writeln!(
+        s,
+        "      \"rounding_slack_slots_max\": {},",
+        r.rounding_slack_slots
+    );
+    let _ = writeln!(
+        s,
+        "      \"rounding_slack_bytes_max\": {},",
+        r.rounding_slack_bytes()
+    );
+    let _ = writeln!(s, "      \"bytes_per_slot\": {}", crate::sizing::SLOT_BYTES);
+    let _ = writeln!(s, "    }}");
     let _ = writeln!(s, "  }},");
 
     let (pass, fired, skipped, suppressed) = report.tally();

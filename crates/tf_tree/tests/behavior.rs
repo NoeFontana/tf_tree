@@ -296,7 +296,14 @@ fn latest_and_latest_common_differ_when_edges_are_uneven() {
 /// terminated. That passed with the wiring deliberately removed — interning an
 /// unclaimed name never reaches the rescue path, so it asserted nothing. This
 /// checks the two properties that were actually missing.
+///
+/// Gated whole: both properties are questions asked *of the view* —
+/// `interning_identity` and `has_liveness_source` are `ArenaView` methods with
+/// no stable-tier spelling — so with `unstable` off there is nothing left to
+/// assert. It still runs under `cargo nextest run --workspace`, which unifies
+/// the feature in from the four consumers that declare it.
 #[test]
+#[cfg(feature = "unstable")]
 fn a_tree_can_rescue_a_wedged_intern() {
     let tree = TreeBuilder::new()
         .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(16)))
@@ -567,14 +574,30 @@ fn span_names_the_edge_that_has_never_published() {
     let err = plan.span(&tree.guard()).unwrap_err();
     // It must name the *silent* edge, not merely fail: a `span` that reported
     // whichever edge it looked at first would satisfy a bare `matches!`.
-    let view = tree.arena_view();
+    //
+    // **The resolution goes through `Tree::edges`, not `arena_view`, so that
+    // there is one assertion here and not two of different strengths.** Both
+    // read the same `EdgeRecord`'s `parent`/`child` — `edges()` is the stable
+    // tier's spelling of it — but the view exists only under `unstable`, so
+    // gating this half would leave the bare `matches!` standing alone in the
+    // tier a packager builds: a `span` that named the wrong edge would then be
+    // caught everywhere *except* there, which is precisely backwards.
+    //
+    // `edges()` lists declared edges in `EdgeId` order, skipping slots whose
+    // record is still zeros; a `TreeBuilder` tree has no such slot, and the
+    // length check below is what turns "`EdgeId` order" into "index `id - 1`"
+    // rather than leaving it a guess.
+    let edges = tree.edges().unwrap();
+    assert_eq!(edges.len(), 2, "both declared edges are listed: {edges:?}");
     let named = match err {
-        LookupError::NoData { edge } => view.edge(edge).map(|r| (r.parent, r.child)),
+        LookupError::NoData { edge } => edges
+            .get(edge.get().wrapping_sub(1) as usize)
+            .map(|(p, c)| (p.as_str(), c.as_str())),
         _ => None,
     };
     assert_eq!(
         named,
-        Some((odom.get(), base.get())),
+        Some(("odom", "base")),
         "expected NoData naming odom -> base, got {err:?}"
     );
 }

@@ -27,8 +27,10 @@
 //! * [`Report::validate`] refuses to emit a report whose rows overclaim: a
 //!   timing row cannot be [`Status::Measured`] on a host that failed the
 //!   fitness probe, an unavailable row must carry a reason *and* the command
-//!   that would produce it elsewhere, and §9.3's four "where we are worse"
-//!   topics must all be present. The binary treats a validation failure as a
+//!   that would produce it elsewhere, §9.3's four "where we are worse"
+//!   topics must all be present, and each of those must carry either a number
+//!   or a stated reason it has none ([`Worse::metrics_absent_because`] — an
+//!   honesty section that cannot regress is the failure it is written against). The binary treats a validation failure as a
 //!   hard error, so the failure mode is "no report" rather than "a flattering
 //!   report".
 //! * [`Status::Indicative`] exists because `TF_TREE_BENCH_FORCE=1` already
@@ -406,6 +408,27 @@ pub struct Worse {
     pub statement: String,
     /// Numbers, where the cost is measurable rather than operational.
     pub metrics: Vec<Metric>,
+    /// Why [`Self::metrics`] is empty — required whenever it is.
+    ///
+    /// **An honesty section that cannot regress is the problem this field
+    /// exists to close.** Two of the four §9.3 entries carried
+    /// `metrics: Vec::new()` for their whole life, and an empty vector is
+    /// indistinguishable from an oversight: nobody reading the report can tell
+    /// "this cost has no number *because*..." from "somebody forgot". Both
+    /// readings are bad, and only one of them is true of any given entry.
+    ///
+    /// [`Report::validate`] enforces the pair in both directions — empty
+    /// metrics need a reason, and a reason beside metrics is a contradiction —
+    /// so this is the same structural honesty [`Row::unavailable`] already has,
+    /// applied to the section whose job is to be quotable against us.
+    ///
+    /// Two shapes of reason are legitimate, and the entries here use one each:
+    /// the cost is measured *elsewhere*, by a recipe this binary cannot run
+    /// (`bridge_supervision`); or the cost is genuinely not denominated in
+    /// nanoseconds or bytes at all (`format_bump_cost`). "Nobody has got round
+    /// to it" is not one of them — that is what `attach_latency` used to be,
+    /// and the answer was to go and measure it.
+    pub metrics_absent_because: Option<String>,
 }
 
 /// Whether this host can produce a timing number that means anything.
@@ -802,14 +825,28 @@ impl Provenance {
             "rustc",
             capture("rustc", &["--version"]).unwrap_or_else(unknown),
         );
-        push(
-            "build_profile",
-            if cfg!(debug_assertions) {
-                "debug".to_owned()
-            } else {
-                "release".to_owned()
-            },
-        );
+        // **The profile directory, measured, not `cfg!(debug_assertions)`.**
+        //
+        // This field used to be a two-valued guess: debug assertions on meant
+        // "debug" and off meant "release". Under `--profile embedder` — the
+        // profile every boundary measurement in this repository is taken at,
+        // because it is the one whose `lto = false` leaves the boundary in the
+        // binary — debug assertions are also off, so the guess printed
+        // `release`. Two runs answering *different questions* therefore carried
+        // *identical* provenance, and `baseline::PORTABLE_FACTS` and
+        // `runstore::BUILD_CRITICAL_FACTS` both compare this key, so both would
+        // have compared them and said nothing.
+        //
+        // `build.rs` reads the directory cargo actually built into out of
+        // `OUT_DIR`; see its comment for why that is a fact rather than a label.
+        push("build_profile", crate::embed::PROFILE_DIR.to_owned());
+        // The half that says what the profile *means*. `build_profile` is the
+        // join key — it is what a comparison matches on — and `build_lto` is
+        // the reason the join key matters: thin LTO inlines across a crate
+        // boundary, so a boundary priced under it is a boundary that was not
+        // there. Recorded beside the profile so a reader of `results.json` does
+        // not have to know this workspace's `[profile.*]` sections by heart.
+        push("build_lto", build_lto());
         push("target", std::env::consts::ARCH.to_owned());
         push("counters_feature", cfg!(feature = "counters").to_string());
         push("shm_feature", cfg!(feature = "shm").to_string());
@@ -1075,6 +1112,21 @@ impl Report {
             if w.statement.trim().is_empty() {
                 bad.push(format!("`worse` entry `{}` states nothing", w.id));
             }
+            match (
+                w.metrics.is_empty(),
+                w.metrics_absent_because.as_deref().map(str::trim),
+            ) {
+                (true, None | Some("")) => bad.push(format!(
+                    "`worse` entry `{}` carries no metrics and no                      `metrics_absent_because`. §9.3's section is the one a reader is                      entitled to quote against us, and an entry with an empty metric                      list reads as an oversight whether or not it is one. Either give                      it a number, or say — in the entry — why the cost has none",
+                    w.id
+                )),
+                (false, Some(_)) => bad.push(format!(
+                    "`worse` entry `{}` carries {} metric(s) *and* a reason they are                      absent. One of the two is wrong, and a reader has no way to tell                      which",
+                    w.id,
+                    w.metrics.len()
+                )),
+                _ => {}
+            }
         }
 
         if bad.is_empty() {
@@ -1183,7 +1235,15 @@ impl Report {
             let _ = writeln!(s, "      \"id\": {},", jstr(w.id));
             let _ = writeln!(s, "      \"topic\": {},", jstr(w.topic));
             let _ = writeln!(s, "      \"statement\": {},", jstr(&w.statement));
-            let _ = writeln!(s, "      \"metrics\": {}", jmetrics(&w.metrics));
+            let _ = writeln!(s, "      \"metrics\": {},", jmetrics(&w.metrics));
+            match &w.metrics_absent_because {
+                Some(why) => {
+                    let _ = writeln!(s, "      \"metrics_absent_because\": {}", jstr(why));
+                }
+                None => {
+                    let _ = writeln!(s, "      \"metrics_absent_because\": null");
+                }
+            }
             s.push_str(if i + 1 == self.worse.len() {
                 "    }\n"
             } else {
@@ -1283,7 +1343,17 @@ impl Report {
                 } else {
                     format!("<br>{}", cell_html(&w.metrics))
                 },
-                esc_html(&w.statement)
+                // The reason is rendered *with* the statement, not below the
+                // table: an explanation of why a cost has no number is only
+                // worth anything next to the place the number would have been.
+                match &w.metrics_absent_because {
+                    None => esc_html(&w.statement),
+                    Some(why) => format!(
+                        "{}<br><em>No metric here: {}</em>",
+                        esc_html(&w.statement),
+                        esc_html(why)
+                    ),
+                }
             );
         }
         s.push_str("</table>\n");
@@ -1668,10 +1738,10 @@ pub fn assemble(opts: &Options) -> Result<Report> {
 /// and `docs/PHASE1.md` §11.2's exploratory measurements are the shape for that:
 /// `just embed-cost` prints it and writes it to `target/embed-cost/`, and
 /// nothing gates it.
-/// The embedding row's `note`, and **the one place this repository states what
-/// `[profile.embedder]` is**.
-///
 /// What the two columns of the tf2 ratio row mean, and what they do not.
+///
+/// (The stray first paragraph this doc comment used to open with belonged to
+/// [`EMBEDDING_NOTE`] and described a different constant.)
 const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides (tf2's \
     policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the \
     MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back \
@@ -1679,10 +1749,31 @@ const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides
     cancels and no arm always gets the colder cache. That pairing is what makes this \
     resolvable where an absolute is not. The two engines are checked to agree on every \
     stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and \
-    therefore FLATTERS tf_tree** by the residual FFI boundary, ~21 ns / 8% at this depth; \
+    therefore FLATTERS tf_tree** by the residual FFI boundary, 45.3 ns / 10% at this depth \
+    (498.2 ns through the binding against 452.9 ns native — this figure used to read \
+    `~21 ns / 8%` here, which `docs/benchmarks/tf2.md` withdrew for having no derivation, \
+    and the correction had reached `ratio.rs` but not this string); \
     the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is \
     2.7x. The floor is set well under both for that reason: this row catches an engine \
-    regression, it does not publish the headline. `ns_per_lookup` on either side is \
+    regression, it does not publish the headline. **The floor speaks for the build in this \
+    report's `build_profile` / `build_lto` provenance fields, and `just tf2-bench-check` \
+    sets those to `release` / `\"thin\"` — NOT to what a consumer compiles, which is \
+    cargo's release defaults (no LTO) and measures 244 ns rather than 202 on this arm, a \
+    paired 2.07x rather than 2.49x. `just tf2-ratio-profiles` is that measurement.** \
+    That build is not a hypothetical and not an approximation: `[profile.*]` is honoured \
+    only in a workspace root, and the published crates declare none, so `cargo add \
+    tf_tree` AND `cargo install tf_tree_cli` both get `lto = false, codegen-units = 16` \
+    — `[profile.embedder]` on both knobs. **The 2.49x is reachable only by building inside \
+    this repository.** `docs/decisions/0025` is why there is nevertheless no second gated \
+    row for it, and the reason is a measurement rather than a preference: across three \
+    repeats the consumer median is stable (2.047-2.088) but its BAND STRADDLES THE FLOOR \
+    in two of the three, so `ratio.rs` returns `Unresolved` there. A threshold cannot be \
+    derived from a band that contains it, and one chosen low enough to pass would be a \
+    gate that always passes — worse than no gate, because it reads as evidence. With the \
+    binding bias above removed as well the consumer estimate is ~1.80x, under the floor; \
+    that is `UNBIASED_ESTIMATE_DEFAULT_RELEASE`, it is `pub` so a reader can reach it, and \
+    `ratio.rs`'s FLOOR doc comment is why it does not move the constant. \
+    `ns_per_lookup` on either side is \
     REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. \
     Single-threaded and uncontended, which is both engines' best case; the contended \
     comparison, where tf2 anti-scales, is `just tf2-scaling`.";
@@ -2005,24 +2096,25 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     let measured_half = match resident {
         Some((resident_bytes, arena_bytes)) => format!(
             "`idle_arena_resident_bytes` is the measured Pss an idle arena of that \
-             geometry actually costs, and it was added expecting to shrink this row: \
-             reserving address space is not the same as holding pages, and the pose \
-             region of an arena nobody has published into has never been read or \
-             written. It does not shrink it — the arena comes out {:.0}% resident \
+             geometry actually costs, and it is now {:.1}% of what the arena reserves \
              ({resident_bytes:.0} B held against {arena_bytes:.0} B reserved by the \
-             arena actually built). So the claim above is no longer arithmetic; it is \
-             measured, and it stands. The cause is the allocator path and not the \
-             design: `HeapArena` asks for 64-byte alignment (`PoseSlot` is one cache \
-             line), and Rust's `alloc_zeroed` reaches `calloc` only when alignment is \
-             at most 16, falling back to `posix_memalign` plus an explicit zero-fill \
-             above it — which touches every page. Measured directly at this size: 4 KiB \
-             resident at align 16, 2356 KiB at align 64. Most of this row is therefore \
-             recoverable rather than inherent; see decision 0021. \
+             arena actually built). **This row used to say the opposite.** The \
+             measurement was added expecting the resident figure to come out far below \
+             the reserved one, found the arena ~100% resident instead, and stood on \
+             that. Decision 0021 then found the cause — `HeapArena` asked the allocator \
+             for 64-byte alignment (`PoseSlot` is one cache line), and Rust's \
+             `alloc_zeroed` reaches `calloc` only at alignment <= 16, falling back above \
+             it to `posix_memalign` plus an explicit zero-fill that touches every page. \
+             The arena is now over-allocated at 16 and aligned to 64 by hand, so \
+             `calloc` returns demand-faulted pages the kernel already guarantees to be \
+             zero. The reservation is unchanged and this entry stands on the \
+             reservation: address space is still a cost tf2 does not pay, a \
+             fixed-capacity arena still cannot grow, and a machine under strict \
+             overcommit is still constrained. What is gone is the *residency*. \
              `idle_arena_resident_bytes` is a delta of a *whole-process* Pss counter \
              across building one tree, quantised to 4 KiB pages, so it also carries \
-             the tree's own non-arena allocations and can land a little either side of \
-             the arena's size. The order of magnitude is the finding; the third digit \
-             is not.",
+             the tree's own non-arena allocations — which is most of what is left. The \
+             order of magnitude is the finding; the third digit is not.",
             resident_bytes / arena_bytes * 100.0
         ),
         None => "`idle_arena_resident_bytes` is absent: Pss could not be measured on \
@@ -2045,6 +2137,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
              the arena *reserves* — and does not depend on this host. {measured_half}"
         ),
         metrics: Vec::new(),
+        metrics_absent_because: None,
     };
     // The arithmetic and the measurement are independent facts, so they are
     // emitted independently: a `from_totals` failure must not discard a Pss
@@ -2091,6 +2184,18 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         ));
     }
 
+    // Both sources of this row's numbers can fail — `from_totals` on an
+    // arithmetic overflow, Pss on a host without `smaps_rollup` or on a build
+    // the memory axis calls unfair — and if both do, the entry has to say so
+    // rather than present an empty list. Set here rather than up with the
+    // statement because only this point knows whether anything was pushed.
+    if floor.metrics.is_empty() {
+        floor.metrics_absent_because = Some(
+            "neither half landed on this run: `ArenaLayout::from_totals` did not return a              layout for the stated geometry, and the Pss measurement was unavailable or              was withheld because this host failed the memory axis of the fitness probe.              The reservation arithmetic is host-independent, so this state is a bug or a              hostile /proc, not a property of the machine — `just bench-report` on any              Linux host that passes `Fitness::probe` fills both in."
+                .to_owned(),
+        );
+    }
+
     vec![
         floor,
         Worse {
@@ -2100,9 +2205,40 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  the lock file, receive the segment fd over a unix socket, map it, and \
                  validate the header. A tf2 consumer constructs a buffer in-process and \
                  is ready immediately. The cost is paid once per process, but it is real, \
-                 and it is a cost tf2 does not have."
+                 and it is a cost tf2 does not have. **Measured on the §11.1 fixture** \
+                 (`just attach-bench`, 201 attach/lookup cycles, ReadOnly). This entry \
+                 carried no number at all until it was built, which made it an honesty \
+                 section that could not regress. \
+                 \
+                 **The number improved 8x and that must not be read as the cost going \
+                 away.** Attach was ~97.5 us p50, almost all of it `populate_hot`; it is \
+                 now **12.4 us p50** (cold ~16.8 us, p99.9 ~25.6 us) because \
+                 `docs/decisions/0024` moved ring population out of attach and onto the \
+                 moment an edge is taken up. The cost *moved*: first plan compile went \
+                 550 ns to **84.3 us** on this fixture, whose plan walks essentially every \
+                 edge. Summed, 100.3 us before against 96.7 us after — on the fixture that \
+                 gains no memory from the change, a wash. What tf2 does not pay is still \
+                 what tf2 does not pay; it is now itemised at two line items instead of \
+                 one, and a reader quoting only the first would be quoting a 8x \
+                 improvement that this fixture did not deliver. \
+                 \
+                 §7.1's guarantee holds throughout: the **first** lookup after attach is \
+                 130 ns p50 before and after, indistinguishable from a steady-state one, \
+                 and the fault *count* is zero. Recompiling a plan whose pages are already \
+                 resident costs 1.33 us, which is what bounds the topology-change path — a \
+                 `reparent` invalidates every cached plan, so that figure is the one \
+                 standing between a reparent and a fault storm across every reader."
                 .to_owned(),
             metrics: Vec::new(),
+            metrics_absent_because: Some(
+                "the figure is `just attach-bench`'s: a separate binary that opens a live \
+                 shared arena over the §11.1 fixture and times the rendezvous. This report \
+                 is produced in one process that never attaches — there is nothing here to \
+                 attach *to* — so the number is stated above with its recipe rather than \
+                 re-measured and gated here. It is a real measurement in the wrong binary, \
+                 not a missing one."
+                    .to_owned(),
+            ),
         },
         Worse {
             id: "format_bump_cost",
@@ -2113,10 +2249,31 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  not attach, by design. `docs/PHASE5.md` §1 bumps v2 to v3 for exactly \
                  this reason — to break it once. tf2 has no shared binary layout and no \
                  equivalent event. `tf_tree doctor --explain-version` prints what an \
-                 operator meeting the refusal needs.",
+                 operator meeting the refusal needs. **This cost is qualitative, and \
+                 that is a finding rather than an omission** — see below.",
                 tf_tree::arena_format_version()
             ),
             metrics: Vec::new(),
+            metrics_absent_because: Some(
+                "this cost is not denominated in nanoseconds or bytes, and no run of this \
+                 benchmark on any host would produce it. Its units are *participants* and \
+                 *coordination*: every process sharing an arena must be rebuilt and \
+                 restarted together, so the quantity is the size of a fleet and the length \
+                 of the window in which it can all be down — properties of a deployment, \
+                 not of a machine. There is no distribution to sample either, because the \
+                 refusal is deterministic and total: a mismatched participant does not \
+                 attach at all, so there is no latency, no failure rate and no tail to \
+                 measure. The one number in reach — how long a single participant takes to \
+                 restart — would be worse than none, because it is precisely the *together* \
+                 that costs, and quoting a per-process figure would understate it while \
+                 looking rigorous. What would genuinely quantify this is operating \
+                 evidence from a deployment that has lived through a bump (how long the \
+                 fleet was mixed, what it cost to hold it down), which is the same class of \
+                 evidence `docs/PROJECT.md` D21 gates PHASE7 on and which this project does \
+                 not have. Until then the honest artifact is the sentence, plus the version \
+                 this build refuses to attach across, which is stated above."
+                    .to_owned(),
+            ),
         },
         Worse {
             id: "bridge_supervision",
@@ -2126,10 +2283,53 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  to fill: the ROS 2 ingest bridge is a process that must be started, \
                  supervised, restarted and monitored. With tf2 there is no such process — \
                  every node subscribes to /tf directly. That is one more thing to page \
-                 somebody about at 3 a.m., and it is the honest cost of the shared arena.",
+                 somebody about at 3 a.m., and it is the honest cost of the shared arena. \
+                 **It has been measured, over a real DDS**, by `just dds-bench` — one run, \
+                 four consumers, a 15 s window, on this project's unpinned host \
+                 (`docs/benchmarks/tf2.md`, the `tf_tree.processes` arm): the bridge \
+                 process burns **0.362 s of CPU in 15 s, about 2.4% of one core**, and it \
+                 burns it whatever N is. Against it a marginal tf_tree consumer costs \
+                 0.0186 s and a marginal tf2 listener 0.445 s over the same window, so the \
+                 supervision cost pays for itself at **roughly one consumer** — the bridge \
+                 is cheaper than the single tf2 listener it replaces. Two significant \
+                 figures is what one run of four processes supports. Memory is the half \
+                 that stays unattributed: `dds_report` sums Pss across an arm and the \
+                 bridge is the process in it reporting `consumers 0`, so its footprint is \
+                 inside the arm total (69.51 MiB over five processes, against tf2's 63.15 \
+                 over four) and is **not** the 6.36 MiB difference — Pss divides a shared \
+                 page by the number of processes mapping it, and those two arms map from \
+                 four and five, so the difference is confounded before any bridge exists. \
+                 **The curve settles what that one point could not.** Run at N = 8, 12 and \
+                 16 as well, the arm totals are 113.80/113.96, 168.39/167.41 and \
+                 219.06/226.59 MiB (tf_tree/tf2): the sign flips between 4 and 8, the two \
+                 stacks are indistinguishable from 8 to 12, and by 16 tf_tree is 3.3% \
+                 ahead. The mechanism is visible in the per-consumer column — tf_tree's \
+                 marginal consumer falls 17.38 -> 13.69 MiB across the sweep while tf2's \
+                 stays flat near 14.2 — which is this entry's cost seen from the other \
+                 side: **one fixed process, amortised.** It is still not an arena result. \
+                 The `composed` arms put both stacks in one process and differ by only \
+                 0.75-1.04 MiB; everything else in those totals is rclcpp and DDS, paid \
+                 identically per process by both. \
+                 What the CPU column shows is the operational shape of this trade: a fixed \
+                 cost you must supervise, bought against a per-consumer cost you do not.",
                 opts.consumers
             ),
             metrics: Vec::new(),
+            metrics_absent_because: Some(
+                "the number above exists, and it belongs to a different artifact. It takes \
+                 ROS 2, a real DDS and five processes — `just dds-bench`, inside \
+                 `docker/tf2` — and `bench_report` runs in one process on the host, where \
+                 `rclcpp` is not linked and `ros/` is not even in the cargo workspace. That \
+                 is the same reason the `.tft` rows in the table above are `unavailable` \
+                 rather than guessed. Carrying the figure here as a `Metric` would be worse \
+                 than leaving it out: metrics in this file are what `crate::baseline` \
+                 compares run to run on one host, so a constant transcribed from another \
+                 host's container run would sit in the gate looking measured and never move \
+                 — a row that cannot regress, in the section whose entire purpose is to be \
+                 the row that can. `dds_report` gates it where it is produced; this entry \
+                 states it with its recipe."
+                    .to_owned(),
+            ),
         },
     ]
 }
@@ -2370,6 +2570,32 @@ fn unknown() -> String {
     "unknown".to_owned()
 }
 
+/// The `lto` setting of the profile this binary was built into.
+///
+/// Read out of the workspace manifest at run time rather than baked at build
+/// time, because the parser lives in [`crate::embed`] and a build script cannot
+/// call it — and a second copy of a TOML reader is a second thing that can
+/// disagree with the first. `CARGO_MANIFEST_DIR` is a *compile-time* constant,
+/// so this resolves against the source tree this binary was built from, not
+/// against wherever it happens to be run.
+///
+/// The failure arm names the path it could not read. A benchmark binary copied
+/// out of its checkout is the case that reaches it, and it must be
+/// distinguishable from "the profile declares no LTO", which
+/// [`crate::embed::lto_for_profile_dir`] spells differently again.
+fn build_lto() -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Cargo.toml");
+    match std::fs::read_to_string(&manifest) {
+        Ok(text) => crate::embed::lto_for_profile_dir(&text, crate::embed::PROFILE_DIR),
+        Err(e) => format!(
+            "unknown (the workspace manifest at {} could not be read: {e})",
+            manifest.display()
+        ),
+    }
+}
+
 fn git(args: &str) -> Option<String> {
     capture("git", &args.split(' ').collect::<Vec<_>>())
 }
@@ -2550,6 +2776,7 @@ mod tests {
                 topic: "topic",
                 statement: "a stated cost".to_owned(),
                 metrics: Vec::new(),
+                metrics_absent_because: Some("a stated reason".to_owned()),
             })
             .collect();
         Report {
@@ -3033,6 +3260,66 @@ mod tests {
             errs.iter().any(|e| e.contains(REQUIRED_WORSE[1])),
             "the violation must name the offending entry: {errs:?}"
         );
+    }
+
+    /// A §9.3 entry with no numbers must say why it has none, and one with
+    /// numbers must not claim it has none.
+    ///
+    /// **This is the rule that closes the hole two of the four entries sat in.**
+    /// `bridge_supervision` and `format_bump_cost` carried `metrics: Vec::new()`
+    /// from the day they were written, and nothing could tell that state apart
+    /// from an oversight — which is exactly the shape of failure this whole
+    /// module is built against, except pointed at the section that is supposed
+    /// to be quotable against us. An entry that cannot regress is not an honest
+    /// entry; an entry that explains why it cannot is.
+    ///
+    /// Mutants, each applied and confirmed to make this test fail: delete the
+    /// `(true, None | Some(""))` arm from `validate` (the first half validates
+    /// `Ok`); delete the `(false, Some(_))` arm (the second half does).
+    #[test]
+    fn a_worse_entry_with_no_numbers_must_say_why() {
+        let mut r = skeleton(false, false);
+        r.worse[0].metrics_absent_because = None;
+        let errs = r
+            .validate()
+            .expect_err("an unexplained empty metric list must fail");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(REQUIRED_WORSE[0]) && e.contains("metrics_absent_because")),
+            "the violation must name the entry and the missing field: {errs:?}"
+        );
+
+        // Whitespace is not an explanation, for the same reason `"   "` is not
+        // a statement two tests above.
+        let mut r = skeleton(false, false);
+        r.worse[0].metrics_absent_because = Some("  ".to_owned());
+        assert!(r.validate().is_err(), "a blank reason must not satisfy it");
+
+        // And the contradiction: numbers *and* a reason they are absent. One of
+        // the two is stale, and the report cannot say which.
+        let mut r = skeleton(false, false);
+        r.worse[0].metrics = vec![Metric::new("bytes", 1.0, "B")];
+        let errs = r
+            .validate()
+            .expect_err("metrics beside a reason they are absent must fail");
+        assert!(
+            errs.iter().any(|e| e.contains("One of the two is wrong")),
+            "{errs:?}"
+        );
+
+        // The real report satisfies the rule on this host — which is the point
+        // of the field, not an incidental check: `worse_entries` is where the
+        // four entries are actually written.
+        let opts = Options::default();
+        for w in worse_entries(&opts, &Fitness::probe(opts.consumers)) {
+            assert_eq!(
+                w.metrics.is_empty(),
+                w.metrics_absent_because.is_some(),
+                "`{}` must carry numbers or a reason it has none, never both and never \
+                 neither",
+                w.id
+            );
+        }
     }
 
     /// The remaining §9.3 row rules, each isolated so a failure names one cause:
@@ -3809,6 +4096,61 @@ CPU part\t: 0xd0c
             EMBEDDING_NOTE.contains(&stated_rel),
             "the row note does not state `{stated_rel}`, which is what \
              [profile.release] now declares"
+        );
+    }
+
+    /// `build_profile` names the directory cargo built into, not a two-valued
+    /// guess from `cfg!(debug_assertions)`.
+    ///
+    /// The guess is what let a `--profile embedder` run — the profile every
+    /// boundary measurement here is taken at, because `lto = false` is the only
+    /// setting that leaves the boundary in the binary — call itself `release`
+    /// and compare cleanly against a thin-LTO baseline.
+    ///
+    /// Mutant (applied, observed): replace the `push("build_profile", …)` value
+    /// with the literal `"release".to_owned()`. This test fails under `cargo
+    /// nextest` with `left: "release", right: "debug"`.
+    ///
+    /// **What this test does not catch**, stated because a note nobody checked
+    /// is how this repository got six wrong attributions: reinstating the old
+    /// `cfg!(debug_assertions)` spelling passes here, because under `cargo
+    /// nextest` both spellings say `debug`. It fails only when the tests
+    /// themselves are built at a third profile
+    /// (`cargo nextest run -p tf_tree_bench --cargo-profile embedder -E
+    /// 'test(build_profile)'` — run, and observed to fail with
+    /// `left: "release", right: "embedder"`). The mutation that fires here is
+    /// the hardcode; the mutation that fires there is the guess.
+    #[test]
+    fn the_build_profile_fact_is_the_directory_cargo_built_into() {
+        let p = Provenance::collect();
+        assert_eq!(
+            p.get("build_profile"),
+            Some(crate::embed::PROFILE_DIR),
+            "the provenance profile must be the one `build.rs` measured"
+        );
+    }
+
+    /// And the profile's *meaning* travels beside its name.
+    ///
+    /// A reader of `results.json` should not have to know this workspace's
+    /// `[profile.*]` sections by heart to know whether the crate boundary was
+    /// inlined away, so `build_lto` is emitted from the manifest for whichever
+    /// profile `build_profile` names.
+    ///
+    /// Mutant (applied, observed): make `build_lto()` ask
+    /// `lto_for_profile_dir` about `crate::embed::REFERENCE_PROFILE` instead of
+    /// `PROFILE_DIR`. This test fails under `cargo nextest` with
+    /// `left: Some("\"thin\"")`, right the `dev` profile's default `false (…)`.
+    #[test]
+    fn the_build_lto_fact_is_the_one_the_manifest_declares_for_that_profile() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
+        let p = Provenance::collect();
+        let dir = p.get("build_profile").expect("build_profile");
+        assert_eq!(
+            p.get("build_lto"),
+            Some(crate::embed::lto_for_profile_dir(&manifest, dir).as_str())
         );
     }
 }

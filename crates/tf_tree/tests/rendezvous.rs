@@ -50,7 +50,11 @@ struct Kid(Child, Option<BufReader<std::process::ChildStdout>>);
 
 impl Kid {
     fn spawn(dir: &PathBuf, args: &[&str]) -> Kid {
-        let exe = env!("CARGO_BIN_EXE_rendezvous_child");
+        // The bin target carries the crate's name, not the file's: this crate is
+        // published, and `--features shm` installs whatever is here into the
+        // user's `bin/`. The manifest argues it; the source stays
+        // `src/bin/rendezvous_child.rs`.
+        let exe = env!("CARGO_BIN_EXE_tf_tree_rendezvous_child");
         let child = Command::new(exe)
             .args(args)
             .env("TF_TREE_RUNTIME_DIR", dir)
@@ -58,7 +62,7 @@ impl Kid {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn rendezvous_child");
+            .expect("spawn the rendezvous child helper");
         Kid(child, None)
     }
 
@@ -573,8 +577,8 @@ fn a_frames_wait_for_a_name_nobody_will_intern_gives_up() {
     use tf_tree::AwaitError;
     use tf_tree_core::frame::blake3_64;
 
-    /// Nothing in `rendezvous_child`'s fixture interns this, and nothing in this
-    /// test does either.
+    /// Nothing in the helper's fixture interns this, and nothing in this test
+    /// does either.
     const MISSING: &str = "no_publisher_will_ever_declare_this";
 
     let scratch = Scratch::new("frames-timeout");

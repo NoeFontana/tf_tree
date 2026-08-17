@@ -310,15 +310,39 @@ fn dropping_an_owned_writer_releases_the_claim_lease() {
     let odom = tree.frame("odom").unwrap();
 
     let writer = tree.claim_owned(base, odom).expect("claim");
-    let edge = tree
-        .arena_view()
-        .topology()
-        .read_frame(base)
-        .expect("base is interned")
-        .2;
-    assert_ne!(
-        edge, 0,
-        "base has no edge, so the probe below names nothing"
+    // **`OwnedWriter::edge`, not a topology read through `arena_view`.** It is
+    // the stable-tier spelling of the same `EdgeId`, and its own docstring is
+    // the argument for preferring it: a caller who cannot ask the writer has to
+    // re-derive the id from a seqlock topology read that can fail, and then has
+    // no cross-check that the two agree. Asking the writer also keeps this test
+    // outside the `unstable` gate that the rest of this suite's arena readers
+    // now carry — which is not a nicety here but the difference between running
+    // and not: `just shm-check` runs this target as `cargo nextest run -p
+    // tf_tree --features shm --test owned_writer`, so anything gated on
+    // `unstable` in this file executes in no recipe at all.
+    let edge = writer.edge().get();
+    // **The cross-check that docstring names — which neither of this line's two
+    // ancestors actually made.** The topology read this branch replaced derived
+    // the id a second way and then compared the two not at all; and
+    // `assert_ne!(edge, 0)`, what replaced it, *cannot* fail: `Tree::claim`
+    // reads the same `edge_of_child` and returns `ClaimApiError::NoEdge
+    // { child }` when it is 0, so a successful `claim_owned` has already ruled
+    // the sentinel out.
+    //
+    // So compare the two structures instead. `writer.edge()` came from the
+    // topology block; `Tree::edges` reads the *edge records*, which are a
+    // separate table filled by the builder, and it is stable-tier. If they
+    // disagree the probe below tests a different edge's byte and every
+    // assertion in this test becomes vacuous.
+    let declared = tree.edges().unwrap();
+    assert_eq!(
+        declared
+            .get(edge.wrapping_sub(1) as usize)
+            .map(|(p, c)| (p.as_str(), c.as_str())),
+        Some(("odom", "base")),
+        "the writer names EdgeId({edge}), which is not the odom -> base edge \
+         this layout declares ({declared:?}), so the lease probe below would \
+         be reading some other edge's byte"
     );
 
     let probe = tf_tree_ipc::LockFile::open(&scratch.lock_path()).expect("open the lock file");

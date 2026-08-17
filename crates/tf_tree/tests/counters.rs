@@ -4,6 +4,17 @@
 //! *built tree*, and the builder is here. `tf_tree_core` owns the counter
 //! structs and the `Guard` that fills them; only this crate can hand it an arena
 //! with edges in it.
+//!
+//! **The whole file is gated, and it is the one place in this crate's suite
+//! where that is the honest granularity.** A counter is only observable through
+//! `Tree::arena_view`'s `edge_counters` — `doctor` reads it that way, and there
+//! is no stable-tier spelling of "what does this edge's `lookups_ok` say". Both
+//! of `Fixture`'s helpers go through the view, so every test below would be
+//! reduced to its setup. `cargo nextest run --workspace` unifies `unstable` in
+//! from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`, so these five
+//! still run in `just test`; what they no longer do is break the build of a
+//! packager who runs `cargo test` on the published tarball.
+#![cfg(feature = "unstable")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::atomic::Ordering::Relaxed;

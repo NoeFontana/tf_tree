@@ -524,6 +524,77 @@ If lookups are slower than expected:
 
 ---
 
+## How big is my arena, and how much of it did I over-declare?
+
+`Capacity` is denominated in **slots**; tf2 evicts by **time**. Those are not the
+same knob, and the translation is where over-declaration happens:
+`Capacity::history(1000.0, 10.0)` asks for ten seconds of a 1 kHz stream — 10 000
+slots — and reserves **16 384**, because `mask == capacity - 1` is the ring's hot
+index and a mask is only a mask at a power of two. Run the same declaration
+against a 10 Hz publisher and that ring retains **27 minutes** of history.
+
+The rounding is not removable. What it is, is *visible*: both `tf_tree doctor`
+and `tf_tree top` print the declaration in bytes, whole-tree in the header and
+per-edge in `top --edge <id>`:
+
+```text
+rings: 19072 slots declared = 1.31 MiB over 4 edge(s); 12600 used = 885.9 KiB (66%);
+       at most 9532 slots = 670.2 KiB is next_pow2 rounding
+arena = 16704 B fixed + 320 B/edge + 144-176 B/frame + 72 B/slot
+```
+
+"At most" is the honest word. The pre-rounding request is **not stored** — the
+edge record carries the capacity after `next_pow2` — so a ring of capacity `C`
+was declared with some count in `[C/2 + 1, C]` and this figure is the upper bound
+of that bracket, not a measurement. A publisher that asked for exactly 16 384
+wasted nothing and looks identical here.
+
+### The sizing formula
+
+```text
+arena = 16 704 B fixed          header + participant table + participant counters
+      +    320 B per edge       claim 64 + edge record 128 + edge counters 128
+      +  144-176 B per frame    frame record 64 + 4 topology blocks x 12 + intern slots
+      +     72 B per slot       stamp 8 + pose 64 (one cache line)
+```
+
+The per-frame term is a range because the intern table is `next_pow2(2 x frames)`
+slots of 16 B — exactly 32 B/frame at a power-of-two frame count, up to 64 B/frame
+just above one. On a *small* tree add up to 384 B of fixed `align64` region
+padding, which is why a 1-frame arena measures 384 B/frame against a stated 144.
+On the benchmark fixture the formula reproduces the arena size the tools report,
+by an independent path — `tree.arena_size_bytes()` comes from the built arena,
+not from this arithmetic:
+
+```text
+16 704 fixed + 320 x 24 edge slots + 3 904 for 25 frames + 72 x 19 072 sample slots
+  = 1 401 472 B = 1368 KiB     (`tf_tree top` prints "arena 1368 KiB")
+```
+
+The frame term is 3 904 rather than 144 x 25 = 3 600 for two reasons, both of
+which are why the per-frame figure is a range: 25 is not a power of two, so the
+intern table takes 64 slots for 50 names (1 024 B, not 800), and each of the four
+topology blocks rounds 300 B up to 320. That is 156 B/frame, inside the stated
+144-176.
+
+Every constant is checked against `crates/tf_tree_arena/src/layout.rs` by
+differencing two real `ArenaLayout`s rather than transcribed from it — see
+`crates/tf_tree_cli/src/sizing.rs`'s tests. They change when
+`docs/PHASE5.md` §1 changes a region, and the test is what notices.
+
+### What over-declaring actually costs
+
+Since [`0021`](./decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md) the heap
+arena reaches `calloc`, so slots you declared and never wrote are demand-faulted
+pages that never become resident: **over-declaration costs no resident memory**.
+It still costs *reservation* — address space, the `.tft` file on disk, the bytes
+a segment transfer copies, and the headroom a machine under strict overcommit
+must have. Treat the numbers above as capacity planning, not as a memory leak,
+and note that neither tool warns on them: there is no threshold here it would be
+honest to fire on, so this is a display and not a `TFT0xx` check.
+
+---
+
 ## What this system deliberately does not do
 
 Worth knowing before you go looking for it:

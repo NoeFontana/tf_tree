@@ -76,6 +76,20 @@ fn main() -> ExitCode {
     let d = runstore::diff(&a, &b);
     print!("{}", runstore::render(&d));
 
+    // Checked before `deltas.is_empty()`, and before the regression verdict.
+    // Both of those are statements *about the numbers*, and the point of this
+    // branch is that there are no numbers here to make a statement about.
+    // Exit 2 rather than 1: "this comparison could not be made" is a different
+    // answer from "this comparison found a regression", and collapsing the two
+    // is how a gate ends up being read as flaky.
+    if !d.comparable() {
+        eprintln!(
+            "\nbench_ab: refusing to compare two runs built differently (see above). \
+             Re-run both halves at the same profile."
+        );
+        return ExitCode::from(2);
+    }
+
     if d.deltas.is_empty() {
         // Not a pass. Two files with no metric in common is the shape a typo in
         // a harness name produces, and reporting it as "no regressions" is the

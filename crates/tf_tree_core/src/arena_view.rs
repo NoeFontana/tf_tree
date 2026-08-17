@@ -532,6 +532,35 @@ impl<'a> ArenaView<'a> {
         Some((edge.interp, self.ring_of(id, edge, claim)?))
     }
 
+    /// The byte extents of one dynamic edge's two rings, as `(offset, len)`
+    /// pairs from the arena base — stamps first, then poses.
+    ///
+    /// Returns `None` under exactly the conditions [`Self::ring`] does, and for
+    /// the same reason: an extent is only meaningful once the record's
+    /// `stamp_off`/`pose_off`/`capacity` triple has been proved to lie inside
+    /// the two regions, so this shares that bounds check with the hot path
+    /// (`ring_bytes`, private) rather than recomputing it alongside.
+    ///
+    /// # What this is for
+    ///
+    /// Page population (`docs/PHASE2.md` §7.1). `MappedArena::populate_hot`
+    /// warms every region that is read on the lookup path *except* the two ring
+    /// arenas, because §7.1's granularity is per-edge and the arena crate cannot
+    /// compute a per-edge extent — [`EdgeRecord`] is defined here, in a crate
+    /// that depends on it. The facade closes that loop: it holds both crates,
+    /// asks this for the extents of an edge it is about to claim or to compile
+    /// into a plan, and hands them to `MappedArena::populate`.
+    ///
+    /// It is deliberately expressed in bytes rather than as a `&[T]`: the caller
+    /// is a `madvise`, and handing out a typed slice of a region another process
+    /// is writing would be a data race dressed as an accessor.
+    #[must_use]
+    pub fn ring_extents(&self, id: EdgeId) -> Option<[(usize, usize); 2]> {
+        let edge = self.edge(id)?;
+        let (stamp_byte_off, pose_byte_off, cap) = self.ring_bytes(edge)?;
+        Some([(stamp_byte_off, cap * 8), (pose_byte_off, cap * 64)])
+    }
+
     /// Assemble a ring from already-resolved records. `None` if `edge` is not a
     /// dynamic ring.
     #[inline]
@@ -541,6 +570,36 @@ impl<'a> ArenaView<'a> {
         edge: &'a EdgeRecord,
         claim: &'a ClaimRecord,
     ) -> Option<SampleRing<'a>> {
+        let (stamp_byte_off, pose_byte_off, cap) = self.ring_bytes(edge)?;
+
+        // SAFETY: `ring_bytes` proved `stamp_off + cap <= stamp_slots` and
+        // `pose_off + cap <= pose_slots`, so both sub-ranges lie wholly
+        // inside the stamp/pose arenas whose extents `validate_arena_header`
+        // confirmed against the mapping. This is enforced there rather than
+        // assumed of `ArenaBuilder::declare_edge`, which only asserts the
+        // invariant — it writes the caller's record unvalidated.
+        let stamps = unsafe { stamp_slots(self.base, stamp_byte_off, cap) };
+        let poses = unsafe { pose_slots(self.base, pose_byte_off, cap) };
+
+        Some(SampleRing {
+            head: &edge.head,
+            heartbeat: &claim.heartbeat,
+            stamps,
+            poses,
+            mask: (cap as u64) - 1,
+            edge: id,
+        })
+    }
+
+    /// The `(stamp_byte_off, pose_byte_off, capacity)` triple for a dynamic
+    /// edge, with the record's offsets proved to lie inside the two ring
+    /// regions. `None` if `edge` is not a dynamic ring.
+    ///
+    /// This is the single place that bound is established, so that
+    /// [`Self::ring_of`]'s `unsafe` slice construction and
+    /// [`Self::ring_extents`]'s `madvise` range cannot drift apart.
+    #[inline]
+    fn ring_bytes(&self, edge: &EdgeRecord) -> Option<(usize, usize, usize)> {
         let cap = edge.capacity as usize;
         if !cap.is_power_of_two() {
             return None;
@@ -572,23 +631,7 @@ impl<'a> ArenaView<'a> {
         let stamp_byte_off = self.header.stamp_arena_off as usize + edge.stamp_off as usize * 8;
         let pose_byte_off = self.header.pose_arena_off as usize + edge.pose_off as usize * 64;
 
-        // SAFETY: the bounds check above proved `stamp_off + cap <= stamp_slots`
-        // and `pose_off + cap <= pose_slots`, so both sub-ranges lie wholly
-        // inside the stamp/pose arenas whose extents `validate_arena_header`
-        // confirmed against the mapping. This is enforced here rather than
-        // assumed of `ArenaBuilder::declare_edge`, which only asserts the
-        // invariant — it writes the caller's record unvalidated.
-        let stamps = unsafe { stamp_slots(self.base, stamp_byte_off, cap) };
-        let poses = unsafe { pose_slots(self.base, pose_byte_off, cap) };
-
-        Some(SampleRing {
-            head: &edge.head,
-            heartbeat: &claim.heartbeat,
-            stamps,
-            poses,
-            mask: (cap as u64) - 1,
-            edge: id,
-        })
+        Some((stamp_byte_off, pose_byte_off, cap))
     }
 }
 

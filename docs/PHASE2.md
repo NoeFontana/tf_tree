@@ -699,8 +699,8 @@ A minor page fault costs single-digit microseconds. The Phase 1 gate is a **150 
 But §3.8 makes the default layout deliberately generous so that zero-configuration startup works, and `MAP_POPULATE` over a 600 MiB address space would fault in — and charge — hundreds of megabytes nobody declared. The two requirements are reconciled by populating at **declaration** granularity:
 
 - `mmap` **without** `MAP_POPULATE`. Untouched regions of a memfd cost nothing (measured, §3.8).
-- At `declare_dynamic`, `madvise(MADV_POPULATE_WRITE)` (Linux ≥ 5.14, measured working) over that edge's stamp and pose ranges. On older kernels, fall back to an explicit zeroing write.
-- On attach, populate the header, frame table, topology blocks, and edge table — small, always touched, always hot.
+- At the moment an edge is **taken up**, `madvise(MADV_POPULATE_WRITE|READ)` (Linux ≥ 5.14, measured working) over that edge's stamp and pose ranges. On older kernels, fall back to touching one byte per page. **Amended by [`0024`](./decisions/0024-population-is-per-edge-at-take-up.md);** this bullet used to say "at `declare_dynamic`", and [`0004`](./decisions/0004-builder-time-edge-declaration.md) deleted that function when it moved declaration to build time. The two moments that replace it are `Tree::claim` for a writer and plan compilation for a reader, both off the query path by D3. Populating every declared ring at attach instead — which is what the code did while this bullet named a dead function — is *per-arena* population, which the title of this section forbids, and it charged every reader for every edge on the vehicle: measured at **5.2×** on a process using 4 of 64 declared edges.
+- On attach, populate the header, frame table, topology blocks, claim table, participant table, edge table and both counter regions — small, always touched, always hot. **Not the two ring arenas:** they are 99.8% of a large arena and are the previous bullet's business.
 
 **`MADV_WILLNEED` does not work here** (measured: zero change in charged pages on a memfd). Do not substitute it.
 
@@ -889,14 +889,14 @@ The Phase 1 24-frame robot tree, plus: 1 writer process (4 dynamic edges as in P
 | Benchmark | Report |
 |---|---|
 | depth-3 cross-process lookup, warm | p50, p99, p99.9 vs the Phase 1 in-process baseline |
-| first access after attach, per-edge population on vs off | p99.9, both |
+| first access after attach, per-edge population on vs off | p99.9, both | **Half done — `just attach-bench`.** With population **on** (the shipped path): first lookup after attach **130 ns p50, ~1.3 us p99.9**, indistinguishable from a steady-state lookup — which is the guarantee §7.1 exists to buy, now demonstrated rather than asserted. The **off** arm is absent and deliberately so: `populate_hot()` is unconditional inside `attach_shared_inner`, and manufacturing an "off" arm out of a different code path would measure something else. It arrives with `docs/decisions/0022`'s B2-prime, the change that gives the attach path a policy. |
 | THP `madvise` vs `never` | p50, p99.9, both |
 | aggregate read throughput, 1→16 consumer processes | scaling curve |
 | **CPU per consumer at 1 kHz × 20 edges, vs ROS 2 `/tf`** | %CPU per consumer, both |
 | **total RSS across 16 consumers, vs ROS 2 `/tf`** | MB, both |
 | publish → visible-to-consumer latency, vs ROS 2 `/tf` | p50, p99.9, both |
 | `SIGKILL` writer → claim reapable → re-claimed | p50, p99 |
-| attach time, cold and warm | p50 |
+| attach time, cold and warm | p50 | **Done — `just attach-bench`.** **97.5 us p50** on the §11.1 fixture, cold 114–153 us, p99.9 157–181 us, over 201 cycles. Almost all of it is population: the arena is 342 pages and 97.5 us / 342 is ~285 ns/page, which is what `MADV_POPULATE_WRITE` costs. "Cold" is the first cycle — fresh VMA and page tables — and **not** a cold page cache, which needs root to arrange. |
 | `open()` when the arena exists vs when creating | p50, both |
 | owner kill → new owner serving | p50, p99 |
 | lookup latency across an ownership migration | p99.9 during vs steady-state |
@@ -976,7 +976,7 @@ Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers 
 - [ ] `shm_torture` runs 30 minutes nightly, clean, under ASan
 - [ ] `HeapArena` / `MappedArena` replay produces **bit-identical** results (§10)
 - [ ] §12.3 gate met, or a written explanation of which criterion failed and by how much
-- [ ] `tf_tree serve` ships with a systemd unit and a container example (§9, superseded by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md); not 0.1.0 scope)
+- [ ] `tf_tree serve` ships with a systemd unit and a container example (§9, superseded by [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md); not first-release scope)
 - [x] `docs/RUNBOOK.md` complete; every row maps to a `doctor` check (rows for unimplemented Phase 2 errors are marked as such)
 - [~] `docs/PHASE3.md` written and carrying §14 forward; the measured numbers land with §12
 

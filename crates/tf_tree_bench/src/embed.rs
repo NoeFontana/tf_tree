@@ -796,6 +796,25 @@ fn one(plan: &Plan, g: &Guard, s: Stamp) -> f64 {
 ///
 /// The section missing, or either key missing from it.
 pub fn profile_settings_from_manifest(manifest: &str, profile: &str) -> Result<(String, String)> {
+    Ok((
+        profile_key(manifest, profile, "lto")?,
+        profile_key(manifest, profile, "codegen-units")?,
+    ))
+}
+
+/// One key out of one `[profile.*]` section of the workspace manifest.
+///
+/// Split out of [`profile_settings_from_manifest`] so [`lto_for_profile_dir`]
+/// can ask for `lto` alone: a profile that declares no `codegen-units` still has
+/// an `lto`, and the provenance block needs the second question answered even
+/// when the first has no answer. Behaviour for the two-key caller is unchanged —
+/// it is the same reader, called twice.
+///
+/// # Errors
+///
+/// The section missing, or the key missing from it. The two are distinguished in
+/// the message because [`lto_for_profile_dir`] reports them differently.
+pub fn profile_key(manifest: &str, profile: &str, key: &str) -> Result<String> {
     let header = format!("[profile.{profile}]");
     let body = manifest
         .split(&header)
@@ -804,14 +823,99 @@ pub fn profile_settings_from_manifest(manifest: &str, profile: &str) -> Result<(
     // Stop at the next section header so a key from a later profile cannot be
     // read as this one's.
     let body = body.split("\n[").next().unwrap_or(body);
-    let key = |k: &str| -> Result<String> {
-        body.lines()
-            .map(str::trim)
-            .find_map(|l| l.strip_prefix(k)?.trim().strip_prefix('=').map(str::trim))
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("{header} declares no `{k}`"))
+    body.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix(key)?.trim().strip_prefix('=').map(str::trim))
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{header} declares no `{key}`"))
+}
+
+/// Whether the workspace manifest declares a `[profile.<profile>]` at all.
+#[must_use]
+pub fn profile_section_exists(manifest: &str, profile: &str) -> bool {
+    manifest.contains(&format!("[profile.{profile}]"))
+}
+
+/// The `lto` setting behind a *profile directory*, spelled for a provenance
+/// block.
+///
+/// # Why a directory and not a profile name
+///
+/// A binary can measure which directory cargo put it in — `build.rs` reads it
+/// out of `OUT_DIR`, and [`PROFILE_DIR`] is the result. It cannot measure the
+/// profile *name*: cargo does not hand one to a build script. So the directory
+/// is the fact and the section name is derived from it, which costs two
+/// irregularities, both handled here:
+///
+/// * `[profile.dev]` builds into `debug/`, so the directory `debug` is asked
+///   about `dev`.
+/// * `[profile.bench]` builds into `release/` *alongside* `[profile.release]`,
+///   so the directory `release` is genuinely ambiguous. This reports
+///   `[profile.release]`'s setting, and
+///   `the_two_profiles_that_share_the_release_directory_agree_about_lto` below
+///   fails if the two sections ever stop agreeing — which is the only way that
+///   ambiguity could produce a wrong answer rather than a merely imprecise one.
+///
+/// # Why a `String` and not a `bool`
+///
+/// `lto` is `false`, `true`, `"thin"` or `"fat"`, and the difference between
+/// `"thin"` and `"fat"` is not nothing. More importantly the "we do not know"
+/// arms are spelled out rather than defaulted silently: a provenance block that
+/// prints `false` when it *guessed* `false` is the exact failure this whole
+/// module exists to prevent. Cargo's default for an undeclared `lto` is `false`,
+/// and that is what is reported — but it says so.
+///
+/// # `inherits` is followed, because not following it printed a wrong fact
+///
+/// A profile that declares no `lto` does **not** necessarily get cargo's
+/// default: if it declares `inherits`, it gets its parent's. `[profile.profiling]`
+/// is exactly that shape — `inherits = "release"`, no `lto` of its own, and
+/// therefore `lto = "thin"` in fact. Before this loop existed a binary built at
+/// `--profile profiling` reported `false (cargo's default; …)`, which is the
+/// precise failure the paragraph above says the module exists to prevent, only
+/// with a parenthetical attached that made it read like a considered answer.
+/// It was caught by running the same benchmark at `release` and at `profiling`
+/// as a control — the two agreed to 0.6% on a number that moves 21% with `lto`,
+/// so the provenance line saying they differed in `lto` could not be true.
+///
+/// The walk is bounded rather than recursive: `inherits` cycles are cargo's
+/// problem to reject, not ours to hang on, and the bound is reported as an
+/// `unknown (…)` like every other thing this function does not know.
+#[must_use]
+pub fn lto_for_profile_dir(manifest: &str, profile_dir: &str) -> String {
+    let mut profile = if profile_dir == "debug" {
+        "dev".to_owned()
+    } else {
+        profile_dir.to_owned()
     };
-    Ok((key("lto")?, key("codegen-units")?))
+    let start = profile.clone();
+    // Cargo's own inheritance chains are a handful of links at most; anything
+    // longer here is a malformed manifest and is reported, not chased.
+    for _ in 0..8 {
+        if let Ok(v) = profile_key(manifest, &profile, "lto") {
+            return if profile == start {
+                v
+            } else {
+                format!("{v} (inherited from [profile.{profile}])")
+            };
+        }
+        if !profile_section_exists(manifest, &profile) {
+            return format!("unknown (the workspace manifest has no [profile.{profile}])");
+        }
+        // The parent's name is a TOML string, so strip the quotes the reader
+        // hands back verbatim.
+        let Ok(parent) = profile_key(manifest, &profile, "inherits") else {
+            return format!("false (cargo's default; [profile.{profile}] declares no `lto`)");
+        };
+        let parent = parent.trim_matches('"').to_owned();
+        // `inherits = "release"` from a section *named* release would loop; so
+        // would any longer cycle, which the bounded loop below catches anyway.
+        if parent == profile {
+            return format!("unknown ([profile.{profile}] inherits itself)");
+        }
+        profile = parent;
+    }
+    format!("unknown ([profile.{start}]'s `inherits` chain does not terminate in 8 steps)")
 }
 
 #[cfg(test)]
@@ -1048,6 +1152,133 @@ mod tests {
     #[test]
     fn a_missing_profile_is_an_error_not_a_default() {
         assert!(profile_settings_from_manifest(&manifest(), "no-such-profile").is_err());
+    }
+
+    /// A profile *directory* is not a profile *name*, and the two places they
+    /// differ are the two places a provenance block could quietly lie.
+    ///
+    /// Mutant (applied, observed): delete the `profile_dir == "debug"` arm of
+    /// [`lto_for_profile_dir`], so a debug build asks about a `[profile.debug]`
+    /// that does not exist. This test fails on the `debug` assertion with
+    /// `unknown (the workspace manifest has no [profile.debug])`, and
+    /// `report::tests::the_build_lto_fact_is_the_one_the_manifest_declares_for_that_profile`
+    /// keeps passing — it compares against this same function, so it cannot
+    /// catch this and is not the check that does.
+    #[test]
+    fn a_profile_directory_maps_to_the_section_that_built_it() {
+        let m = manifest();
+        assert_eq!(lto_for_profile_dir(&m, EMBEDDER_PROFILE), "false");
+        assert_eq!(lto_for_profile_dir(&m, REFERENCE_PROFILE), "\"thin\"");
+        // `[profile.dev]` builds into `debug/` and declares no `lto`, so this is
+        // both irregularities at once: the name mapping, and cargo's default.
+        assert_eq!(
+            lto_for_profile_dir(&m, "debug"),
+            "false (cargo's default; [profile.dev] declares no `lto`)"
+        );
+        // And a directory nothing declares says so rather than defaulting to
+        // `false`, which would read as "LTO is off" — the claim that makes a
+        // boundary measurement believable.
+        let unknown = lto_for_profile_dir(&m, "no-such-dir");
+        assert!(unknown.starts_with("unknown"), "{unknown}");
+    }
+
+    /// `[profile.bench]` and `[profile.release]` share the `release/` directory,
+    /// so that directory cannot identify which of the two produced a binary.
+    ///
+    /// That ambiguity is harmless only while the two agree about `lto`, which is
+    /// what this checks. If they ever diverge, [`lto_for_profile_dir`] starts
+    /// reporting `[profile.release]`'s answer for `cargo bench` binaries and a
+    /// provenance block goes quietly wrong — so this test is the thing standing
+    /// between that comment and a lie.
+    ///
+    /// Mutant (applied, observed): set `[profile.bench]`'s `lto` to `false` in
+    /// the workspace manifest. This test fails with
+    /// `[profile.bench] and [profile.release] share target/release/ …
+    /// left: "false", right: "\"thin\""`.
+    #[test]
+    fn the_two_profiles_that_share_the_release_directory_agree_about_lto() {
+        let m = manifest();
+        assert_eq!(
+            profile_key(&m, "bench", "lto").expect("[profile.bench] lto"),
+            profile_key(&m, REFERENCE_PROFILE, "lto").expect("[profile.release] lto"),
+            "[profile.bench] and [profile.release] share target/release/, so a binary \
+             built into it cannot say which one it came from. While they agree about \
+             `lto` that does not matter; the moment they disagree, `lto_for_profile_dir` \
+             reports the wrong one and says nothing about it"
+        );
+    }
+
+    /// A profile that declares no `lto` but does declare `inherits` gets its
+    /// parent's, not cargo's default.
+    ///
+    /// The real subject is `[profile.profiling]` in the workspace manifest,
+    /// which `inherits = "release"` and so is `lto = "thin"` in fact. A binary
+    /// built at `--profile profiling` used to print `false (cargo's default; …)`
+    /// — a wrong build fact with a confident parenthetical, which is worse than
+    /// no answer. It surfaced as a contradiction between two measurements rather
+    /// than by inspection: the tf2 ratio harness at `profiling` and at `release`
+    /// agreed to 0.6% on an arm that moves 21% when `lto` actually changes.
+    ///
+    /// The synthetic manifest carries the interesting shapes the workspace's
+    /// does not — a two-link chain, a missing parent, a self-inheriting section
+    /// — because the workspace manifest is asserted against separately below and
+    /// must stay free to change.
+    ///
+    /// Mutant (applied, observed): replace the loop body's `inherits` lookup
+    /// with the old single `profile_key(…, "lto")` + `profile_section_exists`
+    /// pair. The first assertion fails with
+    /// `left: "false (cargo's default; [profile.child] declares no `lto`)"`.
+    #[test]
+    fn a_profile_with_no_lto_of_its_own_reports_the_one_it_inherits() {
+        let m = "[profile.base]\nlto = \"thin\"\n\n\
+                 [profile.child]\ninherits = \"base\"\ncodegen-units = 1\n\n\
+                 [profile.grandchild]\ninherits = \"child\"\n\n\
+                 [profile.orphan]\ninherits = \"nowhere\"\n\n\
+                 [profile.ouroboros]\ninherits = \"ouroboros\"\n\n\
+                 [profile.plain]\ncodegen-units = 4\n";
+
+        assert_eq!(
+            lto_for_profile_dir(m, "child"),
+            "\"thin\" (inherited from [profile.base])"
+        );
+        // Two links, and it still names the section the value actually came
+        // from rather than the immediate parent.
+        assert_eq!(
+            lto_for_profile_dir(m, "grandchild"),
+            "\"thin\" (inherited from [profile.base])"
+        );
+        // A profile that declares `lto` itself is unannotated, as before.
+        assert_eq!(lto_for_profile_dir(m, "base"), "\"thin\"");
+        // No `inherits` and no `lto` is the one case where cargo's default is
+        // genuinely the answer, and it still says it is a default.
+        assert!(lto_for_profile_dir(m, "plain").starts_with("false (cargo's default;"));
+        // The three ways not to know, each distinguishable from an answer.
+        assert!(lto_for_profile_dir(m, "orphan").starts_with("unknown ("));
+        assert!(lto_for_profile_dir(m, "ouroboros").starts_with("unknown ("));
+        assert!(lto_for_profile_dir(m, "absent").starts_with("unknown ("));
+    }
+
+    /// The workspace's own `[profile.profiling]`, which is the reason the test
+    /// above exists — and a check that it is still the shape that motivated it.
+    ///
+    /// `docs/benchmarks/tf2.md` uses `profiling` as the control that says the
+    /// depth-3 lookup number tracks `lto` rather than "any profile that is not
+    /// release". That control is only readable if `profiling` really does share
+    /// `release`'s codegen, so this asserts the manifest still says so — by
+    /// comparing two manifest reads rather than by naming `"thin"`, since the
+    /// claim is that the two agree and not what they agree on.
+    #[test]
+    fn the_profiling_profile_reports_the_reference_profiles_lto() {
+        let m = manifest();
+        let reference = profile_key(&m, REFERENCE_PROFILE, "lto").expect("[profile.release] lto");
+        assert_eq!(
+            lto_for_profile_dir(&m, "profiling"),
+            format!("{reference} (inherited from [profile.{REFERENCE_PROFILE}])"),
+            "[profile.profiling] is the control that isolates `lto` from `debuginfo` in \
+             `docs/benchmarks/tf2.md`'s profile table. If it stops inheriting \
+             [profile.{REFERENCE_PROFILE}]'s `lto`, that control stops controlling for \
+             anything and the table's third row has to be re-taken or dropped"
+        );
     }
 
     /// The reader must not read a later section's keys as this profile's.

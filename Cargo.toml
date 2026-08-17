@@ -24,11 +24,28 @@ exclude = [
     "crates/tf_tree_py","crates/tf_tree_tf2_sys"]
 
 [workspace.package]
-# 0.2.0 because `SUPPORT.md` makes an MSRV bump a minor-version bump pre-1.0,
-# and the line below moved. Nothing has been released yet (`0008` measured the
-# name as free on crates.io), so this signals nothing to nobody — it is the
-# policy applied uniformly rather than skipped when it happens to be cheap.
-version = "0.2.0"
+# **0.0.1, and the number is a statement about compatibility rather than about
+# maturity.** Under `0.0.x` cargo treats every release as incompatible with
+# every other: `^0.0.1` — which is what a bare `tf_tree = "0.0.1"` means —
+# matches `0.0.1` and nothing else, so a later `0.0.2` reaches no existing
+# dependant through `cargo update`. That is the honest signal for a first
+# publish of an engine whose §0.0 tables still carry open rows: nothing is
+# promised, and every release may break.
+#
+# **This supersedes `SUPPORT.md`'s minor-bump-on-MSRV rule for the whole 0.0.x
+# line, and the tension it creates is stated rather than deleted.** This field
+# read 0.2.0 on the argument that an MSRV bump is a minor-version bump pre-1.0,
+# and that the policy should be applied uniformly rather than skipped when it
+# happens to be cheap — two measured raises, 1.83 → 1.85 → 1.87, two minor
+# slots. Under 0.0.x there is no minor slot for that rule to occupy. The only
+# field left to move is the patch, and a patch release is exactly what the rule
+# says an MSRV bump must never be. What breaks the deadlock is that the rule's
+# purpose — never move the floor under a dependant who resolved by a range —
+# is already served here by the resolver: no range spans two 0.0.x releases, so
+# an MSRV raise reaches nobody who did not opt into it by editing a manifest.
+# The rule comes back into force at 0.1.0, where a minor slot exists again.
+# `SUPPORT.md`'s MSRV section carries the same statement in its own voice.
+version = "0.0.1"
 edition = "2021"
 # **1.87, and each step was forced by a dependency rather than chosen.**
 #
@@ -55,6 +72,25 @@ edition = "2021"
 # exactly it, so the next silent drift fails the build instead of shipping.
 # Policy: `SUPPORT.md`.
 rust-version = "1.87"
+# **Each publishable crate carries `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE`
+# as symlinks to the three files beside this manifest**, because `cargo package`
+# ships only what is inside the package directory and a `.crate` tarball is a
+# redistribution: an Apache-2.0 recipient who vendors `tf_tree_core` needs the
+# licence text and the §4(d) NOTICE *in the tarball*, not a URL to a repository
+# that was private when they downloaded it.
+#
+# Symlinks rather than fifteen copies, and the choice is measured rather than
+# assumed: `cargo package` **dereferences** them, so the tarball holds real
+# regular files with the real bytes — verified on cargo 1.95 with a probe crate
+# whose symlinked `LICENSE-MIT` arrived as `-rw-r--r-- … 22` bytes of content.
+# Copies would be fifteen spellings of three texts, which is the thing
+# `docs/PROJECT.md` §6 exists to stop.
+#
+# The one cost, stated because it is invisible until it bites: a Windows
+# checkout without `core.symlinks` writes each link as a text file containing
+# the *path*, and `cargo publish` from such a checkout would ship a 17-byte file
+# where the MIT licence should be. Publishing happens from Linux; if that ever
+# changes, check a tarball before uploading.
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
@@ -86,8 +122,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.dependencies]
 # Intra-workspace crates (version pinned so publishable crates carry a real
 # requirement, not a path wildcard).
-tf_tree_math = { path = "crates/tf_tree_math", version = "0.2.0" }
-tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.2.0" }
+tf_tree_math = { path = "crates/tf_tree_math", version = "0.0.1" }
+tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.0.1" }
 # Phase 2 shared memory (see docs/PHASE2.md §2). Linux-only, opt-in via the
 # `shm` feature; `linux_raw` backend so there is no libc crate and no C build.
 # Only `tf_tree_ipc`, and only for `fcntl(F_OFD_*)`: rustix has no OFD locking
@@ -102,9 +138,9 @@ rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "s
 # measurement — the "counters off" row was measuring the counters-on engine.
 # Every crate that wants them re-enables them through its own `counters`
 # feature, which is what makes the switch actually switch.
-tf_tree_core = { path = "crates/tf_tree_core", version = "0.2.0", default-features = false }
-tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.2.0" }
-tf_tree = { path = "crates/tf_tree", version = "0.2.0", default-features = false }
+tf_tree_core = { path = "crates/tf_tree_core", version = "0.0.1", default-features = false }
+tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.0.1" }
+tf_tree = { path = "crates/tf_tree", version = "0.0.1", default-features = false }
 # publish = false crates, wired by path only (no version requirement published).
 # **`default-features = false` for the same load-bearing reason as `tf_tree`
 # above, and it is easy to miss here.** `tf_tree_bench` has its own

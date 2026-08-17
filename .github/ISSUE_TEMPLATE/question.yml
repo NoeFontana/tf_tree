@@ -1,0 +1,82 @@
+# A question. The form's job is to route to `docs/` first and to catch the two
+# things that arrive disguised as questions: a feature request that widens the
+# scope (which is a decision record, per SUPPORT.md's *What is not supported*),
+# and a document that is wrong or stale (which is a fixable bug, and the most
+# useful thing this form collects).
+#
+# The "where did you look" field is not politeness. `docs/` is a contract with a
+# status table per phase, and a question that a document already answers means
+# either the reader did not find the document or the document does not say what
+# it thinks it says. Those need opposite fixes, and only the answer to that
+# field tells them apart.
+#
+# Labels this form sets: question. See config.yml for the roster.
+name: Question
+description: How do I …? Does it support …? Why does it work that way?
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **`docs/` is the answer to most questions, and it is a contract rather than a tour.**
+        Roughly where things are:
+
+        - [`docs/PROJECT.md`](https://github.com/NoeFontana/tf_tree/blob/main/docs/PROJECT.md)
+          — what this is, the architecture, and the decision log in §5. If the answer is
+          "deliberately not", it is usually in there with the argument attached.
+        - `docs/PHASE1.md` … `docs/PHASE5.md` — the normative specs. **Each one's §0.0 status
+          table is the source of truth about what is implemented**, over that document's own
+          prose and over the README. If a spec describes something the table says is not
+          done, the table wins.
+        - [`docs/API.md`](https://github.com/NoeFontana/tf_tree/blob/main/docs/API.md)
+          — the six rules every binding obeys, and the normative surface of each one.
+        - [`SUPPORT.md`](https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md)
+          — what is supported, what is not, and what response to expect.
+
+        Two things arrive here disguised as questions, and both have a better home:
+
+        - **"Could it also do X?"** where X widens the scope. `docs/PROJECT.md` §5 and
+          `docs/PHASE5.md` §8 record several things this project deliberately does not do,
+          each with an argument. Refuting one is a real path and it runs through
+          [`docs/decisions/`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/README.md),
+          not through an issue.
+        - **"The docs say X but it does Y."** That is a bug in the documentation and it is
+          fixable — file it, and say which line.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What is the question?
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: >-
+        The underlying goal, not just the API call you got stuck on. This project has three
+        API tiers on purpose and the answer is often "you are on the wrong one" — which is
+        only visible from the goal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: looked
+    attributes:
+      label: Where did you look, and what did it say?
+      description: >-
+        Naming the document and the section is the useful part. If something there is wrong,
+        stale, or says the opposite of what the code does, quote it — that turns your question
+        into a documentation fix, which is worth more than an answer to you alone.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version and surface
+      description: Which version, and whether you are asking about Rust, Python, the C ABI, the ROS 2 bridge, or the CLI.
+      placeholder: "0.0.1, Python bindings"
+    validations:
+      required: false

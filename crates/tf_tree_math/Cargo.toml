@@ -1,6 +1,11 @@
 [package]
 name = "tf_tree_math"
 description = "no_std SE(3)/SO(3) and dual-quaternion math for the tf_tree transform engine."
+# Relative to *this* directory, so it is the per-crate front page crates.io
+# renders — not the workspace README. `readme.workspace = true` would resolve
+# against the workspace root and give all five crates the same page, which is
+# the opposite of the point.
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +14,14 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
-categories.workspace = true
+# **Overrides the workspace set, and only by widening it.** The two inherited
+# slugs stay; two are added because they are true of this crate and of no other
+# publishable one. `no-std::no-alloc` is exact — this is the one crate here with
+# no allocator at all (`tf_tree_arena` and `tf_tree_core` are `no_std + alloc`,
+# `tf_tree` and `tf_tree_ipc` are `std`) — and `mathematics` is where somebody
+# looking for an SE(3)/SO(3) library actually looks; `science::robotics` alone
+# would hide it from them. Four of the five crates.io allows.
+categories = ["science::robotics", "mathematics", "no-std", "no-std::no-alloc"]
 
 [lints]
 workspace = true

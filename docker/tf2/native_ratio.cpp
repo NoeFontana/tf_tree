@@ -30,18 +30,18 @@
 // apart**: the cross-`.so` call itself, and the fact that the arena here is a
 // shared `memfd` mapping rather than a heap one.
 //
-// **They have since been told apart, elsewhere.** `just abi-split`
-// (`crates/tf_tree_bench/src/backing.rs`) runs the middle arm — the same native
-// Rust API and the same off-grid sweep, on the same `MAP_SHARED` memfd
-// `native_arena` serves this program — paired and interleaved. It puts the
-// backing at **<= 9.6 ns** of the ~105.5 ns gap (worst of nine runs; ~1.8 ns
-// typically), so **at least 91% of the +52% is the shared-library boundary**.
-// The mapping is not the cause, which is what `tf2.md`'s 213-vs-217 row always
-// argued; that row just could not carry it (unpaired, two harnesses, effect
-// smaller than the spread).
+// **They have since been told apart, elsewhere, and the answer is neither.**
+// `just abi-split` (`crates/tf_tree_bench/src/backing.rs`) walks the ladder on
+// the arena `native_arena` serves: the shared mapping costs <= 9.6 ns, attaching
+// read-only from another process costs -0.7 ns, and the link mode costs ~1 ns
+// (`tests/cpp/bench.cpp` compiled against the `.a` and the `.so` measures 245.4
+// against 244.4). What remains is **+99.5 ns / +49% in the C ABI itself**:
+// `tft_plan_at` constructs a `Guard` on every call where the Rust arm hoists
+// one, and `tft_plan_at_many` recovers 41 ns by paying it once per batch.
 //
-// What is still not paired is the boundary half itself: it is a subtraction
-// against a figure from another run rather than a third arm in this program.
+// **A first version of this comment blamed the shared-library boundary.** It
+// had reached that by subtracting a measured mapping cost from the total and
+// attributing the residue; nothing had measured the boundary. It is 0.4%.
 //
 // The consequence for the reader: **neither this ratio nor the Rust one is
 // "the" answer.** They bracket it. See `docs/benchmarks/tf2.md`.

@@ -7,6 +7,7 @@
 #![cfg(feature = "test-hooks")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use core::ffi::c_char;
 use core::ptr;
 
 use tf_tree_c::*;
@@ -224,6 +225,10 @@ fn pack(v: &[f64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_ne_bytes()).collect()
 }
 
+// `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
+// on one target and a no-op on the other; see `src/error.rs` for the full
+// note. The allow is the fix — deleting the cast breaks x86_64.
+#[allow(clippy::unnecessary_cast)]
 fn message(e: &tft_error) -> String {
     let bytes: Vec<u8> = e
         .message
@@ -634,7 +639,7 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
     let count = unsafe { tft_tree_frame_count(f.0) };
     assert_eq!(count, 3, "world/robot/tool");
 
-    let mut buf = [0i8; 64];
+    let mut buf: [c_char; 64] = [0; 64];
     // The real frames answer.
     for id in 1..=count {
         // SAFETY: live handle; 64 writable bytes.
@@ -678,6 +683,9 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
         unsafe { tft_tree_frame_name(f.0, after, buf.as_mut_ptr(), buf.len()) },
         TFT_OK
     );
+    // See `src/error.rs`: `c_char` is `i8` on x86_64 and `u8` on aarch64, so
+    // this cast is necessary on one target and a no-op on the other.
+    #[allow(clippy::unnecessary_cast)]
     let name: String = buf
         .iter()
         .take_while(|&&c| c != 0)

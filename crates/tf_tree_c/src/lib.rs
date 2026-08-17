@@ -706,6 +706,82 @@ pub unsafe extern "C" fn tft_plan_at(
     })
 }
 
+/// [`tft_plan_at`]'s body with the panic guard removed, and **nothing else
+/// changed**.
+///
+/// The read-path twin of [`tft_test_push_unguarded`], and it exists for the same
+/// reason: so `examples/abi_cost.rs` can price `catch_unwind` on a **real,
+/// non-inlinable** call by subtraction rather than by inference.
+/// `tft_guarded_noop` cannot do that job — its body is small enough for rustc to
+/// inline across the crate boundary, so it measures inlined code and answers a
+/// different question.
+///
+/// This matters now because `docs/PHASE4.md` §7 gate criterion 1 is **failing**
+/// (1.34–1.46× against a 1.05 gate) and only about half the gap is attributed:
+/// the per-call `Guard` explains ~35 ns of ~60. `docs/decisions/0022`'s
+/// implementation plan said to price the remainder *before* designing a
+/// `tft_guard` handle around it, and this is what made that possible. It was
+/// priced (that record's amendment 3: no unexplained residue) and **the handle
+/// was then declined** — the answer to the per-call guard is
+/// [`tft_plan_at_many`], one guard per batch. This hook keeps its job: R2 in
+/// `abi_cost.rs` is a standing gate, not a one-off investigation.
+///
+/// Behind `test-hooks`, which nothing that ships enables.
+///
+/// # Safety
+///
+/// Identical to [`tft_plan_at`]: `plan` must be a live handle from
+/// `tft_plan_create`, and `out` must point to at least the layout's payload size
+/// in writable bytes. **Unlike `tft_plan_at` it does not catch unwinds**, so a
+/// panic crossing this boundary is undefined behaviour rather than
+/// `TFT_ERR_INTERNAL`. That is the whole point, and it is why this is not a
+/// shipped entry point.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub unsafe extern "C" fn tft_test_plan_at_unguarded(
+    plan: *const tft_plan,
+    stamp: i64,
+    layout: tft_layout,
+    out: *mut c_void,
+) -> tft_status {
+    // SAFETY: validated below before any field access.
+    if !unsafe { check_plan(plan) } {
+        return bad_handle("tft_plan");
+    }
+    if out.is_null() {
+        return null_arg("out");
+    }
+    let Some(n) = layout::payload_bytes(layout) else {
+        return bad_enum("layout");
+    };
+    // SAFETY: `check_plan` confirmed the magic word, so this points at a live
+    // `tft_plan` constructed by `tft_plan_create`.
+    let h = unsafe { &*plan };
+    // SAFETY: the caller contracts that `out` has `n` writable bytes, and `n` is
+    // exactly what `tft_layout_size` reports for this layout.
+    let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
+
+    let g = h.share.tree.guard();
+    let t = Stamp::<SystemDomain>::from_nanos(stamp);
+    if layout::carries_twist(layout) {
+        match h.plan.at_with_derivatives(&g, t) {
+            Ok(s) => {
+                layout::write_twist6(&s.pose, &s.twist, dst);
+                TFT_OK
+            }
+            Err(e) => record_lookup(e),
+        }
+    } else {
+        match h.plan.at(&g, t) {
+            Ok(iso) => {
+                layout::write(&iso, layout, dst);
+                TFT_OK
+            }
+            Err(e) => record_lookup(e),
+        }
+    }
+}
+
 /// Evaluate `plan` at `n` stamps, writing each result `out_stride_bytes` apart.
 ///
 /// `out_stride_bytes == 0` means tightly packed. A stride larger than the

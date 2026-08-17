@@ -22,7 +22,13 @@
 # fallback should not be "read the manual".
 
 cmake_minimum_required(VERSION 3.16)
-project(tf_tree VERSION 0.1.0 LANGUAGES C CXX)
+# The version here is a hand-kept copy of `[workspace.package] version` in the
+# root `Cargo.toml`, which carries the argument for the number. It is the
+# version a consumer's `find_package(tf_tree 0.0.1 CONFIG REQUIRED)` matches
+# against, so it must not drift from the library it is describing — and it is
+# **not** the ABI version, which `TFT_ABI_VERSION_MAJOR`/`_MINOR` carry (0.5 as
+# of this commit) and `docs/PHASE4.md` §3 versions independently of the crate.
+project(tf_tree VERSION 0.0.1 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -197,11 +203,42 @@ function(tf_tree_probe_shm _lib _out)
         "compile rather than fail to link.")
     return()
   endif()
+  # **Two tables, and a shared library only reliably has the second.**
+  # `nm --defined-only` reads the *static* symbol table, which `strip` removes;
+  # `nm -D` reads the *dynamic* one, which it cannot, because that is the table
+  # the loader resolves against. An archive has only the static one, so the
+  # plain form is tried first and `-D` is the fallback rather than the reverse.
+  #
+  # Measured on a release `libtf_tree_c.so`, grepping for `tft_tree_open`:
+  #
+  #   unstripped   nm -> 1   nm -D -> 1
+  #   stripped     nm -> 0   nm -D -> 1
+  #
+  # Reading only the static table made this probe answer "built without
+  # --features shm" for a shm build whose `.so` had been stripped — a false
+  # negative that a consumer meets as `tft_tree_open` being undeclared, with a
+  # message blaming a feature flag they did set. It reached a CI runner and not
+  # a developer machine, because `[profile.release] strip = "debuginfo"` leaves
+  # the symtab intact here and something in that toolchain did not.
   execute_process(
       COMMAND "${_tf_tree_nm}" --defined-only "${_lib}"
       OUTPUT_VARIABLE _syms
       ERROR_VARIABLE _nm_err
       RESULT_VARIABLE _nm_rc)
+  # A stripped shared library makes `nm` fail outright on some binutils and
+  # return an empty list on others, so both are retried the same way.
+  if(NOT _nm_rc EQUAL 0 OR NOT _syms MATCHES " T _?tft_tree_open[\r\n]")
+    execute_process(
+        COMMAND "${_tf_tree_nm}" -D --defined-only "${_lib}"
+        OUTPUT_VARIABLE _dyn_syms
+        ERROR_VARIABLE _dyn_err
+        RESULT_VARIABLE _dyn_rc)
+    if(_dyn_rc EQUAL 0 AND _dyn_syms MATCHES " T _?tft_tree_open[\r\n]")
+      set(_syms "${_dyn_syms}")
+      set(_nm_rc 0)
+      message(STATUS "tf_tree: ${_lib} answered from the dynamic symbol table")
+    endif()
+  endif()
   if(NOT _nm_rc EQUAL 0)
     # `_nm_err` is the whole point of capturing it: "nm failed" without the
     # reason sends the reader to run it by hand to find out.

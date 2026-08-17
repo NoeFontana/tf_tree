@@ -806,6 +806,20 @@ public:
 
     /// Evaluate at `stamp` into a `T` chosen by [`layout_of`].
     ///
+    /// **On a hot path, prefer `at_many`.** Each call to this function builds a
+    /// `Guard` inside the ABI, because the C signature has nowhere to keep one
+    /// between calls, and on a shared arena that dominates the call: measured on
+    /// the depth-3 fixture, scalar `tft_plan_at` costs **302 ns/lookup against
+    /// `tft_plan_at_many`'s 261** — the batch entry point pays the guard once
+    /// per call rather than once per element, and recovers **41 ns (13.6%)** at
+    /// a batch of 256. Native Rust on the same arena is 202 ns, so the guard is
+    /// most of what a C++ caller pays over it.
+    ///
+    /// This is not a defect you can work around from here beyond batching;
+    /// `docs/decisions/0022` carries the question of whether the C tier should
+    /// be able to hold a guard across calls at all. Until it is answered,
+    /// batching is the whole of the available win.
+    ///
     /// `T` must be trivially copyable and exactly the layout's payload size;
     /// both are `static_assert`ed, so a mismatched type is a compile error
     /// rather than a buffer overrun.
@@ -838,6 +852,12 @@ public:
     }
 
     /// Evaluate at `n` stamps, writing straight into `out`.
+    ///
+    /// **This is the hot-path entry point.** Beyond the zero-copy property
+    /// below, it amortises the per-call `Guard` the C ABI must construct: 261
+    /// ns/element against scalar `at`'s 302 on the depth-3 fixture at a batch of
+    /// 256. **Sort your stamps** — the engine's batch fold walks a cursor, and
+    /// a descending or scattered sweep restarts it.
     ///
     /// **No intermediate buffer and no copy** when `sizeof(T)` equals the
     /// layout's payload — which for `Eigen::Isometry3d` it does. When it does

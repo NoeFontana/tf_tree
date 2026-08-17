@@ -72,18 +72,39 @@ test-doc-error-codes:
 #
 # `docs/API.md` §2.6's tier split puts `tf_tree::unstable::*` and
 # `Tree::arena_view` behind a default-off feature. `cargo build --workspace`
-# cannot reach the tier that split is *for*: `tf_tree_cli`, `tf_tree_c` and
-# `tf_tree_bench` each declare `tf_tree = { features = ["unstable"] }`, the
-# resolver unifies features across a workspace build, so `--workspace` compiles
-# the facade **with** the feature, always. `-p tf_tree` is the only package
-# selection that does not, which is why every line below is `-p`.
+# cannot reach the tier that split is *for*: `tf_tree_cli`, `tf_tree_c`,
+# `tf_tree_bench` and `tf_tree_py` each declare
+# `tf_tree = { features = ["unstable"] }`, the resolver unifies features across a
+# workspace build, so `--workspace` compiles the facade **with** the feature,
+# always. `-p tf_tree` is the only package selection that does not, which is why
+# every line below is `-p`. (Four, not three. The scan at the bottom of this
+# recipe compares `docs/API.md` §6 row 4 and the manifest's `unstable` comment
+# against the manifests — it does **not** read this header, which is how this
+# sentence shipped naming three: `crates/tf_tree_py/Cargo.toml` already carried
+# `features = ["shm", "unstable"]` on the day it was written.)
 #
-# **Stated precisely, because the loose version is wrong.** What no other recipe
-# compiles is `tf_tree`'s *own default feature set* — `counters` on, `unstable`
-# off — and its `shm` variant. `just ingest-check` does compile the facade
-# without `unstable`, but with **no** features at all, because
-# `[workspace.dependencies]` declares `tf_tree = { default-features = false }`;
-# that is a third configuration, not the one `cargo add tf_tree` produces.
+# **Stated precisely, because the loose version is wrong — and the loose version
+# used to be here.** It claimed no other recipe compiles `tf_tree`'s own default
+# feature set or its `shm` variant. Both halves are false, measured with
+# `cargo tree -e features -f '{p} FEATURES={f}'`:
+#
+#     -p tf_tree                                      FEATURES=counters,default
+#     -p tf_tree --features tf_tree_core/miri-soft-float  FEATURES=counters,default
+#     -p tf_tree --features shm                       FEATURES=counters,default,shm
+#
+# so `just miri` (`-p tf_tree --features tf_tree_core/miri-soft-float --lib
+# --test owned_writer`) and `just test-doc-error-codes` (`--doc -p tf_tree -p
+# tf_tree_core`) both reach the default set, and `just shm-check`, `just tsan`
+# and `just shm-rendezvous` all reach the `shm` variant. `just ingest-check`
+# reaches a third configuration, no features at all, because
+# `[workspace.dependencies]` declares `tf_tree = { default-features = false }`.
+#
+# What is genuinely unique to this recipe is narrower and worth keeping for its
+# own sake: the **whole set of stable-tier checks in one place** — clippy on
+# three configurations, the tier's own rustdoc (`just doc` renders the facade at
+# `--all-features`, where a link into `tf_tree::unstable` resolves and here it
+# does not), the consumer-list scan, and the test-count floor. `docs/API.md`
+# §2.6 states the corrected version; do not re-derive it here.
 #
 # **Verified to be a real gate, by breaking it.** Reverting the branch's own
 # `frozen.rs` fix — `self.view()` back to `self.arena_view()`, a crate-internal
@@ -95,16 +116,24 @@ test-doc-error-codes:
 # `error[E0599]: no method named 'arena_view' found for reference '&Tree'`
 # at `crates/tf_tree/src/frozen.rs:239:25`.
 #
-# **What this covers is the library, not `tf_tree`'s test targets, and that is
-# stated rather than implied.** `crates/tf_tree/Cargo.toml` dev-depends on the
-# crate itself with `features = ["unstable"]`, so the arena-reading assertions in
-# `tests/{counters,behavior,construction,frozen,owned_writer}.rs` stay inside
-# `just test` — at the price that **no `tf_tree` test target is ever compiled
-# with the feature off**, and no recipe can change that while the dev-dependency
-# stands. The nearest available substitute is the last two lines: two workspace
-# crates that link the facade *without* the feature and have suites of their own,
-# so the tier gets a runtime pass even though the facade's own tests cannot give
-# it one.
+# **What this covers is the library, not `tf_tree`'s test targets** — every
+# clippy line below is `--lib`, deliberately. The rest of that sentence used to
+# read that no `tf_tree` test target could *ever* be compiled with the feature
+# off, because the manifest dev-depended on the crate itself with
+# `features = ["unstable"]` and unification made the choice for every recipe.
+# 0.0.1 deleted that line (the manifest's `[dev-dependencies]` comment records
+# why: it does not survive `cargo package`), so the constraint is gone —
+# `cargo nextest list -p tf_tree --lib --tests` reports **70** tests where
+# `--features unstable` reports **77**. The seven are `tests/counters.rs` whole
+# plus one test each in `construction.rs` and `behavior.rs`: they carry
+# `#[cfg(feature = "unstable")]` at the call site now, so on the stable tier they
+# do not exist rather than failing to compile.
+#
+# That does not make this recipe cover them — `--lib` still means `--lib` — but
+# it does mean the honest claim is now "this recipe chose not to", not "nothing
+# can". The last two lines stay the runtime pass over the tier: two workspace
+# crates that link the facade and have suites of their own, for the two
+# different reasons recorded where they are.
 stable-tier-check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -140,9 +169,18 @@ stable-tier-check:
     # dev-dependency only breaks a test run. Lumping them together is what would
     # make the number in the prose four or five depending on which document you
     # read, which is the drift this check exists to stop.
+    #
+    # **`want_dev` lost `tf_tree` in 0.0.1** — `crates/tf_tree/Cargo.toml` no
+    # longer dev-depends on itself, so the scan yields `tf_tree_bridge` alone and
+    # this list has to say so or the recipe fails on its own record. Since these
+    # are exact-set comparisons, keeping `tf_tree` off `want_dev` is also what
+    # makes re-acquiring that line fail here: it would come back as a name the
+    # documents do not carry. What that does *not* cover is the other half of the
+    # trade the manifest describes — a misspelled `#[cfg(feature = "unstable")]`
+    # at a call site silently drops a test and no scan of a manifest can see it.
     echo "==> the recorded consumers of the unstable tier are the actual ones"
     want="tf_tree_bench tf_tree_c tf_tree_cli tf_tree_py"
-    want_dev="tf_tree tf_tree_bridge"
+    want_dev="tf_tree_bridge"
     scan() {
         awk -v sect="$1" '
             /^\[/ { s = $0 }
@@ -207,6 +245,27 @@ stable-tier-check:
     # self-description this recipe exists to end.
     echo "==> the downstream suites, run under -p so nothing unifies for them"
     cargo nextest run -p tf_tree_ingest -p tf_tree_bridge
+    # **A floor on each tier's test count, because a `cfg` is a silent switch and
+    # the two guards above it cannot see the failure this one catches.**
+    #
+    # `tests/feature_gates.rs` fails to *compile* on a misspelt feature name, and
+    # the manifest scan above fails on an undocumented consumer. Neither can see
+    # a target that stops being **run** — a gate that still matches, a `--test`
+    # line quietly dropped from a recipe, a `required-features` that stops being
+    # satisfied. Nothing inside the crate can: only the runner knows what it ran.
+    #
+    # Measured at 0.0.1: 70 with `unstable` off, 77 with it on, the seven being
+    # `tests/counters.rs` whole plus one test each in `construction.rs` and
+    # `behavior.rs`. A floor rather than an equality, so adding tests does not
+    # need an edit here.
+    #
+    # `2>/dev/null` also swallows a compile error, which yields 0 and trips the
+    # floor. That is the direction you want it to fail in.
+    echo "==> the tier still lists the tests it is supposed to"
+    have=$(cargo nextest list -p tf_tree 2>/dev/null | wc -l)
+    [ "$have" -ge 70 ] || { echo "the stable tier lists $have tests, was 70 at 0.0.1"; exit 1; }
+    have=$(cargo nextest list -p tf_tree --features unstable 2>/dev/null | wc -l)
+    [ "$have" -ge 77 ] || { echo "the unstable tier lists $have tests, was 77 at 0.0.1"; exit 1; }
 
 # Concurrency model checking under loom (reduced buffer capacities).
 loom:
@@ -266,6 +325,172 @@ miri:
 # ASan needs `-Zbuild-std` so the standard library is instrumented too; without
 # it a use-after-free inside `Box::from_raw` is invisible.
 #
+# **Every runnable artifact is either gated by a recipe or registered as a probe.**
+#
+# This exists because `examples/abi_cost.rs` — which *is* PHASE4 §7 gate
+# criterion 1 — was executed by no recipe and no workflow for months while
+# `docs/PHASE4.md` recorded its number as a PASS and the example itself printed
+# FAIL. A document cited a number that nothing re-derived. An audit found the
+# same shape in roughly a dozen other places.
+#
+# The rule is deliberately weak, because a strong one would be wrong: most of
+# these artifacts are one-off diagnostic probes and running them in CI would be
+# waste. It requires only that an artifact nothing executes be **declared** in
+# `docs/benchmarks/EVIDENCE.md` — as a gate (with its recipe) or a probe (with
+# what it established). A new artifact a document starts citing, with neither,
+# fails here.
+#
+# It does NOT check that a probe's recorded number is still true. That is what
+# makes it a probe. It checks that somebody can find out.
+#
+# A script rather than an inline recipe, like `cpp-check`: it needs `cargo
+# metadata` and multi-line text processing that `just`'s parser mangles.
+evidence-audit:
+    ./scripts/evidence-audit.sh
+
+# **What the diagnostic counters cost a guard — `docs/decisions/0022` question 1.**
+#
+# The 2x2 that question needs: {release, embedder} x {counters on, off}. All four
+# matter, and three of them mislead on their own:
+#
+#   * at `release` (lto = "thin") `Tree::guard` is inlined and the whole cost
+#     shrinks — that profile answers a different question;
+#   * with a *hoisted* guard the flush amortises to nothing, which is what
+#     `counter_cost` already measures and why it finds no contention;
+#   * only a **per-call guard on a WRITABLE arena** pays the flush at all, since
+#     `Guard::drop` early-returns on `!is_writable()`.
+#
+# Both arenas here are writable, so this is the dear configuration on purpose.
+guard-cost:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for prof in release embedder; do
+      for feat in "--features shm" "--no-default-features --features shm"; do
+        case "$feat" in *no-default*) c=off ;; *) c=on ;; esac
+        cargo build --profile "$prof" -q $feat -p tf_tree_bench --bin arena_backing
+        # `--profile release` builds into target/release, not target/profile-release.
+        dir=$([ "$prof" = release ] && echo release || echo "$prof")
+        echo "--- profile=$prof counters=$c"
+        taskset -c 2 "./target/$dir/arena_backing" 2>/dev/null | grep -E "^  (heap|memfd) arena"
+      done
+    done
+
+# **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
+#
+# Four candidates for that gap are eliminated by measurement — the memfd mapping
+# (<= 9.6 ns), the cross-process read-only attach (-0.2 ns), static-vs-shared
+# linkage (~1 ns) and the per-call `Guard` on this arena (+19.3 ns) — leaving
+# ~81 ns unattributed. `just abi-cost` does not reproduce it: its full ABI costs
+# +2.3 ns over a native arm that also guards per call, on a 3-edge tree.
+#
+# The remaining variable is the **caller**. This calls `tft_plan_at` from Rust on
+# the same arena, in the same process, against the same stamps, so the ABI is the
+# only thing that changes between the two arms. Lands near 302 and the cost is
+# the ABI on this fixture; lands near 220 and it is the C++ side, and `0022` is
+# aimed at the wrong thing.
+abi-attached:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -q --features abi-probe -p tf_tree_bench --bin abi_attached
+    cargo build --profile embedder -q --features abi-probe -p tf_tree_bench --bin abi_attached
+    cargo build --release -q --features shm -p tf_tree_bench --bin native_arena
+    rt=$(mktemp -d /tmp/tft-abi-attached.XXXXXX); trap 'rm -rf "$rt"' EXIT
+    export TF_TREE_RUNTIME_DIR="$rt" TF_TREE_NAME=abi_attached
+    coproc OWNER { ./target/release/native_arena --name abi_attached --stream "$rt/fx.tfstream"; }
+    read -r -u "${OWNER[0]}" line || { echo "the arena owner exited before it was ready" >&2; exit 1; }
+    case "$line" in ready\ *) : ;; *) echo "unexpected owner greeting: $line" >&2; exit 1 ;; esac
+    status=0
+    echo "=== release profile (lto = \"thin\" — the boundary is ERASED) ==="
+    taskset -c 2 ./target/release/abi_attached abi_attached || status=$?
+    echo
+    echo "=== embedder profile (lto = false — a REAL boundary) ==="
+    taskset -c 2 ./target/embedder/abi_attached abi_attached --boundary-real || status=$?
+    if [ -n "${OWNER[1]:-}" ]; then exec {OWNER[1]}>&- || true; fi
+    wait "${OWNER_PID:-}" 2>/dev/null || true
+    exit "$status"
+
+# **PHASE2 §12's attach rows**, which had never been measured.
+#
+# §12's table asks for "attach time, cold and warm" (p50) and "first access after
+# attach, per-edge population on vs off" (p99.9, both). `benches/` had neither,
+# and `report.rs`'s `attach_latency` — a required `where_we_are_worse` entry —
+# carried no number at all. An honesty section that cannot regress is not doing
+# the job.
+#
+# **The `population off` arm is deliberately absent**: `populate_hot()` is
+# unconditional inside `attach_shared_inner`, and manufacturing an `off` arm out
+# of some other code path would be worse than saying so. It arrives with `0022`'s
+# B2-prime, which is the change that gives the attach path a policy at all.
+#
+# Pinned, and needs no idle host beyond that: ~100 us against a ~4% run-to-run
+# spread is not a measurement this machine struggles with.
+attach-bench:
+    cargo build --release -q --features shm -p tf_tree_bench --bin attach_bench
+    taskset -c 2 ./target/release/attach_bench
+
+# **PHASE5 §12 gate criterion 4: 16 workers sharing one `.tft`, total Pss within
+# 1.2x of one worker — the project's central memory claim, which nothing had
+# ever run.**
+#
+# `just bench-report`'s `tft_16_workers_rss` row has always been UNAVAILABLE for
+# two reasons, and both dissolved: the report binary is built without `shm` so it
+# has no `Tree::open_frozen` to call (still true — hence a separate binary), and
+# the core budget refused sixteen consumers on four cores (retired by
+# `report.rs`'s `Sensitivity::Memory` axis — Pss is not a timing measurement, and
+# sixteen workers mapping one file share exactly the pages they would share on
+# sixteen cores).
+#
+# **Needs no quiet host and no core parity**, unlike everything else in this
+# file's benchmark section. It does need ~340 MiB of disk and ~1 GiB of RAM.
+#
+# The `.tft` has to be large or the gate is arithmetic about process overhead
+# rather than about sharing: with p MiB private per worker, the criterion needs
+# S >= 74p. The default shape (64 robots x 40 s, 338 MiB) is chosen for that,
+# and it is why §12 gate 2 speaks of a "233 MB index".
+gate4:
+    cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
+    ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
+
+# **PHASE4 §7 gate criterion 1: what the C ABI costs a caller.**
+#
+# This recipe exists because the gate did not have one. `examples/abi_cost.rs`
+# was named in a comment and executed by nothing — no recipe, no workflow — so
+# `docs/PHASE4.md` carried "1.020×, PASS" as a frozen historical reading while
+# the example itself had started printing FAIL.
+#
+# **Two builds, and the second one is the gate.** The workspace `release`
+# profile is `lto = "thin"`, which inlines `tft_plan_at` into this Rust caller —
+# so the boundary the gate exists to price is *not in that binary*.
+# `report.rs`'s §9.2 embedding row already says thin LTO "is exactly what erases
+# the boundary"; nothing had applied it to §7. `[profile.embedder]` is
+# `lto = false` and is the honest one, and `just embed-cost` builds there for the
+# same reason. The `release` run is kept because the contrast between the two is
+# the finding, and because deleting it would leave nobody able to check the
+# claim.
+#
+# **Pinned**, for `cpp-bench`'s reason: an unpinned run migrates cores and swings
+# by more than the gate allows.
+#
+# **Exit status is now the gate** — at the `embedder` profile only. It was not,
+# and the recipe said "wire it in the commit that fixes the regression": this is
+# that commit. What made the old criterion ungateable was its denominator, an
+# inlined loop that moved 43% when an unrelated second `Tree::guard()` call site
+# was added to the same file. The comparands are pinned now
+# (`#[inline(never)]` + `black_box`) and the binary carries a standing control
+# row that fails if the pin ever stops holding. The three rungs it gates and
+# their allowances are `docs/decisions/0023` — draft, so read them as a proposal
+# a human ratifies by merging it.
+abi-cost:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -q -p tf_tree_c --features test-hooks --example abi_cost
+    cargo build --profile embedder -q -p tf_tree_c --features test-hooks --example abi_cost
+    echo "=== release profile (lto = \"thin\" — the boundary is ERASED; contrast only) ==="
+    taskset -c 2 ./target/release/examples/abi_cost release
+    echo
+    echo "=== embedder profile (lto = false — a REAL boundary; THIS one gates) ==="
+    taskset -c 2 ./target/embedder/examples/abi_cost embedder
+
 # The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
 c-abi-check:
     MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
@@ -547,6 +772,23 @@ ingest-check:
 #   `#[cfg(all(feature = "shm", target_os = "linux"))]`. They resolve in the
 #   build docs.rs performs, and de-linking them would trade two working links in
 #   the rendered documentation for a clean run of a command that is not the gate.
+#
+# **And the two excluded crates, which no `-p` here can name.** Both are in the
+# root manifest's `exclude`, so `cargo doc --no-deps -p tf_tree_py` answers
+# *"package ID specification `tf_tree_py` did not match any packages"* and the
+# only spelling that reaches either is `--manifest-path`:
+#
+# * `tf_tree_py` — the crate whose documentation a PyPI user reads, and the one
+#   this recipe would most like to cover. It is gated by `just py-lint`, whose
+#   rustdoc line carries the argument for living there: the `--manifest-path`
+#   form works fine from here, but PyO3's build script needs an interpreter and
+#   `py-*` is what owns one.
+# * `tf_tree_tf2_sys` — rustdoc for it runs in **no** recipe. It needs ROS 2
+#   headers, so the only recipe that could carry it is `just tf2-check`'s
+#   container invocation, and it is `publish = false` behind
+#   `tf_tree_bench --features tf2`, so nothing it says renders on docs.rs. That
+#   is a smaller hole than `tf_tree_py`'s was, and it is stated here rather than
+#   left to be rediscovered.
 doc:
     RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo doc --no-deps --all-features \
         -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
@@ -557,6 +799,17 @@ doc:
     RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p xtask
 
 lint: py-compile
+    # **First, because it is the cheapest and it caught a real one.** PHASE4 §7
+    # gate criterion 1 was recorded as PASS for months while the benchmark that
+    # produces it ran in no recipe at all. This fails if a runnable artifact is
+    # neither executed nor declared in `docs/benchmarks/EVIDENCE.md`.
+    ./scripts/evidence-audit.sh
+    # Second, for the same reason and at the same price — 0.09 s, no network,
+    # no compilation. It fails on a version that moved in one of the nine files
+    # that carry one and not the others, and on a document or a workflow that
+    # names a recipe this file does not define. See `just artifact-versions`
+    # for the three findings it was written for.
+    ./scripts/artifact-versions.py
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
@@ -619,8 +872,9 @@ audit:
 # **The MSRV floor, on the host rather than only in CI.**
 #
 # `SUPPORT.md` calls the floor "enforced, not intended", and until this recipe
-# existed the only thing enforcing it was CI's `msrv` job — which has produced no
-# run since 2026-07-23. A floor whose only gate is a workflow nobody is running is
+# existed the only thing enforcing it was CI's `msrv` job — which produced no run
+# between 2026-07-23 and 2026-08-16. A floor whose only gate is a workflow that
+# may stop running without anyone noticing is
 # back to being intended, which is the exact failure that took `rust-version` from
 # 1.83 to 1.85: the number looked authoritative and nothing had ever compiled
 # against it.
@@ -676,6 +930,48 @@ msrv:
         fi
     done
     exit $rc
+
+# **The repository checked against itself: one version everywhere, and no
+# document that names a recipe which does not exist.**
+#
+# Third of the family that starts with `just msrv` and `just evidence-audit`,
+# and it exists because three independent readings of this release found the
+# same defect in three different places — shipped text contradicting a document
+# that same text names as authoritative. The README's status table against the
+# `§0.0` tables it calls the source of truth; the CLI's `--help`, still saying
+# "live external attach arrives in Phase 2" two phases after it arrived; and a
+# README quickstart that said `just py-wheel` was "build + install" when the
+# recipe only built, so the documented first five minutes ended in
+# `ImportError`. None of the three is a property of the code, which is why no
+# test caught any of them.
+#
+# **The version half is the gap `just msrv` leaves.** That recipe does exactly
+# this for one field: it reads `rust-version` out of the manifest and fails if a
+# hand-written copy — or the README's prose — disagrees. There was no equivalent
+# for `version`, and **nine** files carry a hand-kept copy of it: two manifests
+# outside `[workspace]` (they cannot inherit), `pyproject.toml`, three
+# `CMakeLists.txt` and two `package.xml`. `crates/tf_tree_c/CMakeLists.txt`'s
+# own comment said as much — "Unlike `rust-version`, nothing compares these
+# copies … this is the convention, not a gate" — and this is that sentence
+# stopping being true.
+#
+# **What it deliberately does not check is the README's status table**, which is
+# where the first of the three findings was. No cheap rule separates a stale row
+# from a differently-worded true one, and `docs/PHASE5.md` §10's point about the
+# benchmark baseline applies here: a gate that flaps is a gate people learn to
+# pass by editing the gate. So every rule in the script was measured over the
+# whole corpus before it was written down and narrowed until it had no false
+# positives — the recipe-reference arm resolves 242 references across 19
+# documents and 49 across 3 workflows, and the single finding it produced on the
+# tree it was written against was `just quickstart`, which did not exist yet.
+# `docs/decisions/` is out of its scope for the same reason: a `ready` record is
+# a dated artifact, and renaming a recipe must not force an edit to history.
+#
+# Wired into `just lint` (0.09 s, no network, three runs byte-identical).
+
+# One version across the repository, and no document naming a recipe that is not there.
+artifact-versions:
+    ./scripts/artifact-versions.py
 
 # Run the benchmark suite and the go/no-go gate.
 bench:
@@ -1067,6 +1363,40 @@ tf2-bench-baseline-update:
         --out target/tf2-bench-report'
     cp target/tf2-bench-report/results.json crates/tf_tree_bench/baseline/results-tf2.json
 
+# **Which consumer build does the gated ratio speak for? Both, measured.**
+#
+# `tf2-bench-check` above builds with `cargo run --release`, so its
+# `lookup_ratio_vs_tf2` row is taken under *this workspace's*
+# `[profile.release]` — `lto = "thin"`, which inlines `Plan::at` across the
+# `tf_tree` crate boundary into the harness. A consumer does not get that build:
+# cargo applies the **top-level** package's profile to the whole dependency
+# graph, and cargo's own release defaults set no LTO. `[profile.embedder]` is
+# those defaults written out field by field.
+#
+# So this runs the same paired harness twice, once per profile, and prints both.
+# **Read the tf2 column, not just the quotient**: that arm goes through
+# `tf_tree_tf2_sys`' C++ shim, which no Rust LTO setting can inline into, so it
+# should barely move between the two builds. If it does move, the two runs are
+# not comparable and the quotient of quotients means nothing.
+#
+# Pinned to one core, for `cpp-bench`'s reason: an unpinned run migrates and
+# swings the absolute columns, which are the thing being compared across runs
+# here (the within-run quotient survives migration; a cross-run column does not).
+#
+# Not gated and deliberately not wired into `bench_report`: `bench_report`'s
+# baseline is per-profile by construction (`runstore::BUILD_CRITICAL_FACTS`
+# refuses to compare across `build_profile`), so a second profile is a second
+# baseline, and nothing yet says which one the project claims.
+tf2-ratio-profiles:
+    ./docker/tf2/run.sh 'set -euo pipefail; \
+        cargo build --release -q -p tf_tree_bench --features tf2 --bin tf2_ratio; \
+        cargo build --profile embedder -q -p tf_tree_bench --features tf2 --bin tf2_ratio; \
+        echo "=== [profile.release] — lto = \"thin\": THIS workspace, not a consumer ==="; \
+        taskset -c 2 ./target/tf2-docker/release/tf2_ratio; \
+        echo; \
+        echo "=== [profile.embedder] — lto = false: cargo release defaults, what a consumer gets ==="; \
+        taskset -c 2 ./target/tf2-docker/embedder/tf2_ratio'
+
 # fmt + clippy + unit tests for the tf2 bridge, in the container. `lint` and `test` cannot see it.
 tf2-check:
     ./docker/tf2/run.sh 'set -euo pipefail; \
@@ -1347,6 +1677,11 @@ shm-check:
     # `--lib` and not the whole package: the integration targets are named
     # individually, on purpose.
     cargo nextest run -p tf_tree_bench --features shm --lib
+    # `abi-probe` = `bridge` + `tf_tree_c/test-hooks`, the only configuration in
+    # which `abi_attached` compiles. Without this line the binary that measures
+    # the C ABI boundary is linted by nothing — the same hole `just lint`'s
+    # feature-named clippy passes exist to close.
+    cargo clippy -p tf_tree_bench --features abi-probe --all-targets -- -D warnings
     # Fork poisoning (`docs/decisions/0005` step 9). Separate from
     # `shm-rendezvous` because it needs no second executable and no scratch
     # rendezvous beyond its own: the second process is a `fork` of the first.
@@ -1405,7 +1740,25 @@ shm-check:
     # PRs, and it is why a new shm-only target belongs here in the same commit
     # that adds it.
     cargo nextest run -p tf_tree_arena --features shm
-    cargo nextest run -p tf_tree --features shm --test frozen
+    # **`unstable` on the line below buys exactly one test, and without it that
+    # test runs nowhere.** `freezing_carries_the_counter_regions` (§2's
+    # counter-region carry-over) is `#[cfg(feature = "unstable")]` — all three of
+    # its arena reads go through `Tree::arena_view`, so there is no stable-tier
+    # spelling of it. Every *other* `unstable`-gated test in this crate is reached
+    # by `cargo nextest run --workspace`, where the resolver unifies the feature
+    # in from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`; this target
+    # carries `required-features = ["shm"]`, so `--workspace` skips it whole and
+    # this line is the only one that can run it. Until 0.0.1 the facade's
+    # self-dev-dependency turned the feature on here for free; deleting it (see
+    # `crates/tf_tree/Cargo.toml`) took the test out of every recipe at once and
+    # `--features shm` alone would leave it there. Measured:
+    # `cargo nextest list -p tf_tree --features shm --test frozen` lists 8 tests,
+    # `--features shm,unstable` lists 9.
+    #
+    # The clippy line at the top of this recipe stays `--features shm` alone on
+    # purpose: that is what compiles this crate's test targets with `unstable`
+    # *off*, the shape a packager building the tarball gets.
+    cargo nextest run -p tf_tree --features shm,unstable --test frozen
     # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
     # paragraphs above being obeyed rather than restated.** Half of
     # `tests/owned_writer.rs` is `#[cfg(all(feature = "shm", target_os =
@@ -1540,6 +1893,30 @@ tf2-native-control:
 # `docs/benchmarks/tf2.md` states the bracket, the unpaired point estimate, and
 # what is still owed to close it. Not gated: it is not wired into
 # `bench_report`, so no baseline carries it yet.
+# **The memory comparison with no binding on either side.**
+#
+# Every other memory row in this repository puts tf2 behind the Rust binding
+# `tf_tree_tf2_sys`, so the process being weighed carries a Rust runtime, a Rust
+# allocator and the shim on top of tf2. The one exception, `just dds-bench`, is
+# dominated by rclcpp nodes at ~14 MiB each rather than by either engine. And
+# `docker/tf2/native_ratio.cpp` — built precisely to remove cross-language bias
+# from the *timing* comparison — measures no memory at all.
+#
+# This runs two processes: a C++ program linking only `libtf2`, and `footprint`'s
+# unchanged `mem-tf_tree` mode. Two instruments each — `mallinfo2` (which
+# compares the engines on identical terms, since C++ `operator new` bottoms out
+# in `malloc`) and Pss (which is what an operator sees in `top`, and which
+# `mallinfo2` cannot see).
+#
+# **Needs no idle machine.** Neither instrument is a clock.
+#
+# It prints what tf_tree costs as measured *and* what it would cost right-sized,
+# because those differ by 1.5x and the gap is declared capacity nobody published
+# into. It refuses to print a quotient if the two arms stored different sample
+# counts.
+tf2-native-footprint:
+    ./docker/tf2/run.sh 'bash docker/tf2/native_footprint.sh'
+
 tf2-native-ratio *ARGS:
     ./docker/tf2/run.sh 'bash docker/tf2/native_ratio.sh {{ARGS}}'
 
@@ -1564,7 +1941,25 @@ tf2-native-ratio *ARGS:
 # is measured, the boundary half is a subtraction against a figure from another
 # run, so the tool prints which row is which.
 abi-split:
-    cargo run --release -p tf_tree_bench --features shm --bin arena_backing
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -q --features shm -p tf_tree_bench --bin arena_backing --bin native_arena
+    # The cross-process rung needs an arena somebody else is serving, and
+    # `native_arena` is the owner that serves one. Short runtime dir by
+    # necessity: the attach socket path must fit `sun_path`'s 108 bytes.
+    rt=$(mktemp -d /tmp/tft-abi-split.XXXXXX); trap 'rm -rf "$rt"' EXIT
+    export TF_TREE_RUNTIME_DIR="$rt" TF_TREE_NAME=abi_split
+    coproc OWNER { ./target/release/native_arena --name abi_split --stream "$rt/fx.tfstream"; }
+    read -r -u "${OWNER[0]}" line || { echo "the arena owner exited before it was ready" >&2; exit 1; }
+    case "$line" in ready\ *) : ;; *) echo "unexpected owner greeting: $line" >&2; exit 1 ;; esac
+    status=0
+    ./target/release/arena_backing --attach abi_split || status=$?
+    # Guarded, and `|| true` on every step: bash unsets the fd array when a
+    # coproc has already exited, so a bare close fails with "ambiguous redirect"
+    # and — under `set -e` — takes the script down before `exit "$status"` runs.
+    if [ -n "${OWNER[1]:-}" ]; then exec {OWNER[1]}>&- || true; fi
+    wait "${OWNER_PID:-}" 2>/dev/null || true
+    exit "$status"
 
 # ---------------------------------------------------------------------------
 # Python bindings (docs/PHASE3.md). `tf_tree_py` is excluded from the workspace
@@ -1574,6 +1969,37 @@ abi-split:
 # are what actually gets used. 3.14 is the GIL build; 3.14t is free-threaded,
 # and §7.3 requires the suite to pass on both.
 # ---------------------------------------------------------------------------
+
+# **A clean clone to a working Python REPL in one command — and it fails loudly
+# if the README's own snippet stops printing what the README says it prints.**
+#
+# `README.md`'s "First five minutes" tells a reader to run this and then
+# `.venv/bin/python`. The last step below executes *that* snippet: it is read
+# out of `README.md` rather than copied into a script, and its output is
+# compared against the `# ->` marker in the snippet itself. So there is no
+# second copy of the quickstart to drift (`docs/PROJECT.md` §6) and no expected
+# value written down anywhere but the README. The failure it replaces is the
+# one that shipped — the README said `just py-wheel` installed the extension,
+# `py-wheel` only builds it, and nothing anywhere ran the five minutes.
+#
+# **It depends on `py-setup` rather than carrying a lighter path of its own**,
+# and the temptation was real: `py-setup` installs *two* interpreters, and a
+# reader who has not yet decided they care pays for the free-threaded one up
+# front. What settles it is what happens next. A leaner venv would be a second
+# spelling of "the Python environment" (§6 again), and everything the reader
+# reaches for after the REPL — `just py-test`, `just py-lint`,
+# `just py-test-freethreaded` — assumes `py-setup`'s. A quickstart whose reward
+# for succeeding is that the next recipe fails is not a quickstart.
+#
+# The install line is deliberately the same one `py-test` runs, so a broken
+# install is never something only newcomers see.
+
+# Clean clone -> a Python REPL with the extension installed, verified end to end.
+quickstart: py-setup
+    VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q
+    .venv/bin/python scripts/quickstart_smoke.py
+    @echo ""
+    @echo "==> next: .venv/bin/python   (the extension is installed in that interpreter)"
 
 # Create both venvs and install the toolchain.
 py-setup:
@@ -1594,10 +2020,44 @@ py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
     .venv-t/bin/python -m pytest tests/python -q
 
-# fmt + lint for both languages of the binding.
+# fmt + lint for both languages of the binding, plus the Rust half's rustdoc.
 py-lint:
     cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
     PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
+    # **Rustdoc for the one crate no other recipe compiles the documentation of.**
+    # `just doc` names its packages with `-p`, and this crate is in the root
+    # manifest's `exclude`, so from the root `cargo doc --no-deps -p tf_tree_py`
+    # answers *"package ID specification `tf_tree_py` did not match any
+    # packages"*. Until this line, fmt, clippy, ruff, ruff format and pyright
+    # were the whole of the crate's gate and none of them is rustdoc — for the
+    # crate whose rendered documentation is the one a PyPI user reads. The 0.0.1
+    # release prep found **three** broken intra-doc links here, by running this
+    # command by hand.
+    #
+    # **The reason it is here and not in `just doc` is the interpreter, not
+    # reachability** — the "an excluded crate is structurally out of `just doc`'s
+    # reach" argument is too strong, and was tested rather than inherited: the
+    # `--manifest-path` form below runs perfectly well from the workspace root.
+    # What it needs is a Python, because PyO3's build script runs one. Measured:
+    # with `PYO3_PYTHON` pointed at a venv that does not exist it exits 101
+    # (*"failed to run the Python interpreter at ..."*), and with the variable
+    # unset it quietly *succeeds* against the host's `python3` — 3.12 here, not
+    # the venv's 3.14 — rebuilding pyo3/pyo3-ffi/numpy for that configuration in
+    # 2.6 s, and 2.7 s again to come back. So a copy in `just doc` would either
+    # fail on any machine without a venv, or document a different interpreter
+    # than the one the bindings are tested on, and would thrash one target
+    # directory between two PyO3 configurations whenever the two recipes
+    # alternate. CI already splits the same way: the `docs` job that runs
+    # `just doc` provisions no interpreter, while the `python` job runs
+    # `just py-setup` immediately before this recipe.
+    #
+    # Verified to be a real gate, by breaking it: a `[NoSuchItem]` intra-doc link
+    # added to the top of `crates/tf_tree_py/src/lib.rs` (and restored
+    # byte-for-byte afterwards) gives *"error: unresolved link to `NoSuchItem`"*
+    # and *"error: could not document `tf_tree_py`"*, exit 101. Warm it costs
+    # 0.09 s, which is why it is a line in this recipe and not a recipe of its own.
+    PYO3_PYTHON=$PWD/.venv/bin/python RUSTDOCFLAGS="-D warnings" cargo doc \
+        --manifest-path crates/tf_tree_py/Cargo.toml --no-deps
     .venv/bin/ruff check python tests/python crates/tf_tree_bench/python
     .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python
     # `--strict` over the package and its stubs (PHASE3 §9). Not over
@@ -1606,8 +2066,36 @@ py-lint:
     # green is a gate nobody runs.
     .venv/bin/pyright python
 
-# Build a release wheel.
+# **Builds a wheel. Does not install one — `just quickstart` is what installs.**
+#
+# That sentence is here because its absence shipped a bug: `README.md`
+# documented this recipe as "maturin build + install into .venv", so the
+# quickstart it was part of ended in `ImportError`. The README now points at
+# `just quickstart`, and this comment is the other half of making that stay
+# true.
+#
+# **It was not fixed by making this recipe install**, and the reason is the two
+# recipes directly below. `py-mp-bench` and `py-vs-tf2` call it and then unpack
+# `crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl` by hand into a
+# container. Replacing `maturin build` with `maturin develop` leaves that path
+# unwritten and breaks both; doing both would mutate the host's `.venv` as a
+# side effect of running a benchmark inside a container, which is a worse
+# surprise than the one being fixed. One recipe, one artifact.
+
+# Build a release wheel (it does not install; `just quickstart` does that).
 py-wheel:
+    # **Clear the previous build first, because the two recipes below index
+    # into a glob.** Measured while writing this: after the release bumped the
+    # version, `crates/tf_tree_py/target/wheels/` held `tf_tree-0.1.0-…whl`
+    # *and* `tf_tree-0.0.1-…whl`, and `glob.glob(…)[0]` is filesystem order,
+    # not sorted — so which build those benchmarks measured was luck. It
+    # happened to pick the new one on the machine this was found on, which is
+    # the worst kind of passing. `target/` is where disposable artifacts live
+    # and `cargo clean` removes the directory outright, so nothing is lost that
+    # a rebuild does not restore. Both consumers now `assert len(w) == 1` and
+    # print what they unpacked, so the invariant this line creates is checked
+    # where it is relied on rather than assumed.
+    rm -f crates/tf_tree_py/target/wheels/transform_tree-*.whl
     VIRTUAL_ENV=.venv .venv/bin/maturin build --release
 
 # N Python consumer nodes on one shared arena, against N private `tf2_ros`
@@ -1621,9 +2109,13 @@ py-wheel:
 # RUN THIS ON AN IDLE MACHINE.
 py-mp-bench:
     just py-wheel
+    # The unpack asserts a single wheel instead of taking `glob(...)[0]`; see
+    # `py-wheel` for the stale-wheel it was measured against. A second wheel
+    # means somebody built one by hand, and stopping beats benchmarking
+    # whichever build the filesystem happens to return first.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
-        python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")[0]).extractall(\"target/pywheel\")"; \
+        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/mp_compare.py'
 
 # tf_tree's Python API against tf2_ros's, in the ROS container (PHASE3 §12.1).
@@ -1639,5 +2131,5 @@ py-vs-tf2:
     # the container's system site-packages untouched.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
-        python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob(\"crates/tf_tree_py/target/wheels/tf_tree-*-cp314-*.whl\")[0]).extractall(\"target/pywheel\")"; \
+        python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/tf2_ros_compare.py'

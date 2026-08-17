@@ -372,6 +372,7 @@ def build(
     *,
     capacity: int = ...,
     interp: Literal["sclerp", "lerpslerp"] = ...,
+    frame_headroom: int = ...,
 ) -> Tree:
     """An in-process tree from `(parent, child)` edges.
 
@@ -411,6 +412,7 @@ def open_arena(
     create: list[tuple[str, str]] | None = ...,
     capacity: int = ...,
     interp: Literal["sclerp", "lerpslerp"] = ...,
+    frame_headroom: int = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
 
@@ -509,3 +511,34 @@ def from_ros(stamp: object, /) -> int:
 
 def has_shared_memory() -> bool:
     """Whether this build can share a tree between processes."""
+
+__version__: str
+"""This extension's version, compiled in from the crate manifest.
+
+`importlib.metadata.version("transform_tree")` is the canonical answer and reads a
+different file — `pyproject.toml`'s `[project] version` against this one's
+`Cargo.toml`. `tests/python/test_version.py` asserts the two agree, which is
+the only thing that keeps them from drifting.
+"""
+
+def arena_format_version() -> int:
+    """This build's arena format version — the *set of fields* in the header.
+
+    3 as of `PHASE5.md` §1. A different one is never compatible: there is no
+    conversion layer, so every participant is rebuilt from one commit and
+    restarted together.
+    """
+
+def arena_layout_hash() -> int:
+    """This build's arena layout hash — the *geometry*.
+
+    Checked on attach beside `arena_format_version()`, and a mismatch on either
+    is refused. Two builds agreeing on the version and disagreeing on the hash
+    disagree about *where* things are, which is worse than disagreeing about
+    what they are.
+
+    An `int`, because it is compared rather than read. For a report write
+    `f"0x{tf_tree.arena_layout_hash():08X}"` — the literal `0x` matters, since
+    Python's `{:#010X}` produces `0X…` and would not match what
+    `tft doctor --explain-version` prints.
+    """

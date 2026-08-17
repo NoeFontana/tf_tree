@@ -31,6 +31,38 @@
 //! fact invalidates the comparison, so [`diff`] surfaces it loudly
 //! ([`Diff::host_drift`]) instead of ignoring it.
 //!
+//! # A differing *build* fact is not surfaced — it is refused
+//!
+//! [`HOST_CRITICAL_FACTS`] and [`BUILD_CRITICAL_FACTS`] are two lists because
+//! they earn two different responses. A different CPU makes the absolute
+//! numbers untrustworthy while leaving the ratios worth reading, so it is a
+//! warning above the table. A different `[profile.*]` makes the two runs
+//! *measurements of different programs* — this workspace's `[profile.release]`
+//! sets `lto = "thin"`, which inlines across the crate boundary that
+//! `[profile.embedder]` leaves standing — so there is nothing worth reading and
+//! [`render`] prints no table at all. See [`Diff::comparable`].
+//!
+//! # Which emitted artifacts this covers, and which need nothing
+//!
+//! The refusal above lives in [`diff`], not in a harness, so it covers every
+//! emitter that writes a [`Run`] — for free and without a per-binary opt-in.
+//! The full list, audited rather than assumed, because "a residue is a
+//! hypothesis" applies to coverage as much as to nanoseconds:
+//!
+//! | emitter | comparable artifact | refuses a cross-profile comparison |
+//! |---|---|---|
+//! | `bin/contended_scaling.rs`, `bin/scale_sweep.rs`, `bin/soak.rs` | a [`Run`], via `--json`; `just bench-run` writes two of them per commit and `just bench-ab` compares them | yes — [`diff`], and their provenance is truthful because each binary measures **itself** |
+//! | `bin/dds_report.rs` | a [`Run`], via `aggregate --json` | yes, but only since it started reading `--ros-out`: it is the one emitter that measures *other* programs, so `build_profile` alone described a parser. See [`BUILD_CRITICAL_FACTS`]'s `dds_*` section |
+//! | `bin/bench_report.rs` | `results.json`, compared against the committed baseline by `just bench-check` | yes — [`crate::baseline::PORTABLE_FACTS`] carries `build_profile`, and a mismatch is a gate failure |
+//! | `bin/embed_cost.rs` | `embedder.json` + `release.json`, compared **to each other** | yes — [`crate::embed::Pair::load`] refuses two runs of the same `profile_dir`, or two of different `source_id` |
+//! | `bin/native_arena.rs` | a `.tfstream` | **not applicable, and deliberately given no machinery**: it is the *input* both engines replay, not a measurement. Two of them differing is a fixture change, which `dump_stream`'s own comment covers |
+//! | every other `bin/` | stdout only | **not applicable**: nothing diffs two runs of `footprint`, `attach_bench`, `counter_cost`, `shm_scaling`, `tf2_scaling`, `mp_bench`, `shm_torture`, `frozen_workers`, `arena_backing`, `abi_attached` or `tf2_ratio`. They print a result an operator reads once. A one-shot report is not made safer by refusing to be a thing it is not |
+//!
+//! The last row is the one worth stating explicitly, because the alternative
+//! reading — "add the check everywhere, it is cheap" — costs a reader of each of
+//! those binaries a paragraph explaining a comparison that never happens. If one
+//! of them grows a `--json`, it grows a [`Run`] and this covers it.
+//!
 //! # Schema
 //!
 //! Emitted by hand, for the reason `report.rs` gives for doing the same: the
@@ -49,6 +81,14 @@ use crate::report::{jmetrics, jnum, jstr, Drift, Fitness, Metric, Provenance};
 use crate::workload::Shape;
 
 /// Run-file schema identifier. Bump on any consumer-visible change.
+///
+/// **Adding a provenance fact is not one, and `build_lto` was deliberately
+/// added without a bump.** A bump makes every committed and cached run file
+/// unreadable, which is the same damage renaming a row or metric id does — see
+/// `bin/scale_sweep.rs`'s note on why `rss`/`pss` was not renamed. An older run
+/// file simply carries no `build_lto`, and [`diff`] already treats an absent
+/// build fact as a mismatch rather than as agreement, so nothing reads such a
+/// file as if it had made a claim it never made.
 pub const SCHEMA: &str = "tf_tree.bench-run/1";
 
 /// The provenance facts a timing comparison is only meaningful within.
@@ -63,10 +103,63 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
     "logical_cpus",
     "cpu_governor",
     "kernel",
-    "build_profile",
     "target",
     "counters_feature",
     "transparent_hugepage",
+];
+
+/// The provenance facts that make a comparison **impossible**, not merely
+/// suspect.
+///
+/// [`HOST_CRITICAL_FACTS`] above says "these two numbers came off different
+/// machines, so read the verdicts with that in mind" — and that warning is
+/// survivable, because a *ratio* often is still meaningful when the absolute
+/// numbers are not. These are different in kind: they mean the two runs measured
+/// **different programs answering different questions**, and no arithmetic over
+/// them means anything at all. So [`diff`] refuses instead of warning, and
+/// `bench_ab` exits non-zero.
+///
+/// `build_profile` moved here from the host list, and it is the reason this list
+/// exists. This workspace's `[profile.release]` is `lto = "thin"`;
+/// `[profile.embedder]` is `lto = false`. Thin LTO inlines across the crate
+/// boundary a boundary measurement is trying to price, so the same binary built
+/// the two ways does not measure the same thing — twice in one week that
+/// difference was reported as a property of the code (`docs/PHASE4.md` §0.0
+/// records both). A warning printed above a table of per-row verdicts is not
+/// enough for that: the table is the thing that misleads, and it was still
+/// printed.
+///
+/// `build_lto` is here as well even though it is currently a function of
+/// `build_profile`. It is not redundant: it is what fires if a future edit to
+/// `[profile.embedder]` or `[profile.release]` changes what a profile *means*
+/// while leaving its name alone, which is exactly the change nobody would think
+/// to regenerate a comparison for.
+///
+/// # The three `dds_*` keys, and why a generic list names a specific harness
+///
+/// The first two facts describe **the binary that called [`Run::begin`]**, which
+/// for every harness here is also the binary that took the measurement — except
+/// one. `bin/dds_report.rs` does not measure anything: it parses the `.out`
+/// files of C++ processes that `ros/build.sh` built, so its own `build_profile`
+/// is a true statement about a program that ran a parser. A dds run file
+/// carrying only those two facts refuses on a change to the *aggregator* and
+/// waves through a change to the *arms*, which is the comparison it exists to
+/// make. `dds_report` therefore reads the build that produced the arms out of
+/// the CMake caches that built them and pushes it here, and those keys have to
+/// be on this list or they are decoration.
+///
+/// Naming them here rather than inventing a per-harness list is deliberate and
+/// costs the other harnesses nothing: [`diff`] compares `a.fact(k)` against
+/// `b.fact(k)`, and two `scale_sweep` runs both have `None` for all three, which
+/// is agreement. It is only *one* side being absent that refuses — a dds run
+/// from before this gate against one from after — and that is the correct
+/// reading rather than a regression.
+pub const BUILD_CRITICAL_FACTS: &[&str] = &[
+    "build_profile",
+    "build_lto",
+    "dds_cxx_build_type",
+    "dds_c_abi_profile",
+    "dds_c_abi_lto",
 ];
 
 /// One measurement point: a harness, a workload, an engine, and a position in
@@ -532,10 +625,29 @@ pub struct Diff {
     pub only_in_b: Vec<String>,
     /// `(fact, a, b)` for each [`HOST_CRITICAL_FACTS`] entry that differs.
     pub host_drift: Vec<(String, String, String)>,
+    /// `(fact, a, b)` for each [`BUILD_CRITICAL_FACTS`] entry that differs.
+    ///
+    /// Non-empty means the two runs are **not comparable**; see
+    /// [`Diff::comparable`]. Kept as a separate field rather than folded into
+    /// `host_drift` so the difference between "read this carefully" and "this
+    /// comparison does not exist" survives into every consumer.
+    pub build_mismatch: Vec<(String, String, String)>,
 }
 
 impl Diff {
+    /// Whether the two runs describe the same program built the same way.
+    ///
+    /// `false` means every delta below is arithmetic between two different
+    /// questions. [`render`] prints the reason and **not** the table, and
+    /// `bench_ab` exits non-zero — a refusal, not a caveat.
+    #[must_use]
+    pub fn comparable(&self) -> bool {
+        self.build_mismatch.is_empty()
+    }
+
     /// Whether any metric regressed beyond its tolerance.
+    ///
+    /// Meaningless — and never consulted — when [`Diff::comparable`] is false.
     #[must_use]
     pub fn regressed(&self) -> bool {
         self.deltas.iter().any(|d| d.verdict == Verdict::Worse)
@@ -589,23 +701,31 @@ pub fn diff(a: &Run, b: &Run) -> Diff {
         .cloned()
         .collect();
 
-    let mut host_drift = Vec::new();
-    for fact in HOST_CRITICAL_FACTS {
-        let (va, vb) = (a.fact(fact), b.fact(fact));
-        if va != vb {
-            host_drift.push((
-                (*fact).to_owned(),
-                va.unwrap_or("absent").to_owned(),
-                vb.unwrap_or("absent").to_owned(),
-            ));
-        }
-    }
+    // One walk, two lists. `absent` rather than skipping: a run file written
+    // before a fact existed must read as a mismatch, not as agreement — the
+    // whole point of a build fact is that its silence is not consent.
+    let drift = |facts: &[&str]| -> Vec<(String, String, String)> {
+        facts
+            .iter()
+            .filter_map(|fact| {
+                let (va, vb) = (a.fact(fact), b.fact(fact));
+                (va != vb).then(|| {
+                    (
+                        (*fact).to_owned(),
+                        va.unwrap_or("absent").to_owned(),
+                        vb.unwrap_or("absent").to_owned(),
+                    )
+                })
+            })
+            .collect()
+    };
 
     Diff {
         deltas,
         only_in_a,
         only_in_b,
-        host_drift,
+        host_drift: drift(HOST_CRITICAL_FACTS),
+        build_mismatch: drift(BUILD_CRITICAL_FACTS),
     }
 }
 
@@ -658,16 +778,54 @@ fn compare(row: &str, a: &Metric, b: &Metric) -> Delta {
     }
 }
 
-/// Render a diff as a table.
+/// Render a diff as a table — or, when the two runs are not comparable, as the
+/// reason there is no table.
+///
+/// The table is withheld rather than annotated. A banner above a screen of
+/// per-row verdicts loses to the verdicts: somebody reads "+31% worse" and
+/// carries that number into a commit message, and the fact that one run had the
+/// crate boundary inlined away does not travel with it. Withholding the numbers
+/// is the only presentation that cannot be misquoted.
 #[must_use]
 pub fn render(d: &Diff) -> String {
     let mut s = String::with_capacity(4096);
 
+    if !d.comparable() {
+        s.push_str(
+            "REFUSED — these two runs were built differently, so they do not answer\n\
+             the same question and no verdict over them means anything. The numbers\n\
+             are deliberately not shown.\n",
+        );
+        for (fact, a, b) in &d.build_mismatch {
+            let _ = writeln!(s, "  {fact}: {a:?} -> {b:?}");
+        }
+        s.push_str(
+            "\nThis workspace's [profile.release] is `lto = \"thin\"`, which inlines\n\
+             across the crate boundary that [profile.embedder] (`lto = false`) leaves\n\
+             in the binary. A cost measured under one is not the cost under the other.\n\
+             Re-run both halves at the same profile.\n",
+        );
+        // A run file written before a build fact existed reads as `absent`, and
+        // that lands here rather than being waved through — but it is not the
+        // same news as a profile that changed, so it says so instead of leaving
+        // a reader to infer a build change from a missing field.
+        if d.build_mismatch
+            .iter()
+            .any(|(_, a, b)| a == "absent" || b == "absent")
+        {
+            s.push_str(
+                "\n`absent` above means that run file predates the fact and cannot state\n\
+                 what it was built with. That is not agreement, so it is not treated as\n\
+                 agreement; re-run the older half.\n",
+            );
+        }
+        return s;
+    }
+
     if !d.host_drift.is_empty() {
         s.push_str(
-            "HOST DRIFT — these two runs were not taken on the same machine or the\n\
-             same build, so every timing verdict below is about the host as much as\n\
-             about the change:\n",
+            "HOST DRIFT — these two runs were not taken on the same machine, so every\n\
+             timing verdict below is about the host as much as about the change:\n",
         );
         for (fact, a, b) in &d.host_drift {
             let _ = writeln!(s, "  {fact}: {a:?} -> {b:?}");
@@ -921,5 +1079,136 @@ mod tests {
         let d = diff(&a, &b);
         assert!(d.host_drift.iter().any(|(k, _, _)| k == "cpu_model"));
         assert!(render(&d).contains("HOST DRIFT"));
+        // Host drift is a *warning*: the table is still printed, because a
+        // ratio between two rows of the same run survives a different CPU.
+        // This is the half that distinguishes it from a build mismatch below.
+        assert!(d.comparable(), "a different CPU is not a build mismatch");
+        assert!(
+            render(&d).contains("row / metric"),
+            "the table is still printed"
+        );
+    }
+
+    /// A value for `key` guaranteed to differ from whatever *this* build
+    /// recorded, chosen from the realistic alternatives rather than invented.
+    ///
+    /// **A test about build facts must not hardcode one.**
+    /// `a_profile_that_changed_its_lto_without_changing_its_name_is_refused`
+    /// originally set `build_lto` to `"thin"` and asserted a mismatch. That
+    /// passed under `just test` — debug, where lto is off — and **failed under
+    /// `just tf2-check`, which runs `--release`**: there the real value *is*
+    /// `"thin"`, so the two agreed, no mismatch was detected, and the assertion
+    /// fired. The bug was in the test, not the differ.
+    ///
+    /// It is worth naming what caught it: the failing configuration is
+    /// `--features tf2 --release`, which only the container recipe compiles.
+    /// `just test` builds default features in debug and cannot see it. That is
+    /// the same shape as every other feature-gated hole this repository has
+    /// found, and it is why the container gate is not optional.
+    fn differing_value(r: &Run, key: &str) -> String {
+        let real = r
+            .provenance
+            .facts
+            .iter()
+            .find(|f| f.key == key)
+            .map_or("", |f| f.value.as_str());
+        match key {
+            // `lto` is a TOML scalar as written in the manifest, so a quoted
+            // `"thin"` and a bare `false` are the two shapes in play.
+            "build_lto" if real == "false" => "\"thin\"".to_owned(),
+            "build_lto" => "false".to_owned(),
+            // Profile *directory* names. `embedder` unless we are already there.
+            _ if real == "embedder" => "release".to_owned(),
+            _ => "embedder".to_owned(),
+        }
+    }
+
+    /// A run taken at `--profile embedder` and a run taken at `--release`
+    /// measure different programs — thin LTO inlines across the crate boundary
+    /// the embedder profile leaves standing — so there is no comparison to make.
+    ///
+    /// Mutant (applied, observed): delete `"build_profile"` from
+    /// [`BUILD_CRITICAL_FACTS`], leaving only `build_lto`. This test fails with
+    /// `left: true, right: false` on the `comparable()` assertion, because the
+    /// two synthetic runs differ only in the profile name.
+    #[test]
+    fn two_runs_built_at_different_profiles_refuse_to_be_compared() {
+        let mut a = run(vec![row("n=1", 1.0, 0.1)]);
+        let b = run(vec![row("n=1", 1.0, 0.1)]);
+        let other = differing_value(&b, "build_profile");
+        for f in &mut a.provenance.facts {
+            if f.key == "build_profile" {
+                f.value.clone_from(&other);
+            }
+        }
+
+        let d = diff(&a, &b);
+        assert!(
+            !d.comparable(),
+            "two profiles must not compare; mismatch was {:?}",
+            d.build_mismatch
+        );
+        assert!(d
+            .build_mismatch
+            .iter()
+            .any(|(k, _, _)| k == "build_profile"));
+
+        // **The numbers are withheld, not annotated.** A banner over a table of
+        // verdicts loses to the table; somebody quotes the percentage.
+        let text = render(&d);
+        assert!(text.contains("REFUSED"), "{text}");
+        assert!(
+            !text.contains("row / metric"),
+            "the delta table must not be printed for an incomparable pair:\n{text}"
+        );
+    }
+
+    /// The other build fact, and the one that catches a profile whose *meaning*
+    /// changed while its name did not — an edit to `[profile.embedder]`'s `lto`,
+    /// say, which nobody would think to regenerate a comparison for.
+    ///
+    /// Mutant (applied, observed): delete `"build_lto"` from
+    /// [`BUILD_CRITICAL_FACTS`]. This test fails on the `!d.comparable()`
+    /// assertion; `two_runs_built_at_different_profiles_refuse_to_be_compared`
+    /// above still passes, which is what makes the two rows independent.
+    #[test]
+    fn a_profile_that_changed_its_lto_without_changing_its_name_is_refused() {
+        let mut a = run(vec![row("n=1", 1.0, 0.1)]);
+        let b = run(vec![row("n=1", 1.0, 0.1)]);
+        let other = differing_value(&b, "build_lto");
+        for f in &mut a.provenance.facts {
+            if f.key == "build_lto" {
+                f.value.clone_from(&other);
+            }
+        }
+        let d = diff(&a, &b);
+        assert!(
+            !d.comparable(),
+            "an lto change under a stable profile name must refuse"
+        );
+        assert!(d.build_mismatch.iter().any(|(k, _, _)| k == "build_lto"));
+    }
+
+    /// A run file written before `build_lto` existed must read as a mismatch,
+    /// not as agreement. Silence is not consent for a build fact: the whole
+    /// hazard is a number whose profile nobody wrote down.
+    ///
+    /// Mutant (applied, observed): change [`diff`]'s `drift` closure to skip a
+    /// fact absent from either side (`if va.is_none() || vb.is_none() { return
+    /// None }`). This test fails on `!d.comparable()`.
+    #[test]
+    fn a_run_that_records_no_build_fact_does_not_compare_as_matching() {
+        let mut a = run(vec![row("n=1", 1.0, 0.1)]);
+        let b = run(vec![row("n=1", 1.0, 0.1)]);
+        a.provenance.facts.retain(|f| f.key != "build_lto");
+        let d = diff(&a, &b);
+        assert!(
+            !d.comparable(),
+            "an absent build fact is not a matching one"
+        );
+        assert!(d
+            .build_mismatch
+            .iter()
+            .any(|(k, va, _)| k == "build_lto" && va == "absent"));
     }
 }

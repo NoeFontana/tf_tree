@@ -1,0 +1,192 @@
+# Ordinary bug report.
+#
+# Two fields here are unusual and both are deliberate. The severity dropdown is
+# SUPPORT.md's response-expectation table, spelled as options, so a report
+# arrives already sorted into the row that promises it a timeline. The "how did
+# you gate it" field is there because this repository's own gate is a local
+# `just` recipe and not a pull request's checks: CI has produced no run since
+# 2026-07-23, and both CLAUDE.md and SUPPORT.md say in as many words that a
+# green check is not evidence. Asking "which recipe, and what did it print"
+# is asking for the only evidence that currently exists.
+#
+# If the surprise you are reporting is about what tf2 would have done instead,
+# surprise.yml is the form — it files into the log that gates Phase 7.
+#
+# Labels this form sets: bug, needs-triage. See config.yml for the roster.
+name: Bug report
+description: Something is wrong — a wrong result, a crash, a hang, a refusal that should have succeeded.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you start, two routing notes that will save you time:
+
+        - **If the surprise is that tf2 does it differently**, use
+          [*Surprise log entry*](https://github.com/NoeFontana/tf_tree/issues/new?template=surprise.yml)
+          instead. That form files into the log that gates the whole compatibility layer,
+          and a semantic difference filed as a plain bug loses the comparison that makes it useful.
+        - **If it is memory unsafety reachable from safe Rust**, or anything an untrusted
+          recording, `.tft` file or arena header can cause, that is a security report:
+          the address is in
+          [SECURITY.md](https://github.com/NoeFontana/tf_tree/blob/main/SECURITY.md),
+          and it should not be a public issue.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: >-
+        What you expected, what you got, and the identifier if it refused
+        (`LookupError::…`, `TFT_ERR_…`, a `TFTNNN` id from `doctor`). Errors here are `Copy`
+        identifiers with the prose in a separate layer, so the identifier is the part that
+        pins the site — the message text around it may differ between versions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest thing that shows it: a test, a `main.rs`, a shell transcript, a bag
+        plus the command you pointed at it. SUPPORT.md is blunt about why this field is
+        first among equals — "a bug that cannot be reproduced from the report will be asked
+        for a reproduction once and closed if none arrives". A reproduction that runs from
+        a clean checkout is worth more than a description of one.
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: What kind of bug is it?
+      description: >-
+        These are the rows of
+        [SUPPORT.md's response table](https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md#response-expectations),
+        so picking one is picking the timeline the project has committed to. "Triaged"
+        there means read, reproduced or not, and labelled — not fixed.
+      options:
+        - Soundness — undefined behaviour reachable without writing `unsafe` myself
+        - A wrong lookup result, data corruption, or a deadlock
+        - A crash or panic that is not any of the above
+        - A refusal that should have succeeded, or a success that should have refused
+        - Build, packaging, or installation
+        - Documentation is wrong or stale
+        - Something else
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      description: Select every one you can reproduce it through. Which surfaces it survives is itself a clue.
+      multiple: true
+      options:
+        - "`tf_tree` — the Rust facade"
+        - "`tf_tree_core`"
+        - "`tf_tree_math`"
+        - "`tf_tree_arena`"
+        - "`tf_tree_ipc` — rendezvous, fd passing, the lock file"
+        - Python bindings
+        - C ABI (`tf_tree_c`) or the C++ header
+        - The ROS 2 ingest bridge (`ros/tf_tree_ros`)
+        - "The CLI — `tf_tree` / `tft`"
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: gate
+    attributes:
+      label: Which `just` recipe did you run, and what did it print?
+      description: >-
+        **Paste the failing output, not a verdict.** This project gates locally, by design
+        and by necessity: GitHub Actions has produced no run for this repository since
+        2026-07-23, so a green check on a pull request is unverified and CLAUDE.md and
+        SUPPORT.md both say so. Which recipe you ran is also load-bearing — `just test`
+        builds default features, so everything `#[cfg]`-ed on `shm` is compiled *out* of it;
+        if your bug is in the shared-memory path, `just shm-check` is the recipe that can
+        see it, and `just test` passing says nothing either way. `just ros-build` /
+        `just ros-test` are the entire gate for anything under `ros/`, and they need the
+        container.
+      placeholder: |
+        $ just shm-check
+        ...
+        FAIL [   0.031s] tf_tree::shm attach_reports_format_mismatch
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`tf_tree doctor` output"
+      description: >-
+        Paste it if you have it. `tf_tree_cli` is `publish = false`, so this binary comes
+        from a checkout rather than from `cargo install` — if you are using the library from
+        crates.io you will not have it, and "not installed" is a fine answer. When you do run
+        it, **read the `source:` line before pasting**: `--attach` exists only in a build with
+        the `shm` feature, and without it `doctor` diagnoses its own built-in fixture and says
+        so (`"source": "in-process fixture"` under `--json`), which is a report about our test
+        data. The live-arena invocation is
+        `cargo run -p tf_tree_cli --features shm --bin tf_tree -- --attach --name <arena> doctor`;
+        `--from-bag <recording.mcap>` needs no arena and works anywhere.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: tf_tree version
+      description: >-
+        `tf_tree --version`, the version in your `Cargo.lock`, or `pip show tf_tree`. A git
+        SHA if you built from a checkout. Pre-1.0 only the current release is supported, and
+        a report against an older one will be asked to reproduce on it — so if you are
+        behind, saying so here is faster than finding out later.
+      placeholder: "0.0.1 (or: git 1a2b3c4)"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Architecture and kernel
+      description: >-
+        Output of `uname -srm`, or the equivalent off Linux. `x86_64` Linux is what this is
+        developed and gated on, and it is the only combination where "it works here" means
+        anything. **If you are on `aarch64`, macOS or Windows, say so plainly** —
+        [SUPPORT.md](https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md) says what
+        each of those is worth here and they differ from each other, and the shared-memory
+        layer does not exist off Linux at all. A report from one of them is scarcer than a
+        report from `x86_64` Linux, not less welcome.
+      placeholder: "Linux 6.8.0-136-generic x86_64"
+    validations:
+      required: true
+
+  - type: input
+    id: toolchain
+    attributes:
+      label: Toolchain
+      description: >-
+        `rustc --version`, plus the Python version if this is through the bindings. The MSRV
+        floor is 1.87 and it is enforced, so a build failure below it is expected rather than
+        a bug.
+      placeholder: "rustc 1.89.0 (stable); CPython 3.14"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: routing
+    attributes:
+      label: Before you file
+      options:
+        - label: >-
+            This is not a security report — see SECURITY.md for what belongs there
+            (memory unsafety from safe Rust, and anything an untrusted input can cause).
+          required: true
+        - label: I can re-run this and collect more evidence if asked.
+          required: false

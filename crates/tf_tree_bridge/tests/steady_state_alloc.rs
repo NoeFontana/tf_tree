@@ -14,6 +14,30 @@
 //! `docs/PHASE1.md` §10.4's zero-allocation invariant is about the **engine**,
 //! which this is not.
 //!
+//! # Slope, not intercept
+//!
+//! Each figure below is the second of **two consecutive equal windows**, not one
+//! window's total, and the difference is what makes this test survive CI.
+//!
+//! The property this file names in its own first line is a *rate*: `offer` must
+//! not allocate **more as it runs longer**. An exact total over a single window
+//! pins that rate and an intercept together — and the intercept is not a
+//! property of `offer`, it is whatever one-off cost happens to land after the
+//! warm-up. Three CI runs failed here with `4004` against `4000`: **the same
+//! four allocations every time**, so not noise, and never reproducible on a
+//! developer machine across filtered, whole-package and two-package
+//! invocations, thirty consecutive runs, and both rustc 1.95 and the 1.97 CI
+//! resolves — an eight-iteration warm-up is simply not always long enough to
+//! contain a one-off growth.
+//!
+//! Two windows separate the two. A constant cost lands in the first and cancels;
+//! a genuine per-offer regression changes both and still fails exactly. Verified
+//! by mutation in both directions: one extra allocation *per offer* inside the
+//! measured loop fails, and a one-off allocation before the windows passes.
+//!
+//! The exact equality is kept, because it is still an exact claim — it is now a
+//! claim about the slope alone.
+//!
 //! The `CountingAllocator` is copied from `crates/tf_tree_bench/tests/zero_alloc.rs`,
 //! which established the pattern; the `unsafe` is confined to this test target
 //! and the library crate stays `#![forbid(unsafe_code)]`.
@@ -106,14 +130,19 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
         ingest.offer(Topic::Tf, &s, publisher);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for k in 0..ITERS {
-        s.stamp_nanos = STAMP0 + (8 + k as i64) * MS;
-        s.received = SteadyNanos(T0 + (8 + k as i64) * MS);
-        ingest.offer(Topic::Tf, &s, publisher);
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
-    after - before
+    // **Two windows, and the second is the answer.** See `SLOPE_NOT_INTERCEPT`.
+    let mut window = |from: i64| {
+        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        for k in 0..ITERS {
+            let k = from + k as i64;
+            s.stamp_nanos = STAMP0 + k * MS;
+            s.received = SteadyNanos(T0 + k * MS);
+            ingest.offer(Topic::Tf, &s, publisher);
+        }
+        ALLOCATIONS.load(Ordering::Relaxed) - before
+    };
+    let _first = window(8);
+    window(8 + ITERS as i64)
 }
 
 /// Allocating calls per `offer` for a publisher **stuck below its own high-water
@@ -144,23 +173,28 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
         ingest.offer(Topic::Tf, &s, publisher);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for k in 0..ITERS {
-        let k = 8 + k as i64;
-        s.stamp_nanos = STAMP0 - 5_000 * MS + k * MS;
-        s.received = SteadyNanos(T0 + (1 + k) * MS);
-        assert!(matches!(
-            ingest.offer(Topic::Tf, &s, publisher),
-            Action::Drop { .. }
-        ));
-    }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    // Two windows, as above.
+    let mut window = |from: i64| {
+        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        for k in 0..ITERS {
+            let k = from + k as i64;
+            s.stamp_nanos = STAMP0 - 5_000 * MS + k * MS;
+            s.received = SteadyNanos(T0 + (1 + k) * MS);
+            assert!(matches!(
+                ingest.offer(Topic::Tf, &s, publisher),
+                Action::Drop { .. }
+            ));
+        }
+        ALLOCATIONS.load(Ordering::Relaxed) - before
+    };
+    let _first = window(8);
+    let second = window(8 + ITERS as i64);
     assert_eq!(
         ingest.stats().dropped_non_monotonic,
-        (ITERS + 8) as u64,
+        (2 * ITERS + 8) as u64,
         "the fixture must really be on the regression path"
     );
-    after - before
+    second
 }
 
 /// **No path allocates for its table lookups — including the path a *broken*

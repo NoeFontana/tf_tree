@@ -258,5 +258,12 @@ wait $PUB 2>/dev/null || true
 trap - EXIT INT TERM
 
 echo
+# `--ros-out` is `ros/build.sh`'s $OUT, and it is what makes the run file
+# comparable: `dds_report` is built `--release` here whatever the arms were
+# compiled with, so its own `build_profile` describes a parser. The arms' build
+# comes out of the CMake caches under that directory. `aggregate --json` refuses
+# without it rather than writing a file whose build facts are about the wrong
+# program.
 cargo run --release -q -p tf_tree_bench --bin dds_report -- \
-    aggregate --dir "$RES" --workload "$WORKLOAD" --json "$OUT/results.json"
+    aggregate --dir "$RES" --workload "$WORKLOAD" \
+    --ros-out "$ROOT/target/ros" --json "$OUT/results.json"

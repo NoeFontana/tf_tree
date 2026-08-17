@@ -10,7 +10,10 @@
 # `find_package(tf_tree_ros)`. Nothing here includes a private header of either.
 
 cmake_minimum_required(VERSION 3.16)
-project(tf_tree_bench_ros VERSION 0.1.0 LANGUAGES CXX)
+# Version: a hand-kept copy of the root `Cargo.toml`'s `[workspace.package]
+# version` — see `tf_tree_ros/CMakeLists.txt` for why a benchmark-only package
+# still carries the same number.
+project(tf_tree_bench_ros VERSION 0.0.1 LANGUAGES CXX)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)

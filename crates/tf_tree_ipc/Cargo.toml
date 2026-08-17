@@ -1,6 +1,9 @@
 [package]
 name = "tf_tree_ipc"
 description = "Zero-configuration rendezvous for tf_tree shared arenas: runtime-directory discovery, the OFD lock file, and the open() decision machine."
+# Per-crate front page for crates.io; see `tf_tree_math`'s manifest for why this
+# is not inherited from the workspace.
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +12,14 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
-categories.workspace = true
+# **Overrides the workspace set because the inherited `no-std` is simply false
+# here.** This crate uses `std` (files, sockets, `Arc`), and a `no-std` listing
+# is a promise the compiler breaks on first use. `os::linux-apis` replaces it
+# and is the accurate half of what this crate is: OFD locks, `SOCK_SEQPACKET`,
+# `SCM_RIGHTS`. Not `os::unix-apis`, which is also a real slug and would also be
+# true — the crate is `#![cfg(target_os = "linux")]`, so the narrower one is the
+# honest one and the broader one would invite a BSD user to try.
+categories = ["science::robotics", "os::linux-apis"]
 
 # The crate has no `[features]` today, so `all-features` is currently a no-op —
 # it is here so that adding one cannot silently change what docs.rs renders
@@ -35,6 +45,36 @@ libc.workspace = true
 # Helper for the multi-process tests. A thread cannot stand in for it: half of
 # what this crate relies on is what the *kernel* does when a lock holder dies,
 # and there is no way to SIGKILL a thread out from under its locks.
+#
+# **This crate is published, so a bin target's name is a name `cargo install
+# tf_tree_ipc` writes into `~/.cargo/bin`.** As `ipc_child` it did exactly that —
+# `cargo install --path crates/tf_tree_ipc --root <scratch>` put
+# `<scratch>/bin/ipc_child` on disk — and a name that generic, from a crate that
+# has no business owning it, is the kind of mistake crates.io makes permanent: a
+# published version can be yanked but never deleted. Hence the crate's own name
+# here, while the *file* keeps the short one so that `0005`'s implementation plan
+# still names something that exists.
+#
+# It does still install, and that residue is chosen rather than overlooked,
+# because both ways to install *nothing* cost more than the wart:
+#
+#   - `required-features` on this target alone does not work. Cargo defines
+#     `CARGO_BIN_EXE_<name>` for a bin it *skipped*, so `tests/multiprocess.rs`
+#     compiles against a path that was never built: measured here, `cargo nextest
+#     run -p tf_tree_ipc` reported 7 failures — `NotFound` on spawn — before
+#     fail-fast stopped it. A build error would have been fine; this is not one.
+#   - The dev-dependency-on-itself that would unify the feature back on for
+#     `cargo test` is the trick `crates/tf_tree` deleted for 0.0.1: it is stripped
+#     from the published manifest, so the tarball ships tests that cannot pass.
+#     That crate's `[dev-dependencies]` comment has the measurement, and
+#     `just stable-tier-check` asserts it has not come back *there* — the scan
+#     matches `tf_tree`/`unstable` by name, so it would not have caught this
+#     crate doing the same thing under another. Gating the test target too —
+#     the shape `tf_tree`'s `rendezvous_child`/`rendezvous` pair uses, where the
+#     feature (`shm`) is a real capability and `just shm-check` covers it — would
+#     drop all 22 tests in `tests/multiprocess.rs` out of
+#     `cargo nextest run -p tf_tree_ipc` and out of `just test`, silently, to
+#     tidy up an install nobody performs.
 [[bin]]
-name = "ipc_child"
+name = "tf_tree_ipc_child"
 path = "src/bin/ipc_child.rs"

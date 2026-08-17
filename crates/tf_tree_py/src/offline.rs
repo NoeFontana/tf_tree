@@ -40,7 +40,9 @@ use pyo3::prelude::*;
 use tf_tree::unstable::ArenaView;
 use tf_tree::{EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
-use crate::errors::{detached_err, lookup_err, NoDataError, TfTreeError};
+use crate::errors::{
+    detached_err, edge_label, lookup_err, resolve_frame, NoDataError, TfTreeError,
+};
 use crate::tree::PyTree;
 
 /// Open a frozen `.tft` and read it through the ordinary `Tree` (§4.1).
@@ -95,53 +97,100 @@ pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
 /// # Errors
 ///
 /// Everything `Plan::span` reports, mapped by [`lookup_err`] — except
-/// `LookupError::NoData`, which is re-raised **naming the two frames** rather
-/// than an `EdgeId`. §4.2's premise is that this query answers "why did my
-/// lookup fail at t", and `EdgeId(2)` does not: the Python surface exposes no
-/// way to turn an edge id back into the names the caller typed.
+/// `LookupError::NoData`, which is re-raised with **where on the path** the
+/// silent edge sits. §4.2's premise is that this query answers "why did my
+/// lookup fail at t", and an edge named on its own does not finish the
+/// sentence: `map -> lidar` is what the caller asked for, `base_link -> lidar`
+/// is what is silent, and the message has to join the two.
+///
+/// This arm used to exist to resolve the *names* as well, because `lookup_err`
+/// printed `EdgeId(2)`. It no longer does — every arm of it goes through
+/// [`edge_label`] now — so what is left here is only the path phrasing, and
+/// falling through would lose that and nothing else.
 pub(crate) fn span_impl(tree: &Tree, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
-    let t = tree.frame(target).map_err(|_| {
-        crate::errors::FrameNotDeclaredError::new_err(format!("no frame named {target:?}"))
-    })?;
-    let s = tree.frame(source).map_err(|_| {
-        crate::errors::FrameNotDeclaredError::new_err(format!("no frame named {source:?}"))
-    })?;
-    let plan = tree.plan(t, s).map_err(lookup_err)?;
+    // [`resolve_frame`] rather than `Tree::frame`, which interns: `span` is a
+    // question about an arena and must not add a frame to it.
+    let t = resolve_frame(tree, target)?;
+    let s = resolve_frame(tree, source)?;
+    let plan = tree.plan(t, s).map_err(|e| lookup_err(tree, e))?;
     plan.span(&tree.guard()).map_err(|e| match e {
-        LookupError::NoData { edge } => match named_edge(tree, edge) {
-            Some((parent, child)) => NoDataError::new_err(format!(
-                "edge {parent:?} -> {child:?} on the path from {source:?} to \
-                 {target:?} has no samples, so the path is not answerable at any \
-                 stamp"
-            )),
-            None => lookup_err(e),
-        },
-        other => lookup_err(other),
+        LookupError::NoData { edge } => NoDataError::new_err(format!(
+            "{} on the path from {source:?} to {target:?} has no samples, so \
+             the path is not answerable at any stamp",
+            edge_label(tree, edge)
+        )),
+        other => lookup_err(tree, other),
     })
 }
 
 /// `(parent, child)` frame names for an edge, or `None` if either is missing.
 ///
-/// Only ever called on an error path, so the two `String`s it allocates are not
-/// a hot-path allocation — the rule they would otherwise violate.
-fn named_edge(tree: &Tree, edge: EdgeId) -> Option<(String, String)> {
-    named_edge_in(&tree.arena_view(), edge)
-}
-
-/// [`named_edge`] against a view the caller already holds.
+/// Only ever called on an error path or a listing, so the two `String`s it
+/// allocates are not a hot-path allocation — the rule they would otherwise
+/// violate.
 ///
-/// The enumerators below call this per edge, and building an `ArenaView` per
+/// **Takes the view, and there is no `&Tree` spelling of it any more.** The
+/// enumerators below call this per edge, and building an `ArenaView` per
 /// iteration to throw it away would be the kind of loop that reads as free
-/// because each step is cheap.
-fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)> {
+/// because each step is cheap. [`crate::errors::lookup_err`] wants it for the
+/// same reason from the other direction: one message can name three frames, and
+/// `Tree::view` re-runs `detached()`, `as_participant`, `with_liveness` and
+/// `is_writable` on every call. The two `&Tree` wrappers that used to sit here
+/// had exactly one caller left between them once the error layer took a view of
+/// its own, and it was `edge_label`.
+pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)> {
     // One observation of the record: re-reading `view.edge(edge)` for the child
     // could name a parent and a child that never belonged to the same edge.
     let rec = view.edge(edge)?;
-    let name = |raw: u32| -> Option<String> {
-        let r = view.frame_record(FrameId::new(raw)?)?;
-        Some(stored_name(&r.name, r.name_len))
-    };
+    let name = |raw: u32| named_frame_in(view, FrameId::new(raw)?);
     Some((name(rec.parent)?, name(rec.child)?))
+}
+
+/// One frame's stored name, or `None` if this arena has no usable record there.
+///
+/// The single-frame half of [`named_edge_in`], split out rather than duplicated
+/// because the error layer needs it alone: `LookupError::Disconnected` carries
+/// three `FrameId`s and no edge at all, and spelling them `FrameId(4)` is the
+/// defect [`crate::errors`] exists to keep out of Python.
+///
+/// # The three record-validity checks live here, not in the callers
+///
+/// `ArenaView::frame_record` bounds against `max_frames`, which is
+/// `frame_count + 1 + frame_headroom` — so it hands back a **zeroed headroom
+/// slot** as readily as a frame, and `stored_name` renders that as `""`. Two
+/// callers already knew this and one did not: [`frames_impl`] filtered it and
+/// said why, while this function — the one the error layer reaches through —
+/// let it past. A `Disconnected` naming a headroom id would then read *no path
+/// from "" to "sensor_c"; the chain stops at ""*, and
+/// [`crate::errors::edge_label`]'s fallback — the sentence that says *why* a
+/// name is missing — would never fire, because a name was produced.
+///
+/// **No id reaching here today comes from outside `1..=frame_count`**: every one
+/// is a field of a `LookupError` or a `ClaimApiError`, and those are read from
+/// the topology and edge tables. So this is the contract being made true rather
+/// than a reported failure being fixed — but the contract is exactly what the
+/// fallback rests on (**`None` is "no usable record at that index"**), it costs
+/// one `Relaxed` load on an error path, and the alternative is three callers
+/// each remembering a rule that only one of them wrote down.
+///
+///  1. `FrameId::new` rejects 0, the root sentinel — the type does it, so the
+///     caller cannot skip it.
+///  2. `id <= frame_count`, which is what excludes the headroom slots.
+///  3. `name_hash != 0`, which excludes a slot counted by a concurrent interner
+///     one instant before its record exists ([`frames_impl`] argues that race).
+///
+/// `Relaxed` for the same reason [`frames_impl`] states: `frame_count` is bumped
+/// *before* the record is written, so no acquire here would order the read that
+/// follows it. Check 3 is the guard, not the ordering.
+pub(crate) fn named_frame_in(view: &ArenaView<'_>, frame: FrameId) -> Option<String> {
+    if frame.get() > view.header().frame_count.load(Ordering::Relaxed) {
+        return None;
+    }
+    let rec = view.frame_record(frame)?;
+    if rec.name_hash == 0 {
+        return None;
+    }
+    Some(stored_name(&rec.name, rec.name_len))
 }
 
 /// A frame record's stored — and therefore possibly truncated — name.
@@ -173,8 +222,8 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 /// **That is a reason it was tolerable here, not a reason it is right here, and
 /// the condition it was waiting on has been met.** `tf_tree::Tree::frames` now
 /// exists on the *stable* tier (`docs/API.md` §2.6) and applies exactly the
-/// three checks below with the same `Relaxed` load and the same refusal on a
-/// detached tree — so this body should become
+/// three checks [`named_frame_in`] states, with the same `Relaxed` load and the
+/// same refusal on a detached tree — so this body should become
 /// `tree.frames().map_err(|_| detached_err())`, a forwarder like `span_impl`.
 ///
 /// **It has not been, and the reason is a gate rather than a doubt.** This crate
@@ -245,20 +294,11 @@ pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
         // Three checks, the strictest set any of the four copies of this loop
         // applies (`tf_tree_c::unstable::tft_tree_frame_name` states them as
         // one chain; `tf_tree_cli`'s `Snapshot::capture` applies only the
-        // first):
+        // first) — and they are [`named_frame_in`]'s now rather than this
+        // loop's, because the error layer needs the same three and had none of
+        // them. The bound below is still this loop's: `count` is read once so
+        // the enumeration does not chase a concurrent interner.
         //
-        //  1. `FrameId::new` rejects 0, the root sentinel.
-        //  2. `id <= frame_count` — *this loop's bound*, and load-bearing:
-        //     `frame_record` bounds against `max_frames`, which is
-        //     `frame_count + 1 + frame_headroom`, so an unbounded walk hands
-        //     back zeroed headroom slots as if they were frames.
-        //  3. `name_hash != 0`, below.
-        let Some(id) = FrameId::new(raw) else {
-            continue;
-        };
-        let Some(rec) = view.frame_record(id) else {
-            continue;
-        };
         // **`frame_count` is bumped *before* the record is written**, so a
         // concurrent interner in another process can be counted here one
         // instant before its name exists, and the slot still reads as zeros. A
@@ -269,7 +309,7 @@ pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
         // act on and one that looks like our bug rather than like a race they
         // lost by a microsecond.
         //
-        // This is a filter, not a synchronization edge: the arena's model is
+        // That is a filter, not a synchronization edge: the arena's model is
         // that a record is written before its id is ever *published* and a
         // shared read of a published record races nothing
         // (`ArenaView::frame_record`'s SAFETY note). Enumerating by index steps
@@ -277,10 +317,13 @@ pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
         // and no ordering available here puts it back inside. That is an
         // argument for the enumeration living on `Tree`, where `just loom` and
         // `just miri` can see it, which is the filed follow-up.
-        if rec.name_hash == 0 {
+        let Some(id) = FrameId::new(raw) else {
             continue;
-        }
-        out.push(stored_name(&rec.name, rec.name_len));
+        };
+        let Some(name) = named_frame_in(&view, id) else {
+            continue;
+        };
+        out.push(name);
     }
     Ok(out)
 }
@@ -318,7 +361,7 @@ pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
 /// edge was declared under. The two agree on every tree that was never
 /// reparented, which is every tree Python can build — the binding exposes no
 /// `reparent` — and they can disagree on a shared arena a peer process has
-/// reparented. This reads the record because [`named_edge`], `tf_tree doctor`'s
+/// reparented. This reads the record because [`named_edge_in`], `tf_tree doctor`'s
 /// `Snapshot` and the CLI's edge listing all already do: one wrong-after-reparent
 /// answer beats two answers that disagree with each other.
 ///
@@ -351,8 +394,9 @@ pub(crate) fn edges_impl(tree: &Tree) -> PyResult<Vec<(String, String)>> {
     for raw in 1..count {
         // `None` here means either an id past the edge table — which
         // `edge_count <= max_edges` makes unreachable — or a slot whose record
-        // is still zeros, because a zeroed record names frame 0 and
-        // `FrameId::new(0)` declines. **That second case is what keeps the
+        // is still zeros, because a zeroed record names frame 0, and
+        // `FrameId::new(0)` declines before [`named_frame_in`]'s own two
+        // checks even see it. **That second case is what keeps the
         // sentinel and any headroom slot out of this list**, not the loop
         // bound, so the tempting "never drop an entry" refactor into
         // `Tree::edge_name`'s `<root>` fallback would put `('', '')`-shaped
@@ -534,7 +578,58 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                      {expected}. Re-freeze the source recording — a .tft is a cache, not \
                      an archive (`tf_tree doctor --explain-version`)"
                 ),
-                other => format!("could not be opened as a .tft: {other:?}"),
+                // **The rest of `FrozenError`, enumerated, because it can be.**
+                // Unlike `LookupError` and `FrozenFileError` below, `FrozenError`
+                // is *not* `#[non_exhaustive]` — so this match is exhaustive and
+                // a tenth variant is a compile error here rather than a
+                // `SizeMismatch { actual: 4096, expected: 8192 }` shown to a
+                // Python user as if it were a sentence. Nine variants, and only
+                // the three above had prose; the five arms below are the other
+                // six.
+                //
+                // None of them says "re-freeze the recording", which is the
+                // remedy the three above carry. Those three mean *wrong build*
+                // and re-freezing is the fix; these mean damaged file, wrong
+                // permissions or no memory, and sending someone to re-run an
+                // hour of bag ingest for a truncated write is worse advice than
+                // none.
+                FrozenError::Truncated => {
+                    "ends before a structure its own header promises — the write \
+                     was interrupted, or the file is still being written"
+                        .to_owned()
+                }
+                FrozenError::HeaderInconsistent => {
+                    "has a header whose offsets do not describe a consistent \
+                     file: a region runs past the end, the arena is misaligned, \
+                     or the manifest overlaps something. The file is corrupt"
+                        .to_owned()
+                }
+                FrozenError::SizeMismatch { actual, expected } => format!(
+                    "is {actual} bytes but its header says {expected}; the file is \
+                     truncated or has been appended to"
+                ),
+                // The errno is carried through rather than described, because
+                // `EACCES` and `ENOMEM` on the same call want different
+                // responses and only the number distinguishes them.
+                FrozenError::Io(errno) | FrozenError::Map(errno) => format!(
+                    "could not be read or mapped: {}",
+                    std::io::Error::from_raw_os_error(errno.raw_os_error())
+                ),
+                // **The one arm that still shows a `Debug`, and it says so.**
+                // `ShmError` is the arena-header check a `memfd` attach makes;
+                // it has no `Display`, fifteen variants, and several of them are
+                // struct-shaped (`SizeMismatch { actual, expected }`), so its
+                // `Debug` is a dump and not a sentence. Enumerating a second
+                // enum from this module would be re-spelling `check.rs`'s
+                // reasons in a place that cannot see them change. Labelling the
+                // dump as raw is the honest option: the reader is looking at a
+                // corrupt file and the discriminant is the only handle anyone
+                // has on which check failed.
+                FrozenError::Arena(inner) => format!(
+                    "contains an arena image whose header did not validate; the \
+                     file is corrupt, or was written by a build with a different \
+                     arena layout. The engine's reason, raw: {inner:?}"
+                ),
             };
             TfTreeError::new_err(format!("{shown}: {detail}"))
         }

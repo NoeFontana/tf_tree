@@ -428,7 +428,14 @@ fn stat_cpu_ns() -> u64 {
 }
 
 /// Proportional set size of this process, in KiB.
-pub(crate) fn self_pss_kib() -> u64 {
+///
+/// `pub` rather than `pub(crate)` since `bin/frozen_workers.rs` — a separate
+/// crate target — is what reports PHASE5 §12 gate 4, and Pss summed over live
+/// workers *is* that gate. Pss and not RSS deliberately: it divides each shared
+/// page by the number of mappers, so summing it across N processes gives total
+/// unique bytes, which is the only accounting under which "16 workers share one
+/// arena" means anything.
+pub fn self_pss_kib() -> u64 {
     let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
         return 0;
     };

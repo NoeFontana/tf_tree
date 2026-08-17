@@ -1072,6 +1072,15 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         p.reset
     );
 
+    // The same two lines `doctor` prints, from the same code. `Capacity` is in
+    // slots and this pane is where an operator watches a ring fill, so it is
+    // where "and that costs how much?" gets asked; the formula rides along
+    // dimmed because a byte count with no unit price cannot be acted on.
+    let rings =
+        crate::sizing::Rings::from_edges(cap.edges.iter().map(|e| (e.capacity, e.occupancy())));
+    let _ = writeln!(s, "  {}", rings.line());
+    let _ = writeln!(s, "  {}{}{}", p.dim, crate::sizing::FORMULA, p.reset);
+
     // Which clock the ages are against is not a footnote: `doctor` prints the
     // same `Clock::label` for the same reason, and an operator comparing the two
     // tools has to be able to see that they agreed on the reference.
@@ -1271,6 +1280,15 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
         s,
         "  kind {:?}  capacity {}  head {}  retained {} samples",
         e.kind, e.capacity, e.head, e.retained,
+    );
+    // The header line's arithmetic, narrowed to this edge — the pane an
+    // operator opens when they are deciding whether *this* publisher declared
+    // too much. Same code, so the one-edge figure and the whole-tree figure
+    // cannot disagree.
+    let _ = writeln!(
+        s,
+        "  {}",
+        crate::sizing::Rings::from_edges([(e.capacity, e.occupancy())]).line()
     );
     let c = &e.counters;
     let _ = writeln!(

@@ -7,11 +7,15 @@ use pyo3::types::PyAnyMethods;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tf_tree::{
-    AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree,
-};
+use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree};
 
-use crate::errors::{lookup_err, BufferError, FrameNotDeclaredError, TfTreeError};
+#[cfg(target_os = "linux")]
+use tf_tree::AttachMode;
+
+use crate::errors::{
+    build_err, claim_err, edge_label_of, lookup_err, open_err, push_err, push_msg, resolve_frame,
+    unknown_frame_err, BufferError, TfTreeError,
+};
 
 /// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
 /// (`docs/PHASE3.md` §6.1's amendment — the re-baseline, not §2's superseded
@@ -182,15 +186,15 @@ impl PyTree {
     #[pyo3(signature = (target, source, /))]
     fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str) -> PyResult<PyPlan> {
         let this = slf.get();
-        let t = this
+        // [`resolve_frame`], not `Tree::frame`: compiling a plan is a read, and
+        // `Tree::frame` interns. A typo here used to declare the typo — see that
+        // function for what that costs on an arena with headroom.
+        let t = resolve_frame(&this.inner, target)?;
+        let s = resolve_frame(&this.inner, source)?;
+        let plan = this
             .inner
-            .frame(target)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {target:?}")))?;
-        let s = this
-            .inner
-            .frame(source)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {source:?}")))?;
-        let plan = this.inner.plan(t, s).map_err(lookup_err)?;
+            .plan(t, s)
+            .map_err(|e| lookup_err(&this.inner, e))?;
         Ok(PyPlan {
             plan: Box::new(plan),
             // The refcount that makes the borrow real.
@@ -208,14 +212,12 @@ impl PyTree {
     #[pyo3(signature = (child, parent, /))]
     fn publisher(slf: &Bound<'_, PyTree>, child: &str, parent: &str) -> PyResult<PyPublisher> {
         let this = slf.get();
-        let c = this
-            .inner
-            .frame(child)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {child:?}")))?;
-        let p = this
-            .inner
-            .frame(parent)
-            .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {parent:?}")))?;
+        // Read-only resolution even on this, the one *write* entry point of the
+        // three: topology is builder-time (decision `0004`), so a name with no
+        // record has no edge either and interning it could not produce one — it
+        // would spend a frame slot to reach the same refusal one call later.
+        let c = resolve_frame(&this.inner, child)?;
+        let p = resolve_frame(&this.inner, parent)?;
         // `claim_owned`, not `claim`: this crate no longer extends a lifetime
         // itself. `docs/decisions/0017` step 6 — the writer that comes back owns
         // its `Arc<Tree>`, so the arena outlives it by construction and the
@@ -223,9 +225,10 @@ impl PyTree {
         let writer = this
             .inner
             .claim_owned(c, p)
-            .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+            .map_err(|e| claim_err(&this.inner, parent, child, e))?;
 
         Ok(PyPublisher {
+            edge: edge_label_of(parent, child),
             inner: Mutex::new(Some(writer)),
         })
     }
@@ -374,7 +377,26 @@ impl PyTree {
         let iso = self
             .inner
             .lookup(target, source, Stamp::<SystemDomain>::from_nanos(stamp_ns))
-            .map_err(lookup_err)?;
+            // **The one arm that has to be caught at the call site**, because it
+            // is the one whose identity the error cannot carry:
+            // `LookupError::UnknownFrame` holds a BLAKE3 prefix, BLAKE3 does not
+            // invert, and `lookup_err` has nothing else to work with. *Here*
+            // both names are in scope — this is the entry point that takes them
+            // as strings — so the message can name the one that is missing
+            // instead of a hash the caller cannot search their source for.
+            //
+            // The probe is [`unknown_frame_err`] and it is a pure read.
+            // Re-probing with `Tree::frame` — which is what shipped — *interns*
+            // on a writable tree, so formatting this error spent a frame slot
+            // and then, because the intern succeeded, found nothing wrong and
+            // printed the hash anyway. That function's doc comment carries the
+            // whole account.
+            .map_err(|e| match e {
+                tf_tree::LookupError::UnknownFrame { .. } => {
+                    unknown_frame_err(&self.inner, [target, source], e)
+                }
+                other => lookup_err(&self.inner, other),
+            })?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
         let slice = unsafe { out.as_slice_mut()? };
@@ -564,7 +586,7 @@ impl PyPlan {
         let iso = self
             .plan
             .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
-            .map_err(lookup_err)?;
+            .map_err(|e| lookup_err(self.tree(), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated by us, so nothing else holds a reference and
         // the slice is exactly 16 contiguous f64.
@@ -720,7 +742,7 @@ impl PyPlan {
             let iso = self
                 .plan
                 .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
-                .map_err(lookup_err)?;
+                .map_err(|e| lookup_err(self.tree(), e))?;
             // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
             // slice is exactly 16 writable f64. Aliasing remains the caller's
             // to avoid, as it was before — `as_slice_mut` documents that, and
@@ -765,7 +787,10 @@ impl PyPlan {
     /// The most recent transform on this path.
     fn latest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let g = self.tree().guard();
-        let iso = self.plan.latest(&g).map_err(lookup_err)?;
+        let iso = self
+            .plan
+            .latest(&g)
+            .map_err(|e| lookup_err(self.tree(), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
         let slice = unsafe { out.as_slice_mut()? };
@@ -813,7 +838,7 @@ impl PyPlan {
                 tol,
                 &mut scratch,
             )
-            .map_err(lookup_err)?;
+            .map_err(|e| lookup_err(self.tree(), e))?;
 
         let k = stamps.len();
         let out_s = PyArray1::<i64>::zeros(py, [k], false);
@@ -916,7 +941,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(lookup_err)
+        res.map_err(|e| lookup_err(tree, e))
     }
 
     /// [`PyPlan::at`]'s `layout=` path: allocate the right shape and fill it.
@@ -1092,7 +1117,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(lookup_err)
+        res.map_err(|e| lookup_err(tree, e))
     }
 
     /// [`Self::eval_f64`] for the one `f32` layout.
@@ -1114,7 +1139,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(lookup_err)
+        res.map_err(|e| lookup_err(tree, e))
     }
 }
 
@@ -1136,6 +1161,19 @@ impl PyPlan {
 /// lifetime of its own.
 #[pyclass(name = "Publisher", module = "tf_tree")]
 pub struct PyPublisher {
+    /// How a failed `push` names this edge: `edge "map" -> "base"`.
+    ///
+    /// **The caller's own two strings, captured at claim time, rather than the
+    /// `EdgeId` the writer carries.** Resolving that id back through the arena
+    /// would reach the same pair by a longer route — and would reach the
+    /// *stored* names, which `FrameRecord` truncates at 48 bytes, so a long
+    /// name would come back cut in a message whose whole job is to be
+    /// greppable against the caller's source.
+    ///
+    /// One `String`, allocated once per claim and never per push — a claim is a
+    /// setup call, and `push` only *reads* this field, on the error path. So it
+    /// is not the allocation `docs/API.md` R2 is about.
+    edge: String,
     /// `None` after `__exit__` or `release()`, so a use-after-release is a
     /// clear Python error rather than a claim held past its scope.
     ///
@@ -1191,8 +1229,7 @@ impl PyPublisher {
         let iso = iso_from_quat7(&quat7)?;
         let g = self.lock()?;
         let p = g.as_ref().ok_or_else(released)?;
-        p.push(stamp_ns, &iso)
-            .map_err(|e| TfTreeError::new_err(format!("{e:?}")))
+        p.push(stamp_ns, &iso).map_err(|e| push_err(&self.edge, e))
     }
 
     /// Publish a whole batch: `(N,)` stamps and `(N, 7)` poses.
@@ -1232,8 +1269,13 @@ impl PyPublisher {
             p.push(*stamp, &iso).map_err(|e| {
                 // Name the index: a rejected sample partway through a batch is
                 // otherwise indistinguishable from a rejected batch, and the
-                // samples before it *were* published.
-                TfTreeError::new_err(format!("sample {i} (stamp {stamp}): {e:?}"))
+                // samples before it *were* published. Prefixed rather than
+                // re-worded, so the sentence after the colon is the same one a
+                // scalar `push` produces for the same failure.
+                TfTreeError::new_err(format!(
+                    "sample {i} (stamp {stamp}): {}",
+                    push_msg(&self.edge, e)
+                ))
             })?;
         }
         Ok(())
@@ -1430,6 +1472,25 @@ fn interp_from_str(name: &str) -> PyResult<InterpPolicy> {
     }
 }
 
+/// [`interp_from_str`] backwards, for the one error that has to name a policy.
+///
+/// Kept adjacent to its inverse rather than next to its caller, because the two
+/// are a pair: a spelling added to one and not the other is how
+/// `DerivativesUnavailableError` came to say `interpolation policy 1` — a
+/// number the caller never typed and cannot pass back — while the constructor
+/// two lines up knew the word for it all along.
+///
+/// `InterpPolicy` is deliberately not `#[non_exhaustive]` (see its doc comment
+/// in `tf_tree_core::plan`), so a third policy is a compile error here. That is
+/// the whole reason it can be exhaustive when [`crate::errors::lookup_err`]
+/// cannot.
+pub(crate) fn interp_name(policy: InterpPolicy) -> &'static str {
+    match policy {
+        InterpPolicy::ScLerp => "sclerp",
+        InterpPolicy::LerpSlerp => "lerpslerp",
+    }
+}
+
 /// Build an in-process tree from a simple edge list.
 ///
 /// Topology is builder-time (decision `0004`), so there is no `declare_*` on a
@@ -1458,16 +1519,40 @@ fn interp_from_str(name: &str) -> PyResult<InterpPolicy> {
 /// `DerivativesUnavailableError`. With `ScLerp` the default, that layout works
 /// out of the box. `docs/PHASE3.md` §4.1 spells this keyword the same way in
 /// its own layout sketch.
+///
+/// # `frame_headroom=`, and why zero was not a safe default to be stuck with
+///
+/// Spare **frame-name** slots, `TreeBuilder::frame_headroom` under the same
+/// name. The frame table is sized from the declared topology and never grows
+/// (invariant 3), and `frame_headroom` is the only way to leave room for a name
+/// interned *after* the arena exists. With the 0 this had no way to change, an
+/// arena created from Python could never accept one from any participant: a
+/// Rust or C peer — or the ROS ingest bridge, which reserves eight for exactly
+/// this — calling `Tree::frame()` on it gets `CapacityExceeded` forever.
+///
+/// It is also what makes the arena-mutation regression in
+/// `tests/python/test_errors.py` observable at all: below the capacity
+/// pre-check in `intern_core`, a failed intern writes nothing, so a binding that
+/// interned on an error path looked innocent on every zero-headroom tree.
+///
+/// There is deliberately **no `edge_headroom`**, on `docs/PHASE5.md` §5.8's
+/// amendment: nothing declares an edge at runtime, so the slots it reserves can
+/// only ever be empty (the ROS bridge's config makes the same call).
 #[pyfunction]
-#[pyo3(signature = (edges, *, capacity = 1024, interp = "sclerp"))]
-pub fn build(edges: Vec<(String, String)>, capacity: u32, interp: &str) -> PyResult<PyTree> {
-    let mut b = tf_tree::TreeBuilder::new().default_interp(interp_from_str(interp)?);
+#[pyo3(signature = (edges, *, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
+pub fn build(
+    edges: Vec<(String, String)>,
+    capacity: u32,
+    interp: &str,
+    frame_headroom: u32,
+) -> PyResult<PyTree> {
+    let mut b = tf_tree::TreeBuilder::new()
+        .default_interp(interp_from_str(interp)?)
+        .frame_headroom(frame_headroom);
     for (parent, child) in &edges {
         b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
     }
-    let inner = b
-        .build()
-        .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+    let inner = b.build().map_err(|e| build_err(&edges, capacity, e))?;
     Ok(PyTree {
         inner: Arc::new(inner),
     })
@@ -1494,14 +1579,10 @@ pub fn push(
             "expected [qw, qx, qy, qz, tx, ty, tz]",
         ));
     }
-    let c = tree
-        .inner
-        .frame(child)
-        .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {child:?}")))?;
-    let p = tree
-        .inner
-        .frame(parent)
-        .map_err(|_| FrameNotDeclaredError::new_err(format!("no frame named {parent:?}")))?;
+    // See `Tree.publisher`: builder-time topology means interning a name that
+    // has no record cannot produce an edge to publish on.
+    let c = resolve_frame(&tree.inner, child)?;
+    let p = resolve_frame(&tree.inner, parent)?;
     let iso = tf_tree::Iso3::new(
         tf_tree::Quat {
             w: quat7[0],
@@ -1514,10 +1595,10 @@ pub fn push(
     let publisher = tree
         .inner
         .claim(c, p)
-        .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+        .map_err(|e| claim_err(&tree.inner, parent, child, e))?;
     publisher
         .push(stamp_ns, &iso)
-        .map_err(|e| TfTreeError::new_err(format!("{e:?}")))
+        .map_err(|e| push_err(&edge_label_of(parent, child), e))
 }
 
 /// Attach to a running arena (`docs/PHASE3.md` §4.1).
@@ -1536,20 +1617,36 @@ pub fn push(
 /// its declared edges, so there is no way to create one without saying what is
 /// in it; that is why this is an edge list and not a boolean.
 ///
-/// `capacity` and `interp` describe the edges being created — they are
-/// [`build`]'s, with the same `"sclerp"` default and the same
+/// `capacity`, `interp` and `frame_headroom` describe the edges being created —
+/// they are [`build`]'s, with the same `"sclerp"` default and the same
 /// `layout="quat_twist"` consequence. Without `create` they describe nothing,
 /// but `interp` is still **parsed**: accepting `open(interp="screw")` silently
 /// while `build(interp="screw")` refuses it would make the same typo a startup
 /// error in one call and a no-op in the other.
+///
+/// `frame_headroom` matters more here than it does on [`build`], and this is the
+/// call it was missing from: a *shared* arena is the one other processes attach
+/// to, and `Tree::frame()` from any of them needs a spare slot to intern a name
+/// into. Zero — which is what this used to be, with no way to say otherwise —
+/// means a Python-created arena refuses every runtime frame name for its whole
+/// life.
 ///
 /// **Creating requires `mode="rw"`**, and is refused otherwise rather than
 /// quietly ignored. Both of §4.1's reasons for the read-only default survive
 /// that: a `ro` consumer still cannot bring an arena into existence, and an
 /// `rw` publisher — which has already opted into being able to corrupt the tree
 /// — still has to ask.
+// **Linux-only, and it refuses rather than vanishing.** The whole shared-arena
+// surface — `Open`, `CreatePolicy`, `AttachMode` — is
+// `#[cfg(all(feature = "shm", target_os = "linux"))]` in the facade, and this
+// crate always enables `shm`, so the *target* is what decides. The paired
+// `#[cfg(not(...))]` arm below keeps the attribute present on every platform
+// for the reason `offline.rs` already records: a missing attribute makes a
+// portable script fail with `AttributeError` at a line that has nothing to do
+// with the reason.
+#[cfg(target_os = "linux")]
 #[pyfunction]
-#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp"))]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
 pub fn open_arena(
     name: Option<&str>,
     domain: Option<u32>,
@@ -1557,6 +1654,7 @@ pub fn open_arena(
     create: Option<Vec<(String, String)>>,
     capacity: u32,
     interp: &str,
+    frame_headroom: u32,
 ) -> PyResult<PyTree> {
     let attach = match mode {
         "ro" => AttachMode::ReadOnly,
@@ -1583,7 +1681,9 @@ pub fn open_arena(
         Some(_) => tf_tree::CreatePolicy::IfAbsent,
     });
     if let Some(edges) = &create {
-        let mut b = tf_tree::TreeBuilder::new().default_interp(policy);
+        let mut b = tf_tree::TreeBuilder::new()
+            .default_interp(policy)
+            .frame_headroom(frame_headroom);
         for (parent, child) in edges {
             b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
         }
@@ -1592,13 +1692,42 @@ pub fn open_arena(
     if let Some(d) = domain {
         o = o.domain(d);
     }
+    // Both failures route through the same mapper, because `Open::name` returns
+    // an `OpenError` too — a rejected arena name is `Rendezvous(IpcError)`, and
+    // that arm was already prose. What was not is `Build`, which carries every
+    // one of `BuildError`'s Debug dumps into the call a consumer makes first.
+    let created = create.as_deref().unwrap_or(&[]);
     if let Some(n) = name {
-        o = o
-            .name(n)
-            .map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+        o = o.name(n).map_err(|e| open_err(created, capacity, e))?;
     }
-    let inner = o.open().map_err(|e| TfTreeError::new_err(format!("{e}")))?;
+    let inner = o.open().map_err(|e| open_err(created, capacity, e))?;
     Ok(PyTree {
         inner: Arc::new(inner),
     })
+}
+
+/// See [`open_arena`]. The shared arena is Linux-only, like the `memfd` it maps.
+///
+/// Present on every platform on purpose — `offline.rs` records the argument: an
+/// absent attribute makes a portable script fail with `AttributeError` at a line
+/// that has nothing to do with the reason, and this one has a real reason to
+/// give.
+#[cfg(not(target_os = "linux"))]
+#[pyfunction]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
+#[allow(clippy::needless_pass_by_value)]
+pub fn open_arena(
+    name: Option<&str>,
+    domain: Option<u32>,
+    mode: &str,
+    create: Option<Vec<(String, String)>>,
+    capacity: u32,
+    interp: &str,
+    frame_headroom: u32,
+) -> PyResult<PyTree> {
+    let _ = (name, domain, mode, create, capacity, interp, frame_headroom);
+    Err(crate::errors::TfTreeError::new_err(
+        "a shared tf_tree arena needs the mmap-backed backend, which is \
+         Linux-only in this build; tf_tree.build(...) works everywhere",
+    ))
 }

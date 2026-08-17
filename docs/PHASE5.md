@@ -89,9 +89,11 @@ Per D28, every user of this phase changes nothing about their robot. They point 
   fails on it (5.35–5.62× against ≥ 6×). The `.tft` rows — 16-worker total Pss,
   open time vs bag parse — *are* measurable here. §9.3 already prescribes the
   right response: omit a row that cannot be measured fairly and say why.
-- **GitHub Actions has produced no run since 2026-07-23.** Every gate claimed
-  in this document must be run locally through `just` and the arch stated,
-  because a green check on a PR is not evidence.
+- **CI produced no run between 2026-07-23 and 2026-08-16**, and runs again
+  since. Every gate claimed in this document is still run locally through
+  `just` with the arch stated: CI covers what its jobs cover, and this
+  document's benchmark rows in particular are host-dependent in ways no runner
+  settles.
 
 ---
 
@@ -1592,7 +1594,7 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` with a real disclosure address.
 - **A stated support policy**, honestly scoped. A small-team infrastructure project dies from unanswered issues more often than from bad design. Say what is supported, what is best-effort, and what the response expectation is. Under-promising is fine; silence is not.
 - **MSRV policy** and a CI matrix pinning it.
-- Documentation site (mdBook): a first-five-minutes path that works — `pip install tf_tree`, three lines, a real result — before any architecture prose.
+- Documentation site (mdBook): a first-five-minutes path that works — `pip install transform_tree`, three lines, a real result — before any architecture prose.
 - CI: the full Phase 1–5 suites on `x86_64` and `aarch64`, ASan/UBSan/TSan, Miri, loom, the nightly `shm_torture`, the benchmark artifact as a regression gate.
 - Release automation: `cargo-dist` or equivalent, maturin wheels per Phase 3 §10, PEP 740 attestations, signed tags.
 
@@ -1623,6 +1625,36 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 2. `.tft` open time under **10 ms** for a 233 MB index (it is an `mmap` plus header validation; anything more means work is happening that should not).
 3. Frozen lookup p50 within **20%** of online (accounting for the deeper binary search).
 4. **16 workers sharing one `.tft`: total Pss within 1.2× of one worker.**
+   **MET — 1.024×, measured for the first time by `just gate4`**
+   (`crates/tf_tree_bench/src/bin/frozen_workers.rs`). 16 workers cost **235.5
+   MiB** against **229.9 MiB** for one, on a 338 MiB frozen fleet arena (64
+   robots × 40 s, 1 537 frames, 1 536 edges). Solving `total(N) = S + N·p` over
+   the two rows gives **S = 229.5 MiB shared, p = 0.37 MiB private per worker**.
+   Reproduces to three decimals across runs.
+
+   Three things about this measurement, because each was a way of getting it
+   wrong:
+
+   - **The `.tft` has to be large, and that is the gate's design rather than a
+     convenience.** `(S + 16p)/(S + p) ≤ 1.2` rearranges to `S ≥ 74p`, so with
+     any real per-process cost the criterion is only about *sharing* once the
+     arena is hundreds of MiB. That is where gate 2's "233 MB index" comes from.
+     Run against the 24-frame fixture it would report a failure that is
+     arithmetic about process overhead.
+   - **Workers must actually read the file.** `open_frozen` is an `mmap`; a
+     worker that maps and never touches has no resident share. `--no-touch`
+     measures that case and it comes out at **5.32×, FAIL** — with `S ≈ 0` the
+     ratio collapses to `16p/p`, so an unread mapping is loud rather than
+     silently passing. Every worker sweeps every declared edge across the
+     history before reporting.
+   - **Pss must be sampled while every worker is alive**, behind a barrier.
+     Pss divides a shared page by the number of processes *currently* mapping
+     it, so collecting from each worker as it finishes divides an early
+     finisher's share by three instead of sixteen. The first version of the
+     harness did that and reported **FAIL at 1.43×**. The tell was that the
+     solved-for `p` grew with sweep length — 3.4 MiB at 16 stamps/edge to 10.8
+     MiB at 4096 — which is not something private memory does. With the barrier,
+     `p` is 0.37 MiB at every sweep length.
 5. Ingest throughput ≥ **10× real time** on a representative recording. **Currently held by nobody: `crates/tf_tree_bench/benches/` has no ingest benchmark, so `just bench-check` cannot see a regression on this path.** Measured by hand it passes with a wide margin — 0.048 s for 160 000 transforms through a zstd recording composes to roughly 200× real time for a four-hour bag at 100 Hz × 50 transforms — but a hand measurement is not a gate. Adding one needs a corpus that is *not* produced by `ruzstd`'s own encoder, which understates a real recording's decode cost by about 1.3×; `crate::fixture::compress_records` carries that number.
 6. Every §6 check has a passing fixture test.
 7. Benchmark artifact runs from the published container on a clean machine and reproduces the committed `results.json` within tolerance.

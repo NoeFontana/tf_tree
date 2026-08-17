@@ -455,12 +455,52 @@ a different fact from a shipped one.
 **A tier nothing compiles is not a tier.** The default configuration — the one a
 `cargo add tf_tree` consumer gets — is invisible to `cargo build --workspace`,
 because the resolver unifies the feature in from the crates that ask for it.
-`just stable-tier-check` is therefore normative infrastructure rather than
-convenience: it is the only recipe that compiles the facade in *its own* default
-feature set with `unstable` off, and CI runs it as its own job. (`just
-ingest-check` reaches a nearby configuration — no `unstable`, but no features at
-all, because `[workspace.dependencies]` declares
-`tf_tree = { default-features = false }`.)
+That half is permanent, and it is measurable rather than folklore:
+
+```
+$ cargo tree -p tf_tree -f '{p} FEATURES=[{f}]' --depth 0
+tf_tree v0.0.1 (…/crates/tf_tree) FEATURES=[counters,default]
+
+$ cargo tree --workspace -e features -f '{p} FEATURES=[{f}]' | grep '^tf_tree v'
+tf_tree v0.0.1 (…/crates/tf_tree) FEATURES=[counters,default,unstable]
+```
+
+**What changed at 0.0.1 is the other half — how many recipes reach it.** The
+facade used to carry a `tf_tree = { path = ".", features = ["unstable"] }`
+dev-dependency, which turned the feature on for every one of its own test
+targets; `just stable-tier-check`'s `--lib` lines were then genuinely the only
+place the default tier compiled. That line does not survive `cargo package` and
+was deleted, so *every* `-p tf_tree` selection now resolves to
+`counters,default` — including the test targets, and including two recipes that
+were not written with this tier in mind: `just miri`'s
+`-p tf_tree --lib --test owned_writer` and `just test-doc-error-codes`'
+`--doc -p tf_tree -p tf_tree_core`. Both were run through the first command
+above and print `FEATURES=[counters,default]`. `cargo nextest list -p tf_tree
+--lib --tests` counts 70 tests against 77 with `--features unstable`, which is
+the same fact from the target side.
+
+`just stable-tier-check` remains the *gate*, and CI runs it as its own job: it is
+the recipe that names the configuration on purpose, puts the `shm` and
+no-default-features variants beside it, and renders the tier's own rustdoc — that
+last line is still unique, because `just doc` renders the facade at
+`--all-features`, where a link into `tf_tree::unstable` resolves and a published
+consumer's does not. What is no longer unique is the *compiling*: the `shm`
+variant falls out of `just shm-check`'s
+`cargo clippy -p tf_tree --features shm --all-targets` the same way
+(`FEATURES=[counters,default,shm]`), and the no-features configuration out of
+`just ingest-check`, whose facade is a dependency at `FEATURES=[]` because
+`[workspace.dependencies]` declares `tf_tree = { default-features = false }` —
+a third configuration, not the one `cargo add tf_tree` produces. A recipe that
+reaches a configuration on its way somewhere else is not a gate for it; it is
+how a break gets noticed by the wrong error message.
+
+**One warning about how much of that the check itself defends.** The consumer
+list above is compared to the `[dependencies]` entries, name by name, in both
+this document's §6 row 4 and the manifest comment — but only the *names*: the
+recipe greps row 4 for each of `tf_tree_bench`, `tf_tree_c`, `tf_tree_cli` and
+`tf_tree_py` and asserts nothing about the prose around them. Which recipes
+compile which feature set is exactly the kind of sentence that stays green while
+going stale, and it is the sentence that did.
 
 ---
 
@@ -512,6 +552,25 @@ All of these run at tier 1 or tier 2 frequency, so R2 is not in tension:
   `tree.span()` already ship; `tree.edges()` is the offline `ds.edges()` of
   `PHASE5.md` §4.2, which that section's amendment holds back until §3's
   counting pass exists — the *names* half of it does not wait on that.)
+- **build identity: `__version__`, `arena_format_version()`,
+  `arena_layout_hash()`.** A benchmark number or a bug report that cannot be
+  attributed to a build is worth very little, and `tf_tree.__version__` raised
+  `AttributeError` until these landed, in the first release. Three values
+  because they fail independently: the right version can still refuse to
+  attach, because the arena it was pointed at was written by a different
+  *geometry*. The last two are the two words every participant already compares
+  on attach (`PHASE5.md` §1), re-exported from the facade under the facade's own
+  names — this crate does not gain a `tf_tree_arena` dependency to answer a
+  diagnostic. Import frequency is below even tier 1 and neither call reaches an
+  arena, so R2 is not in tension by the letter either; row 14 has the rest,
+  including why the two are functions and not module constants.
+
+- **arena headroom: `frame_headroom=` on `build` / `open`.** Spare frame-name
+  slots, `TreeBuilder::frame_headroom` under the same name, default `0`. A
+  sizing knob beside `capacity=`, not a layout in R4's sense — R4 is about the
+  *pose* layout, where a wrong guess is a valid-looking transform pointing the
+  wrong way. Without it a Python-created arena admits no runtime-interned frame
+  name from any participant, including a Rust or C peer and the ROS bridge.
 
 ### 3.3 Parity deltas to close
 
@@ -746,7 +805,7 @@ authorized by this document alone.
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
 | 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`) — one build, one profile, `tf_tree_bench` against `tf_tree_core::bench_probe` — gated at 5% on `boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`, and **reporting 1.250–1.254×, i.e. over §9.2's criterion**, with the `lto = "thin"` control at 0.994–0.996× beside it. The two-profile comparison is kept as an exploratory measurement, never gated |
-| 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on — four, checked against the `[dependencies]` entries by `just stable-tier-check` rather than counted by hand; three `compile_fail,E0432` doctests pin that the root no longer answers. **Gating the door did not remove the capability**: stable `Tree::frames` and `Tree::edges` land with it, mirroring row 8's Python surface, so an embedder never signs the waiver to ask what is in their own tree (§7 check 1). the facade's own default feature set with the feature off is compiled by `just stable-tier-check` and by no other recipe, because `--workspace` unifies the feature in; CI runs it as its own job |
+| 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on — four, checked against the `[dependencies]` entries by `just stable-tier-check` rather than counted by hand; three `compile_fail,E0432` doctests pin that the root no longer answers. **Gating the door did not remove the capability**: stable `Tree::frames` and `Tree::edges` land with it, mirroring row 8's Python surface, so an embedder never signs the waiver to ask what is in their own tree (§7 check 1). the facade's own default feature set with the feature off is what **no `--workspace` command compiles**, because the resolver unifies the feature in from those four — measured with `cargo tree -f '{p} FEATURES=[{f}]'`, §2.6. `just stable-tier-check` is the gate for it and CI runs it as its own job; since 0.0.1 deleted the facade's self-dev-dependency it is no longer the *only* recipe that reaches the configuration, because every `-p tf_tree` selection now does — `just miri` and `just test-doc-error-codes` included |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
 | 7 | `Layout::QuatTwist`; derivatives reach Python and C | core, Python, C | §3.3 | **landed** — `PHASE5.md` §4.4 item 1 in full: `plan.at(..., layout=...)` and `at_into` serve all four layouts, and both refusals the twist layout adds are typed — `DerivativesUnavailableError` for a `LerpSlerp` edge, `NoSegmentError` for a stamp with no segment. Python's `interp=` default moved to `"sclerp"` (§3), so a Python-built tree answers a twist without one |
@@ -756,16 +815,18 @@ authorized by this document alone.
 | 11 | Clock-step `doctor` check (`TFT019`) + runbook row | CLI | §5.3 | **landed, and now reachable on real data** — `tf_tree_cli`; fires only on tag 0 and only on a run of at least 8 consecutive rejected arrivals (a threshold this implementation chose, not one §5.3 states), skips naming the tag otherwise, and does not demote `TFT018`. `doctor` gained two recording sources — `--from-bag <recording.mcap>` and `--from-file <index.tft>` — and `TFT019`/`TFT018` **run on the first and skip on the second**: the skip is re-keyed from liveness onto `checks::PushStream`, because a ring holds only the pushes `SampleRing::push` accepted, so an arena of any kind (live, frozen, or bag-built and §3.1-sorted) would have passed both checks unconditionally. `PHASE5.md` §6's last `TFT019` amendment records that its own predicted fix was the wrong one and why |
 | 12 | The shim's query domain from `rcl_clock_type_t` | shim | [`PHASE7.md`](./PHASE7.md) §4 J9 | Phase 7, gated by D21 |
 | 13 | `tft_bridge_options::arena_name` + `TFT_ERR_ARENA_UNAVAILABLE` | C | [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) | **landed** — `arena_name` appended under §3.6's `struct_size` prefix rule and `TFT_ERR_ARENA_UNAVAILABLE` added to the frozen header, ABI minor 4 → 5. A NULL `arena_name` is the private heap arena every pre-`0.5` caller already had; a non-NULL one is `tf_tree::Open` with `require_create(true)`, and a shared arena that cannot be had is a startup refusal with **no heap fallback**. An earlier revision of this cell said "the ABI half landed" and that `0015` steps 3–7 were outstanding; all eight of that record's steps have since landed — #139, #141, #142, #143 and step 7's `PHASE4.md` §5.8 half; that cell's own C surface was complete at #141. What is still outstanding there is the `atfork` test its *Invariants to maintain* clause demands and §9.2's N = 1…16 curve for the new benchmark arm — **neither of which is C API surface**, so neither holds this row open |
+| 14 | `__version__`, `arena_format_version()`, `arena_layout_hash()` on the Python module | Python | §3.2 | **landed** — `tf_tree_py`. `__version__` is `env!("CARGO_PKG_VERSION")` and never a literal: a hand-copied string is wrong exactly once, on the release where somebody bumps the manifest and not the line, and it is wrong *silently* — a report carrying it is mis-attributed rather than un-attributed, which is worse than having no version at all. The other two re-export the facade's own `arena_format_version` / `arena_layout_hash` under the facade's own names, so no second spelling of an existing path exists (`PROJECT.md` §6) and `tf_tree_arena` does not become a dependency of the binding to answer a diagnostic. All three run at import frequency, and neither of the two calls touches an arena or takes a lock — they bottom out in `tf_tree_arena::FORMAT_VERSION` and in `layout_hash`, which is a `const fn` — so R2 is not in tension. **The two are functions rather than module constants, and that is forced rather than chosen:** `tests/python/test_stubs.py` is what keeps the hand-written `.pyi` from rotting, and it collects the stub's `ClassDef`s and `FunctionDef`s only (`test_stubs.py:36`) while skipping underscore-prefixed names on both sides (`:50`). A module-level `FORMAT_VERSION: int` is an `AnnAssign`, invisible to that comparison — it would be the one name in the surface whose existence nothing checks. `has_shared_memory` is the precedent: a compile-time-constant fact about the build, exposed as a nullary function. `__version__` is exempt by that same underscore skip and keeps the dunder because it is what a bug-report template asks for; it is not the canonical answer — `importlib.metadata.version("transform_tree")` is, it reads `pyproject.toml` where this one reads the crate manifest, and `tests/python/test_version.py` is the only thing that stops the two files drifting |
+| 15 | `frame_headroom=` on `tf_tree.build` and `tf_tree.open` | Python | §3.2 | **landed** — `tf_tree_py`. Spare frame-name slots, mirroring `TreeBuilder::frame_headroom`, defaulting to `0` so no existing caller's arena changes size. It is not a `layout=` in R4's sense — R4 governs the *pose* layout, where row-major against column-major and `wxyz` against `xyzw` both produce a valid-looking transform pointing the wrong way; this is an arena-sizing knob beside `capacity=`, which has carried a default since Phase 3. The defect it closes is not ergonomic: a Python-created arena sized `max_frames = unique_frames + 1` can never accept a runtime-interned name from **any** participant, so a Rust, C or ROS-bridge peer calling `Tree::frame()` on it gets `CapacityExceeded` with no way for the creator to have allowed it. No `edge_headroom` beside it — `PHASE5.md` §5.8's amendment records that nothing declares an edge at runtime. Gated by `tests/python/test_errors.py::test_frame_headroom_reaches_the_arena_and_stays_out_of_the_frame_list`, which compares frozen `.tft` sizes (2262912 / 2264320 / 2274048 B at headroom 0 / 8 / 64) with `frames()` identical at each — mutation-verified: dropping `.frame_headroom(...)` makes all three sizes equal and fails the test |
 
-**Eleven of thirteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11 and
-13.** The two that have not are 6 and 12, and neither is merely unscheduled: row
-6 is recorded-not-built on purpose and row 12 is gated by D21. Two of the eleven
-that landed — 3 and 10 — carry a caveat worth keeping, so they are in the list
-below as well. (This count is re-taken from the table above rather than carried
-forward, every time it changes. It has been wrong twice: an early revision said
-"ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named eight rows and
-called them ten; the revision after that kept row 13 out of the count after its
-record's remaining steps had landed.)
+**Thirteen of fifteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11,
+13, 14 and 15.** The two that have not are 6 and 12, and neither is merely
+unscheduled: row 6 is recorded-not-built on purpose and row 12 is gated by D21.
+Two of the thirteen that landed — 3 and 10 — carry a caveat worth keeping, so they are in the
+list below as well. (This count is re-taken from the table above rather than
+carried forward, every time it changes. It has been wrong twice: an early
+revision said "ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named
+eight rows and called them ten; the revision after that kept row 13 out of the
+count after its record's remaining steps had landed.)
 
 - **Row 3 has landed in full, and its benchmark row reports a failing gate.**
   `embedding_cross_crate` measures **1.250–1.254×** against §9.2's 5% criterion.

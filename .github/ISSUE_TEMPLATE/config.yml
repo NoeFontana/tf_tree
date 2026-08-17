@@ -1,0 +1,66 @@
+# Issue-template chooser configuration.
+#
+# ## Blank issues stay on
+#
+# `blank_issues_enabled: false` is the usual setting for a project drowning in
+# low-quality reports. This one has the opposite problem: it has no users yet,
+# and the single most valuable thing anyone can send is an observation that does
+# not fit a form — `docs/PHASE4.md` §1.2's log is a log of *surprises*, and a
+# surprise that fits a template is not the interesting kind. Turning blank
+# issues off would make the first person to hit something we did not anticipate
+# choose between mis-filing it and not filing it. Revisit when the volume is a
+# problem rather than a hope.
+#
+# ## Two of the four labels these forms set do not exist yet
+#
+# GitHub's own documentation for the `labels` key: "If a label does not already
+# exist in the repository, it will not be automatically added to the issue."
+# Silently — no error when the form is saved, no note on the issue. So the
+# roster below is checked rather than assumed. Measured with
+# `gh label list -R NoeFontana/tf_tree` on 2026-08-16:
+#
+#   bug            bug.yml                     EXISTS (GitHub's default set)
+#   question       question.yml                EXISTS (GitHub's default set)
+#   surprise-log   surprise.yml                MISSING — will be dropped
+#   needs-triage   surprise.yml, bug.yml       MISSING — will be dropped
+#
+# The two missing ones, in the spelling the forms use:
+#
+#   gh label create surprise-log --color 0e8a16 \
+#     --description "An entry in the docs/PHASE4.md §1.2 surprise log"
+#   gh label create needs-triage --color fbca04 \
+#     --description "Read but not yet reproduced or classified"
+#
+# Until they exist the forms still work and the label is simply absent, which is
+# the quiet half of this failure: a surprise-log entry that carries no
+# surprise-log label is invisible to the one query that matters.
+#
+# ## One coupling to keep
+#
+# surprise.yml's J-row dropdown copies `docs/PHASE7.md` §4's table. That table
+# says of itself "Rows will be added"; when one is, the dropdown gets the same
+# row in the same commit.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability — do not open an issue
+    url: https://github.com/NoeFontana/tf_tree/blob/main/SECURITY.md
+    about: >-
+      Mail the address in SECURITY.md instead. It also states the threat model up front,
+      which will save you time: processes sharing an arena are mutually trusting by design,
+      so "a read-write participant can corrupt the arena" is documented rather than a
+      defect — while memory unsafety from safe Rust, a crafted arena header, and anything
+      a read-only participant can do to another are all in scope.
+  - name: What is supported, and what response to expect
+    url: https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md
+    about: >-
+      A single-maintainer, pre-1.0 project with honestly scoped timelines: Linux first, the
+      current release only, and a per-kind triage expectation. It is also where the platform
+      answers are, and they are not all the same answer. Note that CI has produced no run
+      since 2026-07-23, so a green check on a pull request is not evidence of anything.
+  - name: Propose a change the documents do not already cover
+    url: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/README.md
+    about: >-
+      New public API, a new crate boundary, a different concurrency protocol, or a feature
+      that widens the scope: those start as a decision record, not as an issue and not as a
+      pull request. Several things this project deliberately does not do are recorded with
+      the argument attached — refuting one is a real path, and this is where it runs.

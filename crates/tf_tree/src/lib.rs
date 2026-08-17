@@ -81,9 +81,14 @@
 //! capacities, counters — not the answer itself.
 //!
 //! The three items that moved do not answer at the crate root any more, and this
-//! is what pins that — the doctest runs with the `unstable` feature *on* (this
-//! crate dev-depends on itself to enable it), so it asserts the split rather
-//! than the feature being off:
+//! is what pins that — **but only when the feature is on**, and where that holds
+//! moved in 0.0.1. It used to be every `cargo test` here, because the crate
+//! dev-depended on itself to enable `unstable`; that line did not survive
+//! `cargo package` and is gone. Today the assertion means "moved to
+//! `tf_tree::unstable`" under `cargo test --doc --workspace`, which unifies the
+//! feature in from the four consumers that declare it, and degrades to the
+//! weaker "absent from the crate root" under a bare `-p tf_tree`. Both readings
+//! are true; `just test` runs the strong one:
 //!
 //! ```compile_fail,E0432
 //! use tf_tree::ArenaView;
@@ -226,6 +231,21 @@
 //! measured here, so if your release builds are slow enough that you want to
 //! take only one of them, measure your own case rather than trusting a guess
 //! from this paragraph.
+
+// **The crates.io front page, compiled.** `README.md`'s `rust` fence is the
+// example a stranger reads first, and no recipe parses a README — the next
+// signature change to `claim`, `plan`, `Capacity::history` or the `Described`
+// wording would break the published page with every gate green. `cfg(doctest)`
+// keeps it out of `cargo doc`, which already renders the module docs above, and
+// off the crate root, whose `//!` block carries intra-doc links a README cannot.
+//
+// It gates the *API*, not the *output*: the fence's `// -> x = 0.5` and its
+// two-line extrapolation message are comments, and a doctest does not read
+// stdout. Turning them into asserts would gate those too, at some cost to how
+// the front page reads; that trade has not been made.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
 
 mod cache;
 mod tree;
