@@ -33,9 +33,17 @@ use pyo3::{create_exception, exceptions::PyException};
 
 use tf_tree::unstable::ArenaView;
 use tf_tree::{
-    BuildError, ClaimApiError, EdgeId, FrameError, FrameId, InterpPolicy, LookupError, OpenError,
-    PushError, Tree,
+    BuildError, ClaimApiError, EdgeId, FrameError, FrameId, InterpPolicy, LookupError, PushError,
+    Tree,
 };
+// **Linux-only, like the mapping it describes.** The facade gates
+// `open::{open, CreatePolicy, Open, OpenError}` on
+// `#[cfg(all(feature = "shm", target_os = "linux"))]`, and this crate always
+// turns `shm` on — so it is the *target*, not the feature, that decides whether
+// the name exists. Importing it unconditionally is what made `tf_tree_py` fail
+// to compile on macOS and Windows.
+#[cfg(target_os = "linux")]
+use tf_tree::OpenError;
 
 use crate::offline::{named_edge_in, named_frame_in};
 use crate::tree::interp_name;
@@ -482,6 +490,7 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
 /// `Build` is the whole of [`build_err`] — `open(create=[...])` is the second
 /// entry point a program calls first, and it reaches every one of those five
 /// Debug dumps through one `From` impl.
+#[cfg(target_os = "linux")]
 pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) -> PyErr {
     match e {
         OpenError::Build(inner) => build_err(edges, capacity, inner),

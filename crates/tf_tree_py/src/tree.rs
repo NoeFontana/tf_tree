@@ -7,9 +7,10 @@ use pyo3::types::PyAnyMethods;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tf_tree::{
-    AttachMode, Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree,
-};
+use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree};
+
+#[cfg(target_os = "linux")]
+use tf_tree::AttachMode;
 
 use crate::errors::{
     build_err, claim_err, edge_label_of, lookup_err, open_err, push_err, push_msg, resolve_frame,
@@ -1635,6 +1636,15 @@ pub fn push(
 /// that: a `ro` consumer still cannot bring an arena into existence, and an
 /// `rw` publisher — which has already opted into being able to corrupt the tree
 /// — still has to ask.
+// **Linux-only, and it refuses rather than vanishing.** The whole shared-arena
+// surface — `Open`, `CreatePolicy`, `AttachMode` — is
+// `#[cfg(all(feature = "shm", target_os = "linux"))]` in the facade, and this
+// crate always enables `shm`, so the *target* is what decides. The paired
+// `#[cfg(not(...))]` arm below keeps the attribute present on every platform
+// for the reason `offline.rs` already records: a missing attribute makes a
+// portable script fail with `AttributeError` at a line that has nothing to do
+// with the reason.
+#[cfg(target_os = "linux")]
 #[pyfunction]
 #[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
 pub fn open_arena(
@@ -1694,4 +1704,30 @@ pub fn open_arena(
     Ok(PyTree {
         inner: Arc::new(inner),
     })
+}
+
+/// See [`open_arena`]. The shared arena is Linux-only, like the `memfd` it maps.
+///
+/// Present on every platform on purpose — `offline.rs` records the argument: an
+/// absent attribute makes a portable script fail with `AttributeError` at a line
+/// that has nothing to do with the reason, and this one has a real reason to
+/// give.
+#[cfg(not(target_os = "linux"))]
+#[pyfunction]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
+#[allow(clippy::needless_pass_by_value)]
+pub fn open_arena(
+    name: Option<&str>,
+    domain: Option<u32>,
+    mode: &str,
+    create: Option<Vec<(String, String)>>,
+    capacity: u32,
+    interp: &str,
+    frame_headroom: u32,
+) -> PyResult<PyTree> {
+    let _ = (name, domain, mode, create, capacity, interp, frame_headroom);
+    Err(crate::errors::TfTreeError::new_err(
+        "a shared tf_tree arena needs the mmap-backed backend, which is \
+         Linux-only in this build; tf_tree.build(...) works everywhere",
+    ))
 }
