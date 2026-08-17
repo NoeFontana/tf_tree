@@ -12,13 +12,28 @@
 # is the right outcome rather than a loss — 3.13t was PEP 703's experimental
 # phase; free-threading became *supported* in 3.14 under PEP 779.
 #
-# NOTE: this workflow has never executed. GitHub Actions has produced no run for
-# this repository since 2026-07-23 (see #24). The cause is now diagnosed rather
-# than suspected and is written up in `ci.yml`'s header: user-workflow runs
-# stopped on every one of this account's **private** repositories at once
-# (2026-07-23 to 2026-07-24) while its **public** ones kept running, which is an
-# account-level Actions billing state — not a trigger, not a runner, and not
-# anything this file can fix. Treat the first real run as unproven.
+# NOTE: **the build matrix has executed; the `publish` job has not.** This file
+# produced nothing at all through the 2026-07-23 to 2026-08-16 Actions outage
+# (`ci.yml`'s header has what that was). Read off the runs API on 2026-08-17, it
+# has three runs: a `v0.0.1` tag push still queued, a `v0.0.2` tag push in which
+# every wheel row and the sdist succeeded and then the run was **cancelled** with
+# `publish` along with it, and a `workflow_dispatch` on `main` that failed.
+#
+# So the rows below are no longer unproven — they build. What is still unproven
+# is the last job: `transform_tree` 0.0.2 is on PyPI — **eleven wheels and no
+# sdist**, read off the index rather than remembered:
+#
+#     $ curl -sS https://pypi.org/pypi/transform-tree/json | \
+#         python3 -c "import json,sys; d=json.load(sys.stdin); \
+#           print({f['packagetype'] for f in d['releases']['0.0.2']}, \
+#                 len(d['releases']['0.0.2']))"
+#     {'bdist_wheel'} 11
+#
+# which is the same eleven the `sdist` step below is written about: the upload
+# died on the twelfth file. It did not get there from the run above, whose
+# `publish` never started.
+# Whatever put it there was outside this file, which means the upload path has
+# been exercised by nobody. Treat a green `publish` as the first evidence for it.
 #
 # **Nothing here tests a wheel.** These jobs build and (on a tag) publish; the
 # suite that would run against the artifact is `ci.yml`'s `python` job, which
@@ -158,6 +173,45 @@ jobs:
         with:
           command: sdist
           args: --out dist
+
+      # **This is the assertion PyPI makes, made here instead.** `0.0.2`'s upload
+      # put all eleven wheels on the index and then died on the twelfth file:
+      #
+      #   400 License-File LICENSE-APACHE does not exist in distribution
+      #
+      # PyPI validates that every `License-File:` in the metadata is present in
+      # the archive, and maturin writes those headers from `[project] license`
+      # while selecting sdist *files* from the cargo package — two different
+      # mechanisms, so the metadata could name a file the archive did not carry.
+      # `pyproject.toml`'s `include` closed that, and this is what keeps it
+      # closed: nothing else compares the two, and the failure is unrecoverable
+      # per version, because neither registry lets a number be reused.
+      #
+      # Deliberately in the `sdist` job and not in `publish`: a build that cannot
+      # be uploaded should fail where it was built, before eleven wheels have
+      # gone to the index and left the release half-done.
+      - name: every License-File named in the metadata is in the archive
+        run: |
+          set -euo pipefail
+          tarball=$(ls dist/*.tar.gz)
+          root=$(basename "$tarball" .tar.gz)
+          echo "checking $tarball"
+          declared=$(tar -xOzf "$tarball" "$root/PKG-INFO" | sed -n 's/^License-File: //p')
+          if [ -z "$declared" ]; then
+            echo "no License-File headers to check"; exit 0
+          fi
+          contents=$(tar -tzf "$tarball")
+          rc=0
+          while IFS= read -r f; do
+            if grep -qxF "$root/$f" <<<"$contents"; then
+              echo "  ok      $f"
+            else
+              echo "::error file=pyproject.toml::PKG-INFO declares 'License-File: $f' but $root/$f is not in the sdist. PyPI will reject the upload with 400. Add it to [tool.maturin] include."
+              rc=1
+            fi
+          done <<<"$declared"
+          exit $rc
+
       - uses: actions/upload-artifact@v7
         with:
           name: sdist
