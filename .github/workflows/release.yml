@@ -8,19 +8,20 @@
 # the tag, runs the repository's own gates, and publishes. The smaller surface is
 # the one to hand the credential to.
 #
-# **This workflow has never executed**, and neither has any other in this
-# repository — GitHub Actions has produced no run since 2026-07-23 (`ci.yml`'s
-# header carries the diagnosis: an account-level Actions state on *private*
-# repositories, inferred from which repositories stopped rather than read from an
-# API this token can reach). The `pull_request` trigger below exists to make the
-# first tag push less of a leap: it exercises everything except the upload.
+# **This workflow has published.** It sat unexecuted for the whole of the
+# 2026-07-23 to 2026-08-16 Actions outage (`ci.yml`'s header), and then ran for
+# real: the `v0.0.2` tag push on 2026-08-17 completed successfully, after a
+# `v0.0.1` push the day before had failed. The `pull_request` trigger below is
+# what made that first tag push less of a leap and is still worth its minutes —
+# it exercises everything except the upload, so the gates and the tag-versus-
+# manifest assertion are checked on the branch rather than on the tag.
 #
-# **The first 0.0.1 publish cannot come from here.** RFC 3691: "A Trusted
-# Publisher Configuration can only be created after an initial manual publishing
-# of a crate" — crates.io has no equivalent of PyPI's pending publisher. So each
-# of the five crates is published once by hand with a token, the Trusted
-# Publisher is configured per crate afterwards, and this workflow serves 0.0.2
-# onward. See `CONTRIBUTING.md` for the one-time sequence.
+# **The first 0.0.1 publish could not come from here**, and that is why the
+# history above starts at 0.0.2. RFC 3691: "A Trusted Publisher Configuration can
+# only be created after an initial manual publishing of a crate" — crates.io has
+# no equivalent of PyPI's pending publisher. So each of the five crates was
+# published once by hand with a token and the Trusted Publisher configured per
+# crate afterwards. See `CONTRIBUTING.md` for that one-time sequence.
 name: release
 
 on:
@@ -91,6 +92,34 @@ jobs:
           echo "tag=${tag} workspace=${ws}"
           if [[ "$tag" != "$ws" ]]; then
             echo "::error::tag v${tag} does not match the workspace version ${ws}" >&2
+            exit 1
+          fi
+
+      # **A tag is the moment "unreleased" stops being true**, and it is the only
+      # moment this repository can know it — which is why the check is here and
+      # not in `just artifact-versions`. That recipe asserts a `## [x.y.z]`
+      # section *exists*; it cannot assert the section is honest, because on any
+      # ordinary commit "unreleased" is the correct thing for it to say.
+      #
+      # `0.0.2` shipped with its section still reading `## [0.0.2] — unreleased`
+      # while the five crates were live on crates.io and the wheel was on PyPI.
+      # Nothing was wrong with the release; the file describing it was wrong, and
+      # neither registry lets that be corrected in place afterwards. Keep a
+      # Changelog 1.1.0 — the format this file declares — puts the date in the
+      # release commit, and this is what makes that a rule rather than a habit.
+      - name: assert the changelog section for this tag carries a date
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          header="$(grep -m1 -F "## [${tag}]" CHANGELOG.md || true)"
+          if [[ -z "$header" ]]; then
+            echo "::error::CHANGELOG.md has no '## [${tag}]' section" >&2
+            exit 1
+          fi
+          echo "changelog header: ${header}"
+          if grep -qi 'unreleased' <<<"$header"; then
+            echo "::error file=CHANGELOG.md::'${header}' still says unreleased, but v${tag} is being released now. Put the release date in the section header." >&2
             exit 1
           fi
 

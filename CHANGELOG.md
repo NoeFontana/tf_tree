@@ -31,7 +31,7 @@ is a bug.
 
 ---
 
-## [0.0.2] — unreleased
+## [0.0.2] — 2026-08-17 (wheels, no sdist)
 
 ### Fixed
 
@@ -79,8 +79,10 @@ a stored token.
 
 ## [0.0.1] — 2026-08-17 (crates.io only)
 
-First publish. The date goes in with the tag; until then nothing has been
-uploaded to crates.io or PyPI.
+First publish: the five publishable crates went to crates.io at 00:33 UTC on
+2026-08-17. **No wheel** — PyPI refused `tf_tree` as too close to an existing
+project, and the distribution was renamed to `transform_tree` for `0.0.2`, so
+that is the first version installable with `pip`.
 
 Everything below is *Added*, because there is no previous release for anything
 to be changed, deprecated, removed or fixed relative to.

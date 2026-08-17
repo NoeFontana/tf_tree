@@ -33,12 +33,20 @@ trap 'rm -rf "$OUT"' EXIT
 # aimed at *our* header and our test; pointed at Eigen and Sophus it reports
 # their choices, and clang duly failed the build on Sophus's use of the GNU
 # `##__VA_ARGS__` extension. `-isystem` is how you say "warn about my code".
+# The system copy wins over the fetched one, because §4.2 is about interop with
+# the Eigen a consumer actually has; `target/thirdparty/eigen` is the bootstrap
+# for a machine that has none, which is every GitHub runner. Eigen is NOT
+# optional the way Sophus is — its absence fails rather than skips, and on
+# 2026-08-17 that is exactly what the first nightly run did, because `cpp-deps`
+# fetched Sophus and nothing fetched Eigen.
 EIGEN=""
-for d in /usr/include/eigen3 /usr/local/include/eigen3; do
+for d in /usr/include/eigen3 /usr/local/include/eigen3 target/thirdparty/eigen; do
     [ -d "$d" ] && EIGEN="-isystem $d" && break
 done
 if [ -z "$EIGEN" ]; then
     echo "cpp-check: FAIL — Eigen not found; §4.2's interop cannot be exercised." >&2
+    echo "        run \`just cpp-deps\` to fetch it (header-only), or install" >&2
+    echo "        libeigen3-dev / eigen." >&2
     exit 1
 fi
 

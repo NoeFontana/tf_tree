@@ -307,10 +307,21 @@ loom:
 # pair's 2 s. **If a second `unsafe` ever lands in `tf_tree`, the target that
 # covers it joins this line**; that is the whole rule, and a `--test` list is
 # how it stays visible instead of silently drifting to nothing.
+#
+# **`MIRIFLAGS` is appended to, not assigned.** Line 1 always inherited the
+# caller's; line 2 used to clobber it, and that one word was why `ci.yml`'s
+# `miri` job spelled both commands out by hand instead of running this recipe —
+# CI wants `-Zmiri-strict-provenance` on top, and there was no way to ask for it
+# without losing `-Zmiri-disable-isolation`. Now `MIRIFLAGS=… just miri` is the
+# stricter run and the recipe is still the single spelling of *which* targets
+# are interpreted. With the variable unset — every local run — the expansion is
+# empty and this is character-for-character the command it was before.
+
+# Miri over the arena, the core, and the facade's one lifetime extension.
 miri:
     cargo +nightly miri test -p tf_tree_arena -p tf_tree_core \
         --features tf_tree_core/miri-soft-float
-    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p tf_tree \
+    MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test -p tf_tree \
         --features tf_tree_core/miri-soft-float --lib --test owned_writer
 
 # **The C ABI under Miri and ASan — `docs/PHASE4.md` §6.1 and §7 gate 4.**
@@ -345,6 +356,13 @@ miri:
 #
 # A script rather than an inline recipe, like `cpp-check`: it needs `cargo
 # metadata` and multi-line text processing that `just`'s parser mangles.
+#
+# **Where it runs:** `just lint` depends on it, so it is on every pull request
+# through `ci.yml`'s `lint` job and on every tag through `release.yml`'s. It has
+# no job of its own on purpose — 0.81 s measured, and a job's own checkout and
+# toolchain install cost more than the check does.
+
+# Every runnable artifact is executed by a recipe or registered as a probe.
 evidence-audit:
     ./scripts/evidence-audit.sh
 
@@ -447,8 +465,26 @@ attach-bench:
 # rather than about sharing: with p MiB private per worker, the criterion needs
 # S >= 74p. The default shape (64 robots x 40 s, 338 MiB) is chosen for that,
 # and it is why §12 gate 2 speaks of a "233 MB index".
+#
+# **The fixture is deleted first, and that is the whole point of the line.**
+# `frozen_workers` reuses `--tft` when the file is there, so without the `rm`
+# this recipe measures whatever `.tft` the last run left on disk: 0.26 s and no
+# freeze, against 1.6 s when it has to build one. Change the freeze path, run
+# `just gate4`, and it validates last week's file and prints PASS — which is
+# this repository's own recorded failure, "a gate that passed while asserting
+# against a file it had not produced", in the one register written to stop it
+# (`docs/benchmarks/EVIDENCE.md`). 1.6 s is not a price worth a stale verdict.
+#
+# On a hosted runner it happens to be moot — `Swatinem/rust-cache` removes loose
+# files under `target/<non-profile-dir>/` before saving, so the fixture is never
+# cached — but that is a property of a third-party action's cleanup routine, not
+# of this gate, and it is worth nothing locally.
+#
+# To iterate without re-freezing, run the binary directly:
+#   ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
 gate4:
     cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
+    rm -f target/gate4/workers.tft
     ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
 
 # **PHASE4 §7 gate criterion 1: what the C ABI costs a caller.**
@@ -480,6 +516,17 @@ gate4:
 # row that fails if the pin ever stops holding. The three rungs it gates and
 # their allowances are `docs/decisions/0023` — draft, so read them as a proposal
 # a human ratifies by merging it.
+#
+# **Why this is not in a workflow when `just gate4` now is**, since the two look
+# like siblings — both are §7-style gate criteria that no job used to run. They
+# differ in what they measure. `gate4` is Pss, which a shared runner reports as
+# honestly as a quiet one. This is a *latency quotient* between two `taskset`-ed
+# columns, and whether it stays resolvable under a hosted runner's neighbours is
+# not something this repository has measured — and a gate that flaps is a gate
+# people learn to pass by editing the gate. Wiring it needs that number first,
+# from repeated runs on a runner, not from an argument. `0023` being draft is a
+# second reason and not the main one: the thresholds it would gate against are
+# still a proposal.
 abi-cost:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -630,6 +677,14 @@ cpp-bench:
     sophus=""
     [ -f target/thirdparty/Sophus/sophus/se3.hpp ] && \
         sophus="-isystem target/thirdparty/Sophus -DSOPHUS_USE_BASIC_LOGGING"
+    # The same three-place search `cpp-check` does, in the same order, rather
+    # than the hardcoded `/usr/include/eigen3` this line used to carry — which
+    # would have failed on exactly the machine `cpp-deps` now provisions.
+    eigen=""
+    for d in /usr/include/eigen3 /usr/local/include/eigen3 target/thirdparty/eigen; do
+        [ -d "$d" ] && eigen="-isystem $d" && break
+    done
+    [ -n "$eigen" ] || { echo "cpp-bench: Eigen not found; run \`just cpp-deps\`" >&2; exit 1; }
     # **Both error modes.** The gate applies to the wrapper, and
     # `-fno-exceptions` is a different wrapper: a first implementation of
     # `expected<T>` made an FFI call per success and missed the gate at 1.064x
@@ -637,25 +692,51 @@ cpp-bench:
     # reporting "gate 2 passes" was wrong, and this is the fix.
     for mode in "" "-fno-exceptions"; do
         g++ -O2 -std=c++17 $mode -Wall -Wextra -Werror -I crates/tf_tree_c/include \
-            -isystem /usr/include/eigen3 $sophus -o "$out/bench" \
+            $eigen $sophus -o "$out/bench" \
             crates/tf_tree_c/tests/cpp/bench.cpp target/release/libtf_tree_c.a \
             -lpthread -ldl -lm
         taskset -c 2 "$out/bench"
         echo
     done
 
-# Fetch Sophus (header-only) into target/thirdparty so `cpp-check` can exercise
-# §4.3. Not vendored: it is a test dependency of one recipe, it is ~10 MB, and
-# putting somebody else's headers in the repo to test a stride is a poor trade.
+# Fetch the header-only C++ dependencies into target/thirdparty so `cpp-check`
+# can exercise §4.2 and §4.3. Not vendored: they are test dependencies of one
+# recipe, and putting somebody else's headers in the repo to test a stride is a
+# poor trade.
+#
+# **Eigen is here because the first nightly run failed without it** (2026-08-17).
+# `cpp-check` treats Eigen as a hard requirement — §4.2's interop cannot be
+# exercised without it, so its absence fails rather than skips — and this recipe
+# fetched only Sophus, so `ubuntu-latest`, which ships no Eigen, could not run
+# the check at all. The fix belongs here rather than as an `apt-get` line in
+# `nightly.yml`: a dependency spelled in a workflow is a dependency the recipe
+# does not have, and a developer without sudo still could not run `just
+# cpp-check`. With it here the workflow needs no change at all.
+#
+# Only fetched when the system has none. `run.sh` prefers `/usr/include/eigen3`,
+# because §4.2 is about interop with the Eigen a consumer actually has; this is
+# the bootstrap for a machine that has none.
 cpp-deps:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p target/thirdparty
+    if [ -d /usr/include/eigen3 ] || [ -d /usr/local/include/eigen3 ]; then
+        echo "cpp-deps: Eigen already installed system-wide"
+    elif [ -d target/thirdparty/eigen ]; then
+        echo "cpp-deps: Eigen already fetched"
+    else
+        # Pinned to the version this repository measured against; 3.4.0 is also
+        # what `libeigen3-dev` installs on the development host, so the fetched
+        # and installed configurations are the same one.
+        git clone -q -c advice.detachedHead=false --depth 1 --branch 3.4.0 \
+            https://gitlab.com/libeigen/eigen.git target/thirdparty/eigen
+        echo "cpp-deps: fetched Eigen 3.4.0"
+    fi
     if [ -d target/thirdparty/Sophus ]; then
         echo "cpp-deps: Sophus already present"
         exit 0
     fi
-    git clone -q --depth 1 --branch 1.22.10 \
+    git clone -q -c advice.detachedHead=false --depth 1 --branch 1.22.10 \
         https://github.com/strasdat/Sophus.git target/thirdparty/Sophus
     echo "cpp-deps: fetched Sophus 1.22.10"
 
@@ -798,18 +879,24 @@ doc:
         --features shm,embed-probe
     RUSTDOCFLAGS='-D warnings' cargo doc --no-deps -p xtask
 
-lint: py-compile
-    # **First, because it is the cheapest and it caught a real one.** PHASE4 §7
-    # gate criterion 1 was recorded as PASS for months while the benchmark that
-    # produces it ran in no recipe at all. This fails if a runnable artifact is
-    # neither executed nor declared in `docs/benchmarks/EVIDENCE.md`.
-    ./scripts/evidence-audit.sh
-    # Second, for the same reason and at the same price — 0.09 s, no network,
-    # no compilation. It fails on a version that moved in one of the nine files
-    # that carry one and not the others, and on a document or a workflow that
-    # names a recipe this file does not define. See `just artifact-versions`
-    # for the three findings it was written for.
-    ./scripts/artifact-versions.py
+# **`evidence-audit` and `artifact-versions` are dependencies, not lines in the
+# body, and the difference is a rule this repository already has.** Both used to
+# be spelled here a second time as `./scripts/…`, beside the recipe of the same
+# name — two spellings of one path, which is the thing `docs/PROJECT.md` §6 says
+# not to do. It also made both recipes look orphaned to anyone auditing which
+# `just --summary` entries a workflow reaches: no workflow names either one, and
+# the only reason they run on every pull request is that `ci.yml`'s `lint` job
+# runs this recipe. Naming them here says so in the one place that cannot drift.
+#
+# They stay first, and stay in this order, because they are the cheapest things
+# in the file and one of them caught a real defect: PHASE4 §7 gate criterion 1
+# was recorded as PASS for months while the benchmark that produces it ran in no
+# recipe at all. `just` runs dependencies left to right and before the body, so
+# ordering survives the move — `py-compile`, then the artifact audit, then the
+# version audit, then six clippy passes.
+
+# fmt + six clippy configurations, behind the two cheap audits.
+lint: py-compile evidence-audit artifact-versions
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
@@ -879,12 +966,19 @@ audit:
 # 1.83 to 1.85: the number looked authoritative and nothing had ever compiled
 # against it.
 #
-# This mirrors that job step for step, and deliberately so — the version is read
-# out of the manifest rather than written here, the `--locked` build uses the
-# committed lockfile (a transitive crate that quietly needs a newer toolchain is
-# the drift being caught, so re-resolving would hide it), and `--lib --bins`
-# because the promise covers what a downstream *links*, not what our
-# dev-dependencies need.
+# **The job no longer mirrors this recipe; it runs it.** It used to be a
+# transcription of two of the three arms below, and the transcription had also
+# dropped the `+$want` from the build — which, with `rust-toolchain.toml` pinning
+# `channel = "stable"`, meant the step that was supposed to compile on the floor
+# compiled on stable. The workflow now installs the floor's toolchain (which is
+# the one thing this recipe cannot do for itself, since it refuses to fall back
+# to stable) and then invokes `just msrv`.
+#
+# The version is read out of the manifest rather than written here, the
+# `--locked` build uses the committed lockfile (a transitive crate that quietly
+# needs a newer toolchain is the drift being caught, so re-resolving would hide
+# it), and `--lib --bins` because the promise covers what a downstream *links*,
+# not what our dev-dependencies need.
 #
 # Requires the floor's toolchain to be installed; when it is not, the recipe stops
 # with the exact `rustup toolchain install` line to run rather than falling back to
@@ -922,8 +1016,13 @@ msrv:
     # Matched loosely (`**1.87**` anywhere in the file) rather than by line, so
     # the sentence can be rewritten without breaking the gate; what may not
     # change silently is the number.
+    # `CLAUDE.md` is on the list because it states the floor too, and because an
+    # agent reads it before it reads anything else — a wrong number there is
+    # acted on rather than merely believed. It was ungated until 2026-08-17,
+    # found while correcting the neighbouring line, which claimed version 0.0.1
+    # unpublished two versions and one publish later.
     echo "==> the number is stated where a user reads it, and still agrees"
-    for f in README.md SUPPORT.md crates/tf_tree/src/lib.rs; do
+    for f in README.md SUPPORT.md CLAUDE.md crates/tf_tree/src/lib.rs; do
         if ! grep -qF "**$want**" "$f"; then
             echo "$f: does not state the MSRV as **$want**"
             rc=1
@@ -2002,11 +2101,21 @@ quickstart: py-setup
     @echo "==> next: .venv/bin/python   (the extension is installed in that interpreter)"
 
 # Create both venvs and install the toolchain.
+#
+# **`--allow-existing`, because this recipe is a dependency and `just` re-runs a
+# dependency per invocation.** `quickstart` depends on `py-setup`, so a caller
+# that runs `just py-setup` and then `just quickstart` runs it twice — and
+# `uv venv` on an existing directory is a hard error ("A virtual environment
+# already exists at: .venv"), not a no-op. That is how it presented: ci.yml's
+# `python` job does exactly that sequence and died on the second one. `--clear`
+# would also work and is wrong, because it deletes and rebuilds both venvs on
+# every call for no gain; `--allow-existing` reuses the directory and the
+# `uv pip install` lines below still bring the toolchain up to date.
 py-setup:
     uv python install 3.14 3.14t
-    uv venv --python 3.14 .venv
+    uv venv --python 3.14 --allow-existing .venv
     VIRTUAL_ENV=.venv uv pip install -q maturin numpy pytest ruff pyright
-    uv venv --python 3.14t .venv-t
+    uv venv --python 3.14t --allow-existing .venv-t
     VIRTUAL_ENV=.venv-t uv pip install -q maturin numpy pytest
 
 # Build the extension into the GIL venv and run the suite.
