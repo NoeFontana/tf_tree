@@ -1655,6 +1655,134 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
      solved-for `p` grew with sweep length — 3.4 MiB at 16 stamps/edge to 10.8
      MiB at 4096 — which is not something private memory does. With the barrier,
      `p` is 0.37 MiB at every sweep length.
+
+   > **Amendment — 1.024× is a statement about a *Rust* worker, and the number
+   > must be cited with the worker's language and start method attached.**
+   >
+   > This is an amendment and not a decision record because nothing here is
+   > decided. The criterion stands, the harness is right, 1.024× reproduces, and
+   > no row is retracted; what changes is the scope of a measured claim, and a
+   > qualification that does not travel with the number it qualifies has not been
+   > written down anywhere useful. [`0023`](./decisions/0023-the-gate-that-could-not-gate.md)
+   > and [`0025`](./decisions/0025-what-build-the-tf2-ratio-gate-speaks-for.md)
+   > are records because each *changed* a gate. The moment someone proposes
+   > changing this one — a second gated row at a Python worker, or a different
+   > fixture — that is a record, and it is named at the end of this amendment as
+   > the thing this text deliberately does not do.
+   >
+   > **The criterion is arithmetic about `p` as much as about sharing**, which the
+   > first bullet above already says: `(S + 16p)/(S + p) ≤ 1.2` is `S ≥ 74p`. So
+   > the gate's verdict is a function of the worker, and the worker in
+   > `frozen_workers.rs` is a Rust process. Every figure below was measured on
+   > 2026-08-17 on the development host — AMD EPYC-Milan, 4 physical / 8 logical
+   > cores, 31 GiB, Linux 6.8.0-136-generic, CPython 3.13.12, numpy 2.5.2,
+   > `transform_tree` 0.0.2. The Rust rows are `just gate4`'s own output. The
+   > Python rows are 16 workers run against **the same `.tft` that recipe writes**,
+   > each opening it after start, sweeping 64 stamps per edge over `Tree.span` for
+   > all 1 536 edges through `Plan.at_into` — the same lookup count the recipe
+   > reports — then reporting `Pss` from `/proc/self/smaps_rollup` behind a
+   > two-phase barrier, so no worker exits until every worker has sampled. That is
+   > the discipline the third bullet above insists on, for the reason it gives.
+   >
+   > ```
+   > $ just gate4
+   > building 64 robots x 40 s: 1537 frames, 1536 edges, 3225600 samples, 336.0 MiB arena
+   > wrote target/gate4/workers.tft — 338.0 MiB on disk (format 3)
+   > PHASE5 §12 gate 4 — 16 workers sharing one .tft, total Pss within 1.2x of one
+   >   .tft target/gate4/workers.tft (338.0 MiB)
+   >
+   >   workers     total Pss    per worker     lookups
+   >         1      230.0 MiB     229.95 MiB       98304
+   >        16      235.4 MiB      14.71 MiB     1572864
+   >
+   >   gate 4: 235.4 MiB / 230.0 MiB = 1.024x against 1.2x — PASS
+   >   solving total(N) = S + N*p over the two rows: S = 229.6 MiB shared, p = 0.36 MiB private per worker
+   >   the gate needs S >= 74x p, i.e. >= 27 MiB, and S is 230 MiB
+   >
+   > $ for w in 1 16; do python pss_run.py target/gate4/workers.tft $w touch; done
+   > W=1  touch=touch    total_pss_kib=262826    per_worker=262826.0
+   > W=16 touch=touch    total_pss_kib=469219    per_worker=29326.2      -> 1.7853x
+   > W=1  touch=touch    total_pss_kib=262777    per_worker=262777.0
+   > W=16 touch=touch    total_pss_kib=469233    per_worker=29327.1      -> 1.7856x
+   >
+   > $ for w in 1 16; do python pss_run.py target/gate4/workers.tft $w notouch; done
+   > W=1  touch=notouch  total_pss_kib=25487     per_worker=25487.0
+   > W=16 touch=notouch  total_pss_kib=225758    per_worker=14109.9      -> 8.86x
+   > ```
+   >
+   > **On gate 4's own fixture, gate 4's own criterion fails at 1.785× when the
+   > worker is a spawned Python process.** Solving the same two rows gives
+   > `S = 243.2 MiB, p = 13.44 MiB` — thirty-seven times the Rust worker's `p` —
+   > so `S ≥ 74p` wants **994 MiB** of arena and the fixture supplies 338. The
+   > no-touch control fails loudly at 8.86×, so neither Python arm is passing or
+   > failing vacuously.
+   >
+   > The same measurement on a second, smaller fixture (64 edges × 8 192 samples,
+   > a 39 MiB `.tft`) separates the start methods:
+   >
+   > | worker | measured `p` | minimum `S` for `S ≥ 74p` |
+   > |---|---|---|
+   > | Rust (`frozen_workers.rs`, the gate's own) | **0.36 MiB** | 27 MiB |
+   > | forked CPython + numpy | **3.36, 3.37 MiB** | 249 MiB |
+   > | spawned CPython + numpy | **14.23, 14.22 MiB** (39 MiB fixture) / **13.44 MiB** (gate fixture) | 1 053 / 994 MiB |
+   >
+   > Two repeats for each Python cell, agreeing to three significant figures; the
+   > Rust row is one run of `just gate4`, whose own third bullet above records
+   > that it reproduces to three decimals. The 0.8 MiB by which
+   > the spawned worker's `p` differs between the two fixtures is consistent with
+   > the worker's own output buffer — 8 191 × 4 × 4 × `f64` is 1.05 MB on the
+   > small fixture against 8 KB on the gate one — which is an explanation
+   > consistent with the numbers, not a second measurement of it. It is also the
+   > amendment's point in miniature: `p` is a property of the worker.
+   >
+   > [`0026`](./decisions/0026-the-corpus-shape-of-a-frozen-index.md) reached
+   > the same conclusion from a different corpus and its numbers are close but not
+   > identical — Rust 0.37, forked 2.24–2.72, spawned 13.24–13.74 MiB, giving
+   > minima of 27.4, 166 and 980 MiB, and a 788 MiB corpus failing at **1.248×**.
+   > The spawned and Rust rows agree with the two above; the forked row does not,
+   > 2.24 against 3.36, and the difference is left unattributed rather than
+   > explained away — the two worker bodies are not the same program, and no
+   > measurement here isolates which difference accounts for it. Either number
+   > puts the forked minimum in the hundreds of MiB and the spawned minimum near a
+   > gigabyte, which is the only thing the gate's arithmetic needs.
+   >
+   > **Why this matters beyond bookkeeping.** §4.3's amendment and `open_file`'s
+   > docstring both say the same thing: a `DataLoader` with `num_workers > 0`
+   > sends its dataset to the workers by pickle "under `spawn` *and* under
+   > `forkserver` — which is CPython 3.14's default start method on Linux, so
+   > this is the common case and not the exotic one". The wedge's audience is
+   > therefore the row with the largest `p` in the table, and a torch worker
+   > imports far more than numpy, so 13.44 MiB is a **floor** for it and not an
+   > estimate.
+   >
+   > **What is and is not host-bound.** No wall-clock figure appears in this
+   > amendment, deliberately: §9.3 forbids presenting one from this box as a gate.
+   > Every number above is a Pss byte count or a ratio of two, which is §9.3's
+   > `Memory` sensitivity — it fails on a debug build or an unreadable
+   > `smaps_rollup` and on nothing else. They are, however, **worker-bound**: `p`
+   > is a property of the interpreter, its extension modules and the worker's own
+   > allocations, and none of those are properties of `tf_tree`.
+   >
+   > **Three limits on these numbers, stated rather than left to be discovered.**
+   > The two arms are raw `subprocess` (a fresh interpreter, which brackets
+   > `spawn`) and raw `os.fork` — **no torch `DataLoader` was in the loop**, which
+   > is `0026`'s open question 2 and is unanswered here too. The interpreter is
+   > CPython 3.13, while the start-method claim above is about 3.14. And **there
+   > is no recipe for the Python rows**: `just gate4` regenerates the Rust row and
+   > nothing regenerates these, which is the same shape as a gate row that no
+   > workflow invokes. Any record that gives criterion 4 a second worker arm owes
+   > a recipe with it.
+   >
+   > **What this amendment does not do.** It does not change criterion 4, add a
+   > row, or move gate 4's **MET**. Whether the gate should acquire a second
+   > worker arm — and if so which start method it pins, and what corpus size that
+   > forces on the fixture — is a decision, and it needs a record.
+   >
+   > **What it obliges.** Wherever 1.024× is cited as evidence for the wedge —
+   > `README.md`, the §9 benchmark report, a talk — it is cited as *a Rust worker
+   > sharing a 338 MiB `.tft`*. Citing it bare, in front of a Python audience,
+   > claims a number this host measures at 1.785× on the same file.
+
 5. Ingest throughput ≥ **10× real time** on a representative recording. **Currently held by nobody: `crates/tf_tree_bench/benches/` has no ingest benchmark, so `just bench-check` cannot see a regression on this path.** Measured by hand it passes with a wide margin — 0.048 s for 160 000 transforms through a zstd recording composes to roughly 200× real time for a four-hour bag at 100 Hz × 50 transforms — but a hand measurement is not a gate. Adding one needs a corpus that is *not* produced by `ruzstd`'s own encoder, which understates a real recording's decode cost by about 1.3×; `crate::fixture::compress_records` carries that number.
 6. Every §6 check has a passing fixture test.
 7. Benchmark artifact runs from the published container on a clean machine and reproduces the committed `results.json` within tolerance.
