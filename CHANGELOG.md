@@ -45,6 +45,24 @@ is a bug.
   argument `offline.rs` already records for `.tft`: a missing attribute makes a
   portable script fail with `AttributeError` somewhere unrelated.
 
+### Note on 0.0.2's PyPI upload
+
+**0.0.2 published eleven wheels and no source distribution**, and the sdist for
+it can never be added under that version — PyPI refused it and the version is
+now partially published. `pip install transform_tree` works on every platform
+the wheels cover; a platform they do not cover has no source fallback until
+0.0.3.
+
+The sdist declared `License-File: LICENSE-APACHE` (and `LICENSE-MIT`, `NOTICE`)
+in its `PKG-INFO` and did not contain them. maturin auto-detects those files at
+the project root for PEP 639 but its sdist selection follows the cargo package
+rules, which never reach the workspace root — the tarball held only
+`Cargo.toml`, `PKG-INFO`, `pyproject.toml` and `README.md`. PyPI validates the
+pair and returns `400 License-File LICENSE-APACHE does not exist in
+distribution`. The wheels were never affected; only the sdist selection is.
+
+`[tool.maturin] include` now names the three files, and `twine check` passes.
+
 ### Note on 0.0.1
 
 **0.0.1 is a crates.io-only release.** All five crates are published at that

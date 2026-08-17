@@ -43,6 +43,19 @@ module-name = "tf_tree._core"
 python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
+# **The sdist declares these and would not ship them.** maturin auto-detects
+# root `LICENSE*` / `NOTICE` for PEP 639 and writes them into PKG-INFO as
+# `License-File:`, but its sdist file selection is driven by the cargo package
+# rules and never picks up files at the *workspace* root — so the tarball's root
+# held only Cargo.toml, PKG-INFO, pyproject.toml and README.md. PyPI validates
+# the pair and refuses the upload:
+#
+#   400 License-File LICENSE-APACHE does not exist in distribution
+#
+# It rejected the 0.0.2 sdist after the eleven wheels had already gone up, which
+# is why that release has wheels and no source distribution. The wheels were
+# never affected — only the sdist selection is.
+include = ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"]
 
 [tool.ruff]
 line-length = 88
