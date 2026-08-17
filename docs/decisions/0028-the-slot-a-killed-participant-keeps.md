@@ -6,6 +6,12 @@
 
 ## Context
 
+> **Line numbers.** Everything in *The defect* and *The ordering* is cited
+> against `f058f4f`, the commit this record was opened on. `528eddd` has
+> since landed the hangup patch and shifted `crates/tf_tree/src/open.rs` by
+> six lines from `spawn_owner_server` onward; both are given where the
+> distinction matters. Nothing outside that one function moved.
+
 ### The defect
 
 Filed as issue #184. `docs/PHASE2.md` §5.1 is NORMATIVE and says it in one
@@ -131,6 +137,26 @@ is about the workloads it does not model, and §0.0 already names the largest on
 *"The killed processes are joiners; the driver owns the rendezvous and is never
 killed."*
 
+**Not mine, and the one number that matters most.** The orchestrator has since
+run the same harness against an engine reverted to the pre-patch behaviour, and
+it fails rather than printing a green run:
+
+```
+RECOVERY FAILURE: 63 of 64 participant slot(s) hold a LIVE record for a process
+                  the kernel says is dead
+Error: the arena was being written on only 75/269 observation rounds ... a ring
+outlives the process that filled it, so those reads say nothing about a live
+arena.                                                                  exit=1
+```
+
+That closes the loop this record's *"a wedged arena scores perfectly"* section
+opens: the harness now detects the class **and says which of the two facts
+caught it**, so the failure cannot be re-hidden by a change that fixes the
+symptom and not the wedge. It is not yet the paired before/after on one binary
+lineage that *What would make this `ready`* asks for — that wants both commands
+recorded side by side against one build tree — but it is what makes the
+detection, rather than the fix, the durable part.
+
 ### The ordering, derived rather than assumed
 
 My brief warned of a window in which the record is already `LIVE` or `RESERVED`
@@ -139,7 +165,8 @@ participant that is merely starting. **On the joiner path that window does not
 exist, and it is the reverse that does.** The order is:
 
 1. Owner's `assign` closure picks a slot and sets its `granted` bit
-   (`tf_tree/src/open.rs:703–726`), then `HelloResponse` is sent
+   (`tf_tree/src/open.rs:703–726` at `f058f4f`, `709–732` at `HEAD`), then
+   `HelloResponse` is sent
    (`tf_tree_ipc/src/server.rs:409–443`).
 2. Client takes the **lock byte**: `Open::register_at`
    (`tf_tree_ipc/src/open.rs:408–419`) does `write_identity` then
@@ -298,7 +325,8 @@ wrong:
 
 **3. The assigner decides from the byte.** Replace the `identity(slot).is_some()`
 skip with the byte probe that is already in scope eight lines below
-(`open.rs:717`), and on `byte free + record not FREE` run the predicate and, if
+(`open.rs:717` at `f058f4f`, `723` at `HEAD`), and on
+`byte free + record not FREE` run the predicate and, if
 it fires, `reclaim` before granting. The near miss #184 identified is the whole
 point: **the authoritative signal is already at the point of decision, being
 consulted for the read-only case and ignored for this one.**
@@ -952,7 +980,7 @@ commit that adds it.
    unconditionally)**. The third is the eviction test and is the reason the
    predicate has two facts; it must exist before step 3.
 3. **The assigner decides from the byte** and reclaims before granting
-   (`open.rs:703`).
+   (`open.rs:709` at `HEAD`; `703` at `f058f4f`).
    *Verified by:* §11.2 scenario 2b above — 128 sequential attach-then-`SIGKILL`
    cycles against a 64-slot arena, every attach succeeding. Fails at HEAD on the
    65th, which is what makes it a falsifier rather than a regression test.
