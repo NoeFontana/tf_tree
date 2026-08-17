@@ -108,6 +108,28 @@ mod imp {
     /// Against the harness this replaced, where a *child* owned the rendezvous,
     /// seed 999 in the second of those configurations averaged exactly 0 and
     /// exited `PASS`.
+    ///
+    /// # Half of that calibration is refuted, and the floor stays anyway
+    ///
+    /// The 15 s / 6 children / 6 Hz half was measured against a wedged arena.
+    /// Before the owner-side fix in `crates/tf_tree/src/open.rs`, that
+    /// configuration exhausted the 64-slot participant table about ten seconds
+    /// in (see [`check_recovery`]), so from two thirds of the way through there
+    /// was no writer left — and the composed count does not notice, because four
+    /// frozen rings whose windows overlap answer every lookup. Measured
+    /// 2026-08-17 on the unfixed build, `--duration 60s --children 6
+    /// --kill-hz 6 --seed 4242`: **93 689 of 93 952 composed reads, 99.7%, on a
+    /// run whose arena had a live writer on 21% of its rounds** and whose
+    /// freshest sample averaged 16.9 seconds old. So "248 per round" was never
+    /// evidence that the reader worked; it is equally compatible with the reader
+    /// working perfectly and nothing being under test.
+    ///
+    /// The floor is **not** lowered on the strength of that, because nothing
+    /// about it was too high — it is a *lower* bound on reading, and reading is
+    /// still required. What was missing is the orthogonal bound:
+    /// [`RoundHealth::arena_is_live`], which asks whether anybody was writing.
+    /// A number that cannot distinguish a healthy run from a dead one is not
+    /// corrected by moving it.
     const MIN_CHAIN_READS_PER_ROUND: u64 = 16;
 
     /// The same floor for single-edge reads, of which each round attempts 64.
@@ -451,6 +473,13 @@ mod imp {
         let mut rounds = 0u64;
         let mut violations = Vec::new();
         let interval = Duration::from_secs_f64(1.0 / a.kill_hz);
+        let started = Instant::now();
+        // Two accumulators: the whole run, and the last hundred rounds. The
+        // second is what dates the moment an arena stopped being written —
+        // without it a 30-minute failure is one average over a run that was
+        // healthy for the first thirty seconds.
+        let mut health = Health::default();
+        let mut window = Health::default();
 
         while Instant::now() < deadline {
             // Jitter, so the kills do not land in phase with any loop a child
@@ -465,7 +494,14 @@ mod imp {
             let left = deadline.saturating_duration_since(Instant::now());
             std::thread::sleep(interval.mul_f64(jitter).min(left));
 
-            reads.add(observe(&observer, &mut rng, &mut violations));
+            let mut round = RoundHealth::default();
+            reads.add(observe(&observer, &mut rng, &mut violations, &mut round));
+            health.add(round);
+            window.add(round);
+            if health.rounds % 100 == 0 {
+                println!("{}", window.line(started.elapsed()));
+                window = Health::default();
+            }
             rounds += 1;
             reap_finished(&mut kids, &mut violations);
             if !violations.is_empty() {
@@ -495,7 +531,9 @@ mod imp {
         // Give the survivors a moment to exit on their own so a violation
         // detected in the last instant is not lost to the teardown.
         std::thread::sleep(Duration::from_millis(200));
-        reads.add(observe(&observer, &mut rng, &mut violations));
+        let mut round = RoundHealth::default();
+        reads.add(observe(&observer, &mut rng, &mut violations, &mut round));
+        health.add(round);
         rounds += 1;
         reap_finished(&mut kids, &mut violations);
         // Kill every remaining child *before* the recovery check: "no claim is
@@ -531,6 +569,7 @@ mod imp {
             reads.chain, reads.edge
         );
 
+        println!("{}", health.line(started.elapsed()));
         println!(
             "shm_torture: {kills} kills, {} violation(s)",
             violations.len()
@@ -541,6 +580,15 @@ mod imp {
         let recovery = recovery?;
         for line in &recovery.notes {
             println!("  {line}");
+        }
+        // **Printed here, bailed on at the end.** The recovery failures are the
+        // most causal thing this run knows — a leaked participant slot is why a
+        // later check will say the observer read a frozen arena — but the
+        // ordering of the *bails* below is load-bearing for the self-test, which
+        // asserts on which message a deliberately-broken run produces. So the
+        // diagnosis is always visible even when a different check fires first.
+        for f in &recovery.failures {
+            println!("  RECOVERY FAILURE: {f}");
         }
         if !violations.is_empty() {
             bail!(
@@ -589,16 +637,43 @@ mod imp {
                 "the observer validated {} composed and {} single-edge transforms over \
                  {rounds} rounds, under the floor of {want_chain}/{want_edge}. This run \
                  proves nothing: `0 violation(s)` is also what a harness that never read \
-                 anything prints. Something is wrong with the reader (see \
-                 `common_window`) or with the rendezvous, not necessarily with the arena.",
+                 anything prints. {}.\n\nRead that as follows. The composed read needs \
+                 one stamp all four rings can answer at once, so it collapses when one \
+                 edge stops being written while the others keep wrapping past it; the \
+                 single-edge reads need only their own ring and keep succeeding on a ring \
+                 nobody has touched for an hour. `writers` at or near 0 with a large \
+                 `freshest` therefore means the arena was not being written at all — look \
+                 at the `could not join` lines on stderr and at the leaked-slot count \
+                 above, not at `common_window`.",
                 reads.chain,
-                reads.edge
+                reads.edge,
+                health.diagnosis()
+            );
+        }
+        // **A run nobody was writing to proves nothing either, and it does not
+        // trip the floor above.** A ring outlives its writer, so four frozen
+        // rings that happen to overlap answer all 256 composed reads a round
+        // forever — measured on this host at 256.0 per round with every child
+        // locked out of the arena and the last write 28 minutes old. That is a
+        // green run over a dead arena, and it is strictly worse than the red one
+        // the same wedge produced on CI, where the four rings froze without an
+        // overlap. This is the check that does not care which way they fell.
+        //
+        // Half the rounds, not all of them: `--kill-hz` guarantees stretches
+        // with no writer on a given edge, and that is the state under test.
+        if health.live_rounds * 2 < rounds {
+            bail!(
+                "the arena was being written on only {}/{rounds} observation rounds: for the \
+                 rest of the run no chain edge had a live writer, or the freshest sample on \
+                 any of the four was over a second old. The {} transforms the observer \
+                 validated came out of rings whose writers were gone — a ring outlives the \
+                 process that filled it, so those reads say nothing about a live arena.\n\n{}",
+                health.live_rounds,
+                reads.total(),
+                health.diagnosis()
             );
         }
         if !recovery.failures.is_empty() {
-            for f in &recovery.failures {
-                eprintln!("  {f}");
-            }
             bail!(
                 "{} recovery failure(s) after the run",
                 recovery.failures.len()
@@ -781,12 +856,243 @@ mod imp {
         }
     }
 
-    /// A burst of checked reads from the never-killed observer.
+    /// What one observation round saw *besides* the transforms it validated.
+    ///
+    /// # Why the read counts are not enough, which is not hypothetical
+    ///
+    /// A ring in a shared arena outlives the process that filled it. So an arena
+    /// whose writers have all gone away still answers every lookup inside the
+    /// window it froze with, for as long as the segment lives — and
+    /// [`Reads`] cannot tell that from an arena six processes are hammering.
+    /// Measured on this host, 2026-08-17, on the 30-minute nightly
+    /// configuration: at minute 17 no child had the segment mapped at all, the
+    /// last writer had died at about t = 30 s, and the observer was still
+    /// scoring the full 256 composed reads per round out of four dead rings
+    /// whose windows happened to overlap. The run would have printed `PASS`.
+    ///
+    /// The same wedge on the GitHub runner froze the four rings *without* an
+    /// overlap, so the composed count went to ~0 and the read floor caught it —
+    /// which is the only reason anybody looked. A gate that depends on which way
+    /// four dead rings happen to fall is not a gate, so everything below is
+    /// checked on every round and reported whether the run passes or fails.
+    #[derive(Default, Clone, Copy)]
+    struct RoundHealth {
+        /// How many chain edges reported a window at all. Fewer than
+        /// `CHAIN.len()` means an edge has never been written.
+        windows: usize,
+        /// Did the four windows intersect?
+        overlap: bool,
+        /// Width of the intersection, ns (`overlap`), or how far apart the
+        /// nearest pair was (`!overlap`).
+        width: i64,
+        gap: i64,
+        /// Index into [`CHAIN`] of the edge whose `newest` was the minimum —
+        /// the one holding the intersection back — and of the edge whose
+        /// `oldest` was the maximum.
+        laggard: usize,
+        blocker: usize,
+        /// Composed reads that succeeded, of the 256 attempted.
+        chain_ok: u64,
+        /// `now - newest` for the *freshest* chain edge, ns. This is the number
+        /// that says whether anybody is still writing.
+        freshest_age: i64,
+        /// Chain edges whose claim word names a participant that is still
+        /// alive / is already dead / is free.
+        writers_live: u64,
+        writers_dead: u64,
+        /// Participant slots holding a `LIVE` record, and slots the kernel
+        /// agrees are alive. **These two disagreeing is the leak** — see
+        /// [`check_recovery`].
+        slots_registered: u64,
+        slots_alive: u64,
+    }
+
+    impl RoundHealth {
+        /// Was the arena *being written* during this round?
+        ///
+        /// Both halves are needed. A live claim holder that is not pushing
+        /// leaves the rings frozen; a recent sample with no holder is the
+        /// hundred milliseconds after a writer died. Only the conjunction says
+        /// the torture is still happening.
+        ///
+        /// One second, and the derivation rather than a tuned constant: `work`
+        /// paces itself at ~1 kHz and publishes on 40% of its operations, so a
+        /// held edge is written every ~2.5 ms. A hundredfold slowdown still
+        /// leaves the freshest edge a quarter of a second old. What this is
+        /// written against is minutes, not milliseconds.
+        fn arena_is_live(self) -> bool {
+            self.writers_live > 0 && self.freshest_age < 1_000_000_000
+        }
+    }
+
+    /// [`RoundHealth`] summed over a run, or over the last hundred rounds.
+    #[derive(Default, Clone, Copy)]
+    struct Health {
+        rounds: u64,
+        short: u64,
+        overlap: u64,
+        live_rounds: u64,
+        chain_ok: u64,
+        width_sum: i64,
+        gap_sum: i64,
+        gap_max: i64,
+        laggard: [u64; CHAIN.len()],
+        freshest_sum: i64,
+        freshest_max: i64,
+        writers_live_sum: u64,
+        writers_dead_sum: u64,
+        slots_registered_max: u64,
+        slots_alive_min: u64,
+    }
+
+    impl Health {
+        fn add(&mut self, h: RoundHealth) {
+            if self.rounds == 0 {
+                self.slots_alive_min = u64::MAX;
+            }
+            self.rounds += 1;
+            if h.windows != CHAIN.len() {
+                self.short += 1;
+            }
+            if h.overlap {
+                self.overlap += 1;
+                self.width_sum += h.width;
+            } else if h.windows == CHAIN.len() {
+                self.gap_sum += h.gap;
+                self.gap_max = self.gap_max.max(h.gap);
+                self.laggard[h.laggard.min(CHAIN.len() - 1)] += 1;
+            }
+            if h.arena_is_live() {
+                self.live_rounds += 1;
+            }
+            self.chain_ok += h.chain_ok;
+            self.freshest_sum += h.freshest_age;
+            self.freshest_max = self.freshest_max.max(h.freshest_age);
+            self.writers_live_sum += h.writers_live;
+            self.writers_dead_sum += h.writers_dead;
+            self.slots_registered_max = self.slots_registered_max.max(h.slots_registered);
+            self.slots_alive_min = self.slots_alive_min.min(h.slots_alive);
+        }
+
+        /// The one-line periodic summary. **One space after the prefix**, not
+        /// three: `tests/torture.rs` finds the composed-read total by taking the
+        /// first `shm_torture:   ` line, and a second one would shadow it.
+        fn line(&self, elapsed: Duration) -> String {
+            let r = self.rounds.max(1) as f64;
+            format!(
+                "shm_torture: t={:.0}s rounds={} composed={}/{} overlap={:.0}% \
+                 window={:.0}ms freshest={:.0}ms writers={:.1}/4 slots={}reg/{}alive live={:.0}%",
+                elapsed.as_secs_f64(),
+                self.rounds,
+                self.chain_ok,
+                self.rounds * 256,
+                100.0 * self.overlap as f64 / r,
+                self.width_sum as f64 / self.overlap.max(1) as f64 / 1e6,
+                self.freshest_sum as f64 / r / 1e6,
+                self.writers_live_sum as f64 / r,
+                self.slots_registered_max,
+                if self.slots_alive_min == u64::MAX {
+                    0
+                } else {
+                    self.slots_alive_min
+                },
+                100.0 * self.live_rounds as f64 / r,
+            )
+        }
+
+        /// The sentence a failing run should not make the next person derive.
+        fn diagnosis(&self) -> String {
+            let r = self.rounds.max(1) as f64;
+            let worst = self
+                .laggard
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, n)| **n)
+                .map_or(0, |(i, _)| i);
+            let (parent, child) = CHAIN[worst];
+            format!(
+                "the four chain windows intersected on {}/{} rounds ({:.1}%); on {} rounds an \
+                 edge had never been written at all. When they did not intersect the nearest \
+                 pair was {:.0} ms apart (worst {:.0} ms) and the edge holding the \
+                 intersection back was most often {parent}->{child}. Averaged over the run \
+                 the freshest of the four edges was {:.0} ms old (worst {:.0} ms) and {:.2} of \
+                 the 4 chain edges had a *live* writer; {} participant slot(s) held a LIVE \
+                 record at the high-water mark while as few as {} were alive by the kernel's \
+                 answer",
+                self.overlap,
+                self.rounds,
+                100.0 * self.overlap as f64 / r,
+                self.short,
+                self.gap_sum as f64 / (self.rounds - self.overlap).max(1) as f64 / 1e6,
+                self.gap_max as f64 / 1e6,
+                self.freshest_sum as f64 / r / 1e6,
+                self.freshest_max as f64 / 1e6,
+                self.writers_live_sum as f64 / r,
+                self.slots_registered_max,
+                if self.slots_alive_min == u64::MAX {
+                    0
+                } else {
+                    self.slots_alive_min
+                },
+            )
+        }
+    }
+
+    /// Read the four chain edges' claim words and the participant table.
+    ///
+    /// **Two predicates, deliberately.** `slots_registered` counts records whose
+    /// `state` is `LIVE`, which is what the arena owner's slot assigner in
+    /// `crates/tf_tree/src/open.rs` consults before granting a slot;
+    /// `slots_alive` counts the ones the *kernel* agrees are alive, which is
+    /// what `docs/PHASE2.md` §5 says liveness is ("any code deciding liveness
+    /// from `state` or `heartbeat` is a bug"). A healthy arena has them equal.
+    /// Their difference is §11.4's leaked participant slot, and it is invisible
+    /// to either predicate alone.
+    fn census(tree: &Tree, h: &mut RoundHealth) {
+        let view = tree.arena_view();
+        for edge in 0..view.header().max_edges.min(CHAIN.len() as u32) {
+            let Some(rec) = view.claim(EdgeId(edge)) else {
+                continue;
+            };
+            let owner = rec.owner.load(Ordering::Acquire);
+            if owner == 0 {
+                continue;
+            }
+            // `slot_of`, not a hand-rolled `& 0xFFFF`: the owner word packs
+            // `(epoch << 16) | (slot + 1)` and reserves a `CLAIMING` sentinel
+            // for a claim in flight, and only the shared helper knows both. A
+            // second spelling here would resolve the sentinel to a plausible
+            // slot number and count a claim nobody holds as a live writer.
+            let slot = tf_tree_core::edge::slot_of(owner);
+            if slot != u32::MAX && tree.participant_alive(slot) {
+                h.writers_live += 1;
+            } else {
+                h.writers_dead += 1;
+            }
+        }
+        let me = tree.participant_slot();
+        let table = view.participants();
+        for slot in 0..table.capacity() as u32 {
+            if slot == me {
+                continue;
+            }
+            if table.identity(slot).is_some() {
+                h.slots_registered += 1;
+            }
+            if tree.participant_alive(slot) {
+                h.slots_alive += 1;
+            }
+        }
+    }
+
+    /// A burst of checked reads from the never-killed observer, and a
+    /// [`RoundHealth`] describing the arena they came out of.
     ///
     /// Returns how many transforms were validated, which the run prints and
     /// [`drive`] enforces a floor on. A count is not decoration here: "0
     /// violations" and "0 reads" print the same verdict, and only one of them is
-    /// a result.
+    /// a result — and neither is "256 reads out of four rings nobody has written
+    /// since the first minute", which is what `health` exists to say.
     ///
     /// Both shapes are read. The composed `map -> tool` is the one §11.4 is
     /// about — a bad sample on any edge reaches it — but it needs all four
@@ -794,10 +1100,44 @@ mod imp {
     /// they keep validating across the moments when the chain cannot be read at
     /// all, and they still see the injected corruption: the injector writes NaN
     /// to whichever single edge it holds.
-    fn observe(tree: &Tree, rng: &mut Rng, violations: &mut Vec<String>) -> Reads {
+    fn observe(
+        tree: &Tree,
+        rng: &mut Rng,
+        violations: &mut Vec<String>,
+        health: &mut RoundHealth,
+    ) -> Reads {
         let mut reads = Reads::default();
         let guard = tree.guard();
         let windows = edge_windows(tree, &guard);
+
+        // **Measured before the reads, not after.** Everything here is a
+        // statement about the arena this round's reads came out of, and the
+        // reads themselves take long enough for a writer to move.
+        health.windows = windows.len();
+        let now = now_nanos();
+        health.freshest_age = windows
+            .iter()
+            .map(|w| now.saturating_sub(w.newest))
+            .min()
+            .unwrap_or(i64::MAX);
+        census(tree, health);
+        // `let Some(..)` rather than `expect`: both are `None` only when no edge
+        // reported a window at all, in which case there is no laggard to name
+        // and `Health::add` records the round as `short` from `windows`. A
+        // 30-minute soak must not panic over a diagnostic.
+        if let (Some(blocker), Some(laggard)) = (
+            windows.iter().max_by_key(|w| w.oldest),
+            windows.iter().min_by_key(|w| w.newest),
+        ) {
+            health.blocker = blocker.which;
+            health.laggard = laggard.which;
+            if windows.len() == CHAIN.len() && blocker.oldest <= laggard.newest {
+                health.overlap = true;
+                health.width = laggard.newest - blocker.oldest;
+            } else {
+                health.gap = blocker.oldest - laggard.newest;
+            }
+        }
 
         for w in &windows {
             let (parent, child) = CHAIN[w.which];
@@ -832,6 +1172,7 @@ mod imp {
             let at = pick(rng, window);
             if let Ok(iso) = plan.at::<tf_tree::SystemDomain>(&guard, Stamp::from_nanos(at)) {
                 reads.chain += 1;
+                health.chain_ok += 1;
                 if let Err(why) = Invariant::check(&iso) {
                     violations.push(format!(
                         "the observer read a bad transform: map->tool at {at}: {why}"
@@ -913,7 +1254,72 @@ mod imp {
             }
         }
 
+        // §11.4's "participant ... slots never leak", and it needs **both**
+        // predicates, because the two can disagree and the disagreement *is* the
+        // leak.
+        //
+        // `participant_alive` is the kernel's answer: `state == LIVE` *and* the
+        // participant's OFD lock byte still held. A `SIGKILL`ed child's byte is
+        // released by the kernel, so that predicate reports it dead — and the
+        // `live` loop below therefore finds nothing, which is exactly what this
+        // function did for the life of the harness while sitting on an arena
+        // that had run out of slots half an hour earlier.
+        //
+        // The arena's owner uses the other one. Its slot assigner
+        // (`crates/tf_tree/src/open.rs`) skips any slot where
+        // `table.identity(slot).is_some()` — `state == LIVE`, no liveness check
+        // — and `ParticipantTable::register_at` fills only a `FREE` slot. So a
+        // record left `LIVE` by a process that never got to run `Drop` is a slot
+        // no future participant can be granted, and the only thing that clears
+        // one is a `LIVE -> FREE` CAS somebody has to perform.
+        //
+        // # What this found, and what fixed it
+        //
+        // Nothing performed that CAS. `docs/PHASE2.md` §3.9 says a dying
+        // participant's records are reaped by the owner and §5 says liveness is
+        // a kernel fact — "any code deciding liveness from `state` or
+        // `heartbeat` is a bug" — but the owner's hangup callback only cleared
+        // its own `granted` bitmask. Measured 2026-08-17 on the unfixed build,
+        // at `--children 6 --kill-hz 6`: 63 of the 64 slots held records for
+        // dead pids within the first hundred rounds, 8193 attaches were refused
+        // `NoParticipantSlots` in sixty seconds, and `tf_tree participants`
+        // against a live 30-minute run printed one `live` row and 63 `stale`
+        // ones. The table holds `DEFAULT_MAX_PARTICIPANTS` = 64 and a run leaks
+        // one per `SIGKILL`, so at 6 Hz it wedges about ten seconds in — which
+        // is why `tests/torture.rs`'s 8 s clean case never saw it and the
+        // 30-minute nightly spent 99% of itself reading rings whose writers were
+        // gone.
+        //
+        // The owner now releases the record in its hangup callback, which is
+        // §3.9 implemented. Measured after, 728 kills over 120 s: the registered
+        // slot count never left 5 of 64.
+        //
+        // This check stays because that fix is one CAS in one callback on one
+        // code path, and the failure it prevents is silent by construction: a
+        // wedged arena reads exactly like a healthy one. `arena_is_live` catches
+        // the *consequence* a round at a time; this names the cause.
         let table = view.participants();
+        let mut leaked = Vec::new();
+        for slot in 0..table.capacity() as u32 {
+            if slot != me && table.identity(slot).is_some() && !tree.participant_alive(slot) {
+                leaked.push(slot);
+            }
+        }
+        if !leaked.is_empty() {
+            out.failures.push(format!(
+                "{} of {} participant slot(s) hold a LIVE record for a process the kernel \
+                 says is dead {:?}{}. These are leaked: the arena owner's slot assigner \
+                 refuses a slot whose record reads LIVE, and `register_at` only fills a FREE \
+                 one, so no process can ever be granted them again. `docs/PHASE2.md` §11.4 \
+                 requires that participant slots never leak and §5 requires that liveness \
+                 come from the lock byte, never from `state`.",
+                leaked.len(),
+                table.capacity(),
+                &leaked[..leaked.len().min(8)],
+                if leaked.len() > 8 { " ..." } else { "" },
+            ));
+        }
+
         let mut live = Vec::new();
         for slot in 0..table.capacity() as u32 {
             if slot != me && tree.participant_alive(slot) {
@@ -950,6 +1356,8 @@ mod imp {
             }
         }
         let mut rng = Rng::new(seed);
+        // One `could not join` line per process; see the arm below.
+        let mut reported = false;
 
         loop {
             // `Never`, in every child: the driver creates and serves the arena
@@ -968,7 +1376,23 @@ mod imp {
                 // Expected while an owner is being killed: back off and retry
                 // rather than exiting, so the driver does not have to
                 // distinguish "lost a race" from "the arena is broken".
-                Err(_) => {
+                // **Printed, not swallowed — but once per process.** A child
+                // that can never join is the failure this harness spent its
+                // life unable to see: it leaves every ring frozen, and a frozen
+                // ring answers lookups exactly like a live one, so the driver's
+                // read counts stay perfect while nothing is under test. The
+                // reason belongs in the log by name (`NoParticipantSlots` is a
+                // different bug from `ArenaHeldButUnreachable`) and no reader
+                // needs it twice: a child retries this loop tens of times a
+                // second, and a healthy run prints none of these at all.
+                Err(e) => {
+                    if !reported {
+                        reported = true;
+                        eprintln!(
+                            "shm_torture: child {} could not join: {e}",
+                            std::process::id()
+                        );
+                    }
                     std::thread::sleep(Duration::from_millis(10 + rng.below(40)));
                     continue;
                 }
