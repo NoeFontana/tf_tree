@@ -16,7 +16,7 @@ name = "transform_tree"
 # without being asked twice. The wheel's compatibility promise is therefore
 # written down — in `CHANGELOG.md` and `SUPPORT.md` — rather than encoded in
 # the number, and it is the same promise the crates make: none.
-version = "0.0.1"
+version = "0.0.2"
 description = "A transform tree engine — faster and more scalable than ROS tf2"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

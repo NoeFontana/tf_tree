@@ -31,7 +31,35 @@ is a bug.
 
 ---
 
-## [0.0.1] — unreleased
+## [0.0.2] — unreleased
+
+### Fixed
+
+- **The Python binding did not compile on macOS or Windows.** `tf_tree_py`
+  imported `OpenError` and `AttachMode` unconditionally and named
+  `Open`/`CreatePolicy` in `open_arena`, all of which the facade gates on
+  `#[cfg(all(feature = "shm", target_os = "linux"))]`. Since the binding always
+  enables `shm`, it is the *target* that decides, and four `wheels.yml` rows —
+  both Windows, both macOS — failed with `E0432`/`E0433`. `open_arena` now keeps
+  a paired non-Linux arm that refuses with a message naming the platform, on the
+  argument `offline.rs` already records for `.tft`: a missing attribute makes a
+  portable script fail with `AttributeError` somewhere unrelated.
+
+### Note on 0.0.1
+
+**0.0.1 is a crates.io-only release.** All five crates are published at that
+version and stay published; no wheel exists for it and none can, because the
+commit it was cut from is the one that did not compile off Linux. The bug was
+invisible until the `v0.0.1` tag ran `wheels.yml` for the first time in the
+project's life — no workflow had run here between 2026-07-23 and 2026-08-16, and
+that one triggers only on a `v*` tag.
+
+0.0.2 is the first release published from a tag to **both** registries, and the
+first to use Trusted Publishing on either: crates.io by OIDC through
+`release.yml`, PyPI through its pending publisher in `wheels.yml`. Neither uses
+a stored token.
+
+## [0.0.1] — 2026-08-17 (crates.io only)
 
 First publish. The date goes in with the tag; until then nothing has been
 uploaded to crates.io or PyPI.
