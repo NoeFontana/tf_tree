@@ -655,15 +655,21 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
         .ok_or(OpenError::Rendezvous(IpcError::ArenaAbsent))?;
     let segment = rustix_dup(segment).map_err(OpenError::Rendezvous)?;
 
-    // A second, read-only mapping so the serving thread can read the
-    // participant table without borrowing the `Tree`. One extra mapping of an
-    // already-resident segment costs page-table entries and nothing else, and
-    // it keeps the thread's lifetime independent of the handle a caller holds.
+    // A second mapping so the serving thread can reach the participant table
+    // without borrowing the `Tree`. One extra mapping of an already-resident
+    // segment costs page-table entries and nothing else, and it keeps the
+    // thread's lifetime independent of the handle a caller holds.
+    //
+    // **Read-write, and it used to be read-only.** §3.9 says that when a
+    // participant dies "the owner reaps its arena-side records"; the hangup
+    // callback below is where that happens, and freeing a record is a CAS on the
+    // arena. An owner always has a writable segment — it either created it or
+    // took over by building one — so this cannot demote a read-only attachment.
     let table_fd = {
         use std::os::fd::AsFd;
         rustix_dup(segment.as_fd()).map_err(OpenError::Rendezvous)?
     };
-    let table_arena = tf_tree_arena::MappedArena::attach(table_fd, AttachMode::ReadOnly)?;
+    let table_arena = tf_tree_arena::MappedArena::attach(table_fd, AttachMode::ReadWrite)?;
 
     let running = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&running);
@@ -723,6 +729,40 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     Err(HelloStatus::NoParticipantSlots)
                 },
                 |slot| {
+                    // **§3.9: "the owner reaps its arena-side records".** This
+                    // is that sentence, and until it was written here nothing in
+                    // the workspace performed it.
+                    //
+                    // A participant that is `SIGKILL`ed never runs `Tree`'s
+                    // `Drop`, so its record stays `LIVE` for ever — and `assign`
+                    // above skips a `LIVE` slot while `register_at` fills only a
+                    // `FREE` one, so that slot could never be granted to anybody
+                    // again. Measured before this existed, with
+                    // `shm_torture --kill-hz 6`: 63 of the 64 slots held records
+                    // for dead pids after thirty seconds, every subsequent
+                    // attach was refused `NoParticipantSlots`, and the arena ran
+                    // the remaining 29 minutes with no writer at all while the
+                    // observer read four frozen rings and scored a perfect 256
+                    // composed lookups per round out of them.
+                    //
+                    // **The incarnation is what makes this safe.**
+                    // `ParticipantTable::release` is a single CAS of
+                    // `live_word(incarnation) -> FREE`, so it frees the slot only
+                    // if it is still the same occupancy this hangup is about. A
+                    // participant that detached cleanly already released it and
+                    // the CAS no-ops; one whose slot has since been re-granted
+                    // has a different incarnation and the CAS fails. Neither can
+                    // free a live participant's slot, which is the property
+                    // `release`'s own doc comment is written around.
+                    //
+                    // Before the `granted` bit, so no `assign` can hand the slot
+                    // out between the two — they run on this one thread, but the
+                    // ordering costs nothing and does not rely on that.
+                    let view = tf_tree_core::arena_view::ArenaView::new(&table_arena);
+                    let table = view.participants();
+                    if let Some((_pid, _start, incarnation)) = table.identity(slot) {
+                        table.release(slot, incarnation);
+                    }
                     // D17: the socket closed, so that participant is gone and
                     // its slot can be handed out again.
                     granted_hangup.set(granted_hangup.get() & !(1u64 << slot));
