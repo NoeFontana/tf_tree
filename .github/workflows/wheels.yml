@@ -177,3 +177,18 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           attestations: true
+          # **Because a partial upload is a state this workflow can reach.**
+          # twine uploads file by file; if PyPI refuses one, the files before it
+          # are already published and the version cannot be re-cut. 0.0.2 landed
+          # exactly there — eleven wheels accepted, then the sdist refused with
+          # `400 License-File LICENSE-APACHE does not exist in distribution`.
+          #
+          # Without this, the dispatch that completes such a release fails on
+          # the first already-published wheel and never reaches the missing
+          # file. Rebuilt wheels are not byte-identical to the uploaded ones, so
+          # "upload only what is new" is not something the matrix can decide.
+          #
+          # It is narrow: PyPI still refuses a *different* file under an
+          # existing name, so this cannot overwrite a published artifact — it
+          # only declines to treat "already there" as an error.
+          skip-existing: true
