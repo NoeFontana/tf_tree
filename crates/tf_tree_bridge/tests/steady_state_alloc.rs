@@ -41,26 +41,75 @@
 //! The `CountingAllocator` is copied from `crates/tf_tree_bench/tests/zero_alloc.rs`,
 //! which established the pattern; the `unsafe` is confined to this test target
 //! and the library crate stays `#![forbid(unsafe_code)]`.
+//!
+//! **A copied instrument does not inherit its original's later fixes**, and this
+//! file is the evidence. The copy was taken on 2026-07-27; six days later
+//! `zero_alloc.rs` was found to be counting other threads' allocations and made
+//! thread-local, and nothing carried that across. See the counter's own comment
+//! for what that does and does not explain about the failures above.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use tf_tree_bridge::{Action, Ingest, Publisher, Sample, SteadyNanos, Topic, TopologyConfig};
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Allocating calls (`alloc` + `realloc`) made **by this thread**.
+    ///
+    /// Deliberately character-for-character the counter in
+    /// `crates/tf_tree_bench/tests/zero_alloc.rs`, so the two can be diffed. That
+    /// file carries the argument; this is the short version. A process-global
+    /// counter charges the measured window for whatever else the process does
+    /// while it is open, and none of that is a property of `offer`.
+    ///
+    /// **This file had the defect that file already fixed.** The counter here was
+    /// copied from `zero_alloc.rs` on 2026-07-27 (`3f39f9b`); `zero_alloc.rs`
+    /// became thread-local on 2026-08-02 (`f53198c`, "the zero-alloc gate counted
+    /// other threads' allocations"), six days later, and the fix was never
+    /// carried across.
+    ///
+    /// What that does and does not settle for #178, because the two are easy to
+    /// run together. It does NOT explain the `4004`-against-`4000` CI failures:
+    /// `zero_alloc.rs` was off by ~4000 because a *sibling test* on another
+    /// thread allocated thousands of times, and this target has one test, so its
+    /// only other thread is libtest's own — which is a plausible source of four
+    /// allocations but has not been shown to be the source of these four. What it
+    /// does settle is which of #178's two hypotheses can still be standing. They
+    /// have opposite fixes; narrowing the instrument first is correct under
+    /// either, so it is done before the search rather than after it.
+    ///
+    /// `const { Cell::new(0) }` is required, not stylistic: a lazily-initialised
+    /// thread-local can allocate on first access, and doing that *inside* the
+    /// global allocator would recurse.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// This thread's allocating-call count.
+///
+/// `try_with` rather than `with`: during thread teardown the local may already
+/// be destroyed, and a panic from inside the allocator is not recoverable.
+fn allocations() -> usize {
+    ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Record one allocating call on this thread, if the local is still live.
+fn note_allocation() {
+    let _ = ALLOCATIONS.try_with(|c| c.set(c.get().wrapping_add(1)));
+}
 
 /// A `System`-backed allocator that counts allocating calls.
 struct CountingAllocator;
 
 // SAFETY: `CountingAllocator` forwards every call unchanged to `System`, which is
-// a sound `GlobalAlloc`. The only added work is a `Relaxed` atomic increment on
-// the allocating paths, which cannot affect the returned pointers or their
-// validity. This impl therefore upholds every `GlobalAlloc` invariant `System`
-// upholds. (Test-only binary; `tf_tree_bridge` proper is `#![forbid(unsafe_code)]`.)
+// a sound `GlobalAlloc`. The only added work is a non-allocating, non-panicking
+// increment of a thread-local `Cell` on the allocating paths, which cannot affect
+// the returned pointers or their validity. This impl therefore upholds every
+// `GlobalAlloc` invariant `System` upholds. (Test-only binary; `tf_tree_bridge`
+// proper is `#![forbid(unsafe_code)]`.)
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_allocation();
         // SAFETY: forwarding an unmodified `layout` to the system allocator.
         unsafe { System.alloc(layout) }
     }
@@ -73,7 +122,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        note_allocation();
         // SAFETY: `ptr`/`layout` originate from `System` and `new_size` is
         // passed through unchanged, satisfying `System::realloc`'s contract.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -132,14 +181,14 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
 
     // **Two windows, and the second is the answer.** See `SLOPE_NOT_INTERCEPT`.
     let mut window = |from: i64| {
-        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        let before = allocations();
         for k in 0..ITERS {
             let k = from + k as i64;
             s.stamp_nanos = STAMP0 + k * MS;
             s.received = SteadyNanos(T0 + k * MS);
             ingest.offer(Topic::Tf, &s, publisher);
         }
-        ALLOCATIONS.load(Ordering::Relaxed) - before
+        allocations() - before
     };
     let _first = window(8);
     window(8 + ITERS as i64)
@@ -175,7 +224,7 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
 
     // Two windows, as above.
     let mut window = |from: i64| {
-        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        let before = allocations();
         for k in 0..ITERS {
             let k = from + k as i64;
             s.stamp_nanos = STAMP0 - 5_000 * MS + k * MS;
@@ -185,7 +234,7 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
                 Action::Drop { .. }
             ));
         }
-        ALLOCATIONS.load(Ordering::Relaxed) - before
+        allocations() - before
     };
     let _first = window(8);
     let second = window(8 + ITERS as i64);
