@@ -971,6 +971,14 @@ commit that adds it.
    changes with it, so it needs a `CHANGELOG` entry under the 0.0.x
    "every release may break every other" promise rather than a silent
    deprecation.
+   **The blast radius is one crate and one test, measured rather than assumed.**
+   The C ABI exposes no attach-from-fd surface at all (`grep` over
+   `crates/tf_tree_c/include/*.h` finds none), and the Python binding's
+   `mode="rw"` builds a `tf_tree::Open` (`tf_tree_py/src/tree.rs:1681`) — the
+   rendezvous path, which takes a byte — so neither binding reaches the arm being
+   removed. Every other in-tree `attach_shared` call passes `ReadOnly`. So a
+   breaking change to the facade costs, in this repository, exactly the one test
+   below.
    *Verified by:* a unit test that `attach_shared(fd, AttachMode::ReadWrite)`
    returns an error rather than a `Tree`; and by
    `crates/tf_tree_bench/tests/multiprocess.rs:398` —
