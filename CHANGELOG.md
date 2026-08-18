@@ -66,19 +66,6 @@ is a bug.
 
 ### Added
 
-- **`tf_tree_math::slerp` is public**, the shortest-arc quaternion
-  interpolation `LerpSlerp` evaluates. It was reachable only by building two
-  `Iso3` with throwaway zero translations, which the optimizer does not fold
-  away (15 x86-64 instructions against 51 at `opt-level = 3`). `ScLerp`'s
-  kernel `dualquat::screw_pow` has been public since Phase 1; this removes the
-  asymmetry rather than opening a new surface.
-
-  **One behavioural difference from the `Iso3` round trip, at the endpoints
-  only:** at `s = 1` with `qa·qb < 0` the bare function returns `-qb` where
-  `LerpSlerp::eval` answers `qb` from a shortcut. Same rotation, opposite
-  components. Callers comparing quaternion components rather than rotations at
-  `s = 1` will see it.
-
 - `just shm-check` runs `cargo nextest run -p tf_tree --features shm --lib`. The
   recipe named integration targets individually and had no `--lib` line, so an
   `shm`-gated unit test in the facade was compiled by clippy and executed by
