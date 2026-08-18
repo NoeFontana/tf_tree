@@ -1867,6 +1867,17 @@ shm-check:
     # edge is permanently unclaimable and invisible to every reaper — and
     # `--workspace` compiles them out. The other half runs under `just test`.
     cargo nextest run -p tf_tree --features shm --test owned_writer
+    # **The facade's own unit tests, under `shm`, which ran in no recipe.** The
+    # two lines above name integration *targets*; `--lib` was missing, so a
+    # `#[cfg(feature = "shm")]` unit test inside `crates/tf_tree/src` was
+    # compiled by this recipe's clippy line and executed by nothing — the same
+    # hole the `-p tf_tree_bench --features shm --lib` line above closes for the
+    # bench crate, in the crate where it is easiest to hit. It went in with
+    # `cache::tests::two_handles_on_one_shared_arena_share_their_plans`, which
+    # is the only place the #196 fix's cross-handle half is checked: that two
+    # `Tree`s onto one segment share an arena id, and therefore share plans
+    # rather than each recompiling.
+    cargo nextest run -p tf_tree --features shm --lib
     # **`docs/PHASE2.md` §11.4's torture harness, gated on a branch.** The
     # nightly is `just shm-torture` (30 minutes); this is the seconds-long
     # self-test that proves the harness's detector still detects. A soak test

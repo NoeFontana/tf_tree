@@ -484,16 +484,25 @@ fn freezing_replaces_the_target_by_rename_not_in_place() {
 
     // The temporary is a sibling and is gone. A temporary in `/tmp` would make
     // the `rename` non-atomic whenever `path` is on another filesystem.
+    //
+    // **The predicate names what `freeze_to` actually creates**, which is
+    // `.{stem}.tmp.{pid}.{n}` (`frozen.rs`'s `temp_sibling`). It used to be
+    // "any entry whose name contains this process's id", and that made this
+    // test fail intermittently — roughly two runs in five on this host —
+    // because `Scratch` puts the target in the *shared* `std::env::temp_dir()`
+    // and every other process on the machine litters there too. The reported
+    // "litter" was a different project's test scratch directories whose
+    // seven-digit pids happened to contain ours as a substring; this assertion
+    // was failing about files `freeze_to` had never written. A gate that
+    // accuses the code under test of another process's mess is worse than no
+    // gate, so match the prefix and nothing else.
     let dir = s.path().parent().unwrap();
-    let stem = s.path().file_name().unwrap();
+    let stem = s.path().file_name().unwrap().to_string_lossy().into_owned();
+    let prefix = format!(".{stem}.tmp.");
     let litter: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .filter(|n| {
-            n != stem
-                && n.to_string_lossy()
-                    .contains(&format!("{}", std::process::id()))
-        })
+        .filter(|n| n.to_string_lossy().starts_with(&prefix))
         .collect();
     assert!(litter.is_empty(), "freeze left litter: {litter:?}");
 }

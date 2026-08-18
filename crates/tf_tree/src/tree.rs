@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -467,6 +467,8 @@ impl TreeBuilder {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let fork_gen = fork_gen_for(&backing);
         Ok(Tree {
+            // Before `backing` moves into `arena`.
+            cache_scope: cache_scope_for(&backing),
             arena: backing,
             participant,
             incarnation,
@@ -517,6 +519,8 @@ impl TreeBuilder {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let fork_gen = fork_gen_for(&backing);
         Ok(Tree {
+            // Before `backing` moves into `arena`.
+            cache_scope: cache_scope_for(&backing),
             arena: backing,
             participant,
             incarnation,
@@ -1169,6 +1173,22 @@ type BoxedLiveness = Box<dyn Fn(u32, &tf_tree_core::ParticipantRecord) -> bool +
 /// own [`crate::Plan`]s.
 pub struct Tree {
     arena: ArenaBacking,
+    /// Which *arena* this tree reads, for the per-thread plan cache's key
+    /// (`crate::cache`).
+    ///
+    /// A compiled [`crate::Plan`] is a list of edge indices plus the static
+    /// transforms folded along the way, so it is only meaningful against the
+    /// arena it was compiled from. The cache is `thread_local!` and shared by
+    /// every `Tree` on the thread, so without this the key
+    /// `(target, source, generation)` matches across trees: ids are handed out
+    /// in interning order and a freshly built tree's generation is its declared
+    /// edge count (one tick per link — *not* zero, which an earlier revision of
+    /// this comment claimed), which makes the collision the *normal* case for
+    /// two similarly-built trees, not an adversarial one.
+    ///
+    /// See [`cache_scope_for`] for why this is the arena's identity rather than
+    /// the handle's, and for what it is derived from.
+    cache_scope: u64,
     /// This process's slot in the arena's participant table.
     ///
     /// Claims name this slot rather than a PID (`docs/PHASE2.md` §1, A3), which
@@ -2231,6 +2251,8 @@ impl Tree {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let fork_gen = fork_gen_for(&backing);
         Ok(Tree {
+            // Before `backing` moves into `arena`.
+            cache_scope: cache_scope_for(&backing),
             arena: backing,
             participant,
             incarnation,
@@ -2278,6 +2300,8 @@ impl Tree {
         let backing = ArenaBacking::Frozen(arena);
         let fork_gen = fork_gen_for(&backing);
         Tree {
+            // Before `backing` moves into `arena`.
+            cache_scope: cache_scope_for(&backing),
             arena: backing,
             // The read-only sentinel, exactly as a `PROT_READ` `attach_shared`
             // takes: registering would write to the participant table, which is
@@ -2532,6 +2556,12 @@ impl Tree {
         }
     }
 
+    /// This tree's arena identity, the first component of the per-thread plan
+    /// cache's key (`crate::cache`, [`cache_scope_for`]).
+    pub(crate) fn cache_scope(&self) -> u64 {
+        self.cache_scope
+    }
+
     /// Which arena *instance* this tree is attached to (A7, §3.7).
     ///
     /// All-zero for a heap tree, which is single-process by construction and so
@@ -2680,6 +2710,85 @@ fn fork_gen_for(backing: &ArenaBacking) -> Option<u64> {
             Some(tf_tree_ipc::fork::generation())
         }
     }
+}
+
+/// Which arena a [`Tree`] reads, as one `u64`, for the plan cache's key.
+///
+/// **The arena, not the handle.** Two `Tree`s mapping one shared segment see
+/// one topology and one set of static transforms, so a plan compiled through
+/// either is correct through the other; giving them separate identities would
+/// cost every second handle a recompile and buy no safety. Two *processes*
+/// mapping that segment have separate caches already — the cache is
+/// `thread_local!` — so nothing here is shared between them but the value.
+///
+/// The two backings answer "which arena" from different places:
+///
+/// * A shared segment already carries an identity: `instance_uuid`, drawn once
+///   per `MappedArena::create` and preserved by every attach, which is exactly
+///   the "this arena instance, as distinct from this arena *name*" question
+///   `docs/decisions/0005` made it answer. Every handle onto one segment
+///   agrees on it, which is the property this key wants.
+/// * A heap arena's `instance_uuid` is all-zero on purpose (`HeapArena` is
+///   single-process by construction, and drawing randomness there would put an
+///   RNG in the no-`shm` dependency budget), and it **must not grow a field to
+///   fix that**: `FORMAT_VERSION = 3` already happened. It does not need one —
+///   a `HeapArena` is owned by exactly one `Tree`, so for that backing handle
+///   identity *is* arena identity — and a process-local counter supplies it.
+///
+/// **Not the base pointer**, which is the tempting answer that adds no state:
+/// the allocator hands the same address straight back to the next arena of the
+/// same layout, measured here as 8 of 8 build-drop-build cycles returning one
+/// address, so a base-pointer key would leave the entire defect standing for
+/// sequential trees — which is what a test suite and any rebuild loop does.
+///
+/// A frozen `.tft` takes a counter id too, even though its header may carry the
+/// `instance_uuid` of the live arena it was frozen from: two files frozen from
+/// one arena at different times share that id and *differ in content*, so it is
+/// not an identity for the image. Two `open_frozen` calls on one path therefore
+/// compile separately, which costs a compile and cannot be wrong.
+fn cache_scope_for(backing: &ArenaBacking) -> u64 {
+    if !backing.is_shared() {
+        return next_local_scope();
+    }
+    let uuid = ArenaView::new(backing.as_dyn()).header().instance_uuid;
+    if uuid == [0u8; 16] {
+        // `create` always draws one, so this is defence rather than a reachable
+        // branch: an all-zero id read as an identity would make every shared
+        // arena the same arena, which is the defect this function exists to
+        // remove.
+        return next_local_scope();
+    }
+    let lo = u64::from_le_bytes([
+        uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+    ]);
+    let hi = u64::from_le_bytes([
+        uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15],
+    ]);
+    // The halves are independent uniform bytes, so their xor is uniform in 64
+    // bits; forcing the top bit costs one bit of that and buys a space disjoint
+    // from the counter's, so a heap tree and a shared tree can never collide by
+    // arithmetic accident and no argument about the odds is needed.
+    (lo ^ hi) | (1 << 63)
+}
+
+/// A process-unique id for an arena that carries no `instance_uuid`.
+///
+/// Process-*local* is the whole requirement: the cache it keys is
+/// `thread_local!`, so a value only ever meets values minted by this process.
+///
+/// The same shape as `tf_tree_c::publisher`'s `NEXT_TOKEN`, and for the same
+/// reason: an identity that can be recycled turns the comparison that uses it
+/// into a coin flip, and a `u64` counter is the cheapest thing that cannot be.
+fn next_local_scope() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    // Relaxed: uniqueness is `fetch_add`'s own guarantee and nothing is
+    // published through this counter, so there is no other thread's writes for
+    // it to order.
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    // Stays out of the shared half of the space: 2^63 trees at one per
+    // nanosecond is 292 years.
+    debug_assert!(n < 1 << 63);
+    n
 }
 
 /// The process-wide empty arena a detached [`Tree`] reads instead of the

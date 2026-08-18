@@ -362,9 +362,14 @@ impl PyTree {
     /// One transform, without compiling a plan first (§4.2).
     ///
     /// The plan is cached per **thread**, keyed on
-    /// `(target, source, topology generation)` — a shared cache behind a lock
-    /// would turn the convenience API into a contention point on exactly the
-    /// workload free-threading exists to serve (§7.2).
+    /// `(arena, target, source, topology generation)` — a shared cache behind a
+    /// lock would turn the convenience API into a contention point on exactly
+    /// the workload free-threading exists to serve (§7.2).
+    ///
+    /// The `arena` component is why two `tf_tree.Tree` objects on one thread do
+    /// not answer for each other (issue #196). This binding calls the Rust
+    /// facade's `Tree::lookup` and keeps no cache of its own, so it inherited
+    /// that defect and inherits the fix with no change on this side.
     ///
     /// Prefer `tree.plan(...)` in a loop: this pays a cache probe per call, and
     /// a plan compiled once pays nothing.
