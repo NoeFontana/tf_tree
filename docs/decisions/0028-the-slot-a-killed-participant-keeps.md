@@ -239,8 +239,8 @@ rest of the plan is unchanged.
 
 ## Decision
 
-**Reclaim at the point of decision, from two agreeing negative facts; keep the
-hangup callback as the O(1) fast path; and move the assigner's authority off
+**Reclaim at the point of decision, from the participant's OFD lock byte; keep
+the hangup callback as the O(1) fast path; and move the assigner's authority off
 `state`.** Concretely, four pieces, none of which adds an arena field and none of
 which bumps `FORMAT_VERSION`:
 
@@ -261,37 +261,42 @@ matters: it does not need the incarnation, because the observed word carries it.
 > row therefore stays **unmet** under this decision as written, and closing it is
 > **open question 6**, which gates `ready`.
 
-**2. One reclamation predicate, named once.** A slot whose `state` reads
-`live_word(inc)` is reclaimable iff **both** of these are negative, and
-**neither is allowed to be "don't know"**:
+**2. One reclamation predicate, named once — the lock byte, and nothing else.**
+A slot whose `state` reads `live_word(inc)` is reclaimable iff its lock byte
+reads free via `F_OFD_GETLK` (`LivenessProbe::is_held`, `tf_tree/src/open.rs:87`,
+which already returns `Option<bool>` for exactly this reason). `None` — the
+kernel would not say — means *not reclaimable* (§6.2).
 
-- its lock byte reads free via `F_OFD_GETLK` (`LivenessProbe::is_held`,
-  `tf_tree/src/open.rs:87`, which already returns `Option<bool>` for exactly this
-  reason), **and**
-- the record's `(pid, start_time)` is absent from `/proc`, or names a different
-  process than the one recorded.
+That is §5.1's own sentence, unmodified: *"whether it is live is a kernel fact."*
+No amendment is needed to consult it, because consulting it is what §5.1
+prescribes.
 
-Either answering "unknown" means *not reclaimable* (§6.2). The second conjunct is
-not belt-and-braces: it is the only thing that protects the byte-less
-`attach_shared(ReadWrite)` participant.
-
-**That last sentence is the whole justification for the conjunct, and it rests on
-an unanswered question — open question 1.** It is listed as an open question and
-consumed here as a premise, which is the wrong order; if the byte-less class is
-not a supported shape the conjunct has no reason to exist. Read question 1's
-recommendation before treating this piece as settled.
-
-**And "either answering unknown means not reclaimable" is not a property this
-code currently has.** `/proc` has three answers, not two, and the partition is by
-`io::ErrorKind`: `ENOENT` maps to `NoSuchProcess`, the *proof of death* branch,
-and `ENOENT` is what an unmounted or `hidepid`-hidden `/proc` returns. A stored
-`start_time` of `0` — what `process_start_time()` writes when it cannot read
-`/proc/self/stat` — compares unequal to every real start time and reads as death
-too. Both are worked through under *"the fail-safe claim is false on this code"*.
-Step 2 therefore owes a **fourth** answer, *this host cannot answer at all*,
-distinguished from *this process is gone*; without it the conjunct is not
-conservative, it is inverted, on exactly the hardened deployments where it
-matters.
+> **This was two conjuncts until 2026-08-18, and the owner's answer to open
+> question 1 is what collapsed it.** The second conjunct — the record's
+> `(pid, start_time)` against `/proc` — existed for exactly one reason: to
+> protect a participant with an arena record and **no** lock byte, which only
+> bare `Tree::attach_shared(fd, ReadWrite)` produces. The owner has ruled that
+> path out (question 1, resolved): the fd-passing attach is for **readers**, and
+> a process that writes joins through the rendezvous, which takes a byte in
+> `register_at` (`tf_tree_ipc/src/open.rs:414-415`) before the arena record is
+> written. With no byte-less writer, the byte is a total predicate over every
+> participant that can hold a slot, and the conjunct protects nobody.
+>
+> Dropping it is not a simplification bought at a cost — it removes three
+> measured failure modes rather than adding a safeguard. `read_start_time` maps
+> `ENOENT` to `NoSuchProcess`, the *proof of death* branch, and `ENOENT` is what
+> an unmounted or `hidepid`-hidden `/proc` returns for **every** pid; and
+> `process_start_time()` stores `0` when it cannot read `/proc/self/stat`, which
+> compares unequal to every real start time and also reads as death. Both are
+> worked through under *"the fail-safe claim is false on this code"*. A predicate
+> that inverts to "everyone is dead" on a hardened host is worse than no second
+> fact, and this decision no longer carries one.
+>
+> **Those two defects do not disappear with the conjunct**, because
+> `record_is_alive` is still the fallback when the OFD probe answers `None`
+> (`tree.rs:2387`) and still the whole predicate for a tree with no probe at all
+> (`liveness_for`, `tree.rs:2813`) — which is the heap and fd-inherited case. They
+> are **#194**; this record simply stops adding a third caller to them.
 
 Three constraints on how that is built, each of which an earlier revision got
 wrong:
@@ -734,6 +739,13 @@ Three facts about `RESERVED`, all in `fill_slot` (`participant.rs:154–170`):
 
 The interleaving needs no ABA and no second reclaimer:
 
+> **Step 0b closes this first variant outright**, and it is the clearest
+> argument for that step: with `attach_shared`'s `ReadWrite` arm refusing, no
+> participant reaches `RESERVED` without already holding its byte, so the
+> "reclaimer sees a free byte over a live registrant" case has no producer. The
+> ABA variant below survives, and is why `reclaim` is scoped to `live_word(inc)`
+> and why §11.3's row stays open as question 6.
+
 - Process `X` calls `Tree::attach_shared(fd, ReadWrite)` — the fd-inheritance
   path, so **no lock byte, ever**. `register` → `fill_slot` CASes slot *s*
   `FREE -> RESERVED`. `X` is then preempted (a page fault on the fresh mapping is
@@ -922,7 +934,9 @@ get a slot back.
 
 ## Implementation plan
 
-Steps 0–7 are **blocked on this record reaching `ready`** — all of them. This is
+Steps 0b–7 are **blocked on this record reaching `ready`**. Step 0 is not: it is
+plain documentation error, it no longer amends a NORMATIVE section, and it can be
+written and reviewed with no code at all. This is
 a crash-consistency protocol change, which `CLAUDE.md` routes through a record
 rather than a PR, and the existing patch is the reason that sentence is in
 `CLAUDE.md`. Step 8 is not blocked; it is an independent documentation defect.
@@ -933,29 +947,39 @@ loom` is the model checker; `just shm-check` is what compiles anything
 `#[cfg]`-ed on `shm`, and every new `shm`-only target belongs on its list in the
 commit that adds it.
 
-0. **Amend `PHASE2.md` §5.1 and §3.3, in §1's numbered-amendment shape, before
-   any code depends on them.** §5.1's last paragraph enumerates the permitted
-   uses of `(pid, start_time)` and asserts it "is no longer on any
-   correctness-critical path"; §3.3 asserts `/proc` is "no longer on the
-   rendezvous path at all". Piece 2 falsifies the first and piece 3 falsifies the
-   second. An amendment that arrives *after* the code it licenses is an
-   interpretation rather than an amendment, which is the failure this record was
-   opened about. The amendment says: exactly one predicate may consult the
-   identity triple; it may only ever **refuse** a reclamation; no other
-   correctness path may read it; and §5.1's enumeration drops `--force-new`,
-   which does not exist. **First, because a normative section cannot be widened
-   by the change that needs it widened** — and it is the only step that can be
-   written and reviewed with no code at all.
-   It carries two further corrections of the same kind, because they are what
-   made the ordering hard to derive in the first place: **§5** says slot
-   assignment needs "no CAS protocol" and that "the record is written by the
-   *owner* … before the response is sent", and the code does neither — the
-   joiner writes it, with a CAS, after taking its byte; and **§11.3's
+0. **Correct `PHASE2.md` §5, §5.1's enumeration and §11.3's row.** ~~Amend §5.1
+   and §3.3 to license the identity triple.~~ **That half is dropped**: open
+   question 1 resolved "no", so the predicate consults the lock byte and nothing
+   else, and consulting the byte is what §5.1 already prescribes. Nothing here
+   widens a NORMATIVE section any more, which is why this step went from *first
+   and blocking* to *ordinary documentation*.
+   What remains are three plain errors, none of which this record introduced and
+   all of which made the ordering hard to derive in the first place: **§5** says
+   slot assignment needs "no CAS protocol" and that "the record is written by the
+   *owner* … before the response is sent", and the code does neither — the joiner
+   writes it, with a CAS, after taking its byte; **§11.3's
    `attach.after_slot_assigned_before_publish` row** inherits that error, saying
-   "lock byte never taken", which is true only of the byte-less
-   `Tree::attach_shared` path.
-   *Verified by:* `just artifact-versions`, and by the amendment being cited by
-   number at the definition of the predicate in step 2.
+   "lock byte never taken", which was true only of the byte-less
+   `Tree::attach_shared` path that step 0b now removes; and **§5.1's enumeration
+   of permitted uses names `--force-new`**, which does not exist (#189).
+   *Verified by:* `just artifact-versions`.
+0b. **`Tree::attach_shared`'s `ReadWrite` arm refuses**, which is what makes the
+   predicate in piece 2 total rather than merely adequate. A caller holding a
+   raw fd attaches read-only; a writer joins through the rendezvous and gets a
+   byte. This is a **breaking change to public facade API** and the doc comment
+   that says "an attached process reads, and publishes to edges it claims"
+   changes with it, so it needs a `CHANGELOG` entry under the 0.0.x
+   "every release may break every other" promise rather than a silent
+   deprecation.
+   *Verified by:* a unit test that `attach_shared(fd, AttachMode::ReadWrite)`
+   returns an error rather than a `Tree`; and by
+   `crates/tf_tree_bench/tests/multiprocess.rs:398` —
+   `concurrent_reparents_from_separate_attachments_are_serialized`, the only
+   in-tree caller — being moved onto a path that takes a byte. **That test must
+   keep testing what it tests**: two attachments with *separate* participant
+   slots and separate process-local `decl` mutexes, racing `reparent` so that
+   only A2's in-arena lock can serialize them. A rewrite that ends up sharing one
+   attachment has deleted the test rather than ported it.
 1. **`ParticipantTable::reclaim`** in `tf_tree_core`, accepting `live_word(inc)`
    **only**, plus its doc comment carrying the three-row `state`/`identity` table
    above **and the reason `RESERVED` is excluded** — a doc comment that does not
@@ -1050,12 +1074,31 @@ open question 6 is answered, and the row has to say which.
 
 Resolved before `draft -> ready`. A `ready` doc has none.
 
-1. **Is `Tree::attach_shared(ReadWrite)` a supported deployment shape?** This is
-   **not a loose end — it is an input the Decision above already consumed**, and
-   listing it here understates it: piece 2's second conjunct exists *only* to
-   protect this class, so the predicate was designed around an unanswered
-   question. Answer it first and the rest follows; leave it open and the record
-   is deciding a shape it cannot justify.
+1. **RESOLVED 2026-08-18 by the owner: no.** ~~Is `Tree::attach_shared(ReadWrite)`
+   a supported deployment shape?~~
+
+   > *"We only want to attach readers to a pre-existing writer."*
+
+   The fd-passing attach is for **readers**. A process that writes joins through
+   the rendezvous, which takes an OFD lock byte in `register_at`
+   (`tf_tree_ipc/src/open.rs:414-415`) before the arena record is written — so
+   every participant that can hold a slot holds a byte, and the byte is a total
+   predicate. This is not a narrowing of the multi-writer model: D7 is one writer
+   *per edge*, and several writer processes owning disjoint edges is exactly what
+   the rendezvous path and `shm_torture`'s six children do. What is ruled out is
+   the **byte-less** writer, which only bare `attach_shared(fd, ReadWrite)`
+   produces.
+
+   Consequences, all folded into the Decision above and the plan below: piece 2
+   collapses to the lock byte alone; **step 0 loses its §5.1/§3.3 amendment**,
+   since consulting the byte is what §5.1 already prescribes; and a new step
+   makes the `ReadWrite` arm of `attach_shared` refuse. The one in-tree caller,
+   `crates/tf_tree_bench/tests/multiprocess.rs:398`, is an *in-process* fixture
+   that opens two attachments to race `reparent` against A2's in-arena lock — not
+   a deployment shape, and it has to move to a path that takes a byte.
+
+   The reasoning that led here is kept below, because the recommendation was
+   argued before the answer arrived and the argument is what the answer rests on.
 
    The byte-less class produces an arena record with no lock byte, so the byte
    conjunct cannot see it. An earlier revision said the `/proc` conjunct "fails
@@ -1087,7 +1130,8 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    Not recommended: keeping both conjuncts because two facts feel safer. The
    second fact is not free, it is three new failure modes and an amendment to a
    NORMATIVE section, bought to protect one caller that is a bench test.
-   **This changes the predicate, so it gates `ready`.**
+   ~~**This changes the predicate, so it gates `ready`.**~~ *Answered; the
+   predicate is changed above and this no longer gates.*
 2. **Should `reclaim` also clear the lock file's identity record** at
    `4096 + 64·i`? Leaving it means `tf_tree participants` keeps printing a
    truthful `stale` row for a slot that has since been reused, which is
@@ -1159,6 +1203,32 @@ Resolved before `draft -> ready`. A `ready` doc has none.
   existing is that the difference matters.
 
 ## Review history
+
+### 2026-08-18 — the owner answered open question 1, and the predicate halved
+
+`attach_shared(fd, ReadWrite)` is **not** a supported deployment shape: the
+fd-passing attach is for readers, and a writer joins through the rendezvous,
+which takes an OFD lock byte before writing the arena record.
+
+What changed as a result, all of it a *narrowing*:
+
+- Piece 2 drops its `/proc` conjunct and is the lock byte alone. It is now a
+  total predicate rather than one with a class it cannot see.
+- Step 0 loses the §5.1/§3.3 amendment and stops blocking; consulting the byte is
+  what §5.1 prescribes, so nothing needs widening. It keeps the three plain
+  documentation errors it also carried.
+- A new step 0b makes the `ReadWrite` arm refuse — a breaking facade change, and
+  the one in-tree caller is a bench fixture that has to move to a byte-taking
+  path without losing what it tests.
+- The `ENOENT`, `hidepid` and `start_time == 0` failure modes stop being this
+  record's problem. **They do not stop being defects**: `record_is_alive` remains
+  the fallback when the OFD probe answers `None` (`tree.rs:2387`) and the entire
+  predicate for a tree with no probe (`liveness_for`, `tree.rs:2813`). Filed as **#194**
+  rather than carried here, because they now outlive this decision.
+
+The reasoning is left in place under open question 1 rather than deleted: the
+recommendation was argued before the answer arrived, and the argument is what the
+answer rests on.
 
 A review pass re-derived the ordering and the crash matrix from the code and
 **refuted one of this record's own decisions**, which is recorded here rather
