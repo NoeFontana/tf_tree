@@ -44,6 +44,14 @@ const SLERP_LERP_FALLBACK: f64 = 1e-6;
 /// adjacent samples on one edge.
 pub(crate) const THETA_SLERP_SMALL: f64 = 0.15;
 
+// **Both constants are quoted as literals in `slerp`'s public documentation**,
+// which is the crates.io page an external caller reads and the only place the
+// fallback band and the crossover are stated in a form they can act on. Neither
+// is `pub` — a re-measurement is allowed to move them, and that is exactly why
+// this is here: the prose is what a re-measurement would leave behind.
+const _: () = assert!(SLERP_LERP_FALLBACK == 1e-6);
+const _: () = assert!(THETA_SLERP_SMALL == 0.15);
+
 /// Interpolate between two poses `a` (at `s = 0`) and `b` (at `s = 1`).
 pub trait Interp {
     /// Interpolate at parameter `s`. `s = 0` returns `a` exactly and `s = 1`
@@ -150,12 +158,99 @@ impl Iso3 {
 
 /// Shortest-arc spherical linear interpolation of two unit quaternions.
 ///
-/// Applies the standard sign fix (`if q_a·q_b < 0 { negate q_b }`) so the path
-/// takes the short way round, and falls back to a normalized LERP when the
-/// half-angle drops below [`SLERP_LERP_FALLBACK`].
+/// This is the rotation kernel [`LerpSlerp`] evaluates, and it is public for
+/// the same reason [`screw_pow`] — [`ScLerp`]'s kernel — always was: a caller
+/// who holds two rotations and no translation should not have to build a pair
+/// of [`Iso3`] with throwaway zero translations to reach it. That is what the
+/// asymmetry cost, measured on the wrapper a downstream crate actually wrote:
+/// with the two arms compiled as exported `extern "C"` functions at
+/// `opt-level = 3`, calling `slerp` directly is 15 x86-64 instructions and the
+/// `Iso3` round trip is 51 — LLVM materializes both isometries and lerps the
+/// zero translations rather than folding them away. Removing that is the whole
+/// benefit; a caller whose quaternion type is not [`Quat`] still converts,
+/// because the types differ.
+///
+/// # Preconditions
+///
+/// Both inputs must be unit, and nothing here checks. A norm test per call
+/// would be paid by every caller on the interpolation hot path to catch one
+/// who has already broken the only invariant [`Quat`] has, and this crate has
+/// no error type to report it through — see [`Quat::normalize`], which makes
+/// the same trade in the other direction for the one input (a zero
+/// quaternion) where the arithmetic would produce infinities rather than
+/// merely a wrong answer.
+///
+/// `s` is a dimensionless fraction of the segment, **not** a stamp. A caller
+/// interpolating between two samples divides in integer nanoseconds and passes
+/// the ratio; nothing in this crate knows what time is.
+///
+/// # Storage order
+///
+/// [`Quat`] is `[w, x, y, z]` — scalar **first**. Eigen and `nalgebra` store it
+/// last, and a transposed conversion compiles, type-checks, and returns a
+/// perfectly unit quaternion that is the wrong rotation. Convention 2 in the
+/// crate docs is this hazard; a boundary that crosses it needs a tested adapter
+/// rather than a careful reading.
+///
+/// # Endpoints and degenerate inputs
+///
+/// On the series and closed-form branches the weights at `s = 0` and `s = 1`
+/// are exactly `(1, 0)` and `(0, 1)`, so both endpoints come back bit-for-bit.
+/// Three qualifications, all measured rather than reasoned:
+///
+/// * **`s = 1` returns `-qb` whenever `qa·qb < 0`.** That is the sign fix
+///   arriving at the endpoint, not an endpoint failure: `-qb` is the same
+///   rotation, and returning `qb` there instead would put a jump in the
+///   returned *components* at exactly `s = 1` while the limit from below goes
+///   to `-qb` — which is worse than the asymmetry it would tidy up, and is why
+///   there is no `s == 1.0` shortcut. Compare rotations, or fix the sign first.
+/// * **Below the LERP fallback the endpoints hold to an ulp, not bit-for-bit.**
+///   Under a quaternion angle of `SLERP_LERP_FALLBACK` (`1e-6` rad) the two
+///   inputs carry no usable direction, so the result is a *renormalized* LERP:
+///   `slerp(qa, qb, 0.0)` is `qa/‖qa‖`, which differs from `qa` by ~2.7e-16
+///   whenever `qa`'s components do not happen to square to exactly `1.0`.
+///   `endpoints_lose_bit_exactness_only_in_the_lerp_fallback` pins both halves.
+/// * **Numerically identical inputs return `qa` for every `s`**, `s` included
+///   in neither weight. Two consecutive `/tf` samples from a stationary body
+///   are exactly this case, and it is an early return rather than an accident:
+///   `h` is `0`, so there is no direction to interpolate along and every later
+///   branch would divide by it.
+///
+/// The output is otherwise **not** renormalized — `qa·wa + qb·wb` is unit to
+/// within `f64`, not exactly. A caller whose type enforces unit norm should
+/// normalize on the way in to its own type.
+///
+/// The first two bullets are also the *entire* difference between calling this
+/// and going through `LerpSlerp::eval` on a pair of zero-translation [`Iso3`],
+/// which answers `s = 0` and `s = 1` from a shortcut that never reaches here.
+/// `the_iso3_round_trip_it_replaces_agrees_as_a_rotation` sweeps both and
+/// classifies every bit difference; as rotations the two agree to 2.7e-16.
+///
+/// # Numerics
+///
+/// The crossover to the closed `acos`/`sin` form is at `THETA_SLERP_SMALL`
+/// (`0.15` rad); below it the weights are a six-term series with no
+/// transcendental and no division, and θ² comes from the *chord* rather than
+/// from `acos(dot)`. Both constants are calibrated, with the measurement in
+/// their own doc comments, and both are deliberately private: they are numbers
+/// a re-measurement is allowed to move, and a `pub const` is a promise not to.
+///
+/// ```
+/// use tf_tree_math::{exp_so3, slerp, Quat, Vec3};
+///
+/// let qa = Quat::IDENTITY;
+/// let qb = exp_so3(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_2));
+/// let mid = slerp(qa, qb, 0.5);
+///
+/// // Half of a 90° yaw is a 45° yaw, and the result is unit without a
+/// // normalization step.
+/// let quarter = exp_so3(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_4));
+/// assert!(mid.sub(quarter).norm() < 1e-15);
+/// assert!((mid.norm() - 1.0).abs() < 1e-15);
+/// ```
 #[inline]
 #[must_use]
-fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
+pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
     let dot = qa.dot(qb);
     let qb = if dot < 0.0 { qb.neg() } else { qb };
 

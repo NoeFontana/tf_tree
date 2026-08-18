@@ -46,7 +46,7 @@ pub mod quat;
 pub mod reference;
 pub mod twist;
 
-pub use interp::{Interp, LerpSlerp, ScLerp};
+pub use interp::{slerp, Interp, LerpSlerp, ScLerp};
 pub use iso3::{exp_se3, log_se3, Iso3, Vec3};
 pub use quat::{exp_so3, log_so3, quat_from_rot3, Quat};
 pub use twist::Twist;
