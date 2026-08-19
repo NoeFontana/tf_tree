@@ -40,11 +40,24 @@
 //! reporting**, so the pages counted are pages actually read. `--no-touch`
 //! exists only to show the difference, and prints a warning saying so.
 //!
+//! # Two worker arms, because `S >= 74p` is arithmetic about the worker
+//!
+//! `p` is private bytes per process, and nothing about it belongs to `tf_tree`:
+//! it is the interpreter, its extension modules and the worker's own
+//! allocations. So the gate's verdict is a function of the worker's language,
+//! and the default arm — this binary, re-executed with `--worker` — is a Rust
+//! one. `--python <interpreter>` runs the same measurement with
+//! `python/gate4_worker.py` as the worker instead, which is the arm the wedge's
+//! audience actually runs. §12 gate 4's amendment carries the `p` table; the
+//! criterion itself is stated over the Rust arm and this binary does not move
+//! it.
+//!
 //! # Usage
 //!
 //! ```text
 //! frozen_workers --build /tmp/x.tft --robots 64 --history 40
 //! frozen_workers --tft /tmp/x.tft --workers 1,16
+//! frozen_workers --tft /tmp/x.tft --workers 1,16 --python .venv/bin/python
 //! frozen_workers --worker /tmp/x.tft          # a child; not run by hand
 //! ```
 
@@ -65,6 +78,16 @@ const GATE: f64 = 1.2;
 /// Worker counts the gate is stated over.
 const DEFAULT_WORKERS: &[usize] = &[1, 16];
 
+/// The stamp window a sweep walks, in nanoseconds — the default fixture's 40 s
+/// of history.
+///
+/// Passed to a Python worker on its command line rather than restated in that
+/// file, so the two arms cannot drift into sweeping different query sets. It
+/// does *not* track `--history`: a shorter fixture leaves part of the grid
+/// outside every edge's window, which both arms report identically in the
+/// `lookups` column.
+const SWEEP_WINDOW_NS: i64 = 40_000_000_000;
+
 fn main() -> Result<()> {
     let mut mode = Mode::Drive;
     let mut path = PathBuf::from("target/gate4/workers.tft");
@@ -77,6 +100,8 @@ fn main() -> Result<()> {
     // on it, which is the finding, so the driver reports the curve over several
     // values rather than one number from one arbitrary pattern.
     let mut stamps = 64usize;
+    let mut interpreter: Option<PathBuf> = None;
+    let mut py_worker: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -124,15 +149,47 @@ fn main() -> Result<()> {
                     .parse()
                     .context("--stamps")?;
             }
+            "--python" => {
+                interpreter = Some(PathBuf::from(
+                    args.next().ok_or_else(|| anyhow!("{a} wants a path"))?,
+                ))
+            }
+            "--py-worker" => {
+                py_worker = Some(PathBuf::from(
+                    args.next().ok_or_else(|| anyhow!("{a} wants a path"))?,
+                ))
+            }
             "--no-touch" => touch = false,
             other => bail!("unknown argument `{other}`"),
         }
     }
 
+    let arm = match interpreter {
+        None => {
+            if py_worker.is_some() {
+                bail!(
+                    "--py-worker names the script the Python arm runs, and the Python arm is \
+                       selected by --python <interpreter>"
+                );
+            }
+            Arm::Rust
+        }
+        // The default is baked in at compile time, so the binary can be run
+        // from anywhere the way the `just gate4` comment suggests. This crate
+        // is `publish = false`, so the absolute build-machine path costs
+        // nobody anything.
+        Some(interpreter) => Arm::Python {
+            interpreter,
+            script: py_worker.unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("python/gate4_worker.py")
+            }),
+        },
+    };
+
     match mode {
         Mode::Build => build(&path, robots, history),
         Mode::Worker => worker(&path, touch, stamps),
-        Mode::Drive => drive(&path, robots, history, &workers, touch, stamps),
+        Mode::Drive => drive(&path, robots, history, &workers, touch, stamps, &arm),
     }
 }
 
@@ -140,6 +197,31 @@ enum Mode {
     Build,
     Worker,
     Drive,
+}
+
+/// Which program the driver spawns as a worker.
+///
+/// The two arms differ in the worker and in nothing else — same fixture, same
+/// stamp grid, same barrier, same `smaps_rollup` read — because the finding
+/// they exist to separate is that `p` belongs to the worker.
+enum Arm {
+    Rust,
+    Python {
+        interpreter: PathBuf,
+        script: PathBuf,
+    },
+}
+
+impl Arm {
+    /// The word the verdict line is cited with. §12 gate 4's amendment: a
+    /// qualification that does not travel with the number it qualifies has not
+    /// been written down anywhere useful.
+    fn language(&self) -> &'static str {
+        match self {
+            Arm::Rust => "Rust",
+            Arm::Python { .. } => "Python",
+        }
+    }
 }
 
 /// A fleet workload big enough for the gate to be about sharing.
@@ -268,7 +350,7 @@ fn sweep(tree: &Tree, stamps: usize) -> Result<u64> {
         // unread, which is the vacuous-pass failure this binary exists to
         // avoid. The step shrinks as `stamps` grows, so a larger count means a
         // denser walk of the same window, not a longer one.
-        let step = (40_000_000_000i64 / stamps.max(1) as i64).max(1);
+        let step = (SWEEP_WINDOW_NS / stamps.max(1) as i64).max(1);
         for k in 0..stamps as i64 {
             let stamp = tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(k * step);
             if plan.at(&guard, stamp).is_ok() {
@@ -286,7 +368,21 @@ fn drive(
     workers: &[usize],
     touch: bool,
     stamps: usize,
+    arm: &Arm,
 ) -> Result<()> {
+    // Checked before anything is built or spawned: a missing script otherwise
+    // presents as sixteen tracebacks and a driver complaining about a `ready`
+    // line it never got.
+    if let Arm::Python { script, .. } = arm {
+        if !script.exists() {
+            bail!(
+                "no Python worker script at {} — name one with --py-worker, the way \
+                 `just gate4-python` does",
+                script.display()
+            );
+        }
+    }
+
     if !path.exists() {
         build(path, robots, history)?;
     }
@@ -302,6 +398,17 @@ fn drive(
 
     println!("PHASE5 §12 gate 4 — 16 workers sharing one .tft, total Pss within {GATE}x of one");
     println!("  .tft {} ({file_mib:.1} MiB)", path.display());
+    match arm {
+        Arm::Rust => println!("  worker  Rust — this binary, re-executed with --worker"),
+        Arm::Python {
+            interpreter,
+            script,
+        } => println!(
+            "  worker  Python — {} {}",
+            interpreter.display(),
+            script.display()
+        ),
+    }
     println!();
     println!(
         "  {:>7}  {:>12}  {:>12}  {:>10}",
@@ -310,7 +417,7 @@ fn drive(
 
     let mut totals: Vec<(usize, f64)> = Vec::new();
     for &n in workers {
-        let (total_kib, reads) = spawn_and_measure(&me, path, n, touch, stamps)?;
+        let (total_kib, reads) = spawn_and_measure(&me, path, n, touch, stamps, arm)?;
         let mib = total_kib as f64 / 1024.0;
         println!(
             "  {n:>7}  {:>9.1} MiB  {:>9.2} MiB  {reads:>10}",
@@ -333,7 +440,11 @@ fn drive(
 
     let ratio = sixteen / one;
     let verdict = if ratio <= GATE { "PASS" } else { "FAIL" };
-    println!("  gate 4: {sixteen:.1} MiB / {one:.1} MiB = {ratio:.3}x against {GATE}x — {verdict}");
+    println!(
+        "  gate 4, {} worker: {sixteen:.1} MiB / {one:.1} MiB = {ratio:.3}x against {GATE}x \
+         — {verdict}",
+        arm.language()
+    );
 
     // The decomposition, because a bare ratio does not say *why*, and the two
     // terms have completely different remedies: more sharing is a design
@@ -355,6 +466,15 @@ fn drive(
             (n16 - GATE) / (GATE - n1) * private
         );
     }
+    if let Arm::Python { .. } = arm {
+        println!();
+        println!(
+            "  This arm REPORTS. Criterion 4 is stated over the Rust worker and its MET is that \
+             row; giving the gate a second arm is a decision and needs a record (PHASE5 §12 gate \
+             4's amendment). `p` above is a property of the interpreter and its extension \
+             modules, not of tf_tree."
+        );
+    }
     Ok(())
 }
 
@@ -371,14 +491,33 @@ fn spawn_and_measure(
     n: usize,
     touch: bool,
     stamps: usize,
+    arm: &Arm,
 ) -> Result<(u64, u64)> {
     let mut kids = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut cmd = Command::new(me);
-        cmd.arg("--worker")
-            .arg(tft)
-            .arg("--stamps")
-            .arg(stamps.to_string());
+        // Spawned in both arms, never forked. A forked Python worker inherits
+        // the parent's heap and measures a `p` no `DataLoader` on CPython 3.14
+        // pays — §4.3's amendment — and the Rust arm has never had another
+        // shape.
+        let (program, mut cmd) = match arm {
+            Arm::Rust => {
+                let mut cmd = Command::new(me);
+                cmd.arg("--worker").arg(tft);
+                (me, cmd)
+            }
+            Arm::Python {
+                interpreter,
+                script,
+            } => {
+                let mut cmd = Command::new(interpreter);
+                cmd.arg(script)
+                    .arg(tft)
+                    .arg("--window-ns")
+                    .arg(SWEEP_WINDOW_NS.to_string());
+                (interpreter.as_path(), cmd)
+            }
+        };
+        cmd.arg("--stamps").arg(stamps.to_string());
         if !touch {
             cmd.arg("--no-touch");
         }
@@ -387,7 +526,7 @@ fn spawn_and_measure(
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("spawning worker {}", me.display()))?;
+            .with_context(|| format!("spawning worker {}", program.display()))?;
         kids.push(child);
     }
 
@@ -407,6 +546,14 @@ fn spawn_and_measure(
         let mut f = line.split_whitespace();
         match (f.next(), f.next()) {
             (Some("ready"), Some(r)) => reads += r.parse::<u64>().context("worker read count")?,
+            // An empty line is end-of-pipe: the worker died before reporting,
+            // and its own diagnosis is already on the inherited stderr above.
+            // For the Python arm that is almost always an interpreter with no
+            // extension installed in it.
+            (None, _) => bail!(
+                "worker {i} exited without reporting — its stderr is above (Python arm: is \
+                 the extension installed in that interpreter? `just gate4-python` does it)"
+            ),
             _ => bail!("worker {i} said {line:?}, which is not a `ready <n>` line"),
         }
         outs.push(rdr);

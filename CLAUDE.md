@@ -179,6 +179,7 @@ second opinion, not the first.
 | `just audit` | `cargo deny check` |
 | `just bench` / `bench-check` / `bench-baseline-update` | suite + go/no-go gate against the committed baseline |
 | `just embed-cost` / `embed-cost-check` | PHASE5 §9.2's two embedding measurements; `bench-check` depends on it |
+| `just gate4` / `gate4-python` | PHASE5 §12 gate 4 — 16 workers on one frozen `.tft` — with its two worker arms. `gate4` **is** the criterion (Rust worker) and runs nightly; `gate4-python` **reports** the same measurement through the same driver with a spawned CPython worker and exits 0 on the FAIL it prints, because `S ≥ 74p` makes the verdict a function of the worker's private cost and a second *gated* arm is a decision. Both arms' current readings live in `docs/benchmarks/EVIDENCE.md`, not here — nothing audits this table |
 | `just test-doc-error-codes` | the `compile_fail,E0277` pins, on nightly (stable rustdoc ignores the code) |
 | `just ros-build` / `ros-test` / `tf2-check` / `dds-bench` | container-only; nothing on the host can run them |
 | `just contended-scaling` / `scale-sweep` / `soak` / `bench-run` / `bench-ab` | exploratory; emit JSON, do **not** feed `bench-check` |

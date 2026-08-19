@@ -161,7 +161,7 @@ jobs:
   #
   #     $ rm -f target/gate4/workers.tft && \
   #       /usr/bin/time -f "%e s  maxrss %M KB" just gate4
-  #     gate 4: 235.4 MiB / 229.9 MiB = 1.024x against 1.2x — PASS
+  #     gate 4, Rust worker: 235.4 MiB / 229.9 MiB = 1.024x against 1.2x — PASS
   #     1.92 s  maxrss 635688 KB
   #
   # matching EVIDENCE.md's 1.024× to three digits. What is not free is getting
