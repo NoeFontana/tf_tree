@@ -141,6 +141,15 @@ is a bug.
   matching write-mode line, so the formatting `just lint` now enforces has a
   recipe that fixes it. `ci.yml`'s `bindings` job invokes the recipe instead of
   re-spelling its two lines.
+- **`just gate4-python` re-derives PHASE5 §12 gate 4's Python arm**, which had
+  been a recorded 1.785× that no recipe regenerated — the shape
+  `docs/benchmarks/EVIDENCE.md` exists to catch. `frozen_workers` gained
+  `--python <interpreter>`, and `crates/tf_tree_bench/python/gate4_worker.py` is
+  the worker it drives: same fixture, same stamp grid, same barrier, so the two
+  arms differ in the worker's language and nothing else. It **reports** — the
+  criterion is stated over the Rust worker and the recipe exits 0 on the FAIL it
+  prints. Both arms now name their worker in the verdict line, so a pasted
+  transcript carries the qualification the amendment asks for.
 
 ## [0.0.2] — 2026-08-17 (wheels, no sdist)
 

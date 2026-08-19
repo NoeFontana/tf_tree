@@ -487,6 +487,72 @@ gate4:
     rm -f target/gate4/workers.tft
     ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
 
+# **The same measurement with a *Python* worker, because gate 4's verdict is a
+# function of the worker's language.**
+#
+# `(S + 16p)/(S + p) <= 1.2` is `S >= 74p`, so criterion 4 is arithmetic about
+# `p` — private bytes per worker — as much as about sharing, and `p` is a
+# property of the interpreter, its extension modules and the worker's own
+# allocations. None of those belong to tf_tree. `docs/PHASE5.md` §12 gate 4's
+# amendment records what follows: the Rust worker's `p` is 0.36 MiB and a
+# spawned CPython one's is 13.44 MiB, so the criterion wants ~994 MiB of arena
+# where the fixture supplies 338, and **gate 4's own file fails gate 4's own
+# criterion at 1.785x with a Python worker.**
+#
+# **This recipe exists because that 1.785x had no recipe.** `just gate4`
+# regenerated the 1.024x and nothing regenerated the qualification, which is
+# `docs/benchmarks/EVIDENCE.md`'s founding failure — a recorded number nothing
+# re-derives — reappearing inside the register itself. §12 gate 4's amendment
+# names the obligation directly: any record that gives criterion 4 a second
+# worker arm owes a recipe with it.
+#
+# **It reports; it does not gate**, and the exit status says so: a Python row
+# printing FAIL still leaves this recipe at 0. Criterion 4 is stated over the
+# Rust worker and its **MET** is that row; giving the gate a second *gated* arm
+# is a decision and needs a record, which the amendment says in as many words. A
+# recipe that quietly promoted a reported number to a gate would be deciding
+# that here.
+#
+# **Same fixture, same deletion, for `gate4`'s reason.** It writes and deletes
+# `target/gate4/workers.tft` — gate 4's own file, not a copy — so "on the same
+# 338 MiB file" is structural rather than promised, and running the two recipes
+# in either order re-freezes instead of measuring last week's. Both arms sweep
+# the *identical* query set: the stamp grid is one constant in
+# `frozen_workers.rs` and is handed to the Python worker on its command line
+# rather than restated there. Checked on a 3.6 MiB fixture whose history is
+# shorter than the grid, where both arms report 5232 lookups of a possible 6144.
+#
+# **`--release`, where `just py-test`'s otherwise identical install line is not.**
+# PHASE5 §9.3's memory axis fails on a debug build and this row is a Pss byte
+# count; it is also the profile a `pip install` gets. `py-setup` is a dependency
+# for `quickstart`'s reason — a leaner venv would be a second spelling of "the
+# Python environment", and it is the interpreter `just py-test` uses.
+#
+# **Not in a workflow, and the reason is not fidelity.** Pss reads as honestly
+# on a shared runner as on a quiet one — that is why `nightly.yml` runs
+# `just gate4` — so this is wireable as it stands. What it would cost is a
+# Python toolchain and a second release build on top of the one that job already
+# pays for, to re-derive a number that gates nothing. The record that gives
+# criterion 4 a second arm is what would make it worth a job.
+#
+# **`--py-worker` is passed although the binary has that exact default.** The
+# default is `CARGO_MANIFEST_DIR` baked in at compile time, which is the build
+# machine's checkout — right for a hand-run, wrong for a binary carried
+# anywhere else — and a recipe naming the file is also how somebody reading the
+# justfile learns that a second, non-cargo artifact is in the loop.
+#
+# ~340 MiB of disk for the fixture, and 466 MiB of summed Pss across the sixteen
+# workers at the moment it is sampled. `/usr/bin/time` on the recipe reports
+# ~635 MB peak RSS, which is the driver building the arena it freezes and not
+# the workers at all. 4.2-4.4 s wall with the venv and both release builds warm.
+gate4-python: py-setup
+    cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
+    VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q --release
+    rm -f target/gate4/workers.tft
+    ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16 \
+        --python .venv/bin/python \
+        --py-worker crates/tf_tree_bench/python/gate4_worker.py
+
 # **PHASE4 §7 gate criterion 1: what the C ABI costs a caller.**
 #
 # This recipe exists because the gate did not have one. `examples/abi_cost.rs`
