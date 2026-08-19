@@ -17,24 +17,55 @@ use tf_tree::{
 
 const MS: i64 = 1_000_000;
 
-/// A path in the temp dir that is removed when the test ends, pass or fail.
-struct Scratch(PathBuf);
+/// A **private directory** in the temp dir, holding one `.tft`, removed when the
+/// test ends, pass or fail.
+///
+/// The directory is the point. `freeze_to` writes its temporary as a *sibling*
+/// of the target — it has to, or the publishing `rename` stops being atomic
+/// whenever the target is on another filesystem — so
+/// [`freezing_replaces_the_target_by_rename_not_in_place`] proves the cleanup by
+/// looking at what the target's parent holds afterwards. With the target
+/// directly in the shared `std::env::temp_dir()`, that parent is a directory
+/// every other process on the machine also writes to, and the test spent its
+/// life either accusing `freeze_to` of another process's litter or narrowing its
+/// predicate until it only matched the litter it already knew about — a gate
+/// that a rename of `frozen.rs`'s private `temp_sibling` scheme would quietly
+/// turn into a no-op. A directory of our own makes the assertion the strict one:
+/// **exactly the target file is here**, whatever the temporary was called.
+///
+/// Per-pid and per-tag, so `nextest`'s process-per-test and a plain
+/// `cargo test`'s threads both get their own.
+struct Scratch {
+    dir: PathBuf,
+    file: PathBuf,
+}
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let mut p = std::env::temp_dir();
-        p.push(format!("tf_tree_{tag}_{}.tft", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        Scratch(p)
+        let dir = std::env::temp_dir().join(format!("tf_tree_frozen-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{tag}.tft"));
+        Scratch { dir, file }
     }
     fn path(&self) -> &Path {
-        &self.0
+        &self.file
+    }
+    /// What the target's parent holds — the directory `freeze_to`'s temporary
+    /// sibling lands in.
+    fn entries(&self) -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(&self.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -483,28 +514,22 @@ fn freezing_replaces_the_target_by_rename_not_in_place() {
     );
 
     // The temporary is a sibling and is gone. A temporary in `/tmp` would make
-    // the `rename` non-atomic whenever `path` is on another filesystem.
+    // the `rename` non-atomic whenever `path` is on another filesystem — so the
+    // sibling is required, and its removal is what this asserts.
     //
-    // **The predicate names what `freeze_to` actually creates**, which is
-    // `.{stem}.tmp.{pid}.{n}` (`frozen.rs`'s `temp_sibling`). It used to be
-    // "any entry whose name contains this process's id", and that made this
-    // test fail intermittently — roughly two runs in five on this host —
-    // because `Scratch` puts the target in the *shared* `std::env::temp_dir()`
-    // and every other process on the machine litters there too. The reported
-    // "litter" was a different project's test scratch directories whose
-    // seven-digit pids happened to contain ours as a substring; this assertion
-    // was failing about files `freeze_to` had never written. A gate that
-    // accuses the code under test of another process's mess is worse than no
-    // gate, so match the prefix and nothing else.
-    let dir = s.path().parent().unwrap();
-    let stem = s.path().file_name().unwrap().to_string_lossy().into_owned();
-    let prefix = format!(".{stem}.tmp.");
-    let litter: Vec<_> = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .filter(|n| n.to_string_lossy().starts_with(&prefix))
-        .collect();
-    assert!(litter.is_empty(), "freeze left litter: {litter:?}");
+    // **The directory `Scratch` owns holds exactly the target and nothing
+    // else.** Deliberately not "no entry matching `.{stem}.tmp.`": that
+    // predicate is a copy of `frozen.rs`'s *private* `temp_sibling` naming
+    // scheme, so renaming that scheme would leave this assertion matching
+    // nothing and passing forever while real litter piled up — the test's whole
+    // job is proving `freeze_to` cleans up. Naming what must be present instead
+    // of what must be absent needs no knowledge of the scheme at all, and it
+    // also catches a temporary written under a name nobody predicted.
+    assert_eq!(
+        s.entries(),
+        vec![s.path().file_name().unwrap().to_owned()],
+        "freeze left something beside the target in its own directory"
+    );
 }
 
 #[test]

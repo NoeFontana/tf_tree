@@ -1989,9 +1989,9 @@ impl Tree {
         // *inside* a lookup — is preserved by warming here rather than by
         // warming every ring in the arena at attach.
         //
-        // `Tree::lookup` reaches this through `cache::get_or_compile`, which
-        // calls `plan` on a miss and nothing on a hit, so a reader pays once per
-        // path per process and the cached path is untouched.
+        // `Tree::lookup` reaches this through `cache::with_plan`, which calls
+        // `plan` on a miss and nothing on a hit, so a reader pays once per path
+        // per process and the cached path is untouched.
         //
         // # Why this hangs off the callback instead of walking the returned plan
         //
@@ -2090,8 +2090,16 @@ impl Tree {
     }
 
     /// Convenience lookup by name at a stamp: interns the names, compiles (or
-    /// reuses a cached) [`crate::Plan`], and evaluates it. Keeps a small per-thread plan
-    /// cache keyed by `(target, source, generation)`.
+    /// reuses a cached) [`crate::Plan`], and evaluates it. Keeps a small
+    /// per-thread plan cache keyed by
+    /// `(arena, target, source, generation)`.
+    ///
+    /// The `arena` component identifies the arena this tree reads, and is what
+    /// keeps two trees on one thread from answering for each other (#196): the
+    /// cache is `thread_local!` and the other three components agree across two
+    /// similarly-built trees as a matter of course. Two handles onto one shared
+    /// segment deliberately share it — one segment is one arena — so a plan
+    /// compiled through either is reused by the other.
     ///
     /// # Errors
     ///
@@ -2114,9 +2122,11 @@ impl Tree {
         // stamps a plan with — so every lookup during a mutation would miss the
         // cache and then fail with `TopologyChanged`.
         let generation = view.topology().stable_generation();
-        let (plan, _hit) = cache::get_or_compile(self, t, s, generation)?;
-        let g = self.guard();
-        plan.at(&g, stamp)
+        cache::with_plan(self, t, s, generation, |plan| {
+            let g = self.guard();
+            plan.at(&g, stamp)
+        })?
+        .0
     }
 
     /// A read-only [`ArenaView`] over the backing arena, for diagnostics and
@@ -2741,23 +2751,59 @@ fn fork_gen_for(backing: &ArenaBacking) -> Option<u64> {
 /// address, so a base-pointer key would leave the entire defect standing for
 /// sequential trees — which is what a test suite and any rebuild loop does.
 ///
-/// A frozen `.tft` takes a counter id too, even though its header may carry the
-/// `instance_uuid` of the live arena it was frozen from: two files frozen from
-/// one arena at different times share that id and *differ in content*, so it is
-/// not an identity for the image. Two `open_frozen` calls on one path therefore
-/// compile separately, which costs a compile and cannot be wrong.
+/// A frozen `.tft` takes a counter id too, even though its header **does** carry
+/// the `instance_uuid` of the live arena it was frozen from — measured, by
+/// freezing one arena to two paths and reading both back: same uuid, non-zero.
+/// Two files frozen from one arena at different times therefore share that id
+/// and *differ in content*, so it is not an identity for the image. Two
+/// `open_frozen` calls on one path also compile separately, which costs a
+/// compile and cannot be wrong.
 fn cache_scope_for(backing: &ArenaBacking) -> u64 {
-    if !backing.is_shared() {
+    // **A match on the variants, not a predicate.** The question here — "does
+    // this backing carry an identity that outlives the handle?" — is one no
+    // existing predicate answers. `is_shared` is the one it was first spelled
+    // as, and its own doc says it means "whether a peer can *mutate* it": the
+    // participant table, the claim protocol and reaping hang off that answer,
+    // and this does not. `is_frozen`'s doc, three lines below it, is the
+    // warning that applies verbatim — a predicate answering a question next to
+    // the one it was asked is one backing variant away from being wrong. Two
+    // concrete ways, both live today:
+    //
+    // * Give `Frozen` the *other* defensible `is_shared` answer — other
+    //   processes really may map the same `.tft`, which is what that method's
+    //   summary line says — and every frozen tree starts keying on the header's
+    //   `instance_uuid`. Measured: two files frozen from one live arena carry
+    //   the **same non-zero** uuid, so two `.tft`s that differ in content would
+    //   share a cache scope. That is issue #196 again, in the offline path.
+    // * Add a mapped-but-immutable backing (a file-backed image, a sealed
+    //   snapshot). `is_shared` false hands every handle its own id, silently
+    //   costing the recompile that
+    //   `cache::tests::two_handles_on_one_shared_arena_share_their_plans`
+    //   exists to prevent; `is_shared` true reads a uuid that may not identify
+    //   the *contents*, which is the bug above.
+    //
+    // Matched here rather than behind a new `ArenaBacking::instance_identity`
+    // method because there is exactly one caller and the compile error is
+    // identical either way — but written this way it lands on the paragraph
+    // that says what the new variant has to answer, instead of on a signature
+    // three hundred lines away.
+    let uuid: Option<[u8; 16]> = match backing {
+        // Single-process by construction: the handle *is* the arena.
+        ArenaBacking::Heap(_) => None,
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        ArenaBacking::Mapped(_) => Some(ArenaView::new(backing.as_dyn()).header().instance_uuid),
+        // The header's uuid identifies the arena this image was taken from, not
+        // the image. See the closing paragraph of this function's doc.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        ArenaBacking::Frozen(_) => None,
+    };
+    // `create` always draws one, so the all-zero arm is defence rather than a
+    // reachable branch: an all-zero id read as an identity would make every
+    // shared arena the same arena, which is the defect this function exists to
+    // remove.
+    let Some(uuid) = uuid.filter(|u| *u != [0u8; 16]) else {
         return next_local_scope();
-    }
-    let uuid = ArenaView::new(backing.as_dyn()).header().instance_uuid;
-    if uuid == [0u8; 16] {
-        // `create` always draws one, so this is defence rather than a reachable
-        // branch: an all-zero id read as an identity would make every shared
-        // arena the same arena, which is the defect this function exists to
-        // remove.
-        return next_local_scope();
-    }
+    };
     let lo = u64::from_le_bytes([
         uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
     ]);

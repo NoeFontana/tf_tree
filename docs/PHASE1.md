@@ -721,7 +721,9 @@ let t = tree.lookup("map", "camera_optical", stamp)?;
 
 `Tree: Send + Sync`. `Plan: Send + Sync + Copy`. `Publisher: Send + !Sync` (single writer is a type-level property, not a convention). `Guard<'a>` borrows the tree.
 
-The convenience `lookup` keeps a small per-thread plan cache keyed by `(FrameId, FrameId, generation)`, 16 entries, direct-mapped. Progressive disclosure: casual use is fast, expert use is fastest.
+The convenience `lookup` keeps a small per-thread plan cache keyed by `(arena, FrameId, FrameId, generation)`, 16 entries, direct-mapped. Progressive disclosure: casual use is fast, expert use is fastest.
+
+The `arena` component was missing from this line, and from the code, until issue #196: the cache is `thread_local!` and shared by every `Tree` the thread touches, while the other three components agree across two trees built from the same names in the same order — ids are handed out in interning order and a fresh tree's generation is its declared edge count — so a second tree was served the first one's compiled plan. It is the arena's identity, not the handle's: two `Tree`s mapping one shared segment share one entry deliberately, because they share one topology.
 
 ### Time
 
