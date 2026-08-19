@@ -337,7 +337,24 @@ pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH,
 };
 
+// **The math surface, including both interpolation kernels.** `slerp` is here
+// for the reason the rest of this block exists: a consumer who reaches
+// `LerpSlerp` through this facade and its kernel through `tf_tree_math` has two
+// direct dependencies to keep in lockstep on a `0.0.x` line where every release
+// breaks every other — which is a worse position than the `Iso3` round trip
+// `docs/API.md` §2.7 told them to abandon. **`ScLerp`'s kernel is here on the
+// same argument**, and it took a review pass to see that leaving it out
+// reproduced the asymmetry one layer up: exporting `LerpSlerp` + `slerp` but
+// `ScLerp` with no route to `screw_pow` puts an `ScLerp` consumer in exactly the
+// two-dependency position this block exists to prevent. What is *not* done is a
+// bare `screw_pow` at this root, which would be a second spelling
+// (`PROJECT.md` §6) of `tf_tree_math::dualquat::screw_pow`. Re-exporting the
+// module is the *same* spelling, so `tf_tree::dualquat::screw_pow` and
+// `tf_tree_math::dualquat::screw_pow` are one path with one prefix swapped.
+// `tests/math_reexports.rs` is what says this list and `tf_tree_math`'s are one
+// set of items rather than two.
+pub use tf_tree_math::dualquat;
 pub use tf_tree_math::{
-    exp_se3, exp_so3, log_se3, log_so3, quat_from_rot3, Interp, Iso3, LerpSlerp, Quat, ScLerp,
-    Twist, Vec3,
+    exp_se3, exp_so3, log_se3, log_so3, quat_from_rot3, slerp, Interp, Iso3, LerpSlerp, Quat,
+    ScLerp, Twist, Vec3,
 };

@@ -22,9 +22,27 @@
 
 use tf_tree_math::{exp_so3, interp, slerp, Quat, Vec3};
 
+/// The series/closed-form crossover, **mirrored** from `interp.rs`'s private
+/// `THETA_SLERP_SMALL`, in quaternion angle.
+///
+/// This is the file's only copy of that number and every sweep below is derived
+/// from it, so a re-measurement that moves the constant needs one edit here
+/// rather than nine. Nothing checks the mirror: `interp.rs` carries
+/// `const _: () = assert!(THETA_SLERP_SMALL == 0.15)`, which refuses to compile
+/// when the constant moves and lists this file among the places to follow it to,
+/// and that is the whole mechanism — a `const` assertion cannot see another
+/// crate's integration test.
+const THETA_CROSSOVER: f64 = 0.15;
+
+/// The LERP-fallback threshold, mirrored from `SLERP_LERP_FALLBACK` on the same
+/// terms as [`THETA_CROSSOVER`].
+const THETA_FALLBACK: f64 = 1e-6;
+
 /// The four components as raw bits, for the exactness claims below. `f64`
-/// equality would call `0.0` and `-0.0` the same, and one of the cases here is
-/// precisely a sign of zero.
+/// equality would call `0.0` and `-0.0` the same, and
+/// `signed_zero_components_are_the_endpoint_exception` is precisely a sign of
+/// zero — the only test here that is, because `sample_rotation` never produces
+/// a zero component (measured: none in 4000 components over `k` in `0..1000`).
 fn bits(q: Quat) -> [u64; 4] {
     [q.w.to_bits(), q.x.to_bits(), q.y.to_bits(), q.z.to_bits()]
 }
@@ -53,20 +71,35 @@ fn step(qa: Quat, theta: f64) -> Quat {
     qa * exp_so3(axis().scale(2.0 * theta))
 }
 
+/// Compiles only if both arguments are the *same* item, not merely two items of
+/// the same signature: a function item's type is unique to its definition, so
+/// one generic parameter cannot take two of them.
+///
+/// Verified in both directions while this was written — `same_item` on two
+/// distinct `fn(i32) -> i32` fails with *"expected fn item, found a different fn
+/// item"* (`E0308`), and a path that does not resolve fails with `E0425`.
+fn same_item<T>(_: T, _: T) {}
+
 /// The root re-export and the module path are the same item, not two.
 ///
 /// `PROJECT.md` §6 forbids a second spelling of an existing path. `interp::slerp`
 /// and the root `slerp` are one function reached two ways — the same arrangement
 /// `Quat`, `Iso3` and `exp_so3` already have — and this is what says so rather
 /// than leaving a reader to assume it.
+///
+/// **This used to compare the bits of two calls, and could not fail.** `pub use`
+/// names a function, it does not copy one, so both calls went to the same
+/// address and any output agreed with itself. The check that can fail is the
+/// one above: a wrapper introduced under either name — the second spelling this
+/// test exists to forbid — is a type error even if its signature is identical.
+///
+/// The **third** path, `tf_tree::slerp`, is checked the same way one crate over
+/// in `tf_tree/tests/math_reexports.rs`; it cannot be checked from here, because
+/// `tf_tree` depends on this crate and not the other way round.
 #[test]
 fn the_root_re_export_and_the_module_path_are_one_function() {
-    let qa = sample_rotation(3);
-    let qb = step(qa, 0.4);
-    for j in 0..=8 {
-        let s = j as f64 / 8.0;
-        assert_eq!(bits(slerp(qa, qb, s)), bits(interp::slerp(qa, qb, s)));
-    }
+    same_item(slerp, interp::slerp);
+    same_item(tf_tree_math::slerp, tf_tree_math::interp::slerp);
 }
 
 /// Above the LERP fallback, both endpoints come back bit-for-bit — `qb`
@@ -76,21 +109,41 @@ fn the_root_re_export_and_the_module_path_are_one_function() {
 /// `(1 − a²)` factor that is *why* the series is exact at both ends ⇒ this test
 /// fails at `s = 0, theta = 2e-6`. That factor is an algebraic property rather
 /// than a truncation artifact, so nothing about term count could substitute.
+///
+/// **The two counters below say the sweep straddles the *documented* crossover,
+/// which is not the same thing as observing the branch `slerp` took** — nothing
+/// outside the crate can see that, since the series and the closed form agree
+/// far below `f64` where they meet. They used to be spelled against a `0.15`
+/// literal of this test's own, which would have gone on reporting coverage of a
+/// branch it no longer reached the moment the constant moved. They are now
+/// derived from [`THETA_CROSSOVER`], and so is the sweep, so the two cannot
+/// disagree.
 #[test]
 fn endpoints_are_bit_exact_above_the_lerp_fallback() {
     let mut saw_sign_fix = 0usize;
-    let mut saw_series = 0usize;
-    let mut saw_closed_form = 0usize;
+    let mut below_crossover = 0usize;
+    let mut above_crossover = 0usize;
     for k in 0..24 {
         let qa = sample_rotation(k);
-        // Straddles the 0.15 rad series/closed-form crossover and reaches past
+        // Straddles the series/closed-form crossover — the two `THETA_CROSSOVER`
+        // terms are one part in a thousand either side of it — and reaches past
         // pi/2, where the shortest-arc sign fix starts firing.
-        for &theta in &[2e-6, 1e-4, 0.02, 0.1499, 0.1501, 0.6, 1.4, 1.9, 2.8] {
+        for &theta in &[
+            2.0 * THETA_FALLBACK,
+            1e-4,
+            0.02,
+            THETA_CROSSOVER * 0.999,
+            THETA_CROSSOVER * 1.001,
+            0.6,
+            1.4,
+            1.9,
+            2.8,
+        ] {
             let qb = step(qa, theta);
-            if theta <= 0.15 {
-                saw_series += 1;
+            if theta <= THETA_CROSSOVER {
+                below_crossover += 1;
             } else {
-                saw_closed_form += 1;
+                above_crossover += 1;
             }
 
             assert_eq!(
@@ -109,8 +162,9 @@ fn endpoints_are_bit_exact_above_the_lerp_fallback() {
         }
     }
     assert!(
-        saw_series > 0 && saw_closed_form > 0,
-        "one branch never ran"
+        below_crossover > 0 && above_crossover > 0,
+        "the sweep no longer straddles THETA_CROSSOVER, so only one of the two \
+         weight formulas was ever asked for an endpoint"
     );
     assert!(
         saw_sign_fix > 0,
@@ -121,7 +175,8 @@ fn endpoints_are_bit_exact_above_the_lerp_fallback() {
 /// **The LERP fallback is the one branch where an endpoint is not bit-exact,
 /// and this is what proves the branch runs at all.**
 ///
-/// Below a quaternion angle of `1e-6` the result is a *renormalized* LERP, so
+/// Below a quaternion angle of [`THETA_FALLBACK`] (`1e-6`) the result is a
+/// *renormalized* LERP, so
 /// `s = 0` returns `qa/‖qa‖`. For a `qa` whose components happen to square to
 /// exactly `1.0` that is `qa`; for one that does not — 14 of the 64 rotations
 /// swept here, counted, where this line said "about a third" until it was —
@@ -143,17 +198,21 @@ fn endpoints_lose_bit_exactness_only_in_the_lerp_fallback() {
         }
         discriminating += 1;
 
-        let inside = slerp(qa, step(qa, 1e-7), 0.0);
-        assert_ne!(bits(inside), bits(qa), "fallback not taken at 1e-7, k={k}");
+        let inside = slerp(qa, step(qa, THETA_FALLBACK * 0.1), 0.0);
+        assert_ne!(
+            bits(inside),
+            bits(qa),
+            "fallback not taken a decade below THETA_FALLBACK, k={k}"
+        );
         let d = inside.sub(qa).norm();
         assert!(d < 1e-15, "fallback perturbed s=0 by {d:e}, k={k}");
         worst = worst.max(d);
 
-        let outside = slerp(qa, step(qa, 1e-5), 0.0);
+        let outside = slerp(qa, step(qa, THETA_FALLBACK * 10.0), 0.0);
         assert_eq!(
             bits(outside),
             bits(qa),
-            "series branch not exact at 1e-5, k={k}"
+            "series branch not exact a decade above THETA_FALLBACK, k={k}"
         );
     }
     assert!(
@@ -172,12 +231,74 @@ fn endpoints_lose_bit_exactness_only_in_the_lerp_fallback() {
     );
 }
 
+/// **A `-0.0` component is the one input for which "both endpoints come back
+/// bit-for-bit" is false, and it is false on every branch.**
+///
+/// The weights at `s = 0` are exactly `(1, 0)`, so the answer is
+/// `qa·1.0 + qb·0.0` and not `qa` — and `-0.0 + (+0.0)` is `+0.0`. Nothing in
+/// this crate manufactures the input: `exp_so3` carries a sign of zero only
+/// from an axis component that already has one, and `sample_rotation`'s
+/// rotations contain no zero component at all (measured over `k` in `0..1000`),
+/// which is why every other sweep in this file misses this.
+///
+/// It is pinned rather than fixed. The fix is an `s == 0.0` shortcut, and
+/// `slerp`'s doc rules out its `s == 1.0` twin on purpose — the limit from
+/// below at `s = 1` goes to `-qb` under the sign fix, so a shortcut returning
+/// `qb` would put a jump in the components at exactly the endpoint. Fixing one
+/// end and not the other buys a sign of zero at the price of an asymmetry
+/// between the two endpoints.
+#[test]
+fn signed_zero_components_are_the_endpoint_exception() {
+    let id = Quat::IDENTITY;
+    // A `-0.0` in `qa`, and a `qb` whose matching component is positive so the
+    // sum is `-0.0 + (+0.0)`.
+    let qa = Quat::new(1.0, -0.0, 0.0, 0.0);
+    assert!(qa.x.is_sign_negative(), "the input lost its sign of zero");
+
+    // One pair per branch, by the *pair's* angle: fallback, series, closed form.
+    for &theta in &[THETA_FALLBACK * 0.1, 0.02, THETA_CROSSOVER * 2.0] {
+        let qb = step(id, theta);
+        assert!(
+            qb.x > 0.0,
+            "theta={theta} does not exercise `-0.0 + (+0.0)`"
+        );
+        let out = slerp(qa, qb, 0.0);
+        assert_ne!(
+            bits(out),
+            bits(qa),
+            "s=0 became bit-exact for a -0.0 component at theta={theta}; if that \
+             is intended, `slerp`'s third endpoint bullet and this test are stale"
+        );
+        assert!(
+            out.x == 0.0 && out.x.is_sign_positive(),
+            "expected +0.0, got {} at theta={theta}",
+            out.x
+        );
+        // The departure is a sign and nothing else: as a rotation, identical.
+        assert_eq!(out.sub(qa).norm(), 0.0, "theta={theta}");
+    }
+}
+
 /// The output stays unit across all three branches without being renormalized.
 ///
-/// The bound is what the sweep measures, not a round number: `slerp` returns
-/// `qa·wa + qb·wb`, so the departure is the rounding of six multiplies and
-/// three adds, and a caller whose type enforces unit norm needs to know it is
-/// an ulp rather than nothing.
+/// `slerp` returns `qa·wa + qb·wb`, so the departure is the rounding of six
+/// multiplies and three adds, and a caller whose type enforces unit norm needs
+/// to know it is an ulp rather than nothing.
+///
+/// **The bound is stated in ulp, and it is deliberately not the measured worst
+/// case.** This sweep measures `3.3306690738754696e-16` on x86-64, which is
+/// `1.5·ε` — and `|‖q‖ − 1|` is *quantized* near 1.0: the representable norms
+/// step by `ε/2` below 1.0 and by `ε` above it, so the departure can only be
+/// `0`, `0.5·ε`, `1.0·ε`, `1.5·ε`, `2.0·ε`, … The measured value is the fourth
+/// of those, and the next one is `4.440892098500626e-16`. An
+/// `assert!(worst < 4e-16)` — which is what this line was — therefore had
+/// **exactly one representable step** of headroom on a quantity produced by
+/// `libm::sqrt` and by whatever the target does with `a*b + c`. aarch64 CI
+/// became real on 2026-08-16 and an FMA-contracting target is a live
+/// possibility; a one-step margin is the same kind of gate this file already
+/// deleted an `assert_eq!(differing_bits, 160)` for being. `4·ε` keeps the
+/// claim worth defending — a few ulp, not a renormalization and not `1e-8` —
+/// with room for a target that rounds this sum differently.
 #[test]
 fn unit_norm_survives_every_branch() {
     let mut worst = 0.0f64;
@@ -197,7 +318,15 @@ fn unit_norm_survives_every_branch() {
         }
     }
     assert!(samples > 20_000, "sweep collapsed to {samples} samples");
-    assert!(worst < 4e-16, "worst |‖slerp‖ − 1| = {worst:e}");
+    let bound = 4.0 * f64::EPSILON;
+    assert!(
+        worst < bound,
+        "worst |‖slerp‖ − 1| = {worst:e} ({:.1} ulp of 1.0), over the {:.0}-ulp \
+         bound; the output stopped being unit to within the rounding of \
+         `qa·wa + qb·wb`",
+        worst / f64::EPSILON,
+        bound / f64::EPSILON
+    );
     assert!(worst > 0.0, "nothing was actually measured");
 }
 
@@ -217,7 +346,7 @@ fn the_arc_is_the_short_one_and_the_sign_of_qb_is_irrelevant() {
     let mut saw_obtuse = 0usize;
     for k in 0..24 {
         let qa = sample_rotation(k);
-        for &theta in &[1e-7, 0.05, 0.3, 1.2, 2.0, 2.9] {
+        for &theta in &[THETA_FALLBACK * 0.1, 0.05, 0.3, 1.2, 2.0, 2.9] {
             let qb = step(qa, theta);
             let dot = qa.dot(qb);
             if dot < 0.0 {
@@ -356,9 +485,10 @@ fn out_of_range_s_extrapolates_and_only_the_closed_form_holds() {
     let mut worst_far = f64::MAX;
     for k in 0..40 {
         let qa = sample_rotation(k);
-        let qb = step(qa, 1e-7);
-        worst_near = worst_near.max(rot_dist(slerp(qa, qb, 100.0), geodesic(qa, 1e-7, 100.0)));
-        worst_far = worst_far.min(rot_dist(slerp(qa, qb, 1e6), geodesic(qa, 1e-7, 1e6)));
+        let theta = THETA_FALLBACK * 0.1;
+        let qb = step(qa, theta);
+        worst_near = worst_near.max(rot_dist(slerp(qa, qb, 100.0), geodesic(qa, theta, 100.0)));
+        worst_far = worst_far.min(rot_dist(slerp(qa, qb, 1e6), geodesic(qa, theta, 1e6)));
     }
     assert!(
         worst_near < 1e-12,
@@ -378,13 +508,42 @@ fn out_of_range_s_extrapolates_and_only_the_closed_form_holds() {
 /// it swallows a `NaN` (or an infinite) `s` and returns `qa`. A caller who
 /// expects a poisoned stamp to show up as a `NaN` pose gets a plausible one
 /// instead, and only from the pairs that carry no motion.
+///
+/// # **Do not "harden" the closed form to make this pass differently**
+///
+/// A `NaN` *component* survives by a mechanism that reads like a bug. `h` is
+/// `NaN`, and `NaN <= x` is false for every `x`, so the component clears the
+/// identical-input return **and both branch tests** — the closed form is the
+/// only arm it can reach, at any angle. There `dot` is `NaN`,
+/// `NaN.min(1.0)` is `1.0`, so `angle` is `acos(1.0) = 0.0` and `sin_angle` is
+/// `0.0`: the `NaN` is destroyed, and the output is `NaN` only because both
+/// weights come back as `0.0/0.0`.
+///
+/// So a guard of the form `if sin_angle == 0.0 { return qa; }` — which looks
+/// like a defence against dividing by zero and is the edit a reader reaches for
+/// on seeing that line — turns a `NaN` input into a **plausible pose**. If one
+/// of the `qnan` assertions below fails on your branch, the answer is not to
+/// relax it.
+///
+/// Mutant, run: that exact guard inserted after `let sin_angle = …` ⇒ this test
+/// fails at `k=0` on *"NaN in qb was swallowed"*, and the other nine tests in
+/// this file all still pass.
+///
+/// (`dot.clamp(-1.0, 1.0)` in place of `.min(1.0)` is safe — `clamp` returns
+/// `NaN` for a `NaN` receiver — and would make this test pass for the reason it
+/// claims to. It is not the current line; `slerp`'s docs record why.)
 #[test]
 fn nan_propagates_except_through_the_identical_input_return() {
     let all_nan = |q: Quat| q.w.is_nan() && q.x.is_nan() && q.y.is_nan() && q.z.is_nan();
     for k in 0..16 {
         let qa = sample_rotation(k);
-        // One pair per branch: fallback, series, closed form.
-        for &theta in &[1e-7, 0.1, 0.5] {
+        // One pair per branch *for a NaN `s`*: fallback, series, closed form.
+        // A NaN *component* is not swept across branches by this list and
+        // cannot be: it makes `h` NaN, so it lands in the closed form whatever
+        // the angle. The three thetas are the same three either way, so the
+        // `qnan` assertions below repeat one branch three times, on purpose —
+        // they are the ones the `sin_angle == 0.0` guard would break.
+        for &theta in &[THETA_FALLBACK * 0.1, 0.1, 0.5] {
             let qb = step(qa, theta);
             assert!(
                 all_nan(slerp(qa, qb, f64::NAN)),
@@ -393,11 +552,14 @@ fn nan_propagates_except_through_the_identical_input_return() {
             let qnan = Quat::new(f64::NAN, qb.x, qb.y, qb.z);
             assert!(
                 all_nan(slerp(qa, qnan, 0.5)),
-                "NaN in qb was swallowed: k={k}"
+                "NaN in qb was swallowed: k={k}. The closed form recreates it as \
+                 0.0/0.0; a guard on `sin_angle == 0.0` returns a plausible pose \
+                 instead. See this test's doc comment."
             );
             assert!(
                 all_nan(slerp(qnan, qb, 0.5)),
-                "NaN in qa was swallowed: k={k}"
+                "NaN in qa was swallowed: k={k}. See this test's doc comment \
+                 before relaxing this."
             );
         }
         // The exception, both ways it fires. `h` is `0`, so nothing downstream

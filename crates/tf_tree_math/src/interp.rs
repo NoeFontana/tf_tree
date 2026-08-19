@@ -65,11 +65,26 @@ const SLERP_LERP_FALLBACK: f64 = 1e-6;
 /// adjacent samples on one edge.
 pub(crate) const THETA_SLERP_SMALL: f64 = 0.15;
 
-// **Both constants are quoted as literals in `slerp`'s public documentation**,
-// which is the crates.io page an external caller reads and the only place the
-// fallback band and the crossover are stated in a form they can act on. Neither
-// is `pub` — a re-measurement is allowed to move them, and that is exactly why
-// this is here: the prose is what a re-measurement would leave behind.
+// **Both constants are quoted as literals outside this file**, and neither is
+// `pub` — a re-measurement is allowed to move them, and that is exactly why
+// these two lines are here: the prose is what a re-measurement would leave
+// behind. What the assertions can do is refuse to compile until whoever moved
+// the constant comes here; what they cannot do is find the prose. So the sites
+// are listed, because "grep for `0.15`" over this repository is not a short
+// list:
+//
+// * `slerp`'s own rustdoc, below — `# Angles`, `# Preconditions` and
+//   `# Numerics`, which is the crates.io page an external caller reads and the
+//   only place the fallback band and the crossover are stated in a form they
+//   can act on.
+// * `THETA_SLERP_SMALL`'s own doc comment above (the per-term-count table and
+//   the 10.47 Hz crossover), and `slerp_weight`'s.
+// * `crates/tf_tree_math/README.md`, *Numerics, and where the constants came
+//   from* — the crates.io front page.
+// * `docs/API.md` §6 row 16.
+// * `crates/tf_tree_math/tests/slerp_public.rs`, which mirrors the crossover in
+//   a single `THETA_CROSSOVER` const and derives its sweep from it, so that
+//   file has one site rather than nine.
 const _: () = assert!(SLERP_LERP_FALLBACK == 1e-6);
 const _: () = assert!(THETA_SLERP_SMALL == 0.15);
 
@@ -205,6 +220,11 @@ impl Iso3 {
 /// `docs/API.md` §2.7 is what authorises this being `pub` and carries the §7
 /// walk, item 8 — what a caller *loses* by taking it — included.
 ///
+/// **The `tf_tree` facade re-exports this**, so a consumer of the engine
+/// reaches it as `tf_tree::slerp` and does not take a second direct dependency
+/// on this crate to do it. `tf_tree`'s `tests/math_reexports.rs` is what says
+/// the two names are one item.
+///
 /// # Angles
 ///
 /// **Every angle here is a *quaternion* angle** — `acos(qa·qb)`, which is
@@ -223,6 +243,29 @@ impl Iso3 {
 /// quaternion) where the arithmetic would produce infinities rather than
 /// merely a wrong answer.
 ///
+/// **Nor a `debug_assert!`, which is the version of that question worth
+/// answering**, since it would cost a release caller nothing and
+/// `iso3.rs`'s `vinv_c3` domain assertion is right there as a precedent.
+/// Three reasons it is not the same case:
+///
+/// * That precedent is a **private** function with exactly one caller in this
+///   crate, whose argument [`crate::log_se3`] derives from [`crate::log_so3`]
+///   and is therefore in range by construction — the assertion pins a contract
+///   the crate owns both ends of. This is a public entry point whose inputs come
+///   from outside, and in the engine from a pose another *process* wrote into
+///   a shared arena.
+/// * **Nothing upstream enforces the invariant**, so the assertion would fire
+///   on real data rather than on a bug: no push path in `tf_tree_core` or the
+///   facade normalizes a stored pose, and a quaternion that has drifted a few
+///   ulp off unit gives a slightly wrong answer here, not a wrong *kind* of
+///   answer. A `debug_assert` would make that a panic in every debug build —
+///   this crate's proptests, `just miri`, and every downstream `cargo test` —
+///   and not in release, which is a value that works or aborts depending on
+///   `-C debug-assertions`.
+/// * It would not catch the hazard this function actually has. The
+///   `# Storage order` transposition produces a **unit** quaternion that is the
+///   wrong rotation, and no norm test of any tolerance sees it.
+///
 /// `s` is a dimensionless fraction of the segment, **not** a stamp. A caller
 /// interpolating between two samples divides in integer nanoseconds and passes
 /// the ratio; nothing in this crate knows what time is.
@@ -237,12 +280,28 @@ impl Iso3 {
 /// * **Closed form** (quaternion angle above `0.15` rad) — the formula is
 ///   `sin((1−s)·θ)/sin θ` and holds off the segment as well as on it:
 ///   `7.2e-15` at `|s| = 20`, part of which is the reference's own rounding.
-/// * **Series** (between the two thresholds) — the weight series is calibrated
-///   for `|a| ≤ 1`; outside it `k = 1 − a²` grows quadratically and the
-///   six-term truncation stops covering it. The `1e-15` bound is gone between
-///   `|s| ≈ 2.3` and `|s| ≈ 5` depending on the angle, the error is `6.0e-6`
-///   at `|s| = 20` (quaternion angle `0.1` rad), and by `|s| = 100` it is
-///   `1.6e3` — not a rotation at all.
+/// * **Series** (between the two thresholds) — **two mechanisms, and which one
+///   loses the bound depends on the angle, not on `s`.** Far out it is
+///   truncation: the weight series is calibrated for `|a| ≤ 1`, and outside it
+///   `k = 1 − a²` grows quadratically until six terms stop covering it — `6.0e-6`
+///   at `|s| = 20` (quaternion angle `0.1` rad), and `1.6e3` by `|s| = 100`,
+///   not a rotation at all. **Where the `1e-15` bound is first lost, though, the
+///   cause at the small-angle end is cancellation and not truncation**: `wa` and
+///   `wb` grow like `∓s` while their sum stays near 1, so the rounding floor is
+///   `(|wa| + |wb|)·ε` and the result cancels back down onto the sphere from
+///   there. Measured over 40 rotations, the bound goes at `|s| ≈ 2.3`–`2.9` for
+///   a quaternion angle of `0.1499` rad and at `|s| ≈ 3.2`–`5.0` for `0.02` rad
+///   — and at `0.02` rad the largest term the six-term series still *carries* is
+///   `5.9e-18` at `|s| = 5`, three orders under the bound, so the remainder it
+///   drops is smaller again, and the observed error there tracks the
+///   cancellation floor instead (`1.2e-15` measured against a floor of
+///   `2.0e-15`). At `0.1499` rad the two are the same size right where the
+///   bound goes: at `|s| = 2.3` the series' weights still match
+///   `sin(aθ)/sin θ` to within their own ulp while the floor is `7.9e-16`, and
+///   by `|s| = 3` the weights are `2.4e-15` off against a floor of `1.1e-15`.
+///   **So the range's two ends have different causes**, and an edit adding a
+///   seventh term would move the `0.1499` end and leave the `0.02` end exactly
+///   where it is.
 /// * **LERP fallback** (below `1e-6` rad) — a chord, extrapolated and
 ///   renormalized. Mechanically the crudest of the three and numerically the
 ///   most forgiving, because the arc it cuts is tiny: `1.2e-14` at `|s| = 100`,
@@ -257,12 +316,30 @@ impl Iso3 {
 /// `1.4`. `out_of_range_s_extrapolates_and_only_the_closed_form_holds` is what
 /// keeps the three bullets above honest.
 ///
-/// **`NaN` is not rejected either**, and it does not always survive. It
-/// propagates through all three branches, from `s` or from either quaternion,
-/// with one exception: two numerically identical inputs return `qa` before `s`
-/// is read at all, so `slerp(qa, qa, f64::NAN)` and `slerp(qa, qa, f64::INFINITY)`
-/// are both `qa`. A `NaN` *component* cannot reach that return — it makes `h`
-/// `NaN`, which is not `<= 0.0` — so it comes back out.
+/// **`NaN` is not rejected either**, and it does not always survive. A `NaN`
+/// `s` propagates through all three branches, with one exception: two
+/// numerically identical inputs return `qa` before `s` is read at all, so
+/// `slerp(qa, qa, f64::NAN)` and `slerp(qa, qa, f64::INFINITY)` are both `qa`.
+///
+/// **A `NaN` *component* takes one branch and one only, and the mechanism is
+/// worth writing down because the obvious hardening breaks it.** It makes `h`
+/// `NaN`, and `NaN <= x` is false for every `x` — so it clears the
+/// identical-input return *and* both branch tests, and the closed form is the
+/// only arm a `NaN` component can reach whatever the angle between the inputs.
+/// There the `NaN` is **destroyed and then recreated**: `dot` is `NaN`,
+/// `NaN.min(1.0)` is `1.0` (Rust's `f64::min` returns the non-`NaN` operand),
+/// so `angle` is `acos(1.0) = 0.0`, `sin_angle` is `0.0`, and the output is
+/// `NaN` only because both weights are `sin(a·0.0)/0.0`, which is `0.0/0.0`.
+/// A guard returning `qa` when `sin_angle == 0.0` — a reasonable-looking
+/// defence against that division — would therefore turn a `NaN` input into a
+/// plausible pose, and it is `nan_propagates_except_through_the_identical_input_return`
+/// that would fail. Replacing `.min(1.0)` with `dot.clamp(-1.0, 1.0)` is the
+/// other obvious edit and is *safe* — `clamp` returns `NaN` for a `NaN`
+/// receiver, so the `NaN` would then survive on its own terms rather than by
+/// coincidence — but it is not made here: the observable behaviour is
+/// identical on every input, so it would be a change to the hot path that no
+/// test could distinguish, and the reason `.min` looks like a bug is that the
+/// paragraph explaining it was missing, not that the line is wrong.
 ///
 /// # Storage order
 ///
@@ -276,7 +353,7 @@ impl Iso3 {
 ///
 /// On the series and closed-form branches the weights at `s = 0` and `s = 1`
 /// are exactly `(1, 0)` and `(0, 1)`, so both endpoints come back bit-for-bit.
-/// Three qualifications, all measured rather than reasoned:
+/// Four qualifications, all measured rather than reasoned:
 ///
 /// * **`s = 1` returns `-qb` whenever `qa·qb < 0`.** That is the sign fix
 ///   arriving at the endpoint, not an endpoint failure: `-qb` is the same
@@ -291,6 +368,22 @@ impl Iso3 {
 ///   `slerp(qa, qb, 0.0)` is `qa/‖qa‖`, which differs from `qa` by ~2.7e-16
 ///   whenever `qa`'s components do not happen to square to exactly `1.0`.
 ///   `endpoints_lose_bit_exactness_only_in_the_lerp_fallback` pins both halves.
+/// * **A `-0.0` component is the one thing "bit-for-bit" does not cover, on
+///   every branch.** Exact weights mean the answer at `s = 0` is
+///   `qa·1.0 + qb·0.0` rather than `qa`, and `-0.0 + (+0.0)` is `+0.0` — so
+///   `slerp(Quat::new(1.0, -0.0, 0.0, 0.0), qb, 0.0)` returns `+0.0` in `x`
+///   for any `qb` whose `x` is positive, and a `-0.0` in `qb` flips the same
+///   way at `s = 1`. The fallback's `normalize` loses it too. **Stated
+///   rather than fixed**, because the fix is an `s == 0.0` shortcut and the
+///   first bullet rules out its `s == 1.0` twin on purpose: adding one end and
+///   not the other trades a sign of zero for an asymmetry between the two
+///   endpoints, which is the larger of the two surprises. Nothing in this crate
+///   manufactures a `-0.0` component — [`crate::exp_so3`] produces one only
+///   from an axis component that already carries the sign, and
+///   `sample_rotation`, which every sweep in `tests/slerp_public.rs` is built
+///   from, emits no zero component at all over `k` in `0..1000` — so this
+///   reaches a caller who built a [`Quat`] by hand.
+///   `signed_zero_components_are_the_endpoint_exception` pins it.
 /// * **Numerically identical inputs return `qa` for every `s`**, `s` included
 ///   in neither weight. Two consecutive `/tf` samples from a stationary body
 ///   are exactly this case, and it is an early return rather than an accident:
@@ -303,9 +396,14 @@ impl Iso3 {
 ///
 /// The first two bullets are also the *entire* difference between calling this
 /// and going through `LerpSlerp::eval` on a pair of zero-translation [`Iso3`],
-/// which answers `s = 0` and `s = 1` from a shortcut that never reaches here.
+/// for any input a rotation can produce — `eval` answers `s = 0` and `s = 1`
+/// from a shortcut that never reaches here.
 /// `the_iso3_round_trip_it_replaces_agrees_as_a_rotation` sweeps both and
-/// classifies every bit difference; as rotations the two agree to 2.7e-16.
+/// classifies every bit difference; as rotations the two agree to 2.7e-16. The
+/// third bullet is a difference too, and is excluded from that sweep rather
+/// than absent from it: `eval`'s shortcut returns `*a` and keeps a `-0.0`,
+/// where this returns `+0.0`, and no rotation the sweep can build has a zero
+/// component to notice it with.
 ///
 /// # Numerics
 ///
