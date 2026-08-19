@@ -573,6 +573,117 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
     );
 }
 
+/// **The same divergence, reached through published API with nothing staged.**
+///
+/// The test above pins the *consequence* on a state built with
+/// `LockFile::try_take_participant(0)`, and says in as many words that no
+/// sequence of `tf_tree::Open` calls was known to produce it. One does, and it
+/// is neither of the two paths #201 was filed on — both of those were measured
+/// not to diverge (#214, #215): an owner death frees byte 0 along with the
+/// ownership byte, and nothing sets `Open::already_attached`.
+///
+/// The producer is [`tf_tree_ipc::Session::release_ownership`], which gives up
+/// the **ownership** byte and keeps **participant byte 0**. That is exactly
+/// what §3.5 asks of it — "give up the owner role while staying attached" —
+/// and what it leaves behind is a live **non-owner** on byte 0, the state
+/// `docs/PHASE2.md` §0.0 said nothing outside a test produces. A forced create
+/// then takes byte 1 against arena record 0, and every liveness predicate reads
+/// record 0's liveness from byte 0, which belongs to somebody else.
+///
+/// **What this adds over the test above is the route, so it stops where the
+/// route is established.** The corrupting consequence is measured there and is
+/// not measured twice here. One thing does differ and is worth an assertion:
+/// the staged survivor writes no identity, so its byte names nobody, while this
+/// one is a real registration — byte 0 carries a plausible `tf_tree
+/// participants` row for a process that is not the one in record 0.
+///
+/// Both sessions are opened by path, so each holds its own open file
+/// description and the bytes genuinely conflict; that is the same reason the
+/// staged survivor above works inside one process. Identity is *not* read to
+/// tell the two apart here, because in one process they share a pid — the
+/// holder mask is what separates them.
+///
+/// Mutant: drop `stranded` before opening the forced creator, so byte 0 is free
+/// when it runs. Applied: the **holder-mask** assertion fails first —
+/// `left: 1, right: 3` — because the creator then takes byte 0 itself and no
+/// second byte is held; the final assertion is never reached. That is the
+/// reading of this test: the stranded byte 0 is the whole cause, and
+/// `CreatePolicy::Always` on its own diverges from nothing.
+#[cfg(feature = "unstable")]
+#[test]
+fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+    use tf_tree_ipc::{ArenaName, EnvVar, NoServer, OpenOutcome, Rendezvous, RuntimeDir};
+
+    let scratch = Scratch::new("release-ownership-divergence");
+    let rendezvous = || {
+        Rendezvous::new(
+            RuntimeDir::resolve().unwrap(),
+            0,
+            ArenaName::new("default", EnvVar::Name).unwrap(),
+        )
+    };
+
+    // An ordinary `tf_tree_ipc` consumer creates, then hands back the owner
+    // role. Every call here is published API; none of it is test-only.
+    let mut stranded = tf_tree_ipc::Open::new(rendezvous())
+        .timeout(std::time::Duration::from_millis(500))
+        .open(&mut NoServer)
+        .expect("the first open must create");
+    assert_eq!(stranded.outcome(), OpenOutcome::Created);
+    assert_eq!(stranded.slot(), 0, "a creator takes participant byte 0");
+    stranded
+        .release_ownership()
+        .expect("§3.5: giving up the owner role must succeed");
+    assert!(!stranded.is_owner(), "the owner role was given up");
+
+    let witness = tf_tree_ipc::LockFile::open(&scratch.0.join("0/default.lock")).unwrap();
+    assert!(
+        !witness.probe_ownership().unwrap().held,
+        "release_ownership must free the ownership byte"
+    );
+    assert!(
+        witness.probe_participant(0).unwrap().held,
+        "and must keep participant byte 0 — §3.5 stays attached"
+    );
+    assert!(
+        witness.read_identity(0).unwrap().is_some(),
+        "unlike the staged survivor above, byte 0 names a real registration"
+    );
+
+    // The forced create. §3.4 step 4 lets it past precisely because it is
+    // `CreatePolicy::Always`, which is the escape hatch's whole purpose.
+    let tree = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Always)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("CreatePolicy::Always must create past a held participant byte");
+
+    assert_eq!(
+        tree.participant_slot(),
+        0,
+        "a fresh arena registers its creator at record 0"
+    );
+    assert_eq!(
+        witness.held_participants().unwrap(),
+        0b11,
+        "exactly two bytes are held: the stranded session's 0 and the creator's"
+    );
+    assert_ne!(
+        tree.participant_slot(),
+        1,
+        "**#201.** The creator's lock byte is 1 and its arena record is 0, so \
+         the predicate that reads record 0's liveness asks the kernel about a \
+         byte belonging to the stranded session"
+    );
+}
+
 /// **`Open::require_create` refuses to join, and leaves nothing behind.**
 ///
 /// `CreatePolicy` has no "create, or refuse if one is already live" setting, so
