@@ -79,12 +79,23 @@ left-invariant but **not** right-invariant. That asymmetry is a property of the
 policy, not a defect in this crate; it is why `ScLerp` is the default, and the
 test that demonstrates it is expected to fail for `LerpSlerp`.
 
-**Both policies' kernels are callable on their own**, without an `Iso3`:
-`slerp(qa, qb, s)` for the shortest-arc quaternion interpolation `LerpSlerp`
-uses, `dualquat::screw_pow(&rel, s)` for `ScLerp`'s screw power. `slerp` became
-public because a downstream crate wanted rotation-only interpolation and was
-reaching it by building two `Iso3` with zero translations — the numerics were
-right, the entry point was missing.
+**Both policies' kernels are callable on their own**, without going through
+`Interp::eval`: `slerp(qa, qb, s)` for the shortest-arc quaternion
+interpolation `LerpSlerp` uses, `dualquat::screw_pow(&rel, s)` for `ScLerp`'s
+screw power. The two are not the same shape and the difference is the reason
+one of them changed. `screw_pow` takes an `Iso3` — the relative transform,
+raised to a real power — because a screw is an SE(3) object and there is
+nothing smaller to hand it. `slerp` takes two `Quat`, and until recently the
+only way to reach it was to build two `Iso3` with throwaway zero translations
+and call `LerpSlerp::eval`: a caller who holds rotations and no translation had
+to invent the translation. That is what became public, and the numerics were
+never the problem — the entry point was missing.
+
+`slerp` is re-exported at the `tf_tree` facade's root as well, so an engine
+consumer reaches it without adding this crate as a second direct dependency.
+`screw_pow` is not: it lives behind a module path (`tf_tree_math::dualquat`),
+and a bare `screw_pow` at the facade root would be a second spelling of it
+rather than the same one.
 
 `s` is a fraction of the segment, `[0, 1]`, and unchecked: out of range the
 three branches extrapolate and degrade differently, so which accuracy a caller

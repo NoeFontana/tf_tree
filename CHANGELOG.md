@@ -78,11 +78,44 @@ is a bug.
   kernel `dualquat::screw_pow` has been public since Phase 1; this removes the
   asymmetry rather than opening a new surface.
 
-  **One behavioural difference from the `Iso3` round trip, at the endpoints
-  only:** at `s = 1` with `qa·qb < 0` the bare function returns `-qb` where
-  `LerpSlerp::eval` answers `qb` from a shortcut. Same rotation, opposite
-  components. Callers comparing quaternion components rather than rotations at
-  `s = 1` will see it.
+  **Two behavioural differences from the `Iso3` round trip, at the endpoints
+  only** — both because `LerpSlerp::eval` answers `s = 0` and `s = 1` from a
+  shortcut that never reaches the kernel:
+
+  - At `s = 1` with `qa·qb < 0` the bare function returns `-qb` where `eval`
+    answers `qb`. Same rotation, opposite components. Callers comparing
+    quaternion components rather than rotations at `s = 1` will see it.
+  - Inside the `1e-6`-rad LERP fallback band the bare function *renormalizes*
+    at both endpoints, where `eval`'s shortcut returns its input exactly — a
+    departure of about `2.7e-16` for any input whose components do not happen
+    to square to exactly `1.0`.
+
+  (The count was **one** here when this entry first landed, while `slerp`'s
+  rustdoc, `docs/API.md` §6 row 16 and
+  `endpoints_lose_bit_exactness_only_in_the_lerp_fallback` all said two. A third
+  difference exists and is not counted with these because no rotation can reach
+  it: a `-0.0` component comes back `+0.0` from the kernel and survives `eval`'s
+  shortcut. It needs a hand-built `Quat`; `slerp`'s *Endpoints and degenerate
+  inputs* section states it.)
+
+- **`tf_tree` re-exports `slerp`.** The commit above made
+  `tf_tree_math::slerp` public for a consumer of the *engine*, and the facade
+  did not carry it — so that consumer still had to add `tf_tree_math` as a
+  second direct dependency and pin it in lockstep with `tf_tree` on a line
+  where every release breaks every other, which is worse than the `Iso3` round
+  trip they were told to abandon. `tf_tree::slerp` is now the same item as
+  `tf_tree_math::slerp`, and **`tf_tree::dualquat`** carries `ScLerp`'s kernel
+  beside it — the first revision re-exported only `LerpSlerp`'s and so
+  reproduced the same asymmetry one layer up, leaving an `ScLerp` consumer in
+  exactly the two-dependency position this closes. The module is re-exported
+  rather than the function, so `tf_tree::dualquat::screw_pow` is the same *path*
+  as `tf_tree_math::dualquat::screw_pow` and not a second spelling of it
+  (`PROJECT.md` §6). On the facade's **stable** tier (no `unstable`
+  feature), checked by `tf_tree/tests/math_reexports.rs`, which compiles only
+  if the two paths resolve to one function. `ScLerp`'s kernel is deliberately
+  not re-exported beside it: `screw_pow` is reached through
+  `tf_tree_math::dualquat`, and a bare name at the facade root would be a
+  second spelling of that path rather than the same one.
 
 - `just shm-check` runs `cargo nextest run -p tf_tree --features shm --lib`. The
   recipe named integration targets individually and had no `--lib` line, so an

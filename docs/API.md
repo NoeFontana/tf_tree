@@ -520,9 +520,40 @@ downstream crate that wanted rotation-only interpolation therefore built two
 numerics were right and the entry point was missing.
 
 **The rule, stated once so the next kernel does not need its own argument:** a
-kernel this crate already evaluates on the hot path is `pub` when the only way
-to reach it from outside is to construct a degenerate input to its wrapper.
-What makes that safe to promise is §2.6's test — *does its shape follow the
+kernel this crate already evaluates on the hot path is `pub` when reaching it
+through its wrapper would make the caller **manufacture a value of a type their
+problem does not contain**.
+
+**`screw_pow` is the precedent for the tier and is not an instance of that
+rule**, and the difference is worth being exact about because an earlier
+revision of this section stated the rule as *"the only way to reach it from
+outside is to construct a degenerate input to its wrapper"* and cited
+`screw_pow` under it. A review pass refuted the first attempt at drawing that
+line, and the refutation is kept because it is the trap. It is **not** true that
+`eval(&Iso3::IDENTITY, &rel, s)` "invents nothing": `Iso3::IDENTITY` is
+manufactured, and it is *more* degenerate than the `Vec3::ZERO` a `slerp` caller
+manufactures, since it fixes a rotation as well as a translation. Measured, that
+call is bit-identical to `screw_pow(&rel, s)` in both `q` and `t` at
+`s` = 0.25/0.5/0.75, so the identity it manufactures is read only by `inv_mul` and
+the trailing compose — which is the older wording's own consequence clause. So
+`screw_pow` *was* an instance of it, and "no valid precedent" would be too
+strong. Nor does arity separate them: `screw_pow` takes one `&Iso3` where
+`ScLerp::eval` takes two, so on a count of arguments its input is the narrower
+one.
+
+What separates them is the **type**, which is why the rule is stated that way
+above. A `slerp` caller holds two quaternions and must invent a *translation* —
+a value of a kind their problem does not contain at all. A `screw_pow` caller
+already holds a relative transform, and supplies a second, legitimate member of
+a type they are already working in. What `screw_pow` does establish is the
+narrower claim this section actually rests on — **that a policy's kernel is
+stable-tier public API in this crate rather than a private detail of the
+policy** — which it has demonstrated since the first commit without an argument
+ever being written down. `slerp` is the first item the rule above decides, and
+the asymmetry row 16 closes is between the two kernels' *visibility*, not
+between two instances of one condition.
+
+What makes the tier safe to promise is §2.6's test — *does its shape follow the
 arena layout* — and `(Quat, Quat, f64) -> Quat` follows nothing: no arena in
 it, no `FORMAT_VERSION` under it, and `PHASE5.md` §1 does not schedule it to
 move. It is stable-tier for the reason `Plan` and `Stamp` are. `tf_tree_math`
@@ -592,6 +623,26 @@ and 1 and 2 out of where it sits; 5 and 8 needed an argument.
    differential test, `the_iso3_round_trip_it_replaces_agrees_as_a_rotation`,
    not a benchmark row. **A math primitive answers check 8 with a differential;
    a binding answers it with a benchmark. The check binds either way.**
+
+**The `tf_tree` facade re-exports it, and that is a second surface with its own
+§7 answer — a short one.** It was missing from row 16 as first landed, and the
+omission mattered: the facade already re-exports `LerpSlerp`, so a consumer who
+took the policy from `tf_tree` and the kernel from `tf_tree_math` held **two
+direct dependencies to keep pinned in lockstep** on a line where every release
+breaks every other — a worse position than the `Iso3` round trip this section
+told them to abandon, and the exact opposite of what row 16 was for. Checks 2
+through 8 are answered above and unchanged, because `pub use` names the item
+rather than wrapping it: `tf_tree::slerp` **is** `tf_tree_math::slerp`, pinned
+by `tf_tree/tests/math_reexports.rs`, which compiles only if the two paths
+resolve to one function item. Check 1 is unaffected for the same reason as
+above — a kernel is a rung below tier 3, not a fourth lookup. The loss under
+check 8 is not the caller's, it is this project's: the name joins the facade's
+stable tier and is a semver promise there, where before it was one crate over.
+`ScLerp`'s kernel deliberately does **not** follow it: `screw_pow` is reached
+through `tf_tree_math::dualquat`, and a bare `screw_pow` at the facade root
+would be a second spelling of that path (`PROJECT.md` §6) rather than the same
+one. `slerp` has no module-path spelling to compete with — `tf_tree_math`
+already re-exports it at its own root.
 
 ---
 
@@ -908,7 +959,7 @@ authorized by this document alone.
 | 13 | `tft_bridge_options::arena_name` + `TFT_ERR_ARENA_UNAVAILABLE` | C | [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) | **landed** — `arena_name` appended under §3.6's `struct_size` prefix rule and `TFT_ERR_ARENA_UNAVAILABLE` added to the frozen header, ABI minor 4 → 5. A NULL `arena_name` is the private heap arena every pre-`0.5` caller already had; a non-NULL one is `tf_tree::Open` with `require_create(true)`, and a shared arena that cannot be had is a startup refusal with **no heap fallback**. An earlier revision of this cell said "the ABI half landed" and that `0015` steps 3–7 were outstanding; all eight of that record's steps have since landed — #139, #141, #142, #143 and step 7's `PHASE4.md` §5.8 half; that cell's own C surface was complete at #141. What is still outstanding there is the `atfork` test its *Invariants to maintain* clause demands and §9.2's N = 1…16 curve for the new benchmark arm — **neither of which is C API surface**, so neither holds this row open |
 | 14 | `__version__`, `arena_format_version()`, `arena_layout_hash()` on the Python module | Python | §3.2 | **landed** — `tf_tree_py`. `__version__` is `env!("CARGO_PKG_VERSION")` and never a literal: a hand-copied string is wrong exactly once, on the release where somebody bumps the manifest and not the line, and it is wrong *silently* — a report carrying it is mis-attributed rather than un-attributed, which is worse than having no version at all. The other two re-export the facade's own `arena_format_version` / `arena_layout_hash` under the facade's own names, so no second spelling of an existing path exists (`PROJECT.md` §6) and `tf_tree_arena` does not become a dependency of the binding to answer a diagnostic. All three run at import frequency, and neither of the two calls touches an arena or takes a lock — they bottom out in `tf_tree_arena::FORMAT_VERSION` and in `layout_hash`, which is a `const fn` — so R2 is not in tension. **The two are functions rather than module constants, and that is forced rather than chosen:** `tests/python/test_stubs.py` is what keeps the hand-written `.pyi` from rotting, and it collects the stub's `ClassDef`s and `FunctionDef`s only (`test_stubs.py:36`) while skipping underscore-prefixed names on both sides (`:50`). A module-level `FORMAT_VERSION: int` is an `AnnAssign`, invisible to that comparison — it would be the one name in the surface whose existence nothing checks. `has_shared_memory` is the precedent: a compile-time-constant fact about the build, exposed as a nullary function. `__version__` is exempt by that same underscore skip and keeps the dunder because it is what a bug-report template asks for; it is not the canonical answer — `importlib.metadata.version("transform_tree")` is, it reads `pyproject.toml` where this one reads the crate manifest, and `tests/python/test_version.py` is the only thing that stops the two files drifting |
 | 15 | `frame_headroom=` on `tf_tree.build` and `tf_tree.open` | Python | §3.2 | **landed** — `tf_tree_py`. Spare frame-name slots, mirroring `TreeBuilder::frame_headroom`, defaulting to `0` so no existing caller's arena changes size. It is not a `layout=` in R4's sense — R4 governs the *pose* layout, where row-major against column-major and `wxyz` against `xyzw` both produce a valid-looking transform pointing the wrong way; this is an arena-sizing knob beside `capacity=`, which has carried a default since Phase 3. The defect it closes is not ergonomic: a Python-created arena sized `max_frames = unique_frames + 1` can never accept a runtime-interned name from **any** participant, so a Rust, C or ROS-bridge peer calling `Tree::frame()` on it gets `CapacityExceeded` with no way for the creator to have allowed it. No `edge_headroom` beside it — `PHASE5.md` §5.8's amendment records that nothing declares an edge at runtime. Gated by `tests/python/test_errors.py::test_frame_headroom_reaches_the_arena_and_stays_out_of_the_frame_list`, which compares frozen `.tft` sizes (2262912 / 2264320 / 2274048 B at headroom 0 / 8 / 64) with `frames()` identical at each — mutation-verified: dropping `.frame_headroom(...)` makes all three sizes equal and fails the test |
-| 16 | `tf_tree_math::slerp` is `pub` | Rust | §2.7 (§2.6's test) | **landed** — the shortest-arc quaternion kernel `LerpSlerp` already evaluates, exported under its own name and re-exported at the crate root, closing the asymmetry with `dualquat::screw_pow`, which has been public since the crate's first commit. **Visibility only**: the body is unchanged, so nothing on the hot path moves. What it deletes downstream is the `Iso3` prologue — 256 bytes of stack, two isometries written out field by field, a zero translation lerped into another — which LLVM folds away in no configuration measured: 28 x86-64 instructions through the consumer's `nalgebra` adapter (41 against 69) and 45 bare (7 against 52) at `opt-level = 3`, moving to 31 and 48 across four release profiles. **No instruction count here is portable and none is quoted as one.** Two earlier revisions did quote one — `15` against `51`, then "the same 36 either way" — and neither reproduces; the second was also arithmetically false against the counts it cited (`59 − 7` is 52). What reproduces is the sign: the wrapper is never optimized out. Two costs, both documented rather than removed: `LerpSlerp::eval`'s `s == 0` / `s == 1` shortcuts hide an endpoint asymmetry the kernel exposes (`-qb` at `s = 1` under the sign fix, renormalized endpoints inside the `1e-6`-rad fallback band), pinned by `the_iso3_round_trip_it_replaces_agrees_as_a_rotation`; and **`s` outside `[0, 1]` is documented as unsupported rather than refused** — which branch runs is a property of the *pair*, so an extrapolation's accuracy is set by the publish rate (closed form holds `7.2e-15` out to `s = ±20`, the series leaves `1e-15` between `|s| ≈ 2.3` and `≈ 5` depending on the angle), and `tf_tree_core` never does it, answering an out-of-window stamp with `ExtrapPolicy` instead. §7's walk, item 8 included, is in §2.7 |
+| 16 | `tf_tree_math::slerp` is `pub` | Rust | §2.7 (§2.6's test) | **landed** — the shortest-arc quaternion kernel `LerpSlerp` already evaluates, exported under its own name, re-exported at `tf_tree_math`'s root, and — since the review of the commit that landed this row — re-exported by the **`tf_tree` facade** as well. That last part was missing on arrival and was not cosmetic: the facade already re-exports `LerpSlerp`, so an engine consumer reaching the kernel had to add `tf_tree_math` as a second direct dependency and pin the two in lockstep, which on a `0.0.x` line is worse than the `Iso3` round trip this row exists to delete. `tf_tree/tests/math_reexports.rs` pins that the two paths are one item rather than two functions. The asymmetry closed here is between the two kernels' **visibility** — `dualquat::screw_pow` has been public since the crate's first commit — and *not* between two instances of §2.7's condition, which `screw_pow` does not meet and never needed to; §2.7 says why in its own words. **Visibility only**: the body is unchanged, so nothing on the hot path moves. What it deletes downstream is the `Iso3` prologue — 256 bytes of stack, two isometries written out field by field, a zero translation lerped into another — which LLVM folds away in no configuration measured: 28 x86-64 instructions through the consumer's `nalgebra` adapter (41 against 69) and 45 bare (7 against 52) at `opt-level = 3`, moving to 31 and 48 across four release profiles. **No instruction count here is portable and none is quoted as one.** Two earlier revisions did quote one — `15` against `51`, then "the same 36 either way" — and neither reproduces; the second was also arithmetically false against the counts it cited (`59 − 7` is 52). What reproduces is the sign: the wrapper is never optimized out. Two costs, both documented rather than removed: `LerpSlerp::eval`'s `s == 0` / `s == 1` shortcuts hide an endpoint asymmetry the kernel exposes (`-qb` at `s = 1` under the sign fix, renormalized endpoints inside the `1e-6`-rad fallback band), pinned by `the_iso3_round_trip_it_replaces_agrees_as_a_rotation`; and **`s` outside `[0, 1]` is documented as unsupported rather than refused** — which branch runs is a property of the *pair*, so an extrapolation's accuracy is set by the publish rate (closed form holds `7.2e-15` out to `s = ±20`, the series leaves `1e-15` between `\|s\| ≈ 2.3` and `≈ 5` depending on the angle), and `tf_tree_core` never does it, answering an out-of-window stamp with `ExtrapPolicy` instead. §7's walk, item 8 included, is in §2.7 |
 
 **Fourteen of sixteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11,
 13, 14, 15 and 16.** The two that have not are 6 and 12, and neither is merely
