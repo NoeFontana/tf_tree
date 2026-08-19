@@ -12,6 +12,29 @@
 > six lines from `spawn_owner_server` onward; both are given where the
 > distinction matters. Nothing outside that one function moved.
 
+> **Errata, 2026-08-19.** Two facts this record cites have since changed, and
+> both are recorded here rather than edited away, because the argument they
+> support is unaffected and a decision record is not rewritten to match code.
+>
+> 1. **"The only `LIVE -> FREE` transition … has exactly one caller: `Tree`'s
+>    `Drop`"** (*The defect*, below) is no longer true. `528eddd` / #191 added a
+>    second: the owner's socket-hangup callback at `crates/tf_tree/src/open.rs:764`
+>    calls `table.release(slot, incarnation)`. Measured on a real two-process
+>    rendezvous arena — the read-write joiner `SIGKILL`ed under a running owner,
+>    slot 1's state word going `0x6` (LIVE) to `0x0` (FREE) within a second. The
+>    sentence describes `f058f4f` and stays as written; what it means today is
+>    that **#184's canonical wedge is reaped**, and the five places candidate (b)
+>    cannot reach — listed under *What is fixed and what is not* — are the whole
+>    of the remaining leak. This staleness has already propagated once: a
+>    `TFT014` implementation copied "no code in the workspace clears one" into an
+>    operator-facing warning, which is false.
+> 2. **"`docs/RUNBOOK.md:414` tells an operator to use it"** (*Corrections*,
+>    below) was true when written and is not now. #203 rewrote that entry to name
+>    `CreatePolicy::Always`, the thing that exists. The finding's substance — the
+>    flag does not exist, and step 8's choice is still open — is untouched, and
+>    #203 deliberately took neither of step 8's two branches, so **whether step 8
+>    reads as discharged is still the owner's call**.
+
 ### The defect
 
 Filed as issue #184. `docs/PHASE2.md` §5.1 is NORMATIVE and says it in one
@@ -40,7 +63,8 @@ byte, no `/proc`, no boot id. The comment says "lives here"; the code says
 
 The only `LIVE -> FREE` transition in the workspace is `ParticipantTable::release`
 (`participant.rs:285`), and it has exactly one caller: `Tree`'s `Drop`
-(`crates/tf_tree/src/tree.rs:2636`). A `SIGKILL`ed process does not run `Drop`.
+(`crates/tf_tree/src/tree.rs:2636`). *(Erratum 1: a second caller landed in
+`528eddd`; see the note at the head of this record.)* A `SIGKILL`ed process does not run `Drop`.
 So a killed read-write participant's slot is `LIVE` for the life of the segment,
 the assigner skips it for ever, and `DEFAULT_MAX_PARTICIPANTS` is 64
 (`crates/tf_tree_arena/src/layout.rs:96`). **Sixty-four abnormal read-write exits
@@ -86,7 +110,7 @@ corrupt reads") cannot detect this class on its own.
   Amending §5 and §11.3's row is part of step 0, with the other §5-family
   corrections.
 - **`--force-new` is a flag `tf_tree_cli` does not have.** `docs/RUNBOOK.md:414`
-  tells an operator to use it; `rg 'force.new' crates/tf_tree_cli` returns
+  tells an operator to use it *(erratum 2: no longer, as of #203)*; `rg 'force.new' crates/tf_tree_cli` returns
   nothing. The capability exists as `CreatePolicy::Always`
   (`tf_tree_ipc/src/open.rs:78`) and as `Open::create`, not as a CLI flag. This
   is the same failure `0019` fixed for `tf_treed` — a runbook row naming a
