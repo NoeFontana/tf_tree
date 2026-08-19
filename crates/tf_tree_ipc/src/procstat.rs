@@ -3,11 +3,13 @@
 //!
 //! `docs/PHASE2.md` §5.1: since the lock file became authoritative for liveness,
 //! none of this is on a correctness-critical path any more. It survives because
-//! `doctor` reports it, the takeover path prints it, and the `--force-new`
-//! escape hatch needs to say *whose* arena is being abandoned. A bare pid is not
-//! an identity — pids are recycled, and on an embedded system with a low
-//! `pid_max` they recycle fast — so a record that names a pid without its start
-//! time names nothing.
+//! `doctor` reports it, the takeover path prints it, and
+//! [`crate::CreatePolicy::Always`] — §3.4's escape hatch, which that section
+//! calls `--force-new` and which no binary exposes as a flag (§0.0, #189) —
+//! needs to say *whose* arena is being abandoned. A bare pid is not an identity
+//! — pids are recycled, and on an embedded system with a low `pid_max` they
+//! recycle fast — so a record that names a pid without its start time names
+//! nothing.
 
 use crate::error::{ProcError, ProcParseError};
 

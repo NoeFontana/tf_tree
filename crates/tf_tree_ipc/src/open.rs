@@ -73,13 +73,44 @@ pub enum CreatePolicy {
     /// that creates an empty arena because the estimator has not started yet
     /// looks healthy and publishes nothing.
     Never,
-    /// Create unconditionally, abandoning any arena that already exists.
+    /// Create over an arena that exists but cannot be reached, abandoning it.
     ///
-    /// This is `--force-new`. It **skips the split-brain check**, which is to
-    /// say it deliberately does the thing §3.4 exists to prevent, and it exists
-    /// only because an operator staring at [`IpcError::ArenaHeldButUnreachable`]
-    /// on a wedged robot needs an escape hatch. Never take this path
-    /// automatically.
+    /// **`docs/PHASE2.md` §3.4 calls this `--force-new`, and the flag has never
+    /// existed** — the escape hatch is this policy and nothing else, on the
+    /// process that creates the arena (§0.0's row, #189). It **skips the
+    /// split-brain check**, which is to say it deliberately does the thing §3.4
+    /// exists to prevent, and it is here only because an operator staring at
+    /// [`IpcError::ArenaHeldButUnreachable`] on a wedged robot needs one. Never
+    /// take this path automatically.
+    ///
+    /// "Unreachable", not "unconditionally": step 1 of the loop still runs, so a
+    /// rendezvous with a server answering on its socket is *joined*. What this
+    /// abandons is an arena whose holders are alive and whose owner is not
+    /// serving.
+    ///
+    /// # What it leaves behind (§3.9, §11.3)
+    ///
+    /// - **The abandoned arena.** Its survivors keep their mappings and keep
+    ///   publishing; §3.9 frees the segment only when the last one drops. Two
+    ///   arenas, two `instance_uuid`s, diverging — chosen, not suffered.
+    /// - **Their lock bytes**, in the same lock file. The new owner's slot
+    ///   assigner skips a byte the kernel reports held, so those slot indices
+    ///   are gone from the replacement's table until the survivors exit. The
+    ///   escape hatch spends participant slots; it never recovers one.
+    /// - **Their claim leases**, at [`crate::CLAIM_BASE`]` + edge_id` in that same
+    ///   file (§6.1). The replacement numbers its edges from zero again, so a
+    ///   writer claiming an id a survivor still holds wins the arena CAS on a
+    ///   record that is genuinely free and then loses the lease — the
+    ///   [`LockAttempt::Contended`] arm, which `tf_tree` surfaces as
+    ///   `ClaimApiError::LeaseContended`. Retrying cannot clear it while the
+    ///   survivor runs; this is the byte aliasing `docs/decisions/0005` §5 of
+    ///   *Consequences* names.
+    /// - **A crash mid-force is the original wedge again.** §11.3's
+    ///   `open.after_create_before_bind` row promises the next `open()` finds
+    ///   nothing alive and creates fresh, but that row assumes no participant
+    ///   byte is held — the one state this policy is reached from. The orphan
+    ///   memfd is still freed with its last mapping; the rendezvous is back
+    ///   where it started, and only another `Always` gets past it.
     Always,
 }
 
@@ -664,8 +695,18 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// **The escape hatch is this policy, not a flag.** The name this test used
+    /// to carry — `force_new_is_the_documented_escape_hatch` — named
+    /// `RUNBOOK.md`'s `--force-new`, which no binary has ever had (#189), so the
+    /// one test covering the capability was named after the one thing about it
+    /// that was untrue. What it exercises is the branch: the loudness §3.4 asks
+    /// for belongs to whoever sets the policy, and nothing here can assert it.
+    ///
+    /// The survivor keeps byte 1 throughout — the created session must take a
+    /// different one, because the two arenas share the lock file and the byte is
+    /// the kernel's, not the arena's.
     #[test]
-    fn force_new_is_the_documented_escape_hatch() {
+    fn create_always_overrides_the_split_brain_check() {
         let (rv, dir) = rendezvous("force");
         let survivor = LockFile::open(rv.lock_path()).unwrap();
         survivor.try_take_participant(1).unwrap();
@@ -674,12 +715,31 @@ mod tests {
             .timeout(Duration::from_millis(30))
             .open(&mut NoServer)
             .is_err());
-        // ...and Always is the loud, explicit override.
+        // ...and Always is the explicit override.
         let s = Open::new(rv)
             .create(CreatePolicy::Always)
             .open(&mut NoServer)
             .unwrap();
         assert_eq!(s.outcome(), OpenOutcome::Created);
+        assert_ne!(s.slot(), 1, "the escape hatch took the survivor's byte");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// **The escape hatch abandons an *unreachable* arena, never a served one.**
+    ///
+    /// Step 1 runs before the create decision, so a rendezvous with a server
+    /// answering is joined whatever the policy says. That is what bounds the
+    /// damage — the doc on [`CreatePolicy::Always`] claims it, and a caller
+    /// reaching for the hatch is entitled to have it tested rather than argued.
+    #[test]
+    fn create_always_still_joins_a_reachable_server() {
+        let (rv, dir) = rendezvous("force-reachable");
+        let s = Open::new(rv)
+            .create(CreatePolicy::Always)
+            .open(&mut ServingAfter(0))
+            .unwrap();
+        assert_eq!(s.outcome(), OpenOutcome::Joined);
+        assert!(!s.is_owner(), "a joiner must not hold byte 0");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

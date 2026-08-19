@@ -408,12 +408,76 @@ the worker.
 
 ### `ArenaHeldButUnreachable`
 
-A participant holds a live arena but is stopped or wedged and cannot take over
-ownership. `doctor` will name the slot and PID; resume or kill it.
+Somebody holds a live arena and nothing is serving it, so
+[`PHASE2.md`](./PHASE2.md) §3.4's split-brain check refuses to create a second
+one. A stopped or wedged participant is one cause. **On this build the ordinary
+cause is not a fault at all**: the owner exited and a perfectly healthy survivor
+still has the arena mapped. §0.0 states why — §3.5's takeover is implemented but
+nothing triggers it, because no participant watches its client socket for `HUP`.
+So the survivor never promotes itself, and every process that tries to open the
+rendezvous meets the check and times out, **for as long as any survivor lives**.
 
-`--force-new` abandons the existing arena. Use it **only** when the holder is
-confirmed unrecoverable — the reason `open()` blocks instead of creating a second
-arena is that two live arenas diverging silently is worse than failing to start.
+```bash
+tf_tree participants   # the holders, by slot and pid — reads the lock file, never maps the arena
+```
+
+**The recovery is to stop every participant**, read-only consumers and any
+`tf_tree top --attach` included. Each process's lock byte is released by the
+kernel when it dies, and the segment is freed when its last mapping drops (§3.9),
+so once the last one is gone the next `open()` creates cleanly. Restarting the
+publisher alone does not help: it is not the survivor, so it takes the same
+split-brain path everything else does.
+
+If a holder must keep running and its arena is written off, the escape hatch is
+**`CreatePolicy::Always`** — [`PHASE2.md`](./PHASE2.md) §3.4 calls it
+`--force-new`, and it is a policy on the process that creates the arena, not a
+flag on `tf_tree`. There is no such flag; §0.0 records why.
+
+```rust
+// `tf_tree::Open` is behind `features = ["shm"]`, Linux only.
+tf_tree::Open::new()
+    .mode(tf_tree::AttachMode::ReadWrite)
+    .create(tf_tree::CreatePolicy::Always)   // skips the split-brain check
+    .layout_if_creating(builder)             // required: decision 0004 sizes an arena from its edges
+    .open()?
+```
+
+Use it **only** when the holder is confirmed unrecoverable, because it does
+exactly what §3.4 exists to prevent, and know what it leaves behind:
+
+- **The old arena stays alive.** Survivors keep their mappings, keep reading, and
+  keep publishing into a segment nobody else can reach. Two arenas, two
+  `instance_uuid`s — the next section of this runbook, arrived at deliberately.
+- **It spends participant slots and never recovers one.** Survivors still hold
+  their bytes in the *same* lock file, and the new owner's slot assigner skips a
+  byte the kernel reports held, so those slot indices are unavailable to the
+  replacement arena until the survivors exit. That also makes it the wrong
+  instrument for a participant table that has filled up
+  (`ParticipantTableFull` / `NoParticipantSlots` above): abandoning an arena
+  discards every writer's data to reclaim a *rendezvous*, which is a different
+  problem from reclaiming the slot of a participant that died.
+- **The survivors' claim leases alias the new arena's.** A claim lease is a byte
+  at `CLAIM_BASE + edge_id` in that same lock file (§6.1), and the replacement
+  numbers its edges from zero again — so a writer that claims an id a survivor
+  still holds gets `LeaseContended` on an edge the new arena reports free, and
+  retrying cannot clear it while the survivor runs. Expect it on whichever edge
+  ids the old topology used first.
+
+- **The creator's own liveness reads off another process's byte.** The lock byte
+  and the arena participant record are the same integer everywhere in the engine,
+  and this is one of two paths that break it (#201): the split-brain check is
+  skipped, so `take_any_participant` hands the creator the first *free* byte —
+  `k+1` when survivors hold `0..k` — while its fresh arena registers it at record
+  **0**. `Tree::participant_alive(0)` then probes byte 0, which belongs to a
+  survivor. While that survivor lives the creator reads alive for the wrong
+  reason; **when the survivor exits, the running creator reads dead**, which is
+  the direction that lets a rescuer take a claim from a live writer. Derived from
+  the code, not yet reproduced. It is a second reason not to reach for this
+  hatch, and the reason a CLI flag must not ship before #201 is answered.
+
+It joins rather than replaces when a server *is* reachable: `open()` probes the
+socket before it takes the ownership byte, so the policy abandons an unreachable
+arena, never one that is being served.
 
 ### Two processes see different data
 

@@ -81,6 +81,21 @@ is a bug.
   **No arena field was added.** The record's `start_time` is unchanged and `0`
   was already what a fresh arena's participant region holds, so this is a
   read-side reinterpretation: `FORMAT_VERSION` and `layout_hash` are untouched.
+- **`RUNBOOK.md`'s recovery from `ArenaHeldButUnreachable` told an operator to
+  use a flag that does not exist** (issue #189). `--force-new` is `PHASE2.md`
+  §3.4's name for the escape hatch, and the escape hatch shipped as
+  `CreatePolicy::Always` on `tf_tree::Open` — a policy on whoever creates the
+  arena, never a command-line flag. `tf_tree_cli` cannot usefully carry one:
+  it supplies no `layout_if_creating`, so the create path it would reach ends in
+  `OpenError::NoLayoutToCreate`, and it exits, so the arena would not outlive the
+  command. The runbook now names the policy and shows the call; `PHASE2.md` §0.0
+  carries the status row the prose is read against.
+
+  The same entry described the wrong cause. It blamed a stopped or wedged
+  participant; on this build the ordinary cause is an owner that exited while a
+  *healthy* survivor kept the arena mapped, because §3.5's takeover has no
+  trigger — and the wedge then lasts as long as any survivor does. The recovery
+  is to stop every participant, which the entry now says.
 
 - **`tests/frozen.rs`'s litter check failed about files it had not produced.**
   It scanned the shared `std::env::temp_dir()` for any entry whose name
