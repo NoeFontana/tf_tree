@@ -69,6 +69,14 @@ use tf_tree::{AttachMode, InterpPolicy, Stamp, Tree};
 /// Attach/lookup cycles timed. Odd, so a median is an observation.
 const CYCLES: usize = 201;
 
+/// The page size the per-page arithmetic in `docs/PHASE2.md` §12.2 divides by.
+/// A constant rather than `sysconf(_SC_PAGESIZE)`, which would buy an `unsafe`
+/// block to print something the byte count beside it already carries: on a host
+/// whose base page is not 4 KiB — a 64 KiB aarch64 kernel is the live example —
+/// the page column is wrong and the byte column still is not, so a reader there
+/// divides again.
+const PAGE_BYTES: usize = 4096;
+
 /// The pair every other harness in this crate measures, so the first-access
 /// number is comparable with the steady-state one.
 const TARGET: &str = "imu_link";
@@ -179,7 +187,13 @@ fn main() -> Result<()> {
         drop(tree);
     }
 
-    report(&attach_ns, &plan_ns, &replan_ns, &first_at_ns);
+    report(
+        owner.arena_size_bytes(),
+        &attach_ns,
+        &plan_ns,
+        &replan_ns,
+        &first_at_ns,
+    );
     Ok(())
 }
 
@@ -212,9 +226,19 @@ fn build_owner() -> Result<Tree> {
     Ok(tree)
 }
 
-fn report(attach: &[f64], plan: &[f64], replan: &[f64], first: &[f64]) {
+fn report(arena_bytes: usize, attach: &[f64], plan: &[f64], replan: &[f64], first: &[f64]) {
     println!("PHASE2 §12 — attach time, and first access after attach");
     println!("  §11.1 fixture on a memfd, {CYCLES} attach/lookup cycles, ReadOnly");
+    // The arena's size is what turns these figures into a per-page cost, and
+    // `docs/PHASE2.md` §12.2 quotes one. That row carried the byte count by
+    // hand from the sitting that first filled it, with nothing re-deriving it;
+    // printing it here makes the division reproducible from this recipe alone.
+    // Pages round **up**, because population advises whole pages: 1 401 472 B
+    // is 342 whole pages and a 640 B remainder, and the remainder is charged.
+    println!(
+        "  arena {arena_bytes} B = {} pages of {PAGE_BYTES} B",
+        arena_bytes.div_ceil(PAGE_BYTES)
+    );
     println!();
     println!(
         "  {:<28} {:>10} {:>10} {:>10} {:>10}",

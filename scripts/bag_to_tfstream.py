@@ -109,7 +109,9 @@ def main() -> int:
         f.write(f"# dynamic edges: {len(edges)}, samples: {len(dynamics)}\n")
         f.write(f"# duration: {span_s:.3f} s\n")
         for (p, c), n in sorted(edges.items()):
-            f.write(f"#   {p} -> {c}: {n} samples ({n / span_s:.1f} Hz)\n" if span_s else "")
+            f.write(
+                f"#   {p} -> {c}: {n} samples ({n / span_s:.1f} Hz)\n" if span_s else ""
+            )
         for (p, c), pose in sorted(statics.items()):
             f.write(f"S {p} {c} {fmt(pose)}\n")
         for ns, p, c, pose in dynamics:
