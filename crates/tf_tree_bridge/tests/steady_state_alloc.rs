@@ -14,39 +14,45 @@
 //! `docs/PHASE1.md` §10.4's zero-allocation invariant is about the **engine**,
 //! which this is not.
 //!
-//! # Slope, not intercept
+//! # Two windows, and both of them are asserted
 //!
-//! Each figure below is the second of **two consecutive equal windows**, not one
-//! window's total, and the difference is what makes this test survive CI.
+//! Every figure below is measured over **two consecutive equal windows**, and
+//! the assertion pins both.
 //!
-//! The property this file names in its own first line is a *rate*: `offer` must
-//! not allocate **more as it runs longer**. An exact total over a single window
-//! pins that rate and an intercept together — and the intercept is not a
-//! property of `offer`, it is whatever one-off cost happens to land after the
-//! warm-up. Three CI runs failed here with `4004` against `4000`: **the same
-//! four allocations every time**, so not noise, and never reproducible on a
-//! developer machine across filtered, whole-package and two-package
-//! invocations, thirty consecutive runs, and both rustc 1.95 and the 1.97 CI
-//! resolves — an eight-iteration warm-up is simply not always long enough to
-//! contain a one-off growth.
+//! The second window is the property this file names in its own first line: a
+//! *rate*, `offer` must not allocate **more as it runs longer**. The first is
+//! pinned alongside it because on these fixtures the intercept is zero as well,
+//! and an amortized growth that only ever landed in window one — a `Vec`
+//! doubling, an index rehash, a capped table filling — would otherwise be
+//! exactly the thing a slope cannot see.
 //!
-//! Two windows separate the two. A constant cost lands in the first and cancels;
-//! a genuine per-offer regression changes both and still fails exactly. Verified
-//! by mutation in both directions: one extra allocation *per offer* inside the
-//! measured loop fails, and a one-off allocation before the windows passes.
+//! **This is where #178 lived, and it is answered rather than routed around.**
+//! Three CI runs failed here with `4004` against `4000` — the same four
+//! allocations every time — and no local run ever reproduced it. Two
+//! explanations were open and they had opposite fixes: an amortized growth in
+//! one of the two hash tables `docs/PHASE4.md` §5.8 gave `Ingest`, or an
+//! artifact of the process-global counter this file used to carry.
 //!
-//! The exact equality is kept, because it is still an exact claim — it is now a
-//! claim about the slope alone.
+//! It was the counter. The four are libtest's **main thread**, they are named
+//! one by one in `ALLOCATIONS`'s own doc, and none of them is a property of
+//! `offer` or of any table in this crate. `Ingest`'s tables were then measured
+//! not to grow at all: 200 000 consecutive offers on each fixture with the
+//! per-offer count recorded individually, and not one offer after the warm-up
+//! was off the modal count of two.
+//!
+//! Verified by mutation in three directions: one extra allocation *per offer*
+//! inside a measured loop fails; a one-off allocation before the windows passes;
+//! a one-off allocation *inside the first window* fails, which is the watch the
+//! second assertion restores.
 //!
 //! The `CountingAllocator` is copied from `crates/tf_tree_bench/tests/zero_alloc.rs`,
 //! which established the pattern; the `unsafe` is confined to this test target
 //! and the library crate stays `#![forbid(unsafe_code)]`.
 //!
 //! **A copied instrument does not inherit its original's later fixes**, and this
-//! file is the evidence. The copy was taken on 2026-07-27; six days later
-//! `zero_alloc.rs` was found to be counting other threads' allocations and made
-//! thread-local, and nothing carried that across. See the counter's own comment
-//! for what that does and does not explain about the failures above.
+//! file is the evidence: the copy was taken on 2026-07-27, `zero_alloc.rs` was
+//! made thread-local six days later, nothing carried that across, and #178 is
+//! the bill for it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -63,21 +69,54 @@ thread_local! {
     /// counter charges the measured window for whatever else the process does
     /// while it is open, and none of that is a property of `offer`.
     ///
-    /// **This file had the defect that file already fixed.** The counter here was
-    /// copied from `zero_alloc.rs` on 2026-07-27 (`3f39f9b`); `zero_alloc.rs`
-    /// became thread-local on 2026-08-02 (`f53198c`, "the zero-alloc gate counted
-    /// other threads' allocations"), six days later, and the fix was never
-    /// carried across.
+    /// **This file had the defect that file already fixed, and #178 was the
+    /// bill.** The counter here was copied from `zero_alloc.rs` on 2026-07-27
+    /// (`3f39f9b`); `zero_alloc.rs` became thread-local on 2026-08-02
+    /// (`f53198c`, "the zero-alloc gate counted other threads' allocations"),
+    /// six days later, and the fix was not carried across until `63dac98`.
     ///
-    /// What that does and does not settle for #178, because the two are easy to
-    /// run together. It does NOT explain the `4004`-against-`4000` CI failures:
-    /// `zero_alloc.rs` was off by ~4000 because a *sibling test* on another
-    /// thread allocated thousands of times, and this target has one test, so its
-    /// only other thread is libtest's own — which is a plausible source of four
-    /// allocations but has not been shown to be the source of these four. What it
-    /// does settle is which of #178's two hypotheses can still be standing. They
-    /// have opposite fixes; narrowing the instrument first is correct under
-    /// either, so it is done before the search rather than after it.
+    /// **#178's four allocations are libtest's own main thread.** They differ
+    /// from `zero_alloc.rs`'s ~4000 in where they come from — that file had a
+    /// *sibling test* allocating on another thread, and this target has one
+    /// test — but not in kind. Above `--test-threads=1` — which is every
+    /// configuration this repository runs — libtest runs a test body on a
+    /// thread it spawns and names after the test. The main thread stays behind,
+    /// and in the handful of statements it executes next it makes exactly four
+    /// allocations, every one of them a container's or a channel's **first**
+    /// use:
+    ///
+    /// 1. `running_tests.insert(id, RunningTest { .. })` — first insert into an
+    ///    empty `HashMap`: one.
+    /// 2. `timeout_queue.push_back(TimeoutEntry { .. })` — first push into an
+    ///    empty `VecDeque`: one.
+    /// 3. `rx.recv_timeout(timeout)`, blocking for the first time on this
+    ///    thread — `mpsc`'s per-thread `Context`, plus the waker's first
+    ///    registration: **two**.
+    /// 4. `get_timed_out_tests(..)` — returns an empty `Vec`: none.
+    ///
+    /// Always four, never three or five, because every one is a first use and
+    /// there is one test in this binary — a second blocking `recv_timeout` on
+    /// the same thread costs nothing, which is what made the number look
+    /// suspiciously like an amortized growth.
+    ///
+    /// Whether they land *inside* a measured window is a scheduling race the
+    /// counter had no business exposing: the main thread needs about a
+    /// microsecond to get through all four, and the test thread needs rather
+    /// longer to parse the topology, build an `Ingest` and warm up, so on an
+    /// unloaded machine the main thread always finishes first. On a contended
+    /// runner it does not. **So it is not deterministic, and #178's premise that
+    /// it was is the one thing here that was wrong.** On 2026-08-16, the day CI
+    /// came back, 32 CI runs predate the slope commit and the job that carries
+    /// this test — `default features (no unstable)`, i.e.
+    /// `just stable-tier-check`'s `-p tf_tree_ingest -p tf_tree_bridge` — failed
+    /// in 3 of them. What is deterministic is the *magnitude*: four one-off
+    /// allocations, adjacent in time, so they land in a window together or not
+    /// at all.
+    ///
+    /// Reproduced under the pre-fix instrument by supplying the delay the runner
+    /// supplies for free — the window read `4004` against a thread-local
+    /// `4000` on the same run — and a thread-local counter removes all four,
+    /// because not one of them is on this thread.
     ///
     /// `const { Cell::new(0) }` is required, not stylistic: a lazily-initialised
     /// thread-local can allocate on first access, and doing that *inside* the
@@ -132,6 +171,15 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
+/// Offers per window, and there are two windows.
+///
+/// **Bounded above by the regressing fixture's runway.**
+/// [`allocs_per_regressing_offer`] replays from five seconds back at 1 ms a
+/// message, so it rejoins the happy path once `8 + 2 * ITERS` reaches 5 000 —
+/// measured: `2_496` is the largest value that keeps both of its windows on the
+/// regression path, and `2_497` takes it off. Going over does not pass quietly
+/// (that fixture asserts every `Action::Drop` and its `dropped_non_monotonic`
+/// total), but it is a bound worth knowing before reaching for a longer run.
 const ITERS: usize = 2_000;
 
 /// One dynamic edge, plus a second the config deliberately does *not* declare.
@@ -152,7 +200,7 @@ const STAMP0: i64 = 10_000_000_000;
 /// One millisecond.
 const MS: i64 = 1_000_000;
 
-/// Allocating calls per `offer`, averaged over `ITERS` steady-state messages.
+/// Allocating calls over each of two consecutive `ITERS`-message windows.
 ///
 /// The `Sample` and the `Publisher` are built once and reused, so what is
 /// measured is `offer`'s own cost and not the caller's message construction.
@@ -165,7 +213,7 @@ const MS: i64 = 1_000_000;
 /// measurement. It could not have halted (one publisher never promotes), but it
 /// would have made an allocation budget flaky rather than failing cleanly, which
 /// is the worst failure mode a steady-state test can have.
-fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
+fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> (usize, usize) {
     let config = TopologyConfig::parse(TOPO).unwrap();
     let mut ingest = Ingest::new(&config);
     let mut s = sample.clone();
@@ -179,7 +227,7 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
         ingest.offer(Topic::Tf, &s, publisher);
     }
 
-    // **Two windows, and the second is the answer.** See `SLOPE_NOT_INTERCEPT`.
+    // **Two windows, and both are the answer.** See the module docs.
     let mut window = |from: i64| {
         let before = allocations();
         for k in 0..ITERS {
@@ -190,8 +238,8 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
         }
         allocations() - before
     };
-    let _first = window(8);
-    window(8 + ITERS as i64)
+    let first = window(8);
+    (first, window(8 + ITERS as i64))
 }
 
 /// Allocating calls per `offer` for a publisher **stuck below its own high-water
@@ -203,7 +251,7 @@ fn allocs_per_offer(sample: &Sample, publisher: &Publisher) -> usize {
 /// five seconds apart), so the initial step is recorded once during warm-up and
 /// the measured window is the *sustained* regression, which is what a stuck
 /// publisher actually produces.
-fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
+fn allocs_per_regressing_offer(publisher: &Publisher) -> (usize, usize) {
     let config = TopologyConfig::parse(TOPO).unwrap();
     let mut ingest = Ingest::new(&config);
     let mut s = Sample::identity("odom", "base", STAMP0).received_at(SteadyNanos(T0));
@@ -236,20 +284,21 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
         }
         allocations() - before
     };
-    let _first = window(8);
+    let first = window(8);
     let second = window(8 + ITERS as i64);
     assert_eq!(
         ingest.stats().dropped_non_monotonic,
         (2 * ITERS + 8) as u64,
         "the fixture must really be on the regression path"
     );
-    second
+    (first, second)
 }
 
 /// **No path allocates for its table lookups — including the path a *broken*
-/// publisher occupies.** All three budgets are exact upper bounds on the
-/// *current* code, chosen to sit strictly below what the flat-tuple maps cost,
-/// so the regression they exist to catch cannot slip back in under them.
+/// publisher occupies.** All three budgets are exact figures for the *current*
+/// code, and each sits strictly below what the flat-tuple maps cost, so the
+/// regression they exist to catch cannot slip back in under them. Each is
+/// asserted over both windows.
 ///
 /// The undeclared case is the one `first_time` was supposed to have solved:
 /// it silenced the log for a 1 kHz undeclared edge and left the allocator
@@ -295,6 +344,15 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> usize {
 /// allocations per offer, budget 2` **with the other two budgets still met**.
 /// That asymmetry is the point of this scenario: no other fixture here can see
 /// it, and the code this replaced allocated twice on exactly that path.
+///
+/// Three mutants on the *harness* rather than on the crate, which is what the
+/// second window is for — all applied and run:
+/// one `String::from` per iteration inside a measured loop ⇒
+/// `declared path, first window: 6000`; one `String::from` before the windows
+/// open ⇒ **passes**, correctly, because an intercept outside the measurement
+/// is not a property of `offer`; one `String::from` at a single iteration
+/// *inside the first window* ⇒ `declared path, first window: 4001`, which is
+/// the amortized-growth watch that pinning only the slope would have lost.
 #[test]
 fn offer_does_not_allocate_for_its_table_lookups() {
     let publisher = Publisher::named(&tf_tree_bridge::gid_for_name("/ekf"), "/ekf");
@@ -323,9 +381,19 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     //
     // And the totals, because the old `(after - before) / ITERS` was integer
     // division by 2000: one allocation every 2001 messages rounded to zero.
-    // That is precisely the shape of an amortized table growth — a `Vec`
-    // doubling, an index rehash, a capped table filling — which is exactly what
-    // this file now has to watch, since `Ingest` gained two hash tables.
+    // That is the shape an amortized table growth has — a `Vec` doubling, an
+    // index rehash, a capped table filling — and it is what this file has to be
+    // able to see, since §5.8 gave `Ingest` two hash tables.
+    //
+    // **There is none, and that is measured rather than argued.** Both windows
+    // are asserted, so a growth event landing in either one fails; and each
+    // fixture was run out to 200 000 consecutive offers with the per-offer count
+    // recorded individually, with not one offer after the warm-up off the modal
+    // two. Nor could there be: each fixture holds one declared edge, one
+    // publisher and one undeclared pair, and every table `offer` touches —
+    // `raw`, `statics`, `authority`, `clocks`, `offsets`, `undeclared`,
+    // `NameNormalizer::seen` — is fully populated by the end of its first offer
+    // and never written again.
     //
     // The per-offer figure is still what a reader wants, so the failure message
     // prints it as a fraction: `0.0005 per offer` is how one allocation per two
@@ -334,15 +402,17 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     const UNDECLARED_PER_OFFER: usize = 2;
     const REGRESSING_PER_OFFER: usize = 0;
 
-    let check = |what: &str, got: usize, want_each: usize| {
+    let check = |what: &str, got: (usize, usize), want_each: usize| {
         let want = want_each * ITERS;
-        assert_eq!(
-            got,
-            want,
-            "{what} path: {got} allocations across {ITERS} offers ({:.4} per offer), \
-             expected exactly {want} ({want_each} per offer)",
-            got as f64 / ITERS as f64
-        );
+        for (which, got) in [("first", got.0), ("second", got.1)] {
+            assert_eq!(
+                got,
+                want,
+                "{what} path, {which} window: {got} allocations across {ITERS} offers \
+                 ({:.4} per offer), expected exactly {want} ({want_each} per offer)",
+                got as f64 / ITERS as f64
+            );
+        }
     };
     check("declared", declared, DECLARED_PER_OFFER);
     check("undeclared", undeclared, UNDECLARED_PER_OFFER);
