@@ -1566,7 +1566,8 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    >
    > - Every process that writes a record holds the matching byte across the whole
    >   of `fill_slot`. `Open::register_at` takes the byte
-   >   (`tf_tree_ipc/src/open.rs:413–415`) before `Tree::attach_shared_at` runs, and
+   >   (`tf_tree_ipc/src/open.rs:445–449`, called at `:335`) before
+   >   `Tree::attach_shared_at` runs, and
    >   the `LockFile` lives in the `Session`, which outlives the `Tree`'s
    >   registration. A joiner that finds the byte contended returns `None` and
    >   never touches the arena.
@@ -1598,15 +1599,36 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    > record. A forked child shares one description rather than acquiring a second,
    > and its `Tree` is poisoned.
    >
-   > *Where it does break, and it is the same hole as question 3.* The argument
-   > presumes byte index == record index. That is **false on two reachable paths**,
-   > both of which reach `register_any`: `CreatePolicy::Always`, which skips §3.4
-   > step 4's held-byte check by design and can therefore give a creator byte *i* >
-   > 0 against a fresh arena's record 0; and the takeover arm. On such a process
-   > the byte predicate does not merely fail to collect `RESERVED` — it **evicts a
-   > live participant's `live_word` record**, which is a defect in piece 2 today and
-   > not only in this question. The assertion piece 2 owes belongs at
-   > `register_any`, and until it exists this challenge has no floor to stand on.
+   > *Where it does break — and the two paths named here first were the wrong
+   > two.* The argument presumes byte index == record index, and that premise
+   > **is** false. But `CreatePolicy::Always` and the takeover arm, named here on
+   > 2026-08-19, do not produce the divergence on their own, and `docs/PHASE2.md`
+   > §0.0 retracted them (#214, #215): an owner death frees byte 0 along with the
+   > ownership byte, so a forced creator lands on byte 0 against record 0 and the
+   > two agree; and nothing sets `Open::already_attached`.
+   >
+   > **Corrected the same day, with a reproduction rather than a derivation.** The
+   > producer is `tf_tree_ipc::Session::release_ownership`
+   > (`tf_tree_ipc/src/open.rs:525`), which gives up the ownership byte while
+   > keeping participant byte 0 — exactly what §3.5 asks of it — leaving a live
+   > **non-owner** holding byte 0. A second process opening with
+   > `CreatePolicy::Always` then skips §3.4 step 4's guard, takes byte 1, and
+   > registers at arena record 0. Measured, public API only, nothing staged:
+   > `arena record = 0, lock byte = Some(1)`, and after the first process exits a
+   > joined peer reports `participant_alive(0) = false` about a process that is
+   > live, holds record 0 and has just pushed a sample, while that process's own
+   > tree reports `true`. `tf_tree_ipc_child hold-participant <lock> 0`, a
+   > `[[bin]]` of the published crate, is a second producer in one command.
+   >
+   > On such a process the byte predicate does not merely fail to collect
+   > `RESERVED` — it **evicts a live participant's `live_word` record**, which is a
+   > defect in piece 2 today and not only in this question. **The conclusion is
+   > unchanged and now rests on a reproduction rather than on a derivation that was
+   > wrong twice**: until the correspondence is asserted, this challenge has no
+   > floor to stand on. The assertion belongs where the byte and the record are
+   > *paired* — `crates/tf_tree/src/open.rs:554`, the single `hold_ownership` call
+   > site, which sees both — rather than at `register_any`, which produces the
+   > divergence but never sees the arena record index.
    >
    > ### One shape not on the record's list, and why I withdrew it
    >
@@ -1671,6 +1693,60 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    >   the rate is not worth amending §0 over, and that at `T ≤ 10 ms` it is not
    >   survivable — so (c) is a bet on the deployment's restart behaviour, which is
    >   not a thing this record can know.
+   >
+   > ### The gate was run. It does not discharge, and the sentence is falsified
+   >
+   > **2026-08-19. Nothing here answers the question either — it reports what the
+   > named experiment did when someone ran it, and two of the three findings are
+   > about the gate rather than about the candidate.**
+   >
+   > **1. The gate sentence, read literally, is false under the model.** It asks
+   > for a case in which "a reclaimer observing `RESERVED` and a registrant holding
+   > the byte can never both succeed". Modelled, both *do* succeed: a reclaimer
+   > wins its `CAS(RESERVED -> FREE)` against a byte-holding registrant's
+   > reservation, and that registrant still returns `Ok`. That is not a refutation
+   > of the argument — it is this record's own predicted outcome, "**a spurious
+   > free, not a second occupant**" — but it is not what the sentence says. The
+   > property the argument needs is *no second occupant*, and the gate wants
+   > restating as that before anything is read against it.
+   >
+   > **2. As modelled, the property was vacuous, so three green runs establish
+   > nothing.** If the byte is modelled as an ideal single-holder token, held for
+   > life by whoever registers successfully, then at most one registrant can reach
+   > `Ok` **by construction of the token**, under any schedule — so `loom` explored
+   > zero executions that could have failed the assertion. Confirmed by re-running
+   > the same model with reclamation effectively disabled: it also passes, in the
+   > same ~40 s. A model that can discharge this gate needs a registrant able to
+   > re-attempt the byte after another's success (a release, or a detach), or a
+   > second slot. **The branch is therefore still ungated**, and the standing of
+   > the "byte as authority" answer is unchanged by this run.
+   >
+   > **3. A constraint piece 2 owes, which this record states nowhere.** **The byte
+   > probe must be evaluated *after* the word observation.** Reversed, `loom` fails
+   > in 0.00 s: the reclaimer probes byte *s* free *before* `X` takes it, then
+   > observes `live_word(1)`, and CASes a live byte-holder's record to `FREE` —
+   > final word `0x0` under a registrant that returned `Ok`. The witness is
+   > C11-legal (the RMW reads the modification-order-latest value; nothing orders
+   > the earlier probe after `X`'s acquisition), and it is **HEAD's scope, not this
+   > question's widening**. It is not a defect today: `Tree::participant_alive`
+   > (`crates/tf_tree/src/tree.rs:2564`) loads `state` and only then calls
+   > `self.liveness`, so `&&` gives it the safe order. But nothing *says* it must,
+   > and `LockFile::held_participants()` returns all 64 bytes in one call
+   > (`tf_tree_ipc/src/open.rs:454`) — a sweep written from that primitive takes
+   > the mask **first**, which is the failing order. The defence above ("it probes
+   > the byte, which the joiner takes before writing anything") never names an
+   > order, and it needs to.
+   >
+   > *How to read a `loom` verdict on this model, since it will be re-run.*
+   > `loom`'s modification order is a vector-clock approximation and
+   > `match_rmw_to_stores` excludes only strictly-earlier stores, so it
+   > over-approximates: **a pass is sound; a failure needs its witness hand-checked
+   > against C11.** All four failures seen here were hand-checked and are legal
+   > executions.
+   >
+   > *Not carried into the repository.* The model is evidence for a `draft` record,
+   > not a test of shipped code, and landing a vacuous case under `just loom` would
+   > be worse than not having it.
 
 ## What would make this `ready`
 
