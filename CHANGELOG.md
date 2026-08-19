@@ -97,6 +97,24 @@ is a bug.
   trigger — and the wedge then lasts as long as any survivor does. The recovery
   is to stop every participant, which the entry now says.
 
+- **`PHASE2.md` §5.1 said the identity triple is off the correctness path while
+  three paths decided liveness from it** (issue #205). All three are in
+  `crates/tf_tree/src/tree.rs`: the OFD probe's fallback, which hands the
+  question to `record_is_alive` whenever `F_OFD_GETLK` declines to answer;
+  `liveness_for`, which *is* the whole predicate for any tree that never got a
+  probe — a heap tree, or one from `Tree::attach_shared`; and `Tree::reparent`,
+  which steals A2's topology lock on `participant_is_alive` and never consults
+  the probe even when the tree has one. The third was found verifying the first
+  two.
+
+  Recorded as a §0.0 status row, not as surgery on §5.1's NORMATIVE prose, on
+  the same ground as #189's row: §0.0 outranks prose, and §5.1's wording is
+  `0028`'s claimed ground. The row also names §3.10 as the reason a `hidepid=2`
+  `ENOENT` is survivable — a dependency #204 put in a code comment and nowhere
+  in the spec, which was #194's own complaint one layer down. **No code
+  changed**: moving those paths off the triple is a design decision and belongs
+  in a record.
+
 - **`tests/frozen.rs`'s litter check failed about files it had not produced.**
   It scanned the shared `std::env::temp_dir()` for any entry whose name
   contained this process's id as a substring, so an unrelated process's scratch
