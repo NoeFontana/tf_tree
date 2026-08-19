@@ -1152,11 +1152,237 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    slot while the first session still holds both. Does the heir reuse its slot,
    and if so which session holds the byte? **This changes step 5's sweep**, so it
    gates `ready` — even though wiring §3.5 itself is out of scope here.
+
+   > **Evidence and a leaning, 2026-08-19. Not an answer — the owner still picks
+   > the shape.**
+   >
+   > *What happens today, read out of the code rather than inferred.*
+   > `grep -rn "already_attached" --include=*.rs` returns eight lines, and exactly one of
+   > them passes `true`: `crates/tf_tree_ipc/src/open.rs:643`, a `tf_tree_ipc`
+   > unit test (`a_survivor_that_holds_the_arena_takes_over_instead`).
+   > `tf_tree::Open::attempt` (`crates/tf_tree/src/open.rs:514–518`) builds its
+   > `tf_tree_ipc::Open` with `.mode().create().timeout()` and never
+   > `.already_attached(...)`, and the facade exposes no setter. **So the answer
+   > to "what does a taking-over participant do" is, today, "nothing takes
+   > over"** — the arm is reachable only from inside `tf_tree_ipc`'s own tests,
+   > and both of the record's claims about it are confirmed: `register_any`
+   > (`open.rs:324`, and again at `:349` for a creator) is `take_any_participant`
+   > + `write_identity`, so the heir
+   > takes a *second* byte on a second open file description while its first
+   > session still holds the first; and if it were wired, `Created | TookOver`
+   > share one arm that calls `builder.build_shared(...)`
+   > (`crates/tf_tree/src/open.rs:550`), which `memfd_create`s a fresh segment.
+   >
+   > *What is new, and it is the reason the answer cannot be "let it take a
+   > second slot".* **The participant slot is baked into every claim and every
+   > topology guard the heir already holds.** A3 encodes claim ownership as
+   > `participant_slot + 1`; `Tree::participant` is a plain field written once at
+   > construction (`tree.rs:2541` reads it back) and never updated; `reap_inner`'s
+   > own-slot guard compares `owner_slot == own_slot` (`tree.rs:2515`); and
+   > `TopoGuard`'s release compares an owner word that `decl`'s doc comment
+   > (`tree.rs:1226`) says is "`participant_slot + 1` and therefore identical for
+   > every thread of this process". §3.5's promise is that the data plane does not
+   > pause, which means the heir keeps its mapping and its claims. If it also
+   > acquired a *new* slot, every claim it holds would name the old one while
+   > every guard it takes names the new one: its own reaper's own-slot guard would
+   > stop recognising its own claims, and a peer sweeping participants would see
+   > the old slot's byte released and its record `LIVE` — **the exact signature
+   > this decision reclaims on.** A heir that took a second slot would arrange for
+   > its own live claims to be reaped.
+   >
+   > *My leaning is that the heir keeps its existing slot, byte and arena record,
+   > and that takeover is byte 0 plus a `bind` and nothing else* — but that is a
+   > leaning, not an answer. §3.3's own table makes the two bytes independent
+   > (byte 0 is ownership; byte `16 + i` is participant liveness), so "which
+   > session holds the byte" needs no arbitration: the original session holds the
+   > participant byte for the whole life of the process, and ownership is a
+   > second, separate lock the same process may also hold. The consequence for
+   > **step 5's sweep is a simplification**: one process is one slot, always, and
+   > a sweep never has to reason about a process occupying two.
+   >
+   > *The cost of that leaning, stated because it is what makes it a decision.*
+   > It means §3.5 cannot be wired as "call `Open::open` again with
+   > `already_attached(true)`", which is what `tf_tree/src/open.rs:22–26` and
+   > `0005` step 5 both describe. It needs a narrower operation on the session
+   > that already exists — take byte 0, unlink, bind, serve — and the existing
+   > takeover arm then has no caller at all.
+   >
+   > *The counter-reading, which I would try first.* `already_attached`'s own doc
+   > comment says the arm exists so that a survivor "is not at risk of creating a
+   > second one" — it was built as a short-circuit past §3.4 step 4, not as a
+   > registration path. On that reading the `register_any` call is simply an
+   > oversight in code nothing calls, there is no design tension to resolve, and
+   > the fix is to delete that one call rather than to invent `promote()`. Every
+   > fact above is consistent with it and it is much the cheaper answer.
+   >
+   > *A correction to piece 2 that holds whichever way question 3 goes.* The
+   > record says the creator's byte/record correspondence "agrees by coincidence".
+   > It is better than that on the ordinary path and worse than that on one
+   > specific path, and both are checkable. §3.4 step 4 refuses to create while
+   > **any** participant byte is held (`tf_tree_ipc/src/open.rs:338`), so a normal
+   > creator runs against an empty lock file and gets byte 0, while
+   > `build_shared` gives it a fresh arena whose first `FREE` record is 0
+   > (`tree.rs:516`, `register_participant`) — the correspondence is *established*
+   > there, not lucky. It is broken in exactly two places, both of which reach
+   > `register_any`: `CreatePolicy::Always`, which skips that check by design and
+   > will therefore hand a creator byte *i* > 0 against record 0 whenever
+   > survivors hold bytes; and the takeover arm above. Nothing reconciles them —
+   > `hold_ownership` (`tree.rs:2382`) parks the session and never compares
+   > `Session::slot` with `Tree::participant`. **So piece 2's "assertion, not a
+   > comment" has exactly one site to live at**, and it is `register_any`.
 4. **What does the sweep cost?** 64 `F_OFD_GETLK` plus up to 64 `/proc` reads,
    against a 97.5 µs p50 attach. Unmeasured, and this repository does not accept
    a number without the command that produced it. Measure it before step 3, and
    decide then whether it needs a bound (e.g. sweep only on the first
    `NoParticipantSlots`, rather than on every grant).
+
+   > **Measured, 2026-08-19.** Host: 8 cores, Linux 6.8, four other build agents
+   > running concurrently, so every figure below is a `p50` over a distribution
+   > and the outliers are the host, not the syscall. Everything was pinned with
+   > `taskset -c 3`.
+   >
+   > *First, the question's own premise is out of date twice over.*
+   >
+   > **The `/proc` half is gone.** Piece 2 as it now stands is the lock byte and
+   > nothing else, and its `None` case is *not reclaimable* rather than a `/proc`
+   > fallback — so the sweep is 64 `F_OFD_GETLK` and **zero** `/proc` reads. That
+   > matters more than it sounds, because a `/proc` read is not a rounding error
+   > next to a `fcntl`: measured here at **14.6 µs** against **531 ns**, i.e.
+   > **27×**. The predicate question 1 removed would have cost up to
+   > 64 × 14.6 µs = **935 µs** per sweep — seven times the *whole* join it was
+   > being priced against. Question 1's resolution was not only a simplification;
+   > it took two orders of magnitude off this question's answer.
+   >
+   > **The 97.5 µs denominator is stale, and it never measured what the *Cost*
+   > section says it measured.** `PHASE2.md` §12.2's row comes from
+   > `just attach-bench`, whose binary calls `Tree::attach_shared(dup, ReadOnly)`
+   > on a memfd (`crates/tf_tree_bench/src/bin/attach_bench.rs:99`) — no
+   > `connect`, no handshake, no `SCM_RIGHTS`, and therefore no assign closure at
+   > all. And the number moved: the row was written on `2026-08-14` (`1e18234`)
+   > and `0024` moved ring population off the attach path on `2026-08-16`
+   > (`0f17fb8`), which split the 97.5 µs in two. Three runs of `just
+   > attach-bench` at `HEAD` give **attach 12.39 / 12.46 / 12.42 µs p50** and
+   > **plan compile (first, populates) 84.8 / 85.0 / 84.6 µs p50**. The sum is
+   > still ~97 µs, so nothing regressed — but "97.5 µs attach" is now two rows,
+   > and §12.2's text should say so.
+   >
+   > *So I measured the denominator the sweep actually runs against.* An
+   > out-of-tree binary (**not** in this repository — see the caveat below) that
+   > creates the arena, serves it, and then times `tf_tree::Open::open()` on the
+   > join arm — the whole §3.7 path, assign closure included:
+   >
+   > ```
+   > $ XDG_RUNTIME_DIR=… TF_TREE_DOMAIN=51 taskset -c 3 ./joincost 200 0
+   > Open::open() join, 0 slots parked   n=200  p50=132240 p90=140233 p99=153452 ns
+   > ```
+   >
+   > **A grant is ~133 µs p50, not 97.5.** Three unpaired repeats of that arm
+   > drifted 132 → 138 → 180 µs as the other agents' load rose, which is why the
+   > A/B below is paired and interleaved rather than run twice.
+   >
+   > *The sweep itself, two ways.*
+   >
+   > **(i) Microbenchmark, the primitive on its own.** `LockFile::held_participants()`
+   > is already exactly the sweep — 64 `probe_participant`, i.e. 64 `F_OFD_GETLK`
+   > — and its own doc comment claims "64 `fcntl` calls on a cold path are free"
+   > without a number. It is not free, but it is cheap:
+   >
+   > ```
+   > $ taskset -c 3 ./sweepcost <dir> 3000
+   > sweep 64x F_OFD_GETLK, 0 held    n=3000  p50=28463 p90=30947 p99=45410 ns  (444.7 ns/probe)
+   > sweep 64x F_OFD_GETLK, 63 held   n=3000  p50=32900 p90=35485 p99=60010 ns  (514.1 ns/probe)
+   > 1x F_OFD_GETLK, slot 0 (held)    n=3000  p50=  561 p90=  611 p99=  662 ns
+   > 1x F_OFD_GETLK, slot 63 (free)   n=3000  p50=  531 p90=  580 p99=  621 ns
+   > F_OFD_SETLK take + release       n=3000  p50= 1853 p90= 2003 p99= 2114 ns
+   > 1x read /proc/<self>/stat        n=3000  p50=15263 p90=15745 p99=33521 ns
+   > 1x read /proc/<other pid>/stat   n=3000  p50=14584 p90=15184 p99=28212 ns
+   > control: 1x read a regular file  n=3000  p50= 7071 p90= 7331 p99=14672 ns
+   > ```
+   >
+   > An earlier run of the same binary on this host under lighter load gave
+   > 23.6–24.1 µs for
+   > the 0-held sweep and 27.8–31.4 µs for the 63-held one, so **the sweep is
+   > 24–33 µs** and a probe is **430–600 ns**. The `/proc` row carries a control
+   > deliberately: a regular file of the same size costs 7.1 µs through the same
+   > `read_to_string`, so ~7 µs of the 14.6 is this host's syscall path and ~7 µs
+   > is `/proc` synthesis. `read_start_time` (`tree.rs:3021`) uses exactly
+   > `std::fs::read_to_string(format!("/proc/{pid}/stat"))`, so 14.6 µs is a
+   > *lower* bound on it — the `format!` is not in my timing.
+   >
+   > **(ii) End to end, paired and interleaved, on the real grant path.** The
+   > same binary as the join measurement, with a third open file description
+   > squatting participant bytes 1..62 directly. Those slots carry no arena
+   > record and were never granted, so neither the `granted` bitmask nor
+   > `identity()` short-circuits them and the assign closure pays one
+   > `F_OFD_GETLK` for each. Each iteration measures a join with them squatted
+   > and a join without, back to back, and takes the difference per pair:
+   >
+   > ```
+   > $ XDG_RUNTIME_DIR=… TF_TREE_DOMAIN=60 taskset -c 3 ./joincost 200 62
+   > join, 62 bytes squatted             p50=170739 ns
+   > join, 0 bytes squatted              p50=138869 ns
+   > paired difference (62 extra GETLK)  p50= 32828 p90= 51828 ns
+   >
+   > $ XDG_RUNTIME_DIR=… TF_TREE_DOMAIN=61 taskset -c 3 ./joincost 200 62
+   > join, 62 bytes squatted             p50=164439 ns
+   > join, 0 bytes squatted              p50=133001 ns
+   > paired difference (62 extra GETLK)  p50= 32239 p90= 41242 ns
+   > ```
+   >
+   > **32.2 and 32.8 µs for 62 probes — 520–530 ns each, agreeing with the
+   > microbenchmark, on the real path, in the real closure.** Scaled to 64:
+   > **~34 µs, or +25 % on a 133 µs grant, in the worst case.**
+   >
+   > *And the worst case is rarer than 64.* The assign loop returns at the first
+   > grantable slot, so it probes `k + 1` slots where `k` is the number it walks
+   > past. What piece 3 changes is *which* slots cost a syscall: today a slot
+   > holding a `LIVE` record is skipped for free by `identity()`, and under piece
+   > 3 it costs one probe. So the added cost is **one `F_OFD_GETLK` per live
+   > read-write participant ahead of the granted slot**, bounded by 64. A healthy
+   > four-publisher arena pays ~2 µs; the wedged arena of #184 pays ~34 µs and
+   > gets a slot instead of a permanent refusal.
+   >
+   > *Does it need a bound? My leaning is no, and one of the two readings of the
+   > proposed bound is unsafe.*
+   >
+   > The question suggests "sweep only on the first `NoParticipantSlots`". Read
+   > as *return the refusal, sweep before the next grant*, *that is broken*, and
+   > the code says why: `Reach::Rejected(why) => return Err(why)`
+   > (`tf_tree_ipc/src/open.rs:291`) is terminal, and `is_retryable`
+   > (`tf_tree/src/open.rs:575`) lists exactly two errors — `ArenaAbsent` and
+   > `ArenaHeldButUnreachable`. `NoParticipantSlots` is neither, so **nobody
+   > retries it**. I hit this by accident while building the harness above:
+   >
+   > ```
+   > thread 'main' panicked at src/main.rs:36:10:
+   > join: Rendezvous(HandshakeRejected { status: NoParticipantSlots, … })
+   > ```
+   >
+   > — a join that raced the owner's hangup handling failed outright rather than
+   > backing off. A design that refuses once and sweeps afterwards would hand the
+   > first joiner after a wedge a terminal error.
+   >
+   > Read as *sweep inside the closure before returning the refusal*, the bound
+   > is sound and costs nothing in the common case — but it buys nothing either,
+   > because the loop's early return already makes the common case cheap, and the
+   > two-pass version would have to keep the `identity()` short-circuit in its
+   > first pass, which is the §5.1 violation this record was opened about. **One
+   > pass, probing the byte, reclaiming inline. 34 µs worst case on a 133 µs
+   > startup path, once per process.** That is my leaning; the owner's call is
+   > whether +25 % on a wedged arena's first grant is worth spending to make the
+   > refusal impossible.
+   >
+   > *Caveat, and it is the one that should shape step 3's verification.* Both
+   > harnesses are out-of-tree scratch binaries in
+   > `/home/dev/.claude/jobs/945078ed/tmp/`, built against `tf_tree` and
+   > `tf_tree_ipc` by path. They are reproducible in the sense that they call
+   > only public API — `LockFile::{held_participants, probe_participant,
+   > try_take_participant, release_participant}` and `tf_tree::Open::open` — but
+   > they are not in the repository and nothing runs them again. **Step 3 owes a
+   > paired join measurement as a bench row**, in the shape used above (squat
+   > *N* bytes, interleave, take the per-pair difference), because three unpaired
+   > runs of one arm on this host spanned 132–180 µs while the paired difference
+   > repeated to within 2 %.
 5. **Can step 7's atfork handler be built inside the async-signal-safety
    constraint?** It needs a lock-free registry of the fds to close, populated
    before any fork; `fork.rs:46–56` is the constraint it has to satisfy. If not,
@@ -1180,6 +1406,247 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    and not merely §11.3.
    **This gates `ready`.** It is the only open question whose wrong answer is
    corruption rather than delay.
+
+   > **Evidence, measurements and a challenge to this record's own refutation,
+   > 2026-08-19. Nothing here is an answer, and the owner should not adopt the
+   > challenge without the loom case named at the end** — this is the exact spot
+   > where this record has already been wrong once, and being wrong here is
+   > corruption.
+   >
+   > ### How a `RESERVED` record is produced, and how wide the window is
+   >
+   > There is exactly one producer: a process dying between `fill_slot`'s CAS and
+   > its publishing store (`participant.rs:154–170`). A *failed* CAS writes
+   > nothing, so a losing registrant leaves no trace. The full instruction
+   > sequence between the slot leaving `FREE` and the identity being published is
+   > seven operations:
+   >
+   > ```
+   > 1  state.compare_exchange(FREE, RESERVED, AcqRel, Acquire)   locked
+   > 2  pid.store(Relaxed)
+   > 3  start_time.store(Relaxed)
+   > 4  attached_at_nanos.store(Relaxed)
+   > 5  heartbeat.store(Relaxed)
+   > 6  incarnation.fetch_add(1, AcqRel)                          locked
+   > 7  state.store(live_word(inc), Release)
+   > ```
+   >
+   > **All seven touch one cache line**, and that is checkable rather than
+   > asserted. `ParticipantRecord` is `#[repr(C, align(64))]` with a `const`
+   > assertion that it is 128 bytes; a replica of it prints
+   >
+   > ```
+   > ParticipantRecord layout: size=128 align=64 state@0 pid@4 start_time@8
+   >                           incarnation@16 attached_at_nanos@24 heartbeat@32
+   > ```
+   >
+   > — every field inside the first 40 bytes. Step 1's CAS brings that line in
+   > exclusive, so **between the CAS and the publish there is no other page to
+   > fault on, no syscall, and no branch**. The two slow, fault-prone things on
+   > the attach path are both *outside* the window and that is not luck:
+   > `arena.populate_hot()` runs before registration in `attach_shared_inner`
+   > (`tree.rs:2242` against `:2252`), so the memory commit — the plausible
+   > trigger for an OOM kill — is finished before the window opens; and
+   > `process_start_time()`'s `/proc/self/stat` read, measured above at ~15 µs, is
+   > evaluated as an *argument* to `fill_slot` (`tree.rs:2884`) and so is also
+   > outside it.
+   >
+   > Measured, as a loop of the same seven operations plus a reset store, on one
+   > `align(64)` record:
+   >
+   > ```
+   > $ taskset -c 3 ./sweepcost <dir> 2000       # three runs
+   > fill_slot window: CAS..store(LIVE) + reset   p50=12.2 / 12.2 / 13.3 ns
+   > publish: store(Release)                      p50= 0.2 ns
+   > publish: compare_exchange(AcqRel)            p50= 5.5 / 6.0 / 6.1 ns
+   > ```
+   >
+   > **The window is ~12 ns.** Sub-question (a) therefore costs **5.3–5.9 ns**,
+   > which against the *measured* 133 µs join (question 4) is **0.004 %**. Cost is
+   > not what (a) has to be argued on.
+   >
+   > ### (c), with the bound actually computed
+   >
+   > "Bounded, rare, permanent" is two-thirds right. It is **not bounded**: the
+   > leak is unbounded in time and the only bound is 64, i.e. the whole table. What
+   > is bounded is the *rate*, and the rate is what the trade has to be made on.
+   >
+   > Model, with its assumptions stated so they can be attacked: a participant
+   > attaches once per life `T` (start to abnormal exit); the kill instant is
+   > independent of where the process is in its own code; the exposed window is
+   > `W_eff`. Then one abnormal exit leaks a `RESERVED` slot with probability
+   > `W_eff / T`, a continuously crash-looping node leaks at `W_eff / T²` slots per
+   > second, and it exhausts 64 slots in **`64·T² / W_eff` seconds**.
+   >
+   > `W_eff` is *wall clock*, not instruction count: a process preempted inside the
+   > window stays exposed for the whole descheduled interval. Preemption lands
+   > inside a 12 ns region with probability ~`W/timeslice`, and costs a runqueue
+   > delay when it does, so `W_eff ≈ W × (runnable per core)`. The table gives
+   > both the uncontended 12.2 ns and a deliberately pessimistic 100 ns (an
+   > 8-deep runqueue):
+   >
+   > | crash-restart period `T` | time to wedge, `W_eff` = 12.2 ns | at `W_eff` = 100 ns |
+   > |---|---|---|
+   > | 10 s | 16 600 yr | 2 030 yr |
+   > | 1 s | 166 yr | 20.3 yr |
+   > | 100 ms | 1.7 yr | 74 d |
+   > | 10 ms | 6.1 d | 17.8 h |
+   > | 1 ms | 87 min | 11 min |
+   >
+   > `T` has a floor this repository can state: a rendezvous join is **133 µs p50**
+   > measured, on top of `fork`/`exec` and runtime start-up, so `T` below ~1 ms is
+   > not reachable by a process that attaches at all. Set against the leak this
+   > record is actually about — one slot per abnormal exit, so **64 exits**, which
+   > at `T = 1 s` is 64 *seconds* — the `RESERVED` leak at the same `T` is
+   > **~10⁷ times slower**.
+   >
+   > Three things that would invalidate that arithmetic, none of which I can rule
+   > out from here: a killer correlated with the attach path (the OOM case is
+   > argued away above, a start-up watchdog is not); a fleet-wide cgroup kill,
+   > which leaves the expectation alone but not the variance; and a host whose
+   > runqueue is far deeper than 8, which moves `W_eff` linearly and the table
+   > quadratically the other way. `SIGSTOP` inside the window is *not* a leak — the
+   > process is alive and holds its byte.
+   >
+   > ### (a) is not a floor, and (a) alone is unsound — the interleaving
+   >
+   > The question calls (a) "the floor for *any* answer other than leave it". Worked
+   > against the code, (a) **on its own does not close the hazard it is there for**,
+   > because `RESERVED` is one value and a CAS against one value is an ABA:
+   >
+   > - `X` CASes slot *s* `FREE -> RESERVED` and is preempted.
+   > - Reclaimer `R` observes *s* `RESERVED`, byte free; it is preempted before its
+   >   CAS.
+   > - Reclaimer `R2` — piece 3 and piece 4 guarantee a second one — reclaims *s*
+   >   and the assigner grants it.
+   > - `Y` takes byte *s* and CASes `FREE -> RESERVED`.
+   > - `R`'s stale `CAS(RESERVED -> FREE)` succeeds against `Y`'s reservation.
+   > - `X` resumes and, **with (a)**, CASes `RESERVED -> live_word(nX)`. If `Y` has
+   >   re-reserved by then the word *is* `RESERVED`, so `X`'s CAS **succeeds** and
+   >   `X` publishes over `Y`. `Y` then publishes over `X`. Two occupants.
+   >
+   > So (a) and (b) are a **matched pair**, not two independent options: (b) without
+   > (a) leaves the unconditional store clobbering whatever it finds, and (a)
+   > without (b) is the ABA above. Anything that collects `RESERVED` by
+   > re-encoding the word needs both, and the record should say so.
+   >
+   > ### A challenge: post-`0b`, is the *byte* not already the answer?
+   >
+   > This is the part to read adversarially, and it is why the section above the
+   > Decision is titled the way it is. The record's refutation has two variants.
+   > Variant 1 — a live byte-less `attach_shared(ReadWrite)` registrant — the
+   > record itself says step 0b removes outright. Variant 2 is the ABA quoted
+   > above, and the record stops it at *"`R`'s stale CAS then succeeds against the
+   > new occupancy"* without carrying it to two occupants. **Carried further, on
+   > the rendezvous path, it does not get there.** With no byte-less registrant:
+   >
+   > - Every process that writes a record holds the matching byte across the whole
+   >   of `fill_slot`. `Open::register_at` takes the byte
+   >   (`tf_tree_ipc/src/open.rs:413–415`) before `Tree::attach_shared_at` runs, and
+   >   the `LockFile` lives in the `Session`, which outlives the `Tree`'s
+   >   registration. A joiner that finds the byte contended returns `None` and
+   >   never touches the arena.
+   > - Piece 3 grants a slot only when its byte is free.
+   > - An exclusive byte cannot be held by two open file descriptions, in one
+   >   process or across two (`ofd.rs`'s module doc).
+   >
+   > Those three together say **two live processes cannot both complete `fill_slot`
+   > at one slot**, whatever the state word does in between — the byte, not the
+   > word, is the occupancy authority. Replaying variant 2 with them: `R`'s stale
+   > CAS frees a word that `Y` owns the byte for; `Y` then publishes `live_word(nY)`
+   > over it and is correct to, because `Y` really does own the slot. The outcome is
+   > a spurious free, not a second occupant. And `X` — the process that would have
+   > raced `Y` — cannot exist, because it would have had to reach `RESERVED`
+   > without a byte.
+   >
+   > **If that argument holds, question 6's answer is "the byte, exactly as for
+   > `live_word`", `reclaim` widens to accept any observed word, `fill_slot` does
+   > not change at all, and §11.3's row closes for free.** I want to be explicit
+   > that I am not asserting it: it is the same shape of argument that was wrong
+   > the first time, its whole load is carried by step 0b, which has not landed,
+   > and it is exactly the kind of claim `just loom` exists to settle.
+   >
+   > *Where I tried to break it, and could not.* The grant window (`granted` set,
+   > byte free, word `FREE`) has nothing to reclaim. A peer running
+   > `reap_participants()` cannot see the `granted` bitmask, but it probes the byte,
+   > which the joiner takes before writing anything. `Tree::drop` releases the
+   > record before the byte, never the reverse. Read-only participants write no
+   > record. A forked child shares one description rather than acquiring a second,
+   > and its `Tree` is poisoned.
+   >
+   > *Where it does break, and it is the same hole as question 3.* The argument
+   > presumes byte index == record index. That is **false on two reachable paths**,
+   > both of which reach `register_any`: `CreatePolicy::Always`, which skips §3.4
+   > step 4's held-byte check by design and can therefore give a creator byte *i* >
+   > 0 against a fresh arena's record 0; and the takeover arm. On such a process
+   > the byte predicate does not merely fail to collect `RESERVED` — it **evicts a
+   > live participant's `live_word` record**, which is a defect in piece 2 today and
+   > not only in this question. The assertion piece 2 owes belongs at
+   > `register_any`, and until it exists this challenge has no floor to stand on.
+   >
+   > ### One shape not on the record's list, and why I withdrew it
+   >
+   > A reclaimer could exclude new occupancy the same way a registrant does — by
+   > **taking the byte**: `F_OFD_SETLK` on `16 + slot`, then the CAS, then unlock.
+   > It needs no change to `fill_slot`, no state re-encoding, no crash-consistency
+   > reordering, and it costs a measured **1.85 µs** (`F_OFD_SETLK take + release`,
+   > above) per slot actually reclaimed. Its crash rows are benign: die before the
+   > CAS and the kernel drops the byte with nothing changed; die after it and the
+   > state is `record FREE, byte held`, which §11.3 already records as safe under
+   > `detach.after_record_released_before_byte`; race a grant and the joiner gets
+   > `Contended` and retries, a path that already exists.
+   >
+   > **I withdraw it, because it does not buy what it looks like it buys.**
+   > Pre-`0b` it does not close the hazard: a byte-less `X` is not excluded by any
+   > byte, so `R` can hold byte *s*, free the record, release, and `X` still
+   > republishes over the next occupant. Post-`0b` it is unnecessary, because the
+   > joiner's own byte already provides the exclusion. What it *does* buy is
+   > tidiness — no stale verdicts, so no spurious frees and no reliance on "the
+   > overwrite happens to be correct" — for 1.85 µs on a path that runs when
+   > something has already died. Worth having, not worth deciding on.
+   >
+   > ### §11.3, walked for each option
+   >
+   > | option | new crash point | state left behind | repair |
+   > |---|---|---|---|
+   > | (a) alone | `fill_slot.after_reclaim_before_publish_cas` | registrant's CAS fails; nothing written | registrant returns `SlotTaken`; **but see the ABA above — (a) alone is unsound, so this row does not stand on its own** |
+   > | (b) | `fill_slot.after_incarnation_bump_before_state_cas` | `incarnation` bumped, slot still `FREE` | none needed: the counter is a guard, not a count, so a gap is invisible. Two racing registrants both bump and only one CASes, so incarnations stop being consecutive per occupancy while staying unique per attempt — which is all `release`'s single-CAS guard needs |
+   > | (a)+(b) | `reclaim.probe_then_reoccupied` for `RESERVED` | reclaimer holds a stale verdict | safe: `reserved_word(inc)` differs across occupancies, so the CAS fails — the same argument that already makes the `live_word` row safe |
+   > | (c) | none | `RESERVED`, byte free, for ever | **none. This is the row that amends §0** |
+   > | byte-as-authority | `reclaim.probe_then_reoccupied` for `RESERVED` | reclaimer frees a word whose byte a live joiner holds | the joiner republishes and is correct to; no second occupant *iff* byte index == record index |
+   >
+   > ### What (a) changes about the public surface, since the question asks
+   >
+   > `register_at` already has `ParticipantError::SlotTaken { slot }`, so no new
+   > variant is needed — but its *meaning* widens from "somebody else got here
+   > first" to "somebody reclaimed the slot under me", and the caller is wrong for
+   > the second. `attach_shared_at` maps every `ParticipantError` to
+   > `ShmError::ParticipantTableFull`, whose doc comment (`tree.rs:2215–2221`) says
+   > "there is nothing useful to retry: the owner would name the same slot again".
+   > Under (a) a retry is exactly the right thing, so that doc comment and that
+   > mapping both change with it. `register`'s loop is unaffected — it already
+   > moves to the next slot on a lost CAS.
+   >
+   > ### What I would put in front of the owner as the decision
+   >
+   > Not a recommendation between the three shapes, because the honest reading is
+   > that **the choice is downstream of step 0b** rather than parallel to it:
+   >
+   > - If **0b lands** and the byte/record correspondence is *asserted* at
+   >   `register_any`, then the byte is a total occupancy authority and the cheapest
+   >   sound answer is to widen `reclaim` to any observed word — no `fill_slot`
+   >   change, §11.3's row closes, §0 stands. **Gate: a loom case in which a
+   >   reclaimer observing `RESERVED` and a registrant holding the byte can never
+   >   both succeed.** If that case does not pass, this whole branch is void.
+   > - If **0b does not land**, byte-less registrants remain and (a)+(b) *together*
+   >   are the minimum sound shape — (a) alone is refuted above. That is two
+   >   crash-consistency changes to `fill_slot`, each needing its own loom case and
+   >   §11.3 row.
+   > - (c) is only a real option in the second world, and its price is now a number
+   >   rather than an adjective: the table above. My leaning is that at `T ≥ 1 s`
+   >   the rate is not worth amending §0 over, and that at `T ≤ 10 ms` it is not
+   >   survivable — so (c) is a bet on the deployment's restart behaviour, which is
+   >   not a thing this record can know.
 
 ## What would make this `ready`
 
