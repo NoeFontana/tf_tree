@@ -2210,24 +2210,36 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  carried no number at all until it was built, which made it an honesty \
                  section that could not regress. \
                  \
-                 **The number improved 8x and that must not be read as the cost going \
-                 away.** Attach was ~97.5 us p50, almost all of it `populate_hot`; it is \
-                 now **12.4 us p50** (cold ~16.8 us, p99.9 ~25.6 us) because \
-                 `docs/decisions/0024` moved ring population out of attach and onto the \
-                 moment an edge is taken up. The cost *moved*: first plan compile went \
-                 550 ns to **84.3 us** on this fixture, whose plan walks essentially every \
-                 edge. Summed, 100.3 us before against 96.7 us after — on the fixture that \
-                 gains no memory from the change, a wash. What tf2 does not pay is still \
+                 **The number improved seven- to eightfold, and that must not be read as \
+                 the cost going away.** Attach was 99.8 us p50 on the commit before \
+                 `docs/decisions/0024` landed — 99 791 ns, that record's own before \
+                 column — almost all of it `populate_hot`; it is now \
+                 **12.3-14.2 us p50**, which is 7.0x to 8.1x — `8x` is the best run, not \
+                 the figure — because `0024` moved ring population out of attach and onto \
+                 the moment an edge is taken up. The cost *moved*: first plan compile \
+                 went 550 ns to **66.3-92.3 us p50** on this fixture, whose plan walks \
+                 essentially every edge. Summed, **100.3 us before** — that is 99 791 \
+                 + 550 ns, `0024`'s paired before column, and *not* the 97.5 us \
+                 `docs/PHASE2.md` §12.2 used to carry, which was a different sitting on \
+                 a different commit and never had 100.3 as its sum — against \
+                 **79.3-106.4 us after**, per run and paired. On the \
+                 fixture that gains no memory from the change, a wash. **The after ranges \
+                 are observed extremes over 28 runs on one busy host, load average 4 to 7, \
+                 rounded outward — what was seen, not a bound**; §12.2 carries the same \
+                 spread and the reason for it, and the ranges printed here before these \
+                 were falsified by the next nine runs. What tf2 does not pay is still \
                  what tf2 does not pay; it is now itemised at two line items instead of \
-                 one, and a reader quoting only the first would be quoting a 8x \
+                 one, and a reader quoting only the first would be quoting a sevenfold \
                  improvement that this fixture did not deliver. \
                  \
                  §7.1's guarantee holds throughout: the **first** lookup after attach is \
-                 130 ns p50 before and after, indistinguishable from a steady-state one, \
-                 and the fault *count* is zero. Recompiling a plan whose pages are already \
-                 resident costs 1.33 us, which is what bounds the topology-change path — a \
-                 `reparent` invalidates every cached plan, so that figure is the one \
-                 standing between a reparent and a fault storm across every reader."
+                 130 ns p50 before and 130-170 ns p50 after, indistinguishable from a \
+                 steady-state one, and the fault *count* is zero. Recompiling a plan \
+                 whose pages are already resident costs ~1.4 us (1.33 us at \
+                 `0f17fb8`, 1.36-1.44 us across the sixteen runs since), which bounds the \
+                 topology-change path — a `reparent` invalidates every cached plan, so \
+                 that figure is the one standing between a reparent and a fault storm \
+                 across every reader."
                 .to_owned(),
             metrics: Vec::new(),
             metrics_absent_because: Some(

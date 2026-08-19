@@ -3,15 +3,20 @@
 
 `just artifact-versions`. This is the third gate of the family that starts with
 `just msrv` and `scripts/evidence-audit.sh`, and it exists because the defect
-those two catch showed up three more times while this release was being cut:
-shipped text that contradicts a document the same text names as authoritative.
+those two catch showed up three more times while this release was being cut —
+and once more after it: shipped text that contradicts a document the same text
+names as authoritative, or that no reader can see at all.
 
   * the README's status table against the `§0.0` tables it calls the source of
     truth;
   * the CLI's `--help`, still saying "live external attach arrives in Phase 2"
     two phases after it arrived;
   * `just py-wheel`, documented in the README as "build + install" while the
-    recipe only built — so the documented quickstart ended in `ImportError`.
+    recipe only built — so the documented quickstart ended in `ImportError`;
+  * and, later, two rows of `docs/PHASE2.md` §12.2 whose measured results
+    rendered as *nothing* on github.com, because each carried them in a third
+    cell of a two-column table (#208) — hiding a benchmark's whole answer and,
+    behind it, a figure that had gone stale.
 
 None of those was caught by a test, because none of them is a property of the
 code. They are properties of the *repository*, and this file is where the ones
@@ -433,6 +438,291 @@ def check_recipe_references() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 5. Every Markdown table row has as many cells as its header.
+# ---------------------------------------------------------------------------
+
+# GFM truncates a row to the header's column count and **says nothing**. A cell
+# past the last column is not a rendering wart, it is deletion: it is gone on
+# github.com while every local editor, every `less` and every diff still shows
+# it, so the author who wrote it has no way to notice. Twice now that has hidden
+# something that mattered:
+#
+#   * `docs/API.md` row 16 shipped with two unescaped pipes inside `|s| ≈ 2.3`
+#     and split into seven cells of a five-column table. The commit that landed
+#     the row said it had fixed exactly that, and had not; a review found it by
+#     counting pipes by hand.
+#   * `docs/PHASE2.md` §12.2 carried two three-cell rows in a two-column table
+#     for five days (#208). Invisible in them were a benchmark's whole result
+#     and a stale figure that a later change had split in two — a wrong number
+#     no reader could see to challenge.
+#
+# **Escape-aware, because `\|` is legitimate inside a cell** and is how API.md's
+# row was fixed. A naive `line.count("|")` false-positives on §3.6's
+# `SHRINK\|GROW` row, which is well formed; that false positive is the reason
+# the rule is written against a splitter rather than a count.
+#
+# Rows with too *few* cells are reported as well, even though GFM pads those and
+# nothing is lost. A table whose rows disagree with its header is a table
+# somebody edited without counting the columns, and the next such edit is the
+# one that deletes.
+#
+# **The risk runs both ways, and the second direction is the dangerous one.** A
+# false *negative* — a ragged row this walks past — leaves the corpus exactly
+# where it was. A false *positive* blocks a correct document, and a gate that
+# does that is a gate somebody switches off. Three constructions put a pipe
+# table where GFM renders none, and each is guarded rather than argued away:
+#
+#   * a **setext H2** — a prose line containing a `|`, then a bare `---` under
+#     it — is a heading. GFM will not read a delimiter row without a `|` in it,
+#     so neither does this, and every table in the corpus has one. Unguarded,
+#     the check calls a heading "1 cells in a 2-column table", and 59 Markdown
+#     files are each one missing blank line away from writing that heading by
+#     accident.
+#   * a **4-space-indented code block** is code, and a table drawn in one
+#     renders as text. Skipped — but the threshold is four spaces past the
+#     innermost open list item's content, not four from the margin, because
+#     `docs/decisions/0005` has a real, rendered table indented four spaces
+#     inside item 11 of an ordered list. A blanket "skip four spaces" would
+#     stop checking it.
+#   * an **HTML comment** hides everything through `-->`, and `CHANGELOG.md`
+#     opens one. Skipped.
+#
+# Each guard was verified by writing the construction it describes into a file
+# and watching the check stay silent, then breaking a row inside a *rendered*
+# table in the same file and watching it fire.
+
+# A delimiter cell: `---`, `:--`, `--:`, `:-:`, any width.
+TABLE_DELIM_CELL_RE = re.compile(r"^\s*:?-+:?\s*$")
+
+# Only ``` and ~~~ fences, up to three leading spaces, as CommonMark has it.
+MD_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+
+# A list marker, which is what moves the indented-code threshold: content of an
+# item indented by the marker's own width is content, not code.
+LIST_MARKER_RE = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])(\s+)")
+
+# A blockquote marker, possibly nested, stripped before anything else looks at
+# the line. Seven documents put tables inside `>` blocks — `docs/API.md`'s
+# inlining measurements are the largest — and those render as tables on
+# github.com and truncate exactly like any other. Without this the check walks
+# past all of them: `> |` makes the first cell `> `, which no delimiter pattern
+# matches, so the table is never recognised at all.
+QUOTE_PREFIX_RE = re.compile(r"^\s*(?:>\s?)+")
+
+
+def table_cells(line: str) -> list[str]:
+    r"""Split a table row on unescaped `|`, the way GFM does.
+
+    A backslash consumes the character after it, so `\|` stays inside its cell.
+    The leading and trailing pipes every table in this repository carries are
+    decoration: GFM drops the empty edge cells they produce, and dropping them
+    here is what makes a row written without them count the same.
+    """
+    cells: list[str] = []
+    current: list[str] = []
+    i = 0
+    while i < len(line):
+        if line[i] == "\\" and i + 1 < len(line):
+            current.append(line[i : i + 2])
+            i += 2
+            continue
+        if line[i] == "|":
+            cells.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(line[i])
+        i += 1
+    cells.append("".join(current))
+    if cells and not cells[0].strip():
+        cells = cells[1:]
+    if cells and not cells[-1].strip():
+        cells = cells[:-1]
+    return cells
+
+
+def strip_html_comments(line: str, inside: bool) -> tuple[str, bool]:
+    """Drop `<!-- ... -->` spans, carrying the open/closed state across lines.
+
+    An HTML comment is raw HTML through its `-->`: whatever is inside it does
+    not render, so a table drawn there is not a table. Returns what is left of
+    the line and whether a comment is still open after it.
+    """
+    kept: list[str] = []
+    i = 0
+    while i < len(line):
+        if inside:
+            end = line.find("-->", i)
+            if end < 0:
+                break
+            inside = False
+            i = end + 3
+            continue
+        start = line.find("<!--", i)
+        if start < 0:
+            kept.append(line[i:])
+            break
+        kept.append(line[i:start])
+        inside = True
+        i = start + 4
+    return "".join(kept), inside
+
+
+def parsed_lines(text: str) -> list[str]:
+    """Blank every line GFM will not read as Markdown, keeping line numbers.
+
+    Fenced code, HTML comments and indented code come back as empty strings
+    rather than being dropped, so a finding's line number is still the line
+    number in the file. Blanking is also how each of them *ends* a table, which
+    is what GFM does with them.
+
+    The indented-code threshold is four spaces past the innermost open list
+    item's content indent. Four from the margin would be wrong in exactly one
+    place that exists today — `docs/decisions/0005`'s table inside item 11 of an
+    ordered list — and wrong in the direction that stops checking a real table.
+    Where the list tracking guesses, it guesses the marker into existence and
+    so raises the floor, which skips *less* and checks *more*.
+    """
+    out: list[str] = []
+    fenced = False
+    commented = False
+    list_indents: list[int] = []
+    for raw in text.splitlines():
+        line = QUOTE_PREFIX_RE.sub("", raw)
+        if not commented and MD_FENCE_RE.match(line):
+            fenced = not fenced
+            out.append("")
+            continue
+        if fenced:
+            out.append("")
+            continue
+        line, commented = strip_html_comments(line, commented)
+        if not line.strip():
+            out.append("")
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while list_indents and indent < list_indents[-1]:
+            list_indents.pop()
+        floor = list_indents[-1] if list_indents else 0
+        if indent >= floor + 4:
+            out.append("")
+            continue
+        marker = LIST_MARKER_RE.match(line)
+        if marker:
+            list_indents.append(len(marker.group(0)))
+        out.append(line)
+    return out
+
+
+def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
+    """(tables, body rows, findings) — findings are (line, found, expected, row).
+
+    A table is recognised the way GFM recognises one: a header line followed by
+    a delimiter line of the same width, where the delimiter row **carries a
+    `|`**. That last clause is the whole difference between a one-column table
+    and a setext `---` heading, and without it a heading over a prose line
+    holding a pipe is reported as a one-cell row. Fenced blocks, HTML comments
+    and indented code are skipped, so a document that *shows* a broken table as
+    an example is not a finding — and the counts come back with the findings
+    because a detector that quietly stops matching would otherwise report a
+    clean corpus forever.
+    """
+    lines = parsed_lines(text)
+    findings: list[tuple[int, int, int, str]] = []
+    tables = 0
+    rows = 0
+    i = 0
+    while i < len(lines):
+        if "|" not in lines[i] or i + 1 >= len(lines):
+            i += 1
+            continue
+        # A delimiter cell holds only `-`, `:` and spaces, so no backslash can
+        # reach one and a plain `in` is exactly "an unescaped pipe" here.
+        if "|" not in lines[i + 1]:
+            i += 1
+            continue
+        delim = table_cells(lines[i + 1])
+        if not delim or not all(TABLE_DELIM_CELL_RE.match(c) for c in delim):
+            i += 1
+            continue
+        header = table_cells(lines[i])
+        tables += 1
+        # A delimiter row that does not match its own header is the same defect
+        # one line earlier: GFM stops seeing a table at all, and the whole thing
+        # renders as a paragraph full of pipes.
+        if len(header) != len(delim):
+            findings.append((i + 2, len(delim), len(header), lines[i + 1]))
+        j = i + 2
+        while j < len(lines) and lines[j].strip() and "|" in lines[j]:
+            rows += 1
+            found = len(table_cells(lines[j]))
+            if found != len(header):
+                findings.append((j + 1, found, len(header), lines[j]))
+            j += 1
+        i = j
+    return tables, rows, findings
+
+
+def check_markdown_tables() -> str:
+    """**Every tracked Markdown file**, `docs/decisions/` included.
+
+    Wider than the recipe scan above, and for a reason that does not contradict
+    it. That one holds records out because a recipe rename must not force an
+    edit to a dated document. A ragged row is not a rename: it is a defect the
+    document had on the day it was written, and a record that renders with a
+    cell missing is misleading today. The corpus was measured before the rule
+    was written — across every tracked Markdown file the only findings were
+    `PHASE2.md` §12.2's two rows, which #208 fixed.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "*.md"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    files = sorted(f for f in listed.split("\0") if f)
+    if not files:
+        fail("`git ls-files '*.md'` listed nothing; this check would pass trivially")
+
+    tables = rows = 0
+    for rel in files:
+        found_tables, found_rows, findings = scan_tables(
+            (ROOT / rel).read_text(encoding="utf-8")
+        )
+        tables += found_tables
+        rows += found_rows
+        for lineno, found, expected, row in findings:
+            # Two different defects, and the advice differs. Too many cells is
+            # the one that deletes; too few is a table somebody stopped
+            # counting, which is how the next edit becomes the first kind.
+            why = (
+                "GFM drops every cell past the header count and warns nobody, "
+                "so what is written past the last column renders as nothing at "
+                "all on github.com while looking right in every editor. Widen "
+                "the header, fold the cell into its neighbour, or escape the "
+                "pipe as `\\|` if it is content."
+                if found > expected
+                else "GFM pads a short row, so nothing is lost here — but a "
+                "table whose rows disagree with its header is one nobody is "
+                "counting the columns of, and the next such edit is the one "
+                "that deletes a cell. Add the missing cell."
+            )
+            fail(
+                f"{rel}:{lineno}: {found} cells in a {expected}-column table.\n"
+                f"    {row.strip()[:110]}\n"
+                f"    {why}"
+            )
+    if not tables:
+        fail("no Markdown table was recognised anywhere; the detector is broken")
+
+    return (
+        f"{rows} rows in {tables} Markdown tables across {len(files)} documents all "
+        f"have their header's cell count"
+    )
+
+
 def check_distribution_name() -> str:
     """The PyPI distribution name, wherever it is written by hand.
 
@@ -475,10 +765,7 @@ def check_distribution_name() -> str:
         and f"{dist}-" not in line
     ]
     for line in stale:
-        fail(
-            f"a justfile wheel glob does not name the distribution "
-            f'"{dist}": {line}'
-        )
+        fail(f'a justfile wheel glob does not name the distribution "{dist}": {line}')
 
     return f'the PyPI distribution is "{dist}"; the module it installs is tf_tree'
 
@@ -490,6 +777,7 @@ def main() -> int:
         check_publishable(authority),
         check_changelog(authority),
         check_recipe_references(),
+        check_markdown_tables(),
         check_distribution_name(),
     ]
 

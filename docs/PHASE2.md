@@ -888,20 +888,34 @@ The Phase 1 24-frame robot tree, plus: 1 writer process (4 dynamic edges as in P
 
 ### 12.2 Required measurements
 
-| Benchmark | Report |
-|---|---|
-| depth-3 cross-process lookup, warm | p50, p99, p99.9 vs the Phase 1 in-process baseline |
-| first access after attach, per-edge population on vs off | p99.9, both | **Half done — `just attach-bench`.** With population **on** (the shipped path): first lookup after attach **130 ns p50, ~1.3 us p99.9**, indistinguishable from a steady-state lookup — which is the guarantee §7.1 exists to buy, now demonstrated rather than asserted. The **off** arm is absent and deliberately so: `populate_hot()` is unconditional inside `attach_shared_inner`, and manufacturing an "off" arm out of a different code path would measure something else. It arrives with `docs/decisions/0022`'s B2-prime, the change that gives the attach path a policy. |
-| THP `madvise` vs `never` | p50, p99.9, both |
-| aggregate read throughput, 1→16 consumer processes | scaling curve |
-| **CPU per consumer at 1 kHz × 20 edges, vs ROS 2 `/tf`** | %CPU per consumer, both |
-| **total RSS across 16 consumers, vs ROS 2 `/tf`** | MB, both |
-| publish → visible-to-consumer latency, vs ROS 2 `/tf` | p50, p99.9, both |
-| `SIGKILL` writer → claim reapable → re-claimed | p50, p99 |
-| attach time, cold and warm | p50 | **Done — `just attach-bench`.** **97.5 us p50** on the §11.1 fixture, cold 114–153 us, p99.9 157–181 us, over 201 cycles. Almost all of it is population: the arena is 342 pages and 97.5 us / 342 is ~285 ns/page, which is what `MADV_POPULATE_WRITE` costs. "Cold" is the first cycle — fresh VMA and page tables — and **not** a cold page cache, which needs root to arrange. |
-| `open()` when the arena exists vs when creating | p50, both |
-| owner kill → new owner serving | p50, p99 |
-| lookup latency across an ownership migration | p99.9 during vs steady-state |
+| Benchmark | Report | Measured |
+|---|---|---|
+| depth-3 cross-process lookup, warm | p50, p99, p99.9 vs the Phase 1 in-process baseline | — |
+| first access after attach, per-edge population on vs off | p99.9, both | **Half done — `just attach-bench`.** With population **on** (the shipped path): the first lookup after attach is **130–170 ns p50** over 25 runs (sixteen in the sitting that rewrote this row, nine in the review before it), indistinguishable from a steady-state lookup — which is the guarantee §7.1 exists to buy, now demonstrated rather than asserted. **Its tail is one sample, and is quoted as one:** nearest-rank p99.9 over 201 cycles *is* the maximum (`pct`, in the binary), so what moves between runs is one draw from the scheduler's tail and not a distribution — 1.2–4.7 us across the sixteen runs of this sitting, ~1.3 us in the sitting that first filled this row, and the cold cycle to the nanosecond in fifteen of those sixteen but not in the sixteenth. The **off** arm is absent and deliberately so: `populate_hot()` is unconditional inside `attach_shared_inner`, and manufacturing an "off" arm out of a different code path would measure something else. It arrives with `docs/decisions/0022`'s B2-prime, the change that gives the attach path a policy. |
+| THP `madvise` vs `never` | p50, p99.9, both | — |
+| aggregate read throughput, 1→16 consumer processes | scaling curve | **Done — `just shm-scaling`; the curve is in [`docs/benchmarks/tf2.md`](./benchmarks/tf2.md).** §0.0 has recorded it **Done** since it was measured, which is why this cell is not a dash. 1/2/4/8 reader processes on one arena: **4.66 → 9.04 → 15.43 → 18.17 M lookups/s** aggregate (1.00x → 1.94x → 3.31x → 3.90x) at 213 → 219 → 257 → 431 ns a lookup, with unique resident 3.5 → 18.7 MiB (Pss, one arena) against the N × 1.4 MiB a private tf2 buffer per process would cost. **The bend is cores, not contention**: this host has 4 physical cores, 4 × 213 ns is an 18.8 M/s roofline, the 8-process row measures 18.2, and its per-lookup cost doubles exactly as 2:1 oversubscription predicts (426 ns predicted, 431 measured). The curve stops at 8 for the same reason — 16 processes on 4 cores measures the scheduler, and the roofline argument is already made. |
+| **CPU per consumer at 1 kHz × 20 edges, vs ROS 2 `/tf`** | %CPU per consumer, both | — |
+| **total RSS across 16 consumers, vs ROS 2 `/tf`** | MB, both | — |
+| publish → visible-to-consumer latency, vs ROS 2 `/tf` | p50, p99.9, both | — |
+| `SIGKILL` writer → claim reapable → re-claimed | p50, p99 | — |
+| attach time, cold and warm | p50 | **Done — `just attach-bench`, which does not run §3.7's rendezvous.** The binary calls `Tree::attach_shared(dup, AttachMode::ReadOnly)` on a duplicated memfd: no `connect`, no version handshake, no `SCM_RIGHTS`, no assign closure. What it times is map, validate, take a participant slot, `populate_hot` — and on a read-only mapping that advice is `MADV_POPULATE_READ`, not `POPULATE_WRITE`: `MappedArena::populate` follows the mapping's protection, because `POPULATE_WRITE` on `PROT_READ` is `EINVAL`. On the §11.1 fixture, 201 cycles a run: attach **12.3–14.2 us p50**, and the first plan compile — which is where the ring population went — **66.3–92.3 us p50**. Those are **observed extremes over 28 runs on this host, rounded outward** (sixteen in the sitting that rewrote this row, nine in the review that falsified its first draft, three in [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md)), at load averages of 4 to 7 wherever the run recorded one — a record of what was seen, **not a bound**. The width is the host: `0028` watched three unpaired repeats of its join arm drift 132 → 138 → 180 us "as the other agents' load rose", and the first draft of this row published ranges over five and eight runs, of which nine fresh runs fell outside eight of ten. **Only the p50s are given as ranges, and that is the point:** `cold` is cycle 0 and nearest-rank p99.9 over 201 cycles *is* the maximum, so each of those is a single sample whose run-to-run movement is one draw from the scheduler's tail — attach's cold cycle has been seen at 16–25 us and its maximum at 19–127 us, the first compile's at 74–113 us and 107–171 us, and a rerun landing outside those intervals says nothing about the code. **This row read `97.5 us p50` until 2026-08-19, and that is a split rather than a regression**: it was measured on `1e18234` (2026-08-14), and [`0024`](./decisions/0024-population-is-per-edge-at-take-up.md) moved ring population off attach and onto edge take-up on `0f17fb8` (2026-08-16). The two halves still sum to **79.3–106.4 us p50** — per run, paired — on this fixture, whose plan walks essentially every edge, and the pre-`0024` pair summed to 100.3 us (99 791 + 550 ns, `0024`'s own before column), so the total did not move. That before column measuring attach at 99.8 us where this row said 97.5 is the same run-to-run width, two days apart. The arena is 1 401 472 B — 343 pages at 4 KiB, printed by the recipe so the division is reproducible — and that sum over 343 is ~230–310 ns/page, which is arithmetic over the whole arena and not a per-page measurement: attach populates the tables, the first plan compile populates the rings its plan reaches. **Attach alone is not that number and neither is a real join**: `0028` measured the whole §3.7 path — `Open::open()` against a live owner, assign closure included — at ~133 us p50, out of tree, so nothing in this repository reproduces it. "Cold" is the first cycle — fresh VMA and page tables — and **not** a cold page cache, which needs root to arrange. |
+| `open()` when the arena exists vs when creating | p50, both | — |
+| owner kill → new owner serving | p50, p99 | — |
+| lookup latency across an ownership migration | p99.9 during vs steady-state | — |
+
+**The third column is where a result goes, and a dash is not a status.** Three
+of these rows carry a measurement. Two of them carried it as a third cell in a
+two-column table until 2026-08-19 — which GFM discards silently, so on
+github.com the figures in them rendered as nothing at all, and one of the two
+was stale for five days behind that, because nobody proofreads what they cannot
+see (#208). The third had never been in this table at all: §0.0 records
+multi-process read scaling **Done**, and a dash here against a **Done** there
+would be this table contradicting the §0.0 that outranks it. A dash means *this
+table* holds no figure for that row, not that none exists: more are measured in
+[`docs/benchmarks/tf2.md`](./benchmarks/tf2.md) (`just mp-bench`,
+`just tf2-bench`), and that register rather than this list is where the `tf2`
+comparison lives. `just artifact-versions` now fails on a row whose cell count
+disagrees with its header, so the next one is caught before it is invisible.
 
 ### 12.3 The gate — NORMATIVE
 

@@ -1164,9 +1164,33 @@ msrv:
 # `docs/decisions/` is out of its scope for the same reason: a `ready` record is
 # a dated artifact, and renaming a recipe must not force an edit to history.
 #
-# Wired into `just lint` (0.09 s, no network, three runs byte-identical).
+# **The newest arm is a rendering check, and it is here because a document can
+# be wrong in a way no reader can see.** GFM drops every cell past the header's
+# column count and warns nobody: `docs/PHASE2.md` §12.2 carried two three-cell
+# rows in a two-column table for five days (#208), so a benchmark's whole result
+# — and a figure that had since gone stale — rendered as nothing at all on
+# github.com while looking right in every editor and every diff. `docs/API.md`
+# row 16 was the same defect from unescaped pipes inside `|s| ≈ 2.3`, and the
+# commit that claimed to fix it did not. Escape-aware, because `\|` is
+# legitimate content — a naive pipe count false-positives on §3.6's `SHRINK\|GROW`
+# row — and it scans every tracked Markdown file, `docs/decisions/` included: a
+# ragged row is not a rename, it is a defect the document had the day it was
+# written.
+#
+# **It also has to not fire on a document that is right**, which is the half a
+# first draft missed: three constructions hold a pipe table that GFM renders as
+# something else — a setext `---` heading under a line with a pipe in it, a
+# four-space-indented code block, and an HTML comment (`CHANGELOG.md` opens
+# one). Each is skipped, each was verified by writing it and watching the check
+# stay silent, and the indented-code rule counts four spaces past the innermost
+# list item's content so that `0005`'s real table inside item 11 keeps being
+# checked. A gate that blocks a correct document is a gate somebody removes.
+#
+# Wired into `just lint` (0.14-0.15 s with the table arm, up from 0.10 s for the
+# four arms without it; no network, three runs byte-identical).
 
-# One version across the repository, and no document naming a recipe that is not there.
+# One version across the repository, no document naming a recipe that is not
+# there, and no table row GFM would silently truncate.
 artifact-versions:
     ./scripts/artifact-versions.py
 
@@ -2319,8 +2343,16 @@ py-lint: py-compile
     # 0.09 s, which is why it is a line in this recipe and not a recipe of its own.
     PYO3_PYTHON=$PWD/.venv/bin/python RUSTDOCFLAGS="-D warnings" cargo doc \
         --manifest-path crates/tf_tree_py/Cargo.toml --no-deps
-    .venv/bin/ruff check python tests/python crates/tf_tree_bench/python
-    .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python
+    # **`scripts/` is in the list because it was in no list.** Three files —
+    # `artifact-versions.py` among them, which is `just lint`'s own gate — were
+    # linted by nothing at all: not ruff, not pyright, not a test. Adding them
+    # cost one `E501` and two reformattings, both pre-existing. Not under
+    # `pyright` as well: that runs `--strict` over the *package*, and
+    # `bag_to_tfstream.py` imports `rosbag2_py`, `rclpy` and `tf2_msgs` at the
+    # top — a wall of missing-import errors for a ROS 2 environment the venv is
+    # not and does not become.
+    .venv/bin/ruff check python tests/python crates/tf_tree_bench/python scripts
+    .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python scripts
     # `--strict` over the package and its stubs (PHASE3 §9). Not over
     # tests/: numpy's own stubs are partially typed, so strict there reports
     # ~120 errors that are numpy's and not ours, and a gate nobody can keep
