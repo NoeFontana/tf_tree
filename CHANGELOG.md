@@ -114,6 +114,19 @@ is a bug.
   `shm`-gated unit test in the facade was compiled by clippy and executed by
   nothing.
 
+- `just py-compile` gates the workspace-excluded `tf_tree_py` on a clean
+  checkout. It skipped whenever there was no `.venv` — which is every CI runner
+  and every first clone — so the dependency `just lint` carries covered nothing
+  in the one configuration CI runs. It now falls back to the interpreter on
+  `PATH` (PyO3 executes a Python to configure itself; it includes no header, and
+  the fallback compiles on a host with no `Python.h`), prefers `.venv` where
+  there is one, and skips only where there is no Python at all. It also carries
+  `cargo fmt --check` for that crate, which `cargo fmt --all` does not reach
+  because the crate is not a workspace member — and `just fmt` gained the
+  matching write-mode line, so the formatting `just lint` now enforces has a
+  recipe that fixes it. `ci.yml`'s `bindings` job invokes the recipe instead of
+  re-spelling its two lines.
+
 ## [0.0.2] — 2026-08-17 (wheels, no sdist)
 
 ### Fixed

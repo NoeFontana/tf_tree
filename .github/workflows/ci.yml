@@ -63,11 +63,14 @@ jobs:
   # sitting in `publish.rs` unseen. Running the recipe is what makes CLAUDE.md's
   # "CI mirrors these recipes 1:1" true rather than aspirational.
   #
-  # `just lint` depends on `py-compile`, which skips loudly when there is no
-  # `.venv` — correct here, because the `bindings` job below is that gate and
-  # needs only an interpreter. It also depends on `evidence-audit` and
-  # `artifact-versions`, which is why neither has a job of its own: 0.81 s and
-  # 0.09 s respectively, and both are pure text checks over the checkout.
+  # `just lint` depends on `py-compile`, which compiles the workspace-excluded
+  # `tf_tree_py` against `.venv`'s interpreter or, failing that, the one on
+  # `PATH` — so on this runner, which has no `.venv`, the dependency is a real
+  # gate rather than the loud skip it used to be. The `bindings` job below runs
+  # the same recipe against a pinned interpreter; see its comment for why both.
+  # `lint` also depends on `evidence-audit` and `artifact-versions`, which is
+  # why neither has a job of its own: 0.81 s and 0.09 s respectively, and both
+  # are pure text checks over the checkout.
   #
   # **`just audit`, not `EmbarkStudios/cargo-deny-action`.** The old note here
   # said the action stays because it supplies the binary and the recipe is one
@@ -169,14 +172,12 @@ jobs:
   # happened to be the same size, and which silently dropped the claim lease and
   # the fork guard. It survived six PRs because nothing built the crate.
   #
-  # `just lint` gained a `py-compile` dependency for this, but it skips when
-  # there is no venv — correct for a clean checkout, useless as a gate. This job
-  # is the gate: it needs only an interpreter, not maturin or a wheel.
-  #
   # Demonstrated against the historical bug itself. Restoring the cross-type
-  # `transmute::<EdgeWriter, Publisher>` gives **4 errors here and 0 from
-  # `cargo clippy --workspace`**, because the workspace does not compile this
-  # crate at all — an error confined to it is invisible, however loud.
+  # `transmute::<EdgeWriter, Publisher>` gives **4 errors from a clippy that
+  # names the crate's own manifest and 0 from `cargo clippy --workspace`**,
+  # because the workspace does not compile this crate at all — an error confined
+  # to it is invisible, however loud.
+  #
   # **The same crate, on the platforms the wheel matrix ships to.**
   #
   # `tf_tree_py` always enables `shm`, but the facade gates its whole
@@ -212,6 +213,32 @@ jobs:
       - name: cargo check (tf_tree_py)
         run: cargo check --manifest-path crates/tf_tree_py/Cargo.toml --features pyo3/extension-module,pyo3/abi3-py39
 
+  # **`just py-compile`, not a re-spelling of that recipe's two lines** — the
+  # transcription this file keeps paying for. One other outlives it: the
+  # `cargo check` in `bindings-non-linux` above, which no recipe spells either
+  # and which is a separate change, not an exception to the rule. The job
+  # could not invoke the recipe before, because the recipe skipped when there was
+  # no `.venv`, which is this runner: it would have gated nothing. `py-compile`
+  # now falls back to the interpreter on `PATH` — the one `actions/setup-python`
+  # puts there — and carries the `cargo fmt` line as well, which nothing else in
+  # CI covers for this crate: `just lint`'s `cargo fmt --all -- --check` reaches
+  # workspace *members* only, and this one is excluded.
+  #
+  # Measured with a cheaper probe than the transmute above, on a checkout with no
+  # `.venv`: a `v.len() == 0` appended to `crates/tf_tree_py/src/lib.rs` left
+  # `cargo clippy --workspace --all-targets -- -D warnings` exiting 0, and took
+  # `just py-compile` to exit 101.
+  #
+  # **The recipe now also runs in the `lint` job, as a dependency, and this job
+  # stays anyway.** One spelling invoked twice is not two spellings, and the two
+  # invocations are not the same compile: `pyo3-build-config` executes the
+  # interpreter and emits a `Py_3_x` cfg for every version at or below it
+  # (measured against 3.12 — `Py_3_8` through `Py_3_12`), so which Python is
+  # found decides what is compiled. This job pins 3.13, the `python` job's
+  # `just py-lint` gets uv's 3.14, and `lint` takes whatever the runner image
+  # ships. It is also the only place the binding gate is named: were `lint`'s
+  # dependency list ever trimmed, a job that ran in no workflow is precisely the
+  # failure this file was rebuilt around.
   bindings:
     name: python bindings compile
     runs-on: ubuntu-latest
@@ -224,14 +251,11 @@ jobs:
         with:
           python-version: '3.13'
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt --check (tf_tree_py)
-        run: cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
-      - name: cargo clippy (tf_tree_py)
-        env:
-          PYO3_PYTHON: python3
-        run: |
-          cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml \
-            --all-targets -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: just py-compile
+        run: just py-compile
 
   test:
     name: test (${{ matrix.os }})

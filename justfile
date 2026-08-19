@@ -933,23 +933,55 @@ lint: py-compile evidence-audit artifact-versions
 # the fork guard. It went unnoticed across six PRs because `just test` and
 # `just lint` never compiled the crate at all.
 #
-# A compile is cheap and needs only an interpreter, so `lint` depends on it. It
-# is skipped with a loud message rather than failing when no venv exists — a
-# clean checkout should not be blocked on `just py-setup` — but on any machine
-# that has ever run the Python suite, it is a real gate.
+# **What it needs is an interpreter, and a venv is only one way to have one.**
+# Until this recipe said so it skipped on every clean checkout — which is every
+# CI runner and every first clone — so the gate `lint` depends on was absent in
+# exactly the configuration CI runs, and `ci.yml`'s `bindings` job covered the
+# hole by re-spelling the two lines below. That job now invokes this recipe.
+# PyO3 needs a Python to *run*, not to link against: its build script executes
+# the interpreter to read a configuration out of it, and pyo3-ffi declares the C
+# API in Rust rather than including a header. Measured on a host with no
+# `/usr/include/python3.12/Python.h` and no `.venv`, from an emptied
+# `crates/tf_tree_py/target`: this recipe compiled every dependency and finished
+# clean against `/usr/bin/python3` in 13.12 s.
+#
+# The venv still wins where there is one, so this recipe and `just py-lint`
+# compile one PyO3 configuration into one target directory instead of thrashing
+# it between two. The skip survives for the only case that genuinely cannot
+# compile: no interpreter at all.
+#
+# **`cargo fmt` lives here because it needs neither a venv nor an interpreter,
+# and because `lint`'s `cargo fmt --all -- --check` does not reach this crate**
+# — `--all` is every workspace *member*, and this one is excluded. Measured: a
+# mangled `fn    _fmt_probe( ) ->u32{ 1 }` appended to
+# `crates/tf_tree_py/src/lib.rs` (restored byte-for-byte afterwards) left
+# `cargo fmt --all -- --check` exiting 0, and failed the line below.
+
+# fmt + clippy for `tf_tree_py`, which no workspace command compiles.
 py-compile:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ ! -x .venv/bin/python ]; then
-        echo "py-compile: SKIPPED — no .venv. Run \`just py-setup\` to gate the bindings." >&2
+    cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
+    if [ -x .venv/bin/python ]; then
+        interpreter=$PWD/.venv/bin/python
+    elif interpreter=$(command -v python3); then
+        :
+    else
+        echo "py-compile: SKIPPED — no interpreter. Install python3, or run \`just py-setup\`." >&2
         exit 0
     fi
-    PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy \
+    PYO3_PYTHON=$interpreter cargo clippy \
         --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
 
 # Format and auto-fix safe lint issues.
 fmt:
     cargo fmt --all
+    # `--all` is every workspace *member*, and `tf_tree_py` is excluded — so
+    # without this line `just lint` fails, through `py-compile`, on a file the
+    # recipe that exists to fix formatting leaves untouched. Only fmt: the
+    # clippy half needs an interpreter, and `py-compile` is where that branch
+    # lives.
+    cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml
     cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings
 
 # cargo-deny: advisories, licenses, bans, sources.
@@ -2140,10 +2172,15 @@ py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
     .venv-t/bin/python -m pytest tests/python -q
 
+# **The fmt and clippy halves are `py-compile`, depended on rather than
+# repeated.** Both lines were spelled here as well, byte for byte, and one
+# recipe restating another is the same defect as a workflow restating one
+# (`docs/PROJECT.md` §6). The interpreter does not change by depending on it:
+# `py-compile` prefers `.venv`, and this recipe cannot run without one anyway —
+# ruff and pyright below are installed there.
+
 # fmt + lint for both languages of the binding, plus the Rust half's rustdoc.
-py-lint:
-    cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml -- --check
-    PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --manifest-path crates/tf_tree_py/Cargo.toml --all-targets -- -D warnings
+py-lint: py-compile
     # **Rustdoc for the one crate no other recipe compiles the documentation of.**
     # `just doc` names its packages with `-p`, and this crate is in the root
     # manifest's `exclude`, so from the root `cargo doc --no-deps -p tf_tree_py`
