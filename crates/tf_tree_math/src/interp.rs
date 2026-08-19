@@ -23,6 +23,12 @@ const SLERP_LERP_FALLBACK: f64 = 1e-6;
 /// exact `acos`/`sin` form; at or below it, the transcendental-free series in
 /// [`slerp_weight`].
 ///
+/// **The angle is `acos(qa·qb)`, which is *half* the rotation angle** the pair
+/// spans, because `qa·qb = cos(Δ/2)`. `0.15` here is a rotation of `0.30` rad,
+/// and every figure below says which of the two it is — measured by bisecting
+/// the branch boundary, which lands on quaternion `0.150000000` rad / rotation
+/// `0.300000000` rad.
+///
 /// **Measured, not guessed** — the same discipline as `THETA_SMALL` in
 /// `docs/PHASE1.md` §3.3 (`docs/PROJECT.md` §5 D12), and for the same reason:
 /// the first draft of this constant was 0.25 by eyeball, and
@@ -34,10 +40,25 @@ const SLERP_LERP_FALLBACK: f64 = 1e-6;
 /// [`slerp_weight`] uses six, so 0.15 sits just inside the measured bound.
 ///
 /// **Why this covers the cases that matter.** The two quaternions are *adjacent
-/// samples on one edge*, so θ is set by the publish rate and the body's angular
-/// velocity. At a brisk 180 °/s: 1 kHz → 3 mrad, 200 Hz → 16 mrad, 50 Hz →
-/// 63 mrad — all inside. A 10 Hz edge on such a body (314 mrad) takes the exact
-/// path, which is correct: that is a genuinely large arc.
+/// samples on one edge*, so the arc between them is set by the publish rate and
+/// the body's angular velocity — and θ is half of that arc. At a brisk 180 °/s,
+/// where the arc is Δ = π/f:
+///
+/// ```text
+/// f         Δ (rotation)   θ = Δ/2      branch
+/// 1 kHz        3.1 mrad     1.6 mrad    series
+/// 200 Hz      15.7 mrad     7.9 mrad    series
+/// 50 Hz       62.8 mrad    31.4 mrad    series
+/// 10 Hz      314.2 mrad   157.1 mrad    exact
+/// ```
+///
+/// **The Δ column is what this table used to give, alone, against a threshold
+/// stated in θ** — a factor of two, in the direction that makes the fast path
+/// look roomier than it is. No row changes side, so the paragraph's conclusion
+/// survives, but the margin does not: the 10 Hz row clears the threshold by
+/// **4.7%**, not by 2×, and the crossover for a 180 °/s body is at
+/// `f = ω/(2·0.15)` = **10.47 Hz**. A 10 Hz edge on such a body takes the exact
+/// path, which is correct — and it is a marginal case, not a comfortable one.
 /// Shared with [`crate::dualquat::screw_pow`], which raises a unit dual
 /// quaternion to a real power and needs the identical `sin(a·φ)/sin(φ)` series
 /// over the identical range — in both cases `φ` is the *half* angle between two
@@ -161,14 +182,36 @@ impl Iso3 {
 /// This is the rotation kernel [`LerpSlerp`] evaluates, and it is public for
 /// the same reason [`screw_pow`] — [`ScLerp`]'s kernel — always was: a caller
 /// who holds two rotations and no translation should not have to build a pair
-/// of [`Iso3`] with throwaway zero translations to reach it. That is what the
-/// asymmetry cost, measured on the wrapper a downstream crate actually wrote:
-/// with the two arms compiled as exported `extern "C"` functions at
-/// `opt-level = 3`, calling `slerp` directly is 15 x86-64 instructions and the
-/// `Iso3` round trip is 51 — LLVM materializes both isometries and lerps the
-/// zero translations rather than folding them away. Removing that is the whole
-/// benefit; a caller whose quaternion type is not [`Quat`] still converts,
-/// because the types differ.
+/// of [`Iso3`] with throwaway zero translations to reach it. A caller whose
+/// quaternion type is not [`Quat`] still converts, because the types differ;
+/// what goes away is the pair of isometries.
+///
+/// **What the round trip costs is a shape, not a number.** Both arms end in the
+/// same out-of-line `slerp`; what the `Iso3` arm puts in front of it is 256
+/// bytes of stack, two 64-byte isometries written out field by field, and a
+/// lerp of one zero translation into another that LLVM does not fold away.
+/// Compiled as exported `extern "C"` arms at `opt-level = 3` on x86-64, that
+/// prologue is 45 instructions bare (7 against 52) and 28 through the
+/// consumer's own `nalgebra` adapter (41 against 69).
+///
+/// **Those two counts are a codegen artifact and are quoted as one.** Across
+/// four release profiles they moved to 48 and 31, and no build produced the
+/// same figure for both argument shapes — so there is no single number here to
+/// carry into a gate, and an earlier revision of this paragraph quoting one
+/// (`15` against `51`, then "36 either way") reproduced in no build measured.
+/// What is stable is the sign: the wrapper survived every configuration tried,
+/// and that is the whole of the benefit.
+///
+/// `docs/API.md` §2.7 is what authorises this being `pub` and carries the §7
+/// walk, item 8 — what a caller *loses* by taking it — included.
+///
+/// # Angles
+///
+/// **Every angle here is a *quaternion* angle** — `acos(qa·qb)`, which is
+/// **half** the rotation the pair spans, because `qa·qb = cos(Δ/2)`. Read as
+/// rotations these numbers are out by a factor of two, in the direction that
+/// makes the fast path look wider than it is; a caller sizing a publish rate
+/// against them is who this section is for.
 ///
 /// # Preconditions
 ///
@@ -183,6 +226,43 @@ impl Iso3 {
 /// `s` is a dimensionless fraction of the segment, **not** a stamp. A caller
 /// interpolating between two samples divides in integer nanoseconds and passes
 /// the ratio; nothing in this crate knows what time is.
+///
+/// **`s` belongs to `[0, 1]`, and nothing clamps or refuses.** Out of range the
+/// function extrapolates, and *how well* is a property of the pair rather than
+/// of `s`, because the pair alone picks the branch — so an extrapolation's
+/// accuracy is set by the publish rate, which is the one thing the caller
+/// asking for it is least likely to be thinking about. Measured against the
+/// exact geodesic `qa·exp(s·Δ·axis)` over 40 rotations, worst case:
+///
+/// * **Closed form** (quaternion angle above `0.15` rad) — the formula is
+///   `sin((1−s)·θ)/sin θ` and holds off the segment as well as on it:
+///   `7.2e-15` at `|s| = 20`, part of which is the reference's own rounding.
+/// * **Series** (between the two thresholds) — the weight series is calibrated
+///   for `|a| ≤ 1`; outside it `k = 1 − a²` grows quadratically and the
+///   six-term truncation stops covering it. The `1e-15` bound is gone between
+///   `|s| ≈ 2.3` and `|s| ≈ 5` depending on the angle, the error is `6.0e-6`
+///   at `|s| = 20` (quaternion angle `0.1` rad), and by `|s| = 100` it is
+///   `1.6e3` — not a rotation at all.
+/// * **LERP fallback** (below `1e-6` rad) — a chord, extrapolated and
+///   renormalized. Mechanically the crudest of the three and numerically the
+///   most forgiving, because the arc it cuts is tiny: `1.2e-14` at `|s| = 100`,
+///   and it takes `|s| = 1e6` — a swept rotation of `0.2` rad — to reach
+///   `3.3e-4`.
+///
+/// **So extrapolation is not supported here**, and that is a statement about
+/// this entry point rather than about the habit: `tf_tree_core` answers a stamp
+/// outside an edge's sample window with `ExtrapPolicy` — `Error`, `Hold` or
+/// `ConstantTwist` — and never hands this function an `s` outside `(0, 1)`. A
+/// caller who wants the tf2 behaviour wants one of those three, not an `s` of
+/// `1.4`. `out_of_range_s_extrapolates_and_only_the_closed_form_holds` is what
+/// keeps the three bullets above honest.
+///
+/// **`NaN` is not rejected either**, and it does not always survive. It
+/// propagates through all three branches, from `s` or from either quaternion,
+/// with one exception: two numerically identical inputs return `qa` before `s`
+/// is read at all, so `slerp(qa, qa, f64::NAN)` and `slerp(qa, qa, f64::INFINITY)`
+/// are both `qa`. A `NaN` *component* cannot reach that return — it makes `h`
+/// `NaN`, which is not `<= 0.0` — so it comes back out.
 ///
 /// # Storage order
 ///
@@ -205,8 +285,9 @@ impl Iso3 {
 ///   to `-qb` — which is worse than the asymmetry it would tidy up, and is why
 ///   there is no `s == 1.0` shortcut. Compare rotations, or fix the sign first.
 /// * **Below the LERP fallback the endpoints hold to an ulp, not bit-for-bit.**
-///   Under a quaternion angle of `SLERP_LERP_FALLBACK` (`1e-6` rad) the two
-///   inputs carry no usable direction, so the result is a *renormalized* LERP:
+///   Under a quaternion angle of `SLERP_LERP_FALLBACK` (`1e-6` rad, a rotation
+///   of `2e-6` rad) the two inputs carry no usable direction, so the result is
+///   a *renormalized* LERP:
 ///   `slerp(qa, qb, 0.0)` is `qa/‖qa‖`, which differs from `qa` by ~2.7e-16
 ///   whenever `qa`'s components do not happen to square to exactly `1.0`.
 ///   `endpoints_lose_bit_exactness_only_in_the_lerp_fallback` pins both halves.
@@ -228,12 +309,14 @@ impl Iso3 {
 ///
 /// # Numerics
 ///
-/// The crossover to the closed `acos`/`sin` form is at `THETA_SLERP_SMALL`
-/// (`0.15` rad); below it the weights are a six-term series with no
-/// transcendental and no division, and θ² comes from the *chord* rather than
-/// from `acos(dot)`. Both constants are calibrated, with the measurement in
-/// their own doc comments, and both are deliberately private: they are numbers
-/// a re-measurement is allowed to move, and a `pub const` is a promise not to.
+/// The crossover to the closed `acos`/`sin` form is at a quaternion angle of
+/// `THETA_SLERP_SMALL` (`0.15` rad — a rotation of `0.30` rad, which for a
+/// body turning at 180 °/s is a 10.47 Hz edge); below it the weights are a
+/// six-term series with no transcendental and no division, and θ² comes from
+/// the *chord* rather than from `acos(dot)`. Both constants are calibrated,
+/// with the measurement in their own doc comments, and both are deliberately
+/// private: they are numbers a re-measurement is allowed to move, and a
+/// `pub const` is a promise not to.
 ///
 /// ```
 /// use tf_tree_math::{exp_so3, slerp, Quat, Vec3};

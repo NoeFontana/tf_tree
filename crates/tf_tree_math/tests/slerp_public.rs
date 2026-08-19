@@ -123,8 +123,9 @@ fn endpoints_are_bit_exact_above_the_lerp_fallback() {
 ///
 /// Below a quaternion angle of `1e-6` the result is a *renormalized* LERP, so
 /// `s = 0` returns `qa/‖qa‖`. For a `qa` whose components happen to square to
-/// exactly `1.0` that is `qa`; for one that does not — about a third of the
-/// rotations sampled here — it differs by a couple of ulp. No value comparison
+/// exactly `1.0` that is `qa`; for one that does not — 14 of the 64 rotations
+/// swept here, counted, where this line said "about a third" until it was —
+/// it differs by a couple of ulp. No value comparison
 /// can tell the fallback from the series (they agree far below `f64`), so that
 /// ulp *is* the observable, and the test asserts it appears below the threshold
 /// and disappears above it with the same `qa`.
@@ -266,6 +267,152 @@ fn numerically_identical_inputs_return_qa_at_every_s() {
     }
 }
 
+/// The exact great-circle point at parameter `s`, valid **off** the segment as
+/// well as on it: stepping `qa` by `s` times the pair's quaternion angle is the
+/// definition an extrapolation is judged against.
+fn geodesic(qa: Quat, theta: f64, s: f64) -> Quat {
+    step(qa, s * theta)
+}
+
+/// The double cover: `q` and `-q` are one rotation, so the distance that counts
+/// is the smaller of the two.
+fn rot_dist(a: Quat, b: Quat) -> f64 {
+    a.sub(b).norm().min(a.add(b).norm())
+}
+
+/// **`s` outside `[0, 1]` is documented as unsupported, and this is the
+/// measurement that sentence rests on.**
+///
+/// The three branches do not degrade alike, and which one a caller gets is
+/// chosen by the *pair* — so the accuracy of an extrapolation is set by the
+/// publish rate, which is the argument for refusing to promise anything about
+/// it. The bands here are two to four orders wide on purpose: what is being
+/// pinned is the *shape* (closed form holds, series collapses, the fallback's
+/// chord is fine until the arc it cuts stops being small), not a libm revision.
+#[test]
+fn out_of_range_s_extrapolates_and_only_the_closed_form_holds() {
+    // Closed form: `sin((1-s)*theta)/sin theta` is as true off the segment as
+    // on it, and the arithmetic does not care.
+    let mut worst_closed = 0.0f64;
+    for k in 0..40 {
+        let qa = sample_rotation(k);
+        let qb = step(qa, 0.5);
+        for &s in &[-20.0, -5.0, 2.0, 5.0, 20.0] {
+            worst_closed = worst_closed.max(rot_dist(slerp(qa, qb, s), geodesic(qa, 0.5, s)));
+        }
+    }
+    assert!(worst_closed > 0.0, "nothing was actually measured");
+    assert!(
+        worst_closed < 1e-13,
+        "the closed form stopped extrapolating: {worst_closed:e}"
+    );
+
+    // Series: `slerp_weight` is calibrated for |a| <= 1. Same pair, in range and
+    // far out of it — the contrast is the finding, not either number alone.
+    let mut worst_in = 0.0f64;
+    let mut worst_out = f64::MAX;
+    for k in 0..40 {
+        let qa = sample_rotation(k);
+        let qb = step(qa, 0.1);
+        for j in 0..=10 {
+            let s = j as f64 / 10.0;
+            worst_in = worst_in.max(rot_dist(slerp(qa, qb, s), geodesic(qa, 0.1, s)));
+        }
+        worst_out = worst_out.min(rot_dist(slerp(qa, qb, 20.0), geodesic(qa, 0.1, 20.0)));
+    }
+    assert!(
+        worst_in < 1e-14,
+        "the series stopped being exact in range: {worst_in:e}"
+    );
+    assert!(
+        worst_out > 1e-8,
+        "the series' out-of-range collapse is gone; the doc's bullet is stale: {worst_out:e}"
+    );
+
+    // Where it leaves 1e-15 — the number the doc quotes as "between |s| ~ 2.3
+    // and ~ 5 depending on the angle".
+    for &theta in &[0.02, 0.1, 0.1499] {
+        for k in 0..40 {
+            let qa = sample_rotation(k);
+            let qb = step(qa, theta);
+            let mut s = 1.0;
+            while s < 8.0 {
+                if rot_dist(slerp(qa, qb, s), geodesic(qa, theta, s)) > 1e-15 {
+                    break;
+                }
+                s += 0.01;
+            }
+            assert!(
+                (2.0..6.0).contains(&s),
+                "series left 1e-15 at |s| = {s} (theta={theta}, k={k}); the doc says 2.3 to 5"
+            );
+        }
+    }
+
+    // LERP fallback: a chord, extrapolated and renormalized — the crudest of the
+    // three mechanically and the most forgiving numerically, because the arc it
+    // cuts is tiny until |s| is enormous.
+    let mut worst_near = 0.0f64;
+    let mut worst_far = f64::MAX;
+    for k in 0..40 {
+        let qa = sample_rotation(k);
+        let qb = step(qa, 1e-7);
+        worst_near = worst_near.max(rot_dist(slerp(qa, qb, 100.0), geodesic(qa, 1e-7, 100.0)));
+        worst_far = worst_far.min(rot_dist(slerp(qa, qb, 1e6), geodesic(qa, 1e-7, 1e6)));
+    }
+    assert!(
+        worst_near < 1e-12,
+        "the fallback's chord showed up far earlier than documented: {worst_near:e}"
+    );
+    assert!(
+        worst_far > 1e-6,
+        "the fallback stopped being a chord: {worst_far:e}"
+    );
+}
+
+/// `NaN` propagates through every branch — except the one early return that
+/// answers before `s` is ever read.
+///
+/// That exception is the interesting half: a stationary body publishes
+/// numerically identical samples, so `slerp(qa, qa, s)` is a *common* call, and
+/// it swallows a `NaN` (or an infinite) `s` and returns `qa`. A caller who
+/// expects a poisoned stamp to show up as a `NaN` pose gets a plausible one
+/// instead, and only from the pairs that carry no motion.
+#[test]
+fn nan_propagates_except_through_the_identical_input_return() {
+    let all_nan = |q: Quat| q.w.is_nan() && q.x.is_nan() && q.y.is_nan() && q.z.is_nan();
+    for k in 0..16 {
+        let qa = sample_rotation(k);
+        // One pair per branch: fallback, series, closed form.
+        for &theta in &[1e-7, 0.1, 0.5] {
+            let qb = step(qa, theta);
+            assert!(
+                all_nan(slerp(qa, qb, f64::NAN)),
+                "s=NaN survived: k={k} theta={theta}"
+            );
+            let qnan = Quat::new(f64::NAN, qb.x, qb.y, qb.z);
+            assert!(
+                all_nan(slerp(qa, qnan, 0.5)),
+                "NaN in qb was swallowed: k={k}"
+            );
+            assert!(
+                all_nan(slerp(qnan, qb, 0.5)),
+                "NaN in qa was swallowed: k={k}"
+            );
+        }
+        // The exception, both ways it fires. `h` is `0`, so nothing downstream
+        // ever looks at `s`.
+        assert_eq!(bits(slerp(qa, qa, f64::NAN)), bits(qa), "k={k}");
+        assert_eq!(bits(slerp(qa, qa, f64::INFINITY)), bits(qa), "k={k}");
+        // And a NaN *component* cannot reach it: `h` is NaN, not `<= 0.0`.
+        let qnan = Quat::new(f64::NAN, qa.x, qa.y, qa.z);
+        assert!(
+            all_nan(slerp(qnan, qnan, 0.5)),
+            "the early return ate a NaN component: k={k}"
+        );
+    }
+}
+
 /// **What a caller who drops the `Iso3` round trip is signing up for.**
 ///
 /// The reason this function became public is that a downstream crate was
@@ -278,10 +425,10 @@ fn numerically_identical_inputs_return_qa_at_every_s() {
 /// As *rotations* the two never disagree: worst `2.7336071744532853e-16` over
 /// the sweep below — the same number
 /// `endpoints_lose_bit_exactness_only_in_the_lerp_fallback` measures, because
-/// it is the same renormalization and nothing else. The **bits** differ at 160
-/// of 7560 sample points, and every one of them is at `s = 0` or `s = 1`,
-/// because those are the two parameters `LerpSlerp::eval` answers from a
-/// shortcut before it ever calls this function:
+/// it is the same renormalization and nothing else. The **bits** differ at some
+/// of the 7560 sample points (160 of them on this host), and every difference is
+/// at `s = 0` or `s = 1`, because those are the two parameters
+/// `LerpSlerp::eval` answers from a shortcut before it ever calls this function:
 ///
 /// * `s = 1` with `qa·qb < 0` — `eval` returns `qb`, this returns `-qb`. Same
 ///   rotation, opposite components. A consumer that compares quaternion
@@ -322,9 +469,22 @@ fn the_iso3_round_trip_it_replaces_agrees_as_a_rotation() {
     }
     assert_eq!(
         samples, 7560,
-        "sweep changed shape; the counts below are stale"
+        "sweep changed shape; the 7560 in this test's doc comment is stale"
     );
-    assert_eq!(differing_bits, 160, "the endpoint delta moved");
+    // **Not `assert_eq!(differing_bits, 160)`, which is what this line used to
+    // be.** 160 is a joint property of `sample_rotation`'s arbitrary rotations,
+    // the theta list, `libm`'s `sin`/`cos`/`acos`, and whether each `qa`'s
+    // components happen to square to exactly 1.0 — the same objection this file
+    // already makes to a bit-pattern gate 150 lines up, and none of it is the
+    // behaviour under test. What is under test is asserted twice already: every
+    // difference is at an endpoint (in the loop, where it names the case that
+    // broke it) and the two stay one rotation to 4e-16 (below). All that is left
+    // for this line is that the enumeration had something to enumerate.
+    assert!(
+        differing_bits > 0,
+        "no sample distinguished the direct call from the Iso3 round trip, so \
+         the endpoint exceptions this test documents were never exercised"
+    );
     assert!(
         worst < 4e-16,
         "the two stopped being the same rotation: {worst:e}"

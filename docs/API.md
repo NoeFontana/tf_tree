@@ -510,6 +510,89 @@ recipe greps row 4 for each of `tf_tree_bench`, `tf_tree_c`, `tf_tree_cli` and
 compile which feature set is exactly the kind of sentence that stays green while
 going stale, and it is the sentence that did.
 
+### 2.7 A kernel the engine already runs is public on its own terms — NORMATIVE
+
+`tf_tree_math` ships two interpolation policies and, until row 16, one of their
+two kernels: `dualquat::screw_pow` — `ScLerp`'s — has been `pub` since the
+crate's first commit, while `slerp` — `LerpSlerp`'s — was `fn slerp`. A
+downstream crate that wanted rotation-only interpolation therefore built two
+`Iso3` with throwaway zero translations and called `LerpSlerp::eval`. The
+numerics were right and the entry point was missing.
+
+**The rule, stated once so the next kernel does not need its own argument:** a
+kernel this crate already evaluates on the hot path is `pub` when the only way
+to reach it from outside is to construct a degenerate input to its wrapper.
+What makes that safe to promise is §2.6's test — *does its shape follow the
+arena layout* — and `(Quat, Quat, f64) -> Quat` follows nothing: no arena in
+it, no `FORMAT_VERSION` under it, and `PHASE5.md` §1 does not schedule it to
+move. It is stable-tier for the reason `Plan` and `Stamp` are. `tf_tree_math`
+has no `unstable` feature to gate it with in any case, which is the same
+position `tf_tree_core` is in and answers the same way: a statement instead of
+a mechanism.
+
+**Why this is a section and not a decision record.** `CLAUDE.md` sends *a change
+the specs do not cover* to a `draft` record. This one is covered: §2.6 decides
+the tier, R2 is satisfied rather than consulted (the function **is** the hot
+path), and `PROJECT.md` §6's no-second-spelling rule is answered by the kernel
+being a different function from the policy — different inputs, one of them
+absent — rather than another way to spell it. Rows 14 and 15 are the closest
+precedent: both are new public API on a published artifact (the PyPI wheel),
+both cite §3.2, and `grep` over `docs/decisions/` finds no record authorising
+either — `0026` and `0027` only *invoke* `arena_format_version()` in shell
+transcripts, and `0019`'s `frame_headroom` is the Rust `TreeBuilder` knob, not
+the Python keyword. They are not an isolated pair either. **Of the fifteen rows
+before this one, ten name a section of this document as their authority and
+five name a record or a phase spec** — so the §6 preamble's "nothing here is
+authorized by this document alone" cannot mean that a section never authorises,
+or two thirds of its own table would be unauthorised. It is about *scheduling*:
+a row still has to land somewhere, and this one lands in the PR that writes it.
+A record here would contain no question.
+
+**§7, walked**, here rather than in a phase spec because §7 is here. The
+surface is one free function, so checks 3, 4, 6 and 7 fall out of the signature
+and 1 and 2 out of where it sits; 5 and 8 needed an argument.
+
+1. **Tiers.** Not a fourth way to look a transform up: it takes two poses the
+   caller already holds, never a `(target, source)`, and resolves no name. The
+   ladder is unaffected — `Plan::at` reaches it through `LerpSlerp::eval`
+   exactly as before, and this is a rung *below* tier 3, not beside it.
+2. **Hot tier.** It is the hot tier. No allocation, no lock, no name
+   resolution, no conversion; `#[inline]`; the body is untouched by row 16, so
+   `Plan::at` compiles to what it compiled to before. The `_into` corollary
+   binds batch entry points and there is no batch here — one 32-byte value out.
+3. **Time.** No stamp anywhere. `s` is a dimensionless fraction and the doc now
+   says who divides in integer nanoseconds to obtain it; there is no float
+   seconds path to leak in, because there is no time in the signature.
+4. **Layout.** `Quat` is `[w, x, y, z]`, scalar-first, stated in the function's
+   own `# Storage order` heading with the Eigen/`nalgebra` transposition named
+   as the hazard it is. Chosen-by-type is not available with one type.
+5. **Errors.** It cannot fail and returns no error. What it *can* do is answer
+   nonsense: the preconditions section states that both inputs must be unit and
+   that `NaN` propagates through every branch except the numerically-identical
+   early return, which returns `qa` for any `s` — `NaN` and `±inf` included.
+6. **Writability.** A pure function of `Copy` values. Nothing to write.
+7. **Lifetimes.** Takes and returns by value; no lifetime to store, which is
+   the check most Rust surfaces fail and this one cannot.
+8. **Losses — and this is the one that needed a decision.** Read literally,
+   check 8 asks for a *benchmark* row where the new surface is worse, and there
+   is none to add: both call shapes end in the same out-of-line `slerp`, and
+   what the `Iso3` round trip puts in front of it is tens of instructions of
+   wrapper — 28 through the consumer's own `nalgebra` adapter, 45 bare, and 31
+   and 48 in other release profiles. **That spread is itself the argument.** A
+   criterion row measuring a quantity whose *static* instruction count already
+   moves 10% between two `opt-level = 3` builds would be a gate whose
+   denominator moves more than its signal — [`0023`](./decisions/0023-the-gate-that-could-not-gate.md)
+   is what that costs, 43% on an unrelated edit, and it is not a lesson worth
+   re-learning for a wrapper. Read for what it is *for* — name what the reader loses — it
+   binds, and the loss is behavioural rather than temporal: at `s = 0` and
+   `s = 1` the direct call is **worse** than the round trip it replaces, because
+   `LerpSlerp::eval`'s endpoint shortcuts hide two things the kernel does not
+   (`-qb` at `s = 1` under the sign fix; renormalized endpoints inside the
+   `1e-6`-rad fallback band). The table discharging check 8 is therefore a
+   differential test, `the_iso3_round_trip_it_replaces_agrees_as_a_rotation`,
+   not a benchmark row. **A math primitive answers check 8 with a differential;
+   a binding answers it with a benchmark. The check binds either way.**
+
 ---
 
 ## 3. Python — mirror, plus conveniences that pay for themselves
@@ -825,11 +908,12 @@ authorized by this document alone.
 | 13 | `tft_bridge_options::arena_name` + `TFT_ERR_ARENA_UNAVAILABLE` | C | [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) | **landed** — `arena_name` appended under §3.6's `struct_size` prefix rule and `TFT_ERR_ARENA_UNAVAILABLE` added to the frozen header, ABI minor 4 → 5. A NULL `arena_name` is the private heap arena every pre-`0.5` caller already had; a non-NULL one is `tf_tree::Open` with `require_create(true)`, and a shared arena that cannot be had is a startup refusal with **no heap fallback**. An earlier revision of this cell said "the ABI half landed" and that `0015` steps 3–7 were outstanding; all eight of that record's steps have since landed — #139, #141, #142, #143 and step 7's `PHASE4.md` §5.8 half; that cell's own C surface was complete at #141. What is still outstanding there is the `atfork` test its *Invariants to maintain* clause demands and §9.2's N = 1…16 curve for the new benchmark arm — **neither of which is C API surface**, so neither holds this row open |
 | 14 | `__version__`, `arena_format_version()`, `arena_layout_hash()` on the Python module | Python | §3.2 | **landed** — `tf_tree_py`. `__version__` is `env!("CARGO_PKG_VERSION")` and never a literal: a hand-copied string is wrong exactly once, on the release where somebody bumps the manifest and not the line, and it is wrong *silently* — a report carrying it is mis-attributed rather than un-attributed, which is worse than having no version at all. The other two re-export the facade's own `arena_format_version` / `arena_layout_hash` under the facade's own names, so no second spelling of an existing path exists (`PROJECT.md` §6) and `tf_tree_arena` does not become a dependency of the binding to answer a diagnostic. All three run at import frequency, and neither of the two calls touches an arena or takes a lock — they bottom out in `tf_tree_arena::FORMAT_VERSION` and in `layout_hash`, which is a `const fn` — so R2 is not in tension. **The two are functions rather than module constants, and that is forced rather than chosen:** `tests/python/test_stubs.py` is what keeps the hand-written `.pyi` from rotting, and it collects the stub's `ClassDef`s and `FunctionDef`s only (`test_stubs.py:36`) while skipping underscore-prefixed names on both sides (`:50`). A module-level `FORMAT_VERSION: int` is an `AnnAssign`, invisible to that comparison — it would be the one name in the surface whose existence nothing checks. `has_shared_memory` is the precedent: a compile-time-constant fact about the build, exposed as a nullary function. `__version__` is exempt by that same underscore skip and keeps the dunder because it is what a bug-report template asks for; it is not the canonical answer — `importlib.metadata.version("transform_tree")` is, it reads `pyproject.toml` where this one reads the crate manifest, and `tests/python/test_version.py` is the only thing that stops the two files drifting |
 | 15 | `frame_headroom=` on `tf_tree.build` and `tf_tree.open` | Python | §3.2 | **landed** — `tf_tree_py`. Spare frame-name slots, mirroring `TreeBuilder::frame_headroom`, defaulting to `0` so no existing caller's arena changes size. It is not a `layout=` in R4's sense — R4 governs the *pose* layout, where row-major against column-major and `wxyz` against `xyzw` both produce a valid-looking transform pointing the wrong way; this is an arena-sizing knob beside `capacity=`, which has carried a default since Phase 3. The defect it closes is not ergonomic: a Python-created arena sized `max_frames = unique_frames + 1` can never accept a runtime-interned name from **any** participant, so a Rust, C or ROS-bridge peer calling `Tree::frame()` on it gets `CapacityExceeded` with no way for the creator to have allowed it. No `edge_headroom` beside it — `PHASE5.md` §5.8's amendment records that nothing declares an edge at runtime. Gated by `tests/python/test_errors.py::test_frame_headroom_reaches_the_arena_and_stays_out_of_the_frame_list`, which compares frozen `.tft` sizes (2262912 / 2264320 / 2274048 B at headroom 0 / 8 / 64) with `frames()` identical at each — mutation-verified: dropping `.frame_headroom(...)` makes all three sizes equal and fails the test |
+| 16 | `tf_tree_math::slerp` is `pub` | Rust | §2.7 (§2.6's test) | **landed** — the shortest-arc quaternion kernel `LerpSlerp` already evaluates, exported under its own name and re-exported at the crate root, closing the asymmetry with `dualquat::screw_pow`, which has been public since the crate's first commit. **Visibility only**: the body is unchanged, so nothing on the hot path moves. What it deletes downstream is the `Iso3` prologue — 256 bytes of stack, two isometries written out field by field, a zero translation lerped into another — which LLVM folds away in no configuration measured: 28 x86-64 instructions through the consumer's `nalgebra` adapter (41 against 69) and 45 bare (7 against 52) at `opt-level = 3`, moving to 31 and 48 across four release profiles. **No instruction count here is portable and none is quoted as one.** Two earlier revisions did quote one — `15` against `51`, then "the same 36 either way" — and neither reproduces; the second was also arithmetically false against the counts it cited (`59 − 7` is 52). What reproduces is the sign: the wrapper is never optimized out. Two costs, both documented rather than removed: `LerpSlerp::eval`'s `s == 0` / `s == 1` shortcuts hide an endpoint asymmetry the kernel exposes (`-qb` at `s = 1` under the sign fix, renormalized endpoints inside the `1e-6`-rad fallback band), pinned by `the_iso3_round_trip_it_replaces_agrees_as_a_rotation`; and **`s` outside `[0, 1]` is documented as unsupported rather than refused** — which branch runs is a property of the *pair*, so an extrapolation's accuracy is set by the publish rate (closed form holds `7.2e-15` out to `s = ±20`, the series leaves `1e-15` between `|s| ≈ 2.3` and `≈ 5` depending on the angle), and `tf_tree_core` never does it, answering an out-of-window stamp with `ExtrapPolicy` instead. §7's walk, item 8 included, is in §2.7 |
 
-**Thirteen of fifteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11,
-13, 14 and 15.** The two that have not are 6 and 12, and neither is merely
+**Fourteen of sixteen rows have landed in full: 1, 2, 3, 4, 5, 7, 8, 9, 10, 11,
+13, 14, 15 and 16.** The two that have not are 6 and 12, and neither is merely
 unscheduled: row 6 is recorded-not-built on purpose and row 12 is gated by D21.
-Two of the thirteen that landed — 3 and 10 — carry a caveat worth keeping, so they are in the
+Two of the fourteen that landed — 3 and 10 — carry a caveat worth keeping, so they are in the
 list below as well. (This count is re-taken from the table above rather than
 carried forward, every time it changes. It has been wrong twice: an early
 revision said "ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named

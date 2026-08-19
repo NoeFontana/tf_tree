@@ -64,10 +64,11 @@ assert!((t_odom_sensor.t.y - 1.0).abs() < 1e-15);
 * The small-angle threshold for the `V`/`V⁻¹` series is `θ < 0.1` with four
   terms — not the `1e-8` most libraries use. Both were checked against a
   50-digit reference.
-* `slerp`'s series/exact crossover is `0.15` rad, measured rather than
-  eyeballed: the constant's doc comment carries the per-term-count error table
-  and the publish rates it covers. An earlier `0.25` looked fine and was 3e-9
-  off.
+* `slerp`'s series/exact crossover is `0.15` rad of **quaternion** angle —
+  `acos(qa·qb)`, half the rotation the pair spans, so a rotation of `0.30` rad.
+  Measured rather than eyeballed: the constant's doc comment carries the
+  per-term-count error table and the publish rates it covers, in both angles.
+  An earlier `0.25` looked fine and was 3e-9 off.
 
 ## Two interpolation policies, and one of them is deliberately asymmetric
 
@@ -85,11 +86,18 @@ public because a downstream crate wanted rotation-only interpolation and was
 reaching it by building two `Iso3` with zero translations — the numerics were
 right, the entry point was missing.
 
+`s` is a fraction of the segment, `[0, 1]`, and unchecked: out of range the
+three branches extrapolate and degrade differently, so which accuracy a caller
+gets is decided by the publish rate. `slerp`'s doc comment measures all three
+and says why extrapolation is not offered here.
+
 ## Version
 
-**0.0.1, and `0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
+**`0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
 incompatible with every other, which is the intended signal: pin exactly, and
-expect a later release to break. The reasoning is written out in the
+expect a later release to break. The number is deliberately not repeated here —
+this line read `0.0.1` while the crate was `0.0.2`, because nothing gates a
+version in prose. The reasoning is written out in the
 repository's [`Cargo.toml`](https://github.com/NoeFontana/tf_tree/blob/main/Cargo.toml)
 under `[workspace.package] version`, and the release notes are in
 [`CHANGELOG.md`](https://github.com/NoeFontana/tf_tree/blob/main/CHANGELOG.md).
