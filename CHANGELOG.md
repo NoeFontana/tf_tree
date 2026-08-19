@@ -33,6 +33,44 @@ is a bug.
 
 ## [Unreleased]
 
+## [0.0.3] — 2026-08-19 (first with a source distribution)
+
+**This release exists partly to prove one thing.** `0.0.2` has eleven wheels and
+no sdist, because PyPI accepted the wheels and then refused the twelfth file with
+`400 License-File LICENSE-APACHE does not exist in distribution` — a partial
+upload no registry lets you re-cut. The metadata declared three licence files the
+tarball did not carry, and `pyproject.toml`'s `[tool.maturin] include` closed
+that. The gate that keeps it closed lives in the `sdist` job, before `publish`,
+so a build that cannot be uploaded fails where it was built rather than after
+eleven wheels have gone to the index. **This is the first release where that runs
+in CI rather than locally** (issue #179).
+
+### Known issues
+
+- **A process's lock byte and its arena participant record can carry different
+  indices** (issue #201), which every liveness predicate in the engine assumes
+  cannot happen. Reproduced and pinned by
+  `defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing`: with a
+  live holder of participant byte 0 and a `CreatePolicy::Always` creator at arena
+  record 0, `Tree::participant_alive(0)` answers about the *holder's* byte, and
+  the verdict flips from alive to dead when only that holder leaves — about a
+  process that never stopped publishing.
+
+  **How that state arises is not known.** The escape-hatch route is measurably
+  not it: an owner plus survivors holds bytes `[0, 1, 2]`, killing the owner
+  leaves `[1, 2]`, and the forced creator then takes byte 0 against record 0,
+  which agree. Two attempts to construct a live non-owner holder of byte 0
+  through `tf_tree::Open` alone failed — a failed construction, not an
+  unreachability argument. Nothing acts on the verdict destructively today, so
+  the harm is conditional on a future rescuer; `docs/decisions/0028` question 3
+  is where it is settled.
+
+- **`Tree::reparent` decides topology-lock liveness from `/proc` even on a tree
+  holding an OFD probe** (issue #213), and it is the only topology-lock path in
+  the facade. Recorded in `docs/PHASE2.md` §0.0 as the third place the identity
+  triple is still correctness-critical.
+
+
 ### Fixed
 
 - **`Tree::lookup`'s per-thread plan cache could serve one tree's compiled plan
@@ -175,6 +213,14 @@ is a bug.
   `tf_tree_math::dualquat`, and a bare name at the facade root would be a
   second spelling of that path rather than the same one.
 
+- **`just artifact-versions` checks every Markdown table's rows against its
+  header.** `docs/API.md` row 16 rendered with a phantom cell from #198 to #209 —
+  and the commit that claimed to fix it escaped four of six pipes — while
+  `PHASE2.md` §12.2 hid two rows' measured results entirely, because GFM discards
+  every cell past the header count. Nobody proofreads what they cannot see. The
+  check is escape-aware, skips fenced code, HTML comments and indented code, and
+  is verified in both directions: a ragged row fails with its location, and the
+  three constructions GFM does *not* render as a table stay silent.
 - `just shm-check` runs `cargo nextest run -p tf_tree --features shm --lib`. The
   recipe named integration targets individually and had no `--lib` line, so an
   `shm`-gated unit test in the facade was compiled by clippy and executed by

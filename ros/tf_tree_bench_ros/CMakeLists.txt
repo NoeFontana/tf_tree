@@ -13,7 +13,7 @@ cmake_minimum_required(VERSION 3.16)
 # Version: a hand-kept copy of the root `Cargo.toml`'s `[workspace.package]
 # version` — see `tf_tree_ros/CMakeLists.txt` for why a benchmark-only package
 # still carries the same number.
-project(tf_tree_bench_ros VERSION 0.0.2 LANGUAGES CXX)
+project(tf_tree_bench_ros VERSION 0.0.3 LANGUAGES CXX)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
