@@ -463,17 +463,22 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   retrying cannot clear it while the survivor runs. Expect it on whichever edge
   ids the old topology used first.
 
-- **The creator's own liveness reads off another process's byte.** The lock byte
-  and the arena participant record are the same integer everywhere in the engine,
-  and this is one of two paths that break it (#201): the split-brain check is
-  skipped, so `take_any_participant` hands the creator the first *free* byte —
-  `k+1` when survivors hold `0..k` — while its fresh arena registers it at record
-  **0**. `Tree::participant_alive(0)` then probes byte 0, which belongs to a
-  survivor. While that survivor lives the creator reads alive for the wrong
-  reason; **when the survivor exits, the running creator reads dead**, which is
-  the direction that lets a rescuer take a claim from a live writer. Derived from
-  the code, not yet reproduced. It is a second reason not to reach for this
-  hatch, and the reason a CLI flag must not ship before #201 is answered.
+- **It does *not* leave the creator's lock byte and arena record disagreeing, and
+  an earlier revision of this bullet said it did.** The correction is kept here
+  because the wrong version is the intuitive one. Those two indices are the same
+  integer everywhere in the engine, and #201 is about the paths that break it —
+  but this is not one of them, measured rather than reasoned: an owner plus two
+  read-write survivors holds bytes `[0, 1, 2]`, and `SIGKILL`ing the owner leaves
+  `[1, 2]`, so the forced creator's `take_any_participant` returns byte **0** and
+  its fresh arena registers it at record **0**. They agree. The kernel frees
+  exactly the byte the new arena reuses, because the owner held record 0 and byte
+  0 for its whole life and the owner-side assigner skips slot 0 for every joiner —
+  so no survivor can be holding byte 0 when the owner dies.
+
+  What #201 needs is a **live holder of byte 0 that is not the arena owner**, and
+  nothing in the workspace produces one outside a test that takes the byte by
+  hand. That is not a proof that it is unreachable — only that it was not
+  constructed. `docs/decisions/0028`'s question 3 is where that gets settled.
 
 It joins rather than replaces when a server *is* reachable: `open()` probes the
 socket before it takes the ownership byte, so the policy abandons an unreachable
