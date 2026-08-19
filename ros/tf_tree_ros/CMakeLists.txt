@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.16)
 # versions itself independently is a package whose number stops meaning
 # anything. Unlike `rust-version`, nothing compares these copies — `just msrv`
 # checks that field alone — so this is the convention, not a gate.
-project(tf_tree_ros VERSION 0.0.2 LANGUAGES CXX)
+project(tf_tree_ros VERSION 0.0.3 LANGUAGES CXX)
 
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)

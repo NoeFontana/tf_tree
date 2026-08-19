@@ -23,7 +23,7 @@ description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential
 # step even though this crate is `publish = false`: it path-depends on
 # `tf_tree_math` with a version requirement, and `^0.0.2` matches only `0.0.2`,
 # so a stale number here does not resolve — it fails to build.
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 # Outside the workspace, so this cannot inherit `[workspace.package]
 # rust-version` and has to repeat it. It is not free to differ: this crate path-
@@ -63,7 +63,7 @@ unreachable_pub = "warn"
 unused_must_use = "deny"
 
 [dependencies]
-tf_tree_math = { path = "../tf_tree_math", version = "0.0.2" }
+tf_tree_math = { path = "../tf_tree_math", version = "0.0.3" }
 
 [build-dependencies]
 cc = "1"
