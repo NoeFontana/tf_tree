@@ -887,6 +887,24 @@ impl Source {
             Source::Frozen => checks::PushStream::RingsAtRest,
         }
     }
+
+    /// What kind of participant table this source's arena carries, which is what
+    /// decides whether `TFT014` has evidence.
+    ///
+    /// The split is *not* the same one [`Self::stream`] makes, and the two
+    /// disagree on both recording sources: an ingested bag builds an ordinary
+    /// arena in **this** process, so its participant table is this process's
+    /// own and perfectly answerable, while its push stream is a replay. Only a
+    /// frozen `.tft` carries somebody else's table.
+    fn slot_table(&self) -> checks::SlotTable {
+        match self {
+            Source::Fixture(_) | Source::Bag(_) => checks::SlotTable::Current,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Live => checks::SlotTable::Current,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            Source::Frozen => checks::SlotTable::Image,
+        }
+    }
 }
 
 /// Build the fixture, or attach — and keep whatever has to stay alive alive.
@@ -1208,6 +1226,7 @@ fn cmd_doctor(
         occupancy: checks::occupancy_of(tree),
         clock_step: &clock_step,
         stream: src.stream(),
+        slots: src.slot_table(),
         counters: tf_tree::counters_compiled_in(),
     };
     let report = checks::run(&inputs, &ids);
@@ -1876,6 +1895,20 @@ fn explain_format_version() {
 mod tests {
     use super::*;
 
+    /// One running writer in slot 0 — the owner every claimed edge in this
+    /// module's hand-built snapshots names.
+    ///
+    /// A snapshot whose claims name a slot no participant table holds is a
+    /// snapshot of a wedged arena, and these fixtures are about healthy ones.
+    fn live_writer() -> Vec<doctor::ParticipantInfo> {
+        vec![doctor::ParticipantInfo {
+            slot: 0,
+            state: doctor::SlotState::Live,
+            pid: 4711,
+            alive: true,
+        }]
+    }
+
     /// **The `TFT007` coverage note reaches `Meta.notes`, which is its only
     /// route to an operator.**
     ///
@@ -1910,6 +1943,7 @@ mod tests {
             head: 100,
             claimed: true,
             claiming: false,
+            owner_slot: Some(0),
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
             nominal_rate_mhz: mhz,
@@ -1928,6 +1962,7 @@ mod tests {
                 frame(3, "base_link", 2, 2),
             ],
             edges: vec![dyn_edge(1, 1, 2, Some(20_000)), dyn_edge(2, 2, 3, None)],
+            participants: live_writer(),
         };
         // 20 Hz on edge 1, comfortably more than `RATE_MIN_INTERVALS`, so it is
         // compared and passes; edge 2 declares nothing and is not.
@@ -1995,6 +2030,7 @@ mod tests {
             head: 100,
             claimed: true,
             claiming: false,
+            owner_slot: Some(0),
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
             nominal_rate_mhz: None,
@@ -2016,6 +2052,7 @@ mod tests {
                 frame(3, "base_link", 2, 2),
             ],
             edges: vec![dyn_edge(1, 1, 2, 0), dyn_edge(2, 2, 3, 3)],
+            participants: live_writer(),
         };
         // A clock step, not a stray inversion: ten pushes at a 10 ms period,
         // the clock jumps 100 ms backwards, and the publisher carries on at the
@@ -2359,11 +2396,13 @@ mod tests {
                     head: 100,
                     claimed,
                     claiming: false,
+                    owner_slot: claimed.then_some(0),
                     owner_pid: if claimed { 4711 } else { 0 },
                     newest_stamp: Some(1_000_000_000),
                     nominal_rate_mhz: None,
                 })
                 .collect(),
+            participants: live_writer(),
         }
     }
 

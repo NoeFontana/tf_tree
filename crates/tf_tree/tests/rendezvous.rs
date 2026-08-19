@@ -88,6 +88,25 @@ impl Kid {
         }
     }
 
+    /// Ask a `join-rw-report` child about one slot and read its answer.
+    ///
+    /// Unlike [`Self::poke`] this keeps the pipe: the child answers one line
+    /// per line it reads, so a caller can put the same question either side of
+    /// a `SIGKILL` and compare, which is the only way to observe a transition
+    /// rather than a state.
+    ///
+    /// `unstable`, with its one caller: the helper mode this drives reads a
+    /// participant record's raw `state` word through `Tree::arena_view`, and
+    /// that feature is what gates it (`docs/API.md` §2.6).
+    #[cfg(feature = "unstable")]
+    fn ask(&mut self, slot: u32) -> String {
+        use std::io::Write;
+        let stdin = self.0.stdin.as_mut().expect("piped stdin");
+        writeln!(stdin, "{slot}").expect("write a slot query");
+        stdin.flush().expect("flush the slot query");
+        self.line()
+    }
+
     fn kill(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -787,6 +806,116 @@ fn a_stopped_peer_is_alive_and_a_killed_one_is_not() {
     );
 }
 
+/// **The hangup reap clears a joiner's slot and cannot clear the owner's — the
+/// two halves of the same arena, measured against each other.**
+///
+/// `TFT014`'s participant arm fires on `state == LIVE` with a free lock byte.
+/// This is the one shape of that state a test can stage out of real processes,
+/// and it is `docs/decisions/0028`'s candidate-B hole 3, *"the owner's own slot
+/// leaks unconditionally"* — the owner registers itself and nothing hangs up on
+/// it, so no `LIVE -> FREE` transition exists for its record.
+///
+/// **The control matters more than the positive here.** #184 was written about
+/// a `SIGKILL`ed rendezvous joiner under a running owner, and #191 closed that:
+/// the owner's socket-hangup callback calls `ParticipantTable::release`, so the
+/// killed peer's slot returns to `FREE` and `TFT014` correctly says nothing.
+/// A test that only showed the leak would leave the reader unable to tell which
+/// of the two shapes the check is for. Both are asserted, on one arena, from
+/// one observer.
+///
+/// **The observer has to be a process that joined before the owner died.** With
+/// the owner gone the rendezvous socket is gone, so a fresh attach is refused
+/// `ArenaHeldButUnreachable` — asserted below, because it is also the reason
+/// `tf_tree doctor --attach` cannot reach this arena: the check's predicate
+/// covers the shape, the CLI's only live source cannot get to it.
+///
+/// Mutant: delete the `table.release(slot, incarnation)` from the hangup
+/// callback in `crates/tf_tree/src/open.rs` (i.e. revert #191). Applied: the
+/// `#191` assertion fails after the full two seconds of polling with *"it is
+/// still: slot 1 state live word 0x6 pid … alive false"* — #184 reproduced,
+/// and the exact predicate `TFT014` fires on.
+/// Mutant B: have the child answer `alive` from its own `state` word instead
+/// of from `Tree::participant_alive`. Applied: the dead owner's slot reports
+/// *"slot 0 state live word 0x6 pid … alive true"* and the lock-byte assertion
+/// fails. That mutant is `docs/PHASE2.md` §5.1's forbidden inference written
+/// out, and it is the defect `0028` is about.
+#[cfg(feature = "unstable")]
+#[test]
+fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
+    let scratch = Scratch::new("owner-slot");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    // Slots are handed out in join order, and each child is waited for before
+    // the next is spawned, so these numbers are determined rather than hoped
+    // for: owner 0, peer 1, watcher 2.
+    let mut peer = Kid::spawn(&scratch.0, &["join-rw"]);
+    assert!(peer.line().starts_with("joined "), "peer did not join");
+    let mut watcher = Kid::spawn(&scratch.0, &["join-rw-report"]);
+    assert_eq!(watcher.line(), "joined", "watcher did not join");
+
+    for slot in 0..3 {
+        let seen = watcher.ask(slot);
+        assert!(
+            seen.contains("state live") && seen.contains("alive true"),
+            "all three participants must start out live and running: {seen}"
+        );
+    }
+
+    // **#191, measured.** The owner is running, so its `epoll` sees the peer's
+    // socket close and the callback releases the record. That is asynchronous
+    // — a different process on a different thread — so this polls rather than
+    // asserting once; a bounded wait that fails by timing out is the only
+    // shape available for "something else will do this shortly".
+    peer.kill();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        seen = watcher.ask(1);
+        if seen.contains("state free") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        seen.contains("state free"),
+        "the owner's hangup callback must release a killed joiner's record \
+         (#191); it is still: {seen}"
+    );
+
+    // **Hole 3, measured.** Nothing hangs up on the owner, so its own record is
+    // left exactly as `TFT014` describes: `LIVE`, with the kernel reporting its
+    // lock byte free.
+    owner.kill();
+    let mut seen = String::new();
+    for _ in 0..25 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        seen = watcher.ask(0);
+        assert!(
+            seen.contains("state live"),
+            "no code path can clear the owner's own record, so it must stay \
+             LIVE for the life of the segment: {seen}"
+        );
+    }
+    assert!(
+        seen.contains("alive false"),
+        "the kernel released the dead owner's lock byte, so the liveness \
+         predicate must say so: {seen}"
+    );
+
+    // **And nobody new can be told about it.** `doctor --attach` joins through
+    // the rendezvous, which died with the owner, so the shape above is one the
+    // CLI check cannot be pointed at — `docs/PHASE5.md` §6's `TFT014`
+    // amendment says which shapes it can.
+    let mut late = Kid::spawn(&scratch.0, &["join-rw"]);
+    let refused = late.line();
+    assert!(
+        refused.starts_with("error") && refused.contains("unreachable"),
+        "a fresh attach to an owner-less arena must be refused, or this leak \
+         would be reachable from `doctor --attach`: {refused}"
+    );
+}
+
 /// A read-only peer and a read-write peer get different slots.
 ///
 /// **What this verifies, and what it cannot.** `mode="ro"` is the consumer
@@ -1019,11 +1148,17 @@ fn the_acquire_window_backs_out() {
         "both handles took the same slot, so the reaper would skip the claim as its own"
     );
 
-    REAPER.set(reaper).ok().expect("set reaper");
-    tf_tree::CLAIM_WINDOW_HOOK
-        .set(reap_from_inside_the_window as fn())
-        .ok()
-        .expect("install hook");
+    // `assert!(… .is_ok())` and not `.ok().expect()`: `OnceLock::set` hands the
+    // value back in the `Err`, and `Tree` is not `Debug`, which is what the
+    // older spelling was working around. `clippy::ok_expect` flags it, and no
+    // recipe compiled this configuration until the line below in `shm-check`.
+    assert!(REAPER.set(reaper).is_ok(), "set reaper");
+    assert!(
+        tf_tree::CLAIM_WINDOW_HOOK
+            .set(reap_from_inside_the_window as fn())
+            .is_ok(),
+        "install hook"
+    );
 
     let child = claimer.frame("base").unwrap();
     let parent = claimer.frame("map").unwrap();

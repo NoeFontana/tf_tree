@@ -43,6 +43,7 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
         occupancy: checks::occupancy_of(&tree),
         clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
         stream: checks::PushStream::Observed,
+        slots: checks::SlotTable::Current,
         counters: tf_tree::counters_compiled_in(),
     };
     let report = checks::run(&inputs, &BTreeSet::new());
@@ -301,6 +302,7 @@ capacity = 64
             occupancy: checks::occupancy_of(&tree),
             clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
             stream: checks::PushStream::RingsUnderWriter,
+            slots: checks::SlotTable::Current,
             counters: tf_tree::counters_compiled_in(),
         },
         &BTreeSet::new(),
@@ -334,6 +336,130 @@ capacity = 64
 
     drop(declared);
     drop(undeclared);
+}
+
+/// **`TFT014` sees the wedge, on a real arena, through the real liveness
+/// predicate.**
+///
+/// The unit tests build a `ParticipantInfo` and hand it to the check, which
+/// proves the reporting and nothing about how `alive` was reached. This one
+/// puts a `LIVE` record into an actual participant table and lets
+/// `Snapshot::capture` ask `Tree::participant_alive` about it — the seam issue
+/// #184 fell through, where a killed writer's record is left `LIVE` and
+/// `ParticipantTable::identity` keeps answering with its dead pid.
+///
+/// **What is staged and what is real.** The record is injected with
+/// `register_at`, which no ordinary code path produces, so this proves the
+/// *predicate and the report* on a real arena and not that any deployment
+/// reaches this state. The shape that does is a whole process dying, and it is
+/// `crates/tf_tree/tests/rendezvous.rs`'s
+/// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`: a real owner
+/// `SIGKILL`ed, leaving a real `LIVE` record over a free byte, which is
+/// `docs/decisions/0028`'s candidate-B hole 3. It lives there rather than here
+/// because that arena has no owner left to attach to — `doctor --attach` is
+/// refused `ArenaHeldButUnreachable`, so the only observer is a process that
+/// joined first.
+///
+/// **The pid is `u32::MAX` because that is the deterministic form of "gone".**
+/// It exceeds every `pid_max`, so `/proc/<pid>` cannot exist and the predicate
+/// takes its `NoSuchProcess` branch — the same branch a killed and reaped
+/// writer's pid takes, without racing pid reuse to get there. On a
+/// rendezvous-opened tree the same slot is answered by `F_OFD_GETLK` on its
+/// lock byte instead; both are `Tree::participant_alive`, which is the point of
+/// routing through it rather than spelling a third predicate here.
+///
+/// Non-vacuity is the whole risk in a test like this, so three things are
+/// asserted about the *healthy* half of the same arena: the table is fully
+/// captured, this process's own slot reads alive, and the live writers'
+/// claims produce no edge finding.
+///
+/// Mutant: in `tft014`, drop the participant loop. Applied: `left: Pass,
+/// right: Fired` — which is exactly the state `tf_tree doctor` was in before
+/// this, on the arena the check is named for.
+/// Mutant B: in `Snapshot::capture`, set `alive: state == SlotState::Live`.
+/// Applied: the "must read dead through the real predicate" assertion fires
+/// first, printing `alive: true` for pid 4294967295. That mutant is
+/// `docs/PHASE2.md` §5.1's forbidden inference written out, and the assertion
+/// that catches it is deliberately upstream of the check, so the failure names
+/// the predicate rather than the report.
+#[test]
+fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
+    const GONE: u32 = u32::MAX;
+
+    let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
+    let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
+
+    // Slot 0 is this process. Slot 1 is the record a killed writer leaves: the
+    // publication protocol is the same one `register` runs, because the state
+    // being simulated is a *complete* registration whose process then died.
+    tree.arena_view()
+        .participants()
+        .register_at(1, GONE, 1, 0)
+        .expect("slot 1 of a 64-slot table is free");
+
+    let snap = Snapshot::capture(&tree);
+    let obs = Observations::from_samples(samples);
+    let stats = checks::collect_edge_stats(&tree, &snap);
+    let clock = Clock::decide(&checks::newest_stamps(&snap), 1_700_000_000_000_000_000);
+    let report = checks::run(
+        &Inputs {
+            snap: &snap,
+            obs: &obs,
+            stats: &stats,
+            host: None,
+            clock,
+            arena_bytes: tree.arena_size_bytes() as u64,
+            occupancy: checks::occupancy_of(&tree),
+            clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
+            stream: checks::PushStream::Observed,
+            slots: checks::SlotTable::Current,
+            counters: tf_tree::counters_compiled_in(),
+        },
+        &BTreeSet::new(),
+    );
+
+    assert_eq!(
+        snap.participants.len(),
+        64,
+        "the whole table must be captured, or `1 of N` in the finding is a guess"
+    );
+    let own = snap.participant(0).expect("this process holds slot 0");
+    assert!(
+        own.alive,
+        "the running process that built the arena must not read as leaked: {own:?}"
+    );
+    let stale = snap.participant(1).expect("slot 1 was just registered");
+    assert!(
+        !stale.alive && stale.pid == GONE,
+        "the injected record must read dead through the real predicate: {stale:?}"
+    );
+
+    let o = report
+        .outcomes
+        .iter()
+        .find(|o| o.check == Tft::Tft014)
+        .expect("TFT014 must be in the report");
+    assert_eq!(o.status, Status::Fired, "{o:?}");
+    assert_eq!(
+        o.findings.len(),
+        1,
+        "one leaked slot, and no edge: the fixture's writers are alive and holding \
+         their claims: {:?}",
+        o.findings
+    );
+    assert_eq!(o.findings[0].subject, format!("slot 1 pid {GONE}"));
+    assert!(
+        o.findings[0].message.contains("1 of 64"),
+        "the operator's budget is 64 slots and the finding must say so: {}",
+        o.findings[0].message
+    );
+    assert_eq!(
+        Tft::Tft014.severity(),
+        Severity::Warn,
+        "PHASE5 §6's row says warn; detection is not reclamation"
+    );
+
+    drop(writers);
 }
 
 /// **The CLI's `counters` feature must actually control the engine's.**

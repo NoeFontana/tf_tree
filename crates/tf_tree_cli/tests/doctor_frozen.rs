@@ -44,6 +44,59 @@ fn tf_tree() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tf_tree"))
 }
 
+/// Write a small recording into `dir` and freeze it, returning the `.tft`.
+///
+/// **The freeze runs in a subprocess and that is load-bearing rather than
+/// incidental**: it is what makes the file's participant table describe a
+/// process that has since exited, which is the state `TFT014` must not judge.
+fn freeze_a_recording(dir: &Scratch) -> PathBuf {
+    let bag = dir.0.join("run.mcap");
+    let tft = dir.0.join("run.tft");
+    write_mcap(&bag, &small_recording()).unwrap();
+
+    let freeze = tf_tree()
+        .arg("freeze")
+        .arg("--from-bag")
+        .arg(&bag)
+        .arg("--out")
+        .arg(&tft)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        String::from_utf8_lossy(&freeze.stderr)
+    );
+    tft
+}
+
+/// `doctor --from-file <tft> --json`, asserted to succeed.
+fn doctor_json(tft: &PathBuf) -> String {
+    let out = tf_tree()
+        .arg("doctor")
+        .arg("--from-file")
+        .arg(tft)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let json = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{json}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json
+}
+
+/// The `--json` object for `id`, as a window wide enough to hold its status,
+/// its reason and its first finding.
+fn outcome_of<'a>(json: &'a str, id: &str) -> &'a str {
+    let at = json
+        .find(&format!("\"id\": \"{id}\""))
+        .unwrap_or_else(|| panic!("{id} missing:\n{json}"));
+    &json[at..(at + 1200).min(json.len())]
+}
+
 /// **A frozen `.tft` is a `doctor` source, and the checks that read the arena
 /// run on it unchanged.**
 ///
@@ -65,37 +118,8 @@ fn tf_tree() -> Command {
 #[test]
 fn a_frozen_index_is_a_doctor_source_and_the_two_stream_checks_skip_on_it() {
     let dir = Scratch::new("wiring");
-    let bag = dir.0.join("run.mcap");
-    let tft = dir.0.join("run.tft");
-    write_mcap(&bag, &small_recording()).unwrap();
+    let json = doctor_json(&freeze_a_recording(&dir));
 
-    let freeze = tf_tree()
-        .arg("freeze")
-        .arg("--from-bag")
-        .arg(&bag)
-        .arg("--out")
-        .arg(&tft)
-        .output()
-        .unwrap();
-    assert!(
-        freeze.status.success(),
-        "freeze failed: {}",
-        String::from_utf8_lossy(&freeze.stderr)
-    );
-
-    let out = tf_tree()
-        .arg("doctor")
-        .arg("--from-file")
-        .arg(&tft)
-        .arg("--json")
-        .output()
-        .unwrap();
-    let json = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "{json}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     assert!(
         json.contains("\"source\": \"frozen .tft index\""),
         "the report must name what it read:\n{json}"
@@ -107,10 +131,7 @@ fn a_frozen_index_is_a_doctor_source_and_the_two_stream_checks_skip_on_it() {
     );
 
     for id in ["TFT018", "TFT019"] {
-        let at = json
-            .find(&format!("\"id\": \"{id}\""))
-            .unwrap_or_else(|| panic!("{id} missing:\n{json}"));
-        let window = &json[at..(at + 1200).min(json.len())];
+        let window = outcome_of(&json, id);
         assert!(
             window.contains("\"status\": \"skipped\""),
             "{id} must not claim a verdict it cannot have: {window}"
@@ -124,6 +145,47 @@ fn a_frozen_index_is_a_doctor_source_and_the_two_stream_checks_skip_on_it() {
             "{id} must point at the source that can answer: {window}"
         );
     }
+}
+
+/// **`TFT014` skips on a `.tft`, and this is the file that proves it has to.**
+///
+/// §2.3's freeze copies the whole arena, participant records included, so this
+/// file carries a `LIVE` record for the `tf_tree freeze` subprocess that wrote
+/// it — a process this test had already reaped before `doctor` started. Ask
+/// `Tree::participant_alive` about it and the kernel says that pid is gone, so
+/// without the [`SlotTable::Image`] skip **every correct `.tft` in existence
+/// reports a leaked participant slot**, at warn severity, about an arena with
+/// no assigner for a leaked slot to wedge.
+///
+/// The `pass` it used to report was no better: `owner_pid` came from
+/// `ParticipantTable::identity`, which answers for any `LIVE` record however
+/// dead its process, so the old quiet was `PHASE2.md` §5.1's forbidden
+/// inference producing the right answer here for the wrong reason.
+///
+/// Mutant: give `Source::Frozen` the table `SlotTable::Current` in `lib.rs`'s
+/// `Source::slot_table`. Applied: the skipped-status assertion fails, and the
+/// window it prints is the finding — `"subject": "slot 0 pid 1019885"`, the pid
+/// of that reaped `tf_tree freeze`.
+///
+/// [`SlotTable::Image`]: tf_tree_cli::checks::SlotTable::Image
+#[test]
+fn a_frozen_index_is_not_asked_whether_its_participants_are_running() {
+    let dir = Scratch::new("slots");
+    let json = doctor_json(&freeze_a_recording(&dir));
+
+    let window = outcome_of(&json, "TFT014");
+    assert!(
+        window.contains("\"status\": \"skipped\""),
+        "TFT014 must not judge a copy of a participant table: {window}"
+    );
+    assert!(
+        window.contains("byte copy of the whole arena"),
+        "TFT014's reason must name why a file cannot answer: {window}"
+    );
+    assert!(
+        window.contains("--attach"),
+        "the skip must send the operator to the source that can answer: {window}"
+    );
 }
 
 /// **A recording handed to `--from-file` is told which flag it wanted.**

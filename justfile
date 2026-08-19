@@ -1842,6 +1842,27 @@ mp-bench-tf2:
 shm-check:
     cargo clippy -p tf_tree_arena --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree --features shm --all-targets -- -D warnings
+    # **The line above is the packager's shape; this one is the shape two of
+    # this crate's targets are actually *run* in.** `just shm-check`'s
+    # `--test frozen` line and `just shm-rendezvous` both pass
+    # `shm,unstable`, and the tests those features buy —
+    # `freezing_carries_the_counter_regions` and
+    # `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`, plus the
+    # helper's `join-rw-report` mode — are `#[cfg(feature = "unstable")]`, so
+    # the pass above compiles them **out**. `just lint`'s workspace clippy
+    # cannot reach them either: both targets carry `required-features =
+    # ["shm"]`, so `--workspace` skips them whole. Without this line that code
+    # is executed by a recipe and linted by nothing, which is the same hole
+    # every other feature-named pass in this file exists to close.
+    cargo clippy -p tf_tree --features shm,unstable --all-targets -- -D warnings
+    # **And this one is the shape `just shm-rendezvous` runs**, which is not the
+    # line above: `test-hooks` is what compiles `CLAIM_WINDOW_HOOK`'s call site,
+    # and the pass above leaves it out. Adding the `unstable` pass without this
+    # one would have left the *executed* configuration linted by nothing, which
+    # is the hole being closed rather than a second copy of it. It found a real
+    # defect on arrival — a `clippy::ok_expect` in `the_acquire_window_backs_out`
+    # that had never been compiled under `-D warnings` by any recipe.
+    cargo clippy -p tf_tree --features shm,test-hooks,unstable --all-targets -- -D warnings
     cargo clippy -p tf_tree_ipc --all-targets -- -D warnings
     cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree_cli --features shm --all-targets -- -D warnings
@@ -2064,7 +2085,20 @@ shm-rendezvous:
     # arena CAS and the lease `SETLK`. The window is a single syscall wide, so
     # `the_acquire_window_backs_out` cannot place a reaper inside it by racing.
     # The hook is inert when unset, so the other tests run as they always did.
-    cargo nextest run -p tf_tree --features shm,test-hooks --test rendezvous
+    #
+    # **`unstable` buys exactly one test here, the same trade `just
+    # shm-check`'s `--test frozen` line makes.**
+    # `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`
+    # reads a participant record's raw `state` word, and
+    # `Tree::arena_view` is the only route to it (`docs/API.md` §2.6) — a slot
+    # that stays `LIVE` after its process dies cannot be told from one that was
+    # released by `Tree::participant_alive` alone, because that predicate folds
+    # `state == LIVE` into its own answer. Without the feature the test and the
+    # helper's `join-rw-report` mode are both `#[cfg]`-ed out and the recipe
+    # runs one test fewer, silently. Measured:
+    # `cargo nextest list -p tf_tree --features shm,test-hooks --test rendezvous`
+    # lists 15, `--features shm,test-hooks,unstable` lists 16.
+    cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:
