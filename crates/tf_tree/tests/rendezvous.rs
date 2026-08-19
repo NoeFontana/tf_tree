@@ -245,6 +245,86 @@ fn a_read_only_attach_refuses_to_create() {
     );
 }
 
+/// **`RUNBOOK.md`'s escape hatch out of `ArenaHeldButUnreachable`, run as written.**
+///
+/// `docs/PHASE2.md` §3.4 asks for it as `--force-new` and no binary ever grew
+/// the flag (#189, and §0.0's row), so the procedure an operator follows is
+/// `CreatePolicy::Always` on the process that creates the arena — and until this
+/// test nothing above `tf_tree_ipc` ran it. That crate's
+/// `create_always_overrides_the_split_brain_check` stops at the lock file; the
+/// half a stranded operator needs is that the policy carries through
+/// `build_shared` and comes back holding a `Tree`.
+///
+/// The stranded participant is a bare lock byte rather than a process, because a
+/// held byte is the entirety of what §3.4 step 4 consults. A second process
+/// would add a socket, a mapping and a race without changing the input.
+///
+/// The last two assertions are what separates the escape hatch from slot
+/// reclamation (#184): it abandons the arena and **leaves the byte held**, so
+/// the replacement's table is one slot smaller for as long as the survivor runs.
+///
+/// **Mutant: drop `self.create != CreatePolicy::Always &&` from step 4's
+/// condition** ⇒ measured — `Always` yields the ownership byte like every other
+/// policy, and the second half fails with `ArenaHeldButUnreachable`.
+#[test]
+fn the_escape_hatch_creates_over_a_stranded_participant() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("force-new");
+    let lock_path = scratch.0.join("0/default.lock");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+    let survivor = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        survivor.try_take_participant(3).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+
+    let layout = || {
+        TreeBuilder::new()
+            .default_interp(InterpPolicy::LerpSlerp)
+            .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+    };
+    let creator = |policy| {
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(policy)
+            .layout_if_creating(layout())
+            .timeout(std::time::Duration::from_millis(100))
+    };
+
+    // The wedge itself: a held byte, nothing serving, and an ordinary creator
+    // refusing rather than starting a second arena beside it.
+    let err = creator(CreatePolicy::IfAbsent)
+        .open()
+        .err()
+        .expect("a held participant byte must turn an ordinary creator away");
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. })
+        ),
+        "expected ArenaHeldButUnreachable, got {err:?}"
+    );
+
+    let tree = creator(CreatePolicy::Always)
+        .open()
+        .expect("CreatePolicy::Always must create over a stranded participant");
+    assert_ne!(
+        tree.participant_slot(),
+        3,
+        "the escape hatch took the stranded participant's slot"
+    );
+
+    // A second open file description, because `F_OFD_GETLK` reports only
+    // *conflicting* locks and `survivor`'s own byte does not conflict with
+    // itself — asking through `survivor` would report its own byte free.
+    let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert!(
+        witness.probe_participant(3).unwrap().held,
+        "abandoning the arena released the stranded participant's byte"
+    );
+}
+
 /// **`Open::require_create` refuses to join, and leaves nothing behind.**
 ///
 /// `CreatePolicy` has no "create, or refuse if one is already live" setting, so

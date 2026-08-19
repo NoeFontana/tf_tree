@@ -1942,8 +1942,9 @@ impl Tree {
             Ok(tf_tree_ipc::LockAttempt::Acquired) => {}
             Ok(tf_tree_ipc::LockAttempt::Contended) => {
                 // The record was free but a live process holds the lease.
-                // Reachable only through a reaper bug or `--force-new` byte
-                // aliasing; back the CAS out rather than publish beside them.
+                // Reachable only through a reaper bug or `CreatePolicy::Always`
+                // byte aliasing; back the CAS out rather than publish beside
+                // them.
                 tf_tree_core::edge::release(claim_rec, owner);
                 return Err(ClaimApiError::LeaseContended { edge: eid });
             }

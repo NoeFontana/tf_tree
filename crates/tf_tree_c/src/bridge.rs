@@ -993,8 +993,9 @@ unsafe fn bridge_of<'a>(b: *mut tft_bridge) -> Result<&'a mut tft_bridge, tft_st
 ///
 /// [`tf_tree::CreatePolicy`] has no "create, or refuse if one is already live"
 /// setting: `IfAbsent` silently *joins*, which would have this bridge claiming
-/// edges in an arena somebody else sized, and `Always` is `--force-new` and
-/// documents itself as never to be taken automatically.
+/// edges in an arena somebody else sized, and `Always` is `docs/PHASE2.md`
+/// §3.4's escape hatch, which documents itself as never to be taken
+/// automatically.
 /// `docs/decisions/0019` §3's question 3 settles it — a second bridge on a held
 /// name is a rendezvous refusal, and this is where it is refused.
 ///
