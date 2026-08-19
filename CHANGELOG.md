@@ -57,6 +57,31 @@ is a bug.
   holding two `tf_tree.Tree` objects on one thread was exposed. The C ABI never
   was: it exposes no collapsed lookup, only `tft_plan_create` and `tft_plan_at`.
 
+- **The liveness predicate could report a running process dead** (issue #194).
+  Its own doc comment states the bias it is built on — every ambiguity resolves
+  to *alive*, because a false "dead" lets a rescuer take an entry from a running
+  process, which is corruption, while a false "alive" only delays recovery — and
+  two of its branches produced the other direction.
+
+  A `/proc` that is not mounted fails every open with `ENOENT`, the same errno a
+  genuinely dead pid produces, and that was read as proof of death: on such a
+  host every participant read dead at once. The classification now depends on a
+  one-shot probe of `/proc/self`, because a process that cannot see its own entry
+  learns nothing from the absence of anybody else's. The `ENOENT` that remains
+  ambiguous is `hidepid=2` hiding another user's process, which `docs/PHASE2.md`
+  §3.10's same-user participants rule out — a dependency the code now names.
+
+  Separately, a registrant that could not read its own start time stored `0`, and
+  `0` compares unequal to every real start time, so the first reader that *could*
+  read `/proc` declared that registrant dead while it was running. A stored `0`
+  is now read as *unknown*, and `process_start_time` returns an `Option` so the
+  sentinel is written deliberately rather than returned as though it were a
+  measurement.
+
+  **No arena field was added.** The record's `start_time` is unchanged and `0`
+  was already what a fresh arena's participant region holds, so this is a
+  read-side reinterpretation: `FORMAT_VERSION` and `layout_hash` are untouched.
+
 - **`tests/frozen.rs`'s litter check failed about files it had not produced.**
   It scanned the shared `std::env::temp_dir()` for any entry whose name
   contained this process's id as a substring, so an unrelated process's scratch

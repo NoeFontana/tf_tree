@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -598,7 +598,12 @@ impl TreeBuilder {
         //    them sound: no shared `ArenaView` can exist while one happens.
         let layout = ArenaLayout::new(max_frames, max_edges, caps)?;
         let boot_id = boot_id();
-        let mut arena = make(&layout, std::process::id(), process_start_time(), boot_id)?;
+        let mut arena = make(
+            &layout,
+            std::process::id(),
+            process_start_time().unwrap_or(UNKNOWN_START_TIME),
+            boot_id,
+        )?;
         // Scoped so the builder's exclusive borrow ends before `arena` moves into
         // the `Tree`; nothing may declare an edge once the tree is shareable.
         {
@@ -2868,8 +2873,11 @@ fn poison_arena() -> &'static HeapArena {
 /// slot and there is no other way to be named. The slot is released in
 /// [`Tree`]'s `Drop`.
 fn register_participant(view: &ArenaView) -> Result<(u32, u64), ParticipantError> {
-    view.participants()
-        .register(std::process::id(), process_start_time(), now_nanos())
+    view.participants().register(
+        std::process::id(),
+        process_start_time().unwrap_or(UNKNOWN_START_TIME),
+        now_nanos(),
+    )
 }
 
 /// Register into the slot the arena's owner named (`docs/PHASE2.md` §3.7).
@@ -2880,8 +2888,12 @@ fn register_participant(view: &ArenaView) -> Result<(u32, u64), ParticipantError
 /// numbers would make every liveness answer be about somebody else.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn register_participant_at(view: &ArenaView, slot: u32) -> Result<u64, ParticipantError> {
-    view.participants()
-        .register_at(slot, std::process::id(), process_start_time(), now_nanos())
+    view.participants().register_at(
+        slot,
+        std::process::id(),
+        process_start_time().unwrap_or(UNKNOWN_START_TIME),
+        now_nanos(),
+    )
 }
 
 /// Wall-clock nanoseconds since the epoch, saturating; `0` if the clock is
@@ -2933,7 +2945,9 @@ fn now_nanos() -> i64 {
 ///
 /// `Unreadable` resolves to **alive**, and every branch is chosen the same way:
 /// a false "dead" lets a rescuer take an entry from a running process, which is
-/// corruption; a false "alive" only delays recovery.
+/// corruption; a false "alive" only delays recovery. [`alive_given`] is where
+/// the bias is applied, and two of its arms exist because two branches once
+/// produced the other direction.
 fn record_is_alive(rec: &tf_tree_core::ParticipantRecord) -> bool {
     use core::sync::atomic::Ordering;
     if tf_tree_core::participant::state_of(rec.state.load(Ordering::Acquire))
@@ -2943,10 +2957,31 @@ fn record_is_alive(rec: &tf_tree_core::ParticipantRecord) -> bool {
     }
     let pid = rec.pid.load(Ordering::Relaxed);
     let start_time = rec.start_time.load(Ordering::Relaxed);
-    match read_start_time(pid) {
+    alive_given(start_time, read_start_time(pid), proc_answers_here())
+}
+
+/// Turn a record's stored `start_time` and what `/proc` said into a verdict.
+///
+/// Both host facts arrive as parameters rather than as reads, because both are
+/// things a test cannot arrange: whether `/proc` answers is a property of the
+/// machine the suite runs on, and staging pid reuse means exhausting the pid
+/// space. Passing them in is what makes the bias below assertable instead of
+/// merely stated.
+fn alive_given(stored_start_time: u64, probe: ProcStartTime, proc_answers: bool) -> bool {
+    match probe {
+        // The registrant could not read its own start time and stored
+        // `UNKNOWN_START_TIME`, so there is nothing here to compare against.
+        // Comparing anyway is false for every real start time, so the first
+        // reader that *can* read `/proc` reports a running process dead — and it
+        // does not even degrade to a bare-pid check, which would at least be
+        // conservative. It inverts.
+        ProcStartTime::Known(_) if stored_start_time == UNKNOWN_START_TIME => true,
         // PID reuse: same number, different process. Not our participant.
-        ProcStartTime::Known(st) => st == start_time,
-        ProcStartTime::NoSuchProcess => false,
+        ProcStartTime::Known(st) => st == stored_start_time,
+        // Death, but only as read from a host that would have shown us the
+        // entry. On one that answers `ENOENT` for every pid, a missing entry
+        // says nothing and every participant in the arena would read dead.
+        ProcStartTime::NoSuchProcess => !proc_answers,
         ProcStartTime::Unreadable => true,
     }
 }
@@ -2990,48 +3025,144 @@ fn participant_is_alive(
         return false;
     };
 
-    match read_start_time(pid) {
-        // PID reuse: same number, different process. Not our participant.
-        ProcStartTime::Known(st) => st == start_time,
-        ProcStartTime::NoSuchProcess => false,
-        ProcStartTime::Unreadable => true,
+    alive_given(start_time, read_start_time(pid), proc_answers_here())
+}
+
+/// The `start_time` a participant record carries when this host would not say
+/// what it is.
+///
+/// **Zero, and not a new field.** `FORMAT_VERSION = 3` already happened and
+/// CLAUDE.md forbids adding an arena field opportunistically; a fresh arena's
+/// participant region is zero anyway, so zero is already the value that means
+/// "nothing written here". What changes is the *reading*: [`alive_given`] treats
+/// a stored zero as unknown rather than as a start time to compare against.
+///
+/// A process genuinely started in tick 0 of the boot collides with the sentinel
+/// and reads as unknown — that is, as **alive**, the direction the predicate is
+/// biased towards, and only for a process in pid 1's neighbourhood.
+const UNKNOWN_START_TIME: u64 = 0;
+
+/// Would this host tell us that some other process exists?
+///
+/// A `/proc` that is not mounted — a `chroot` without one, a stripped container
+/// — fails **every** open with `ENOENT`, the same errno a genuinely dead pid
+/// produces and indistinguishable from it at the call site. Reading our own
+/// entry settles which it is: this process is running by construction, so if
+/// `/proc/self/stat` is not there then `/proc` is not there, and an `ENOENT`
+/// about anybody else proves nothing at all.
+///
+/// **Latched on a decisive answer only**, because the answer is a property of the
+/// host rather than of the pid being asked about, and the callers are the
+/// liveness predicate — run under the topology lock, and once per claim per reap
+/// sweep. `Ok` latches "this host answers"; `ENOENT` latches "it does not",
+/// which is the genuine no-`/proc` host and is correct forever there. **Any
+/// other error is indecisive and is deliberately not latched**: `ENOMEM`, an LSM
+/// or seccomp denial, or a bind-mount race during startup would otherwise make
+/// one transient failure permanent, and permanently answering "cannot answer"
+/// means this process can never prove a death again — the reap sweep stops
+/// reclaiming slots and the topology lock stops being stealable, so a momentary
+/// error becomes a lasting loss of recovery. It is the safe direction and it is
+/// still the wrong trade. An indecisive call resolves to alive and re-probes
+/// next time.
+///
+/// The steady-state cost is unchanged and is zero syscalls: one `stat` on the
+/// first liveness question, then a relaxed atomic load, on every host that has a
+/// `/proc` and equally on every host that has none.
+///
+/// The residual is a `/proc` unmounted *after* a successful first question, which
+/// leaves a latched `true` and the misreading this exists to prevent. That is the
+/// behaviour before the probe existed, on a host doing something no supported
+/// deployment does, and covering it would put a syscall back on the predicate's
+/// path.
+///
+/// **`hidepid=2` is out of scope by dependency, not by accident.** It hides
+/// another user's entries behind the same `ENOENT`, which nothing here can
+/// distinguish — but `docs/PHASE2.md` §3.10 makes participants same-user by
+/// construction, so a hidden entry cannot belong to one. That is the trust model
+/// carrying weight on a correctness path, and it is named here because it is
+/// named nowhere else.
+fn proc_answers_here() -> bool {
+    /// Not yet asked, or asked and answered indecisively.
+    const UNASKED: u8 = 0;
+    /// `/proc/self/stat` was readable: an `ENOENT` about anyone else is real.
+    const ANSWERS: u8 = 1;
+    /// `/proc/self/stat` was absent: no `ENOENT` here proves anything.
+    const SILENT: u8 = 2;
+
+    static HOST: AtomicU8 = AtomicU8::new(UNASKED);
+    match HOST.load(Ordering::Relaxed) {
+        ANSWERS => true,
+        SILENT => false,
+        _ => match latch_for(&std::fs::metadata("/proc/self/stat")) {
+            Some(true) => {
+                HOST.store(ANSWERS, Ordering::Relaxed);
+                true
+            }
+            Some(false) => {
+                HOST.store(SILENT, Ordering::Relaxed);
+                false
+            }
+            None => false,
+        },
+    }
+}
+
+/// Which way a probe of `/proc/self/stat` latches, and whether it latches at all.
+///
+/// Split out from [`proc_answers_here`] so the three-way classification can be
+/// tested without an unmounted `/proc` or an induced `ENOMEM`. `None` is the
+/// indecisive case and is the whole point of the split: it must not latch.
+fn latch_for(probe: &std::io::Result<std::fs::Metadata>) -> Option<bool> {
+    match probe {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
 /// The outcome of asking `/proc` when a process started.
 ///
-/// Three cases, not two: "no such process" is the only one that proves death,
+/// Three cases, not two: "no such process" is the only one that can prove death,
 /// and collapsing it with "could not read" is what turns a hardened `/proc`, a
 /// container without `hidepid` access, or an `EMFILE` into a false report of
 /// death (`docs/PHASE2.md` §6.2).
+///
+/// *Can* prove it, and does not on its own. `NoSuchProcess` is what the read
+/// saw, not a verdict: [`proc_answers_here`] is the second fact it needs, and
+/// [`alive_given`] is where the two meet.
+#[derive(Clone, Copy)]
 enum ProcStartTime {
     /// Field 22 of `/proc/<pid>/stat`, in clock ticks since boot.
     Known(u64),
-    /// The process does not exist.
+    /// There was no entry — `ENOENT`.
     NoSuchProcess,
-    /// It might; `/proc` would not say.
+    /// There might be; `/proc` would not say.
     Unreadable,
 }
 
 /// Read another process's start time (`/proc/<pid>/stat` field 22).
-///
-/// Field 2 is `comm`, parenthesised and free to contain spaces *and*
-/// parentheses, so the scan starts after the **last** `)` — the parsing trap
-/// `docs/PHASE2.md` §5.1 calls out by name.
 fn read_start_time(pid: u32) -> ProcStartTime {
     let stat = match std::fs::read_to_string(std::format!("/proc/{pid}/stat")) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProcStartTime::NoSuchProcess,
         Err(_) => return ProcStartTime::Unreadable,
     };
-    let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
-        return ProcStartTime::Unreadable;
-    };
-    after_comm
-        .split_whitespace()
-        .nth(19)
-        .and_then(|v| v.parse().ok())
-        .map_or(ProcStartTime::Unreadable, ProcStartTime::Known)
+    parse_start_time(&stat).map_or(ProcStartTime::Unreadable, ProcStartTime::Known)
+}
+
+/// Field 22 out of one `/proc/<pid>/stat` line, in clock ticks since boot.
+///
+/// Field 2 is `comm`, parenthesised and free to contain spaces *and*
+/// parentheses, so the scan starts after the **last** `)` — the parsing trap
+/// `docs/PHASE2.md` §5.1 calls out by name. After it the fields are state(3),
+/// ppid(4), … starttime(22), so starttime is the 20th token from there.
+///
+/// `tf_tree_ipc::parse_start_time` is the same parser behind a richer error
+/// type; this copy exists because that crate is a dependency only under the
+/// `shm` feature and the predicate above is not.
+fn parse_start_time(stat: &str) -> Option<u64> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// This host's boot id, read once per process.
@@ -3070,30 +3201,25 @@ fn boot_id() -> [u8; 16] {
 }
 
 /// This process's start time in clock ticks since boot (`/proc/self/stat` field
-/// 22); `0` if unavailable.
+/// 22), or `None` if this host would not say.
 ///
 /// Paired with the PID this is a **reuse-proof** process identity
 /// (`docs/PHASE2.md` §1, A7 and §5.1): PIDs wrap, and a reaper that trusted a
 /// bare PID could conclude a long-dead participant is alive because an unrelated
 /// process now holds its number.
 ///
-/// Field 22 is counted after the comm field, which is parenthesised and may
-/// itself contain spaces and parentheses — so the scan starts after the *last*
-/// `)`, not at a naive whitespace split.
-fn process_start_time() -> u64 {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-        return 0;
-    };
-    let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
-        return 0;
-    };
-    // After `)` the fields are state(3), ppid(4), ... starttime(22), so
-    // starttime is the 20th whitespace-separated token here.
-    after_comm
-        .split_whitespace()
-        .nth(19)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+/// **`Option`, where this used to return `0` on failure.** A registrant that
+/// cannot read its own start time has no identity to publish, and making the
+/// caller name what it writes instead — [`UNKNOWN_START_TIME`] — is what stops
+/// the sentinel being mistaken for a start time. It had been one: a `0` written
+/// here compares unequal to every real start time, so the first reader that
+/// could read `/proc` declared the registrant dead while it was running.
+///
+/// Not cached. It is constant for a process, but a `fork`ed child's differs from
+/// its parent's, and a cache would hand the child the parent's value to register
+/// under — reintroducing exactly the mismatch above.
+fn process_start_time() -> Option<u64> {
+    parse_start_time(&std::fs::read_to_string("/proc/self/stat").ok()?)
 }
 
 /// A [`LookupError`] paired with the [`Tree`] that can resolve its ids to names.
@@ -3450,5 +3576,222 @@ impl ClaimErrorExt for tf_tree_core::ClaimError {
             tf_tree_core::ClaimError::EdgeAlreadyClaimed { owner_slot } => *owner_slot,
             _ => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// A start time a host could report, one that is not it, and the sentinel a
+    /// registration writes when the host reports nothing.
+    const REAL: u64 = 4321;
+    const OTHER: u64 = 4322;
+    const UNSET: u64 = UNKNOWN_START_TIME;
+
+    /// Hand `f` a participant record carrying the identity asked for.
+    ///
+    /// Through `register_at` rather than field by field: `ParticipantRecord`'s
+    /// fields are public but its `Default` is `#[cfg(test)]` inside
+    /// `tf_tree_core`, and a record assembled here by hand would not be the one
+    /// the publication protocol produces.
+    fn with_record(pid: u32, start_time: u64, f: impl FnOnce(&tf_tree_core::ParticipantRecord)) {
+        let arena = HeapArena::new(&ArenaLayout::minimal(), 0, 0, [0u8; 16]);
+        let view = ArenaView::new(&arena);
+        let table = view.participants();
+        table
+            .register_at(0, pid, start_time, 0)
+            .expect("slot 0 of a fresh arena is free");
+        f(table.get(0).expect("slot 0 is within every layout's table"));
+    }
+
+    /// **The documented bias, as an assertion rather than a comment.**
+    ///
+    /// Every combination of the two facts the predicate has, with each verdict
+    /// written out rather than derived — a table that recomputed the
+    /// implementation would pass against any implementation. Death is provable
+    /// in four of the sixteen, and a fifth appearing here owes an argument.
+    #[test]
+    fn every_ambiguity_resolves_to_alive() {
+        // stored start time, what /proc said, does this host answer, alive?
+        let cases = [
+            (REAL, ProcStartTime::Known(REAL), true, true),
+            (REAL, ProcStartTime::Known(REAL), false, true),
+            // Both start times known and different: pid reuse. The one shape of
+            // death that does not depend on the host answering at all.
+            (REAL, ProcStartTime::Known(OTHER), true, false),
+            (REAL, ProcStartTime::Known(OTHER), false, false),
+            // No entry, from a host whose entries mean something.
+            (REAL, ProcStartTime::NoSuchProcess, true, false),
+            (REAL, ProcStartTime::NoSuchProcess, false, true),
+            (REAL, ProcStartTime::Unreadable, true, true),
+            (REAL, ProcStartTime::Unreadable, false, true),
+            // Nothing was recorded, so there is nothing to compare against: no
+            // live `/proc` entry can make this record dead, whatever it says.
+            (UNSET, ProcStartTime::Known(REAL), true, true),
+            (UNSET, ProcStartTime::Known(REAL), false, true),
+            (UNSET, ProcStartTime::Known(OTHER), true, true),
+            (UNSET, ProcStartTime::Known(OTHER), false, true),
+            (UNSET, ProcStartTime::NoSuchProcess, true, false),
+            (UNSET, ProcStartTime::NoSuchProcess, false, true),
+            (UNSET, ProcStartTime::Unreadable, true, true),
+            (UNSET, ProcStartTime::Unreadable, false, true),
+        ];
+        let mut dead = 0;
+        for (row, (stored, probe, answers, alive)) in cases.into_iter().enumerate() {
+            dead += usize::from(!alive);
+            assert_eq!(
+                alive_given(stored, probe, answers),
+                alive,
+                "row {row}: stored={stored}, proc_answers={answers}"
+            );
+        }
+        assert_eq!(dead, 4, "the table itself grew or lost a verdict of death");
+    }
+
+    /// `ENOENT` is proof of death only where `/proc` would have shown the entry.
+    ///
+    /// The host fact is a parameter precisely so this needs no unmounted
+    /// `/proc`: on a host with none, *every* pid reads `NoSuchProcess`, running
+    /// ones included, and the whole participant table resolves to dead at once.
+    #[test]
+    fn enoent_proves_death_only_on_a_host_that_answers() {
+        assert!(!alive_given(REAL, ProcStartTime::NoSuchProcess, true));
+        assert!(
+            alive_given(REAL, ProcStartTime::NoSuchProcess, false),
+            "a host that cannot see its own /proc entry reported another \
+             process dead on the strength of an ENOENT that means nothing"
+        );
+    }
+
+    /// A record whose `start_time` is the sentinel is **unknown**, not a
+    /// mismatch.
+    ///
+    /// The inversion: `process_start_time` used to return `0` on failure, and
+    /// that `0` went into the record. A reader that *could* read `/proc` then
+    /// got `Known(st)` with `st != 0`, so the comparison was false and the
+    /// verdict was death about a running process.
+    #[test]
+    fn a_sentinel_start_time_reads_unknown_rather_than_mismatched() {
+        for answers in [true, false] {
+            assert!(alive_given(UNSET, ProcStartTime::Known(REAL), answers));
+        }
+    }
+
+    /// The same inversion end to end, through the real predicate.
+    ///
+    /// The pid is this process's, so `/proc` answers `Known` with a start time
+    /// that is certainly not the sentinel: the exact shape that used to invert.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_process_with_no_recorded_start_time_reads_alive() {
+        with_record(std::process::id(), UNSET, |rec| {
+            assert!(
+                record_is_alive(rec),
+                "a record carrying no start time was reported dead about the \
+                 very process asking"
+            );
+        });
+    }
+
+    /// The fix must not buy its safety by making death unprovable.
+    ///
+    /// `pid_max` is at most 2^22, so `u32::MAX` is a number no process holds and
+    /// no reuse can hand back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_impossible_pid_is_still_dead() {
+        with_record(u32::MAX, REAL, |rec| assert!(!record_is_alive(rec)));
+    }
+
+    /// Pid reuse is still caught: our own number, a start time that is not ours.
+    ///
+    /// Derived from the real one rather than picked, because any literal is a
+    /// start time some process could genuinely have — `REAL` is 4321 ticks,
+    /// which is a process launched 43 seconds into the boot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recycled_pid_is_dead() {
+        let not_ours = process_start_time().expect("this host answers about itself") + 1;
+        with_record(std::process::id(), not_ours, |rec| {
+            assert!(
+                !record_is_alive(rec),
+                "the start-time comparison stopped happening"
+            );
+        });
+    }
+
+    /// The host probe answers here, which is what makes the two tests above mean
+    /// what they say — on a host that answered `false` both would read alive.
+    #[cfg(target_os = "linux")]
+    /// The probe latches a decisive answer and refuses to latch anything else.
+    ///
+    /// The indecisive arm is the one that matters: an `ENOMEM`, an LSM denial or
+    /// a bind-mount race during startup must cost this process one call's worth
+    /// of caution, not its ability to prove a death for the rest of its life.
+    #[test]
+    fn only_a_decisive_proc_probe_latches() {
+        let present = std::fs::metadata(".");
+        assert!(
+            present.is_ok(),
+            "the test's own working directory must exist"
+        );
+        assert_eq!(
+            latch_for(&present),
+            Some(true),
+            "a readable entry latches yes"
+        );
+
+        let absent = std::fs::metadata("/proc/self/tf-tree-no-such-entry");
+        assert_eq!(
+            absent.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "fixture must actually produce NotFound"
+        );
+        assert_eq!(
+            latch_for(&absent),
+            Some(false),
+            "a genuine absence latches no"
+        );
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let indecisive: std::io::Result<std::fs::Metadata> =
+                Err(std::io::Error::new(kind, "induced"));
+            assert_eq!(
+                latch_for(&indecisive),
+                None,
+                "{kind:?} is indecisive and must not latch"
+            );
+        }
+    }
+
+    #[test]
+    fn this_host_answers_about_its_own_processes() {
+        assert!(proc_answers_here());
+        assert!(process_start_time().is_some());
+    }
+
+    /// `docs/PHASE2.md` Appendix B's fixture, against this crate's copy of the
+    /// parser: for a process named `evil) proc` the naive whitespace split
+    /// returns field 12 where field 22 was meant, silently and plausibly.
+    ///
+    /// `tf_tree_ipc` pins the same case against its own copy. This one is
+    /// reachable in a build with no `shm` feature, where that crate is not a
+    /// dependency at all.
+    #[test]
+    fn the_last_paren_is_the_only_safe_anchor() {
+        let raw = "1234 (evil) proc) S 1 1234 1234 0 -1 4194304 1 2 3 4 5 6 7 8 9 10 11 12 13";
+        assert_eq!(parse_start_time(raw), Some(13));
+        assert_eq!(
+            raw.split_whitespace().nth(21).map(str::to_owned),
+            Some("12".to_owned()),
+            "the fixture stopped demonstrating the trap it was chosen for"
+        );
     }
 }
