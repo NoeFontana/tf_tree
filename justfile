@@ -2086,18 +2086,22 @@ shm-rendezvous:
     # `the_acquire_window_backs_out` cannot place a reaper inside it by racing.
     # The hook is inert when unset, so the other tests run as they always did.
     #
-    # **`unstable` buys exactly one test here, the same trade `just
-    # shm-check`'s `--test frozen` line makes.**
-    # `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`
-    # reads a participant record's raw `state` word, and
-    # `Tree::arena_view` is the only route to it (`docs/API.md` §2.6) — a slot
-    # that stays `LIVE` after its process dies cannot be told from one that was
-    # released by `Tree::participant_alive` alone, because that predicate folds
-    # `state == LIVE` into its own answer. Without the feature the test and the
-    # helper's `join-rw-report` mode are both `#[cfg]`-ed out and the recipe
-    # runs one test fewer, silently. Measured:
+    # **`unstable` buys two tests here, the same trade `just shm-check`'s
+    # `--test frozen` line makes.** Both drive the helper's `join-rw-report`
+    # mode, which reads a participant record's raw `state` word through
+    # `Tree::arena_view` — the only route to it (`docs/API.md` §2.6).
+    # `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` needs it
+    # because a slot that stays `LIVE` after its process dies cannot be told
+    # from one that was released by `Tree::participant_alive` alone, since that
+    # predicate folds `state == LIVE` into its own answer;
+    # `defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing`
+    # needs it because the *creator* cannot ask about itself — the probe's own
+    # slot is short-circuited to alive — so the observer has to be a second
+    # process reporting on somebody else's record. Without the feature both
+    # tests and the helper mode are `#[cfg]`-ed out and the recipe runs two
+    # tests fewer, silently. Measured:
     # `cargo nextest list -p tf_tree --features shm,test-hooks --test rendezvous`
-    # lists 15, `--features shm,test-hooks,unstable` lists 16.
+    # lists 16, `--features shm,test-hooks,unstable` lists 18.
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.

@@ -95,7 +95,7 @@ impl Kid {
     /// a `SIGKILL` and compare, which is the only way to observe a transition
     /// rather than a state.
     ///
-    /// `unstable`, with its one caller: the helper mode this drives reads a
+    /// `unstable`, with both its callers: the helper mode this drives reads a
     /// participant record's raw `state` word through `Tree::arena_view`, and
     /// that feature is what gates it (`docs/API.md` §2.6).
     #[cfg(feature = "unstable")]
@@ -341,6 +341,235 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
     assert!(
         witness.probe_participant(3).unwrap().held,
         "abandoning the arena released the stranded participant's byte"
+    );
+}
+
+/// **A pinned defect (#201), not desired behaviour. Invert or delete this test
+/// when the divergence is fixed** — every assertion below states what the code
+/// does today, and two of them state something wrong: that one process's lock
+/// byte and its arena record are different integers, and that a live,
+/// publishing arena owner reads dead.
+///
+/// `docs/PHASE2.md` makes the participant slot *one* number: its §0.0 table
+/// says "the arena slot and the lock byte are the same integer", and §3.7's
+/// `HelloResponse` repeats it field by field — `participant_slot` "matches the
+/// lock-file byte the client must take". That is why
+/// `Tree::participant_alive` can take an arena record index and hand it
+/// straight to a probe of the lock byte at that index
+/// (`crates/tf_tree/src/open.rs`'s `LivenessProbe::is_held`).
+///
+/// [`CreatePolicy::Always`] is the path on which it can break. §3.4 step 4 reads
+/// `if self.create != CreatePolicy::Always && lock.any_participant_held()?`, so
+/// the escape hatch skips the split-brain check *by design* and falls through
+/// to `register_any` → `take_any_participant`, the first **free** byte. With
+/// byte 0 already held the creator gets byte 1, while `build_shared` hands it
+/// arena record **0** on a fresh arena. Nothing reconciles the two afterwards:
+/// `hold_ownership` parks the session and never compares `Session::slot` with
+/// `Tree::participant`.
+///
+/// **How that precondition arises is not known, and #201's answer to it is
+/// measurably wrong.** The issue has the divergence biting "precisely in the
+/// scenario the flag exists for: survivors are holding bytes" — an operator
+/// force-creating past a wedge, with survivors on `0..k`. Run, that scenario
+/// does not diverge. One `own` child plus two `join-rw` children hold bytes
+/// `[0, 1, 2]`; `SIGKILL` the owner and the held set is `[1, 2]`; a
+/// `CreatePolicy::Always` creator then takes byte **0** *and* arena record
+/// **0**, one integer again. That is structural, not luck: an ordinary
+/// creator's participant byte *is* 0, because step 4 refused to create while
+/// any byte was held, and one `LockFile` description carries both it and the
+/// ownership byte — so the death that frees the ownership byte frees byte 0 in
+/// the same kernel action. §3.4 step 2 gates the hatch on that byte, so
+/// against an owner that is wedged rather than dead (`SIGSTOP`, still holding
+/// it) the hatch never reaches step 4 at all and `open()` fails
+/// `ArenaHeldButUnreachable` naming the stuck slot. While the owner lives it
+/// keeps arena record 0, and `open.rs`'s `assign` closure skips a record that
+/// has an identity, so no joiner is granted slot 0 either: every byte a
+/// survivor can hold is >= 1.
+/// `the_escape_hatch_creates_over_a_stranded_participant` strands its byte at 3
+/// and its creator takes byte 0 with record 0 — harmless for the same reason.
+///
+/// Those three readings were taken out of tree, driving
+/// `tf_tree_rendezvous_child` and `tf_tree::Open` from a scratch binary, and
+/// **nothing in this file pins them**. What they establish is negative: the
+/// route #201 gives for reaching the divergence does not reach it.
+///
+/// So the divergence needs a **live holder of byte 0 that is not the arena's
+/// owner**, and this test stages one with
+/// `tf_tree_ipc::LockFile::try_take_participant(0)`, which nothing in the
+/// workspace does outside tests. Two independent attempts to construct that
+/// holder through `tf_tree::Open` alone failed. **A failed construction is not
+/// an unreachability argument**, and settling which of the two this is — a
+/// defect no public API can reach, or one nobody has found the route to — is
+/// the question `0028` has to answer before #189's `--force-new` flag would
+/// turn this policy into a documented operator procedure. #201's second path,
+/// the takeover arm that also calls `register_any`, is out of reach for an
+/// unrelated reason: nothing sets `Open::already_attached`. What is pinned
+/// below is therefore the *consequence* of the divergence, on a staged
+/// instance of it, and not its reachability.
+///
+/// Both signs below are read from a process that is not the creator, because
+/// the creator's own `participant_alive(0)` hits `use_ofd_liveness`'s "never
+/// report ourselves dead" guard — which compares the queried slot against the
+/// *arena record* — and would show neither:
+///
+/// - **The right verdict, off the wrong byte.** While the survivor holds byte
+///   0, record 0 reads alive on the strength of a byte belonging to somebody
+///   else — a byte carrying no identity at all, since the survivor never wrote
+///   one. The answer is nonetheless *correct* here: the process in record 0 is
+///   alive. The genuinely wrong `alive` — the forced creator dies while the
+///   survivor keeps byte 0, so record 0 reads alive about a dead process — is
+///   **not measured, here or anywhere**. It would need a helper mode that
+///   creates with `CreatePolicy::Always` inside a child, so the parent can
+///   `SIGKILL` the creator and keep questioning a watcher that joined before
+///   it died; `rendezvous_child.rs` has no such mode and this test does not add
+///   one.
+/// - **False dead, which is the corrupting one.** The survivor releases byte 0
+///   and the verdict about record 0 flips to dead, though the process in that
+///   record has not moved: it still holds byte 1, still owns the arena, still
+///   publishes. **Nothing acts on that verdict destructively today**, which is
+///   why this is a pinned defect rather than an incident: `Tree::reap_inner`
+///   decides claim reaping from `lock.probe_claim(edge)` — the claim byte, held
+///   by the live publisher — and not from `participant_alive`; the owner's
+///   arena-record reap is driven by socket `HUP`; and `tf_tree_cli`'s
+///   participant checks say "Detection only. Nothing here reclaims anything" in
+///   as many words. The harm is conditional on a rescuer that reclaims from
+///   this predicate — which `docs/PHASE2.md` §5.1 makes the authority on
+///   liveness, and which `0028`'s piece 2 is a design for.
+///
+/// That same piece 2 would make the lock byte the *whole* predicate, with no
+/// `record_is_alive` fallback — which does not soften this today (the fallback
+/// is reached only on a probe *error*, and a free byte probes fine as
+/// `Some(false)`) but would make the divergence unconditional rather than a
+/// property of the probe a tree happens to carry.
+///
+/// Mutant: drop the `tree.use_ofd_liveness(...)` on `open`'s `Joined` arm, so
+/// the watcher answers from the `/proc` inference instead of from the lock
+/// byte. Applied: both asks report `slot 0 state live word 0x6 pid <creator>
+/// alive true` and the final assertion fails. That is the reading of this test
+/// — it measures the byte-index path and nothing else. Record 0's own pid was
+/// alive the whole time, so every predicate that asked about *the record* got
+/// the right answer; only the one that asked about the byte at its index did
+/// not.
+#[cfg(feature = "unstable")]
+#[test]
+fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, Stamp, TreeBuilder};
+
+    let scratch = Scratch::new("slot-divergence");
+    let lock_path = scratch.0.join("0/default.lock");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+
+    // The stranded survivor, on **byte 0** — the index a fresh arena also gives
+    // its first participant record. A separate open file description, so its
+    // byte conflicts with everything that asks about it.
+    //
+    // **Staged through `tf_tree_ipc`, because no sequence of `tf_tree::Open`
+    // calls is known to produce it** — see the doc comment. An owner death
+    // frees byte 0 along with the ownership byte, so the operator scenario
+    // #201 names arrives here with byte 0 free and diverges from nothing.
+    let survivor = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        survivor.try_take_participant(0).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+
+    let tree = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Always)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("CreatePolicy::Always must create over a stranded participant");
+    let publisher = tree
+        .claim(tree.frame("base").unwrap(), tree.frame("map").unwrap())
+        .expect("claim the one edge");
+    publisher
+        .push(1_000, &tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]))
+        .expect("push");
+
+    // **The divergence, stated in the two files that disagree.** Record 0 is
+    // this process; byte 0 is the survivor's, and carries no identity because
+    // `try_take_participant` writes none. This process's own byte is 1.
+    assert_eq!(
+        tree.participant_slot(),
+        0,
+        "a fresh arena registers its creator at record 0"
+    );
+    let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert!(
+        witness.probe_participant(0).unwrap().held,
+        "the survivor must still hold the byte record 0's liveness is read from"
+    );
+    assert!(
+        witness.read_identity(0).unwrap().is_none(),
+        "the survivor wrote no identity, so byte 0 names nobody"
+    );
+    assert_eq!(
+        witness
+            .read_identity(1)
+            .map(|id| id.map(|i| i.pid))
+            .unwrap(),
+        Some(std::process::id()),
+        "the creator's lock byte is 1 while its arena record is 0 (#201)"
+    );
+
+    // The observer has to be another process: `use_ofd_liveness` returns `true`
+    // unconditionally for the asking tree's own slot, so the creator cannot see
+    // either sign of this about itself.
+    let mut watcher = Kid::spawn(&scratch.0, &["join-rw-report"]);
+    assert_eq!(watcher.line(), "joined", "the watcher did not join");
+
+    let stranded = watcher.ask(0);
+    assert!(
+        stranded.contains("state live") && stranded.contains("alive true"),
+        "record 0 should read alive here, but on the survivor's byte rather \
+         than on its own: {stranded}"
+    );
+
+    // And the index the creator *does* hold a byte at carries no arena record,
+    // so this is not an off-by-one that some other record covers: there is no
+    // slot at which both halves describe the creator.
+    let orphan = watcher.ask(1);
+    assert!(
+        orphan.contains("state free"),
+        "byte 1 is the creator's, and nothing is registered at record 1: {orphan}"
+    );
+
+    // Nothing about the process in record 0 changes across this line. Only the
+    // *survivor* leaves.
+    drop(survivor);
+    assert!(
+        !witness.probe_participant(0).unwrap().held,
+        "dropping the survivor must release byte 0"
+    );
+    assert!(
+        witness.probe_participant(1).unwrap().held,
+        "the creator still holds its own byte"
+    );
+    let g = tree.guard();
+    let plan = tree
+        .plan(tree.frame("map").unwrap(), tree.frame("base").unwrap())
+        .unwrap();
+    assert!(
+        plan.at(&g, Stamp::<tf_tree::SystemDomain>::from_nanos(1_000))
+            .is_ok(),
+        "the creator must still be serving its own transform"
+    );
+
+    let deserted = watcher.ask(0);
+    assert!(
+        deserted.contains(&format!("pid {}", std::process::id())),
+        "record 0 is this process's: {deserted}"
+    );
+    assert!(
+        deserted.contains("state live") && deserted.contains("alive false"),
+        "**#201, the corrupting direction.** A live, publishing arena owner \
+         must not read dead because an unrelated process released the byte at \
+         its record's index: {deserted}"
     );
 }
 
