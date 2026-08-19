@@ -88,9 +88,15 @@ jobs:
           # matrix) indefinitely.
           #
           # `macos-15-intel` is the successor and **the last x86_64 macOS image
-          # Actions will offer** — GitHub retires the architecture entirely in
-          # autumn 2027. When that lands, this row goes away and macOS is
-          # arm64-only; `macos-latest` above already covers Apple Silicon.
+          # Actions will offer**. The date is announced rather than inferred:
+          # `actions/runner-images#13045` says the label "will be available from
+          # now until August 2027", after which "the x86_64 architecture will not
+          # be supported on GitHub Actions". This comment said *autumn* 2027
+          # until that was checked (#180); August is both more specific and
+          # earlier than autumn, which matters for a row that fails by queueing
+          # silently rather than by erroring. When it lands, this row goes away
+          # and macOS is arm64-only; `macos-latest` above already covers Apple
+          # Silicon.
           - { os: macos-15-intel, target: x86_64, manylinux: auto }
           - { os: windows-latest, target: x64, manylinux: auto }
     steps:
