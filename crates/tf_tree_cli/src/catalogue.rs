@@ -38,13 +38,14 @@
 //!
 //! **The last two got new ids rather than being folded into existing ones.**
 //! `TFT013` is *declared but never published*, which is not *published and then
-//! abandoned*; `TFT014` is a claim held by a slot whose owner is gone, which is
-//! not *no claim at all*; `TFT006` is a check on a stamp's *value*, not on the
-//! order stamps arrive in. Giving any of those a second meaning would defeat the
-//! point of having stable ids. Appending two is additive — `--suppress` gains
-//! two spellings, `--json` gains two entries in an array consumers already
-//! iterate — whereas renumbering an existing id would break every runbook and CI
-//! job that names one. §6's amendment records the decision.
+//! abandoned*; `TFT014` is a slot, or the claim it was holding, whose owner is
+//! gone, which is not *no claim at all*; `TFT006` is a check on a stamp's
+//! *value*, not on the order stamps arrive in. Giving any of those a second
+//! meaning would defeat the point of having stable ids. Appending two is
+//! additive — `--suppress` gains two spellings, `--json` gains two entries in
+//! an array consumers already iterate — whereas renumbering an existing id
+//! would break every runbook and CI job that names one. §6's amendment records
+//! the decision.
 //!
 //! [`Uncatalogued`] survives that change and has no producer today. It stays for
 //! two reasons: the `uncatalogued` key is part of the stable `--json` schema, so

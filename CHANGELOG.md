@@ -183,6 +183,51 @@ is a bug.
   criterion is stated over the Rust worker and the recipe exits 0 on the FAIL it
   prints. Both arms now name their worker in the verdict line, so a pasted
   transcript carries the qualification the amendment asks for.
+- **`tf_tree doctor`'s `TFT014` reports the participant-slot leak its catalogue
+  row is named for** (issue #190, `docs/decisions/0028` plan step 6). A
+  participant killed without running `Drop` leaves a `LIVE` record over a free
+  lock byte; the owner's slot assigner skips such a record, and 64 of them wedge
+  the arena at `NoParticipantSlots`. `doctor` now names each one, with the pid
+  and how much of the fixed budget is spent. Severity stays **warn**, and
+  **nothing is reclaimed** — `0028` is a draft record that exists so no
+  reclamation lands before its predicate is settled.
+
+  **It is not the shape #184 measured, and the finding says so.** #191 gave the
+  owner a socket-hangup reap (`0028`'s *candidate B*), so a rendezvous joiner
+  killed under a running owner has its record released — measured with an
+  owner, a read-write joiner and a third observing process: with the joiner
+  `SIGKILL`ed, its `state` word had gone `0x6` (`LIVE`) to `0x0` (`FREE`) by the
+  observer's first poll 50 ms later. Seeing this finding means the slot was one
+  that reap cannot reach, and the message names the five: the owner's own slot,
+  a client its `epoll` never watched, an `attach_shared` participant, a
+  takeover, and an owner that died inside the callback. Two leave the owner
+  dead, so `doctor --attach` cannot be pointed at them at all — the check's doc
+  comment and `PHASE5.md` §6's amendment both say which is which.
+
+  **The claim half was blind in that same state and is fixed with it.** It fired
+  on `owner_pid == 0`, resolved through `ParticipantTable::identity`, which
+  answers for any record whose `state` word reads `LIVE` — which a `SIGKILL`ed
+  writer's does until something clears it. `PHASE2.md` §5.1 forbids deciding
+  liveness from `state` in as many words. A `Snapshot` now carries the
+  participant table with `Tree::participant_alive` already applied — the
+  kernel's `F_OFD_GETLK` on the slot's lock byte — and both halves read that one
+  answer.
+
+  Three conditions in the title stay undetected, and `PHASE5.md` §6's amendment
+  says why each is a gap in the available evidence rather than in the check: a
+  `RESERVED` record, which the predicate cannot tell from a healthy joiner
+  mid-attach; the fork case, where the kernel truthfully reports the inherited
+  byte as held; and a claim whose slot has since been re-granted, where the
+  claim word carries the `ClaimRecord`'s own epoch rather than the participant's
+  incarnation and so joins to whoever holds the slot now.
+
+  **`TFT014` now skips on `doctor --from-file`, where it reported `pass`.** A
+  frozen `.tft` is a byte copy of the whole arena, participant records
+  included, so every slot in one names a process that exited when the freeze
+  finished — and a file has no assigner for a leaked slot to wedge. A `--json`
+  consumer reading `TFT014` on a `.tft` sees `skipped` with a reason where it
+  saw `pass`; the `pass` was an all-clear about a question the file cannot be
+  asked, and it held only because the old predicate was reading `state`.
 
 ## [0.0.2] — 2026-08-17 (wheels, no sdist)
 

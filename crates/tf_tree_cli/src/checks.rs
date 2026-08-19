@@ -76,7 +76,7 @@ use tf_tree::{Domain, EdgeId, SensorDomain, SimDomain, SteadyDomain, SystemDomai
 use tf_tree_bench::fixture::PushSample;
 
 use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
-use crate::doctor::{self, Observations, Snapshot};
+use crate::doctor::{self, Observations, SlotState, Snapshot};
 use crate::hostfacts::{HostFacts, MemLock, ShmemThp, Thp};
 
 /// A stamp further than this from the reference clock is not a late sample, it
@@ -525,8 +525,52 @@ pub struct Inputs<'a> {
     /// How the push stream in `obs` was obtained, which is what decides whether
     /// `TFT001`, `TFT011`'s Phase 1 half, `TFT018` and `TFT019` have evidence.
     pub stream: PushStream,
+    /// What kind of participant table `snap` carries, which is what decides
+    /// whether `TFT014` has evidence.
+    pub slots: SlotTable,
     /// Whether the engine compiled `docs/PHASE5.md` §5's counters in.
     pub counters: bool,
+}
+
+/// Where the participant table in a [`Snapshot`] came from.
+///
+/// The sibling of [`PushStream`], and it exists for the same reason: the
+/// question "is this participant running?" has an answer for some sources and
+/// none for others, and the difference has to be a value the check reads rather
+/// than a fact the caller remembers to act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotTable {
+    /// The table of an arena that exists now — a live shared segment
+    /// (`doctor --attach`), or one this process built and still holds (the
+    /// fixture, `doctor --from-bag`). Its records name processes that could
+    /// still be running, so asking whether they are is a question with an
+    /// answer.
+    Current,
+    /// A byte copy of a table as it stood at some past instant
+    /// (`doctor --from-file`).
+    Image,
+}
+
+impl SlotTable {
+    /// Why this table cannot say whether a participant is running, or `None`
+    /// when it can.
+    ///
+    /// One function for the predicate and the sentence, exactly as
+    /// [`PushStream::no_writer_identity`] is: a new variant cannot compile
+    /// without answering both at once.
+    #[must_use]
+    pub fn no_liveness(self) -> Option<&'static str> {
+        match self {
+            SlotTable::Current => None,
+            SlotTable::Image => Some(
+                "a frozen .tft holds a byte copy of the whole arena (PHASE5 §2.3), participant \
+                 records included, so every slot in it names a process that exited when the \
+                 freeze finished and every claim names a slot from that run. Reporting them \
+                 would fire on every correct .tft ever written; a file has no assigner for a \
+                 leaked slot to wedge. Ask the arena instead: tf_tree doctor --attach",
+            ),
+        }
+    }
 }
 
 /// Run every catalogue entry plus the two id-less Phase 1 checks.
@@ -1151,42 +1195,187 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft013, out)
 }
 
-/// `TFT014` — a claim that outlived its owner.
+/// `TFT014` — a participant slot, or a claim, that outlived its owner.
 ///
-/// The claim word names a *participant slot*, not a pid. A slot that no longer
-/// resolves to a `LIVE` identity while the claim is still held is precisely a
-/// leaked claim: the writer is gone and nothing released its edge, so no other
-/// process can take it.
+/// Both halves of §6's title, and they are one condition seen from two tables:
+/// a process died without running `Drop`, and what it left behind is a slot
+/// nothing will reassign and — if it was writing — an edge nothing will
+/// reclaim. `Snapshot::participants` carries one liveness answer per slot and
+/// both halves read it, so a report cannot call the same process alive on an
+/// edge line and dead on a slot line.
 ///
-/// A record caught mid-claim (`CLAIMING`) also resolves to no slot, and is
-/// **excluded**, because from a snapshot the two are not the same thing. A
-/// normal handoff parks `CLAIMING` in the record for the few instructions
-/// between winning it and publishing an identity, so a `doctor` run that lands
-/// in that window on a *healthy* arena would report a leak on an edge whose
-/// publisher is restarting. `Tree::reap` may act on `CLAIMING` only because it
-/// first consults an independent liveness source — `probe_claim` on the lock
-/// file — and a live claimer in that window is protected by the lock still
-/// being held. This check takes no such probe, so it has no evidence with which
-/// to tell a dead mid-claim from a live one, and reports neither. The cost is a
-/// claimer killed inside that window going unreported; the alternative is a
-/// warn-severity false positive on every publisher restart, which is what
-/// teaches operators to ignore the check.
+/// # The predicate is the lock byte, and only for a `LIVE` record
 ///
-/// **This rests entirely on the owner word being decoded correctly.** It is
+/// `docs/PHASE2.md` §5.1: liveness is the participant's OFD lock byte, never
+/// the record. [`crate::doctor::ParticipantInfo::alive`] is
+/// [`Tree::participant_alive`], which is `F_OFD_GETLK` on the slot's byte for a
+/// tree from `tf_tree::open` and a `/proc` inference otherwise; both fail safe
+/// towards *alive*. Reading `state` instead is what made this check blind in
+/// the state it is named for — `identity` answers for any record whose `state`
+/// word reads `LIVE`, and a participant killed without running `Drop` leaves
+/// one behind, so `owner_pid` came back non-zero and the check stayed quiet
+/// (`docs/decisions/0028`, issue #184).
+///
+/// **Detection only. Nothing here reclaims anything**, deliberately: `0028` is
+/// `draft` and exists so that no reclamation lands before its predicate is
+/// settled.
+///
+/// # Which shapes reach it, and which of those `--attach` can see
+///
+/// **Not the one issue #184 measured.** A rendezvous joiner `SIGKILL`ed under a
+/// running owner is reclaimed by the owner's socket-hangup callback
+/// (`crates/tf_tree/src/open.rs`, issue #191, which `0028` calls *candidate B —
+/// hangup-driven owner reap*): its `ParticipantTable::release` is a real
+/// `LIVE -> FREE` transition — measured with an owner, a read-write joiner and
+/// a third observing process, the killed joiner's `state` word reading `FREE`
+/// by the observer's first poll 50 ms later. On that arena this arm stays quiet
+/// and the claim half is what speaks.
+///
+/// So a slot finding here means the slot was one that callback **cannot**
+/// reach. `0028` enumerates those places; the ones that leave this state — a
+/// `LIVE` record over a free byte — are:
+///
+/// * **The owner's own slot** (`0028` candidate B, hole 3). The owner registers
+///   itself and nothing hangs up on it.
+/// * **An owner killed between the hangup's probe and its CAS** (`0028`, *"a
+///   crash between the hangup and the CAS"*). One `compare_exchange`, so
+///   nothing is torn; what is lost is the reclamation.
+/// * **A client the owner's `epoll::add` failed for** (hole 4). It is
+///   deliberately left unwatched, so its death produces no hangup.
+/// * **A `ReadWrite` `Tree::attach_shared` participant** (hole 5). No socket
+///   and no grant, so no hangup, ever.
+/// * **A takeover heir's inherited peers** (hole 3 again). A new owner's
+///   `epoll` set holds no pre-takeover client sockets. §3.5 takeover is not
+///   wired, so this is reachable only once it is.
+///
+/// The remaining hole, the fork-inherited connection (hole 1), leaves the byte
+/// **held** by the child and so is a silence rather than a finding — it is
+/// named below with the others.
+///
+/// **`doctor --attach` can be pointed at only two of those five today**, which
+/// is worth knowing before reading a quiet report as an all-clear: attaching
+/// goes through the rendezvous, so the two shapes that leave the owner dead
+/// refuse a fresh join with `ArenaHeldButUnreachable` — the record is `LIVE`,
+/// the leak is real, and no new process can be told. `epoll::add` and
+/// `attach_shared` leave the owner running and are reachable now; takeover
+/// becomes a third once §3.5 is wired.
+/// `crates/tf_tree/tests/rendezvous.rs`'s
+/// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` stages the
+/// reclaimed peer and the unreclaimable owner on one arena and asserts that
+/// refusal.
+///
+/// # It needs a table, not a picture of one
+///
+/// A frozen `.tft` is a byte copy of the whole arena, participant records
+/// included, so *every* slot in it names a process that exited when the freeze
+/// finished. Running here would fire on every correct `.tft` ever written, for
+/// an arena that has no assigner for a leaked slot to wedge — so the check
+/// **skips** on [`SlotTable::Image`] and says which source can answer. That
+/// replaces a `pass`, which was the worse of the two: a fabricated all-clear
+/// about a question the file cannot be asked.
+///
+/// # Which direction it fails in
+///
+/// Towards silence, in four named ways, because a warn that fires on a
+/// healthy robot is one that gets suppressed within a week.
+///
+/// * **`RESERVED` is not reported.** A registrant is `RESERVED` for the few
+///   instructions between winning the slot and publishing its identity, and
+///   `participant_alive` folds `state == LIVE` in ahead of the probe — so it
+///   answers "not alive" for a healthy joiner mid-attach exactly as it does for
+///   one that died there. Separating them needs the raw byte, which is a probe
+///   this layer does not have (`cmd_participants` opens the lock file directly;
+///   `doctor` does not). Nothing collects a `RESERVED` record either — that is
+///   `0028`'s open question 6 — so what is missed here is a leak no answer
+///   would repair today.
+/// * **The fork case is not reported.** A child that inherited the mapping
+///   holds the parent's byte (`0028` §6.2), so the kernel says *alive* for a
+///   process that provably cannot participate. Naming it needs a second,
+///   independent fact — `/proc` disagreeing with the recorded
+///   `(pid, start_time)` — and `participant_alive` composes that fact away
+///   rather than exposing it. Inventing a second liveness spelling here to get
+///   at it is the thing this check must not do.
+/// * **A claim over a slot that has since been re-granted is not reported, and
+///   this one is reachable from the ordinary #184 flow.** The claim's owner word
+///   carries the `ClaimRecord`'s own per-edge epoch, not the participant's
+///   incarnation (`tf_tree_core::edge::pack_owner`), so nothing in it says
+///   *which occupancy* of the slot took the claim. The hangup reap frees the
+///   dead writer's slot but not its claims — nothing calls
+///   `Tree::reap_participant` on hangup — so once a later joiner is granted that
+///   slot, the stale claim joins to a live participant and the edge reads
+///   healthy while no process is writing it. Not a regression: the
+///   `owner_pid == 0` predicate was silent here too, for the same reason.
+///   Closing it needs the incarnation *inside* the claim word, which is an
+///   arena format change and not one `0028` proposes.
+/// * **A claim caught mid-handoff (`CLAIMING`) is excluded.** It names no slot,
+///   exactly as a dead owner's claim names no slot, so from a snapshot the two
+///   are the same shape. `Tree::reap` may act on `CLAIMING` because it probes
+///   the claim's *own* lease first; this check has no such probe, so it reports
+///   neither and loses a claimer killed inside that window.
+///
+/// It fails the other way in exactly one place, and it is a shape `0028`'s open
+/// question 1 has since ruled out of the deployment model: a `ReadWrite`
+/// `Tree::attach_shared` writes an arena record and takes **no lock byte**, so
+/// its healthy participant reads as a leak. Every supported read-write
+/// participant joins through the rendezvous, which takes the byte before the
+/// record leaves `FREE`; making that arm refuse is a step of `0028` and not of
+/// this check.
+///
+/// **The claim half rests on the owner word being decoded correctly.** It is
 /// `(epoch << 16) | (slot + 1)`, so a hand-rolled `word - 1` resolves every
 /// live claim to nothing and reports every claimed edge as leaked;
 /// `Snapshot::capture` uses `tf_tree_core::edge::slot_of`, and
 /// `doctor::tests::a_held_claim_resolves_to_the_writers_pid` pins it.
 fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
+    if let Some(why) = inp.slots.no_liveness() {
+        return CheckOutcome::skipped(Tft::Tft014, why);
+    }
     let mut out = Vec::new();
+    let slots = inp.snap.participants.len();
+    let leaked = inp
+        .snap
+        .participants
+        .iter()
+        .filter(|p| p.state == SlotState::Live && !p.alive)
+        .count();
+    for p in &inp.snap.participants {
+        if p.state != SlotState::Live || p.alive {
+            continue;
+        }
+        out.push(Finding::about(
+            Tft::Tft014,
+            format!("slot {} pid {}", p.slot, p.pid),
+            format!(
+                "the record is LIVE and the lock byte is free — pid {} left slot {} registered \
+                 and no longer holds it, and the owner's socket-hangup reap did not clear it. \
+                 That reap collects a rendezvous peer, so this is a slot it cannot reach: the \
+                 owner's own, one its epoll never watched, an attach_shared participant, a \
+                 takeover, or an owner that died inside the callback (docs/decisions/0028). \
+                 Nothing reclaims it — {leaked} of {slots} slots are spent for the life of \
+                 the segment, and at {slots} every further attach fails NoParticipantSlots. \
+                 Only stopping every participant, which frees the segment, frees a slot",
+                p.pid, p.slot
+            ),
+        ));
+    }
     for e in &inp.snap.edges {
-        if e.claimed && !e.claiming && e.owner_pid == 0 {
+        if !e.claimed || e.claiming {
+            continue;
+        }
+        // No slot at all (a word that resolves outside this table) counts as
+        // dead: there is no participant it could be asking about, and the edge
+        // is held by nobody either way.
+        let owner_alive = e
+            .owner_slot
+            .and_then(|slot| inp.snap.participant(slot))
+            .is_some_and(|p| p.alive);
+        if !owner_alive {
             out.push(Finding::on_edge(
                 Tft::Tft014,
                 e.id,
                 inp.snap.edge_label(e),
-                "claim is held by a participant slot that no longer resolves to a live \
-                 identity — the writer is gone and the edge cannot be reclaimed",
+                "claim is held by a participant slot whose owner is not running — the writer \
+                 is gone and nothing released the edge, so no other process can take it",
             ));
         }
     }
@@ -1297,9 +1486,9 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
 ///
 /// The Phase 1 `unclaimed-dynamic` check, given an id by `docs/PHASE5.md` §6's
 /// amendment. Distinct from `TFT013` (declared and *never* published to) and
-/// from `TFT014` (a claim held by a slot whose owner is gone): this is an edge
-/// with no claim at all, which may have a full ring of history that is now
-/// going stale.
+/// from `TFT014` (a slot, or the claim it was holding, whose owner is gone):
+/// this is an edge with no claim at all, which may have a full ring of history
+/// that is now going stale.
 fn tft017(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(
         Tft::Tft017,
@@ -1749,7 +1938,7 @@ mod tests {
 
     use super::*;
     use crate::catalogue::Status;
-    use crate::doctor::{EdgeInfo, FrameInfo};
+    use crate::doctor::{EdgeInfo, FrameInfo, ParticipantInfo};
     use tf_tree::InterpPolicy;
 
     fn frame(id: u32, name: &str, parent: u32, depth: u16) -> FrameInfo {
@@ -1774,10 +1963,27 @@ mod tests {
             head,
             claimed: true,
             claiming: false,
+            owner_slot: Some(0),
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
             nominal_rate_mhz: None,
         }
+    }
+
+    /// The participant table that goes with [`edge`]: one running writer in
+    /// slot 0, which is the owner every edge this helper builds names.
+    ///
+    /// Every fixture gets one, because `TFT014`'s claim half now asks the
+    /// participant table whether the owner is running and an empty table
+    /// answers "nobody is" — the state a hand-built snapshot would otherwise
+    /// fall into by omission rather than by intent.
+    fn live_writer() -> Vec<ParticipantInfo> {
+        vec![ParticipantInfo {
+            slot: 0,
+            state: SlotState::Live,
+            pid: 4711,
+            alive: true,
+        }]
     }
 
     /// `n` samples on `edge`, one every `period_ns`, from a single writer.
@@ -1796,6 +2002,7 @@ mod tests {
         Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: vec![e],
+            participants: live_writer(),
         }
     }
 
@@ -1818,6 +2025,7 @@ mod tests {
             // process that exits after one assertion has nothing to reclaim.
             clock_step: Box::leak(Box::new(ClockStepEvidence::capture(snap, obs))),
             stream: PushStream::Observed,
+            slots: SlotTable::Current,
             counters: true,
         }
     }
@@ -2124,6 +2332,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: (0..6).map(|i| edge(i + 1, 1, 2, 100)).collect(),
+            participants: live_writer(),
         };
         let stats: Vec<EdgeStats> = stamps
             .iter()
@@ -2170,6 +2379,7 @@ mod tests {
         let mut mid = edge(1, 1, 2, 100);
         mid.claimed = true;
         mid.claiming = true;
+        mid.owner_slot = None;
         mid.owner_pid = 0;
 
         let snap = two_frame_snapshot(mid.clone());
@@ -2192,6 +2402,113 @@ mod tests {
             1,
             "a claim held by a slot with no live identity is still a leak: {o:?}"
         );
+    }
+
+    /// **The wedge state: a `LIVE` record whose process is gone, and the claim
+    /// it is still holding.** Both halves of `TFT014`'s title, on one arena.
+    ///
+    /// This is the state `docs/decisions/0028` is written about — a `LIVE`
+    /// record over a free lock byte — but **not** the arena issue #184
+    /// measured: #191 gave the owner a hangup reap, so a rendezvous joiner's
+    /// record is released and this shape survives only where that reap cannot
+    /// reach (the enumeration is on [`tft014`]). Which one it came from does
+    /// not change what the check must do with it, so the fixture is built
+    /// directly; the real-process version is
+    /// `crates/tf_tree/tests/rendezvous.rs`'s
+    /// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`.
+    ///
+    /// **The pid is deliberately non-zero**: the previous predicate was
+    /// `owner_pid == 0`, and `owner_pid` comes from
+    /// `ParticipantTable::identity`, which answers for any `LIVE` record
+    /// however dead its process — so the arena the check is named for was the
+    /// one arena it could not see.
+    ///
+    /// Mutant: restore `e.owner_pid == 0` as the claim half's guard. Applied:
+    /// the edge finding disappears and the count assertion fails at 1, while
+    /// the slot finding still fires — which is `doctor` reporting a leaked slot
+    /// and calling the edge it stranded healthy.
+    /// Mutant B: drop the `p.state != SlotState::Live` term. Applied: the 63
+    /// free slots of any real table report as leaks; here the `Reserved` slot
+    /// below fires and the count assertion fails at 3.
+    #[test]
+    fn a_stale_live_slot_and_the_claim_it_stranded_are_both_reported() {
+        let obs = Observations::new();
+        let mut held = edge(1, 1, 2, 100);
+        held.owner_slot = Some(0);
+        held.owner_pid = 4711;
+
+        let mut snap = two_frame_snapshot(held);
+        snap.participants = vec![
+            ParticipantInfo {
+                slot: 0,
+                state: SlotState::Live,
+                pid: 4711,
+                alive: false,
+            },
+            // A joiner mid-attach. `participant_alive` folds `state == LIVE` in
+            // ahead of the lock-byte probe, so this reads `alive: false` on a
+            // perfectly healthy process — which is why `RESERVED` is not
+            // reportable from here.
+            ParticipantInfo {
+                slot: 1,
+                state: SlotState::Reserved,
+                pid: 4712,
+                alive: false,
+            },
+        ];
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 2, "one slot and one edge: {o:?}");
+        assert_eq!(o.findings[0].subject, "slot 0 pid 4711");
+        assert_eq!(o.findings[0].edge, None, "a slot leak is not about an edge");
+        assert!(
+            o.findings[0].message.contains("1 of 2 slots"),
+            "the slot finding must say how much of the fixed budget is spent: {:?}",
+            o.findings[0].message
+        );
+        assert_eq!(
+            o.findings[1].edge,
+            Some(1),
+            "the claim half must still name the edge: {o:?}"
+        );
+
+        // **The same arena, read out of a `.tft`, must not report any of
+        // it.** A frozen file is a byte copy of the whole arena (PHASE5 §2.3),
+        // so its participant table names a run that ended and its claims name
+        // that run's slots. Firing here is firing on every correct `.tft`, and
+        // it is the only shape of this snapshot that a real source produces.
+        let frozen = tft014(&Inputs {
+            slots: SlotTable::Image,
+            ..inputs(&snap, &obs, &[], Clock::Wall(0))
+        });
+        assert!(
+            matches!(frozen.status, Status::Skipped(_)),
+            "a frozen .tft cannot be asked this and must say so, not pass: {frozen:?}"
+        );
+    }
+
+    /// **A slot nobody holds is not a leak.**
+    ///
+    /// [`ParticipantInfo::alive`] is `false` for every `FREE` record in a real
+    /// table — the predicate short-circuits on `state != LIVE` before it probes
+    /// anything — and a 64-slot arena with one publisher has 63 of them. A
+    /// check that read `alive` alone would report a healthy robot as leaking 63
+    /// slots, which is the false positive that gets a warn suppressed for good.
+    #[test]
+    fn a_free_slot_is_not_a_leak() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants
+            .extend((1..64).map(|slot| ParticipantInfo {
+                slot,
+                state: SlotState::Free,
+                pid: 0,
+                alive: false,
+            }));
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Pass, "{o:?}");
     }
 
     /// **An out-of-order stream is not a dropout.**
@@ -2291,6 +2608,7 @@ mod tests {
                 owner_pid: 0,
                 ..edge(1, 1, 2, 100)
             }],
+            participants: live_writer(),
         };
         let f = doctor::check_unclaimed_dynamic(&unclaimed);
         assert_eq!(f.len(), 1, "the fixture must fire the check it is about");
@@ -2402,6 +2720,7 @@ mod tests {
                     ..edge(2, 2, 3, 100)
                 },
             ],
+            participants: live_writer(),
         }
     }
 
@@ -2911,6 +3230,7 @@ mod tests {
                 frame(4, "laser", 3, 3),
             ],
             edges: vec![on_rate, too_slow, undeclared],
+            participants: live_writer(),
         };
         let mut events = steady(1, 12, 50 * MS); // 20 Hz: exactly nominal
         events.extend(steady(2, 12, 100 * MS)); // 10 Hz: half of nominal
@@ -3049,6 +3369,7 @@ mod tests {
             // Edge 2 appears in no sample at all: `by_edge` has no entry, which
             // is the `samples: None` path and not the short-slice one.
             edges: vec![short, stopped],
+            participants: live_writer(),
         };
         let obs = Observations::from_samples(steady(1, 4, 50 * MS));
 
@@ -3167,6 +3488,7 @@ mod tests {
                     ..edge(4, 4, 5, 0)
                 },
             ],
+            participants: live_writer(),
         };
         let mut events = steady(1, 12, 50 * MS);
         // Declared, but only three intervals: a rate measured from that is

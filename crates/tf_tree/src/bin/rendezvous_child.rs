@@ -20,6 +20,7 @@
 //! open-free     -> as `join`, but through the zero-argument `tf_tree::open()`
 //! own-headroom  -> "owning", then on stdin: "interned <frame id>"
 //! peer-alive <slot> -> "alive <bool>", then parks
+//! join-rw-report -> "joined", then one report line per slot number on stdin
 //! own-claiming  -> "claimed <edge>", then parks holding it
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
@@ -234,6 +235,56 @@ fn main() {
                 .open()
                 .expect("join");
             say(&format!("alive {}", tree.participant_alive(slot)));
+            loop {
+                std::thread::park();
+            }
+        }
+        // **A surviving participant that reports on other slots, repeatedly.**
+        //
+        // `peer-alive` answers once and needs a *fresh* join to answer again,
+        // which is exactly what a killed owner makes impossible: the rendezvous
+        // socket dies with it, so no new process can attach
+        // (`ArenaHeldButUnreachable`) and the only observer left is one that
+        // joined while the owner was up. This mode is that observer. It reads
+        // one slot number per line from stdin and answers with both facts the
+        // arena carries about that slot — the record's `state` word and
+        // `Tree::participant_alive` — so a caller can watch `LIVE -> FREE`, or
+        // watch it fail to happen, without inferring either from the other.
+        //
+        // `unstable`, because the `state` word is only reachable through
+        // `Tree::arena_view` (`docs/API.md` §2.6). Reporting `participant_alive`
+        // alone would not do: it folds `state == LIVE` into its answer, so
+        // `false` covers both "the record was cleared" and "the record is still
+        // LIVE and its process is gone", and telling those two apart is the
+        // whole question.
+        #[cfg(feature = "unstable")]
+        "join-rw-report" => {
+            let tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::Never)
+                .timeout(std::time::Duration::from_millis(500))
+                .open()
+                .expect("join");
+            say("joined");
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut stdin.lock(), &mut line).unwrap_or(0) > 0 {
+                let slot: u32 = line.trim().parse().expect("a slot number per line");
+                line.clear();
+                let view = tree.arena_view();
+                let rec = view.participants().get(slot).expect("slot in range");
+                let word = rec.state.load(std::sync::atomic::Ordering::Acquire);
+                let state = match tf_tree_core::participant::state_of(word) {
+                    tf_tree_core::participant::LIVE => "live",
+                    tf_tree_core::participant::RESERVED => "reserved",
+                    _ => "free",
+                };
+                say(&format!(
+                    "slot {slot} state {state} word {word:#x} pid {} alive {}",
+                    rec.pid.load(std::sync::atomic::Ordering::Relaxed),
+                    tree.participant_alive(slot),
+                ));
+            }
             loop {
                 std::thread::park();
             }

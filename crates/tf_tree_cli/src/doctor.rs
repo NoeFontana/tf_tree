@@ -159,12 +159,31 @@ pub struct EdgeInfo {
     /// Whether the claim record was caught **mid-handoff** (the `CLAIMING`
     /// sentinel) rather than actually held.
     ///
-    /// Separate from `claimed`/`owner_pid` because both of those collapse it
+    /// Separate from `claimed`/`owner_slot` because both of those collapse it
     /// into "claimed by nobody", which is also what a genuinely leaked claim
-    /// looks like. Distinguishing them needs a liveness source a snapshot does
-    /// not have, so `TFT014` uses this to stay silent instead of guessing.
+    /// looks like. The snapshot now carries a liveness source
+    /// ([`Snapshot::participants`]) and it still cannot separate these two:
+    /// `CLAIMING` names no slot, so there is nobody to ask about. `TFT014` uses
+    /// this to stay silent instead of guessing.
     pub claiming: bool,
+    /// The participant slot the claim word names, or `None` when the edge is
+    /// unclaimed or its record was caught mid-handoff.
+    ///
+    /// The claim's link into [`Snapshot::participants`], and the only honest
+    /// route from an edge to its owner's liveness: `docs/PHASE2.md` §5.1 says a
+    /// participant record describes *who* a slot belongs to and never whether
+    /// it is running, so the question has to be put to the slot rather than
+    /// answered from the claim.
+    pub owner_slot: Option<u32>,
     /// The current claim owner's PID (`0` if unclaimed).
+    ///
+    /// Resolved through `ParticipantTable::identity`, which answers only for a
+    /// `LIVE` record — so this is `state`, **and `state` is not liveness**
+    /// (`docs/PHASE2.md` §5.1). A writer killed without running `Drop` leaves a
+    /// `LIVE` record behind, and until something clears it this keeps answering
+    /// with that dead pid, which is how `TFT014` came to be blind in the state
+    /// it is named for (decision `0028`). This is a label to print;
+    /// `owner_slot` and [`ParticipantInfo::alive`] are the answer to ask.
     pub owner_pid: u32,
     /// Newest published stamp, if any samples exist.
     pub newest_stamp: Option<i64>,
@@ -193,7 +212,69 @@ impl EdgeInfo {
     }
 }
 
-/// A point-in-time, read-only capture of a tree's topology, edges, and claims.
+/// What a participant slot's `state` word says (`docs/PHASE2.md` §5.1).
+///
+/// Carried as three named states rather than the raw word so that no consumer
+/// can compare it against a constant and call the answer liveness. Whether the
+/// participant is *running* is [`ParticipantInfo::alive`], and it comes from
+/// somewhere else entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    /// Nobody holds this slot.
+    Free,
+    /// A registrant won the slot and has not published its identity yet — a
+    /// handful of instructions on a healthy joiner.
+    Reserved,
+    /// An identity is published here. **Says nothing about whether the process
+    /// it names still exists.**
+    Live,
+}
+
+/// One participant slot in a captured [`Snapshot`].
+///
+/// **Four fields, because four is what the checks read.** The arena's
+/// `ParticipantRecord` carries two more — `start_time` and `incarnation` — and
+/// both were captured here at first. Neither was ever read, and the doc comment
+/// on `incarnation` promised a discrimination the encoding forbids: the claim
+/// owner word is `(epoch << 16) | (slot + 1)` where `epoch` is the
+/// `ClaimRecord`'s **own per-edge counter** (`tf_tree_core::edge::pack_owner`),
+/// not the participant's incarnation, so the two are not comparable and no join
+/// between them can be written. A captured field nothing reads is a claim
+/// nobody maintains, and that one had already gone false; the silence it was
+/// supposed to cover is named in `TFT014`'s doc comment instead. `Snapshot` is
+/// what the checks read, not a mirror of the arena — no operator-facing surface
+/// in this crate shows either field, `tf_tree top` discards both from
+/// `identity`'s tuple, and `tf_tree participants` never opens the arena at all.
+#[derive(Clone, Debug)]
+pub struct ParticipantInfo {
+    /// Slot index — also the lock-file byte (`docs/PHASE2.md` §3.7), which is
+    /// what makes [`Self::alive`] answerable at all.
+    pub slot: u32,
+    /// The record's `state` word.
+    pub state: SlotState,
+    /// The recorded process id.
+    ///
+    /// **A label, not an identity.** The record's `start_time` is what makes a
+    /// pid reuse-proof, and it is deliberately not captured beside it (see the
+    /// note on this struct): composing `(pid, start_time)` against `/proc` here
+    /// would be a second liveness spelling in a layer that must have exactly
+    /// one, which is `docs/decisions/0028` §6.2's rule and the reason
+    /// `TFT014`'s fork case is a silence rather than a finding.
+    pub pid: u32,
+    /// Whether the participant is still running, from
+    /// [`Tree::participant_alive`] — `F_OFD_GETLK` on this slot's lock byte for
+    /// a tree obtained from `tf_tree::open`, a `/proc` inference otherwise, and
+    /// never the `state` word above on its own.
+    ///
+    /// `false` for a [`SlotState::Free`] or [`SlotState::Reserved`] record as
+    /// well, because that predicate folds `state == LIVE` in ahead of the
+    /// probe. Only `state == Live && !alive` is evidence of anything, and
+    /// `TFT014` is the check that says what.
+    pub alive: bool,
+}
+
+/// A point-in-time, read-only capture of a tree's topology, edges, claims and
+/// participant slots.
 ///
 /// Built from a live [`Tree`] via [`Snapshot::capture`], or by hand in tests to
 /// exhibit a specific condition.
@@ -203,9 +284,22 @@ pub struct Snapshot {
     pub frames: Vec<FrameInfo>,
     /// All edges, id order.
     pub edges: Vec<EdgeInfo>,
+    /// Every participant slot in the table, slot order — the free ones
+    /// included, so `participants.len()` is the table's capacity and a finding
+    /// can say how much of a fixed budget a leak has spent.
+    pub participants: Vec<ParticipantInfo>,
 }
 
 impl Snapshot {
+    /// The captured slot `slot`, or `None` if this snapshot has no such slot.
+    #[must_use]
+    pub fn participant(&self, slot: u32) -> Option<&ParticipantInfo> {
+        // Not `participants[slot]`: a hand-built snapshot carries the slots its
+        // case needs rather than a dense table, and an out-of-range claim word
+        // must resolve to "no such participant" rather than panic.
+        self.participants.iter().find(|p| p.slot == slot)
+    }
+
     /// Capture the current state of `tree` through its read-only arena view.
     #[must_use]
     pub fn capture(tree: &Tree) -> Snapshot {
@@ -318,12 +412,14 @@ impl Snapshot {
             // by hand is what produced `pid 0` for every live writer.
             //
             // `slot_of` returns `u32::MAX` for an unclaimed record and for one
-            // caught mid-claim, and `identity` rejects that, so both read as
-            // "no owner" rather than as a plausible wrong pid.
-            let owner_slot = if owner_word == 0 {
-                None
-            } else {
-                Some(tf_tree_core::edge::slot_of(owner_word))
+            // caught mid-claim; both become `None` here, so a claim in flight
+            // names no participant rather than naming a plausible wrong one.
+            let owner_slot = match owner_word {
+                0 => None,
+                w => match tf_tree_core::edge::slot_of(w) {
+                    u32::MAX => None,
+                    slot => Some(slot),
+                },
             };
             // `ring` is `None` for a static/tombstoned edge (capacity 0), so this
             // needs no separate power-of-two guard.
@@ -339,11 +435,13 @@ impl Snapshot {
                 head: rec.head.load(Ordering::Relaxed),
                 claimed: owner_word != 0,
                 claiming: tf_tree_core::edge::is_claiming(owner_word),
+                owner_slot,
                 // A3: the claim names a *participant slot*, not a PID, so the
-                // owning process is resolved through the participant table. A
-                // slot that no longer resolves means the owner detached or died
-                // between the two reads, which reports as pid 0 — the honest
-                // answer, and what the reaper will act on.
+                // pid to print is resolved through the participant table. A
+                // slot that resolves to no `LIVE` identity prints as pid 0.
+                // **That is a label, not a verdict** — `identity` answers from
+                // `state`, and §5.1 forbids deciding liveness from `state`;
+                // `participants` below is where the verdict comes from.
                 owner_pid: owner_slot
                     .and_then(|slot| view.participants().identity(slot))
                     .map_or(0, |(pid, _start, _inc)| pid),
@@ -355,7 +453,56 @@ impl Snapshot {
             });
         }
 
-        Snapshot { frames, edges }
+        // **The participant table, and the one liveness answer per slot that
+        // both halves of `TFT014` read.** Captured here rather than recomputed
+        // in the check because `Tree::participant_alive` is a syscall on a live
+        // arena: asking it once per slot and joining the claims against the
+        // result is 64 probes instead of one per claimed edge, and — the part
+        // that is not about speed — it makes "is slot 7 alive?" have a single
+        // answer in a report, so an edge finding and a slot finding cannot
+        // disagree about the same process.
+        let table = view.participants();
+        let capacity = table.capacity();
+        let mut participants = Vec::with_capacity(capacity);
+        for slot in 0..capacity as u32 {
+            let Some(rec) = table.get(slot) else {
+                continue;
+            };
+            // **Two reads of the state word, either side of the probe, and
+            // they have to agree.** A clean detach is `LIVE -> FREE` and a
+            // reuse is `FREE -> RESERVED -> LIVE(incarnation + 1)`; either can
+            // land inside the `F_OFD_GETLK` this brackets, and the combination
+            // it leaves behind — `LIVE` from the first load, byte free from the
+            // probe — is indistinguishable from a leak. The word carries the
+            // incarnation, which `fill_slot` only ever increments, so an
+            // unchanged word is proof this is the same occupancy throughout.
+            // A word that moved is a slot in active use, and the fail-safe
+            // direction for that (§6.2) is alive.
+            let before = rec.state.load(Ordering::Acquire);
+            let alive = tree.participant_alive(slot);
+            let after = rec.state.load(Ordering::Acquire);
+            let state = match tf_tree_core::participant::state_of(after) {
+                tf_tree_core::participant::LIVE => SlotState::Live,
+                tf_tree_core::participant::RESERVED => SlotState::Reserved,
+                _ => SlotState::Free,
+            };
+            participants.push(ParticipantInfo {
+                slot,
+                state,
+                // Read unconditionally, unlike `identity`, which withholds it
+                // unless the record is `LIVE`. A leaked slot's whole value to an
+                // operator is the pid that is *supposed* to be there, and that
+                // is precisely the record `identity` would decline to open.
+                pid: rec.pid.load(Ordering::Relaxed),
+                alive: alive || before != after,
+            });
+        }
+
+        Snapshot {
+            frames,
+            edges,
+            participants,
+        }
     }
 
     /// The display name of frame `id`, or `#id` if it is not in the snapshot.
@@ -883,10 +1030,22 @@ mod tests {
             head: 0,
             claimed,
             claiming: false,
+            owner_slot: claimed.then_some(0),
             owner_pid: if claimed { 1234 } else { 0 },
             newest_stamp: None,
             nominal_rate_mhz: None,
         }
+    }
+
+    /// A participant table of one running process, in slot 0 — the owner every
+    /// claimed [`dyn_edge`] names.
+    fn one_live_participant() -> Vec<ParticipantInfo> {
+        vec![ParticipantInfo {
+            slot: 0,
+            state: SlotState::Live,
+            pid: 1234,
+            alive: true,
+        }]
     }
 
     fn sample(edge: u32, pid: u32, stamp_ns: i64, delay_ns: i64) -> PushSample {
@@ -906,6 +1065,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "a", 2, 0), frame(2, "b", 1, 0)],
             edges: vec![],
+            participants: one_live_participant(),
         };
         let findings = check_cycles(&snap);
         assert_eq!(findings.len(), 1);
@@ -923,6 +1083,7 @@ mod tests {
                 frame(3, "base", 2, 2),
             ],
             edges: vec![],
+            participants: one_live_participant(),
         };
         assert!(check_cycles(&snap).is_empty());
     }
@@ -934,6 +1095,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: vec![dyn_edge(1, 1, 2, 512, false)],
+            participants: one_live_participant(),
         };
         let findings = check_unclaimed_dynamic(&snap);
         assert_eq!(findings.len(), 1);
@@ -945,6 +1107,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: vec![dyn_edge(1, 1, 2, 512, true)],
+            participants: one_live_participant(),
         };
         assert!(check_unclaimed_dynamic(&snap).is_empty());
     }
@@ -977,6 +1140,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: vec![dyn_edge(1, 1, 2, 4, true)],
+            participants: one_live_participant(),
         };
         let obs = Observations::from_samples(vec![
             sample(1, 1, 0, 500_000_000),
@@ -995,6 +1159,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: vec![dyn_edge(1, 1, 2, 4096, true)],
+            participants: one_live_participant(),
         };
         let obs = Observations::from_samples(vec![
             sample(1, 1, 0, 20_000_000),
@@ -1015,6 +1180,7 @@ mod tests {
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: vec![dyn_edge(1, 1, 2, 4096, true)],
+            participants: one_live_participant(),
         };
         // Stamps march backwards: every interval, and so the median, is negative.
         let obs = Observations::from_samples(
@@ -1067,6 +1233,7 @@ mod tests {
                 frame(4, "island", 0, 0),
             ],
             edges: vec![],
+            participants: one_live_participant(),
         };
         let findings = check_unreachable(&snap);
         assert_eq!(findings.len(), 1);
@@ -1083,6 +1250,7 @@ mod tests {
                 frame(3, "base", 2, 2),
             ],
             edges: vec![],
+            participants: one_live_participant(),
         };
         assert!(check_unreachable(&snap).is_empty());
     }
