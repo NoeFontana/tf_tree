@@ -31,6 +31,46 @@ is a bug.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`Tree::lookup`'s per-thread plan cache could serve one tree's compiled plan
+  to another** (issue #196). The cache is `thread_local!` and shared by every
+  `Tree` on the thread, but its key was `(target, source, generation)` — and all
+  three agree across trees as a matter of course, because `FrameId`s are handed
+  out in interning order and a built tree's generation is its declared edge
+  count. Two trees built from the same names in the same order therefore
+  collided, and so did a tree rebuilt after its predecessor was dropped. The key
+  now carries an arena identity: a shared segment uses its existing
+  `instance_uuid`, so two handles onto one segment still share plans, and every
+  other backing takes a process-local counter. **No arena field was added** and
+  the per-thread cache's footprint is unchanged — the extra `u64` fits in the
+  entry's existing padding, measured at 2176 bytes per entry either way.
+
+  The failure was a wrong number, never a bad read: a stolen plan naming an edge
+  index the other arena does not have is refused by `ArenaView::edge`'s bounds
+  check with `LookupError::UnknownEdge`.
+
+  **`tf_tree_py` inherited this and is fixed by the same change** — its `lookup`
+  calls the Rust facade and keeps no cache of its own, so any Python process
+  holding two `tf_tree.Tree` objects on one thread was exposed. The C ABI never
+  was: it exposes no collapsed lookup, only `tft_plan_create` and `tft_plan_at`.
+
+- **`tests/frozen.rs`'s litter check failed about files it had not produced.**
+  It scanned the shared `std::env::temp_dir()` for any entry whose name
+  contained this process's id as a substring, so an unrelated process's scratch
+  directories tripped it — roughly two runs in five, making `just shm-check`
+  intermittently red. It now matches the `.{stem}.tmp.` prefix `freeze_to`
+  actually writes.
+
+### Added
+
+- `just shm-check` runs `cargo nextest run -p tf_tree --features shm --lib`. The
+  recipe named integration targets individually and had no `--lib` line, so an
+  `shm`-gated unit test in the facade was compiled by clippy and executed by
+  nothing.
+
 ## [0.0.2] — 2026-08-17 (wheels, no sdist)
 
 ### Fixed

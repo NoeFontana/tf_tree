@@ -40,10 +40,18 @@ A convenience that collapses tiers is allowed — `Tree::lookup`,
 2. It is visibly the collapsed one: named differently, documented as paying a
    cache probe, and never the example in the README's hot loop.
 
-`Tree::lookup`'s per-thread cache is keyed `(target, source, generation)` and
-`PHASE3.md` §7.2 already requires it be genuinely `thread_local!` rather than a
-shared map behind a lock — a collapsed convenience that becomes a contention
-point has failed condition 1 in a second way.
+`Tree::lookup`'s per-thread cache is keyed `(arena, target, source, generation)`
+and `PHASE3.md` §7.2 already requires it be genuinely `thread_local!` rather
+than a shared map behind a lock — a collapsed convenience that becomes a
+contention point has failed condition 1 in a second way.
+
+The `arena` component is not decoration and this sentence used to omit it
+(issue #196). One thread's cache is shared by every `Tree` it touches, and
+the other three components agree across trees as a matter of course —
+`FrameId`s are handed out in interning order and a built tree's generation is
+its edge count — so without it a second tree is served the first tree's
+compiled plan. Two handles onto one *shared segment* deliberately share an
+id, because they share a topology; everything else gets its own.
 
 The tiers are also the migration ladder. A user arrives at tier 3 by way of
 tiers 1 and 2, and every surface — including the shim — must offer a way down.

@@ -157,8 +157,11 @@ not a defect we can engineer away: `lookupTransform(target, source, t)` has no
 place to hold a compiled plan.
 
 Mitigation is the per-thread plan cache that `Tree::lookup` already uses, keyed
-on `(FrameId, FrameId, generation)`. Residual cost per call: two name hashes, a
-cache probe, and the `TransformStamped` construction.
+on `(arena, FrameId, FrameId, generation)` — the arena component since issue
+#196, without which one `Buffer`'s plan was served to another on the same
+thread, which for a shim holding several buffers is the *normal* case rather
+than an exotic one. Residual cost per call: two name hashes, a cache probe, and
+the `TransformStamped` construction.
 
 **NORMATIVE (`API.md` §7.8):** the benchmark table carries a row where the shim
 is **slower than native `tf_tree`**, beside the row where it is faster than
