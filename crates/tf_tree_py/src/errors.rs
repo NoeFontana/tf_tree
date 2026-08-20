@@ -500,10 +500,13 @@ pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) 
              mapped. The engine's reason, raw: {inner:?}"
         )),
         // `Rendezvous`, `NoLayoutToCreate`, `ReadOnlyCannotCreate`,
-        // `ArenaAlreadyLive` — prose already, and `IpcError`'s `Display` is the
-        // one place that knows what a runtime directory or a refused handshake
-        // means. Re-spelling it here would be a second copy that stops agreeing
-        // with the first.
+        // `ArenaAlreadyLive`, `TakeoverUnsupported` — prose already, and the
+        // last of them cannot arrive here at all besides: it needs a
+        // `#[cfg(test)]` field of `tf_tree::Open`, which only that crate's own
+        // test target can set. `IpcError`'s `Display` is the one place that
+        // knows what a runtime directory or a refused handshake means.
+        // Re-spelling it here would be a second copy that stops agreeing with
+        // the first.
         other => TfTreeError::new_err(format!("{other}")),
     }
 }
