@@ -1191,6 +1191,13 @@ msrv:
 
 # One version across the repository, no document naming a recipe that is not
 # there, and no table row GFM would silently truncate.
+#
+# **The table check enumerates with `git ls-files '*.md'`, so a document you have
+# not staged yet is not checked at all** — a new record passes this recipe
+# trivially until `git add`. CI never sees that, because it checks out a tree in
+# which everything is tracked; the false green is local and it is loudest exactly
+# when you are adding the document whose table you want checked. `git add -A`
+# first, then run this.
 artifact-versions:
     ./scripts/artifact-versions.py
 
