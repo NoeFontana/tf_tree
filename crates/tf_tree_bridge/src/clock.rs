@@ -740,9 +740,11 @@ impl OffsetTable {
         // than dropping them. `tracked()` counts live rows, so it still reports
         // zero here — which is what the assertion in
         // `clear_forgets_the_time_base_that_was_thrown_away` reads.
-        for row in &mut self.rows {
-            *row = None;
-        }
+        //
+        // `fill`, not a loop: `clippy::manual_slice_fill` became a `-D warnings`
+        // error when the rolling stable toolchain moved to 1.98. `Offset` is
+        // `Copy`, so this is the same store with no clone in it.
+        self.rows.fill(None);
     }
 
     /// How many publishers have a row.
