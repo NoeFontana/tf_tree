@@ -56,7 +56,7 @@ use tf_tree::{InterpPolicy, Tree};
 use tf_tree_bench::mp::{busy_fraction, require_quiet_machine, Histogram};
 use tf_tree_bench::report::Metric;
 use tf_tree_bench::runstore::{Run, RunRow};
-use tf_tree_bench::shm_util::{sibling_binary, spawn_attached};
+use tf_tree_bench::shm_util::{sibling_binary, spawn_attached, WRITER_SLACK_S};
 use tf_tree_bench::workload::{self, Backing, Built};
 
 /// Reader counts to sweep, matching §11.2's list.
@@ -70,10 +70,6 @@ const WRITERS: &[usize] = &[0, 1, 2, 4];
 const READER_HZ: f64 = 1000.0;
 /// Measurement window per point, split in half between the two reader passes.
 const SECONDS: f64 = 4.0;
-/// Slack added to the writers' window so they outlive the readers they contend
-/// with. A writer that exits first turns the tail of every reader row into a
-/// quiescent-tree measurement, silently.
-const WRITER_SLACK_S: f64 = 1.0;
 /// Query pairs handed to each reader. Capped because they travel on argv, and
 /// because a node resolving more than a handful of chains per cycle is not the
 /// shape being modelled.
@@ -258,12 +254,21 @@ fn collect_reader(child: &mut Child) -> ReaderReport {
 struct WriterReport {
     pushed: u64,
     rejected: u64,
+    /// What this writer's rendezvous join cost, in nanoseconds.
+    ///
+    /// **Outside every measured window** — the writer joins before its clock
+    /// starts and before its `ProcStats` baseline is taken — and reported for
+    /// exactly that reason: it is the one cost `docs/decisions/0028` step 0b
+    /// added to this harness, and a reader of the table is entitled to see its
+    /// size rather than take the claim on trust.
+    join_ns: u64,
 }
 
 fn collect_writer(child: &mut Child) -> WriterReport {
     let mut w = WriterReport {
         pushed: 0,
         rejected: 0,
+        join_ns: 0,
     };
     let out = BufReader::new(child.stdout.take().expect("writer stdout"));
     for line in out.lines() {
@@ -272,6 +277,8 @@ fn collect_writer(child: &mut Child) -> WriterReport {
             w.pushed = rest.trim().parse().unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("rejected ") {
             w.rejected = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("join_ns ") {
+            w.join_ns = rest.trim().parse().unwrap_or(0);
         }
     }
     w
@@ -324,7 +331,14 @@ fn main() {
 
     let w = workload::by_name(args.workload).expect("workload");
     let built: Built = w
-        .build(InterpPolicy::LerpSlerp, Backing::Shared(ARENA))
+        // **`Served`, not `Shared`** — the coordinator creates the arena through
+        // `tf_tree::Open`, takes the ownership byte and runs an owner thread,
+        // so a writer child can join and be granted a participant slot with a
+        // lock byte behind it. `docs/decisions/0028` step 0b closed the
+        // byte-less read-write attach these writers used to take, and the
+        // readers are unaffected: they still get the raw descriptor on stdin
+        // and still attach read-only.
+        .build(InterpPolicy::LerpSlerp, Backing::Served(ARENA))
         .unwrap_or_else(|e| {
             eprintln!("contended_scaling: {e:#}");
             std::process::exit(1);
@@ -364,6 +378,10 @@ fn main() {
     let mut next_stamps: Vec<i64> = built.publishers.iter().map(|p| p.next_stamp_ns).collect();
 
     let mut run = Run::begin(*args.readers.iter().max().unwrap_or(&1));
+    // The slowest rendezvous join seen anywhere in the sweep, printed once in
+    // the footer. A per-writer line would be up to 35 of them in a full run and
+    // would sit in the middle of the table.
+    let mut worst_join_ns: u64 = 0;
 
     println!("tf_tree contended read scaling  [workload: {}]", w.name);
     println!("=========================================================");
@@ -472,6 +490,10 @@ fn main() {
                     // reported a contended row.
                     let a = vec![
                         "writer".to_owned(),
+                        // The rendezvous name, so the child joins *this*
+                        // arena rather than whatever `$TF_TREE_NAME` resolves
+                        // to on the machine running the benchmark.
+                        ARENA.to_owned(),
                         p.rate_hz.to_string(),
                         (args.seconds + WRITER_SLACK_S).to_string(),
                         p.seed.to_string(),
@@ -506,6 +528,8 @@ fn main() {
                 assert!(c.wait().expect("wait").success(), "a reader failed");
             }
             let wreports: Vec<WriterReport> = writers.iter_mut().map(collect_writer).collect();
+            worst_join_ns =
+                worst_join_ns.max(wreports.iter().map(|w| w.join_ns).max().unwrap_or(0));
             for c in &mut writers {
                 assert!(c.wait().expect("wait").success(), "a writer failed");
             }
@@ -599,6 +623,20 @@ fn main() {
         "Machine was {:.0}% busy before the run.",
         baseline_busy * 100.0
     );
+    if worst_join_ns > 0 {
+        println!(
+            "Writers join through the rendezvous, not over the descriptor: a read-write attach\n\
+             over a bare fd takes no participant lock byte and is refused (docs/decisions/0028\n\
+             step 0b). The slowest join in this run was {:.0} us, and every join completes\n\
+             BEFORE that writer's clock and its ProcStats baseline start — so no column above\n\
+             contains it. It is retried, bounded by WRITER_SLACK_S ({:.1} s): a join is time\n\
+             the readers spend on a tree that writer is not yet contending, and past the slack\n\
+             the row would be worth less than the failure, so the writer dies instead.\n\
+             Readers are unchanged: raw descriptor, read-only attach.",
+            worst_join_ns as f64 / 1000.0,
+            WRITER_SLACK_S
+        );
+    }
     println!("`fail` is err_slot_recycled + err_slot_contended, summed over every edge. It counts");
     println!("reads that FAILED, not reads that retried — a successful seqlock retry is invisible");
     println!("to the arena by design, and what it costs shows up in the service columns.");

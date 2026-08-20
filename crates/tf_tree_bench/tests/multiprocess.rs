@@ -22,8 +22,13 @@ use tf_tree::{AttachMode, Capacity, EdgeCfg, InterpPolicy, Iso3, Stamp, Tree, Tr
 use tf_tree_bench::fixture;
 use tf_tree_bench::shm_util::{sibling_binary, spawn_attached};
 
-/// Build the §11.1 fixture topology into a shared segment and populate it.
-fn shared_fixture() -> Tree {
+/// The §11.1 fixture topology, declared but not built.
+///
+/// Split out of [`shared_fixture`] because [`served_fixture`] declares the same
+/// edges through a different constructor. Two copies of this loop would let the
+/// two harnesses drift into different topologies, which is a difference that
+/// shows up as a test result.
+fn fixture_builder() -> TreeBuilder {
     let mut b = TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
     for e in fixture::EDGES {
         b = match e.kind {
@@ -37,13 +42,24 @@ fn shared_fixture() -> Tree {
             ),
         };
     }
-    let tree = b.build_shared("tf_tree.test").expect("build shared arena");
+    b
+}
+
+/// Fill a freshly built fixture tree with the history every reader below asks
+/// about.
+fn populate(tree: &Tree) {
+    let (writers, samples) = fixture::spin_up(tree).expect("spin up");
+    drop(writers);
+    drop(samples);
+}
+
+/// Build the §11.1 fixture topology into a shared segment and populate it.
+fn shared_fixture() -> Tree {
+    let tree = fixture_builder()
+        .build_shared("tf_tree.test")
+        .expect("build shared arena");
     assert!(tree.is_shared());
-    {
-        let (writers, samples) = fixture::spin_up(&tree).expect("spin up");
-        drop(writers);
-        drop(samples);
-    }
+    populate(&tree);
     tree
 }
 
@@ -372,6 +388,89 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
     );
 }
 
+/// A scratch runtime directory for the one test below that needs a rendezvous,
+/// removed when it ends.
+///
+/// **`set_var` is process-wide, and that is safe here only because `nextest`
+/// gives every test its own process** — `just shm-check` runs this target as
+/// `cargo nextest run -p tf_tree_bench --features shm --test multiprocess`.
+/// Under plain `cargo test` the tests in this file share one process and one
+/// environment; a `cargo test` invocation of this target is not supported. The
+/// same caveat is written out at greater length on `tf_tree`'s
+/// `tests/rendezvous.rs`, which this is modelled on.
+///
+/// Every other test in this file goes through `build_shared`, which reaches no
+/// lock file and no socket and needs none of this.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let p = std::env::temp_dir().join(format!("tf_tree_mp-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create the scratch runtime directory");
+        std::env::set_var("TF_TREE_RUNTIME_DIR", &p);
+        Scratch(p)
+    }
+
+    /// The lock file the rendezvous below puts the participant bytes in.
+    ///
+    /// `<runtime dir>/<domain>/<name>.lock`, with the default domain 0 — the
+    /// layout `tf_tree_ipc::Rendezvous` resolves and the one
+    /// `tests/rendezvous.rs` reads the same way.
+    fn lock_path(&self) -> std::path::PathBuf {
+        self.0.join(format!("0/{RACE_ARENA}.lock"))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The rendezvous name the reparent race creates its arena under. Distinct from
+/// every other name in the workspace so a stray runtime directory cannot make
+/// two harnesses share an arena.
+const RACE_ARENA: &str = "tf_tree_reparent_race";
+
+/// The fixture topology, created **through the rendezvous** so that peers can
+/// join it and be given a participant slot with a lock byte behind it.
+///
+/// `CreatePolicy::Always` rather than `IfAbsent`: the scratch directory is
+/// this process's own and empty, so there is nothing to join, and `Always`
+/// makes that an assertion rather than a race.
+fn served_fixture() -> Tree {
+    let tree = tf_tree::Open::new()
+        .name(RACE_ARENA)
+        .expect("a valid rendezvous name")
+        .mode(AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Always)
+        .layout_if_creating(fixture_builder())
+        .open()
+        .expect("create and serve the fixture arena");
+    assert!(tree.is_shared());
+    assert!(tree.is_writable());
+    populate(&tree);
+    tree
+}
+
+/// One read-write peer, joined through the rendezvous.
+///
+/// This is the *only* way to get a read-write attachment since
+/// `docs/decisions/0028` plan step 0b: `Tree::attach_shared(fd, ReadWrite)`
+/// returns `ShmError::ReadWriteNeedsRendezvous`, because a bare descriptor has
+/// no lock file to take a participant byte in. Every `Tree` this returns holds
+/// one.
+fn join_read_write() -> Tree {
+    tf_tree::Open::new()
+        .name(RACE_ARENA)
+        .expect("a valid rendezvous name")
+        .mode(AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Never)
+        .open()
+        .expect("join the served fixture arena read-write")
+}
+
 /// Two independent attachments race `reparent`, and only the **arena** lock can
 /// stop them colliding.
 ///
@@ -385,20 +484,64 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
 /// Verified in-process rather than across a `fork` because the failure being
 /// tested is a *data race on the shared bytes*, which needs both mutators alive
 /// and interleaved; the process-boundary half is covered by the test above.
+///
+/// # Why this one test needs a rendezvous when nothing else in the file does
+///
+/// It used to take its two attachments from `Tree::attach_shared(fd,
+/// ReadWrite)` on a duplicated descriptor. `docs/decisions/0028` plan step 0b
+/// removed that: a read-write attach registers a participant record, and over a
+/// bare descriptor there is no lock file to take the byte that decides whether
+/// the record may be reclaimed. So the arena is created through
+/// [`served_fixture`] and the peers join through [`join_read_write`], which is
+/// now the only read-write path there is.
+///
+/// **The port preserves each property the test was written for, and the
+/// assertions below say which line preserves which:**
+///
+/// * *Separate participant slots.* Each joiner is granted its own by the
+///   owner's assigner, and the byte assertion below proves three distinct ones
+///   are held — the strongest form this property has ever had here, because
+///   `attach_shared`'s self-assignment left nothing outside the arena to check.
+/// * *Separate process-local `decl` mutexes.* Still three distinct `Tree`
+///   values, so still three distinct `Mutex<()>` fields; nothing about the
+///   transport changes that, and a rewrite that shared one attachment would
+///   have deleted the test rather than ported it.
+/// * *Only A2's in-arena lock can serialize them.* The racing block is
+///   unchanged, and so is the generation count that falsifies it.
+/// * *A third view of the segment.* The owner tree, exactly as before.
 #[test]
 fn concurrent_reparents_from_separate_attachments_are_serialized() {
-    let tree = shared_fixture();
+    let scratch = Scratch::new("reparent-race");
+    let tree = served_fixture();
 
-    let attach = || {
-        let fd = tree
-            .shared_fd()
-            .expect("shared fd")
-            .try_clone_to_owned()
-            .expect("dup fd");
-        Tree::attach_shared(fd, AttachMode::ReadWrite).expect("attach read-write")
-    };
-    let a = attach();
-    let b = attach();
+    let a = join_read_write();
+    let b = join_read_write();
+
+    // **Three participants, three bytes, and that is what the port bought.**
+    // The owner took byte 0 when it created the arena and each joiner took its
+    // own during the handshake, before its arena record was written. Byte 3 is
+    // asserted free so this cannot pass against a build that reports every byte
+    // held.
+    {
+        let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path())
+            .expect("the rendezvous created a lock file");
+        for slot in 0..3 {
+            assert!(
+                lock.probe_participant(slot)
+                    .expect("probe a participant byte")
+                    .held,
+                "participant byte {slot} is free: this attachment is byte-less, \
+                 which is the state step 0b exists to make unconstructible"
+            );
+        }
+        assert!(
+            !lock
+                .probe_participant(3)
+                .expect("probe a participant byte")
+                .held,
+            "byte 3 reads held with three participants; the probe says yes to everything"
+        );
+    }
 
     // Two frames with their own edges, moved between two parents that are
     // themselves unrelated, so neither mutation can create a cycle.

@@ -76,6 +76,21 @@ pub enum ShmError {
     TooSmall,
     /// Every participant slot is taken, so this process cannot join.
     ParticipantTableFull,
+    /// [`crate::AttachMode::ReadWrite`] was asked for over a bare file
+    /// descriptor, which takes no participant lock byte.
+    ///
+    /// **The fd-passing attach is for readers**
+    /// (`docs/decisions/0028-the-slot-a-killed-participant-keeps.md`, open
+    /// question 1). A process that publishes joins through the rendezvous —
+    /// `tf_tree::Open` — which takes an OFD lock byte for its slot *before* the
+    /// arena record is written, and that byte is what decides whether the slot
+    /// may be reclaimed. A writer registered over a raw descriptor holds a live
+    /// record with a permanently free byte, which is indistinguishable, by the
+    /// byte alone, from a slot leaked by a killed process.
+    ///
+    /// Attach [`crate::AttachMode::ReadOnly`] over the descriptor, or build the
+    /// writer on `tf_tree::Open`.
+    ReadWriteNeedsRendezvous,
     /// The header's region offsets do not match the geometry its own capacities
     /// imply, so the regions cannot be trusted to lie within the segment.
     ///

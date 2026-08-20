@@ -450,6 +450,54 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
 /// alive the whole time, so every predicate that asked about *the record* got
 /// the right answer; only the one that asked about the byte at its index did
 /// not.
+///
+/// ---
+///
+/// **2026-08-20 — the consequence above is no longer constructible, and the
+/// name is history** (`docs/decisions/0028` plan step 0c). The name is kept
+/// because `CHANGELOG.md`'s `0.0.3` *Known issues*, `docs/PHASE2.md` §0.0's
+/// participant-registry row and `0028` itself all cite it; renaming would leave
+/// four dangling references for a cosmetic gain, and the transcript above is
+/// the evidence those documents point at.
+///
+/// **Step 0c asked whether this test survives, on the reading that a facade
+/// assertion cannot reach a state staged below the facade. Run, it does not
+/// survive as written.** The state is staged below the facade, but the byte and
+/// the record are *paired* at it — `Open::attempt` is what builds the arena and
+/// registers the record — so the guard sits directly on this path. Measured, at
+/// the guard's first green build: `CreatePolicy::Always must create over a
+/// stranded participant: ParticipantSlotDiverged`, this test's own `expect`
+/// panicking. So the staging is not a way around the assertion, which is the
+/// answer the step wanted.
+///
+/// **What is lost, stated because it is the only thing this file loses.** The
+/// measurement that gives the block above its force — a joined watcher
+/// reporting `alive false` about a live, publishing process holding record 0 —
+/// cannot be retaken through public API, because it needs a `Tree` whose byte
+/// and record disagree and nothing will now produce one: `use_ofd_liveness` is
+/// `pub(crate)` and installed only by the two arms of `Open::attempt`, one of
+/// which is this refusal. That is the fix working, not a gap. The transcript
+/// survives here, in `docs/PHASE2.md` §0.0 and in `0028`.
+///
+/// **What it pins now**, and neither is covered by its sibling
+/// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`: that the
+/// guard is *identity-blind* — this byte 0 carries no identity record at all,
+/// where the sibling's is a real registration — and that a caller can act on
+/// the refusal, which is the argument for returning an error rather than
+/// asserting. Release the byte and the ordinary create succeeds with byte and
+/// record at one index.
+///
+/// Mutant: delete the `session.slot() != tree.participant_slot()` guard from
+/// `Open::attempt`. Applied: `.err().expect("a create that would diverge must
+/// be refused")` panics on an `Ok(Tree)`.
+///
+/// Mutant: compare against `session.slot()` twice, i.e. a guard that can never
+/// fire. Applied: the same `expect` panics — the recovery half of the test is
+/// never reached, so a tautological guard cannot pass this file.
+///
+/// Mutant: `std::mem::forget` the session instead of dropping it on the refusal
+/// path. Applied: `the refused creator kept a participant byte` fails,
+/// `left: 3, right: 1`.
 #[cfg(feature = "unstable")]
 #[test]
 fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
@@ -473,7 +521,15 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
         tf_tree_ipc::LockAttempt::Acquired
     );
 
-    let tree = tf_tree::Open::new()
+    // **Refused, and this is the answer to the question `0028` plan step 0c
+    // left open.** The state is staged *below* the facade, but the byte and the
+    // record are still *paired* at the facade — `Open::attempt` is what builds
+    // the arena and registers the record — so the guard does reach it. Measured
+    // before this test was converted: the line that used to stand here,
+    // `.expect("CreatePolicy::Always must create over a stranded participant")`,
+    // panicked with `ParticipantSlotDiverged`.
+    let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    let err = tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
         .create(CreatePolicy::Always)
         .layout_if_creating(
@@ -483,73 +539,80 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
         )
         .timeout(std::time::Duration::from_millis(500))
         .open()
-        .expect("CreatePolicy::Always must create over a stranded participant");
+        .err()
+        .expect("a create that would diverge must be refused");
+    assert!(
+        matches!(err, tf_tree::OpenError::ParticipantSlotDiverged),
+        "expected ParticipantSlotDiverged, got {err:?}"
+    );
+
+    // **What this pins that its sibling cannot.** The guard compares two
+    // integers and consults nothing else. This byte 0 carries *no identity
+    // record at all* — `try_take_participant` writes none — so a guard that
+    // tried to decide from the lock file's identity rows, or to excuse a
+    // divergence whose byte names nobody, would have nothing to read here.
+    assert!(
+        witness.read_identity(0).unwrap().is_none(),
+        "the staged survivor writes no identity, and the refusal must not need one"
+    );
+    assert!(
+        witness.probe_participant(0).unwrap().held,
+        "the refusal disturbed the staged survivor's byte"
+    );
+    assert_eq!(
+        witness.held_participants().unwrap(),
+        0b1,
+        "the refused creator kept a participant byte"
+    );
+    assert!(
+        !witness.probe_ownership().unwrap().held,
+        "the refused creator kept the ownership byte"
+    );
+    // **No bound rendezvous socket survives the refusal.** What that catches is
+    // a refusal that returns while the owner server it spawned is still alive;
+    // what it does *not* catch is the guard's **placement**, because
+    // `impl Drop for OwnerServer` unlinks either way. Both measured, in the
+    // sibling test, which carries the note.
+    assert!(
+        !scratch.0.join("0/default.sock").exists(),
+        "a refused create must not leave a bound rendezvous socket"
+    );
+
+    // **The refusal is recoverable, which is the argument for an error rather
+    // than an assertion.** Stop the process holding the byte — the one thing
+    // `OpenError::ParticipantSlotDiverged`'s documentation tells a caller to do
+    // — and the ordinary path works, with byte and record at one index again.
+    drop(survivor);
+    let tree = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("with byte 0 released, an ordinary create must succeed");
+    assert_eq!(
+        tree.participant_slot(),
+        0,
+        "a fresh arena registers its creator at record 0"
+    );
+    assert_eq!(
+        witness.held_participants().unwrap(),
+        0b1,
+        "and at lock byte 0 — the same integer, which is the whole invariant"
+    );
+
+    // And it is a working arena, not merely an opened one: the process the
+    // guard refused to strand is publishing and reading back its own transform.
     let publisher = tree
         .claim(tree.frame("base").unwrap(), tree.frame("map").unwrap())
         .expect("claim the one edge");
     publisher
         .push(1_000, &tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]))
         .expect("push");
-
-    // **The divergence, stated in the two files that disagree.** Record 0 is
-    // this process; byte 0 is the survivor's, and carries no identity because
-    // `try_take_participant` writes none. This process's own byte is 1.
-    assert_eq!(
-        tree.participant_slot(),
-        0,
-        "a fresh arena registers its creator at record 0"
-    );
-    let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
-    assert!(
-        witness.probe_participant(0).unwrap().held,
-        "the survivor must still hold the byte record 0's liveness is read from"
-    );
-    assert!(
-        witness.read_identity(0).unwrap().is_none(),
-        "the survivor wrote no identity, so byte 0 names nobody"
-    );
-    assert_eq!(
-        witness
-            .read_identity(1)
-            .map(|id| id.map(|i| i.pid))
-            .unwrap(),
-        Some(std::process::id()),
-        "the creator's lock byte is 1 while its arena record is 0 (#201)"
-    );
-
-    // The observer has to be another process: `use_ofd_liveness` returns `true`
-    // unconditionally for the asking tree's own slot, so the creator cannot see
-    // either sign of this about itself.
-    let mut watcher = Kid::spawn(&scratch.0, &["join-rw-report"]);
-    assert_eq!(watcher.line(), "joined", "the watcher did not join");
-
-    let stranded = watcher.ask(0);
-    assert!(
-        stranded.contains("state live") && stranded.contains("alive true"),
-        "record 0 should read alive here, but on the survivor's byte rather \
-         than on its own: {stranded}"
-    );
-
-    // And the index the creator *does* hold a byte at carries no arena record,
-    // so this is not an off-by-one that some other record covers: there is no
-    // slot at which both halves describe the creator.
-    let orphan = watcher.ask(1);
-    assert!(
-        orphan.contains("state free"),
-        "byte 1 is the creator's, and nothing is registered at record 1: {orphan}"
-    );
-
-    // Nothing about the process in record 0 changes across this line. Only the
-    // *survivor* leaves.
-    drop(survivor);
-    assert!(
-        !witness.probe_participant(0).unwrap().held,
-        "dropping the survivor must release byte 0"
-    );
-    assert!(
-        witness.probe_participant(1).unwrap().held,
-        "the creator still holds its own byte"
-    );
     let g = tree.guard();
     let plan = tree
         .plan(tree.frame("map").unwrap(), tree.frame("base").unwrap())
@@ -557,19 +620,7 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
     assert!(
         plan.at(&g, Stamp::<tf_tree::SystemDomain>::from_nanos(1_000))
             .is_ok(),
-        "the creator must still be serving its own transform"
-    );
-
-    let deserted = watcher.ask(0);
-    assert!(
-        deserted.contains(&format!("pid {}", std::process::id())),
-        "record 0 is this process's: {deserted}"
-    );
-    assert!(
-        deserted.contains("state live") && deserted.contains("alive false"),
-        "**#201, the corrupting direction.** A live, publishing arena owner \
-         must not read dead because an unrelated process released the byte at \
-         its record's index: {deserted}"
+        "the recovered creator must serve its own transform"
     );
 }
 
@@ -603,12 +654,39 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
 /// tell the two apart here, because in one process they share a pid — the
 /// holder mask is what separates them.
 ///
+/// **2026-08-20 — converted from a defect pin into a regression test**
+/// (`docs/decisions/0028` plan step 0c). Everything above is kept because the
+/// *route* is the finding: two derivations of how this state arises were wrong
+/// before a reproduction found it, and this project keeps its refutations on
+/// the page. What changed is the verdict at the end. `Open::attempt` now
+/// compares `tf_tree_ipc::Session::slot` with `Tree::participant_slot` at the
+/// single `hold_ownership` call site — the one place in the workspace where
+/// both numbers are in scope, since `tf_tree_ipc` has no arena dependency and
+/// cannot see a record index — and returns
+/// [`tf_tree::OpenError::ParticipantSlotDiverged`] instead of a `Tree` whose
+/// every liveness answer would be about the stranded session. The assertions
+/// that used to read `tree.participant_slot() == 0` with `0b11` bytes held are
+/// now the refusal, plus the proof that it leaves the rendezvous exactly as it
+/// found it.
+///
+/// Mutant: delete the `session.slot() != tree.participant_slot()` guard from
+/// `Open::attempt`. Applied: `.err().expect("the divergence must be refused,
+/// not handed back as a Tree")` panics — the open returns `Ok` and the whole
+/// test is downstream of that line.
+///
+/// Mutant: `std::mem::forget` the session instead of dropping it on the refusal
+/// path. Applied: `the refused creator kept a participant byte` fails,
+/// `left: 3, right: 1` — bytes 0 and 1 both held. That is the assertion that
+/// makes this a refusal which costs a caller nothing rather than one that burns
+/// a slot per attempt.
+///
 /// Mutant: drop `stranded` before opening the forced creator, so byte 0 is free
-/// when it runs. Applied: the **holder-mask** assertion fails first —
-/// `left: 1, right: 3` — because the creator then takes byte 0 itself and no
-/// second byte is held; the final assertion is never reached. That is the
-/// reading of this test: the stranded byte 0 is the whole cause, and
-/// `CreatePolicy::Always` on its own diverges from nothing.
+/// when it runs. Applied: the same `expect` panics, because the creator then
+/// takes byte 0 itself, the two indices agree and the open legitimately
+/// succeeds. That is the reading of this test — the stranded byte 0 is the
+/// whole cause, and `CreatePolicy::Always` on its own diverges from nothing, so
+/// the guard refuses no healthy create. (Before the conversion this mutant
+/// failed the **holder-mask** assertion first, `left: 1, right: 3`.)
 #[cfg(feature = "unstable")]
 #[test]
 fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
@@ -652,8 +730,10 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
     );
 
     // The forced create. §3.4 step 4 lets it past precisely because it is
-    // `CreatePolicy::Always`, which is the escape hatch's whole purpose.
-    let tree = tf_tree::Open::new()
+    // `CreatePolicy::Always`, which is the escape hatch's whole purpose — and
+    // one line further on, `Open::attempt` compares the byte it was handed with
+    // the record `build_shared` registered it at, and refuses.
+    let err = tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
         .create(CreatePolicy::Always)
         .layout_if_creating(
@@ -663,24 +743,71 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
         )
         .timeout(std::time::Duration::from_millis(500))
         .open()
-        .expect("CreatePolicy::Always must create past a held participant byte");
-
-    assert_eq!(
-        tree.participant_slot(),
-        0,
-        "a fresh arena registers its creator at record 0"
+        .err()
+        .expect("the divergence must be refused, not handed back as a Tree");
+    assert!(
+        matches!(err, tf_tree::OpenError::ParticipantSlotDiverged),
+        "**#201, closed.** The creator's lock byte would have been 1 and its \
+         arena record 0, so every predicate reading record 0's liveness would \
+         have asked the kernel about the stranded session's byte. Expected \
+         ParticipantSlotDiverged, got {err:?}"
     );
+
+    // **No bound rendezvous socket survives the refusal.** That is less than an
+    // earlier revision of this comment claimed — it said the line below made the
+    // guard's placement load-bearing — and it is worth keeping for what it does
+    // catch: a refusal that returns while the owner server it spawned is still
+    // alive. Measured: with the guard moved below `spawn_owner_server` *and*
+    // the server `std::mem::forget`-ed instead of dropped, both `defect_201`
+    // tests fail at this assertion — `a refused create must not leave a bound
+    // rendezvous socket`.
+    //
+    // **It does not pin the placement, and nothing in this file does.** Measured
+    // by moving the guard below `spawn_owner_server` on its own: the socket is
+    // bound and published — an `eprintln!` from inside the refusal reports `sock
+    // exists now = true` — and then `impl Drop for OwnerServer`
+    // (`crates/tf_tree_ipc/src/server.rs:475`) unlinks the path it published, so
+    // both tests stay green and this assertion never notices. The placement
+    // rests on an argument instead, stated at the guard in
+    // `crates/tf_tree/src/open.rs`: between the bind and the guard a joiner can
+    // complete a §3.7 handshake and hold the segment, and refusing after that
+    // would tear an arena out from under a process that did nothing wrong. That
+    // needs a second process scheduled inside those two statements, which no
+    // test here can arrange, so the ordering is defensible on its own merits and
+    // untested.
+    assert!(
+        !scratch.0.join("0/default.sock").exists(),
+        "a refused create must not leave a bound rendezvous socket"
+    );
+
+    // **And it left nothing behind.** Byte 1 — the one `register_any` handed
+    // the forced creator — is free again, and so is the ownership byte it took
+    // on the way in; only the stranded session's byte 0 is still held, by the
+    // process entitled to it. A refusal that returned while its `Session` lived
+    // would burn a slot per attempt, which is the failure
+    // `require_create_refuses_a_live_arena_and_releases_its_slot` pins for the
+    // other refusal on this path.
     assert_eq!(
         witness.held_participants().unwrap(),
-        0b11,
-        "exactly two bytes are held: the stranded session's 0 and the creator's"
+        0b1,
+        "the refused creator kept a participant byte"
     );
-    assert_ne!(
-        tree.participant_slot(),
-        1,
-        "**#201.** The creator's lock byte is 1 and its arena record is 0, so \
-         the predicate that reads record 0's liveness asks the kernel about a \
-         byte belonging to the stranded session"
+    assert!(
+        !witness.probe_ownership().unwrap().held,
+        "the refused creator kept the ownership byte"
+    );
+    assert!(
+        witness.probe_participant(0).unwrap().held,
+        "the refusal disturbed the stranded session's byte"
+    );
+
+    // The identity record at byte 1 outlives the byte, exactly as it does when
+    // a process exits: §5.1 makes the *byte* the liveness and the record
+    // advisory. Pinned so a later reader does not mistake the leftover row for
+    // the leak the three assertions above rule out.
+    assert!(
+        witness.read_identity(1).unwrap().is_some(),
+        "identity records are advisory, and releasing a byte does not erase one"
     );
 }
 
@@ -846,6 +973,68 @@ fn a_wait_for_an_arena_that_never_starts_gives_up() {
     assert!(
         elapsed < budget * 20,
         "it overran its budget by more than the backoff can explain: {elapsed:?}"
+    );
+}
+
+/// **A whole-second budget is retried, not rejected.**
+///
+/// `await_open` derives each attempt's timeout by subtracting elapsed time from
+/// the caller's budget, and that subtraction is the only thing in the crate that
+/// manufactures a `Duration` nobody wrote. `await_open(Duration::from_secs(1))`
+/// reaches the handshake as `999.999_9xx ms` on the first iteration; the
+/// conversion to `SO_RCVTIMEO_NEW`'s `(tv_sec, tv_usec)` rounds the
+/// sub-microsecond tail up without carrying, yielding `tv_usec == 1_000_000`,
+/// which the kernel rejects with `EDOM`. That arrives as
+/// `IpcError::ClientSocketSetup`, which `is_retryable` calls **terminal** — so
+/// the call returned in microseconds with a local-resource error instead of
+/// waiting out its budget, and every whole-second budget was affected.
+///
+/// The budget is `1 s` and not `300 ms` **on purpose**:
+/// `a_wait_for_an_arena_that_never_starts_gives_up` uses 300 ms, whose remainder
+/// lands at `tv_usec == 300_000`, and that is why fifteen passing rendezvous
+/// tests were blind to this.
+///
+/// Mutant: delete the `Duration::new(secs, subsec_micros * 1_000)` truncation in
+/// `Open::await_open` ⇒ this fails on the error assertion with
+/// `ClientSocketSetup { raw_os_error: 33 }`, and on the elapsed one, having
+/// returned almost immediately.
+#[test]
+fn a_whole_second_wait_is_not_refused_by_the_socket_timeout() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let _scratch = Scratch::new("whole-second-budget");
+
+    let budget = Duration::from_secs(1);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = tf_tree::Open::new().await_open(budget);
+        let _ = tx.send((outcome.err(), started.elapsed()));
+    });
+
+    // Same shape as the test above, and for the same reason: there is no
+    // `.config/nextest.toml`, so nothing else bounds a call that hangs.
+    let (err, elapsed) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("await_open never returned");
+    let err = err.expect("an empty machine has no arena to open");
+
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+                | tf_tree::OpenError::Rendezvous(
+                    tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. }
+                )
+        ),
+        "a whole-second budget must end in the last retryable rendezvous error, \
+         not in a local socket failure: {err:?}"
+    );
+    assert!(
+        elapsed >= budget,
+        "it did not wait out a whole-second budget ({elapsed:?}) — the first \
+         attempt was refused before it could retry"
     );
 }
 

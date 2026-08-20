@@ -205,6 +205,53 @@ pub enum OpenError {
     /// attach leaves nothing behind.
     #[error("an arena is already live at this rendezvous and require_create was set")]
     ArenaAlreadyLive,
+    /// This process's participant **lock byte** and its arena participant
+    /// **record** came out at different indices, so the arena was not published
+    /// (`docs/decisions/0028` plan step 0c, issue #201).
+    ///
+    /// [`Tree::participant_slot`] calls that integer "the one number that
+    /// indexes both tables", and `docs/PHASE2.md` §5.1's liveness predicate
+    /// spends it that way: it asks the kernel about the byte at slot *i* and
+    /// then reads the arena record at slot *i*. When the two disagree every
+    /// answer is about somebody else — reproduced through published API as
+    /// `participant_alive(0) == false` about a process that holds record 0 and
+    /// is still pushing samples.
+    ///
+    /// **Only [`CreatePolicy::Always`] can reach it.** §3.4 step 4 refuses to
+    /// create while any participant byte is held, so an ordinary creator runs
+    /// against an empty lock file and takes byte 0 against a fresh arena's
+    /// record 0; the escape hatch skips that check by design and takes the
+    /// first *free* byte instead. The state it lands on is a live **non-owner**
+    /// holding byte 0, which [`tf_tree_ipc::Session::release_ownership`]
+    /// produces from a documented §3.5 call.
+    ///
+    /// # What a caller does about it
+    ///
+    /// Not retry — a second forced create against the same holder diverges
+    /// identically. Either stop the process still holding the byte (`tf_tree
+    /// participants` names it from the lock file's identity records), or open
+    /// with [`CreatePolicy::IfAbsent`] and let the wedge be diagnosed rather
+    /// than created over.
+    ///
+    /// # Why an error and not an assertion
+    ///
+    /// The engine's liveness bias, stated on `record_is_alive`: a false
+    /// "dead" lets a rescuer take an entry from a running process, which is
+    /// corruption, while a false "alive" only delays recovery. A diverged
+    /// pairing manufactures the corrupting direction, and `0028`'s plan step 1
+    /// is the first code that acts on such a verdict destructively. A
+    /// `debug_assert!` would compile out of exactly the builds that ship, so it
+    /// would be a comment with a test harness attached.
+    ///
+    /// The refusal leaves nothing behind: the arena is dropped before the owner
+    /// server binds, so no peer ever saw it, and the session is dropped with it
+    /// so both the ownership and participant bytes are released. Neither index
+    /// is carried in this value — `docs/API.md` R5 keeps errors `Copy` and
+    /// prose in a separate layer, and the two numbers are readable from the
+    /// lock file by anything entitled to see them.
+    #[error("this process's participant lock byte and its arena participant record are different slots; the arena was not published")]
+    ParticipantSlotDiverged,
+
     /// The rendezvous resolved to [`OpenOutcome::TookOver`], and §3.5 takeover
     /// is not wired (`docs/decisions/0028` plan step 9).
     ///
@@ -471,7 +518,11 @@ impl Open {
     ///
     /// [`Open::timeout`] is clamped to what is left of `timeout` on every
     /// attempt, or a default `Open` would let one held-but-unreachable attempt
-    /// run the full [`DEFAULT_OPEN_TIMEOUT`] past the caller's deadline.
+    /// run the full [`DEFAULT_OPEN_TIMEOUT`] past the caller's deadline. That
+    /// clamp is then floored at one backoff interval and truncated to whole
+    /// microseconds, because the handshake's `SO_RCVTIMEO` rejects a value
+    /// outside either bound and reports it as a *terminal* error; the comment on
+    /// the loop has the two failures in full.
     ///
     /// # Errors
     ///
@@ -491,8 +542,26 @@ impl Open {
             // that ran out exactly on an iteration boundary would replace the
             // rendezvous' real answer with a local socket error. The overrun
             // this permits is 200 µs, well inside one scheduler tick.
+            //
+            // **And truncated to whole microseconds, which is the same hazard
+            // from the other end.** `SO_RCVTIMEO_NEW` carries a
+            // `(tv_sec, tv_usec)` pair, and the conversion rounds the
+            // sub-microsecond tail *up* without carrying into `tv_sec`: a
+            // `Duration` in the last microsecond of a second becomes
+            // `tv_usec == 1_000_000`, which the kernel rejects with `EDOM` —
+            // again `IpcError::ClientSocketSetup`, again terminal. This loop is
+            // the only place that *manufactures* a `Duration` by subtraction,
+            // so it is the only place that produces one nobody wrote: a plain
+            // `await_open(Duration::from_secs(1))` reaches here as
+            // `999.999_9xx ms` on the first iteration and failed outright.
+            // Observed as `setsockopt(4, SOL_SOCKET, SO_RCVTIMEO_NEW,
+            // {tv_sec=0, tv_usec=1000000}) = -1 EDOM` under `strace`. Dropping
+            // up to 999 ns costs nothing, and the floor above is a whole number
+            // of microseconds so this cannot undercut it.
             let left = timeout.saturating_sub(start.elapsed());
             let per_attempt = core::cmp::max(core::cmp::min(self.timeout, left), MIN_BACKOFF);
+            let per_attempt =
+                Duration::new(per_attempt.as_secs(), per_attempt.subsec_micros() * 1_000);
             let err = match self.attempt(per_attempt) {
                 Ok(tree) => return Ok(tree),
                 Err(e) if is_retryable(e) => e,
@@ -600,7 +669,14 @@ impl Open {
                     .take_attached()
                     .ok_or(OpenError::Rendezvous(IpcError::ArenaAbsent))?;
                 let slot = attached.response.participant_slot;
-                let mut tree = Tree::attach_shared_at(attached.segment, self.mode, slot)?;
+                // `attach_joined_at`, not the `pub` `attach_shared_at`: that
+                // one refuses `ReadWrite` because a caller holding a raw
+                // descriptor holds no lock byte. Here the byte is already
+                // taken — `session` is holding it, taken by `register_at`
+                // during the handshake, before this record is written — which
+                // is exactly the crate-private path's precondition
+                // (`docs/decisions/0028` plan step 0b).
+                let mut tree = Tree::attach_joined_at(attached.segment, self.mode, slot)?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 tree.use_claim_leases(open_claim_lock(&rv)?);
                 // The socket and the lock file must outlive the handshake: the
@@ -617,6 +693,53 @@ impl Open {
                 let mut tree = builder.build_shared(rv.name().as_str())?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 tree.use_claim_leases(open_claim_lock(&rv)?);
+
+                // **The byte/record correspondence, asserted where the two are
+                // paired** (`docs/decisions/0028` plan step 0c, issue #201).
+                // `session.slot()` is the participant lock byte this process
+                // holds; `tree.participant_slot()` is the arena record
+                // `build_shared` just registered it at. Nothing between them
+                // reconciles the two — the byte is chosen by `register_any` in
+                // `tf_tree_ipc`, which has no arena dependency and cannot see
+                // the record index, and the record is chosen by the first `FREE`
+                // slot in a fresh arena. On every ordinary path they agree by
+                // construction; under `CreatePolicy::Always`, which skips §3.4
+                // step 4's guard by design, they need not.
+                //
+                // §5.1's predicate reads one at the index of the other, so a
+                // disagreement makes every liveness verdict about somebody else.
+                // That is not hypothetical: `participant_alive(0) == false` was
+                // measured about a live, publishing process whose record is 0
+                // and whose byte is 1.
+                //
+                // **Before `spawn_owner_server`, not after**, which is the whole
+                // of why the check sits on this line rather than inside
+                // `hold_ownership`. The server binds `rv.sock_path()` and starts
+                // answering handshakes, so one line later a joiner could already
+                // hold this segment, and refusing then would tear an arena out
+                // from under a process that did nothing wrong. Here the arena is
+                // still private: nobody but this process has ever seen it.
+                //
+                // **That ordering is an argument, not a tested property, and the
+                // tests say so.** Moving this block below `spawn_owner_server`
+                // leaves both `defect_201` tests in
+                // `crates/tf_tree/tests/rendezvous.rs` green: the socket is bound
+                // and published, and then `impl Drop for OwnerServer`
+                // (`crates/tf_tree_ipc/src/server.rs:475`) unlinks the path it
+                // published, so nothing on disk tells the two placements apart.
+                // What separates them is a joiner scheduled inside these two
+                // statements, which no test in this workspace can arrange.
+                if session.slot() != tree.participant_slot() {
+                    // Record first, then byte — the order a healthy participant
+                    // leaves in (`Tree`'s `Drop` releases the record, and only
+                    // then does the `Session` release the byte). Explicit rather
+                    // than left to scope order, for the same reason the
+                    // `require_create` refusal above is.
+                    drop(tree);
+                    drop(session);
+                    return Err(OpenError::ParticipantSlotDiverged);
+                }
+
                 let server = spawn_owner_server(&rv, &tree)?;
                 tree.hold_ownership(session, server);
                 Ok(tree)
