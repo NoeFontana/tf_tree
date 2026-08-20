@@ -255,9 +255,7 @@ fn push_many_honours_a_stride() {
         let one = quat7([1.0, 0.0, 0.0, 0.0], [tx, 0.0, 0.0]);
         src[i * STRIDE..i * STRIDE + 56].copy_from_slice(&one);
         // Poison the padding, so a stride bug reads garbage rather than zeros.
-        for b in &mut src[i * STRIDE + 56..(i + 1) * STRIDE] {
-            *b = 0xAB;
-        }
+        src[i * STRIDE + 56..(i + 1) * STRIDE].fill(0xAB);
     }
     // SAFETY: live handle; `stamps` has N elements and `src` is N*STRIDE bytes.
     let rc = unsafe {
@@ -432,9 +430,7 @@ fn a_batch_reports_the_index_that_failed() {
         src[i * 56..(i + 1) * 56].copy_from_slice(&one);
     }
     // Element 3's quaternion is zeroed: an uninitialized C struct.
-    for b in &mut src[3 * 56..3 * 56 + 32] {
-        *b = 0;
-    }
+    src[3 * 56..3 * 56 + 32].fill(0);
     let stamps: Vec<i64> = (0..N as i64).map(|i| i * 1_000_000).collect();
     // SAFETY: live handle; N stamps and N tightly packed payloads.
     let rc = unsafe {
