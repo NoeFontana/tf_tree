@@ -214,15 +214,29 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
 ## Not in this record: #220
 
 **#220 is not record material and should not become a second draft.** The
-`Created | TookOver` arm (`crates/tf_tree/src/open.rs:546`) calls
-`builder.build_shared(...)`, so a taker-over would build a *new* arena rather
-than inherit the one it already has. Checked at that call site, there is no fd,
-no socket path, no `Rendezvous` and no way to take the session's arena in scope —
-**so the arm cannot be fixed in place under any answer to `0028` question 3.**
-Fixing it means restructuring where the heir's arena comes from, which is exactly
-what question 3 is about, and `OpenOutcome::TookOver` is unconstructible from
-`tf_tree::Open` today because the builder has no `already_attached` setter.
+`Created | TookOver` arm called `builder.build_shared(...)`, so a taker-over
+would have built a *new* arena rather than inherit the one it already has.
+Checked at that call site, there was no fd, no socket path, no `Rendezvous` and
+no way to take the session's arena in scope — **so the arm could not be fixed in
+place under any answer to `0028` question 3.** Fixing it means restructuring
+where the heir's arena comes from, which is exactly what question 3 is about.
 
-Its home is `0028`'s implementation plan, as a step that lands with §3.5's
-trigger. Filing a second record would put the same question-3 dependency in two
+**Landed as `0028` plan step 9, which is where this said its home was.** The arm
+is split: `OpenOutcome::Created` keeps the `build_shared`
+(`crates/tf_tree/src/open.rs:613`, the line this paragraph used to cite as `:546`)
+and `OpenOutcome::TookOver` refuses with `OpenError::TakeoverUnsupported`
+(`:624`) — a refusal rather than an adoption for the reason above, that nothing
+at the match names the arena this process already holds. Restructuring where the
+heir's arena comes from is still unbuilt, and still question 3's.
+
+One sentence here needs its correction stated rather than deleted, because it is
+what a reader would check first: `OpenOutcome::TookOver` **remains
+unconstructible through `tf_tree::Open`'s public surface** — the builder has no
+`already_attached` setter, under no feature, and step 9 deliberately did not add
+one. It is reachable from exactly one place, a `#[cfg(test)]` field of the same
+name on that builder, which only `tf_tree` compiled as its own test target can
+set; `open::tests::a_takeover_refuses_rather_than_building_a_second_arena`
+(`:996`) is its only user.
+
+Filing a second record would have put the same question-3 dependency in two
 places.
