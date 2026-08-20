@@ -184,13 +184,18 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
    unavailable in the environment §0.0's #205 row was written in. If neither can
    be staged, this record ships a change with no test that distinguishes the old
    behaviour from the new, and that has to be stated rather than glossed.
-2. **Does the adapter belong to this record or to `0028` piece 2?** `0028`'s
-   piece 2 is "one reclamation predicate, named once", and this is "one liveness
-   predicate, named once", one layer up. They are not the same object — piece 2
-   decides whether to *reclaim*, this decides whether to *steal* — but if both
-   land, two records will have specified the ordering constraint. **This gates
-   `ready`**, because the wrong answer is the second spelling the decision is
-   about avoiding.
+2. **RESOLVED 2026-08-20: this record survives, and the ordering constraint is
+   stated once — in `PHASE2.md` §5.1, not in either record.** ~~Does the adapter
+   belong to this record or to `0028` piece 2?~~ They are not the same object and
+   should not be merged: piece 2 decides whether to **reclaim** a slot, this
+   decides whether to **steal** a topology lock, and they owe different §11.3
+   rows. What must not be duplicated is the word-before-byte rule, so **whichever
+   of the two lands first writes it into §5.1 and the other cites it.** `0028` is
+   `ready` as of the same day and its step 1 lands first on the current
+   sequencing, so the amendment travels with that step unless the order changes.
+   Note the amendment is narrow and additive: §5.1 already makes the byte the
+   answer for a tree that carries a probe; what it does not yet say is *when* the
+   byte may be read relative to the word.
 3. **Is P5 in scope?** The socket-hangup callback decides liveness from neither
    fact. It is correct under D17 and its incarnation guard bounds the damage, so
    nothing here proposes changing it — but a record titled "one liveness

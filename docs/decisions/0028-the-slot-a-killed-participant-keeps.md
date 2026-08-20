@@ -1,8 +1,17 @@
 # 0028: the slot a killed participant keeps
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** none — this record exists so that none lands first.
+**Implementation:** the plan below, in its stated order — which is a safety
+property and not a preference. Four PRs have already landed inside this record's
+scope and are marked as such per step: `adeb158` (#191, candidate B),
+`4a91d6f` (#210, `TFT014`'s claim half), `356e746` (#218, all three of step 0's
+clauses), `ecae587` (#221, the #201 falsifier).
+
+> **Moved `draft -> ready` on 2026-08-20**, with all six open questions resolved
+> — see *Open questions*, where each keeps the argument that produced it, and
+> *Review history* for what the transition changed. Step 7 is **not** in this
+> record any more: it became [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md).
 
 ## Context
 
@@ -220,9 +229,12 @@ There is exactly one path that has **no** byte: `Tree::attach_shared`
 (`tree.rs:2171`), the fd-inheritance entry point, self-assigns via `register`
 and never touches the lock file. In `ReadWrite` mode that produces a `LIVE`
 record with a permanently free byte — indistinguishable, by the byte alone, from
-the leak. Today only `crates/tf_tree_bench/tests/multiprocess.rs:398` does this,
-but `attach_shared` is public API and §0.0 names "fd-inherited trees" as a
-supported class. **A reclaimer keyed on "byte free ⇒ dead" evicts it while it is
+the leak. ~~Today only `crates/tf_tree_bench/tests/multiprocess.rs:398` does
+this~~ — **two in-tree callers do, and the second matters more**:
+`crates/tf_tree_bench/src/bin/load_child.rs:302` attaches `ReadWrite` and then
+*claims and publishes*, so the byte-less writer is a working harness component
+and not only a fixture (step 0b). And `attach_shared` is public API — as is
+`attach_shared_at` — while §0.0 names "fd-inherited trees" as a supported class. **A reclaimer keyed on "byte free ⇒ dead" evicts it while it is
 running.** That, and not the start-up window, is the eviction hazard this record
 has to defend against.
 
@@ -995,54 +1007,126 @@ commit that adds it.
    changes with it, so it needs a `CHANGELOG` entry under the 0.0.x
    "every release may break every other" promise rather than a silent
    deprecation.
-   **The blast radius is one crate and one test, measured rather than assumed.**
-   The C ABI exposes no attach-from-fd surface at all (`grep` over
-   `crates/tf_tree_c/include/*.h` finds none), and the Python binding's
-   `mode="rw"` builds a `tf_tree::Open` (`tf_tree_py/src/tree.rs:1681`) — the
-   rendezvous path, which takes a byte — so neither binding reaches the arm being
-   removed. Every other in-tree `attach_shared` call passes `ReadOnly`. So a
-   breaking change to the facade costs, in this repository, exactly the one test
-   below.
-   *Verified by:* a unit test that `attach_shared(fd, AttachMode::ReadWrite)`
-   returns an error rather than a `Tree`; and by
-   `crates/tf_tree_bench/tests/multiprocess.rs:398` —
-   `concurrent_reparents_from_separate_attachments_are_serialized`, the only
-   in-tree caller — being moved onto a path that takes a byte. **That test must
+   **It is two entry points, not one.** `Tree::attach_shared_at`
+   (`crates/tf_tree/src/tree.rs:2229`) is also `pub`, also takes a mode, and also
+   registers — at a *caller-supplied* slot, with no byte unless the caller
+   happens to hold one. `Open::attempt` calls it holding the byte
+   (`crates/tf_tree/src/open.rs:536`); a direct caller need not. Both arms
+   refuse, or the step does not close the class it exists to close.
+   **The blast radius was stated as one test and that was wrong when written.**
+   Re-measured at HEAD, `grep -rn 'attach_shared' --include=*.rs crates/ xtask/`
+   crossed with `AttachMode::ReadWrite` gives **two** in-tree `ReadWrite`
+   fd-attach sites, not one:
+   `crates/tf_tree_bench/tests/multiprocess.rs:398`, which this step already
+   names, and **`crates/tf_tree_bench/src/bin/load_child.rs:302`**, which attaches
+   `ReadWrite` through `attach` (`:68`, `:73`), then **claims an edge (`:309`) and
+   pushes in a rate loop**. That is a byte-less writer holding a claim — precisely
+   the class open question 1 rules out — living in this workspace's own
+   contention harness, and `git show f058f4f:.../load_child.rs` has the identical
+   lines, so it is a mis-measurement rather than drift. It is reached by
+   `crates/tf_tree_bench/src/bin/contended_scaling.rs:333`, i.e. by
+   `just contended-scaling` and by nothing else (`scale_sweep.rs` does not
+   reference it, and its recipe declares itself single-process).
+   The bindings are still clear: the C ABI exposes no attach-from-fd surface
+   (`grep` over `crates/tf_tree_c/include/*.h` and `crates/tf_tree_c/src/` finds
+   none), and the Python binding's `mode="rw"` builds a `tf_tree::Open`
+   (`tf_tree_py/src/tree.rs:1686`; the `:1681` this step cited resolved at
+   `385fdd1` and has since moved) — the rendezvous path, which takes a byte.
+   **The byte-less class is narrowed by this step, not eliminated.**
+   `TreeBuilder::build_shared` called directly (`tree.rs:504`, registering at
+   `:516`) still writes a record and takes no byte, and it is a supported shape —
+   it is how an arena gets created. What makes piece 2 total anyway is that such
+   a tree has **no lock file and therefore no probe**: `use_ofd_liveness` is
+   installed only by the two arms of `Open::attempt`, so the byte predicate never
+   runs on a tree that has no bytes to run on. Piece 2 is scoped to trees
+   carrying a probe, and on those, after this step, every participant holds a
+   byte. That scoping belongs in piece 2's doc comment.
+   *Verified by:* unit tests that **both** `attach_shared(fd, ReadWrite)` and
+   `attach_shared_at(fd, ReadWrite, slot)` return an error rather than a `Tree`;
+   by `crates/tf_tree_bench/tests/multiprocess.rs:398` —
+   `concurrent_reparents_from_separate_attachments_are_serialized` — being moved
+   onto a path that takes a byte; and by `load_child.rs`'s writer mode being
+   moved with it, or `just contended-scaling` losing its writer. **That test must
    keep testing what it tests**: two attachments with *separate* participant
    slots and separate process-local `decl` mutexes, racing `reparent` so that
    only A2's in-arena lock can serialize them. A rewrite that ends up sharing one
    attachment has deleted the test rather than ported it.
-1. **`ParticipantTable::reclaim`** in `tf_tree_core`, accepting `live_word(inc)`
-   **only**, plus its doc comment carrying the three-row `state`/`identity` table
-   above **and the reason `RESERVED` is excluded** — a doc comment that does not
-   say why will be "fixed" by the next reader who notices the omission.
+0c. **The byte/record correspondence, asserted where the two are paired.**
+   ~~Part of piece 2's third constraint.~~ **Promoted to its own step by open
+   question 6's resolution, and placed here because of what it gates.** #201 is
+   reproduced through shipped public API — `tf_tree_ipc::Session::release_ownership`
+   (`tf_tree_ipc/src/open.rs:525`) keeps participant byte 0 while giving up the
+   ownership byte, so a forced create lands on byte 1 against arena record 0 — and
+   `PHASE2.md` §0.0's participant-registry row carries the transcript. **Nothing
+   acts destructively on that verdict today, and piece 2 is the code that first
+   would**, so this step lands before it. That ordering is the safety property
+   this plan's order exists for.
+   The site is `crates/tf_tree/src/open.rs:554`, the single `hold_ownership` call,
+   which is where the session's byte and the tree's record index are both in
+   scope. **Not `register_any`**: `tf_tree_ipc` has no arena dependency, so the
+   record index is not visible there at all.
+   *Verified by:* converting
+   `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`
+   (`crates/tf_tree/tests/rendezvous.rs`, #221) from a defect pin into a
+   regression test — it asserts the divergence today, and must assert the refusal
+   afterwards. Its sibling `defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing`
+   stages the same state through `tf_tree_ipc` and pins the *consequence*; decide
+   explicitly whether it survives, because the assertion does not reach a state
+   staged below the facade.
+1. **`ParticipantTable::reclaim`** in `tf_tree_core`, accepting **any observed
+   word** — `live_word(inc)` and `RESERVED` alike — as a single
+   `compare_exchange(observed, FREE, AcqRel, Acquire)`. ~~Accepting `live_word(inc)`
+   only, and carrying the reason `RESERVED` is excluded.~~ **Open question 6
+   widened it**, and the doc comment now has to carry the opposite argument: why
+   accepting `RESERVED` is safe *given* step 0b and step 0c, and that it is not
+   safe without them. A doc comment that states the rule without the precondition
+   will be "simplified" by the next reader.
    *Verified by:* a loom case `reclaim_races_register` in
-   `crates/tf_tree_core/src/loom_tests.rs` — a reclaimer observing `W` and a
-   registrant CASing `FREE -> RESERVED` on the same slot never both succeed, and
-   the slot never ends with two owners; unit tests that `reclaim` fires from
-   `live_word(inc)` and **fails when the observed word has changed**; and a unit
-   test that it **refuses `RESERVED`**, which is the regression test for the
-   defect this record's first revision shipped. Add the loom case to
-   `PHASE1.md` §10.2's list.
+   `crates/tf_tree_core/src/loom_tests.rs` — the ordering and erasure properties
+   question 6's evidence block establishes: the word is observed **before** the
+   byte is probed, and no registrant that returned `Ok` is left with a `FREE`
+   record. **It must ship with the control that fails**: the same model with the
+   probe order reversed, which erases a published record in 0.00 s. A model
+   without a failing control proves nothing — that is question 6's own finding.
+   Do **not** assert "no two occupants" in it; that property is entailed by the
+   byte being an exclusive lock and is not a `loom` question, which is why
+   step 0c exists instead. Plus unit tests that `reclaim` fires from an observed
+   `live_word(inc)`, fires from an observed `RESERVED`, and **fails when the
+   observed word has changed**. Add the loom case to `PHASE1.md` §10.2's list
+   (`docs/PHASE1.md:789`, the five-bullet list at `:793-797`).
 2. **The predicate, once.** A single private function in `tf_tree`, taking the
    `LivenessProbe` and the record, returning `Reclaimable | Live | Unknown`. It
    must not be built on `record_is_alive` (piece 2's first constraint), must skip
-   this process's own slot (second), and must assert the byte/record slot
-   correspondence rather than assume it (third).
-   *Verified by:* four multiprocess tests in `crates/tf_tree/tests/` — target
-   `SIGSTOP`ped (byte held ⇒ `Live`), target `SIGKILL`ed (both negative ⇒
-   `Reclaimable`), **a live `attach_shared(ReadWrite)` participant with no byte
-   at all (⇒ `Live`, via `/proc`)**, and **the sweeper's own slot (⇒ `Live`,
-   unconditionally)**. The third is the eviction test and is the reason the
-   predicate has two facts; it must exist before step 3.
+   this process's own slot (second), and **must observe the state word before it
+   probes the byte** (third — see question 6; `Tree::participant_alive`
+   (`tree.rs:2564`) already has this order, by `&&`'s short-circuit, and the
+   predicate should *be* that body rather than resemble it). The correspondence
+   it used to be asked to assert is step 0c.
+   Its doc comment states the scope: **this predicate applies to a tree carrying
+   a probe**, i.e. one from `Open::attempt`, and on such a tree every participant
+   holds a byte. A tree with no lock file has no probe and never reaches here.
+   *Verified by:* three multiprocess tests in `crates/tf_tree/tests/` — target
+   `SIGSTOP`ped (byte held ⇒ `Live`), target `SIGKILL`ed (byte free ⇒
+   `Reclaimable`), and **the sweeper's own slot (⇒ `Live`, unconditionally)**.
+   ~~And a live `attach_shared(ReadWrite)` participant with no byte at all
+   (⇒ `Live`, via `/proc`).~~ **That test is struck: question 1 and step 0b
+   between them make its subject unconstructible**, and the predicate no longer
+   has two facts for it to exercise.
 3. **The assigner decides from the byte** and reclaims before granting
    (`open.rs:709` at `HEAD`; `703` at `f058f4f`).
    *Verified by:* §11.2 scenario 2b above — 128 sequential attach-then-`SIGKILL`
    cycles against a 64-slot arena, every attach succeeding. Fails at HEAD on the
    65th, which is what makes it a falsifier rather than a regression test.
-4. **The hangup fast path**, i.e. the existing patch, rebased onto `reclaim` and
-   onto the observed word rather than a separately-loaded incarnation. It does
-   **not** gain `RESERVED` collection; that is open question 6.
+4. **The hangup fast path**, i.e. the existing patch (`adeb158`, #191, already
+   landed), rebased onto `reclaim` and onto the observed word rather than a
+   separately-loaded incarnation. ~~It does not gain `RESERVED` collection; that
+   is open question 6.~~ **It does now**: question 6 widened `reclaim`, so the
+   callback collects whatever word it observes. Note that this callback is a
+   liveness verdict taken from **neither** the byte nor `/proc` — only the socket
+   (D17) — and it is the one facade path that *mutates* the participant table on
+   one; `0029` enumerates it as P5. Its incarnation guard is what bounds a wrong
+   verdict to a spurious free rather than a second occupant, and rebasing must
+   not lose that.
    *Verified by:* a multiprocess test asserting the record reads `FREE` after the
    owner's `epoll` wakeup and **before** any new attach — which is what
    distinguishes the fast path from step 3 doing the work.
@@ -1072,17 +1156,41 @@ commit that adds it.
    plan has already claimed `TFT020`. `doctor` will need the lock file, which
    `tft014` does not take today; `cmd_participants` (`lib.rs:1768`) is the
    pattern.
-7. **The fork handler closes inherited descriptors** (§6.2/§7.3). Carries open
-   question 1 and may need its own record — it changes a normative protocol.
-   *Verified by:* extend `crates/tf_tree_bench/tests/fork.rs` — fork after
-   attach, `SIGKILL` the parent, assert the owner observes `HUP` **while the
-   child is still running**, and assert the child's `Tree` is still poisoned and
-   its destructors still release nothing of the parent's.
-8. **`--force-new`**: either add the flag to `tf_tree_cli` or delete
-   `RUNBOOK.md:414`. *Not blocked on this record.*
-   *Verified by:* `just artifact-versions`, which already gates that every
-   `just <recipe>` reference in docs resolves — the same class of check, one
-   surface over.
+7. **~~The fork handler closes inherited descriptors~~ — moved to
+   [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md).** It amends
+   normative §6.2/§7.3, which `CLAUDE.md` routes through a record of its own, and
+   open question 5 anticipated exactly this disposition. **The fork hole remains a
+   documented limitation of this record**, stated in *The fork hole is real* above
+   and unchanged by anything here: a forked child keeps the connection's open file
+   description alive, so no `HUP` fires, and by §6.2 it holds the lock byte too —
+   so the kernel's own answer says "alive" for a process that provably cannot
+   participate. Nothing in this plan reclaims that slot, and `0030` is where it
+   gets addressed.
+8. **`--force-new`** — **done** (#189, closed 2026-08-19). Neither branch was
+   taken as written: the flag is not added and `RUNBOOK.md`'s entry was not
+   deleted but rewritten to name `CreatePolicy::Always`, the capability that
+   exists, with §0.0's row recording why `tf_tree_cli` cannot usefully grow the
+   flag (it supplies no `layout_if_creating`, so every create path it can reach
+   ends in `OpenError::NoLayoutToCreate`) and that a flag arrives with
+   [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §1's
+   `tf_tree serve`.
+9. **The `Created | TookOver` arm stops building an arena** (#220). Under open
+   question 3's answer the heir keeps its slot and takeover is byte 0 plus a
+   `bind`, so `OpenOutcome::TookOver` never reaches this arm at all — and the arm
+   as written would `build_shared` a **fresh** segment, forking the tree rather
+   than inheriting it. Checked at `crates/tf_tree/src/open.rs:546`: no fd, no
+   socket path, no `Rendezvous` and no way to take the session's arena is in
+   scope, so the arm **cannot** be taught to adopt one. It splits, and the
+   `TookOver` half refuses.
+   *Verified by:* a unit test that the `TookOver` arm returns an error rather
+   than a `Tree`. Note this is currently unconstructible from `tf_tree::Open` —
+   the builder exposes no `already_attached` setter — so the test reaches it
+   through `tf_tree_ipc` or through a `#[cfg(test)]` seam, and must say which.
+   **This step also invalidates two documents** that describe wiring §3.5 as
+   "call `Open::open` again with `already_attached(true)`":
+   `crates/tf_tree/src/open.rs:22-26`'s module documentation, and
+   [`0005`](./0005-the-shared-memory-seam.md) step 5. Both are corrected here,
+   not silently left.
 
 Documentation, landing with the step that makes each true: §5.1's last paragraph
 and §3.3's are amended **first**, in step 0, because piece 2 falsifies both;
@@ -1105,6 +1213,11 @@ open question 6 is answered, and the row has to say which.
 ## Open questions
 
 Resolved before `draft -> ready`. A `ready` doc has none.
+
+**All six are resolved as of 2026-08-20.** Each keeps the argument that produced
+it, including the ones that were wrong — the reasoning is what the answer rests
+on, and two of these were argued to a conclusion this record then had to retract.
+Question 1 was answered by the owner on 2026-08-18; the other five below.
 
 1. **RESOLVED 2026-08-18 by the owner: no.** ~~Is `Tree::attach_shared(ReadWrite)`
    a supported deployment shape?~~
@@ -1165,13 +1278,31 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    NORMATIVE section, bought to protect one caller that is a bench test.
    ~~**This changes the predicate, so it gates `ready`.**~~ *Answered; the
    predicate is changed above and this no longer gates.*
-2. **Should `reclaim` also clear the lock file's identity record** at
+2. **RESOLVED 2026-08-20: no — the leaning is adopted.** `reclaim` does not touch
+   the lock file's identity record; the next registrant overwrites it, which
+   `register_at` already does. The evidence an operator diagnoses from is kept,
+   and the confusing case (a truthful `stale` row for a slot since reused) is a
+   reporting problem for `tf_tree participants`, not a reason to delete evidence
+   from the mutation path. ~~Should `reclaim` also clear the lock file's identity record~~ at
    `4096 + 64·i`? Leaving it means `tf_tree participants` keeps printing a
    truthful `stale` row for a slot that has since been reused, which is
    confusing; clearing it deletes the evidence an operator uses to diagnose. My
    leaning is to leave it and have the next registrant overwrite it, which is
    what `register_at` already does — but that is a leaning, not an answer.
-3. **What does a taking-over participant do with its existing slot?**
+3. **RESOLVED 2026-08-20: the heir keeps its existing slot, byte and arena
+   record, and takeover is byte 0 plus a `bind` and nothing else.** The leaning
+   below is promoted to the answer, because its argument is a contradiction
+   rather than a preference: the participant slot is baked into every claim and
+   every topology guard the heir already holds, so a heir that acquired a second
+   slot would arrange for its own live claims to be reaped. **The consequence for
+   the gating item is a simplification** — one process is one slot, always, so
+   step 5's sweep never reasons about a process occupying two — which is why this
+   question stopped being a blocker once its own evidence was read rather than
+   summarised. The cost is real and is accepted: §3.5 cannot be wired as "call
+   `Open::open` again with `already_attached(true)`", so `tf_tree/src/open.rs:22-26`
+   and `0005` step 5 both describe a protocol that will not be built, the existing
+   takeover arm ends with no caller, and #220's arm refuses rather than adopting
+   (plan step 9). ~~What does a taking-over participant do with its existing slot?~~
    `already_attached` routes to `register_any`
    (`tf_tree_ipc/src/open.rs:323–332`), taking a second byte and a second arena
    slot while the first session still holds both. Does the heir reuse its slot,
@@ -1255,7 +1386,11 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    > `hold_ownership` (`tree.rs:2382`) parks the session and never compares
    > `Session::slot` with `Tree::participant`. **So piece 2's "assertion, not a
    > comment" has exactly one site to live at**, and it is `register_any`.
-4. **What does the sweep cost?** 64 `F_OFD_GETLK` plus up to 64 `/proc` reads,
+4. **RESOLVED — measured, with the command, in the block below.** A full 64-byte
+   sweep is ~23–28 µs and a single probe ~0.4 µs on this host; the assigner's
+   closure returns at the first grantable slot, so 64 probes is the wedged-state
+   worst case rather than a per-grant cost, and a healthy arena pays about one
+   probe. No bound is added. ~~What does the sweep cost?~~ 64 `F_OFD_GETLK` plus up to 64 `/proc` reads,
    against a 97.5 µs p50 attach. Unmeasured, and this repository does not accept
    a number without the command that produced it. Measure it before step 3, and
    decide then whether it needs a bound (e.g. sweep only on the first
@@ -1408,11 +1543,39 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    > *N* bytes, interleave, take the per-pair difference), because three unpaired
    > runs of one arm on this host spanned 132–180 µs while the paired difference
    > repeated to within 2 %.
-5. **Can step 7's atfork handler be built inside the async-signal-safety
-   constraint?** It needs a lock-free registry of the fds to close, populated
-   before any fork; `fork.rs:46–56` is the constraint it has to satisfy. If not,
-   the fork case stays a documented limitation and step 7 becomes its own record.
-6. **What collects a `RESERVED` record, and at what cost?** This is the question
+5. **RESOLVED 2026-08-20 by taking this question's own second branch: step 7
+   becomes its own record, [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md),
+   and the fork case stays a documented limitation here.** Note what the answer
+   is *not*: it is not a finding that the handler cannot be built. The routing is
+   decided on governance rather than feasibility — closing inherited descriptors
+   amends normative §6.2/§7.3, and `CLAUDE.md` sends a normative protocol change
+   through a record whichever way the async-signal-safety question then falls.
+   That question travels to `0030` unanswered, which is where it can be answered
+   against an implementation plan instead of against a step in someone else's.
+   ~~Can step 7's atfork handler be built inside the async-signal-safety
+   constraint?~~ It needs a lock-free registry of the fds to close, populated
+   before any fork; `fork.rs:46–56` is the constraint it has to satisfy.
+6. **RESOLVED 2026-08-20: the byte collects it, exactly as for `live_word`.**
+   `reclaim` widens to accept **any** observed word (plan step 1), `fill_slot`
+   does not change, §11.3's `attach.after_slot_assigned_before_publish` row gains
+   a repair, and §0 stands — so sub-questions (a), (b) and (c) all fall away
+   unchosen. **This is conditional, and the condition is the whole answer:** it
+   holds only with step 0b (no byte-less writer) and step 0c (the correspondence
+   asserted), which is why both precede piece 2 in the plan.
+   **The gate that was written for this question was replaced rather than met**,
+   because it asked the wrong tool. "A reclaimer observing `RESERVED` and a
+   registrant holding the byte can never both succeed" is false under a model —
+   both do succeed, which is this record's own predicted outcome — and the
+   property it meant, *no second occupant*, is entailed by the byte being an
+   exclusive lock and is not a `loom` question at all. Two independently built
+   models were vacuous for it in the same structural way, one demonstrating it
+   with a byte-blind hostile reclaimer that still passed over 1 140 088
+   executions, the other by counting the antecedent at 0 in 7 993 469. The two
+   obligations that replaced it are in the evidence block below, and **both are
+   now discharged or scheduled**: the ordering-and-erasure `loom` case is plan
+   step 1, and the correspondence falsifier already exists on `main` as #221's
+   test and becomes plan step 0c's regression test.
+   ~~What collects a `RESERVED` record, and at what cost?~~ This is the question
    the first revision of this record answered by guessing, and the guess put two
    live processes on one slot. §11.3 promises "record cleared by any reaper" and
    nothing in this decision clears one. The three shapes are costed in
@@ -1830,7 +1993,35 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    > `compare_exchange` routes through it on both paths. **A pass is sound; a
    > failure needs its witness hand-checked before it is believed.**
 
-## What would make this `ready`
+## What made this `ready`
+
+Kept as written, with each item's disposition, because two of the five were
+**struck rather than satisfied** and a reader is owed the reason.
+
+- **Questions 1, 3 and 6 answered** — 1 by the owner on 2026-08-18, 3 and 6 on
+  2026-08-20. Question 6 was answered by replacing its gate, not by meeting it;
+  question 3 by promoting the argument already under it. Questions 2, 4 and 5
+  resolved with them, since a `ready` doc has none.
+- **The §5.1/§3.3 amendment**: not needed. Question 1's answer removed it, which
+  the bullet below already allowed for.
+- **Question 4 measured**: done, in the block under it.
+- **~~#184's pre-patch numbers re-taken on a provably pre-patch binary.~~
+  STRUCK.** Plan step 3's own verifier is better evidence than the thing this
+  bullet asks for: 128 sequential attach-then-`SIGKILL` cycles against a 64-slot
+  arena, which **fails at HEAD on the 65th**. That is a falsifier on the current
+  binary rather than a number re-taken on a reverted one, and it is already in
+  the plan. Re-taking historical numbers would demonstrate the harness detects
+  the class, which the partial discharge below already did.
+- **~~The existing patch explicitly adopted as step 4.~~ DONE** — it is step 4,
+  and its constraint (do not lose the incarnation guard) is written there. It had
+  already landed as `adeb158`/#191 before this record was opened, which is the
+  thing the bullet was guarding against; what the bullet buys now is that the
+  rebase onto `reclaim` happens *inside* this plan rather than beside it.
+
+The two struck bullets are struck on argument, not on convenience. If either is
+wanted back, the place to re-open it is here.
+
+### The original list, for the record
 
 - Questions 1, 3 and **6** answered; they change the predicate, the sweep, and
   whether `fill_slot` itself changes. **6 is the blocker** — the others change
@@ -1860,6 +2051,47 @@ Resolved before `draft -> ready`. A `ready` doc has none.
   existing is that the difference matters.
 
 ## Review history
+
+### 2026-08-20 — `draft -> ready`; the remaining five questions answered
+
+The owner delegated this review. Three decisions, and the argument for each was
+already on the page — the transition promoted arguments rather than inventing
+them, which is the strongest thing that can be said about it and also the reason
+it took three days of evidence to reach.
+
+- **Question 6.** The byte collects a `RESERVED` record exactly as it collects a
+  `live_word` one; `reclaim` widens; `fill_slot` does not change. **Conditional
+  on steps 0b and 0c**, which is why both precede piece 2. The gate written for
+  this question was *replaced*: its sentence is false under a model, and the
+  property it meant is not a `loom` question. Two independent models were vacuous
+  for it identically — a byte-blind hostile reclaimer still passed 1 140 088
+  executions; the antecedent counted 0 in 7 993 469.
+- **Question 3.** The heir keeps its slot; takeover is byte 0 plus a `bind`. Its
+  own evidence block already contained the contradiction that settles it, and the
+  consequence for step 5 is a *simplification*. **An earlier recommendation to
+  "dissolve" this question rather than answer it was withdrawn** — its support
+  cited a §11.3 row that does not exist in §11.3, only a proposed one in this
+  record under a caveat forbidding that use.
+- **Question 5.** Step 7 leaves this record for `0030`, on governance rather than
+  feasibility. Questions 2 and 4 resolved with their recorded leaning and their
+  measurement respectively.
+
+**What the transition found that the plan did not know**, and the reason a drift
+audit was run before rather than after:
+
+- **Step 0b's blast radius was wrong when written.** There are **two** in-tree
+  `ReadWrite` fd-attach callers, not one: the test this record names, and
+  `crates/tf_tree_bench/src/bin/load_child.rs:302`, which claims an edge and
+  pushes in a rate loop — a byte-less writer holding a claim, the exact class
+  question 1 rules out, inside this workspace's own contention harness.
+- **`Tree::attach_shared_at` is also `pub`**, also `ReadWrite`-capable and also
+  byte-less when called directly, so step 0b names two entry points.
+- **The byte-less class is narrowed, not eliminated**: `TreeBuilder::build_shared`
+  called directly still registers without a byte and is a supported shape. What
+  makes piece 2 total anyway is that such a tree has no lock file and therefore
+  no probe — the predicate is scoped to trees that carry one.
+- **Step 0 had already landed** (`356e746`, #218), including a §0.0 rewrite it
+  does not name, and step 8 was closed by #189 by taking neither of its branches.
 
 ### 2026-08-18 — the owner answered open question 1, and the predicate halved
 
