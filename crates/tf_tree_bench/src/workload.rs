@@ -66,7 +66,33 @@ pub enum Backing {
     Heap,
     /// A shared `memfd` arena under the given rendezvous name. Requires the
     /// `shm` feature and Linux.
+    ///
+    /// **Readers only, for peers.** The fd is the whole capability, and since
+    /// `docs/decisions/0028` plan step 0b a peer that takes it can attach
+    /// `ReadOnly` and nothing else: a read-write attach over a bare descriptor
+    /// registers a participant record with no lock byte behind it, and
+    /// `Tree::attach_shared` now refuses. A harness whose children *publish*
+    /// wants [`Backing::Served`].
     Shared(&'static str),
+    /// A shared arena created **through the rendezvous**, so that peer
+    /// processes can join it read-write.
+    ///
+    /// The difference from [`Backing::Shared`] is not the arena — it is the same
+    /// `memfd` with the same layout — but everything around it: this process
+    /// takes the ownership byte, creates the lock file, and runs the owner's
+    /// serving thread, so a child can `tf_tree::Open` its way in, be granted a
+    /// participant slot, and take the lock byte that slot's liveness is decided
+    /// by. `just contended-scaling`'s writers need exactly that and nothing
+    /// else does, which is why it is a second variant rather than a change to
+    /// the first.
+    ///
+    /// Costs a runtime directory (`$TF_TREE_RUNTIME_DIR`, else
+    /// `$XDG_RUNTIME_DIR/tf_tree`, else `/run/tf_tree`, else `/tmp/tf_tree-<uid>`
+    /// — the last always resolvable) and leaves a lock file and a socket in it.
+    /// `CreatePolicy::Always`: a benchmark that silently *joined* somebody's
+    /// live arena would publish into it, so this takes the arena over rather
+    /// than sharing one it did not size.
+    Served(&'static str),
 }
 
 /// How a workload's frame tree is shaped.
@@ -624,8 +650,18 @@ fn build_tree(plan: &BuildPlan, interp: InterpPolicy, backing: Backing) -> Resul
         Backing::Shared(name) => b
             .build_shared(name)
             .map_err(|e| anyhow!("build_shared: {e}")),
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        Backing::Served(name) => tf_tree::Open::new()
+            .name(name)
+            .and_then(|o| {
+                o.mode(tf_tree::AttachMode::ReadWrite)
+                    .create(tf_tree::CreatePolicy::Always)
+                    .layout_if_creating(b)
+                    .open()
+            })
+            .map_err(|e| anyhow!("creating and serving the arena {name:?}: {e}")),
         #[cfg(not(all(feature = "shm", target_os = "linux")))]
-        Backing::Shared(_) => {
+        Backing::Shared(_) | Backing::Served(_) => {
             bail!("a shared arena needs `--features shm` on Linux; this build has neither")
         }
     }

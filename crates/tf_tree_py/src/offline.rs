@@ -617,7 +617,7 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                 ),
                 // **The one arm that still shows a `Debug`, and it says so.**
                 // `ShmError` is the arena-header check a `memfd` attach makes;
-                // it has no `Display`, fifteen variants, and several of them are
+                // it has no `Display`, sixteen variants, and several of them are
                 // struct-shaped (`SizeMismatch { actual, expected }`), so its
                 // `Debug` is a dump and not a sentence. Enumerating a second
                 // enum from this module would be re-spelling `check.rs`'s

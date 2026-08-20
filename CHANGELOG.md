@@ -33,6 +33,46 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **`Tree::attach_shared` and `Tree::attach_shared_at` now refuse
+  `AttachMode::ReadWrite`**, with the new `ShmError::ReadWriteNeedsRendezvous`.
+  A read-write attach over a bare file descriptor is a compile-time-fine,
+  run-time-refused combination as of this release; `AttachMode::ReadOnly` is
+  unchanged on both, and so is every path through `tf_tree::Open`.
+
+  **A writer joins through `tf_tree::Open`.** The reason is not style. A
+  read-write attach *registers a participant record* in the arena, and the
+  rendezvous takes an OFD lock byte for that slot before writing the record — so
+  on every rendezvous path the byte is a complete answer to "is this participant
+  alive?". A descriptor carries no lock file, so a writer that arrived that way
+  held a `LIVE` record with a permanently free byte: indistinguishable, by the
+  byte alone, from a slot leaked by a `SIGKILL`ed process. That ambiguity is what
+  stopped anything from reclaiming leaked slots, which is the wedge
+  `docs/decisions/0028` exists to fix — 64 abnormal read-write exits over an
+  arena's whole life wedge it at `NoParticipantSlots` permanently.
+
+  **Both entry points, because closing one closes nothing.** `attach_shared_at`
+  takes a slot number, but being *told* a slot index is not the same as having
+  been granted one, and a `pub` function cannot tell the two apart.
+  `tf_tree::Open`'s joiner now registers through a crate-private path whose
+  precondition is the byte it is already holding.
+
+  **Porting.** A consumer that read: attach `AttachMode::ReadOnly`, unchanged. A
+  consumer that published over an inherited or `SCM_RIGHTS`-passed fd: build it
+  on `tf_tree::Open` — the descriptor stops being the whole capability, and the
+  process needs a runtime directory (`$TF_TREE_RUNTIME_DIR`,
+  `$XDG_RUNTIME_DIR/tf_tree`, `/run/tf_tree`, or `/tmp/tf_tree-<uid>`) it shares
+  with the arena's creator. The Python `mode="rw"`, the C ABI and the ROS 2
+  bridge are all unaffected: none of them exposes an attach-from-descriptor
+  surface, and Python's read-write mode already built a `tf_tree::Open`.
+
+  This is a breaking change to the Rust facade, and on the `0.0.x` line that is
+  what every release is permitted to be — see the note at the head of this file.
+  It is a refusal rather than a deprecation because the shape being removed is
+  unsound rather than merely discouraged: a deprecation warning would leave the
+  slot-leak ambiguity in place for as long as anyone ignored it.
+
 ### Fixed
 
 - **A process's participant lock byte and its arena participant record could
@@ -57,6 +97,21 @@ is a bug.
   **New public API** on the `0.0.x` promise: `OpenError` gains a variant. It is
   `#[non_exhaustive]`, so a caller matching with a wildcard arm is unaffected;
   both bindings forward it by `Display` and needed no change.
+
+- **`Open::await_open` failed immediately for any whole-second budget.** It
+  derives each attempt's socket timeout by subtracting elapsed time from the
+  caller's budget, so `await_open(Duration::from_secs(1))` reached the handshake
+  as `999.999_9xx ms`. Converting that to `SO_RCVTIMEO_NEW`'s
+  `(tv_sec, tv_usec)` rounds the sub-microsecond tail up without carrying into
+  `tv_sec`, producing `tv_usec == 1_000_000`, which the kernel rejects with
+  `EDOM` — surfaced as `IpcError::ClientSocketSetup`, which is classified
+  **terminal**, so the call returned in microseconds with a local-resource error
+  rather than waiting out its budget. The per-attempt timeout is now truncated to
+  whole microseconds, the ceiling counterpart of the `MIN_BACKOFF` floor that was
+  already there for the `EINVAL`-on-zero case at the other end. Every existing
+  test used a sub-second budget, whose remainder never reaches the last
+  microsecond of a second, which is why all fifteen rendezvous tests were blind
+  to it.
 
 ## [0.0.3] — 2026-08-19 (first with a source distribution)
 

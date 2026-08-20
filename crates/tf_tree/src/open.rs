@@ -455,7 +455,11 @@ impl Open {
     ///
     /// [`Open::timeout`] is clamped to what is left of `timeout` on every
     /// attempt, or a default `Open` would let one held-but-unreachable attempt
-    /// run the full [`DEFAULT_OPEN_TIMEOUT`] past the caller's deadline.
+    /// run the full [`DEFAULT_OPEN_TIMEOUT`] past the caller's deadline. That
+    /// clamp is then floored at one backoff interval and truncated to whole
+    /// microseconds, because the handshake's `SO_RCVTIMEO` rejects a value
+    /// outside either bound and reports it as a *terminal* error; the comment on
+    /// the loop has the two failures in full.
     ///
     /// # Errors
     ///
@@ -475,8 +479,26 @@ impl Open {
             // that ran out exactly on an iteration boundary would replace the
             // rendezvous' real answer with a local socket error. The overrun
             // this permits is 200 µs, well inside one scheduler tick.
+            //
+            // **And truncated to whole microseconds, which is the same hazard
+            // from the other end.** `SO_RCVTIMEO_NEW` carries a
+            // `(tv_sec, tv_usec)` pair, and the conversion rounds the
+            // sub-microsecond tail *up* without carrying into `tv_sec`: a
+            // `Duration` in the last microsecond of a second becomes
+            // `tv_usec == 1_000_000`, which the kernel rejects with `EDOM` —
+            // again `IpcError::ClientSocketSetup`, again terminal. This loop is
+            // the only place that *manufactures* a `Duration` by subtraction,
+            // so it is the only place that produces one nobody wrote: a plain
+            // `await_open(Duration::from_secs(1))` reaches here as
+            // `999.999_9xx ms` on the first iteration and failed outright.
+            // Observed as `setsockopt(4, SOL_SOCKET, SO_RCVTIMEO_NEW,
+            // {tv_sec=0, tv_usec=1000000}) = -1 EDOM` under `strace`. Dropping
+            // up to 999 ns costs nothing, and the floor above is a whole number
+            // of microseconds so this cannot undercut it.
             let left = timeout.saturating_sub(start.elapsed());
             let per_attempt = core::cmp::max(core::cmp::min(self.timeout, left), MIN_BACKOFF);
+            let per_attempt =
+                Duration::new(per_attempt.as_secs(), per_attempt.subsec_micros() * 1_000);
             let err = match self.attempt(per_attempt) {
                 Ok(tree) => return Ok(tree),
                 Err(e) if is_retryable(e) => e,
@@ -579,7 +601,14 @@ impl Open {
                     .take_attached()
                     .ok_or(OpenError::Rendezvous(IpcError::ArenaAbsent))?;
                 let slot = attached.response.participant_slot;
-                let mut tree = Tree::attach_shared_at(attached.segment, self.mode, slot)?;
+                // `attach_joined_at`, not the `pub` `attach_shared_at`: that
+                // one refuses `ReadWrite` because a caller holding a raw
+                // descriptor holds no lock byte. Here the byte is already
+                // taken — `session` is holding it, taken by `register_at`
+                // during the handshake, before this record is written — which
+                // is exactly the crate-private path's precondition
+                // (`docs/decisions/0028` plan step 0b).
+                let mut tree = Tree::attach_joined_at(attached.segment, self.mode, slot)?;
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 tree.use_claim_leases(open_claim_lock(&rv)?);
                 // The socket and the lock file must outlive the handshake: the

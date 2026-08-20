@@ -391,7 +391,7 @@ fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
 /// list, and they say so in words instead of dumping the struct that carries
 /// the detail. The exception is `Shm`, which follows [`crate::offline`]'s
 /// `FrozenError::Arena` precedent for the identical reason: `ShmError` has no
-/// `Display`, fifteen variants and several struct-shaped ones, so enumerating it
+/// `Display`, sixteen variants and several struct-shaped ones, so enumerating it
 /// here would re-spell `tf_tree_arena`'s reasons in a file that cannot see them
 /// change. Labelling the discriminant as raw is the honest option.
 pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError) -> PyErr {
