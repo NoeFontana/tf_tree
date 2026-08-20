@@ -1,12 +1,35 @@
 //! One reader or writer process for the contended-scaling harness.
 //!
-//! Attaches to the shared arena handed over on stdin (`shm_util`) and plays one
-//! of two roles, selected by argv:
+//! Plays one of two roles, selected by argv, and **the two reach the arena by
+//! different routes**:
 //!
-//! * `reader` — two passes over the same query set, because
+//! * `reader` — attaches read-only to the segment handed over on stdin
+//!   (`shm_util`), then makes two passes over the same query set, because
 //!   `docs/PHASE1.md` §11.2 asks for **both** aggregate throughput and per-lookup
 //!   p99.9, and one loop cannot honestly produce both. See below.
-//! * `writer` — claims one edge and publishes at its rate for the window.
+//! * `writer` — **joins through the rendezvous** (`tf_tree::Open`), claims one
+//!   edge and publishes at its rate for the window.
+//!
+//! # Why the writer does not use the descriptor the reader uses
+//!
+//! `docs/decisions/0028` plan step 0b: `Tree::attach_shared(fd,
+//! AttachMode::ReadWrite)` returns `ShmError::ReadWriteNeedsRendezvous`. A
+//! read-write attach registers a participant record, and a bare descriptor has
+//! no lock file in which to take the byte that decides whether that record may
+//! be reclaimed — so a writer that arrived this way would be a `LIVE` record
+//! with a permanently free byte, indistinguishable from a slot leaked by a
+//! killed process. This binary was one of the two in-tree callers of that shape,
+//! and it *claimed an edge and published*, which is precisely the class the
+//! decision rules out.
+//!
+//! **What it costs the measurement: nothing that is measured.** The join happens
+//! before the writer's clock starts and before its `ProcStats` baseline is
+//! taken, so the rate loop — the thing the readers are contended by — is
+//! byte-for-byte the code it was. The handshake's own cost is reported as
+//! `join_ns` rather than hidden. The coordinator pays for it too, in that it now
+//! creates the arena through `tf_tree::Open` and runs an owner thread that sits
+//! in `epoll_wait` for the run; the readers still take the raw descriptor and
+//! still attach read-only, unchanged.
 //!
 //! # Why a reader runs two passes rather than one
 //!
@@ -50,6 +73,7 @@ use std::time::{Duration, Instant};
 use tf_tree::{AttachMode, Plan, Stamp, Tree};
 use tf_tree_bench::fixture;
 use tf_tree_bench::mp::{Histogram, ProcStats, RateLoop};
+use tf_tree_bench::shm_util::WRITER_SLACK_S;
 
 /// How many clock-pair reads the overhead control performs.
 const CLOCK_CALIBRATION_ITERS: usize = 100_000;
@@ -58,26 +82,96 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  \
          load_child reader <hz> <seconds> <lo_ns> <hi_ns> <target|source> [...]\n  \
-         load_child writer <rate_hz> <seconds> <seed> <next_stamp_ns> <parent> <child>\n\
+         load_child writer <arena> <rate_hz> <seconds> <seed> <next_stamp_ns> <parent> <child>\n\
          \n\
-         The shared arena arrives as this process's standard input."
+         A reader takes the shared arena on its standard input; a writer joins\n\
+         <arena> through the rendezvous, because a read-write attach over a bare\n\
+         descriptor is refused (docs/decisions/0028 step 0b)."
     );
     std::process::exit(2)
 }
 
-fn attach(mode: AttachMode) -> Tree {
+/// The reader's route in: the segment arrives on stdin and is mapped read-only.
+///
+/// No `mode` parameter any more. It had exactly two callers and one of them was
+/// the `ReadWrite` writer this file no longer has; leaving the parameter would
+/// leave a function whose only remaining argument value is the one every caller
+/// passes, and whose other value is now a runtime error.
+fn attach_read_only() -> Tree {
     let fd = std::io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .expect("segment from stdin");
-    Tree::attach_shared(fd, mode).expect("attach to the shared arena")
+    Tree::attach_shared(fd, AttachMode::ReadOnly).expect("attach to the shared arena")
+}
+
+/// The writer's route in: the rendezvous, which grants a participant slot and
+/// takes its lock byte.
+///
+/// Returns the tree and what the join cost, in nanoseconds. The cost is returned
+/// rather than swallowed because it is the one thing this change adds to the
+/// harness, and a number nobody can see is a number nobody can check.
+///
+/// `CreatePolicy::Never`: the coordinator created and is serving the arena. A
+/// writer that created one would publish into a segment no reader is attached
+/// to and still report a full row.
+///
+/// # `await_open`, not `open`, and why the bound is `WRITER_SLACK_S`
+///
+/// **This function is the only way this harness can now fail to reach the arena
+/// at all**, which the fd-inheritance attach it replaced could not: that one
+/// mapped a descriptor the child already held. Every writer here instead races
+/// the coordinator's owner thread, and `Open::open` is a *single* attempt —
+/// bounded by `DEFAULT_OPEN_TIMEOUT`, 5 s — after which this would panic and
+/// `contended_scaling`'s `assert!(c.wait()…success())` would take the whole
+/// sweep down. `Open::await_open` exists for exactly that race, and retries only
+/// what `is_retryable` admits: `ArenaAbsent` and `ArenaHeldButUnreachable`,
+/// "never started" and "not yet". The second is the one that can actually happen
+/// here — the owner's accept loop is one thread inside the coordinator process,
+/// and up to four writers connect to it at once on a box the sweep is
+/// deliberately oversubscribing. Everything else — a `FORMAT_VERSION` or
+/// `layout_hash` disagreement, a missing runtime directory — is terminal and
+/// comes back verbatim on the first attempt, so no budget is burned turning a
+/// precise message into a timeout.
+///
+/// The bound is [`WRITER_SLACK_S`] because that is the margin the *coordinator*
+/// already sized for this. A writer's rate loop runs `[join, join + seconds +
+/// WRITER_SLACK_S]` while its readers run `[0, seconds]`: the slack is what pays
+/// for a writer starting late, so a join inside it costs coverage the harness
+/// budgeted, and a join past it leaves the front of every reader row measuring a
+/// quiescent tree — the same silent failure `WRITER_SLACK_S` was introduced to
+/// stop, arriving from the other end of the window. So the retry is bounded by
+/// the point beyond which retrying successfully would produce a row not worth
+/// having, and failing there is the honest outcome rather than a regression: a
+/// real join has been measured at ~133 us (`docs/decisions/0028`), which fits
+/// inside this budget seven thousand times over.
+fn join_read_write(arena: &str) -> (Tree, u64) {
+    let start = Instant::now();
+    let tree = tf_tree::Open::new()
+        .name(arena)
+        .and_then(|o| {
+            o.mode(AttachMode::ReadWrite)
+                .create(tf_tree::CreatePolicy::Never)
+                .await_open(Duration::from_secs_f64(WRITER_SLACK_S))
+        })
+        .unwrap_or_else(|e| {
+            panic!(
+                "joining the arena {arena:?} through the rendezvous, within a \
+                 {WRITER_SLACK_S} s budget: {e}. Only ArenaAbsent and \
+                 ArenaHeldButUnreachable are retried inside it; anything else \
+                 came back on the first attempt. The coordinator creates the \
+                 arena with Backing::Served; a writer cannot attach over the \
+                 descriptor on stdin since docs/decisions/0028 step 0b"
+            )
+        });
+    (tree, start.elapsed().as_nanos() as u64)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("reader") if args.len() >= 6 => reader(&args[1..]),
-        Some("writer") if args.len() == 7 => writer(&args[1..]),
+        Some("writer") if args.len() == 8 => writer(&args[1..]),
         _ => usage(),
     }
 }
@@ -92,7 +186,7 @@ fn reader(args: &[String]) {
     let lo: i64 = args[2].parse().expect("lo_ns");
     let hi: i64 = args[3].parse().expect("hi_ns");
 
-    let tree = attach(AttachMode::ReadOnly);
+    let tree = attach_read_only();
     let plans: Vec<Plan> = args[4..]
         .iter()
         .map(|spec| {
@@ -293,13 +387,14 @@ fn clock_overhead() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn writer(args: &[String]) {
-    let rate_hz: f64 = args[0].parse().expect("rate_hz");
-    let seconds: f64 = args[1].parse().expect("seconds");
-    let seed: f64 = args[2].parse().expect("seed");
-    let next_stamp_ns: i64 = args[3].parse().expect("next_stamp_ns");
-    let (parent_name, child_name) = (&args[4], &args[5]);
+    let arena = &args[0];
+    let rate_hz: f64 = args[1].parse().expect("rate_hz");
+    let seconds: f64 = args[2].parse().expect("seconds");
+    let seed: f64 = args[3].parse().expect("seed");
+    let next_stamp_ns: i64 = args[4].parse().expect("next_stamp_ns");
+    let (parent_name, child_name) = (&args[5], &args[6]);
 
-    let tree = attach(AttachMode::ReadWrite);
+    let (tree, join_ns) = join_read_write(arena);
     let parent = tree
         .frame(parent_name)
         .unwrap_or_else(|e| panic!("frame {parent_name}: {e:?}"));
@@ -332,6 +427,10 @@ fn writer(args: &[String]) {
     let after = ProcStats::read();
     let d = after.since(before);
 
+    // Before `pushed`, so a writer that dies mid-window still reports what its
+    // join cost. The coordinator ignores lines it does not recognise, so this
+    // one is additive.
+    println!("join_ns {join_ns}");
     println!("pushed {pushed}");
     // Reported rather than swallowed. A writer whose pushes are being rejected
     // is not contending with anything, and a scaling row taken against one is a

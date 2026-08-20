@@ -31,6 +31,20 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 
+/// Slack added to a `contended_scaling` writer's publishing window, in seconds.
+///
+/// **Shared between the coordinator and `load_child`, and that is the point.**
+/// The coordinator spends it at the *end* — a writer that exits before the
+/// readers it contends with turns the tail of every reader row into a
+/// quiescent-tree measurement, silently — and the writer child spends it at the
+/// *start*, as the budget its rendezvous join is allowed to take. Both halves
+/// are the same margin: a writer's rate loop covers `[join, join + seconds +
+/// WRITER_SLACK_S]` while its readers cover `[0, seconds]`, so a join longer
+/// than this leaves more of the reader window uncontended than the harness ever
+/// budgeted for. Two copies of the number could drift into a window with a hole
+/// at both ends, which no column in the table would show.
+pub const WRITER_SLACK_S: f64 = 1.0;
+
 /// Spawn `program` with `segment` as its standard input.
 ///
 /// The segment's own fd is `CLOEXEC` — deliberately, so a shared arena never
