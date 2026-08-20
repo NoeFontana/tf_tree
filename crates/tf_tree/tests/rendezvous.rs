@@ -849,6 +849,68 @@ fn a_wait_for_an_arena_that_never_starts_gives_up() {
     );
 }
 
+/// **A whole-second budget is retried, not rejected.**
+///
+/// `await_open` derives each attempt's timeout by subtracting elapsed time from
+/// the caller's budget, and that subtraction is the only thing in the crate that
+/// manufactures a `Duration` nobody wrote. `await_open(Duration::from_secs(1))`
+/// reaches the handshake as `999.999_9xx ms` on the first iteration; the
+/// conversion to `SO_RCVTIMEO_NEW`'s `(tv_sec, tv_usec)` rounds the
+/// sub-microsecond tail up without carrying, yielding `tv_usec == 1_000_000`,
+/// which the kernel rejects with `EDOM`. That arrives as
+/// `IpcError::ClientSocketSetup`, which `is_retryable` calls **terminal** — so
+/// the call returned in microseconds with a local-resource error instead of
+/// waiting out its budget, and every whole-second budget was affected.
+///
+/// The budget is `1 s` and not `300 ms` **on purpose**:
+/// `a_wait_for_an_arena_that_never_starts_gives_up` uses 300 ms, whose remainder
+/// lands at `tv_usec == 300_000`, and that is why fifteen passing rendezvous
+/// tests were blind to this.
+///
+/// Mutant: delete the `Duration::new(secs, subsec_micros * 1_000)` truncation in
+/// `Open::await_open` ⇒ this fails on the error assertion with
+/// `ClientSocketSetup { raw_os_error: 33 }`, and on the elapsed one, having
+/// returned almost immediately.
+#[test]
+fn a_whole_second_wait_is_not_refused_by_the_socket_timeout() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let _scratch = Scratch::new("whole-second-budget");
+
+    let budget = Duration::from_secs(1);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = tf_tree::Open::new().await_open(budget);
+        let _ = tx.send((outcome.err(), started.elapsed()));
+    });
+
+    // Same shape as the test above, and for the same reason: there is no
+    // `.config/nextest.toml`, so nothing else bounds a call that hangs.
+    let (err, elapsed) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("await_open never returned");
+    let err = err.expect("an empty machine has no arena to open");
+
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+                | tf_tree::OpenError::Rendezvous(
+                    tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. }
+                )
+        ),
+        "a whole-second budget must end in the last retryable rendezvous error, \
+         not in a local socket failure: {err:?}"
+    );
+    assert!(
+        elapsed >= budget,
+        "it did not wait out a whole-second budget ({elapsed:?}) — the first \
+         attempt was refused before it could retry"
+    );
+}
+
 /// **`docs/decisions/0019` §2b's second wait: a frame interned after the arena
 /// already exists.**
 ///

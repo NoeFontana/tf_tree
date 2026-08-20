@@ -2191,42 +2191,91 @@ impl Tree {
     /// declared by the creator — so there is no builder here and none is
     /// possible: `docs/PROJECT.md` §5 D4 forbids growth, and a second process
     /// declaring edges into a fixed layout is exactly the growth that is
-    /// forbidden. An attached process reads, and publishes to edges it claims.
+    /// forbidden. **An attached process reads.** It does not publish: this path
+    /// takes [`AttachMode::ReadOnly`] and nothing else, and the paragraph below
+    /// is why.
     ///
-    /// Use [`AttachMode::ReadOnly`] unless this process actually publishes. It
-    /// maps `PROT_READ`, which makes corruption impossible rather than merely
-    /// impolite — the only real safety boundary in the trust model
-    /// (`docs/PHASE2.md` §0), and enforced by the MMU rather than by convention.
+    /// The read-only mapping is `PROT_READ`, which makes corruption impossible
+    /// rather than merely impolite — the only real safety boundary in the trust
+    /// model (`docs/PHASE2.md` §0), and enforced by the MMU rather than by
+    /// convention.
+    ///
+    /// # A writer joins through [`crate::Open`], not through a descriptor
+    ///
+    /// **This is a refusal, not advice:** [`AttachMode::ReadWrite`] here returns
+    /// [`ShmError::ReadWriteNeedsRendezvous`]
+    /// (`docs/decisions/0028-the-slot-a-killed-participant-keeps.md`, plan step
+    /// 0b). A read-write attach *registers a participant record*; the rendezvous
+    /// takes an OFD lock byte for its slot before writing that record, and a bare
+    /// descriptor has no lock file to take one in. A record with a permanently
+    /// free byte is indistinguishable, by the byte alone, from a slot leaked by a
+    /// killed process — so allowing one here would mean no reclaimer could ever
+    /// key on the byte.
+    ///
+    /// A read-only attach registers nothing (the table is in the arena and
+    /// writing it needs a writable mapping), so it can leak no slot and is
+    /// unaffected.
     ///
     /// # Errors
     ///
-    /// [`ShmError`] if the segment is unsealed (and so could be truncated under
-    /// a reader, faulting it with `SIGBUS`), is not a tf_tree arena, or was
-    /// written by a build with a different `FORMAT_VERSION` or record layout.
+    /// [`ShmError::ReadWriteNeedsRendezvous`] for a [`AttachMode::ReadWrite`]
+    /// `mode`, before the segment is even mapped. Otherwise [`ShmError`] if the
+    /// segment is unsealed (and so could be truncated under a reader, faulting it
+    /// with `SIGBUS`), is not a tf_tree arena, or was written by a build with a
+    /// different `FORMAT_VERSION` or record layout.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn attach_shared(fd: std::os::fd::OwnedFd, mode: AttachMode) -> Result<Tree, ShmError> {
+        refuse_a_byteless_writer(mode)?;
         Tree::attach_shared_inner(fd, mode, None)
     }
 
     /// Attach into the participant slot an owner granted (`docs/PHASE2.md` §3.7).
     ///
-    /// Used by [`crate::open`]; [`Tree::attach_shared`] is the fd-inheritance
-    /// path, where there is no owner to ask and the slot is self-assigned.
+    /// [`Tree::attach_shared`] is the fd-inheritance path, where there is no
+    /// owner to ask and the slot is self-assigned.
+    ///
+    /// **This entry point refuses [`AttachMode::ReadWrite`] for
+    /// [`Tree::attach_shared`]'s reason, and the slot argument does not change
+    /// it.** A caller holding a raw descriptor and a slot number holds no lock
+    /// byte for that slot: the byte is taken inside the rendezvous, by the
+    /// handshake that also produced the number. Being told a slot index is not
+    /// the same as having been granted one, and a `pub` entry point cannot tell
+    /// the two apart. [`crate::open`]'s joiner registers through a crate-private
+    /// path (`Tree::attach_joined_at`) that carries the byte as its
+    /// precondition.
     ///
     /// # Errors
     ///
-    /// As [`Tree::attach_shared`], plus [`ShmError::ParticipantTableFull`] if
-    /// the named slot is not free.
-    ///
-    /// That last case means the arena still holds a record for a participant
-    /// whose lock byte is already gone — the owner grants only slots its table
-    /// reports free, and this process only got here after taking the byte. A
-    /// **stale record with a free byte is exactly what reaping is for**
-    /// (`docs/PHASE2.md` §6.3, `docs/decisions/0005` step 8), and until that
-    /// lands there is nothing useful to retry: the owner would name the same
-    /// slot again. It is surfaced rather than papered over.
+    /// [`ShmError::ReadWriteNeedsRendezvous`] for a [`AttachMode::ReadWrite`]
+    /// `mode`. Otherwise as [`Tree::attach_shared`], plus
+    /// [`ShmError::ParticipantTableFull`] if the named slot is not free — which
+    /// a read-only attach cannot reach either, because it registers nothing.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn attach_shared_at(
+        fd: std::os::fd::OwnedFd,
+        mode: AttachMode,
+        slot: u32,
+    ) -> Result<Tree, ShmError> {
+        refuse_a_byteless_writer(mode)?;
+        Tree::attach_shared_inner(fd, mode, Some(slot))
+    }
+
+    /// [`Tree::attach_shared_at`] for the one caller that has already taken the
+    /// participant lock byte for `slot`.
+    ///
+    /// `pub(crate)`, with the byte as its precondition: the only caller is
+    /// [`crate::open`]'s `Joined` arm, which reaches here holding the
+    /// `tf_tree_ipc` session that took byte `slot` during the handshake
+    /// (`tf_tree_ipc/src/open.rs`'s `register_at`, before the arena record is
+    /// written). That is the whole difference between this and the `pub` entry
+    /// point above, and it is why this one may register a read-write
+    /// participant.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tree::attach_shared_at`], minus the refusal.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn attach_joined_at(
         fd: std::os::fd::OwnedFd,
         mode: AttachMode,
         slot: u32,
@@ -2684,6 +2733,29 @@ impl Drop for Tree {
                 .participants()
                 .release(self.participant, self.incarnation);
         }
+    }
+}
+
+/// Refuse a read-write attach that arrives over a bare file descriptor.
+///
+/// One function rather than a check repeated at each entry point, because there
+/// are two `pub` entry points and closing one of them closes nothing:
+/// [`Tree::attach_shared`] and [`Tree::attach_shared_at`] differ only in where
+/// the slot index comes from, and neither has a lock file to take a byte in
+/// (`docs/decisions/0028-the-slot-a-killed-participant-keeps.md` plan step 0b).
+///
+/// **Before the segment is mapped**, deliberately: the refusal is a property of
+/// the arguments alone, and a caller who gets it after a `SizeMismatch` would be
+/// told about the wrong thing.
+///
+/// [`AttachMode::ReadOnly`] passes through untouched. It registers no
+/// participant record at all — `attach_shared_inner` gives a non-writable
+/// backing the `u32::MAX` sentinel instead — so it can strand no slot.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn refuse_a_byteless_writer(mode: AttachMode) -> Result<(), ShmError> {
+    match mode {
+        AttachMode::ReadOnly => Ok(()),
+        AttachMode::ReadWrite => Err(ShmError::ReadWriteNeedsRendezvous),
     }
 }
 
@@ -3794,5 +3866,64 @@ mod tests {
             Some("12".to_owned()),
             "the fixture stopped demonstrating the trap it was chosen for"
         );
+    }
+
+    /// **`Tree::attach_shared(fd, ReadWrite)` returns an error, not a `Tree`.**
+    ///
+    /// `docs/decisions/0028` plan step 0b: a read-write attach registers a
+    /// participant record, and over a bare descriptor there is no lock file in
+    /// which to take the byte that record's liveness is decided by. Both `pub`
+    /// entry points refuse; closing one would close nothing, because the other
+    /// is byte-less in exactly the same way.
+    ///
+    /// **`ReadOnly` is checked in the same test, on both**, because a refusal
+    /// that also broke the reader path would pass an assertion that only looked
+    /// for the error.
+    ///
+    /// Mutant: delete either `refuse_a_byteless_writer` call ⇒ that arm returns
+    /// `Ok` and its `expect_err` fails.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[test]
+    fn a_read_write_attach_over_a_descriptor_is_refused_on_both_entry_points() {
+        let owner = TreeBuilder::new()
+            .static_edge("a", "b", &Iso3::IDENTITY)
+            .build_shared("tf_tree-attach-refusal-test")
+            .expect("build a shared arena");
+        let dup = || {
+            owner
+                .shared_fd()
+                .expect("a shared tree has a segment fd")
+                .try_clone_to_owned()
+                .expect("dup the segment fd")
+        };
+
+        assert_eq!(
+            Tree::attach_shared(dup(), AttachMode::ReadWrite).err(),
+            Some(ShmError::ReadWriteNeedsRendezvous),
+            "attach_shared handed out a byte-less writer"
+        );
+        // Slot 1 rather than 0: the owner holds 0, so a build that skipped the
+        // refusal would get past registration here and return a `Tree`, which
+        // is the failure this asserts against. `ParticipantTableFull` would be
+        // the *wrong* error and is not accepted.
+        assert_eq!(
+            Tree::attach_shared_at(dup(), AttachMode::ReadWrite, 1).err(),
+            Some(ShmError::ReadWriteNeedsRendezvous),
+            "attach_shared_at handed out a byte-less writer"
+        );
+
+        // And the reader path is untouched on both. A read-only attach registers
+        // no record at all, so it can strand no slot and has nothing to refuse.
+        let ro = Tree::attach_shared(dup(), AttachMode::ReadOnly)
+            .expect("a read-only fd attach still works");
+        assert!(!ro.is_writable());
+        assert_eq!(ro.arena_size_bytes(), owner.arena_size_bytes());
+
+        let ro_at = Tree::attach_shared_at(dup(), AttachMode::ReadOnly, 1)
+            .expect("a read-only fd attach at a named slot still works");
+        assert!(!ro_at.is_writable());
+        // The slot argument was ignored, as it always was for a read-only
+        // attach: there is no record to put anywhere.
+        assert_eq!(ro_at.participant, u32::MAX);
     }
 }
