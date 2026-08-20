@@ -1113,7 +1113,8 @@ Resolved before `draft -> ready`. A `ready` doc has none.
 
    The fd-passing attach is for **readers**. A process that writes joins through
    the rendezvous, which takes an OFD lock byte in `register_at`
-   (`tf_tree_ipc/src/open.rs:414-415`) before the arena record is written — so
+   (`tf_tree_ipc/src/open.rs:446`; `:414-415` was `register_any`'s doc comment
+   even when this was written) before the arena record is written — so
    every participant that can hold a slot holds a byte, and the byte is a total
    predicate. This is not a narrowing of the multi-writer model: D7 is one writer
    *per edge*, and several writer processes owning disjoint edges is exactly what
@@ -1747,6 +1748,87 @@ Resolved before `draft -> ready`. A `ready` doc has none.
    > *Not carried into the repository.* The model is evidence for a `draft` record,
    > not a test of shipped code, and landing a vacuous case under `just loom` would
    > be worse than not having it.
+   >
+   > ### Built again, twice, independently — and the gate is not a `loom` question
+   >
+   > **2026-08-20. Still not an answer. What this establishes is that the gate as
+   > worded cannot be discharged by a model of this kind, and why — which is a
+   > result about the gate, and it is what lets the gate be replaced with two
+   > obligations that *can* be met.**
+   >
+   > Two models were built from this record independently and without sight of one
+   > another: **A**, one slot changing hands, with a registrant that releases and a
+   > second that re-acquires, so a reclaimer's verdict can outlive the occupancy it
+   > was formed against; and **B**, two slots with an assigner, a sweeping
+   > reclaimer, and the byte as a per-slot lock. Both drive the real
+   > `register_at`/`fill_slot` and the real `FREE`/`RESERVED`/`live_word` encoding.
+   > Every number below was re-run by a second party on a binary they rebuilt.
+   >
+   > **Both are non-vacuous for the ordering and erasure properties, and both are
+   > vacuous for "no second occupant" — for the same structural reason.** That
+   > agreement is the finding. It was reached two ways:
+   >
+   > - In A, a control in which the reclaimer is made *byte-blind and maximally
+   >   hostile* — it frees any non-`FREE` word regardless of the byte — **still
+   >   passes** "no second occupant": 1 140 088 executions at
+   >   `LOOM_MAX_PREEMPTIONS=5`, during which it erased 151 590 `LIVE` records.
+   >   A control that reverses the mechanism under test into active hostility and
+   >   still passes means the model cannot see that hazard.
+   > - In B, the *antecedent* was counted directly: `register_at` was entered twice
+   >   on one slot in **0** executions, out of 260 350 at `P=3` and **7 993 469** at
+   >   `P=5`. No schedule could have failed the property.
+   >
+   > **The reason is not a modelling mistake, and building a third model will not
+   > fix it.** "No second occupant" is entailed by three facts a model must encode
+   > to be faithful at all — byte index equals record index, the byte is an
+   > exclusive lock, and the byte is held across the whole of `fill_slot` — and it
+   > needs no memory-ordering argument. `loom` decides questions about the C11
+   > memory model. **This one is a question about OFD lock semantics and about an
+   > index correspondence**, and no amount of preemption exploration will turn it
+   > into the other kind. B demonstrated the dependence: a variant identical to the
+   > real one except that a registrant releases its byte immediately after
+   > publishing **fails in 0.17 s**. What holds the property up is therefore an
+   > ordering the code arranges — `Tree`'s `Drop` releases the record
+   > (`tree.rs:2682-2685`) and only then the byte with the `Session` — rather than
+   > anything a model checker verified.
+   >
+   > **What the runs did establish, non-vacuously, and it is not nothing:**
+   >
+   > - **The ordering constraint of finding 3 above, now with a mechanism rather
+   >   than an observation.** Under word-then-byte, the `Acquire` load of a
+   >   `live_word` *synchronises-with* the publishing `Release` store, so a byte
+   >   probe sequenced after it must see the byte held. Reverse the two reads, or
+   >   take one up-front holder mask, and a published record is erased **in
+   >   0.00 s**. Both models, separately.
+   > - **No erasure under the correct order.** `reclaim_fired_on_LIVE = 0` in every
+   >   byte-holding configuration of A — 493 035 executions at `P=5`, with the
+   >   widened CAS actually firing 2 451 times, every one against a `RESERVED` word
+   >   whose byte a live registrant held. The stale-verdict-across-occupancies
+   >   hazard was reached and survived.
+   > - **B's `C4`: with byte index ≠ record index, two live participants reach one
+   >   arena record in ~2.6 s.** So #201 is not only a false verdict — at model
+   >   level it is the corruption this record exists to prevent.
+   >
+   > **The gate, restated as two obligations that can actually be met.** Replacing
+   > the sentence at the end of this block:
+   >
+   > 1. **A `loom` case for the ordering and erasure properties** — word observed
+   >    before byte probed, no published record erased. Built, passes
+   >    non-vacuously, with all three mandated controls failing.
+   > 2. **The byte/record correspondence asserted, and pinned by a multiprocess
+   >    test** — because that is the half `loom` structurally cannot reach. The
+   >    falsifier already exists and is on `main`:
+   >    `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`
+   >    (`crates/tf_tree/tests/rendezvous.rs`, #221).
+   >
+   > *Reading a `loom` verdict on these models.* Five reported failures were
+   > hand-checked and are **tool artifacts**, including one in which a thread's own
+   > `Acquire` load returned a value modification-order-earlier than that same
+   > thread's `Release` store — a same-thread coherence violation that no C11
+   > execution admits. `loom` 0.7.2's `match_rmw_to_stores` hands an RMW only
+   > modification-order-newest stores over a vector-clock partial order, and
+   > `compare_exchange` routes through it on both paths. **A pass is sound; a
+   > failure needs its witness hand-checked before it is believed.**
 
 ## What would make this `ready`
 
