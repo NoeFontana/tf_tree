@@ -33,6 +33,31 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A process's participant lock byte and its arena participant record could
+  carry different indices** (issue #201), which every liveness predicate in the
+  engine assumes cannot happen. `Open::attempt` now compares the two where they
+  are paired — the single `hold_ownership` call site, the one place in the
+  workspace that can see both, since `tf_tree_ipc` chooses the byte and has no
+  arena dependency — and refuses with the new
+  `OpenError::ParticipantSlotDiverged` instead of returning a `Tree` whose every
+  liveness answer is about another process. `docs/decisions/0028` plan step 0c.
+
+  **`CreatePolicy::Always` is the only policy that can reach it**, because §3.4
+  step 4 refuses to create while any participant byte is held and the escape
+  hatch skips that check by design. The state it lands on is a live *non-owner*
+  holding byte 0, which `tf_tree_ipc::Session::release_ownership` produces from
+  a documented §3.5 call — the route `0.0.3`'s *Known issues* entry said was not
+  known. A refusal costs the caller nothing: the check runs before the owner
+  server binds, so no peer ever saw the arena, and both the participant and
+  ownership bytes are released with the session. Stop the process still holding
+  the byte, or open with `CreatePolicy::IfAbsent`.
+
+  **New public API** on the `0.0.x` promise: `OpenError` gains a variant. It is
+  `#[non_exhaustive]`, so a caller matching with a wildcard arm is unaffected;
+  both bindings forward it by `Display` and needed no change.
+
 ## [0.0.3] — 2026-08-19 (first with a source distribution)
 
 **This release exists partly to prove one thing.** `0.0.2` has eleven wheels and

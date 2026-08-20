@@ -2384,6 +2384,15 @@ impl Tree {
     }
 
     /// Park the owner's session and serving thread.
+    ///
+    /// **This is not where the byte/record correspondence is checked**, though
+    /// it is the function that first has both numbers in one place and
+    /// `docs/PHASE2.md` §0.0 named it for that reason. The check is at the sole
+    /// call site, `crate::open::Open::attempt`, two statements earlier — *before*
+    /// `spawn_owner_server` binds the rendezvous socket, so a refusal happens
+    /// while the arena is still private (`docs/decisions/0028` plan step 0c). By
+    /// the time this is called, `session.slot() == self.participant` has already
+    /// been established.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub(crate) fn hold_ownership(
         &mut self,

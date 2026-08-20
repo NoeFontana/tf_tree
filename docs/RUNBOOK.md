@@ -476,9 +476,38 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   so no survivor can be holding byte 0 when the owner dies.
 
   What #201 needs is a **live holder of byte 0 that is not the arena owner**, and
-  nothing in the workspace produces one outside a test that takes the byte by
-  hand. That is not a proof that it is unreachable — only that it was not
-  constructed. `docs/decisions/0028`'s question 3 is where that gets settled.
+  there is one. `tf_tree_ipc::Session::release_ownership` gives up the ownership
+  byte while keeping participant byte 0 — exactly what §3.5 asks of it, "give up
+  the owner role while staying attached" — so it leaves a live non-owner on byte
+  0 from a documented call on a published crate. An earlier revision of this
+  paragraph said nothing in the workspace produced that state outside a test that
+  took the byte by hand, and called that a failed construction rather than an
+  unreachability argument. It was the former, and it was wrong: the state was
+  reproduced through published API on 2026-08-19 and is pinned by
+  `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`.
+
+  **So a forced create can now be refused, and that is what an operator will
+  see.** Against such a holder the creator takes participant byte **1** while its
+  fresh arena registers it at record **0**, and `Open::attempt` compares the two
+  before the arena is published: `open()` returns
+  `OpenError::ParticipantSlotDiverged` — *"this process's participant lock byte
+  and its arena participant record are different slots; the arena was not
+  published"* — instead of a `Tree` whose every liveness answer would be about
+  the holder. **Do not retry**: a second forced create against the same holder
+  diverges identically. Stop the process still holding byte 0 (`tf_tree
+  participants` names it from the lock file's identity records), or open with
+  `CreatePolicy::IfAbsent` and diagnose the wedge rather than create over it. A
+  refusal costs nothing and leaves nothing: it runs before the owner server
+  binds, so no peer ever saw the arena, and the participant and ownership bytes
+  are released with the session — the slot the bullet above says this policy
+  spends is not spent by an attempt that is refused.
+
+  **On a build without that check — `0.0.3` and earlier — the same call returns a
+  `Tree` instead**, and every predicate it answers about record 0 is really about
+  the holder's byte: `participant_alive(0)` reads `false` about a process that is
+  live, holds record 0, and has just pushed a sample. That is `0.0.3`'s *Known
+  issues* entry; [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md)
+  plan step 0c is the check that closed it.
 
 It joins rather than replaces when a server *is* reachable: `open()` probes the
 socket before it takes the ownership byte, so the policy abandons an unreachable
