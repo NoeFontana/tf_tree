@@ -27,8 +27,9 @@ clauses), `ecae587` (#221, the #201 falsifier).
 >
 > 1. **"The only `LIVE -> FREE` transition … has exactly one caller: `Tree`'s
 >    `Drop`"** (*The defect*, below) is no longer true. `528eddd` / #191 added a
->    second: the owner's socket-hangup callback at `crates/tf_tree/src/open.rs:764`
->    calls `table.release(slot, incarnation)`. Measured on a real two-process
+>    second: the owner's socket-hangup callback — `crates/tf_tree/src/open.rs:764`
+>    when this erratum was written, `:1262` at `f65343f` *(erratum 3)* — calls
+>    `table.release(slot, incarnation)`. Measured on a real two-process
 >    rendezvous arena — the read-write joiner `SIGKILL`ed under a running owner,
 >    slot 1's state word going `0x6` (LIVE) to `0x0` (FREE) within a second. The
 >    sentence describes `f058f4f` and stays as written; what it means today is
@@ -44,6 +45,46 @@ clauses), `ecae587` (#221, the #201 falsifier).
 >    #203 deliberately took neither of step 8's two branches, so **whether step 8
 >    reads as discharged is still the owner's call**.
 
+> **Errata, 2026-08-21**, on plan steps 3 and 4 landing. Both are the same
+> failure as the two above, one layer down: a citation that was true when it was
+> written and stopped being true under this record's own plan.
+>
+> 3. **Every "at `HEAD`" line number in this record had rotted**, because
+>    `crates/tf_tree/src/open.rs` has moved under five commits since `f058f4f`:
+>    `adeb158` (#191), `3636e21` (#227, step 0b), `d25557f` (#228, step 0c),
+>    `1b29208` (#229, step 9) and `f65343f` (#231, step 2) — four of them this
+>    record's own plan, none of them touching the assigner. They are re-resolved
+>    against **`f65343f`**, named as a commit so they cannot rot again, and the
+>    `f058f4f` numbers beside them are untouched: the assigner's
+>    `identity(slot).is_some()` skip is `open.rs:1207` (cited as `:709`), the
+>    hangup callback's `release` is `:1262` (cited as `:764`), the byte probe
+>    the skip sits above is `:1221` (cited as `:723`), the assigner's scan — the
+>    skip through the end of the closure — runs `:1207–1228` (cited as
+>    `709–732`), and `lock_probe` is opened at `:1133` (cited as `:635`). **The
+>    four single numbers were right when written**: all four resolve exactly at
+>    `528eddd`, the #191 branch commit these errata were checked against, whose
+>    squash on `main` is `adeb158`. They were pinned to a name that moves, which
+>    is the whole defect. Where steps 3 and 4 have now *landed*, the plan cites
+>    the post-step lines instead and says so.
+> 4. **The doc comment two passages quote from `ParticipantTableFull` is gone,
+>    and plan step 0b is what deleted it.** *Candidate A* cites
+>    `tree.rs:2182–2191` and open question 6's *"What (a) changes about the
+>    public surface"* cites `:2215–2221`, both for *"there is nothing useful to
+>    retry: the owner would name the same slot again"*. `rg 'nothing useful to
+>    retry'` returns nothing at `f65343f`, so a reader checking either citation
+>    today finds an invention — **and it was not one.** Both were accurate when
+>    written: the sentence was in `Tree::attach_shared_at`'s `# Errors` section,
+>    at `tree.rs:2182–2191` in `f058f4f` and at `:2226` in `3636e21^`, and
+>    `3636e21` (#227, **this record's plan step 0b**) removed the paragraph it
+>    sat in — the same commit that made a byte-less writer unable to attach at
+>    all, which is why the paragraph went. This entry is here rather than a
+>    silent deletion because "the quotation is fabricated" is what the evidence
+>    looks like at `HEAD` and is the wrong conclusion. What the variant documents
+>    now is one sentence, in another crate: *"Every participant slot is taken, so
+>    this process cannot join"* (`crates/tf_tree_arena/src/check.rs:77`). **The
+>    argument the quotation supported is unaffected and is now measured** rather
+>    than cited — see *Candidate A*.
+
 ### The defect
 
 Filed as issue #184. `docs/PHASE2.md` §5.1 is NORMATIVE and says it in one
@@ -55,9 +96,9 @@ sentence:
 > is a bug.**
 
 The owner's slot assigner decides from `state`. At `f058f4f`, the commit this
-record was opened against, `crates/tf_tree/src/open.rs:703` — and **unchanged at
-`HEAD`**, where `528eddd` has moved it to line 709 without touching it, which is
-the point of this record:
+record was opened against, `crates/tf_tree/src/open.rs:703` — and **unchanged
+until plan step 3 landed**, at `f65343f` sitting at line 1207, moved by five
+commits and touched by none of them, which is the point of this record:
 
 ```rust
 if table.identity(slot).is_some() {
@@ -198,7 +239,7 @@ participant that is merely starting. **On the joiner path that window does not
 exist, and it is the reverse that does.** The order is:
 
 1. Owner's `assign` closure picks a slot and sets its `granted` bit
-   (`tf_tree/src/open.rs:703–726` at `f058f4f`, `709–732` at `HEAD`), then
+   (`tf_tree/src/open.rs:703–726` at `f058f4f`, `1207–1228` at `f65343f`), then
    `HelloResponse` is sent
    (`tf_tree_ipc/src/server.rs:409–443`).
 2. Client takes the **lock byte**: `Open::register_at`
@@ -366,7 +407,7 @@ wrong:
 
 **3. The assigner decides from the byte.** Replace the `identity(slot).is_some()`
 skip with the byte probe that is already in scope eight lines below
-(`open.rs:717` at `f058f4f`, `723` at `HEAD`), and on
+(`open.rs:717` at `f058f4f`, `1221` at `f65343f`), and on
 `byte free + record not FREE` run the predicate and, if
 it fires, `reclaim` before granting. The near miss #184 identified is the whole
 point: **the authoritative signal is already at the point of decision, being
@@ -474,10 +515,17 @@ on §6.3.
 *Why it is not sufficient on its own, in one line:* the assigner would correctly
 **decide** the slot is free, and then `register_at` would refuse it, because
 `fill_slot` CASes from `FREE` and the record is still `LIVE`. The joiner gets
-`ShmError::ParticipantTableFull` (`tree.rs:2182–2191`, whose doc comment already
-predicts this exact outcome and says "there is nothing useful to retry"). A
-decides correctly and cannot act. It is a necessary half — it is piece 3 of the
-decision — and not a candidate by itself.
+`ShmError::ParticipantTableFull` (`tree.rs:2182–2191` at `f058f4f`, whose doc
+comment predicted this exact outcome and said "there is nothing useful to
+retry"). *(That doc comment was deleted by plan step 0b and the quotation no
+longer resolves — erratum 4. It needs no doc comment: the outcome is now
+measured. Run
+`the_assigner_collects_a_record_left_reserved_by_a_killed_registrant` against
+`f65343f` — where the assigner already fails to skip a `RESERVED` record,
+because `identity()` reports `None` for one — and it grants the slot, after
+which the joiner is refused `ParticipantTableFull` by its own
+`FREE -> RESERVED` CAS.)* A decides correctly and cannot act. It is a necessary
+half — it is piece 3 of the decision — and not a candidate by itself.
 
 ### Candidate C — two-phase publication, or a grace period
 
@@ -877,7 +925,8 @@ covered.
   `allow(unsafe_code)` exception is.
 - The assigner stops being able to answer "is this slot in use" from the arena
   alone, so the owner's serving thread now needs the lock file as well as the
-  table. It already opens one (`lock_probe`, `open.rs:635`).
+  table. It already opens one (`lock_probe`, `open.rs:1133` at `f65343f`,
+  `:635` when this was written).
 - The owner's second mapping becomes `ReadWrite`. Candidate B's justification for
   that is sound and survives into the decision: an owner either created the
   segment or took over by building one, so it always has a writable segment and
@@ -1113,10 +1162,29 @@ commit that adds it.
    between them make its subject unconstructible**, and the predicate no longer
    has two facts for it to exercise.
 3. **The assigner decides from the byte** and reclaims before granting
-   (`open.rs:709` at `HEAD`; `703` at `f058f4f`).
-   *Verified by:* §11.2 scenario 2b above — 128 sequential attach-then-`SIGKILL`
-   cycles against a 64-slot arena, every attach succeeding. Fails at HEAD on the
-   65th, which is what makes it a falsifier rather than a regression test.
+   (`open.rs:1207` at `f65343f`; `703` at `f058f4f`; the verdict is at `:1259`
+   and the `reclaim` at `:1296` as landed).
+   ~~*Verified by:* §11.2 scenario 2b above — 128 sequential
+   attach-then-`SIGKILL` cycles against a 64-slot arena, every attach
+   succeeding. Fails at HEAD on the 65th, which is what makes it a falsifier
+   rather than a regression test.~~
+   **That falsifier does not falsify, and the correction is the useful part.**
+   Scenario 2b **passes at `f65343f`** — measured, not predicted: `528eddd`/#191
+   landed after this plan was written, so a killed joiner's slot comes back
+   through the hangup callback and 128 cycles never exhaust the table. (Disable
+   only that callback and it fails on the **64th**, not the 65th: the owner
+   holds slot 0, so 63 slots are available to joiners.) It stays as the
+   end-to-end property, now satisfied by two independent mechanisms.
+   *Verified by*, as landed — three tests in
+   `crates/tf_tree/tests/rendezvous.rs`, each failing at `f65343f`:
+   `the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear` (a `LIVE`
+   record in a slot this owner never granted, which the callback structurally
+   cannot reach ⇒ `NoParticipantSlots`);
+   `the_assigner_collects_a_record_left_reserved_by_a_killed_registrant` (the
+   same, `RESERVED` ⇒ `ParticipantTableFull`, candidate A's argument performed by
+   the machine); and scenario 2b's `slot_recycling_under_abnormal_exit`, kept for
+   the property. Both of the first two **stage** their record — the states have
+   no producer reachable from public API here — and say so in their comments.
 4. **The hangup fast path**, i.e. the existing patch (`adeb158`, #191, already
    landed), rebased onto `reclaim` and onto the observed word rather than a
    separately-loaded incarnation. ~~It does not gain `RESERVED` collection; that
@@ -1129,7 +1197,13 @@ commit that adds it.
    not lose that.
    *Verified by:* a multiprocess test asserting the record reads `FREE` after the
    owner's `epoll` wakeup and **before** any new attach — which is what
-   distinguishes the fast path from step 3 doing the work.
+   distinguishes the fast path from step 3 doing the work. As landed, two:
+   `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` for the `LIVE`
+   word (#191's test, which the rebase must not break) and
+   `the_hangup_collects_a_record_left_reserved_by_a_killed_registrant` for the
+   widening this step is *for* — the second fails at `f65343f`, and fails again
+   if the callback's `!= FREE` is narrowed back to `== LIVE`, with the word
+   still reading `0x1` after two seconds of polling.
 5. **`Tree::reap_participants()`**, refused on a read-only tree.
    *Verified by:* kill the **owner**, then have a surviving read-write
    participant call it and assert the owner's slot returns to `FREE`. No hangup
@@ -1831,8 +1905,13 @@ Question 1 was answered by the owner on 2026-08-18; the other five below.
    > variant is needed — but its *meaning* widens from "somebody else got here
    > first" to "somebody reclaimed the slot under me", and the caller is wrong for
    > the second. `attach_shared_at` maps every `ParticipantError` to
-   > `ShmError::ParticipantTableFull`, whose doc comment (`tree.rs:2215–2221`) says
-   > "there is nothing useful to retry: the owner would name the same slot again".
+   `ShmError::ParticipantTableFull`, whose doc comment (`tree.rs:2215–2221`) says
+   > "there is nothing useful to retry: the owner would name the same slot again"
+   > *[erratum 4: accurate when written — the sentence was at `tree.rs:2226`
+   > then — and deleted since by plan step 0b (`3636e21`), so the citation no
+   > longer resolves. The deliberation is kept verbatim. The point being made,
+   > that (a) would widen `SlotTaken`'s meaning and make a retry right where
+   > the mapping said it was useless, does not depend on the quotation]*.
    > Under (a) a retry is exactly the right thing, so that doc comment and that
    > mapping both change with it. `register`'s loop is unaffected — it already
    > moves to the next slot on a lost CAS.

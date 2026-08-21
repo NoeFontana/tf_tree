@@ -1445,6 +1445,378 @@ fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
     );
 }
 
+/// **`docs/PHASE2.md` §11.2 scenario 2b — slot recycling under abnormal exit.**
+///
+/// Attach and `SIGKILL` a read-write participant 128 times against a 64-slot
+/// arena, one at a time; every attach must succeed. This is the end-to-end
+/// property `docs/decisions/0028` was opened about — #184 measured
+/// `slots=63reg/0alive` and every subsequent attach refused
+/// `NoParticipantSlots` — and it is the shape a crash-looping node produces in
+/// minutes.
+///
+/// **What it does and does not falsify, measured rather than asserted.** The
+/// record's plan names this as step 3's falsifier and says it "fails at HEAD on
+/// the 65th". That was written against `f058f4f`, before `528eddd`/#191 landed
+/// the owner's hangup callback, and it is **stale**: on `main` this test passes,
+/// because a `SIGKILL`ed joiner's socket closes, the owner's `epoll` reports
+/// `HUP`, and the callback already frees the record. Disabling only that
+/// callback and re-running gives
+///
+/// ```text
+/// attach 64 of 128 was refused: error the arena owner refused this attach:
+/// NoParticipantSlots ... every participant slot is taken.
+/// ```
+///
+/// — the 64th and not the 65th, because the owner holds slot 0 and only 63 are
+/// ever available to joiners. So this scenario pins the *property*, and after
+/// step 3 it holds through two independent mechanisms rather than one; what
+/// pins step 3 itself is
+/// [`the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`], which
+/// stages the state the hangup cannot reach.
+#[test]
+fn slot_recycling_under_abnormal_exit() {
+    let scratch = Scratch::new("recycle-2b");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    for cycle in 1..=128u32 {
+        let mut joiner = Kid::spawn(&scratch.0, &["join-rw"]);
+        let line = joiner.line();
+        assert!(
+            line.starts_with("joined "),
+            "attach {cycle} of 128 was refused: {line}"
+        );
+        // `kill` waits, so the kernel has torn down the child's descriptors by
+        // the time the next attach starts: its lock byte is released and its
+        // socket is closed with no cooperation from it.
+        joiner.kill();
+    }
+}
+
+/// **`docs/decisions/0028` plan step 3 — the assigner decides from the byte.**
+///
+/// The step-3 falsifier, and it exists because §11.2's scenario 2b above stopped
+/// being one when #191 landed. The state under test is the one the hangup
+/// callback structurally cannot reach: **a participant record that is not
+/// `FREE`, whose lock byte the kernel reports free, in a slot this owner never
+/// granted.** 0028's *"Five places candidate B does not reach"* lists its real
+/// producers — a §3.5 heir serving an arena whose participants connected to the
+/// dead owner, the `epoll::add` failure path (`tf_tree_ipc/src/server.rs`,
+/// which deliberately declines to call `on_hangup` after a successful
+/// handshake), and the owner's own record — and every one of them is
+/// unreachable from public API at `main`: §3.5 is unwired, `epoll::add` fails
+/// only under `ENOSPC`/`ENOMEM`, and an owner's death takes its rendezvous with
+/// it.
+///
+/// So the state is **staged** rather than produced, through `unstable`'s
+/// `Tree::arena_view` and `tf_tree_core`'s `ParticipantTable::register_at` —
+/// the same API a joiner registers itself with, called by a joined read-write
+/// participant for slots that are not its own. That is a fixture and this
+/// comment says so; what makes it the right fixture is that it is
+/// *indistinguishable at the assigner* from all three real producers, which is
+/// the only property the assigner can act on.
+///
+/// The recorded pid is `u32::MAX`, which no process can have — and it is
+/// **decorative**: the predicate this test drives consults the OFD lock byte
+/// and nothing else (`reclamation_verdict`, 0028 open question 1). A test that
+/// depended on the pid would be testing a `/proc` conjunct that was deliberately
+/// removed.
+///
+/// Before step 3 the owner skips every one of these slots for ever
+/// (`table.identity(slot).is_some()`) and the attach below is refused
+/// `NoParticipantSlots`. After it, the first stale record whose byte reads free
+/// is reclaimed and the slot granted.
+#[cfg(feature = "unstable")]
+#[test]
+fn the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear() {
+    use tf_tree_core::participant::{state_of, FREE};
+
+    let scratch = Scratch::new("assigner-reclaims");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    // A joined read-write participant, so the staging writes go through a
+    // writable mapping. It also holds a slot of its own, which the loop below
+    // leaves alone because `register_at` refuses a slot that is not `FREE`.
+    let sweeper = join_as_sweeper();
+    let view = sweeper.arena_view();
+    let table = view.participants();
+    let capacity = u32::try_from(table.capacity()).unwrap();
+
+    let mut staged = 0u32;
+    for slot in 0..capacity {
+        // `u32::MAX` for the pid: see this test's doc comment.
+        if table.register_at(slot, u32::MAX, 0, 0).is_ok() {
+            staged += 1;
+        }
+    }
+    assert_eq!(
+        staged,
+        capacity - 2,
+        "every slot but the owner's and the sweeper's should have been free to \
+         stage; the fixture is not staging what it thinks it is"
+    );
+
+    // The precondition, asserted rather than assumed: there is now no slot an
+    // assigner reading `state` alone could hand out.
+    for slot in 0..capacity {
+        let word = table
+            .get(slot)
+            .expect("slot in range")
+            .state
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(
+            state_of(word),
+            FREE,
+            "slot {slot} still reads FREE, so a grant would prove nothing"
+        );
+    }
+
+    let mut joiner = Kid::spawn(&scratch.0, &["join-rw"]);
+    let line = joiner.line();
+    assert!(
+        line.starts_with("joined "),
+        "the owner must reclaim a stale record and grant its slot; every slot \
+         held a record for a pid that cannot exist, and its lock byte was never \
+         taken: {line}"
+    );
+}
+
+/// **`docs/decisions/0028` plan step 3 — the assigner collects a `RESERVED`
+/// record, which nothing in this workspace ever collected.**
+///
+/// The behaviour change steps 3 and 4 are *for* is not that a dead `LIVE`
+/// record is collected — #191's hangup callback already did that, which is why
+/// §11.2 scenario 2b passes at `HEAD` — but that a **`RESERVED`** one is.
+/// `identity()` returns `None` for a `RESERVED` word, so `release` could never
+/// name such a slot and no code in this workspace collected one: a process
+/// killed inside `fill_slot`'s two-phase publication lost its slot to
+/// everybody, for the life of the segment. §11.3's
+/// `attach.after_slot_assigned_before_publish` row promised it "cleared by any
+/// reaper" with no reaper behind it.
+///
+/// **This is a staged fixture and this sentence is the disclosure.** The window
+/// is `fill_slot`'s `FREE -> RESERVED` CAS to its publishing `Release` store —
+/// four `Relaxed` stores and one `fetch_add` — so a test that tried to
+/// `SIGKILL` a registrant inside it would be a flake with an arbitrarily small
+/// hit rate, not a test. The record is therefore built the way
+/// [`the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`] builds
+/// its stale `LIVE` one: through `ParticipantTable::register_at`, which **is**
+/// `fill_slot`, and then the state word driven back to `RESERVED`. That rewinds
+/// exactly one instruction of the protocol — the publishing store — and leaves
+/// the bytes a registrant killed after its last identity store leaves, its
+/// incarnation bump included.
+///
+/// What makes it the right fixture is the same property the sibling test rests
+/// on: it is **indistinguishable at the assigner** from the real producer. The
+/// assigner reads a `state` word and a lock byte, and both are what a killed
+/// registrant leaves.
+///
+/// **What this fails with at `HEAD` is candidate A's argument, performed.**
+/// `identity()` reports `None` for a `RESERVED` word, so `HEAD`'s assigner does
+/// not skip these slots — it *grants* one, and then `fill_slot`'s
+/// `FREE -> RESERVED` CAS refuses the joiner the slot it was just given:
+///
+/// ```text
+/// the owner must reclaim a RESERVED record and grant its slot; ...: error
+/// ParticipantTableFull
+/// ```
+///
+/// That is `0028`'s *"decides correctly and cannot act"* — deciding without
+/// reclaiming leaves the grant useless — with a different error than the
+/// `LIVE` case's `NoParticipantSlots`, because the refusal comes from the
+/// joiner's own CAS rather than from the owner's scan.
+///
+/// Mutant (the narrowing this test exists to fail, and the one a reviewer
+/// reaches for): give the assigner's `Reclamation::Reclaimable` arm an
+/// `if state_of(observed) != LIVE { continue; }`, i.e. reclaim only the shape
+/// #191 already handled. Applied and run: this test fails at the assertion
+/// below with `NoParticipantSlots`, and it is the **only** test in the
+/// rendezvous target that fails — 28 of 29 pass, including
+/// [`the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`], which is
+/// why that test alone did not pin step 3's widening.
+#[cfg(feature = "unstable")]
+#[test]
+fn the_assigner_collects_a_record_left_reserved_by_a_killed_registrant() {
+    use std::sync::atomic::Ordering;
+    use tf_tree_core::participant::{state_of, FREE, RESERVED};
+
+    let scratch = Scratch::new("assigner-reserved");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    let view = sweeper.arena_view();
+    let table = view.participants();
+    let capacity = u32::try_from(table.capacity()).unwrap();
+
+    let mut staged = 0u32;
+    for slot in 0..capacity {
+        // `register_at` *is* `fill_slot`, so the slot passes through `RESERVED`
+        // on its way to `LIVE` here exactly as a joiner's does; the store below
+        // rewinds the last instruction of that protocol and nothing else.
+        if table.register_at(slot, u32::MAX, 0, 0).is_ok() {
+            table
+                .get(slot)
+                .expect("slot in range")
+                .state
+                .store(RESERVED, Ordering::Release);
+            staged += 1;
+        }
+    }
+    assert_eq!(
+        staged,
+        capacity - 2,
+        "every slot but the owner's and the sweeper's should have been free to \
+         stage; the fixture is not staging what it thinks it is"
+    );
+
+    // The precondition, asserted rather than assumed, and asserted as
+    // `RESERVED` rather than as "not `FREE`": a fixture that had left these
+    // `LIVE` would pass under the mutant above and prove nothing about the
+    // word this test is named for.
+    for slot in 0..capacity {
+        let word = table
+            .get(slot)
+            .expect("slot in range")
+            .state
+            .load(Ordering::Acquire);
+        assert_ne!(
+            state_of(word),
+            FREE,
+            "slot {slot} still reads FREE, so a grant would prove nothing"
+        );
+        if slot != 0 && slot != sweeper.participant_slot() {
+            assert_eq!(
+                state_of(word),
+                RESERVED,
+                "slot {slot} is the staged shape and must read RESERVED"
+            );
+        }
+    }
+
+    let mut joiner = Kid::spawn(&scratch.0, &["join-rw"]);
+    let line = joiner.line();
+    assert!(
+        line.starts_with("joined "),
+        "the owner must reclaim a RESERVED record and grant its slot; every \
+         slot held one, left by a registrant killed between `fill_slot`'s CAS \
+         and its publishing store, and no lock byte was held: {line}"
+    );
+}
+
+/// **`docs/decisions/0028` plan step 4 — the hangup callback collects a
+/// `RESERVED` record, which `release` structurally could not.**
+///
+/// The same behaviour change as
+/// [`the_assigner_collects_a_record_left_reserved_by_a_killed_registrant`],
+/// on the other of the two callers. Step 4 replaced
+/// `identity(slot)` + `release(slot, incarnation)` with one `state` load handed
+/// to `ParticipantTable::reclaim`, and the widening is the whole of what that
+/// buys: `identity` returns `None` for a `RESERVED` word, so the old callback
+/// walked past this record no matter how long its process had been dead.
+///
+/// **Staged, for the reason the sibling test states**, and staged on a
+/// participant that is *really there*: the peer joins through the real
+/// rendezvous, takes its real lock byte, and its record is then rewound to the
+/// word `fill_slot` leaves between its CAS and its publishing store. The
+/// `SIGKILL` after that is not staged — the kernel closes the socket and
+/// releases the byte with no cooperation from the peer — so what the owner's
+/// `epoll` sees, and what its callback then reads, is exactly what a registrant
+/// killed in that window produces.
+///
+/// **This isolates the callback from the assigner**, which is the point of
+/// asserting on the word rather than on a later attach: no process joins after
+/// the kill, so `assign` never runs, and the only thing that can drive this
+/// word to `FREE` is the hangup callback. (`Tree`'s `Drop` cannot: it is
+/// `release`, whose CAS names `live_word(inc)` and cannot match the bare
+/// constant `RESERVED` — and the peer was `SIGKILL`ed, so it ran no `Drop` at
+/// all.)
+///
+/// Mutant (the narrowing this test exists to fail): restore the callback's
+/// pre-step-4 narrowness by testing `state_of(observed) == LIVE` instead of
+/// `!= FREE`. Applied and run: this test fails after the full two seconds of
+/// polling with *"slot 2 is still 0x1"*, and it is the only failure in the
+/// target — 28 of 29 pass. `HEAD` itself fails it the same way, for the same
+/// reason by a different route: `identity()` returns `None` for `0x1`, so the
+/// `if let Some(..)` never enters.
+#[cfg(feature = "unstable")]
+#[test]
+fn the_hangup_collects_a_record_left_reserved_by_a_killed_registrant() {
+    use std::sync::atomic::Ordering;
+    use tf_tree_core::participant::{state_of, FREE, LIVE, RESERVED};
+
+    let scratch = Scratch::new("hangup-reserved");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    let mut peer = Kid::spawn(&scratch.0, &["join-rw"]);
+    assert!(peer.line().starts_with("joined "), "peer did not join");
+
+    let view = sweeper.arena_view();
+    let table = view.participants();
+    let capacity = u32::try_from(table.capacity()).unwrap();
+    let mine = sweeper.participant_slot();
+
+    // The peer's slot is **derived, not assumed**: the three live records are
+    // the owner's (slot 0, which it registers as the arena's creator), this
+    // process's, and the peer's, so the peer is the one that is neither.
+    let live: Vec<u32> = (0..capacity)
+        .filter(|slot| {
+            let word = table
+                .get(*slot)
+                .expect("slot in range")
+                .state
+                .load(Ordering::Acquire);
+            state_of(word) == LIVE
+        })
+        .collect();
+    assert!(
+        live.len() == 3 && live.contains(&0) && live.contains(&mine),
+        "the owner (slot 0), this process (slot {mine}) and the peer should \
+         hold the only live records; instead: {live:?}"
+    );
+    let peer_slot = *live
+        .iter()
+        .find(|slot| **slot != 0 && **slot != mine)
+        .expect("the peer holds a live record");
+
+    // Rewind the peer's record to the word `fill_slot` leaves between its CAS
+    // and its publishing store, then kill it. The peer never reads its own
+    // record, so this changes nothing about the process — only about what the
+    // owner finds when the socket closes.
+    table
+        .get(peer_slot)
+        .expect("slot in range")
+        .state
+        .store(RESERVED, Ordering::Release);
+    peer.kill();
+
+    // Asynchronous by construction — a different process, on a different
+    // thread — so this is a bounded wait that fails by timing out, the same
+    // shape `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` uses.
+    let mut word = RESERVED;
+    for _ in 0..100 {
+        word = table
+            .get(peer_slot)
+            .expect("slot in range")
+            .state
+            .load(Ordering::Acquire);
+        if state_of(word) == FREE {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        state_of(word),
+        FREE,
+        "the owner's hangup callback must collect a RESERVED record, not only \
+         a LIVE one; slot {peer_slot} is still {word:#x} two seconds after the \
+         registrant holding it was killed"
+    );
+}
+
 /// A read-only peer and a read-write peer get different slots.
 ///
 /// **What this verifies, and what it cannot.** `mode="ro"` is the consumer
@@ -1749,7 +2121,16 @@ fn lock_path(scratch: &std::path::Path) -> PathBuf {
 /// takes a `Tree` and a slot and there is no line protocol to invent: the seam
 /// returns the verdict directly, so a failing assertion prints the verdict
 /// rather than a parse of one.
-#[cfg(feature = "test-hooks")]
+///
+/// `unstable` is on the gate as well as `test-hooks` because `0028`'s three
+/// step-3 and step-4 tests all need the same participant — a joined read-write
+/// process that is not the owner — to reach the participant table through
+/// `Tree::arena_view`:
+/// [`the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`],
+/// [`the_assigner_collects_a_record_left_reserved_by_a_killed_registrant`] and
+/// [`the_hangup_collects_a_record_left_reserved_by_a_killed_registrant`]. A
+/// second copy of these six lines is the kind of duplication `CLAUDE.md` names.
+#[cfg(any(feature = "test-hooks", feature = "unstable"))]
 fn join_as_sweeper() -> tf_tree::Tree {
     tf_tree::Open::new()
         .mode(tf_tree::AttachMode::ReadWrite)
