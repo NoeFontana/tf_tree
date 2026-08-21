@@ -303,6 +303,126 @@ impl<'a> ParticipantTable<'a> {
         );
     }
 
+    /// Free a slot whose participant is gone, guarded by the state word the
+    /// caller observed.
+    ///
+    /// One `compare_exchange(observed, FREE)`, so **any** change to the word
+    /// between the caller's observation and this CAS aborts the reclamation.
+    /// It differs from [`ParticipantTable::release`] in one way that matters: it
+    /// needs no incarnation, because the observed word carries it —
+    /// [`live_word`] packs the incarnation into the high 30 bits. `release`
+    /// stays exactly as it is for the clean-detach path; this is the path for a
+    /// slot whose process never ran `Drop` (`docs/decisions/0028`).
+    ///
+    /// **The liveness verdict is not taken here.** `docs/PHASE2.md` §5.1 is
+    /// normative that "whether it is live is a kernel fact": the caller decides
+    /// from the participant's OFD lock byte and this is only the guarded store
+    /// that acts on the decision. Nothing in this function reads `heartbeat`,
+    /// and `state` selects *which* slots are candidates rather than answering
+    /// whether a process is alive.
+    ///
+    /// Returns whether the CAS succeeded — i.e. whether the word was still
+    /// `observed` and is now [`FREE`]. An `observed` of [`FREE`] is vacuously
+    /// such a case and collects nothing; callers pass a non-`FREE` word because
+    /// a `FREE` slot has nothing to collect. `false` for a slot beyond the
+    /// table.
+    ///
+    /// # `RESERVED` is accepted, and *only* under two preconditions
+    ///
+    /// `observed` may be [`RESERVED`] as well as `live_word(inc)`. Unlike
+    /// `live_word`, **`RESERVED` is one bare constant carrying no
+    /// incarnation**: two different occupancies of a slot are byte-identical
+    /// words, so against it the CAS guard degenerates to an ABA and cannot tell
+    /// a killed registrant from a running one. What makes accepting it safe is
+    /// therefore not this function. It is two properties of the code around it,
+    /// and **if either stops holding, this must be narrowed back to
+    /// `live_word(inc)`**:
+    ///
+    /// 1. **Every process that writes a record holds the matching lock byte
+    ///    across the whole of `fill_slot`.** `Tree::attach_shared` and
+    ///    `Tree::attach_shared_at` refuse `ReadWrite`, so a writer joins through
+    ///    the rendezvous, which takes the byte before the arena record is
+    ///    written (`0028` step 0b).
+    /// 2. **The lock byte and the arena record index are the same integer**,
+    ///    asserted where the two are paired rather than assumed (`0028` step
+    ///    0c). Without it a reclaimer asks the kernel about one participant and
+    ///    frees another's record.
+    ///
+    /// With both, the byte — not the word — is the occupancy authority, and a
+    /// stale verdict that frees a `RESERVED` word frees one whose byte a live
+    /// joiner holds. That joiner publishes over it and is *correct* to, because
+    /// it really does own the slot: the outcome is a spurious free, not a second
+    /// occupant. Without either, it **is** a second occupant, sharing the
+    /// `slot + 1` owner encoding that claims (A3) and the topology lock (A2)
+    /// rest on. `0028` open question 6 works that interleaving through; an
+    /// earlier revision of that record shipped the opposite claim, which is why
+    /// the precondition is stated here and not left as a rule.
+    ///
+    /// # Ordering — a caller obligation, not an implementation detail
+    ///
+    /// A caller must **observe the word before it probes the byte**. The
+    /// `Acquire` load that produces a `live_word` synchronises-with
+    /// `fill_slot`'s publishing `Release` store, so a byte probe sequenced after
+    /// it must see the byte held. Reversed — byte first, or one up-front holder
+    /// mask such as `LockFile::held_participants()` returns — a reclaimer probes
+    /// a byte before its joiner takes it, then observes the record that joiner
+    /// has since published, and erases it.
+    /// `loom_tests::reclaim_races_register` is that property, and it ships with
+    /// two **runnable** failing controls: reversing the two reads erases a
+    /// published record, and so does keeping the order while weakening the
+    /// observation to `Relaxed`. The obligation is therefore the `Acquire`, not
+    /// the source order. That model says nothing about the CAS below it — see
+    /// the next section, and its own doc comment, which measures how little.
+    ///
+    /// # Ordering — this CAS's own strength, which no test here distinguishes
+    ///
+    /// Written down because it is **unpinned**, rather than left for the next
+    /// reader to discover and quietly "simplify": weakening this
+    /// `compare_exchange` to `Relaxed`/`Relaxed` passes the whole `tf_tree_core`
+    /// suite and all of `cargo xtask loom`, controls included — measured on
+    /// 2026-08-21 (71 unit tests, 20 loom models, all green), not assumed. The loom model above is about the *caller's* read order and
+    /// never reaches this CAS on a contended slot; the unit tests that do reach
+    /// it are single-threaded, where every ordering is equivalent. `AcqRel` is
+    /// here on a protocol argument, and `docs/PHASE1.md` §10.2 is why that
+    /// argument has to be stated rather than implied:
+    ///
+    /// - **The `Release` half orders this reclaimer's decision *inputs* before
+    ///   the store that acts on them.** The verdict is formed from the state
+    ///   word and the OFD byte, and for `RESERVED` — which carries no
+    ///   incarnation, so the guard below degenerates to an ABA — the byte is the
+    ///   whole of it. A `Relaxed` store may be reordered before a preceding
+    ///   load: the slot could become `FREE` to other threads before the probe
+    ///   has read the byte, which is a reclaimer acting on a verdict it has not
+    ///   finished forming. Nothing in this workspace can measure that, because
+    ///   the probe is `F_OFD_GETLK` — a syscall, and a syscall is a barrier on
+    ///   every architecture this builds for. The ordering is stated for the
+    ///   model, and the model is where the byte-as-authority argument lives.
+    /// - **The `Acquire` half publishes the collected occupancy to the
+    ///   collector.** A successful CAS *reads* the word `fill_slot` released, so
+    ///   `Acquire` makes it synchronise-with that publication and the `pid` and
+    ///   `start_time` written `Relaxed` under `RESERVED` are visible to whoever
+    ///   just reclaimed the slot — which is what `0028` piece 4 and `TFT014`
+    ///   report out of a sweep.
+    /// - **`Acquire` on failure leaves a losing caller ordered after the
+    ///   occupancy that defeated it.** A `false` return is a load of the word
+    ///   that beat this verdict; the same synchronises-with edge means the
+    ///   identity a caller re-reads *after* the failure belongs to the new
+    ///   occupant. Without it a sweep that retries can re-read the dead
+    ///   process's identity, re-form the same verdict, and name a participant
+    ///   that has already been replaced.
+    /// - **It is the same store [`ParticipantTable::release`] makes**, from the
+    ///   clean-detach path, at the same strength. The two differ in their guard,
+    ///   not in what they publish, and a slot freed by a reaper being weaker
+    ///   than one freed by its owner would need a reason nobody has.
+    pub fn reclaim(&self, slot: u32, observed: u32) -> bool {
+        let Some(rec) = self.get(slot) else {
+            return false;
+        };
+        rec.state
+            .compare_exchange(observed, FREE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Read a slot's `(pid, start_time, incarnation)` if it is [`LIVE`].
     ///
     /// The Acquire load pairs with `register`'s Release store, so a caller that
