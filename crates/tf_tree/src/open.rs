@@ -264,9 +264,11 @@ pub(crate) enum Reclamation {
 ///    [`Reclamation::Reclaimable`] carries the word instead of leaving the
 ///    caller to fetch one. A reload yields the same word in every state a test
 ///    can stage, so nothing in this workspace fails when one is introduced.
-///    **Step 1 has not landed. Until it does, that half is argued and
-///    modelled, not tested** — and this paragraph is the notice, not a plan to
-///    leave it so.
+///    **Step 1 has landed** (`ParticipantTable::reclaim`, and
+///    `reclaim_races_register` beside it), so that half is modelled rather than
+///    merely argued — but it is modelled *there* and not tested *here*, and the
+///    two are not the same claim: `loom` reasons about the C11 ordering, while
+///    nothing in this crate's tests fails when a reload is introduced.
 ///
 /// # The `FREE` word is a live participant, more often than not
 ///
