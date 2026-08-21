@@ -84,14 +84,41 @@ fn open_claim_lock(rv: &Rendezvous) -> Result<std::sync::Arc<tf_tree_ipc::LockFi
 /// kernel's own answer.
 pub(crate) struct LivenessProbe {
     lock: tf_tree_ipc::LockFile,
+    /// How many times [`Self::is_held`] has asked the kernel.
+    ///
+    /// **`#[cfg(feature = "test-hooks")]`, absent from every shipped build**,
+    /// and it exists for one reason: it is the only part of
+    /// [`reclamation_verdict`]'s third constraint that a test in this workspace
+    /// can observe. *Which* of the two reads happened first is not visible in
+    /// any sequence of stable slot states — only in an interleaving, which is
+    /// `loom`'s job (0028 plan step 1) — but *whether the byte was read at all*
+    /// is visible, and a predicate that decides a `FREE` word without a syscall
+    /// is a predicate that reached the word first. See
+    /// [`reclamation_verdict_for_test`], which renders this, and
+    /// `a_free_word_is_decided_without_asking_the_kernel`, which asserts it.
+    #[cfg(feature = "test-hooks")]
+    probes: std::sync::atomic::AtomicU32,
 }
 
 impl LivenessProbe {
+    /// Wrap a description this caller already opened.
+    ///
+    /// One constructor rather than two struct literals, so the `test-hooks`
+    /// field above is initialised in one place instead of behind a `#[cfg]` at
+    /// every construction site.
+    fn from_lock(lock: tf_tree_ipc::LockFile) -> LivenessProbe {
+        LivenessProbe {
+            lock,
+            #[cfg(feature = "test-hooks")]
+            probes: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
     /// Open a second description of the rendezvous lock file.
     fn open(rv: &Rendezvous) -> Result<LivenessProbe, IpcError> {
-        Ok(LivenessProbe {
-            lock: tf_tree_ipc::LockFile::open(rv.lock_path())?,
-        })
+        Ok(LivenessProbe::from_lock(tf_tree_ipc::LockFile::open(
+            rv.lock_path(),
+        )?))
     }
 
     /// Whether `slot`'s byte is held, or `None` if the kernel could not say.
@@ -100,8 +127,260 @@ impl LivenessProbe {
     /// caller turns "cannot tell" back into the `/proc` inference rather than
     /// into a "dead" verdict that would steal a working process's claim.
     pub(crate) fn is_held(&self, slot: u32) -> Option<bool> {
+        // Counted before the syscall, not after: what a test asks is whether
+        // the kernel was *reached*, and an `Err` from the probe is still a
+        // read of the byte.
+        #[cfg(feature = "test-hooks")]
+        self.probes.fetch_add(1, Ordering::Relaxed);
         self.lock.probe_participant(slot).ok().map(|p| p.held)
     }
+
+    /// How many times this probe has asked the kernel. Test scaffolding; see
+    /// the field.
+    #[cfg(feature = "test-hooks")]
+    fn probe_count(&self) -> u32 {
+        self.probes.load(Ordering::Relaxed)
+    }
+}
+
+/// What a reclamation sweep may do with one participant slot.
+///
+/// `docs/decisions/0028-the-slot-a-killed-participant-keeps.md`, the Decision's
+/// piece 2. Three answers, and exactly one of them is destructive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+pub(crate) enum Reclamation {
+    /// The record may be collected, and `observed` is the `state` word this
+    /// verdict was formed against.
+    ///
+    /// **The word is carried rather than left to the caller to re-read.**
+    /// `ParticipantTable::reclaim` (0028 piece 1) is a
+    /// `compare_exchange(observed, FREE, ..)` against *the word the caller
+    /// observed*, and by [`reclamation_verdict`]'s third constraint that has to
+    /// be the word observed **before** the byte was probed. A caller that
+    /// re-loaded `state` to build the CAS guard would hold a word read *after*
+    /// the probe, which is the failing order — so the word travels with the
+    /// verdict and there is nothing to re-read.
+    Reclaimable { observed: u32 },
+    /// Somebody is running here, or the slot is this process's own. Not
+    /// collectable.
+    Live,
+    /// No verdict, so **not collectable** — `docs/PHASE2.md` §6.2's fail-safe
+    /// direction. Either the kernel declined to answer, or the slot holds no
+    /// record to collect at all (a `FREE` word).
+    Unknown,
+}
+
+/// Whether `slot`'s participant record may be reclaimed — from the lock byte,
+/// and from nothing else.
+///
+/// `docs/decisions/0028-the-slot-a-killed-participant-keeps.md` piece 2, plan
+/// step 2. **One predicate, named once:** every reclamation decision goes
+/// through this function, and a second copy of it is the defect that record was
+/// opened about, re-created. `docs/PHASE2.md` §5.1 is NORMATIVE and this is its
+/// sentence in code — *"whether it is live is a kernel fact"* — so consulting
+/// the byte needs no amendment to it, because consulting the byte is what it
+/// prescribes.
+///
+/// # Scope: a tree that carries a probe, and the **two** steps that buy it
+///
+/// A [`LivenessProbe`] is installed by [`Open::attempt`] and by nothing else,
+/// so this predicate only ever runs against a tree obtained from the
+/// rendezvous. That is the scope; what makes the byte a *sound* answer inside
+/// it is not one earlier step but two. **0028's open question 6 resolved
+/// conditionally, and the condition is the whole answer:** *"it holds only with
+/// step 0b (no byte-less writer) **and** step 0c (the correspondence
+/// asserted)"*. They buy different halves, neither buys the other's, and both
+/// are on `main`.
+///
+/// **Step 0b buys *every participant holds a byte*** — which is what makes the
+/// byte a *total* predicate here rather than merely an adequate one.
+/// [`Tree::attach_shared`] and [`Tree::attach_shared_at`] refuse
+/// [`AttachMode::ReadWrite`] (`refuse_a_byteless_writer`), so the byte-less
+/// writer they used to produce has no producer left. `TreeBuilder::build_shared`
+/// called directly still registers without a byte, and is still supported — it
+/// is how an arena is created — but such a tree has **no lock file, therefore
+/// no probe**, and never reaches here.
+///
+/// **Step 0c buys *the byte at index `slot` is the byte of the record at index
+/// `slot`***, and nothing else does. The two indices are chosen by code that
+/// cannot see the other: the byte by `register_any` in `tf_tree_ipc`, which has
+/// no arena dependency, and the record by the first `FREE` slot of a fresh
+/// arena. On every ordinary path they agree by construction; under
+/// `CreatePolicy::Always`, which skips §3.4 step 4's guard by design, they
+/// diverged — *measured*, in
+/// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`. This
+/// function reads one at the index of the other, so without 0c's assertion
+/// every verdict below is about a different process than the one it names, and
+/// a `Reclaimable` verdict then frees a live participant's record. The
+/// assertion is in [`Open::attempt`]'s `Created` arm, before the owner server
+/// is spawned.
+///
+/// # The three constraints, each of which an earlier revision got wrong
+///
+/// 1. **It is not built on `record_is_alive`.** That function opens with
+///    `state_of(..) != LIVE { return false }`, so composing it would decide
+///    liveness from `state` — the thing §5.1 calls a bug — and 0028's open
+///    question 1 took the `/proc` half off this path outright: `/proc` maps an
+///    unmounted or `hidepid`-hidden entry to `ENOENT`, which `read_start_time`
+///    classifies as `NoSuchProcess`, the *proof of death* branch. A second
+///    conjunct that inverts to "everyone is dead" on a hardened host is worse
+///    than no second conjunct, so there is not one.
+/// 2. **This process's own slot is skipped, unconditionally, and first.**
+///    `F_OFD_GETLK` answers about *conflicting* locks, so an open file
+///    description does not see its own — the rule `Tree::use_ofd_liveness` and
+///    `reap_inner` already carry, for claims and for records alike. This
+///    probe's separate description happens to make our own byte visible again,
+///    but a sweep that leant on that detail would be one refactor away from
+///    reclaiming its own live slot.
+/// 3. **The state word is observed *before* the byte is probed**, and that is
+///    not a stylistic preference. Under word-then-byte the `Acquire` load of a
+///    `live_word` **synchronises-with** the publishing `Release` store in
+///    `fill_slot`, so a byte probe sequenced after it must see the byte held.
+///    Reverse the two reads — or take one up-front holder mask, which
+///    `LockFile::held_participants` makes the natural way to write a sweep —
+///    and `loom` erases a published record in 0.00 s: the probe sees byte *s*
+///    free before the registrant takes it, then the load observes
+///    `live_word(1)`, and the CAS frees a live byte-holder's record. Two
+///    independently built models, separately (0028 open question 6).
+///    `Tree::participant_alive` already has this order, by `&&`'s
+///    short-circuit; this is the one place that *states* it.
+///
+///    **What pins it here, and what does not.** No sequence of *stable* slot
+///    states tells the two orders apart: on a `FREE` word both return
+///    [`Reclamation::Unknown`] and on a `LIVE` word both consult the byte, so
+///    the disagreement lives only in an interleaving — and the interleaving is
+///    between two adjacent statements, which no multiprocess test in this
+///    workspace can schedule a registrant into. What *is* observable without a
+///    race is whether the byte was read **at all**, and only a predicate that
+///    reached the word first can decide a `FREE` slot without a syscall: that
+///    is `a_free_word_is_decided_without_asking_the_kernel`
+///    (`crates/tf_tree/tests/rendezvous.rs`), which the reversal fails.
+///    The interleaving itself is `reclaim_races_register`, the `loom` case 0028
+///    plan step 1 owes in `crates/tf_tree_core/src/loom_tests.rs`, shipping with
+///    the reversed control that erases a published record in 0.00 s. That case
+///    is also the **only** thing that pins this constraint's other half — that
+///    `observed` is not re-read after the probe, which is why
+///    [`Reclamation::Reclaimable`] carries the word instead of leaving the
+///    caller to fetch one. A reload yields the same word in every state a test
+///    can stage, so nothing in this workspace fails when one is introduced.
+///    **Step 1 has not landed. Until it does, that half is argued and
+///    modelled, not tested** — and this paragraph is the notice, not a plan to
+///    leave it so.
+///
+/// # The `FREE` word is a live participant, more often than not
+///
+/// A `FREE` word is reported [`Reclamation::Unknown`] rather than reclaimable,
+/// and that branch is **neither dead nor a formality**. It is the ordinary
+/// state of a **live read-only joiner**: the rendezvous takes its lock byte in
+/// `register_at` during the handshake, and then `attach_joined_at` registers no
+/// arena record at all, because the table is in the arena and a `PROT_READ`
+/// mapping cannot be written. Read-only is the consumer default (D18) *and* the
+/// Python default, so on a real system this is the common slot shape, not a
+/// corner — [`Open::attempt`]'s own `assign` closure already has to special-case
+/// it for the same reason. `spawn_owner_server`'s comment says it in the
+/// negative: *"the table alone reports its slot empty"*.
+///
+/// So the two wrong answers here are wrong about a running process. Reporting
+/// [`Reclamation::Live`] instead — what deleting the branch produces, since the
+/// byte is held — is merely imprecise. Reporting [`Reclamation::Reclaimable`]
+/// is the corrupting direction this whole record exists to prevent: `reclaim`
+/// would CAS `FREE -> FREE`, **succeed**, and report a slot collected that a
+/// live joiner is sitting in, which steps 3-5 then hand to somebody else while
+/// its byte is still held. `a_live_read_only_joiner_is_unknown_not_reclaimable`
+/// (`crates/tf_tree/tests/rendezvous.rs`) stages exactly that participant, and
+/// fails for both mutations.
+///
+/// The rule the branch encodes is narrow: the word answers *is there a record
+/// here*, never *is its process alive*. This function does not invent a
+/// liveness answer about a slot that holds no record, in either direction.
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+pub(crate) fn reclamation_verdict(
+    probe: &LivenessProbe,
+    own_slot: u32,
+    slot: u32,
+    rec: &tf_tree_core::ParticipantRecord,
+) -> Reclamation {
+    // Constraint 2, before anything else and with nothing in front of it.
+    if slot == own_slot {
+        return Reclamation::Live;
+    }
+    // Constraint 3: the word first. Everything below is sequenced after this
+    // load, which is the whole of the argument above.
+    let observed = rec.state.load(Ordering::Acquire);
+    if tf_tree_core::participant::state_of(observed) == tf_tree_core::participant::FREE {
+        return Reclamation::Unknown;
+    }
+    // Constraint 1: the kernel, and only the kernel. `None` is "would not say",
+    // which is not "dead" (§6.2).
+    match probe.is_held(slot) {
+        Some(true) => Reclamation::Live,
+        Some(false) => Reclamation::Reclaimable { observed },
+        None => Reclamation::Unknown,
+    }
+}
+
+/// [`reclamation_verdict`] for `slot`, rendered as one line.
+///
+/// **Test scaffolding, and present only under `--features test-hooks`.** The
+/// predicate is private and its production callers are `docs/decisions/0028`
+/// plan steps 3, 4 and 5, none of which has landed — so without a seam the
+/// three multiprocess tests step 2 owes could not reach it, and the same
+/// argument that put [`crate::CLAIM_WINDOW_HOOK`] behind this feature applies:
+/// a window a test cannot otherwise stand in. (`Open`'s own `#[cfg(test)]`
+/// `already_attached` seam rejected a `pub` one for a reason that does not
+/// reach here — what it would have published was a route `Open` withholds on
+/// purpose, where this publishes a read-only verdict about a slot.)
+///
+/// `own_slot` is a **parameter rather than `tree.participant_slot()`**, and
+/// that is the point of it: with the tree's real slot passed, the own-slot
+/// guard is unobservable, because this probe's separate open file description
+/// reports our own byte as held and the byte answer agrees with the guard. A
+/// test that points `own_slot` at a slot whose byte reads *free* is the only
+/// way to see the guard rather than the byte, and deleting the guard has to
+/// fail something.
+///
+/// # The rendered line, and why it carries a syscall count
+///
+/// `reclaimable word 0x… probes=N`, `live probes=N`, `unknown probes=N`, plus
+/// `no-lock-file` and `no-such-slot` for a caller that named neither — those
+/// two carry no count because they never build a probe.
+///
+/// `N` is [`LivenessProbe::probe_count`], and it is here because it is the only
+/// part of the predicate's **program order** a test can see. The verdict alone
+/// is the same under both read orders for every slot state a test can stage
+/// (see the third constraint on [`reclamation_verdict`]); `N` is not. It makes
+/// three separate statements assertable:
+///
+/// - `probes=0` on a `FREE` word — the word was reached first and short-circuited.
+/// - `probes=1` on a `LIVE` word — the kernel *was* asked, so the verdict is
+///   not being read out of `state` (§5.1's bug).
+/// - `probes=0` on our own slot — the guard answered with nothing in front of it.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn reclamation_verdict_for_test(
+    tree: &Tree,
+    lock_path: &std::path::Path,
+    own_slot: u32,
+    slot: u32,
+) -> String {
+    let Ok(lock) = tf_tree_ipc::LockFile::open(lock_path) else {
+        return "no-lock-file".to_string();
+    };
+    let probe = LivenessProbe::from_lock(lock);
+    let view = tree.view();
+    let Some(rec) = view.participants().get(slot) else {
+        return "no-such-slot".to_string();
+    };
+    let verdict = match reclamation_verdict(&probe, own_slot, slot, rec) {
+        Reclamation::Reclaimable { observed } => format!("reclaimable word {observed:#x}"),
+        Reclamation::Live => "live".to_string(),
+        Reclamation::Unknown => "unknown".to_string(),
+    };
+    // After the call, so it counts this verdict's syscalls and no others: the
+    // probe is built one line above and dropped one line below.
+    format!("{verdict} probes={}", probe.probe_count())
 }
 
 /// The rendezvous session a `Tree` from [`Open::open`] holds.

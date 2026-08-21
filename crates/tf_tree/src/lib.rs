@@ -315,6 +315,14 @@ mod open;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
 
+/// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
+/// predicate, which is private and has no production caller until that record's
+/// steps 3-5. Absent unless `--features test-hooks`; see
+/// [`open::reclamation_verdict_for_test`].
+#[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
+#[doc(hidden)]
+pub use open::reclamation_verdict_for_test;
+
 /// **The unstable tier — `docs/API.md` §2.6.** Enabling the `unstable` feature
 /// is the waiver; read the module's own documentation for what it waives.
 #[cfg(feature = "unstable")]

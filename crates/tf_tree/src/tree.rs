@@ -2623,6 +2623,17 @@ impl Tree {
         match self.view().participants().get(slot) {
             None => false,
             Some(rec) => {
+                // **The word first, then the liveness source** — here that
+                // order comes from `&&`'s short-circuit rather than from a
+                // statement, and it is not free to reverse: under
+                // word-then-byte the `Acquire` load of a live word
+                // synchronises-with `fill_slot`'s publishing `Release` store,
+                // so a probe sequenced after it must see the byte held.
+                // `crate::open`'s `reclamation_verdict` is where that is stated
+                // and argued (`docs/decisions/0028` piece 2, third constraint);
+                // this is the same order, and splitting it into two statements
+                // that probe first is what a model erases a published record
+                // with.
                 tf_tree_core::participant::state_of(rec.state.load(Ordering::Acquire))
                     == tf_tree_core::participant::LIVE
                     && (self.liveness)(slot, rec)

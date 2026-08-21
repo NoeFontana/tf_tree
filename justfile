@@ -2112,13 +2112,23 @@ shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
 # The zero-config rendezvous end to end: a foreign process calls
 # `tf_tree::open()`, joins a served arena, and reads the same transform.
 shm-rendezvous:
-    # `test-hooks` adds one injection point inside `Tree::claim`, between the
-    # arena CAS and the lease `SETLK`. The window is a single syscall wide, so
-    # `the_acquire_window_backs_out` cannot place a reaper inside it by racing.
-    # The hook is inert when unset, so the other tests run as they always did.
+    # **`test-hooks` buys six tests here**, and both of the seams it carries
+    # exist because the state under test cannot be stood in from outside.
+    # `CLAIM_WINDOW_HOOK` is one injection point inside `Tree::claim`, between
+    # the arena CAS and the lease `SETLK`: the window is a single syscall wide,
+    # so `the_acquire_window_backs_out` cannot place a reaper inside it by
+    # racing. The hook is inert when unset, so the other tests run as they
+    # always did. `reclamation_verdict_for_test` reaches `docs/decisions/0028`
+    # plan step 2's predicate, which is private and has no production caller
+    # until that record's steps 3-5; its five tests turn on facts only the
+    # kernel produces — a `SIGSTOP`ped process keeps its lock byte, a
+    # `SIGKILL`ed one loses it, a read-only joiner holds one and writes no arena
+    # record — so they cannot be unit tests inside the crate. That seam also
+    # reports how many times the predicate asked the kernel, which is the only
+    # part of its read *order* a multiprocess test can observe.
     #
-    # **`unstable` buys two tests here, the same trade `just shm-check`'s
-    # `--test frozen` line makes.** Both drive the helper's `join-rw-report`
+    # **`unstable` buys three tests here, the same trade `just shm-check`'s
+    # `--test frozen` line makes.** Two of them drive the helper's `join-rw-report`
     # mode, which reads a participant record's raw `state` word through
     # `Tree::arena_view` — the only route to it (`docs/API.md` §2.6).
     # `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` needs it
@@ -2128,11 +2138,19 @@ shm-rendezvous:
     # `defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing`
     # needs it because the *creator* cannot ask about itself — the probe's own
     # slot is short-circuited to alive — so the observer has to be a second
-    # process reporting on somebody else's record. Without the feature both
-    # tests and the helper mode are `#[cfg]`-ed out and the recipe runs two
-    # tests fewer, silently. Measured:
-    # `cargo nextest list -p tf_tree --features shm,test-hooks --test rendezvous`
-    # lists 16, `--features shm,test-hooks,unstable` lists 18.
+    # process reporting on somebody else's record. The third,
+    # `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`, has
+    # carried the gate since #221 added it, and its body names no `unstable` API
+    # — it reads the arena through `Tree::participant_slot` and `tf_tree_ipc`'s
+    # lock-file accessors — so that one is a gate to re-examine rather than a
+    # trade. Without the feature all three and the helper mode are `#[cfg]`-ed
+    # out and the recipe runs three tests fewer, silently.
+    #
+    # Measured on this branch, `cargo nextest list -p tf_tree --test rendezvous`
+    # per feature set: `shm` 16, `shm,unstable` 19, `shm,test-hooks` 22,
+    # `shm,test-hooks,unstable` **25** — the line below. (An earlier revision of
+    # this comment said 16 and 18; it was written before #221 and #228 and was
+    # already stale by two.)
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
