@@ -20,7 +20,7 @@ use crate::buffer::{PoseSlot, SampleRing};
 use crate::edge::{claim, ClaimRecord};
 use crate::error::{EdgeId, LookupError};
 use crate::frame::{intern_core, InternTable, CLAIM_UNRECORDED};
-use crate::participant::{ParticipantRecord, ParticipantTable};
+use crate::participant::{state_of, ParticipantRecord, ParticipantTable, FREE, LIVE, RESERVED};
 use crate::sample::ExtrapPolicy;
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
@@ -802,5 +802,243 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
         for other in [0, 1, 3] {
             assert_eq!(t.identity(other), None, "slot {other} should be untouched");
         }
+    });
+}
+
+/// A reclaimer sweeping the table while a joiner registers: **the caller's**
+/// read order. The state word is observed before the lock byte is probed, and no
+/// record a joiner published is erased.
+///
+/// # What this model pins — and what it does not
+///
+/// Both properties it asserts are properties of the **caller** of
+/// [`ParticipantTable::reclaim`], not of `reclaim`:
+///
+/// - **Ordering.** An `Acquire` load returning a `live_word` synchronises-with
+///   `fill_slot`'s publishing `Release` store, so the byte its holder took
+///   *before* that store must read held to any probe sequenced after the load.
+///   A sweep that reads the byte first — or takes one up-front holder mask,
+///   which is the shape `LockFile::held_participants()` invites — has no such
+///   edge. This is the assertion with teeth: at `LOOM_MAX_PREEMPTIONS=3` the
+///   sweeper observes slot 1 carrying a published `live_word` in 38 of 294
+///   executions, and in every one of those the byte reads held.
+/// - **No erasure.** A joiner that returned `Ok` is never left with a `FREE`
+///   record.
+///
+/// It does **not** pin `reclaim`'s own CAS guard, and this comment claimed
+/// otherwise until a verifier measured it. Measured, at
+/// `LOOM_MAX_PREEMPTIONS=3` (294 executions) and `=5` (781): the sweeper reaches
+/// the CAS on the joiner's slot in **zero** of them — every execution either
+/// observes slot 1 `FREE` or finds its byte held, which is the ordering property
+/// above doing its job. The only CAS that ever fires here is the corpse's, on a
+/// word no other thread writes, so its success in all 294 and all 781 is a fact
+/// about the harness and not about the guard: **a `reclaim` that ignored
+/// `observed` entirely passes this model.** What pins the guard is the unit test
+/// [`crate::tests::reclaim_fails_when_the_observed_word_has_changed`]; what pins
+/// the *strength* of `reclaim`'s own orderings is nothing in this workspace, a
+/// gap stated with its argument on `reclaim` itself rather than left for the
+/// next reader to rediscover here.
+///
+/// The corpse is still staged and its CAS still asserted, because a model that
+/// never enters the code under test would be vacuous in a second and worse way.
+/// That assertion is labelled below for what it is: harness liveness.
+///
+/// "No two occupants" is **not** asserted either. Two independently-built models
+/// were vacuous for it in the same structural way — 0028 open question 6 records
+/// a byte-blind hostile reclaimer passing it over 1 140 088 executions while
+/// erasing 151 590 `LIVE` records — because it is entailed by the byte being an
+/// exclusive lock and needs no schedule exploration at all. What makes
+/// `reclaim`'s widening to `RESERVED` safe is the same non-C11 fact: every
+/// writer holds its byte across the whole of `fill_slot` (0028 step 0b) and the
+/// byte index and the record index are the same integer (step 0c).
+///
+/// # The controls, which ship runnable
+///
+/// 0028's plan requires this model to ship with the control that fails, because
+/// a model with no failing control proves nothing — question 6's own finding.
+/// Both controls are `#[test]`s in this file rather than a paragraph, so
+/// `cargo xtask loom` re-runs them and a model that has quietly stopped being
+/// falsifiable fails the suite instead of waiting to be believed:
+///
+/// - [`control_reclaim_races_register_probes_the_byte_first`] — the two reads
+///   swapped. Loom finds the execution where the sweeper reads byte 1 free
+///   before the joiner takes it, observes the `live_word` the joiner has since
+///   published, and CASes a live participant's record to `FREE`.
+/// - [`control_reclaim_races_register_observes_relaxed`] — the right order, but
+///   the word observed `Relaxed`. It erases too, which is what says the property
+///   is carried by the synchronises-with edge and not by the order two lines
+///   happen to be written in.
+///
+/// Both witnesses are legal C11 executions: the sweeper reads the byte's
+/// *initial* store because nothing orders it after the joiner's acquisition.
+/// Each is `#[should_panic]` on the erasure assertion, which is the one that
+/// speaks first — the ordering flag trips in the same execution and is reported
+/// rather than acted on.
+///
+/// # Modelling notes
+///
+/// Slot 0's corpse is reclaimed uncontended, which is also what keeps this model
+/// clear of loom 0.7.2's `match_rmw_to_stores` over-approximation: an RMW is
+/// offered every store back to the first in its own causality, so a second
+/// writer to a slot a stale verdict names lets a `RESERVED -> FREE` CAS match a
+/// modification-order-superseded store and report a C11-illegal erasure. A pass
+/// here is sound; a failure needs its witness hand-checked before it is
+/// believed. That is also why the same-slot race is not modelled here.
+///
+/// The byte is modelled as an exclusive per-slot lock word, taken and never
+/// released: `Session` outlives the `Tree`'s registration, and `Tree::drop`
+/// releases the record before the byte, never the reverse. The probe is a
+/// `Relaxed` load deliberately — `F_OFD_GETLK` is a syscall and is at least that
+/// strong, so a property that holds against the weakest read holds against the
+/// real one. The corpse is staged inline because a process killed inside
+/// `fill_slot` executes no further instruction, ever: the idiom of
+/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`].
+#[test]
+fn reclaim_races_register() {
+    reclaim_races_register_model(Sweep::WordThenByte);
+}
+
+/// The failing control: the byte is probed **before** the word is observed.
+///
+/// See [`reclaim_races_register`]. Erases a published record, which is the
+/// point; `#[should_panic]` so the erasure is an assertion this suite makes
+/// rather than a claim it prints.
+#[test]
+#[should_panic(expected = "no erasure")]
+fn control_reclaim_races_register_probes_the_byte_first() {
+    reclaim_races_register_model(Sweep::ByteThenWord);
+}
+
+/// The second failing control: the right read order, the word observed
+/// `Relaxed`.
+///
+/// See [`reclaim_races_register`]. What carries the property is the
+/// synchronises-with edge, not the source order, and this is how that is known.
+#[test]
+#[should_panic(expected = "no erasure")]
+fn control_reclaim_races_register_observes_relaxed() {
+    reclaim_races_register_model(Sweep::WordRelaxedThenByte);
+}
+
+/// How one sweep reads a slot: the protocol, and the two controls that break it.
+#[derive(Clone, Copy)]
+enum Sweep {
+    /// The word (`Acquire`) first, then the byte. What `reclaim`'s doc requires
+    /// of a caller.
+    WordThenByte,
+    /// The byte first. Control.
+    ByteThenWord,
+    /// The right order, `Relaxed` observation. Control.
+    WordRelaxedThenByte,
+}
+
+/// The model behind [`reclaim_races_register`] and its two controls.
+fn reclaim_races_register_model(shape: Sweep) {
+    /// Killed between `fill_slot`'s CAS and its publishing store, leaving slot 0
+    /// `RESERVED` with a byte the kernel released at its death.
+    const P_CORPSE: u32 = 0xDEAD;
+    /// The joiner the owner granted slot 1.
+    const P_JOINER: u32 = 7;
+    const T_JOINER: u64 = 2;
+    /// Lock-byte states. `docs/decisions/0005` makes the byte index and the
+    /// arena record index the same integer; 0028 step 0c asserts it.
+    const BYTE_FREE: u32 = 0;
+    const BYTE_HELD: u32 = 1;
+
+    /// One reclamation decision, for one slot.
+    ///
+    /// Returns whether the CAS fired, and whether this sweeper ever read a byte
+    /// free under a published `live_word` — the ordering violation itself,
+    /// reported rather than acted on so that the erasure assertion is the one
+    /// that speaks first.
+    fn sweep(
+        table: &[ParticipantRecord],
+        bytes: &[AtomicU32],
+        slot: usize,
+        shape: Sweep,
+    ) -> (bool, bool) {
+        let (observed, held) = match shape {
+            Sweep::WordThenByte => {
+                let observed = table[slot].state.load(Ordering::Acquire);
+                (observed, bytes[slot].load(Ordering::Relaxed) != BYTE_FREE)
+            }
+            Sweep::ByteThenWord => {
+                let held = bytes[slot].load(Ordering::Relaxed) != BYTE_FREE;
+                (table[slot].state.load(Ordering::Acquire), held)
+            }
+            Sweep::WordRelaxedThenByte => {
+                let observed = table[slot].state.load(Ordering::Relaxed);
+                (observed, bytes[slot].load(Ordering::Relaxed) != BYTE_FREE)
+            }
+        };
+        if observed == FREE || held {
+            return (false, false);
+        }
+        let fired = ParticipantTable::new(table).reclaim(slot as u32, observed);
+        (fired, state_of(observed) == LIVE)
+    }
+
+    loom::model(move || {
+        let table = Arc::new(alloc::vec![
+            ParticipantRecord::default(),
+            ParticipantRecord::default()
+        ]);
+        let bytes = Arc::new(alloc::vec![
+            AtomicU32::new(BYTE_FREE),
+            AtomicU32::new(BYTE_FREE)
+        ]);
+
+        // The corpse in slot 0. `register` can never collect it — it only ever
+        // CASes from FREE — which is why such a slot was lost to everybody for
+        // ever before `reclaim` existed.
+        table[0].pid.store(P_CORPSE, Ordering::Relaxed);
+        table[0].state.store(RESERVED, Ordering::Release);
+
+        // A: a joiner granted slot 1. It takes its lock byte before it writes
+        // anything to the arena — the invariant step 0b makes total.
+        let ta = Arc::clone(&table);
+        let ba = Arc::clone(&bytes);
+        let joiner = thread::spawn(move || {
+            assert!(
+                ba[1]
+                    .compare_exchange(BYTE_FREE, BYTE_HELD, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok(),
+                "nobody else takes byte 1 in this model"
+            );
+            ParticipantTable::new(&ta).register_at(1, P_JOINER, T_JOINER, 0)
+        });
+
+        // B: a peer running `reap_participants` (0028 piece 4) over the whole
+        // table, holding no byte of its own. Slot 0 is the corpse it collects;
+        // slot 1 is the live joiner it must not touch.
+        let tb = Arc::clone(&table);
+        let bb = Arc::clone(&bytes);
+        let sweeper = thread::spawn(move || (sweep(&tb, &bb, 0, shape), sweep(&tb, &bb, 1, shape)));
+
+        let registered = joiner.join().unwrap();
+        let ((corpse_fired, corpse_bad_order), (_, joiner_bad_order)) = sweeper.join().unwrap();
+
+        let t = ParticipantTable::new(&table);
+        let inc = registered.expect("slot 1 was granted to this joiner alone");
+        assert_eq!(
+            t.identity(1),
+            Some((P_JOINER, T_JOINER, inc)),
+            "no erasure: a joiner that returned Ok was left without its record"
+        );
+        assert!(
+            !(corpse_bad_order || joiner_bad_order),
+            "ordering: a byte read free under a published live_word, so the word \
+             was not observed first"
+        );
+        // Harness liveness, not evidence about the guard: the corpse's CAS is
+        // uncontended, on a word no other thread writes, so it fires in every
+        // execution and would fire for a `reclaim` that never looked at
+        // `observed`. It is here so that a model in which nothing under test
+        // ever runs fails instead of passing.
+        assert!(
+            corpse_fired,
+            "the widened CAS never fired: nothing was tested"
+        );
+        assert_eq!(t.get(0).unwrap().state.load(Ordering::Acquire), FREE);
     });
 }

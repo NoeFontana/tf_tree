@@ -33,6 +33,29 @@ is a bug.
 
 ## [Unreleased]
 
+### Added
+
+- **`ParticipantTable::reclaim`** in `tf_tree_core` — free a participant slot
+  whose process is gone, guarded by the state word the caller observed rather
+  than by an incarnation a reaper has no way to hold. `ParticipantTable::release`
+  stays the clean-detach path; this is the path for a slot whose process never
+  ran `Drop`, and it also accepts `RESERVED` — the word a process killed inside
+  the two-phase publication leaves behind — which `release` cannot name at all.
+  `docs/decisions/0028`, plan step 1.
+
+  **It is listed here because it is public surface, not because anything ships
+  on it yet.** `tf_tree_core` is one of the five crates that publish, so a new
+  `pub fn` is an API change on the `0.0.x` promise. The pieces that make #184's
+  leaked slots actually get reclaimed — the liveness predicate, the owner's
+  assign-time sweep, and `Tree::reap_participants()` — land on top of it.
+
+  **The liveness verdict is not taken here.** `docs/PHASE2.md` §5.1 is normative
+  that whether a participant is alive is a kernel fact; this is only the guarded
+  store that acts on the decision, and it reads no `heartbeat`. A caller must
+  observe the state word **before** it probes the OFD lock byte — the doc comment
+  carries that obligation, and its loom model ships with two runnable controls
+  that erase a live participant's record without it.
+
 ### Changed — breaking
 
 - **`Tree::attach_shared` and `Tree::attach_shared_at` now refuse
