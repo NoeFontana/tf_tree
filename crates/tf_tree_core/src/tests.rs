@@ -1313,6 +1313,125 @@ fn a_stale_release_cannot_free_a_reused_participant_slot() {
     );
 }
 
+/// `reclaim` frees a slot left `LIVE` by a process that never ran `Drop`.
+///
+/// The clean-detach path is `release`, which needs the incarnation as a
+/// separate argument; a reaper has no incarnation to pass, only the word it
+/// observed — and `live_word` packs the incarnation into that word, so the
+/// observed word *is* the guard. `docs/decisions/0028`.
+#[test]
+fn reclaim_frees_a_slot_from_the_observed_live_word() {
+    use crate::participant::{live_word, ParticipantTable, FREE};
+    use core::sync::atomic::Ordering;
+
+    let slots: Vec<ParticipantRecord> = (0..2).map(|_| ParticipantRecord::default()).collect();
+    let table = ParticipantTable::new(&slots);
+
+    let (slot, inc) = table.register(1234, 99, 0).expect("register");
+    // The process is `SIGKILL`ed: no `release`, so the record stays LIVE and the
+    // kernel frees its lock byte. A reaper observes the word and acts on it.
+    let observed = table.get(slot).expect("slot").state.load(Ordering::Acquire);
+    assert_eq!(observed, live_word(inc));
+    assert!(table.reclaim(slot, observed), "the word was unchanged");
+
+    assert_eq!(
+        table.get(slot).expect("slot").state.load(Ordering::Acquire),
+        FREE
+    );
+    assert_eq!(table.identity(slot), None);
+    // And the slot is usable again, which is the whole point of #184.
+    let (again, inc2) = table.register(5678, 100, 0).expect("re-register");
+    assert_eq!(again, slot);
+    assert_eq!(inc2, inc + 1, "the incarnation counter is never recycled");
+}
+
+/// `reclaim` also frees a slot left `RESERVED`, which `release` cannot.
+///
+/// `RESERVED` is what a process killed between `fill_slot`'s CAS and its
+/// publishing store leaves behind — §11.3's
+/// `attach.after_slot_assigned_before_publish` row. It carries no incarnation,
+/// so `release` has no word to name it by; the observed word is the only handle
+/// on it. That this is *safe* is not a property of this function — it holds
+/// because the byte is the occupancy authority (`0028` steps 0b and 0c), and
+/// the memory-model half is `loom_tests::reclaim_races_register`.
+#[test]
+fn reclaim_frees_a_slot_from_an_observed_reserved() {
+    use crate::participant::{ParticipantTable, FREE, RESERVED};
+    use core::sync::atomic::Ordering;
+
+    let slots: Vec<ParticipantRecord> = (0..2).map(|_| ParticipantRecord::default()).collect();
+    let table = ParticipantTable::new(&slots);
+
+    // Staged rather than raced: a process that died inside `fill_slot` executes
+    // no further instruction, so every store it will ever make has happened.
+    table
+        .get(1)
+        .expect("slot")
+        .state
+        .store(RESERVED, Ordering::Release);
+    // `register` cannot collect it — it only ever CASes from FREE — which is why
+    // such a slot was lost to everybody for ever.
+    assert_eq!(table.register(1, 1, 0).expect("register").0, 0);
+
+    assert!(table.reclaim(1, RESERVED));
+    assert_eq!(
+        table.get(1).expect("slot").state.load(Ordering::Acquire),
+        FREE
+    );
+    assert_eq!(table.register(5678, 100, 0).expect("register").0, 1);
+}
+
+/// `reclaim` fails when the observed word has changed under it.
+///
+/// That is the whole safety bound: the reclaimer's verdict was formed against
+/// one occupancy, and a slot that has been freed, re-granted and re-occupied
+/// since carries a different `live_word`. `docs/decisions/0028` names that row
+/// `reclaim.probe_then_reoccupied`, in its own crash matrix — the rows §11.3 is
+/// *missing* for this path. **§11.3 has no such row**, and citing one there
+/// would be the mistake that record's question-6 evidence was itself corrected
+/// for. It is also the case a caller must not mistake for "already free": the
+/// return is *did this CAS fire*, not *is the slot free now*.
+///
+/// **This is what pins `reclaim`'s CAS guard.** The loom model
+/// `loom_tests::reclaim_races_register` does not — measured, it never reaches
+/// that CAS on a contended slot — so a `reclaim` that ignored `observed`
+/// entirely would pass the model and fail here.
+#[test]
+fn reclaim_fails_when_the_observed_word_has_changed() {
+    use crate::participant::{live_word, state_of, ParticipantTable, LIVE, RESERVED};
+    use core::sync::atomic::Ordering;
+
+    let slots: Vec<ParticipantRecord> = (0..2).map(|_| ParticipantRecord::default()).collect();
+    let table = ParticipantTable::new(&slots);
+
+    let (slot, inc1) = table.register(1234, 99, 0).expect("register");
+    let stale = live_word(inc1);
+    // Between the observation and the CAS the slot is reclaimed by somebody
+    // else and handed to a new process.
+    assert!(table.reclaim(slot, stale));
+    let (slot2, inc2) = table.register(5678, 100, 0).expect("re-register");
+    assert_eq!(slot2, slot);
+    assert_ne!(inc2, inc1);
+
+    assert!(
+        !table.reclaim(slot, stale),
+        "a stale verdict freed the slot's new occupant"
+    );
+    assert_eq!(
+        state_of(table.get(slot).expect("slot").state.load(Ordering::Acquire)),
+        LIVE
+    );
+    assert_eq!(table.identity(slot).map(|id| id.0), Some(5678));
+
+    // The same guard on the widened word: a `RESERVED` verdict formed against
+    // one occupancy does not fire on a slot that is no longer `RESERVED`.
+    assert!(!table.reclaim(slot, RESERVED));
+    assert_eq!(table.identity(slot).map(|id| id.0), Some(5678));
+
+    // A slot beyond the table is refused rather than panicking.
+    assert!(!table.reclaim(9, live_word(1)));
+}
+
 /// A stalled *anonymous* claimant must be reported, in bounded time, to both a
 /// would-be interner and a reader — never waited on forever, never stolen from.
 ///
