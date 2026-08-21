@@ -1417,10 +1417,15 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 >   `state == LIVE` in ahead of its probe and so answers *not alive* for a
 >   healthy joiner mid-attach exactly as for one that died there. With the raw
 >   byte the two separate: byte held is a registrant in flight and byte free is
->   a registrant that is not coming back. Note that **nothing reclaims a
->   `RESERVED` record even now** — `0028` question 6 widened `reclaim` to accept
->   any observed word, and steps 3–5 are what will act on it — so what this buys
->   today is a name for the state, not a repair.
+>   a registrant that is not coming back. ~~Note that **nothing reclaims a
+>   `RESERVED` record even now**~~ — **that stopped being true on 2026-08-21.**
+>   `0028` question 6 widened `reclaim` to accept any observed word, and steps 3,
+>   4 and 5 have all landed, so a `RESERVED` record with a free byte is now
+>   collected by the assigner when a grant walks past it, by the owner's
+>   socket-hangup callback, and by any read-write participant calling
+>   `Tree::reap_participants`. What this check buys is still a *name* for the
+>   state — the repair is elsewhere and deliberately so, per the detection-only
+>   rule below — but the repair now exists.
 > * **The fork case is reported, as its own finding with its own message.** Byte
 >   *held*, recorded pid gone: a forked child inherited the parent's open file
 >   descriptions, so the socket never hangs up and §6.2's rule keeps the lock
