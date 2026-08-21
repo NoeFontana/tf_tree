@@ -2119,15 +2119,16 @@ shm-rendezvous:
     # so `the_acquire_window_backs_out` cannot place a reaper inside it by
     # racing. The hook is inert when unset, so the other tests run as they
     # always did. `reclamation_verdict_for_test` reaches `docs/decisions/0028`
-    # plan step 2's predicate, which is private and has no production caller
-    # until that record's steps 3-5; its five tests turn on facts only the
-    # kernel produces — a `SIGSTOP`ped process keeps its lock byte, a
+    # plan step 2's predicate, which is private and — since that record's plan
+    # step 3 put it in the owner's slot assigner — has a production caller that
+    # *acts* on a verdict without ever reporting one; its five tests turn on
+    # facts only the kernel produces — a `SIGSTOP`ped process keeps its lock byte, a
     # `SIGKILL`ed one loses it, a read-only joiner holds one and writes no arena
     # record — so they cannot be unit tests inside the crate. That seam also
     # reports how many times the predicate asked the kernel, which is the only
     # part of its read *order* a multiprocess test can observe.
     #
-    # **`unstable` buys three tests here, the same trade `just shm-check`'s
+    # **`unstable` buys six tests here, the same trade `just shm-check`'s
     # `--test frozen` line makes.** Two of them drive the helper's `join-rw-report`
     # mode, which reads a participant record's raw `state` word through
     # `Tree::arena_view` — the only route to it (`docs/API.md` §2.6).
@@ -2143,14 +2144,26 @@ shm-rendezvous:
     # carried the gate since #221 added it, and its body names no `unstable` API
     # — it reads the arena through `Tree::participant_slot` and `tf_tree_ipc`'s
     # lock-file accessors — so that one is a gate to re-examine rather than a
-    # trade. Without the feature all three and the helper mode are `#[cfg]`-ed
-    # out and the recipe runs three tests fewer, silently.
+    # trade. The last three are `0028`'s plan steps 3 and 4, and all three need
+    # the feature to *stage* their fixture rather than to name an API:
+    # `the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`,
+    # `the_assigner_collects_a_record_left_reserved_by_a_killed_registrant` and
+    # `the_hangup_collects_a_record_left_reserved_by_a_killed_registrant` write
+    # participant records through `Tree::arena_view`, the only route to the
+    # table, because the states they stage — a record that is not `FREE` with a
+    # free lock byte in a slot this owner never granted, and a `RESERVED` record
+    # left by a registrant killed inside `fill_slot`'s publication window, which
+    # `0028` open question 4 measured at ~12 ns — have no producer reachable
+    # from public API here. Without the feature all
+    # six and the helper mode are `#[cfg]`-ed out and the recipe runs six tests
+    # fewer, silently.
     #
     # Measured on this branch, `cargo nextest list -p tf_tree --test rendezvous`
-    # per feature set: `shm` 16, `shm,unstable` 19, `shm,test-hooks` 22,
-    # `shm,test-hooks,unstable` **25** — the line below. (An earlier revision of
-    # this comment said 16 and 18; it was written before #221 and #228 and was
-    # already stale by two.)
+    # per feature set: `shm` 17, `shm,unstable` 23, `shm,test-hooks` 23,
+    # `shm,test-hooks,unstable` **29** — the line below. (Earlier revisions of
+    # this comment said 16/18, then 16/19/22/25, then 17/21/23/27; the first was
+    # written before #221 and #228, the second before `0028`'s plan steps 3 and
+    # 4, the third before the two tests that pin those steps' `RESERVED` half.)
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.

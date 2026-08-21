@@ -98,6 +98,46 @@ is a bug.
 
 ### Fixed
 
+- **A `SIGKILL`ed read-write participant kept its arena slot for ever, and the
+  owner's slot assigner decided liveness from a word it is normative not to**
+  (issue #184). The assigner skipped any slot whose `ParticipantRecord::state`
+  read `LIVE`, and `docs/PHASE2.md` §5.1 says that in as many words: *"Any code
+  deciding liveness from `state` or `heartbeat` is a bug."* A process killed
+  without running `Drop` never clears its record, so sixty-four abnormal
+  read-write exits wedged an arena permanently — a budget a crash-looping node
+  spends in minutes. The assigner now takes its verdict from the participant's
+  OFD lock byte, through the single `reclamation_verdict` predicate, and
+  **reclaims the dead record before granting the slot** — deciding without
+  reclaiming would change nothing, because `fill_slot` fills only a `FREE` slot
+  and the joiner would be refused the slot just judged collectable.
+  `docs/decisions/0028` plan step 3.
+
+  **The owner's hangup callback is rebased onto the same operation** (plan
+  step 4): it loads the `state` word once and hands it to
+  `ParticipantTable::reclaim` rather than reading an incarnation out of
+  `identity()` and calling `release`. For a live word the guard is identical —
+  `live_word` packs the incarnation into the word — and the callback now also
+  collects `RESERVED`, which `identity()` reports as `None` and `release` could
+  therefore never name: a process killed inside the two-phase publication used
+  to lose its slot to everybody, for ever. **That widening is the headline of
+  these two steps, so it is pinned rather than asserted**: one test per
+  collector stages the `RESERVED` word — `0028` open question 4 measured that
+  publication window at ~12 ns, so it is staged rather than raced, and the tests
+  say so — and narrowing either caller back to `LIVE` fails exactly one of them,
+  while both fail at the commit before this change.
+
+  **No format change and nothing on the hot path.** `FORMAT_VERSION` and
+  `layout_hash` are untouched, `Plan::at` is not involved, and the cost is at
+  most one `F_OFD_GETLK` per slot the assigner would otherwise have skipped, on
+  a handshake already measured at 97.5 µs p50. No public API changes.
+
+  **What is still not reclaimed**, so that a green run is not read as more than
+  it is: a slot whose lock byte is held by a `fork`ed child that inherited the
+  descriptor is **deliberately** left alone — the kernel says the byte is held,
+  and §6.2 says that is the truth (`docs/decisions/0030`); and a full sweep of
+  every slot, rather than of the slots one grant walks past, is
+  `Tree::reap_participants()` and has not landed.
+
 - **A process's participant lock byte and its arena participant record could
   carry different indices** (issue #201), which every liveness predicate in the
   engine assumes cannot happen. `Open::attempt` now compares the two where they

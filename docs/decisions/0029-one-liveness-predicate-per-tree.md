@@ -37,16 +37,26 @@ three and there are five.
 | P2 | `use_ofd_liveness` (`tree.rs:2413`) | the OFD byte, with an explicit "never report ourselves dead" guard, falling back to `record_is_alive` when `F_OFD_GETLK` declines to answer | both arms of `Open::attempt`, and nothing else |
 | P3 | `Tree::participant_alive` (`tree.rs:2564`) | the state word `Acquire`, **then** `self.liveness` — the order is right, and it is right by `&&`'s short-circuit rather than by statement | whichever of P1/P2 the tree carries |
 | P4 | `Tree::reparent` (`tree.rs:1735`) | `participant_is_alive`, i.e. the triple, **never** `self.liveness` | every tree, including those that paid for a probe. **This is #213** |
-| P5 | the owner server's socket-hangup callback (`crates/tf_tree/src/open.rs:758-768`) | neither the byte nor the triple — only the socket (D17) | the owner's serving thread |
+| P5 | the owner server's socket-hangup callback (`crates/tf_tree/src/open.rs:1360–1462`, mutating at `:1446–1458`) | neither the byte nor the triple — only the socket (D17) | the owner's serving thread |
 
 **P5 is the one that matters most and is missing from every existing
 enumeration**, including §0.0's row and this record's first draft of this table.
 It is the *only* facade path that **mutates** the participant table on a liveness
-verdict: `table.identity(slot)` at `:763`, then `table.release(slot, incarnation)`
-at `:764`, `LIVE -> FREE`. Everything else merely reports. Its incarnation guard
-means a wrong verdict is a spurious free rather than a second occupant, which is
-why it is survivable — but any statement of the form "the facade decides liveness
-from X" has to account for a path that decides it from neither X nor Y.
+verdict — `rec.state.load(Acquire)` at `:1449`, then
+`table.reclaim(slot, observed)` at `:1456`, driving the word to `FREE`.
+Everything else merely reports. **This row cited `identity(slot)` at `:763` and
+`release(slot, incarnation)` at `:764` until `0028`'s plan step 4 rebased the
+callback onto the observed word**, and the numbers had rotted twice over besides;
+the substance is unchanged, because the guard is the same comparison for a
+`live_word` — `live_word` packs the incarnation into the word — so a wrong
+verdict is still a spurious free rather than a second occupant. For the
+`RESERVED` word the callback now also collects, that bound comes from the lock
+byte instead (`0028` open question 6, and `ParticipantTable::reclaim`'s doc
+comment). What does not change is the point of the row: any statement of the form
+"the facade decides liveness from X" has to account for a path that decides it
+from neither X nor Y. **A sixth predicate must not be added here without reading
+that step**, because this path now shares `reclaim` with the slot assigner, which
+*does* decide from the byte.
 
 Downstream, two shipped consumers already override P1/P2 rather than trusting
 them, which is worth knowing before adding a sixth:
@@ -223,9 +233,10 @@ where the heir's arena comes from, which is exactly what question 3 is about.
 
 **Landed as `0028` plan step 9, which is where this said its home was.** The arm
 is split: `OpenOutcome::Created` keeps the `build_shared`
-(`crates/tf_tree/src/open.rs:613`, the line this paragraph used to cite as `:546`)
+(`crates/tf_tree/src/open.rs:978`, the line this paragraph has now cited as
+`:546` and `:613`; it is pinned to a moving file and will rot again)
 and `OpenOutcome::TookOver` refuses with `OpenError::TakeoverUnsupported`
-(`:624`) — a refusal rather than an adoption for the reason above, that nothing
+(`:1057`) — a refusal rather than an adoption for the reason above, that nothing
 at the match names the arena this process already holds. Restructuring where the
 heir's arena comes from is still unbuilt, and still question 3's.
 
