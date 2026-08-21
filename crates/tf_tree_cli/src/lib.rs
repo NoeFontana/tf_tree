@@ -1208,7 +1208,34 @@ fn cmd_doctor(
 
     let (tree, mut src) = doctor_source(live, from_bag, from_file, ingest)?;
     let obs = observations(tree, &mut src);
-    let snap = Snapshot::capture(tree);
+    // **The arena first, the lock file second** — `Snapshot::capture` reads
+    // every slot's `state` word and the probe below asks about every slot's
+    // byte, and that order is `docs/decisions/0028` piece 2's third constraint
+    // rather than a preference. It is not kept by these two statements being in
+    // this order: `slot_facts` takes the *captured row*, so there is nothing
+    // here that could be computed first. See [`slot_facts`].
+    #[allow(unused_mut)]
+    let mut snap = Snapshot::capture(tree);
+    // **`TFT014`'s participant half needs the lock file, and this is where
+    // `doctor` finally opens one** (`0028` plan step 6). Only on `--attach`: no
+    // other source has a rendezvous, and a `.tft`'s or a bag's table is
+    // answered — or skipped — without one.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    if live.attach {
+        if let Some(lock) = live
+            .rendezvous()
+            .ok()
+            .filter(|rv| rv.lock_path().exists())
+            .and_then(|rv| tf_tree_ipc::LockFile::open(rv.lock_path()).ok())
+        {
+            snap.probe_lock_facts(|row| slot_facts(&lock, row));
+        }
+        // No `else`, and deliberately no error: the arena mapped, so there is a
+        // tree to report on. Without the file every slot keeps
+        // `doctor::LockByte::Unknown`, which `checks::slot_leak` reads as "not
+        // asked" rather than as "free" — the check narrows, it does not
+        // fabricate.
+    }
     let stats = checks::collect_edge_stats(tree, &snap);
     let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
     // Captured here, not inside the check: `TFT019`'s outcome and its note in
@@ -1763,6 +1790,152 @@ fn tf_tree_arena_align_mib() -> u64 {
     tf_tree::ARENA_FILE_ALIGN / (1024 * 1024)
 }
 
+/// The lock file's facts about **one** captured participant slot, for
+/// `TFT014`.
+///
+/// `docs/decisions/0028` plan step 6: `doctor` needs the lock file, which
+/// `tft014` did not take. `cmd_participants` is the pattern — open the file,
+/// probe each byte, read each identity — and this is one iteration of that loop
+/// reshaped into a value [`doctor::Snapshot::probe_lock_facts`] can carry into
+/// the check.
+///
+/// # It takes the captured row, and that is the read-order pin
+///
+/// The `state` word is observed by `Snapshot::capture` and the byte here, and
+/// `0028` piece 2's third constraint says the word must be read first: under
+/// word-then-byte the `Acquire` load of a live word synchronises-with
+/// `fill_slot`'s publishing `Release` store, so a probe sequenced after it must
+/// see the byte held; reversed, a sweep can see a byte free before a registrant
+/// takes it and then read the record it published, and `loom` erases a
+/// published record that way in 0.00 s.
+///
+/// The argument that the order matters is `loom`'s, in `tf_tree`'s model of
+/// `reclamation_verdict` — no sequence of stable slot states can show which
+/// read happened first, so no test in this crate can. What *is* pinned here is
+/// that this program obeys it, and the pin is this signature: the parameter is
+/// the already-captured [`doctor::ParticipantInfo`], not a slot number, so
+/// there is no call to hoist above `Snapshot::capture` that compiles. The
+/// earlier revision took `&LockFile` alone and returned a whole table; moving
+/// its one call site above the capture compiled and passed every test.
+///
+/// Three-valued on purpose. `probe_participant` failing is not "free" — the
+/// `top` merge collapses it that way because a missing byte costs it a display
+/// column, where here it would be an accusation (§6.2's fail-safe rule).
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn slot_facts(lock: &tf_tree_ipc::LockFile, row: &doctor::ParticipantInfo) -> doctor::SlotFacts {
+    let byte = match lock.probe_participant(row.slot) {
+        Ok(p) if p.held => doctor::LockByte::Held,
+        Ok(_) => doctor::LockByte::Free,
+        Err(_) => doctor::LockByte::Unknown,
+    };
+    let id = lock.read_identity(row.slot).ok().flatten();
+    doctor::SlotFacts {
+        byte,
+        recorded: recorded_process(id.as_ref()),
+        recorded_pid: id.map(|i| i.pid),
+    }
+}
+
+/// What `/proc` says about the process a lock-file identity record names.
+///
+/// **A diagnostic inference and never a protocol decision** (`docs/PHASE2.md`
+/// §5.1). It is the sentence `tf_tree_ipc::Identity::matches_running_process`
+/// was written for — *"slot 3's record names pid 1841, which is gone"* — and it
+/// is spelled here rather than called there for one reason, which
+/// `docs/decisions/0028` works through in *"the fail-safe claim is false on this
+/// code"*: that method is two-valued and maps every read failure to `false`, so
+/// on a host whose `/proc` is not mounted every participant reads as gone.
+/// `TFT014`'s fork arm fires on *byte held plus process gone*, so under the
+/// two-valued answer it would fire on every healthy slot in the table on such a
+/// host — the "check that always fires" failure, at `warn`, on a correct robot.
+///
+/// The verdict itself is [`recorded_given`], which is `tf_tree`'s `alive_given`
+/// with `tf_tree`'s three-way `ProcStartTime` split spelled through
+/// `tf_tree_ipc::ProcError`, whose variants already draw the same line. This
+/// function is the two reads that classification needs and nothing else.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn recorded_process(id: Option<&tf_tree_ipc::Identity>) -> doctor::RecordedProcess {
+    let Some(id) = id else {
+        return doctor::RecordedProcess::Unknown;
+    };
+    recorded_given(
+        id.start_time,
+        tf_tree_ipc::start_time_of(id.pid),
+        // The honest test for "would this host have shown us an entry" is
+        // whether it will show us our *own*: `/proc/self/stat` is about a
+        // process that is running by construction. `tf_tree`'s
+        // `proc_answers_here` latches the same probe; this is a one-shot
+        // command and does not need the latch.
+        tf_tree_ipc::self_start_time().is_ok(),
+    )
+}
+
+/// Turn a recorded `start_time`, what the `/proc` read came back as, and
+/// whether this host's `/proc` answers at all, into one of the three answers
+/// [`doctor::RecordedProcess`] allows.
+///
+/// **This is `tf_tree`'s `alive_given` (`crates/tf_tree/src/tree.rs`),
+/// transposed onto a three-valued result instead of a fail-safe boolean, and
+/// deliberately not a second classification.** Same three inputs, same arms,
+/// same bias — `record_is_alive`'s doc states it: *a false "dead" lets a
+/// rescuer take an entry from a running process, which is corruption; a false
+/// "alive" only delays recovery*. In an operator tool the corresponding
+/// corruption is telling somebody a live process is gone, and the arms below
+/// exist to keep that out.
+///
+/// Both host facts arrive as parameters rather than as reads, for the reason
+/// `alive_given` gives: neither is a thing a test can arrange. Whether `/proc`
+/// answers is a property of the machine the suite runs on, and staging pid
+/// reuse means exhausting the pid space. Passing them in is what makes the bias
+/// assertable instead of merely stated.
+///
+/// The arms, and which way each fails:
+///
+/// * **A stored `start_time` of zero** is `Identity::of_self_best_effort`'s
+///   *"could not read my own"*, not a start time. It compares unequal to every
+///   real one, so comparing anyway reports a *running* process dead — the
+///   inversion `0028` names and `alive_given` carries its own arm for.
+/// * **A start time that matches**: running.
+/// * **A start time that differs**: the pid was recycled, so the process that
+///   took this slot is gone even though the number is in use.
+/// * **`ENOENT`, on a host that would have shown us an entry**: gone. This is
+///   the *only* arm that proves death, exactly as `ProcStartTime::NoSuchProcess`
+///   plus `proc_answers` is the only one in `alive_given`.
+/// * **`ENOENT` on a host whose `/proc` says that about everybody**: unknown.
+/// * **Any other read failure, and any parse failure**: unknown. An `EACCES`
+///   from a `hidepid` mount, an `EMFILE`, an `ENOMEM`, a `stat` line this
+///   parser did not understand — none of them is information about whether a
+///   process exists, and the revision that shipped mapped every one of them to
+///   *gone*: `Err(_) if self_start_time().is_ok() => Gone`. On a `hidepid=2`
+///   host that reads a running publisher's slot as a fork inheritor and prints
+///   a `warn` telling an operator its process no longer exists.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn recorded_given(
+    stored_start_time: u64,
+    probe: Result<u64, tf_tree_ipc::ProcError>,
+    proc_answers: bool,
+) -> doctor::RecordedProcess {
+    use doctor::RecordedProcess as R;
+    if stored_start_time == 0 {
+        return R::Unknown;
+    }
+    match probe {
+        Ok(start) if start == stored_start_time => R::Running,
+        Ok(_) => R::Gone,
+        Err(tf_tree_ipc::ProcError::Unreadable { raw_os_error, .. })
+            if std::io::Error::from_raw_os_error(raw_os_error).kind()
+                == std::io::ErrorKind::NotFound =>
+        {
+            if proc_answers {
+                R::Gone
+            } else {
+                R::Unknown
+            }
+        }
+        Err(_) => R::Unknown,
+    }
+}
+
 /// Liveness is the kernel's answer — `F_OFD_GETLK` on the participant's byte —
 /// not an inference from the identity record, which is why a `SIGSTOP`ped
 /// process correctly reads as alive (§5.1).
@@ -1906,6 +2079,9 @@ mod tests {
             state: doctor::SlotState::Live,
             pid: 4711,
             alive: true,
+            byte: doctor::LockByte::Held,
+            recorded: doctor::RecordedProcess::Running,
+            recorded_pid: Some(4711),
         }]
     }
 
@@ -2547,5 +2723,97 @@ mod tests {
         };
         assert_eq!(b.flags_set(), vec!["--future-horizon"]);
         assert_eq!(IngestArgs::default().flags_set(), Vec::<&str>::new());
+    }
+
+    /// **"Cannot tell" is not "dead", and every arm that could have said
+    /// otherwise is here.**
+    ///
+    /// `record_is_alive`'s doc states the bias this test enforces: *a false
+    /// "dead" lets a rescuer take an entry from a running process, which is
+    /// corruption; a false "alive" only delays recovery*. `doctor` is where an
+    /// operator decides what to kill, so the corresponding corruption is
+    /// telling somebody a running process is gone — and `TFT014`'s fork arm
+    /// fires on *byte held plus process gone*, so a `/proc` failure classified
+    /// as death puts a `warn` on a healthy publisher.
+    ///
+    /// The revision this replaced was
+    /// `Err(_) if self_start_time().is_ok() => Gone`, which called **every**
+    /// non-`ENOENT` failure and every parse failure death. The three `Unknown`
+    /// rows below are the ones it got wrong; on a `hidepid=2` mount or under
+    /// `EMFILE`, every one of them is a live participant.
+    ///
+    /// `proc_answers` and the probe are parameters for the reason
+    /// `alive_given`'s are: neither is arrangeable from a test. Staging pid
+    /// reuse means exhausting the pid space, and unmounting `/proc` is not
+    /// something a test suite may do to the machine it runs on.
+    ///
+    /// Mutant: restore `Err(_) if proc_answers => Gone` as a single arm.
+    /// Applied: it panicked on the `EACCES` row with *left: Gone, right:
+    /// Unknown* — a `hidepid` host's every participant reported as a dead
+    /// process. The `EMFILE` and `Parse` rows go the same way behind it.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[test]
+    fn a_proc_read_that_cannot_answer_is_never_read_as_death() {
+        use doctor::RecordedProcess as R;
+        use tf_tree_ipc::{ProcError, ProcParseError};
+
+        const STORED: u64 = 4242;
+        let unreadable = |errno: i32| {
+            Err(ProcError::Unreadable {
+                pid: 7,
+                raw_os_error: errno,
+            })
+        };
+
+        // The two arms that are evidence, and the only two.
+        assert_eq!(recorded_given(STORED, Ok(STORED), true), R::Running);
+        assert_eq!(
+            recorded_given(STORED, Ok(STORED + 1), true),
+            R::Gone,
+            "a different start time on the same pid is a recycled pid"
+        );
+        assert_eq!(
+            recorded_given(STORED, unreadable(2), true),
+            R::Gone,
+            "ENOENT on a host that would have shown us an entry is the one \
+             proof of death"
+        );
+
+        // Everything else is a refusal to answer.
+        assert_eq!(
+            recorded_given(STORED, unreadable(2), false),
+            R::Unknown,
+            "ENOENT on a host that says that about everybody proves nothing"
+        );
+        assert_eq!(
+            recorded_given(STORED, unreadable(13), true),
+            R::Unknown,
+            "EACCES is a hidepid mount, not a dead process"
+        );
+        assert_eq!(
+            recorded_given(STORED, unreadable(24), true),
+            R::Unknown,
+            "EMFILE is this process being out of descriptors"
+        );
+        assert_eq!(
+            recorded_given(
+                STORED,
+                Err(ProcError::Parse {
+                    pid: 7,
+                    cause: ProcParseError::NoClosingParen,
+                }),
+                true,
+            ),
+            R::Unknown,
+            "a stat line we could not parse is not a death certificate"
+        );
+
+        // And the record that never had a start time to compare.
+        assert_eq!(
+            recorded_given(0, Ok(STORED), true),
+            R::Unknown,
+            "`of_self_best_effort`'s zero compares unequal to every real start \
+             time; treating it as a mismatch reports a running process dead"
+        );
     }
 }

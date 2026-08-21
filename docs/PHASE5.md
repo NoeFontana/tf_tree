@@ -1400,6 +1400,109 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > deployment model. Making that arm refuse is a step of `0028`, not of this
 > check.
 
+> **Amendment — `doctor` opens the lock file, and two of the three silences
+> above become findings.**
+>
+> [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) plan step 6,
+> landing after that record went `ready`. The amendment above closes with three
+> conditions the check could not reach; **two of them were gaps in what `doctor`
+> would ask, not gaps in the arena**, and asking is the whole change. `doctor`
+> now opens the rendezvous lock file on `--attach` — the thing
+> `tf_tree participants` always did — probes every participant byte and reads
+> every identity record beside it, and `checks::slot_leak` composes the three
+> facts in one place.
+>
+> * **`RESERVED` is reported**, when its byte is free. It could not be before
+>   because the only fact available was `Tree::participant_alive`, which folds
+>   `state == LIVE` in ahead of its probe and so answers *not alive* for a
+>   healthy joiner mid-attach exactly as for one that died there. With the raw
+>   byte the two separate: byte held is a registrant in flight and byte free is
+>   a registrant that is not coming back. Note that **nothing reclaims a
+>   `RESERVED` record even now** — `0028` question 6 widened `reclaim` to accept
+>   any observed word, and steps 3–5 are what will act on it — so what this buys
+>   today is a name for the state, not a repair.
+> * **The fork case is reported, as its own finding with its own message.** Byte
+>   *held*, recorded pid gone: a forked child inherited the parent's open file
+>   descriptions, so the socket never hangs up and §6.2's rule keeps the lock
+>   byte held on behalf of a process that no longer exists. **It is deliberately
+>   not the same message as a free byte**, because the responses are opposites —
+>   a free byte is a slot a reaper should collect, and this is a slot no reaper
+>   may touch, since the kernel's own answer is *held* and overruling it with a
+>   `/proc` inference is the inversion §5.1 exists to forbid. The remedy is
+>   upstream: stop the child, or use a start method that inherits no descriptors
+>   (`multiprocessing`'s `spawn`, or fork+exec). `0030` closes it at the source.
+> * **And it is judged from the lock file alone, so the *read-only* inheritor is
+>   reported too.** That one is the case worth having: D18 makes read-only the
+>   consumer default, a read-only participant writes **no** arena record at all,
+>   and Python's `multiprocessing` forks by default — so the likeliest fork leak
+>   on a real deployment is a held byte over an arena row that reads `FREE`. A
+>   predicate that opened with *"a `FREE` record is not a leak"* returned
+>   `"status": "pass"` for exactly that shape while `docs/RUNBOOK.md` told the
+>   operator this check reports it; clause (b) therefore reads the byte and the
+>   identity record, which are the two facts such a slot has, and the finding
+>   names the missing record rather than pretending to one.
+> * **The third silence stands unchanged** — a claim whose slot has since been
+>   re-granted still needs the incarnation inside the claim word, and no format
+>   change is proposed.
+>
+> **The `/proc` half is three-valued, and that is the load-bearing detail.**
+> `Identity::matches_running_process` exists for exactly this sentence and is
+> two-valued: it maps *every* read failure to `false`, so on a host whose `/proc`
+> is not mounted every participant reads as gone — and the fork arm, which fires
+> on *byte held plus process gone*, would then fire on every healthy slot in the
+> table. `0028` works that inversion through in *"the fail-safe claim is false on
+> this code"*. `recorded_given` in `tf_tree_cli` therefore answers
+> *running / gone / cannot say*, and it is `tf_tree`'s own `alive_given`
+> transposed rather than a second classification: same three inputs, same arms,
+> same bias. **Only one arm proves death** — `ENOENT` on a host that would have
+> shown us an entry, tested the way `tf_tree`'s `proc_answers_here` tests it, by
+> reading `/proc/self/stat`, which is about a process that is running by
+> construction. Every other failure is *cannot say*: an `EACCES` from a `hidepid`
+> mount, an `EMFILE`, a `stat` line the parser did not understand. The first
+> revision of this step collapsed all of them to *gone* whenever `/proc/self`
+> read, which on a hardened host reports a running publisher as a fork inheritor
+> — a false death in the tool an operator uses to decide what to kill, which is
+> the direction `record_is_alive`'s doc calls corruption.
+>
+> **The finding prints the pid its evidence is about.** That is the lock file
+> identity's, not the arena record's: on a `RESERVED` row the record's `pid`
+> field is still zero (`fill_slot` writes it after the `FREE -> RESERVED` CAS)
+> and on a read-only slot there is no record at all, so a subject built from it
+> read *"slot 8 pid 0 … /proc has no running process for it"*. Where both exist
+> and differ, both are named. The subject also carries which of the two shapes
+> it is — `byte free`, `byte still HELD`, or `byte not probed` for a source that
+> opened no lock file — because the responses are opposite and the difference
+> has to survive being read at 3am.
+>
+> **The word-before-byte order is pinned by a signature, not by a comment.**
+> `0028` piece 2's third constraint requires the `state` word to be observed
+> before the byte is probed. `Snapshot::probe_lock_facts` takes a *callback* that
+> is handed the already-captured row for the slot it is about, and `slot_facts`
+> takes that row rather than a slot number — so there is no lock-file value in
+> `cmd_doctor` that could be computed before `Snapshot::capture`, and the hoist
+> does not compile. The argument that the order *matters* stays where it is
+> proved, in `loom`'s model of `tf_tree`'s `reclamation_verdict`; no sequence of
+> stable slot states can show which read went first, so no test in the CLI
+> claims to.
+>
+> **The false positive named above has had its producer removed.** `0028` step
+> 0b made both `Tree::attach_shared` and `Tree::attach_shared_at` refuse
+> `AttachMode::ReadWrite`, so a byte-less writer has no in-tree producer left.
+> `TreeBuilder::build_shared` called directly still registers without a byte and
+> is still supported, but such a tree has no lock file at all — it reaches the
+> *byte unknown* row of `slot_leak`'s table and is judged by `/proc` alone,
+> exactly as it was before. That row is also what `--from-bag` and the in-process
+> fixture take, so a source with no rendezvous keeps the predicate this check
+> shipped with rather than falling silent, and its message says so instead of
+> claiming a probe the run never made.
+>
+> **Still detection, and still no new id.** Nothing here reclaims anything:
+> `0028` reclaims from the assigner (step 3) and from `Tree::reap_participants`
+> (step 5), and a `doctor` check that mutated a robot's arena as a side effect of
+> being asked a question would be the tool overstepping in the direction D18
+> exists to define. `TFT014`'s title already claims this ground, `0027` has
+> `TFT020`, and §0.0's "sixteen detect" is unchanged.
+
 ---
 
 ## 7. `tf_tree top`

@@ -212,6 +212,112 @@ impl EdgeInfo {
     }
 }
 
+/// What the kernel says about a participant slot's **lock byte** — the fact
+/// `docs/PHASE2.md` §5.1 calls authoritative.
+///
+/// Three answers, not two, and the third is the one that keeps a check honest:
+/// a `doctor` run that never opened a lock file has not learnt the byte is
+/// free, it has learnt nothing, and collapsing those into `Free` is how a warn
+/// starts firing on every arena `doctor` can reach without a rendezvous.
+///
+/// The byte is the *only* liveness fact in this model. [`RecordedProcess`] is a
+/// `/proc` inference beside it, and the two are carried apart rather than
+/// composed because [`crate::checks::slot_leak`] has to tell a slot whose byte
+/// the kernel released from one a forked child is still holding on a dead
+/// process's behalf — and a single boolean cannot say which
+/// (`docs/decisions/0028` plan step 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockByte {
+    /// `F_OFD_GETLK` reported a conflicting lock: somebody's open file
+    /// description holds this slot. Note *somebody's* — an OFD lock names no
+    /// process (`LockProbe::holder_pid` is `-1`), which is exactly why the fork
+    /// case needs a second fact.
+    Held,
+    /// `F_OFD_GETLK` reported no conflict. On a rendezvous arena this is the
+    /// leak signature when the record is not `FREE`
+    /// (`docs/decisions/0028`, *The ordering*).
+    Free,
+    /// Nobody asked, or the kernel would not answer: there is no lock file for
+    /// this arena (the fixture, `--from-bag`), or the `fcntl` failed. **Not**
+    /// evidence in either direction (§6.2's fail-safe rule).
+    Unknown,
+}
+
+/// What `/proc` says about the process a slot's lock-file identity record
+/// names.
+///
+/// **A diagnostic inference, never a protocol decision** (`docs/PHASE2.md`
+/// §5.1). It exists to say "slot 3's record names pid 1841, which is gone" —
+/// the sentence `tf_tree_ipc::Identity::matches_running_process` was written
+/// for — and it is three-valued where that method is two-valued for one
+/// reason: that method maps *every* read failure to `false`, so on a host with
+/// no `/proc` mounted, or one where a `hidepid` mount or an `EMFILE` makes the
+/// read fail, every participant reads as gone — and the fork arm of
+/// [`crate::checks::slot_leak`] would then fire on every healthy slot in the
+/// table. `docs/decisions/0028` works that inversion through in
+/// *"the fail-safe claim is false on this code"*; [`Self::Unknown`] is the
+/// answer it says is owed.
+///
+/// **This is the classification, and there is not a second one.**
+/// `crate::recorded_given` is the only place a `/proc` answer becomes one of
+/// these three, and it is `tf_tree`'s `alive_given` transposed: same three
+/// inputs (the stored start time, what the read came back as, whether this
+/// host's `/proc` answers at all), same arms, same bias. *Cannot tell* is
+/// [`Self::Unknown`] there and here, never [`Self::Gone`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedProcess {
+    /// `/proc` has an entry for the recorded pid whose start time matches the
+    /// record's. The process that took this slot is still running.
+    Running,
+    /// The recorded process is provably gone: either `/proc` has no entry for
+    /// its pid *on a host that would have shown one*, or it has an entry whose
+    /// start time differs — a recycled pid, which is a different process.
+    Gone,
+    /// No identity record to ask about, or `/proc` would not say — an
+    /// unreadable entry, a malformed `stat` line, or an `ENOENT` on a host
+    /// whose `/proc` answers `ENOENT` for everybody. **Never evidence of
+    /// death**: `record_is_alive`'s doc calls a false death corruption, and
+    /// this is the value that keeps one out of an operator tool.
+    Unknown,
+}
+
+/// The lock file's facts about one participant slot, as
+/// [`Snapshot::probe_lock_facts`] merges them in.
+///
+/// A struct rather than a tuple because three of the four fields are about
+/// *different* processes and a positional `(u32, LockByte, RecordedProcess)`
+/// invited exactly the confusion `docs/decisions/0028` plan step 6 shipped
+/// with: the pid the `/proc` evidence is about is the **lock file's**, and it
+/// is not the pid in the arena record beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotFacts {
+    /// What the kernel said about the slot's lock byte.
+    pub byte: LockByte,
+    /// What `/proc` said about the process the slot's identity record names.
+    pub recorded: RecordedProcess,
+    /// The pid that identity record names, or `None` if no record has ever
+    /// been written for this slot (or no lock file was read at all).
+    ///
+    /// **The pid [`Self::recorded`] is about.** A finding that prints
+    /// [`ParticipantInfo::pid`] beside a `/proc` sentence is printing a
+    /// different process's number: on a `RESERVED` slot the arena record's pid
+    /// field is still zero, and `doctor` shipped
+    /// *"slot 8 pid 0 … /proc has no running process for it"* because of it.
+    pub recorded_pid: Option<u32>,
+}
+
+impl SlotFacts {
+    /// The facts a source with no lock file has: none.
+    #[must_use]
+    pub fn unasked() -> SlotFacts {
+        SlotFacts {
+            byte: LockByte::Unknown,
+            recorded: RecordedProcess::Unknown,
+            recorded_pid: None,
+        }
+    }
+}
+
 /// What a participant slot's `state` word says (`docs/PHASE2.md` §5.1).
 ///
 /// Carried as three named states rather than the raw word so that no consumer
@@ -268,9 +374,47 @@ pub struct ParticipantInfo {
     ///
     /// `false` for a [`SlotState::Free`] or [`SlotState::Reserved`] record as
     /// well, because that predicate folds `state == LIVE` in ahead of the
-    /// probe. Only `state == Live && !alive` is evidence of anything, and
-    /// `TFT014` is the check that says what.
+    /// probe.
+    ///
+    /// **It is the composed answer, and [`Self::byte`] is the fact underneath
+    /// it.** Both are carried because a check that has only this one cannot
+    /// tell a healthy joiner mid-attach from one that died there — the record
+    /// is `RESERVED` and this is `false` in both cases — which is the silence
+    /// `docs/decisions/0028` plan step 6 exists to close.
     pub alive: bool,
+    /// What the kernel said about this slot's lock byte, or
+    /// [`LockByte::Unknown`] if nothing asked.
+    ///
+    /// Filled by [`Snapshot::probe_lock_facts`], never by
+    /// [`Snapshot::capture`]: the byte lives in the lock file and a `Snapshot`
+    /// is taken from the arena. `tf_tree top` merges the same file into its own
+    /// capture for the same reason (`crate::top::Capture::merge_lock_rows`).
+    pub byte: LockByte,
+    /// What `/proc` said about the process this slot's lock-file identity
+    /// record names, or [`RecordedProcess::Unknown`] if nothing asked.
+    ///
+    /// **The identity record, not [`Self::pid`].** §3.3 writes the lock-file
+    /// identity *before* the byte is taken, so it is populated for a joiner
+    /// still in `RESERVED` — where the arena record's `pid` field is either
+    /// zero or the previous occupant's, because `fill_slot` writes the identity
+    /// fields *after* its `FREE -> RESERVED` CAS (`docs/decisions/0028`,
+    /// *"`RESERVED` is not a word this predicate may act on"*). Judging a
+    /// `RESERVED` slot from `pid` would be judging somebody else.
+    ///
+    /// It is also populated for a slot whose arena record is `FREE` and always
+    /// will be: a read-only participant takes a byte and writes an identity
+    /// record and **no** arena record at all (D18), so the identity is the only
+    /// name that slot has.
+    pub recorded: RecordedProcess,
+    /// The pid the lock-file identity record names — the pid [`Self::recorded`]
+    /// is an answer about — or `None` when no record was read.
+    ///
+    /// Carried beside [`Self::pid`] rather than replacing it because the two
+    /// are different facts about different tables and a finding may need
+    /// either: the `/proc` evidence is about this one, and the arena record's
+    /// occupancy is about that one. They agree on an ordinary `LIVE` slot and
+    /// diverge on exactly the rows `TFT014` reports.
+    pub recorded_pid: Option<u32>,
 }
 
 /// A point-in-time, read-only capture of a tree's topology, edges, claims and
@@ -464,6 +608,7 @@ impl Snapshot {
         let table = view.participants();
         let capacity = table.capacity();
         let mut participants = Vec::with_capacity(capacity);
+        let unasked = SlotFacts::unasked();
         for slot in 0..capacity as u32 {
             let Some(rec) = table.get(slot) else {
                 continue;
@@ -495,6 +640,12 @@ impl Snapshot {
                 // is precisely the record `identity` would decline to open.
                 pid: rec.pid.load(Ordering::Relaxed),
                 alive: alive || before != after,
+                // The arena has no lock file in it. A caller that has one
+                // probes it afterwards; one that has not says so rather than
+                // fabricating a byte.
+                byte: unasked.byte,
+                recorded: unasked.recorded,
+                recorded_pid: unasked.recorded_pid,
             });
         }
 
@@ -502,6 +653,66 @@ impl Snapshot {
             frames,
             edges,
             participants,
+        }
+    }
+
+    /// Ask the lock file about every captured slot, and fold its answers into
+    /// the rows.
+    ///
+    /// # Why the probe is a callback, and why that is the read-order pin
+    ///
+    /// The state word is read by [`Self::capture`] and the byte by `probe`, and
+    /// `docs/decisions/0028` piece 2's third constraint says the word must be
+    /// read **first**: under word-then-byte the `Acquire` load of a live word
+    /// synchronises-with `fill_slot`'s publishing `Release` store, so a probe
+    /// sequenced after it must see the byte held. Reversed, a sweep can see a
+    /// byte free before a registrant takes it and then read the record it
+    /// published — `loom` erases a published record that way in 0.00 s, in
+    /// `tf_tree`'s model of `reclamation_verdict`, which is where that argument
+    /// is *proved*.
+    ///
+    /// **What is pinned here is the call order, and it is pinned by this
+    /// signature.** `probe` is handed the already-captured
+    /// [`ParticipantInfo`] for the slot it is about — not a slot number — so
+    /// there is no value for a caller to compute before `capture` and no way to
+    /// hoist the probe above it that type-checks. An earlier revision passed a
+    /// precomputed `&[(u32, LockByte, RecordedProcess)]`, and moving its one
+    /// producer above `Snapshot::capture` compiled, ran, and passed every test
+    /// in the suite. *Which* read the kernel performed first is not observable
+    /// in any sequence of stable states — that is `loom`'s job, in `tf_tree` —
+    /// but which call the program makes first is, and this is where it is
+    /// fixed. `doctor::tests::the_probe_is_handed_the_word_that_was_read_first`
+    /// keeps the signature meaningful.
+    ///
+    /// # It does **not** overwrite [`ParticipantInfo::alive`], and `top` does
+    ///
+    /// `top` assigns `alive = held` — *"the kernel's answer wins over the arena
+    /// record's"* — because it renders one liveness column and the kernel is
+    /// the fact behind it. That is the right rule for a column and the wrong
+    /// one here: `TFT014` has to separate a slot whose byte the kernel released
+    /// from one a forked child is still holding for a dead process
+    /// (`docs/decisions/0028` plan step 6, cases (a) and (b)), and both facts
+    /// have to survive to the check for it to. So the byte arrives beside
+    /// `alive` rather than on top of it, and [`crate::checks::slot_leak`] is
+    /// the one place the two are composed.
+    ///
+    /// # Every captured slot is probed, including the `FREE` ones
+    ///
+    /// [`Self::capture`] emits a row per slot of the arena's participant table,
+    /// `FREE` records included, and every one of them is asked. That is not
+    /// thoroughness for its own sake: a **read-only** participant holds a lock
+    /// byte and writes no arena record at all (D18, and Python's default), so
+    /// its record reads `FREE` while its byte reads *held* — and when such a
+    /// process is `fork`ed and dies, the byte its child inherited is still held
+    /// on behalf of a pid that is gone, with a `FREE` record over it. Skipping
+    /// `FREE` rows here, or in [`crate::checks::slot_leak`], makes the single
+    /// most likely fork leak on a Python deployment invisible.
+    pub fn probe_lock_facts(&mut self, mut probe: impl FnMut(&ParticipantInfo) -> SlotFacts) {
+        for p in &mut self.participants {
+            let facts = probe(p);
+            p.byte = facts.byte;
+            p.recorded = facts.recorded;
+            p.recorded_pid = facts.recorded_pid;
         }
     }
 
@@ -1045,7 +1256,88 @@ mod tests {
             state: SlotState::Live,
             pid: 1234,
             alive: true,
+            byte: LockByte::Held,
+            recorded: RecordedProcess::Running,
+            recorded_pid: Some(1234),
         }]
+    }
+
+    /// **The byte probe cannot run before the word was read, and this is what
+    /// keeps the signature that says so meaningful.**
+    ///
+    /// `docs/decisions/0028` piece 2's third constraint: the `state` word must
+    /// be observed before the lock byte is probed, or a sweep can see a byte
+    /// free before a registrant takes it and then read the record it published.
+    /// *Which* read the kernel performed first is invisible in any sequence of
+    /// stable slot states — `loom` is the only thing that can see an
+    /// interleaving, and `tf_tree`'s model of `reclamation_verdict` is where
+    /// that argument is proved. What this crate can pin is that `cmd_doctor`
+    /// makes the calls in that order, and [`Snapshot::probe_lock_facts`] does it
+    /// by type: the probe is handed the already-captured [`ParticipantInfo`],
+    /// so there is no lock-file value in `cmd_doctor` that could be computed
+    /// before `Snapshot::capture`.
+    ///
+    /// The revision this replaced took a precomputed
+    /// `&[(u32, LockByte, RecordedProcess)]` built by a free function of the
+    /// lock file alone. Hoisting that function's call above `Snapshot::capture`
+    /// compiled and passed all eleven attach tests — the order was asserted in
+    /// two doc comments and pinned by nothing.
+    ///
+    /// This asserts the two properties the signature is worth: the probe is
+    /// called **once per captured row**, and each call is handed *that row*,
+    /// word already populated. A slot the capture never emitted cannot be
+    /// probed, and a row the capture emitted cannot be skipped.
+    ///
+    /// Mutant: probe only rows whose `state` is `Live`. Applied: the
+    /// `RESERVED` and `FREE` rows vanish from `seen` and the first assertion
+    /// fails — which is also the read-only fork inheritor going unreported,
+    /// since its row is the `FREE` one.
+    #[test]
+    fn the_probe_is_handed_the_word_that_was_read_first() {
+        let row = |slot: u32, state: SlotState| ParticipantInfo {
+            slot,
+            state,
+            pid: 4711,
+            alive: false,
+            byte: LockByte::Unknown,
+            recorded: RecordedProcess::Unknown,
+            recorded_pid: None,
+        };
+        let mut snap = Snapshot {
+            frames: vec![],
+            edges: vec![],
+            participants: vec![
+                row(0, SlotState::Live),
+                row(1, SlotState::Reserved),
+                row(2, SlotState::Free),
+            ],
+        };
+
+        let mut seen = Vec::new();
+        snap.probe_lock_facts(|p| {
+            // The probe's whole input is the captured row, which is the point:
+            // it cannot be called with a slot number the capture did not emit,
+            // and it cannot be called before there is a row to hand it.
+            seen.push((p.slot, p.state));
+            SlotFacts {
+                byte: LockByte::Held,
+                recorded: RecordedProcess::Gone,
+                recorded_pid: Some(1841 + p.slot),
+            }
+        });
+
+        assert_eq!(
+            seen,
+            vec![
+                (0, SlotState::Live),
+                (1, SlotState::Reserved),
+                (2, SlotState::Free),
+            ],
+            "every captured row is probed exactly once, and is handed its own \
+             already-read state word"
+        );
+        assert_eq!(snap.participants[2].byte, LockByte::Held);
+        assert_eq!(snap.participants[2].recorded_pid, Some(1843));
     }
 
     fn sample(edge: u32, pid: u32, stamp_ns: i64, delay_ns: i64) -> PushSample {

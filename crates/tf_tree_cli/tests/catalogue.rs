@@ -447,7 +447,14 @@ fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
          their claims: {:?}",
         o.findings
     );
-    assert_eq!(o.findings[0].subject, format!("slot 1 pid {GONE}"));
+    // `byte not probed`: this is an in-process arena with no rendezvous, so
+    // `Snapshot::probe_lock_facts` was never called and the verdict rests on
+    // `/proc` alone. The subject says which evidence the run had rather than
+    // letting a `--from-bag` finding read like an `--attach` one.
+    assert_eq!(
+        o.findings[0].subject,
+        format!("slot 1 pid {GONE}, byte not probed")
+    );
     assert!(
         o.findings[0].message.contains("1 of 64"),
         "the operator's budget is 64 slots and the finding must say so: {}",

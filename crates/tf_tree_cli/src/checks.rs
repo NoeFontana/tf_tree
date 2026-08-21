@@ -76,7 +76,9 @@ use tf_tree::{Domain, EdgeId, SensorDomain, SimDomain, SteadyDomain, SystemDomai
 use tf_tree_bench::fixture::PushSample;
 
 use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
-use crate::doctor::{self, Observations, SlotState, Snapshot};
+use crate::doctor::{
+    self, LockByte, Observations, ParticipantInfo, RecordedProcess, SlotState, Snapshot,
+};
 use crate::hostfacts::{HostFacts, MemLock, ShmemThp, Thp};
 
 /// A stamp further than this from the reference clock is not a late sample, it
@@ -1195,6 +1197,209 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft013, out)
 }
 
+/// Which of `TFT014`'s two participant leaks a slot is, if either.
+///
+/// `docs/decisions/0028` plan step 6. **Two findings and not one**, because the
+/// responses differ and an operator sent after the wrong one at 3am has been
+/// actively misled: (a) is a slot nothing will ever reassign, and (b) is a slot
+/// a *live* open file description is holding on behalf of a process that no
+/// longer exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotLeak {
+    /// **(a)** A record that is not `FREE` over a lock byte nobody holds.
+    ///
+    /// `docs/decisions/0028`'s *The ordering* table: on every path that has a
+    /// byte, the byte is taken *before* the arena record leaves `FREE`, so
+    /// "free byte over a non-`FREE` record" is the leak and nothing else
+    /// produces it.
+    Abandoned,
+    /// **(b)** The byte *is* held, and `/proc` says the process the identity
+    /// record names is gone.
+    ///
+    /// **Judged without reference to the arena record, and it has to be.** The
+    /// two facts are the lock file's — a held byte and the identity beside it —
+    /// so this fires on a `FREE` arena row as readily as on a `LIVE` one, which
+    /// is what makes the *read-only* participant's inheritor visible. That one
+    /// writes no arena record at all (D18) and is the shape a `fork`ed Python
+    /// worker leaves behind, so a variant that needed a record would miss the
+    /// case it is mostly for.
+    ///
+    /// So what holds it is a descriptor that outlived its process, which on
+    /// Linux means a `fork` inheritor: `docs/PHASE2.md` §6.2 is NORMATIVE that
+    /// an OFD lock belongs to the open file description and that `fork` shares
+    /// it. **Not reclaimable, deliberately** — the kernel's answer is *alive*,
+    /// and overruling it with a `/proc` inference is the inversion §5.1 exists
+    /// to forbid. `docs/decisions/0030` closes it at the source, by having the
+    /// atfork handler close what it inherited; until then this is a documented
+    /// limitation *with a detection*, which is the whole reason this variant
+    /// exists.
+    ForkInheritor,
+}
+
+/// Whether participant slot `p` is one of the two leaks above.
+///
+/// # One predicate, and the read order it depends on
+///
+/// The `state` word is consulted **first**, and it answers only *is there a
+/// record here* — never *is its process alive*, which is the split
+/// `docs/PHASE2.md` §5.1 draws and the reason `identity()` in the assigner was
+/// a bug. The byte is consulted second. That order is a correctness constraint
+/// rather than a style: `tf_tree`'s `reclamation_verdict` (`0028` piece 2, third
+/// constraint) states the argument in full — under word-then-byte the `Acquire`
+/// load of a live word synchronises-with `fill_slot`'s publishing `Release`
+/// store, so a byte probe sequenced after it must see the byte held, and
+/// reversing the two erases a published record under `loom` in 0.00 s.
+///
+/// This function is the *reporting* half and does not re-read either fact: the
+/// word was read by [`Snapshot::capture`] and the byte by
+/// [`Snapshot::probe_lock_facts`], whose signature is what makes the order
+/// unhoistable — it hands the probe the captured row, so there is nothing to
+/// compute before the capture. The argument that the order *matters* is
+/// `loom`'s, in `tf_tree`; the argument that this program obeys it is that
+/// signature.
+///
+/// # Every arm, and which way it fails
+///
+/// | `state` | byte | `/proc` | verdict |
+/// |---|---|---|---|
+/// | `FREE` | held | gone | **(b)** [`SlotLeak::ForkInheritor`] — the read-only participant's inheritor, and the likeliest one |
+/// | `FREE` | held | running or unknown | nothing — an ordinary read-only consumer (D18) |
+/// | `FREE` | free or unknown | any | nothing — an empty slot, which is most of a real table |
+/// | non-`FREE` | free | gone | **(a)** [`SlotLeak::Abandoned`] |
+/// | non-`FREE` | free | unknown | **(a)** — the byte alone is the leak signature, and §5.1 says the byte is the fact |
+/// | non-`FREE` | free | running | nothing. See below |
+/// | non-`FREE` | held | gone | **(b)** [`SlotLeak::ForkInheritor`] |
+/// | non-`FREE` | held | running or unknown | nothing — somebody is holding it |
+/// | `LIVE` | unknown | any | (a) iff [`ParticipantInfo::alive`] is false |
+///
+/// **A `FREE` record is not silence, and that was a real hole.** `FREE` says
+/// only that no *arena* record is here, and the participant D18 makes the
+/// consumer default — read-only, `PROT_READ`, Python's `multiprocessing`
+/// worker — never writes one: it takes a lock byte, writes a lock-file identity
+/// record, and leaves the arena table alone. So the fork inheritor of a
+/// read-only participant is `FREE` + held + gone, it is the single most likely
+/// shape on a Python deployment, and returning `None` for every `FREE` row
+/// reported it as `"status": "pass"` while `docs/RUNBOOK.md` told the operator
+/// this check would name it. Clause (b) is therefore judged from the byte and
+/// the identity record, which are the two facts such a slot has; clause (a)
+/// still needs an arena record, because an arena record is the thing it says
+/// nothing will reassign.
+///
+/// **`free` + `running` is silence, and it is the one place this is quieter
+/// than the reclaimer.** `tf_tree`'s reclamation predicate calls a non-`FREE`
+/// record over a free byte reclaimable with no `/proc` conjunct at all, so on
+/// that combination a report and a sweep can disagree. The disagreement is
+/// deliberate: what produces it is a participant with a record and no byte,
+/// which `0028` open question 1 ruled out of the deployment model and step 0b
+/// removed the producer of — and naming a process `/proc` says is *running* as
+/// leaked is the one false positive that gets a `warn` suppressed for good.
+///
+/// **The `unknown` byte row is the source with no lock file at all** — the
+/// in-process fixture and `--from-bag`, whose participant table is this
+/// process's own. It keeps exactly the predicate this check shipped with, so a
+/// source that cannot be asked about a byte reports what it always did rather
+/// than falling silent.
+///
+/// **The one race left in it is `register_any`'s, and it is µs-wide.** That
+/// path takes the byte *before* writing the identity record (a deliberate
+/// deviation from §3.3, argued in `tf_tree_ipc::Open::register_any`), so for a
+/// few microseconds a freshly taken byte sits over the *previous* occupant's
+/// identity — and if that occupant is dead, this reads (b). A diagnostic that
+/// is momentarily wrong about a slot being re-taken is the cost of that
+/// deviation, and it is priced in the direction of a report rather than a
+/// reclamation: nothing acts on (b) but a human.
+#[must_use]
+pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
+    // The word first, and it answers exactly one question: is there an arena
+    // record here? `FREE` means there is not — which is the ordinary state of
+    // a live read-only joiner, whose byte is held and whose arena record was
+    // never written because the mapping is `PROT_READ` (D18, and the Python
+    // default). It is most of a real table. It is *not* a reason to stop
+    // asking: the byte beside a `FREE` record can still be held for a process
+    // that is gone, and that is clause (b) with no arena record under it.
+    if p.state == SlotState::Free {
+        return (p.byte == LockByte::Held && p.recorded == RecordedProcess::Gone)
+            .then_some(SlotLeak::ForkInheritor);
+    }
+    match (p.byte, p.recorded) {
+        (LockByte::Free, RecordedProcess::Running) => None,
+        (LockByte::Free, RecordedProcess::Gone | RecordedProcess::Unknown) => {
+            Some(SlotLeak::Abandoned)
+        }
+        (LockByte::Held, RecordedProcess::Gone) => Some(SlotLeak::ForkInheritor),
+        (LockByte::Held, RecordedProcess::Running | RecordedProcess::Unknown) => None,
+        // No byte was asked for. `alive` is then the `/proc` inference
+        // `Tree::participant_alive` falls back to, and `state == LIVE` is
+        // already folded into it — so `RESERVED` cannot be judged from here and
+        // is not.
+        (LockByte::Unknown, _) => {
+            (p.state == SlotState::Live && !p.alive).then_some(SlotLeak::Abandoned)
+        }
+    }
+}
+
+/// The evidence clause of an [`SlotLeak::Abandoned`] finding.
+///
+/// Three renderings because there are three evidence sets. A message that says
+/// "the lock byte is free" on a run that never opened a lock file is asserting
+/// a syscall it did not make, and an operator who then goes looking for the
+/// holder has been sent by the tool.
+fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
+    match (p.byte, p.recorded) {
+        (LockByte::Free, RecordedProcess::Gone) => {
+            "the lock byte is free, and /proc has no running process for it"
+        }
+        (LockByte::Free, _) => {
+            "the lock byte is free, and /proc could not say what became of the process — so \
+             the kernel's answer is the whole of the evidence"
+        }
+        _ => {
+            "/proc says its process is gone, and no lock file was read on this run — so the \
+             kernel's own answer about the byte is not in this report"
+        }
+    }
+}
+
+/// The pid a slot finding's evidence is about, and the arena record's, in one
+/// subject line.
+///
+/// **The lock file's pid leads, because the `/proc` sentence in every message
+/// below is about that one.** `doctor` shipped
+/// *"slot 8 pid 0 … /proc has no running process for it"*: the `0` is
+/// [`ParticipantInfo::pid`], the arena record's field, which is still zero on a
+/// `RESERVED` row and is *always* zero on the `FREE` row a read-only
+/// participant leaves — while the process the sentence is about is named only
+/// in the lock file. Printing the record's number beside the other one's
+/// evidence gives an operator a pid to hunt that no evidence in the finding
+/// concerns.
+///
+/// Both are named when both exist and differ, because both are then real: the
+/// lock file names the process, and the arena record names the occupancy that
+/// is stuck. When the record's field is zero it names nothing and is left out
+/// rather than printed as a `0` somebody has to interpret.
+///
+/// The trailing byte clause is what separates the two shapes **in the subject
+/// alone**, which is what `docs/RUNBOOK.md`'s `TFT014` rows key on: at 3am, a
+/// slot to reap and a slot nothing may reap must not need a paragraph of prose
+/// to tell apart.
+fn slot_subject(p: &ParticipantInfo) -> String {
+    let evidence_pid = p.recorded_pid.unwrap_or(p.pid);
+    let byte = match p.byte {
+        LockByte::Held => "byte still HELD",
+        LockByte::Free => "byte free",
+        LockByte::Unknown => "byte not probed",
+    };
+    match p.recorded_pid {
+        Some(rp) if rp != p.pid && p.pid != 0 => {
+            format!(
+                "slot {} pid {rp} (arena record names pid {}), {byte}",
+                p.slot, p.pid
+            )
+        }
+        _ => format!("slot {} pid {evidence_pid}, {byte}", p.slot),
+    }
+}
+
 /// `TFT014` — a participant slot, or a claim, that outlived its owner.
 ///
 /// Both halves of §6's title, and they are one condition seen from two tables:
@@ -1204,21 +1409,32 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 /// both halves read it, so a report cannot call the same process alive on an
 /// edge line and dead on a slot line.
 ///
-/// # The predicate is the lock byte, and only for a `LIVE` record
+/// # The predicate is the lock byte, and it is [`slot_leak`]
 ///
 /// `docs/PHASE2.md` §5.1: liveness is the participant's OFD lock byte, never
-/// the record. [`crate::doctor::ParticipantInfo::alive`] is
-/// [`Tree::participant_alive`], which is `F_OFD_GETLK` on the slot's byte for a
-/// tree from `tf_tree::open` and a `/proc` inference otherwise; both fail safe
+/// the record. The **claim half** reads
+/// [`crate::doctor::ParticipantInfo::alive`], which is
+/// [`Tree::participant_alive`] — `F_OFD_GETLK` on the slot's byte for a tree
+/// from `tf_tree::open` and a `/proc` inference otherwise, both failing safe
 /// towards *alive*. Reading `state` instead is what made this check blind in
 /// the state it is named for — `identity` answers for any record whose `state`
 /// word reads `LIVE`, and a participant killed without running `Drop` leaves
 /// one behind, so `owner_pid` came back non-zero and the check stayed quiet
 /// (`docs/decisions/0028`, issue #184).
 ///
-/// **Detection only. Nothing here reclaims anything**, deliberately: `0028` is
-/// `draft` and exists so that no reclamation lands before its predicate is
-/// settled.
+/// The **participant half** needs more than one boolean and takes it from
+/// [`slot_leak`], whose table is the whole predicate. One `alive` cannot
+/// separate a joiner healthily sitting in `RESERVED` from one that died there,
+/// nor a released byte from one a forked child still holds, and those are the
+/// two silences `0028` plan step 6 closes. The extra facts arrive through
+/// [`Snapshot::probe_lock_facts`]; a source with no lock file supplies neither
+/// and the check reports what it always did.
+///
+/// **Detection only. Nothing here reclaims anything**, deliberately: `0028`
+/// reclaims from the *assigner* and from `Tree::reap_participants`, and a
+/// `doctor` check that mutated a robot's arena as a side effect of being asked
+/// a question would be the tool overstepping in the direction D18 exists to
+/// prevent.
 ///
 /// # Which shapes reach it, and which of those `--attach` can see
 ///
@@ -1249,8 +1465,11 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 ///   wired, so this is reachable only once it is.
 ///
 /// The remaining hole, the fork-inherited connection (hole 1), leaves the byte
-/// **held** by the child and so is a silence rather than a finding — it is
-/// named below with the others.
+/// **held** by the child, so it is not in the list above — it is a finding of
+/// its own shape, [`SlotLeak::ForkInheritor`], and the one that does not need
+/// an arena record at all: the read-only participant D18 makes the consumer
+/// default writes none, and a `fork`ed Python worker holding its dead parent's
+/// byte is exactly a `FREE` row over a held byte.
 ///
 /// **`doctor --attach` can be pointed at only two of those five today**, which
 /// is worth knowing before reading a quiet report as an all-clear: attaching
@@ -1276,25 +1495,20 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 ///
 /// # Which direction it fails in
 ///
-/// Towards silence, in four named ways, because a warn that fires on a
+/// Towards silence, in three named ways, because a warn that fires on a
 /// healthy robot is one that gets suppressed within a week.
 ///
-/// * **`RESERVED` is not reported.** A registrant is `RESERVED` for the few
-///   instructions between winning the slot and publishing its identity, and
-///   `participant_alive` folds `state == LIVE` in ahead of the probe — so it
-///   answers "not alive" for a healthy joiner mid-attach exactly as it does for
-///   one that died there. Separating them needs the raw byte, which is a probe
-///   this layer does not have (`cmd_participants` opens the lock file directly;
-///   `doctor` does not). Nothing collects a `RESERVED` record either — that is
-///   `0028`'s open question 6 — so what is missed here is a leak no answer
-///   would repair today.
-/// * **The fork case is not reported.** A child that inherited the mapping
-///   holds the parent's byte (`0028` §6.2), so the kernel says *alive* for a
-///   process that provably cannot participate. Naming it needs a second,
-///   independent fact — `/proc` disagreeing with the recorded
-///   `(pid, start_time)` — and `participant_alive` composes that fact away
-///   rather than exposing it. Inventing a second liveness spelling here to get
-///   at it is the thing this check must not do.
+/// **Two of the five that used to be here are now findings**, which is `0028`
+/// plan step 6: `RESERVED` was unreportable while the only fact was
+/// `participant_alive` (it folds `state == LIVE` in ahead of the probe and so
+/// answers "not alive" for a healthy joiner mid-attach exactly as for one that
+/// died there), and the fork case was unreportable while `/proc` was composed
+/// away rather than carried. `doctor` now opens the lock file — the thing
+/// `cmd_participants` always did and this check did not — and [`slot_leak`]
+/// composes the three facts once. Note what did **not** change: the fork case
+/// is still not reclaimable by anybody, because the kernel's answer for it is
+/// *held*; what it gained is a name.
+///
 /// * **A claim over a slot that has since been re-granted is not reported, and
 ///   this one is reachable from the ordinary #184 flow.** The claim's owner word
 ///   carries the `ClaimRecord`'s own per-edge epoch, not the participant's
@@ -1313,13 +1527,15 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 ///   the claim's *own* lease first; this check has no such probe, so it reports
 ///   neither and loses a claimer killed inside that window.
 ///
-/// It fails the other way in exactly one place, and it is a shape `0028`'s open
-/// question 1 has since ruled out of the deployment model: a `ReadWrite`
-/// `Tree::attach_shared` writes an arena record and takes **no lock byte**, so
-/// its healthy participant reads as a leak. Every supported read-write
-/// participant joins through the rendezvous, which takes the byte before the
-/// record leaves `FREE`; making that arm refuse is a step of `0028` and not of
-/// this check.
+/// **The one place it used to fail the other way has had its producer
+/// removed.** A `ReadWrite` `Tree::attach_shared` wrote an arena record and
+/// took no lock byte, so its healthy participant read as a leak; `0028` step 0b
+/// made both fd-attach arms refuse `ReadWrite`, so every supported read-write
+/// participant now joins through the rendezvous and takes its byte before the
+/// record leaves `FREE`. `TreeBuilder::build_shared` called directly still
+/// registers without a byte and is still supported — but such a tree has no
+/// lock file, so it reaches [`slot_leak`]'s `unknown` byte row and is judged by
+/// `/proc` alone, exactly as it was before.
 ///
 /// **The claim half rests on the owner word being decoded correctly.** It is
 /// `(epoch << 16) | (slot + 1)`, so a hand-rolled `word - 1` resolves every
@@ -1332,31 +1548,72 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
     }
     let mut out = Vec::new();
     let slots = inp.snap.participants.len();
+    // The budget figure is about slots nothing will reassign, so it counts (a)
+    // only: a fork inheritor's byte comes back when the last inheritor exits,
+    // and folding it in would report a recoverable slot as permanently spent.
     let leaked = inp
         .snap
         .participants
         .iter()
-        .filter(|p| p.state == SlotState::Live && !p.alive)
+        .filter(|p| slot_leak(p) == Some(SlotLeak::Abandoned))
         .count();
     for p in &inp.snap.participants {
-        if p.state != SlotState::Live || p.alive {
-            continue;
+        // The word this row actually carries. `FREE` used to render as `LIVE`
+        // because no `FREE` row could produce a finding; one can now — the
+        // read-only participant's fork inheritor — and calling its record
+        // `LIVE` would send an operator looking for an arena record that was
+        // never written.
+        let state = match p.state {
+            SlotState::Reserved => "RESERVED",
+            SlotState::Live => "LIVE",
+            SlotState::Free => "FREE (no arena record: a read-only participant, D18)",
+        };
+        // The pid every sentence below is about: the lock file's, which is the
+        // one `/proc` was asked about, falling back to the arena record's on a
+        // source that read no lock file.
+        let pid = p.recorded_pid.unwrap_or(p.pid);
+        match slot_leak(p) {
+            None => {}
+            Some(SlotLeak::Abandoned) => out.push(Finding::about(
+                Tft::Tft014,
+                slot_subject(p),
+                format!(
+                    "a record left behind — the record is {state}, {} — pid {pid} \
+                     left slot {} registered and no longer holds it, and the owner's \
+                     socket-hangup reap did not clear it. That reap collects a rendezvous \
+                     peer, so this is a slot it cannot reach: the owner's own, one its epoll \
+                     never watched, an attach_shared participant, a takeover, or an owner \
+                     that died inside the callback (docs/decisions/0028). Nothing reclaims \
+                     it — {leaked} of {slots} slots are spent for the life of the segment, \
+                     and at {slots} every further attach fails NoParticipantSlots. Only \
+                     stopping every participant, which frees the segment, frees a slot",
+                    abandoned_evidence(p),
+                    p.slot
+                ),
+            )),
+            Some(SlotLeak::ForkInheritor) => out.push(Finding::about(
+                Tft::Tft014,
+                slot_subject(p),
+                format!(
+                    "a fork inheritor — byte still HELD, recorded pid gone. The record is \
+                     {state} and its lock byte is still HELD, but /proc says the pid the \
+                     lock file records for it, {pid}, is gone — so slot {} is held by an open \
+                     file description that outlived its process, which on Linux means a \
+                     forked child inherited it (PHASE2 §6.2: an OFD lock belongs to the \
+                     description, and fork shares it). This is NOT the same fault as a slot \
+                     whose byte is free and NOT one to go looking for a reaper for: nothing \
+                     may reclaim this slot, because the kernel's own answer is 'held' and \
+                     overruling that with a /proc guess is what would evict a running \
+                     participant. The child cannot use the slot either — a shared arena is \
+                     mapped MADV_DONTFORK, so the handle it inherited is poisoned — and the \
+                     byte comes back on its own when the last inheritor exits. Stop the \
+                     child, or start workers with a start method that inherits no \
+                     descriptors: multiprocessing's `spawn` (Python's default on Linux is \
+                     `fork`), or fork+exec (docs/decisions/0030)",
+                    p.slot
+                ),
+            )),
         }
-        out.push(Finding::about(
-            Tft::Tft014,
-            format!("slot {} pid {}", p.slot, p.pid),
-            format!(
-                "the record is LIVE and the lock byte is free — pid {} left slot {} registered \
-                 and no longer holds it, and the owner's socket-hangup reap did not clear it. \
-                 That reap collects a rendezvous peer, so this is a slot it cannot reach: the \
-                 owner's own, one its epoll never watched, an attach_shared participant, a \
-                 takeover, or an owner that died inside the callback (docs/decisions/0028). \
-                 Nothing reclaims it — {leaked} of {slots} slots are spent for the life of \
-                 the segment, and at {slots} every further attach fails NoParticipantSlots. \
-                 Only stopping every participant, which frees the segment, frees a slot",
-                p.pid, p.slot
-            ),
-        ));
     }
     for e in &inp.snap.edges {
         if !e.claimed || e.claiming {
@@ -1938,7 +2195,7 @@ mod tests {
 
     use super::*;
     use crate::catalogue::Status;
-    use crate::doctor::{EdgeInfo, FrameInfo, ParticipantInfo};
+    use crate::doctor::{EdgeInfo, FrameInfo};
     use tf_tree::InterpPolicy;
 
     fn frame(id: u32, name: &str, parent: u32, depth: u16) -> FrameInfo {
@@ -1983,6 +2240,9 @@ mod tests {
             state: SlotState::Live,
             pid: 4711,
             alive: true,
+            byte: LockByte::Held,
+            recorded: RecordedProcess::Running,
+            recorded_pid: Some(4711),
         }]
     }
 
@@ -2427,9 +2687,11 @@ mod tests {
     /// the edge finding disappears and the count assertion fails at 1, while
     /// the slot finding still fires — which is `doctor` reporting a leaked slot
     /// and calling the edge it stranded healthy.
-    /// Mutant B: drop the `p.state != SlotState::Live` term. Applied: the 63
-    /// free slots of any real table report as leaks; here the `Reserved` slot
-    /// below fires and the count assertion fails at 3.
+    /// Mutant B: drop the `p.state == SlotState::Live` conjunct from
+    /// [`slot_leak`]'s `(LockByte::Unknown, _)` arm, leaving `!p.alive`.
+    /// Applied: the `Reserved` slot below fires as well and the count
+    /// assertion fails at *left: 3, right: 2* — which on a real no-lock-file
+    /// table is every joiner caught mid-attach reported as a leak.
     #[test]
     fn a_stale_live_slot_and_the_claim_it_stranded_are_both_reported() {
         let obs = Observations::new();
@@ -2438,29 +2700,47 @@ mod tests {
         held.owner_pid = 4711;
 
         let mut snap = two_frame_snapshot(held);
+        // **A source with no lock file**, which is what `byte: Unknown` says:
+        // the fixture and `--from-bag` build their arena in this process and
+        // have no rendezvous to probe. It is the row of [`slot_leak`]'s table
+        // that keeps this check's original predicate, so this test pins that
+        // row rather than the new byte-driven ones.
         snap.participants = vec![
             ParticipantInfo {
                 slot: 0,
                 state: SlotState::Live,
                 pid: 4711,
                 alive: false,
+                byte: LockByte::Unknown,
+                // No lock file was read, so there is no recorded pid either:
+                // the arena record's is the only name this row has, and the
+                // finding has to print that one.
+                recorded_pid: None,
+                recorded: RecordedProcess::Unknown,
             },
             // A joiner mid-attach. `participant_alive` folds `state == LIVE` in
             // ahead of the lock-byte probe, so this reads `alive: false` on a
-            // perfectly healthy process — which is why `RESERVED` is not
-            // reportable from here.
+            // perfectly healthy process — which is why a source with no byte to
+            // probe must not report `RESERVED`. With a byte, it can: that is
+            // `a_reserved_record_over_a_free_byte_is_the_leak_a_byte_can_see`.
             ParticipantInfo {
                 slot: 1,
                 state: SlotState::Reserved,
                 pid: 4712,
                 alive: false,
+                byte: LockByte::Unknown,
+                recorded_pid: None,
+                recorded: RecordedProcess::Unknown,
             },
         ];
 
         let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert_eq!(o.status, Status::Fired, "{o:?}");
         assert_eq!(o.findings.len(), 2, "one slot and one edge: {o:?}");
-        assert_eq!(o.findings[0].subject, "slot 0 pid 4711");
+        // `byte not probed`, because this source has no lock file: the subject
+        // states which evidence the run actually had, so a `--from-bag` finding
+        // and an `--attach` one are not read as the same claim.
+        assert_eq!(o.findings[0].subject, "slot 0 pid 4711, byte not probed");
         assert_eq!(o.findings[0].edge, None, "a slot leak is not about an edge");
         assert!(
             o.findings[0].message.contains("1 of 2 slots"),
@@ -2488,13 +2768,265 @@ mod tests {
         );
     }
 
-    /// **A slot nobody holds is not a leak.**
+    /// One participant slot with the three facts [`slot_leak`] reads.
+    ///
+    /// The two pids agree here, which is the ordinary case; the row where they
+    /// diverge has its own builder in
+    /// [`the_subject_names_the_pid_the_evidence_is_about`].
+    fn slot(
+        n: u32,
+        state: SlotState,
+        byte: LockByte,
+        recorded: RecordedProcess,
+    ) -> ParticipantInfo {
+        ParticipantInfo {
+            slot: n,
+            state,
+            pid: 4712,
+            // `false` for every non-`LIVE` record and for a `LIVE` one over a
+            // free byte, which is what `Tree::participant_alive` answers. None
+            // of the rows below reads it — that is the point of them.
+            alive: false,
+            byte,
+            recorded,
+            // A row whose byte was never probed read no lock file, so it has no
+            // identity record to name a pid either. Tying the two together here
+            // keeps every fixture in this module a shape a real run produces.
+            recorded_pid: (byte != LockByte::Unknown).then_some(4712),
+        }
+    }
+
+    /// **A `RESERVED` record over a free byte is a leak, and the byte is what
+    /// makes it visible.**
+    ///
+    /// `docs/decisions/0028` plan step 6 widened clause (a) from `LIVE` to any
+    /// non-`FREE` record, and this is the row that needed the widening:
+    /// `Tree::participant_alive` folds `state == LIVE` in ahead of the probe,
+    /// so `alive` is `false` here whatever the byte says and the old predicate
+    /// could not act on it in either direction. The sibling
+    /// `a_joiner_holding_its_byte_mid_attach_is_not_reported` is the same
+    /// record with the byte held, and the pair is the whole argument for
+    /// carrying the byte separately from `alive`.
+    ///
+    /// Mutant: restore the predicate this check shipped with — replace
+    /// [`slot_leak`]'s whole body with
+    /// `(p.state == SlotState::Live && !p.alive).then_some(SlotLeak::Abandoned)`.
+    /// Applied: `left: Pass, right: Fired` — the `RESERVED` leak goes back to
+    /// being invisible.
+    #[test]
+    fn a_reserved_record_over_a_free_byte_is_the_leak_a_byte_can_see() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(slot(
+            1,
+            SlotState::Reserved,
+            LockByte::Free,
+            RecordedProcess::Gone,
+        ));
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 1, "one slot, no edge: {o:?}");
+        assert!(
+            o.findings[0].message.starts_with("a record left behind —"),
+            "the two TFT014 shapes must be separable from the first few words: {}",
+            o.findings[0].message
+        );
+        assert!(
+            o.findings[0].message.contains("the record is RESERVED"),
+            "the message must say which word it found, or an operator cannot \
+             tell a half-finished registration from a finished one: {}",
+            o.findings[0].message
+        );
+    }
+
+    /// **The fork case is its own finding, with its own remedy.**
+    ///
+    /// `0028` plan step 6 clause (b), and the reason it is a *distinct* message
+    /// rather than a second producer of the first one: the byte is held, so
+    /// nothing may reclaim this slot — the kernel's answer is *alive* and
+    /// overruling it with `/proc` is the inversion `PHASE2.md` §5.1 forbids.
+    /// An operator told "the lock byte is free" here would go looking for a
+    /// reaper that must not run.
+    ///
+    /// Mutant: return `SlotLeak::Abandoned` from the `(Held, Gone)` arm.
+    /// Applied: it panicked on the first `contains` — *"the fork case must be
+    /// named as itself"* — with the abandoned wording, which tells an operator
+    /// to reap a slot the kernel says is held.
+    #[test]
+    fn a_held_byte_over_a_dead_pid_is_the_fork_case_and_says_so() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(slot(
+            1,
+            SlotState::Live,
+            LockByte::Held,
+            RecordedProcess::Gone,
+        ));
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 1, "{o:?}");
+        let m = &o.findings[0].message;
+        assert!(
+            m.contains("forked child inherited it"),
+            "the fork case must be named as itself: {m}"
+        );
+        assert!(
+            m.contains("`spawn`"),
+            "the remedy is a start method and the message has to name it: {m}"
+        );
+        assert!(
+            !m.contains("Only stopping every participant"),
+            "a fork-held byte comes back when the last inheritor exits, so the \
+             permanent-loss wording belongs to the other finding: {m}"
+        );
+    }
+
+    /// **A joiner mid-attach, holding its byte, is not reported — either way.**
+    ///
+    /// The negative `0028` plan step 6 asks for by name, and the one that stops
+    /// this becoming a check that always fires. §3.3's order is identity, then
+    /// byte, then the arena record's `FREE -> RESERVED` CAS, so *every* healthy
+    /// registrant passes through exactly this state.
+    ///
+    /// Both facts are needed to stay silent and the fixture proves it: a
+    /// `Running` process behind a held byte, and an `Unknown` one behind a held
+    /// byte (a `/proc` that would not answer, which must never read as death).
+    ///
+    /// Mutant: widen the fork arm to `(LockByte::Held, _)`. Applied:
+    /// `left: Fired, right: Pass` — every healthy joiner and every participant
+    /// on a `/proc`-less host reported as a fork inheritor. The same mutation
+    /// fails `doctor_is_silent_about_a_joiner_that_is_mid_attach` in
+    /// `tests/attach.rs`, which is the end-to-end half of this claim.
+    #[test]
+    fn a_joiner_holding_its_byte_mid_attach_is_not_reported() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(slot(
+            1,
+            SlotState::Reserved,
+            LockByte::Held,
+            RecordedProcess::Running,
+        ));
+        snap.participants.push(slot(
+            2,
+            SlotState::Reserved,
+            LockByte::Held,
+            RecordedProcess::Unknown,
+        ));
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Pass, "{o:?}");
+    }
+
+    /// **A process `/proc` says is running is not called leaked, whatever its
+    /// byte says.**
+    ///
+    /// The one row where this check is deliberately quieter than the reclaimer
+    /// (`slot_leak`'s table says so in as many words): `tf_tree`'s reclamation
+    /// predicate calls a non-`FREE` record over a free byte reclaimable with no
+    /// `/proc` conjunct at all. What produces that combination is a participant
+    /// with a record and no byte, which `0028` open question 1 ruled out and
+    /// step 0b removed the producer of — and naming a *running* process as
+    /// leaked is the false positive that gets a `warn` suppressed for good.
+    ///
+    /// Mutant: fold the `(Free, Running)` arm into the `Abandoned` one.
+    /// Applied: `left: Fired, right: Pass`, with a finding whose evidence
+    /// clause reads *"the lock byte is free, and /proc could not say what became
+    /// of the process…"* about a process `/proc` had just said was running.
+    #[test]
+    fn a_running_process_over_a_free_byte_is_not_called_leaked() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(slot(
+            1,
+            SlotState::Live,
+            LockByte::Free,
+            RecordedProcess::Running,
+        ));
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Pass, "{o:?}");
+    }
+
+    /// **A message never claims a syscall the run did not make.**
+    ///
+    /// Two sources reach clause (a) by different evidence: `--attach`, which
+    /// has a lock file and can say the byte is free, and the fixture or
+    /// `--from-bag`, which have none and are judged by `/proc` alone. The
+    /// wording that shipped before step 6 — *"the lock byte is free"* —
+    /// predates `doctor` opening a lock file at all, so on the second source it
+    /// asserted a probe nobody performed and sent an operator looking for a
+    /// holder.
+    ///
+    /// Mutant: return the `LockByte::Free` string from every arm of
+    /// `abandoned_evidence`. Applied: it panicked on the second `contains`,
+    /// printing a no-lock-file source's finding claiming *"the lock byte is
+    /// free and /proc has no running process for it"* — a probe that run never
+    /// made.
+    #[test]
+    fn the_evidence_clause_names_the_facts_the_run_actually_had() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(slot(
+            1,
+            SlotState::Live,
+            LockByte::Free,
+            RecordedProcess::Gone,
+        ));
+        // The no-lock-file source: `alive` is the whole of the evidence, and it
+        // is `false` here because `slot` builds it that way.
+        snap.participants.push(slot(
+            2,
+            SlotState::Live,
+            LockByte::Unknown,
+            RecordedProcess::Unknown,
+        ));
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.findings.len(), 2, "{o:?}");
+        assert!(
+            o.findings[0]
+                .message
+                .contains("the lock byte is free, and /proc has no running process"),
+            "{}",
+            o.findings[0].message
+        );
+        assert!(
+            o.findings[1]
+                .message
+                .contains("no lock file was read on this run"),
+            "a run with no lock file must not claim the byte is free: {}",
+            o.findings[1].message
+        );
+        assert!(
+            o.findings[1].message.contains("2 of 3 slots"),
+            "the budget must count both abandoned slots: {}",
+            o.findings[1].message
+        );
+    }
+
+    /// **A slot nobody holds is not a leak, and neither is a read-only
+    /// consumer that is running.**
     ///
     /// [`ParticipantInfo::alive`] is `false` for every `FREE` record in a real
     /// table — the predicate short-circuits on `state != LIVE` before it probes
     /// anything — and a 64-slot arena with one publisher has 63 of them. A
     /// check that read `alive` alone would report a healthy robot as leaking 63
     /// slots, which is the false positive that gets a warn suppressed for good.
+    ///
+    /// **The fixture's `/proc` answer was `Gone` and has been corrected to
+    /// `Running`, which is what the comment beside it always claimed.** A
+    /// read-only consumer holding its own byte is `Running`; `FREE` + held +
+    /// *gone* is not that shape at all — it is the read-only participant's fork
+    /// inheritor, the byte held on behalf of a process that has exited, and
+    /// [`a_free_record_over_a_held_byte_for_a_dead_pid_is_the_fork_case`] is
+    /// where it now belongs. Asserting `Pass` over the old fixture was
+    /// asserting that `doctor` stays silent about the likeliest leak a Python
+    /// deployment produces. The two halves below keep the row non-degenerate on
+    /// the axis the old comment cared about: 31 slots nobody holds at all, and
+    /// 32 held by running readers.
     #[test]
     fn a_free_slot_is_not_a_leak() {
         let obs = Observations::new();
@@ -2505,10 +3037,143 @@ mod tests {
                 state: SlotState::Free,
                 pid: 0,
                 alive: false,
+                // Half the table is genuinely empty and half is the real shape
+                // of a robot's consumers: a free record with a *held* byte,
+                // because a read-only participant writes no arena record (D18).
+                byte: if slot % 2 == 0 {
+                    LockByte::Held
+                } else {
+                    LockByte::Free
+                },
+                recorded: if slot % 2 == 0 {
+                    RecordedProcess::Running
+                } else {
+                    RecordedProcess::Unknown
+                },
+                recorded_pid: (slot % 2 == 0).then_some(9000 + slot),
             }));
 
         let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert_eq!(o.status, Status::Pass, "{o:?}");
+    }
+
+    /// **A `FREE` record over a held byte whose pid is gone is the fork case,
+    /// and it is the one `doctor` most needs to report.**
+    ///
+    /// The read-only participant D18 makes the consumer default writes **no**
+    /// arena record: it takes a lock byte, writes a lock-file identity record,
+    /// and leaves the participant table `FREE`. `fork` it — which is what
+    /// Python's `multiprocessing` does by default on Linux — and let the parent
+    /// die, and the child's inherited open file description keeps the byte held
+    /// for a pid that no longer exists, with a `FREE` row over it.
+    ///
+    /// The revision that shipped returned `None` for every `FREE` row, so this
+    /// came out `"status": "pass"` — while the paragraph the same commit added
+    /// to `docs/RUNBOOK.md` told the operator `doctor --attach` reports it. The
+    /// doc was the true half.
+    ///
+    /// Mutant: restore the bare `if p.state == SlotState::Free { return None }`
+    /// in `slot_leak`. Applied: `left: Pass, right: Fired` here, while
+    /// `a_free_slot_is_not_a_leak` still passes — the silence being total is
+    /// exactly why no existing test caught it.
+    #[test]
+    fn a_free_record_over_a_held_byte_for_a_dead_pid_is_the_fork_case() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(ParticipantInfo {
+            slot: 3,
+            state: SlotState::Free,
+            // Nothing was ever written to the arena record, so its pid field is
+            // zero — which is why the finding has to take its pid from the lock
+            // file.
+            pid: 0,
+            alive: false,
+            byte: LockByte::Held,
+            recorded: RecordedProcess::Gone,
+            recorded_pid: Some(1841),
+        });
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 1, "{o:?}");
+        assert_eq!(
+            o.findings[0].subject, "slot 3 pid 1841, byte still HELD",
+            "the subject must name the lock file's pid, not the empty arena \
+             record's, and must say the byte is held"
+        );
+        let m = &o.findings[0].message;
+        assert!(
+            m.contains("forked child inherited it"),
+            "the fork case must be named as itself: {m}"
+        );
+        assert!(
+            m.contains("read-only participant"),
+            "an operator told the record is FREE needs to be told why a leak has \
+             no record: {m}"
+        );
+    }
+
+    /// **The subject names the pid the evidence is about, and names the arena
+    /// record's separately when they differ.**
+    ///
+    /// `doctor` shipped `"subject": "slot 8 pid 0"` on a `RESERVED` row whose
+    /// message read *"/proc has no running process for it"*: the `0` is the
+    /// arena record's `pid` field, still unwritten because `fill_slot` fills it
+    /// after the `FREE -> RESERVED` CAS, and the `/proc` sentence is about the
+    /// lock file's pid. An operator given `pid 0` has been given a number no
+    /// evidence in the finding concerns.
+    ///
+    /// Mutant: build the subject from `p.pid` again
+    /// (`format!("slot {} pid {}", p.slot, p.pid)`). Applied: it panicked on
+    /// the first assertion with *left: "slot 8 pid 0"* — the shipped string,
+    /// verbatim.
+    #[test]
+    fn the_subject_names_the_pid_the_evidence_is_about() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        // A registrant that died inside `fill_slot`: the byte it took has been
+        // released by its death, the arena record is `RESERVED` with an unset
+        // pid, and the lock file names it.
+        snap.participants.push(ParticipantInfo {
+            slot: 8,
+            state: SlotState::Reserved,
+            pid: 0,
+            alive: false,
+            byte: LockByte::Free,
+            recorded: RecordedProcess::Gone,
+            recorded_pid: Some(1841),
+        });
+        // A slot re-registered by a live process while the lock file still
+        // names the dead previous holder is not this shape — but a `LIVE`
+        // record whose own pid differs from the recorded one is, and both
+        // numbers are then real and worth printing.
+        snap.participants.push(ParticipantInfo {
+            slot: 9,
+            state: SlotState::Live,
+            pid: 4711,
+            alive: false,
+            byte: LockByte::Free,
+            recorded: RecordedProcess::Gone,
+            recorded_pid: Some(1842),
+        });
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(
+            o.findings[0].subject, "slot 8 pid 1841, byte free",
+            "a RESERVED record's pid field is 0 and naming it is naming nobody"
+        );
+        assert!(
+            o.findings[0]
+                .message
+                .contains("pid 1841 left slot 8 registered"),
+            "the message must be about the same pid as the subject: {}",
+            o.findings[0].message
+        );
+        assert_eq!(
+            o.findings[1].subject, "slot 9 pid 1842 (arena record names pid 4711), byte free",
+            "when both pids are real, both are worth an operator's time"
+        );
     }
 
     /// **An out-of-order stream is not a dropout.**
