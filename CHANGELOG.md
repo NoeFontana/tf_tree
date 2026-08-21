@@ -56,6 +56,38 @@ is a bug.
   carries that obligation, and its loom model ships with two runnable controls
   that erase a live participant's record without it.
 
+- **`Tree::reap_participants()`** — reclaim the participant records of processes
+  the kernel says are gone, and return how many were collected. Sweeps the
+  arena's participant table, asks the OFD lock byte about each slot that holds a
+  record, and frees the ones whose byte the kernel has released.
+  `docs/decisions/0028`, plan step 5.
+
+  **It is not owner-only, and that is the point of it.** `docs/PHASE2.md` §6.3:
+  *"reaping must not be owner-only — an owner-only design leaks every claim held
+  at the moment the owner died."* The owner's socket-hangup reap cannot reach the
+  owner's **own** slot — the owner registers itself and no socket of its own
+  closes, so no hangup ever fires for it — which is why a `SIGKILL`ed owner used
+  to leave a `LIVE` record over a released lock byte for the life of the segment.
+  Any surviving read-write participant can now collect it.
+
+  **Refused on a read-only tree**, returning `0` rather than reaping: reclaiming
+  is a `compare_exchange` and a `PROT_READ` mapping answers one with `SIGSEGV`
+  (`docs/API.md` R6, D18). `Tree::is_writable()` is how a caller tells that `0`
+  from "there was nothing to collect". A tree that did not come from
+  `tf_tree::open` reaps nothing either: liveness is a kernel fact about a lock
+  byte (`docs/PHASE2.md` §5.1), and a heap tree has no lock file to ask.
+
+  **It never collects its own slot**, and it does not decide from `state`: the
+  word selects which slots are candidates, the kernel decides which of those are
+  dead, and the word is observed *before* the byte is probed so the two cannot be
+  read out of order.
+
+  **This does not make reclamation automatic.** It runs when a participant calls
+  it. The owner-side sweep that would reclaim at the point a slot is granted is a
+  later step of the same record, and the `fork` case is deliberately out of reach
+  of both — a forked child keeps the parent's open file description, so the
+  kernel reports the byte held and this correctly declines to act.
+
 ### Changed — breaking
 
 - **`Tree::attach_shared` and `Tree::attach_shared_at` now refuse

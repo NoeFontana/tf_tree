@@ -316,8 +316,10 @@ mod open;
 pub use open::{open, CreatePolicy, Open, OpenError};
 
 /// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
-/// predicate, which is private and has no production caller until that record's
-/// steps 3-5. Absent unless `--features test-hooks`; see
+/// predicate, which is private. Its production caller is
+/// [`Tree::reap_participants`] (that record's step 5), which acts on the
+/// verdict and reports a count — and a count cannot separate the two verdicts
+/// that collect nothing. Absent unless `--features test-hooks`; see
 /// [`open::reclamation_verdict_for_test`].
 #[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
 #[doc(hidden)]

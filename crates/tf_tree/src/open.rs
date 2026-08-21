@@ -148,7 +148,6 @@ impl LivenessProbe {
 /// `docs/decisions/0028-the-slot-a-killed-participant-keeps.md`, the Decision's
 /// piece 2. Three answers, and exactly one of them is destructive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) enum Reclamation {
     /// The record may be collected, and `observed` is the `state` word this
     /// verdict was formed against.
@@ -288,15 +287,15 @@ pub(crate) enum Reclamation {
 /// byte is held — is merely imprecise. Reporting [`Reclamation::Reclaimable`]
 /// is the corrupting direction this whole record exists to prevent: `reclaim`
 /// would CAS `FREE -> FREE`, **succeed**, and report a slot collected that a
-/// live joiner is sitting in, which steps 3-5 then hand to somebody else while
-/// its byte is still held. `a_live_read_only_joiner_is_unknown_not_reclaimable`
+/// live joiner is sitting in, which the sweeps of steps 3-5 then hand to
+/// somebody else while its byte is still held.
+/// `a_live_read_only_joiner_is_unknown_not_reclaimable`
 /// (`crates/tf_tree/tests/rendezvous.rs`) stages exactly that participant, and
 /// fails for both mutations.
 ///
 /// The rule the branch encodes is narrow: the word answers *is there a record
 /// here*, never *is its process alive*. This function does not invent a
 /// liveness answer about a slot that holds no record, in either direction.
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) fn reclamation_verdict(
     probe: &LivenessProbe,
     own_slot: u32,
@@ -325,11 +324,14 @@ pub(crate) fn reclamation_verdict(
 /// [`reclamation_verdict`] for `slot`, rendered as one line.
 ///
 /// **Test scaffolding, and present only under `--features test-hooks`.** The
-/// predicate is private and its production callers are `docs/decisions/0028`
-/// plan steps 3, 4 and 5, none of which has landed — so without a seam the
-/// three multiprocess tests step 2 owes could not reach it, and the same
-/// argument that put [`crate::CLAIM_WINDOW_HOOK`] behind this feature applies:
-/// a window a test cannot otherwise stand in. (`Open`'s own `#[cfg(test)]`
+/// predicate is private, and the seam does not become redundant now that it has
+/// a production caller: [`Tree::reap_participants`] (`docs/decisions/0028` plan
+/// step 5) *acts* on the verdict, so what it reports is a slot count, and the
+/// three answers this renders are exactly what a count cannot separate — a slot
+/// left alone because the byte was held reads the same as one left alone
+/// because the kernel would not say, and both read the same as a slot with no
+/// record in it. The same argument that put [`crate::CLAIM_WINDOW_HOOK`] behind
+/// this feature applies: a window a test cannot otherwise stand in. (`Open`'s own `#[cfg(test)]`
 /// `already_attached` seam rejected a `pub` one for a reason that does not
 /// reach here — what it would have published was a route `Open` withholds on
 /// purpose, where this publishes a read-only verdict about a slot.)

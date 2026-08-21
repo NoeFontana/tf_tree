@@ -1414,7 +1414,11 @@ fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
 
     // **Hole 3, measured.** Nothing hangs up on the owner, so its own record is
     // left exactly as `TFT014` describes: `LIVE`, with the kernel reporting its
-    // lock byte free.
+    // lock byte free — and it stays that way for as long as nobody *asks*. The
+    // watcher here only reads. `Tree::reap_participants` (`0028` plan step 5)
+    // is the code path that clears it, and it runs when a survivor calls it and
+    // at no other time; `a_survivor_reaps_the_killed_owners_slot_which_no_hangup_can`
+    // is that half.
     owner.kill();
     let mut seen = String::new();
     for _ in 0..25 {
@@ -1422,8 +1426,9 @@ fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
         seen = watcher.ask(0);
         assert!(
             seen.contains("state live"),
-            "no code path can clear the owner's own record, so it must stay \
-             LIVE for the life of the segment: {seen}"
+            "nothing clears the owner's own record *by itself* — no socket of \
+             its own closes, so no hangup fires — and this watcher never \
+             sweeps, so the record must stay LIVE: {seen}"
         );
     }
     assert!(
@@ -1723,11 +1728,12 @@ fn the_acquire_window_backs_out() {
 // ---------------------------------------------------------------------------
 // `docs/decisions/0028` plan step 2 — the reclamation predicate, once.
 //
-// The predicate is `crate::open::reclamation_verdict`, and it is private: its
-// production callers are that record's steps 3, 4 and 5, none of which has
-// landed. These three reach it through `reclamation_verdict_for_test`, the
-// `--features test-hooks` seam, for the same reason `CLAIM_WINDOW_HOOK` exists
-// — the state under test cannot be stood in from outside the crate.
+// The predicate is `crate::open::reclamation_verdict`, and it is private. Step
+// 5's `Tree::reap_participants` is its first production caller and *acts* on
+// the verdict, so what it reports is a count; these reach the verdict itself
+// through `reclamation_verdict_for_test`, the `--features test-hooks` seam, for
+// the same reason `CLAIM_WINDOW_HOOK` exists — `Live` and `Unknown` are two
+// different reasons to collect nothing, and a count cannot tell them apart.
 //
 // Real processes, as everywhere else in this file: the two facts the predicate
 // is made of — that a `SIGSTOP`ped process keeps its lock byte and a `SIGKILL`ed
@@ -1748,8 +1754,12 @@ fn lock_path(scratch: &std::path::Path) -> PathBuf {
 /// The sweeper is **this** process rather than a helper, because the predicate
 /// takes a `Tree` and a slot and there is no line protocol to invent: the seam
 /// returns the verdict directly, so a failing assertion prints the verdict
-/// rather than a parse of one.
-#[cfg(feature = "test-hooks")]
+/// rather than a parse of one. `Tree::reap_participants` is the same shape for
+/// the same reason, one feature over — hence the `any`, which is not an
+/// aesthetic choice: `just shm-check` clippies this target at
+/// `shm,unstable`, without `test-hooks`, and a `test-hooks`-only helper used by
+/// an `unstable` test is a compile error in that pass and in no other.
+#[cfg(any(feature = "test-hooks", feature = "unstable"))]
 fn join_as_sweeper() -> tf_tree::Tree {
     tf_tree::Open::new()
         .mode(tf_tree::AttachMode::ReadWrite)
@@ -2236,5 +2246,241 @@ fn a_free_word_is_decided_without_asking_the_kernel() {
         ask(0, 0),
         "live probes=0",
         "the own-slot guard cost a byte probe, so it is no longer first"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `docs/decisions/0028` plan step 5 — `Tree::reap_participants`, and it is not
+// owner-only.
+//
+// Public API, so these need no seam; what they need is `unstable`, because the
+// thing being asserted is a participant record's raw `state` word and
+// `Tree::arena_view` is the only route to it (`docs/API.md` §2.6).
+// `Tree::participant_alive` cannot stand in: it folds `state == LIVE` into its
+// answer, so it reads `false` both for a slot this sweep collected and for the
+// stale-`LIVE` record it was supposed to collect and did not — which is the
+// whole distinction.
+
+/// The raw `state` word of `slot`, read through the unstable view.
+///
+/// `Acquire`, to pair with `fill_slot`'s publishing `Release` store: this reads
+/// the same word `ParticipantTable::reclaim` CASes, and reading it weakly here
+/// would make the assertion about a value the sweep never saw.
+#[cfg(feature = "unstable")]
+fn state_word(tree: &tf_tree::Tree, slot: u32) -> u32 {
+    tree.arena_view()
+        .participants()
+        .get(slot)
+        .expect("slot in range")
+        .state
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// **A surviving read-write participant reclaims the killed *owner's* slot —
+/// the case no hangup can ever cover.**
+///
+/// This is `docs/decisions/0028` plan step 5's stated verification, and the
+/// target is the owner deliberately. #191's socket-hangup callback collects a
+/// killed **joiner's** record within milliseconds, so a test that killed one
+/// would be racing the owner's own fast path. Nothing hangs up on the owner:
+/// it registers itself, no socket of its own closes, and `epoll` has nothing to
+/// report — candidate B's hole 3, *"the owner's own slot leaks
+/// unconditionally"*. Its record stays `LIVE` over a byte the kernel released,
+/// for the life of the segment, and that is #184's wedge. A sweep by a
+/// *survivor* is the only thing that collects it, which is what makes
+/// `PHASE2.md` §6.3's "reaping must not be owner-only" a property of the code
+/// rather than a sentence in a spec.
+///
+/// **The sweep is asserted to do nothing first.** A reaper that collected on
+/// some other ground — or on none — would pass the post-kill assertion for the
+/// wrong reason, so the same call is made either side of the `SIGKILL` and the
+/// death is what has to change the answer.
+///
+/// **It asserts nothing about a new joiner, on purpose.** §3.5's takeover is
+/// unwired, so once the owner is dead every fresh `open()` is correctly refused
+/// `ArenaHeldButUnreachable` (`docs/PHASE2.md` §0.0 spells out the sequence:
+/// the joiner wins the ownership byte, meets §3.4's split-brain check against
+/// this process's participant byte, and times out). This covers survivor
+/// reclamation, not rejoin. A harness that conflated the two would report a
+/// §3.5 gap as a reclamation failure.
+///
+/// `Kid::kill` waits, and after `wait` returns the kernel has torn the owner's
+/// descriptors down — so no polling and no sleep: unlike #191's asynchronous
+/// callback, this sweep runs in *this* process when it is called.
+///
+/// Mutants, all applied to `Tree::reap_participants` and all measured:
+///
+/// - **Count the verdict and never call `reclaim`.** Fails at the word
+///   assertion, *left: 6, right: 0* — the sweep reported a collection it did
+///   not make.
+/// - **Act on every verdict that is not `Unknown`**, i.e. collect `Live` too.
+///   Fails at the *pre-kill* assertion, *left: 2, right: 0*: with every
+///   participant running it reclaims the dead-to-nobody owner **and this
+///   process's own live record**. That assertion exists for this mutant.
+/// - **Do not keep the probe** (`use_ofd_liveness` stores `None`). Fails at the
+///   count, *left: 0, right: 1* — a sweep with no kernel fact to consult
+///   collects nothing, which is the right answer to the wrong question.
+///
+/// And **two that pass**, recorded because they are the constraints this test
+/// cannot reach:
+///
+/// - **Re-read the state word after the probe** and CAS against that instead of
+///   the word the verdict carried. Green. A reload yields the same word in every
+///   state stageable here; the interleaving where it does not is
+///   `reclaim_races_register`, `tf_tree_core`'s `loom` case, which is where that
+///   half is pinned.
+/// - **Delete `reclamation_verdict`'s own-slot guard**
+///   (`if slot == own_slot { return Reclamation::Live; }`). Green — and green
+///   for the whole `--features shm,unstable` target, 21 of 21, which is why the
+///   assertion on the sweeper's own record below says what it catches rather
+///   than claiming this. On `shm,test-hooks,unstable` that mutant is 27 run, 25
+///   passed, 2 failed, and neither failure is here: it is
+///   `the_sweepers_own_slot_is_live_even_when_the_byte_reads_free`, which points
+///   the seam's `own_slot` at a byte the kernel has *released* — the only shape
+///   where the guard and the byte can disagree — plus
+///   `a_free_word_is_decided_without_asking_the_kernel` on the probe count.
+///   Those two pin the guard; a sweep run by a live process cannot.
+#[test]
+#[cfg(feature = "unstable")]
+fn a_survivor_reaps_the_killed_owners_slot_which_no_hangup_can() {
+    let scratch = Scratch::new("reap-participants-owner");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
+
+    // `0x6` is `live_word(1)`: the owner registered into a fresh record, so its
+    // incarnation is 1. Asserted as a word rather than as a state, because it
+    // is the word `reclaim` CASes against.
+    assert_eq!(
+        state_word(&sweeper, 0),
+        0x6,
+        "the owner's record is not the LIVE word this test is about"
+    );
+    assert_eq!(
+        sweeper.reap_participants(),
+        0,
+        "a sweep collected a slot while every participant was running, so what \
+         follows would pass for the wrong reason"
+    );
+
+    owner.kill();
+
+    assert_eq!(
+        sweeper.reap_participants(),
+        1,
+        "the killed owner's record was not collected: nothing hangs up on an \
+         owner, so a survivor's sweep is the only thing that can, and #184's \
+         wedge is exactly this record staying LIVE for the life of the segment"
+    );
+    assert_eq!(
+        state_word(&sweeper, 0),
+        0,
+        "the sweep reported a collection it did not make: the record must read \
+         FREE, which is what makes the slot grantable again"
+    );
+
+    // The sweeper is still in its own slot: the sweep left a record whose byte
+    // is held exactly as it found it. **That is what this catches — not the
+    // own-slot guard, which it cannot reach.** The sweeper's byte really is
+    // held and the probe's separate description reports it held, so with
+    // `reclamation_verdict`'s `if slot == own_slot { return Live; }` deleted
+    // the *byte* returns the same `Live` the guard would have and this test
+    // stays green (measured below). What it does fail for is a sweep that
+    // clears a record over a held byte — the "act on every verdict that is not
+    // `Unknown`" mutant, here on the one participant still running after the
+    // kill, which the pre-kill assertion catches on two slots and this one
+    // catches after the table has stopped being uniform.
+    assert_eq!(
+        state_word(&sweeper, 1),
+        0x6,
+        "the sweeper cleared its own live record, whose byte it still holds"
+    );
+    assert!(
+        sweeper.participant_alive(1),
+        "the sweeper reports itself dead after sweeping"
+    );
+
+    // Idempotent: there is nothing left to collect, and a second sweep must not
+    // invent one out of the record it just cleared.
+    assert_eq!(
+        sweeper.reap_participants(),
+        0,
+        "a second sweep collected a slot the first one already freed"
+    );
+}
+
+/// **A read-only tree reaps nothing, and the slot it declines to collect is one
+/// a read-write tree would.**
+///
+/// `docs/API.md` R6 and D18: read-only is the consumer default and the Python
+/// default, and reclaiming is a `compare_exchange`. A `PROT_READ` mapping does
+/// not fault politely on one — it delivers `SIGSEGV` — so the refusal is what
+/// makes read-only a safety boundary rather than a loaded gun. It is the same
+/// refusal `Tree::reap_dead` makes for claims, in the same shape: `0`, with
+/// `Tree::is_writable` as the way to tell "refused" from "nothing to collect".
+///
+/// **The staged state is the wedge itself**, not an empty table: the owner is
+/// killed first, so slot 0 holds precisely the stale-`LIVE` record the previous
+/// test collects. A refusal over an arena with nothing in it would pass with
+/// the guard deleted.
+///
+/// Mutants, both applied:
+///
+/// - **Delete the `!self.arena.is_writable()` refusal.** This test aborts with
+///   **signal 11: SIGSEGV**, inside `ParticipantTable::reclaim`'s
+///   `compare_exchange` on a `PROT_READ` page. Not an assertion failure — the
+///   refusal is a safety boundary, and the mutant demonstrates which kind.
+/// - **Keep a `self.participant == u32::MAX` check instead**, the shape
+///   `reap_inner` carries. Green: a read-only attachment registers no arena
+///   record, so the sentinel catches the same trees by a different fact. It is
+///   a proxy for unwritability rather than a second guard, which is why
+///   `reap_participants` carries one check and not two, and why the one it
+///   carries is the one that names the hazard.
+#[test]
+#[cfg(feature = "unstable")]
+fn a_read_only_tree_reaps_no_participant_records() {
+    let scratch = Scratch::new("reap-participants-ro");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    // D18's default, and the shape a `PROT_READ` mapping arrives in: a byte,
+    // and no arena record of its own.
+    let consumer = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadOnly)
+        .create(tf_tree::CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("join the arena read-only");
+    assert!(
+        !consumer.is_writable(),
+        "the consumer attached writable, so this test would prove nothing"
+    );
+    assert_eq!(
+        consumer.participant_slot(),
+        u32::MAX,
+        "a read-only attachment must register no arena record"
+    );
+
+    owner.kill();
+
+    assert_eq!(
+        state_word(&consumer, 0),
+        0x6,
+        "the killed owner's record is not the LIVE word a read-write sweeper \
+         would collect, so the refusal below would be about nothing"
+    );
+    assert_eq!(
+        consumer.reap_participants(),
+        0,
+        "a read-only tree reaped a participant record"
+    );
+    assert_eq!(
+        state_word(&consumer, 0),
+        0x6,
+        "a read-only tree wrote to the participant table"
     );
 }
