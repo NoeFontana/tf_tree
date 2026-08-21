@@ -43,7 +43,7 @@ over the README, and over this file.
 | [`PHASE5.md`](./docs/PHASE5.md) | Frozen `.tft`, bag ingestion, counters, `TFT001`–`TFT019`, `tf_tree top`. |
 | [`PHASE7.md`](./docs/PHASE7.md) | The `tf2` shim. **GATED (D21), not scheduled.** |
 | [`API.md`](./docs/API.md) | **Not a phase.** Cross-cutting API contract: six rules (§1), per-binding surface (§2–§5), delta table (§6), new-surface checklist (§7). |
-| [`decisions/`](./docs/decisions/) | `0002`–`0003` superseded; `0004`–`0030` authoritative. `0028` is **ready** — its plan's order is a safety property, not a preference. |
+| [`decisions/`](./docs/decisions/) | `0002`–`0003` superseded; `0004`–`0030` authoritative. `0028` is **implemented and frozen** — do not edit it; drift is fixed by a record that supersedes it. Its fork half is [`0030`](./docs/decisions/0030-the-atfork-handler-and-inherited-descriptors.md), still `draft`. |
 
 Three cautions specific to current work:
 
