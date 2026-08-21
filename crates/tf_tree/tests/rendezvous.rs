@@ -1719,3 +1719,522 @@ fn the_acquire_window_backs_out() {
         )
         .expect("and the reclaimed edge must be publishable");
 }
+
+// ---------------------------------------------------------------------------
+// `docs/decisions/0028` plan step 2 — the reclamation predicate, once.
+//
+// The predicate is `crate::open::reclamation_verdict`, and it is private: its
+// production callers are that record's steps 3, 4 and 5, none of which has
+// landed. These three reach it through `reclamation_verdict_for_test`, the
+// `--features test-hooks` seam, for the same reason `CLAIM_WINDOW_HOOK` exists
+// — the state under test cannot be stood in from outside the crate.
+//
+// Real processes, as everywhere else in this file: the two facts the predicate
+// is made of — that a `SIGSTOP`ped process keeps its lock byte and a `SIGKILL`ed
+// one loses it without cooperating — are the kernel's, and neither is stageable
+// in one process.
+
+/// The rendezvous lock file the predicate probes, for a scratch directory.
+///
+/// The same path `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`
+/// opens: domain 0, the default arena name.
+#[cfg(feature = "test-hooks")]
+fn lock_path(scratch: &std::path::Path) -> PathBuf {
+    scratch.join("0/default.lock")
+}
+
+/// Join the arena read-write, as the process that will do the sweeping.
+///
+/// The sweeper is **this** process rather than a helper, because the predicate
+/// takes a `Tree` and a slot and there is no line protocol to invent: the seam
+/// returns the verdict directly, so a failing assertion prints the verdict
+/// rather than a parse of one.
+#[cfg(feature = "test-hooks")]
+fn join_as_sweeper() -> tf_tree::Tree {
+    tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("join the arena as a read-write participant")
+}
+
+/// The kernel's own state character for `pid` — field 3 of `/proc/<pid>/stat`.
+///
+/// Parsed from the **last** `)` rather than by splitting the line, because
+/// field 2 is the executable name in parentheses and may itself contain spaces
+/// and parentheses. `None` if the process is gone.
+///
+/// This is a read of `/proc`, in a file whose predicate deliberately does not
+/// read `/proc`. It is not a second liveness source: it is how the test
+/// establishes its own **precondition** — that the target really is stopped —
+/// and if `/proc` were unreadable this test would fail loudly rather than
+/// quietly assert nothing, which is the direction that matters.
+#[cfg(feature = "test-hooks")]
+fn proc_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
+    after_comm.split_whitespace().next()?.chars().next()
+}
+
+/// Block until `pid` is genuinely stopped by a job-control signal, or panic.
+///
+/// **This is what makes `kill -STOP` load-bearing.** `kill(2)` returning says
+/// the signal was *queued*, not that the target has stopped running, so without
+/// a wait the assertion that follows could be measuring a still-scheduled
+/// process. And with the wait, deleting the `SIGSTOP` does not leave the test
+/// passing — it leaves it panicking here, which is the property this helper
+/// exists for.
+#[cfg(feature = "test-hooks")]
+fn await_stopped(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // `T` is "stopped (on a signal)". Linux reports a `ptrace`-stopped
+        // process as `t`; nothing here traces, but accepting it costs nothing
+        // and a spurious failure under a debugger costs a reader an hour.
+        match proc_state(pid) {
+            Some('T' | 't') => return,
+            other => assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} never reached state T; it reads {other:?}. The SIGSTOP \
+                 this test is about did not take, so nothing below would be a \
+                 measurement of a stopped process"
+            ),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// **A participant the kernel has stopped is still `Live`, and the stoppedness
+/// is load-bearing.**
+///
+/// `docs/PROJECT.md` §5 D17: liveness is the socket and the byte, never a
+/// timeout. A `SIGSTOP`ped process is not scheduled — it publishes nothing,
+/// advances nothing, answers nothing — and holds every OFD lock it took,
+/// because the kernel releases those on *death* and on nothing else. A
+/// predicate that called this participant dead would reclaim the slot of a
+/// writer that is merely descheduled, which is `docs/decisions/0028`'s eviction
+/// hazard exactly.
+///
+/// # What it pins, precisely
+///
+/// [`await_stopped`] is the assertion that carries the claim: the test blocks
+/// until `/proc/<pid>/stat` reads `T` and **panics if it never does**, so a
+/// revision that drops the `kill -STOP` fails here rather than passing on a
+/// running process. That was verified by removing the `SIGSTOP` block and
+/// re-running, not assumed. The `probes=1` half is a second statement: the
+/// kernel *was* asked about this slot, so the `Live` did not come out of the
+/// `state` word (`docs/PHASE2.md` §5.1's bug).
+///
+/// # What it does not pin, so nobody reads it as more
+///
+/// It does **not** separate the byte from `/proc`. A stopped process is still
+/// in `/proc` with an unchanged `start_time`, so `record_is_alive` — the
+/// composition `docs/decisions/0028`'s open question 1 rejects — would also
+/// answer `true` here. The reason that function is off this path is a *host
+/// configuration* (`hidepid`, or `/proc` unmounted, which it classifies as
+/// proof of death), and no test in this workspace can stage a host. That
+/// argument lives in the predicate's first constraint and is not tested.
+/// What this test does separate the byte from is any scheme that requires the
+/// target to keep running — a heartbeat or a timeout — because it establishes
+/// that the target is not running at all.
+///
+/// Mutant: `Some(true) => Reclamation::Reclaimable { observed }` — the
+/// held-byte arm alone, so the free-byte arm still answers correctly. Applied:
+/// this test fails with *left: `"reclaimable word 0x6 probes=1"`, right:
+/// `"live probes=1"`* and the message below.
+/// `a_killed_participants_slot_is_reclaimable_…` fails with it too, on its
+/// pre-kill control, and so does `a_free_word_is_decided_…` on its `LIVE`-word
+/// control — three of the five. `the_sweepers_own_slot_…` and
+/// `a_live_read_only_joiner_…` pass: neither reaches the held-byte arm, one
+/// because the guard answers first and the other because the word does.
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_stopped_participant_is_live_to_the_reclamation_predicate() {
+    let scratch = Scratch::new("verdict-stopped");
+
+    // Slots are handed out in join order and each join is awaited before the
+    // next begins, so these numbers are determined rather than hoped for:
+    // owner 0, this process 1, the target 2.
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
+
+    // Read-write, deliberately. A read-only joiner takes a byte and writes no
+    // arena record at all — that participant is
+    // `a_live_read_only_joiner_is_unknown_not_reclaimable`'s subject, and its
+    // verdict is `unknown` for a reason that has nothing to do with this one.
+    let mut target = Kid::spawn(&scratch.0, &["join-rw"]);
+    assert!(target.line().starts_with("joined "), "target did not join");
+
+    let ask = |slot: u32| {
+        tf_tree::reclamation_verdict_for_test(
+            &sweeper,
+            &lock_path(&scratch.0),
+            sweeper.participant_slot(),
+            slot,
+        )
+    };
+
+    let pid = target.0.id();
+    // The state field is read *before* the stop as well, so `T` below is a
+    // transition this test caused and not a constant the parser invented.
+    assert_ne!(
+        proc_state(pid),
+        Some('T'),
+        "the target was already stopped before this test stopped it"
+    );
+    assert_eq!(
+        ask(2),
+        "live probes=1",
+        "the target was not live to begin with"
+    );
+
+    assert!(
+        Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success()),
+        "could not SIGSTOP the target"
+    );
+    // Load-bearing: `kill` returning means the signal was queued, and this is
+    // what makes the rest of the test a measurement of a *stopped* process.
+    await_stopped(pid);
+    assert_eq!(
+        proc_state(pid),
+        Some('T'),
+        "the target left state T between the wait and the verdict"
+    );
+
+    assert_eq!(
+        ask(2),
+        "live probes=1",
+        "a stopped participant was not reported live: it holds its lock byte, \
+         D17 forbids telling it apart from a slow one, and `probes=1` is the \
+         claim that the kernel — not the `state` word — is what was asked"
+    );
+
+    let _ = Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status();
+}
+
+/// **A `SIGKILL`ed participant's slot is `Reclaimable` — and the target is the
+/// *owner*, because that is the shape that stays reclaimable.**
+///
+/// #191's socket-hangup callback releases a killed **joiner's** record within
+/// milliseconds, so asserting on one would be racing the owner's own reap for a
+/// state that is supposed to disappear. Nothing hangs up on the owner
+/// (`docs/decisions/0028`, candidate B's hole 3: *"the owner's own slot leaks
+/// unconditionally"* — it registers itself and no socket of its own can close),
+/// so its record stays `LIVE` over a byte the kernel has released, for the life
+/// of the segment. That is #184's wedge, and it is the state the predicate
+/// exists to name.
+///
+/// The observer has to have joined **before** the owner died: the rendezvous
+/// socket dies with it, so a fresh attach is refused `ArenaHeldButUnreachable`.
+///
+/// `Kid::kill` waits, and after `wait` returns the kernel has torn the owner's
+/// descriptors down — so this needs no polling and no sleep.
+///
+/// Mutant: `Some(false) => Reclamation::Unknown` — the free-byte arm alone, i.e.
+/// a predicate that never collects anything. Applied: this test fails with
+/// *left: `"unknown probes=1"`, right: `"reclaimable word 0x6 probes=1"`*, and
+/// so does `the_sweepers_own_slot_…`'s control;
+/// `a_stopped_participant_is_live_…` passes, which is the point of running the
+/// two arms as separate mutants.
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_killed_participants_slot_is_reclaimable_to_the_reclamation_predicate() {
+    let scratch = Scratch::new("verdict-killed");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
+
+    let ask = |slot: u32| {
+        tf_tree::reclamation_verdict_for_test(
+            &sweeper,
+            &lock_path(&scratch.0),
+            sweeper.participant_slot(),
+            slot,
+        )
+    };
+
+    // A transition, not a state: the same question either side of the kill.
+    assert_eq!(
+        ask(0),
+        "live probes=1",
+        "the owner was not live before it was killed, so what follows proves nothing"
+    );
+
+    owner.kill();
+
+    // `0x6` is `live_word(1)`: the owner registered into a fresh record, so its
+    // incarnation is 1. The word is asserted rather than the variant because
+    // `ParticipantTable::reclaim` CASes against *this* word, and a verdict that
+    // carried a different one would free somebody else's occupancy.
+    assert_eq!(
+        ask(0),
+        "reclaimable word 0x6 probes=1",
+        "the killed owner's slot was not collectable: its record is still LIVE \
+         and the kernel has released its byte, which is #184's wedge"
+    );
+}
+
+/// **The sweeper's own slot is `Live`, unconditionally — including when its
+/// byte reads free.**
+///
+/// `F_OFD_GETLK` reports only *conflicting* locks, so an open file description
+/// does not see its own. This probe holds a second description, which happens
+/// to make our own byte visible again — so on the ordinary shape the guard and
+/// the byte agree and the guard is unobservable. `own_slot` is therefore a
+/// parameter of the seam, and this test points it at a slot whose byte the
+/// kernel has *released*: the same record, the same free byte, once as
+/// somebody else's and once as our own. Only the guard can separate them.
+///
+/// `docs/decisions/0028` piece 2's second constraint is written about exactly
+/// this: *"a sweep that omits the guard is one refactor away from reclaiming
+/// its own live slot"*.
+///
+/// Mutant: delete the `if slot == own_slot { return Reclamation::Live; }` guard
+/// from `reclamation_verdict`. Applied: this test fails with *left:
+/// `"reclaimable word 0x6 probes=1"`, right: `"live probes=0"`* and the message
+/// below. `a_free_word_is_decided_…` fails with it too, on its own-slot line
+/// (`"live probes=1"` against `"live probes=0"`); the other three pass, because
+/// the byte answers for them, which is why this test has to ask about a byte
+/// that reads free.
+///
+/// `probes=0` on the two guard answers is the second thing this test pins, and
+/// it is about **order**, not about cost: the guard runs with nothing in front
+/// of it, so a revision that moved it below the byte probe would report
+/// `probes=1` here and fail even where the verdict happened to agree.
+#[test]
+#[cfg(feature = "test-hooks")]
+fn the_sweepers_own_slot_is_live_even_when_the_byte_reads_free() {
+    let scratch = Scratch::new("verdict-own");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
+
+    let ask = |own_slot: u32, slot: u32| {
+        tf_tree::reclamation_verdict_for_test(&sweeper, &lock_path(&scratch.0), own_slot, slot)
+    };
+
+    owner.kill();
+
+    // The control: as somebody else's slot, the dead owner's record is exactly
+    // the state the predicate collects.
+    assert_eq!(
+        ask(sweeper.participant_slot(), 0),
+        "reclaimable word 0x6 probes=1",
+        "the control failed, so the assertion below would hold for the wrong reason"
+    );
+
+    // The guard: the same record, the same released byte, asked about as ours.
+    assert_eq!(
+        ask(0, 0),
+        "live probes=0",
+        "the guard did not fire: a sweep that judges its own slot from the byte \
+         reclaims itself the moment the probe stops seeing its own description"
+    );
+
+    // And the ordinary shape, where the byte agrees with the guard.
+    assert_eq!(
+        ask(sweeper.participant_slot(), sweeper.participant_slot()),
+        "live probes=0",
+        "the sweeper reported itself anything but live"
+    );
+}
+
+/// **A live read-only joiner holds a lock byte and has no arena record — and
+/// the predicate must say `unknown`, not `reclaimable`.**
+///
+/// This is the `FREE`-word branch, and it is not a formality. `Open`'s joiner
+/// takes its participant lock byte inside the handshake (`register_at`), and
+/// then `attach_joined_at` registers **nothing** when the mode is read-only:
+/// the participant table lives in the arena and a `PROT_READ` mapping cannot be
+/// written. Read-only is the consumer default (D18) *and* the Python default,
+/// so a slot whose byte is held and whose record reads `FREE` is the common
+/// shape on a real system — `spawn_owner_server`'s `assign` closure already has
+/// to special-case it (*"the table alone reports its slot empty"*).
+///
+/// A wrong disposition here is a **false-death verdict about a live process**,
+/// which is the corrupting direction `docs/decisions/0028` exists to prevent:
+/// `reclaim(slot, FREE)` is a CAS `FREE -> FREE` that *succeeds*, so a sweep
+/// would report the slot collected and steps 3-5 would hand it to somebody else
+/// while this joiner is still sitting in it, still holding the byte.
+///
+/// Two slots are asked about, because "empty" and "held by a reader" must give
+/// the same answer for *different* reasons and a test that asked only about an
+/// untouched slot would let a reader believe the branch is dead-slot handling.
+///
+/// Not a second spelling of `a_read_only_peer_holds_a_byte_without_an_arena_record`,
+/// which stages the same participant to pin something else: that the *owner*
+/// hands a read-only and a read-write peer different slots. It asserts nothing
+/// about a reclamation verdict, and there is no verdict in it to assert.
+///
+/// The record is shown to be non-`LIVE` without `unstable`: the byte is probed
+/// directly, and `Tree::participant_alive(2)` folds `state == LIVE` into its
+/// answer, so *byte held* together with *not alive* leaves only "the word is
+/// not `LIVE`".
+///
+/// Mutants, both applied, both reported at the **slot 2** assertion because
+/// that is the one that runs first — slot 3 is never reached under either:
+/// - **Delete the branch.** Slot 2 becomes `"live probes=1"`: the byte is held,
+///   so the predicate answers about the byte of a participant that has no
+///   record at all.
+/// - **Invert it to `Reclaimable { observed }`.** Slot 2 becomes
+///   `"reclaimable word 0x0 probes=0"` — a collect verdict about a running
+///   process, which is the direction that corrupts.
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_live_read_only_joiner_is_unknown_not_reclaimable() {
+    let scratch = Scratch::new("verdict-readonly");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
+
+    // `join`, not `join-rw`: the read-only consumer default.
+    let mut reader = Kid::spawn(&scratch.0, &["join"]);
+    assert!(
+        reader.line().starts_with("joined "),
+        "the read-only joiner did not attach"
+    );
+
+    // The kernel, asked directly instead of through the predicate, so the
+    // premise is established independently of the thing under test.
+    let witness = tf_tree_ipc::LockFile::open(&lock_path(&scratch.0)).unwrap();
+    assert!(
+        witness.probe_participant(2).unwrap().held,
+        "the read-only joiner did not take a participant byte, so this test is \
+         not staging the state it is about"
+    );
+    assert!(
+        !witness.probe_participant(3).unwrap().held,
+        "slot 3 was handed out to somebody; it is meant to be untouched"
+    );
+    assert!(
+        !sweeper.participant_alive(2),
+        "slot 2's record reads LIVE, so the read-only joiner registered after \
+         all and the FREE-word branch is not what this test reaches"
+    );
+
+    let ask = |slot: u32| {
+        tf_tree::reclamation_verdict_for_test(
+            &sweeper,
+            &lock_path(&scratch.0),
+            sweeper.participant_slot(),
+            slot,
+        )
+    };
+
+    assert_eq!(
+        ask(2),
+        "unknown probes=0",
+        "a live read-only joiner's slot was given a liveness verdict: its \
+         record is FREE because it cannot write one, and collecting it would \
+         hand a running process's slot away"
+    );
+    assert_eq!(
+        ask(3),
+        "unknown probes=0",
+        "an untouched slot was given a verdict: there is no record to collect \
+         and reclaim(slot, FREE) would be a CAS that succeeds having freed nothing"
+    );
+}
+
+/// **A `FREE` word is decided without asking the kernel — the one part of the
+/// predicate's read *order* a multiprocess test can see.**
+///
+/// `docs/decisions/0028` piece 2's third constraint says the `state` word is
+/// observed **before** the byte is probed. No sequence of stable slot states
+/// tells the two orders apart — on a `FREE` word both answer `unknown`, on a
+/// `LIVE` word both consult the byte — so the verdict alone cannot pin it, and
+/// the interleaving that *does* separate them is two adjacent statements wide,
+/// which nothing here can schedule a registrant into. That interleaving is
+/// `reclaim_races_register`, plan step 1's `loom` case, and it is where the
+/// argument lives.
+///
+/// What survives into a multiprocess test is **whether the byte was read at
+/// all**, which the seam reports as `probes=`. Only a predicate that reached
+/// the word first can answer a `FREE` slot with no syscall, so:
+///
+/// - `probes=1` on a `LIVE` word — the kernel is what was asked, not `state`
+///   (`docs/PHASE2.md` §5.1).
+/// - `probes=0` on a `FREE` word — the word was reached first and short-circuited.
+/// - `probes=0` on our own slot — the guard is in front of both reads.
+///
+/// Mutants, both applied:
+/// - **Probe the byte before loading the word.** The middle assertion becomes
+///   `"unknown probes=1"` and this test fails. It is the reversal the verifier
+///   ran, and before this test existed all three earlier tests stayed green
+///   under it.
+/// - **Move the own-slot guard below the probe.** The last assertion becomes
+///   `"live probes=1"` and this test fails. `the_sweepers_own_slot_…` fails
+///   with it as well, on the same `probes=0` — measured, after an earlier
+///   revision of this note predicted it would pass because the *verdict* is
+///   unchanged. It is unchanged; the syscall count is what both tests catch it
+///   by, and that is the point of carrying one.
+///
+/// **What it still does not pin:** re-reading `observed` after the probe. A
+/// reload yields the same word in every state stageable here, so nothing in
+/// this workspace fails when one is introduced; that half is also
+/// `reclaim_races_register`'s, and step 1 has not landed.
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_free_word_is_decided_without_asking_the_kernel() {
+    let scratch = Scratch::new("verdict-order");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning "), "owner did not start");
+
+    let sweeper = join_as_sweeper();
+    assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
+
+    // A live read-only joiner: byte held, record FREE. The one shape that puts
+    // a *held* byte behind a `FREE` word, so the `probes=0` below cannot be
+    // explained by there being nothing to probe.
+    let mut reader = Kid::spawn(&scratch.0, &["join"]);
+    assert!(
+        reader.line().starts_with("joined "),
+        "the read-only joiner did not attach"
+    );
+    let witness = tf_tree_ipc::LockFile::open(&lock_path(&scratch.0)).unwrap();
+    assert!(
+        witness.probe_participant(2).unwrap().held,
+        "slot 2's byte is not held, so a skipped probe would prove nothing"
+    );
+
+    let ask = |own_slot: u32, slot: u32| {
+        tf_tree::reclamation_verdict_for_test(&sweeper, &lock_path(&scratch.0), own_slot, slot)
+    };
+
+    assert_eq!(
+        ask(sweeper.participant_slot(), 0),
+        "live probes=1",
+        "a LIVE word was answered without asking the kernel, which is deciding \
+         liveness from `state` (PHASE2 §5.1's bug)"
+    );
+    assert_eq!(
+        ask(sweeper.participant_slot(), 2),
+        "unknown probes=0",
+        "a FREE word cost a byte probe, so the byte was read before the word \
+         was decided — the read order piece 2's third constraint forbids"
+    );
+    assert_eq!(
+        ask(0, 0),
+        "live probes=0",
+        "the own-slot guard cost a byte probe, so it is no longer first"
+    );
+}

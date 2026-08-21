@@ -75,12 +75,26 @@ shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
 # rustdoc — but it is no longer the only thing standing between this feature
 # split and a compile error nobody sees.
 unstable = []
-# A single injection point inside `Tree::claim`, between the arena CAS and the
-# lease `SETLK` (`docs/decisions/0005` §5). Off by default and absent from the
-# API entirely unless enabled: the window it exposes is one syscall wide and
-# there is no other way to place a reaper inside it deterministically, but a
-# published hook that runs arbitrary code mid-claim is not something a shipped
-# build should carry. Enabled by `just shm-rendezvous`.
+# **Two seams a test cannot otherwise stand in.** Off by default and absent from
+# the API entirely unless enabled; both are `#[doc(hidden)]`.
+#
+# 1. `CLAIM_WINDOW_HOOK` — a single injection point inside `Tree::claim`,
+#    between the arena CAS and the lease `SETLK` (`docs/decisions/0005` §5). The
+#    window it exposes is one syscall wide and there is no other way to place a
+#    reaper inside it deterministically, but a published hook that runs
+#    arbitrary code mid-claim is not something a shipped build should carry.
+# 2. `reclamation_verdict_for_test` — `docs/decisions/0028` plan step 2's
+#    reclamation predicate, which is private and whose production callers are
+#    that record's steps 3-5. The five multiprocess tests around it turn on facts
+#    only the kernel produces (a `SIGSTOP`ped process keeps its lock byte, a
+#    `SIGKILL`ed one loses it, a read-only joiner holds one and writes no arena
+#    record), so they cannot be unit tests inside the crate, and nothing outside
+#    it can name a private function. The same feature adds the probe counter the
+#    seam reports, which is the only part of the predicate's read order a
+#    multiprocess test can observe.
+#
+# Enabled by `just shm-rendezvous`, and linted by `just shm-check`'s
+# `--features shm,test-hooks,unstable` clippy pass.
 test-hooks = []
 
 [dependencies]
