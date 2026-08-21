@@ -56,6 +56,40 @@ is a bug.
   carries that obligation, and its loom model ships with two runnable controls
   that erase a live participant's record without it.
 
+- **`Tree::reap_participants()`** — reclaim the participant records of processes
+  the kernel says are gone, and return how many were collected. Sweeps the
+  arena's participant table, asks the OFD lock byte about each slot that holds a
+  record, and frees the ones whose byte the kernel has released.
+  `docs/decisions/0028`, plan step 5.
+
+  **It is not owner-only, and that is the point of it.** `docs/PHASE2.md` §6.3:
+  *"reaping must not be owner-only — an owner-only design leaks every claim held
+  at the moment the owner died."* The owner's socket-hangup reap cannot reach the
+  owner's **own** slot — the owner registers itself and no socket of its own
+  closes, so no hangup ever fires for it — which is why a `SIGKILL`ed owner used
+  to leave a `LIVE` record over a released lock byte for the life of the segment.
+  Any surviving read-write participant can now collect it.
+
+  **Refused on a read-only tree**, returning `0` rather than reaping: reclaiming
+  is a `compare_exchange` and a `PROT_READ` mapping answers one with `SIGSEGV`
+  (`docs/API.md` R6, D18). `Tree::is_writable()` is how a caller tells that `0`
+  from "there was nothing to collect". A tree that did not come from
+  `tf_tree::open` reaps nothing either: liveness is a kernel fact about a lock
+  byte (`docs/PHASE2.md` §5.1), and a heap tree has no lock file to ask.
+
+  **It never collects its own slot**, and it does not decide from `state`: the
+  word selects which slots are candidates, the kernel decides which of those are
+  dead, and the word is observed *before* the byte is probed so the two cannot be
+  read out of order.
+
+  **This does not make reclamation automatic.** It runs when a participant calls
+  it. The owner-side collectors that reclaim without being asked are the other
+  two in this release — the slot assigner (step 3) and the socket-hangup
+  callback (step 4) — and all three share this one predicate and one
+  `ParticipantTable::reclaim`. The `fork` case is deliberately out of reach of
+  every one of them: a forked child keeps the parent's open file description, so
+  the kernel reports the byte held and they correctly decline to act.
+
 ### Changed — breaking
 
 - **`Tree::attach_shared` and `Tree::attach_shared_at` now refuse
@@ -134,9 +168,10 @@ is a bug.
   **What is still not reclaimed**, so that a green run is not read as more than
   it is: a slot whose lock byte is held by a `fork`ed child that inherited the
   descriptor is **deliberately** left alone — the kernel says the byte is held,
-  and §6.2 says that is the truth (`docs/decisions/0030`); and a full sweep of
-  every slot, rather than of the slots one grant walks past, is
-  `Tree::reap_participants()` and has not landed.
+  and §6.2 says that is the truth (`docs/decisions/0030`). A full sweep of every
+  slot, rather than of the slots one grant walks past, is
+  `Tree::reap_participants()` above — the third collector, added in this same
+  release, and the only one that can reach the owner's own slot.
 
 - **A process's participant lock byte and its arena participant record could
   carry different indices** (issue #201), which every liveness predicate in the

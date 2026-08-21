@@ -287,8 +287,9 @@ pub(crate) enum Reclamation {
 /// byte is held — is merely imprecise. Reporting [`Reclamation::Reclaimable`]
 /// is the corrupting direction this whole record exists to prevent: `reclaim`
 /// would CAS `FREE -> FREE`, **succeed**, and report a slot collected that a
-/// live joiner is sitting in, which steps 3-5 then hand to somebody else while
-/// its byte is still held. `a_live_read_only_joiner_is_unknown_not_reclaimable`
+/// live joiner is sitting in, which the sweeps of steps 3-5 then hand to
+/// somebody else while its byte is still held.
+/// `a_live_read_only_joiner_is_unknown_not_reclaimable`
 /// (`crates/tf_tree/tests/rendezvous.rs`) stages exactly that participant, and
 /// fails for both mutations.
 ///
@@ -323,20 +324,23 @@ pub(crate) fn reclamation_verdict(
 /// [`reclamation_verdict`] for `slot`, rendered as one line.
 ///
 /// **Test scaffolding, and present only under `--features test-hooks`.** The
-/// predicate is private, and although it now has a production caller —
-/// `spawn_owner_server`'s slot assigner, `docs/decisions/0028` plan step 3 —
-/// that caller only ever *acts* on a verdict, it does not report one. Without
-/// this seam the tests step 2 owes could still not name a slot and read back
-/// what the predicate says about it, and the same argument that put
+/// predicate is private, and the seam does not become redundant now that the
+/// predicate has production callers. There are two, and they are the two the
+/// `0028` plan named — `spawn_owner_server`'s slot assigner (plan step 3) and
+/// [`Tree::reap_participants`] (plan step 5) — and *both act on a verdict
+/// without ever reporting one*. The assigner returns at the **first** grantable
+/// slot, so it says nothing at all about the rest of the table; the sweep walks
+/// every slot but reports a count, and the three answers this renders are
+/// exactly what a count cannot separate — a slot left alone because the byte
+/// was held reads the same as one left alone because the kernel would not say,
+/// and both read the same as a slot with no record in it. So without this seam
+/// the tests step 2 owes could still not name a slot and read back what the
+/// predicate says about it, and the same argument that put
 /// [`crate::CLAIM_WINDOW_HOOK`] behind this feature applies: a window a test
 /// cannot otherwise stand in. (`Open`'s own `#[cfg(test)]` `already_attached`
 /// seam rejected a `pub` one for a reason that does not reach here — what it
 /// would have published was a route `Open` withholds on purpose, where this
 /// publishes a read-only verdict about a slot.)
-///
-/// It is also the only route to the verdict for a slot the assigner will not
-/// reach: `assign` returns at the **first** grantable slot, so a sweep of the
-/// whole table is plan step 5's `reap_participants` and not this one.
 ///
 /// `own_slot` is a **parameter rather than `tree.participant_slot()`**, and
 /// that is the point of it: with the tree's real slot passed, the own-slot
@@ -1305,12 +1309,49 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                                         // Dropping this `continue` and ignoring
                                         // the return passes the whole
                                         // rendezvous suite — measured, not
-                                        // assumed — because this thread is the
-                                        // only grantor and nothing in this
-                                        // workspace can make the CAS lose. It
-                                        // becomes load-bearing the moment a
-                                        // second reclaimer exists, which is
-                                        // plan step 5's `reap_participants`.
+                                        // assumed.
+                                        //
+                                        // **An earlier revision of this comment
+                                        // predicted that plan step 5's
+                                        // `reap_participants` would make it
+                                        // load-bearing, by putting a second
+                                        // reclaimer in the workspace. Step 5
+                                        // landed; the prediction was wrong, and
+                                        // re-measured rather than re-asserted:**
+                                        // with the guard deleted the tree is
+                                        // green at 148 of 148
+                                        // (`-p tf_tree --features
+                                        // shm,test-hooks,unstable`) and over
+                                        // five consecutive runs of the 31-test
+                                        // rendezvous target. Two reasons, and
+                                        // the second is the durable one. The
+                                        // sweep runs when a participant *calls*
+                                        // it, and nothing schedules one against
+                                        // a grant in flight — but more to the
+                                        // point, the byte probe below already
+                                        // catches the case a lost CAS is
+                                        // frightening for: the only way to lose
+                                        // it to an occupancy rather than to a
+                                        // peer sweeper's `FREE` is for somebody
+                                        // to have registered here, and by plan
+                                        // step 0b a registrant holds this
+                                        // slot's byte across the whole of
+                                        // `fill_slot` and keeps it for its
+                                        // life, so `is_held` reports it and the
+                                        // slot is skipped anyway.
+                                        //
+                                        // What the guard still bounds is the
+                                        // residue neither of those covers: a
+                                        // slot reclaimed under us, re-registered
+                                        // by a third process, and *abandoned* by
+                                        // it before the probe below — free byte,
+                                        // occupied word, and a grant that hands
+                                        // the joiner a slot `fill_slot` will
+                                        // refuse it. The guard turns that into a
+                                        // skipped slot. Nothing in this
+                                        // workspace can stage it, so it is kept
+                                        // on the argument and not on a test —
+                                        // which is what "unpinned" means here.
                                         continue;
                                     }
                                 }
@@ -1418,27 +1459,30 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     // precondition, and says what to narrow it back to if
                     // either half stops holding.
                     //
-                    // **And the ABA cannot in fact be assembled here today**,
-                    // for a reason stronger than the one about granting.
-                    // Reaching a second `RESERVED` needs the slot to pass
-                    // through `FREE` first, and **the only operation in this
-                    // workspace that can drive a `RESERVED` word to `FREE` is
-                    // `reclaim` itself**: the other writer of `FREE` is
-                    // `ParticipantTable::release`, whose CAS names
-                    // `live_word(inc)` and therefore cannot match the bare
-                    // constant `1`. Outside `tf_tree_core`'s own unit and
-                    // `loom` tests, `reclaim` has exactly two call sites — this
-                    // callback and the `assign` closure above — and `serve`
-                    // calls both from its one `epoll` loop, on this thread. So
-                    // the *first* leg of the ABA is closed, not merely the
-                    // re-grant: nothing can free this word while this callback
-                    // holds it, let alone re-reserve it. (The `granted` bit
-                    // below is also cleared after this CAS, which closes the
-                    // re-grant leg twice over.) The paragraph above is what
-                    // happens when the single-thread premise stops holding — a
-                    // §3.5 heir serving an arena whose participants it never
-                    // granted, or plan step 5's peer sweep — not a race in this
-                    // loop.
+                    // **The single-thread argument that used to close the
+                    // ABA's first leg no longer holds, and the paragraph above
+                    // is why that costs nothing.** Reaching a second `RESERVED`
+                    // needs the slot to pass through `FREE` first, and **the
+                    // only operation in this workspace that can drive a
+                    // `RESERVED` word to `FREE` is `reclaim` itself**: the other
+                    // writer of `FREE` is `ParticipantTable::release`, whose CAS
+                    // names `live_word(inc)` and therefore cannot match the bare
+                    // constant `1`. When plan step 4 landed, `reclaim` had
+                    // exactly two call sites outside `tf_tree_core`'s own unit
+                    // and `loom` tests — this callback and the `assign` closure
+                    // above — and `serve` calls both from its one `epoll` loop,
+                    // on this thread, so nothing could free this word while this
+                    // callback held it. **Plan step 5 added the third**:
+                    // `Tree::reap_participants` sweeps the whole table from any
+                    // surviving read-write participant, in another process, on a
+                    // thread this loop knows nothing about. So the first leg is
+                    // open now, and what bounds the interleaving is the byte
+                    // argument above and not this thread — a spurious free,
+                    // never a second occupant. (The `granted` bit below is still
+                    // cleared after this CAS, which closes the *re-grant* leg
+                    // for slots this owner granted; a §3.5 heir serving an arena
+                    // whose participants it never granted would not have even
+                    // that.)
                     //
                     // Before the `granted` bit, so no `assign` can hand the slot
                     // out between the two — they run on this one thread, but the

@@ -479,6 +479,8 @@ impl TreeBuilder {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             claim_lock: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
+            ofd_probe: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
             fork_gen,
         })
     }
@@ -530,6 +532,8 @@ impl TreeBuilder {
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             claim_lock: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
+            ofd_probe: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             fork_gen,
         })
@@ -1254,6 +1258,38 @@ pub struct Tree {
     /// arena CAS alone is the claim exactly as it was before leases existed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     claim_lock: Option<std::sync::Arc<tf_tree_ipc::LockFile>>,
+    /// The kernel-authoritative liveness probe, kept as a *probe* and not only
+    /// as the closure it is folded into.
+    ///
+    /// `None` for every tree that did not come from [`crate::open`], which is
+    /// the same set as `claim_lock`'s and for the same reason: no rendezvous,
+    /// no lock file, no byte to ask about.
+    ///
+    /// **Why the same object is held twice.** [`Self::use_ofd_liveness`] boxes
+    /// it into `liveness`, which answers one question — *is the participant in
+    /// this slot running* — and answers it as a `bool`, folding `None` back
+    /// into the `/proc` inference. [`Self::reap_participants`] needs the
+    /// unfolded answer: `crate::open::reclamation_verdict` distinguishes
+    /// *the kernel says free* from *the kernel would not say*, because only the
+    /// first may be acted on destructively (`docs/PHASE2.md` §6.2).
+    ///
+    /// The `Arc` is shared because there is nothing here to rebuild a probe
+    /// *from*. `crate::open::LivenessProbe::open` takes a `Rendezvous`, and no
+    /// field of a `Tree` carries one: `attachment` holds a
+    /// `tf_tree_ipc::Session`, which is a `LockFile`, a slot and an outcome,
+    /// and a `LockFile` is a `File` with no path. The probe can only be built
+    /// at open time, so reaching a second consumer means one object with two
+    /// holders.
+    ///
+    /// **It buys reach, not agreement.** A rebuilt probe would be one more open
+    /// file description of the same file — this one already is one, which is
+    /// [`crate::open::LivenessProbe`]'s own documented choice — so the two
+    /// would answer *identically* about every byte, ours included. Sharing
+    /// costs an `open(2)` and an fd less; it decides nothing. What keeps either
+    /// consumer off its own slot is the explicit guard each one writes, and
+    /// neither guard depends on which description asked.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    ofd_probe: Option<std::sync::Arc<crate::open::LivenessProbe>>,
     /// The fork generation this tree was opened in, or `None` for a backing that
     /// survives a `fork` intact.
     ///
@@ -2328,6 +2364,8 @@ impl Tree {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             claim_lock: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
+            ofd_probe: None,
+            #[cfg(all(feature = "shm", target_os = "linux"))]
             fork_gen,
         })
     }
@@ -2383,6 +2421,7 @@ impl Tree {
             decl: Mutex::new(()),
             attachment: None,
             claim_lock: None,
+            ofd_probe: None,
             fork_gen,
         }
     }
@@ -2470,6 +2509,19 @@ impl Tree {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub(crate) fn use_ofd_liveness(&mut self, probe: crate::open::LivenessProbe) {
         let own_slot = self.participant;
+        // **One description, two holders — and the `Arc` is exactly the
+        // lifetime convenience.** The probe arrives by value, the closure below
+        // must own what it captures, and `Self::reap_participants` needs the
+        // same object for the three-valued answer this closure collapses.
+        // Nothing in a `Tree` can build a second one: `LivenessProbe::open`
+        // wants a `Rendezvous` and a `LockFile` keeps no path. Sharing is not a
+        // correctness property — this probe is *already* a description of its
+        // own, which the closure's own comment below and `LivenessProbe`'s doc
+        // comment both say, so a second one would agree about every byte
+        // including ours; it would cost an `open(2)` and an fd and decide
+        // nothing. See the `ofd_probe` field.
+        let probe = std::sync::Arc::new(probe);
+        self.ofd_probe = Some(std::sync::Arc::clone(&probe));
         self.liveness = Box::new(move |slot, rec| {
             // **Never report ourselves dead.** `F_OFD_GETLK` answers about
             // *conflicting* locks, so a description does not see its own — a
@@ -2588,6 +2640,141 @@ impl Tree {
             }
             tf_tree_core::edge::reap(rec);
             reaped += 1;
+        }
+        reaped
+    }
+
+    /// Reclaim the participant records of processes the kernel says are gone
+    /// (`docs/PHASE2.md` §3.9 and §6.3, `docs/decisions/0028` plan step 5).
+    ///
+    /// Returns how many records were collected. Sweeps every slot in the
+    /// arena's participant table, applies the one reclamation predicate to
+    /// each, and frees the record where — and only where — that predicate says
+    /// the byte is free.
+    ///
+    /// # This is deliberately not owner-only
+    ///
+    /// `docs/PROJECT.md` §6 lists "reaping from the owner only" as a design
+    /// smell by name and `docs/PHASE2.md` §6.3 forbids it outright, and the
+    /// reason is concrete rather than stylistic. The owner's socket-hangup
+    /// callback is the O(1) fast path and it cannot see five things (`0028`,
+    /// candidate B), of which **the owner's own slot** is the one no `HUP` can
+    /// ever cover: the owner registers itself, no socket of its own closes, and
+    /// nothing hangs up on it. A `SIGKILL`ed owner therefore leaves a `LIVE`
+    /// record over a byte the kernel has released — #184's wedge — and any
+    /// *surviving* read-write participant calling this is what collects it.
+    ///
+    /// # One slot per process, so the sweep never reasons about two
+    ///
+    /// `0028` open question 3 settled that a taking-over heir keeps the slot,
+    /// byte and record it already holds — takeover is byte 0 plus a `bind` —
+    /// because its participant slot is baked into every claim (A3) and every
+    /// topology guard (A2) it holds. So one process is one slot, always, and
+    /// nothing here has to reconcile a process occupying two.
+    ///
+    /// # What it refuses, and how you can tell
+    ///
+    /// **A read-only tree reaps nothing**, and returns `0` rather than an
+    /// error, which is [`Self::reap_dead`]'s shape and `docs/API.md` R6's
+    /// substance taken through the door that rule's own text opens: reclaiming
+    /// is a `compare_exchange` and a `PROT_READ` mapping answers one with
+    /// `SIGSEGV`, so the check is what makes read-only a safety boundary; and
+    /// [`Self::is_writable`] is public *"so a consumer can branch on capability
+    /// instead of on an error it was going to get"*. Read-only is the consumer
+    /// default (D18) and the Python default, so this is the ordinary case, not
+    /// a corner. A caller that needs to tell "refused" from "nothing to
+    /// collect" asks `is_writable()`; the two are otherwise the same `0`.
+    ///
+    /// **A tree with no lock file reaps nothing**, for the reason the predicate
+    /// documents: liveness is a kernel fact about a byte (§5.1), and a heap
+    /// tree or a directly-built `build_shared` tree has no byte to ask about.
+    /// The probe is installed by `Open::attempt` and by nothing else.
+    ///
+    /// **This process's own slot is never collected.** The predicate's own
+    /// second constraint, unconditional and evaluated first: `F_OFD_GETLK`
+    /// reports only *conflicting* locks, so a description does not see its own,
+    /// and a sweep that judged itself from the byte would reclaim its own live
+    /// record the moment a refactor shared one description.
+    ///
+    /// **A tree detached by `fork` reaps nothing**, and what stops it is the
+    /// crate-internal `view()` answering with the poison arena rather than a
+    /// check here — the same single mechanism `Drop` relies on, kept single on
+    /// purpose. The poison arena's table is empty, so every slot reads `FREE`
+    /// and the sweep collects nothing without a syscall.
+    ///
+    /// # Cost
+    ///
+    /// Nothing on the hot path — `Plan::at` is untouched, so `docs/API.md` R2
+    /// is unaffected. One `F_OFD_GETLK` per non-`FREE` slot that is not ours,
+    /// and nothing at all for the others: a `FREE` word costs one `Acquire`
+    /// load and no syscall, which is what makes the common shape free — a
+    /// read-only joiner holds a byte and writes no record, so most slots on a
+    /// real system are exactly that. For scale, 64 probes were measured at
+    /// ~23-28 µs and a single probe at ~0.4 µs, against a 97.5 µs p50 attach
+    /// (`0028` open question 4); a sweep that finds nothing to ask about costs
+    /// neither.
+    ///
+    /// # The read order is a correctness property
+    ///
+    /// Every slot goes through `crate::open::reclamation_verdict`, which
+    /// observes the `state` word **before** it probes the byte and carries the
+    /// observed word into the verdict so this loop has nothing to re-read.
+    /// `ParticipantTable::reclaim` is a `compare_exchange` against *that* word,
+    /// so a slot that changed between the verdict and the CAS is not collected.
+    /// Reversed — or written from `LockFile::held_participants`, which returns
+    /// all 64 bytes in one call and makes the wrong order the natural one —
+    /// `loom` erases a published record in 0.00 s. That is why this sweeps
+    /// through the predicate rather than taking a holder mask first, and why
+    /// there is exactly one predicate to sweep through.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[must_use]
+    pub fn reap_participants(&self) -> usize {
+        // R6, and first: a `PROT_READ` mapping does not fault politely on a
+        // `compare_exchange`, it delivers `SIGSEGV`.
+        //
+        // **One check, not two**, and unlike `reap_inner`'s pair that is a
+        // choice with a measurement behind it. The `participant == u32::MAX`
+        // half would catch every read-only tree here too — a read-only
+        // attachment registers no record, so the sentinel and unwritability
+        // arrive together — and deleting it alone leaves
+        // `a_read_only_tree_reaps_no_participant_records` green. It is the
+        // proxy; this is the hazard. `reap_inner` needs the sentinel for a
+        // second reason this has not got — `slot + 1` overflows when it forms
+        // an owner word — and a guard kept for a reason that does not apply is
+        // the one a later reader deletes as redundant, having deleted the wrong
+        // one.
+        if !self.arena.is_writable() {
+            return 0;
+        }
+        // No rendezvous, no lock file, no kernel fact to act on. The predicate
+        // is scoped to a tree carrying a probe, and this is that scope.
+        let Some(probe) = self.ofd_probe.as_ref() else {
+            return 0;
+        };
+
+        let view = self.view();
+        let table = view.participants();
+        let slots = view.header().max_participants;
+        let mut reaped = 0;
+
+        for slot in 0..slots {
+            let Some(rec) = table.get(slot) else {
+                continue;
+            };
+            // The word, then the byte, then the CAS against the word — all
+            // three inside the predicate and `reclaim`, so this loop chooses no
+            // ordering of its own and cannot get one wrong.
+            if let crate::open::Reclamation::Reclaimable { observed } =
+                crate::open::reclamation_verdict(probe, self.participant, slot, rec)
+            {
+                // `false` when the slot moved under us — reclaimed by a racing
+                // sweeper, or re-occupied. Not counted, because nothing was
+                // collected: racing reclaimers are harmless and at most one
+                // CAS succeeds.
+                if table.reclaim(slot, observed) {
+                    reaped += 1;
+                }
+            }
         }
         reaped
     }

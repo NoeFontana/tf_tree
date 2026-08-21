@@ -2119,16 +2119,19 @@ shm-rendezvous:
     # so `the_acquire_window_backs_out` cannot place a reaper inside it by
     # racing. The hook is inert when unset, so the other tests run as they
     # always did. `reclamation_verdict_for_test` reaches `docs/decisions/0028`
-    # plan step 2's predicate, which is private and — since that record's plan
-    # step 3 put it in the owner's slot assigner — has a production caller that
-    # *acts* on a verdict without ever reporting one; its five tests turn on
-    # facts only the kernel produces — a `SIGSTOP`ped process keeps its lock byte, a
+    # plan step 2's predicate, which is private and whose two production
+    # callers — the owner's slot assigner (that record's plan step 3) and
+    # `Tree::reap_participants` (step 5) — both *act* on a verdict without ever
+    # reporting one: the assigner stops at the first grantable slot, and the
+    # sweep reports a slot count and so cannot separate `Live` from `Unknown`.
+    # Its five tests turn on facts only the kernel produces — a `SIGSTOP`ped
+    # process keeps its lock byte, a
     # `SIGKILL`ed one loses it, a read-only joiner holds one and writes no arena
     # record — so they cannot be unit tests inside the crate. That seam also
     # reports how many times the predicate asked the kernel, which is the only
     # part of its read *order* a multiprocess test can observe.
     #
-    # **`unstable` buys six tests here, the same trade `just shm-check`'s
+    # **`unstable` buys eight tests here, the same trade `just shm-check`'s
     # `--test frozen` line makes.** Two of them drive the helper's `join-rw-report`
     # mode, which reads a participant record's raw `state` word through
     # `Tree::arena_view` — the only route to it (`docs/API.md` §2.6).
@@ -2144,7 +2147,7 @@ shm-rendezvous:
     # carried the gate since #221 added it, and its body names no `unstable` API
     # — it reads the arena through `Tree::participant_slot` and `tf_tree_ipc`'s
     # lock-file accessors — so that one is a gate to re-examine rather than a
-    # trade. The last three are `0028`'s plan steps 3 and 4, and all three need
+    # trade. Three more are `0028`'s plan steps 3 and 4, and all three need
     # the feature to *stage* their fixture rather than to name an API:
     # `the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`,
     # `the_assigner_collects_a_record_left_reserved_by_a_killed_registrant` and
@@ -2154,16 +2157,23 @@ shm-rendezvous:
     # free lock byte in a slot this owner never granted, and a `RESERVED` record
     # left by a registrant killed inside `fill_slot`'s publication window, which
     # `0028` open question 4 measured at ~12 ns — have no producer reachable
-    # from public API here. Without the feature all
-    # six and the helper mode are `#[cfg]`-ed out and the recipe runs six tests
-    # fewer, silently.
+    # from public API here. The last two are plan step 5's:
+    # `a_survivor_reaps_the_killed_owners_slot_which_no_hangup_can` and
+    # `a_read_only_tree_reaps_no_participant_records` call public API and need
+    # the feature only to *observe* — the raw `state` word is what separates "the
+    # sweep collected the slot" from "the sweep left the wedge in place", and
+    # `Tree::participant_alive` reads `false` for both. Without the feature all
+    # eight and the helper mode are `#[cfg]`-ed out and the recipe runs eight
+    # tests fewer, silently.
     #
     # Measured on this branch, `cargo nextest list -p tf_tree --test rendezvous`
-    # per feature set: `shm` 17, `shm,unstable` 23, `shm,test-hooks` 23,
-    # `shm,test-hooks,unstable` **29** — the line below. (Earlier revisions of
-    # this comment said 16/18, then 16/19/22/25, then 17/21/23/27; the first was
-    # written before #221 and #228, the second before `0028`'s plan steps 3 and
-    # 4, the third before the two tests that pin those steps' `RESERVED` half.)
+    # per feature set: `shm` 17, `shm,unstable` 25, `shm,test-hooks` 23,
+    # `shm,test-hooks,unstable` **31** — the line below. (Earlier revisions of
+    # this comment said 16/18, then 16/19/22/25, then 16/21/22/27 on `0028` plan
+    # step 5's branch and 17/23/23/29 on steps 3 and 4's; each was written
+    # before the next tests landed, and the last two are what merging those two
+    # branches adds up to, which is why the numbers here are re-measured rather
+    # than added together.)
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.

@@ -1373,10 +1373,11 @@ mod imp {
         // disagree until somebody looks, and that is what this check is for
         // now. Collection is **lazy**: the assigner reaches a slot only when a
         // grant walks past its index, the hangup callback only when the socket
-        // that owned it closes, and nothing sweeps the table (plan step 5's
-        // `reap_participants` has not landed). A record still held by a dead
-        // process when the run is over has leaked, because no further grant is
-        // coming.
+        // that owned it closes, and the one collector that does sweep the whole
+        // table — plan step 5's `Tree::reap_participants` — runs when a
+        // participant calls it, which this harness never does. A record still
+        // held by a dead process when the run is over has leaked, because no
+        // further grant is coming and nobody here is going to sweep.
         //
         // # What this found, and what fixed it
         //
@@ -1401,9 +1402,11 @@ mod imp {
         // plan step 4. Measured after, 728 kills over 120 s: the registered
         // slot count never left 5 of 64.
         //
-        // This check stays because both collectors are one CAS on one code path
-        // apiece — the callback's, and the assigner's — and neither runs unless
-        // something drives it, while the failure it prevents is silent by
+        // This check stays because both collectors that run *without being
+        // asked* are one CAS on one code path apiece — the callback's, and the
+        // assigner's — and neither runs unless something drives it, while the
+        // third has to be called and nothing here calls it; and the failure it
+        // prevents is silent by
         // construction: a wedged arena reads exactly like a healthy one. `arena_is_live` catches
         // the *consequence* a round at a time; this names the cause.
         // **Polled, not sampled once, and the difference is a flaky gate.**
@@ -1436,10 +1439,11 @@ mod imp {
         if !leaked.is_empty() {
             out.failures.push(format!(
                 "{} of {} participant slot(s) hold a LIVE record for a process the kernel \
-                 says is dead {:?}{}. These are leaked: nothing sweeps the participant \
-                 table, so a dead record is collected only when a grant walks past its slot \
-                 (`docs/decisions/0028` plan step 3) or when the socket that owned it closes \
-                 (step 4) — and this run is over, so neither is coming. `docs/PHASE2.md` §11.4 \
+                 says is dead {:?}{}. These are leaked: nothing in this harness sweeps the \
+                 participant table, so a dead record is collected only when a grant walks past \
+                 its slot (`docs/decisions/0028` plan step 3) or when the socket that owned it \
+                 closes (step 4) — and this run is over, so neither is coming. \
+                 `docs/PHASE2.md` §11.4 \
                  requires that participant slots never leak and §5 requires that liveness \
                  come from the lock byte, never from `state`. Still held two seconds after \
                  the last child was reaped, so this is not the owner's hangup callback \
