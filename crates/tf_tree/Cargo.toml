@@ -84,8 +84,13 @@ unstable = []
 #    reaper inside it deterministically, but a published hook that runs
 #    arbitrary code mid-claim is not something a shipped build should carry.
 # 2. `reclamation_verdict_for_test` — `docs/decisions/0028` plan step 2's
-#    reclamation predicate, which is private and whose production callers are
-#    that record's steps 3-5. The five multiprocess tests around it turn on facts
+#    reclamation predicate, which is private and whose two production callers
+#    both act on a verdict without reporting one: the owner's slot assigner
+#    (that record's step 3) stops at the first grantable slot, and
+#    `Tree::reap_participants` (step 5) reports a slot count — so `Live` and
+#    `Unknown`, the two verdicts that collect nothing for opposite reasons, are
+#    indistinguishable through either. The five multiprocess tests around it
+#    turn on facts
 #    only the kernel produces (a `SIGSTOP`ped process keeps its lock byte, a
 #    `SIGKILL`ed one loses it, a read-only joiner holds one and writes no arena
 #    record), so they cannot be unit tests inside the crate, and nothing outside
