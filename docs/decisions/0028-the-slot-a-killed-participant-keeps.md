@@ -1,17 +1,44 @@
 # 0028: the slot a killed participant keeps
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** the plan below, in its stated order — which is a safety
-property and not a preference. Four PRs have already landed inside this record's
-scope and are marked as such per step: `adeb158` (#191, candidate B),
-`4a91d6f` (#210, `TFT014`'s claim half), `356e746` (#218, all three of step 0's
-clauses), `ecae587` (#221, the #201 falsifier).
+**Implementation:** complete, in the plan's stated order — which is a safety
+property and not a preference, because piece 2 is the first code that acts
+destructively on a byte-derived verdict and steps 0b and 0c are what make that
+verdict trustworthy.
+
+| Step | Landed as |
+|---|---|
+| 0 — `PHASE2.md` §5, §5.1, §11.3's row | `356e746` (#218) |
+| 0b — `attach_shared` / `attach_shared_at` refuse `ReadWrite` | `3636e21` (#227) |
+| 0c — the byte/record correspondence asserted | `d25557f` (#228) |
+| 1 — `ParticipantTable::reclaim` | `b352fdc` (#230) |
+| 2 — the predicate, once | `f65343f` (#231) |
+| 3 — the assigner decides from the byte | `78d6315` (#232) |
+| 4 — the hangup fast path, rebased onto `reclaim` | `adeb158` (#191), rebased in `78d6315` (#232) |
+| 5 — `Tree::reap_participants` | `001a1ad` (#233) |
+| 6 — `TFT014`'s participant half | `4a91d6f` (#210), completed in `91f45dc` (#234) |
+| 7 — the atfork handler | **not here** — [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md) |
+| 8 — `--force-new` | #189, by taking neither branch as written |
+| 9 — the `TookOver` arm refuses | `1b29208` (#229) |
+
+`ecae587` (#221) landed the #201 falsifier that step 0c converts into a
+regression test.
 
 > **Moved `draft -> ready` on 2026-08-20**, with all six open questions resolved
-> — see *Open questions*, where each keeps the argument that produced it, and
-> *Review history* for what the transition changed. Step 7 is **not** in this
-> record any more: it became [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md).
+> — see *Open questions*, where each keeps the argument that produced it — and
+> **`ready -> implemented` on 2026-08-21**. *Review history* has what each
+> transition changed. Step 7 is **not** in this record any more: it became
+> [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md).
+>
+> **This document is frozen.** `decisions/README.md`'s lifecycle makes
+> `implemented` an immutability lock: it is not edited to match what the code
+> does, and drift is fixed by a record that supersedes it. Two things are
+> therefore frozen *as they are* and a reader should know it — the errata blocks
+> above, and the fact that four of this record's citations rotted because **its
+> own step 0b deleted the code they pointed at**. That is a property of citing a
+> moving name, not of the argument, and it is left standing as evidence rather
+> than tidied away on the way out.
 
 ## Context
 
@@ -2130,6 +2157,41 @@ wanted back, the place to re-open it is here.
   existing is that the difference matters.
 
 ## Review history
+
+### 2026-08-21 — `ready -> implemented`
+
+Eight PRs, in the plan's order. The table at the head of this record maps each
+step to what landed it. What the implementation found is worth more than the fact
+that it finished, so:
+
+- **This record's named falsifier for step 3 did not falsify.** §11.2 scenario 2b
+  existed only as a proposal *inside this document*; landed in `PHASE2.md` for
+  real, it **passes at HEAD**, because `528eddd`/#191's hangup callback already
+  satisfied it — and it fails on the **64th** attach, not the 65th, since the
+  owner holds slot 0 and joiners only ever get 63. Three tests that do fail at
+  HEAD replaced it. This is the second time this record cited something that
+  lived only in its own proposal table; the first was a §11.3 row.
+- **The `RESERVED` widening — question 6's whole answer — was asserted in three
+  places and pinned by nothing.** Narrowing both production callers back to
+  LIVE-only, i.e. exactly the pre-patch narrowness, passed 144 tests. It now has
+  one test per collector, staged rather than raced because question 4 measured
+  the window at ~12 ns.
+- **Step 1's `loom` model does not constrain `reclaim`.** Its controls fail for
+  the *caller's* read order; `s1_fire_attempt = 0` across every execution, and a
+  `reclaim` that ignores `observed` passes it. The guard is pinned by a unit test
+  instead, and the model's doc says so rather than implying otherwise.
+- **A clean auto-merge falsified six statements without touching them**, each a
+  place where one branch described the other's absence. The worst reached
+  `RUNBOOK.md`, which told an operator "Nothing reclaims it on this build" after
+  three things did.
+- **Prediction that did not come true, recorded rather than quietly dropped:**
+  steps 3–4 noted that deleting the assigner's `if !table.reclaim(..)` guard
+  survives, and predicted step 5 would make it load-bearing. Step 5 landed; it
+  still survives, 148 tests passing, and the comment was corrected.
+
+What is *not* fixed and is not this record's any more: the fork hole (`0030`),
+and rejoining an arena whose owner has died, since §3.5 takeover is unwired and
+question 3 settled that wiring it means byte 0 plus a `bind`.
 
 ### 2026-08-20 — `draft -> ready`; the remaining five questions answered
 
