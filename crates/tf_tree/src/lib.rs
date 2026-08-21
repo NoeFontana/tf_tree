@@ -316,10 +316,12 @@ mod open;
 pub use open::{open, CreatePolicy, Open, OpenError};
 
 /// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
-/// predicate, which is private. Its production caller is
-/// [`Tree::reap_participants`] (that record's step 5), which acts on the
-/// verdict and reports a count — and a count cannot separate the two verdicts
-/// that collect nothing. Absent unless `--features test-hooks`; see
+/// predicate, which is private. Its two production callers are the owner's
+/// slot assigner (that record's step 3) and [`Tree::reap_participants`] (step
+/// 5); both act on the verdict without reporting one — the assigner stops at
+/// the first grantable slot, the sweep reports a count — and neither a grant
+/// nor a count can separate the two verdicts that collect nothing. Absent
+/// unless `--features test-hooks`; see
 /// [`open::reclamation_verdict_for_test`].
 #[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
 #[doc(hidden)]

@@ -324,17 +324,23 @@ pub(crate) fn reclamation_verdict(
 /// [`reclamation_verdict`] for `slot`, rendered as one line.
 ///
 /// **Test scaffolding, and present only under `--features test-hooks`.** The
-/// predicate is private, and the seam does not become redundant now that it has
-/// a production caller: [`Tree::reap_participants`] (`docs/decisions/0028` plan
-/// step 5) *acts* on the verdict, so what it reports is a slot count, and the
-/// three answers this renders are exactly what a count cannot separate — a slot
-/// left alone because the byte was held reads the same as one left alone
-/// because the kernel would not say, and both read the same as a slot with no
-/// record in it. The same argument that put [`crate::CLAIM_WINDOW_HOOK`] behind
-/// this feature applies: a window a test cannot otherwise stand in. (`Open`'s own `#[cfg(test)]`
-/// `already_attached` seam rejected a `pub` one for a reason that does not
-/// reach here — what it would have published was a route `Open` withholds on
-/// purpose, where this publishes a read-only verdict about a slot.)
+/// predicate is private, and the seam does not become redundant now that the
+/// predicate has production callers. There are two, and they are the two the
+/// `0028` plan named — `spawn_owner_server`'s slot assigner (plan step 3) and
+/// [`Tree::reap_participants`] (plan step 5) — and *both act on a verdict
+/// without ever reporting one*. The assigner returns at the **first** grantable
+/// slot, so it says nothing at all about the rest of the table; the sweep walks
+/// every slot but reports a count, and the three answers this renders are
+/// exactly what a count cannot separate — a slot left alone because the byte
+/// was held reads the same as one left alone because the kernel would not say,
+/// and both read the same as a slot with no record in it. So without this seam
+/// the tests step 2 owes could still not name a slot and read back what the
+/// predicate says about it, and the same argument that put
+/// [`crate::CLAIM_WINDOW_HOOK`] behind this feature applies: a window a test
+/// cannot otherwise stand in. (`Open`'s own `#[cfg(test)]` `already_attached`
+/// seam rejected a `pub` one for a reason that does not reach here — what it
+/// would have published was a route `Open` withholds on purpose, where this
+/// publishes a read-only verdict about a slot.)
 ///
 /// `own_slot` is a **parameter rather than `tree.participant_slot()`**, and
 /// that is the point of it: with the tree's real slot passed, the own-slot
@@ -1171,6 +1177,16 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
     };
     let table_arena = tf_tree_arena::MappedArena::attach(table_fd, AttachMode::ReadWrite)?;
 
+    // **The owner's own slot, which no sweep may collect.**
+    // `reclamation_verdict`'s second constraint skips it unconditionally and
+    // first — `F_OFD_GETLK` reports only *conflicting* locks, so a description
+    // does not see its own byte, and a sweep that leant on this probe's
+    // separate description happening to make ours visible would be one refactor
+    // away from reclaiming its own live record. One integer indexes both tables
+    // (§3.7), and `Open::attempt`'s `Created` arm is what asserts that here
+    // (`docs/decisions/0028` plan step 0c) rather than assuming it.
+    let own_slot = tree.participant_slot();
+
     let running = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&running);
     let join = std::thread::Builder::new()
@@ -1206,8 +1222,151 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                         if granted_assign.get() & bit != 0 {
                             continue; // granted, not yet hung up
                         }
-                        if table.identity(slot).is_some() {
-                            continue; // a registered participant lives here
+                        let Some(rec) = table.get(slot) else {
+                            // `n` came from `capacity()`, so this cannot fire;
+                            // it is the `Option` and not a bound check.
+                            continue;
+                        };
+                        // **Is there a record here at all** — a question about
+                        // the *record*, not about its process. `docs/PHASE2.md`
+                        // §5.1 forbids deciding *liveness* from `state`, and
+                        // this decides something else: whether `fill_slot`'s
+                        // `FREE -> RESERVED` CAS could succeed at this index.
+                        // Granting a slot whose word is not `FREE` hands the
+                        // joiner `ShmError::ParticipantTableFull` — *"Every
+                        // participant slot is taken, so this process cannot
+                        // join"* — about the very slot this loop just decided
+                        // was free, and there is nothing it can usefully retry.
+                        let word = rec.state.load(Ordering::Acquire);
+                        if tf_tree_core::participant::state_of(word)
+                            != tf_tree_core::participant::FREE
+                        {
+                            // **This is `docs/decisions/0028`'s defect, at the
+                            // line it was filed against.** The test used to be
+                            // `if table.identity(slot).is_some() { continue }`,
+                            // and `identity` returns `Some` iff the word reads
+                            // `LIVE` — so a participant that was `SIGKILL`ed,
+                            // and therefore never ran `Tree`'s `Drop`, kept its
+                            // slot for the life of the segment and the assigner
+                            // skipped it for ever. Sixty-four abnormal
+                            // read-write exits wedged the arena (#184: 63 of 64
+                            // slots holding records for dead pids, every
+                            // subsequent attach refused). §5.1 is normative
+                            // that this is a bug in as many words: *"Any code
+                            // deciding liveness from `state` or `heartbeat` is
+                            // a bug."*
+                            //
+                            // The verdict comes from the kernel instead, and
+                            // through the **one** predicate — a second copy of
+                            // it is the defect that record was opened about,
+                            // re-created.
+                            match reclamation_verdict(&lock_probe, own_slot, slot, rec) {
+                                Reclamation::Reclaimable { observed } => {
+                                    // **Deciding correctly is not enough**, and
+                                    // 0028's candidate A is the record of why:
+                                    // `fill_slot` CASes from `FREE`, so a slot
+                                    // judged collectable and left `LIVE` is
+                                    // refused to the very joiner this grant is
+                                    // for. Reclaim first, grant second.
+                                    //
+                                    // `observed` comes from the verdict rather
+                                    // than from a fresh load, which is what
+                                    // `Reclamation::Reclaimable` carries it
+                                    // for: it is the word read *before* the
+                                    // byte was probed, and `reclaim`'s ordering
+                                    // obligation is about that word. A reload
+                                    // here would build the CAS guard out of a
+                                    // word read *after* the probe — the failing
+                                    // order, which erases a published record.
+                                    //
+                                    // **And nothing in this crate would catch
+                                    // one**, which is why it is written down
+                                    // here rather than left to the reviewer who
+                                    // finds `observed` redundant. Measured:
+                                    // binding the arm as `Reclaimable { .. }`
+                                    // and opening it with
+                                    // `let observed = rec.state.load(Acquire);`
+                                    // compiles clean under `-D warnings` — no
+                                    // `unused variable`, because the arm stops
+                                    // binding the field — and all 29 rendezvous
+                                    // tests pass. A reload yields the same word
+                                    // in every state a test can stage, so the
+                                    // property lives in the model and not here:
+                                    // `tf_tree_core::loom_tests`'
+                                    // `reclaim_races_register`, which
+                                    // [`reclamation_verdict`]'s third
+                                    // constraint routes to, ships the reversed
+                                    // control that erases a published record.
+                                    if !table.reclaim(slot, observed) {
+                                        // The word moved between the
+                                        // observation and the CAS, so this
+                                        // verdict is about an occupancy that no
+                                        // longer exists. Leave the slot; the
+                                        // next handshake forms a fresh verdict.
+                                        //
+                                        // **Unpinned, and written down rather
+                                        // than left to be "simplified".**
+                                        // Dropping this `continue` and ignoring
+                                        // the return passes the whole
+                                        // rendezvous suite — measured, not
+                                        // assumed.
+                                        //
+                                        // **An earlier revision of this comment
+                                        // predicted that plan step 5's
+                                        // `reap_participants` would make it
+                                        // load-bearing, by putting a second
+                                        // reclaimer in the workspace. Step 5
+                                        // landed; the prediction was wrong, and
+                                        // re-measured rather than re-asserted:**
+                                        // with the guard deleted the tree is
+                                        // green at 148 of 148
+                                        // (`-p tf_tree --features
+                                        // shm,test-hooks,unstable`) and over
+                                        // five consecutive runs of the 31-test
+                                        // rendezvous target. Two reasons, and
+                                        // the second is the durable one. The
+                                        // sweep runs when a participant *calls*
+                                        // it, and nothing schedules one against
+                                        // a grant in flight — but more to the
+                                        // point, the byte probe below already
+                                        // catches the case a lost CAS is
+                                        // frightening for: the only way to lose
+                                        // it to an occupancy rather than to a
+                                        // peer sweeper's `FREE` is for somebody
+                                        // to have registered here, and by plan
+                                        // step 0b a registrant holds this
+                                        // slot's byte across the whole of
+                                        // `fill_slot` and keeps it for its
+                                        // life, so `is_held` reports it and the
+                                        // slot is skipped anyway.
+                                        //
+                                        // What the guard still bounds is the
+                                        // residue neither of those covers: a
+                                        // slot reclaimed under us, re-registered
+                                        // by a third process, and *abandoned* by
+                                        // it before the probe below — free byte,
+                                        // occupied word, and a grant that hands
+                                        // the joiner a slot `fill_slot` will
+                                        // refuse it. The guard turns that into a
+                                        // skipped slot. Nothing in this
+                                        // workspace can stage it, so it is kept
+                                        // on the argument and not on a test —
+                                        // which is what "unpinned" means here.
+                                        continue;
+                                    }
+                                }
+                                // A live participant holds the byte, or the
+                                // slot is our own. Not ours to collect.
+                                Reclamation::Live => continue,
+                                // The kernel would not say. §6.2's fail-safe
+                                // direction is to leave it alone: a slot nobody
+                                // can use costs one participant, a wrong grant
+                                // costs a running one its record. **`Unknown`
+                                // cannot mean "no record here" on this line** —
+                                // that is the predicate's `FREE` branch, and
+                                // the `if` above has already excluded it.
+                                Reclamation::Unknown => continue,
+                            }
                         }
                         // **And the lock byte must be free too.** A read-only
                         // participant takes its byte but writes no arena
@@ -1220,6 +1379,17 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                         // `granted` bitmask hides that until an owner restart
                         // or a takeover clears it, after which the owner names
                         // the same slot forever and the joiner loops.
+                        //
+                        // **A slot just reclaimed is probed twice**, and that
+                        // is deliberate rather than overlooked. The verdict
+                        // above reported the byte free, but the byte is not
+                        // ours between the two reads: `tf_tree_ipc`'s
+                        // `hold-participant` helper is a `[[bin]]` of a
+                        // published crate and can take any byte at any moment,
+                        // and §3.5's heir takes one through `register_any`
+                        // without asking an owner. Losing that race costs a
+                        // skipped slot whose dead record has already been
+                        // collected, which is the harmless direction.
                         if lock_probe.is_held(slot).unwrap_or(false) {
                             continue;
                         }
@@ -1234,10 +1404,14 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     // the workspace performed it.
                     //
                     // A participant that is `SIGKILL`ed never runs `Tree`'s
-                    // `Drop`, so its record stays `LIVE` for ever — and `assign`
-                    // above skips a `LIVE` slot while `register_at` fills only a
-                    // `FREE` one, so that slot could never be granted to anybody
-                    // again. Measured before this existed, with
+                    // `Drop`, so its record stays `LIVE` until somebody else
+                    // clears it — and when this was written nobody did: `assign`
+                    // above skipped a `LIVE` slot while `register_at` fills only
+                    // a `FREE` one, so that slot could never be granted to
+                    // anybody again. (`assign` no longer skips it; that is plan
+                    // step 3, and this callback is now the O(1) fast path for
+                    // the same collection rather than the only one.)
+                    // Measured before this existed, with
                     // `shm_torture --kill-hz 6`: 63 of the 64 slots held records
                     // for dead pids after thirty seconds, every subsequent
                     // attach was refused `NoParticipantSlots`, and the arena ran
@@ -1245,23 +1419,86 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     // observer read four frozen rings and scored a perfect 256
                     // composed lookups per round out of them.
                     //
-                    // **The incarnation is what makes this safe.**
-                    // `ParticipantTable::release` is a single CAS of
-                    // `live_word(incarnation) -> FREE`, so it frees the slot only
-                    // if it is still the same occupancy this hangup is about. A
-                    // participant that detached cleanly already released it and
-                    // the CAS no-ops; one whose slot has since been re-granted
-                    // has a different incarnation and the CAS fails. Neither can
-                    // free a live participant's slot, which is the property
-                    // `release`'s own doc comment is written around.
+                    // **The observed word is what makes this safe**, and it
+                    // has to give the same bound the incarnation guard gave.
+                    // This callback used to read `identity(slot)` for the
+                    // incarnation and call `release(slot, incarnation)`; it now
+                    // loads the `state` word once and hands *that* to
+                    // `reclaim`, which is one `compare_exchange(observed, FREE)`
+                    // — the load and the compare fused rather than a load and
+                    // then a separately-built guard (`docs/decisions/0028` plan
+                    // step 4).
+                    //
+                    // *For a `live_word(inc)`* the bound is identical, because
+                    // the word **is** the incarnation: `live_word` packs it into
+                    // the high 30 bits, so "still live and still the occupancy
+                    // this hangup is about" is the same single comparison
+                    // `release` made. A participant that detached cleanly has
+                    // already stored `FREE`, so the `!= FREE` test below skips
+                    // it; one whose slot was re-granted carries a different
+                    // incarnation and the CAS fails.
+                    //
+                    // *For a `RESERVED` word* — which this collects and
+                    // `release` never could, because `identity` returns `None`
+                    // for it — the guard is weaker and the bound is not. A
+                    // `RESERVED` word is the bare constant `1` and carries no
+                    // incarnation, so against it the CAS degenerates to an ABA:
+                    // if the slot were freed, re-granted and driven back to
+                    // `RESERVED` between this load and this CAS, the CAS would
+                    // succeed against the *new* occupancy. What bounds that is
+                    // the byte and not the word. By plan step 0b every process
+                    // that writes a record holds the matching lock byte across
+                    // the whole of `fill_slot`, and by step 0c that byte is the
+                    // byte at the record's own index — so the record such a CAS
+                    // erases belongs to a joiner that is holding the byte and is
+                    // about to publish `live_word` over it, and is *entitled*
+                    // to, because it really does own the slot. **The outcome is
+                    // a spurious free, never a second occupant**, which is the
+                    // same bound the incarnation guard bought.
+                    // `ParticipantTable::reclaim`'s doc comment carries that
+                    // precondition, and says what to narrow it back to if
+                    // either half stops holding.
+                    //
+                    // **The single-thread argument that used to close the
+                    // ABA's first leg no longer holds, and the paragraph above
+                    // is why that costs nothing.** Reaching a second `RESERVED`
+                    // needs the slot to pass through `FREE` first, and **the
+                    // only operation in this workspace that can drive a
+                    // `RESERVED` word to `FREE` is `reclaim` itself**: the other
+                    // writer of `FREE` is `ParticipantTable::release`, whose CAS
+                    // names `live_word(inc)` and therefore cannot match the bare
+                    // constant `1`. When plan step 4 landed, `reclaim` had
+                    // exactly two call sites outside `tf_tree_core`'s own unit
+                    // and `loom` tests — this callback and the `assign` closure
+                    // above — and `serve` calls both from its one `epoll` loop,
+                    // on this thread, so nothing could free this word while this
+                    // callback held it. **Plan step 5 added the third**:
+                    // `Tree::reap_participants` sweeps the whole table from any
+                    // surviving read-write participant, in another process, on a
+                    // thread this loop knows nothing about. So the first leg is
+                    // open now, and what bounds the interleaving is the byte
+                    // argument above and not this thread — a spurious free,
+                    // never a second occupant. (The `granted` bit below is still
+                    // cleared after this CAS, which closes the *re-grant* leg
+                    // for slots this owner granted; a §3.5 heir serving an arena
+                    // whose participants it never granted would not have even
+                    // that.)
                     //
                     // Before the `granted` bit, so no `assign` can hand the slot
                     // out between the two — they run on this one thread, but the
                     // ordering costs nothing and does not rely on that.
                     let view = tf_tree_core::arena_view::ArenaView::new(&table_arena);
                     let table = view.participants();
-                    if let Some((_pid, _start, incarnation)) = table.identity(slot) {
-                        table.release(slot, incarnation);
+                    if let Some(rec) = table.get(slot) {
+                        let observed = rec.state.load(Ordering::Acquire);
+                        if tf_tree_core::participant::state_of(observed)
+                            != tf_tree_core::participant::FREE
+                        {
+                            // The return is dropped deliberately: `false` means
+                            // the word moved under this verdict, which is the
+                            // case where there is nothing left to do.
+                            let _ = table.reclaim(slot, observed);
+                        }
                     }
                     // D17: the socket closed, so that participant is gone and
                     // its slot can be handed out again.

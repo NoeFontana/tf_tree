@@ -1358,13 +1358,26 @@ mod imp {
         // function did for the life of the harness while sitting on an arena
         // that had run out of slots half an hour earlier.
         //
-        // The arena's owner uses the other one. Its slot assigner
-        // (`crates/tf_tree/src/open.rs`) skips any slot where
+        // The arena's owner *used* to use the other one, and this paragraph
+        // said so in the present tense for longer than it was true. Its slot
+        // assigner (`crates/tf_tree/src/open.rs`) skipped any slot where
         // `table.identity(slot).is_some()` — `state == LIVE`, no liveness check
-        // — and `ParticipantTable::register_at` fills only a `FREE` slot. So a
-        // record left `LIVE` by a process that never got to run `Drop` is a slot
-        // no future participant can be granted, and the only thing that clears
-        // one is a `LIVE -> FREE` CAS somebody has to perform.
+        // — and `ParticipantTable::register_at` fills only a `FREE` slot, so a
+        // record left `LIVE` by a process that never got to run `Drop` was a
+        // slot no future participant could be granted. **`docs/decisions/0028`
+        // plan step 3 ended that**: the assigner takes its verdict from the
+        // participant's OFD lock byte, through `reclamation_verdict`, and
+        // reclaims the dead record before it grants the slot.
+        //
+        // So the two predicates no longer disagree for ever — but they still
+        // disagree until somebody looks, and that is what this check is for
+        // now. Collection is **lazy**: the assigner reaches a slot only when a
+        // grant walks past its index, the hangup callback only when the socket
+        // that owned it closes, and the one collector that does sweep the whole
+        // table — plan step 5's `Tree::reap_participants` — runs when a
+        // participant calls it, which this harness never does. A record still
+        // held by a dead process when the run is over has leaked, because no
+        // further grant is coming and nobody here is going to sweep.
         //
         // # What this found, and what fixed it
         //
@@ -1383,13 +1396,18 @@ mod imp {
         // 30-minute nightly spent 99% of itself reading rings whose writers were
         // gone.
         //
-        // The owner now releases the record in its hangup callback, which is
-        // §3.9 implemented. Measured after, 728 kills over 120 s: the registered
+        // The owner now collects the record in its hangup callback, which is
+        // §3.9 implemented — `release` when that landed (#191), one
+        // `ParticipantTable::reclaim` guarded by the observed word since `0028`
+        // plan step 4. Measured after, 728 kills over 120 s: the registered
         // slot count never left 5 of 64.
         //
-        // This check stays because that fix is one CAS in one callback on one
-        // code path, and the failure it prevents is silent by construction: a
-        // wedged arena reads exactly like a healthy one. `arena_is_live` catches
+        // This check stays because both collectors that run *without being
+        // asked* are one CAS on one code path apiece — the callback's, and the
+        // assigner's — and neither runs unless something drives it, while the
+        // third has to be called and nothing here calls it; and the failure it
+        // prevents is silent by
+        // construction: a wedged arena reads exactly like a healthy one. `arena_is_live` catches
         // the *consequence* a round at a time; this names the cause.
         // **Polled, not sampled once, and the difference is a flaky gate.**
         // Reclamation is asynchronous by construction: the child's socket closes
@@ -1421,9 +1439,11 @@ mod imp {
         if !leaked.is_empty() {
             out.failures.push(format!(
                 "{} of {} participant slot(s) hold a LIVE record for a process the kernel \
-                 says is dead {:?}{}. These are leaked: the arena owner's slot assigner \
-                 refuses a slot whose record reads LIVE, and `register_at` only fills a FREE \
-                 one, so no process can ever be granted them again. `docs/PHASE2.md` §11.4 \
+                 says is dead {:?}{}. These are leaked: nothing in this harness sweeps the \
+                 participant table, so a dead record is collected only when a grant walks past \
+                 its slot (`docs/decisions/0028` plan step 3) or when the socket that owned it \
+                 closes (step 4) — and this run is over, so neither is coming. \
+                 `docs/PHASE2.md` §11.4 \
                  requires that participant slots never leak and §5 requires that liveness \
                  come from the lock byte, never from `state`. Still held two seconds after \
                  the last child was reaped, so this is not the owner's hangup callback \
