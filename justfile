@@ -1962,6 +1962,16 @@ shm-check:
     # this needs: the measurements are RSS and minor-fault deltas, and threads
     # sharing a process would read each other's.
     cargo nextest run -p tf_tree_bench --features shm --test population
+    # **`tf_tree_cli`'s unit tests under `shm`, which ran in no recipe.** The
+    # lines below name integration targets one by one, and `just test`'s
+    # `--workspace` builds default features — so every `#[cfg(feature = "shm")]`
+    # unit test in `src/` was compiled by the clippy line above and executed
+    # nowhere. `lib.rs`'s `recorded_given` is one: it is the `/proc`
+    # classification `TFT014`'s fork arm rests on, and its arms are only
+    # assertable by passing the two host facts in, which is a unit test's job
+    # (`docs/decisions/0028` plan step 6). `--lib` and not the whole package:
+    # the integration targets are named individually, on purpose.
+    cargo nextest run -p tf_tree_cli --features shm --lib
     # The CLI against a live arena, and `participants` against no arena at all.
     # This is the milestone's acceptance test: the shipped binary, through clap,
     # joining somebody else's tree.

@@ -406,6 +406,26 @@ transient. Python's `multiprocessing` defaults to `fork` on Linux, so this is th
 single most likely way to meet it; use the `spawn` start method, or open inside
 the worker.
 
+**And the child is holding a participant slot while it does this.** `fork` shares
+the open file descriptions, not just the mapping-shaped hole in them, so the
+child keeps the parent's rendezvous socket *and* its participant lock byte alive
+— which means the owner never sees a `HUP` when the parent dies, and the kernel
+keeps answering "held" for a slot nobody can use. `doctor --attach` reports it as
+the second `TFT014` shape in the table below (*byte still HELD*), and it is the
+one leak nothing may reclaim: the kernel is right, and the fix is upstream of it.
+The slot returns when the last inheritor exits.
+
+**It is reported whether or not the parent was a writer**, which matters because
+the ordinary Python worker is not one. A read-only participant — the consumer
+default (D18), and what `Tree::open`/`attach` gives you unless you ask for more —
+takes a lock byte and writes **no** arena participant record at all, so the slot
+its inheritor is holding shows an empty record. `doctor` reports it from the two
+facts such a slot does have, the byte and the lock file's identity record, and
+says so in the finding: *the record is FREE (no arena record: a read-only
+participant, D18)*. `tf_tree participants` shows the same slot as `live` with the
+dead parent's pid beside it, which is the corroborating view — the byte really is
+held, by a description the parent no longer owns.
+
 ### `ArenaHeldButUnreachable`
 
 Somebody holds a live arena and nothing is serving it, so
@@ -599,6 +619,9 @@ Almost certainly a bug — topology should be near-static after startup.
 | `inconsistent-rate` | A frame published at a wildly varying rate | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
+| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the process is gone and the kernel has released its lock byte, but its arena record still says `LIVE` (or `RESERVED`) | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died, since §3.5 takeover is unwired and no new process can join it. For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
+| `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the parent's open file descriptions, so the lock byte is still held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record at all — the finding then reads *the record is FREE (no arena record: a read-only participant, D18)* | Different fault, different fix — **do not go looking for a reaper**, and nothing may run one: the kernel's own answer for this slot is *held*, and overruling it with a `/proc` guess is what would evict a running participant. Stop the child, and start workers with a start method that inherits no descriptors — `multiprocessing`'s `spawn` (Python defaults to `fork` on Linux), or fork+exec. The byte comes back on its own when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child*, above |
+| `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run that read **no lock file**: `--from-bag`, or the built-in fixture. The verdict is a `/proc` inference alone | Read it as a weaker claim than the `byte free` row, not a different fault. To get the kernel's answer, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous |
 | `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena — which, `doctor` having no recording source, is the only outcome either of them has on a deployment |
 
 ---
