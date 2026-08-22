@@ -473,10 +473,17 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
 /// **What is lost, stated because it is the only thing this file loses.** The
 /// measurement that gives the block above its force — a joined watcher
 /// reporting `alive false` about a live, publishing process holding record 0 —
-/// cannot be retaken through public API, because it needs a `Tree` whose byte
-/// and record disagree and nothing will now produce one: `use_ofd_liveness` is
-/// `pub(crate)` and installed only by the two arms of `Open::attempt`, one of
-/// which is this refusal. That is the fix working, not a gap. The transcript
+/// can no longer be staged *through this route*, because `Open::attempt` now
+/// refuses a diverged pair.
+///
+/// **It is not unreachable, and an earlier revision of this comment said it
+/// was.** That revision claimed nothing would now produce a `Tree` whose byte
+/// and record disagree, and it conflated the judged tree with the judging one:
+/// the probe belongs to the *observer*, and the subject needs no byte at all. A
+/// directly-called `TreeBuilder::build_shared` registers a `LIVE` record with no
+/// lock byte, and a facade joiner reads it dead —
+/// `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
+/// below pins exactly that, with no divergence anywhere in it. The transcript
 /// survives here, in `docs/PHASE2.md` §0.0 and in `0028`.
 ///
 /// **What it pins now**, and neither is covered by its sibling
@@ -2871,4 +2878,160 @@ fn a_read_only_tree_reaps_no_participant_records() {
         0x6,
         "a read-only tree wrote to the participant table"
     );
+}
+
+/// **A participant record with no lock byte reads dead, and the sweep frees it
+/// while the process is still publishing.**
+///
+/// This is what is left of #201 after `docs/decisions/0028` plan step 0c, and it
+/// is **not** what #201 was filed about. Step 0c closed the byte/record
+/// *divergence* through `tf_tree::Open`, and `docs/PHASE2.md` §0.0 concluded
+/// from that that "no `Tree` whose byte and record disagree can be constructed".
+/// That sentence conflated the tree being **judged** with the tree doing the
+/// **judging**: the probe belongs to the observer, which joins normally, and the
+/// subject needs no probe and no byte at all.
+///
+/// **There is no divergence anywhere below.** `TreeBuilder::build_shared`
+/// registers a `LIVE` participant record and takes no lock byte, because such an
+/// arena has no lock file — the fd is the capability. Published through
+/// `tf_tree_ipc::OwnerServer` so facade peers can join, that record is a `LIVE`
+/// word over a permanently free byte: precisely the shape step 0b refused for
+/// `attach_shared(ReadWrite)`, reached by a call step 0b does not cover.
+///
+/// **It pins the defect, not the fix.** When
+/// `docs/decisions/0031-the-participant-record-with-no-byte.md` is answered this
+/// test flips, and each `PIN:` message says which way. It is written as a pin
+/// rather than left for later because the claim it replaces sat in `PHASE2.md`
+/// §0.0 — the document that outranks every other in this project — for three
+/// days, and what let it survive is that nobody executed it.
+///
+/// Every call here is shipped public API: `TreeBuilder::build_shared`,
+/// `Tree::shared_fd`, `tf_tree_ipc::OwnerServer::bind_at`, `Tree::open`,
+/// `Tree::reap_participants`. **Nothing in this workspace composes them this
+/// way**, which is why running the suite never found it — the bench binaries
+/// that call `build_shared` pass the fd directly and stand up no rendezvous, so
+/// no probe-carrying observer exists in them to hold the wrong opinion.
+///
+/// **Mutant, run rather than asserted.** `Tree::reap_participants` counting the
+/// verdict without calling `ParticipantTable::reclaim`:
+///
+/// ```text
+/// assertion `left == right` failed: PIN: the sweep currently FREEs the record
+/// of a process that is running
+///   left: 6
+///  right: 0
+/// ```
+///
+/// So the post-sweep word is what carries the claim, not the count beside it.
+#[test]
+#[cfg(feature = "unstable")]
+fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
+    let scratch = Scratch::new("byteless");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+
+    let creator = tf_tree::TreeBuilder::new()
+        .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+        .dynamic_edge(
+            "map",
+            "base",
+            tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(64)),
+        )
+        .build_shared("tf_tree-byteless")
+        .expect("build_shared");
+    let record = creator.participant_slot();
+
+    assert!(
+        !scratch.0.join("0/default.lock").exists(),
+        "a build_shared arena must carry no lock file — the absence is the \
+         premise of this test, not an incidental"
+    );
+
+    // Publish it with the two published `tf_tree_ipc` calls. The assign closure
+    // is this test's own and hands out slots from 1, so the facade's slot
+    // assigner — which *would* reclaim on the way past — never runs. What frees
+    // the record below is `reap_participants` and nothing else.
+    let desc = tf_tree_ipc::SegmentDescriptor {
+        format_version: tf_tree_arena::FORMAT_VERSION,
+        layout_hash: tf_tree_arena::layout_hash(),
+        arena_size: creator.arena_size_bytes() as u64,
+        instance_uuid: creator.instance_uuid(),
+        boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
+    };
+    let seg: std::os::fd::OwnedFd = creator
+        .shared_fd()
+        .expect("a build_shared tree has a segment fd")
+        .try_clone_to_owned()
+        .unwrap();
+    let rv = tf_tree_ipc::Rendezvous::new(
+        tf_tree_ipc::RuntimeDir::resolve().unwrap(),
+        0,
+        tf_tree_ipc::ArenaName::new("default", tf_tree_ipc::EnvVar::Name).unwrap(),
+    );
+    let server =
+        tf_tree_ipc::OwnerServer::bind_at(rv.sock_path(), desc, std::process::id()).unwrap();
+    let shutdown = server.shutdown_handle().unwrap();
+    let serving = std::thread::spawn(move || {
+        let mut next = 1;
+        let _ = server.serve(
+            std::os::fd::AsFd::as_fd(&seg),
+            |_r| {
+                let s = next;
+                next += 1;
+                Ok(s)
+            },
+            |_s| {},
+        );
+    });
+
+    let publisher = creator
+        .claim(
+            creator.frame("base").unwrap(),
+            creator.frame("map").unwrap(),
+        )
+        .expect("claim");
+    publisher
+        .push(1_000, &tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]))
+        .unwrap();
+
+    let rescuer = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("a facade peer joins the served arena");
+
+    assert!(
+        !rescuer.participant_alive(record),
+        "PIN: a joined peer currently reads the byte-less creator as DEAD. If \
+         this assertion fails, 0031 has been answered — invert the test, do not \
+         delete it"
+    );
+    assert_eq!(
+        state_word(&creator, record),
+        0x6,
+        "the creator's record must be LIVE going in, or the sweep below is \
+         about nothing"
+    );
+
+    let reaped = rescuer.reap_participants();
+
+    assert!(
+        reaped >= 1,
+        "PIN: the sweep currently collects the live creator; it collected {reaped}"
+    );
+    assert_eq!(
+        state_word(&creator, record),
+        0x0,
+        "PIN: the sweep currently FREEs the record of a process that is running"
+    );
+
+    publisher
+        .push(3_000, &tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]))
+        .expect(
+            "the creator goes on publishing into an arena whose participant \
+             table no longer records it — which is the whole defect",
+        );
+
+    let _ = shutdown.stop();
+    let _ = serving.join();
 }

@@ -1,0 +1,215 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Shortest-arc spherical linear interpolation of two unit quaternions."><title>slerp in tf_tree - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="tf_tree" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">slerp</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../tf_tree/index.html">tf_tree</a><span class="version">0.0.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">slerp</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#angles" title="Angles">Angles</a></li><li><a href="#preconditions" title="Preconditions">Preconditions</a></li><li><a href="#storage-order" title="Storage order">Storage order</a></li><li><a href="#endpoints-and-degenerate-inputs" title="Endpoints and degenerate inputs">Endpoints and degenerate inputs</a></li><li><a href="#numerics" title="Numerics">Numerics</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate tf_<wbr>tree</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">tf_tree</a></div><h1>Function <span class="fn">slerp</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"></span></div><pre class="rust item-decl"><code>pub fn slerp(qa: <a class="struct" href="struct.Quat.html" title="struct tf_tree::Quat">Quat</a>, qb: <a class="struct" href="struct.Quat.html" title="struct tf_tree::Quat">Quat</a>, s: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f64.html">f64</a>) -&gt; <a class="struct" href="struct.Quat.html" title="struct tf_tree::Quat">Quat</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Shortest-arc spherical linear interpolation of two unit quaternions.</p>
+<p>This is the rotation kernel <a href="struct.LerpSlerp.html" title="struct tf_tree::LerpSlerp"><code>LerpSlerp</code></a> evaluates, and it is public for
+the same reason <a href="dualquat/fn.screw_pow.html" title="fn tf_tree::dualquat::screw_pow"><code>screw_pow</code></a> — <a href="struct.ScLerp.html" title="struct tf_tree::ScLerp"><code>ScLerp</code></a>’s kernel — always was: a caller
+who holds two rotations and no translation should not have to build a pair
+of <a href="struct.Iso3.html" title="struct tf_tree::Iso3"><code>Iso3</code></a> with throwaway zero translations to reach it. A caller whose
+quaternion type is not <a href="struct.Quat.html" title="struct tf_tree::Quat"><code>Quat</code></a> still converts, because the types differ;
+what goes away is the pair of isometries.</p>
+<p><strong>What the round trip costs is a shape, not a number.</strong> Both arms end in the
+same out-of-line <code>slerp</code>; what the <code>Iso3</code> arm puts in front of it is 256
+bytes of stack, two 64-byte isometries written out field by field, and a
+lerp of one zero translation into another that LLVM does not fold away.
+Compiled as exported <code>extern "C"</code> arms at <code>opt-level = 3</code> on x86-64, that
+prologue is 45 instructions bare (7 against 52) and 28 through the
+consumer’s own <code>nalgebra</code> adapter (41 against 69).</p>
+<p><strong>Those two counts are a codegen artifact and are quoted as one.</strong> Across
+four release profiles they moved to 48 and 31, and no build produced the
+same figure for both argument shapes — so there is no single number here to
+carry into a gate, and an earlier revision of this paragraph quoting one
+(<code>15</code> against <code>51</code>, then “36 either way”) reproduced in no build measured.
+What is stable is the sign: the wrapper survived every configuration tried,
+and that is the whole of the benefit.</p>
+<p><code>docs/API.md</code> §2.7 is what authorises this being <code>pub</code> and carries the §7
+walk, item 8 — what a caller <em>loses</em> by taking it — included.</p>
+<p><strong>The <code>tf_tree</code> facade re-exports this</strong>, so a consumer of the engine
+reaches it as <code>tf_tree::slerp</code> and does not take a second direct dependency
+on this crate to do it. <code>tf_tree</code>’s <code>tests/math_reexports.rs</code> is what says
+the two names are one item.</p>
+<h2 id="angles"><a class="doc-anchor" href="#angles">§</a>Angles</h2>
+<p><strong>Every angle here is a <em>quaternion</em> angle</strong> — <code>acos(qa·qb)</code>, which is
+<strong>half</strong> the rotation the pair spans, because <code>qa·qb = cos(Δ/2)</code>. Read as
+rotations these numbers are out by a factor of two, in the direction that
+makes the fast path look wider than it is; a caller sizing a publish rate
+against them is who this section is for.</p>
+<h2 id="preconditions"><a class="doc-anchor" href="#preconditions">§</a>Preconditions</h2>
+<p>Both inputs must be unit, and nothing here checks. A norm test per call
+would be paid by every caller on the interpolation hot path to catch one
+who has already broken the only invariant <a href="struct.Quat.html" title="struct tf_tree::Quat"><code>Quat</code></a> has, and this crate has
+no error type to report it through — see <a href="struct.Quat.html#method.normalize" title="method tf_tree::Quat::normalize"><code>Quat::normalize</code></a>, which makes
+the same trade in the other direction for the one input (a zero
+quaternion) where the arithmetic would produce infinities rather than
+merely a wrong answer.</p>
+<p><strong>Nor a <code>debug_assert!</code>, which is the version of that question worth
+answering</strong>, since it would cost a release caller nothing and
+<code>iso3.rs</code>’s <code>vinv_c3</code> domain assertion is right there as a precedent.
+Three reasons it is not the same case:</p>
+<ul>
+<li>That precedent is a <strong>private</strong> function with exactly one caller in this
+crate, whose argument <a href="fn.log_se3.html" title="fn tf_tree::log_se3"><code>crate::log_se3</code></a> derives from <a href="fn.log_so3.html" title="fn tf_tree::log_so3"><code>crate::log_so3</code></a>
+and is therefore in range by construction — the assertion pins a contract
+the crate owns both ends of. This is a public entry point whose inputs come
+from outside, and in the engine from a pose another <em>process</em> wrote into
+a shared arena.</li>
+<li><strong>Nothing upstream enforces the invariant</strong>, so the assertion would fire
+on real data rather than on a bug: no push path in <code>tf_tree_core</code> or the
+facade normalizes a stored pose, and a quaternion that has drifted a few
+ulp off unit gives a slightly wrong answer here, not a wrong <em>kind</em> of
+answer. A <code>debug_assert</code> would make that a panic in every debug build —
+this crate’s proptests, <code>just miri</code>, and every downstream <code>cargo test</code> —
+and not in release, which is a value that works or aborts depending on
+<code>-C debug-assertions</code>.</li>
+<li>It would not catch the hazard this function actually has. The
+<code># Storage order</code> transposition produces a <strong>unit</strong> quaternion that is the
+wrong rotation, and no norm test of any tolerance sees it.</li>
+</ul>
+<p><code>s</code> is a dimensionless fraction of the segment, <strong>not</strong> a stamp. A caller
+interpolating between two samples divides in integer nanoseconds and passes
+the ratio; nothing in this crate knows what time is.</p>
+<p><strong><code>s</code> belongs to <code>[0, 1]</code>, and nothing clamps or refuses.</strong> Out of range the
+function extrapolates, and <em>how well</em> is a property of the pair rather than
+of <code>s</code>, because the pair alone picks the branch — so an extrapolation’s
+accuracy is set by the publish rate, which is the one thing the caller
+asking for it is least likely to be thinking about. Measured against the
+exact geodesic <code>qa·exp(s·Δ·axis)</code> over 40 rotations, worst case:</p>
+<ul>
+<li><strong>Closed form</strong> (quaternion angle above <code>0.15</code> rad) — the formula is
+<code>sin((1−s)·θ)/sin θ</code> and holds off the segment as well as on it:
+<code>7.2e-15</code> at <code>|s| = 20</code>, part of which is the reference’s own rounding.</li>
+<li><strong>Series</strong> (between the two thresholds) — <strong>two mechanisms, and which one
+loses the bound depends on the angle, not on <code>s</code>.</strong> Far out it is
+truncation: the weight series is calibrated for <code>|a| ≤ 1</code>, and outside it
+<code>k = 1 − a²</code> grows quadratically until six terms stop covering it — <code>6.0e-6</code>
+at <code>|s| = 20</code> (quaternion angle <code>0.1</code> rad), and <code>1.6e3</code> by <code>|s| = 100</code>,
+not a rotation at all. <strong>Where the <code>1e-15</code> bound is first lost, though, the
+cause at the small-angle end is cancellation and not truncation</strong>: <code>wa</code> and
+<code>wb</code> grow like <code>∓s</code> while their sum stays near 1, so the rounding floor is
+<code>(|wa| + |wb|)·ε</code> and the result cancels back down onto the sphere from
+there. Measured over 40 rotations, the bound goes at <code>|s| ≈ 2.3</code>–<code>2.9</code> for
+a quaternion angle of <code>0.1499</code> rad and at <code>|s| ≈ 3.2</code>–<code>5.0</code> for <code>0.02</code> rad
+— and at <code>0.02</code> rad the largest term the six-term series still <em>carries</em> is
+<code>5.9e-18</code> at <code>|s| = 5</code>, three orders under the bound, so the remainder it
+drops is smaller again, and the observed error there tracks the
+cancellation floor instead (<code>1.2e-15</code> measured against a floor of
+<code>2.0e-15</code>). At <code>0.1499</code> rad the two are the same size right where the
+bound goes: at <code>|s| = 2.3</code> the series’ weights still match
+<code>sin(aθ)/sin θ</code> to within their own ulp while the floor is <code>7.9e-16</code>, and
+by <code>|s| = 3</code> the weights are <code>2.4e-15</code> off against a floor of <code>1.1e-15</code>.
+<strong>So the range’s two ends have different causes</strong>, and an edit adding a
+seventh term would move the <code>0.1499</code> end and leave the <code>0.02</code> end exactly
+where it is.</li>
+<li><strong>LERP fallback</strong> (below <code>1e-6</code> rad) — a chord, extrapolated and
+renormalized. Mechanically the crudest of the three and numerically the
+most forgiving, because the arc it cuts is tiny: <code>1.2e-14</code> at <code>|s| = 100</code>,
+and it takes <code>|s| = 1e6</code> — a swept rotation of <code>0.2</code> rad — to reach
+<code>3.3e-4</code>.</li>
+</ul>
+<p><strong>So extrapolation is not supported here</strong>, and that is a statement about
+this entry point rather than about the habit: <code>tf_tree_core</code> answers a stamp
+outside an edge’s sample window with <code>ExtrapPolicy</code> — <code>Error</code>, <code>Hold</code> or
+<code>ConstantTwist</code> — and never hands this function an <code>s</code> outside <code>(0, 1)</code>. A
+caller who wants the tf2 behaviour wants one of those three, not an <code>s</code> of
+<code>1.4</code>. <code>out_of_range_s_extrapolates_and_only_the_closed_form_holds</code> is what
+keeps the three bullets above honest.</p>
+<p><strong><code>NaN</code> is not rejected either</strong>, and it does not always survive. A <code>NaN</code>
+<code>s</code> propagates through all three branches, with one exception: two
+numerically identical inputs return <code>qa</code> before <code>s</code> is read at all, so
+<code>slerp(qa, qa, f64::NAN)</code> and <code>slerp(qa, qa, f64::INFINITY)</code> are both <code>qa</code>.</p>
+<p><strong>A <code>NaN</code> <em>component</em> takes one branch and one only, and the mechanism is
+worth writing down because the obvious hardening breaks it.</strong> It makes <code>h</code>
+<code>NaN</code>, and <code>NaN &lt;= x</code> is false for every <code>x</code> — so it clears the
+identical-input return <em>and</em> both branch tests, and the closed form is the
+only arm a <code>NaN</code> component can reach whatever the angle between the inputs.
+There the <code>NaN</code> is <strong>destroyed and then recreated</strong>: <code>dot</code> is <code>NaN</code>,
+<code>NaN.min(1.0)</code> is <code>1.0</code> (Rust’s <code>f64::min</code> returns the non-<code>NaN</code> operand),
+so <code>angle</code> is <code>acos(1.0) = 0.0</code>, <code>sin_angle</code> is <code>0.0</code>, and the output is
+<code>NaN</code> only because both weights are <code>sin(a·0.0)/0.0</code>, which is <code>0.0/0.0</code>.
+A guard returning <code>qa</code> when <code>sin_angle == 0.0</code> — a reasonable-looking
+defence against that division — would therefore turn a <code>NaN</code> input into a
+plausible pose, and it is <code>nan_propagates_except_through_the_identical_input_return</code>
+that would fail. Replacing <code>.min(1.0)</code> with <code>dot.clamp(-1.0, 1.0)</code> is the
+other obvious edit and is <em>safe</em> — <code>clamp</code> returns <code>NaN</code> for a <code>NaN</code>
+receiver, so the <code>NaN</code> would then survive on its own terms rather than by
+coincidence — but it is not made here: the observable behaviour is
+identical on every input, so it would be a change to the hot path that no
+test could distinguish, and the reason <code>.min</code> looks like a bug is that the
+paragraph explaining it was missing, not that the line is wrong.</p>
+<h2 id="storage-order"><a class="doc-anchor" href="#storage-order">§</a>Storage order</h2>
+<p><a href="struct.Quat.html" title="struct tf_tree::Quat"><code>Quat</code></a> is <code>[w, x, y, z]</code> — scalar <strong>first</strong>. Eigen and <code>nalgebra</code> store it
+last, and a transposed conversion compiles, type-checks, and returns a
+perfectly unit quaternion that is the wrong rotation. Convention 2 in the
+crate docs is this hazard; a boundary that crosses it needs a tested adapter
+rather than a careful reading.</p>
+<h2 id="endpoints-and-degenerate-inputs"><a class="doc-anchor" href="#endpoints-and-degenerate-inputs">§</a>Endpoints and degenerate inputs</h2>
+<p>On the series and closed-form branches the weights at <code>s = 0</code> and <code>s = 1</code>
+are exactly <code>(1, 0)</code> and <code>(0, 1)</code>, so both endpoints come back bit-for-bit.
+Four qualifications, all measured rather than reasoned:</p>
+<ul>
+<li><strong><code>s = 1</code> returns <code>-qb</code> whenever <code>qa·qb &lt; 0</code>.</strong> That is the sign fix
+arriving at the endpoint, not an endpoint failure: <code>-qb</code> is the same
+rotation, and returning <code>qb</code> there instead would put a jump in the
+returned <em>components</em> at exactly <code>s = 1</code> while the limit from below goes
+to <code>-qb</code> — which is worse than the asymmetry it would tidy up, and is why
+there is no <code>s == 1.0</code> shortcut. Compare rotations, or fix the sign first.</li>
+<li><strong>Below the LERP fallback the endpoints hold to an ulp, not bit-for-bit.</strong>
+Under a quaternion angle of <code>SLERP_LERP_FALLBACK</code> (<code>1e-6</code> rad, a rotation
+of <code>2e-6</code> rad) the two inputs carry no usable direction, so the result is
+a <em>renormalized</em> LERP:
+<code>slerp(qa, qb, 0.0)</code> is <code>qa/‖qa‖</code>, which differs from <code>qa</code> by ~2.7e-16
+whenever <code>qa</code>’s components do not happen to square to exactly <code>1.0</code>.
+<code>endpoints_lose_bit_exactness_only_in_the_lerp_fallback</code> pins both halves.</li>
+<li><strong>A <code>-0.0</code> component is the one thing “bit-for-bit” does not cover, on
+every branch.</strong> Exact weights mean the answer at <code>s = 0</code> is
+<code>qa·1.0 + qb·0.0</code> rather than <code>qa</code>, and <code>-0.0 + (+0.0)</code> is <code>+0.0</code> — so
+<code>slerp(Quat::new(1.0, -0.0, 0.0, 0.0), qb, 0.0)</code> returns <code>+0.0</code> in <code>x</code>
+for any <code>qb</code> whose <code>x</code> is positive, and a <code>-0.0</code> in <code>qb</code> flips the same
+way at <code>s = 1</code>. The fallback’s <code>normalize</code> loses it too. <strong>Stated
+rather than fixed</strong>, because the fix is an <code>s == 0.0</code> shortcut and the
+first bullet rules out its <code>s == 1.0</code> twin on purpose: adding one end and
+not the other trades a sign of zero for an asymmetry between the two
+endpoints, which is the larger of the two surprises. Nothing in this crate
+manufactures a <code>-0.0</code> component — <a href="fn.exp_so3.html" title="fn tf_tree::exp_so3"><code>crate::exp_so3</code></a> produces one only
+from an axis component that already carries the sign, and
+<code>sample_rotation</code>, which every sweep in <code>tests/slerp_public.rs</code> is built
+from, emits no zero component at all over <code>k</code> in <code>0..1000</code> — so this
+reaches a caller who built a <a href="struct.Quat.html" title="struct tf_tree::Quat"><code>Quat</code></a> by hand.
+<code>signed_zero_components_are_the_endpoint_exception</code> pins it.</li>
+<li><strong>Numerically identical inputs return <code>qa</code> for every <code>s</code></strong>, <code>s</code> included
+in neither weight. Two consecutive <code>/tf</code> samples from a stationary body
+are exactly this case, and it is an early return rather than an accident:
+<code>h</code> is <code>0</code>, so there is no direction to interpolate along and every later
+branch would divide by it.</li>
+</ul>
+<p>The output is otherwise <strong>not</strong> renormalized — <code>qa·wa + qb·wb</code> is unit to
+within <code>f64</code>, not exactly. A caller whose type enforces unit norm should
+normalize on the way in to its own type.</p>
+<p>The first two bullets are also the <em>entire</em> difference between calling this
+and going through <code>LerpSlerp::eval</code> on a pair of zero-translation <a href="struct.Iso3.html" title="struct tf_tree::Iso3"><code>Iso3</code></a>,
+for any input a rotation can produce — <code>eval</code> answers <code>s = 0</code> and <code>s = 1</code>
+from a shortcut that never reaches here.
+<code>the_iso3_round_trip_it_replaces_agrees_as_a_rotation</code> sweeps both and
+classifies every bit difference; as rotations the two agree to 2.7e-16. The
+third bullet is a difference too, and is excluded from that sweep rather
+than absent from it: <code>eval</code>’s shortcut returns <code>*a</code> and keeps a <code>-0.0</code>,
+where this returns <code>+0.0</code>, and no rotation the sweep can build has a zero
+component to notice it with.</p>
+<h2 id="numerics"><a class="doc-anchor" href="#numerics">§</a>Numerics</h2>
+<p>The crossover to the closed <code>acos</code>/<code>sin</code> form is at a quaternion angle of
+<code>THETA_SLERP_SMALL</code> (<code>0.15</code> rad — a rotation of <code>0.30</code> rad, which for a
+body turning at 180 °/s is a 10.47 Hz edge); below it the weights are a
+six-term series with no transcendental and no division, and θ² comes from
+the <em>chord</em> rather than from <code>acos(dot)</code>. Both constants are calibrated,
+with the measurement in their own doc comments, and both are deliberately
+private: they are numbers a re-measurement is allowed to move, and a
+<code>pub const</code> is a promise not to.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>tf_tree_math::{exp_so3, slerp, Quat, Vec3};
+
+<span class="kw">let </span>qa = Quat::IDENTITY;
+<span class="kw">let </span>qb = exp_so3(Vec3::new(<span class="number">0.0</span>, <span class="number">0.0</span>, core::f64::consts::FRAC_PI_2));
+<span class="kw">let </span>mid = slerp(qa, qb, <span class="number">0.5</span>);
+
+<span class="comment">// Half of a 90° yaw is a 45° yaw, and the result is unit without a
+// normalization step.
+</span><span class="kw">let </span>quarter = exp_so3(Vec3::new(<span class="number">0.0</span>, <span class="number">0.0</span>, core::f64::consts::FRAC_PI_4));
+<span class="macro">assert!</span>(mid.sub(quarter).norm() &lt; <span class="number">1e-15</span>);
+<span class="macro">assert!</span>((mid.norm() - <span class="number">1.0</span>).abs() &lt; <span class="number">1e-15</span>);</code></pre></div></div></details></section></div></main></body></html>

@@ -2746,8 +2746,11 @@ impl Tree {
         if !self.arena.is_writable() {
             return 0;
         }
-        // No rendezvous, no lock file, no kernel fact to act on. The predicate
-        // is scoped to a tree carrying a probe, and this is that scope.
+        // No rendezvous, no lock file, no kernel fact to act on. This scopes the
+        // *sweeper*, and only the sweeper: it says nothing about whether the
+        // records it will judge have bytes of their own. A `build_shared`
+        // participant in this same arena has none, and is read dead — see
+        // `docs/decisions/0031-the-participant-record-with-no-byte.md`.
         let Some(probe) = self.ofd_probe.as_ref() else {
             return 0;
         };
@@ -2784,10 +2787,23 @@ impl Tree {
     /// `u32::MAX` for a read-only attachment, which takes a lock-file byte but
     /// writes no arena record — it cannot, the mapping is `PROT_READ`.
     ///
-    /// The one number that indexes both tables (`docs/PHASE2.md` §3.7): the
-    /// arena record and the lock-file byte are deliberately the same integer, so
-    /// this is what a caller passes to [`Self::participant_alive`] to ask about
-    /// itself.
+    /// **On a tree that came from `tf_tree::Open`**, the one number that indexes
+    /// both tables (`docs/PHASE2.md` §3.7): the arena record and the lock-file
+    /// byte are deliberately the same integer, so this is what a caller passes
+    /// to [`Self::participant_alive`] to ask about itself.
+    ///
+    /// **On a tree from `TreeBuilder::build_shared` it indexes one table**,
+    /// because there is no lock file for it to index the other of. That is not a
+    /// smaller version of the same thing: every reclaimer keys on the byte
+    /// (`docs/PHASE2.md` §5.1), so such a record reads *dead* to any peer
+    /// carrying a probe, and `Tree::reap_participants` will free it while this
+    /// process is still publishing. See
+    /// `docs/decisions/0031-the-participant-record-with-no-byte.md`.
+    ///
+    /// The three names above are deliberately **not** intra-doc links: this
+    /// method is compiled into the default tier and all three are `shm`-gated,
+    /// so linking them breaks `just stable-tier-check`'s rustdoc pass — which is
+    /// the tier a published consumer reads.
     #[must_use]
     pub fn participant_slot(&self) -> u32 {
         self.participant
