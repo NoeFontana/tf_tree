@@ -159,7 +159,12 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
 
 - One predicate per tree, stated in one place, with the ordering in it.
 - `reparent` on a rendezvous tree stops stealing a topology lock from a live
-  mutator that `/proc` cannot see (`hidepid`, PID namespace).
+  mutator that `/proc` misreports — `hidepid` against a **non-dumpable**
+  participant, a PID-namespace mismatch, or an unreaped **zombie**. This bullet
+  used to say bare "`hidepid`", dropping the qualifier the *Rationale* and
+  `PHASE2.md` §0.0's #205 row both carry; and the discriminating shape is a
+  resolvable entry describing the **wrong** process, not an unreadable one. See
+  question 1.
 - `reparent` on a **probe-less** tree is unchanged, so the class §0.0's #205 row
   describes shrinks from three paths to two rather than closing.
 - One more caller of `self.liveness`, which is `Box<dyn Fn>` — an indirect call
@@ -188,12 +193,143 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
 
 ## Open questions
 
-1. **Can step 4's discriminating test be built on an ordinary host?** The two
-   predicates agree except where `/proc` lies, and the two known ways to make it
-   lie are `hidepid=2` and a PID-namespace mismatch. `unshare --fork --pid` was
-   unavailable in the environment §0.0's #205 row was written in. If neither can
-   be staged, this record ships a change with no test that distinguishes the old
-   behaviour from the new, and that has to be stated rather than glossed.
+1. **RESOLVED 2026-08-22: yes — with `-U`. The command in this question is the
+   right one missing one flag; the other mechanism it names is real but is
+   narrower than this record says.** ~~Can step 4's discriminating test be built
+   on an ordinary host? The two predicates agree except where `/proc` lies, and
+   the two known ways to make it lie are `hidepid=2` and a PID-namespace
+   mismatch. `unshare --fork --pid` was unavailable in the environment §0.0's
+   #205 row was written in. If neither can be staged, this record ships a change
+   with no test that distinguishes the old behaviour from the new, and that has
+   to be stated rather than glossed.~~
+
+   Measured on `dev-box-2026-01` (Ubuntu 24.04, kernel 6.8.0-136, util-linux
+   2.39.3, `apparmor_restrict_unprivileged_userns=1`), unprivileged unless a line
+   says otherwise. **Not measured on a CI runner**, and every capability below is
+   distro policy rather than a kernel guarantee.
+
+   **`unshare --fork --pid` is still refused, so the row's environment note stands
+   as written** — `unshare: unshare failed: Operation not permitted`, exit 1. So
+   is `unshare -Ur` (`write failed /proc/self/uid_map: Operation not permitted`,
+   the AppArmor restriction). **`unshare -U --fork --pid` succeeds, exit 0**, as
+   does the bare `unshare(2)` call, so no binary profile is doing the work.
+   Creating the user namespace in the same call supplies the capability the
+   pid-namespace check wants, and the task keeps its host kuid for permission
+   checks: `open` a 0600 lock file `O_RDWR`, `fcntl(F_OFD_SETLK)`, `shm_open` an
+   existing 0600 segment, `mmap(MAP_SHARED, RW)`, write through it, `connect()`
+   to a 0600 unix socket — all OK.
+
+   **It is a real participant, not a mimic.** `tf_tree_rendezvous_child` built at
+   `7739805` with `--features shm,unstable`: an owner and a control joiner in the
+   host namespace, a third joiner under
+   `unshare -U --fork --kill-child --pid`. The namespaced one completed the whole
+   rendezvous — `SCM_RIGHTS`, slot assignment, mapping — and printed
+   `joined bfd2ea4f46b8358b:3fd057317fb64a89:…`, byte-identical to the control.
+   Then, on that live arena:
+
+   ```
+   tf_tree --attach top       ->  slot 2   pid 1   rw   live   yes
+   F_OFD_GETLK(byte 16 + 2)   ->  F_WRLCK                      # byte says ALIVE
+   tf_tree peer-alive 2       ->  alive true
+   read_start_time(1)         ->  Known(12)  vs stored 287088242
+   alive_given(...)           ->  false                        # triple says DEAD
+   ```
+
+   `/proc/1` is `systemd`. That is #205's predicted **collision**,
+   `Known(st) != stored` — not `ENOENT`-shaped, so the bias that makes everything
+   else survivable does not fire. **§0.0's "derived from the code and from §3.1's
+   own text, not reproduced" can be retired: it is reproduced, against the
+   shipped binaries.**
+
+   **`hidepid=2` is narrower than this record says, and not zero.** An earlier
+   revision of this answer claimed it discriminates nothing because §3.10 makes
+   participants same-user. That is refuted by measurement. Same-user is not
+   sufficient: a same-user but **non-dumpable** target is hidden. In a throwaway
+   container with its own procfs — a host remount is *not* private, see below —
+   two uid-1000 `sleep`s, one under `prctl(PR_SET_DUMPABLE, 0)`:
+
+   ```
+   /proc mounted hidepid=invisible
+   dumpable target:     pid=13 uid=1000 dumpable=1   -> VISIBLE
+   NON-dumpable target: pid=15 uid=1000 dumpable=0   -> HIDDEN
+   owner of /proc/13 = 1000 ; owner of /proc/15 = 1000
+   remount hidepid=off:  NON-dumpable same-user      -> VISIBLE
+   ```
+
+   The mechanism is `has_pid_permissions` falling through to
+   `ptrace_may_access`, which fails on `dumpable == 0`; directory ownership is a
+   separate effect and is *not* what hides it. So a participant that drops
+   privileges without a re-exec, or hardens itself with `PR_SET_DUMPABLE(0)`, is
+   hidden from a same-user reader. **§0.0's #205 row and this record's
+   *Rationale* are already right** — they say `hidepid=2` "**without** §3.10's
+   same-user rule" and head the paragraph "§3.10 is *a* dependency … and it is
+   not sufficient". What is wrong is the unqualified phrasing in **this question
+   as written above and in the second *Consequences* bullet** ("a live mutator
+   that `/proc` cannot see (`hidepid`, PID namespace)"), and
+   `proc_answers_here`'s doc comment, which says a hidden entry cannot belong to
+   a participant. Dumpability is a **third** dependency, alongside same-user and
+   a shared PID namespace, and it is stated nowhere.
+
+   `hidepid` cannot be staged unprivileged here in any case: with full `CapEff`
+   inside the userns, every `mount`/`remount` returns `EACCES` from AppArmor, and
+   so does mounting a *fresh* procfs at a new mountpoint.
+
+   **A third staging this record never named, needing nothing: an unreaped
+   zombie.** `/proc/<pid>` survives with `state=Z` and its start time intact, so
+   the triple reads `Known(287080225) == stored` → **alive** while the kernel has
+   released the byte → `F_UNLCK` → **dead**. No namespace, no sudo, no container,
+   no mount. Two qualifications, both measured. Its **reaping parent must stay
+   alive**: with the parent gone the subreaper collected instantly and the
+   predicate returned `NoSuchProcess … => triple says DEAD`, and the
+   discriminator vanished. And it is **not a case of `/proc` lying** — `state=Z`
+   is accurate and `read_start_time`/`alive_given` never read field 3 — so unlike
+   the namespace collision it is fixable *inside* the `/proc` predicate. It
+   discriminates old code from new code, so it survives as a test; it is much
+   weaker as an argument that the byte is authoritative.
+
+   **Pid reuse stays out.** `pid_max` is 4194304 and this host forks ~6600
+   processes/second, so a wrap is ~630 s of storm per run and racy besides;
+   `/proc/sys/kernel/ns_last_pid` needs `CAP_SYS_ADMIN` over the namespace and is
+   refused from the host and from inside the userns. Docker 29.1.3 is present and
+   a container is a fourth staging, but it is strictly heavier than four words of
+   `unshare` and would put a container dependency on `cargo test`.
+
+   **Two preconditions, or the staging silently fails.** (a)
+   `TF_TREE_RUNTIME_DIR` must be named explicitly: the default is
+   `/tmp/tf_tree-<getuid()>` (`runtime_dir.rs:127`) and inside the empty-map
+   userns `getuid()` is 65534 — measured, the namespaced joiner reported
+   `error no arena is serving and CreatePolicy::Never forbids creating one` and
+   created `/tmp/tf_tree-65534` beside the owner's `/tmp/tf_tree-1000`. The
+   `Scratch` harness in `tests/rendezvous.rs` already sets it. (b) The staging
+   passes `runtime_dir.rs:155`'s `meta.uid() != uid` gate only because an
+   **empty** `uid_map` collapses both `getuid()` and `stat()`'s uid to the
+   overflow uid 65534. With a *mapped* userns, `getuid()` would be 0 against
+   `meta.uid()` 65534 and the open would be refused — so "improving" the staging
+   into a mapped namespace breaks it.
+
+   **This already produces a wrong shipped diagnosis, which is worth more than
+   the test.** `slot_leak` classifies `(LockByte::Held, RecordedProcess::Gone)`
+   as `SlotLeak::ForkInheritor` (`crates/tf_tree_cli/src/checks.rs:1329`), and
+   `recorded_given`'s `Ok(_) => R::Gone` (`crates/tf_tree_cli/src/lib.rs:1924`)
+   is exactly the start-time collision above. So `doctor` fires `TFT014` on the
+   namespaced participant with the fork-inheritor text — *"a fork inheritor —
+   byte still HELD, recorded pid gone … which on Linux means a forked child
+   inherited it (PHASE2 §6.2) … Stop the child, or start workers with a start
+   method that inherits no descriptors: multiprocessing's `spawn`"*
+   (`checks.rs:1598-1612`). The cause is a PID-namespace mismatch; the
+   remediation is about fork inheritance and is useless. Reported from a live
+   run whose transcript was not archived; **the code path is confirmed by reading
+   and the run has to be retaken and captured before it is cited as a
+   measurement.**
+
+   **So step 4 is buildable and this record does not ship uncovered.** What it
+   must absorb is P5: the socket-hangup reclaim drives a dead joiner's word to
+   `FREE`, and both predicates short-circuit on a non-`LIVE` word, so a zombie
+   *joiner* stops discriminating before anything can observe it. The namespace
+   holder is immune — it is alive and its socket is open. **Whether a killed and
+   unreaped *owner*'s word stays `LIVE` long enough to observe the zombie
+   disagreement in a live session was not tested by anyone, and it is the one
+   thing that could make test (B) unwritable.**
 2. **RESOLVED 2026-08-20: this record survives, and the ordering constraint is
    stated once — in `PHASE2.md` §5.1, not in either record.** ~~Does the adapter
    belong to this record or to `0028` piece 2?~~ They are not the same object and
@@ -217,7 +353,11 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
 
 - Question 2 answered — it decides whether this record survives at all or is
   folded into `0028`'s plan as a step.
-- Question 1 attempted, with the command, and its answer written down either way.
+- ~~Question 1 attempted, with the command, and its answer written down either
+  way.~~ **MET, and it did better than "attempted": `unshare -U --fork --pid`
+  stages the collision unprivileged on an ordinary host, so the change will not
+  ship without a test that distinguishes it. Step 4 needs rewriting around
+  `Known(st) != stored` rather than an unreadable entry — see question 1.**
 - The §11.3 `topo.holding_lock` walk drafted and agreed, since D15 makes it the
   gate rather than a deliverable.
 

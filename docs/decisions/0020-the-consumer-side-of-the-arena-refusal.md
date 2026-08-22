@@ -270,23 +270,129 @@ _Not to be started while this record is `draft`._
 
 ## Open questions
 
-1. **A distinct code, or `TFT_ERR_ARENA_UNAVAILABLE` reused?** The *Decision*
-   argues distinct. The counter-argument is real and is not addressed by the
-   "one diagnostic, two meanings" objection on its own: the two conditions are
-   returned by *different functions*, so a caller can already tell them apart by
-   which call it made, and "the arena you wanted is not available" describes
+1. **RESOLVED 2026-08-22 — distinct, and the falsifier this question named does
+   not exist.** ~~A distinct code, or `TFT_ERR_ARENA_UNAVAILABLE` reused? The
+   *Decision* argues distinct. The counter-argument is real and is not addressed
+   by the "one diagnostic, two meanings" objection on its own: the two conditions
+   are returned by *different functions*, so a caller can already tell them apart
+   by which call it made, and "the arena you wanted is not available" describes
    both. Reusing costs one fewer permanent code. What has not been checked is
    whether `tf_tree doctor` or `tf_tree top` would ever have to report both from
-   one place, which is where the ambiguity would actually bite.
+   one place, which is where the ambiguity would actually bite.~~
+
+   **`doctor` and `top` cannot report either code, and cannot be made to without
+   a new dependency edge.** `grep -rnE "TFT_ERR|tft_status|tft_last_error"
+   crates/tf_tree_cli/` exits 1, and `crates/tf_tree_cli/Cargo.toml` names
+   `tf_tree` and optional `tf_tree_ipc` and nothing else. Every CLI attach is
+   `AttachArgs::open` (`crates/tf_tree_cli/src/attach.rs:70-101`), a
+   `tf_tree::Open::open()` returning a Rust `OpenError` inside an `anyhow`
+   context. **So the site this question named as where the ambiguity would bite
+   does not exist**, and the question cannot be answered the way it expected to
+   be.
+
+   **One place holds both, and it is a weak falsifier rather than none.**
+   `ros/tf_tree_ros/test/test_shared_arena.cpp` handles the consumer-join status
+   at `:248` (`ASSERT_EQ(open_status_now(), TFT_ERR_INTERNAL)`, which plan step 1
+   changes) and the bridge-create status at `:357`
+   (`EXPECT_EQ(e.status(), TFT_ERR_ARENA_UNAVAILABLE)`) — in two different `TEST`
+   bodies, through two different C++ types. The plausible consumer,
+   `ros/tf_tree_bench_ros/src/bench_consumer.cpp`, hosts a bridge under
+   `--mode tf_tree_bridge` (`:472`) and joins one under `--mode tf_tree_attach`
+   (`:539`), but its only catch prints `e.what()` and never a `tft_status`. **No
+   consumer is obliged to distinguish them today.**
+
+   **The two-meanings objection survives anyway, because it never needed a
+   reporting site.** It is a property of the constant.
+   `TFT_ERR_ARENA_UNAVAILABLE`'s documented meaning already includes *"the
+   rendezvous name is **already held by a live arena**"*
+   (`crates/tf_tree_c/src/error.rs:126-130`). The condition this record wants a
+   code for is *"no arena is serving this (domain, name)"* — the negation. Under
+   reuse one constant would mean both "this name is taken" and "this name is
+   empty". That is the shape `PHASE5.md` §6's `TFT017`/`TFT018` amendment takes
+   too: different condition ⇒ different id.
+
+   **Second leg: the frozen header's per-code contract, and an add-only
+   history.** `TFT_ERR_ARENA_UNAVAILABLE` carries a **normative** sole-producer
+   clause — *"**Returned only by `tft_bridge_create`, and only when
+   `tft_bridge_options::arena_name` is non-NULL**, which is what keeps adding it
+   a minor bump under `docs/PHASE4.md` §3.6"* — and that clause is what made the
+   `4` → `5` bump provable rather than conventional. It is asserted at **one
+   authored site**, `crates/tf_tree_c/src/error.rs:141`; `tf_tree.h:398` is its
+   generated copy. (An earlier revision of this answer counted a third site at
+   `xtask/src/headers.rs:156`. **That comment belongs to `TFT_ERR_BAD_CONFIG` on
+   line 162, not to `TFT_ERR_ARENA_UNAVAILABLE` on line 169** — worth reading for
+   the distinction it draws rather than the count it does not add: it says
+   *"Returned only by `tft_bridge_create` **today**"*, an observational clause,
+   where `error.rs:141`'s is normative and bolded.) The precedent is unbroken: 34
+   codes, 34 distinct values, no removed `pub const TFT_(OK|ERR_)` line in
+   `error.rs`'s history.
+
+   **The counter-argument survives and is recorded as surviving.** Reuse is
+   ABI-safe: a `0.5` caller cannot express `tft_tree_open_wait`, so it cannot
+   receive the code from a join under either spelling. The case for a distinct
+   code is about a documented per-code contract in a header §3.1 calls a promise
+   that can never be withdrawn — **not** about a diagnosis anyone would get wrong
+   today, and the record should not claim otherwise.
+
+   *Not run:* no reuse was attempted, and `cargo run -p xtask -- headers --check`
+   was not re-run against one, so "what reuse costs at the gates" is read off the
+   sources rather than off a failing gate.
 2. **Does `tft_tree_open` stay unchanged forever, or is `TFT_ERR_INTERNAL` on it
    deprecated at the next major?** The *Decision* leaves it alone to protect the
    minor bump. If `0.x` → `1.0` is close enough, the simpler shape — widen the
    existing function, no new symbol — becomes available and the wait can be
    argued on its own merits instead of carrying the code.
-3. **Should the wait be the only new thing, with the partition exposed some other
-   way?** `tft_tree_open_wait` is a *policy* in the ABI (a poll loop with this
-   crate's backoff), and `0018` is on record that blocking belongs in the caller.
-   `0018`'s argument is about arena primitives and a `PROT_READ` consumer's
-   inability to register on a futex, so it does not obviously reach a
+3. **RESOLVED 2026-08-22 — `0018` does not reach a userspace poll in the ABI.
+   What replaces this question is the header *tier*, and there is no precedent to
+   settle it with.** ~~Should the wait be the only new thing, with the partition
+   exposed some other way? `tft_tree_open_wait` is a *policy* in the ABI (a poll
+   loop with this crate's backoff), and `0018` is on record that blocking belongs
+   in the caller. `0018`'s argument is about arena primitives and a `PROT_READ`
+   consumer's inability to register on a futex, so it does not obviously reach a
    userspace poll in a wrapper — but "obviously" is doing work in that sentence
-   and somebody should check it before this moves to `ready`.
+   and somebody should check it before this moves to `ready`.~~
+
+   **`0018`'s boundary is the arena, not the language boundary.** Its *Decision*
+   is **"No blocking primitive in the arena, and none in `tf_tree_core`. The wait
+   lives in the caller"** (`0018:33-34`); the two places it weighs are inside the
+   arena as a futex or robust mutex, or in the caller as a sleep-and-recheck
+   loop; and its decisive argument is that every shared-memory blocking primitive
+   requires the waiter to **register** by writing a word the waker can see, which
+   a `PROT_READ` consumer physically cannot do. A userspace poll writes nothing,
+   so the argument does not reach it, and neither cost `0018` names — a layout
+   change, and weight on the push path — applies.
+
+   **The in-force citation is `API.md`, not `0018`'s plan.** *"**No blocking wait
+   in the core.** Settled by [`0018`]. … the waiting itself lives in the caller"*
+   (`docs/API.md:353-357`) — the cross-cutting contract stating `0018`'s scope as
+   *core*, in the document that governs the C surface. Pair it with `0019` §2b,
+   which shipped the identical policy: *"Both are convenience on the facade over
+   a poll loop; **no arena primitive, no notification mechanism, no futex** —
+   `0018`'s argument applies unchanged and with more force"* (`0019:229-231`),
+   covering `Open::await_open`, a `MIN_BACKOFF` → `MAX_BACKOFF` deadline loop
+   that has shipped. `tf_tree_c` already depends on the facade with
+   `features = ["unstable"]`, so `tft_tree_open_wait` would wrap a loop that
+   exists rather than invent one at the boundary.
+
+   **Do not cite `0018` plan step 5 as authorisation.** It reads *"the shim's
+   wait — and `tft_wait_until_covered()` — is implemented there, not here, **and
+   not before `PHASE7.md` §0.0's gates are met**"* (`0018:245-247`), and the
+   sentence under it is explicit: *"Steps 1–4 are not gated by D21 … **Step 5
+   is**"* (`:249-250`). The only C-ABI wait symbol `0018` names is one it
+   simultaneously puts behind four unmet gates.
+
+   **What is genuinely open is the tier, and nothing constrains it.** There is no
+   existing wait symbol in either header — `grep -rn tft_wait_until_covered`
+   returns two hits, both prose — and `ros/tf_tree_tf2/` does not exist (`ls ros/`
+   is `build.sh dds_bench.sh tf_tree_bench_ros tf_tree_ros`). So "the project's
+   precedent puts its wait in `tf_tree_unstable.h`" is a **plan, not a
+   precedent**, and this record is the one that has to choose. It matters:
+   *Decision* §3 puts `tft_tree_open_wait` in the frozen `tf_tree.h`, and the
+   whole `5` → `6` argument is an argument about the frozen tier's rules. If the
+   wait went to the unstable tier, question 1's minor-bump argument changes shape
+   and question 2 stays open longer. Worth recording either way:
+   **`tft_tree_open_wait` would be the C ABI's first blocking entry point.**
+
+   *Not run:* nothing was compiled for this answer, and `PHASE4.md` §3 was read
+   only through blocking-related greps, so a cancellation or reentrancy rule
+   stated in other words could still exist.
