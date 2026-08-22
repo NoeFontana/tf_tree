@@ -76,10 +76,32 @@ pub struct ParticipantRecord {
     _pad: [u8; 88],
 }
 
+// **`size_of` is not a layout.** Every structural check this crate had before
+// these pins — `size_of`, `align_of`, `layout_hash`'s region strides — is
+// invariant under a *field reorder*, and a reorder changes what every byte on
+// disk and in a shared segment **means** while all of them still pass. Two
+// builds then attach to each other, agree on `FORMAT_VERSION` and
+// `layout_hash`, and read each other's records wrong.
+//
+// These are wire records: they go into a shared `memfd` another process maps,
+// and `write_frozen` memcpys them into a `.tft` a later build opens. Their
+// field offsets are part of the format, and nothing asserted them.
+//
+// Appending a field is still fine — the pins below do not move. *Moving* one is
+// a format break and now says so at compile time. See
+// `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md` for
+// the neighbouring gap: the region table and `layout_hash`'s stride array are
+// also two hand-kept facts with nothing between them.
 #[cfg(not(loom))]
 const _: () = {
     assert!(core::mem::size_of::<ParticipantRecord>() == 128);
     assert!(core::mem::align_of::<ParticipantRecord>() == 64);
+    assert!(core::mem::offset_of!(ParticipantRecord, state) == 0);
+    assert!(core::mem::offset_of!(ParticipantRecord, pid) == 4);
+    assert!(core::mem::offset_of!(ParticipantRecord, start_time) == 8);
+    assert!(core::mem::offset_of!(ParticipantRecord, incarnation) == 16);
+    assert!(core::mem::offset_of!(ParticipantRecord, attached_at_nanos) == 24);
+    assert!(core::mem::offset_of!(ParticipantRecord, heartbeat) == 32);
 };
 
 /// Zeroed, i.e. [`FREE`] — the state a fresh arena's participant region is in.
