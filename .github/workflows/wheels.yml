@@ -12,28 +12,32 @@
 # is the right outcome rather than a loss — 3.13t was PEP 703's experimental
 # phase; free-threading became *supported* in 3.14 under PEP 779.
 #
-# NOTE: **the build matrix has executed; the `publish` job has not.** This file
-# produced nothing at all through the 2026-07-23 to 2026-08-16 Actions outage
-# (`ci.yml`'s header has what that was). Read off the runs API on 2026-08-17, it
-# has three runs: a `v0.0.1` tag push still queued, a `v0.0.2` tag push in which
-# every wheel row and the sdist succeeded and then the run was **cancelled** with
-# `publish` along with it, and a `workflow_dispatch` on `main` that failed.
+# NOTE: **the whole file has now executed, `publish` included.** It produced
+# nothing at all through the 2026-07-23 to 2026-08-16 Actions outage (`ci.yml`'s
+# header has what that was), and until 2026-08-19 the last job had never run. It
+# has since run twice and this note is the evidence, read off the API rather than
+# remembered:
 #
-# So the rows below are no longer unproven — they build. What is still unproven
-# is the last job: `transform_tree` 0.0.2 is on PyPI — **eleven wheels and no
-# sdist**, read off the index rather than remembered:
+#     $ gh api repos/:owner/:repo/actions/workflows/wheels.yml/runs \
+#         -q '.workflow_runs[] | "\(.head_branch) \(.conclusion)"'
+#     v0.0.4  success        v0.0.3  success
+#     main    failure        v0.0.2  cancelled       v0.0.1  failure
 #
-#     $ curl -sS https://pypi.org/pypi/transform-tree/json | \
-#         python3 -c "import json,sys; d=json.load(sys.stdin); \
-#           print({f['packagetype'] for f in d['releases']['0.0.2']}, \
-#                 len(d['releases']['0.0.2']))"
-#     {'bdist_wheel'} 11
+# with `sdist` and `publish` both `success` on each of the two tag runs.
 #
-# which is the same eleven the `sdist` step below is written about: the upload
-# died on the twelfth file. It did not get there from the run above, whose
-# `publish` never started.
-# Whatever put it there was outside this file, which means the upload path has
-# been exercised by nobody. Treat a green `publish` as the first evidence for it.
+# **The sdist gap is closed too** (#179). `transform_tree` 0.0.2 landed as
+# eleven wheels and no sdist — the upload died on the twelfth file, and it did
+# not get there from this workflow, whose `publish` had never started. 0.0.3 and
+# 0.0.4 each carry twelve files including the sdist:
+#
+#     $ curl -sS https://pypi.org/pypi/transform_tree/json | python3 -c "..."
+#     0.0.2: ['bdist_wheel'] 11
+#     0.0.3: ['bdist_wheel', 'sdist'] 12
+#     0.0.4: ['bdist_wheel', 'sdist'] 12
+#
+# So the upload path is exercised rather than assumed. What that does *not* say
+# is that it is exercised on every platform: see the `macos-15-intel` row below,
+# which is on borrowed time and fails by queueing rather than by erroring.
 #
 # **Nothing here tests a wheel.** These jobs build and (on a tag) publish; the
 # suite that would run against the artifact is `ci.yml`'s `python` job, which
@@ -61,10 +65,32 @@ jobs:
   # `v0.0.2` matrix had one row requesting `macos-13`, a label retired on
   # 2025-12-04; the job did not fail, it sat *queued* against a label no runner
   # carries while every other row went green, and the publish job waited behind
-  # it. Whether `timeout-minutes` covers time spent queued is not something
-  # GitHub's own workflow-syntax reference states, and the community answers
-  # disagree — so this is a bound on a hung *build*, and the guard against a
-  # retired label is knowing the signature: a row with `status: queued` and an
+  # it.
+  #
+  # **`timeout-minutes` does not cover queue time, and the stall is bounded at
+  # 24 hours.** Both halves were checked rather than left open (#180). The
+  # workflow-syntax reference defines the setting as time to "let a job *run*"
+  # and ties it to the "job execution time limit"; the GitHub-hosted limits are
+  # likewise stated in *execution* time, and community discussion #50926 is a
+  # feature request premised on exactly this gap. So it is a bound on a hung
+  # *build* and nothing else.
+  #
+  # The bound on the queue came from this repository's own history, not the
+  # docs — which list a 24-hour "job queue time" row under **self-hosted** only
+  # and have no queue row for GitHub-hosted runners:
+  #
+  #     $ gh api repos/:owner/:repo/actions/runs/31982307326/jobs \
+  #         -q '.jobs[] | select(.labels[0]=="macos-13")'
+  #     created_at   2026-08-17T00:32:13Z
+  #     completed_at 2026-08-18T00:32:14Z
+  #     conclusion   "cancelled"      runner_name ""
+  #
+  # 24 hours and one second, never assigned a runner. `timeout-minutes` did not
+  # exist in this file then, so it was not the cause. A tag push against a
+  # retired label therefore stalls for a day, then the run fails and `publish`
+  # skips — bad, but not the "forever" this file used to say.
+  #
+  # The guard remains knowing the signature: a row with `status: queued` and an
   # empty `runner_name` long after its siblings finished. See issue #180.
   abi3:
     name: abi3 ${{ matrix.target }}
@@ -80,12 +106,14 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
           - { os: macos-latest, target: aarch64, manylinux: auto }
           # **`macos-15-intel`, not `macos-13`.** The macOS 13 image was retired
-          # on 2025-12-04; a job requesting it does not fail, it **queues
-          # forever** against a label no runner carries. That is how it
-          # presented here — the `v0.0.2` wheel matrix sat with one row
-          # `queued` and no runner assigned while every other row had long
-          # since passed, holding the PyPI publish (which `needs` the whole
-          # matrix) indefinitely.
+          # on 2025-12-04; a job requesting it does not fail, it **queues for
+          # 24 hours** against a label no runner carries and is then cancelled.
+          # That is how it presented here — the `v0.0.2` wheel matrix sat with
+          # one row `queued` and no runner assigned while every other row had
+          # long since passed, holding the PyPI publish (which `needs` the whole
+          # matrix) behind it. This comment said "forever" and "indefinitely"
+          # until the run was read back: 24 h + 1 s, quoted in the job comment
+          # above.
           #
           # `macos-15-intel` is the successor and **the last x86_64 macOS image
           # Actions will offer**. The date is announced rather than inferred:
