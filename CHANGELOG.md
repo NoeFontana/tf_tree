@@ -46,9 +46,10 @@ collectors now reclaim a dead participant's slot — the owner's slot assigner o
 the next grant that walks past it, the owner's socket-hangup callback, and
 `Tree::reap_participants()` from any read-write participant, which is the only
 one that can reach the owner's own slot. All three share **one** liveness
-predicate and **one** `ParticipantTable::reclaim`, and the predicate is the OFD
-lock byte, which `docs/PHASE2.md` §5.1 is normative is the only fact that may
-answer the question.
+predicate and **one** `ParticipantTable::reclaim`, and that predicate is the OFD
+lock byte — the only fact `docs/PHASE2.md` §5.1 permits to answer the question,
+in as many words: *"Any code deciding liveness from `state` or `heartbeat` is a
+bug."*
 
 **Two things to read before upgrading.** A read-write attach over a bare file
 descriptor is now *refused* — see *Changed — breaking*, which carries the port.
