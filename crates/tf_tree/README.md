@@ -115,11 +115,13 @@ exception — it is a private read-only mapping and a child inherits it intact.
 
 ## Version
 
-**0.0.1, and `0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
+**`0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
 incompatible with every other — `tf_tree = "0.0.1"` means `^0.0.1`, which
 matches `0.0.1` and nothing else — so a later release reaches no existing
-dependant through `cargo update`. That is the intended signal for a first
-publish: pin exactly, and expect a later release to break. The reasoning is
+dependant through `cargo update`. That is the intended signal: pin exactly, and
+expect a later release to break. The current number is deliberately not repeated
+here — this line said `0.0.1` for three releases, because nothing gates a
+version in prose. The reasoning is
 written out in the repository's
 [`Cargo.toml`](https://github.com/NoeFontana/tf_tree/blob/main/Cargo.toml) under
 `[workspace.package] version`, and the release notes are in

@@ -70,9 +70,11 @@ draws the line between this and an actual vulnerability.
 
 ## Version
 
-**0.0.1, and `0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
+**`0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
 incompatible with every other, which is the intended signal: pin exactly, and
-expect a later release to break. The reasoning is written out in the
+expect a later release to break. The number is deliberately not repeated here —
+this line read `0.0.1` for three releases, because nothing gates a version in
+prose. The reasoning is written out in the
 repository's [`Cargo.toml`](https://github.com/NoeFontana/tf_tree/blob/main/Cargo.toml)
 under `[workspace.package] version`, and the release notes are in
 [`CHANGELOG.md`](https://github.com/NoeFontana/tf_tree/blob/main/CHANGELOG.md).
