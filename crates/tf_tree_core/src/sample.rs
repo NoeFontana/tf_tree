@@ -48,6 +48,42 @@ pub enum ExtrapPolicy {
     ConstantTwist,
 }
 
+/// Nanoseconds from `from` to `to` as an `f64`, for a pair the caller has
+/// already ordered so that `from <= to`.
+///
+/// **The subtraction is done in `u64`, and that is load-bearing rather than a
+/// micro-optimisation.** Every caller here has established its ordering — the
+/// bracket precondition `t_i <= t < t_j`, or two adjacent ring samples, or the
+/// forward-extrapolation branch's `t > t_new > t_prev` — so the difference is
+/// mathematically non-negative in all of them. It still does not *fit* an `i64`
+/// once the two stamps are more than `i64::MAX` apart, and the signed
+/// subtraction was reached with exactly that:
+///
+/// * in a checked build it panicked — `attempt to subtract with overflow`;
+/// * in a release build it wrapped, and the wrap is the worse half. A negative
+///   `t_j - t_i` makes `s` negative, so `Interp::eval` runs *backwards past* the
+///   older sample and returns a pose from outside the bracket. No error, no
+///   panic, wrong answer, on the hot path.
+///
+/// Casting through `u64` first makes the result exact for every ordered `i64`
+/// pair: `wrapping_sub` on the bit patterns *is* the true distance, not a
+/// truncation of it, and for `(i64::MIN, i64::MAX)` it yields `u64::MAX`.
+///
+/// Two samples 292 years apart is malformed data, and this is not an endorsement
+/// of it. But the defensible answers to malformed data are an error naming the
+/// edge or a correct interpolation of it; a silently wrong pose is neither, and
+/// removing that was the point. If a bound on segment width is wanted it belongs
+/// upstream in `push`, as a `LookupError` that names the edge (R5), not here as
+/// an accident of two's complement.
+///
+/// `from > to` is a caller bug and yields a nonsense magnitude rather than a
+/// panic; every call site in this module is directly preceded by the comparison
+/// that rules it out.
+#[inline]
+fn span_ns(from: i64, to: i64) -> f64 {
+    (to as u64).wrapping_sub(from as u64) as f64
+}
+
 impl SampleRing<'_> {
     /// Sample the edge at stamp `t` under interpolation policy `I` and
     /// extrapolation policy `policy`.
@@ -112,7 +148,7 @@ impl SampleRing<'_> {
             let a = self.read_slot((i & self.mask) as usize)?;
             let b = self.read_slot(((i + 1) & self.mask) as usize)?;
             // t_i < t < t_j guaranteed here, so the denominator is non-zero.
-            let s = (t - t_i) as f64 / (t_j - t_i) as f64;
+            let s = span_ns(t_i, t) / span_ns(t_i, t_j);
             I::eval(&a, &b, s)
         };
 
@@ -200,7 +236,7 @@ impl SampleRing<'_> {
             let t_j = self.stamp_at(i + 1);
             let a = self.read_slot((i & self.mask) as usize)?;
             let b = self.read_slot(((i + 1) & self.mask) as usize)?;
-            let s = (t - t_i) as f64 / (t_j - t_i) as f64;
+            let s = span_ns(t_i, t) / span_ns(t_i, t_j);
             I::eval(&a, &b, s)
         };
 
@@ -501,7 +537,7 @@ impl SampleRing<'_> {
         };
         let t_i = self.stamp_at(i);
         let t_j = self.stamp_at(i + 1);
-        let dt = (t_j - t_i) as f64;
+        let dt = span_ns(t_i, t_j);
         if dt == 0.0 {
             // Equal stamps are legal (invariant 6) but span no time, so the
             // velocity would be infinite rather than merely unknown.
@@ -509,7 +545,7 @@ impl SampleRing<'_> {
         }
         let a = self.read_slot((i & self.mask) as usize)?;
         let b = self.read_slot(((i + 1) & self.mask) as usize)?;
-        let s = (t - t_i) as f64 / dt;
+        let s = span_ns(t_i, t) / dt;
         let (pose, xi) = ScLerp::eval_with_twist(&a, &b, s);
 
         // Same revalidation and the same bound as `sample`: if the ring lapped
@@ -562,7 +598,7 @@ impl SampleRing<'_> {
         let t_prev = self.stamp_at(prev);
         let a = self.read_slot((prev & self.mask) as usize)?;
         let b = self.read_slot((newest & self.mask) as usize)?;
-        let dt = (t_new - t_prev) as f64;
+        let dt = span_ns(t_prev, t_new);
         let result = if dt == 0.0 {
             // Equal stamps span no time: nothing to extend along, and the
             // velocity would be infinite rather than unknown.
@@ -571,7 +607,7 @@ impl SampleRing<'_> {
             // Constant screw twist of a->b, extended to `t`. `param > 1` walks
             // past `b` along the same screw; at `t == t_new` it is exactly 1 and
             // reproduces `b`.
-            let param = (t - t_prev) as f64 / dt;
+            let param = span_ns(t_prev, t) / dt;
             let (pose, xi) = ScLerp::eval_with_twist(&a, &b, param);
             (pose, xi.scale(NANOS_PER_SEC / dt))
         };

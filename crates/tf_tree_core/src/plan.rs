@@ -1670,13 +1670,35 @@ fn subdivide<D: Domain>(
     // headroom: once splitting stops, up to `depth` already-committed ancestors
     // still emit one knot each as the DFS unwinds, so this keeps the final count
     // at or below `MAX_KNOTS`.
+    // **The width is taken in `u64`, and that is not a micro-optimisation.**
+    // `a_s < b_s` is guaranteed by `at_adaptive`'s degenerate-span early return,
+    // so `b_s - a_s` is mathematically non-negative — but it does not fit in an
+    // `i64` once the span exceeds `i64::MAX`, and `at_adaptive(i64::MIN, i64::MAX)`
+    // is a *legitimate* request rather than a pathological one: it is precisely
+    // what `span() == Ok(None)` — "answerable at any stamp" — invites a caller to
+    // ask of an all-static plan. The signed subtraction panicked on it in a checked
+    // build and wrapped in a release one, and the release wrap is the worse half:
+    // the negative difference fails the `> 1` test, so the recursion stops
+    // immediately and returns a two-knot straight line for a path that was never
+    // straight. Measured on a dynamic plan spanning ±2^62: two knots, endpoints
+    // -0.4989 and -0.9953, true midpoint -17.2030, against a requested tolerance
+    // of 1e-6. No error, no panic, no knot in the middle.
+    //
+    // Casting through `u64` makes the difference exact for every ordered pair an
+    // `i64` can hold, and `wrapping_sub` is the *identity* on that difference
+    // rather than a truncation of it — for `(i64::MIN, i64::MAX)` it is `u64::MAX`,
+    // the true width.
+    let width = (b_s as u64).wrapping_sub(a_s as u64);
     let can_split = depth < MAX_ADAPTIVE_DEPTH
-        && (b_s - a_s) > 1
+        && width > 1
         && scratch.stamps.len() + (MAX_ADAPTIVE_DEPTH as usize) + 1 < MAX_KNOTS;
     if can_split {
-        let m_s = a_s + (b_s - a_s) / 2;
+        // `width / 2 <= 2^63 - 1` fits an `i64`, and `a_s + width / 2` is the
+        // midpoint of two `i64`s, which always does too — so the add cannot
+        // overflow either, and `wrapping_add` documents that rather than risking it.
+        let m_s = a_s.wrapping_add((width / 2) as i64);
         let m_p = plan.fold_at(g, m_s)?;
-        let s = (m_s - a_s) as f64 / (b_s - a_s) as f64;
+        let s = (m_s as u64).wrapping_sub(a_s as u64) as f64 / width as f64;
         let approx = <LerpSlerp as Interp>::eval(&a_p, &b_p, s);
         if !within(tol, &approx, &m_p) {
             subdivide(plan, g, a_s, a_p, m_s, m_p, depth + 1, tol, scratch)?;
