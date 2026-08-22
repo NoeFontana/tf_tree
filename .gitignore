@@ -74,8 +74,24 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 
-# Rust
-/target/
+# Rust.
+#
+# **`target*/`, not `target/`.** This glob is the third fix for the same trap in
+# this file, and the first that covers the class rather than one instance. A
+# parallel build setting `CARGO_TARGET_DIR=target-p` — the obvious way to run two
+# cargo invocations without fighting over one lock — writes a *sibling* of
+# `target/`, and the anchored `/target/` this line replaces matched none of it.
+# Four such directories (`target-p`, `target-x`, `target-miri`, `target-stable`:
+# 1386 files, 358 MiB of fingerprints and rlibs) were committed and merged across
+# three pull requests before anyone noticed, taking a fresh clone from 5 MiB to
+# 112 MiB and the v0.0.4 source tarball from 9 MiB to 119 MiB.
+#
+# The two earlier fixes are still below, each naming one further spelling the
+# anchored rule missed (`/crates/*/target/`, `/log/`). Three instances, three
+# named patches, and that is the tell: **no ignore rule anticipates the next
+# spelling.** `just no-build-output` is the part that actually closes this — it
+# rejects tracked build output by its own signature, whatever it is called.
+/target*/
 **/*.rs.bk
 .maturin/
 

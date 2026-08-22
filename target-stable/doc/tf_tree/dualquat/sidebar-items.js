@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["screw_pow","screw_pow_with_twist","screw_twist"]};

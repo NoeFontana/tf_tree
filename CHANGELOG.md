@@ -31,6 +31,43 @@ is a bug.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **358 MiB of committed cargo build output is untracked, and a gate now makes
+  the class unmergeable.** Four `CARGO_TARGET_DIR` siblings — `target-p`,
+  `target-x`, `target-miri`, `target-stable`, 1386 files — were committed and
+  merged across #237, #242 and #243. `.gitignore`'s `/target/` is *anchored*, so
+  it matched a child named `target/` and none of its siblings; `git status`
+  stayed clean because the files were tracked, and no test, lint or release gate
+  looks at what is tracked. A fresh clone cost 112 MiB instead of 5 MiB, and the
+  v0.0.4 GitHub source tarball 119 MiB instead of 9 MiB.
+
+  **No published artifact was affected.** `cargo publish` and `maturin sdist`
+  both package from a crate root, and the junk sat above every one of them —
+  verified against the registries: the five 0.0.4 crates are 0.06–0.23 MiB each
+  and the `transform_tree` 0.0.4 sdist is 0.67 MiB with zero `target-*` entries.
+
+  History was left intact deliberately, so every published SHA and the `v0.0.4`
+  tag still resolve. The 358 MiB therefore remains reachable in the history and a
+  clone still pays it; removing it needs a force-push that would move the release
+  tag, and that trade was declined.
+
+  Two fixes, and the second is the one that matters: `.gitignore` now says
+  `/target*/`, and `just no-build-output` rejects any tracked file carrying a
+  cargo build-output signature (`CACHEDIR.TAG`, `.fingerprint/`,
+  `.rustc_info.json`, the two lock files) regardless of what the directory is
+  called. `.gitignore` had already been patched twice for this same trap, once
+  per spelling — no ignore rule anticipates the next one.
+
+- **`CLAUDE.md` and `ci.yml` both said `just lint` runs six clippy passes; it
+  runs eight.** `pure-hash` (#243) added two and neither prose site was updated —
+  including a comment that explicitly claimed to have counted rather than
+  remembered.
+
+---
+
 ## [0.0.4] — 2026-08-22 (the slot a killed participant keeps)
 
 **One defect, present for the project's whole life, is the reason this release
