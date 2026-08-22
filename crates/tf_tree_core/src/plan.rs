@@ -1111,8 +1111,22 @@ impl Plan {
         self.fold_at(g, common)
     }
 
-    /// The interval over which this plan is answerable, or `None` when it is
-    /// unbounded (`docs/PHASE5.md` §4.2).
+    /// The **outer bound outside which this plan certainly cannot answer**, or
+    /// `None` when it is unbounded (`docs/PHASE5.md` §4.2).
+    ///
+    /// **It is not "the interval over which this plan is answerable", which is
+    /// what this sentence used to say.** The value is an *intersection of outer
+    /// windows* and carries no information about holes inside them: a publisher
+    /// that died for 30 s in the middle of a 100 Hz edge moves neither end, so a
+    /// span can be almost entirely gap and still look healthy. Measured on this
+    /// repository's own recording, one edge's widest bracket is 5.3 s inside a
+    /// 42 s span — 105× its own median — carrying 2.57 m of unobserved motion.
+    ///
+    /// Outside the returned interval [`Self::at`] refuses; **inside it, `at`
+    /// answering is not evidence that anything was observed near the stamp** —
+    /// it interpolates across whatever bracket it finds. `tf_tree doctor`'s
+    /// `TFT009` is what detects that today, after the fact and from the same
+    /// bytes.
     ///
     /// [`Self::latest_common`] generalised from a point to a range: the
     /// **intersection** of every dynamic step's retained window, so the lower end
