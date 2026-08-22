@@ -47,8 +47,11 @@ over the README, and over this file.
 
 Three cautions specific to current work:
 
-- **`FORMAT_VERSION = 3` already happened.** Phase 6's regions are reserved so
-  the break happened once. **Do not add arena fields opportunistically.**
+- **`FORMAT_VERSION = 3` already happened** — for the **header**. Phase 6's
+  header fields are reserved; its **region table is not**, so the region break
+  is still owed ([`0032`](./docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md),
+  `draft`). **Do not add arena fields opportunistically** — that instruction is
+  unchanged, and `0032` gives it a queue to join rather than an indefinite wait.
 - **`PHASE5.md` §8 is a section about *not* building something.** Visualization
   is deliberately absent, argument recorded. **Do not propose a viewer
   integration without refuting §8.1 first.**
