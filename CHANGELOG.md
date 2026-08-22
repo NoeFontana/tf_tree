@@ -265,6 +265,26 @@ same shape one layer up. Each has a home; none is a surprise waiting to be found
   segment is freed. `docs/RUNBOOK.md` carries the procedure where an operator
   will look for it.
 
+- **`Tree::reap_participants` will free the record of a live process that
+  created its arena with `TreeBuilder::build_shared`.** That call registers a
+  `LIVE` participant record and takes **no lock byte**, because such an arena has
+  no lock file at all — the fd is the capability. Every collector in this release
+  keys on the byte, so every one of them reads that record as dead. Measured: a
+  `build_shared` creator served through `tf_tree_ipc::OwnerServer` is reported
+  `alive false` by an ordinary joiner, and the sweep CASes its record to `FREE`
+  while it is still publishing.
+
+  **Who is affected is narrow, and worth stating precisely.** It needs a
+  *rendezvous* over a `build_shared` arena — that is, `OwnerServer::bind_at` and
+  `serve` called by hand — because a peer only forms an opinion about a record if
+  it joined and took a probe. An arena created through `tf_tree::Open` is
+  unaffected (its creator holds byte 0), and so is the ordinary `build_shared`
+  deployment that passes `Tree::shared_fd` to children and stands up no
+  rendezvous: no peer there carries a probe. Nothing in this workspace composes
+  it the affected way. **Until `docs/decisions/0031` is answered, do not call
+  `Tree::reap_participants` in a process tree where anything served a
+  `build_shared` arena by hand.**
+
 - **`Tree::reparent` decides topology-lock liveness from `/proc` even when the
   tree holds an OFD probe** (issue #213) — the same §5.1 shape this release fixed
   for participant slots, one layer up, on the one path that takes A2's topology
