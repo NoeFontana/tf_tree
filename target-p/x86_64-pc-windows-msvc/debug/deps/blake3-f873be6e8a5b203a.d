@@ -1,0 +1,14 @@
+/home/dev/.claude/jobs/945078ed/tmp/wt/pE/target-p/x86_64-pc-windows-msvc/debug/deps/blake3-f873be6e8a5b203a.d: /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/lib.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/guts.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/hazmat.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/platform.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_avx2.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/portable.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_sse2.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_sse41.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/io.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/join.rs
+
+/home/dev/.claude/jobs/945078ed/tmp/wt/pE/target-p/x86_64-pc-windows-msvc/debug/deps/libblake3-f873be6e8a5b203a.rmeta: /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/lib.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/guts.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/hazmat.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/platform.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_avx2.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/portable.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_sse2.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_sse41.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/io.rs /home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/join.rs
+
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/lib.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/guts.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/hazmat.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/platform.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_avx2.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/portable.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_sse2.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/rust_sse41.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/io.rs:
+/home/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/blake3-1.8.5/src/join.rs:

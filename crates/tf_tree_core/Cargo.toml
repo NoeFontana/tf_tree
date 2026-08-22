@@ -31,6 +31,36 @@ rustdoc-args = ["--cfg", "docsrs"]
 # not fork and the two builds still attach to each other.
 default = ["counters"]
 counters = []
+# **The pure-Rust BLAKE3 backend, so a consumer asks this crate rather than
+# reaching around it.** `blake3` declares `cc` as an *unconditional*
+# `[build-dependencies]`, so no feature removes it from the graph — what `pure`
+# changes is that `build.rs` stops *invoking* a C compiler for the target.
+#
+# On Linux targets that is invisible: blake3 probes for a compiler and falls
+# back to Rust intrinsics on its own, so the build succeeds either way (measured
+# with `CC=/nonexistent`, and cross-compiling to `aarch64-unknown-linux-gnu`).
+# **On `*-apple-darwin` and `*-windows-msvc` it is not**, and this is the whole
+# reason the feature exists — measured at `d955a44`:
+#
+#     cargo check -p tf_tree_core --target x86_64-apple-darwin
+#       error: failed to run custom build command for `blake3 v1.8.5`
+#     cargo check -p tf_tree_core --target x86_64-apple-darwin --features pure-hash
+#       Finished `dev` profile in 2.78s
+#
+# Same both ways for `x86_64-pc-windows-msvc`. Without this feature a consumer
+# cross-compiling to either target has to take its own `blake3` dependency and
+# turn `pure` on there — reaching around the crate that owns the dependency.
+#
+# **It cannot change a hash, and therefore cannot change a `.tft`.** BLAKE3 is a
+# specified function: every backend computes the same digest, so `blake3_64`,
+# the frame-hash region and `layout_hash` are unaffected. This is a build-time
+# knob, not a format one.
+#
+# `ci.yml`'s `bindings-non-linux` job says a cross-check "dies in a dependency
+# before reaching this crate" and uses native runners because of it; issue #180
+# names the same C-toolchain requirement as what blocks cross-compiling the
+# x86_64 macOS wheel once `macos-15-intel` retires. Both are about this.
+pure-hash = ["blake3/pure"]
 # Route libm through its soft-float paths. Needed **only** under Miri, whose
 # interpreter cannot execute the x86 inline `sqrt` asm libm's default `arch`
 # feature emits. `just miri` turns it on explicitly.

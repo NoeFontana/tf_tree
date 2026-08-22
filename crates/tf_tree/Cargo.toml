@@ -34,6 +34,10 @@ default = ["counters"]
 # off removes the counter code from the engine, and the arena regions stay
 # (D34) so the layout hash does not fork.
 counters = ["tf_tree_core/counters"]
+# Forwarded so a facade consumer does not have to depend on `tf_tree_core`
+# directly to reach it. Same shape as `counters` above, and for the same reason:
+# the feature belongs to the crate that owns the dependency.
+pure-hash = ["tf_tree_core/pure-hash"]
 # Phase 2 shared memory: `TreeBuilder::build_shared` / `Tree::attach_shared`.
 # Linux-only and off by default — the single-process build must not grow a
 # syscall dependency it never uses.
