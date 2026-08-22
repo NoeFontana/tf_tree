@@ -93,6 +93,10 @@ pub struct EdgeRecord {
     /// 0.1 Hz (a map update) to 1 kHz (an IMU), and an integer hertz cannot
     /// express the low end.
     pub nominal_rate_mhz: u32,
+    /// The 4 bytes the compiler inserts before `head`'s 8-byte alignment.
+    /// Named so a struct literal initialises them: unnamed padding is left
+    /// uninitialised, and `write_frozen` memcpys this record to disk.
+    _pad1: [u8; 4],
     /// Monotone total samples published (invariant 5).
     pub head: AtomicU64,
     /// Inline pose for static edges (`f64` bit patterns; see [`Iso3::to_bits`]).
@@ -141,6 +145,7 @@ impl EdgeRecord {
             stamp_off,
             pose_off,
             nominal_rate_mhz: 0,
+            _pad1: [0; 4],
             head: AtomicU64::new(0),
             static_pose: [0; 7],
             declared_by_slot: u32::MAX,
@@ -162,6 +167,7 @@ impl EdgeRecord {
             stamp_off: 0,
             pose_off: 0,
             nominal_rate_mhz: 0,
+            _pad1: [0; 4],
             head: AtomicU64::new(0),
             static_pose: pose,
             declared_by_slot: u32::MAX,
