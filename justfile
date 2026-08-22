@@ -366,6 +366,24 @@ miri:
 evidence-audit:
     ./scripts/evidence-audit.sh
 
+# **No tracked file is build output.** 6 ms measured, and it exists because 358
+# MiB of cargo fingerprints and rlibs were committed and merged across three
+# pull requests without one test, lint or release gate noticing.
+#
+# `CARGO_TARGET_DIR=target-p` — how you run two cargo invocations without them
+# fighting over one lock — writes a *sibling* of `target/`, which `.gitignore`'s
+# anchored `/target/` did not match. `git status` stayed clean because the files
+# were tracked, and the published crates.io and PyPI artifacts were unaffected
+# because both package from a crate root, above which the junk sat. Nothing in
+# the pipeline could see it.
+#
+# It checks build output by *signature*, not by path: `.gitignore` has now been
+# patched three times for this same trap, once per spelling, and a fourth
+# spelling would slip past all three. See the script for why these four patterns
+# and no others.
+no-build-output:
+    ./scripts/no-build-output.sh
+
 # **What the diagnostic counters cost a guard — `docs/decisions/0022` question 1.**
 #
 # The 2x2 that question needs: {release, embedder} x {counters on, off}. All four
@@ -958,11 +976,16 @@ doc:
 # in the file and one of them caught a real defect: PHASE4 §7 gate criterion 1
 # was recorded as PASS for months while the benchmark that produces it ran in no
 # recipe at all. `just` runs dependencies left to right and before the body, so
-# ordering survives the move — `py-compile`, then the artifact audit, then the
-# version audit, then eight clippy passes.
+# ordering survives the move — `no-build-output`, then `py-compile`, then the
+# artifact audit, then the version audit, then eight clippy passes.
+#
+# `no-build-output` goes first because it is both the cheapest (6 ms measured,
+# 5 ms in CI) and the
+# one whose failure invalidates the rest: if the tree has build output committed
+# in it, what clippy thinks of the source is not the interesting news.
 
-# fmt + eight clippy configurations, behind the two cheap audits.
-lint: py-compile evidence-audit artifact-versions
+# fmt + eight clippy configurations, behind the three cheap audits.
+lint: no-build-output py-compile evidence-audit artifact-versions
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line

@@ -47,21 +47,34 @@ jobs:
   # **`just lint`, not a transcription of two of its lines.**
   #
   # This job used to run `cargo fmt --all -- --check` and `cargo clippy
-  # --workspace --all-targets` directly. `just lint` is those two plus **five**
+  # --workspace --all-targets` directly. `just lint` is those two plus **seven**
   # more clippy invocations. Counted off the recipe body rather than remembered:
-  # it runs six `cargo clippy` commands, of which the `--workspace` one is the
-  # line this job already had. (`grep -c 'cargo clippy'` says 7 — one of those
+  # it runs eight `cargo clippy` commands, of which the `--workspace` one is the
+  # line this job already had. (`grep -c 'cargo clippy'` says 9 — one of those
   # is a *comment* quoting the workspace command, which is why the count is
-  # taken from the executed lines.) Each of the five exists because a
-  # default-off (or default-*on*) feature makes a file invisible to
-  # `--workspace`: `-p tf_tree_c --features bridge`, `-p tf_tree_c
-  # --features test-hooks`, `-p tf_tree_ingest --features fixture`,
+  # taken from the executed lines.)
+  #
+  # **This paragraph said five and six until it was corrected here.** `pure-hash`
+  # (#243) added two rows and neither this comment nor CLAUDE.md's table was
+  # updated, so a count explicitly labelled "counted, not remembered" drifted
+  # anyway — which is the argument for the recipe being the single source and
+  # these numbers being prose that any reader should re-count.
+  #
+  # Each of the seven exists because a default-off (or default-*on*) feature
+  # makes a file invisible to `--workspace`: `-p tf_tree_c --features bridge`,
+  # `-p tf_tree_c --features test-hooks`, `-p tf_tree_ingest --features fixture`,
   # `-p tf_tree_ingest --no-default-features`, `-p tf_tree_cli
-  # --no-default-features`. One of them —
+  # --no-default-features`, and `--features pure-hash` for each of
+  # `tf_tree_core` and `tf_tree`. One of them —
   # `-p tf_tree_c --features test-hooks` — ran in **no workflow at all** under
   # the old spelling, and the justfile records that a real warning had been
   # sitting in `publish.rs` unseen. Running the recipe is what makes CLAUDE.md's
   # "CI mirrors these recipes 1:1" true rather than aspirational.
+  #
+  # `just lint` also depends on `no-build-output`, which rejects any tracked file
+  # carrying a cargo build-output signature. It runs first because it is the
+  # cheapest thing in the recipe and because 358 MiB of `target-*` directories
+  # reached `main` through three green runs of this very job.
   #
   # `just lint` depends on `py-compile`, which compiles the workspace-excluded
   # `tf_tree_py` against `.venv`'s interpreter or, failing that, the one on
