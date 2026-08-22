@@ -686,3 +686,97 @@ impl<'a> ArenaBuilder<'a> {
         Ok(())
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod padding_tests {
+    use crate::edge::EdgeRecord;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// **Every byte an `EdgeRecord` puts on disk is initialised.**
+    ///
+    /// `EdgeRecord` is `#[repr(C, align(64))]`; `nominal_rate_mhz` ends at
+    /// offset 28 and `head: AtomicU64` must start 8-aligned, so the compiler
+    /// reserves `[28..32)`. A struct literal initialises *fields*, not padding
+    /// — `_pad0` and `_pad2` are named and zeroed and this one was not.
+    /// [`TopologyBuilder::declare_edge`] publishes the record with the **typed**
+    /// `core::ptr::write` a few hundred lines above, which copies the hole, and
+    /// `write_frozen` memcpys the whole arena to the file. So four bytes of
+    /// producer memory reached disk in every `.tft`, once per declared edge.
+    ///
+    /// It was **UB** (reading uninitialised memory as `u8`), an **information
+    /// leak** into a shipped artifact, and the reason a `.tft` could not be
+    /// content-addressed. Naming the bytes moves nothing: `size_of` is still
+    /// 128, both offsets are unchanged, and `layout_hash` is untouched because
+    /// it folds literal stride constants rather than field offsets.
+    ///
+    /// **It lives here, and the two rejected homes are worth recording.**
+    /// `tf_tree_core` is `#![deny(unsafe_code)]` outside `buffer` and this
+    /// module, so `src/tests.rs` cannot take the `&[u8]` view — and this is the
+    /// module holding the write that caused it. `tf_tree_arena` cannot host it
+    /// either: it sits *below* `tf_tree_core` and cannot name `EdgeRecord`. A
+    /// `tf_tree_core/tests/` directory is the third non-option — it breaks
+    /// `cargo xtask loom`, which runs `cargo test -p tf_tree_core --tests` under
+    /// `--cfg loom`, because `loom` is a `cfg(loom)` **dev**-dependency that an
+    /// integration test's plain-library build of the crate does not get.
+    ///
+    /// **Mutant, run rather than asserted.** With `_pad1` removed,
+    /// `cargo +nightly miri test -p tf_tree_core` reports *"Undefined Behavior:
+    /// reading memory at `alloc[0x0..0x80]`, but memory is uninitialized at
+    /// `[0x1c..0x20]`"* — `0x1c..0x20` is 28..32 — and this test fails.
+    #[test]
+    fn an_edge_record_leaves_no_uninitialised_bytes() {
+        /// The same `&[u8]` view `write_frozen` takes of the arena.
+        fn wire_bytes(rec: &EdgeRecord) -> &[u8] {
+            // SAFETY: `EdgeRecord` is `#[repr(C)]` with every hole named, so it
+            // has no uninitialised bytes — the property under test — and the
+            // reference is live for `size_of` bytes.
+            unsafe {
+                core::slice::from_raw_parts(
+                    core::ptr::from_ref(rec).cast::<u8>(),
+                    size_of::<EdgeRecord>(),
+                )
+            }
+        }
+
+        // Geometry first: if `head` moves, the hole this guards is elsewhere
+        // and the test must say so rather than quietly pass.
+        assert_eq!(size_of::<EdgeRecord>(), 128);
+        assert_eq!(align_of::<EdgeRecord>(), 64);
+        assert_eq!(offset_of!(EdgeRecord, nominal_rate_mhz), 24);
+        assert_eq!(
+            offset_of!(EdgeRecord, head),
+            32,
+            "head moved; the hole this test guards is no longer at [28..32)"
+        );
+
+        for fill in [0xAA_u8, 0x55, 0xEE, 0x00] {
+            // Dirty the stack the constructors are about to build on.
+            let mut dirt = [fill; 1024];
+            core::hint::black_box(&mut dirt);
+
+            let dynamic = EdgeRecord::dynamic(1, 2, 64, 0, 0, 0, 0);
+            let statik = EdgeRecord::static_edge(1, 2, [0; 7], 0);
+            for (what, rec) in [("dynamic", &dynamic), ("static_edge", &statik)] {
+                assert_eq!(
+                    &wire_bytes(rec)[28..32],
+                    &[0_u8; 4],
+                    "{what}: the hole before `head` carries producer memory into \
+                     every .tft (stack was filled {fill:#04x})"
+                );
+            }
+        }
+
+        // The general property, observed the way `write_frozen` observes it.
+        let mut dirt = [0xC3_u8; 1024];
+        core::hint::black_box(&mut dirt);
+        let a = EdgeRecord::dynamic(7, 9, 128, 16, 32, 1, 2);
+        core::hint::black_box(&mut [0_u8; 1024]);
+        let b = EdgeRecord::dynamic(7, 9, 128, 16, 32, 1, 2);
+        assert_eq!(
+            wire_bytes(&a),
+            wire_bytes(&b),
+            "two identically-built EdgeRecords differ byte for byte, so the \
+             arena carries producer state and a .tft cannot be content-addressed"
+        );
+    }
+}
