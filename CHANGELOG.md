@@ -102,6 +102,41 @@ is a bug.
   including a comment that explicitly claimed to have counted rather than
   remembered.
 
+### Added
+
+- **`just artifact-versions` now reads the five crates.io front pages** (#238).
+  The gate is "one release, one version", and it could not see a version written
+  in prose — so four of the five publishable crates' `README.md` opened their
+  Version section with `0.0.1` for three releases while the workspace was `0.0.3`.
+  `tf_tree_math` had hit it first and fixed it the right way, by deleting the
+  number and recording why, and **that fix reached one crate of five**: a lesson
+  written into prose only propagates if the next person reads the prose.
+
+  The rule is narrower than the obvious one, because the obvious one flaps. "No
+  version-shaped literal" fails 57 times today on correct prose (`MSRV is
+  **1.87**`, `Apache-2.0`, `tf_tree_math`'s SE(3) examples); a bare
+  three-component rule still fails 9 times, and all 9 are deliberate — including
+  the very sentence #236 added to record this bug. What ships is **a
+  three-component `v?X.Y.Z` outside an inline code span**, which is 0 hits today
+  and exactly 4 against `abd2fd9^`, on exactly the four defective files, with
+  `tf_tree_math` silent. The exemption is safe because the defect was never in
+  code: it was bold. Fenced blocks stay in scope, so a future versioned install
+  snippet is covered.
+
+  Scope is derived rather than listed — `PUBLISHABLE` plus each manifest's
+  `[package] readme` — so option 2's stated cost of encoding "these five files"
+  is not paid, and a crate that publishes without a `readme` key fails.
+
+  **It has nothing to check today**, and that is the honest description: after
+  #236 no tracked Markdown file makes a live claim about the current version.
+  It is a regression guard.
+
+- **`just msrv`'s prose arm now covers those same five front pages.** All five
+  state `MSRV is **1.87**` and none was checked. Found while closing #238, in the
+  same five files, in the same class. That arm remains a *presence* test — a
+  document stating the right floor and a wrong one alongside it still passes,
+  which is a separate gap and is now written down next to the loop.
+
 ---
 
 ## [0.0.4] — 2026-08-22 (the slot a killed participant keeps)
