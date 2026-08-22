@@ -1153,8 +1153,21 @@ msrv:
     # acted on rather than merely believed. It was ungated until 2026-08-17,
     # found while correcting the neighbouring line, which claimed version 0.0.1
     # unpublished two versions and one publish later.
+    #
+    # The five publishable crates' `README.md` are on the list because each is
+    # rendered as a crates.io front page and each states the floor — and none of
+    # them was checked until 2026-08-22, found while closing #238 about the
+    # neighbouring defect in the same five files. Same class, same files, and the
+    # front page is where an adopter actually reads the number.
+    #
+    # **This arm tests presence, not absence.** A document that states the right
+    # floor and a wrong one alongside it passes, demonstrated on a copy. That is a
+    # real gap and it is not this recipe's to close by loosening the match.
     echo "==> the number is stated where a user reads it, and still agrees"
-    for f in README.md SUPPORT.md CLAUDE.md crates/tf_tree/src/lib.rs; do
+    for f in README.md SUPPORT.md CLAUDE.md crates/tf_tree/src/lib.rs \
+             crates/tf_tree/README.md crates/tf_tree_core/README.md \
+             crates/tf_tree_math/README.md crates/tf_tree_arena/README.md \
+             crates/tf_tree_ipc/README.md; do
         if ! grep -qF "**$want**" "$f"; then
             echo "$f: does not state the MSRV as **$want**"
             rc=1

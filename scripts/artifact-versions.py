@@ -723,6 +723,99 @@ def check_markdown_tables() -> str:
     )
 
 
+PROSE_VERSION_RE = re.compile(r"\bv?[0-9]+\.[0-9]+\.[0-9]+\b")
+
+
+def check_front_page_versions() -> str:
+    """No three-component version literal in prose on a crates.io front page.
+
+    **What it cost to not have this.** Four of the five publishable crates'
+    `README.md` — the pages crates.io renders — opened their Version section with
+    ``**0.0.1, and `0.0.x` promises nothing.**`` while `[workspace.package]
+    version` was `0.0.3`. Wrong on the front page of `tf_tree`, `tf_tree_core`,
+    `tf_tree_arena` and `tf_tree_ipc` for three releases. `tf_tree_math` had hit
+    it first and fixed it the right way — by deleting the number and recording
+    why — and **that fix reached one crate of five**, which is the whole argument
+    for a gate: a lesson written into prose only propagates if the next person
+    reads the prose.
+
+    **Scope is derived, not listed.** `PUBLISHABLE` names the release; each of
+    those manifests names its own front page in `[package] readme`. A crate that
+    publishes without a `readme` key is itself a failure, in the same shape as
+    `check_versions`' "no version site found" — a scan that silently finds
+    nothing is how a gate keeps passing after its subject moved. So this does not
+    pay option 2's stated cost of encoding "these five files".
+
+    **Why three components, and why inline code is exempt.** Both narrower than
+    they look, and both were measured against the whole corpus before being
+    written, per this module's standard:
+
+    * "no version-shaped literal at all" fails **57** times on these five files
+      today, every one correct: `MSRV is **1.87**`, `Apache-2.0`, and
+      `tf_tree_math`'s SE(3) worked examples with their `0.0` and `0.15`.
+    * a bare three-component rule still fails **9** times, and all 9 are
+      deliberate — `tf_tree/README.md`'s worked example of cargo's caret
+      semantics, and the past-tense sentence #236 added to record this very bug.
+      A gate in that shape would demand deleting the sentence that documents it.
+    * exempting inline code spans is not a loophole, because the defect was not
+      in code. It was **bold** — `**0.0.1, and ...**`. Measured: 0 hits across
+      the five files today, and exactly 4 against `abd2fd9^` (the tree #236
+      fixed), on exactly the four defective files, with `tf_tree_math` silent.
+
+    Fenced blocks stay in scope deliberately, at no cost today — no README
+    carries a versioned install snippet — so a future ```toml``` block pinning
+    `tf_tree = "0.0.4"` is covered rather than exempt.
+
+    **What this buys today: nothing, and that is the honest description.** After
+    #236 no tracked Markdown file makes a live claim about the current version.
+    This is purely a regression guard. Its value is that #236's lesson stops
+    depending on anybody re-reading it.
+    """
+    checked = []
+    for name in sorted(PUBLISHABLE):
+        manifest = f"crates/{name}/Cargo.toml"
+        readme = load_toml(manifest).get("package", {}).get("readme")
+        if not readme:
+            fail(
+                f"{manifest} publishes but declares no [package] readme, so this "
+                f"check cannot find its crates.io front page. Either name the "
+                f"file or explain here why the crate has none."
+            )
+            continue
+
+        rel = f"crates/{name}/{readme}"
+        text = (ROOT / rel).read_text(encoding="utf-8")
+
+        # Blank the code, keep the prose — the inverse of `code_spans`, which is
+        # why that helper is not reused here. Fences are blanked first (same
+        # length, newlines kept) so the inline pass cannot match a backtick
+        # inside one and so every offset still names the right line.
+        fence_blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+        prose = list(text)
+        for span in INLINE_RE.finditer(fence_blanked):
+            for i in range(span.start(), span.end()):
+                prose[i] = " "
+        prose = "".join(prose)
+
+        for hit in PROSE_VERSION_RE.finditer(prose):
+            line_no = text.count("\n", 0, hit.start()) + 1
+            line = text.splitlines()[line_no - 1].strip()
+            fail(
+                f"{rel}:{line_no} states the version {hit.group(0)!r} in prose:\n"
+                f"      {line}\n"
+                f"    This file is rendered as {name}'s crates.io front page, and "
+                f"nothing updates a number written there. Delete it and say why, "
+                f"as crates/tf_tree_math/README.md does — or put it in backticks "
+                f"if it is a worked example rather than a claim about this release."
+            )
+        checked.append(rel)
+
+    return (
+        f"no version literal in prose on any of the "
+        f"{len(checked)} publishable crates' front pages"
+    )
+
+
 def check_distribution_name() -> str:
     """The PyPI distribution name, wherever it is written by hand.
 
@@ -778,6 +871,7 @@ def main() -> int:
         check_changelog(authority),
         check_recipe_references(),
         check_markdown_tables(),
+        check_front_page_versions(),
         check_distribution_name(),
     ]
 
