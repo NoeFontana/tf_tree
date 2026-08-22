@@ -31,7 +31,29 @@ is a bug.
 
 ---
 
-## [Unreleased]
+## [0.0.4] — 2026-08-22 (the slot a killed participant keeps)
+
+**One defect, present for the project's whole life, is the reason this release
+exists.** A shared arena granted participant slots and took one back only when
+the process holding it ran `Drop`. A `SIGKILL`ed writer does not, so sixty-four
+abnormal read-write exits — over an arena's *whole life*, not sixty-four at once
+— wedged it at `NoParticipantSlots` permanently. It hid because **a wedged arena
+scores perfectly**: a ring outlives the process that filled it, so every composed
+read still succeeds, off samples nobody is refreshing.
+
+`docs/decisions/0028` is the record and this release is its whole plan. Three
+collectors now reclaim a dead participant's slot — the owner's slot assigner on
+the next grant that walks past it, the owner's socket-hangup callback, and
+`Tree::reap_participants()` from any read-write participant, which is the only
+one that can reach the owner's own slot. All three share **one** liveness
+predicate and **one** `ParticipantTable::reclaim`, and the predicate is the OFD
+lock byte, which `docs/PHASE2.md` §5.1 is normative is the only fact that may
+answer the question.
+
+**Two things to read before upgrading.** A read-write attach over a bare file
+descriptor is now *refused* — see *Changed — breaking*, which carries the port.
+And `Open::await_open` returned immediately for any whole-second budget in
+`0.0.3`; if you called it that way, you never waited.
 
 ### Added
 
@@ -210,6 +232,42 @@ is a bug.
   test used a sub-second budget, whose remainder never reaches the last
   microsecond of a second, which is why all fifteen rendezvous tests were blind
   to it.
+
+### Known issues
+
+These are the two things `docs/decisions/0028` does **not** fix, plus one of the
+same shape one layer up. Each has a home; none is a surprise waiting to be found.
+
+- **A `fork`ed child keeps its parent's participant slot alive, and the kernel
+  agrees with it.** The client socket is `CLOEXEC` and `fork` does not `exec`, so
+  the child keeps the connection's open file description and the owner never sees
+  `HUP`; and by `docs/PHASE2.md` §6.2 the child holds the participant **lock
+  byte** by the same mechanism. So the byte — which this release makes the whole
+  liveness predicate — answers *alive* for a process that provably cannot
+  participate: no mapping, poisoned `Tree`. None of the three collectors touches
+  it, deliberately, because reclaiming a slot the kernel calls held is the
+  corrupting direction. Reclamation waits for the last inheritor to exit, which
+  for a `multiprocessing` worker pool is the pool's lifetime. `tf_tree doctor`
+  reports this case under `TFT014` with its own message, because the operator
+  response is the opposite of a free byte's. Whether a child-side
+  `pthread_atfork` handler may close the inherited descriptors is
+  `docs/decisions/0030`, which is `draft` — and whose first open question can
+  close it as *rejected*, making this a permanent documented limitation rather
+  than an open hole.
+
+- **An arena whose owner has died cannot be rejoined.** `docs/PHASE2.md` §3.5
+  takeover is unwired, and as of this release the arm that would have reached it
+  refuses with the new `OpenError::TakeoverUnsupported` instead of doing the
+  wrong thing quietly: it `memfd_create`d a *fresh* segment, so a "taker-over"
+  got an empty arena with the same name and none of the state it was inheriting.
+  Recovery is unchanged and is not a signal — every mapping has to go so the
+  segment is freed. `docs/RUNBOOK.md` carries the procedure where an operator
+  will look for it.
+
+- **`Tree::reparent` decides topology-lock liveness from `/proc` even when the
+  tree holds an OFD probe** (issue #213) — the same §5.1 shape this release fixed
+  for participant slots, one layer up, on the one path that takes A2's topology
+  lock. `docs/decisions/0029` is the record and it is `draft`.
 
 ## [0.0.3] — 2026-08-19 (first with a source distribution)
 
