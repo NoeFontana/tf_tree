@@ -1,0 +1,37 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Fast SE(3) screw interpolation via unit dual-quaternion powers."><title>tf_tree::dualquat - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="tf_tree" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module dualquat</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../tf_tree/index.html">tf_tree</a><span class="version">0.0.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module dualquat</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#the-hot-path-spends-no-transcendental-at-all" title="The hot path spends no transcendental at all">The hot path spends no transcendental at all</a></li></ul><h3><a href="#functions">Module Items</a></h3><ul class="block"><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate tf_<wbr>tree</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">tf_tree</a></div><h1>Module <span>dualquat</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"></span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Fast SE(3) screw interpolation via unit dual-quaternion powers.</p>
+<p>The reference geodesic interpolation is <code>a · exp_se3(s · log_se3(a⁻¹·b))</code>
+(see [<code>crate::reference::sclerp</code>]). That route spends two transcendental
+pairs (an <code>atan2</code>+more in <code>log</code>, a <code>sin_cos</code> in <code>exp</code>) and the full <code>V</code>/<code>V⁻¹</code>
+series. The screw form here computes the identical result raising the
+relative transform’s unit dual quaternion to the power <code>s</code>.</p>
+<p>A unit dual quaternion <code>q̂ = q_r + ε q_d</code> of a rigid transform <code>(q, t)</code> has
+<code>q_r = q</code> and <code>q_d = ½·(0,t)⊗q</code>. Its screw parameters are the angle <code>θ</code>,
+pitch translation <code>d</code>, axis direction <code>l</code>, and moment <code>m</code>; the power <code>q̂ˢ</code>
+scales <code>θ</code> and <code>d</code> by <code>s</code> and leaves <code>l</code>, <code>m</code> fixed.</p>
+<h2 id="the-hot-path-spends-no-transcendental-at-all"><a class="doc-anchor" href="#the-hot-path-spends-no-transcendental-at-all">§</a>The hot path spends no transcendental at all</h2>
+<p>Writing <code>φ = θ/2</code>, the screw power needs exactly two scalars from the angle:
+<code>cos(sφ)</code> and <code>sin(sφ)</code>. The naive route computes <code>φ = atan2(sin φ, cos φ)</code>
+and then <code>sincos(sφ)</code> — and, separately, <code>1/sin φ</code> to normalize the axis,
+which is why the old code also needed a <code>sqrt</code> and a near-identity fallback.</p>
+<p>Two observations remove all of it:</p>
+<ol>
+<li><strong><code>sin φ</code> never appears alone.</strong> <code>l = q_v/sin φ</code>, <code>d = −2·q_d.w/sin φ</code>
+and <code>m</code> are each singular as <code>φ → 0</code>, but the <em>products</em> that actually
+reach the result — <code>sin(sφ)·l</code>, <code>m·sin(sφ)</code>, <code>½sd·sin(sφ)</code> — are all
+finite, because every <code>1/sin φ</code> cancels against a <code>sin(sφ)</code> or a
+<code>q_v ∝ sin φ</code>. Grouping the algebra that way deletes the <code>sqrt</code>, both
+divisions by <code>sin φ</code>, and the reason the <code>SCREW_SMALL</code> fallback existed.</li>
+<li><strong><code>sin(sφ)/sin(φ)</code> is the slerp weight.</strong> It is the same function
+[<code>crate::interp</code>] already evaluates as a transcendental-free polynomial in
+<code>u = φ²</code>, valid over the same range, for the same reason (the two samples
+are adjacent on one edge, so <code>φ</code> is milliradians). With
+<code>w = sin(sφ)/sin φ</code> and <code>wa = sin((1−s)φ)/sin φ</code> in hand,
+<code>cos(sφ) = wa + w·cos φ</code> — an all-positive sum for <code>s ∈ [0,1]</code> and
+<code>cos φ ≥ 0</code>, so it cancels nothing.</li>
+</ol>
+<p>What remains on the fast path is two Horner polynomials, one reciprocal and
+multiply–adds: <strong>no <code>sqrt</code>, no <code>atan2</code>, no <code>sincos</code>, no division by a
+quantity that approaches zero.</strong></p>
+</div></details><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.screw_pow.html" title="fn tf_tree::dualquat::screw_pow">screw_<wbr>pow</a></dt><dd>Raise the rigid transform <code>rel</code> to the real power <code>s</code> along its screw axis.</dd><dt><a class="fn" href="fn.screw_pow_with_twist.html" title="fn tf_tree::dualquat::screw_pow_with_twist">screw_<wbr>pow_<wbr>with_<wbr>twist</a></dt><dd><a href="fn.screw_pow.html" title="fn tf_tree::dualquat::screw_pow"><code>screw_pow</code></a>, plus the segment’s body twist <code>ξ = log_se3(rel)</code> <strong>per unit
+<code>s</code></strong> — <code>docs/PHASE4.md</code> §2.3.</dd><dt><a class="fn" href="fn.screw_twist.html" title="fn tf_tree::dualquat::screw_twist">screw_<wbr>twist</a></dt><dd>The segment’s body twist <code>ξ = log_se3(rel)</code> <strong>without</strong> raising <code>rel</code> to any
+power — <code>docs/PHASE4.md</code> §2.3.</dd></dl></section></div></main></body></html>

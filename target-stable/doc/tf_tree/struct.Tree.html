@@ -1,0 +1,329 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="A transform tree: a fixed-capacity arena plus the ergonomic operations for publishing samples and looking up transforms. Build one with `TreeBuilder`."><title>Tree in tf_tree - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="tf_tree" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc struct"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Tree</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../tf_tree/index.html">tf_tree</a><span class="version">0.0.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Tree</a></h2><h3><a href="#implementations">Methods</a></h3><ul class="block method"><li><a href="#method.arena_size_bytes" title="arena_size_bytes">arena_size_bytes</a></li><li><a href="#method.await_frames" title="await_frames">await_frames</a></li><li><a href="#method.boot_id" title="boot_id">boot_id</a></li><li><a href="#method.claim" title="claim">claim</a></li><li><a href="#method.claim_owned" title="claim_owned">claim_owned</a></li><li><a href="#method.describe" title="describe">describe</a></li><li><a href="#method.detached" title="detached">detached</a></li><li><a href="#method.edges" title="edges">edges</a></li><li><a href="#method.frame" title="frame">frame</a></li><li><a href="#method.frames" title="frames">frames</a></li><li><a href="#method.guard" title="guard">guard</a></li><li><a href="#method.instance_uuid" title="instance_uuid">instance_uuid</a></li><li><a href="#method.is_shared" title="is_shared">is_shared</a></li><li><a href="#method.is_writable" title="is_writable">is_writable</a></li><li><a href="#method.lookup" title="lookup">lookup</a></li><li><a href="#method.participant_alive" title="participant_alive">participant_alive</a></li><li><a href="#method.participant_slot" title="participant_slot">participant_slot</a></li><li><a href="#method.plan" title="plan">plan</a></li><li><a href="#method.reparent" title="reparent">reparent</a></li></ul><h3><a href="#trait-implementations">Trait Implementations</a></h3><ul class="block trait-implementation"><li><a href="#impl-Drop-for-Tree" title="Drop">Drop</a></li></ul><h3><a href="#synthetic-implementations">Auto Trait Implementations</a></h3><ul class="block synthetic-implementation"><li><a href="#impl-Freeze-for-Tree" title="!Freeze">!Freeze</a></li><li><a href="#impl-RefUnwindSafe-for-Tree" title="!RefUnwindSafe">!RefUnwindSafe</a></li><li><a href="#impl-UnwindSafe-for-Tree" title="!UnwindSafe">!UnwindSafe</a></li><li><a href="#impl-Send-for-Tree" title="Send">Send</a></li><li><a href="#impl-Sync-for-Tree" title="Sync">Sync</a></li><li><a href="#impl-Unpin-for-Tree" title="Unpin">Unpin</a></li><li><a href="#impl-UnsafeUnpin-for-Tree" title="UnsafeUnpin">UnsafeUnpin</a></li></ul><h3><a href="#blanket-implementations">Blanket Implementations</a></h3><ul class="block blanket-implementation"><li><a href="#impl-Any-for-T" title="Any">Any</a></li><li><a href="#impl-Borrow%3CT%3E-for-T" title="Borrow&#60;T&#62;">Borrow&#60;T&#62;</a></li><li><a href="#impl-BorrowMut%3CT%3E-for-T" title="BorrowMut&#60;T&#62;">BorrowMut&#60;T&#62;</a></li><li><a href="#impl-From%3CT%3E-for-T" title="From&#60;T&#62;">From&#60;T&#62;</a></li><li><a href="#impl-Into%3CU%3E-for-T" title="Into&#60;U&#62;">Into&#60;U&#62;</a></li><li><a href="#impl-TryFrom%3CU%3E-for-T" title="TryFrom&#60;U&#62;">TryFrom&#60;U&#62;</a></li><li><a href="#impl-TryInto%3CU%3E-for-T" title="TryInto&#60;U&#62;">TryInto&#60;U&#62;</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate tf_<wbr>tree</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">tf_tree</a></div><h1>Struct <span class="struct">Tree</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/tf_tree/tree.rs.html#1183-1301">Source</a> </span></div><pre class="rust item-decl"><code>pub struct Tree { <span class="comment">/* private fields */</span> }</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>A transform tree: a fixed-capacity arena plus the ergonomic operations for
+publishing samples and looking up transforms. Build one with <a href="struct.TreeBuilder.html" title="struct tf_tree::TreeBuilder"><code>TreeBuilder</code></a>.</p>
+<p><code>Send + Sync</code>: the arena’s interior mutation is all atomic, the single runtime
+topology mutation (<a href="struct.Tree.html#method.reparent" title="method tf_tree::Tree::reparent"><code>Self::reparent</code></a>) is serialized by the in-arena topology
+lock (<code>docs/PHASE2.md</code> §1, A2) behind a process-local mutex, and lookups are
+read-only. Share one <code>Tree</code> across threads; each reader compiles or caches its
+own <a href="struct.Plan.html" title="struct tf_tree::Plan"><code>crate::Plan</code></a>s.</p>
+</div></details><h2 id="implementations" class="section-header">Implementations<a href="#implementations" class="anchor">§</a></h2><div id="implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-Tree" class="impl"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1303-2900">Source</a><a href="#impl-Tree" class="anchor">§</a><h3 class="code-header">impl <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.detached" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1313-1323">Source</a><h4 class="code-header">pub fn <a href="#method.detached" class="fn">detached</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this tree belongs to a process that no longer exists — it was
+opened before a <code>fork()</code> and this is the child.</p>
+<p>One relaxed load of a process-local counter; see <code>tf_tree_ipc::fork</code>
+for why it is not <code>getpid()</code>.</p>
+<p>A detached tree is not repairable. Open a new one in the child, or
+<code>exec</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.frame" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1380-1396">Source</a><h4 class="code-header">pub fn <a href="#method.frame" class="fn">frame</a>(&amp;self, name: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>, <a class="enum" href="enum.FrameError.html" title="enum tf_tree::FrameError">FrameError</a>&gt;</h4></section></summary><div class="docblock"><p>Resolve a frame name to its stable id.</p>
+<p>A name declared at build time resolves to its existing id without
+consuming a slot. A name that was never declared is interned on demand,
+which needs a free frame slot (see <a href="struct.TreeBuilder.html#method.frame_headroom" title="method tf_tree::TreeBuilder::frame_headroom"><code>TreeBuilder::frame_headroom</code></a>).</p>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p><strong><a href="enum.FrameError.html#variant.ReadOnly" title="variant tf_tree::FrameError::ReadOnly"><code>FrameError::ReadOnly</code></a> if this tree is a read-only attachment and
+<code>name</code> is not already interned</strong> — which is the most common failure on
+the default attach (<code>Open::new</code> is read-only, D18), and the one
+this section used not to mention at all. It is not a permissions
+complaint about a name that exists: it means <em>this name is not declared
+and I cannot declare it</em>. A consumer racing its publisher wants
+<a href="struct.Tree.html#method.await_frames" title="method tf_tree::Tree::await_frames"><code>Tree::await_frames</code></a>; a consumer that will never see the name declared
+wants the creator to declare it, or <code>frame_headroom</code> and a writable
+attach.</p>
+<p>Also <a href="enum.FrameError.html#variant.CapacityExceeded" title="variant tf_tree::FrameError::CapacityExceeded"><code>FrameError::CapacityExceeded</code></a> if the frame table is full,
+<a href="enum.FrameError.html#variant.FrameHashCollision" title="variant tf_tree::FrameError::FrameHashCollision"><code>FrameError::FrameHashCollision</code></a> if a name hash collides,
+<a href="enum.FrameError.html#variant.InternContended" title="variant tf_tree::FrameError::InternContended"><code>FrameError::InternContended</code></a> if another interner holds the name’s
+slot and cannot be judged, and <a href="enum.FrameError.html#variant.ChildDetached" title="variant tf_tree::FrameError::ChildDetached"><code>FrameError::ChildDetached</code></a> on a tree
+inherited across a <code>fork()</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.frames" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1436-1486">Source</a><h4 class="code-header">pub fn <a href="#method.frames" class="fn">frames</a>(&amp;self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>Every interned frame’s name, in <a href="struct.FrameId.html" title="struct tf_tree::FrameId"><code>FrameId</code></a> order.</p>
+<p>The stable answer to “what is in this tree”, and the plural of
+<a href="struct.Tree.html#method.frame" title="method tf_tree::Tree::frame"><code>Tree::frame</code></a>. It is on the <em>stable</em> surface deliberately: an embedder
+must not have to enable the <code>unstable</code> feature to ask what their own tree
+contains, which is what gating <code>Tree::arena_view</code> would otherwise have
+forced (<code>docs/API.md</code> §2.6, §7 check 1). Python has had <code>tree.frames()</code>
+since §3.2 and this is its mirror.</p>
+<h5 id="names-only"><a class="doc-anchor" href="#names-only">§</a>Names only</h5>
+<p>No rate, no jitter, no sample count. That is <code>docs/PHASE5.md</code> §4.2’s
+<code>ds.edges()</code> and it stays held back until §3’s counting pass exists —
+the same line the Python surface draws.</p>
+<h5 id="the-snapshot-is-a-snapshot"><a class="doc-anchor" href="#the-snapshot-is-a-snapshot">§</a>The snapshot is a snapshot</h5>
+<p>On a live shared arena another process may intern a frame while this
+walk runs, so the list is what was true at some instant inside the call,
+exactly as <a href="struct.Plan.html#method.latest" title="method tf_tree::Plan::latest"><code>crate::Plan::latest</code></a> already is. Frames are append-only, so
+what it <em>does</em> promise is that nothing in it will be removed or renamed;
+a later call can only be longer.</p>
+<p>A slot whose id has been counted but whose record is not yet written is
+skipped rather than reported with an empty name — see the walk’s own
+comments for what that filter is and, more importantly, what it is not.</p>
+<p><code>frame_count</code> over-counts by one when a frame is abandoned mid-intern
+(<code>tf_tree_core::frame</code>’s <code>finish</code>: the record “stays written but
+unreferenced”), and that abandoned record carries a real name and a
+non-zero hash, so it lands here at a second id. <code>len()</code> is therefore an
+upper bound on the tree’s frames, not the frame count.</p>
+<h5 id="errors-1"><a class="doc-anchor" href="#errors-1">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.ChildDetached" title="variant tf_tree::LookupError::ChildDetached"><code>LookupError::ChildDetached</code></a> on a tree inherited across a <code>fork()</code>.
+Such a tree reads a one-frame poison arena, so answering would hand back
+a plausible-looking short list instead of naming the fork.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.await_frames" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1595-1662">Source</a><h4 class="code-header">pub fn <a href="#method.await_frames" class="fn">await_frames</a>&lt;const N: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>&gt;(
+    &amp;self,
+    names: [&amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.array.html">N</a>],
+    timeout: <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/time/struct.Duration.html" title="struct core::time::Duration">Duration</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;[<a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.array.html">N</a>], <a class="enum" href="enum.AwaitError.html" title="enum tf_tree::AwaitError">AwaitError</a>&gt;</h4></section></summary><div class="docblock"><p>Wait until every name in <code>names</code> is interned, and return their ids.</p>
+<p><strong>The second of <code>docs/decisions/0019</code> §2b’s two waits.</strong>
+<code>Open::await_open</code> waits for the <em>arena</em> to exist; this waits
+for <em>names</em> to be interned into an arena that already does. They are two
+different absences, and a consumer that started before its publisher
+meets both.</p>
+<p>Array in, array out, and <strong>no allocation</strong>: <code>N</code> is a const generic, and
+ids found on an early iteration are memoized rather than re-probed —
+which is legal because frames are append-only (D10), so a name once found
+cannot become unfound. That memoization is a <em>cost</em> property only:
+<code>find_frame</code> is idempotent, so dropping it would return the same ids,
+just after re-hashing every already-resolved name on every iteration. No
+assertion anywhere observes it, and <code>tests/rendezvous.rs</code> says so rather
+than claiming a guard it does not have.</p>
+<h5 id="the-predicate-is-find_frame-and-two-handles-are-refused-outright"><a class="doc-anchor" href="#the-predicate-is-find_frame-and-two-handles-are-refused-outright">§</a>The predicate is <code>find_frame</code>, and two handles are refused outright</h5>
+<p>The wait polls the arena’s intern table directly, never <a href="struct.Tree.html#method.frame" title="method tf_tree::Tree::frame"><code>Tree::frame</code></a>,
+which is the wrong predicate in <em>both</em> modes for opposite reasons: on a
+read-only arena it answers <a href="enum.FrameError.html#variant.ReadOnly" title="variant tf_tree::FrameError::ReadOnly"><code>FrameError::ReadOnly</code></a> for an absent name —
+so the wait would never resolve — and on a writable one it <strong>interns and
+succeeds immediately</strong>. The second is the dangerous one: it is a
+confident wrong answer, an id for a name nobody declared.</p>
+<p>So a writable tree gets <a href="enum.AwaitError.html#variant.WritableTree" title="variant tf_tree::AwaitError::WritableTree"><code>AwaitError::WritableTree</code></a> rather than a
+silently-chosen meaning, before any sleep. A publisher already has
+<a href="struct.Tree.html#method.frame" title="method tf_tree::Tree::frame"><code>Tree::frame</code></a>, which on its tree cannot fail for absence. A frozen
+<code>.tft</code> gets <a href="enum.AwaitError.html#variant.FrozenTree" title="variant tf_tree::AwaitError::FrozenTree"><code>AwaitError::FrozenTree</code></a> for the sibling reason: it has no
+writers, so the poll is futile by construction.</p>
+<p><strong>Which gate pins which half</strong>, because they are not the same gate. The
+<code>WritableTree</code> refusal is <code>tests/await_frames.rs</code> under plain
+<code>just test</code>; <code>FrozenTree</code> is <code>tests/frozen.rs</code> under <code>just shm-check</code>;
+and the choice of <code>find_frame</code> over <a href="struct.Tree.html#method.frame" title="method tf_tree::Tree::frame"><code>Tree::frame</code></a> can only be observed
+on a <em>read-only</em> handle, which a default build cannot construct at all —
+it is pinned by <code>a_consumer_waits_for_a_frame_interned_after_the_arena_exists</code>
+in <code>tests/rendezvous.rs</code>, under <code>just shm-rendezvous</code>, and nowhere else.</p>
+<h5 id="granularity"><a class="doc-anchor" href="#granularity">§</a>Granularity</h5>
+<p>A bounded poll — <code>MIN_BACKOFF</code> 200 µs doubling to <code>MAX_BACKOFF</code> 4 ms,
+this crate’s pair, shared with <code>Open::await_open</code> — not a notification.
+<code>docs/decisions/0018</code> records
+why there is no arena-resident primitive to wake on (a <code>PROT_READ</code>
+consumer cannot register on one without giving up D18’s boundary), and
+the argument applies here with more force because topology settles once,
+at startup. This therefore returns <em>later</em> than the name appeared, by up
+to one backoff interval plus scheduler granularity.</p>
+<h5 id="errors-2"><a class="doc-anchor" href="#errors-2">§</a>Errors</h5>
+<p><a href="enum.AwaitError.html#variant.WritableTree" title="variant tf_tree::AwaitError::WritableTree"><code>AwaitError::WritableTree</code></a> immediately on a writable tree;
+<a href="enum.AwaitError.html#variant.FrozenTree" title="variant tf_tree::AwaitError::FrozenTree"><code>AwaitError::FrozenTree</code></a> immediately on a frozen <code>.tft</code>;
+<a href="enum.AwaitError.html#variant.ChildDetached" title="variant tf_tree::AwaitError::ChildDetached"><code>AwaitError::ChildDetached</code></a> on a tree inherited across a <code>fork()</code>;
+<a href="enum.AwaitError.html#variant.Frame" title="variant tf_tree::AwaitError::Frame"><code>AwaitError::Frame</code></a> if a name resolves to a hash collision or a
+contended interner; <a href="enum.AwaitError.html#variant.Timeout" title="variant tf_tree::AwaitError::Timeout"><code>AwaitError::Timeout</code></a> carrying the hash of the
+<strong>first</strong> name still missing when the budget ran out — first in <code>names</code>
+order, not first probed, so a request whose leading names resolved names
+the earliest one that did not.</p>
+<h5 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h5>
+<p>The refusal, which is the part of the contract a caller most needs to
+know and the only part reachable without a shared arena:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>std::time::Duration;
+<span class="kw">use </span>tf_tree::{AwaitError, Iso3, TreeBuilder};
+
+<span class="kw">let </span>tree = TreeBuilder::new()
+    .static_edge(<span class="string">"map"</span>, <span class="string">"odom"</span>, <span class="kw-2">&amp;</span>Iso3::IDENTITY)
+    .build()
+    .expect(<span class="string">"layout"</span>);
+
+<span class="comment">// A heap tree is writable, so `Tree::frame` would intern "no_such_frame"
+// on demand and hand back an id for a frame nobody declared. This says so
+// instead — and says it in microseconds, not after the five seconds.
+</span><span class="kw">let </span>started = std::time::Instant::now();
+<span class="macro">assert_eq!</span>(
+    tree.await_frames([<span class="string">"map"</span>, <span class="string">"no_such_frame"</span>], Duration::from_secs(<span class="number">5</span>)),
+    <span class="prelude-val">Err</span>(AwaitError::WritableTree),
+);
+<span class="macro">assert!</span>(started.elapsed() &lt; Duration::from_millis(<span class="number">100</span>));
+
+<span class="comment">// On that tree the right call is `Tree::frame`, which cannot fail for
+// absence.
+</span><span class="macro">assert!</span>(tree.frame(<span class="string">"map"</span>).is_ok());</code></pre></div>
+<p>And the consumer this method exists for — <code>docs/decisions/0019</code> §2b’s
+startup sequence. <strong><code>text</code>, not <code>rust</code>, and that is the record’s own
+deliberate choice</strong>: the three calls yield <code>OpenError</code>, <code>AwaitError</code> and
+<a href="enum.LookupError.html" title="enum tf_tree::LookupError"><code>LookupError</code></a>, and <code>LookupError</code> implements neither <code>Display</code> nor
+<code>Error</code>, so no single <code>?</code>-chain unifies them — not even into
+<code>Box&lt;dyn Error&gt;</code>. It also needs a live arena and <code>--features shm</code>.</p>
+<div class="example-wrap"><pre class="language-text"><code>// Two waits, because they are two different absences.
+let tree = tf_tree::Open::new()
+    .mode(AttachMode::ReadOnly)                      // implies CreatePolicy::Never
+    .await_open(Duration::from_secs(5))?;            // wait for the arena
+let [target, source] =
+    tree.await_frames([&quot;map&quot;, &quot;base_link&quot;], Duration::from_secs(5))?;
+let plan = tree.plan(target, source)?;</code></pre></div></div></details><details class="toggle method-toggle" open><summary><section id="method.edges" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1694-1732">Source</a><h4 class="code-header">pub fn <a href="#method.edges" class="fn">edges</a>(&amp;self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;(<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>)&gt;, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>Every declared edge as a <code>(parent, child)</code> name pair, in <a href="struct.EdgeId.html" title="struct tf_tree::EdgeId"><code>EdgeId</code></a>
+order.</p>
+<p>The stable mirror of Python’s <code>tree.edges()</code> (<code>docs/API.md</code> §3.2), and
+on the stable surface for <a href="struct.Tree.html#method.frames" title="method tf_tree::Tree::frames"><code>Tree::frames</code></a>’s reason.</p>
+<p><code>(parent, child)</code> is <a href="struct.TreeBuilder.html#method.dynamic_edge" title="method tf_tree::TreeBuilder::dynamic_edge"><code>TreeBuilder::dynamic_edge</code></a>’s argument order, so
+the list reads back the way it was written — but it rebuilds the <em>graph</em>
+only: the pair does not report the edge’s kind, and telling a static edge
+from a dynamic one is <code>tf_tree::unstable::EdgeKind</code>’s job, which is
+arena-shaped and therefore unstable (<code>docs/API.md</code> §2.6).</p>
+<p>The pair is read out of the <a href="struct.EdgeId.html" title="struct tf_tree::EdgeId"><code>EdgeId</code></a>’s own record, which is the
+<em>declared</em> topology. <a href="struct.Tree.html#method.reparent" title="method tf_tree::Tree::reparent"><code>Tree::reparent</code></a> moves a child under a new parent
+without rewriting that record, so on a reparented tree this names the
+edge’s declaration and the live topology block names its current parent.
+They can disagree, and every other listing in this workspace makes the
+same choice: one answer that is wrong after a reparent beats two answers
+that disagree with each other.</p>
+<h5 id="names-only-1"><a class="doc-anchor" href="#names-only-1">§</a>Names only</h5>
+<p>See <a href="struct.Tree.html#method.frames" title="method tf_tree::Tree::frames"><code>Tree::frames</code></a> — the statistics half is <code>docs/PHASE5.md</code> §4.2’s and
+is held back on every surface, not just this one.</p>
+<h5 id="errors-3"><a class="doc-anchor" href="#errors-3">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.ChildDetached" title="variant tf_tree::LookupError::ChildDetached"><code>LookupError::ChildDetached</code></a> on a tree inherited across a <code>fork()</code>.
+The poison arena such a tree reads has zero edges, so without this the
+answer is a silent empty list.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.reparent" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1758-1785">Source</a><h4 class="code-header">pub fn <a href="#method.reparent" class="fn">reparent</a>(
+    &amp;self,
+    child: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+    new_parent: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="enum" href="enum.ReparentError.html" title="enum tf_tree::ReparentError">ReparentError</a>&gt;</h4></section></summary><div class="docblock"><p>Re-parent an existing <code>child</code> frame under <code>new_parent</code>, reusing the child’s
+already-declared edge (no new capacity is allocated). This is the only
+runtime topology mutation; it bumps the topology generation, invalidating
+compiled <a href="struct.Plan.html" title="struct tf_tree::Plan"><code>crate::Plan</code></a>s so they recompile against the new shape.</p>
+<h5 id="serialization-docsphase2md-1-a2"><a class="doc-anchor" href="#serialization-docsphase2md-1-a2">§</a>Serialization (<code>docs/PHASE2.md</code> §1, A2)</h5>
+<p>Two locks, doing two different jobs:</p>
+<ul>
+<li><code>self.decl</code>, a plain <code>Mutex</code>, keeps <em>this</em> process’s threads out of
+each other’s way. It serializes nothing across a process boundary and
+never did; it is kept because it is free and stops two threads of one
+process burning the arena lock’s spin budget against each other.</li>
+<li>The <strong>in-arena</strong> [<code>TopoLockView</code>] is the real one. Its word lives in
+the header, so every participant that mapped the segment contends on
+the same bytes, and it is stealable from a participant that died
+holding it — which is why this is no longer refused on a shared arena.</li>
+</ul>
+<h5 id="errors-4"><a class="doc-anchor" href="#errors-4">§</a>Errors</h5>
+<p><a href="enum.ReparentError.html#variant.NoEdge" title="variant tf_tree::ReparentError::NoEdge"><code>ReparentError::NoEdge</code></a> if <code>child</code> has no incoming edge to reuse,
+<a href="enum.ReparentError.html#variant.Topology" title="variant tf_tree::ReparentError::Topology"><code>ReparentError::Topology</code></a> if the move would create a cycle or references
+an out-of-range frame, or <a href="enum.ReparentError.html#variant.LockContended" title="variant tf_tree::ReparentError::LockContended"><code>ReparentError::LockContended</code></a> if a live peer
+holds the topology lock (retry).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.claim" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1796-1858">Source</a><h4 class="code-header">pub fn <a href="#method.claim" class="fn">claim</a>(
+    &amp;self,
+    child: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+    parent: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.EdgeWriter.html" title="struct tf_tree::EdgeWriter">EdgeWriter</a>&lt;'_&gt;, <a class="enum" href="enum.ClaimApiError.html" title="enum tf_tree::ClaimApiError">ClaimApiError</a>&gt;</h4></section></summary><div class="docblock"><p>Claim exclusive write access to the dynamic edge whose child is <code>child</code>
+(and whose parent must be <code>parent</code>). Returns a <a href="struct.Publisher.html" title="struct tf_tree::Publisher"><code>Publisher</code></a>; dropping it
+releases the claim.</p>
+<h5 id="errors-5"><a class="doc-anchor" href="#errors-5">§</a>Errors</h5>
+<p><a href="enum.ClaimApiError.html" title="enum tf_tree::ClaimApiError"><code>ClaimApiError</code></a> if <code>child</code> is unknown, no edge attaches it, the parent
+does not match, the edge carries no sample ring (it is static or
+tombstoned), or the edge is already claimed.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.claim_owned" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#1889-1946">Source</a><h4 class="code-header">pub fn <a href="#method.claim_owned" class="fn">claim_owned</a>(
+    self: &amp;<a class="struct" href="https://doc.rust-lang.org/1.97.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;<a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a>&gt;,
+    child: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+    parent: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.OwnedWriter.html" title="struct tf_tree::OwnedWriter">OwnedWriter</a>, <a class="enum" href="enum.ClaimApiError.html" title="enum tf_tree::ClaimApiError">ClaimApiError</a>&gt;</h4></section></summary><div class="docblock"><p>Claim <code>child</code>’s edge, keeping the tree alive for as long as the writer
+lives (<code>docs/decisions/0017</code>).</p>
+<p>The scoped <a href="struct.Tree.html#method.claim" title="method tf_tree::Tree::claim"><code>Tree::claim</code></a> is preferable where the claim’s scope is
+lexical — the borrow checker then enforces the claim’s lifetime for free.
+Use this where the writer is <em>stored</em>: a node that publishes for the life
+of the process, or a binding whose handle type cannot carry a lifetime.
+See <a href="struct.OwnedWriter.html" title="struct tf_tree::OwnedWriter"><code>OwnedWriter</code></a> for the full argument, and <code>docs/API.md</code> §2.1 for the
+rule this exists to satisfy.</p>
+<h5 id="why-self-arcself-and-not-arctree-by-value"><a class="doc-anchor" href="#why-self-arcself-and-not-arctree-by-value">§</a>Why <code>self: &amp;Arc&lt;Self&gt;</code> and not <code>Arc&lt;Tree&gt;</code> by value</h5>
+<p>By value would force a clone at every call site that already holds the
+handle, and it reads as though the tree were consumed. This spelling
+makes the refcount bump an implementation detail while keeping the real
+requirement — that the tree is <em>already</em> shared — visible in the
+signature. It also means the method is simply unavailable on a <code>Tree</code> a
+caller owns outright, which is the correct answer: they should be using
+<a href="struct.Tree.html#method.claim" title="method tf_tree::Tree::claim"><code>Tree::claim</code></a>.</p>
+<h5 id="cost"><a class="doc-anchor" href="#cost">§</a>Cost</h5>
+<p>Exactly <a href="struct.Tree.html#method.claim" title="method tf_tree::Tree::claim"><code>Tree::claim</code></a> plus one <code>Arc</code> strong-count increment, paid once
+at claim time. Nothing is added to <code>push</code>.</p>
+<h5 id="errors-6"><a class="doc-anchor" href="#errors-6">§</a>Errors</h5>
+<p><a href="enum.ClaimApiError.html" title="enum tf_tree::ClaimApiError"><code>ClaimApiError</code></a>, exactly as <a href="struct.Tree.html#method.claim" title="method tf_tree::Tree::claim"><code>Tree::claim</code></a> — this is that call with
+the tree’s own handle stapled to the result.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.plan" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2017-2059">Source</a><h4 class="code-header">pub fn <a href="#method.plan" class="fn">plan</a>(
+    &amp;self,
+    target: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+    source: <a class="struct" href="struct.FrameId.html" title="struct tf_tree::FrameId">FrameId</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>Compile a <code>lookup(target, source)</code> path into a reusable <a href="struct.Plan.html" title="struct tf_tree::Plan"><code>crate::Plan</code></a>.</p>
+<h5 id="errors-7"><a class="doc-anchor" href="#errors-7">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.Disconnected" title="variant tf_tree::LookupError::Disconnected"><code>LookupError::Disconnected</code></a> / <a href="enum.LookupError.html#variant.TreeTooDeep" title="variant tf_tree::LookupError::TreeTooDeep"><code>LookupError::TreeTooDeep</code></a> as
+[<code>compile</code>].</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.guard" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2106-2132">Source</a><h4 class="code-header">pub fn <a href="#method.guard" class="fn">guard</a>(&amp;self) -&gt; <a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;</h4></section></summary><div class="docblock"><p>A fresh <a href="struct.Guard.html" title="struct tf_tree::Guard"><code>Guard</code></a> pinning the current topology generation for a batch of
+lookups.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.lookup" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2150-2172">Source</a><h4 class="code-header">pub fn <a href="#method.lookup" class="fn">lookup</a>&lt;D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>&gt;(
+    &amp;self,
+    target: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    source: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    stamp: <a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>Convenience lookup by name at a stamp: interns the names, compiles (or
+reuses a cached) <a href="struct.Plan.html" title="struct tf_tree::Plan"><code>crate::Plan</code></a>, and evaluates it. Keeps a small
+per-thread plan cache keyed by
+<code>(arena, target, source, generation)</code>.</p>
+<p>The <code>arena</code> component identifies the arena this tree reads, and is what
+keeps two trees on one thread from answering for each other (#196): the
+cache is <code>thread_local!</code> and the other three components agree across two
+similarly-built trees as a matter of course. Two handles onto one shared
+segment deliberately share it — one segment is one arena — so a plan
+compiled through either is reused by the other.</p>
+<h5 id="errors-8"><a class="doc-anchor" href="#errors-8">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.UnknownFrame" title="variant tf_tree::LookupError::UnknownFrame"><code>LookupError::UnknownFrame</code></a> if a name was never declared, or any
+compilation / evaluation error.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.arena_size_bytes" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2219-2221">Source</a><h4 class="code-header">pub fn <a href="#method.arena_size_bytes" class="fn">arena_size_bytes</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a></h4></section></summary><div class="docblock"><p>Total size of the backing arena, in bytes.</p>
+<p>Because the arena is sized from the declared edges (decision <code>0004</code>), this
+reflects the dynamic edges’ capacities only: static edges reserve no ring
+slots, so a tree that is mostly static is far smaller than a uniform
+per-edge reservation would be.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.is_shared" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2392-2394">Source</a><h4 class="code-header">pub fn <a href="#method.is_shared" class="fn">is_shared</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this tree’s arena is shared with other processes.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.boot_id" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2442-2444">Source</a><h4 class="code-header">pub fn <a href="#method.boot_id" class="fn">boot_id</a>(&amp;self) -&gt; [<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u8.html">u8</a>; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.array.html">16</a>]</h4></section></summary><div class="docblock"><p>The boot id of the host that created this arena, all 16 bytes.</p>
+<p>Read from the header rather than cached: a <code>Tree</code> that attached to
+somebody else’s segment must report the <em>creator’s</em> boot id, which is
+what makes a segment surviving a reboot detectable (<code>docs/PHASE2.md</code> §1,
+A7).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.is_writable" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2453-2455">Source</a><h4 class="code-header">pub fn <a href="#method.is_writable" class="fn">is_writable</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether this tree may publish — false for a read-only attachment.</p>
+<p>Every mutating method checks this and returns an error rather than
+letting the store reach a <code>PROT_READ</code> page, so callers do not have to;
+it is exposed so a consumer can branch on capability instead of on an
+error it was going to get.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.participant_slot" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2808-2810">Source</a><h4 class="code-header">pub fn <a href="#method.participant_slot" class="fn">participant_slot</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u32.html">u32</a></h4></section></summary><div class="docblock"><p>This process’s own participant slot in the arena’s table.</p>
+<p><code>u32::MAX</code> for a read-only attachment, which takes a lock-file byte but
+writes no arena record — it cannot, the mapping is <code>PROT_READ</code>.</p>
+<p><strong>On a tree that came from <code>tf_tree::Open</code></strong>, the one number that indexes
+both tables (<code>docs/PHASE2.md</code> §3.7): the arena record and the lock-file
+byte are deliberately the same integer, so this is what a caller passes
+to <a href="struct.Tree.html#method.participant_alive" title="method tf_tree::Tree::participant_alive"><code>Self::participant_alive</code></a> to ask about itself.</p>
+<p><strong>On a tree from <code>TreeBuilder::build_shared</code> it indexes one table</strong>,
+because there is no lock file for it to index the other of. That is not a
+smaller version of the same thing: every reclaimer keys on the byte
+(<code>docs/PHASE2.md</code> §5.1), so such a record reads <em>dead</em> to any peer
+carrying a probe, and <code>Tree::reap_participants</code> will free it while this
+process is still publishing. See
+<code>docs/decisions/0031-the-participant-record-with-no-byte.md</code>.</p>
+<p>The three names above are deliberately <strong>not</strong> intra-doc links: this
+method is compiled into the default tier and all three are <code>shm</code>-gated,
+so linking them breaks <code>just stable-tier-check</code>’s rustdoc pass — which is
+the tier a published consumer reads.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.participant_alive" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2825-2845">Source</a><h4 class="code-header">pub fn <a href="#method.participant_alive" class="fn">participant_alive</a>(&amp;self, slot: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u32.html">u32</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether the participant in <code>slot</code> is still running.</p>
+<p>The kernel’s answer for a tree obtained from <code>tf_tree::open</code>, a <code>/proc</code>
+inference otherwise (<code>docs/PHASE2.md</code> §5.1). Exposed because <code>doctor</code>
+and the reaper both need it, and because it is the one predicate whose
+two implementations differ in a way a test can see: a <code>SIGSTOP</code>ped
+holder still holds its lock byte.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.instance_uuid" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2864-2866">Source</a><h4 class="code-header">pub fn <a href="#method.instance_uuid" class="fn">instance_uuid</a>(&amp;self) -&gt; [<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u8.html">u8</a>; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.array.html">16</a>]</h4></section></summary><div class="docblock"><p>Which arena <em>instance</em> this tree is attached to (A7, §3.7).</p>
+<p>All-zero for a heap tree, which is single-process by construction and so
+has no second attacher to disambiguate against.</p>
+<p>Distinct from the arena <em>name</em>: two processes that both resolved
+<code>&lt;runtime_dir&gt;/&lt;domain&gt;/&lt;name&gt;</code> can still hold different segments if the
+owner died and was replaced between their <code>open()</code> calls. Comparing
+names cannot detect that; comparing this can, which is why it appears in
+a <code>Tree</code>’s <code>__repr__</code> and in <code>doctor</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.describe" class="method"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2870-2872">Source</a><h4 class="code-header">pub fn <a href="#method.describe" class="fn">describe</a>(&amp;self, err: <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>) -&gt; <a class="struct" href="struct.Described.html" title="struct tf_tree::Described">Described</a>&lt;'_&gt;</h4></section></summary><div class="docblock"><p>Wrap a <a href="enum.LookupError.html" title="enum tf_tree::LookupError"><code>LookupError</code></a> so its <code>Display</code> resolves ids to frame names.</p>
+</div></details></div></details></div><h2 id="trait-implementations" class="section-header">Trait Implementations<a href="#trait-implementations" class="anchor">§</a></h2><div id="trait-implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-Drop-for-Tree" class="impl"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2931-2960">Source</a><a href="#impl-Drop-for-Tree" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/ops/drop/trait.Drop.html" title="trait core::ops::drop::Drop">Drop</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3><div class="docblock"><p>Best-effort Linux boot id folded to a <code>u64</code> (Phase 2 staleness input); <code>0</code> if
+unavailable. Phase 1 stores it and does nothing else with it.</p>
+</div></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.drop" class="method trait-impl"><a class="src rightside" href="../src/tf_tree/tree.rs.html#2932-2959">Source</a><a href="#method.drop" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/ops/drop/trait.Drop.html#method.drop" class="fn">drop</a>(&amp;mut self)</h4></section></summary><div class='docblock'>Executes the destructor for this type. <a href="https://doc.rust-lang.org/1.97.1/core/ops/drop/trait.Drop.html#method.drop">Read more</a></div></details><details class="toggle method-toggle" open><summary><section id="method.pin_drop" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/ops/drop.rs.html#267">Source</a><a href="#method.pin_drop" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/ops/drop/trait.Drop.html#method.pin_drop" class="fn">pin_drop</a>(self: <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;&amp;mut Self&gt;)</h4></section></summary><span class="item-info"><div class="stab unstable"><span class="emoji">🔬</span><span>This is a nightly-only experimental API. (<code>pin_ergonomics</code>)</span></div></span><div class='docblock'>Execute the destructor for this type, but different to <a href="https://doc.rust-lang.org/1.97.1/core/ops/drop/trait.Drop.html#method.drop" title="method core::ops::drop::Drop::drop"><code>Drop::drop</code></a>, it requires <code>self</code>
+to be pinned. <a href="https://doc.rust-lang.org/1.97.1/core/ops/drop/trait.Drop.html#method.pin_drop">Read more</a></div></details></div></details></div><h2 id="synthetic-implementations" class="section-header">Auto Trait Implementations<a href="#synthetic-implementations" class="anchor">§</a></h2><div id="synthetic-implementations-list"><section id="impl-Freeze-for-Tree" class="impl"><a href="#impl-Freeze-for-Tree" class="anchor">§</a><h3 class="code-header">impl !<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Freeze.html" title="trait core::marker::Freeze">Freeze</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section><section id="impl-RefUnwindSafe-for-Tree" class="impl"><a href="#impl-RefUnwindSafe-for-Tree" class="anchor">§</a><h3 class="code-header">impl !<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/panic/unwind_safe/trait.RefUnwindSafe.html" title="trait core::panic::unwind_safe::RefUnwindSafe">RefUnwindSafe</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section><section id="impl-Send-for-Tree" class="impl"><a href="#impl-Send-for-Tree" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section><section id="impl-Sync-for-Tree" class="impl"><a href="#impl-Sync-for-Tree" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section><section id="impl-Unpin-for-Tree" class="impl"><a href="#impl-Unpin-for-Tree" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Unpin.html" title="trait core::marker::Unpin">Unpin</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section><section id="impl-UnsafeUnpin-for-Tree" class="impl"><a href="#impl-UnsafeUnpin-for-Tree" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.UnsafeUnpin.html" title="trait core::marker::UnsafeUnpin">UnsafeUnpin</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section><section id="impl-UnwindSafe-for-Tree" class="impl"><a href="#impl-UnwindSafe-for-Tree" class="anchor">§</a><h3 class="code-header">impl !<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/panic/unwind_safe/trait.UnwindSafe.html" title="trait core::panic::unwind_safe::UnwindSafe">UnwindSafe</a> for <a class="struct" href="struct.Tree.html" title="struct tf_tree::Tree">Tree</a></h3></section></div><h2 id="blanket-implementations" class="section-header">Blanket Implementations<a href="#blanket-implementations" class="anchor">§</a></h2><div id="blanket-implementations-list"><details class="toggle implementors-toggle"><summary><section id="impl-Any-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/any.rs.html#141">Source</a><a href="#impl-Any-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a> for T<div class="where">where
+    T: 'static + ?<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.type_id" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/any.rs.html#142">Source</a><a href="#method.type_id" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/any/trait.Any.html#tymethod.type_id" class="fn">type_id</a>(&amp;self) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/any/struct.TypeId.html" title="struct core::any::TypeId">TypeId</a></h4></section></summary><div class='docblock'>Gets the <code>TypeId</code> of <code>self</code>. <a href="https://doc.rust-lang.org/1.97.1/core/any/trait.Any.html#tymethod.type_id">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-Borrow%3CT%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#212">Source</a><a href="#impl-Borrow%3CT%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.Borrow.html" title="trait core::borrow::Borrow">Borrow</a>&lt;T&gt; for T<div class="where">where
+    T: ?<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.borrow" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#214">Source</a><a href="#method.borrow" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.Borrow.html#tymethod.borrow" class="fn">borrow</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.reference.html">&amp;T</a></h4></section></summary><div class='docblock'>Immutably borrows from an owned value. <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.Borrow.html#tymethod.borrow">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-BorrowMut%3CT%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#221">Source</a><a href="#impl-BorrowMut%3CT%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.BorrowMut.html" title="trait core::borrow::BorrowMut">BorrowMut</a>&lt;T&gt; for T<div class="where">where
+    T: ?<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.borrow_mut" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#222">Source</a><a href="#method.borrow_mut" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.BorrowMut.html#tymethod.borrow_mut" class="fn">borrow_mut</a>(&amp;mut self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.reference.html">&amp;mut T</a></h4></section></summary><div class='docblock'>Mutably borrows from an owned value. <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.BorrowMut.html#tymethod.borrow_mut">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-From%3CT%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#786">Source</a><a href="#impl-From%3CT%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html" title="trait core::convert::From">From</a>&lt;T&gt; for T</h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.from" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#789">Source</a><a href="#method.from" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html#tymethod.from" class="fn">from</a>(t: T) -&gt; T</h4></section></summary><div class="docblock"><p>Returns the argument unchanged.</p>
+</div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-Into%3CU%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#768-770">Source</a><a href="#impl-Into%3CU%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T, U&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.Into.html" title="trait core::convert::Into">Into</a>&lt;U&gt; for T<div class="where">where
+    U: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html" title="trait core::convert::From">From</a>&lt;T&gt;,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.into" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#778">Source</a><a href="#method.into" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.Into.html#tymethod.into" class="fn">into</a>(self) -&gt; U</h4></section></summary><div class="docblock"><p>Calls <code>U::from(self)</code>.</p>
+<p>That is, this conversion is whatever the implementation of
+<code><a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html" title="trait core::convert::From">From</a>&lt;T&gt; for U</code> chooses to do.</p>
+</div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-TryFrom%3CU%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#828-830">Source</a><a href="#impl-TryFrom%3CU%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T, U&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;U&gt; for T<div class="where">where
+    U: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.Into.html" title="trait core::convert::Into">Into</a>&lt;T&gt;,</div></h3></section></summary><div class="impl-items"><details class="toggle" open><summary><section id="associatedtype.Error-1" class="associatedtype trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#832">Source</a><a href="#associatedtype.Error-1" class="anchor">§</a><h4 class="code-header">type <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" class="associatedtype">Error</a> = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/convert/enum.Infallible.html" title="enum core::convert::Infallible">Infallible</a></h4></section></summary><div class='docblock'>The type returned in the event of a conversion error.</div></details><details class="toggle method-toggle" open><summary><section id="method.try_from" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#835">Source</a><a href="#method.try_from" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#tymethod.try_from" class="fn">try_from</a>(value: U) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;T, &lt;T as <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;U&gt;&gt;::<a class="associatedtype" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" title="type core::convert::TryFrom::Error">Error</a>&gt;</h4></section></summary><div class='docblock'>Performs the conversion.</div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-TryInto%3CU%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#812-814">Source</a><a href="#impl-TryInto%3CU%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T, U&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryInto.html" title="trait core::convert::TryInto">TryInto</a>&lt;U&gt; for T<div class="where">where
+    U: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;T&gt;,</div></h3></section></summary><div class="impl-items"><details class="toggle" open><summary><section id="associatedtype.Error" class="associatedtype trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#816">Source</a><a href="#associatedtype.Error" class="anchor">§</a><h4 class="code-header">type <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryInto.html#associatedtype.Error" class="associatedtype">Error</a> = &lt;U as <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;T&gt;&gt;::<a class="associatedtype" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" title="type core::convert::TryFrom::Error">Error</a></h4></section></summary><div class='docblock'>The type returned in the event of a conversion error.</div></details><details class="toggle method-toggle" open><summary><section id="method.try_into" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#819">Source</a><a href="#method.try_into" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryInto.html#tymethod.try_into" class="fn">try_into</a>(self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;U, &lt;U as <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;T&gt;&gt;::<a class="associatedtype" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" title="type core::convert::TryFrom::Error">Error</a>&gt;</h4></section></summary><div class='docblock'>Performs the conversion.</div></details></div></details></div></section></div></main></body></html>

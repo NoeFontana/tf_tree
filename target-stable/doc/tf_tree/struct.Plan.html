@@ -1,0 +1,363 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="A compiled `lookup(target, source)` path."><title>Plan in tf_tree - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="tf_tree" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc struct"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Plan</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../tf_tree/index.html">tf_tree</a><span class="version">0.0.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Plan</a></h2><h3><a href="#implementations">Methods</a></h3><ul class="block method"><li><a href="#method.at" title="at">at</a></li><li><a href="#method.at_adaptive" title="at_adaptive">at_adaptive</a></li><li><a href="#method.at_many" title="at_many">at_many</a></li><li><a href="#method.at_many_into" title="at_many_into">at_many_into</a></li><li><a href="#method.at_many_into_f32" title="at_many_into_f32">at_many_into_f32</a></li><li><a href="#method.at_with_derivatives" title="at_with_derivatives">at_with_derivatives</a></li><li><a href="#method.domain" title="domain">domain</a></li><li><a href="#method.generation" title="generation">generation</a></li><li><a href="#method.is_empty" title="is_empty">is_empty</a></li><li><a href="#method.latest" title="latest">latest</a></li><li><a href="#method.latest_common" title="latest_common">latest_common</a></li><li><a href="#method.len" title="len">len</a></li><li><a href="#method.query" title="query">query</a></li><li><a href="#method.slowest_nominal_rate_mhz" title="slowest_nominal_rate_mhz">slowest_nominal_rate_mhz</a></li><li><a href="#method.span" title="span">span</a></li><li><a href="#method.steps" title="steps">steps</a></li></ul><h3><a href="#trait-implementations">Trait Implementations</a></h3><ul class="block trait-implementation"><li><a href="#impl-Clone-for-Plan" title="Clone">Clone</a></li><li><a href="#impl-Copy-for-Plan" title="Copy">Copy</a></li><li><a href="#impl-Debug-for-Plan" title="Debug">Debug</a></li></ul><h3><a href="#synthetic-implementations">Auto Trait Implementations</a></h3><ul class="block synthetic-implementation"><li><a href="#impl-Freeze-for-Plan" title="Freeze">Freeze</a></li><li><a href="#impl-RefUnwindSafe-for-Plan" title="RefUnwindSafe">RefUnwindSafe</a></li><li><a href="#impl-Send-for-Plan" title="Send">Send</a></li><li><a href="#impl-Sync-for-Plan" title="Sync">Sync</a></li><li><a href="#impl-Unpin-for-Plan" title="Unpin">Unpin</a></li><li><a href="#impl-UnsafeUnpin-for-Plan" title="UnsafeUnpin">UnsafeUnpin</a></li><li><a href="#impl-UnwindSafe-for-Plan" title="UnwindSafe">UnwindSafe</a></li></ul><h3><a href="#blanket-implementations">Blanket Implementations</a></h3><ul class="block blanket-implementation"><li><a href="#impl-Any-for-T" title="Any">Any</a></li><li><a href="#impl-Borrow%3CT%3E-for-T" title="Borrow&#60;T&#62;">Borrow&#60;T&#62;</a></li><li><a href="#impl-BorrowMut%3CT%3E-for-T" title="BorrowMut&#60;T&#62;">BorrowMut&#60;T&#62;</a></li><li><a href="#impl-CloneToUninit-for-T" title="CloneToUninit">CloneToUninit</a></li><li><a href="#impl-From%3CT%3E-for-T" title="From&#60;T&#62;">From&#60;T&#62;</a></li><li><a href="#impl-Into%3CU%3E-for-T" title="Into&#60;U&#62;">Into&#60;U&#62;</a></li><li><a href="#impl-ToOwned-for-T" title="ToOwned">ToOwned</a></li><li><a href="#impl-TryFrom%3CU%3E-for-T" title="TryFrom&#60;U&#62;">TryFrom&#60;U&#62;</a></li><li><a href="#impl-TryInto%3CU%3E-for-T" title="TryInto&#60;U&#62;">TryInto&#60;U&#62;</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate tf_<wbr>tree</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">tf_tree</a></div><h1>Struct <span class="struct">Plan</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"></span></div><pre class="rust item-decl"><code>pub struct Plan { <span class="comment">/* private fields */</span> }</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>A compiled <code>lookup(target, source)</code> path.</p>
+<p><code>Copy</code>, <code>Send</code>, <code>Sync</code>, heap-free, dependency-free: a fixed <code>[Step; MAX_DEPTH]</code>
+array plus the topology generation it was compiled against. Evaluate it with
+<a href="struct.Plan.html#method.at" title="method tf_tree::Plan::at"><code>Plan::at</code></a> and friends against a <a href="struct.Guard.html" title="struct tf_tree::Guard"><code>Guard</code></a>; a generation mismatch is
+<a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a> (“re-plan”), never a silent stale read.</p>
+</div></details><h2 id="implementations" class="section-header">Implementations<a href="#implementations" class="anchor">§</a></h2><div id="implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-Plan" class="impl"><a href="#impl-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.generation" class="method"><h4 class="code-header">pub fn <a href="#method.generation" class="fn">generation</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u64.html">u64</a></h4></section></summary><div class="docblock"><p>The topology generation this plan was compiled against.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.domain" class="method"><h4 class="code-header">pub fn <a href="#method.domain" class="fn">domain</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u8.html">u8</a></h4></section></summary><div class="docblock"><p>The plan’s time-domain tag (the domain of its dynamic edges; <code>0</code> when the
+plan is all-static or empty).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.steps" class="method"><h4 class="code-header">pub fn <a href="#method.steps" class="fn">steps</a>(&amp;self) -&gt; &amp;[<a class="enum" href="enum.Step.html" title="enum tf_tree::Step">Step</a>]</h4></section></summary><div class="docblock"><p>The compiled steps (post-folding).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.len" class="method"><h4 class="code-header">pub fn <a href="#method.len" class="fn">len</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a></h4></section></summary><div class="docblock"><p>The number of compiled steps.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.is_empty" class="method"><h4 class="code-header">pub fn <a href="#method.is_empty" class="fn">is_empty</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Whether the plan is empty (a <code>lookup(x, x)</code> identity plan).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.at" class="method"><h4 class="code-header">pub fn <a href="#method.at" class="fn">at</a>&lt;D&gt;(&amp;self, g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;, t: <a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p>Evaluate the plan at stamp <code>t</code> (an <code>At(t)</code> query).</p>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<ul>
+<li><a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a> — the topology changed since compilation.</li>
+<li><a href="enum.LookupError.html#variant.TimeDomainMismatch" title="variant tf_tree::LookupError::TimeDomainMismatch"><code>LookupError::TimeDomainMismatch</code></a> — <code>D</code> does not match the plan’s edges.</li>
+<li>Any sampling error from an edge (<a href="enum.LookupError.html#variant.NoData" title="variant tf_tree::LookupError::NoData"><code>LookupError::NoData</code></a>,
+<a href="enum.LookupError.html#variant.Extrapolation" title="variant tf_tree::LookupError::Extrapolation"><code>LookupError::Extrapolation</code></a>, …).</li>
+</ul>
+<h5 id="why-inline--and-what-was-actually-measured"><a class="doc-anchor" href="#why-inline--and-what-was-actually-measured">§</a>Why <code>#[inline]</code> — and what was actually measured</h5>
+<p><code>docs/API.md</code> §2.3 makes the attribute normative on this method, on the
+fold, on <code>Guard::sample</code> and on the <code>Iso3</code> operators (the last already
+carried it). Its stated reason — “Rust does not inline across crates
+without <code>#[inline]</code> or LTO” — <strong>is not why it helps here</strong>, and the
+generated code says so:</p>
+<div><table><thead><tr><th>downstream profile</th><th>before</th><th>after</th></tr></thead><tbody>
+<tr><td><code>lto = false</code>, <code>codegen-units = 16</code> (cargo’s <code>--release</code> default)</td><td>313 ns</td><td>256 ns</td></tr>
+<tr><td><code>lto = "thin"</code>, <code>codegen-units = 1</code> (this workspace’s own)</td><td>217 ns</td><td>207 ns</td></tr>
+</tbody></table>
+</div>
+<p>Depth-3 interpolating lookup, external crate, 20 M iterations, best of
+five. The <code>objdump</code> of that caller explains the shape:</p>
+<div><table><thead><tr><th>attribute placed on</th><th>caller <code>.text</code></th><th>calls left in the caller</th></tr></thead><tbody>
+<tr><td>nothing (the state before)</td><td>106 B</td><td>1 → <code>Plan::fold_at</code></td></tr>
+<tr><td><code>Plan::at</code> <strong>alone</strong></td><td>106 B — <em>byte-identical</em></td><td>1 → <code>Plan::fold_at</code></td></tr>
+<tr><td><code>fold_at</code> alone</td><td>62 B</td><td>1 → <code>Plan::at</code></td></tr>
+<tr><td><code>fold_at</code> + <code>Plan::at</code></td><td>1332 B</td><td>1 → <code>Guard::sample_hinted</code></td></tr>
+<tr><td>all five on this path, as shipped</td><td>1565 B</td><td>3 → <code>sampler</code>, 2× <code>SampleRing::sample_from</code></td></tr>
+</tbody></table>
+</div>
+<p><strong>Five, not six.</strong> <code>Self::fold_at_cursors</code> was marked in the same
+commit and is not on this path at all — no row above ever moved because
+of it. It was measured separately, on the batch entry point that does
+reach it, and removed: see its own doc comment for the numbers. Marking
+it had been symmetry, not measurement.</p>
+<p><strong><code>at</code> is generic, so its MIR crossed the crate boundary anyway and a
+downstream caller was already inlining it.</strong> On its own the attribute
+changes nothing. What it buys is LLVM’s <code>inlinehint</code> on the <em>non-generic</em>
+links: <code>fold_at</code> first — the one real cross-crate call there ever
+was — then this method again, to stop the cost model halting at a
+now-larger <code>at</code>, then <code>Guard::sample*</code> to remove the last one. Marking
+fewer leaves a call in the middle; that is the claim the third and fourth
+rows above test rather than assert.</p>
+<p><strong>The price is the caller’s code size: 106 B → 1565 B at every embedder
+call site</strong>, ~15×, and that is the <em>scalar</em> caller only. It is why
+<code>fold_at_with_derivatives</code>, <code>fold_latest</code> and <code>fold_latest_common</code> are
+deliberately not marked — and why <code>Self::fold_at_cursors</code>, whose price
+on the batch path went unmeasured for a round, no longer is either.</p>
+<p>Note the second row of the first table: <code>lto = "thin"</code> does <strong>not</strong>
+subsume the hint. This workspace’s own profile still moves ~4.5%, so the
+benchmark gate is not indifferent to this change — <code>just bench-ab</code> is
+workspace-wide and was not run. <code>docs/API.md</code> §2.3 item 3 (a gated
+cross-crate row) has since landed and does measure it continuously:
+<code>just embed-cost</code>, and the <code>embedding_cross_crate</code> row of
+<code>docs/PHASE5.md</code> §9.2’s artifact.</p>
+<p><strong>That row reports a ratio over §9.2’s 5% criterion, and it also reports
+the control that says what does close it.</strong> Both columns are the same
+three lines behind <code>#[inline(never)]</code>, one compiled in <code>tf_tree_bench</code>
+and one here; three consecutive runs, <code>taskset</code>-pinned, paired rounds:</p>
+<div><table><thead><tr><th>downstream profile</th><th>out-of-crate</th><th>in-crate</th><th>ratio</th></tr></thead><tbody>
+<tr><td><code>lto = false</code>, <code>codegen-units = 16</code></td><td>240.0–240.1 ns</td><td>191.3–191.8 ns</td><td><strong>1.250–1.254</strong></td></tr>
+<tr><td><code>lto = "thin"</code>, <code>codegen-units = 1</code></td><td>193.0–195.0 ns</td><td>194.2–196.2 ns</td><td>0.994–0.996</td></tr>
+</tbody></table>
+</div>
+<p>So the boundary costs about a quarter of a depth-3 lookup at cargo’s
+<code>--release</code> defaults, and <code>lto = "thin"</code> in the embedder’s own profile
+erases it.</p>
+<p><strong>An earlier revision of this paragraph added “which no <code>#[inline]</code>
+placement closes”. That is removed, because the row’s own toggle refutes
+it.</strong> Dropping this attribute from <code>Plan::fold_at</code> and re-running the
+recipe takes the ratio from 1.253 to <strong>1.001</strong> — inside the gate — by
+making the in-crate column 6.7% slower (191.5 → 204.4 ns) and the
+<code>lto = "thin"</code> control 6.9% slower (193.2 → 206.6 ns), while the
+out-of-crate embedder column gets <em>faster</em> (239.9 → 203.9 ns). A
+placement moves it; what no placement measured here does is improve
+every column at once. Nothing is claimed about whether some other one
+would.</p>
+<p><strong>Do not read 203.9 ns against the 256 ns in the first table.</strong> Those are
+different probes — the first is a throwaway 20 M-iteration loop, this one
+is <code>just embed-cost</code>’s sweep over 1024 off-grid stamps — and only ratios
+within one table are comparable. What both tables agree on is direction,
+and the second is the one that runs on every change.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.at_with_derivatives" class="method"><h4 class="code-header">pub fn <a href="#method.at_with_derivatives" class="fn">at_with_derivatives</a>&lt;D&gt;(
+    &amp;self,
+    g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;,
+    t: <a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Sample.html" title="struct tf_tree::Sample">Sample</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p>Evaluate the plan at <code>t</code>, returning the pose <strong>and its derivatives</strong> —
+<code>docs/PHASE4.md</code> §2.2.</p>
+<h5 id="which-frame-the-twist-is-in--read-this-once"><a class="doc-anchor" href="#which-frame-the-twist-is-in--read-this-once">§</a>Which frame the twist is in — read this once</h5>
+<p>The twist is body-frame (right), <code>V^b = (T⁻¹Ṫ)^∨</code>, expressed in the
+plan’s <strong>source</strong> frame. Use <a href="struct.Twist.html#method.to_spatial" title="method tf_tree::Twist::to_spatial"><code>tf_tree_math::Twist::to_spatial</code></a> with the
+returned pose to get it in the <strong>target</strong> frame.</p>
+<p>It is the source frame because <code>plan(target, source)</code> evaluates
+<code>T_target_source</code>, and <code>T⁻¹Ṫ</code> is by construction resolved in the frame <code>T</code>
+maps <em>from</em>. Concretely, for <code>plan(map, base)</code> where <code>base</code> is rotated
++90° about z and moves along <strong>map</strong>’s +x at 1 m/s:</p>
+<div class="example-wrap"><pre class="language-text"><code>sample.twist.v              == (0, −1, 0)   // resolved in base axes
+sample.twist.to_spatial(&amp;p) == (1,  0, 0)   // resolved in map axes</code></pre></div>
+<p>Both are 1 m/s, so <strong><code>‖v‖</code> is identical and a magnitude check cannot tell
+them apart</strong>. Getting this wrong is wrong by the full rotation
+<code>R_target_source</code>, silently. An earlier revision of this doc comment said
+“target”, which is why the example is here rather than a sentence.</p>
+<p>Costs roughly two plain lookups: the same sampling work, plus one adjoint
+application per plan step (two quaternion rotations and a cross product,
+no transcendentals — see [<code>tf_tree_math::twist</code>]).</p>
+<h5 id="errors-1"><a class="doc-anchor" href="#errors-1">§</a>Errors</h5>
+<p>Everything <a href="struct.Plan.html#method.at" title="method tf_tree::Plan::at"><code>Self::at</code></a> can return, plus:</p>
+<ul>
+<li><a href="enum.LookupError.html#variant.DerivativesUnavailable" title="variant tf_tree::LookupError::DerivativesUnavailable"><code>LookupError::DerivativesUnavailable</code></a> — some edge on the path is
+<code>LerpSlerp</code>, whose body twist is an artifact of the interpolant rather
+than of the motion. Refused rather than returned (§2.4).</li>
+<li><a href="enum.LookupError.html#variant.NoSegment" title="variant tf_tree::LookupError::NoSegment"><code>LookupError::NoSegment</code></a> — an edge has a pose at <code>t</code> but no segment to
+differentiate (one retained sample, or two with equal stamps).</li>
+</ul>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.query" class="method"><h4 class="code-header">pub fn <a href="#method.query" class="fn">query</a>&lt;D&gt;(&amp;self, g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;, q: <a class="enum" href="enum.Query.html" title="enum tf_tree::Query">Query</a>&lt;D&gt;) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p>Dispatch a <a href="enum.Query.html" title="enum tf_tree::Query"><code>Query</code></a> against the plan.</p>
+<h5 id="errors-2"><a class="doc-anchor" href="#errors-2">§</a>Errors</h5>
+<p>As <a href="struct.Plan.html#method.at" title="method tf_tree::Plan::at"><code>Self::at</code></a> / <a href="struct.Plan.html#method.latest" title="method tf_tree::Plan::latest"><code>Self::latest</code></a> / <a href="struct.Plan.html#method.latest_common" title="method tf_tree::Plan::latest_common"><code>Self::latest_common</code></a>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.latest" class="method"><h4 class="code-header">pub fn <a href="#method.latest" class="fn">latest</a>(&amp;self, g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>Sample every dynamic edge at <em>its own</em> newest stamp (freshest per edge).</p>
+<p>The timestamps used may differ between edges — this is the freshest value
+each edge can provide, not a temporally consistent snapshot. Use
+<a href="struct.Plan.html#method.latest_common" title="method tf_tree::Plan::latest_common"><code>Self::latest_common</code></a> when consistency matters.</p>
+<h5 id="errors-3"><a class="doc-anchor" href="#errors-3">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a>, or <a href="enum.LookupError.html#variant.NoData" title="variant tf_tree::LookupError::NoData"><code>LookupError::NoData</code></a> if a dynamic
+edge is empty.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.latest_common" class="method"><h4 class="code-header">pub fn <a href="#method.latest_common" class="fn">latest_common</a>(&amp;self, g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>Sample every dynamic edge at the newest stamp common to all of them (the
+<code>min</code> of their newest stamps) — tf2’s <code>Time(0)</code> semantics.</p>
+<h5 id="errors-4"><a class="doc-anchor" href="#errors-4">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a>, <a href="enum.LookupError.html#variant.NoData" title="variant tf_tree::LookupError::NoData"><code>LookupError::NoData</code></a> if an edge is
+empty, or <a href="enum.LookupError.html#variant.Extrapolation" title="variant tf_tree::LookupError::Extrapolation"><code>LookupError::Extrapolation</code></a> if an edge’s retained window does
+not reach the common stamp.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.span" class="method"><h4 class="code-header">pub fn <a href="#method.span" class="fn">span</a>(&amp;self, g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;(<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.i64.html">i64</a>, <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.i64.html">i64</a>)&gt;, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>The interval over which this plan is answerable, or <code>None</code> when it is
+unbounded (<code>docs/PHASE5.md</code> §4.2).</p>
+<p><a href="struct.Plan.html#method.latest_common" title="method tf_tree::Plan::latest_common"><code>Self::latest_common</code></a> generalised from a point to a range: the
+<strong>intersection</strong> of every dynamic step’s retained window, so the lower end
+is a <code>max</code> and the upper end a <code>min</code>. The upper end is <code>latest_common</code>’s
+own stamp — both are <code>min</code> over <a href="crate::buffer::SampleRing::newest_stamp"><code>SampleRing::newest_stamp</code></a>.</p>
+<p>The two do <em>not</em> share a helper, on purpose: <code>latest_common</code> is a lookup
+path and folding it onto <code>Guard::window</code> would cost it a second atomic
+load and a second mask per edge to compute a lower end it never uses.
+<code>spans_agree_with_latest_common</code> in <code>tests.rs</code> pins the agreement instead.</p>
+<p>It lives here, next to that method and to
+<a href="crate::buffer::SampleRing::retained"><code>SampleRing::retained</code></a>, because the
+definition of a ring’s readable window <strong>has already changed once</strong> — a
+copy of this arithmetic in a binding crate would not have moved with it,
+and would be provable only through that binding’s own test runner.</p>
+<p>Three answers, kept distinct on purpose:</p>
+<ul>
+<li><code>Some((t0, t1))</code> with <code>t0 &lt;= t1</code> — the plan answers there, and nowhere
+else without extrapolating.</li>
+<li><code>Some((t0, t1))</code> with <code>t0 &gt; t1</code> — <strong>an empty intersection is a real
+answer</strong>, not an error: two edges on the path have disjoint histories
+and the caller’s <code>t0 &lt;= t &lt;= t1</code> is correctly false everywhere.
+Collapsing it to <code>None</code> would make it indistinguishable from the
+unbounded case below.</li>
+<li><code>None</code> — every step folded to a static transform (or the plan is the
+empty <code>lookup(x, x)</code>), so it is answerable at <em>any</em> stamp and there is
+no finite interval to report.</li>
+</ul>
+<h5 id="staleness"><a class="doc-anchor" href="#staleness">§</a>Staleness</h5>
+<p>On a live arena the answer ages the moment it is returned, and the two
+ends are not even one snapshot of one ring — see <code>Guard::window</code>. That
+is the same contract <a href="struct.Plan.html#method.latest" title="method tf_tree::Plan::latest"><code>Self::latest</code></a> has, and refusing to answer would be
+worse than answering the question that was asked. On a frozen <code>.tft</code>, the
+case §4.2 is about, nothing pushes and the interval is exact.</p>
+<h5 id="errors-5"><a class="doc-anchor" href="#errors-5">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a> (or <a href="enum.LookupError.html#variant.ChildDetached" title="variant tf_tree::LookupError::ChildDetached"><code>LookupError::ChildDetached</code></a> on a
+fork-poisoned guard), <a href="enum.LookupError.html#variant.UnknownEdge" title="variant tf_tree::LookupError::UnknownEdge"><code>LookupError::UnknownEdge</code></a>, or
+<a href="enum.LookupError.html#variant.NoData" title="variant tf_tree::LookupError::NoData"><code>LookupError::NoData</code></a> naming the first edge on the path that has never
+published — which is a different fact from an empty intersection and is
+reported differently.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.slowest_nominal_rate_mhz" class="method"><h4 class="code-header">pub fn <a href="#method.slowest_nominal_rate_mhz" class="fn">slowest_nominal_rate_mhz</a>(
+    &amp;self,
+    g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u32.html">u32</a>&gt;, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;</h4></section></summary><div class="docblock"><p>The <strong>slowest</strong> declared nominal publish rate among this plan’s dynamic
+edges, in milli-hertz, or <code>None</code> when no edge on the plan declares one
+(<code>docs/decisions/0018</code>).</p>
+<p>Together with <a href="struct.Plan.html#method.span" title="method tf_tree::Plan::span"><code>Self::span</code></a> this is the whole engine-side input to a
+caller’s blocking wait. <strong>There is no blocking primitive in the arena and
+there is not going to be one</strong>: every shared-memory wait requires the
+waiter to register by <em>writing</em> a word the waker can see, and D18 makes
+consumers attach <code>PROT_READ</code>, so that store is a <code>SIGSEGV</code> rather than an
+error. Buying back ~1 ms of startup latency by spending an MMU-enforced
+safety boundary is the wrong trade; <code>0018</code> records it, and records the
+escalation path (the Phase 2 owner server, not a futex) so it is not
+reinvented.</p>
+<p>The wait the shim writes, once, out of these two:</p>
+<div class="example-wrap"><pre class="language-text"><code>loop {
+    let g = tree.guard();
+    match plan.span(&amp;g)? {
+        None                                  =&gt; return plan.at(&amp;g, wanted),
+        Some((_, newest)) if newest &gt;= wanted  =&gt; return plan.at(&amp;g, wanted),
+        Some((_, newest)) =&gt; sleep(min(deadline_remaining,
+                                       (wanted - newest) + one_period)),
+    }
+    if now &gt;= deadline { return Err(Timeout) }
+}</code></pre></div>
+<p>where <code>one_period</code> is <code>1e9 / (mhz / 1000)</code> nanoseconds from <em>this</em>
+method. It is a <strong>prediction, not a poll interval</strong>: the shortfall is
+known and the period is declared, so the typical wake count is one or
+two. A naive 1 ms poll against a 10 Hz edge wakes a hundred times.</p>
+<h5 id="slowest-and-why-the-answer-is-a-min"><a class="doc-anchor" href="#slowest-and-why-the-answer-is-a-min">§</a>Slowest, and why the answer is a <code>min</code></h5>
+<p>A plan is answerable only when <em>every</em> dynamic edge on it has reached the
+stamp, so the edge that decides when the wait ends is the one that
+publishes least often. Sleeping a period of the fastest edge on a path
+that also carries a 10 Hz map update wakes a hundred times per useful
+answer — the poll this design exists to avoid, arrived at from inside the
+prediction.</p>
+<h5 id="0-is-undeclared-and-is-skipped-rather-than-treated-as-0-hz"><a class="doc-anchor" href="#0-is-undeclared-and-is-skipped-rather-than-treated-as-0-hz">§</a><code>0</code> is <em>undeclared</em>, and is skipped rather than treated as 0 Hz</h5>
+<p><code>EdgeRecord::nominal_rate_mhz</code> uses <code>0</code> as “not declared” — an edge whose
+ring was sized by an explicit slot count states no rate. Reading the
+sentinel as a rate makes it the minimum of every set it appears in and
+yields an infinite period, so one undeclared edge would silently disable
+the wait for the whole path. <code>docs/PHASE5.md</code> §6’s <code>TFT007</code> amendment
+makes the same distinction load-bearing for the rate check, and for the
+same reason: comparing against zero fabricates a finding on every edge of
+a correct arena.</p>
+<p><code>None</code> — nobody declared — is therefore a real third answer and not a
+degenerate minimum. A caller falls back to a conservative period and
+<strong>should say so once at startup</strong> rather than silently, because a
+mysteriously slow wait and a mysteriously busy one look identical from
+outside (<code>0018</code> <em>Consequences</em>).</p>
+<h5 id="a-declared-rate-may-be-an-observed-one"><a class="doc-anchor" href="#a-declared-rate-may-be-an-observed-one">§</a>A declared rate may be an observed one</h5>
+<p><code>tf_tree topology --discover</code> measures a rate and writes it into the same
+<code>rate_hz</code> this reads as a declaration, so a recording of a degraded
+publisher declares the fault as nominal. Here the consequence is one
+extra wake, which is why the ambiguity is tolerable in a wait and was not
+tolerable for <code>TFT007</code> (<code>docs/PHASE5.md</code> §6).</p>
+<h5 id="why-it-is-generation-checked-and-why-it-is-not-nodata"><a class="doc-anchor" href="#why-it-is-generation-checked-and-why-it-is-not-nodata">§</a>Why it is generation-checked, and why it is not <code>NoData</code></h5>
+<p>It calls <code>check_generation</code> exactly as <a href="struct.Plan.html#method.span" title="method tf_tree::Plan::span"><code>Self::span</code></a> does, so a stale
+plan reports <a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a> and a fork-poisoned guard
+reports <a href="enum.LookupError.html#variant.ChildDetached" title="variant tf_tree::LookupError::ChildDetached"><code>LookupError::ChildDetached</code></a>. A waiter that missed either would
+spin until its deadline against a plan that can never be satisfied — the
+one failure mode a <em>timeout</em> API hides best.</p>
+<p>It does <strong>not</strong> return <a href="enum.LookupError.html#variant.NoData" title="variant tf_tree::LookupError::NoData"><code>LookupError::NoData</code></a> for an edge that has never
+published, which is where it deliberately parts company with
+<a href="struct.Plan.html#method.span" title="method tf_tree::Plan::span"><code>Self::span</code></a>. A declaration is a property of the topology, not of the
+stream: the caller asking how long to sleep is by definition asking
+<em>before</em> the data exists, and that is the startup case this whole loop
+was built for.</p>
+<h5 id="errors-6"><a class="doc-anchor" href="#errors-6">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.TopologyChanged" title="variant tf_tree::LookupError::TopologyChanged"><code>LookupError::TopologyChanged</code></a>, <a href="enum.LookupError.html#variant.ChildDetached" title="variant tf_tree::LookupError::ChildDetached"><code>LookupError::ChildDetached</code></a>, or
+<a href="enum.LookupError.html#variant.UnknownEdge" title="variant tf_tree::LookupError::UnknownEdge"><code>LookupError::UnknownEdge</code></a> if a step names an edge this arena has no
+record for.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.at_many" class="method"><h4 class="code-header">pub fn <a href="#method.at_many" class="fn">at_many</a>&lt;D&gt;(
+    &amp;self,
+    g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;,
+    stamps: &amp;[<a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;],
+    out: &amp;mut [<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>],
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p>Evaluate the plan at each stamp in <code>stamps</code>, writing results into <code>out</code>.</p>
+<p>When <code>stamps</code> is monotone non-decreasing, each dynamic edge resumes its
+bracket search from the previous stamp via an exponential (galloping) search
+— <code>O(1)</code> amortized per stamp instead of <code>O(log n)</code>. Non-monotone input
+falls back to an independent search per stamp.</p>
+<h5 id="errors-7"><a class="doc-anchor" href="#errors-7">§</a>Errors</h5>
+<p>As <a href="struct.Plan.html#method.at" title="method tf_tree::Plan::at"><code>Self::at</code></a>, plus a debug-time length check that <code>out.len() &gt;= stamps.len()</code> (extra <code>out</code> slots are left untouched).</p>
+<h5 id="panics"><a class="doc-anchor" href="#panics">§</a>Panics</h5>
+<p>If <code>out.len() &lt; stamps.len()</code> (there is nowhere to write a result).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.at_many_into" class="method"><h4 class="code-header">pub fn <a href="#method.at_many_into" class="fn">at_many_into</a>&lt;D&gt;(
+    &amp;self,
+    g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;,
+    stamps: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.i64.html">i64</a>],
+    layout: <a class="enum" href="enum.Layout.html" title="enum tf_tree::Layout">Layout</a>,
+    out: &amp;mut [<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f64.html">f64</a>],
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p>Evaluate a batch <strong>directly into a caller’s buffer</strong>, in <code>layout</code>.</p>
+<p>The point of this over <a href="struct.Plan.html#method.at_many" title="method tf_tree::Plan::at_many"><code>Self::at_many</code></a> is that <code>Iso3</code> is
+<code>repr(C, align(64))</code> and so cannot alias any layout a consumer wants
+(see [<code>crate::layout</code>]). Writing through it costs an intermediate buffer
+and a second pass; this writes once, in place, and allocates nothing.</p>
+<p><code>out</code> is a flat <code>f64</code> slice of at least <code>stamps.len() * layout.elems()</code>.
+Use <a href="struct.Plan.html#method.at_many_into_f32" title="method tf_tree::Plan::at_many_into_f32"><code>Self::at_many_into_f32</code></a> for <a href="enum.Layout.html#variant.Affine32" title="variant tf_tree::Layout::Affine32"><code>Layout::Affine32</code></a>.</p>
+<p><a href="enum.Layout.html#variant.QuatTwist" title="variant tf_tree::Layout::QuatTwist"><code>Layout::QuatTwist</code></a> is the batch form of <a href="struct.Plan.html#method.at_with_derivatives" title="method tf_tree::Plan::at_with_derivatives"><code>Self::at_with_derivatives</code></a>
+and folds through exactly that path, so the thirteen <code>f64</code> it writes per
+stamp are the same bits the scalar call would produce — including its
+refusals. It is the only layout here that can fail for a reason the pose
+layouts cannot.</p>
+<p><strong><code>stamps</code> is raw nanoseconds, with the domain as the type parameter.</strong>
+<code>Stamp&lt;D&gt;</code> is a newtype and not <code>repr(transparent)</code>, so a caller holding
+<code>&amp;[i64]</code> — every FFI caller, and the NumPy path in particular — would
+have to <em>allocate and copy</em> to produce <code>&amp;[Stamp&lt;D&gt;]</code>, which is exactly
+the intermediate buffer this method exists to remove. Nothing is lost:
+the domain is still checked, once per call rather than carried in eight
+bytes of <code>PhantomData</code> per element.</p>
+<h5 id="errors-8"><a class="doc-anchor" href="#errors-8">§</a>Errors</h5>
+<p><a href="enum.LookupError.html#variant.BufferTooSmall" title="variant tf_tree::LookupError::BufferTooSmall"><code>LookupError::BufferTooSmall</code></a> if <code>out</code> cannot hold the batch, or
+<a href="enum.LookupError.html#variant.WrongElementType" title="variant tf_tree::LookupError::WrongElementType"><code>LookupError::WrongElementType</code></a> for an <code>f32</code> layout. Both are checked
+<strong>before a single element is written</strong>, so a rejected call leaves the
+caller’s buffer untouched — <code>docs/PHASE3.md</code> §5.3 requires that, because
+a half-written output is worse than none: it looks like data.</p>
+<p>For <a href="enum.Layout.html#variant.QuatTwist" title="variant tf_tree::Layout::QuatTwist"><code>Layout::QuatTwist</code></a>, additionally
+<a href="enum.LookupError.html#variant.DerivativesUnavailable" title="variant tf_tree::LookupError::DerivativesUnavailable"><code>LookupError::DerivativesUnavailable</code></a> and <a href="enum.LookupError.html#variant.NoSegment" title="variant tf_tree::LookupError::NoSegment"><code>LookupError::NoSegment</code></a>,
+exactly as <a href="struct.Plan.html#method.at_with_derivatives" title="method tf_tree::Plan::at_with_derivatives"><code>Self::at_with_derivatives</code></a> returns them — a <code>LerpSlerp</code>
+edge is refused rather than finite-differenced.</p>
+<p><strong>Only the two checks above are all-or-nothing.</strong> Every other error is a
+property of a <em>stamp</em>, so it can fire after <code>k</code> rows are already
+written and the batch stops there, leaving <code>k</code> live rows and the rest as
+the caller left them, with nothing in the buffer marking the boundary —
+which is why the element index is worth recovering from the error
+(<code>NoData</code>, <code>Extrapolation</code> and <code>SlotRecycled</code> name the edge and the
+window). The distinction is not academic:
+<code>DerivativesUnavailable</code> is a property of an <em>edge</em>, so it always fires
+at element 0 and the buffer really is untouched, while
+<a href="enum.LookupError.html#variant.NoSegment" title="variant tf_tree::LookupError::NoSegment"><code>LookupError::NoSegment</code></a> on the same layout depends on which segment
+the stamp brackets and is not.</p>
+<p>Otherwise as <a href="struct.Plan.html#method.at" title="method tf_tree::Plan::at"><code>Self::at</code></a>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.at_many_into_f32" class="method"><h4 class="code-header">pub fn <a href="#method.at_many_into_f32" class="fn">at_many_into_f32</a>&lt;D&gt;(
+    &amp;self,
+    g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;,
+    stamps: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.i64.html">i64</a>],
+    layout: <a class="enum" href="enum.Layout.html" title="enum tf_tree::Layout">Layout</a>,
+    out: &amp;mut [<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.f32.html">f32</a>],
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p><a href="struct.Plan.html#method.at_many_into" title="method tf_tree::Plan::at_many_into"><code>Self::at_many_into</code></a> for <code>f32</code> layouts (<a href="enum.Layout.html#variant.Affine32" title="variant tf_tree::Layout::Affine32"><code>Layout::Affine32</code></a>).</p>
+<h5 id="errors-9"><a class="doc-anchor" href="#errors-9">§</a>Errors</h5>
+<p>As <a href="struct.Plan.html#method.at_many_into" title="method tf_tree::Plan::at_many_into"><code>Self::at_many_into</code></a>, with <a href="enum.LookupError.html#variant.WrongElementType" title="variant tf_tree::LookupError::WrongElementType"><code>LookupError::WrongElementType</code></a> for a
+layout that is not <code>f32</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.at_adaptive" class="method"><h4 class="code-header">pub fn <a href="#method.at_adaptive" class="fn">at_adaptive</a>&lt;'s, D&gt;(
+    &amp;self,
+    g: &amp;<a class="struct" href="struct.Guard.html" title="struct tf_tree::Guard">Guard</a>&lt;'_&gt;,
+    span: (<a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;, <a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;),
+    tol: <a class="struct" href="struct.ErrBound.html" title="struct tf_tree::ErrBound">ErrBound</a>,
+    scratch: &amp;'s mut <a class="struct" href="struct.AdaptiveScratch.html" title="struct tf_tree::AdaptiveScratch">AdaptiveScratch</a>&lt;D&gt;,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;(&amp;'s [<a class="struct" href="struct.Stamp.html" title="struct tf_tree::Stamp">Stamp</a>&lt;D&gt;], &amp;'s [<a class="struct" href="struct.Iso3.html" title="struct tf_tree::Iso3">Iso3</a>]), <a class="enum" href="enum.LookupError.html" title="enum tf_tree::LookupError">LookupError</a>&gt;<div class="where">where
+    D: <a class="trait" href="trait.Domain.html" title="trait tf_tree::Domain">Domain</a>,</div></h4></section></summary><div class="docblock"><p>Emit the minimum set of knots such that <a href="struct.LerpSlerp.html" title="struct tf_tree::LerpSlerp"><code>LerpSlerp</code></a> between adjacent knots
+stays within <code>tol</code> of the exact plan evaluation across <code>span</code>.</p>
+<p>Recursive bisection: the midpoint of each segment is evaluated exactly and
+compared against the LERP of the segment endpoints; the segment is
+subdivided only if the error exceeds <code>tol</code>. Recursion depth is bounded at
+<a href="constant.MAX_ADAPTIVE_DEPTH.html" title="constant tf_tree::MAX_ADAPTIVE_DEPTH"><code>MAX_ADAPTIVE_DEPTH</code></a> and the knot count at <a href="constant.MAX_KNOTS.html" title="constant tf_tree::MAX_KNOTS"><code>MAX_KNOTS</code></a>. All output lives
+in the caller-provided <code>scratch</code>; there is no global allocation.</p>
+<p>Returns parallel slices <code>(stamps, poses)</code> of the emitted knots (strictly
+increasing in stamp). The consumer LERPs between them on whatever device the
+points live on, with the reconstruction error bounded by construction. This
+is the API that replaces the abandoned deskew helper.</p>
+<h5 id="errors-10"><a class="doc-anchor" href="#errors-10">§</a>Errors</h5>
+<p>As <a href="struct.Plan.html#method.at" title="method tf_tree::Plan::at"><code>Self::at</code></a>. An empty span (<code>start &gt;= end</code>) yields the two endpoints.</p>
+</div></details></div></details></div><h2 id="trait-implementations" class="section-header">Trait Implementations<a href="#trait-implementations" class="anchor">§</a></h2><div id="trait-implementations-list"><details class="toggle implementors-toggle" open><summary><section id="impl-Clone-for-Plan" class="impl"><a href="#impl-Clone-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html" title="trait core::clone::Clone">Clone</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.clone" class="method trait-impl"><a href="#method.clone" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html#tymethod.clone" class="fn">clone</a>(&amp;self) -&gt; <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h4></section></summary><div class='docblock'>Returns a duplicate of the value. <a href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html#tymethod.clone">Read more</a></div></details><details class="toggle method-toggle" open><summary><section id="method.clone_from" class="method trait-impl"><span class="rightside"><span class="since" title="Stable since Rust version 1.0.0, const unstable">1.0.0 (const: <a href="https://github.com/rust-lang/rust/issues/142757" title="Tracking issue for const_clone">unstable</a>)</span> · <a class="src" href="https://doc.rust-lang.org/1.97.1/src/core/clone.rs.html#245-247">Source</a></span><a href="#method.clone_from" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html#method.clone_from" class="fn">clone_from</a>(&amp;mut self, source: &amp;Self)</h4></section></summary><div class='docblock'>Performs copy-assignment from <code>source</code>. <a href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html#method.clone_from">Read more</a></div></details></div></details><details class="toggle implementors-toggle" open><summary><section id="impl-Debug-for-Plan" class="impl"><a href="#impl-Debug-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/fmt/trait.Debug.html" title="trait core::fmt::Debug">Debug</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.fmt" class="method trait-impl"><a href="#method.fmt" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/fmt/trait.Debug.html#tymethod.fmt" class="fn">fmt</a>(&amp;self, f: &amp;mut <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/fmt/struct.Formatter.html" title="struct core::fmt::Formatter">Formatter</a>&lt;'_&gt;) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/fmt/struct.Error.html" title="struct core::fmt::Error">Error</a>&gt;</h4></section></summary><div class='docblock'>Formats the value using the given formatter. <a href="https://doc.rust-lang.org/1.97.1/core/fmt/trait.Debug.html#tymethod.fmt">Read more</a></div></details></div></details><section id="impl-Copy-for-Plan" class="impl"><a href="#impl-Copy-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Copy.html" title="trait core::marker::Copy">Copy</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section></div><h2 id="synthetic-implementations" class="section-header">Auto Trait Implementations<a href="#synthetic-implementations" class="anchor">§</a></h2><div id="synthetic-implementations-list"><section id="impl-Freeze-for-Plan" class="impl"><a href="#impl-Freeze-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Freeze.html" title="trait core::marker::Freeze">Freeze</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section><section id="impl-RefUnwindSafe-for-Plan" class="impl"><a href="#impl-RefUnwindSafe-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/panic/unwind_safe/trait.RefUnwindSafe.html" title="trait core::panic::unwind_safe::RefUnwindSafe">RefUnwindSafe</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section><section id="impl-Send-for-Plan" class="impl"><a href="#impl-Send-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section><section id="impl-Sync-for-Plan" class="impl"><a href="#impl-Sync-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section><section id="impl-Unpin-for-Plan" class="impl"><a href="#impl-Unpin-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Unpin.html" title="trait core::marker::Unpin">Unpin</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section><section id="impl-UnsafeUnpin-for-Plan" class="impl"><a href="#impl-UnsafeUnpin-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.UnsafeUnpin.html" title="trait core::marker::UnsafeUnpin">UnsafeUnpin</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section><section id="impl-UnwindSafe-for-Plan" class="impl"><a href="#impl-UnwindSafe-for-Plan" class="anchor">§</a><h3 class="code-header">impl <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/panic/unwind_safe/trait.UnwindSafe.html" title="trait core::panic::unwind_safe::UnwindSafe">UnwindSafe</a> for <a class="struct" href="struct.Plan.html" title="struct tf_tree::Plan">Plan</a></h3></section></div><h2 id="blanket-implementations" class="section-header">Blanket Implementations<a href="#blanket-implementations" class="anchor">§</a></h2><div id="blanket-implementations-list"><details class="toggle implementors-toggle"><summary><section id="impl-Any-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/any.rs.html#141">Source</a><a href="#impl-Any-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a> for T<div class="where">where
+    T: 'static + ?<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.type_id" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/any.rs.html#142">Source</a><a href="#method.type_id" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/any/trait.Any.html#tymethod.type_id" class="fn">type_id</a>(&amp;self) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.97.1/core/any/struct.TypeId.html" title="struct core::any::TypeId">TypeId</a></h4></section></summary><div class='docblock'>Gets the <code>TypeId</code> of <code>self</code>. <a href="https://doc.rust-lang.org/1.97.1/core/any/trait.Any.html#tymethod.type_id">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-Borrow%3CT%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#212">Source</a><a href="#impl-Borrow%3CT%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.Borrow.html" title="trait core::borrow::Borrow">Borrow</a>&lt;T&gt; for T<div class="where">where
+    T: ?<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.borrow" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#214">Source</a><a href="#method.borrow" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.Borrow.html#tymethod.borrow" class="fn">borrow</a>(&amp;self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.reference.html">&amp;T</a></h4></section></summary><div class='docblock'>Immutably borrows from an owned value. <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.Borrow.html#tymethod.borrow">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-BorrowMut%3CT%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#221">Source</a><a href="#impl-BorrowMut%3CT%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.BorrowMut.html" title="trait core::borrow::BorrowMut">BorrowMut</a>&lt;T&gt; for T<div class="where">where
+    T: ?<a class="trait" href="https://doc.rust-lang.org/1.97.1/core/marker/trait.Sized.html" title="trait core::marker::Sized">Sized</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.borrow_mut" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/borrow.rs.html#222">Source</a><a href="#method.borrow_mut" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.BorrowMut.html#tymethod.borrow_mut" class="fn">borrow_mut</a>(&amp;mut self) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.reference.html">&amp;mut T</a></h4></section></summary><div class='docblock'>Mutably borrows from an owned value. <a href="https://doc.rust-lang.org/1.97.1/core/borrow/trait.BorrowMut.html#tymethod.borrow_mut">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-CloneToUninit-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/clone.rs.html#547">Source</a><a href="#impl-CloneToUninit-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/clone/trait.CloneToUninit.html" title="trait core::clone::CloneToUninit">CloneToUninit</a> for T<div class="where">where
+    T: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html" title="trait core::clone::Clone">Clone</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.clone_to_uninit" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/clone.rs.html#549">Source</a><a href="#method.clone_to_uninit" class="anchor">§</a><h4 class="code-header">unsafe fn <a href="https://doc.rust-lang.org/1.97.1/core/clone/trait.CloneToUninit.html#tymethod.clone_to_uninit" class="fn">clone_to_uninit</a>(&amp;self, dest: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.pointer.html">*mut </a><a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u8.html">u8</a>)</h4></section></summary><span class="item-info"><div class="stab unstable"><span class="emoji">🔬</span><span>This is a nightly-only experimental API. (<code>clone_to_uninit</code>)</span></div></span><div class='docblock'>Performs copy-assignment from <code>self</code> to <code>dest</code>. <a href="https://doc.rust-lang.org/1.97.1/core/clone/trait.CloneToUninit.html#tymethod.clone_to_uninit">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-From%3CT%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#786">Source</a><a href="#impl-From%3CT%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html" title="trait core::convert::From">From</a>&lt;T&gt; for T</h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.from" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#789">Source</a><a href="#method.from" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html#tymethod.from" class="fn">from</a>(t: T) -&gt; T</h4></section></summary><div class="docblock"><p>Returns the argument unchanged.</p>
+</div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-Into%3CU%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#768-770">Source</a><a href="#impl-Into%3CU%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T, U&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.Into.html" title="trait core::convert::Into">Into</a>&lt;U&gt; for T<div class="where">where
+    U: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html" title="trait core::convert::From">From</a>&lt;T&gt;,</div></h3></section></summary><div class="impl-items"><details class="toggle method-toggle" open><summary><section id="method.into" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#778">Source</a><a href="#method.into" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.Into.html#tymethod.into" class="fn">into</a>(self) -&gt; U</h4></section></summary><div class="docblock"><p>Calls <code>U::from(self)</code>.</p>
+<p>That is, this conversion is whatever the implementation of
+<code><a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.From.html" title="trait core::convert::From">From</a>&lt;T&gt; for U</code> chooses to do.</p>
+</div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-ToOwned-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/alloc/borrow.rs.html#72-74">Source</a><a href="#impl-ToOwned-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/alloc/borrow/trait.ToOwned.html" title="trait alloc::borrow::ToOwned">ToOwned</a> for T<div class="where">where
+    T: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/clone/trait.Clone.html" title="trait core::clone::Clone">Clone</a>,</div></h3></section></summary><div class="impl-items"><details class="toggle" open><summary><section id="associatedtype.Owned" class="associatedtype trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/alloc/borrow.rs.html#76">Source</a><a href="#associatedtype.Owned" class="anchor">§</a><h4 class="code-header">type <a href="https://doc.rust-lang.org/1.97.1/alloc/borrow/trait.ToOwned.html#associatedtype.Owned" class="associatedtype">Owned</a> = T</h4></section></summary><div class='docblock'>The resulting type after obtaining ownership.</div></details><details class="toggle method-toggle" open><summary><section id="method.to_owned" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/alloc/borrow.rs.html#77">Source</a><a href="#method.to_owned" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/alloc/borrow/trait.ToOwned.html#tymethod.to_owned" class="fn">to_owned</a>(&amp;self) -&gt; T</h4></section></summary><div class='docblock'>Creates owned data from borrowed data, usually by cloning. <a href="https://doc.rust-lang.org/1.97.1/alloc/borrow/trait.ToOwned.html#tymethod.to_owned">Read more</a></div></details><details class="toggle method-toggle" open><summary><section id="method.clone_into" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/alloc/borrow.rs.html#81">Source</a><a href="#method.clone_into" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/alloc/borrow/trait.ToOwned.html#method.clone_into" class="fn">clone_into</a>(&amp;self, target: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.reference.html">&amp;mut T</a>)</h4></section></summary><div class='docblock'>Uses borrowed data to replace owned data, usually by cloning. <a href="https://doc.rust-lang.org/1.97.1/alloc/borrow/trait.ToOwned.html#method.clone_into">Read more</a></div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-TryFrom%3CU%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#828-830">Source</a><a href="#impl-TryFrom%3CU%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T, U&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;U&gt; for T<div class="where">where
+    U: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.Into.html" title="trait core::convert::Into">Into</a>&lt;T&gt;,</div></h3></section></summary><div class="impl-items"><details class="toggle" open><summary><section id="associatedtype.Error-1" class="associatedtype trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#832">Source</a><a href="#associatedtype.Error-1" class="anchor">§</a><h4 class="code-header">type <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" class="associatedtype">Error</a> = <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/convert/enum.Infallible.html" title="enum core::convert::Infallible">Infallible</a></h4></section></summary><div class='docblock'>The type returned in the event of a conversion error.</div></details><details class="toggle method-toggle" open><summary><section id="method.try_from" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#835">Source</a><a href="#method.try_from" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#tymethod.try_from" class="fn">try_from</a>(value: U) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;T, &lt;T as <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;U&gt;&gt;::<a class="associatedtype" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" title="type core::convert::TryFrom::Error">Error</a>&gt;</h4></section></summary><div class='docblock'>Performs the conversion.</div></details></div></details><details class="toggle implementors-toggle"><summary><section id="impl-TryInto%3CU%3E-for-T" class="impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#812-814">Source</a><a href="#impl-TryInto%3CU%3E-for-T" class="anchor">§</a><h3 class="code-header">impl&lt;T, U&gt; <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryInto.html" title="trait core::convert::TryInto">TryInto</a>&lt;U&gt; for T<div class="where">where
+    U: <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;T&gt;,</div></h3></section></summary><div class="impl-items"><details class="toggle" open><summary><section id="associatedtype.Error" class="associatedtype trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#816">Source</a><a href="#associatedtype.Error" class="anchor">§</a><h4 class="code-header">type <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryInto.html#associatedtype.Error" class="associatedtype">Error</a> = &lt;U as <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;T&gt;&gt;::<a class="associatedtype" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" title="type core::convert::TryFrom::Error">Error</a></h4></section></summary><div class='docblock'>The type returned in the event of a conversion error.</div></details><details class="toggle method-toggle" open><summary><section id="method.try_into" class="method trait-impl"><a class="src rightside" href="https://doc.rust-lang.org/1.97.1/src/core/convert/mod.rs.html#819">Source</a><a href="#method.try_into" class="anchor">§</a><h4 class="code-header">fn <a href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryInto.html#tymethod.try_into" class="fn">try_into</a>(self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;U, &lt;U as <a class="trait" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html" title="trait core::convert::TryFrom">TryFrom</a>&lt;T&gt;&gt;::<a class="associatedtype" href="https://doc.rust-lang.org/1.97.1/core/convert/trait.TryFrom.html#associatedtype.Error" title="type core::convert::TryFrom::Error">Error</a>&gt;</h4></section></summary><div class='docblock'>Performs the conversion.</div></details></div></details></div></section></div></main></body></html>
