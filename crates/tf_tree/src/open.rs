@@ -192,14 +192,27 @@ pub(crate) enum Reclamation {
 /// asserted)"*. They buy different halves, neither buys the other's, and both
 /// are on `main`.
 ///
-/// **Step 0b buys *every participant holds a byte*** — which is what makes the
-/// byte a *total* predicate here rather than merely an adequate one.
-/// [`Tree::attach_shared`] and [`Tree::attach_shared_at`] refuse
+/// **Step 0b buys *every participant that joined through the rendezvous holds a
+/// byte*.** [`Tree::attach_shared`] and [`Tree::attach_shared_at`] refuse
 /// [`AttachMode::ReadWrite`] (`refuse_a_byteless_writer`), so the byte-less
-/// writer they used to produce has no producer left. `TreeBuilder::build_shared`
-/// called directly still registers without a byte, and is still supported — it
-/// is how an arena is created — but such a tree has **no lock file, therefore
-/// no probe**, and never reaches here.
+/// writer they used to produce has no producer left.
+///
+/// **It does not buy *every participant*, and the difference is a live defect.**
+/// `TreeBuilder::build_shared` called directly still registers without a byte.
+/// `0028` concluded that this was harmless because such a tree has "no lock file,
+/// therefore no probe, and never reaches here" — **and that is wrong, because the
+/// probe belongs to the *observer*, not to the subject**. This function is handed
+/// `rec`, a record in a shared arena; whether *that* participant has a byte is
+/// unrelated to whether the caller has a probe. A `build_shared` creator whose
+/// arena is served through `tf_tree_ipc::OwnerServer` is read `Reclaimable` by
+/// every peer that joined normally, and [`Tree::reap_participants`] frees its
+/// record while it is publishing —
+/// `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
+/// (`crates/tf_tree/tests/rendezvous.rs`) pins it. The predicate is therefore
+/// **total only over participants that joined through the rendezvous**, which is
+/// a property of the arena's population and not of this caller.
+/// `docs/decisions/0031-the-participant-record-with-no-byte.md` is where that is
+/// being decided; nothing here changes until it is.
 ///
 /// **Step 0c buys *the byte at index `slot` is the byte of the record at index
 /// `slot`***, and nothing else does. The two indices are chosen by code that
