@@ -3035,3 +3035,207 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
     let _ = shutdown.stop();
     let _ = serving.join();
 }
+
+/// **A byte-less publisher loses the edge it is writing to, and can be evicted
+/// again every time it takes it back.**
+///
+/// `docs/decisions/0031` open question 1, which asked whether the false-dead
+/// verdict leads on to a *claim*-level loss. Measured answer: **the claim goes,
+/// but D7 does not** — the eviction is an availability failure, not corruption,
+/// and that is what keeps `0031` a documented limitation rather than a
+/// fix-before-release.
+///
+/// The mechanism is one line below the one the sibling test above pins.
+/// `take_claim_lease` opens `let Some(lock) = self.claim_lock.as_ref() else {
+/// return Ok(None) }`, so a `build_shared` publisher holds **no lease byte
+/// either**; `reap_inner` declines only on a byte it can see *held*, and an
+/// unheld byte is indistinguishable from a dead holder's.
+///
+/// **What this asserts, and what it deliberately does not.** It pins that the
+/// live publisher is evicted (the defect) *and* that `push` refuses afterwards
+/// rather than interleaving (the property that bounds the severity). If `0031`
+/// is answered by giving the record a byte, the first assertion flips and the
+/// second must not.
+///
+/// Its control is `a_leased_publisher_keeps_its_edge_against_a_sweeper` below:
+/// same harness, publisher joined through the rendezvous, `reap_dead` takes
+/// nothing. Without it this test would also pass against a reaper that simply
+/// reaps everything.
+///
+/// **Mutant, run rather than asserted.** `reap_inner` made to decline every
+/// claim — roughly the shape of one answer to `0031` — fails this test and
+/// leaves the control passing, which is the right pair:
+///
+/// ```text
+/// assertion `left == right` failed: PIN: an ordinary peer's sweep currently
+/// takes the claim of a publisher that is running.
+/// ```
+#[test]
+#[cfg(feature = "unstable")]
+fn a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to() {
+    let scratch = Scratch::new("evict");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+    let creator = byteless_served_arena();
+    let (shutdown, serving) = serve(&creator, 1);
+
+    let victim = creator
+        .claim(
+            creator.frame("base").unwrap(),
+            creator.frame("map").unwrap(),
+        )
+        .expect("the byte-less creator claims the edge");
+    victim
+        .push(1_000, &tf_tree::exp_se3([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]))
+        .expect("and publishes");
+
+    let sweeper = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("an ordinary peer joins");
+
+    assert_eq!(
+        sweeper.reap_dead(),
+        1,
+        "PIN: an ordinary peer's sweep currently takes the claim of a publisher \
+         that is running. If this is now 0, 0031 has been answered — invert it"
+    );
+
+    let thief = sweeper
+        .claim(
+            sweeper.frame("base").unwrap(),
+            sweeper.frame("map").unwrap(),
+        )
+        .expect("PIN: and the edge is then claimable by somebody else");
+
+    // The half that bounds the severity: the victim is refused, not interleaved.
+    let revoked = victim.push(2_000, &tf_tree::exp_se3([0.0, 0.0, 0.0, 2.0, 0.0, 0.0]));
+    assert!(
+        matches!(revoked, Err(tf_tree::PushError::ClaimRevoked { .. })),
+        "D7 must hold through the eviction: the evicted writer has to be refused, \
+         not left interleaving with the new one. Got {revoked:?}"
+    );
+    thief
+        .push(3_000, &tf_tree::exp_se3([0.0, 0.0, 0.0, 99.0, 0.0, 0.0]))
+        .expect("the new owner publishes normally");
+
+    // And the victim cannot keep it: re-claiming is the documented remedy and
+    // lands it straight back in the byte-less state.
+    drop(victim);
+    let retaken = creator
+        .claim(
+            creator.frame("base").unwrap(),
+            creator.frame("map").unwrap(),
+        )
+        .err()
+        .map(|e| format!("{e:?}"));
+    assert!(
+        retaken.is_some(),
+        "the thief holds it now, so the victim's re-claim must be refused here; \
+         the unbounded cycle is what happens when the thief releases"
+    );
+
+    let _ = shutdown.stop();
+    let _ = serving.join();
+}
+
+/// The control for the test above: a publisher that joined through the
+/// rendezvous holds a lease byte, and the same sweep declines it.
+#[test]
+#[cfg(feature = "unstable")]
+fn a_leased_publisher_keeps_its_edge_against_a_sweeper() {
+    let scratch = Scratch::new("evictctl");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+    let creator = byteless_served_arena();
+    let (shutdown, serving) = serve(&creator, 1);
+
+    let open = || {
+        tf_tree::Open::new()
+            .mode(tf_tree::AttachMode::ReadWrite)
+            .create(tf_tree::CreatePolicy::Never)
+            .timeout(std::time::Duration::from_millis(500))
+            .open()
+            .expect("join")
+    };
+    let holder = open();
+    let _kept = holder
+        .claim(holder.frame("base").unwrap(), holder.frame("map").unwrap())
+        .expect("a properly joined publisher claims");
+
+    let sweeper = open();
+    assert_eq!(
+        sweeper.reap_dead(),
+        0,
+        "a sweep must not take the claim of a publisher holding its lease byte"
+    );
+    assert!(
+        sweeper
+            .claim(
+                sweeper.frame("base").unwrap(),
+                sweeper.frame("map").unwrap()
+            )
+            .is_err(),
+        "and the edge must stay unclaimable"
+    );
+
+    let _ = shutdown.stop();
+    let _ = serving.join();
+}
+
+/// A `build_shared` arena, served through the two published `tf_tree_ipc` calls
+/// so facade peers can join it. Shared by the two tests above.
+#[cfg(feature = "unstable")]
+fn byteless_served_arena() -> tf_tree::Tree {
+    tf_tree::TreeBuilder::new()
+        .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+        .dynamic_edge(
+            "map",
+            "base",
+            tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(64)),
+        )
+        .build_shared("tf_tree-evict")
+        .expect("build_shared")
+}
+
+/// Serve `tree`, granting joiners slots from `first` upward.
+#[cfg(feature = "unstable")]
+fn serve(
+    tree: &tf_tree::Tree,
+    first: u32,
+) -> (tf_tree_ipc::ShutdownHandle, std::thread::JoinHandle<()>) {
+    use std::os::fd::{AsFd, OwnedFd};
+    let desc = tf_tree_ipc::SegmentDescriptor {
+        format_version: tf_tree_arena::FORMAT_VERSION,
+        layout_hash: tf_tree_arena::layout_hash(),
+        arena_size: tree.arena_size_bytes() as u64,
+        instance_uuid: tree.instance_uuid(),
+        boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
+    };
+    let seg: OwnedFd = tree
+        .shared_fd()
+        .expect("a build_shared tree has a segment fd")
+        .try_clone_to_owned()
+        .unwrap();
+    let rv = tf_tree_ipc::Rendezvous::new(
+        tf_tree_ipc::RuntimeDir::resolve().unwrap(),
+        0,
+        tf_tree_ipc::ArenaName::new("default", tf_tree_ipc::EnvVar::Name).unwrap(),
+    );
+    let server =
+        tf_tree_ipc::OwnerServer::bind_at(rv.sock_path(), desc, std::process::id()).unwrap();
+    let shutdown = server.shutdown_handle().unwrap();
+    let h = std::thread::spawn(move || {
+        let mut next = first;
+        let _ = server.serve(
+            seg.as_fd(),
+            |_r| {
+                let s = next;
+                next += 1;
+                Ok(s)
+            },
+            |_s| {},
+        );
+    });
+    (shutdown, h)
+}

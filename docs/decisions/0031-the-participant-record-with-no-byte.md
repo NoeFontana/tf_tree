@@ -111,13 +111,111 @@ will later be bound over it.
 
 ## Open questions
 
-1. **Does the false-dead verdict lead on to a claim-level loss?** The measurement
+1. **RESOLVED 2026-08-22 by measurement: no — the failure is availability, not
+   integrity. D7 is never violated. But the eviction is unbounded.**
+   ~~Does the false-dead verdict lead on to a claim-level loss? The measurement
    above erases the *participant record*. Whether a second writer can then take
    the edge — the outcome D7 and `record_is_alive`'s own doc comment call
    corruption — was measured by nobody, and it is what decides whether this is a
    defect to fix before the next release or a documented limitation. **This is
    the question to answer first**; the shape of the fix depends on the answer's
-   severity.
+   severity.~~
+
+   **The claim goes.** `take_claim_lease` opens with
+   `let Some(lock) = self.claim_lock.as_ref() else { return Ok(None) }`, so a
+   byte-less publisher holds **no lease byte either** — not just no participant
+   byte. `Tree::reap_inner`'s guard is
+   `if lock.probe_claim(edge).map_or(true, |p| p.held) { continue; }`, which
+   declines only when the byte is *held* (and fails safe to held on a probe
+   error). An unheld byte is indistinguishable from a dead holder's, so an
+   ordinary peer's `reap_dead()` takes the claim of a publisher that is running:
+
+   ```
+   A: byte-less creator, record 0, two samples pushed
+      reader(A) @1500 = -1.500
+   B: joined at slot 1
+   B: reap_dead() reaped 1 CLAIM(s) from a LIVE publisher
+   B: claim -> Ok, B now owns the edge A is still writing to
+   A: push @3000 -> Err(ClaimRevoked { edge: EdgeId(1) })
+   B: push @3000 -> Ok(())
+      reader(B) @1500 = -1.500   [A's old samples survive]
+      reader(B) @3000 = -99.000  [B's]
+
+   VERDICT two-writers-on-one-edge: false
+   VERDICT victim-silently-stops:   true
+   ```
+
+   **D7 holds and no data is corrupted, which is the part that decides the
+   severity.** `edge::reap` bumps the epoch before clearing the owner, so the
+   victim's very next `push` is refused with `ClaimRevoked` rather than
+   interleaving with the new writer. The ring is untouched — `reap` writes only
+   `epoch` and `owner` — so samples already published stay readable, and the new
+   writer's land normally.
+
+   **The control discriminates.** Identical harness, publisher joined through the
+   rendezvous so it holds a lease: `B: reap_dead() reaped 0 CLAIM(s)` and
+   `B: claim -> Err(AlreadyClaimed(EdgeAlreadyClaimed { owner_slot: 1 }))`. So the
+   reaper is not simply taking everything; it is the missing byte that decides.
+
+   **What makes it worse than a one-off: the victim cannot keep the edge.**
+   `ClaimRevoked`'s documented remedy is to re-claim, and re-claiming succeeds —
+   into the same byte-less state, immediately re-reapable. Four rounds, holding
+   the writer across them:
+
+   ```
+   round 1: B reap_dead() -> 1;  A push -> Err(ClaimRevoked { edge: EdgeId(1) })
+   round 1: A re-claimed OK — and is byte-less again
+   round 2: B reap_dead() -> 1;  A push -> Err(ClaimRevoked { edge: EdgeId(1) })
+   ...
+   round 4: B reap_dead() -> 1;  A push -> Err(ClaimRevoked { edge: EdgeId(1) })
+   ```
+
+   Every sample between eviction and re-claim is lost, and by
+   `PHASE2.md`'s own point about a stale ring, **a consumer cannot tell**: the
+   ring keeps answering every lookup off samples nobody is refreshing. The victim
+   knows; the fleet does not.
+
+   **Nothing does this automatically, and that is the other half of the
+   severity.** `reap_dead` and `reap_participant` are explicit calls with no
+   production caller — `git grep` finds `crates/tf_tree_bench/src/bin/shm_torture.rs`
+   and `crates/tf_tree/src/bin/rendezvous_child.rs`, a bench and a test binary.
+   The owner's socket-hangup callback reclaims **only the participant record**
+   (`table.reclaim`), never a claim. So reaching this needs a hand-served
+   `build_shared` arena *and* a peer that sweeps.
+
+   **A compounding effect, through the participant half that did ship in
+   0.0.4.** Once `reap_participants()` frees the byte-less record, the slot is
+   grantable, and the next joiner gets the index the live claim still names:
+
+   ```
+   B: reap_participants() freed 1 RECORD(s) — A's among them
+   C: joined at slot 0 (A's old record index)
+   C: claim -> Err(AlreadyClaimed(EdgeAlreadyClaimed { owner_slot: 0 }))
+   C: reap_dead() -> 0  [reap_inner skips owner_slot == own_slot]
+   A: push after all this -> Ok(())
+   ```
+
+   C is told it already owns an edge it never claimed, and **cannot reap it,
+   because the guard that stops a process reaping its own live claim now shields
+   A's**. Two live processes on one slot index — which is exactly the failure
+   `0028`'s review pass worked out for `RESERVED` ("the worked interleaving ends
+   with **two live processes on one slot index**, which is the uniqueness A3's
+   claims and A2's topology lock both rest on"), reached by a different route.
+
+   **So: a documented limitation, not a fix-before-the-next-release.** The
+   integrity properties hold. What does not hold is that a byte-less publisher
+   can keep an edge in the presence of a sweeper, and that the participant table
+   uniquely identifies a process. Both belong in whichever option this record
+   takes; neither forces the timing.
+
+   **Two instrument failures in this measurement, recorded because both produced
+   a confident wrong reading first.** The reader helper built its transform with
+   `exp_se3([x, 0, 0, 0, 0, 0])` — `xi[0..3]` is ω, so that is a pure *rotation*
+   and every translation read back `0.000`, three stages running, including one
+   whose answer was known. And the first recovery harness let the `EdgeWriter`
+   drop each round, which *releases* the claim, so rounds 2–4 reaped 0 and the
+   run read as "safe after the first eviction". Both were caught only by having a
+   stage with a known-good expected value in it.
 2. **Is a served `build_shared` arena a shape this project supports at all?**
    `0028:1113` calls `build_shared` "a supported shape — it is how an arena gets
    created", but every composition of it in this workspace
