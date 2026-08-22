@@ -959,9 +959,9 @@ doc:
 # was recorded as PASS for months while the benchmark that produces it ran in no
 # recipe at all. `just` runs dependencies left to right and before the body, so
 # ordering survives the move — `py-compile`, then the artifact audit, then the
-# version audit, then six clippy passes.
+# version audit, then eight clippy passes.
 
-# fmt + six clippy configurations, behind the two cheap audits.
+# fmt + eight clippy configurations, behind the two cheap audits.
 lint: py-compile evidence-audit artifact-versions
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
@@ -990,6 +990,17 @@ lint: py-compile evidence-audit artifact-versions
     # finishing clean, and this line failed on it.
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
+    # **`pure-hash`, because every pass above compiles it out.** The feature is
+    # off by default and swaps `blake3`'s backend, so nothing else here builds a
+    # line of it — the same shape as the five rows above, and the reason this
+    # recipe has more than one pass at all.
+    #
+    # This is a *lint* row and not the row that proves the feature does its job:
+    # what it buys is a cross-check to `*-apple-darwin` / `*-windows-msvc`, and
+    # that needs the target installed. `ci.yml`'s `bindings-non-linux` is where
+    # that belongs.
+    cargo clippy -p tf_tree_core --features pure-hash --all-targets -- -D warnings
+    cargo clippy -p tf_tree --features pure-hash --all-targets -- -D warnings
 
 # **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
 #
