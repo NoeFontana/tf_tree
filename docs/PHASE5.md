@@ -153,6 +153,8 @@ Phase 5 needs new arena regions. Phases 1–3 are implemented, so this is a real
 
 Regions whose Phase 6 content does not exist yet are declared in the header with offset `0`, meaning absent. Phase 6 then fills them **without another layout change**, because the region table already accounts for them.
 
+> **Disputed, 2026-08-22, by [`0032`](./decisions/0032-the-region-table-was-not-part-of-the-purchase.md) — `draft`, so this clause is flagged rather than retracted.** The header fields above exist; the **region table does not**. `crates/tf_tree_arena/src/layout.rs` declares `N_REGIONS = 11` and `grep -n spline` over it returns nothing, so a Phase 6 spline region is a *twelfth* region and changes `ArenaLayout::total_size()` for the same declared geometry — i.e. another `FORMAT_VERSION`. `spline_region_off` is a place to write an offset, not a reservation of the bytes it would point at. Do not cite this clause as the reason a byte can wait until it is settled.
+
 **NORMATIVE:** recompute `layout_hash` and bump `FORMAT_VERSION` to 3 in one commit. Ship a `tf_tree doctor --explain-version` that prints both versions and the required action when a mismatch is detected, since this is the error operators will meet during the upgrade.
 
 > **Amendment — this field set does not fit the current header, and the header
