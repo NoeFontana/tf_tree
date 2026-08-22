@@ -239,6 +239,11 @@ store does not move.**
    per-binding surface and in `tf_tree.build`'s docstring, with the budget
    arithmetic that makes it concrete rather than a bare number: 48 bytes minus
    the longest frame name in your topology is what a namespace prefix has left.
+   **The worst case measured for open question 1 is 5 bytes** — a shipped,
+   xacro-expanded PR2 description whose longest link is 43 — and the
+   documentation should say so plainly, because at 5 bytes **no namespacing
+   prefix the ROS ecosystem ships fits**, and a reader who is told only "48 minus
+   your longest name" will not work that out for themselves.
 
 ## Rationale
 
@@ -299,12 +304,21 @@ hot path — interning happens at declaration.
 
 ## Consequences
 
-- **It is a breaking change, and the size of the break is not known.** A program
-  that builds a tree with a 60-byte frame name works today and stops. The
-  arithmetic says the common case is comfortable — `48 - len("camera_optical_frame")`
-  leaves 28 bytes for a prefix, and conventional ROS link names are well under
-  that — but **no survey of real fleet frame names was done for this record**,
-  and one topology is not a survey. See open question 1.
+- **It is a breaking change, and the size of the break is now measured.** A
+  program that builds a tree with a 60-byte frame name works today and stops.
+  ~~The arithmetic says the common case is comfortable — `48 -
+  len("camera_optical_frame")` leaves 28 bytes for a prefix, and conventional ROS
+  link names are well under that — but **no survey of real fleet frame names was
+  done for this record**, and one topology is not a survey.~~ **That 28 was
+  arithmetic on a name nobody had looked up, and the survey now exists** (open
+  question 1): the longest name in a decoded recording is **42 bytes** (a PAL
+  TIAGo's `head_front_camera_link_color_optical_frame`) and the longest in a
+  shipped robot description is **43** (`narrow_stereo_l_stereo_camera_optical_frame`,
+  an xacro-expanded PR2). **The headroom is 5 bytes, not 28**, and no namespacing
+  prefix the ecosystem ships fits in it — `realsense2_camera`'s own test uses
+  `robot1/` (7 B) and `spot_ros2` sets the prefix to the unit's own name, which
+  is unbounded. So the break is theoretical for one unprefixed robot and one
+  namespace character away for a fleet.
 - **Existing `.tft` files are not fixed and cannot be.** The full names are gone
   from any arena already written. `TFT020` reports; regeneration from the source
   recording is the only repair.
@@ -353,12 +367,152 @@ hot path — interning happens at declaration.
 
 ## Open questions
 
-1. **Does any real frame name exceed 48 bytes?** The refusal's entire cost is
+1. **RESOLVED 2026-08-22 by measurement: no — nothing reachable exceeds 48. The
+   margin is **5 bytes**, not the 28 this record's *Consequences* asserts.**
+   ~~**Does any real frame name exceed 48 bytes?** The refusal's entire cost is
    here and nothing in this record measures it. What would answer it: the frame
    sets of the recordings in `testdata/`, of `docker/tf2`'s fixtures, and of any
    public `/tf` bag, reported as a length histogram. If the maximum anywhere is
    comfortably under 48 the break is theoretical; if a real recording has one,
-   the hash-suffix alternative comes off the shelf.
+   the hash-suffix alternative comes off the shelf.~~
+
+   **Synthetic and captured are separated, because most of what this repository
+   holds is synthetic.** `zstd_conformance.mcap`, `synthetic_empty.db3` and
+   `/home/dev/src/loop`'s eight `/tf` scenes each say in their own
+   `ATTRIBUTION.md` that nothing came off a robot, and `docker/tf2` contributes
+   no frame names of its own — its three harnesses read `parent`/`child` out of
+   a `.tfstream`, `native_scaling.cpp:96` defaulting to
+   `testdata/tfstream/indoor_atelier.tfstream` and `native_ratio.cpp:191` /
+   `native_footprint.cpp:148` to `target/native/fixture.tfstream`, which
+   `crates/tf_tree_bench/src/bin/native_arena.rs` generates from the bench
+   fixture. Both are sources this repository already had. Public recordings were
+   therefore fetched.
+
+   | Source | Kind | Distinct | Max B | >48 |
+   |---|---|---:|---:|---:|
+   | `testdata/tfstream/indoor_atelier.tfstream` | captured | 10 | 16 | 0 |
+   | Zenodo 19894190, upstream `.db3` of the above, re-decoded from CDR | captured | 10 | 16 | 0 |
+   | Zenodo 19894190 outdoor run, 100 498 msgs, Header `frame_id`s | captured | 3 | 14 | 0 |
+   | HF `xrkong/nuway_rosbag`, Nav2 shuttle, 1.32 GB MCAP — `/tf` proper | captured | 2 | 9 | 0 |
+   | — same bag, Header `frame_id`s across 110 channels | captured | 16 | 24 | 0 |
+   | Zenodo 13749419, RoboCup@Home 2024, PAL TIAGo, `/tf` + `/tf_static` | captured | 65 | **42** | 0 |
+   | — same bag, its own `/robot_description` URDF | captured | 53 | 40 | 0 |
+   | HF `UniflexAI/rosbag2_d435i_g1_indoor`, Unitree G1, **sampled** 24 × 2 MB of 16.4 GB | captured | — | 27 | 0 |
+   | **26** published robot-description packages, literal `<link name>` (+`.xml`/`.world`/SDF `<frame name>`) | published | **887** | **43** | 0 |
+   | `crates/tf_tree_bench/src/fixture.rs` | synthetic | 24 | 20 | 0 |
+   | `crates/tf_tree_ingest/src/fixture.rs` | synthetic | 7 | 9 | 0 |
+   | `/home/dev/src/loop` `fixtures/mcap-tf`, 8 scenes | synthetic | 3 | 9 | 0 |
+
+   Pooled over the four **fully decoded** recordings — 86 distinct names — the
+   tail is `34:2  35:1  37:1  40:1  42:2` and the maximum is
+   `head_front_camera_link_color_optical_frame`, **42 bytes**, off the TIAGo. The
+   G1 bag is a fifth recording, sampled rather than decoded (its `/tf` carries
+   177 messages, and a name appearing under ~1 per 680 MB could hide from the
+   sampler); it is corroboration, not a decoded row. The 887-name description
+   population's tail is `37:6  38:4  39:2  40:3  41:4  43:2` — nothing at 42, and
+   nothing between 44 and 48 — with the maximum
+   `narrow_stereo_l_stereo_camera_optical_frame` and its `_r_` sibling, **43
+   bytes**, in `moveit_resources-ros2/pr2_description/urdf/robot.xml`: a shipped,
+   xacro-expanded, unprefixed PR2 description. A `robot_state_publisher` fed that
+   file publishes that frame.
+
+   **This was run, not computed.** Every set was interned through
+   `TreeBuilder::frame` and read back through `Tree::frames()`, in probes built
+   against this commit, with a control that proves the probe can see the defect:
+
+   ```
+   self-test 48/49/56:  interned 3 distinct, frames() -> 3 entries / 3 distinct; NOT round-tripped: 2
+      lost: "bbbb…b" (49 B)
+      lost: "cccc…c" (56 B)
+   indoor_atelier /tf:          10 distinct, max input bytes 16; inputs >48B: 0; NOT round-tripped: 0
+   nuway shuttle:               16 distinct, max input bytes 24; inputs >48B: 0; NOT round-tripped: 0
+   RoboCup TIAGo 65 frames:     65 distinct, max input bytes 42; inputs >48B: 0; NOT round-tripped: 0
+   description link names:     887 distinct, max input bytes 43; inputs >48B: 0; NOT round-tripped: 0
+   ```
+
+   **So the refusal breaks no recording that could be obtained, and the
+   hash-suffix alternative stays on the shelf. Three corrections follow.**
+
+   **(a) The budget is 5 bytes, not 28 — and there is no prefix length that
+   fits.** *Consequences* argues from `48 − len("camera_optical_frame")`. The
+   longest name in a recording is 42 B, leaving 6; the longest in a shipped
+   description is 43 B, leaving **5**. Both are smaller than every namespacing
+   prefix the ecosystem ships: `realsense2_camera` declares `tf_prefix`, "prefix
+   to be prepended to all frame IDs" (`rs_launch.py:95`), and its own live test
+   sets it to `robot1/`, 7 bytes; `spot_ros2` sets
+   `frame_prefix = self.name + "/"` (`spot_ros2.py:503`), so the prefix is the
+   unit's own name and is unbounded. Composed by hand — a real prefix over a real
+   name set, and labelled as such because no recording obtained here publishes a
+   prefixed frame:
+
+   ```
+   TIAGo 65 real frames,   'tiago/'  (6 B) : max 48 B; refused 0
+   TIAGo 65 real frames,   'robot1/' (7 B) : max 49 B; refused 2
+      "robot1/head_front_camera_link_color_optical_frame" (49 B)
+   887 description links,  'tiago/'  (6 B) : refused 2
+      "tiago/narrow_stereo_l_stereo_camera_optical_frame" (49 B), and its _r_ sibling
+   ```
+
+   An earlier revision of this answer said a 6-byte prefix still fits; measured
+   against the wider corpus it does not, and the honest statement is stronger
+   than the one it replaces: **no namespace prefix in the ecosystem is
+   accommodated by the current bound across shipped descriptions.** **Decision
+   item 5 must state 5, measured, rather than 28, illustrated** — a docstring
+   that understates the constraint by five-fold is worse than a bare number.
+
+   **(b) A URDF is a lower bound on a recording, not an upper one.** The TIAGo
+   bag publishes its own `/robot_description`, whose longest link is 40 bytes,
+   while its `/tf` carries 42: the 42-byte string
+   `head_front_camera_link_color_optical_frame` does not occur anywhere in the
+   63 066-byte URDF — the RGB-D driver built it at run time by appending
+   `_color_optical_frame` to the link `head_front_camera_link`. Note the doubled
+   `_link_…_frame`: this is concatenation drift, not a name anyone chose, and it
+   is the mechanism most likely to push a deployment past 48. Independently
+   reproduced against the bag. Anyone who checks a URDF and concludes there is
+   room has checked the wrong artefact — and the description population is itself
+   a lower bound on what it produces, since 307 further link names in the same
+   packages are xacro templates (`${namespace}camera_depth_optical_frame`,
+   `${prefix}${fingerprefix}_inner_finger_pad`) whose prefix is supplied at build
+   time.
+
+   **(c) `TFT020`'s false positive is reachable, not merely constructible.**
+   Item 4 keeps the check a warning because a genuine 48-byte name resolves
+   correctly. That case is not hypothetical: the TIAGo's two longest frames under
+   the 6-byte namespace `tiago/` land at **exactly 48 bytes**, genuine and
+   correct.
+
+   **One thing found that nobody asked for.** The same packages contain **10**
+   literal identifiers over 48 bytes, up to 55
+   (`depth_camera_front_camera_parent_to_depth_optical_frame`, ANYmal C's shipped
+   `anymal.urdf`) — but every one is a `<joint name>`, and joints are not tf
+   frames. Two of the ten are PR2's, formed by suffixing `_joint` onto the same
+   43-byte link that sets the link maximum, which is (b)'s mechanism again.
+   ANYmal C's longest *link* is 38, so the 17-byte gap between its joint and link
+   naming is pure convention. If tf_tree ever interns anything joint-shaped — a
+   diagnostic, an edge label, an `edges()` key built as `parent_to_child` — the
+   48-byte store fails immediately on a robot that is already shipping.
+
+   **What this does not establish.** Five recordings is not a survey, and one of
+   the five was sampled rather than decoded. **No multi-robot or
+   `tf_prefix`-namespaced `/tf` bag could be found** — Zenodo's API searched three
+   ways, HuggingFace's dataset index for `rosbag`, `mcap` and `ros2_bag`; the
+   other candidates with tf data (Tesla, R3LIVE/FAST-LIVO, Málaga) carry no `/tf`
+   topic at all — and that is precisely the shape that would cross 48. **The
+   description corpus is 26 repositories of 34 attempted**: eight downloads
+   returned 9- or 14-byte error bodies and were not retried —
+   `nasa/val_description`, `ros-industrial/motoman`, `ros-industrial/abb`,
+   `nobleo/nav2_multirobot_bringup`, `ipa320/cob_common`,
+   `Sanctuary-AI/phoenix_description`, `leo-rover/leo_common-ros2`,
+   `ros-perception/velodyne_simulator`. Three are reachable on a different branch
+   (`motoman@noetic-devel`, `abb@noetic-devel`, `cob_common@kinetic_dev`); five
+   are gone from GitHub, including the NASA Valkyrie description and the one
+   *multirobot* bringup in the list — the two most relevant entries to this
+   question. Nothing here was built or gated under `just`; the probes are
+   standalone crates path-depending on `crates/tf_tree`, on local `rustc 1.97.1`
+   against CI's pinned 1.98.0. **The finding is that the break is theoretical for
+   one unprefixed robot and one namespace character away for a fleet**, which is
+   a weaker claim than "comfortable" and is stated here rather than smoothed
+   over.
 2. **Should the bound be exposed as a constant?** `tf_tree_core::MAX_FRAME_NAME`
    would let a caller check before declaring, which R6's read-only-by-default
    posture likes. It also pins 48 as public API, which makes a future widening a
