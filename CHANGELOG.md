@@ -35,6 +35,42 @@ is a bug.
 
 ### Fixed
 
+- **A stamp far from the origin overflowed two arithmetic sites, and a release
+  build answered wrongly rather than panicking.** An all-static path is
+  answerable at *any* stamp — `Plan::span` returns `Ok(None)` and says so — which
+  makes `i64::MIN` and `i64::MAX` ordinary arguments rather than pathological
+  ones. Two places subtracted them signed:
+
+  * `plan::subdivide`'s segment width. `at_adaptive(i64::MIN, i64::MAX)` on an
+    all-static plan panicked in a checked build. In a release build the width
+    wrapped negative, failed the `> 1` split test, and returned a two-knot
+    straight line: measured on a dynamic path spanning ±2^62, endpoints -0.4989
+    and -0.9953 against a true midpoint of -17.2030, for a requested tolerance of
+    1e-6. No error, no panic.
+  * `sample.rs`'s interpolation parameter, on the hot path, for two bracketing
+    samples more than `i64::MAX` apart. A wrapped denominator makes `s` negative,
+    so `Interp::eval` runs backwards past the older sample and returns a pose from
+    outside the bracket entirely. Measured in release: `t.x = -4.55e43` where the
+    two samples were 0 and 10, returned as `Ok`.
+
+  Every stamp difference in `sample.rs` now goes through one `span_ns` helper that
+  subtracts in `u64`, which is exact for every ordered `i64` pair rather than a
+  truncation of it. Five call sites; the ordering each relies on is established
+  immediately above it. This is not an endorsement of 292-year sample gaps — if a
+  segment-width bound is wanted it belongs in `push` as an error naming the edge
+  (R5), not in an accident of two's complement.
+
+  Found by measuring the static/dynamic isolation guarantee rather than by reading
+  the code, and the second site was found by the first one's skeptic after the
+  original report scoped it to "all-static plans only" on a control that varied
+  two things at once.
+
+- **The stamp-independence of an all-static path is now pinned** (`wide_stamps.rs`).
+  It was true and untested at the extremes: perturbing a folded static step for
+  `t != 0` is caught near the origin by three existing tests in `lookup.rs`, and
+  by nothing at `i64::MIN`. The new test asserts bit-identical results across the
+  full range.
+
 - **358 MiB of committed cargo build output is untracked, and a gate now makes
   the class unmergeable.** Four `CARGO_TARGET_DIR` siblings — `target-p`,
   `target-x`, `target-miri`, `target-stable`, 1386 files — were committed and
