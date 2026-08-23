@@ -35,6 +35,35 @@ is a bug.
 
 ### Fixed
 
+- **`docs/decisions/README.md` carried an unresolved merge conflict on `main`,
+  and every gate was green on it.** `<<<<<<< Updated upstream`, `||||||| Stash
+  base`, `=======` and `>>>>>>> Stashed changes` sat in the middle of the
+  decision status table with three copies of the `0033`/`0034`/`0035` rows, two
+  of them stale. The cause was a `git rebase` on a dirty worktree: the autostash
+  popped into a conflict *after* the rebase had already printed "Successfully
+  rebased", and `git status` was clean afterwards because the markers were inside
+  a file staged in the same command.
+
+  All eighteen CI checks passed on it, `just lint` included.
+  `scripts/artifact-versions.py` reads that very table on every run and counts
+  cells per row against the header — and a conflict marker is not a table row,
+  while the duplicated rows it *did* see were well-formed. Nothing else in the
+  workspace reads a Markdown table for anything but its shape.
+
+  Resolved by keeping `main`'s `0033` and `0035` rows, which were newer than the
+  stash base, and the stash's `0034` row, which was the edit that pull request was
+  making.
+
+  `just no-conflict-markers` is the new gate, fifth in the family that starts
+  with `just msrv`'s third arm and now runs first in `just lint` beside
+  `no-build-output`. Three markers and not four: `=======` alone is half of every
+  conflict and also a Markdown setext heading underline, and this repository is
+  more prose than code — every conflict git writes carries the
+  `<<<<<<<`/`>>>>>>>` pair, so dropping the ambiguous one costs no coverage.
+  Measured against the whole tracked corpus before it was written, per
+  `no-build-output`'s standard: the three matched the one corrupted file and
+  nothing else. It fails on the parent commit and passes on this one.
+
 - **`doctor`'s `TFT014` no longer calls a healthy participant in another PID
   namespace a fork inheritor and tell the operator to stop it** (#239, `0033`).
   The two faults have opposite remediations and, until this, the same sentence:

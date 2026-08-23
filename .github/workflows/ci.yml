@@ -76,6 +76,14 @@ jobs:
   # cheapest thing in the recipe and because 358 MiB of `target-*` directories
   # reached `main` through three green runs of this very job.
   #
+  # And on `no-conflict-markers`, for the same reason one job later: an
+  # unresolved `<<<<<<< Updated upstream` reached `main` inside
+  # `docs/decisions/README.md`'s status table, and **this job was green on it**,
+  # along with the other seventeen. A rebase on a dirty worktree autostashed,
+  # popped into a conflict after reporting success, and the markers were staged
+  # in the same command. `artifact-versions` reads that exact table and counts
+  # cells per row; a conflict marker is not a row.
+  #
   # `just lint` depends on `py-compile`, which compiles the workspace-excluded
   # `tf_tree_py` against `.venv`'s interpreter or, failing that, the one on
   # `PATH` — so on this runner, which has no `.venv`, the dependency is a real
