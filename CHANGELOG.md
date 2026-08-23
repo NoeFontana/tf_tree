@@ -33,6 +33,37 @@ is a bug.
 
 ## [Unreleased]
 
+### Added
+
+- **`tf_tree_py` gains a `pure-hash` passthrough, and `just py-cross-check`
+  compiles it** (#180). `macos-15-intel` is the last x86_64 macOS image GitHub
+  Actions will offer and it disappears in August 2027; the fallback is
+  cross-building x86_64 from the arm64 runner, and that was written off because
+  blake3's C backend needs a target C toolchain.
+
+  `pure-hash` (#243) removed that for `tf_tree_core` and `tf_tree` but was never
+  forwarded to the binding, so a cross build of the *wheel* still died in
+  blake3's build script before pyo3 was reached. Measured both ways from Linux:
+  without the feature, `cargo check --target x86_64-apple-darwin` exits 101 in
+  `cc` on `-arch x86_64`; with it, all three of `{x86_64,aarch64}-apple-darwin`
+  and `x86_64-pc-windows-msvc` exit 0. A full `cargo build --lib` for
+  `x86_64-apple-darwin` compiles all 178 objects and stops at exactly one step —
+  the final link, wanting an Apple linker driver and the macOS SDK.
+
+  So option 2 needs seven things and **six are now true**; the seventh is whether
+  the arm64 runner's SDK carries x86_64 slices, which is a five-minute check on a
+  real runner and cannot be answered from Linux.
+
+  Two findings from the same experiment worth recording. **libpython is a
+  non-issue** — maturin writes its own cross PyO3 config from the abi3 feature and
+  passes `-C link-arg=-undefined dynamic_lookup`, so no target interpreter is
+  needed. And **`shm` never enters a macOS build at all**: `tf_tree` declares
+  `tf_tree_ipc` under a target table, so it is absent from the non-Linux
+  dependency graph. The macOS wheel has always been deliberately different and
+  says so at runtime through `has_shared_memory()` and a refusing
+  `#[cfg(not(target_os = "linux"))]` arm on `open_arena` — nothing was quietly
+  different.
+
 ### Fixed
 
 - **A stamp far from the origin overflowed two arithmetic sites, and a release
