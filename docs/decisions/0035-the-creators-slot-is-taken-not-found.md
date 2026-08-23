@@ -91,15 +91,32 @@ by definition the first participant, and the first participant takes the first
 slot.** That is a self-contained property of the rendezvous. The arena side then
 relies on it, rather than the ipc side importing anything.
 
-**On `--force-new`, which gets the same treatment on purpose.**
+**On `--force-new`, and a correction to this record's first draft.**
 `CreatePolicy::Always` skips step 4, so a contended byte 0 there means a *live*
-participant holds it — and forcing a fresh arena past a live participant is the
-split brain the flag exists to resolve, not to cause. The wedged arena it is
-written for has **dead** participants, and the kernel releases an OFD lock when
-its holder dies, so byte 0 is free in exactly the case the flag is for. When a
-live holder does persist, the existing loop times out into
-`ArenaHeldButUnreachable`, which already names the holders. One behaviour for
-every policy; no new error variant on a published crate.
+participant holds it, and the create yields rather than diverging. One behaviour
+for every policy, and no new error variant on a published crate.
+
+This record first justified that with "the wedged arena `--force-new` is written
+for has **dead** participants, and the kernel released their bytes when they
+died, so byte 0 is free in exactly the case the flag is for". **That is wrong for
+the case §3.4 actually names.** §3.4 offers `--force-new` as the escape hatch for
+a participant that is `SIGSTOP`ped — alive, holding its byte, never taking over —
+and calls it "an explicit, loud escape hatch that abandons the existing arena".
+Against a live holder of byte 0, it does not abandon anything.
+
+**It did not before this change either**, and that is the whole of the defence.
+`defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing` records
+three revisions of the same line: `Always` *did* create over a stranded
+participant (byte 1 against record 0 — #201); `0028` step 0c made that
+`ParticipantSlotDiverged`; this record makes it `ArenaHeldButUnreachable` with
+`first_slot: Some(0)`. None of the three delivers the documented escape hatch,
+and only the third tells the operator which slot to look at.
+
+So: the gap is pre-existing, this change makes the failure legible rather than
+cryptic, and closing it is a separate question — it means deciding what
+`--force-new` may do to a lock file whose bytes a live process holds, which is
+`#189`'s territory and not a slot-assignment question. Filed rather than folded
+in.
 
 ## Consequences
 

@@ -528,13 +528,24 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
         tf_tree_ipc::LockAttempt::Acquired
     );
 
-    // **Refused, and this is the answer to the question `0028` plan step 0c
-    // left open.** The state is staged *below* the facade, but the byte and the
-    // record are still *paired* at the facade — `Open::attempt` is what builds
-    // the arena and registers the record — so the guard does reach it. Measured
-    // before this test was converted: the line that used to stand here,
-    // `.expect("CreatePolicy::Always must create over a stranded participant")`,
-    // panicked with `ParticipantSlotDiverged`.
+    // **Refused — and since `0035` it is refused one layer lower, with a better
+    // error.** Three revisions of this line, each measured:
+    //
+    // 1. `.expect("CreatePolicy::Always must create over a stranded
+    //    participant")` — it did, with byte 1 against record 0. That is #201.
+    // 2. `0028` step 0c added the facade guard, and this became
+    //    `ParticipantSlotDiverged`: no divergence reached a caller, but the
+    //    error named nothing an operator could act on.
+    // 3. `0035` makes step 5 take byte 0 atomically, so the create never gets
+    //    that far. Byte 0 is held, the acquire is contended, and that is step
+    //    4's condition — yield, back off, and time out into
+    //    `ArenaHeldButUnreachable`, which **names the holder**: `first_slot:
+    //    Some(0)`. That is the difference worth pinning. `ParticipantSlotDiverged`
+    //    tells an operator that two integers disagreed; this tells them which
+    //    slot to look at.
+    //
+    // Everything else this test asserts is unchanged, and that is the point of
+    // keeping it: the refusal still disturbs nothing.
     let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
     let err = tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
@@ -549,8 +560,14 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
         .err()
         .expect("a create that would diverge must be refused");
     assert!(
-        matches!(err, tf_tree::OpenError::ParticipantSlotDiverged),
-        "expected ParticipantSlotDiverged, got {err:?}"
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+                first_slot: Some(0),
+                ..
+            })
+        ),
+        "expected ArenaHeldButUnreachable naming slot 0, got {err:?}"
     );
 
     // **What this pins that its sibling cannot.** The guard compares two
@@ -737,9 +754,17 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
     );
 
     // The forced create. §3.4 step 4 lets it past precisely because it is
-    // `CreatePolicy::Always`, which is the escape hatch's whole purpose — and
-    // one line further on, `Open::attempt` compares the byte it was handed with
-    // the record `build_shared` registered it at, and refuses.
+    // `CreatePolicy::Always` — and then step 5 asks the kernel for byte 0,
+    // which this test has arranged to be held by a **real registration** with an
+    // identity record behind it. Contended, so the create yields.
+    //
+    // **`--force-new` cannot abandon an arena whose byte 0 a live process
+    // holds, and it could not before `0035` either.** §3.4 calls it "an
+    // explicit, loud escape hatch that abandons the existing arena", and for the
+    // `SIGSTOP`ped-participant case it describes, that is not what happens: it
+    // was `ParticipantSlotDiverged` after `0028` and it is
+    // `ArenaHeldButUnreachable` now. The gap is pre-existing and is not this
+    // record's to close — what changed is that the error now names the slot.
     let err = tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
         .create(CreatePolicy::Always)
@@ -753,11 +778,19 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
         .err()
         .expect("the divergence must be refused, not handed back as a Tree");
     assert!(
-        matches!(err, tf_tree::OpenError::ParticipantSlotDiverged),
-        "**#201, closed.** The creator's lock byte would have been 1 and its \
-         arena record 0, so every predicate reading record 0's liveness would \
-         have asked the kernel about the stranded session's byte. Expected \
-         ParticipantSlotDiverged, got {err:?}"
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+                first_slot: Some(0),
+                ..
+            })
+        ),
+        "**#201, closed at the source.** The creator's lock byte would have been \
+         1 and its arena record 0, so every predicate reading record 0's \
+         liveness would have asked the kernel about the stranded session's \
+         byte. `0035` stops the byte being handed out at all, so the refusal \
+         now comes from the rendezvous and names the holder. Expected \
+         ArenaHeldButUnreachable {{ first_slot: Some(0), .. }}, got {err:?}"
     );
 
     // **No bound rendezvous socket survives the refusal.** That is less than an
@@ -808,13 +841,22 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
         "the refusal disturbed the stranded session's byte"
     );
 
-    // The identity record at byte 1 outlives the byte, exactly as it does when
-    // a process exits: §5.1 makes the *byte* the liveness and the record
-    // advisory. Pinned so a later reader does not mistake the leftover row for
-    // the leak the three assertions above rule out.
+    // **`0035` removed the residue this used to pin.** Until then the refused
+    // creator had *taken* byte 1 and written an identity there before the
+    // facade compared the two integers and refused, so byte 1 kept an advisory
+    // row it no longer owned — harmless under §5.1, which makes the byte the
+    // liveness and the record advisory, but a row naming a process that never
+    // served. The assertion here read `is_some()` and explained why that was
+    // acceptable.
+    //
+    // Now the create never reaches a second byte: step 5 asks for byte 0, is
+    // refused, and yields. Nothing is taken and nothing is written, so the
+    // refusal leaves the lock file **exactly** as it found it. That is a
+    // stronger property than the one it replaces and is worth pinning in its
+    // place.
     assert!(
-        witness.read_identity(1).unwrap().is_some(),
-        "identity records are advisory, and releasing a byte does not erase one"
+        witness.read_identity(1).unwrap().is_none(),
+        "a refused create must take no byte, and so write no identity behind it"
     );
 }
 
