@@ -249,6 +249,7 @@ fn a_live_participant_prevents_a_second_arena() {
                 holder_slots,
                 first_slot,
                 first_pid,
+                ownership_held,
             } => {
                 assert_eq!(holder_slots, 1 << 3, "iteration {i}");
                 assert_eq!(first_slot, Some(3), "iteration {i}");
@@ -256,6 +257,14 @@ fn a_live_participant_prevents_a_second_arena() {
                     first_pid,
                     survivor.0.id(),
                     "the error must name the process an operator has to kill"
+                );
+                // The child holds a participant byte and nothing else, and every
+                // refusal above gave the ownership byte back — so this is the
+                // one state §3.4's escape hatch can actually resolve, and the
+                // error has to say so rather than read like the byte-0 wedge.
+                assert!(
+                    !ownership_held,
+                    "iteration {i}: nothing holds the ownership byte in this scenario"
                 );
             }
             other => panic!("iteration {i}: expected ArenaHeldButUnreachable, got {other}"),

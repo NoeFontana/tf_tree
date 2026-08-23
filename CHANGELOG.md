@@ -116,12 +116,99 @@ is a bug.
   `--force-new` (`CreatePolicy::Always`) is deliberately not exempted. It skips
   step 4, so a contended byte 0 there means a *live* participant holds it, and
   forcing a fresh arena past one is the split brain the flag exists to resolve.
-  The wedged arena it is written for has **dead** participants, whose bytes the
-  kernel released when they died.
+  Byte 0 is free in exactly the case the hatch is for because it is the
+  **owner's** slot, held for the owner's whole life while joiners are assigned
+  `>= 1` — not, as this entry first said, because the wedged arena's participants
+  are dead. That was false in both directions and is corrected below (#257).
 
   **Not fixed:** the takeover arm (`Open::already_attached`) still reaches
   `register_any` and can still produce the divergence. Its correct slot is
   `0029` question 3, which is `draft`.
+
+### Changed — breaking
+
+- **`IpcError::ArenaHeldButUnreachable` gains an `ownership_held: bool`, and its
+  message now tells an operator which of three states they are in** (#257).
+  `--force-new` (`CreatePolicy::Always`) is not the empty promise the issue
+  assumed and not the unconditional remedy `RUNBOOK.md` offered. Measured, it
+  creates iff **nothing is serving**, **the ownership byte is free** and
+  **participant byte 0 is free** — and since byte 0 is the creator's slot
+  (`0035`), held by the owner for its whole life while joiners are assigned
+  `>= 1`, that reduces to *the owner is gone and non-owner participants survive*,
+  which is exactly the stranded-participant case `PHASE2.md` §3.4 offers it for.
+  `the_escape_hatch_creates_over_a_stranded_participant` has pinned it working
+  since it was written.
+
+  Until now the error could not tell those states apart. A live byte 0 and a
+  stranded byte 3 produced the same sentence, differing only in a slot number
+  whose meaning appeared nowhere in the message — so the honest answer ("stop
+  that process; no force can pass it") and the useful one ("force will create
+  here") were indistinguishable. The bool is read with one `F_OFD_GETLK` at the
+  deadline, next to the identity record already read there, and is advisory in
+  the same way: it says what was true at that instant. `Display` spends it on
+  three arms, and splits the pre-existing empty-mask arm in two — its text
+  claimed the ownership byte was "held for the whole open timeout", which the
+  probe cannot say when it comes back free, so that case now gets its own
+  sentence. That split is the one branch in this change nothing stages: reaching
+  it needs a holder that lets go between the last acquire attempt and the probe,
+  and its reachability is read rather than measured.
+
+  The slot-0 arm's remedy branches on the rest of the mask, and it has to. "Stop
+  that process and an ordinary open will create" is true only when byte 0 is the
+  *only* byte held; with a joiner still on byte 2, stopping the byte-0 holder
+  leaves `IfAbsent` refusing and makes the forced create the one thing that
+  works — the opposite advice. Measured, and pinned by the `0b101` arm of
+  `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass`.
+
+  **This is a breaking change on a published crate**: `IpcError` is not
+  `#[non_exhaustive]`, so a downstream `match` that destructures this variant
+  field-by-field stops compiling until it adds the field or a `..`. Taken
+  deliberately — every `0.0.x` is incompatible with every other, which is this
+  file's opening promise, and the alternative is an error that recommends a
+  recovery that cannot work.
+
+  Two new tests pin the boundary from both sides, each with the control that
+  makes it non-vacuous:
+  `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` (both policies
+  return the *same* error; move the held byte to 3 and `Always` creates) and
+  `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through`
+  (release only the ownership byte and the same forced create succeeds).
+
+- **A false sentence about `--force-new` is corrected in the four live places it
+  was copied to** (#257): `PHASE2.md` §3.4, `Open::register_creator`'s doc
+  comment, `docs/decisions/README.md`'s `0035` row, and the `[Unreleased]` entry
+  above. Each said the wedged arena the hatch exists for has *dead* participants
+  whose bytes the kernel released when they died. It
+  is false, and backwards: a wedge **requires** a live holder, because an arena
+  all of whose holders are dead holds no participant byte at all, so §3.4 step 4
+  never fires and an ordinary `CreatePolicy::IfAbsent` open already creates with
+  no force involved. §3.4 also contradicted itself — the paragraph four lines
+  below described the wedge as a `SIGSTOP`ped participant, which is alive and
+  holding its byte.
+
+  A fifth site said something different and equally wrong:
+  `CreatePolicy::Always`'s own doc comment described what it abandons as "an
+  arena whose holders are alive and whose owner is not serving", which is
+  precisely the state it cannot abandon — the holder of byte 0 *is* the owner
+  that is not serving. It now says: an arena whose owner is gone and whose
+  non-owner holders are alive.
+
+  `docs/decisions/0035` is `implemented` and is left alone: it quotes the
+  sentence in order to retract it, and `PHASE2.md` §0.0's `--force-new` row is
+  where this project corrects a frozen record's copies. That row now also records
+  that `0035`'s own correction over-reached — its "None of the three delivers the
+  documented escape hatch" generalises from one staged state, a live holder of
+  byte 0, and is refuted by the stranded-participant test passing at this
+  revision.
+
+- **`RUNBOOK.md`'s `ArenaHeldButUnreachable` section stops telling operators to
+  expect an error that path can no longer return** (#257). It said a forced
+  create against a live holder of byte 0 returns
+  `OpenError::ParticipantSlotDiverged`; since `0035` the create never gets that
+  far, and the operator sees `ArenaHeldButUnreachable { first_slot: Some(0), .. }`
+  instead — so anyone grepping their logs for the string the runbook named found
+  nothing. Its escape-hatch recipe also offered `CreatePolicy::Always`
+  unconditionally; it now states the two states in which that is refused.
 
 ### Added
 

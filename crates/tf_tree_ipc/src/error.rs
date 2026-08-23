@@ -342,6 +342,19 @@ pub enum IpcError {
         /// The pid in that slot's identity record, or `0` if it was never
         /// written. Advisory (§5.1): the lock is the liveness, this is the name.
         first_pid: u32,
+        /// Whether the **ownership** byte was held by somebody else at the
+        /// moment this error was built.
+        ///
+        /// One `F_OFD_GETLK` taken at the deadline, so — like `first_pid` — it
+        /// is advisory: it says what was true at that instant, not what was
+        /// true for the whole timeout. It is carried because it is the one bit
+        /// that separates the two remedies, and `Display` spends it: a forced
+        /// create ([`crate::CreatePolicy::Always`]) has to take the ownership
+        /// byte before it reaches the participant bytes it is allowed to skip,
+        /// so with this `true` it cannot help, and with it `false` and
+        /// `first_slot` above 0 it is exactly the case `docs/PHASE2.md` §3.4
+        /// offers it for.
+        ownership_held: bool,
     },
     /// A `/proc` read needed for an identity record failed.
     Proc(ProcError),
@@ -486,23 +499,72 @@ impl fmt::Display for IpcError {
             // without ever serving. Saying "slot 64, pid 0" there would point an
             // operator at a slot that does not exist.
             IpcError::ArenaHeldButUnreachable {
-                holder_slots: 0, ..
+                holder_slots: 0,
+                ownership_held: true,
+                ..
             } => f.write_str(
                 "the ownership byte was held for the whole open timeout by a process that \
                  never started serving, and no participant is attached; nothing was created",
+            ),
+            // Same empty mask, but the ownership probe at the deadline came back
+            // free. The mask and the probe are read one after the other, at two
+            // instants, so a holder that let go between the last acquire attempt
+            // and the probe lands here — the arm above would claim it was held
+            // "for the whole open timeout", which this cannot say.
+            IpcError::ArenaHeldButUnreachable {
+                holder_slots: 0, ..
+            } => f.write_str(
+                "nothing held the ownership byte or any participant byte when the open timeout \
+                 expired, so whatever blocked every attempt had let go by then; retrying is the \
+                 right response",
             ),
             IpcError::ArenaHeldButUnreachable {
                 holder_slots,
                 first_slot,
                 first_pid,
-            } => match first_slot {
-                Some(slot) => write!(
+                ownership_held,
+            } => match (first_slot, ownership_held) {
+                // Slot 0 is the creator's slot (`0035`, `CREATOR_SLOT`), and a
+                // forced create takes slot 0 or nothing — so this is the one
+                // state the escape hatch provably cannot pass, and pointing an
+                // operator at it would send them down a path that fails.
+                (Some(0), _) => write!(
+                    f,
+                    "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
+                     hold their lock bytes, and slot 0 (pid {first_pid}) is the arena creator's \
+                     own slot — CreatePolicy::Always takes slot 0 or nothing, so no forced create \
+                     can pass this. Stop the process holding slot 0: {next}",
+                    next = if holder_slots == 1 {
+                        "it is the only holder, so an ordinary open will then create"
+                    } else {
+                        "the other slots in the mask above are still held, so an ordinary open \
+                         will still refuse — that is when PHASE2 §3.4's CreatePolicy::Always \
+                         becomes the escape hatch, provided nothing still holds the ownership byte"
+                    }
+                ),
+                // Every held byte is a non-owner's and nothing holds ownership:
+                // §3.4's stranded-participant case, and the only one where
+                // `CreatePolicy::Always` is the answer.
+                (Some(slot), false) => write!(
                     f,
                     "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
                      hold their lock bytes (slot {slot}, pid {first_pid}) and none took over \
-                     ownership before the deadline; refusing to create a second arena"
+                     ownership before the deadline; refusing to create a second arena. The \
+                     creator's slot 0 and the ownership byte are both free, which is the case \
+                     PHASE2 §3.4's escape hatch is for: CreatePolicy::Always will create a fresh \
+                     arena and abandon this one"
                 ),
-                None => write!(
+                // A live holder of the ownership byte blocks the forced create
+                // before it ever reaches the participant bytes it may skip.
+                (Some(slot), true) => write!(
+                    f,
+                    "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
+                     hold their lock bytes (slot {slot}, pid {first_pid}), and the ownership byte \
+                     is held by a process that is not serving. CreatePolicy::Always will not pass \
+                     this — it has to take the ownership byte before the participant bytes it may \
+                     skip. Stop the holders; refusing to create a second arena"
+                ),
+                (None, _) => write!(
                     f,
                     "an arena is alive but unreachable: no participant byte is held, yet ownership \
                      could not be taken before the deadline; refusing to create a second arena"

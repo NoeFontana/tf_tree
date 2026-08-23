@@ -221,7 +221,10 @@ pub(crate) enum Reclamation {
 /// arena. On every ordinary path they agree by construction; under
 /// `CreatePolicy::Always`, which skips §3.4 step 4's guard by design, they
 /// diverged — *measured*, in
-/// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`. This
+/// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`. `0035`
+/// has since put the create path on `register_creator`, which takes byte 0
+/// atomically, so that route is closed and the **takeover** arm is what this
+/// still buys. This
 /// function reads one at the index of the other, so without 0c's assertion
 /// every verdict below is about a different process than the one it names, and
 /// a `Reclaimable` verdict then frees a live participant's record. The
@@ -519,17 +522,27 @@ pub enum OpenError {
     /// `participant_alive(0) == false` about a process that holds record 0 and
     /// is still pushing samples.
     ///
-    /// **Only [`CreatePolicy::Always`] can reach it.** §3.4 step 4 refuses to
-    /// create while any participant byte is held, so an ordinary creator runs
-    /// against an empty lock file and takes byte 0 against a fresh arena's
-    /// record 0; the escape hatch skips that check by design and takes the
-    /// first *free* byte instead. The state it lands on is a live **non-owner**
-    /// holding byte 0, which [`tf_tree_ipc::Session::release_ownership`]
-    /// produces from a documented §3.5 call.
+    /// **No create path can reach it, and that is recent.** Until `0035` a
+    /// creator scanned for the first free byte, so a byte 0 that changed hands
+    /// mid-scan left it holding byte *n* against arena record 0 — and
+    /// [`CreatePolicy::Always`], which skips §3.4 step 4's guard by design, was
+    /// the policy that met that state most often. A creator now takes byte 0
+    /// with a single `F_OFD_SETLK`, so the acquire *is* the check and the
+    /// divergence is unrepresentable there; a contended byte 0 is refused with
+    /// [`IpcError::ArenaHeldButUnreachable`] instead. This doc used to say
+    /// "only `CreatePolicy::Always` can reach it" — true when it was written,
+    /// and no longer.
+    ///
+    /// What remains reachable is the **takeover** arm — `Open::already_attached`
+    /// still registers through `register_any` — and hand-rolled
+    /// `tf_tree_ipc::Open` plus `TreeBuilder::build_shared` construction, which
+    /// registers a record with no byte to pair it against. Whether the §3.5 heir
+    /// should reuse its slot is `0029` question 3, which is why `0035` left this
+    /// guard standing rather than deleting it.
     ///
     /// # What a caller does about it
     ///
-    /// Not retry — a second forced create against the same holder diverges
+    /// Not retry — the takeover arm against the same holder diverges
     /// identically. Either stop the process still holding the byte (`tf_tree
     /// participants` names it from the lock file's identity records), or open
     /// with [`CreatePolicy::IfAbsent`] and let the wedge be diagnosed rather
@@ -1006,7 +1019,10 @@ impl Open {
                 // the record index, and the record is chosen by the first `FREE`
                 // slot in a fresh arena. On every ordinary path they agree by
                 // construction; under `CreatePolicy::Always`, which skips §3.4
-                // step 4's guard by design, they need not.
+                // step 4's guard by design, they need not — as written. `0035`
+                // then put the create path on `register_creator`, which takes
+                // byte 0 atomically, so this comparison is an assertion on that
+                // arm and a filter only on the takeover one.
                 //
                 // §5.1's predicate reads one at the index of the other, so a
                 // disagreement makes every liveness verdict about somebody else.

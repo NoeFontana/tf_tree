@@ -504,6 +504,263 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
     );
 }
 
+/// **The boundary of the escape hatch, from both sides of it** (#257).
+///
+/// `the_escape_hatch_creates_over_a_stranded_participant` above shows
+/// `CreatePolicy::Always` working; this shows where it stops, and the two
+/// together are what §3.4's prose is now written against. The rule the code
+/// implements is not "force always creates" and not "force never creates": a
+/// forced create skips step 4's participant scan and **nothing else**, so it
+/// still has to take the ownership byte (step 2) and still has to take
+/// participant byte 0 (step 5, `0035`'s `CREATOR_SLOT`). Hold either one live
+/// and it refuses exactly like an ordinary open.
+///
+/// That is why the operator-facing bit is *which* byte is held, not whether one
+/// is: byte 0 is the creator's own slot and the owner keeps it for its whole
+/// life, so a live holder of it is an arena whose owner is still there — and no
+/// force can help. Bytes `>= 1` are joiners, so a live holder of one with byte 0
+/// free is the owner-is-gone wedge §3.4 offers the hatch for.
+///
+/// Measured at `09efc9b`, before the `ownership_held` field existed, the two
+/// states printed the *same* sentence: "participant slots 0x1 still hold their
+/// lock bytes (slot 0, pid 0) and none took over ownership before the deadline;
+/// refusing to create a second arena" against the identical line with `0x8` and
+/// `slot 3` in it — differing only in a slot number whose meaning appears
+/// nowhere in the message. The `assert_ne!` below is that they no longer do.
+///
+/// The holders are bare lock bytes rather than processes because a held byte is
+/// the entirety of what steps 2, 4 and 5 consult; a second process would add a
+/// socket, a mapping and a race without changing the input. Each is its own
+/// open file description, since `F_OFD_GETLK` reports only *conflicting* locks
+/// and a description's own byte does not conflict with itself.
+///
+/// **Mutant: `ownership_held: false` hardcoded at the construction site**
+/// (`Open::held_but_unreachable`). Applied ⇒ measured: the sibling test below
+/// fails, and it fails one assertion *earlier* than the message check — at
+/// `expected ArenaHeldButUnreachable with ownership_held, got …
+/// ownership_held: false`. **Mutant: `(Some(0), _) if false`, i.e. the slot-0
+/// arm folded back into the generic one.** Applied ⇒ measured, this test fails
+/// on `the message must not send an operator to the escape hatch here`, and the
+/// message it printed was the stranded-joiner one — "CreatePolicy::Always will
+/// create a fresh arena and abandon this one", recommended for the one state
+/// where it cannot work.
+#[test]
+fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("force-boundary");
+    let lock_path = scratch.0.join("0/default.lock");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+
+    let opener = |policy| {
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(policy)
+            .layout_if_creating(
+                TreeBuilder::new()
+                    .default_interp(InterpPolicy::LerpSlerp)
+                    .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+            )
+            .timeout(std::time::Duration::from_millis(100))
+    };
+
+    // The creator's own byte, held live. Nothing holds ownership: the point is
+    // that byte 0 alone is enough to refuse.
+    let on_byte_0 = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        on_byte_0.try_take_participant(0).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+
+    let refusal = |policy| {
+        opener(policy)
+            .open()
+            .err()
+            .unwrap_or_else(|| panic!("{policy:?} created an arena over a live byte 0"))
+    };
+    let ordinary = refusal(CreatePolicy::IfAbsent);
+    let forced = refusal(CreatePolicy::Always);
+    assert_eq!(
+        ordinary, forced,
+        "forcing must change nothing about a wedge on byte 0"
+    );
+    assert!(
+        matches!(
+            forced,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+                holder_slots: 0b1,
+                first_slot: Some(0),
+                ownership_held: false,
+                ..
+            })
+        ),
+        "expected ArenaHeldButUnreachable naming slot 0 with ownership free, got {forced:?}"
+    );
+    let byte_0_message = forced.to_string();
+    assert!(
+        byte_0_message.contains("no forced create can pass this"),
+        "the message must not send an operator to the escape hatch here: {byte_0_message}"
+    );
+    assert!(
+        byte_0_message.contains("it is the only holder, so an ordinary open will then create"),
+        "byte 0 alone: stopping it really is sufficient, and the message may say so: \
+         {byte_0_message}"
+    );
+
+    // **The remedy branches on the rest of the mask, and getting that wrong is
+    // how this message tells an operator something false.** Add one ordinary
+    // joiner's byte and nothing else changes about slot 0 — but "stop it and an
+    // ordinary open will create" stops being true, because step 4 still sees
+    // byte 2. Measured: stopping only the byte-0 holder in this state leaves
+    // `IfAbsent` refusing and makes `Always` the *only* thing that works, which
+    // is the opposite of what the un-branched sentence advised.
+    let alongside = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        alongside.try_take_participant(2).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+    let crowded = refusal(CreatePolicy::Always);
+    assert!(
+        matches!(
+            crowded,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+                holder_slots: 0b101,
+                first_slot: Some(0),
+                ..
+            })
+        ),
+        "expected slot 0 plus slot 2 in the mask, got {crowded:?}"
+    );
+    let crowded_message = crowded.to_string();
+    assert!(
+        crowded_message.contains("the other slots in the mask above are still held"),
+        "with a joiner still attached the remedy is not 'an ordinary open will create': \
+         {crowded_message}"
+    );
+    assert!(
+        !crowded_message.contains("it is the only holder"),
+        "the two remedies must not both appear: {crowded_message}"
+    );
+    drop(alongside);
+
+    // **The positive control.** One variable changes — which byte is held — and
+    // the same forced create that just refused now succeeds. Without this the
+    // test would pass just as well against an `open()` that never creates.
+    drop(on_byte_0);
+    let stranded = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        stranded.try_take_participant(3).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+    let still_refused = refusal(CreatePolicy::IfAbsent);
+    let stranded_message = still_refused.to_string();
+    assert!(
+        stranded_message.contains("escape hatch is for"),
+        "a stranded joiner is the case the hatch is for: {stranded_message}"
+    );
+    assert_ne!(
+        byte_0_message, stranded_message,
+        "the two states must not print the same sentence — telling them apart is the \
+         whole point of the field"
+    );
+
+    let tree = opener(CreatePolicy::Always)
+        .open()
+        .expect("byte 0 free and only a joiner stranded: the hatch must create");
+    assert_eq!(
+        tree.participant_slot(),
+        0,
+        "the forced creator takes the creator's slot like any other creator"
+    );
+    let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert!(
+        witness.probe_participant(3).unwrap().held,
+        "the abandoned arena's survivor must keep its byte"
+    );
+}
+
+/// **The third state, which is neither of the two above** (#257).
+///
+/// A forced create takes the ownership byte before it reaches the participant
+/// bytes it is allowed to skip, so a live holder of *that* byte refuses it even
+/// with byte 0 free and only a joiner stranded — the shape that otherwise looks
+/// exactly like §3.4's escape-hatch case. Reachable in the field as §11.3's
+/// `open.after_create_before_bind` window and as any process that took ownership
+/// and has not begun serving.
+///
+/// It matters because the remedy differs: here there is a second process to
+/// stop, and an error that recommended `CreatePolicy::Always` on the strength of
+/// `first_slot: Some(1)` alone would send an operator down a path that fails.
+///
+/// The control is the isolating one: **only** the ownership byte goes away —
+/// same stranded joiner on byte 1, same free byte 0, same policy — and the
+/// create succeeds.
+#[test]
+fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("force-ownership");
+    let lock_path = scratch.0.join("0/default.lock");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+
+    let forced = || {
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::Always)
+            .layout_if_creating(
+                TreeBuilder::new()
+                    .default_interp(InterpPolicy::LerpSlerp)
+                    .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+            )
+            .timeout(std::time::Duration::from_millis(100))
+    };
+
+    let ownership = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        ownership.try_take_ownership().unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+    let stranded = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        stranded.try_take_participant(1).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+
+    let err = forced()
+        .open()
+        .err()
+        .expect("a held ownership byte must refuse even a forced create");
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+                first_slot: Some(1),
+                ownership_held: true,
+                ..
+            })
+        ),
+        "expected ArenaHeldButUnreachable with ownership_held, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("CreatePolicy::Always will not pass this"),
+        "the message must not recommend the hatch here: {message}"
+    );
+
+    // The control: release the ownership byte and change nothing else.
+    drop(ownership);
+    let tree = forced()
+        .open()
+        .expect("with ownership free this is the stranded-joiner case again");
+    assert_eq!(tree.participant_slot(), 0);
+    let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert!(
+        witness.probe_participant(1).unwrap().held,
+        "the abandoned arena's survivor must keep its byte"
+    );
+    drop(stranded);
+}
+
 /// **A pinned defect (#201), not desired behaviour. Invert or delete this test
 /// when the divergence is fixed** — every assertion below states what the code
 /// does today, and two of them state something wrong: that one process's lock
