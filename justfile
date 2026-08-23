@@ -2218,9 +2218,17 @@ shm-rendezvous:
     # reports how many times the predicate asked the kernel, which is the only
     # part of its read *order* a multiprocess test can observe.
     #
-    # **`unstable` buys eight tests here, the same trade `just shm-check`'s
-    # `--test frozen` line makes.** Two of them drive the helper's `join-rw-report`
-    # mode, which reads a participant record's raw `state` word through
+    # **`unstable` buys eleven tests here, the same trade `just shm-check`'s
+    # `--test frozen` line makes.** The enumeration below names the eight that
+    # existed when it was written; the other three —
+    # `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`,
+    # `a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to` and
+    # `a_leased_publisher_keeps_its_edge_against_a_sweeper` — landed since, and
+    # are named rather than absorbed because a `comm` over two `nextest list`
+    # runs is how they were found and the next reader deserves the same list.
+    #
+    # Two of the eight drive the helper's `join-rw-report` mode, which reads a
+    # participant record's raw `state` word through
     # `Tree::arena_view` — the only route to it (`docs/API.md` §2.6).
     # `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` needs it
     # because a slot that stays `LIVE` after its process dies cannot be told
@@ -2250,17 +2258,26 @@ shm-rendezvous:
     # the feature only to *observe* — the raw `state` word is what separates "the
     # sweep collected the slot" from "the sweep left the wedge in place", and
     # `Tree::participant_alive` reads `false` for both. Without the feature all
-    # eight and the helper mode are `#[cfg]`-ed out and the recipe runs eight
-    # tests fewer, silently.
+    # eleven and the helper mode are `#[cfg]`-ed out and the recipe runs eleven
+    # tests fewer, silently — eight enumerated above plus the three named at the
+    # top of this comment, which is the arithmetic that made both numbers here
+    # wrong until they were re-measured.
     #
     # Measured on this branch, `cargo nextest list -p tf_tree --test rendezvous`
-    # per feature set: `shm` 17, `shm,unstable` 25, `shm,test-hooks` 23,
-    # `shm,test-hooks,unstable` **31** — the line below. (Earlier revisions of
+    # per feature set: `shm` 18, `shm,unstable` 29, `shm,test-hooks` 24,
+    # `shm,test-hooks,unstable` **35** — the line below. (Earlier revisions of
     # this comment said 16/18, then 16/19/22/25, then 16/21/22/27 on `0028` plan
     # step 5's branch and 17/23/23/29 on steps 3 and 4's; each was written
-    # before the next tests landed, and the last two are what merging those two
-    # branches adds up to, which is why the numbers here are re-measured rather
-    # than added together.)
+    # before the next tests landed, which is why the numbers here are
+    # re-measured rather than added together.)
+    #
+    # **Two of the four were already stale before this branch touched them**,
+    # and that is worth one sentence because it is the failure mode the
+    # re-measuring exists to catch: at 09efc9b the same command reports
+    # 17/28/23/34, not 17/25/23/31, so the `unstable` columns had drifted by
+    # three while the other two were exact. This branch adds one ungated test —
+    # `a_stopped_and_continued_owner_still_serves_the_rendezvous`, the `EINTR`
+    # regression — which is +1 in every column and not what moved them.
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.

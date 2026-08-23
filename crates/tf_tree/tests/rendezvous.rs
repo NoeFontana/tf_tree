@@ -206,6 +206,166 @@ fn the_free_open_joins_a_served_arena() {
     );
 }
 
+/// How many threads `pid` has, from `/proc/<pid>/status`.
+///
+/// An owner is exactly two: the main thread, parked, and `tf_tree-owner`
+/// running `OwnerServer::serve`. So "the serving thread died and the process
+/// did not" — the shape of the defect below — is one integer, visible from
+/// outside without asking the process anything.
+fn threads(pid: u32) -> Option<usize> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Block until `pid` has left state `T`, or panic.
+///
+/// The mirror of [`await_stopped`], and load-bearing for the same reason: it is
+/// the **continue** that delivers the `EINTR`, and `kill(2)` returning says only
+/// that `SIGCONT` was queued. Without this wait, everything below could be a
+/// measurement of a process that is still stopped — which is a different
+/// experiment with a different expected answer.
+fn await_continued(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match proc_state(pid) {
+            Some('T' | 't') => assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} never left state T after SIGCONT, so nothing below \
+                 would be a measurement of a continued process"
+            ),
+            Some(_) => return,
+            None => panic!("pid {pid} died instead of continuing"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Give `pid` up to `budget` to settle, then report its thread count.
+///
+/// The budget is what buys the failure a chance to *happen* before it is
+/// asserted on — the serving thread dies microseconds after the `SIGCONT`, and
+/// spawning the joiner below takes longer than that, but neither is a
+/// guarantee. Returning early when the count moves under us keeps it from
+/// being a flat sleep in the case where the change lands late.
+///
+/// Measured either way, both arms cost the budget end to end: 0.512 s with the
+/// defect and 0.513 s without it, because by the time [`await_continued`]
+/// returns the thread is usually already gone and there is no *change* left to
+/// observe — only a count to read. A bare `sleep` would give the same coverage
+/// and a worse message; this way the count that failed is the count printed.
+fn threads_settle(pid: u32, budget: std::time::Duration) -> Option<usize> {
+    let start = threads(pid);
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        let now = threads(pid);
+        if now != start {
+            return now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    threads(pid)
+}
+
+/// **An owner that was stopped and continued is still serving.**
+///
+/// `epoll_wait` is one of the interfaces `signal(7)` lists as failing with
+/// `EINTR` after a stop signal followed by `SIGCONT`, with no signal handler
+/// installed anywhere — Ctrl-Z then `fg`, a container freeze/thaw, a debugger
+/// attaching and detaching. `OwnerServer::serve` propagated that errno like any
+/// other, and the consequences were not confined to the loop: `serve` returned
+/// `Err`, the server's `Drop` unlinked the published socket, and the process
+/// **lived on** holding participant byte 0 and the ownership byte. §3.4 then
+/// has no exit for anybody — nothing serves, and step 4 refuses to create a
+/// second arena because a participant byte is held by a process that really is
+/// alive — so an operator's only remedy was killing a healthy publisher.
+///
+/// # What each part of this test is for
+///
+/// The join *before* the signals is the control: it establishes that this
+/// rendezvous served, so a failure afterwards is caused by the pair and not by
+/// a fixture that never worked. [`await_stopped`] makes the `SIGSTOP` a fact
+/// rather than a queued signal and [`await_continued`] does the same for the
+/// `SIGCONT`, which is the one that delivers the `EINTR`. The thread count is
+/// the mechanism stated directly — a dead serving thread inside a live process
+/// — and the second join is the consequence an operator actually meets.
+///
+/// # Measured, both ways
+///
+/// On the parent commit this fails at the thread-count assertion with
+/// `left: Some(1), right: Some(2)`, `default.sock` gone; with the retry it
+/// passes. Three controls, run standalone against the parent commit, say the
+/// stop/continue *pair* is what does it and not the act of signalling: no
+/// signal at all, three `SIGWINCH`es (default-ignored), and a bare `SIGCONT` to
+/// a never-stopped owner each left two threads, the socket in place and the
+/// join succeeding.
+#[test]
+fn a_stopped_and_continued_owner_still_serves_the_rendezvous() {
+    let scratch = Scratch::new("stop-cont");
+    let sock = scratch.0.join("0/default.sock");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    let published = owner.line();
+    assert!(published.starts_with("owning "), "got {published}");
+    let owner_value = published.strip_prefix("owning ").unwrap().to_string();
+    let pid = owner.0.id();
+
+    assert_eq!(
+        threads(pid),
+        Some(2),
+        "an owner should be a parked main thread plus tf_tree-owner; without \
+         two there is no serving thread for this test to lose"
+    );
+    assert!(sock.exists(), "the owner published no socket at {sock:?}");
+
+    // The control. Everything after this is a comparison against a rendezvous
+    // that demonstrably worked.
+    let mut before = Kid::spawn(&scratch.0, &["join"]);
+    let joined = before.line();
+    assert_eq!(
+        joined.strip_prefix("joined "),
+        Some(owner_value.as_str()),
+        "the fixture never served in the first place: {joined}"
+    );
+
+    for signal in ["-STOP", "-CONT"] {
+        if signal == "-CONT" {
+            // Between the two: the target is genuinely stopped, so the SIGCONT
+            // below is a *continue* rather than a no-op on a running process.
+            await_stopped(pid);
+        }
+        assert!(
+            Command::new("kill")
+                .args([signal, &pid.to_string()])
+                .status()
+                .is_ok_and(|s| s.success()),
+            "could not send {signal} to the owner"
+        );
+    }
+    await_continued(pid);
+
+    assert_eq!(
+        threads_settle(pid, std::time::Duration::from_millis(500)),
+        Some(2),
+        "the owner's serving thread died on a stop/continue pair while the \
+         process lived on holding its lock bytes; socket present: {}",
+        sock.exists()
+    );
+
+    let mut after = Kid::spawn(&scratch.0, &["join"]);
+    let rejoined = after.line();
+    assert_eq!(
+        rejoined.strip_prefix("joined "),
+        Some(owner_value.as_str()),
+        "a second process could not join after the owner was stopped and \
+         continued: {rejoined}"
+    );
+}
+
 /// **`docs/decisions/0019` §2a: a read-only attach cannot create.**
 ///
 /// **The `layout_if_creating` is load-bearing and the test is vacuous without
@@ -2217,7 +2377,12 @@ fn join_as_sweeper() -> tf_tree::Tree {
 /// establishes its own **precondition** — that the target really is stopped —
 /// and if `/proc` were unreadable this test would fail loudly rather than
 /// quietly assert nothing, which is the direction that matters.
-#[cfg(feature = "test-hooks")]
+///
+/// **Ungated, unlike the rest of this section.** It grew a second caller that
+/// carries no feature gate —
+/// [`a_stopped_and_continued_owner_still_serves_the_rendezvous`] — and
+/// `just shm-check` clippies this target at `shm` alone, where a
+/// `test-hooks`-only helper used by an ungated test is a compile error.
 fn proc_state(pid: u32) -> Option<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.get(stat.rfind(')')? + 1..)?;
@@ -2232,7 +2397,9 @@ fn proc_state(pid: u32) -> Option<char> {
 /// process. And with the wait, deleting the `SIGSTOP` does not leave the test
 /// passing — it leaves it panicking here, which is the property this helper
 /// exists for.
-#[cfg(feature = "test-hooks")]
+///
+/// Ungated for the same reason as [`proc_state`]: the EINTR regression above
+/// stops a process too, and it is not a `test-hooks` test.
 fn await_stopped(pid: u32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
