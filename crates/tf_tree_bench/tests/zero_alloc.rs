@@ -148,7 +148,9 @@ fn no_allocations_after_construction() {
 /// a three-step plan. Neither of those is where an allocation would hide. The
 /// things that scale with the workload — the compiled plan's step array, the
 /// guard's per-edge bookkeeping, the bracket search's state — are all
-/// fixed-size by design (`Plan` is `[Step; MAX_DEPTH]` and `Copy`, invariant 8),
+/// fixed-size by design (`Plan` is `[Step; MAX_DEPTH]` and `Copy`, invariant 8;
+/// `0034` moved `MAX_DEPTH` 16 → 32, which changes the array's size and not the
+/// property this test is about),
 /// and this asserts that the design survived contact with a 1537-frame tree, a
 /// four-dynamic-step plan and a ring that laps repeatedly during the loop.
 ///

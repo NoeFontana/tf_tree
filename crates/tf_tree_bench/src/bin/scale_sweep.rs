@@ -512,11 +512,20 @@ fn limits() {
     );
 
     // Depth, which is a compile-time constant and the one a migrating user
-    // actually trips over.
+    // actually trips over. **Two constants since `0034`**, and printing only the
+    // compiled one told a migrating user their 24-link chain was refused when a
+    // rigid one of that length is not — the raw walk is what a tf2 tree's own
+    // depth is measured against.
     println!(
-        "  compiled plan depth:         {} steps — LookupError::TreeTooDeep beyond it.\n\
-         {:31}A tf2 tree deeper than this cannot be migrated as-is.",
+        "  path edges walked:           {} — LookupError::TreeTooDeep beyond it.\n\
+         {:31}This is what a tf2 tree's own depth is measured against.\n\
+           compiled plan steps:         {} — LookupError::TreeTooDeep beyond it,\n\
+         {:31}counted *after* adjacent static links fold into one step, so a\n\
+         {:31}rigid chain costs one step however long it is.",
+        tf_tree::MAX_PATH_EDGES,
+        "",
         tf_tree::MAX_DEPTH,
+        "",
         "",
     );
 

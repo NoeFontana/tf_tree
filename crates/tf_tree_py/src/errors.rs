@@ -753,19 +753,42 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
         // and `MixedTimeDomains` is arguably a `Disconnected`-shaped refusal —
         // and both are noted as decision-record material rather than taken here.
 
-        // **"depth {depth} exceeds the maximum of {MAX_DEPTH}" would be false**,
-        // and it is what the obvious phrasing produces. `plan::compile` reports
-        // `nt + ns` — the steps it had *already collected* when the fixed array
-        // filled — so at the refusal the number equals the bound rather than
-        // exceeding it (`crates/tf_tree_core/src/tests.rs` asserts exactly
-        // `TreeTooDeep { depth: MAX_DEPTH }`). What is true is that the walk
-        // needed more, and that is what this says.
-        LookupError::TreeTooDeep { depth } => TfTreeError::new_err(format!(
-            "this path needs more than the {} steps a compiled plan holds; the \
-             walk had collected {depth} when it stopped. Real trees are 4–8 \
-             deep — re-parent so the two frames share a nearer ancestor",
-            tf_tree::MAX_DEPTH
-        )),
+        // **"depth {depth} exceeds the maximum of {MAX_DEPTH}" used to be
+        // false**, and it is what the obvious phrasing produces. Until `0034`
+        // `plan::compile` reported `nt + ns` — the edges it had *already
+        // collected* when the fixed array filled — so at the refusal the number
+        // equalled the bound rather than exceeding it.
+        //
+        // **That argument inverts now, and only for one of the two bounds.**
+        // There are two: `MAX_PATH_EDGES` on the raw walk and `MAX_DEPTH` on the
+        // folded plan, and one variant carries both because the C ABI's status
+        // table is frozen. Above `MAX_PATH_EDGES` the old reading still holds —
+        // the walk stops when it runs out of buffer and never learns the real
+        // length, so the number is a floor, and this arm says "longer than"
+        // rather than quoting it. At or below it the number is the *exact*
+        // folded step count and does exceed the bound, so that sentence can be
+        // written plainly for the first time.
+        //
+        // **No remedy naming static edges here.** `tf_tree.build` declares every
+        // edge dynamic (`crates/tf_tree_py/src/tree.rs`), so "make the fixed
+        // links static so they fold" — which the Rust facade's own prose does
+        // say, and may — names something a Python caller cannot reach.
+        LookupError::TreeTooDeep { depth } => TfTreeError::new_err(
+            if usize::from(depth) > tf_tree::MAX_PATH_EDGES {
+                format!(
+                    "the path between these frames is longer than the {} edges a \
+                     lookup walks — re-parent so the two frames share a nearer \
+                     ancestor",
+                    tf_tree::MAX_PATH_EDGES
+                )
+            } else {
+                format!(
+                    "this path compiles to {depth} steps and a plan holds {} — \
+                     re-parent so the two frames share a nearer ancestor",
+                    tf_tree::MAX_DEPTH
+                )
+            },
+        ),
         // Recycled and Contended are both "the ring beat the reader", and both
         // are retryable, but they are *not* the same advice: a lap means the
         // history the reader wanted is gone and a retry re-reads a newer

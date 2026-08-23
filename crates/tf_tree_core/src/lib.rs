@@ -164,10 +164,54 @@ pub use plan::{
     MAX_KNOTS,
 };
 
-/// Maximum combined path depth of a compiled plan (used by the next PR). Real
-/// trees are 4–8; 16 is generous. Declared here so the fixed step array and the
-/// [`LookupError::TreeTooDeep`] bound share one constant.
-pub const MAX_DEPTH: usize = 16;
+/// Maximum length of a **compiled** plan: the number of [`plan::Step`] slots a
+/// [`plan::Plan`] carries, counted *after* constant folding.
+///
+/// A slot here costs **128 bytes** — `size_of::<Step>()`, measured; the
+/// discriminant forces a second cacheline past `Iso3`'s 64 — and every `Plan`
+/// carries `MAX_DEPTH` of them by value whatever its real length, in the facade's
+/// 16-slot thread-local plan cache and behind every Python `Plan`. That is the
+/// slot this constant prices, and it is why it is not the walk's bound: see
+/// [`MAX_PATH_EDGES`].
+///
+/// Raised 16 → 32 by
+/// [`0034`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md).
+/// A survey of 91 real robot descriptions put the worst *graph diameter* at 30
+/// joints (p95 24) — the quantity a lookup walks, up to the common ancestor and
+/// back down, which is not root-to-leaf depth. And the cost 16 was defended on,
+/// "everyone pays, on the hot path", did not survive being taken: the criterion
+/// `lookup`, `query_mix` and `at_many` rows are flat within ±0.5% at 32, and no
+/// evaluate row measured since moves more than ±2% in either direction. What is
+/// not flat is `compile`'s cache-miss path, which is why `0034` deletes the
+/// second `[Step; MAX_DEPTH]` array in the same change — measured, that pays
+/// back 14% of a 114% regression rather than all of it.
+pub const MAX_DEPTH: usize = 32;
+
+/// Maximum number of **raw** path edges [`plan::compile`] will walk, counted
+/// across both sides of the lowest common ancestor before folding.
+///
+/// A slot here is a `u32` edge id in `compile`'s stack frame: **4 bytes**, paid
+/// once, on a call D3 already places off the hot path. 128 bytes against 4 is
+/// why one number cannot price both slots.
+///
+/// Exceeding it is [`LookupError::TreeTooDeep`]; so is a path that *fits* the
+/// walk but still folds to more than [`MAX_DEPTH`] steps. The two are told apart
+/// by the reported `depth` — see that variant's own documentation.
+///
+/// 64 is ~1.9× the floor the survey sets: a 30-joint diameter plus a deployed
+/// `/tf` prefix (`map → odom → base_footprint`) is ~33. It is deliberately not
+/// 256: this constant sets the worst *accepted* compile latency — **0.9-1.1 µs**
+/// here for 64 static edges folding to one step, against 3.97 µs for the same
+/// shape at 256 — and a refused pair is not cached
+/// (`tf_tree`'s `cache`), so it recompiles on every lookup with nothing
+/// amortising it.
+///
+/// The range on that number is not hedging: two independently written harnesses
+/// on this host measured the same shape at 904 ns and at 1092 ns, 21% apart, and
+/// neither is wrong about what it timed. Quoting one to three digits would claim
+/// a precision the pair does not support. What both agree on, and what chooses
+/// the constant, is the ~4x between 64 and 256.
+pub const MAX_PATH_EDGES: usize = 64;
 
 #[cfg(all(test, loom))]
 mod loom_tests;

@@ -519,7 +519,8 @@ the compiled plan. §13 records what removing them actually returned.
 **Verdict: falsified.** Removing both scans moved nothing.
 
 `Plan::at` computed `has_dynamic` and `first_dynamic_edge` on every call, each an
-O(`len`) walk of a `[Step; MAX_DEPTH]` array — **2048 bytes**, see §15 — 28 steps of scanning on a
+O(`len`) walk of a `[Step; MAX_DEPTH]` array — **2048 bytes** at the
+`MAX_DEPTH = 16` these numbers were taken at, 4096 since `0034`; see §15 — 28 steps of scanning on a
 depth-14 lookup, before folding anything. `first_dynamic_edge`'s own doc comment
 called it "an O(plan length) scan … loop-invariant" and hoisted it for the batch
 path while the scalar path kept paying it. Both are functions of the compiled
@@ -650,6 +651,13 @@ the enum discriminant rounds the whole variant to two cache lines and
 `[Step; MAX_DEPTH]` is **2048 bytes**. A depth-6 fold walks 768 bytes, twelve
 cache lines, to read six discriminants and six edge ids. (§13 and `plan.rs` both
 said "1 KiB"; both understated it by 2× and are corrected.)
+
+> **`MAX_DEPTH` was 16 when every number on this page was taken; `0034` moved it
+> to 32, so the array is 4096 bytes now.** Nothing measured here moves with it:
+> the fold is O(`len`) and the "depth-6 fold walks 768 bytes" figure is a
+> function of the plan's real length, not of the array's declared size. The
+> array size appears in this document only as the thing §13's rejected lever
+> wanted to shrink. `size_of::<Step>()` is still 128.
 
 Better still, the fix looked unconstrained: `Plan` is a value type, **not an
 arena structure**, so there is no `FORMAT_VERSION` to break. And `Iso3`'s

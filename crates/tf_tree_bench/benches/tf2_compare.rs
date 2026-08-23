@@ -345,8 +345,9 @@ fn bench_scale(c: &mut Criterion) {
     //
     // The last shape grows *wide* rather than deeper on purpose: a lookup
     // composes `chain_depth + 1` steps, and tf_tree caps a compiled plan at
-    // `tf_tree_core::MAX_DEPTH` (16), so a 24-deep spine is rejected outright
-    // with `TreeTooDeep`. tf2 has no such limit. That is a real difference in
+    // `tf_tree_core::MAX_DEPTH` (32 since `0034`, 16 when this shape was
+    // chosen), so a spine past it is rejected outright with `TreeTooDeep`. tf2
+    // has no such limit. That is a real difference in
     // what the two engines accept — recorded in `docs/benchmarks/tf2.md` rather
     // than papered over — but it is not a *performance* difference, so the
     // scaling row stays inside the budget where both engines can answer.

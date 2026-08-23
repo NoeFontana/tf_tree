@@ -57,8 +57,9 @@ use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Stamp, SystemDomain, Tree, TreeBu
 use tf_tree_bench::fixture::dynamic_pose;
 use tf_tree_core::EdgeId;
 
-/// Dynamic edges. Wide rather than deep: `MAX_DEPTH` caps a chain at 16, and the
-/// point is arena *size*, so the frames fan out from one root.
+/// Dynamic edges. Wide rather than deep: `MAX_DEPTH` caps a *compiled* chain at
+/// 32 and `MAX_PATH_EDGES` the walk at 64, and the point is arena *size*, so the
+/// frames fan out from one root.
 const EDGES: usize = 64;
 /// Slots per ring. 64 edges x 16384 slots x 72 B/sample is ~75 MiB of arena —
 /// well past the 2 MiB huge-page unit, and past the 32 MiB L3 too.

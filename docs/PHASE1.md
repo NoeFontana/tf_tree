@@ -587,7 +587,8 @@ Binary search over logical indices with masking on probe is required — searchi
 ### 7.1 Step representation
 
 ```rust
-pub const MAX_DEPTH: usize = 16;
+pub const MAX_DEPTH: usize = 32;
+pub const MAX_PATH_EDGES: usize = 64;
 
 #[derive(Clone, Copy)]
 pub enum Step {
@@ -603,7 +604,31 @@ pub struct Plan {
 }
 ```
 
-Fixed array, no `SmallVec`, no allocation, no dependency. Combined depth exceeding 16 is `TreeTooDeep` — generous, since real trees are 4–8.
+Fixed array, no `SmallVec`, no allocation, no dependency.
+
+**Two bounds, and they price different slots** ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)).
+`MAX_DEPTH` bounds the *compiled* plan, counted **after** §7.2's folding: a slot
+there is a `Step`, **128 bytes measured**, carried by value in every `Plan` and
+in a 16-slot thread-local cache. `MAX_PATH_EDGES` bounds the *raw walk*: a slot
+there is a `u32` in `compile`'s stack frame. 128 bytes against 4 is why one
+number cannot price both, and this section said otherwise until `0034` — it read
+"combined depth exceeding 16 is `TreeTooDeep` — generous, since real trees are
+4–8", which is sound about a moving `/tf` graph and wrong about a rigid
+assembly, where a 20-link fixed chain folds to **one step** and was refused
+anyway.
+
+Either bound overrun is `TreeTooDeep`, one variant for both because the C ABI's
+status table is frozen. Its `depth` field says which: `MAX_PATH_EDGES + 1` is the
+walk refusing (the walk stops when it runs out of buffer, so it never learns the
+real length), and anything at or below `MAX_PATH_EDGES` is the **exact** folded
+step count.
+
+"Real trees are 4–8" is retired as a justification, and what replaces it is a
+survey rather than an intuition: 91 real robot descriptions from 26 repositories,
+whose worst *graph diameter* — up to the lowest common ancestor and back down,
+which is the quantity a lookup pays, not root-to-leaf depth — is **30 joints**,
+p95 24, median 10. 32 is the next power of two above 30; 64 is ~1.9× the 30 plus
+a deployed `map → odom → base_footprint` prefix.
 
 ### 7.2 Compilation
 
@@ -638,6 +663,29 @@ Verify the direction by hand once against a three-frame example before writing c
 2. Collapse every run of adjacent `Static` into a single `Static` by composing them.
 
 A depth-6 chain with 4 static edges typically folds to 3 steps. Assert in a test that the canonical URDF fixture folds from 6 steps to 3.
+
+**Folding takes the walk's two `u32` buffers, not an intermediate `[Step; MAX_DEPTH]`
+array** ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)).
+The buffers hold everything a step does — an edge id, plus an `inverted` flag
+that is `true` iff the edge came from the target side — so the copy was free to
+delete, and deleting it is what lets `MAX_PATH_EDGES` be generous without a
+second 128-bytes-a-slot array.
+
+Two properties of the fold are load-bearing and neither is obvious:
+
+* **The source half is emitted in reverse of walk order**, which is what makes
+  the composition associate `((s[n-1] · s[n-2]) · …)`. `Iso3` composition is not
+  associative under rounding and every test in the suite is tolerance-based
+  (`TOL = 1e-12`), so a change that folds during the walk — meeting `s[0]` first
+  — would produce different bits and pass every test. Verify a change here
+  against **bits**, not tolerance.
+* **The loop does not stop when the output array fills.** It skips the write,
+  keeps counting, and goes on resolving every remaining edge, so (a) `TreeTooDeep`
+  reports the true folded length rather than the bound, and (b) `UnknownEdge` and
+  `MixedTimeDomains` still win over `TreeTooDeep` for a defect that sits past the
+  bound. Stopping early is cheaper and was measured; it is not what ships, and
+  `error_precedence_over_defect_kind_position_and_foldability` in
+  `crates/tf_tree_core/src/tests.rs` is the table that pins the difference.
 
 ### 7.3 Evaluation
 

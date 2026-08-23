@@ -1,8 +1,44 @@
 # 0034: the depth bound priced two slots the same
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** none — prototyped, surveyed and measured; not landed.
+**Implementation:** landed in one change (#251). Both bounds moved, `fold` takes
+the two `u32` slices, variant C, and the twenty prose/test sites.
+
+> **Implementation notes**, kept because two of them are numbers this record
+> predicted and got wrong.
+>
+> * **The combined cost is +83.5%, and the record's own prediction that deleting
+>   the array would pay for the raise was wrong.** Re-measured on the landed
+>   change with a three-arm design — HEAD, an intermediate build carrying only
+>   `MAX_DEPTH = 32`, and this one: the constant costs +114.2% and the deletion
+>   buys back −14.1% (0 of 30 reps slower). See *Consequences*, which carries the
+>   full table; the remainder is #264.
+> * **The bit-equality harness has a non-vacuity control, and needed one.** 4376
+>   shapes bit-identical to a rebuilt HEAD — exhaustive over every static/dynamic
+>   pattern × every LCA split for lengths 1–8, so straight chains, Y shapes and
+>   every interleaving, with non-identity poses. A third build that right-
+>   associates each static run differs on **1881 of them** at max 2.132e-14,
+>   which is two orders *inside* the suite's `TOL = 1e-12`. That is rationale
+>   (D)'s argument, executed: the whole existing suite would accept the
+>   reassociation this record refuses. An independent reviewer rebuilt the
+>   harness from scratch over 28919 rows and reproduced both numbers.
+> * **One mutant came back equivalent, and that was the finding.** Replacing the
+>   combined `nt + ns` raw bound with the per-side spelling passed 881/881,
+>   because every depth test used a straight chain where the two are identical.
+>   A `y_arena(40, 40)` fixture was added; the same mutant then returns
+>   `Ok(Plan { len: 1 })` for an 80-edge path against a bound of 64.
+> * **The `depth == MAX_PATH_EDGES` seam is the row both message renderers
+>   needed.** A path of exactly the walk's bound is walked in full and then
+>   refused by the compiled bound, so `depth` takes its largest compiled-refusal
+>   value there — and `>=` instead of `>` blames the walk for a path it walked.
+>   Both the Rust and the Python suite were green on that mutant until a row at
+>   the seam was added to each.
+> * Three stale numbers were corrected rather than propagated: `plan.rs`'s
+>   "keeps `Guard` at 48 bytes" (208 before this change, 336 after),
+>   `PHASE4.md`'s "the guard's 208 bytes", and a 21% disagreement between two
+>   harnesses on the worst accepted compile — recorded as the 0.9–1.1 µs range it
+>   is, rather than quoted to three digits from one of them.
 
 ## Context
 
