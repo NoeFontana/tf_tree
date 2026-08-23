@@ -414,6 +414,31 @@ py-cross-check:
 no-build-output:
     ./scripts/no-build-output.sh
 
+# **No tracked file carries an unresolved merge-conflict marker.**
+#
+# The fifth of the repository-property gates, and it exists because
+# `docs/decisions/README.md` reached `main` with `<<<<<<< Updated upstream` in
+# the middle of its status table and three copies of the last three rows, two of
+# them stale. A `git rebase` on a dirty worktree autostashed, rebased, reported
+# success, and then popped the stash into a conflict — after which `git status`
+# was clean, because the markers were inside a file that got staged in the same
+# breath.
+#
+# **All eighteen CI checks passed on it**, `just lint` included.
+# `artifact-versions.py` reads that very table every run and counts cells per row
+# against the header; a conflict marker is not a table row, and the duplicated
+# rows it did see were well-formed. Nothing else in the workspace reads a
+# Markdown table for anything but its shape.
+#
+# Three markers, not four: `=======` alone is half of every conflict and also a
+# Markdown setext heading underline, and this repository is more prose than code.
+# Every conflict git writes carries the `<<<<<<<`/`>>>>>>>` pair, so dropping the
+# ambiguous one costs no coverage. Measured against the whole tracked corpus
+# before it was written: the three matched the one corrupted file and nothing
+# else.
+no-conflict-markers:
+    ./scripts/no-conflict-markers.sh
+
 # **What the diagnostic counters cost a guard — `docs/decisions/0022` question 1.**
 #
 # The 2x2 that question needs: {release, embedder} x {counters on, off}. All four
@@ -1015,7 +1040,7 @@ doc:
 # in it, what clippy thinks of the source is not the interesting news.
 
 # fmt + eight clippy configurations, behind the three cheap audits.
-lint: no-build-output py-compile evidence-audit artifact-versions
+lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-versions
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
