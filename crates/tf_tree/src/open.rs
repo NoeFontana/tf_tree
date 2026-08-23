@@ -1560,8 +1560,21 @@ fn rustix_dup(fd: std::os::fd::BorrowedFd<'_>) -> Result<std::os::fd::OwnedFd, I
 }
 
 /// This process's name, NUL-padded, for the handshake's diagnostic field.
+///
+/// **The 32 here and the 32 `docs/decisions/0033` narrowed are different
+/// numbers, and this is the one site in the workspace where they meet.**
+/// `HelloRequest::client_name` is **wire** bytes `56..88` of an 88-byte
+/// datagram (`tf_tree_ipc::wire`, pinned by `the_byte_layout_is_pinned` and by
+/// `docs/PHASE2.md` §3.7) and it did not move; the lock file's identity record
+/// is a different structure whose `name` went to `[u8; 16]` so that
+/// `pid_ns_inode` could have `48..56`. So `self_comm` narrowed and this pads,
+/// which reads like a redundancy and is not one: collapsing the two back
+/// together changes a pinned wire layout.
 fn name_bytes() -> [u8; 32] {
-    tf_tree_ipc::self_comm()
+    let mut out = [0u8; 32];
+    let comm = tf_tree_ipc::self_comm();
+    out[..comm.len()].copy_from_slice(&comm);
+    out
 }
 
 /// **`docs/decisions/0028` plan step 9 (#220), and the reason it is a unit test

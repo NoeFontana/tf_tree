@@ -1471,6 +1471,32 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > — a false death in the tool an operator uses to decide what to kill, which is
 > the direction `record_is_alive`'s doc calls corruption.
 >
+> **And there is a fourth input class, which is not about `/proc`'s answer but
+> about whether the question is askable — [`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md).**
+> A recorded pid is namespace-local. Resolved against another PID namespace's
+> `/proc` it names an unrelated process or none at all, and until `0033` both
+> outcomes reached *gone*: a healthy participant inside a container or an
+> `unshare --fork --pid` was reported as a fork inheritor, with the *stop the
+> child* remediation — the opposite of what that fault wants. The two faults are
+> not merely similar in summary, they render **byte-identical** text from the
+> same formatter, so nothing in the finding could have told them apart.
+>
+> `recorded_given` therefore answers *cannot say* ahead of the whole `/proc`
+> classification, on two conditions, and **no new id and no new arena field**:
+> the recorded PID namespace differs from the observer's own (`Identity` carries
+> it since `0033`; `0` is *unknown namespace* and keeps the older behaviour), or
+> the observer's `/proc` does not describe the observer's own namespace at all,
+> in which case no pid in the file is resolvable **including `doctor`'s own** —
+> the shape in which `doctor` reported its own participant slot as a leak. Both
+> land on the existing *byte held, cannot say* silence, so a same-namespace fork
+> inheritor observed from its own `/proc` is reported exactly as before, and the
+> one class that stays undetectable is a participant in a different namespace
+> whose byte really has been inherited: this reports nothing rather than
+> reporting the wrong thing. **The namespace is recorded at registration, never
+> derived at diagnosis** — reading `/proc/<recorded_pid>/ns/pid` fails *open*,
+> because in the observer's namespace that pid names a different process whose
+> namespace then matches.
+>
 > **The finding prints the pid its evidence is about.** That is the lock file
 > identity's, not the arena record's: on a `RESERVED` row the record's `pid`
 > field is still zero (`fill_slot` writes it after the `FREE -> RESERVED` CAS)

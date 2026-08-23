@@ -392,11 +392,24 @@ fn lock_of(scratch: &Scratch) -> tf_tree_ipc::LockFile {
     tf_tree_ipc::LockFile::open(rv.lock_path()).expect("the publisher created the lock file")
 }
 
-/// A 32-byte `comm` field.
-fn comm(name: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let n = name.len().min(out.len());
-    out[..n].copy_from_slice(&name.as_bytes()[..n]);
+/// A 16-byte `comm` field.
+///
+/// **Sixteen since `docs/decisions/0033`, and the fixtures below had to shrink
+/// their names for a reason the size change does not show.** Written at offset
+/// 32, the old 17-to-20-byte literals were the only thing in this repository
+/// that put nonzero bytes in `48..56` — precisely the range that is now
+/// `pid_ns_inode`. Left alone they would have handed the zero-means-unknown
+/// compatibility path a fabricated namespace, and every assertion below would
+/// then hold or fail for a reason unrelated to what it is pinning. The kernel
+/// caps a real `comm` at 15 bytes, so a fixture that does not fit here is a
+/// fixture no process could have written.
+fn comm(name: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    assert!(
+        name.len() < out.len(),
+        "a fixture name the kernel could not have produced: {name}"
+    );
+    out[..name.len()].copy_from_slice(name.as_bytes());
     out
 }
 
@@ -469,7 +482,11 @@ fn doctor_json_reports_a_stale_live_record_as_an_abandoned_slot() {
                 start_time: 4242,
                 boot_id: [0u8; 16],
                 mode: tf_tree_ipc::AccessMode::ReadWrite,
-                name: comm("a-writer-that-died"),
+                name: comm("writer-died"),
+                // A **pre-`0033`** record: zero is "unknown namespace", which
+                // means keep the behaviour this test was written against. The
+                // arms where the field is set are `tft014_namespace_*`, below.
+                pid_ns_inode: 0,
             },
         )
         .expect("write the identity record");
@@ -550,7 +567,8 @@ fn doctor_json_reports_a_held_byte_over_a_dead_pid_as_a_fork_inheritor() {
             start_time: 4242,
             boot_id: [0u8; 16],
             mode: tf_tree_ipc::AccessMode::ReadWrite,
-            name: comm("a-parent-that-forked"),
+            name: comm("parent-forked"),
+            pid_ns_inode: 0,
         },
     )
     .expect("write the identity record");
@@ -635,7 +653,8 @@ fn doctor_json_reports_a_read_only_fork_inheritor_with_no_arena_record() {
             boot_id: [0u8; 16],
             // Read-only: the mode that writes no arena record.
             mode: tf_tree_ipc::AccessMode::ReadOnly,
-            name: comm("a-forked-consumer"),
+            name: comm("forked-consumer"),
+            pid_ns_inode: 0,
         },
     )
     .expect("write the identity record");
@@ -739,4 +758,414 @@ fn doctor_is_silent_about_a_joiner_that_is_mid_attach() {
         "a healthy joiner mid-attach was reported as a leak — this is the check \
          becoming one that always fires:\n{check}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `docs/decisions/0033` plan step 1 — the four arms of the namespace false
+// positive.
+//
+// `TFT014` calls a healthy participant in another PID namespace a *fork
+// inheritor* and tells the operator to stop it. The four arms below are the
+// four ways an observer and a participant can disagree about what a pid number
+// means, and they are lettered as `0033` letters them:
+//
+//   A  a namespaced participant seen from the host      `Ok(_) => Gone`
+//   B  a host participant seen from a container         `ENOENT => Gone`
+//   C  a genuine surviving fork inheritor               `ENOENT => Gone`
+//   D  participant and observer inside one bare `unshare --fork --pid`
+//
+// **C is the true positive and must keep firing.** A and C render
+// byte-identical findings — 1092 bytes each once the slot number and the
+// interpolated pid are normalised — so *which arm the classifier took carries
+// no information about which fault is present*, and nothing below may assert on
+// it. Every assertion here is on the rendered evidence in the `--json`
+// document, which is what an operator and a script both read.
+//
+// A, B and C are staged through the lock file, the way the three `TFT014` tests
+// above are staged and for the reason
+// `doctor_json_reports_a_held_byte_over_a_dead_pid_as_a_fork_inheritor` gives:
+// the state under test is a set of bytes in a file plus a byte held by some
+// open file description, and the kernel cannot tell a second description in
+// this process from an inherited one. What a namespace adds to that is one
+// `u64` in the record and one in the observer, and only the second of those
+// needs a real namespace — which is arm D, and arm D is therefore the one
+// staged with a real `unshare`.
+// ---------------------------------------------------------------------------
+
+/// An nsfs inode that is not this process's.
+///
+/// Adjacent to our own on purpose: nsfs inums come from one allocator, and the
+/// two `0033` measured differ by 652. Picking `1` would test a comparison no
+/// kernel can produce. It does not matter whether some *other* live namespace
+/// happens to own this number — the only comparison the guard makes is against
+/// the observer's own, and this differs from that by construction.
+fn a_foreign_pid_ns() -> u64 {
+    own_pid_ns() + 1
+}
+
+fn own_pid_ns() -> u64 {
+    let ino = tf_tree_ipc::self_pid_ns_inode()
+        .expect("/proc/self/ns/pid must be readable to stage a namespace arm");
+    assert_ne!(ino, 0, "zero is the record's `unknown namespace` marker");
+    ino
+}
+
+/// Stage the **two** slot shapes `TFT014` can accuse, both with a held byte and
+/// the same recorded identity.
+///
+/// Both, and not one, because they reach the verdict down different lines and a
+/// fix that handles only the second passes a test that stages only the second:
+///
+/// * `arena` — an arena participant record that is **not** `FREE`, which is the
+///   main match's `(LockByte::Held, RecordedProcess::Gone)` arm in
+///   `checks::slot_leak`. This is the shape `0033`'s arm B accused *first*, and
+///   the slot it accused was the arena's read-write owner.
+/// * `bare` — no arena record at all, which is `slot_leak`'s `SlotState::Free`
+///   early return. D18's read-only consumer, and the likeliest fork leak on a
+///   Python deployment.
+///
+/// **The returned [`tf_tree_ipc::LockFile`] is the held byte and has to be kept
+/// alive by the caller**: an OFD lock belongs to the open file description, so
+/// dropping it releases both bytes and turns every arm below into the *byte
+/// free* shape — which fires `TFT014` for a different reason and would let arm
+/// A and arm B pass with no guard in the binary at all.
+fn stage_two_accusable_slots(
+    scratch: &Scratch,
+    pubr: &Tree,
+    id: &tf_tree_ipc::Identity,
+    arena: u32,
+    bare: u32,
+) -> tf_tree_ipc::LockFile {
+    let lock = lock_of(scratch);
+    for slot in [arena, bare] {
+        lock.write_identity(slot, id)
+            .expect("write the identity record");
+        assert_eq!(
+            lock.try_take_participant(slot).expect("take the byte"),
+            tf_tree_ipc::LockAttempt::Acquired,
+            "slot {slot} of a 64-slot table is free"
+        );
+    }
+    pubr.arena_view()
+        .participants()
+        .register_at(arena, id.pid, id.start_time, 0)
+        .expect("the arena half of the non-FREE shape");
+    // This process's own second open file description holds both bytes, which
+    // is what an inherited one looks like to the kernel — the premise §6.2
+    // rests on, and the reason the three `TFT014` tests above stage a fork
+    // without forking.
+    lock
+}
+
+/// Both accusable shapes, from the `--json` document, as an operator reads them.
+fn tft014_names_slot(check: &str, slot: u32) -> bool {
+    check.contains(&format!("slot {slot} pid "))
+}
+
+/// **Arm A: a live participant one PID namespace away, seen from the host.**
+///
+/// The recorded pid *exists here* — inside `unshare -U --fork --pid` a
+/// participant is pid 1, and pid 1 on the host is `systemd` — with a completely
+/// different start time. So the probe succeeds, `Ok(_) => Gone` fires, and
+/// `TFT014` reports a running process as a forked child's leftovers with the
+/// remediation *stop the child*. `0033`'s *Context* stages exactly this and
+/// quotes the finding.
+///
+/// The stored start time is read from pid 1 and moved by one rather than
+/// invented, because the arm under test is *"the number is in use and the start
+/// time differs"* and a fabricated constant could collide.
+///
+/// **The observer stands on the host, and that is a constraint rather than a
+/// convenience** (`0033` plan step 1). Moving it inside the namespace turns
+/// this into arm D, which the recorded-namespace guard alone does not silence —
+/// so a version of this test written that way would report the fix as not
+/// working, and then, once both guards landed, pass for a reason that has
+/// nothing to do with what it pins.
+///
+/// Mutant: delete the recorded-namespace guard from `recorded_given`, leaving
+/// only `0033`'s second one. Applied: this failed at the first assertion, on a
+/// `"status": "fired"` document carrying **two** findings — *"slot 21 pid 1,
+/// byte still HELD … The record is LIVE"* and *"slot 22 pid 1 … The record is
+/// FREE"* — which is both of `checks::slot_leak`'s routes to `ForkInheritor`
+/// firing on one healthy participant, with the *stop the child* remedy.
+#[test]
+fn tft014_namespace_arm_a_a_namespaced_participant_is_not_a_fork_inheritor() {
+    /// The non-`FREE` shape: `checks::slot_leak`'s main match.
+    const ARENA: u32 = 21;
+    /// The `FREE`-record shape: its `SlotState::Free` early return.
+    const BARE: u32 = 22;
+    let scratch = Scratch::new("tft014-ns-arm-a");
+    let pubr = publish(&scratch);
+
+    let Ok(init_start) = tf_tree_ipc::start_time_of(1) else {
+        panic!("/proc/1/stat is unreadable, so arm A's `Ok(_)` arm cannot be staged here");
+    };
+    let _held = stage_two_accusable_slots(
+        &scratch,
+        &pubr,
+        &tf_tree_ipc::Identity {
+            // Namespace-local. Here it names init.
+            pid: 1,
+            start_time: init_start + 1,
+            boot_id: [0u8; 16],
+            mode: tf_tree_ipc::AccessMode::ReadWrite,
+            name: comm("namespaced"),
+            pid_ns_inode: a_foreign_pid_ns(),
+        },
+        ARENA,
+        BARE,
+    );
+
+    let json = doctor_json(&scratch);
+    let check = check_of(&json, "TFT014");
+    assert!(
+        !tft014_names_slot(check, ARENA),
+        "a live participant in another namespace was reported as a leak — and \
+         the slot is the non-FREE shape, which is the one an arm-B fix that \
+         only handles `FREE` records walks past:\n{check}"
+    );
+    assert!(
+        !tft014_names_slot(check, BARE),
+        "the same, for the read-only shape with no arena record:\n{check}"
+    );
+}
+
+/// **Arm B: a host participant seen from another PID namespace — the mirror,
+/// and it takes the other arm.**
+///
+/// The recorded pid is not in the observer's `/proc` at all, so this reaches
+/// `Gone` through `ENOENT` while arm A reaches it through `Ok(_)`. That is the
+/// measurement behind `0033` *Decision* 3's placement: a guard written as an
+/// arm ahead of `Ok(_)` silences A and leaves B firing, and a guard written at
+/// the `ENOENT` arm silences arm C, which is the one true positive this check
+/// exists for. Only a guard before the whole `match probe` covers both and
+/// neither.
+///
+/// `u32::MAX` is the deterministic form of "not in this `/proc`" — it exceeds
+/// every `pid_max`, so the classifier reaches its no-entry branch without
+/// racing pid reuse to get there.
+///
+/// **What is staged here and what `0033` staged.** The record ran a container
+/// `doctor` over a bind-mounted runtime dir and the first slot it accused was
+/// the arena's read-write **owner**, through the non-`FREE`
+/// `(LockByte::Held, Gone)` arm. This process is the owner and cannot move
+/// itself into a second namespace, so the non-`FREE` shape is staged beside the
+/// bare one instead: same line in `checks::slot_leak`, same verdict, one slot
+/// over. The real container run is arm B in `0033`'s own staging scripts.
+///
+/// Mutant: the one on arm C — write the guard as an arm ahead of
+/// `Ok(_) => Gone`. Applied: **this** is the only one of the four that fails,
+/// which is what makes A and B two tests rather than one.
+#[test]
+fn tft014_namespace_arm_b_a_host_participant_seen_from_elsewhere_is_not_one_either() {
+    /// The non-`FREE` shape: `checks::slot_leak`'s main match.
+    const ARENA: u32 = 23;
+    /// The `FREE`-record shape: its `SlotState::Free` early return.
+    const BARE: u32 = 24;
+    const GONE: u32 = u32::MAX;
+
+    let scratch = Scratch::new("tft014-ns-arm-b");
+    let pubr = publish(&scratch);
+
+    let _held = stage_two_accusable_slots(
+        &scratch,
+        &pubr,
+        &tf_tree_ipc::Identity {
+            pid: GONE,
+            start_time: 4242,
+            boot_id: [0u8; 16],
+            mode: tf_tree_ipc::AccessMode::ReadWrite,
+            name: comm("host-side"),
+            pid_ns_inode: a_foreign_pid_ns(),
+        },
+        ARENA,
+        BARE,
+    );
+
+    let json = doctor_json(&scratch);
+    let check = check_of(&json, "TFT014");
+    assert!(
+        !tft014_names_slot(check, ARENA),
+        "the non-FREE shape: a pid this /proc does not number is not a pid this \
+         /proc can call gone:\n{check}"
+    );
+    assert!(
+        !tft014_names_slot(check, BARE),
+        "the same, for the FREE-record shape:\n{check}"
+    );
+}
+
+/// **Arm C: the true positive, and the reason none of this may be written at an
+/// arm.**
+///
+/// A genuine surviving fork inheritor: the byte is held for a process that
+/// really is gone, in the observer's **own** PID namespace. Byte for byte this
+/// is arm B with one `u64` changed, it takes the same `ENOENT` branch, and
+/// `0033` measured the two findings as byte-identical text once the slot and
+/// pid are normalised. So this is the row that decides whether the fix
+/// discriminates or merely silences: it must fire after every step of `0033`,
+/// and it fires here on both accusable shapes.
+///
+/// Mutant: express the recorded-namespace guard as an arm ahead of
+/// `Ok(_) => Gone` instead of before the whole `match probe` — i.e. leave the
+/// `ENOENT` branch alone. Applied: 3 passed, 1 failed — this test passes, arm A
+/// passes, arm D passes, and **arm B fails**, because B reaches `Gone` through
+/// `ENOENT` and an arm ahead of `Ok(_)` never sees it. That is `0033`
+/// *Decision* 3's placement argument as a measurement rather than a sentence,
+/// and it is why A, B and C are three tests and not one.
+#[test]
+fn tft014_namespace_arm_c_a_real_fork_inheritor_in_this_namespace_still_fires() {
+    /// The non-`FREE` shape: `checks::slot_leak`'s main match.
+    const ARENA: u32 = 25;
+    /// The `FREE`-record shape: its `SlotState::Free` early return.
+    const BARE: u32 = 26;
+    const GONE: u32 = u32::MAX;
+
+    let scratch = Scratch::new("tft014-ns-arm-c");
+    let pubr = publish(&scratch);
+
+    let _held = stage_two_accusable_slots(
+        &scratch,
+        &pubr,
+        &tf_tree_ipc::Identity {
+            pid: GONE,
+            start_time: 4242,
+            boot_id: [0u8; 16],
+            mode: tf_tree_ipc::AccessMode::ReadWrite,
+            name: comm("forked-here"),
+            // The observer's own. Nothing else separates this from arm B.
+            pid_ns_inode: own_pid_ns(),
+        },
+        ARENA,
+        BARE,
+    );
+
+    let json = doctor_json(&scratch);
+    let check = check_of(&json, "TFT014");
+    assert!(
+        check.contains("\"status\": \"fired\""),
+        "the namespace guards silenced the fault TFT014 exists for:\n{check}"
+    );
+    assert!(
+        tft014_names_slot(check, ARENA),
+        "the non-FREE shape must still be reported:\n{check}"
+    );
+    assert!(
+        tft014_names_slot(check, BARE),
+        "so must the read-only shape, which is the likeliest one on a Python \
+         deployment:\n{check}"
+    );
+    assert!(
+        check.contains("forked child inherited it"),
+        "and it must still be named as the fork case, with the `spawn` \
+         remedy:\n{check}"
+    );
+}
+
+/// **Arm D: participant and observer inside one bare `unshare --fork --pid`,
+/// where `doctor` accuses its own slot.**
+///
+/// The arm the recorded-namespace guard is *structurally blind* to, and the
+/// only one here that needs a real namespace. Every process in this staging is
+/// in the same PID namespace, so every recorded inode equals the observer's own
+/// and that guard never fires — while the pid each record carries came from
+/// `std::process::id()` and is namespace-local, and the `/proc` that
+/// `start_time_of` resolves it against is still the parent's. The two are drawn
+/// from different numberings and the first guard compares neither of them.
+///
+/// So `doctor` reads the record **it wrote at attach**, decides the process
+/// named in it is gone, and prints the *stop the child* remediation about
+/// itself. `0033` measured that: slot 1 of that run is `doctor`'s own
+/// participant slot, pid 8, `(the record is FREE — a read-only participant,
+/// D18)`. The second guard is `readlink("/proc/self")` against `getpid()`,
+/// which disagree exactly when `/proc` is not this namespace's.
+///
+/// **A container is not this shape.** A real runtime remounts `/proc`, so
+/// `readlink /proc/self` there matches its pid 1 and this guard is silent —
+/// which is why arm B is the container arm and this one is bare `unshare`.
+///
+/// Mutant: delete the `proc_is_ours` guard, leaving only the recorded-namespace
+/// one. Applied: A, B and C pass and **this fails**, on
+/// *"slot 1 pid 1, byte still HELD … The record is FREE (no arena record: a
+/// read-only participant, D18)"* — `doctor` inside the namespace is pid 1, it
+/// took slot 1 at attach, and slot 1 is the slot it accused. The converse
+/// mutant, deleting the recorded-namespace guard and keeping this one, passes
+/// this and fails A and B. Neither guard carries the other's arms, which is the
+/// measurement `0033` plan step 4b asks for.
+///
+/// **Skips loudly**, in the shape `just lint`'s `py-compile` skip has: an
+/// unprivileged `unshare -U --fork --pid` works on an ordinary Linux 6.8
+/// desktop and is refused where `kernel.unprivileged_userns_clone` is off or a
+/// seccomp profile blocks the syscall, neither of which a CI runner can be
+/// assumed to allow. A skip prints why; it does not pass quietly.
+/// `print_stderr` is a workspace `warn` and this arm is what it is for: a skip
+/// nobody sees is a pass. Allowed on the two items that print, not on the file,
+/// so a stray `eprintln!` in an ordinary test here still warns.
+#[allow(clippy::print_stderr)]
+#[test]
+fn tft014_namespace_arm_d_doctor_does_not_accuse_its_own_slot() {
+    let scratch = Scratch::new("tft014-ns-arm-d");
+    let _pubr = publish(&scratch);
+
+    let Some(json) = doctor_json_under_a_pid_namespace(&scratch) else {
+        eprintln!(
+            "SKIP tft014_namespace_arm_d: no usable `unshare -U --fork --pid` on this host, \
+             so the one arm that needs a second PID namespace around the *observer* cannot \
+             be staged. The guard it pins is `recorded_given`'s `proc_is_ours`; its unit \
+             rows are `a_pid_from_another_namespace_is_not_a_pid_this_proc_can_answer_about`."
+        );
+        return;
+    };
+
+    let check = check_of(&json, "TFT014");
+    assert!(
+        !check.contains("forked child inherited it"),
+        "`doctor`, run where /proc is not its own namespace's, reported a fork \
+         inheritor — the accused slot is its own, and the operator is being \
+         told to stop the process reading the report:\n{check}"
+    );
+    assert!(
+        check.contains("\"status\": \"pass\"") || check.contains("\"status\": \"skip\""),
+        "every pid in the file is drawn from a numbering this /proc does not \
+         use, so there is no verdict left to give:\n{check}"
+    );
+}
+
+/// Run the shipped binary's `doctor --json --attach` inside a fresh PID
+/// namespace whose `/proc` is the parent's, or `None` if this host will not
+/// make one.
+///
+/// `-U` is what makes it unprivileged: `unshare --fork --pid` alone is refused
+/// without `CAP_SYS_ADMIN`, and `-Ur` fails on `uid_map` on an ordinary
+/// desktop, so `-U` without `-r` is the variant that stages this. Without a
+/// `uid_map` the process shows as `nobody` inside while its kernel uid is
+/// unchanged — which is what lets it still open the `0600` lock file and take a
+/// byte, and therefore be a *participant* rather than merely a process.
+///
+/// Deliberately **no** `--mount-proc`: remounting `/proc` is what a real
+/// container runtime does and it is what makes this fault a bare-`unshare`
+/// shape rather than a fleet shape. Mounting it here would stage arm B badly
+/// instead of arm D at all.
+#[allow(clippy::print_stderr)]
+fn doctor_json_under_a_pid_namespace(scratch: &Scratch) -> Option<String> {
+    let out = Command::new("unshare")
+        .args(["-U", "--fork", "--pid"])
+        .arg(env!("CARGO_BIN_EXE_tf_tree"))
+        .args(["doctor", "--attach", "--json"])
+        .env("TF_TREE_RUNTIME_DIR", &scratch.0)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // A refused `unshare` and a `doctor` that could not attach are both "this
+    // host will not stage arm D", and neither may read as a pass. The
+    // discriminator is the document itself: `check_of` needs one.
+    if !stdout.contains("\"TFT014\"") {
+        eprintln!(
+            "unshare/doctor produced no TFT014 document (status {:?}):\nstdout: {stdout}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    Some(stdout)
 }
