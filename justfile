@@ -366,6 +366,36 @@ miri:
 evidence-audit:
     ./scripts/evidence-audit.sh
 
+# **The 2027 escape hatch, checked today.** `macos-15-intel` is the last x86_64
+# macOS image Actions will offer and it goes away in August 2027 (#180); the
+# fallback is cross-building x86_64 from the arm64 runner. This recipe is what
+# stops that fallback from quietly stopping working in the meantime.
+#
+# Three targets, `cargo check` only — this is deliberately **not** a build. The
+# link step needs an Apple linker driver and the macOS SDK, which no Linux host
+# has; measured, a full `cargo build --lib` for `x86_64-apple-darwin` compiles all
+# 178 objects and fails at exactly that one step. So `check` is the most this can
+# assert from here, and what it asserts is the half that broke: without
+# `pure-hash`, blake3's build script shells out to `cc` with `-arch x86_64` and
+# dies before pyo3 is reached at all (exit 101, reproduced both ways).
+#
+# It is also the only thing that compiles `tf_tree_py`'s `pure-hash` feature.
+# `bindings-non-linux` uses native runners, so it never needs the feature and
+# never exercises it. A feature no job compiles is a feature that rots.
+py-cross-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for t in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+        rustup target list --installed | grep -qx "$t" \
+            || rustup target add "$t"
+    done
+    for t in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+        echo "==> cargo check --target $t (pure-hash)"
+        cargo check --manifest-path crates/tf_tree_py/Cargo.toml --target "$t" \
+            --features pure-hash,pyo3/extension-module,pyo3/abi3-py39
+    done
+    echo "py-cross-check: the wheel's Rust half cross-compiles to macOS and Windows"
+
 # **No tracked file is build output.** 6 ms measured, and it exists because 358
 # MiB of cargo fingerprints and rlibs were committed and merged across three
 # pull requests without one test, lint or release gate noticing.

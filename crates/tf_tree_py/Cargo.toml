@@ -74,6 +74,31 @@ missing_docs = "warn"
 unreachable_pub = "warn"
 unused_must_use = "deny"
 
+# **`pure-hash` exists here for a date in 2027, and it is gated so it cannot rot.**
+#
+# `tf_tree_core` takes `blake3` with its C backend, whose build script shells out
+# to `cc` with `-arch` and `-mmacosx-version-min` on an Apple target. From a Linux
+# host that fails before pyo3 is even reached, which is why `bindings-non-linux`
+# uses *native* runners and why #180's cross-compile option was written off.
+#
+# `pure-hash` (#243) removed that blocker for `tf_tree_core` and `tf_tree`, and the
+# forward was never wired to this crate — so a cross build of the *wheel* still
+# died in blake3. Measured: with this feature, `cargo check --target
+# {x86_64,aarch64}-apple-darwin` and `x86_64-pc-windows-msvc` all succeed here, and
+# a full `cargo build --lib` for `x86_64-apple-darwin` compiles all 178 objects and
+# stops only at the final link, for want of an Apple linker driver and SDK.
+#
+# It matters because `macos-15-intel` is the last x86_64 macOS image Actions will
+# offer and it disappears in August 2027 (#180). When that lands, the fallback is
+# to cross-build x86_64 from the arm64 runner, and this line is one of the seven
+# things that needs to be true. Landing it now — years early, for one line — is
+# cheap; discovering it in 2027 while a release is queued is not.
+#
+# `just py-cross-check` is what keeps it honest. An unused feature is an
+# unverified one.
+[features]
+pure-hash = ["tf_tree/pure-hash"]
+
 [dependencies]
 # `"unstable"` — `docs/API.md` §2.6. `offline.rs` walks the frame and edge
 # tables of a frozen `.tft` through `Tree::arena_view`, which is now the Rust

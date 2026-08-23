@@ -269,6 +269,18 @@ jobs:
           tool: just
       - name: just py-compile
         run: just py-compile
+      # **The cross-compile half, and it runs here because it can only run on
+      # Linux.** `bindings-non-linux` checks macOS and Windows on *native*
+      # runners, so it never needs `tf_tree_py`'s `pure-hash` feature and never
+      # compiles it. This step is the only thing that does.
+      #
+      # What it guards is #180: `macos-15-intel` is the last x86_64 macOS image
+      # Actions offers and it disappears in August 2027, at which point the
+      # fallback is cross-building x86_64 from the arm64 runner. Measured, that
+      # fallback needs seven things and six are now true; this keeps the one that
+      # was a one-line diff from silently reverting.
+      - name: just py-cross-check
+        run: just py-cross-check
 
   test:
     name: test (${{ matrix.os }})
