@@ -85,8 +85,27 @@ pub enum CreatePolicy {
     ///
     /// "Unreachable", not "unconditionally": step 1 of the loop still runs, so a
     /// rendezvous with a server answering on its socket is *joined*. What this
-    /// abandons is an arena whose holders are alive and whose owner is not
-    /// serving.
+    /// abandons is an arena whose **owner is gone** and whose non-owner holders
+    /// are alive — §3.4's stranded-participant case, and the only shape it can
+    /// abandon.
+    ///
+    /// The sentence that stood here said "an arena whose holders are alive and
+    /// whose owner is not serving", which is precisely the state it *cannot*
+    /// abandon: this policy skips step 4's participant scan and nothing else, so
+    /// it still takes the ownership byte at step 2 and still takes participant
+    /// byte 0 at step 5 — and byte 0 is the owner's slot for the owner's whole
+    /// life (`CREATOR_SLOT`, `docs/decisions/0035`; joiners are
+    /// assigned slots `>= 1`). An owner that is alive holds one or both, so it
+    /// refuses exactly like [`CreatePolicy::IfAbsent`]; the two bytes being free
+    /// is when this creates, and an owner that is gone is the ordinary — not the
+    /// only — way they get that way. [`Session::release_ownership`] frees the
+    /// ownership byte and keeps byte 0, so a live non-owner can sit on the
+    /// creator's slot with no owner anywhere and this still refuses. Read the
+    /// bytes, not the role. Measured both ways by
+    /// `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` and
+    /// `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through`
+    /// (`crates/tf_tree/tests/rendezvous.rs`); the error's own `Display` now
+    /// names which of the three states a caller is in.
     ///
     /// # What it leaves behind (§3.9, §11.3)
     ///
@@ -470,10 +489,28 @@ impl Open {
     /// creator's byte. Forcing a fresh arena past one is the split brain
     /// `--force-new` is supposed to resolve, not cause; the caller loops and, if
     /// the holder persists, times out into
-    /// [`IpcError::ArenaHeldButUnreachable`], which names it. The wedged arena
-    /// `--force-new` exists for has *dead* participants, and the kernel released
-    /// their bytes when they died — so byte 0 is free in exactly the case the
-    /// flag is for.
+    /// [`IpcError::ArenaHeldButUnreachable`], which names it.
+    ///
+    /// **And byte 0 is free in exactly the case the escape hatch is for**, which
+    /// is not the reason this comment used to give. It said the wedged arena has
+    /// *dead* participants whose bytes the kernel already released — false, and
+    /// backwards: a wedge **requires** a live holder, because if every holder
+    /// were dead no participant byte would be held, step 4 would not fire, and
+    /// an ordinary [`CreatePolicy::IfAbsent`] create would already succeed with
+    /// no force involved. The real reason is the slot assignment `0035` makes
+    /// exact: byte 0 is the *owner's*, held for the owner's whole life, and
+    /// joiners get `>= 1`. So a free byte 0 with a held byte `>= 1` means the
+    /// owner is gone and a non-owner survived — §3.4's stranded participant, the
+    /// case the hatch resolves — and a held byte 0 is somebody on the creator's
+    /// slot, which no force can pass. Usually that is the owner; it need not be,
+    /// because [`Session::release_ownership`] keeps byte 0 while giving up the
+    /// role, and `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`
+    /// pins that state. The refusal is the same either way, which is the point
+    /// of predicating it on the byte rather than on who is meant to hold it.
+    /// Measured by
+    /// `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass`
+    /// (`crates/tf_tree/tests/rendezvous.rs`): with byte 0 held both policies
+    /// return the *same* error; move the held byte to 3 and `Always` creates.
     fn register_creator(
         &self,
         lock: &LockFile,
@@ -520,6 +557,15 @@ impl Open {
     }
 
     /// Build the timeout error, naming the slots an operator has to deal with.
+    ///
+    /// **The ownership probe is what makes the message actionable.** Every
+    /// caller reaching this line has released the ownership byte again — step 2
+    /// either never acquired it, or one of step 4's / step 5's branches gave it
+    /// back — so `F_OFD_GETLK` here reports somebody *else*, which is precisely
+    /// the bit that decides whether [`CreatePolicy::Always`] could help: it has
+    /// to take that byte before it reaches the participant bytes it is allowed
+    /// to skip. Read at the deadline and advisory like the identity record, not
+    /// a claim about the whole timeout.
     fn held_but_unreachable(&self, lock: &LockFile) -> Result<IpcError, IpcError> {
         let holder_slots = lock.held_participants()?;
         // `trailing_zeros()` is 64 on an empty mask, which is not a slot any
@@ -535,6 +581,7 @@ impl Open {
             holder_slots,
             first_slot: first,
             first_pid,
+            ownership_held: lock.probe_ownership()?.held,
         })
     }
 }

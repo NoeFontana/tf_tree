@@ -453,6 +453,27 @@ If a holder must keep running and its arena is written off, the escape hatch is
 `--force-new`, and it is a policy on the process that creates the arena, not a
 flag on `tf_tree`. There is no such flag; §0.0 records why.
 
+**It is not unconditional, and which holder is stuck decides whether it can help
+at all.** A forced create skips §3.4's participant scan and nothing else, so it
+still takes the ownership byte and still takes participant byte **0** — the
+creator's slot, which the owner holds for its whole life while joiners are
+assigned `>= 1`. Three states, and they need different remedies:
+
+| what is held | forced create |
+|---|---|
+| only slots `>= 1`, nothing else | **creates.** This is the case the hatch is for: the owner is gone, ordinary consumers survived |
+| slot **0** | **refuses**, identically to an ordinary open. Byte 0 is the creator's slot — usually the owner, but `Session::release_ownership` can leave a live non-owner there. Stop that process. If it was the *only* holder, an ordinary open then creates and no force is needed; if slots `>= 1` are still held, you land on row 1 and the forced create is the remedy |
+| the ownership byte, by a process that is not serving | **refuses.** Something took ownership and never bound its socket; stop it, then re-open |
+
+**The error is what tells you which of the three you are in**, and since #257 it
+says so in as many words instead of printing one sentence with a different slot
+number in it. `tf_tree participants` covers the first two rows — it walks the
+participant bytes, so a held slot 0 shows up there as `live` — but it does **not**
+show the ownership byte at all, which is why the third row is a bit
+(`ownership_held`) on `ArenaHeldButUnreachable` rather than something to go and
+look up. In both refusing rows the remedy is the paragraph above: stop the
+process, and the kernel releases the byte.
+
 ```rust
 // `tf_tree::Open` is behind `features = ["shm"]`, Linux only.
 tf_tree::Open::new()
@@ -506,17 +527,40 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   reproduced through published API on 2026-08-19 and is pinned by
   `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`.
 
-  **So a forced create can now be refused, and that is what an operator will
-  see.** Against such a holder the creator takes participant byte **1** while its
-  fresh arena registers it at record **0**, and `Open::attempt` compares the two
-  before the arena is published: `open()` returns
-  `OpenError::ParticipantSlotDiverged` — *"this process's participant lock byte
-  and its arena participant record are different slots; the arena was not
-  published"* — instead of a `Tree` whose every liveness answer would be about
-  the holder. **Do not retry**: a second forced create against the same holder
-  diverges identically. Stop the process still holding byte 0 (`tf_tree
-  participants` names it from the lock file's identity records), or open with
-  `CreatePolicy::IfAbsent` and diagnose the wedge rather than create over it. A
+  **So a forced create is refused against such a holder, and this is the error an
+  operator will actually see.** The create never reaches the divergence: since
+  `0035` a creator takes byte 0 with one `F_OFD_SETLK` and that acquire *is* the
+  check, so a live holder of byte 0 makes it contended, the opener yields and
+  backs off, and `open()` times out with
+
+  ```text
+  ArenaHeldButUnreachable { holder_slots: 0x1, first_slot: Some(0), first_pid: <the holder>, ownership_held: false }
+  ```
+
+  — *"…slot 0 (pid N) is the arena creator's own slot — CreatePolicy::Always
+  takes slot 0 or nothing, so no forced create can pass this. Stop the process
+  holding slot 0: it is the only holder, so an ordinary open will then create"*.
+  When other slots are held too the same message ends *"the other slots in the
+  mask above are still held, so an ordinary open will still refuse — that is when
+  PHASE2 §3.4's CreatePolicy::Always becomes the escape hatch"*, because after
+  byte 0 frees you are in row 1 of the table above. The message branches there
+  rather than giving one remedy that is right in one state and wrong in the
+  other — which is the defect #257 was filed on, one state over.
+
+  **An earlier revision of this paragraph told you to expect
+  `OpenError::ParticipantSlotDiverged` here, and grepping your logs for it will
+  find nothing** (#257). That was true between `0028` step 0c and `0035`: the
+  forced creator took byte **1** against arena record **0** and the facade
+  compared the two before publishing. `0035` moved the refusal one layer down, to
+  the acquire, and `ParticipantSlotDiverged` is now unreachable from the create
+  path — the guard stays where it was, as an assertion, and its remaining
+  producers are the takeover arm and hand-rolled `tf_tree_ipc::Open` +
+  `TreeBuilder::build_shared` construction (`0035`, *Consequences*).
+
+  **Do not retry**: a second forced create against the same holder is refused
+  identically. Stop the process still holding byte 0 (`tf_tree participants`
+  names it from the lock file's identity records), or open with
+  `CreatePolicy::IfAbsent` and diagnose the wedge rather than create over it. The
   refusal costs nothing and leaves nothing: it runs before the owner server
   binds, so no peer ever saw the arena, and the participant and ownership bytes
   are released with the session — the slot the bullet above says this policy
