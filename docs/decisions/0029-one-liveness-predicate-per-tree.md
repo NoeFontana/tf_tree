@@ -90,32 +90,136 @@ rather than the type's. Worse at the sweep scale: `LockFile::held_participants()
 returns all 64 bytes in one call, so anyone writing this from the mask takes
 every probe before reading any word — the failing order, by construction.
 
+## `just loom` gives this change zero coverage, and its own models say why
+
+The ordering constraint above is a `loom` result, so be exact about what `loom`
+does *not* cover. `crates/tf_tree_core/src/loom_tests.rs` is the only file in the
+workspace containing `loom::model`; A2's lock appears there as `TopoModel`, a
+documented reimplementation whose `acquire` takes the predicate as a parameter,
+"injected exactly as in the real code".
+
+**Every predicate any model passes is correct by construction.** All four sites:
+
+| site | predicate | what it models |
+|---|---|---|
+| `loom_tests.rs:525` | `\|_\| true` | nothing is ever stolen |
+| `:566` | `\|_\| true` | nothing is ever stolen |
+| `:645` | `\|_\| true` | the corpse taking the lock, before it dies |
+| `:661` | `\|slot\| slot != DEAD_SLOT` | the thief, exactly right about a corpse |
+
+So the model's liveness is an **oracle**, and A2's exclusion is a theorem of the
+oracle rather than of the code.
+
+**Measured, and the obvious experiment does not work — which is the sharper
+result.** Flipping `:566`'s predicate from `|_| true` to `|_| false`, so the
+model is maximally wrong about two live holders, leaves
+`two_mutators_race_the_lock_and_a_reader_sees_no_mix` **green** (6.42 s). It is
+not that loom explored and found nothing. That model never reaches the code under
+test: `acquire` only considers stealing after `MODEL_SPIN_LIMIT` (= 3) CAS
+attempts fail, and there the lock is always released inside that budget. A
+`panic!` planted in the steal branch proves it directly:
+
+```
+test loom_tests::a_dead_lock_holder_is_stolen_from_and_leaves_no_trace ... FAILED
+        panicked at loom_tests.rs:458: PROBE: steal branch reached
+test loom_tests::two_mutators_race_the_lock_and_a_reader_sees_no_mix ... ok
+```
+
+**One model steals, and its victim is inert by construction.** In
+`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace` the holder is
+`core::mem::forget`ed — "the crash: no release, no `Drop`" — so it executes no
+further instruction, ever. There is therefore no live holder anywhere in the
+suite for a wrong predicate to steal *from*, which is exactly the failure piece 1
+would introduce.
+
+That test says as much itself: its first draft ran the dying participant as a
+loom thread and the authors removed it, because *"it is **not this one**: it is
+the false-negative case, where liveness wrongly declares a live-but-stalled
+participant dead and it later resumes"*. **That is the class piece 1 enters** —
+excluded from the model on the strength of a fail-safety this change gives up.
+
+**So `just loom` stays green through this change whatever it does**, and the
+§11.3 walk plus a real multiprocess test are the entire gate. Closing the gap
+means a model with a live holder and a fallible predicate, which is a new model
+rather than a new assertion.
+
 ## Decision — proposed, not taken
 
 **`Tree::reparent` uses `self.liveness`, and `participant_is_alive` is deleted
-rather than left as a second spelling.** Three pieces:
+rather than left as a second spelling — but not until
+[`0031`](./0031-the-participant-record-with-no-byte.md) has decided what a `LIVE`
+record with no lock byte means.** Three pieces:
 
-1. **An adapter that reads the word first.** It takes the slot, loads
-   `rec.state` with `Acquire`, returns `false` if the word is not `LIVE`, and
-   only then calls `self.liveness`. That is P3's body; the adapter should *be*
-   P3 rather than resemble it, so there is one place where the order is stated.
+1. **An adapter that reads the word first, and that is *not* P3.** It takes the
+   slot, loads `rec.state` with `Acquire`, returns `false` if the word is not
+   `LIVE`, and only then consults a liveness source. That much is P3's body and
+   is not negotiable — it is the one place the word-before-byte order is stated.
+
+   **An earlier revision of this piece said the adapter "should *be* P3 rather
+   than resemble it". Written and run, that is a regression in the corrupting
+   direction** (#213, 2026-08-22). P3 is `Tree::participant_alive`; its liveness
+   source on a rendezvous tree is `use_ofd_liveness`'s closure, which ends
+   `probe.is_held(slot).unwrap_or_else(|| record_is_alive(rec))`. For `0031`'s
+   byte-less class — a directly-called `TreeBuilder::build_shared` creator holds
+   a `LIVE` record and no byte at all — `is_held` returns `Some(false)`, so P3
+   answers **dead about a live, still-publishing process**. Not a prediction:
+   `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
+   asserts exactly that and passes at `HEAD`. Today `reparent` refuses such a
+   holder with `Err(LockContended { owner_slot: 0 })` and is *right*, by accident
+   of using the weaker predicate; an adapter that **is** P3 turns that refusal
+   into `Ok(())` and **steals A2's topology lock from a live mutator** — the
+   direction §6.2 forbids and the direction this record exists to prevent.
+
+   **It is a design question, not an adapter detail, because the probe API
+   collapses the two cases.** `LivenessProbe::is_held` is
+   `self.lock.probe_participant(slot).ok().map(|p| p.held)`, so "byte released by
+   a dead holder" and "holder never had a byte" are the same `Some(false)`. No
+   adapter can separate them, and no in-arena discriminator may be added for it —
+   `FORMAT_VERSION = 3` already happened.
 2. **`participant_is_alive` is removed.** `grep` gives it three occurrences —
    the call at `tree.rs:1735`, a doc-link at `:2939`, and the definition at
    `:3007` — so no public item changes and no signature moves. What changes is
    `reparent`'s semantics, which belongs in `CHANGELOG.md` as a behaviour entry,
    not as a breaking-API entry.
 3. **A §11.3 walk, because a topology lock is a mutation protocol.** §11.3 has
-   exactly eleven rows (`docs/PHASE2.md:865-876`) and the one this touches is
-   `topo.holding_lock` — *"lock stuck → stealable after liveness check (A2)"*.
+   **fourteen** rows — `docs/PHASE2.md:868-881`, the table data rows strictly
+   between §11.3's heading and §11.4's. This record said "exactly eleven rows
+   (`docs/PHASE2.md:865-876`)": eleven was the count before
+   [`0028`](./0028-the-slot-a-killed-participant-keeps.md)'s plan steps 3 and 4
+   added the `hangup.*`/`reclaim.*` rows, so the citation contradicted the
+   document it cites, inside the one unmet gate item. Bound the window by the two
+   headings when recounting — §11.2 above and §11.4 below both carry prose that
+   reads like table rows, and a wider window gives sixteen.
+
+   The row this obviously touches is `topo.holding_lock` — *"lock stuck → stealable after liveness check (A2)"*.
    Its holder classes have to be re-walked with P5 in them: a holder whose slot
    the owner already released on `HUP` reads dead under P4 today via
    `identity() -> None`, and would read dead under the adapter too, by a
    different route. That is the same verdict for a different reason, which is
    exactly the kind of coincidence that stops being true later.
 
-**This narrows the exposure; it does not remove it.** Trees with no probe — heap,
-a directly-called `build_shared`, `attach_shared` — still have nothing but the
-triple, so P1 remains the whole predicate for them and #205's row stays open.
+**This narrows one exposure and widens another; it removes neither.** A tree that
+carries no probe of its own — heap, a directly-called `build_shared`,
+`attach_shared` — still has nothing but the triple, so P1 remains its whole
+predicate and #205's row stays open. And a *holder* with no byte becomes newly
+stealable from, by every observer that does carry a probe. Those are two
+different axes — the observer's probe and the subject's byte — and the second is
+`0031`'s. See *Consequences*.
+
+### Blocked on `0031`, and on exactly one of its questions
+
+[`0031`](./0031-the-participant-record-with-no-byte.md) is `draft` and
+"authorises nothing"; its Decision is **"None yet"**, between two shapes: give
+every registration a byte, so a `LIVE` record over a free byte really is dead and
+P3 becomes safe for `reparent` unchanged; or restore a second fact for byte-less
+records only, which changes P3 *itself*, and then piece 1's adapter must be P3
+*as amended*. Piece 1 is unwritable under "either", because the two options give
+opposite answers to the only question the adapter asks.
+
+`0031`'s own gate makes its Decision wait on **its question 2** — "is a served
+`build_shared` arena a shape this project supports at all?", which it calls a
+scope decision rather than an engineering one. That single question blocks this
+record. `0031` needs nothing from this record; the dependency runs one way.
 
 ## Rationale
 
@@ -158,13 +262,32 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
 ## Consequences
 
 - One predicate per tree, stated in one place, with the ordering in it.
-- `reparent` on a rendezvous tree stops stealing a topology lock from a live
-  mutator that `/proc` misreports — `hidepid` against a **non-dumpable**
+- **The change trades one exposure for another. It is two bullets, and an
+  earlier revision wrote only the first.**
+- *Narrowed.* `reparent` on a rendezvous tree stops stealing a topology lock from
+  a live mutator that `/proc` misreports — `hidepid` against a **non-dumpable**
   participant, a PID-namespace mismatch, or an unreaped **zombie**. This bullet
   used to say bare "`hidepid`", dropping the qualifier the *Rationale* and
   `PHASE2.md` §0.0's #205 row both carry; and the discriminating shape is a
   resolvable entry describing the **wrong** process, not an unreadable one. See
   question 1.
+- *Widened.* `reparent` **starts** stealing a topology lock from a live mutator
+  that holds no lock byte — `0031`'s class: a directly-called
+  `TreeBuilder::build_shared` creator, `LIVE` record, no lock file, still
+  publishing. Measured rather than predicted (#213, 2026-08-22): at `HEAD` the
+  call is `Err(LockContended { owner_slot: 0 })` and the creator keeps
+  publishing; with the adapter it is `Ok(())`. The control that isolates the
+  cause is a properly joined participant that *does* hold its byte, under the
+  same adapter — refused, `topo_lock.owner` unchanged. **The exposure this
+  change removes and the exposure it creates are neither the same size nor the
+  same class**, and until `0031` answers, the second is unbounded.
+- **The residual class was stated on the wrong axis, and that is the error worth
+  naming.** "Trees with no probe" classifies by the *observer*. The hazard is set
+  by whether the **holder** has a byte: the probe belongs to the observer and the
+  subject needs none. `0031` says it outright, and this repository has already
+  let the same conflation reach `PHASE2.md` §0.0 once. Restated correctly: a
+  *holder* with no byte is newly stealable from on every tree obtained from
+  `tf_tree::Open`.
 - `reparent` on a **probe-less** tree is unchanged, so the class §0.0's #205 row
   describes shrinks from three paths to two rather than closing.
 - One more caller of `self.liveness`, which is `Box<dyn Fn>` — an indirect call
@@ -351,8 +474,15 @@ measurable: `tree.rs:2908-2936`'s seam documentation renders onto
 
 ## What would make this `ready`
 
-- Question 2 answered — it decides whether this record survives at all or is
-  folded into `0028`'s plan as a step.
+- ~~Question 2 answered — it decides whether this record survives at all or is
+  folded into `0028`'s plan as a step.~~ **MET 2026-08-20: it survives.**
+- **`0031`'s question 2 answered and `0031`'s Decision taken.** Piece 1 is
+  unwritable under "either option", so this is a hard prerequisite rather than a
+  courtesy.
+- **A `loom` model containing a live holder that a wrong predicate can steal
+  from, or an explicit statement that there will not be one.** No existing model
+  contains one, so `just loom` is green on this change by construction — see the
+  section above.
 - ~~Question 1 attempted, with the command, and its answer written down either
   way.~~ **MET, and it did better than "attempted": `unshare -U --fork --pid`
   stages the collision unprivileged on an ordinary host, so the change will not
