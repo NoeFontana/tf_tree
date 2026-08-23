@@ -553,10 +553,11 @@ mod tests {
             boot_id: [7u8; 16],
             mode: AccessMode::ReadWrite,
             name: {
-                let mut n = [0u8; 32];
+                let mut n = [0u8; 16];
                 n[..4].copy_from_slice(b"node");
                 n
             },
+            pid_ns_inode: 4_026_531_836,
         };
         lf.write_identity(5, &id).unwrap();
         assert_eq!(lf.read_identity(5).unwrap(), Some(id));

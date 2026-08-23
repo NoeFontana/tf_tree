@@ -1867,27 +1867,117 @@ fn recorded_process(id: Option<&tf_tree_ipc::Identity>) -> doctor::RecordedProce
         // `proc_answers_here` latches the same probe; this is a one-shot
         // command and does not need the latch.
         tf_tree_ipc::self_start_time().is_ok(),
+        id.pid_ns_inode,
+        // **The observer's own namespace, never one read through the recorded
+        // pid** (`docs/decisions/0033` *Decision* 2). The probe the issue
+        // suggested — `readlink /proc/<recorded_pid>/ns/pid` — fails *open*: a
+        // namespace-local pid names a different process here, so on a host
+        // where that number happens to be in use it reads an unrelated
+        // same-uid process, finds a matching namespace, and confirms
+        // `ForkInheritor` with false confidence. That is the same
+        // successful-read-of-the-wrong-process class `recorded_given`'s own doc
+        // records as the previously shipped bug here.
+        //
+        // Zero on a failed read, which lands on the same arm as a pre-`0033`
+        // record: keep today's behaviour. Degrading to `Unknown` for every slot
+        // instead would make `TFT014` unable to fire at all, trading a false
+        // positive for a blind spot.
+        tf_tree_ipc::self_pid_ns_inode().unwrap_or(0),
+        // Whether this `/proc` describes *this* process's pid namespace. Read
+        // in one process against a number this process already holds: the
+        // shell spelling of this probe forks, so its two halves are about two
+        // processes, and it disagrees in a container where the answer is yes.
+        //
+        // `true` on a failed read, by the same failed-read rule as the line
+        // above.
+        tf_tree_ipc::proc_self_pid().is_none_or(|p| p == std::process::id()),
     )
 }
 
-/// Turn a recorded `start_time`, what the `/proc` read came back as, and
-/// whether this host's `/proc` answers at all, into one of the three answers
+/// Turn a recorded `start_time`, what the `/proc` read came back as, and three
+/// facts about where the observer is standing, into one of the three answers
 /// [`doctor::RecordedProcess`] allows.
 ///
 /// **This is `tf_tree`'s `alive_given` (`crates/tf_tree/src/tree.rs`),
 /// transposed onto a three-valued result instead of a fail-safe boolean, and
-/// deliberately not a second classification.** Same three inputs, same arms,
-/// same bias — `record_is_alive`'s doc states it: *a false "dead" lets a
-/// rescuer take an entry from a running process, which is corruption; a false
-/// "alive" only delays recovery*. In an operator tool the corresponding
-/// corruption is telling somebody a live process is gone, and the arms below
-/// exist to keep that out.
+/// deliberately not a second classification.** Same arms, same bias —
+/// `record_is_alive`'s doc states it: *a false "dead" lets a rescuer take an
+/// entry from a running process, which is corruption; a false "alive" only
+/// delays recovery*. In an operator tool the corresponding corruption is
+/// telling somebody a live process is gone, and the arms below exist to keep
+/// that out.
 ///
-/// Both host facts arrive as parameters rather than as reads, for the reason
-/// `alive_given` gives: neither is a thing a test can arrange. Whether `/proc`
-/// answers is a property of the machine the suite runs on, and staging pid
-/// reuse means exhausting the pid space. Passing them in is what makes the bias
-/// assertable instead of merely stated.
+/// It is **not** "same three inputs" any more, and the two that were added are
+/// not more of the same kind. `alive_given`'s three answer *"what does `/proc`
+/// say about this pid?"*; `docs/decisions/0033`'s two answer *"is this pid a
+/// number I can ask `/proc` about at all?"*, which has to be settled first
+/// because a pid is namespace-local and the classification below reads it as if
+/// it were not.
+///
+/// Every host fact arrives as a parameter rather than as a read, for the reason
+/// `alive_given`'s do: none of them is a thing a test can arrange. Whether
+/// `/proc` answers is a property of the machine the suite runs on, staging pid
+/// reuse means exhausting the pid space, and the two namespace facts need a
+/// second pid namespace around the *observer*. Passing them in is what makes
+/// the bias assertable instead of merely stated.
+///
+/// # The two guards, before the match, and why they are two
+///
+/// Both sit ahead of the whole `match probe` rather than as an arm ahead of
+/// `Ok(_) => Gone`, and that placement is a measurement rather than a taste
+/// (`0033` *Decision* 3). The namespace-shaped false positives take **different
+/// arms**: a namespaced participant seen from the host takes `Ok(_)`, because
+/// its recorded pid 1 exists here as `systemd` with another start time, while a
+/// host participant seen from a container takes `ENOENT`, because its recorded
+/// pid is not in that `/proc` at all. A genuine surviving fork inheritor takes
+/// the `ENOENT` arm too and renders **byte-identical** text to the first — so
+/// arm membership carries no information about which fault is present, and any
+/// fix expressed at an arm either misses one false positive or silences the one
+/// true positive.
+///
+/// * **`recorded_pid_ns` against `observer_pid_ns`** asks *is the recorded
+///   process comparable to me?* A record from another PID namespace names a pid
+///   drawn from a numbering this `/proc` does not use, so no probe result about
+///   it is evidence. Zero on either side is *unknown namespace* — a pre-`0033`
+///   record, or a `/proc` this process could not read — and means keep the
+///   behaviour that shipped before the field existed.
+/// * **`proc_is_ours`** asks a different question: *is my `/proc` describing my
+///   own namespace at all?* Inside a bare `unshare --fork --pid` that never
+///   remounted `/proc`, it is not — and then every recorded pid in the file is
+///   incomparable **including this process's own**, which is how `doctor` came
+///   to report its own participant slot as a fork inheritor and tell the
+///   operator to stop it. The guard above is structurally blind to that: every
+///   participant there is in the *same* namespace, so the inodes match and it
+///   never fires.
+///
+///   `Unknown`-for-everything is right here and wrong for a failed read, and
+///   the difference is that this is a **successful** read establishing that the
+///   pid column of this file is drawn from a numbering `/proc` does not use.
+///   There is no verdict left to give, so giving none is not a degradation. A
+///   `readlink` that *fails* is the failed-read case and takes the failed-read
+///   rule at the call site: today's behaviour, never `Unknown` for every slot,
+///   because a check that can never fire is a blind spot traded for a false
+///   positive.
+///
+/// Both land on `slot_leak`'s existing `(LockByte::Held, Unknown) => None`, so
+/// the check reports nothing rather than reporting a different wrong thing, and
+/// a same-namespace fork inheritor observed from a `/proc` that is its own is
+/// classified exactly as before. **`checks.rs` needs no edit for that shape,
+/// and a reader who does not know it will go looking for one.**
+///
+/// **They are not verdict-neutral, though, and the one verdict they move is
+/// named here rather than left to be found.** `slot_leak`'s other arm reads
+/// `(LockByte::Free, Gone | Unknown) => Some(SlotLeak::Abandoned)`, deliberately
+/// — its own doc table says *"the byte alone is the leak signature, and §5.1
+/// says the byte is the fact"*. So a slot with a **non-`FREE` record, a free
+/// byte, and a recorded process that reads `Running` today** goes from silence
+/// to a `TFT014` *byte free* report once either guard degrades it to `Unknown`.
+/// For the first guard that needs the host process at the recorded
+/// namespace-local pid to have a *matching* start time, which is the pid-reuse
+/// collision the identity triple exists to exclude. The second is wider,
+/// because it degrades every slot in the file at once — but only on a `/proc`
+/// that is not the observer's namespace's, where the alternative reading of
+/// that same slot is an accusation. Accepted, `0033` *Consequences*.
 ///
 /// The arms, and which way each fails:
 ///
@@ -1914,9 +2004,22 @@ fn recorded_given(
     stored_start_time: u64,
     probe: Result<u64, tf_tree_ipc::ProcError>,
     proc_answers: bool,
+    recorded_pid_ns: u64,
+    observer_pid_ns: u64,
+    proc_is_ours: bool,
 ) -> doctor::RecordedProcess {
     use doctor::RecordedProcess as R;
     if stored_start_time == 0 {
+        return R::Unknown;
+    }
+    // Zero on either side is "unknown namespace", not a namespace — a record
+    // written before the field existed, or a writer that could not read
+    // `/proc`. Comparing it would turn every such record into `Unknown`, which
+    // is the blind spot rather than the fix.
+    if recorded_pid_ns != 0 && observer_pid_ns != 0 && recorded_pid_ns != observer_pid_ns {
+        return R::Unknown;
+    }
+    if !proc_is_ours {
         return R::Unknown;
     }
     match probe {
@@ -2764,16 +2867,25 @@ mod tests {
                 raw_os_error: errno,
             })
         };
+        // The `docs/decisions/0033` facts, held at "the observer is standing
+        // where the record was written": same namespace, and a `/proc` that is
+        // this process's own. Every row below is then about the `/proc`
+        // classification alone, which is what it was about before those two
+        // parameters existed. The rows where they are *not* held are the test
+        // beneath this one.
+        let here = |stored, probe, proc_answers| {
+            recorded_given(stored, probe, proc_answers, HERE, HERE, true)
+        };
 
         // The two arms that are evidence, and the only two.
-        assert_eq!(recorded_given(STORED, Ok(STORED), true), R::Running);
+        assert_eq!(here(STORED, Ok(STORED), true), R::Running);
         assert_eq!(
-            recorded_given(STORED, Ok(STORED + 1), true),
+            here(STORED, Ok(STORED + 1), true),
             R::Gone,
             "a different start time on the same pid is a recycled pid"
         );
         assert_eq!(
-            recorded_given(STORED, unreadable(2), true),
+            here(STORED, unreadable(2), true),
             R::Gone,
             "ENOENT on a host that would have shown us an entry is the one \
              proof of death"
@@ -2781,22 +2893,22 @@ mod tests {
 
         // Everything else is a refusal to answer.
         assert_eq!(
-            recorded_given(STORED, unreadable(2), false),
+            here(STORED, unreadable(2), false),
             R::Unknown,
             "ENOENT on a host that says that about everybody proves nothing"
         );
         assert_eq!(
-            recorded_given(STORED, unreadable(13), true),
+            here(STORED, unreadable(13), true),
             R::Unknown,
             "EACCES is a hidepid mount, not a dead process"
         );
         assert_eq!(
-            recorded_given(STORED, unreadable(24), true),
+            here(STORED, unreadable(24), true),
             R::Unknown,
             "EMFILE is this process being out of descriptors"
         );
         assert_eq!(
-            recorded_given(
+            here(
                 STORED,
                 Err(ProcError::Parse {
                     pid: 7,
@@ -2810,10 +2922,123 @@ mod tests {
 
         // And the record that never had a start time to compare.
         assert_eq!(
-            recorded_given(0, Ok(STORED), true),
+            here(0, Ok(STORED), true),
             R::Unknown,
             "`of_self_best_effort`'s zero compares unequal to every real start \
              time; treating it as a mismatch reports a running process dead"
+        );
+    }
+
+    /// A namespace inode standing in for "the observer's own". The value is
+    /// arbitrary — nothing here reads a real one — but it must be nonzero,
+    /// because zero is the *unknown namespace* marker and would disable the
+    /// guard rather than exercise it.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    const HERE: u64 = 4_026_531_836;
+    /// A second, different namespace. The two nsfs inums measured in
+    /// `docs/decisions/0033`; they are one allocator's numbers, so a real pair
+    /// differs by very little, which is worth reproducing rather than picking
+    /// `1` and `2`.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    const ELSEWHERE: u64 = 4_026_532_488;
+
+    /// **A pid from another PID namespace is not a pid this `/proc` can be
+    /// asked about, and until `docs/decisions/0033` `doctor` asked anyway.**
+    ///
+    /// The two guards answer different questions and the rows below are
+    /// arranged to show that rather than to state it: the namespace-mismatch
+    /// rows all hold `proc_is_ours = true`, and the `proc_is_ours = false` rows
+    /// all hold the namespaces *equal*. Neither guard can carry the other's
+    /// rows, which is the whole reason there are two.
+    ///
+    /// The four arms `0033` stages are (A) a namespaced participant seen from
+    /// the host, which takes `Ok(_)`; (B) a host participant seen from a
+    /// container, which takes `ENOENT`; (C) a genuine surviving fork inheritor,
+    /// which takes `ENOENT` too and whose finding renders byte-identical to
+    /// A's; and (D) participant and observer both inside one bare
+    /// `unshare --fork --pid`, where every namespace matches and `/proc` is the
+    /// parent's. A and B are the first block, C is the row that must stay
+    /// `Gone`, D is the second block. The end-to-end stagings are
+    /// `tests/attach.rs`'s `tft014_namespace_*`.
+    ///
+    /// Mutant: drop the `recorded_pid_ns != 0` conjunct. Applied: the
+    /// pre-`0033`-record row fails with *left: Unknown, right: Gone* — every
+    /// record written before the field existed becomes unclassifiable, which is
+    /// `TFT014` unable to fire rather than fixed.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[test]
+    fn a_pid_from_another_namespace_is_not_a_pid_this_proc_can_answer_about() {
+        use doctor::RecordedProcess as R;
+
+        const STORED: u64 = 4242;
+        let enoent = Err(tf_tree_ipc::ProcError::Unreadable {
+            pid: 7,
+            raw_os_error: 2,
+        });
+
+        // Arm A: the recorded pid exists here — it is pid 1, `systemd` — and
+        // its start time differs, so the probe succeeds and the classification
+        // below would call it `Gone`. It is a live participant one namespace
+        // away.
+        assert_eq!(
+            recorded_given(STORED, Ok(STORED + 1), true, ELSEWHERE, HERE, true),
+            R::Unknown,
+            "a recycled-pid verdict about a pid from another numbering is not \
+             a verdict"
+        );
+        // Arm B, the mirror: the recorded pid is not in this `/proc` at all.
+        // Same fault, the other arm — which is why the guard is before the
+        // match and not inside it.
+        assert_eq!(
+            recorded_given(STORED, enoent, true, ELSEWHERE, HERE, true),
+            R::Unknown,
+            "ENOENT about a pid this /proc does not number proves nothing"
+        );
+        // Arm C, the true positive, and the reason the guard is not written at
+        // an arm: it takes the same `ENOENT` arm as B and renders the same
+        // text. Only the namespace separates them.
+        assert_eq!(
+            recorded_given(STORED, enoent, true, HERE, HERE, true),
+            R::Gone,
+            "a fork inheritor in the observer's own namespace is exactly what \
+             TFT014 exists to report"
+        );
+
+        // Zero is *unknown namespace*, on either side, and must not fire the
+        // guard: a record written before `0033` reads zero, and so does one
+        // whose writer could not read `/proc`.
+        assert_eq!(
+            recorded_given(STORED, enoent, true, 0, HERE, true),
+            R::Gone,
+            "a pre-0033 record keeps the behaviour it was written under"
+        );
+        assert_eq!(
+            recorded_given(STORED, enoent, true, ELSEWHERE, 0, true),
+            R::Gone,
+            "an observer that could not read its own namespace degrades to \
+             today's behaviour, not to a check that can never fire"
+        );
+
+        // Arm D. Every namespace here matches — that is what makes it arm D
+        // rather than arm A — so the guard above is silent and this one is the
+        // only thing between `doctor` and a finding about its own slot.
+        assert_eq!(
+            recorded_given(STORED, enoent, true, HERE, HERE, false),
+            R::Unknown,
+            "if /proc is not this namespace's, no pid in the file is \
+             resolvable here, including this process's own"
+        );
+        assert_eq!(
+            recorded_given(STORED, Ok(STORED), true, HERE, HERE, false),
+            R::Unknown,
+            "not even a start time that matches, since it matched some other \
+             namespace's pid 7"
+        );
+        // And the same two facts with `/proc` back to its own: the guard is
+        // about the observer's `/proc` and nothing else.
+        assert_eq!(
+            recorded_given(STORED, Ok(STORED), true, HERE, HERE, true),
+            R::Running
         );
     }
 }

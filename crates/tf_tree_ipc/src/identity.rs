@@ -17,7 +17,7 @@
 //! to clear it — that is the whole reason the lock is authoritative).
 
 use crate::error::{IpcError, ProcError};
-use crate::procstat::{boot_id, self_comm, self_start_time};
+use crate::procstat::{boot_id, self_comm, self_pid_ns_inode, self_start_time};
 
 /// Size of one identity record. The 64-byte stride is NORMATIVE (§3.3) and is
 /// one cache line, so a record never straddles two.
@@ -81,7 +81,32 @@ pub struct Identity {
     /// How this participant mapped the arena.
     pub mode: AccessMode,
     /// `comm`, NUL-padded. Diagnostics only.
-    pub name: [u8; 32],
+    ///
+    /// **Sixteen bytes at `32..48` since `docs/decisions/0033`, where it was
+    /// thirty-two.** The kernel caps `comm` at 15 bytes plus its NUL
+    /// (`TASK_COMM_LEN`), so nothing that ever reached this field filled half of
+    /// the old one — the narrowing is what makes room for `pid_ns_inode` without
+    /// touching the 64-byte stride, and therefore without touching
+    /// `FORMAT_VERSION` or `layout_hash`, neither of which this file is.
+    pub name: [u8; 16],
+    /// The `nsfs` inode of the writer's PID namespace, or **`0` for "unknown
+    /// namespace"**.
+    ///
+    /// The discriminator `pid` cannot be: a pid is namespace-local, so a record
+    /// written inside `unshare --fork --pid` or a container names a *different*
+    /// process when it is resolved against an observer's `/proc`, and the
+    /// identity triple has nothing that differs — `boot_id` is identical across
+    /// every namespace on one host, and the kernel has no per-namespace boot id.
+    /// `docs/decisions/0033` is the argument; `TFT014` calling a healthy
+    /// containerised participant a fork inheritor, and telling the operator to
+    /// stop it, is what it cost.
+    ///
+    /// **Zero must mean *keep the pre-`0033` behaviour*, never "namespace 0".**
+    /// A record written before this field existed reads back as zero, because
+    /// `comm` never reached byte 48; so does one whose writer could not read
+    /// `/proc`. Lock files outlive the process that wrote them, so an observer
+    /// meets both.
+    pub pid_ns_inode: u64,
 }
 
 impl Identity {
@@ -100,6 +125,12 @@ impl Identity {
             boot_id: boot_id().map_err(IpcError::from)?,
             mode,
             name: self_comm(),
+            // Not an error even here, where every other field is one: an
+            // unreadable namespace is `0`, which every reader already has a
+            // rule for. Failing `of_self` on it would make a `/proc` without
+            // `ns/` — a kernel built with `CONFIG_PID_NS=n`, or a sandbox that
+            // hides the directory — refuse an arena it can otherwise serve.
+            pid_ns_inode: self_pid_ns_inode().unwrap_or(0),
         })
     }
 
@@ -116,13 +147,24 @@ impl Identity {
             boot_id: boot_id().unwrap_or([0u8; 16]),
             mode,
             name: self_comm(),
+            pid_ns_inode: self_pid_ns_inode().unwrap_or(0),
         }
     }
 
     /// The name field as a string, trimmed at the first NUL.
     #[must_use]
     pub fn name_str(&self) -> &str {
-        let end = self.name.iter().position(|b| *b == 0).unwrap_or(32);
+        // `self.name.len()`, never a literal: with the field at `[u8; 16]` a
+        // hard-coded 32 is an out-of-bounds slice on a `pub` method, and the
+        // type checker does not see it. Not reachable from data this workspace
+        // writes — `self_comm` NUL-terminates every name the kernel can produce
+        // — but `from_bytes` is `pub`, validates `pid != 0` and nothing else,
+        // and decodes a file any same-uid process can `pwrite` into.
+        let end = self
+            .name
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(self.name.len());
         core::str::from_utf8(&self.name[..end]).unwrap_or("<non-utf8>")
     }
 
@@ -139,7 +181,14 @@ impl Identity {
         out[12..28].copy_from_slice(&self.boot_id);
         out[28] = self.mode as u8;
         // 29..32 padding
-        out[32..64].copy_from_slice(&self.name);
+        // `32 + self.name.len()`, and for the same reason `name_str` spells its
+        // bound that way: both sides of `copy_from_slice` are slices, so a
+        // literal 32 here type-checks against a `[u8; 16]` and then panics at
+        // run time on *every* `to_bytes` — which is every `write_identity`,
+        // which is every registering `open()`.
+        out[32..32 + self.name.len()].copy_from_slice(&self.name);
+        out[48..56].copy_from_slice(&self.pid_ns_inode.to_le_bytes());
+        // 56..64 spare
         out
     }
 
@@ -158,14 +207,20 @@ impl Identity {
         start.copy_from_slice(&raw[4..12]);
         let mut boot = [0u8; 16];
         boot.copy_from_slice(&raw[12..28]);
-        let mut name = [0u8; 32];
-        name.copy_from_slice(&raw[32..64]);
+        let mut name = [0u8; 16];
+        name.copy_from_slice(&raw[32..48]);
+        let mut ns = [0u8; 8];
+        ns.copy_from_slice(&raw[48..56]);
         Some(Identity {
             pid,
             start_time: u64::from_le_bytes(start),
             boot_id: boot,
             mode: AccessMode::from_byte(raw[28]),
             name,
+            // A pre-`0033` record reaches here too, and reads `0`: its writer's
+            // `comm` stopped at byte 47 or earlier, so these eight bytes are
+            // the NUL padding of a name that was never this long.
+            pid_ns_inode: u64::from_le_bytes(ns),
         })
     }
 
@@ -201,15 +256,81 @@ mod tests {
             boot_id: [0xAB; 16],
             mode: AccessMode::ReadWrite,
             name: {
-                let mut n = [0u8; 32];
+                let mut n = [0u8; 16];
                 n[..5].copy_from_slice(b"hello");
                 n
             },
+            pid_ns_inode: 4_026_531_836,
         };
         let bytes = id.to_bytes();
         assert_eq!(bytes.len(), 64);
         assert_eq!(Identity::from_bytes(&bytes), Some(id));
         assert_eq!(id.name_str(), "hello");
+    }
+
+    /// **The compatibility direction that has to hold in the wild: a record
+    /// written before `pid_ns_inode` existed decodes as `0`, "unknown
+    /// namespace".** Lock files outlive the process that wrote them, and this
+    /// crate carries no version field to make the change detectable, so this is
+    /// the whole compatibility argument rather than one clause of it.
+    ///
+    /// The bytes below are the *pre-`0033`* encoding, built here rather than
+    /// produced by the current encoder — which could not produce them, and that
+    /// is the point. What makes it decode correctly is that `self_comm` could
+    /// never write past byte 47: the kernel caps `comm` at 15 bytes plus its
+    /// NUL, so `48..64` of every record the old code wrote is padding.
+    #[test]
+    fn a_pre_0033_record_reads_as_unknown_namespace() {
+        let mut old = [0u8; IDENTITY_RECORD_LEN];
+        old[0..4].copy_from_slice(&4242u32.to_le_bytes());
+        old[4..12].copy_from_slice(&987_654u64.to_le_bytes());
+        old[12..28].copy_from_slice(&[7u8; 16]);
+        old[28] = AccessMode::ReadWrite as u8;
+        // The old field was `32..64`; a real writer filled at most `32..47`.
+        old[32..36].copy_from_slice(b"node");
+
+        let id = Identity::from_bytes(&old).expect("a nonzero pid is a written record");
+        assert_eq!(id.name_str(), "node", "an old name still decodes");
+        assert_eq!(
+            id.pid_ns_inode, 0,
+            "an old record must read as unknown, never as namespace 0"
+        );
+
+        // And the other direction, which is what lets an unmodified decoder
+        // read a new record: every reader NUL-trims, so the name is intact and
+        // the inode is simply never looked at.
+        let new = Identity {
+            pid: 4242,
+            start_time: 987_654,
+            boot_id: [7u8; 16],
+            mode: AccessMode::ReadWrite,
+            name: *b"node\0\0\0\0\0\0\0\0\0\0\0\0",
+            pid_ns_inode: 4_026_532_488,
+        }
+        .to_bytes();
+        assert_eq!(&new[32..36], b"node");
+        assert_eq!(new[36], 0, "an old reader trims here and stops");
+
+        // **A pre-`0033` name longer than the new field, which is the only
+        // input that reaches `name_str`'s fallback.** The `"node"` record
+        // above has a NUL at 36 and never gets there, so it does not pin
+        // `unwrap_or(self.name.len())` at all: reverting that to the old
+        // `unwrap_or(32)` left `-p tf_tree_ipc` 91/91, `--lib` 124/124 and
+        // `--test attach` 16/16 green. Sixteen bytes with no NUL is what an
+        // 18-to-20-byte name from before the narrowing leaves in `32..48`, and
+        // on `unwrap_or(32)` it panics — *range end index 32 out of range for
+        // slice of length 16* — on a `pub` method, from lock-file bytes any
+        // process with the right uid can write.
+        let mut long = [0u8; IDENTITY_RECORD_LEN];
+        long[0..4].copy_from_slice(&4242u32.to_le_bytes());
+        long[32..48].copy_from_slice(b"a-parent-that-fo");
+        let id = Identity::from_bytes(&long).expect("a nonzero pid is a written record");
+        assert_eq!(
+            id.name_str(),
+            "a-parent-that-fo",
+            "a name that fills the field decodes to all of it and panics on none of it"
+        );
+        assert_eq!(id.pid_ns_inode, 0, "and it is still an unknown namespace");
     }
 
     #[test]
@@ -226,7 +347,8 @@ mod tests {
             start_time: 2,
             boot_id: [3; 16],
             mode: AccessMode::ReadOnly,
-            name: [4; 32],
+            name: [4; 16],
+            pid_ns_inode: 5,
         };
         let b = id.to_bytes();
         assert_eq!(&b[0..4], &1u32.to_le_bytes());
@@ -234,7 +356,13 @@ mod tests {
         assert_eq!(&b[12..28], &[3u8; 16]);
         assert_eq!(b[28], 0);
         assert_eq!(&b[29..32], &[0u8; 3], "padding must be zero");
-        assert_eq!(&b[32..64], &[4u8; 32]);
+        assert_eq!(&b[32..48], &[4u8; 16]);
+        assert_eq!(&b[48..56], &5u64.to_le_bytes());
+        // The tail `0033` left spare. Nothing else in the workspace pins this
+        // layout, so without this line the eight bytes a future field would
+        // take are pinned by nothing — and the pre-`0033` compatibility
+        // argument is exactly that a record's unused tail reads zero.
+        assert_eq!(&b[56..64], &[0u8; 8], "the spare tail must be zero");
     }
 
     #[test]
@@ -243,6 +371,11 @@ mod tests {
         assert_eq!(id.pid, std::process::id());
         assert!(id.start_time > 0);
         assert!(id.matches_running_process());
+        assert_eq!(
+            Some(id.pid_ns_inode),
+            crate::procstat::self_pid_ns_inode(),
+            "the record names the namespace its pid is drawn from"
+        );
 
         let mut dead = id;
         // Same pid, a start time no live process can have.
@@ -258,5 +391,21 @@ mod tests {
         let id = Identity::of_self_best_effort(AccessMode::ReadWrite);
         assert_eq!(id.pid, std::process::id());
         assert_eq!(id.mode, AccessMode::ReadWrite);
+        // **This is the only test of the production writer's namespace field,
+        // and without it `0033` ships inert.** `of_self_best_effort` is the
+        // sole constructor on the registration path (`open.rs`'s step 5 and
+        // `ipc_child`); `of_self` has one caller in the workspace and it is a
+        // test. Every `TFT014` namespace arm hand-writes `pid_ns_inode` into a
+        // synthetic record, so replacing the read here with a literal `0` —
+        // the fix recording nothing, in the field it exists to fill — left
+        // `-p tf_tree_ipc` 91/91, `-p tf_tree_cli --features shm --lib`
+        // 124/124, `--test attach` 16/16 and `--test rendezvous` 31/31 all
+        // green. Measured, not supposed. Mutant: with this line, that same
+        // change fails here.
+        assert_eq!(
+            Some(id.pid_ns_inode),
+            crate::procstat::self_pid_ns_inode(),
+            "the registration path must record the namespace it actually read"
+        );
     }
 }

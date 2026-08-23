@@ -118,7 +118,10 @@ pub use ofd::LockAttempt;
 pub use open::{
     CreatePolicy, NoServer, Open, OpenOutcome, Reach, ServerProbe, Session, DEFAULT_OPEN_TIMEOUT,
 };
-pub use procstat::{boot_id, parse_start_time, self_comm, self_start_time, start_time_of};
+pub use procstat::{
+    boot_id, parse_start_time, proc_self_pid, self_comm, self_pid_ns_inode, self_start_time,
+    start_time_of,
+};
 pub use rendezvous::{
     domain_from_env, name_from_env, ArenaName, Rendezvous, DEFAULT_NAME, MAX_NAME_LEN,
 };

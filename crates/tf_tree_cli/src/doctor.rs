@@ -260,10 +260,20 @@ pub enum LockByte {
 ///
 /// **This is the classification, and there is not a second one.**
 /// `crate::recorded_given` is the only place a `/proc` answer becomes one of
-/// these three, and it is `tf_tree`'s `alive_given` transposed: same three
-/// inputs (the stored start time, what the read came back as, whether this
-/// host's `/proc` answers at all), same arms, same bias. *Cannot tell* is
-/// [`Self::Unknown`] there and here, never [`Self::Gone`].
+/// these three, and it is `tf_tree`'s `alive_given` transposed: same arms, same
+/// bias. *Cannot tell* is [`Self::Unknown`] there and here, never
+/// [`Self::Gone`].
+///
+/// **It is no longer the same three inputs, and the two that
+/// `docs/decisions/0033` added are a different kind of input.** The original
+/// three — the stored start time, what the read came back as, whether this
+/// host's `/proc` answers at all — all ask what `/proc` says about a pid. The
+/// added two ask whether the pid is a number this `/proc` can be asked about:
+/// the namespace the record was written in against the observer's own, and
+/// whether the observer's `/proc` describes the observer's own namespace.
+/// Until they were there, a healthy participant in another PID namespace read
+/// as [`Self::Gone`] and `TFT014` told the operator to stop it — the opposite
+/// remediation to the one that fault wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordedProcess {
     /// `/proc` has an entry for the recorded pid whose start time matches the

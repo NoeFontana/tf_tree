@@ -124,16 +124,117 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-/// This process's `comm`, NUL-padded into the 32 bytes an identity record has
+/// This process's `comm`, NUL-padded into the 16 bytes an identity record has
 /// for it. Diagnostics only.
+///
+/// **Sixteen since `docs/decisions/0033`, where it was thirty-two, and the
+/// narrowing costs no diagnostic text.** The
+/// kernel caps `comm` at 15 bytes of content plus its NUL (`TASK_COMM_LEN`), so
+/// no name that ever reached this function filled half the old field: a record
+/// written by a process whose binary basename is 52 characters used 15 bytes of
+/// the 32 and left `47..64` zero. The eight bytes freed at `48..56` are
+/// [`crate::Identity::pid_ns_inode`].
+///
+/// This is a **public signature change on a publishing crate**, taken on the
+/// `0.0.x` line where every release may break every other. In-tree there are
+/// three callers, and one of them — `tf_tree`'s handshake `name_bytes` — pads
+/// back to 32, because the wire's `client_name` is a different 32 that did not
+/// move.
 #[must_use]
-pub fn self_comm() -> [u8; 32] {
-    let mut out = [0u8; 32];
+pub fn self_comm() -> [u8; 16] {
+    let mut out = [0u8; 16];
     let raw = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
     let src = raw.trim().as_bytes();
     let n = core::cmp::min(src.len(), out.len());
     out[..n].copy_from_slice(&src[..n]);
     out
+}
+
+/// This process's PID namespace, as the `nsfs` inode `/proc/self/ns/pid` names.
+///
+/// The discriminator [`crate::Identity`] carries so that a `doctor` in another
+/// PID namespace can tell *"the recorded pid is not comparable from here"* from
+/// *"the recorded process is gone"* — two faults with opposite operator
+/// remediations, and until `0033` the same sentence.
+///
+/// # `readlink`, not `stat`, and never `lstat`
+///
+/// **NORMATIVE (`docs/decisions/0033` *Decision* 1).** All three candidate
+/// reads were measured in four arms, one process per arm doing all three, and
+/// `readlink` is the only one correct in every arm:
+///
+/// | arm | `read_link` | `metadata().ino()` | `symlink_metadata().ino()` |
+/// |---|---|---|---|
+/// | plain host | `pid:[4026531836]` | `4026531836` | `81341846` **wrong** |
+/// | `unshare -U --fork` | `pid:[4026531836]` | `EACCES` | `81340131` **wrong** |
+/// | `unshare -U --fork --pid` | `pid:[4026532488]` | `EACCES` | `81340134` **wrong** |
+/// | default `docker run` | `pid:[4026532489]` | `4026532489` | a procfs dentry **wrong** |
+///
+/// `metadata()` fails *loudly* in the two arms with an unmapped **user**
+/// namespace — note that a default container has a pid namespace and no user
+/// namespace, so reaching for `docker` as the nearest container makes `stat`
+/// look correct and it is not. `symlink_metadata()` succeeds in all four and
+/// returns the procfs *dentry's* inode rather than the `nsfs` one it points at:
+/// a plausible wrong number, which is the same "successful read of the wrong
+/// thing" class `0033` rejects its `/proc/<recorded_pid>` probe for.
+///
+/// # `None`, not an error
+///
+/// Every caller treats an unreadable `/proc` as *unknown namespace* and carries
+/// on: [`crate::Identity::of_self_best_effort`] exists so that a missing `/proc`
+/// cannot fail an `open()`, and `doctor` must degrade to the behaviour it had
+/// before this field existed rather than to "cannot say" about every slot. An
+/// `IpcError` here would have exactly one correct handler at every call site,
+/// which is what makes it the wrong return type.
+#[must_use]
+pub fn self_pid_ns_inode() -> Option<u64> {
+    parse_ns_inode(std::fs::read_link("/proc/self/ns/pid").ok()?.to_str()?)
+}
+
+/// `pid:[4026531836]` into `4026531836`.
+///
+/// Strict on both ends for `parse_uuid`'s reason: quietly accepting a prefix,
+/// a suffix or another namespace type's link would make two different
+/// namespaces compare equal, and the only thing this number is ever used for is
+/// a comparison.
+fn parse_ns_inode(link: &str) -> Option<u64> {
+    let inner = link.strip_prefix("pid:[")?.strip_suffix(']')?;
+    // `u64::from_str` accepts a leading `+`; the kernel never writes one, so a
+    // link that carries one is not a link this wrote.
+    if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    inner.parse().ok()
+}
+
+/// The pid this process's `/proc` calls it — `readlink("/proc/self")`.
+///
+/// Half of the second guard `0033` *Decision* 4 adds: it equals
+/// [`std::process::id`] exactly when `/proc` describes the caller's **own** pid
+/// namespace, and differs when it does not — a bare `unshare -U --fork --pid`
+/// that never remounted `/proc`, where every pid in `/proc` is drawn from the
+/// parent numbering while `getpid()` is drawn from the child's. On that
+/// disagreement no pid written by any process in this file is resolvable here,
+/// **including the caller's own** — which is the failure `0033` measured, a
+/// `doctor` reporting its own participant slot as a fork inheritor.
+///
+/// **Compare it in one process or not at all.** The first attempt to measure
+/// this read `$(readlink /proc/self)` from a shell and compared it against
+/// `$$`; the command substitution forks, so the two halves were about two
+/// processes and it disagreed in a container too. That is the same
+/// read-of-the-wrong-process shape `0033` rejects, arriving in the experiment
+/// instead of the code — hence a function that reads one number and a caller
+/// that already holds the other.
+///
+/// `None` on any failure, and the caller's rule is `0033`'s failed-read rule:
+/// degrade to today's behaviour, never to "cannot say" about everything.
+#[must_use]
+pub fn proc_self_pid() -> Option<u32> {
+    std::fs::read_link("/proc/self")
+        .ok()?
+        .to_str()?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -238,5 +339,54 @@ mod tests {
         assert!(parse_uuid("01234567-89ab-cdef-0123-456789abcde").is_none());
         assert!(parse_uuid("01234567-89ab-cdef-0123-456789abcdef0").is_none());
         assert!(parse_uuid("zzzz4567-89ab-cdef-0123-456789abcdef").is_none());
+    }
+
+    /// The two link texts measured in `docs/decisions/0033` *Decision* 1, and
+    /// the near misses that must not parse.
+    ///
+    /// A namespace inode is only ever *compared*, so a parser that accepts a
+    /// prefix, a suffix, or another namespace type's link makes two different
+    /// namespaces read equal — `parse_uuid`'s trap, one file down.
+    #[test]
+    fn ns_link_parsing_rejects_near_misses() {
+        assert_eq!(parse_ns_inode("pid:[4026531836]"), Some(4_026_531_836));
+        assert_eq!(parse_ns_inode("pid:[4026532488]"), Some(4_026_532_488));
+        // Another namespace type's link. `/proc/self/ns/` holds eight of these
+        // and the numbers are drawn from one allocator, so accepting the prefix
+        // would compare a *user* namespace against a pid namespace.
+        assert_eq!(parse_ns_inode("user:[4026531837]"), None);
+        assert_eq!(parse_ns_inode("mnt:[4026531840]"), None);
+        // Truncation in either direction.
+        assert_eq!(parse_ns_inode("pid:[4026531836"), None);
+        assert_eq!(parse_ns_inode("pid:4026531836]"), None);
+        assert_eq!(parse_ns_inode("pid:[]"), None);
+        // `u64::from_str` would take this one; the kernel never writes it.
+        assert_eq!(parse_ns_inode("pid:[+4026531836]"), None);
+        assert_eq!(parse_ns_inode("pid:[ 4026531836 ]"), None);
+        assert_eq!(parse_ns_inode(""), None);
+    }
+
+    /// The two `/proc` reads `0033` adds, on the host this suite runs on.
+    ///
+    /// Neither can assert a *value* — an nsfs inum is allocated per namespace
+    /// and a test cannot know which — so what is pinned is the shape: the
+    /// namespace read parses, and `/proc/self` agrees with `getpid()` on any
+    /// host whose `/proc` is its own. The disagreeing arm is not arrangeable
+    /// from inside one process, which is why `0033` stages it as arm D of a
+    /// subprocess test rather than here.
+    #[test]
+    fn the_namespace_reads_answer_about_this_process() {
+        let ino = self_pid_ns_inode().expect("/proc/self/ns/pid is readable here");
+        assert_ne!(ino, 0, "zero is the record's `unknown namespace` marker");
+        assert_eq!(
+            Some(ino),
+            self_pid_ns_inode(),
+            "a namespace inode must not change under a process"
+        );
+        assert_eq!(
+            proc_self_pid(),
+            Some(std::process::id()),
+            "`/proc` describes this process's own pid namespace"
+        );
     }
 }

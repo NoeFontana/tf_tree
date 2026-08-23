@@ -35,6 +35,87 @@ is a bug.
 
 ### Fixed
 
+- **`doctor`'s `TFT014` no longer calls a healthy participant in another PID
+  namespace a fork inheritor and tell the operator to stop it** (#239, `0033`).
+  The two faults have opposite remediations and, until this, the same sentence:
+  a live participant inside `unshare -U --fork --pid`, seen from the host,
+  rendered *"slot 1 pid 1, byte still HELD: a fork inheritor — byte still HELD,
+  recorded pid gone … Stop the child"* — text **byte-identical** to a genuine
+  surviving fork inheritor's, 1092 bytes each once the slot number and the
+  interpolated pid are normalised. The accused process was alive, `state=S`, and
+  owned by the user reading the report.
+
+  The cause is that a recorded pid is namespace-local while `/proc` is not. A
+  namespaced participant records pid 1, and pid 1 on the host is `systemd` with
+  a different start time, so `recorded_given`'s *"the number is in use and the
+  start time differs, therefore the pid was recycled"* arm fires — an arm that
+  is correct for the case it was written for. Nothing in the identity record
+  could tell: `boot_id` is identical across every namespace on one host and the
+  kernel has no per-namespace boot id.
+
+  **The namespace is recorded at registration, not derived at diagnosis**, and
+  that is the whole design. Probing `/proc/<recorded_pid>/ns/pid` fails *open*:
+  measured, it read an unrelated same-uid process at the recorded number, found
+  a matching namespace, and would have *confirmed* the fork verdict with false
+  confidence — the same successful-read-of-the-wrong-process class as the bug
+  this classifier was last fixed for. So `Identity` carries the writer's own
+  `/proc/self/ns/pid` inode and `doctor` compares it against its **own**.
+
+  Four arms staged, all four firing before and only the right one after:
+  **A** a namespaced participant seen from the host (`unshare -U --fork --pid`,
+  unprivileged); **B** a host participant seen from a container over a
+  bind-mounted runtime dir, which reaches the same verdict through `ENOENT`
+  instead — which is why the guard sits before the whole `match probe` and not
+  as an arm ahead of one branch; **C** a genuine surviving fork inheritor, the
+  true positive, which fires before and after; **D** participant *and* `doctor`
+  inside one bare `unshare -U --fork --pid`, where every namespace matches and
+  `doctor` reported **its own participant slot** — *"slot 1 pid 1, byte still
+  HELD … The record is FREE (no arena record: a read-only participant, D18)"* —
+  telling the operator to stop the process printing the report. D needs a second
+  guard, `readlink("/proc/self")` against `getpid()`, because there the pids are
+  namespace-local and the `/proc` resolving them is the parent's; the first
+  guard is structurally blind to it. Measured separately: with only the
+  namespace guard, A, B and C behave and D still fires; with only the `/proc`
+  guard, D behaves and A and B still fire. Neither carries the other's arms.
+  Real stagings ran `6 passed, 5 fired` before and `7 passed, 4 fired` after on
+  A, B and D, against isolating host controls that were `7 passed, 4 fired`
+  throughout; C stayed `6 passed, 5 fired`. `tests/attach.rs`'s
+  `tft014_namespace_arm_*` are the in-tree four, behind `just shm-check`, and
+  arm D skips loudly where `unshare -U` is refused.
+
+  **What this does not fix**, said here because it will otherwise be read as
+  fixed: the arena's `ParticipantRecord` gains no namespace discriminator, so
+  the three paths `docs/PHASE2.md` §0.0 already calls corrupting still resolve a
+  namespace-local pid against the observer's `/proc`. Those are arena fields and
+  a `FORMAT_VERSION` bump; this is the lock file, and neither `FORMAT_VERSION`
+  nor `layout_hash` moved. One verdict does move that was not the point: a slot
+  with a non-`FREE` record, a *free* byte, and a recorded process that read
+  `Running` now reads `Unknown` and so becomes a *byte free* report. Reaching it
+  needs the host process at the recorded namespace-local pid to have a matching
+  start time, which is the pid-reuse collision the identity triple exists to
+  exclude — accepted, and named so it is not a surprise. **The second guard is
+  wider than that**, and the record did not price it: where the first degrades
+  one record, the `/proc`-is-mine check degrades *every* slot in the file at
+  once, because if `/proc` is not the observer's namespace's then no recorded
+  pid in it is comparable — including the observer's own. Still the right
+  trade, since on such a `/proc` the alternative reading of that same slot is an
+  accusation, but it is a difference and it is written onto `recorded_given`'s
+  doc rather than left to be found.
+
+  **Two assertions here exist because a review proved the fix was otherwise
+  ungated, and both were mutated to check.** Replacing the production writer's
+  namespace read with a literal `0` — the fix recording nothing, in the field it
+  exists to fill — left `tf_tree_ipc` 91/91, `tf_tree_cli --features shm --lib`
+  124/124, `--test attach` 16/16 and `--test rendezvous` 31/31 green, because
+  every `TFT014` arm hand-writes the field into a synthetic record and
+  `of_self` (the constructor that *was* pinned) has one caller in the workspace
+  and it is a test. Reverting `name_str`'s fallback to `unwrap_or(32)` was
+  likewise green everywhere, because the compatibility record's `"node"` has a
+  NUL at byte 36 and never reaches the fallback. `best_effort_never_fails` now
+  asserts the recorded inode against a fresh read, and the compatibility test
+  gained a sixteen-byte name with no NUL — which is what an 18-to-20-byte
+  pre-`0033` name leaves in `32..48`, and which panics on the old spelling.
+
 - **Stopping and continuing an owner — Ctrl-Z then `fg`, or a `gdb -p` attach
   and detach — no longer strands its arena.** `OwnerServer::serve`'s
   `epoll_wait` propagated `EINTR` like any other
@@ -126,6 +207,36 @@ is a bug.
   `0029` question 3, which is `draft`.
 
 ### Changed — breaking
+
+- **`tf_tree_ipc::self_comm` returns `[u8; 16]`, not `[u8; 32]`, and
+  `tf_tree_ipc::Identity` gains `pid_ns_inode: u64` while `name` narrows to
+  `[u8; 16]`** (#239, `0033`). This is a public break on a **publishing** crate,
+  taken on the `0.0.x` line where every release may break every other, and said
+  here rather than left to a compile error downstream. In-tree there are exactly
+  three callers of `self_comm` and every `Identity` literal is a compile error
+  until it names the new field, so nothing about this is silent — except two
+  sites that are not, and both are in `tf_tree_ipc` itself: `name_str`'s
+  `unwrap_or(32)` becomes an out-of-bounds slice on a `pub` method, and
+  `to_bytes`'s `out[32..64].copy_from_slice(&self.name)` is slice-to-slice, so
+  it type-checks and then panics on *every* registering `open()`. Both now spell
+  the bound `self.name.len()`.
+
+  **The on-disk record did not grow and did not move.** `name` is `32..48`,
+  `pid_ns_inode` is `48..56`, the 64-byte stride is unchanged, and the second
+  page of the lock file is still exactly one page. It is free because the kernel
+  caps `comm` at 15 bytes plus its NUL (`TASK_COMM_LEN`) — a real record written
+  by a process whose binary basename is 52 characters used 15 of the 32, with
+  `47..64` zero — so the eight bytes taken were padding in every record ever
+  written. In both directions the change is compatible without a version field:
+  every reader NUL-trims, so an old decoder reads a new record's name correctly
+  and never sees the inode, and a new decoder reads `0` in an old record, which
+  is already this field's *unknown namespace*.
+
+  `tf_tree`'s handshake is **not** affected and pads back to 32:
+  `HelloRequest::client_name` is wire bytes `56..88` of an 88-byte datagram,
+  pinned by `the_byte_layout_is_pinned` and by `docs/PHASE2.md` §3.7. The two
+  32s were never the same 32, which is why that one site looks redundant and is
+  not.
 
 - **`IpcError::ArenaHeldButUnreachable` gains an `ownership_held: bool`, and its
   message now tells an operator which of three states they are in** (#257).

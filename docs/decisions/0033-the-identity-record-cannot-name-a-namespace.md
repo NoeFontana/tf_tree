@@ -1,10 +1,35 @@
 # 0033: the identity record cannot name a namespace
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** none yet — moved `draft` → `ready` 2026-08-23. This record
-exists because the obvious fix reads the wrong process, and because the field it
-needs does not fit.
+**Implementation:** this PR, all seven plan steps (#239). Moved `draft` →
+`ready` 2026-08-23 and `ready` → `implemented` the same day. This record exists
+because the obvious fix reads the wrong process, and because the field it needs
+does not fit.
+
+**What the implementation added to what is written below**, kept short because
+the record is frozen from here:
+
+* The four arms are `crates/tf_tree_cli/tests/attach.rs`'s `tft014_namespace_*`,
+  behind `just shm-check`. A, B and C are staged through the lock file the way
+  the three `TFT014` tests beside them are; D runs the shipped binary under a
+  real `unshare -U --fork --pid` and **skips loudly** where that is refused.
+* **The guards were measured separately, and they are orthogonal.** With only
+  *Decision* 3's guard: A, B, C behave and **D still fires**. With only
+  *Decision* 4's: D behaves and **A and B still fire**. With the guard written
+  as an arm ahead of `Ok(_) => Gone` instead of before the whole `match probe`:
+  A, C and D pass and **B fails**, which is this record's placement argument
+  reproduced as a failing test rather than as prose.
+* Re-executed end to end on the real stagings: A, B and D went from
+  `6 passed, 5 fired` to `7 passed, 4 fired` against isolating controls that
+  were `7 passed, 4 fired` throughout; **C stayed `6 passed, 5 fired`**.
+* Plan step 3's verification, executed: slot 1's raw record after arm A reads
+  `+48: 8702 00f0 0000 0000` — little-endian `4026532487` — against the
+  participant's own `readlink /proc/self/ns/pid` of `pid:[4026532487]`, with
+  `56..64` zero and `joiner` NUL-padded in `32..48`.
+* Two line numbers in *Consequences* had drifted by the time this landed:
+  `RUNBOOK.md:623` is `:667` at `f269110`, and `PHASE5.md` §6's arm list has
+  moved down. The sites are the ones named, not the numbers.
 
 **Amended 2026-08-23 by an audit that re-executed it against `09efc9b` in two
 independent worktrees, each reproducing the other's numbers.** What the audit
