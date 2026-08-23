@@ -35,6 +35,54 @@ is a bug.
 
 ### Fixed
 
+- **Stopping and continuing an owner — Ctrl-Z then `fg`, or a `gdb -p` attach
+  and detach — no longer strands its arena.** `OwnerServer::serve`'s
+  `epoll_wait` propagated `EINTR` like any other
+  errno. `signal(7)` lists `epoll_wait` among the interfaces that fail with
+  `EINTR` after a stop signal followed by `SIGCONT` **with no signal handler
+  installed anywhere**, so "this crate installs none" was never a reason it could
+  not happen.
+
+  What it cost is out of all proportion to the cause. `serve` returned `Err`, the
+  server's `Drop` unlinked the published socket, and the process *lived on*
+  holding participant byte 0 and the ownership byte. §3.4 then has no exit for
+  anybody: nothing serves, so no new process can join, and step 4 refuses to
+  create a second arena because a participant byte is held by a process that
+  genuinely is alive. The arena was permanently unreachable and the only remedy
+  was killing an otherwise-healthy publisher. Nothing reported it either — the
+  facade's owner thread discards the result (`let _ = server.serve(...)`).
+
+  Measured on a staged owner: `SIGSTOP` + `SIGCONT` took it from two threads to
+  one, `default.sock` disappeared, and a join returned *"an arena is alive but
+  unreachable: participant slots 0x1 still hold their lock bytes (slot 0, pid
+  of a living process)"*. Three controls say it is the stop/continue **pair**
+  and not the act of signalling: no signal for the same interval, three
+  `SIGWINCH`es
+  (default-ignored), and a bare `SIGCONT` to a never-stopped owner each left
+  two threads, the socket in place, and the join succeeding.
+
+  **Two triggers are measured, and the obvious third is not.** Ctrl-Z + `fg`
+  (`SIGTSTP` + `SIGCONT`) reproduces it. A debugger reproduces it too, but by a
+  different mechanism and only one way round: `PTRACE_ATTACH` + `PTRACE_DETACH`
+  over every tid in `/proc/<pid>/task`, which is what `gdb -p` does, wedges the
+  pre-fix build, while attaching to the main thread alone does not — that tracee
+  sits in ptrace-stop and the syscall restarts. A container freeze/thaw is the
+  one everybody will assume and **nobody has run**: `signal(7)`'s list is scoped
+  to stop signals resumed by `SIGCONT`, and a cgroup freezer is a different
+  mechanism, so it is left as a suspicion rather than written down as a cause.
+
+  The fix retries that one errno and returns every other, so an `EBADF` is still
+  loud rather than an infinite spin. The regression test is
+  `a_stopped_and_continued_owner_still_serves_the_rendezvous`
+  (`just shm-rendezvous`): it stops and continues a real
+  owner and then has a second process join, and on the parent commit it fails on
+  both halves independently — the thread count (`left: Some(1), right: Some(2)`)
+  and the join.
+
+  **Not fixed, and deliberately out of scope:** what an owner should *do* when
+  its server dies for a reason that is not `EINTR`. It still keeps its bytes
+  silently. That is a protocol question, not a retry.
+
 - **A creator now takes participant slot 0 atomically, so it cannot end up
   holding one integer while its arena record holds another** (#201, `0035`).
   §3.4 step 4's split-brain scan and step 5's slot acquire were two passes over

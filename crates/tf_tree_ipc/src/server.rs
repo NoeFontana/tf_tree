@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use rustix::event::epoll;
 use rustix::fd::{BorrowedFd, OwnedFd};
+use rustix::io::Errno;
 use rustix::net::{
     accept_with, bind, listen, recvmsg, sendmsg, socket_with, AddressFamily, RecvFlags,
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
@@ -266,7 +267,49 @@ impl OwnerServer {
         let mut events = [core::mem::MaybeUninit::<epoll::Event>::uninit(); 16];
 
         loop {
-            let (ready, _) = epoll::wait(&ep, &mut events, None).map_err(io)?;
+            // **`EINTR` is not a failure here, and propagating it strands the
+            // arena.** `epoll_wait` is one of the interfaces `signal(7)` lists
+            // as failing with `EINTR` after a stop signal followed by `SIGCONT`
+            // — *even with no handler installed anywhere in the process*, which
+            // is why "this crate installs no signal handlers" is not an argument
+            // that it cannot happen. **Two triggers are measured and a third is
+            // not, so they are not listed as one.** Ctrl-Z then `fg` (`SIGTSTP`
+            // + `SIGCONT`) wedges the pre-fix build and not this one. A debugger
+            // does too, but by a different mechanism and only one way round:
+            // `PTRACE_ATTACH` + `PTRACE_DETACH` over every tid in
+            // `/proc/<pid>/task`, as `gdb -p` does, wedges it, while attaching
+            // to the main thread alone does not — the tracee sits in
+            // ptrace-stop and the syscall restarts. A container freeze/thaw is
+            // the plausible third and **nobody has run it**; `signal(7)`'s list
+            // is scoped to stop signals resumed by `SIGCONT`, and a cgroup
+            // freezer is a different mechanism, so it stays a suspicion.
+            //
+            // What propagating cost: `serve` returns `Err`, this server's `Drop`
+            // runs `unlink_if_still_ours` and removes the published socket, and
+            // the process **lives on** still holding participant byte 0 and the
+            // ownership byte with nothing serving. §3.4 then has no exit for
+            // anybody — a joiner cannot reach a server, and step 4's split-brain
+            // check refuses to create a second arena because a participant byte
+            // is held by a process that is genuinely alive. Measured on this
+            // branch before the fix: `SIGSTOP` + `SIGCONT` to an owner takes it
+            // from two threads to one, `default.sock` disappears, and a join
+            // reports `an arena is alive but unreachable: participant slots 0x1
+            // still hold their lock bytes (slot 0, pid <alive>)`. The only
+            // remedy was killing a healthy process. Three controls — no signal,
+            // three `SIGWINCH`es, and a bare `SIGCONT` to a never-stopped owner
+            // — all left the socket up and the join succeeding, so it is the
+            // stop/continue pair and not the act of signalling.
+            //
+            // Retry, do not swallow: every other errno still returns, so a real
+            // `epoll` failure (`EBADF` after a descriptor accident) is still
+            // loud rather than an infinite spin. `e == Errno::INTR` and not a
+            // pattern match, matching `ofd::try_lock`'s `EAGAIN`/`EACCES` arm —
+            // the crate's one existing errno discrimination.
+            let (ready, _) = match epoll::wait(&ep, &mut events, None) {
+                Ok(ready) => ready,
+                Err(e) if e == Errno::INTR => continue,
+                Err(e) => return Err(io(e)),
+            };
 
             for ev in ready.iter() {
                 match ev.data.u64() {
