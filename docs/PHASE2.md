@@ -422,9 +422,17 @@ loop {
     }
 
     // 5. Serve.
-    if creating { memfd_create; ftruncate; mmap; init header; seal (§3.6) }
+    if creating {
+        // The creator's slot is 0, and the ACQUIRE is the check: step 4 is a
+        // separate pass, so participant byte 0 can change hands between them.
+        if F_OFD_SETLK(participant byte 0, exclusive) fails {
+            release the ownership byte; backoff; continue   // step 4, arriving late
+        }
+        pwrite identity for slot 0
+        memfd_create; ftruncate; mmap; init header; seal (§3.6)
+    }
     unlink stale sock; bind sock.tmp; chmod; rename -> sock; listen
-    pwrite identity; F_OFD_SETLK our participant byte
+    if taking over { pwrite identity; F_OFD_SETLK our participant byte }
     return Created | TookOver
 }
 on timeout -> Err(ArenaHeldButUnreachable { holder_slots, identities })
@@ -433,6 +441,32 @@ on timeout -> Err(ArenaHeldButUnreachable { holder_slots, identities })
 **Step 4 is the whole design.** Without it, this sequence is possible: the owner dies; a fresh process starts, finds no socket, wins the ownership lock before any surviving participant notices the `HUP`, and creates a *second* arena. The surviving participants keep using the first. Two arenas, both live, silently diverging — worse than any failure to start, because nothing reports an error and the robot's transform tree is quietly inconsistent between nodes.
 
 The check is **deterministic, not a grace period.** If any participant byte is locked, a live arena exists; a fresh process must not create one, full stop. No timing assumption, no window to tune.
+
+**A creator takes participant slot 0, and the acquire is the check.** Not "any
+free byte": the arena's first `FREE` record is 0, and the facade indexes the lock
+byte and the arena record with **one** integer, so a creator on any other byte
+hands out a tree whose liveness predicates disagree with themselves (#201).
+
+Step 4 does not establish that on its own, and the gap is not one instruction:
+`any_participant_held` probes byte 0 **first** and then 63 more before it
+returns, so byte 0 can be taken for the rest of that scan. Measured, with a
+second open file description toggling byte 0 across 4000 iterations of exactly
+the two calls steps 4 and 5 make, **2242 took a non-zero byte**. It is reachable
+from outside this workspace whatever this workspace does, because
+`LockFile::try_take_participant` is public API on a published crate.
+
+So the two become one operation — a single `F_OFD_SETLK` on participant byte 0,
+whose atomicity is the kernel's. There is no window because there is no gap, and
+it is cheaper than the scan it replaces. Contention is not a new failure: it is
+step 4's condition arriving late, so it takes step 4's branch.
+
+**`--force-new` is not exempt, and does not need to be.** It skips step 4 by
+design, so a contended byte 0 there means a *live* participant holds it —
+forcing a fresh arena past one is the split brain the flag exists to resolve, not
+to cause. The wedged arena it is for has *dead* participants, and the kernel
+released their bytes when they died, so byte 0 is free in exactly the case the
+flag is written for. When a live holder does persist, the loop times out into the
+error below, which names it.
 
 The timeout case is also correct behaviour rather than a limitation. If a participant is `SIGSTOP`ped and never takes over, no new process can join — and that is the right answer, because the alternative is divergence. The error names the stuck slots and their identities, so an operator can see exactly what to kill. Provide `--force-new` as an explicit, loud escape hatch that abandons the existing arena; never take that path automatically.
 
