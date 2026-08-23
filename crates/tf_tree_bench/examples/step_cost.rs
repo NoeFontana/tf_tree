@@ -439,8 +439,11 @@ fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
 }
 
 /// The fold again, but walking a **compact** step encoding instead of the
-/// 2048-byte `[Step; MAX_DEPTH]` array — the upper bound on what shrinking
-/// `Step` could return.
+/// 4096-byte `[Step; MAX_DEPTH]` array — the upper bound on what shrinking
+/// `Step` could return. (2048 bytes when this was measured; `0034` moved
+/// `MAX_DEPTH` 16 → 32 and the array with it. The measurement below is
+/// unchanged, because it is O(`len`) and `MAX_DEPTH` sets only the declared
+/// size.)
 ///
 /// `Step` is **128 bytes**, not the 64 it looks like, because `Step::Static`
 /// carries an `Iso3` and `Iso3` is `#[repr(C, align(64))]` with an explicit

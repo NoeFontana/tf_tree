@@ -33,7 +33,7 @@ use crate::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, La
 use crate::sample::ExtrapPolicy;
 use crate::sync::spin;
 use crate::topology::TopologyView;
-use crate::MAX_DEPTH;
+use crate::{MAX_DEPTH, MAX_PATH_EDGES};
 
 /// Maximum number of knots [`Plan::at_adaptive`] may emit.
 pub const MAX_KNOTS: usize = 4096;
@@ -516,8 +516,9 @@ impl Plan {
     ///
     /// They used to be computed on demand, and `Plan::at` called *both* — once
     /// through `check_domain` → `has_dynamic`, and once for `note`'s
-    /// attribution. Each is an O(`len`) scan over a 2 KiB `[Step; MAX_DEPTH]`
-    /// array, so a depth-14 lookup walked 28 steps before folding anything.
+    /// attribution. Each is an O(`len`) scan over a 4 KiB `[Step; MAX_DEPTH]`
+    /// array (2 KiB when this was measured, at `MAX_DEPTH = 16`), so a depth-14
+    /// lookup walked 28 steps before folding anything.
     /// `first_dynamic_edge`'s own doc comment already said it was
     /// "loop-invariant" and hoisted it for the *batch* path; the scalar path
     /// kept paying it per call.
@@ -1902,7 +1903,11 @@ pub struct Guard<'a> {
 /// there is no value here to collide with.
 ///
 /// Encoding the poison in a field that already exists — rather than adding one —
-/// keeps `Guard` at 48 bytes and adds **no load at all** to the hot path:
+/// costs `Guard` nothing and adds **no load at all** to the hot path:
+/// (the "48 bytes" this sentence used to quote was already stale when `0034`
+/// measured it at 208; it is 336 at `MAX_DEPTH = 32`, since `Guard` carries
+/// `[Cell<u64>; MAX_DEPTH]`. The argument was never about the absolute size —
+/// it is that a field that already exists costs no bytes at all.)
 /// [`Plan::check_generation`] already reads `generation`, and the poison check
 /// is the comparison it was already making. An `Option<LookupError>` field cost
 /// 32 bytes on a struct built once per `at()` call.
@@ -2489,11 +2494,16 @@ impl<'a> Guard<'a> {
 ///
 /// * [`LookupError::Disconnected`] — `target` and `source` are in different
 ///   connected components.
-/// * [`LookupError::TreeTooDeep`] — the combined path exceeds [`MAX_DEPTH`].
+/// * [`LookupError::TreeTooDeep`] — the walk needed more than
+///   [`MAX_PATH_EDGES`] raw edges, or the path folded to more than
+///   [`MAX_DEPTH`] steps. Which one is readable off the reported `depth`; see
+///   the variant's own documentation.
 /// * [`LookupError::FrameOutOfRange`] — a frame id is out of range for `topo`.
 /// * [`LookupError::MissingEdge`] — a parent link on the path records no edge.
 /// * [`LookupError::UnknownEdge`] / [`LookupError::MixedTimeDomains`] — as
-///   `fold`.
+///   `fold`, and **before** the compiled-length refusal: `fold` resolves every
+///   edge on the path, including the ones past the step array, so a defect
+///   anywhere on a too-long path is named rather than hidden behind its length.
 pub fn compile(
     topo: &TopologyView,
     edge_meta: impl Fn(EdgeId) -> Option<EdgeMeta>,
@@ -2534,13 +2544,45 @@ pub fn compile(
             }};
         }
 
+        let mut a = target;
+        let mut b = source;
+        let (mut pa, mut da, mut ea) = read!(a);
+        let (mut pb, mut db, mut eb) = read!(b);
+
+        // Edges collected walking up from target (emit inverted, in order) and from
+        // source (emit forward, in reverse). Bounded by MAX_PATH_EDGES: two
+        // `[u32; 64]` buffers, 512 bytes of stack together.
+        let mut t_edges = [0u32; MAX_PATH_EDGES];
+        let mut nt = 0usize;
+        let mut s_edges = [0u32; MAX_PATH_EDGES];
+        let mut ns = 0usize;
+
         // Record the edge on the link from `$frame` up to its parent. Edge id `0`
         // is the "no edge" sentinel (`set_parent` accepts it when only the parent
         // link matters) but is *also* a real edge-table slot, so it must never be
         // emitted as a `Step::Dyn` — that would silently sample an unrelated
         // edge's ring.
+        //
+        // The raw bound lives here, checked on `nt + ns` rather than per side,
+        // so `MAX_PATH_EDGES` means "edges walked" and not "edges walked on one
+        // side": the per-side spelling this replaces let a Y-shaped path walk up
+        // to twice the bound before refusing. It is checked *before* the
+        // sentinel, which keeps the precedence the old code had — a defect wins
+        // over depth by its position on the path, not by the path's length.
+        //
+        // The walk does not keep counting past the bound the way `fold` does.
+        // It cannot: it stops precisely because it has no buffer left, and a
+        // corrupt parent chain with a cycle in it would not terminate. So the
+        // number reported is `MAX_PATH_EDGES + 1` — "more than the bound", the
+        // one value above it this field ever takes — rather than a raw length
+        // nothing measured.
         macro_rules! push_edge {
             ($buf:expr, $n:expr, $edge:expr, $frame:expr) => {{
+                if nt + ns == MAX_PATH_EDGES {
+                    return Err(LookupError::TreeTooDeep {
+                        depth: (MAX_PATH_EDGES + 1) as u16,
+                    });
+                }
                 if $edge == 0 {
                     return Err(LookupError::MissingEdge { child: $frame });
                 }
@@ -2549,25 +2591,8 @@ pub fn compile(
             }};
         }
 
-        let mut a = target;
-        let mut b = source;
-        let (mut pa, mut da, mut ea) = read!(a);
-        let (mut pb, mut db, mut eb) = read!(b);
-
-        // Edges collected walking up from target (emit inverted, in order) and from
-        // source (emit forward, in reverse). Bounded by MAX_DEPTH.
-        let mut t_edges = [0u32; MAX_DEPTH];
-        let mut nt = 0usize;
-        let mut s_edges = [0u32; MAX_DEPTH];
-        let mut ns = 0usize;
-
         // Bring the deeper frame up until depths match.
         while da > db {
-            if nt >= MAX_DEPTH {
-                return Err(LookupError::TreeTooDeep {
-                    depth: (nt + ns) as u16,
-                });
-            }
             push_edge!(t_edges, nt, ea, a);
             a = frame_or_disconnect(pa, target, source, a)?;
             let (p, d, e) = read!(a);
@@ -2576,11 +2601,6 @@ pub fn compile(
             ea = e;
         }
         while db > da {
-            if ns >= MAX_DEPTH {
-                return Err(LookupError::TreeTooDeep {
-                    depth: (nt + ns) as u16,
-                });
-            }
             push_edge!(s_edges, ns, eb, b);
             b = frame_or_disconnect(pb, target, source, b)?;
             let (p, d, e) = read!(b);
@@ -2599,11 +2619,6 @@ pub fn compile(
                     cut_at: a,
                 });
             }
-            if nt >= MAX_DEPTH || ns >= MAX_DEPTH {
-                return Err(LookupError::TreeTooDeep {
-                    depth: (nt + ns) as u16,
-                });
-            }
             push_edge!(t_edges, nt, ea, a);
             push_edge!(s_edges, ns, eb, b);
             a = frame_or_disconnect(pa, target, source, a)?;
@@ -2618,39 +2633,20 @@ pub fn compile(
             eb = e;
         }
 
-        if nt + ns > MAX_DEPTH {
-            return Err(LookupError::TreeTooDeep {
-                depth: (nt + ns) as u16,
-            });
-        }
-
-        // Build the raw step list: target side inverted in order, source side
-        // forward in reverse.
-        let mut steps = [Step::Static(Iso3::IDENTITY); MAX_DEPTH];
-        let mut len = 0usize;
-        for &e in t_edges.iter().take(nt) {
-            steps[len] = Step::Dyn {
-                edge: EdgeId(e),
-                inverted: true,
-            };
-            len += 1;
-        }
-        for k in 0..ns {
-            let e = s_edges[ns - 1 - k];
-            steps[len] = Step::Dyn {
-                edge: EdgeId(e),
-                inverted: false,
-            };
-            len += 1;
-        }
-
         // Confirm the whole walk observed one generation before folding.
         if topo.generation() != start_gen {
             spin();
             continue 'walk;
         }
 
-        let (steps, len, domain) = fold(&steps, len, &edge_meta)?;
+        // `fold` takes the two edge-id slices directly. There used to be a
+        // `[Step; MAX_DEPTH]` intermediate here, built purely to hand to `fold`;
+        // it held nothing the slices do not — an edge id, plus an `inverted`
+        // flag that is `true` iff the edge came from `t_edges`. Deleting it is
+        // what lets the raw bound be generous, and it is also what pays for
+        // `MAX_DEPTH`'s move to 32: `compile` used to materialise two arrays of
+        // it per call and now materialises one.
+        let (steps, len, domain) = fold(&t_edges[..nt], &s_edges[..ns], &edge_meta)?;
         return Ok(Plan::new(start_gen, steps, len, domain));
     }
 }
@@ -2674,19 +2670,54 @@ fn frame_or_disconnect(
 /// the step is inverted), then collapse adjacent `Static` runs by composing them.
 /// Returns the folded step array, its length, and the plan's domain tag.
 ///
+/// Takes the walk's two raw buffers rather than a step array: `t_edges` in walk
+/// order, emitted inverted, then `s_edges` **reversed**, emitted forward. That
+/// reversal is load-bearing — it is why the composition associates
+/// `((s[n-1] * s[n-2]) * …)`, and `Iso3` composition is not associative under
+/// rounding, so an accumulator meeting `s[0]` first would produce a different
+/// bit pattern that every tolerance-based test in the suite would accept.
+///
+/// # Running past the end of the output array
+///
+/// The output is `[Step; MAX_DEPTH]` and the input may be up to
+/// [`MAX_PATH_EDGES`] long, so a path can fold to more steps than fit. The loop
+/// does **not** stop when that happens: it skips the write, keeps incrementing
+/// `n`, and goes on resolving every remaining edge through `edge_meta`. Two
+/// things fall out of that, and both are the reason it is written this way:
+///
+/// * `n` past the loop is the *true* compiled length, which is what
+///   [`LookupError::TreeTooDeep`] reports — not the bound, and not the raw walk
+///   length.
+/// * [`LookupError::UnknownEdge`] and [`LookupError::MixedTimeDomains`] are
+///   still raised for a defect that sits past the bound. Returning early
+///   instead is cheaper and was measured (a refused 64-edge dynamic chain: 994 ns
+///   early-return against 1778 ns here, with two controls where the two do
+///   identical work reading +3.2 / −6.2 ns, i.e. noise) — but it makes a
+///   too-long path report its length instead of its defect, which is the
+///   opposite of the precedence `0034` promises. The cost is paid only by paths
+///   that are refused anyway.
+///
+/// The collapse decision therefore reads a tracked `last_static` rather than
+/// `out[n - 1]`, which is the one thing that would not work past the array end.
+///
 /// # Errors
 ///
 /// * [`LookupError::UnknownEdge`] — a step names an edge with no record in this
 ///   arena.
 /// * [`LookupError::MixedTimeDomains`] — the path's dynamic edges do not all
 ///   share one time domain, so no single query stamp addresses them all.
+/// * [`LookupError::TreeTooDeep`] — the folded path needs more than
+///   [`MAX_DEPTH`] steps. Reported as the exact folded step count.
 fn fold(
-    raw: &[Step; MAX_DEPTH],
-    len: usize,
+    t_edges: &[u32],
+    s_edges: &[u32],
     edge_meta: &impl Fn(EdgeId) -> Option<EdgeMeta>,
 ) -> Result<([Step; MAX_DEPTH], usize, u8), LookupError> {
     let mut out = [Step::Static(Iso3::IDENTITY); MAX_DEPTH];
     let mut n = 0usize;
+    // Whether `out[n - 1]` is a `Static` — tracked rather than read back,
+    // because `n` may be past the array. `false` while `n == 0`.
+    let mut last_static = false;
     // `None` until the first dynamic step fixes the plan's domain. Every later
     // dynamic step must agree: taking the last one (as this used to) let a plan
     // spanning a system-clock edge and a sensor-clock edge pass `check_domain`
@@ -2694,56 +2725,66 @@ fn fold(
     // misread D9 exists to prevent.
     let mut domain: Option<u8> = None;
 
-    for step in raw.iter().take(len) {
-        // Resolve the step to either a constant or a (still dynamic) sample.
-        let resolved = match *step {
-            Step::Static(m) => Step::Static(m),
-            Step::Dyn { edge, inverted } => {
-                let meta = edge_meta(edge).ok_or(LookupError::UnknownEdge { edge })?;
-                match meta.kind {
-                    EdgeKind::Static => {
-                        let m = if inverted {
-                            meta.static_pose.inverse()
-                        } else {
-                            meta.static_pose
-                        };
-                        Step::Static(m)
+    let path = t_edges
+        .iter()
+        .map(|&e| (e, true))
+        .chain(s_edges.iter().rev().map(|&e| (e, false)));
+
+    for (edge, inverted) in path {
+        let edge = EdgeId(edge);
+        // Resolve the edge to either a constant or a (still dynamic) sample.
+        let meta = edge_meta(edge).ok_or(LookupError::UnknownEdge { edge })?;
+        let resolved = match meta.kind {
+            EdgeKind::Static => {
+                let m = if inverted {
+                    meta.static_pose.inverse()
+                } else {
+                    meta.static_pose
+                };
+                Step::Static(m)
+            }
+            _ => {
+                // Dynamic (or tombstone — treated as dynamic; sampling it will
+                // surface the real error). Pin/verify the domain.
+                match domain {
+                    None => domain = Some(meta.domain),
+                    Some(d) if d != meta.domain => {
+                        return Err(LookupError::MixedTimeDomains {
+                            edge,
+                            expected: d,
+                            got: meta.domain,
+                        })
                     }
-                    _ => {
-                        // Dynamic (or tombstone — treated as dynamic; sampling it
-                        // will surface the real error). Pin/verify the domain.
-                        match domain {
-                            None => domain = Some(meta.domain),
-                            Some(d) if d != meta.domain => {
-                                return Err(LookupError::MixedTimeDomains {
-                                    edge,
-                                    expected: d,
-                                    got: meta.domain,
-                                })
-                            }
-                            Some(_) => {}
-                        }
-                        Step::Dyn { edge, inverted }
-                    }
+                    Some(_) => {}
                 }
+                Step::Dyn { edge, inverted }
             }
         };
 
-        // Collapse into the previous step if both are Static.
-        match (n, resolved) {
-            (m, Step::Static(cur)) if m > 0 => {
-                if let Step::Static(prev) = out[n - 1] {
-                    out[n - 1] = Step::Static(prev * cur);
-                } else {
-                    out[n] = Step::Static(cur);
-                    n += 1;
+        // Collapse into the previous step if both are Static, otherwise append.
+        // Both arms are guarded on the array bound rather than on `n` alone:
+        // past `MAX_DEPTH` the composed value has nowhere to live and this call
+        // is going to refuse, but the counting has to continue.
+        match resolved {
+            Step::Static(cur) if last_static => {
+                if n <= MAX_DEPTH {
+                    if let Step::Static(prev) = out[n - 1] {
+                        out[n - 1] = Step::Static(prev * cur);
+                    }
                 }
             }
-            (_, s) => {
-                out[n] = s;
+            s => {
+                if n < MAX_DEPTH {
+                    out[n] = s;
+                }
+                last_static = matches!(s, Step::Static(_));
                 n += 1;
             }
         }
+    }
+
+    if n > MAX_DEPTH {
+        return Err(LookupError::TreeTooDeep { depth: n as u16 });
     }
 
     Ok((out, n, domain.unwrap_or(0)))

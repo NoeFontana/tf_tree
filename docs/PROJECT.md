@@ -186,7 +186,7 @@ When a cargo feature is compiled out, the arena *regions* it would use stay decl
 | Frame | A named coordinate system. Interned to a `FrameId`. |
 | Edge | The relationship between a frame and its parent, storing `T_parent_child`. One per non-root frame. |
 | Arena | The single flat allocation holding all records and buffers. Position-independent; relocatable by `memcpy`. |
-| Plan | A compiled query: topology resolved, static edges folded, reduced to ≤16 steps. |
+| Plan | A compiled query: topology resolved, static edges folded, reduced to ≤`MAX_DEPTH` steps (**32**; the raw walk that produces it is bounded separately at `MAX_PATH_EDGES` = 64 — [`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)). |
 | Guard | A pinned topology generation; makes a batch of lookups consistent and cheap. |
 | Generation | Monotone counter on topology mutations. A plan whose generation is stale must be recompiled. |
 | Head | Monotone count of samples ever published to an edge. Masked only at access. |

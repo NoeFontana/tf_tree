@@ -32,10 +32,17 @@
 //!
 //! # The three limits a scale sweep will find, named here rather than hit
 //!
-//! * `tf_tree_core::MAX_DEPTH` (**16**) caps a *compiled* plan. A 24-deep spine
-//!   is refused outright — `docs/benchmarks/tf2.md` records that this was found
-//!   while building a scaling row, and it is checked in [`Workload::estimate`]
-//!   so a catalogue entry cannot be added that no harness can query.
+//! * **Two depth bounds, and they price different slots** (`0034`).
+//!   `tf_tree_core::MAX_DEPTH` (**32**) caps a *compiled* plan — steps counted
+//!   after adjacent static links fold — and `MAX_PATH_EDGES` (**64**) caps the
+//!   raw walk. A 24-deep spine was refused outright when one number did both;
+//!   `docs/benchmarks/tf2.md` records that this was found while building a
+//!   scaling row. The **raw** bound is checked in [`Workload::estimate`], which
+//!   is cheap and needs no arena; the **compiled** one cannot be — folding needs
+//!   the edge kinds, so it surfaces from [`Workload::build`]'s own
+//!   `Built::plans`, and `tests/workload.rs` asserts it over the whole
+//!   catalogue. Either way a catalogue entry cannot be added that no harness can
+//!   query.
 //! * `BuildError::TooManyFrames` / `TooManyEdges`: both counts are `u32`.
 //! * **`LayoutError::ArenaTooLarge`: the whole arena must fit a `u32` offset
 //!   model**, so 4 GiB is a hard ceiling regardless of frame and edge counts.
@@ -281,7 +288,8 @@ impl Built {
     /// # Errors
     ///
     /// If a frame name is unknown or the path does not compile (disconnected,
-    /// or deeper than `MAX_DEPTH`).
+    /// longer than `MAX_PATH_EDGES` raw edges, or more than `MAX_DEPTH` steps
+    /// once folded).
     pub fn plans(&self) -> Result<Vec<Plan>> {
         let mut out = Vec::with_capacity(self.pairs.len());
         for (target, source) in &self.pairs {
@@ -1048,11 +1056,19 @@ fn deepest_chain(statics: &[StaticEdge], dynamics: &[DynEdge]) -> Result<(String
         }
     }
     let (depth, root, leaf) = best.ok_or_else(|| anyhow!("topology has no edges"))?;
-    if depth > tf_tree::MAX_DEPTH {
+    // **Checked against the raw bound, not the compiled one**, because `depth`
+    // here is a count of *edges* — this map is built from `statics` and
+    // `dynamics` both — and `MAX_DEPTH` bounds the plan *after* adjacent static
+    // links fold. Before `0034` this refused a long mostly-static chain that
+    // compiles to a handful of steps, which is exactly the shape the record
+    // exists for. What the raw bound refuses, no plan can be compiled for; what
+    // survives it may still be too deep once folded, and `Built::plans` is where
+    // that surfaces, with the true step count in the error.
+    if depth > tf_tree::MAX_PATH_EDGES {
         bail!(
-            "deepest chain is {depth} edges ({leaf} <- {root}) and MAX_DEPTH is {}; \
+            "deepest chain is {depth} edges ({leaf} <- {root}) and MAX_PATH_EDGES is {}; \
              no plan can be compiled for it",
-            tf_tree::MAX_DEPTH
+            tf_tree::MAX_PATH_EDGES
         );
     }
     Ok((root.to_owned(), leaf.to_owned()))

@@ -33,6 +33,68 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **`tf_tree_core::MAX_DEPTH` is 32, not 16, and it now means what its
+  documentation always said** (#251, `0034`). It bounds the *compiled* plan —
+  `Plan`'s `[Step; MAX_DEPTH]` array, counted **after** adjacent static links
+  fold into one step. It used to be enforced on the **raw walk** instead, which
+  is a different quantity: a 17-link rigid chain that compiles to a *single*
+  constant was refused at exactly the length a 17-joint arm was. A new
+  **`tf_tree_core::MAX_PATH_EDGES` = 64** bounds the walk. Both are `pub const`
+  and re-exported by `tf_tree`, so on the `0.0.x` line this is a semver-relevant
+  change to a value **and** to a meaning, on five published crates.
+
+  **Two bounds because one number cannot price both slots.** A compiled slot is
+  a `Step` — **128 bytes**, measured — carried by value in every `Plan`, in a
+  16-slot thread-local plan cache, and behind every Python `Plan`. A raw slot is
+  a `u32` edge id in `compile`'s stack frame: 4 bytes, paid once, on a call D3
+  already places off the query path.
+
+  **The values come from a survey, not from an intuition.** 91 distinct real
+  robot structures from 26 repositories, and the binding quantity is the graph
+  **diameter** in joints — up to the common ancestor and back down, which is
+  what a lookup walks — not root-to-leaf depth: max 30, p95 24, median 10.
+  Root-to-leaf depth maxes at 18, so a survey that measured *that* would have
+  concluded 24 was ample. At `MAX_DEPTH = 16` the old engine refused at least one
+  frame pair on **26 of the 91**. `MAX_PATH_EDGES = 64` is ~1.9× the floor a
+  deployment sets (a 30-joint diameter plus `map → odom → base_footprint`), and
+  deliberately not 256: this constant sets the worst *accepted* compile — 1.09 µs
+  at 64 against 3.97 µs at 256 — and a refused pair is not cached (#259), so it
+  recompiles on every lookup with nothing amortising it.
+
+- **`LookupError::TreeTooDeep { depth }` reports one quantity per bound, and the
+  two are disjoint** (`0034`). It reported three different things: the bound for
+  a one-sided chain, the truth for a balanced two-sided path, and neither for a
+  lopsided one. Now `MAX_PATH_EDGES + 1` means the **walk** refused — the walk
+  stops when it runs out of buffer and never learns the real length, so that is
+  the only value above the bound this field takes — and anything at or below
+  `MAX_PATH_EDGES` is the **exact** folded step count. No new variant and no new
+  `tft_status`: the C ABI's status table is frozen, and `TFT_ERR_TREE_TOO_DEEP`
+  still covers both. Its header prose no longer names `TFT_MAX_DEPTH`, a macro
+  referenced in two places and **defined nowhere** since Phase 4; it is still not
+  defined, because `0034` split the quantity it was vaguely about into two and
+  freezing that one name now would make it ambiguous rather than merely absent.
+
+- **Error precedence on a too-long path.** `fold` now runs before the compiled
+  bound is checked, so `UnknownEdge` and `MixedTimeDomains` are raised for a
+  defect that sits **past** the bound rather than being hidden behind the path's
+  length; `MissingEdge` is unchanged and still wins by its position in the walk.
+  Nothing in the workspace pinned precedence, which is why this was invisible;
+  `error_precedence_over_defect_kind_position_and_foldability` is the table that
+  pins it now, verified by building the cheaper implementation and watching the
+  two discriminating rows go red.
+
+  The Rust and Python `TreeTooDeep` messages are rewritten with it. The Rust
+  facade rendered **"path depth 16 exceeds the maximum of 16"** — self-
+  contradictory, and shipped for the whole of Phases 1–5 because nothing
+  asserted the text — and now names which bound refused and, for the compiled
+  one, `TreeBuilder::static_edge` as a remedy. Python's does **not** name that
+  remedy: `tf_tree.build` declares every edge dynamic, so a static edge is
+  unreachable from Python and `docs/API.md` R5 puts a binding-specific remedy in
+  the binding's own prose layer. Both renderings are now asserted
+  (`crates/tf_tree/tests/lookup.rs`, `tests/python/test_errors.py`).
+
 ### Fixed
 
 - **`docs/decisions/README.md` carried an unresolved merge conflict on `main`,

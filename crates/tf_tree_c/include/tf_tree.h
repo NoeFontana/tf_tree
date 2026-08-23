@@ -278,7 +278,17 @@ typedef struct {
 #define TFT_ERR_WRONG_THREAD -30
 
 /**
- * The path between the two frames is deeper than `TFT_MAX_DEPTH`.
+ * The path between the two frames is too long: more raw edges than a lookup
+ * will walk, or more steps than a compiled plan holds once adjacent rigid
+ * links fold into one.
+ *
+ * **Two engine bounds, one status**, because this table is frozen. Neither is
+ * named as a macro here: `TFT_MAX_DEPTH` was referenced in this doc and in the
+ * header for the whole of Phase 4 and **defined nowhere**, and `0034` split the
+ * quantity it was vaguely about into two, so freezing that one name now would
+ * make it ambiguous rather than merely absent. Exporting a constant for each is
+ * its own change — it needs `xtask headers` and a decision on what a C caller
+ * is promised about a value that has already moved once.
  */
 #define TFT_ERR_TREE_TOO_DEEP -21
 

@@ -346,7 +346,7 @@ pub use tf_tree_core::plan::{
     SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
 };
 pub use tf_tree_core::{
-    ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH,
+    ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH, MAX_PATH_EDGES,
 };
 
 // **The math surface, including both interpolation kernels.** `slerp` is here

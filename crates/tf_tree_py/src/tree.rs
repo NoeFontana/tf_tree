@@ -440,8 +440,10 @@ type Knots<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray3<f64>>);
 
 /// # A `#[pyclass]` may not contain an over-aligned type
 ///
-/// `Plan` is `align(64), size 2112` — it holds `[Step; MAX_DEPTH]` and `Step`
-/// carries an `Iso3`, which is one cacheline by design. **CPython's object
+/// `Plan` is `align(64), size 4160` — it holds `[Step; MAX_DEPTH]` and `Step`
+/// carries an `Iso3`, which is one cacheline by design. (2112 before `0034`
+/// moved `MAX_DEPTH` 16 → 32; the alignment, which is what this section is
+/// about, is unchanged and is what forces the `Box`.) **CPython's object
 /// allocator guarantees 16-byte alignment at best**, so storing a `Plan`
 /// directly in a pyclass makes every field access a misaligned dereference.
 /// Under a debug build that aborts the interpreter outright:

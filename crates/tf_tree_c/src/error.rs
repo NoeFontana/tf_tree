@@ -66,7 +66,17 @@ pub const TFT_ERR_NO_DERIVATIVES: tft_status = -19;
 pub const TFT_ERR_NO_SEGMENT: tft_status = -20;
 /// A `tft_publisher` was used from a thread other than its creator's.
 pub const TFT_ERR_WRONG_THREAD: tft_status = -30;
-/// The path between the two frames is deeper than `TFT_MAX_DEPTH`.
+/// The path between the two frames is too long: more raw edges than a lookup
+/// will walk, or more steps than a compiled plan holds once adjacent rigid
+/// links fold into one.
+///
+/// **Two engine bounds, one status**, because this table is frozen. Neither is
+/// named as a macro here: `TFT_MAX_DEPTH` was referenced in this doc and in the
+/// header for the whole of Phase 4 and **defined nowhere**, and `0034` split the
+/// quantity it was vaguely about into two, so freezing that one name now would
+/// make it ambiguous rather than merely absent. Exporting a constant for each is
+/// its own change — it needs `xtask headers` and a decision on what a C caller
+/// is promised about a value that has already moved once.
 pub const TFT_ERR_TREE_TOO_DEEP: tft_status = -21;
 /// The compiled-against ABI version is incompatible with this library (§3.6).
 pub const TFT_ERR_ABI_MISMATCH: tft_status = -6;
@@ -449,9 +459,16 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
             TFT_ERR_NO_SEGMENT
         }
         L::TreeTooDeep { depth } => {
+            // `requested` carries `depth`, and since `0034` that number is the
+            // count that overran *one of two* bounds — the raw walk's or the
+            // folded plan's. The sentence says "one of the engine's two length
+            // bounds" rather than picking one, because this layer cannot name
+            // either without naming a macro, and the one this header used to
+            // name (`TFT_MAX_DEPTH`) was never defined; see
+            // `TFT_ERR_TREE_TOO_DEEP`.
             set_error(
                 TFT_ERR_TREE_TOO_DEEP,
-                "the path between these frames is deeper than the engine's fixed limit",
+                "the path between these frames overruns one of the engine's two length bounds",
                 |e| e.requested = i64::from(depth),
             );
             TFT_ERR_TREE_TOO_DEEP

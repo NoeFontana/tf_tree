@@ -2038,7 +2038,9 @@ impl Tree {
         // # Why this hangs off the callback instead of walking the returned plan
         //
         // Not style, and it was not predicted. `Plan` is a `[Step; MAX_DEPTH]`,
-        // about 2 KiB by value, and this method is a tail expression so the
+        // 4160 bytes by value — 2112 when this was measured, before `0034`
+        // moved `MAX_DEPTH` 16 → 32, which makes the argument stronger and not
+        // weaker — and this method is a tail expression so the
         // compiler builds the result straight into the caller's slot. Binding it
         // to a local in order to iterate `plan.steps()` costs a copy of all of
         // it, and that copy is worth **80 ns on `first lookup after attach`**:
@@ -2046,7 +2048,7 @@ impl Tree {
         // row §7.1 exists to protect. The cause was isolated by applying the
         // restructure *with the old population behaviour*, where it reproduced
         // in full — so it is the binding, not the populating. `Result::inspect`
-        // is not an escape: it takes `self` by value and moves the same 2 KiB.
+        // is not an escape: it takes `self` by value and moves the same array.
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let edge_meta = |eid| {
             self.populate_edge_rings(eid);
@@ -3631,8 +3633,41 @@ impl fmt::Display for Described<'_> {
                 tree.frame_name(source),
                 tree.frame_name(cut_at),
             ),
+            // **Two bounds, one variant, so this arm has to read `depth` before
+            // it can say anything true.** Rendering one sentence for both is
+            // what shipped "path depth 16 exceeds the maximum of 16" — a
+            // self-contradiction, because the old `depth` was the guard's own
+            // count at the moment it fired and so equalled the bound rather
+            // than exceeding it. `0034` made the two cases disjoint (see
+            // `LookupError::TreeTooDeep`'s field docs) and this is the arm that
+            // spends that.
+            //
+            // The compiled-bound sentence names `static_edge`, and that is a
+            // Rust-specific remedy on purpose: `docs/API.md` R5 makes the prose
+            // layer the place a binding-specific remedy belongs, and this is
+            // the Rust one. `tf_tree_core`'s own doc must not name it, because
+            // Python cannot declare a static edge at all and C reaches one only
+            // through an unstable feature-gated path.
             LookupError::TreeTooDeep { depth } => {
-                write!(f, "path depth {depth} exceeds the maximum of {MAX}", MAX = tf_tree_core::MAX_DEPTH)
+                if usize::from(depth) > tf_tree_core::MAX_PATH_EDGES {
+                    write!(
+                        f,
+                        "the path between these frames is longer than the {MAX} \
+                         edges a lookup walks: re-parent so the two frames \
+                         share a nearer ancestor",
+                        MAX = tf_tree_core::MAX_PATH_EDGES,
+                    )
+                } else {
+                    write!(
+                        f,
+                        "this path compiles to {depth} steps and a plan holds \
+                         {MAX}: declare the rigid links on it with \
+                         TreeBuilder::static_edge so each adjacent run folds to \
+                         one step, or re-parent so the two frames share a \
+                         nearer ancestor",
+                        MAX = tf_tree_core::MAX_DEPTH,
+                    )
+                }
             }
             LookupError::NoData { edge } => {
                 write!(f, "no samples on {}", tree.edge_name(edge))

@@ -1070,61 +1070,517 @@ fn compile_rejects_the_no_edge_sentinel() {
     assert_eq!(err, LookupError::MissingEdge { child: b });
 }
 
-/// `docs/PHASE1.md` §7.1 pins `MAX_DEPTH` at 16 and makes a longer combined
-/// path [`LookupError::TreeTooDeep`]. Nothing in the workspace asserted it, so
-/// the four depth guards in `compile` were free to be off by one — and the
-/// failure is not a clean panic but a *truncated plan*: a transform composed
-/// from the bottom of the chain and missing its top, which looks entirely
-/// plausible.
+/// A root plus a chain of `links` frames, `f0 -> f1 -> … -> f{links}`, where the
+/// edge on the link into `f{i}` is `EdgeId(i)`. Returns the arena and the frame
+/// ids in chain order, so `chain[k]` is `k` edges below the root.
 ///
-/// Mutant: `if nt >= MAX_DEPTH` -> `if nt > MAX_DEPTH` in the first
-/// depth-equalisation loop ⇒ `t_edges[16]` panics out of bounds.
-#[test]
-fn max_depth_is_the_exact_boundary_between_a_plan_and_tree_too_deep() {
+/// Edge id == the child's frame id: non-zero, in range, and unique, so no link
+/// trips the `MissingEdge` sentinel check instead. `sentinel_at` names a link to
+/// record with edge `0` on purpose — that is how the sentinel defect is placed
+/// at a chosen distance along the path.
+fn chain_arena(links: usize, sentinel_at: Option<usize>) -> (HeapArena, Vec<FrameId>) {
     use alloc::format;
 
-    // 20 frame slots => ids 1..=19: a root plus an 18-link chain.
-    let layout = ArenaLayout::new(20, 20, alloc::vec![0; 20]).unwrap();
+    let slots = links + 2;
+    let layout = ArenaLayout::new(slots as u32, slots as u32, alloc::vec![0; slots]).unwrap();
     let arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
-    let view = ArenaView::new(&arena);
-
-    let mut chain: Vec<FrameId> = Vec::new();
-    for i in 0..19u32 {
-        chain.push(view.intern(&format!("f{i}")).unwrap());
-    }
-    for w in chain.windows(2) {
-        // Edge id == the child's frame id: non-zero, in range, and unique, so
-        // no link trips the `MissingEdge` sentinel check instead.
-        view.topology()
-            .set_parent(w[1], w[0].get(), w[1].get())
-            .unwrap();
-    }
-
-    let meta = |eid: EdgeId| {
-        view.edge(eid).map(|e| crate::plan::EdgeMeta {
-            kind: crate::edge::EdgeKind::from_u8(e.kind),
-            domain: e.domain,
-            static_pose: Iso3::from_bits(&e.static_pose),
-        })
+    let chain: Vec<FrameId> = {
+        let view = ArenaView::new(&arena);
+        let mut chain = Vec::new();
+        for i in 0..=links {
+            chain.push(view.intern(&format!("f{i}")).unwrap());
+        }
+        for (k, w) in chain.windows(2).enumerate() {
+            let edge = if sentinel_at == Some(k + 1) {
+                0
+            } else {
+                w[1].get()
+            };
+            view.topology().set_parent(w[1], w[0].get(), edge).unwrap();
+        }
+        chain
     };
+    (arena, chain)
+}
 
-    // Exactly MAX_DEPTH links: compiles, with every step retained.
+/// A **Y**: one root with a target branch of `p` links and a source branch of
+/// `q`, so `lookup(target, source)` walks `p + q` edges through the lowest
+/// common ancestor. Edge ids are the child frame's own id, as in
+/// [`chain_arena`].
+///
+/// The straight chain is the shape every depth test in this file used, and it is
+/// the shape that cannot see a **per-side** bound: one side is zero.
+fn y_arena(p: usize, q: usize) -> (HeapArena, FrameId, FrameId) {
+    use alloc::format;
+
+    let slots = p + q + 2;
+    let layout = ArenaLayout::new(slots as u32, slots as u32, alloc::vec![0; slots]).unwrap();
+    let arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
+    let (target, source) = {
+        let view = ArenaView::new(&arena);
+        let root = view.intern("root").unwrap();
+        let mut cur = root;
+        for i in 0..p {
+            let f = view.intern(&format!("t{i}")).unwrap();
+            view.topology().set_parent(f, cur.get(), f.get()).unwrap();
+            cur = f;
+        }
+        let target = cur;
+        let mut cur = root;
+        for j in 0..q {
+            let f = view.intern(&format!("s{j}")).unwrap();
+            view.topology().set_parent(f, cur.get(), f.get()).unwrap();
+            cur = f;
+        }
+        (target, cur)
+    };
+    (arena, target, source)
+}
+
+/// An `EdgeMeta` for a synthetic chain: every edge is `kind`, in domain `0`, and
+/// carries a **non-identity** static pose that differs per edge.
+///
+/// The pose has to differ per edge, and it has to be a rotation as well as a
+/// translation. An all-identity harness makes composition order invisible —
+/// `I * I` is `I` in whatever association — and `docs/decisions/0034`'s
+/// rationale (D) turns on exactly that being visible.
+fn distinct_pose(edge: u32) -> Iso3 {
+    // `pose` is the suite's own generator: an `exp_se3` of a twist with three
+    // non-zero rotation components, so no two edges compose commutatively.
+    pose(u64::from(edge) + 1)
+}
+
+fn chain_meta(kind: crate::edge::EdgeKind) -> impl Fn(EdgeId) -> Option<crate::plan::EdgeMeta> {
+    move |eid: EdgeId| {
+        Some(crate::plan::EdgeMeta {
+            kind,
+            domain: 0,
+            static_pose: distinct_pose(eid.0),
+        })
+    }
+}
+
+/// [`MAX_DEPTH`](crate::MAX_DEPTH) is the length of the **compiled** array, and
+/// this is its boundary: `MAX_DEPTH` dynamic edges compile whole, one more is
+/// refused.
+///
+/// The refusal reports the **exact folded length**, not the bound. That is what
+/// `fold` running past the end of its output array buys, and it is the half of
+/// `0034` that a test can see: before it, this assertion read
+/// `depth: MAX_DEPTH`, which is the self-contradiction
+/// `crates/tf_tree/src/tree.rs` rendered as "path depth 16 exceeds the maximum
+/// of 16".
+///
+/// Mutant: `if n > MAX_DEPTH` -> `if n > MAX_PATH_EDGES` in `fold`, i.e. the
+/// refusal keyed to the wrong bound. **Applied and run**: `881 tests run: 877
+/// passed, 4 failed` — this test, the precedence table, the raw-bound test and
+/// the corpus test, all four on
+/// `plan.rs:536: range end index 33 out of range for slice of length 32`. The
+/// prediction written here first was a *truncated plan*, and it is wrong:
+/// `Plan::new` slices `steps[..len]` to derive `dyn_count`, so an out-of-range
+/// `len` panics there rather than shipping a plausible-looking short plan. The
+/// note is what the mutation produced, not what it was expected to.
+#[test]
+fn the_compiled_bound_is_the_exact_boundary_between_a_plan_and_tree_too_deep() {
+    let (arena, chain) = chain_arena(crate::MAX_DEPTH + 1, None);
+    let view = ArenaView::new(&arena);
+    let meta = chain_meta(crate::edge::EdgeKind::Dynamic);
     let root = chain[0];
+
     let at_limit = chain[crate::MAX_DEPTH];
-    let plan = crate::plan::compile(&view.topology(), meta, at_limit, root).unwrap();
+    let plan = crate::plan::compile(&view.topology(), &meta, at_limit, root).unwrap();
     assert_eq!(
         plan.len(),
         crate::MAX_DEPTH,
-        "a depth-16 path must compile whole"
+        "a MAX_DEPTH-step path must compile whole"
     );
 
-    // One link further: refused, and the error names the depth that overflowed.
     let past_limit = chain[crate::MAX_DEPTH + 1];
     assert_eq!(
-        crate::plan::compile(&view.topology(), meta, past_limit, root).unwrap_err(),
+        crate::plan::compile(&view.topology(), &meta, past_limit, root).unwrap_err(),
         LookupError::TreeTooDeep {
-            depth: crate::MAX_DEPTH as u16
+            depth: (crate::MAX_DEPTH + 1) as u16
+        },
+        "the compiled bound reports the true folded length, not the bound"
+    );
+}
+
+/// [`MAX_PATH_EDGES`](crate::MAX_PATH_EDGES) is the length of the **walk**, and
+/// this is the whole of `0034`: the same chain length that a dynamic path is
+/// refused at compiles to a *single step* when the links are static.
+///
+/// The walk's refusal reports `MAX_PATH_EDGES + 1` rather than a length, and
+/// that is deliberate — the walk stops because it has no buffer left, so it
+/// never learns how much further the path went. `fold` can count past its array
+/// because its input is already bounded; the walk cannot, because a corrupt
+/// parent chain with a cycle in it would not terminate.
+///
+/// Mutant: `if nt + ns == MAX_PATH_EDGES` -> `if $n >= MAX_PATH_EDGES` in
+/// `push_edge!` — the **per-side** spelling this replaced, and the one HEAD had.
+/// **Applied and run twice.** Against the test as first written — a straight
+/// chain and nothing else — the whole workspace passed, `881 passed, 0 failed`:
+/// a one-sided walk puts every edge on one side, so a per-side bound and a
+/// combined one are the same bound and no straight chain can tell them apart.
+/// That is why the `y_arena` row below exists, and against it the same mutant
+/// gives `880 passed, 1 failed` — the 40-up/40-down Y **compiles**, returning
+/// `Ok(Plan { len: 1 })` for a path of 80 edges, because neither side reaches 64
+/// on its own. `MAX_PATH_EDGES = 64` would have meant "up to 127 edges walked".
+#[test]
+fn the_raw_bound_is_the_exact_boundary_the_walk_refuses_at() {
+    let (arena, chain) = chain_arena(crate::MAX_PATH_EDGES + 1, None);
+    let view = ArenaView::new(&arena);
+    let meta = chain_meta(crate::edge::EdgeKind::Static);
+    let root = chain[0];
+
+    // The row `0034` exists for: 64 raw edges, far past `MAX_DEPTH`, folding to
+    // one constant.
+    let at_limit = chain[crate::MAX_PATH_EDGES];
+    let plan = crate::plan::compile(&view.topology(), &meta, at_limit, root).unwrap();
+    assert_eq!(
+        plan.len(),
+        1,
+        "a static chain folds to one step at any length"
+    );
+
+    let past_limit = chain[crate::MAX_PATH_EDGES + 1];
+    assert_eq!(
+        crate::plan::compile(&view.topology(), &meta, past_limit, root).unwrap_err(),
+        LookupError::TreeTooDeep {
+            depth: (crate::MAX_PATH_EDGES + 1) as u16
+        },
+    );
+
+    // **The bound is on `nt + ns`, and only a Y can see that.** Per-side guards
+    // — which is what this replaced, and what HEAD had at `MAX_DEPTH` — let a
+    // path 40 edges up and 40 edges back down walk all 80 before anything
+    // refuses, because neither side reaches the bound on its own. The whole
+    // suite passes with the per-side spelling restored **except this
+    // assertion**, and the way it fails is the point: the 80-edge path
+    // *succeeds*, `Ok(Plan { len: 1 })`, because these links are static and 80
+    // of them fold to one step. A bound of 64 would have meant 127 edges
+    // walked.
+    let (y, y_target, y_source) = y_arena(40, 40);
+    let y_view = ArenaView::new(&y);
+    assert_eq!(
+        crate::plan::compile(&y_view.topology(), &meta, y_target, y_source).unwrap_err(),
+        LookupError::TreeTooDeep {
+            depth: (crate::MAX_PATH_EDGES + 1) as u16
+        },
+        "MAX_PATH_EDGES must mean edges walked, not edges walked on one side"
+    );
+    // The control: the same Y one edge under the bound compiles, so the row
+    // above is about the bound and not about Y shapes.
+    let (ok_y, ok_target, ok_source) = y_arena(32, 32);
+    let ok_view = ArenaView::new(&ok_y);
+    assert_eq!(
+        crate::plan::compile(&ok_view.topology(), &meta, ok_target, ok_source)
+            .unwrap()
+            .len(),
+        1,
+        "64 edges walked is exactly the bound and must be accepted"
+    );
+
+    // And the two bounds are genuinely separate numbers: a chain longer than
+    // `MAX_DEPTH` but shorter than `MAX_PATH_EDGES` compiles when it folds and
+    // is refused when it does not.
+    let mid = chain[crate::MAX_DEPTH + 8];
+    assert_eq!(
+        crate::plan::compile(&view.topology(), &meta, mid, root)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        crate::plan::compile(
+            &view.topology(),
+            chain_meta(crate::edge::EdgeKind::Dynamic),
+            mid,
+            root
+        )
+        .unwrap_err(),
+        LookupError::TreeTooDeep {
+            depth: (crate::MAX_DEPTH + 8) as u16
+        },
+    );
+}
+
+/// **Error precedence, which nothing in the workspace pinned** — which is why
+/// `0034` could move it invisibly. A table over (defect kind) x (position, before
+/// or after the compiled bound fills) x (foldable or not).
+///
+/// The discriminating row is `("unknown edge", 40, all-dynamic)` and its
+/// `MixedTimeDomains` twin: the path is 48 dynamic edges, so the compiled array
+/// is full by step 32 and the defect sits 8 steps past it. `fold` skips the
+/// write, keeps counting, and still resolves that edge — so the caller is told
+/// what is *wrong* with their path rather than how long it is.
+///
+/// Mutant (variant A, the cheap alternative `0034` step 3 reads as): give `fold`
+/// an early `if n >= MAX_DEPTH { return Err(TreeTooDeep { depth: n as u16 }) }`
+/// at the top of the loop body. **Applied and run**: three of the nine rows move
+/// and six do not —
+///
+/// ```text
+/// clean, all-dynamic: got TreeTooDeep { depth: 32 }, want TreeTooDeep { depth: 48 }
+/// unknown edge past the bound, all-dynamic: got TreeTooDeep { depth: 32 }, want UnknownEdge { edge: EdgeId(9) }
+/// mixed domains past the bound, all-dynamic: got TreeTooDeep { depth: 32 }, want MixedTimeDomains { edge: EdgeId(9), expected: 0, got: 7 }
+/// ```
+///
+/// — so the mutant loses both the precedence *and* the true folded length. The
+/// six that stay green are the control: every all-static row, and
+/// `missing edge past the bound, all-dynamic`, which is raised in the walk and
+/// therefore wins by position under either variant. Those two defect rows are
+/// what separates the two implementations, and they are the reason the dearer
+/// one ships.
+///
+/// The last row is the other side of the same coin: a defect past the **raw**
+/// bound is not reachable, because the walk really does stop there. Depth wins
+/// that one, and it has to — `fold` never sees an edge the walk did not collect.
+#[test]
+fn error_precedence_over_defect_kind_position_and_foldability() {
+    use crate::edge::EdgeKind::{Dynamic, Static};
+
+    /// Which defect to place.
+    enum Defect {
+        /// None: the control row.
+        Clean,
+        /// `set_parent` recorded edge `0` on the defective link.
+        Sentinel,
+        /// `edge_meta` answers `None` for the defective edge.
+        Unknown,
+        /// `edge_meta` answers a second domain tag for it.
+        OtherDomain,
+    }
+
+    /// Path length in edges, and the two positions, **counted in walk order**:
+    /// the lookup runs `chain[LEN] -> chain[0]`, so step 0 is the link into the
+    /// leaf and step `k` is `k` edges above it. On an all-dynamic path step `k`
+    /// is also compiled step `k`, so `AFTER` sits 8 steps past a full array.
+    const LEN: usize = 48;
+    const BEFORE: usize = 5;
+    const AFTER: usize = 40;
+
+    let cases: [(
+        &str,
+        Defect,
+        usize,
+        usize,
+        crate::edge::EdgeKind,
+        LookupError,
+    ); 9] = [
+        // The control. All-dynamic overruns the compiled bound and reports its
+        // true folded length.
+        (
+            "clean, all-dynamic",
+            Defect::Clean,
+            LEN,
+            0,
+            Dynamic,
+            LookupError::TreeTooDeep { depth: LEN as u16 },
+        ),
+        (
+            "missing edge before the bound, all-dynamic",
+            Defect::Sentinel,
+            LEN,
+            BEFORE,
+            Dynamic,
+            LookupError::MissingEdge {
+                child: FrameId::new((LEN - BEFORE + 1) as u32).unwrap(),
+            },
+        ),
+        (
+            "missing edge past the bound, all-dynamic",
+            Defect::Sentinel,
+            LEN,
+            AFTER,
+            Dynamic,
+            LookupError::MissingEdge {
+                child: FrameId::new((LEN - AFTER + 1) as u32).unwrap(),
+            },
+        ),
+        (
+            "unknown edge before the bound, all-dynamic",
+            Defect::Unknown,
+            LEN,
+            BEFORE,
+            Dynamic,
+            LookupError::UnknownEdge {
+                edge: EdgeId((LEN - BEFORE + 1) as u32),
+            },
+        ),
+        // *** The row that separates variant C from variant A. ***
+        (
+            "unknown edge past the bound, all-dynamic",
+            Defect::Unknown,
+            LEN,
+            AFTER,
+            Dynamic,
+            LookupError::UnknownEdge {
+                edge: EdgeId((LEN - AFTER + 1) as u32),
+            },
+        ),
+        (
+            "mixed domains past the bound, all-dynamic",
+            Defect::OtherDomain,
+            LEN,
+            AFTER,
+            Dynamic,
+            LookupError::MixedTimeDomains {
+                edge: EdgeId((LEN - AFTER + 1) as u32),
+                expected: 0,
+                got: 7,
+            },
+        ),
+        // All-static: the compiled array never fills, so these rows read the
+        // same under either variant. They are the control that shows the two
+        // rows above are about the bound and not about the position.
+        (
+            "missing edge past the bound, all-static",
+            Defect::Sentinel,
+            LEN,
+            AFTER,
+            Static,
+            LookupError::MissingEdge {
+                child: FrameId::new((LEN - AFTER + 1) as u32).unwrap(),
+            },
+        ),
+        (
+            "unknown edge past the bound, all-static",
+            Defect::Unknown,
+            LEN,
+            AFTER,
+            Static,
+            LookupError::UnknownEdge {
+                edge: EdgeId((LEN - AFTER + 1) as u32),
+            },
+        ),
+        // Past the *raw* bound the walk really does stop, so the defect is
+        // unreachable and depth wins. It has to: `fold` never sees an edge the
+        // walk did not collect.
+        (
+            "unknown edge past the raw bound, all-static",
+            Defect::Unknown,
+            crate::MAX_PATH_EDGES + 6,
+            crate::MAX_PATH_EDGES + 4,
+            Static,
+            LookupError::TreeTooDeep {
+                depth: (crate::MAX_PATH_EDGES + 1) as u16,
+            },
+        ),
+    ];
+
+    // Rows are collected rather than asserted one at a time: the table's value
+    // is which rows move together, and a per-row `assert_eq!` reports only the
+    // first.
+    let mut wrong: Vec<alloc::string::String> = Vec::new();
+    for (label, defect, links, step, kind, want) in cases {
+        // Walk step `step` is the link into `chain[links - step]`, whose edge id
+        // is that frame's own id.
+        let link = links - step;
+        let edge = (link + 1) as u32;
+        let sentinel = matches!(defect, Defect::Sentinel).then_some(link);
+        let (arena, chain) = chain_arena(links, sentinel);
+        let view = ArenaView::new(&arena);
+
+        let unknown = matches!(defect, Defect::Unknown).then_some(edge);
+        let other_domain = matches!(defect, Defect::OtherDomain).then_some(edge);
+        let meta = move |eid: EdgeId| {
+            if unknown == Some(eid.0) {
+                return None;
+            }
+            Some(crate::plan::EdgeMeta {
+                kind,
+                domain: u8::from(other_domain == Some(eid.0)) * 7,
+                static_pose: distinct_pose(eid.0),
+            })
+        };
+
+        let got = crate::plan::compile(&view.topology(), meta, chain[links], chain[0]).unwrap_err();
+        if got != want {
+            wrong.push(alloc::format!("{label}: got {got:?}, want {want:?}"));
         }
+    }
+    assert!(
+        wrong.is_empty(),
+        "precedence table:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// The corpus shape, and the corpus ceiling.
+///
+/// ANYmal C is the one structure in the 91-robot URDF survey where folding
+/// materially helps: its worst frame pair is **20 joints** apart and folds to
+/// **13** steps, because the chain is `fixed fixed revolute` six times over. It
+/// is the right fixture precisely because a straight static chain is not — an
+/// alternation exercises the *adjacent*-only collapse rule, which a run of
+/// statics cannot get wrong.
+///
+/// At `MAX_DEPTH = 16` this shape was refused outright (20 raw edges). It now
+/// compiles, and the two numbers that matter are pinned: 20 edges walked, 13
+/// steps kept.
+///
+/// The ceiling rows are the survey's other two numbers: the worst *diameter*
+/// anyone measured is 30 joints (Unitree H2 Plus), which must compile with a
+/// deployed `/tf` prefix on top of it; and a path past `MAX_PATH_EDGES` must
+/// still refuse.
+#[test]
+fn the_anymal_c_shape_folds_and_the_corpus_ceiling_holds() {
+    // `fixed fixed revolute` x 6, then two more fixed: 20 links.
+    const PATTERN: [crate::edge::EdgeKind; 20] = {
+        use crate::edge::EdgeKind::{Dynamic, Static};
+        [
+            Static, Static, Dynamic, Static, Static, Dynamic, Static, Static, Dynamic, Static,
+            Static, Dynamic, Static, Static, Dynamic, Static, Static, Dynamic, Static, Static,
+        ]
+    };
+
+    let (arena, chain) = chain_arena(PATTERN.len(), None);
+    let view = ArenaView::new(&arena);
+    // `chain[k]`'s own frame id is the edge into it, and `chain[0]` is id 1, so
+    // the links carry edge ids 2..=21 and `PATTERN[k - 1]` is link `k`'s kind.
+    let meta = |eid: EdgeId| {
+        Some(crate::plan::EdgeMeta {
+            kind: PATTERN[eid.0 as usize - 2],
+            domain: 0,
+            static_pose: distinct_pose(eid.0),
+        })
+    };
+    let plan =
+        crate::plan::compile(&view.topology(), meta, chain[PATTERN.len()], chain[0]).unwrap();
+    assert_eq!(
+        plan.len(),
+        13,
+        "ANYmal C: 20 raw edges, 6 revolute, adjacent fixed runs collapsed"
+    );
+
+    // The corpus ceiling: 30 dynamic joints plus `map -> odom -> base_footprint`
+    // is 33 edges, and every one of them is a step.
+    let (arena, chain) = chain_arena(33, None);
+    let view = ArenaView::new(&arena);
+    let dynamic = chain_meta(crate::edge::EdgeKind::Dynamic);
+    assert_eq!(
+        crate::plan::compile(&view.topology(), &dynamic, chain[33], chain[0]).unwrap_err(),
+        LookupError::TreeTooDeep { depth: 33 },
+        "33 dynamic steps is past MAX_DEPTH and says so exactly"
+    );
+    // …and the same 33 edges with the arm's fixed offsets declared static fit
+    // easily, which is the deployment this bound is sized for.
+    let mostly_static = |eid: EdgeId| {
+        Some(crate::plan::EdgeMeta {
+            kind: if eid.0.is_multiple_of(3) {
+                crate::edge::EdgeKind::Dynamic
+            } else {
+                crate::edge::EdgeKind::Static
+            },
+            domain: 0,
+            static_pose: distinct_pose(eid.0),
+        })
+    };
+    assert_eq!(
+        crate::plan::compile(&view.topology(), mostly_static, chain[33], chain[0])
+            .unwrap()
+            .len(),
+        23
     );
 }
 

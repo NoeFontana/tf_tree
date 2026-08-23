@@ -1443,7 +1443,7 @@ the working set (256 rings is 18 MiB of first-touched pages), not false sharing 
   `LayoutError::ArenaTooLarge` — every region offset in the header is a `u32`.
   This was undocumented, and it is the one that binds first on any populated
   tree; `TooManyFrames`/`TooManyEdges` are `u32` counts nothing reaches.
-* 16 compiled plan steps (`MAX_DEPTH`), as the section below already records.
+* 32 compiled plan steps (`MAX_DEPTH`) and 64 raw path edges (`MAX_PATH_EDGES`), as the section below already records.
 
 ### Duration — `just soak`
 
@@ -1794,18 +1794,29 @@ instead of printing its (excellent) latencies as a result.
 
 ## A real difference: maximum chain depth
 
-tf_tree caps a compiled plan at `tf_tree_core::MAX_DEPTH` (**16** steps); a
-deeper path is rejected with `LookupError::TreeTooDeep`. **tf2 has no such
-limit.**
+tf_tree bounds a path twice; **tf2 bounds it not at all.**
+
+* `tf_tree_core::MAX_PATH_EDGES` (**64**) caps the *raw walk* — every edge
+  between the two frames, up to their common ancestor and back down.
+* `tf_tree_core::MAX_DEPTH` (**32**) caps the *compiled plan*, counted **after**
+  adjacent rigid links fold into one step. A 40-link fixed chain is one step.
+
+Either overrun is `LookupError::TreeTooDeep`, and its `depth` says which:
+`MAX_PATH_EDGES + 1` is the walk, anything at or below `MAX_PATH_EDGES` is the
+exact folded step count.
 
 This is a deliberate design choice — the fixed `[Step; MAX_DEPTH]` array is what
-makes `Plan` `Copy`, heap-free and allocation-free — and [`PHASE1.md`](../PHASE1.md) §7.1 argues
-16 is generous when real trees are 4-8 deep. It was hit while building the
-scaling row above (a 24-deep spine is refused outright), so it is recorded here
-rather than discovered by a user.
+makes `Plan` `Copy`, heap-free and allocation-free. It was hit while building the
+scaling row above (a 24-deep spine was refused outright when **one** number did
+both jobs), so it is recorded here rather than discovered by a user.
+[`0034`](../decisions/0034-the-depth-bound-priced-two-slots-the-same.md) split
+the two and re-sized both against a survey of 91 real robot descriptions, whose
+worst graph *diameter* is 30 joints.
 
-**If you are migrating from tf2 and your tree is deeper than 16, tf_tree will
-refuse the lookup.** Check before adopting.
+**If you are migrating from tf2, the number to compare is your worst frame
+pair's diameter — up to the common ancestor and back down — not your tree's
+root-to-leaf depth.** Past 64 edges, or past 32 steps once your fixed joints are
+declared static, tf_tree refuses the lookup. Check before adopting.
 
 ## Data provenance
 

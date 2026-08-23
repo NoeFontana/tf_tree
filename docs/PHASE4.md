@@ -143,7 +143,8 @@ same profile (`0022` amendment 4). Of the ~45 ns it costs on a shared arena:
 `detached()`, `is_shared()`, `with_fork_check` — +6.7, the cold bracket-search
 cursor ~4.8, and ~16 ns still unattributed. **`tf_tree_ipc::fork::generation`
 itself costs 0.2 ns**, which was the leading hypothesis and is now refuted;
-`#[inline]` on `Tree::guard` and halving the guard's 208 bytes were each applied,
+`#[inline]` on `Tree::guard` and halving the guard's 208 bytes (336 since `0034`
+raised `MAX_DEPTH`; 208 is the number this experiment ran against) were each applied,
 measured, found to move nothing, and reverted. Two things follow for anyone
 reading this section for a lever: there is **no cheap structural fix worth more
 than ~7 ns**, and the counter-flush win `0022` question 1 was carrying (~18 ns)

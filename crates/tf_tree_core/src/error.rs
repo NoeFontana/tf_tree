@@ -86,9 +86,30 @@ pub enum LookupError {
         /// The frame at which the ancestor walk ran out of parents.
         cut_at: FrameId,
     },
-    /// The combined path depth exceeded [`crate::MAX_DEPTH`].
+    /// The path is too long for one of the two bounds it has to fit: more than
+    /// [`crate::MAX_PATH_EDGES`] raw edges to walk, or more than
+    /// [`crate::MAX_DEPTH`] steps once folded.
+    ///
+    /// One variant covers both because the C ABI's `tft_status` table is frozen
+    /// and a second refusal would need a new code to describe a path nobody has
+    /// (`0034`). `depth` is what tells them apart.
     TreeTooDeep {
-        /// The depth that overflowed the fixed step array.
+        /// **The count that overran its bound**, and the two cases are disjoint
+        /// by construction, so this one number says which bound refused:
+        ///
+        /// * `MAX_PATH_EDGES + 1` — the walk. It is the only value above
+        ///   [`crate::MAX_PATH_EDGES`] this field takes, and it means "more than
+        ///   the bound" rather than a measured length: the walk stops the moment
+        ///   it runs out of buffer, so it never learns how much further the path
+        ///   went.
+        /// * `MAX_DEPTH + 1 ..= MAX_PATH_EDGES` — the folded step array, and
+        ///   here the number is **exact**. `fold` keeps counting past the end of
+        ///   the array precisely so it can report the real folded length.
+        ///
+        /// It was neither of those before `0034`: it was `nt + ns` at whichever
+        /// per-side guard happened to fire, which is the bound for a one-sided
+        /// chain, the truth for a balanced two-sided path, and neither for a
+        /// lopsided one.
         depth: u16,
     },
     /// The edge has no published samples yet.

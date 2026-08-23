@@ -5,7 +5,8 @@
 //! numbers. The failure mode that matters is therefore not a crash: it is a
 //! sweep that runs green while measuring nothing — a query pair that does not
 //! resolve, a stamp window that no edge covers, a fleet whose cross-robot path
-//! exceeds `MAX_DEPTH`. Each of those turns a benchmark row into a timing of
+//! exceeds `MAX_DEPTH` once folded (or `MAX_PATH_EDGES` before it is). Each of
+//! those turns a benchmark row into a timing of
 //! the error path, and none of them is visible in the output.
 //!
 //! So this file builds **every** catalogue entry and asserts, for each, that its

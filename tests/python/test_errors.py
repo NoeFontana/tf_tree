@@ -110,14 +110,41 @@ def _disconnected():
 
 def _too_deep():
     # A previously-unhandled variant, and the reason it is in the table: before
-    # the `other =>` catch-all was deleted this raised the text
-    # `TreeTooDeep { depth: 16 }`. `MAX_DEPTH` is 16 (`tf_tree_core`), so 24
-    # links is comfortably past it without depending on the exact value.
+    # the `other =>` catch-all was deleted this raised a Rust struct dump. Since
+    # `0034` there are two bounds — `MAX_DEPTH` (32) on the compiled plan and
+    # `MAX_PATH_EDGES` (64) on the raw walk — and `tf_tree.build` declares every
+    # edge dynamic, so nothing folds and 48 links is past the first and short of
+    # the second. That is deliberate: it exercises the *compiled* bound, which is
+    # the arm whose sentence changed.
     t = tf_tree.build(
-        [("world_a", "chassis_b")] + [(f"f{i}", f"f{i + 1}") for i in range(24)],
+        [("world_a", "chassis_b")] + [(f"f{i}", f"f{i + 1}") for i in range(48)],
         capacity=8,
     )
-    t.plan("f0", "f24")
+    t.plan("f0", "f48")
+
+
+def _too_long_a_walk():
+    # The other bound, and the other sentence. 80 links is past
+    # `MAX_PATH_EDGES`, so the walk refuses before `fold` ever runs.
+    t = tf_tree.build(
+        [("world_a", "chassis_b")] + [(f"g{i}", f"g{i + 1}") for i in range(80)],
+        capacity=8,
+    )
+    t.plan("g0", "g80")
+
+
+def _at_the_seam():
+    # **Exactly `MAX_PATH_EDGES` links: the seam between the two sentences, and
+    # the row that pins which comparison the renderer uses.** The walk *accepts*
+    # 64 edges, `fold` then reports `depth == 64`, and that is the largest value
+    # a compiled-bound refusal can carry. A renderer written with `>=` instead of
+    # `>` tells the caller their path was too long to walk when it was walked in
+    # full, and leaves this suite green without this row.
+    t = tf_tree.build(
+        [("world_a", "chassis_b")] + [(f"h{i}", f"h{i + 1}") for i in range(64)],
+        capacity=8,
+    )
+    t.plan("h0", "h64")
 
 
 def _non_monotonic_push():
@@ -194,6 +221,8 @@ CASES = [
     (_unknown_frame_through_span, tf_tree.FrameNotDeclaredError, ("ghost_frame",)),
     (_disconnected, tf_tree.DisconnectedError, ("world_a", "sensor_c")),
     (_too_deep, tf_tree.TfTreeError, ()),
+    (_too_long_a_walk, tf_tree.TfTreeError, ()),
+    (_at_the_seam, tf_tree.TfTreeError, ()),
     (_non_monotonic_push, tf_tree.TfTreeError, ("world_a", "chassis_b")),
     (_non_monotonic_push_many, tf_tree.TfTreeError, ("world_a", "chassis_b")),
     (_non_monotonic_module_push, tf_tree.TfTreeError, ("world_a", "chassis_b")),
@@ -228,19 +257,26 @@ CASES = [
 def test_a_message_carries_frame_names_and_no_rust_internals(trigger, exc_type, names):
     """The whole point of the prose layer, checked on every message it reaches.
 
-    ``_too_deep`` carries no name assertion on purpose: `TreeTooDeep` is a
-    property of the *path length* and the error holds no frame or edge id at
-    all, so demanding a name would be demanding an invention. It is in the table
-    for the other two assertions — it is the variant the deleted ``other =>``
-    catch-all used to render as ``TreeTooDeep { depth: 16 }``, so it is the row
-    that fails if the catch-all comes back.
+    ``_too_deep`` and ``_too_long_a_walk`` carry no name assertion on purpose:
+    `TreeTooDeep` is a property of the *path length* and the error holds no frame
+    or edge id at all, so demanding a name would be demanding an invention. They
+    are in the table for the other two assertions — it is the variant the deleted
+    ``other =>`` catch-all used to render as a Debug dump, so they are the rows
+    that fail if the catch-all comes back. **Two rows since `0034`**, because
+    there are now two bounds behind the one variant and each renders its own
+    sentence; neither asserts the number, so a row that only *changed* which
+    bound it trips would still pass, which is why the two are built at 48 and 80
+    links rather than at one length.
 
     Mutant: restore ``other => TfTreeError::new_err(format!("{other:?}"))`` at
-    the end of ``lookup_err`` and delete the ``TreeTooDeep`` arm. **Applied and
-    run**: ``1 failed, 139 passed`` — ``too_deep`` fails on ``RUST_STRUCT`` with
-    ``TreeTooDeep { depth: 16 }`` and nothing else in the suite moves, which is
-    exactly the shape of the bug: a variant ships a Debug dump while every
-    handled one looks fine.
+    the end of ``lookup_err`` and delete the ``TreeTooDeep`` arm. **Applied,
+    rebuilt and run**: ``2 failed, 146 passed`` — ``too_deep`` fails on
+    ``RUST_STRUCT`` with ``TreeTooDeep { depth: 48 }`` and ``too_long_a_walk``
+    with ``TreeTooDeep { depth: 65 }``, and nothing else in the suite moves,
+    which is exactly the shape of the bug: a variant ships a Debug dump while
+    every handled one looks fine. (The counts are re-taken, not carried: this
+    note said ``1 failed, 139 passed`` at ``depth: 16``, and all three numbers
+    moved.)
 
     Mutant: give ``build`` back ``.map_err(|e|
     TfTreeError::new_err(format!("{e}")))`` — the spelling both entry points
@@ -293,6 +329,45 @@ def runtime_dir(monkeypatch):
 
 
 @shm
+def test_the_two_too_deep_sentences_name_the_bound_that_refused():
+    """One error variant carries two bounds, so the message has to choose.
+
+    ``MAX_DEPTH`` (32) bounds the compiled plan and ``MAX_PATH_EDGES`` (64) the
+    raw walk, and ``TreeTooDeep`` carries both because the C ABI's status table
+    is frozen. The chooser is ``depth``: above ``MAX_PATH_EDGES`` the walk
+    refused and never learned the real length, so the sentence says *longer
+    than*; at or below it the number is the exact folded step count.
+
+    **The row that matters is the seam.** Exactly 64 links is walked in full and
+    then refused by the compiled bound with ``depth == 64`` — the largest value a
+    compiled-bound refusal can carry. A renderer written with ``>=`` instead of
+    ``>`` blames the walk for a path it walked, and every other row here stays
+    green while it does.
+    """
+    with pytest.raises(tf_tree.TfTreeError) as past_compiled:
+        _too_deep()
+    assert "compiles to 48 steps and a plan holds 32" in str(past_compiled.value)
+
+    with pytest.raises(tf_tree.TfTreeError) as past_walk:
+        _too_long_a_walk()
+    assert "longer than the 64 edges a lookup walks" in str(past_walk.value)
+    assert "compiles to" not in str(past_walk.value)
+
+    with pytest.raises(tf_tree.TfTreeError) as seam:
+        _at_the_seam()
+    assert "compiles to 64 steps and a plan holds 32" in str(seam.value)
+    assert "edges a lookup walks" not in str(seam.value), (
+        "the walk accepted this path; it must not be blamed for it"
+    )
+
+    # No remedy the caller cannot reach: `tf_tree.build` declares every edge
+    # dynamic, so a static-edge suggestion would name surface Python does not
+    # have. `docs/API.md` R5 puts the binding-specific remedy in each binding's
+    # own prose layer, and the Rust facade's does say it.
+    for exc in (past_compiled, past_walk, seam):
+        assert "static_edge" not in str(exc.value)
+
+
 def test_open_reports_a_bad_edge_list_the_way_build_does(runtime_dir):
     """`tf_tree.open(create=...)` is `build` behind one `From` impl.
 

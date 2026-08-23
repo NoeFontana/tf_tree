@@ -129,10 +129,19 @@ fn index(key: Key) -> usize {
 ///
 /// # Why a closure and not `-> Plan`
 ///
-/// `Plan` is `Copy` and **2112 bytes** (`size_of`, measured; `align_of` 64,
-/// which is what pads the 2136-byte `Entry` out to a 2176-byte slot). Returning
-/// one hands the caller a copy, and the caller is `Tree::lookup`, which only
-/// wants to call `Plan::at` on it.
+/// `Plan` is `Copy` and **4160 bytes** (`size_of`, measured; `align_of` 64,
+/// which is what pads the 4184-byte `Entry` out to a 4224-byte slot, and the
+/// 16-slot table to 66.0 KiB per thread). Returning one hands the caller a copy,
+/// and the caller is `Tree::lookup`, which only wants to call `Plan::at` on it.
+///
+/// **Every byte count in the table below was measured at `MAX_DEPTH = 16`**,
+/// where `Plan` was 2112 and the slot 2176, and `0034` has since moved the
+/// constant to 32. The counts are not re-taken — the `LD_PRELOAD` interposer
+/// session is not reproducible from here — and they do not need to be: what the
+/// table establishes is *how many* copies each binding makes, which is a
+/// property of the code shape and not of the array's length. The doubling makes
+/// the argument stronger, since every copy the shipped form avoids is now twice
+/// the size.
 ///
 /// **Counted, not read off a disassembly.** A `memcpy` interposer
 /// (`LD_PRELOAD`, versioned `memcpy@GLIBC_2.14`) over a hot-cache harness, with
