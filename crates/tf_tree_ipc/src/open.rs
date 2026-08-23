@@ -233,6 +233,16 @@ const MIN_BACKOFF: Duration = Duration::from_micros(200);
 /// attempts, so a takeover that completes in a millisecond is joined promptly.
 const MAX_BACKOFF: Duration = Duration::from_millis(4);
 
+/// The participant slot a creator takes, and the reason it is a named constant
+/// rather than a `0` in one expression.
+///
+/// It is the *same integer* as the arena record `TreeBuilder::build_shared`
+/// gives the creator, and the facade's liveness predicates index both with it —
+/// `LivenessProbe::is_held(slot)` probes the lock byte while
+/// `ParticipantTable` indexes the record. Two spellings of one number is how
+/// they drifted (#201).
+const CREATOR_SLOT: u32 = 0;
+
 impl Open {
     /// Start from an already-resolved rendezvous.
     #[must_use]
@@ -374,10 +384,9 @@ impl Open {
                     // a timeout that cannot change the answer.
                     lock.release_ownership()?;
                     return Err(IpcError::ArenaAbsent);
-                } else {
+                } else if let Some(slot) = self.register_creator(&lock, &identity)? {
                     // 5. Serve. The caller owes: memfd create + seal (§3.6),
                     //    unlink stale sock, bind, listen.
-                    let slot = self.register_any(&lock, &identity)?;
                     return Ok(Session {
                         outcome: OpenOutcome::Created,
                         lock,
@@ -385,6 +394,13 @@ impl Open {
                         owner: true,
                         attached: None,
                     });
+                } else {
+                    // Somebody took the creator's byte between step 4's scan and
+                    // step 5's acquire. That is step 4's own condition arriving
+                    // late, so it takes step 4's branch — release ownership and
+                    // go round again. Nothing was built, so there is nothing to
+                    // unwind.
+                    lock.release_ownership()?;
                 }
             }
 
@@ -416,6 +432,60 @@ impl Open {
     /// **This path is now only for a creator or a taker-over**, neither of which
     /// has an owner to ask. A joiner uses [`Open::register_at`], where §3.3's
     /// order *is* restored because the slot is known before anything is written.
+    /// Take **the creator's slot**, or report that somebody else holds it.
+    ///
+    /// # Why this is not `register_any`
+    ///
+    /// A creator is the *first* participant — §3.4 step 4 refuses to create
+    /// while any participant byte is held — so its slot is `0`, and every
+    /// consumer of a created arena relies on that: the arena's first `FREE`
+    /// record is `0` too, and the facade's liveness predicates index the lock
+    /// byte and the arena record with **one** integer.
+    ///
+    /// `register_any` scans for the first free byte, and step 4's scan is a
+    /// *separate* pass. Between them the correspondence is only a hope:
+    /// `any_participant_held` probes byte 0 first and then 63 more before
+    /// returning, so the window in which byte 0 can be taken by somebody else is
+    /// the rest of that scan — 63 `F_OFD_GETLK` calls wide, not one instruction.
+    /// Measured with a second open file description toggling byte 0, 4000
+    /// iterations of exactly the two calls step 4 and step 5 make: **2242 took a
+    /// non-zero byte** while the arena would have registered record 0.
+    ///
+    /// That is reachable from outside this workspace whatever this workspace
+    /// does, because `LockFile::try_take_participant` is public API on a
+    /// published crate.
+    ///
+    /// So the check and the take are **one operation**: a single `F_OFD_SETLK`
+    /// on byte 0, whose atomicity is the kernel's. There is no window to close
+    /// because there is no gap. `Ok(None)` means somebody else holds it, which
+    /// is step 4's condition, so the caller takes step 4's branch.
+    ///
+    /// This is cheaper than what it replaces — one `SETLK` instead of a scan —
+    /// and the diverged state stops being *detected* and becomes
+    /// unrepresentable. The facade's `ParticipantSlotDiverged` guard stays where
+    /// it is, now as an assertion this path cannot trip.
+    ///
+    /// **`CreatePolicy::Always` gets the same treatment on purpose.** It skips
+    /// step 4, so `Ok(None)` there means a *live* participant holds the
+    /// creator's byte. Forcing a fresh arena past one is the split brain
+    /// `--force-new` is supposed to resolve, not cause; the caller loops and, if
+    /// the holder persists, times out into
+    /// [`IpcError::ArenaHeldButUnreachable`], which names it. The wedged arena
+    /// `--force-new` exists for has *dead* participants, and the kernel released
+    /// their bytes when they died — so byte 0 is free in exactly the case the
+    /// flag is for.
+    fn register_creator(
+        &self,
+        lock: &LockFile,
+        identity: &Identity,
+    ) -> Result<Option<u32>, IpcError> {
+        if lock.try_take_participant(CREATOR_SLOT)? == LockAttempt::Contended {
+            return Ok(None);
+        }
+        lock.write_identity(CREATOR_SLOT, identity)?;
+        Ok(Some(CREATOR_SLOT))
+    }
+
     fn register_any(&self, lock: &LockFile, identity: &Identity) -> Result<u32, IpcError> {
         let slot = lock.take_any_participant()?;
         lock.write_identity(slot, identity)?;

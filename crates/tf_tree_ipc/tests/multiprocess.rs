@@ -792,3 +792,84 @@ fn claim_bytes_and_participant_bytes_do_not_overlap() {
     );
     observer.release_claim(3).unwrap();
 }
+
+/// **A creator takes participant slot 0 or it does not create** — #201.
+///
+/// The arena's first `FREE` record is 0, so a creator that holds any other lock
+/// byte hands the facade a tree whose liveness predicates index two different
+/// integers with one number. §3.4 step 4's scan and step 5's acquire used to be
+/// two passes over the same bytes, and `any_participant_held` probes byte 0
+/// *first* and then 63 more before returning — so the gap in which byte 0 could
+/// change hands was the rest of that scan.
+///
+/// The racer is a second open file description toggling byte 0, which is
+/// published API (`LockFile::try_take_participant`): a downstream consumer of
+/// this crate can do it whether or not anything in this workspace does.
+///
+/// **Mutant:** replace `register_creator` with `register_any` in step 5 — i.e.
+/// the code before the fix — and this fails with a non-zero slot within the
+/// first few dozen iterations. Measured at that revision, 4000 iterations of the
+/// two calls in isolation: 2242 took a non-zero byte.
+///
+/// It is a stress test, not a deterministic one; the assertion it makes is not
+/// statistical, though. **Every** create must be slot 0, so one bad iteration
+/// fails it, and the control below stops it passing vacuously.
+#[test]
+fn a_creator_takes_slot_zero_or_does_not_create() {
+    let scratch = Scratch::new("creator_slot_zero");
+    let rv = scratch.rendezvous();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let racer_stop = std::sync::Arc::clone(&stop);
+    let racer_path = rv.lock_path().to_path_buf();
+    // Materialise the file first: the racer must not race the creation itself.
+    drop(LockFile::open(rv.lock_path()).unwrap());
+    let racer = std::thread::spawn(move || {
+        let lock = LockFile::open(&racer_path).unwrap();
+        while !racer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = lock.try_take_participant(0);
+            std::hint::spin_loop();
+            let _ = lock.release_participant(0);
+        }
+    });
+
+    let mut created = 0u32;
+    let mut yielded = 0u32;
+    for i in 0..400 {
+        match Open::new(rv.clone())
+            .create(CreatePolicy::IfAbsent)
+            .timeout(Duration::from_millis(20))
+            .open(&mut NoServer)
+        {
+            Ok(session) => {
+                assert_eq!(
+                    session.outcome(),
+                    OpenOutcome::Created,
+                    "iteration {i}: nothing serves, so every success is a create"
+                );
+                assert_eq!(
+                    session.slot(),
+                    0,
+                    "iteration {i}: a creator took byte {} while the arena would \
+                     register record 0 — #201's divergence",
+                    session.slot()
+                );
+                created += 1;
+            }
+            // Losing the byte-0 race is a yield, not a failure: the condition is
+            // transient and the loop re-enters until the timeout.
+            Err(IpcError::ArenaHeldButUnreachable { .. }) => yielded += 1,
+            Err(other) => panic!("iteration {i}: unexpected {other:?}"),
+        }
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    racer.join().unwrap();
+
+    // The positive control. Without it this passes trivially if every open
+    // yielded and none ever created.
+    assert!(
+        created > 0,
+        "no create succeeded in 400 attempts ({yielded} yields) — the test proved nothing"
+    );
+}

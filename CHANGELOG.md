@@ -33,6 +33,48 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A creator now takes participant slot 0 atomically, so it cannot end up
+  holding one integer while its arena record holds another** (#201, `0035`).
+  §3.4 step 4's split-brain scan and step 5's slot acquire were two passes over
+  the same bytes. `any_participant_held` probes byte 0 **first** and then up to
+  63 more before returning, so byte 0 could change hands for the rest of that
+  scan — and the facade indexes the lock byte and the arena record with one
+  number, so a creator on any other byte hands out a tree whose liveness
+  predicates disagree with themselves.
+
+  Measured, 4000 iterations of exactly the two calls steps 4 and 5 make, against
+  a second open file description toggling byte 0: **2242 took a non-zero byte**.
+  Control with the racer off: 4000 took byte 0, none diverged.
+
+  No in-tree production path occupies that window today. It is fixed anyway
+  because `LockFile::try_take_participant` is public API on a published crate, so
+  a downstream consumer can — and "no caller in our own tree does this" is not an
+  invariant a library can offer.
+
+  The fix is smaller and faster than what it replaces: one `F_OFD_SETLK` on byte
+  0 instead of a scan, so the check and the take are a single kernel-atomic
+  operation and there is no window because there is no gap. Losing that acquire
+  is not a new failure mode — it is step 4's condition arriving late, and takes
+  step 4's existing branch.
+
+  Since `0028` this was **detected** rather than silent: the facade refused with
+  `OpenError::ParticipantSlotDiverged`, which is not in `is_retryable`, so a
+  transient race became a permanent failure (measured end to end: 210 of 400).
+  That path is now unreachable from a create. The guard stays where it is, as an
+  assertion.
+
+  `--force-new` (`CreatePolicy::Always`) is deliberately not exempted. It skips
+  step 4, so a contended byte 0 there means a *live* participant holds it, and
+  forcing a fresh arena past one is the split brain the flag exists to resolve.
+  The wedged arena it is written for has **dead** participants, whose bytes the
+  kernel released when they died.
+
+  **Not fixed:** the takeover arm (`Open::already_attached`) still reaches
+  `register_any` and can still produce the divergence. Its correct slot is
+  `0029` question 3, which is `draft`.
+
 ### Added
 
 - **`tf_tree_py` gains a `pure-hash` passthrough, and `just py-cross-check`
