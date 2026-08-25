@@ -2133,8 +2133,14 @@ impl Tree {
         g
     }
 
-    /// Convenience lookup by name at a stamp: interns the names, compiles (or
-    /// reuses a cached) [`crate::Plan`], and evaluates it. Keeps a small
+    /// Convenience lookup by name at a stamp: **resolves** the names, compiles
+    /// (or reuses a cached) [`crate::Plan`], and evaluates it.
+    ///
+    /// Resolves, and does not intern — unlike [`Tree::frame`], which declares a
+    /// name it does not find. A name that was never declared is
+    /// [`LookupError::UnknownFrame`] here, raised before any compile, which is
+    /// why a typo is not one of the pairs the plan cache's refusal caching is
+    /// about. Keeps a small
     /// per-thread plan cache keyed by
     /// `(arena, target, source, generation)`.
     ///
@@ -2166,11 +2172,14 @@ impl Tree {
         // stamps a plan with — so every lookup during a mutation would miss the
         // cache and then fail with `TopologyChanged`.
         let generation = view.topology().stable_generation();
+        // `.0` then `?`: the outer `Result` is the *compile*, which the cache
+        // now answers for on a hit whether it succeeded or not (#259), and the
+        // inner one is the evaluation, which it never answers for.
         cache::with_plan(self, t, s, generation, |plan| {
             let g = self.guard();
             plan.at(&g, stamp)
-        })?
-        .0
+        })
+        .0?
     }
 
     /// A read-only [`ArenaView`] over the backing arena, for diagnostics and

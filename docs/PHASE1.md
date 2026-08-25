@@ -671,6 +671,41 @@ that is `true` iff the edge came from the target side — so the copy was free t
 delete, and deleting it is what lets `MAX_PATH_EDGES` be generous without a
 second 128-bytes-a-slot array.
 
+**And it writes its output into the `Plan` being returned, not into one it hands
+back** (#264). `0034` deleted the array *before* the fold and left the two after
+it: `fold` returned `[Step; MAX_DEPTH]` by value and `Plan::new` took one by
+value, so the same array crossed two by-value boundaries and was materialised at
+each. Disassembled at `MAX_DEPTH = 32`, none of the three copies on the
+`Tree::plan` path had been optimised away:
+
+| copy | site | bytes |
+|---|---|---|
+| 1 | `fold` returning `out` into the caller's `sret` buffer | 4096 |
+| 2 | `Plan::new` copying its parameter into `self.steps` | 4096 |
+| 3 | `compile`'s `Plan` into `Tree::plan`'s `sret` slot | 4160 |
+
+12 352 bytes of `memcpy` to compile a plan that is usually six steps long, none
+of it proportional to the path. So `Plan::identity` makes the buffer and
+`fold_into` fills it through `&mut Plan` — writing the steps *and* the four
+fields that are a function of them (`len`, `domain`, `dyn_count`, `first_dyn`),
+accumulated as the steps are appended rather than by a second pass. That deletes
+copies 1 and 2 and leaves one array, one writer and one construction step in the
+whole compile. Measured, three builds interleaved, medians of 5 rounds of 20 000
+reps, `taskset -c 2`: a 6-step `Tree::plan` goes **265.0 ns → 118.7 ns, −55.2%**,
+ranges [261-267] against [114-122] and so non-overlapping.
+
+`Plan::identity` is the only constructor, and that is deliberate: a plan is a
+complete, correct value the moment it exists (zero steps is the answer
+`compile` owes for `target == source`), so there is no half-built state a
+second call has to finish — and therefore none a future arm can forget to
+finish. A plan that skipped its fold would otherwise answer `Iso3::IDENTITY`
+for every stamp, which is a wrong answer where a refusal belongs.
+
+Copy 3 stays. It is `compile`'s return-by-value, not a temporary, and removing it
+means an out-parameter on a `pub` function — an `API.md` §7 change, for the
+remaining third. Marking `fold_into` `#[inline]` was tried and moves nothing:
+the `sret` `memcpy` survives it byte for byte.
+
 Two properties of the fold are load-bearing and neither is obvious:
 
 * **The source half is emitted in reverse of walk order**, which is what makes

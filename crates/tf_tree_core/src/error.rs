@@ -103,7 +103,7 @@ pub enum LookupError {
         ///   it runs out of buffer, so it never learns how much further the path
         ///   went.
         /// * `MAX_DEPTH + 1 ..= MAX_PATH_EDGES` — the folded step array, and
-        ///   here the number is **exact**. `fold` keeps counting past the end of
+        ///   here the number is **exact**. `fold_into` keeps counting past the end of
         ///   the array precisely so it can report the real folded length.
         ///
         /// It was neither of those before `0034`: it was `nt + ns` at whichever

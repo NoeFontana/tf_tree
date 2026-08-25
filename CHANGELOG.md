@@ -97,6 +97,71 @@ is a bug.
 
 ### Fixed
 
+- **A `Tree::lookup` that cannot be planned recompiled on every call, forever**
+  (#259). `with_plan` stored a compiled `Plan` and propagated a *failed* compile
+  with `?` — which returns before the store — so a frame pair that cannot be
+  planned paid the full compile per lookup for the life of the process. The
+  cache now holds the **result** of compiling a key, refusal included.
+
+  The pairs this covers are the ones whose *topology* refuses: `Disconnected`
+  (a declared frame whose parent link was never established, or one `reparent`ed
+  out of the queried subtree), `MissingEdge` (a link carrying the `0` edge
+  sentinel), `TreeTooDeep`, and a defective edge anywhere on the path. It is
+  **not** a typo'd frame name — `Tree::lookup` resolves names with a lookup, not
+  an intern, so an undeclared name is `UnknownFrame` before any compile — and it
+  is not an edge that simply has no samples yet, which compiles fine and fails
+  in `Plan::at` with `NoData`.
+
+  It was invisible while it was cheap. At `MAX_DEPTH = 16`, checked *during* the
+  walk, a 40-edge path was refused after 16 edges. `0034` separated the raw-walk
+  bound from the compiled-plan bound, so a path that is going to be refused is
+  now walked to its full length and — under the fold that gives `0034` its
+  stated error precedence — folded in full as well. Measured on a 60-edge chain
+  that walks inside `MAX_PATH_EDGES` and folds past `MAX_DEPTH`, medians of 5
+  rounds of 20 000 reps, `taskset -c 2`, builds interleaved: **579.0 ns →
+  291.5 ns, −49.6%**, ranges [576-585] against [291-297], landing on top of what
+  a *shallow* refusal costs — what is left is resolving the two names. A third
+  build carrying only #264's change moved this metric −0.9%, so the win is this
+  one's.
+
+  Safe for the same reason a cached plan is: the key carries the topology
+  generation, and every refusal `compile` can produce is a verdict on the reads
+  that key fixes. The two that are not — `Plan::at`'s `NoData`/`Extrapolation`
+  and `Tree::plan`'s post-`fork` `ChildDetached` — are respectively out of reach
+  by construction and declined explicitly. Nothing is stored unless the
+  generation is still the key's when the compile returns, which makes that an
+  invariant the code checks rather than an argument three facts deep. It costs
+  no memory: `Result<Plan, LookupError>` is `size_of::<Plan>()`, the `Err`
+  variant riding a niche in the `[Step; MAX_DEPTH]` array, pinned by a test. The
+  successful-hit path is unchanged and measured flat (+0.1%, inside its range).
+
+- **`Tree::plan` moved a `Plan`-sized array three times, none of it
+  proportional to the path** (#264). Disassembled at `MAX_DEPTH = 32`, all three
+  copies had survived optimisation: `fold` returning its `[Step; MAX_DEPTH]` out
+  through the caller's `sret` buffer (4096 B), `Plan::new` copying that same
+  array from its by-value parameter into `self.steps` (4096 B), and `compile`'s
+  `Plan` into `Tree::plan`'s `sret` slot (4160 B) — **12 352 bytes of `memcpy`
+  to compile a plan that is usually six steps long.**
+
+  The array is now written once, in place: `Plan::identity` makes the buffer and
+  `fold_into` fills it through `&mut Plan`, writing the steps *and* the four
+  fields that are a function of them (`len`, `domain`, `dyn_count`, `first_dyn`),
+  accumulated as the steps are appended rather than by a second pass over what
+  was just written. That deletes the first two copies — re-disassembled,
+  `fold_into` calls no `memcpy` at all. A 6-step `Tree::plan` goes
+  **265.0 ns → 118.7 ns, −55.2%** (same protocol as above; ranges [261-267]
+  against [114-122]). Refused paths barely move, because a refusal returns `Err`
+  and never constructs a `Plan`.
+
+  `Plan::identity` is the only constructor, so a `Plan` is a complete value the
+  moment it exists and there is no half-built state a later arm could forget to
+  complete — which would otherwise answer `Iso3::IDENTITY` for every stamp where
+  a refusal belongs.
+
+  The third copy stays: it is `compile` returning by value, and removing it means
+  an out-parameter on a `pub` function. Marking `fold_into` `#[inline]` was
+  measured and changes nothing.
+
 - **`docs/decisions/README.md` carried an unresolved merge conflict on `main`,
   and every gate was green on it.** `<<<<<<< Updated upstream`, `||||||| Stash
   base`, `=======` and `>>>>>>> Stashed changes` sat in the middle of the
