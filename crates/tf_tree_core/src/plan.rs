@@ -499,8 +499,9 @@ pub struct Plan {
     steps: [Step; MAX_DEPTH],
     len: u8,
     domain: u8,
-    /// How many of `steps[..len]` are [`Step::Dyn`], computed once at compile
-    /// time. See [`Plan::new`] for why this is stored rather than counted.
+    /// How many of `steps[..len]` are [`Step::Dyn`], accumulated as the steps
+    /// are appended. See [`fold_into`] for why this is stored rather than
+    /// counted.
     dyn_count: u8,
     /// The edge of the *first* [`Step::Dyn`], or [`EdgeId`]`(0)` when there is
     /// none. Only meaningful together with `dyn_count`; read it through
@@ -509,45 +510,90 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Assemble a plan and derive everything that is a pure function of its
-    /// steps.
+    /// The identity plan for `generation`: zero steps, and **the buffer
+    /// [`fold_into`] fills**.
     ///
-    /// # Why these two are stored and not computed on demand
+    /// It is a complete, correct `Plan` as it stands — `steps[..0]` is empty and
+    /// [`Plan::at`] composes nothing over it, which is exactly the answer
+    /// [`compile`] owes for `target == source`. That is why this is the *only*
+    /// constructor and why [`fold_into`] takes the whole `Plan` rather than its
+    /// step array: there is no half-built state a second call has to complete,
+    /// and so none a future arm can forget to complete. A plan that skipped its
+    /// fold would otherwise answer `Iso3::IDENTITY` for every stamp — a wrong
+    /// answer where a refusal belongs.
     ///
-    /// They used to be computed on demand, and `Plan::at` called *both* — once
-    /// through `check_domain` → `has_dynamic`, and once for `note`'s
-    /// attribution. Each is an O(`len`) scan over a 4 KiB `[Step; MAX_DEPTH]`
-    /// array (2 KiB when this was measured, at `MAX_DEPTH = 16`), so a depth-14
-    /// lookup walked 28 steps before folding anything.
-    /// `first_dynamic_edge`'s own doc comment already said it was
-    /// "loop-invariant" and hoisted it for the *batch* path; the scalar path
-    /// kept paying it per call.
+    /// # Why there is one array and it lives here
     ///
-    /// Both are functions of the compiled steps alone, so compile time is the
-    /// right place. `Plan` is a value type — **not an arena structure** — so
-    /// this costs no format version and no layout hash; the two fields land in
-    /// padding the struct already had.
+    /// This used to be `Plan::new(generation, steps, len, domain)` taking the
+    /// step array **by value**, fed by a `fold` that returned one by value. That
+    /// was two of the three array-sized copies `Tree::plan` paid per compile,
+    /// neither of them proportional to the path (#264). Disassembled at
+    /// `MAX_DEPTH = 32`, none of the three had been optimised away:
     ///
-    /// Every construction goes through here so the derivation cannot drift from
-    /// the steps it describes; `plan_derived_fields_match_a_fresh_scan` pins it.
-    fn new(generation: u64, steps: [Step; MAX_DEPTH], len: usize, domain: u8) -> Plan {
-        let mut dyn_count = 0u8;
-        let mut first_dyn = EdgeId(0);
-        for step in &steps[..len] {
-            if let Step::Dyn { edge, .. } = step {
-                if dyn_count == 0 {
-                    first_dyn = *edge;
-                }
-                dyn_count = dyn_count.saturating_add(1);
-            }
-        }
+    /// | copy | site | bytes |
+    /// |---|---|---|
+    /// | 1 | `fold` returning its `out` array into the caller's `sret` buffer | 4096 |
+    /// | 2 | `Plan::new` copying that parameter into `self.steps` | 4096 |
+    /// | 3 | `compile`'s `Plan` into `Tree::plan`'s `sret` slot | 4160 |
+    ///
+    /// 12 352 bytes of `memcpy` to compile a plan that is usually six steps
+    /// long. **Re-takeable in one command**, unlike the `LD_PRELOAD` session
+    /// behind `tf_tree::cache`'s copy-count table:
+    ///
+    /// ```text
+    /// cargo rustc --release -p tf_tree --lib -- --emit=asm -C codegen-units=1 -o /tmp/t.s
+    /// ```
+    ///
+    /// then read the `movl $N, %edx` before each `callq *memcpy@GOTPCREL` in the
+    /// `Tree::plan` and `fold_into` symbols (v0 mangling: grep `4Tree4plan` and
+    /// `9fold_into`). `compile` has no symbol of its own — it inlines into
+    /// `Tree::plan`.
+    ///
+    /// Copies 1 and 2 are the *same array crossing two by-value boundaries*, and
+    /// both are gone once there is one array — this one, inside the `Plan` that
+    /// will be returned — written once, in place. Re-disassembled after:
+    /// `fold_into` calls no `memcpy` at all, and the only one left on the path is
+    /// copy 3's 4160.
+    ///
+    /// **Copy 3 stays, and was not left alone for lack of trying.** It is
+    /// `compile` returning by value into its caller's `sret` slot, not a
+    /// temporary; the local `Plan` is address-taken across a real call to
+    /// `fold_into`, and LLVM declines to place it in the `sret` memory. Marking
+    /// `fold_into` `#[inline]` was measured and changes nothing — the same 4160
+    /// `memcpy`, the same instruction count in both functions. Removing it needs
+    /// an out-parameter on [`compile`], which is `pub`: a `docs/API.md` §7
+    /// change for the remaining third, and not one this took.
+    ///
+    /// Worth **−55.2%** on a 6-step `Tree::plan` — 265.0 ns → 118.7 ns, medians
+    /// of 5 rounds of 20 000 reps, `taskset -c 2`, builds interleaved, ranges
+    /// [261-267] against [114-122] and so non-overlapping. The refused paths
+    /// barely move (−4.3% fold-bound, −11.1% shallow), because a refusal returns
+    /// `Err` and never constructs a `Plan`, so it never paid copies 2 and 3 in
+    /// the first place.
+    ///
+    /// **Attribution was isolated rather than assumed**, with a third build
+    /// carrying only this change and not #259's: it moved a 6-step `Tree::plan`
+    /// −54.8% and the refused-lookup metric −0.9%, while #259 alone moved the
+    /// refused lookup −48.2% and this metric +4.3% — i.e. each change owns one
+    /// number and contributes noise to the other's. A residue on
+    /// `plan_refused_walk_ns` (−9.3%) has a mechanism in neither: that path
+    /// refuses inside the walk, before either `Plan::identity` or `fold_into` is
+    /// reached. It is recorded as unattributed code layout, not claimed.
+    ///
+    /// The identity array is not waste and is not removable: `Step` is an enum,
+    /// so `steps[len..]` holding an invalid discriminant would be UB the moment
+    /// the `Copy` or `Debug` derive touched it, and initialising it lazily needs
+    /// `MaybeUninit` — `unsafe`, at no boundary the unsafe budget names
+    /// (`docs/decisions/0007`). It is a vectorised store loop, not a `memcpy`,
+    /// and the deleted `fold` was already paying it for `out`.
+    fn identity(generation: u64) -> Plan {
         Plan {
             generation,
-            steps,
-            len: len as u8,
-            domain,
-            dyn_count,
-            first_dyn,
+            steps: [Step::Static(Iso3::IDENTITY); MAX_DEPTH],
+            len: 0,
+            domain: 0,
+            dyn_count: 0,
+            first_dyn: EdgeId(0),
         }
     }
 
@@ -566,7 +612,7 @@ impl Plan {
         self.domain
     }
 
-    /// What [`Plan::new`] derived, next to what a fresh scan of the same steps
+    /// What [`fold_into`] derived, next to what a fresh scan of the same steps
     /// produces — `((stored_has_dynamic, stored_edge), (scanned, scanned))`.
     ///
     /// Test-only, and it lives here because the fields are private to this
@@ -2500,10 +2546,11 @@ impl<'a> Guard<'a> {
 ///   the variant's own documentation.
 /// * [`LookupError::FrameOutOfRange`] — a frame id is out of range for `topo`.
 /// * [`LookupError::MissingEdge`] — a parent link on the path records no edge.
-/// * [`LookupError::UnknownEdge`] / [`LookupError::MixedTimeDomains`] — as
-///   `fold`, and **before** the compiled-length refusal: `fold` resolves every
-///   edge on the path, including the ones past the step array, so a defect
-///   anywhere on a too-long path is named rather than hidden behind its length.
+/// * [`LookupError::UnknownEdge`] / [`LookupError::MixedTimeDomains`] — raised
+///   by the constant fold, and **before** the compiled-length refusal: the fold
+///   resolves every edge on the path, including the ones past the step array, so
+///   a defect anywhere on a too-long path is named rather than hidden behind its
+///   length.
 pub fn compile(
     topo: &TopologyView,
     edge_meta: impl Fn(EdgeId) -> Option<EdgeMeta>,
@@ -2512,13 +2559,7 @@ pub fn compile(
 ) -> Result<Plan, LookupError> {
     if target == source {
         // Identity plan; still stamp it with a consistent generation.
-        let generation = topo.stable_generation();
-        return Ok(Plan::new(
-            generation,
-            [Step::Static(Iso3::IDENTITY); MAX_DEPTH],
-            0,
-            0,
-        ));
+        return Ok(Plan::identity(topo.stable_generation()));
     }
 
     // Retry the whole walk if a topology mutation lands between reads, so every
@@ -2570,7 +2611,8 @@ pub fn compile(
         // sentinel, which keeps the precedence the old code had — a defect wins
         // over depth by its position on the path, not by the path's length.
         //
-        // The walk does not keep counting past the bound the way `fold` does.
+        // The walk does not keep counting past the bound the way `fold_into`
+        // does.
         // It cannot: it stops precisely because it has no buffer left, and a
         // corrupt parent chain with a cycle in it would not terminate. So the
         // number reported is `MAX_PATH_EDGES + 1` — "more than the bound", the
@@ -2639,15 +2681,20 @@ pub fn compile(
             continue 'walk;
         }
 
-        // `fold` takes the two edge-id slices directly. There used to be a
+        // `fold_into` takes the two edge-id slices directly. There used to be a
         // `[Step; MAX_DEPTH]` intermediate here, built purely to hand to `fold`;
         // it held nothing the slices do not — an edge id, plus an `inverted`
         // flag that is `true` iff the edge came from `t_edges`. Deleting it is
         // what lets the raw bound be generous, and it is also what pays for
         // `MAX_DEPTH`'s move to 32: `compile` used to materialise two arrays of
         // it per call and now materialises one.
-        let (steps, len, domain) = fold(&t_edges[..nt], &s_edges[..ns], &edge_meta)?;
-        return Ok(Plan::new(start_gen, steps, len, domain));
+        // Folded **into the plan that is about to be returned**, not into a
+        // temporary handed back by value (#264). A refusal drops `plan` with
+        // its steps half-written, which is unobservable for the same reason it
+        // always was: it is a local, and this returns `Err`.
+        let mut plan = Plan::identity(start_gen);
+        fold_into(&mut plan, &t_edges[..nt], &s_edges[..ns], &edge_meta)?;
+        return Ok(plan);
     }
 }
 
@@ -2668,7 +2715,49 @@ fn frame_or_disconnect(
 
 /// Constant folding: replace static edges with constant steps (pre-inverting when
 /// the step is inverted), then collapse adjacent `Static` runs by composing them.
-/// Returns the folded step array, its length, and the plan's domain tag.
+/// Writes the folded steps into `plan`, along with the four fields that are a
+/// function of them: `len`, `domain`, `dyn_count` and `first_dyn`.
+///
+/// # The `Plan` is borrowed, and the array used to be returned
+///
+/// This returned `([Step; MAX_DEPTH], usize, u8)`, which put a 4096-byte
+/// `memcpy` between its own stack and the caller's — measured in the shipped
+/// disassembly, not assumed (#264, and the table on [`Plan::identity`]). It now
+/// writes into the `Plan` `compile` is about to return, so the array is written
+/// exactly once and there is one construction step rather than two to remember.
+/// Nothing else changed: the loop below, its bound handling and its error
+/// precedence are as they were.
+///
+/// # Why `dyn_count` and `first_dyn` are stored and not computed on demand
+///
+/// They used to be computed on demand, and `Plan::at` called *both* — once
+/// through `check_domain` → `has_dynamic`, and once for `note`'s attribution.
+/// Each is an O(`len`) scan over a 4 KiB `[Step; MAX_DEPTH]` array (2 KiB when
+/// this was measured, at `MAX_DEPTH = 16`), so a depth-14 lookup walked 28 steps
+/// before folding anything. `first_dynamic_edge`'s own doc comment already said
+/// it was "loop-invariant" and hoisted it for the *batch* path; the scalar path
+/// kept paying it per call.
+///
+/// Both are functions of the compiled steps alone, so compile time is the right
+/// place — and this loop is the right point *within* compile time, because it
+/// already holds the step and its discriminant. Deriving them from a second pass
+/// over the array (which is what the short-lived `Plan::finish` did) put an
+/// O(`len`) read back on the path #264 exists to shorten, immediately after
+/// writing the thing it read. `Plan` is a value type — **not an arena
+/// structure** — so storing them costs no format version and no layout hash; the
+/// two fields land in padding the struct already had.
+///
+/// This is the only writer, so the derivation cannot drift from the steps it
+/// describes; `plan_derived_fields_match_a_fresh_scan` pins it against a fresh
+/// scan.
+///
+/// **`plan` may be left partially written when this returns `Err`.** That is not
+/// a caller obligation so much as a fact with nowhere to go: the only caller
+/// borrows a local `Plan` it then drops. Every entry is a valid `Step` — the
+/// array arrives fully initialised from [`Plan::identity`] and this only ever
+/// overwrites entries — and `len`/`domain`/`dyn_count`/`first_dyn` are published
+/// in one block at the end, past every `?`. So a partial fold is not a
+/// half-formed value; it is still the identity plan it started as.
 ///
 /// Takes the walk's two raw buffers rather than a step array: `t_edges` in walk
 /// order, emitted inverted, then `s_edges` **reversed**, emitted forward. That
@@ -2708,13 +2797,25 @@ fn frame_or_disconnect(
 ///   share one time domain, so no single query stamp addresses them all.
 /// * [`LookupError::TreeTooDeep`] — the folded path needs more than
 ///   [`MAX_DEPTH`] steps. Reported as the exact folded step count.
-fn fold(
+fn fold_into(
+    plan: &mut Plan,
     t_edges: &[u32],
     s_edges: &[u32],
     edge_meta: &impl Fn(EdgeId) -> Option<EdgeMeta>,
-) -> Result<([Step; MAX_DEPTH], usize, u8), LookupError> {
-    let mut out = [Step::Static(Iso3::IDENTITY); MAX_DEPTH];
+) -> Result<(), LookupError> {
+    let out = &mut plan.steps;
     let mut n = 0usize;
+    // Derived here rather than by a second pass over `out`: the append arm below
+    // already holds the step and its discriminant, so both fall out for free,
+    // where a second pass would put an O(`len`) read back on the path #264
+    // exists to shorten, immediately after writing the thing it reads.
+    // Equivalent by construction — the
+    // collapse arm only ever rewrites a `Static` in place, so it can neither add
+    // nor remove a `Dyn`, and every append that is *written* is an append with
+    // `n < MAX_DEPTH`, which on any path that returns `Ok` is every append.
+    // `plan_derived_fields_match_a_fresh_scan` is the pin.
+    let mut dyn_count = 0u8;
+    let mut first_dyn = EdgeId(0);
     // Whether `out[n - 1]` is a `Static` — tracked rather than read back,
     // because `n` may be past the array. `false` while `n == 0`.
     let mut last_static = false;
@@ -2777,6 +2878,12 @@ fn fold(
                 if n < MAX_DEPTH {
                     out[n] = s;
                 }
+                if let Step::Dyn { edge, .. } = s {
+                    if dyn_count == 0 {
+                        first_dyn = edge;
+                    }
+                    dyn_count = dyn_count.saturating_add(1);
+                }
                 last_static = matches!(s, Step::Static(_));
                 n += 1;
             }
@@ -2787,5 +2894,9 @@ fn fold(
         return Err(LookupError::TreeTooDeep { depth: n as u16 });
     }
 
-    Ok((out, n, domain.unwrap_or(0)))
+    plan.len = n as u8;
+    plan.domain = domain.unwrap_or(0);
+    plan.dyn_count = dyn_count;
+    plan.first_dyn = first_dyn;
+    Ok(())
 }

@@ -96,9 +96,55 @@ pub enum Backing {
     /// Costs a runtime directory (`$TF_TREE_RUNTIME_DIR`, else
     /// `$XDG_RUNTIME_DIR/tf_tree`, else `/run/tf_tree`, else `/tmp/tf_tree-<uid>`
     /// — the last always resolvable) and leaves a lock file and a socket in it.
-    /// `CreatePolicy::Always`: a benchmark that silently *joined* somebody's
-    /// live arena would publish into it, so this takes the arena over rather
-    /// than sharing one it did not size.
+    ///
+    /// # `require_create`, and the protection this comment used to claim
+    ///
+    /// A benchmark that silently *joined* somebody's live arena would measure
+    /// that arena's shape and contention and publish the numbers as its own.
+    /// This comment used to say `CreatePolicy::Always` prevented that, and
+    /// **it never did.** Step 1 of the `docs/PHASE2.md` §3.4 loop runs under
+    /// every policy, so a rendezvous with a server answering on its socket is
+    /// *joined* — `tf_tree_ipc`'s `create_always_still_joins_a_reachable_server`
+    /// pins exactly that outcome. What `Always` skips is step 4's split-brain
+    /// check and nothing else. #258's five-arm table is the measurement: against
+    /// a healthy served arena the two policies were indistinguishable, and the
+    /// arm that asked for a larger capacity and an extra `base -> cam` edge was
+    /// handed the owner's arena, which has no `cam` frame at all. The §3.7
+    /// handshake cannot catch that either, because `layout_hash` is a
+    /// *struct-layout* constant — two processes that disagree about the
+    /// topology agree about it exactly.
+    ///
+    /// Executed here rather than read off the ticket:
+    /// `a_served_workload_refuses_an_arena_it_did_not_create`
+    /// (`crates/tf_tree_bench/tests/multiprocess.rs`) drives *this* call site
+    /// twice, once with a matching shape and once with a `humanoid` that shares
+    /// no frame name with `robot`. Before this change both arms reached the
+    /// join: the first returned a `Built` over the owner's arena in silence, and
+    /// the second got as far as `populate` and failed there with `frame link_0:
+    /// CapacityExceeded` — a true statement about the 24-frame arena it should
+    /// never have been given, three layers from the cause.
+    ///
+    /// [`tf_tree::Open::require_create`] is the fourth corner `CreatePolicy`
+    /// has no variant for, and is what actually refuses: `OpenOutcome::Joined`
+    /// becomes `OpenError::ArenaAlreadyLive`, with the session dropped before
+    /// the error is returned so a refused attach leaves neither a participant
+    /// byte nor a client the owner still counts. `bin/native_arena.rs` has set
+    /// it for this same reason since it was written; this variant is the site
+    /// that reached for it and got a comment instead.
+    ///
+    /// # And `IfAbsent` rather than `Always`
+    ///
+    /// Once the refusal is carried by `require_create`, nothing is left for
+    /// `Always` to buy. The two policies differ only over an arena that is live
+    /// but *unreachable*, and creating over one is the wrong answer **for a
+    /// measurement**: its survivors keep publishing into a segment this process
+    /// cannot see, their participant bytes stay spent, and their claim leases
+    /// alias the replacement's edge ids — a stranger's contention, inside the
+    /// number. `IfAbsent` reports `ArenaHeldButUnreachable`, which names the
+    /// holding slots and their pids. A harness that stops and says which pid to
+    /// kill is worth more than one that measures the wrong arena, and the
+    /// operator escape hatch `Always` exists for is explicitly documented as a
+    /// thing never to take automatically.
     Served(&'static str),
 }
 
@@ -663,7 +709,10 @@ fn build_tree(plan: &BuildPlan, interp: InterpPolicy, backing: Backing) -> Resul
             .name(name)
             .and_then(|o| {
                 o.mode(tf_tree::AttachMode::ReadWrite)
-                    .create(tf_tree::CreatePolicy::Always)
+                    .create(tf_tree::CreatePolicy::IfAbsent)
+                    // The whole of the refusal; see `Backing::Served`. Without
+                    // it this line measures whatever arena happens to answer.
+                    .require_create(true)
                     .layout_if_creating(b)
                     .open()
             })

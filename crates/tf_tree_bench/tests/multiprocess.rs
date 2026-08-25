@@ -21,6 +21,7 @@ use std::io::{BufRead, BufReader};
 use tf_tree::{AttachMode, Capacity, EdgeCfg, InterpPolicy, Iso3, Stamp, Tree, TreeBuilder};
 use tf_tree_bench::fixture;
 use tf_tree_bench::shm_util::{sibling_binary, spawn_attached};
+use tf_tree_bench::workload::Backing;
 
 /// The §11.1 fixture topology, declared but not built.
 ///
@@ -388,7 +389,7 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
     );
 }
 
-/// A scratch runtime directory for the one test below that needs a rendezvous,
+/// A scratch runtime directory for the tests below that need a rendezvous,
 /// removed when it ends.
 ///
 /// **`set_var` is process-wide, and that is safe here only because `nextest`
@@ -400,7 +401,9 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
 /// `tests/rendezvous.rs`, which this is modelled on.
 ///
 /// Every other test in this file goes through `build_shared`, which reaches no
-/// lock file and no socket and needs none of this.
+/// lock file and no socket and needs none of this. Three use it now, under two
+/// different arena names — which is why [`Scratch::lock_path`] takes the name
+/// rather than assuming [`RACE_ARENA`].
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -412,13 +415,20 @@ impl Scratch {
         Scratch(p)
     }
 
-    /// The lock file the rendezvous below puts the participant bytes in.
+    /// The lock file the rendezvous puts `arena`'s participant bytes in.
     ///
     /// `<runtime dir>/<domain>/<name>.lock`, with the default domain 0 — the
     /// layout `tf_tree_ipc::Rendezvous` resolves and the one
     /// `tests/rendezvous.rs` reads the same way.
-    fn lock_path(&self) -> std::path::PathBuf {
-        self.0.join(format!("0/{RACE_ARENA}.lock"))
+    ///
+    /// **`arena` is a parameter and used to be [`RACE_ARENA`] inlined.** One
+    /// scratch directory now serves two rendezvous names, and a hardcoded one
+    /// would have opened `<dir>/0/tf_tree_reparent_race.lock` for a test whose
+    /// arena is [`SERVED_WORKLOAD_ARENA`] — a lock file describing nothing, whose
+    /// every `probe_participant(..).held` reads `false` and whose every
+    /// `assert!(!..held)` therefore passes vacuously.
+    fn lock_path(&self, arena: &str) -> std::path::PathBuf {
+        self.0.join(format!("0/{arena}.lock"))
     }
 }
 
@@ -433,25 +443,114 @@ impl Drop for Scratch {
 /// two harnesses share an arena.
 const RACE_ARENA: &str = "tf_tree_reparent_race";
 
+/// The rendezvous name [`a_served_workload_refuses_an_arena_it_did_not_create`]
+/// uses. Distinct from [`RACE_ARENA`] for the same reason that one is distinct
+/// from every other name here.
+const SERVED_WORKLOAD_ARENA: &str = "tf_tree_served_workload";
+
+/// **`Backing::Served` refuses an arena it did not create — including one of a
+/// different shape.** (#258, at the site the ticket is named after.)
+///
+/// The ticket's five-arm table: against a healthy served arena,
+/// `CreatePolicy::Always` and `CreatePolicy::IfAbsent` were indistinguishable
+/// and *both* handed the caller the owner's arena. The second arm below is the
+/// one that makes it a wrong number rather than a shared one — `humanoid` is a
+/// ~117-frame synthetic spine and `robot` is the 24-frame fixture, so they
+/// share not one frame name, and the rendezvous still resolved to `Joined`.
+/// §3.7 cannot catch it: `layout_hash` is a *struct-layout* constant,
+/// byte-identical between two processes that disagree about every frame in the
+/// tree.
+///
+/// Both arms refuse in `build_tree`, before `Workload::build` populates
+/// anything, so the second one costs its arithmetic `plan()` and nothing else.
+///
+/// **Mutant: restore `.create(Always)` and delete `.require_create(true)` from
+/// `build_tree`** — HEAD before this change — and the two arms fail
+/// *differently*, which is worth writing down because the second one is not
+/// what was predicted:
+///
+/// * *same shape* returns `Ok`. The join is silent and total: a `Built` over
+///   somebody else's arena, and nothing downstream can tell.
+/// * *different shape* returns `Err`, but from two layers further on and about
+///   the wrong thing — `populating workload humanoid: frame link_0:
+///   CapacityExceeded`. The open succeeded; the 24-frame arena it was handed
+///   simply had no room for the 117th frame. So the shape mismatch is caught
+///   here only by accident, and only because these two shapes are far apart:
+///   the ticket's own ALT arm asked for one extra edge and more slots, which
+///   the owner's arena absorbed, and it reported success with the frame it
+///   asked for absent.
+///
+/// The assertion is therefore on the *message*, not merely on failure — a test
+/// that accepted any `Err` would pass against the defect for this pair.
+///
+/// **Mutant: keep `require_create` and set `Always`** ⇒ still passes. The
+/// policy is not what refuses, which is the whole of the ticket.
+#[test]
+fn a_served_workload_refuses_an_arena_it_did_not_create() {
+    let _scratch = Scratch::new("served-workload");
+    let robot = tf_tree_bench::workload::by_name("robot").expect("the robot workload");
+    let humanoid = tf_tree_bench::workload::by_name("humanoid").expect("the humanoid workload");
+
+    let owner = robot
+        .build(
+            InterpPolicy::LerpSlerp,
+            Backing::Served(SERVED_WORKLOAD_ARENA),
+        )
+        .expect("create and serve the robot arena");
+
+    for (label, w) in [("same shape", robot), ("different shape", humanoid)] {
+        let e = w
+            .build(
+                InterpPolicy::LerpSlerp,
+                Backing::Served(SERVED_WORKLOAD_ARENA),
+            )
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: a second Served build joined the owner's arena instead of refusing"
+                )
+            });
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("already live"),
+            "{label}: refused for the wrong reason: {msg}"
+        );
+    }
+
+    drop(owner);
+}
+
 /// The fixture topology, created **through the rendezvous** so that peers can
 /// join it and be given a participant slot with a lock byte behind it.
 ///
-/// `CreatePolicy::Always` rather than `IfAbsent`: the scratch directory is
-/// this process's own and empty, so there is nothing to join, and `Always`
-/// makes that an assertion rather than a race.
+/// `require_create(true)` rather than `CreatePolicy::Always`: the scratch
+/// directory is this process's own and empty, so there is nothing to join, and
+/// the point of saying so in code is to make that an assertion rather than a
+/// hope. **`Always` was not making it one** (#258) — it skips §3.4's
+/// split-brain check and nothing else, so step 1 still joins a server that
+/// answers, and a stray arena under this name would have been joined in
+/// silence. `require_create` is the setting that turns that outcome into
+/// [`tf_tree::OpenError::ArenaAlreadyLive`], which is what
+/// [`a_second_served_fixture_refuses_rather_than_joining_the_first`] measures.
 fn served_fixture() -> Tree {
-    let tree = tf_tree::Open::new()
-        .name(RACE_ARENA)
-        .expect("a valid rendezvous name")
-        .mode(AttachMode::ReadWrite)
-        .create(tf_tree::CreatePolicy::Always)
-        .layout_if_creating(fixture_builder())
-        .open()
-        .expect("create and serve the fixture arena");
+    let tree = try_served_fixture().expect("create and serve the fixture arena");
     assert!(tree.is_shared());
     assert!(tree.is_writable());
     populate(&tree);
     tree
+}
+
+/// [`served_fixture`]'s open, without the `expect` and without populating —
+/// so a test can look at the *refusal* rather than only at the success.
+fn try_served_fixture() -> Result<Tree, tf_tree::OpenError> {
+    tf_tree::Open::new()
+        .name(RACE_ARENA)
+        .expect("a valid rendezvous name")
+        .mode(AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::IfAbsent)
+        .require_create(true)
+        .layout_if_creating(fixture_builder())
+        .open()
 }
 
 /// One read-write peer, joined through the rendezvous.
@@ -469,6 +568,70 @@ fn join_read_write() -> Tree {
         .create(tf_tree::CreatePolicy::Never)
         .open()
         .expect("join the served fixture arena read-write")
+}
+
+/// **A second `Backing::Served`-shaped open refuses instead of joining.**
+///
+/// The defect #258 reports, at the smaller of its two call sites: the harness
+/// asks to *create and serve* an arena it sized, and gets somebody else's
+/// instead, with no error and no way to tell from the returned `Tree`. Both
+/// sites reached for a "create, and refuse to join" policy;
+/// [`tf_tree::CreatePolicy`] has no such variant, and both settled for `Always`
+/// under the belief that it was one.
+///
+/// The second open here is in this process rather than a child, which is the
+/// same shape [`join_read_write`] already relies on: the owner's serving thread
+/// answers its own socket, so step 1 connects and the rendezvous resolves to
+/// `Joined` exactly as it would across a process boundary. What the test pins
+/// is the arm after that resolution.
+///
+/// **Mutant: drop `.require_create(true)` from [`try_served_fixture`]** ⇒ the
+/// second open returns `Ok`, and this test fails on `expect_err`. That is the
+/// pre-fix behaviour verbatim.
+///
+/// **Mutant: `CreatePolicy::Always` instead of `IfAbsent`** ⇒ still passes, and
+/// that is the point of the ticket: the policy is not what refuses.
+#[test]
+fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
+    let scratch = Scratch::new("served-refuses-to-join");
+    let owner = served_fixture();
+
+    // `Tree` is not `Debug`, so this is `match` rather than `expect_err`.
+    let refused = match try_served_fixture() {
+        Err(e) => e,
+        Ok(_) => {
+            panic!("a second creator was handed the first one's arena instead of being refused")
+        }
+    };
+    assert!(
+        matches!(refused, tf_tree::OpenError::ArenaAlreadyLive),
+        "expected ArenaAlreadyLive, got {refused:?}"
+    );
+
+    // The refusal left nothing behind: the owner is byte 0 and its two peers
+    // would be 1 and 2, so a refused attach that kept its session would show as
+    // a held byte 1. `join_read_write` then has to be able to take that byte,
+    // which is the same claim from the other side.
+    {
+        let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
+            .expect("the rendezvous created a lock file");
+        assert!(
+            !lock
+                .probe_participant(1)
+                .expect("probe a participant byte")
+                .held,
+            "the refused open kept its participant byte"
+        );
+    }
+    let peer = join_read_write();
+    assert_eq!(
+        peer.participant_slot(),
+        1,
+        "the byte the refusal released was not reissued"
+    );
+
+    drop(peer);
+    drop(owner);
 }
 
 /// Two independent attachments race `reparent`, and only the **arena** lock can
@@ -523,7 +686,7 @@ fn concurrent_reparents_from_separate_attachments_are_serialized() {
     // asserted free so this cannot pass against a build that reports every byte
     // held.
     {
-        let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path())
+        let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
             .expect("the rendezvous created a lock file");
         for slot in 0..3 {
             assert!(

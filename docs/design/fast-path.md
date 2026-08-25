@@ -524,7 +524,11 @@ O(`len`) walk of a `[Step; MAX_DEPTH]` array — **2048 bytes** at the
 depth-14 lookup, before folding anything. `first_dynamic_edge`'s own doc comment
 called it "an O(plan length) scan … loop-invariant" and hoisted it for the batch
 path while the scalar path kept paying it. Both are functions of the compiled
-steps, so `Plan::new` now derives them once (`dyn_count`, `first_dyn`).
+steps, so `fold_into` now derives them once (`dyn_count`, `first_dyn`) as it
+appends each step. The derivation lived in `Plan::new` when this was written,
+which took the step array by value; #264 moved it into the fold to stop that
+array being copied and to stop a second O(`len`) pass reading what the fold had
+just written.
 
 `bench_ab` over the depth sweep, pinned, idle host:
 

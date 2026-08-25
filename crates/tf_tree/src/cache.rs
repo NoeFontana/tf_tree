@@ -24,6 +24,10 @@
 //! test suite's fixtures) are exactly the ones whose edge counts agree.
 //! `tests/plan_cache_identity.rs` is the three shapes of that.
 //!
+//! What a slot holds is the **result** of compiling that key, refusal included
+//! (#259); the generation component is what makes that sound, and
+//! [`store_refusal`] is what checks it rather than assuming it. See [`Entry`].
+//!
 //! `docs/API.md` §1 R1 permits `lookup` to collapse the three tiers on the
 //! condition that it goes through this cache; R2's "never allocates, never
 //! locks" governs the *hot* tier — `Plan::at` — and this probe is neither an
@@ -62,7 +66,49 @@ struct Key {
 #[derive(Clone, Copy)]
 struct Entry {
     key: Key,
-    plan: Plan,
+    /// What [`Tree::plan`] answered for [`Entry::key`] — **a refusal included**.
+    ///
+    /// # Why an error is exactly as cacheable as a plan
+    ///
+    /// The cache's whole correctness argument is that `compile`'s output is a
+    /// function of `(arena, target, source, generation)`. That argument does
+    /// not mention success. `compile` reads two things — the topology through
+    /// `read_frame`, and edge metadata through `edge_meta` — and every refusal
+    /// it can produce is a verdict on those same reads: `Disconnected` and
+    /// `MissingEdge` on the parent chain, `TreeTooDeep` on its length,
+    /// `UnknownEdge` and `MixedTimeDomains` on the edge records the walk
+    /// reaches. A key that fixes the reads fixes the verdict.
+    ///
+    /// Three classes of error are *not* functions of the key. The first is out
+    /// of reach here rather than filtered out of it — a distinction worth
+    /// keeping, because it cannot rot — and [`store_refusal`] declines the
+    /// other two, one per condition:
+    ///
+    /// * `NoData`, `Extrapolation`, `SlotRecycled`, `SlotContended`,
+    ///   `TimeDomainMismatch` and `TopologyChanged` come from
+    ///   `Plan::at`, i.e. from `f`, and travel in the `R` of [`with_plan`]'s
+    ///   return. They never touch an `Entry`, and a change that let them would
+    ///   be caching the sample history.
+    /// * `ChildDetached` is [`Tree::plan`]'s own guard, raised before it reads
+    ///   the arena at all. It is a property of the *process* after a `fork`,
+    ///   not of the key. [`store_refusal`] declines it by name.
+    /// * A `FrameOutOfRange` from `read_frame` exhausting `TOPO_RETRY_LIMIT`
+    ///   rather than from a genuinely out-of-range id — a livelock fallback
+    ///   under a mutation storm, which is transient by construction.
+    ///   [`store_refusal`] declines that one too, because reaching the retry
+    ///   limit takes `TOPO_RETRY_LIMIT` observed changes to the topology word
+    ///   and therefore moves the generation.
+    ///
+    /// # It costs nothing
+    ///
+    /// `size_of::<Result<Plan, LookupError>>() == size_of::<Plan>() == 4160`:
+    /// `Plan`'s `[Step; MAX_DEPTH]` has spare discriminant encodings, so the
+    /// `Err` variant occupies a niche and `LookupError`'s 32 bytes land inside
+    /// the array. The slot, the table and the 66.0 KiB per thread are all
+    /// unchanged. [`tests::a_refusal_is_free_to_cache`] pins it, because a
+    /// future `LookupError` variant that outgrew the niche would grow every
+    /// slot by 64 bytes silently.
+    result: Result<Plan, LookupError>,
 }
 
 thread_local! {
@@ -126,6 +172,80 @@ fn index(key: Key) -> usize {
 ///
 /// The arena identity is read from `tree` rather than passed in, so no caller
 /// can supply one that does not belong to the tree it is about to compile from.
+///
+/// # A refusal is a result, and is cached like one
+///
+/// `f` runs only when there is a `Plan` to run it against; a key whose compile
+/// was refused answers with the refusal and does not call `f`. That is the
+/// whole of issue #259, whose symptom is that a frame pair which cannot be
+/// planned used to recompile **on every lookup, forever** — the `?` returned
+/// before the store and nothing else on that path reached the cache.
+///
+/// It was invisible while it was cheap. `MAX_DEPTH` was 16 and was checked
+/// *during* the walk, so a 40-edge path was refused after 16 edges at ~50-70 ns.
+/// `0034` separated the raw-walk bound from the compiled-plan bound, and a path
+/// that is going to be refused is now walked to its full length and — under the
+/// fold that gives `0034` its stated error precedence — folded in full as well:
+/// ~1.0 µs where the bound stops the walk early, ~1.8 µs where it does not. A
+/// consumer polling one mis-configured pair pays that per lookup.
+///
+/// **Which pairs those are is narrower than it first looks**, and the three
+/// examples that stood here — a typo'd frame name, a sensor that never came up,
+/// a URDF branch nobody publishes — were all wrong. The first two never reach
+/// this function: `Tree::lookup` resolves names through `find`, which is a
+/// lookup and not an intern, so an undeclared name is `UnknownFrame` before a
+/// compile is attempted. The third compiles perfectly and fails in `Plan::at`
+/// with `NoData`, which this deliberately does not cache. The pairs that
+/// actually pay are the ones whose *topology* refuses:
+///
+/// * `Disconnected` — a declared frame whose parent link was never established,
+///   or one `reparent`ed out of the queried subtree.
+/// * `MissingEdge` — a link carrying the `0` edge sentinel, which `set_parent`
+///   accepts for a reparent "where only the parent link matters". Permanent,
+///   and on every lookup that crosses it.
+/// * `TreeTooDeep` — a path at the ceiling; `0034` surveyed 91 descriptions and
+///   found diameters to 30 against a `MAX_DEPTH` of 32.
+/// * `UnknownEdge` / `MixedTimeDomains` — a defect anywhere on the path, which
+///   the fold resolves every edge to find.
+///
+/// Measured through `Tree::lookup` on a 60-edge chain that walks inside
+/// `MAX_PATH_EDGES` and folds past `MAX_DEPTH` — the arm that pays the *whole*
+/// fold before refusing — medians of 5 rounds of 20 000 reps, `taskset -c 2`,
+/// builds interleaved: **579.0 ns → 291.5 ns, −49.6%**, ranges [576-585] against
+/// [291-297]. It lands on top of the *shallow* refusal's 290.9 ns, which is the
+/// point: what is left is resolving the two names, and the compile is gone
+/// whatever it would have cost. A third build carrying only #264's change moved
+/// this metric −0.9%, so the win is this change's and not that one's.
+///
+/// The **control** is `lookup_ok_hit_ns` — a successful repeat lookup, the path
+/// the copy-count table above exists to protect. It moved +0.1% (504.5 → 505.1),
+/// inside its own run-to-run range. Widening [`Entry`] to hold a `Result` cost
+/// the hit path nothing, which is what the `&entry.result` match is for. A
+/// 4160-byte `memcpy` there would have cost ~40 ns against a 506 ns baseline —
+/// +8%, an order of magnitude outside the run-to-run range — so the control is
+/// not merely consistent with no copy, it excludes one.
+///
+/// The **miss** path did move, and it is written down here because it was
+/// measured rather than because it matters: the three `Plan` copies `Tree::lookup`
+/// makes on a miss are 4160 bytes each where they were 4120, since the `Err`
+/// variant's niche lives inside `steps` and the leading bytes can no longer be
+/// treated as padding. 120 bytes added to a path that already moves twelve
+/// kilobytes, on the arm #264 cut by more than half.
+///
+/// # The slot it occupies is not a cost worth avoiding
+///
+/// The objection is that 16 direct-mapped slots have no notion of usefulness,
+/// so a permanently-broken pair can evict a working plan and the victim is the
+/// colliding entry rather than the least useful one. True, and it is the
+/// argument *for* treating the two alike rather than against it: a cache
+/// entry's worth is its hit rate times the work it avoids, and a refusal avoids
+/// **more** work per hit than a plan does — the refused path is the one that
+/// walks to the bound. Ranking refusals below plans would be the arbitrary
+/// choice here. A separate negative table was the alternative and buys nothing
+/// it would not also cost: at 32 bytes a refusal it lands at about the same
+/// footprint, in exchange for a second index, a second residency argument, and
+/// a working set split across two tables that the [`index`] measurements were
+/// never taken over.
 ///
 /// # Why a closure and not `-> Plan`
 ///
@@ -203,7 +323,7 @@ pub(crate) fn with_plan<R>(
     source: FrameId,
     generation: u64,
     f: impl FnOnce(&Plan) -> R,
-) -> Result<(R, bool), LookupError> {
+) -> (Result<R, LookupError>, bool) {
     let key = Key {
         scope: tree.cache_scope(),
         target: target.get(),
@@ -216,21 +336,366 @@ pub(crate) fn with_plan<R>(
             let slots = c.borrow();
             if let Some(entry) = &slots[idx] {
                 if entry.key == key {
-                    return Ok((f(&entry.plan), true));
+                    // `&entry.result`, and the `&` is the same load-bearing one
+                    // the section above is about: matching through the
+                    // reference yields a `&Plan` pointing into the slot, where
+                    // matching the value would lift all 4160 bytes out of it to
+                    // decide which variant it is.
+                    return match &entry.result {
+                        Ok(plan) => (Ok(f(plan)), true),
+                        Err(e) => (Err(*e), true),
+                    };
                 }
             }
         }
-        let plan = tree.plan(target, source)?;
-        c.borrow_mut()[idx] = Some(Entry { key, plan });
-        Ok((f(&plan), false))
+        let plan = match tree.plan(target, source) {
+            Ok(plan) => plan,
+            Err(e) => {
+                if store_refusal(tree, key, e) {
+                    c.borrow_mut()[idx] = Some(Entry {
+                        key,
+                        result: Err(e),
+                    });
+                }
+                return (Err(e), false);
+            }
+        };
+        c.borrow_mut()[idx] = Some(Entry {
+            key,
+            result: Ok(plan),
+        });
+        (Ok(f(&plan)), false)
     })
+}
+
+/// Whether `refusal` — which [`Tree::plan`] just returned for `key` — is a
+/// function of `key`, and may therefore be stored under it.
+///
+/// **The check, not an argument that one is unnecessary.** There is a sound
+/// argument that the generation half is unnecessary: `compile` re-reads the
+/// generation itself and the counter only ever increases, so a refusal computed
+/// under a generation other than `key.generation` is filed under a key no later
+/// lookup can construct, and is simply dead. That argument is correct and it is
+/// also three facts deep, one of which lives in another crate. This is one
+/// relaxed load on a path that has just spent a microsecond compiling, and it
+/// converts the argument into an invariant the code enforces: **nothing is
+/// stored whose value the key does not determine.**
+///
+/// # Why `ChildDetached` is matched by name
+///
+/// It is the one refusal [`Tree::plan`] produces without reading the arena, so
+/// it describes the *process* after a `fork` and not the key. This condition
+/// used to be spelled `!tree.detached()`, which is equivalent — `Tree::plan`
+/// returns `ChildDetached` if and only if it is detached, that being its first
+/// statement — and equivalent in the way that cannot be tested: reaching it
+/// needs a `fork` landing between `Tree::lookup`'s own detached check and
+/// `Tree::plan`'s, and the workspace's only `fork()` lives in another crate's
+/// test binary. Matching the value says the same thing about the thing it is
+/// actually about, and [`tests::store_refusal_declines_what_the_key_does_not_determine`]
+/// can then pin both arms with no fork at all.
+///
+/// Reading the generation is safe either way and that is not what changed:
+/// [`Tree::view`] answers from a *poison arena* once detached — a real, mapped,
+/// in-process arena — so the load would have been meaningless rather than
+/// unsound.
+///
+/// The success path needs none of this: a `Plan` carries the generation it was
+/// compiled under and `Plan::at` refuses a mismatch with `TopologyChanged`, so
+/// it is self-checking at *evaluation* time. A refusal has no evaluation, and
+/// this is where it gets the equivalent.
+fn store_refusal(tree: &Tree, key: Key, refusal: LookupError) -> bool {
+    !matches!(refusal, LookupError::ChildDetached)
+        && tree.view().topology().stable_generation() == key.generation
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use tf_tree_core::LookupError;
+
     use crate::{Iso3, TreeBuilder};
+
+    /// [`super::with_plan`] for a pair that is **expected to compile**: asserts
+    /// that it did, and returns the hit flag.
+    ///
+    /// The `.unwrap()` these call sites used to carry did this for free, when
+    /// the return was `Result<(R, bool), LookupError>`. Lifting the compile
+    /// result out of the tuple — so a *refusal* can report a hit too (#259) —
+    /// deleted the assertion silently, and `let (_, hit) = …` is an explicit
+    /// discard, so nothing warned. Because refusals now land in the cache, every
+    /// hit-rate test below would then have kept passing against a build where
+    /// nothing compiles at all: measured, with `tree.plan(..).and(Err(..))`
+    /// forcing every compile to fail,
+    /// [`the_cache_hits_exactly_where_its_index_predicts`],
+    /// [`two_trees_keep_separate_entries_and_still_hit`] and
+    /// `two_handles_on_one_shared_arena_share_their_plans` were all green — they
+    /// were measuring that *something* was cached, not that a plan was. With the
+    /// assertion back, all three fail against that build, in both feature
+    /// configurations. [`the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one`]
+    /// is **not** on the list and stays green either way: it models [`super::index`]
+    /// directly and never reaches the cache at all.
+    fn compiled_hit(
+        tree: &crate::Tree,
+        target: tf_tree_core::FrameId,
+        source: tf_tree_core::FrameId,
+        generation: u64,
+    ) -> bool {
+        let (compiled, hit) = super::with_plan(tree, target, source, generation, |_| ());
+        compiled.expect("expected a compiled plan");
+        hit
+    }
+
+    /// Two frames in **separate components**, plus the reparent that joins them.
+    ///
+    /// `y` is the frame moved rather than `x`, and that is not arbitrary: it is
+    /// the one carrying an `edge_of_child`, and a path through a link whose edge
+    /// is the `0` sentinel is [`LookupError::MissingEdge`] — which would turn
+    /// the "now it works" half of
+    /// [`a_cached_refusal_does_not_survive_the_topology_that_caused_it`] into a
+    /// second refusal that the test would have accepted as one.
+    fn two_components() -> (crate::Tree, tf_tree_core::FrameId, tf_tree_core::FrameId) {
+        let tree = TreeBuilder::new()
+            .static_edge("a", "b", &Iso3::IDENTITY)
+            .static_edge("x", "y", &Iso3::IDENTITY)
+            .build()
+            .unwrap();
+        let b = tree.frame("b").unwrap();
+        let y = tree.frame("y").unwrap();
+        (tree, b, y)
+    }
+
+    /// **Caching a refusal costs no bytes** — the claim [`super::Entry`] makes,
+    /// pinned rather than asserted.
+    ///
+    /// `Plan` is `[Step; MAX_DEPTH]` and `Step` is an enum with spare
+    /// discriminant encodings, so `Result<Plan, LookupError>` puts its `Err`
+    /// variant in a niche inside that array and `LookupError`'s 32 bytes fit
+    /// there. Nothing guarantees that survives a new `LookupError` variant with
+    /// a wider payload, and the failure mode if it does not is silent: every
+    /// slot grows by an alignment step and the per-thread table with it.
+    ///
+    /// The equality is the assertion; the absolute numbers are recorded in the
+    /// message so a failure says which way it moved. They are `MAX_DEPTH = 32`
+    /// figures and a retune of that constant is expected to change them.
+    #[test]
+    fn a_refusal_is_free_to_cache() {
+        use std::mem::size_of;
+        assert_eq!(
+            size_of::<Result<tf_tree_core::Plan, LookupError>>(),
+            size_of::<tf_tree_core::Plan>(),
+            "Result<Plan, LookupError> ({}) outgrew Plan ({}): the Err variant \
+             stopped fitting a niche, and every cache slot just grew",
+            size_of::<Result<tf_tree_core::Plan, LookupError>>(),
+            size_of::<tf_tree_core::Plan>(),
+        );
+        assert_eq!(
+            size_of::<super::Entry>(),
+            size_of::<tf_tree_core::Plan>() + align_of::<tf_tree_core::Plan>(),
+            "an Entry is a Key padded to Plan's alignment plus the Plan itself"
+        );
+    }
+
+    /// **A refused pair compiles once, not once per lookup** (#259).
+    ///
+    /// The defect: `with_plan` propagated a failed compile with `?`, which
+    /// returned before the store, so nothing on that path ever reached the
+    /// cache. The second probe below missed forever.
+    ///
+    /// **Mutant: restore the `?`** — i.e. delete the `store_refusal` arm and let
+    /// the `Err` return without storing ⇒ `hit2` is `false` and this fails on
+    /// its first assertion.
+    #[test]
+    fn a_refused_pair_is_compiled_once_and_then_answered_from_the_cache() {
+        let (tree, b, y) = two_components();
+        let g = tree.guard().generation();
+
+        let (r1, hit1) = super::with_plan(&tree, b, y, g, |_| ());
+        assert!(!hit1, "the first compile must be a miss");
+        let e1 = r1.unwrap_err();
+        assert!(
+            matches!(e1, LookupError::Disconnected { .. }),
+            "expected Disconnected, got {e1:?}"
+        );
+
+        let (r2, hit2) = super::with_plan(&tree, b, y, g, |_| ());
+        assert!(hit2, "the refusal was recompiled instead of being cached");
+        assert_eq!(
+            r2.unwrap_err(),
+            e1,
+            "the cached refusal is not the same one"
+        );
+    }
+
+    /// **[`super::store_refusal`] declines what the key does not determine** —
+    /// both arms, directly, because neither had a test and the whole point of
+    /// the predicate is to be the check rather than the argument.
+    ///
+    /// Measured before this existed: replacing the body with `true` left
+    /// `cargo nextest run -p tf_tree` at 101/101 passing, with or without
+    /// `--features shm`. An equivalent mutant is worse than no guard, because it
+    /// reads as one.
+    ///
+    /// **Mutant: body → `true`** ⇒ both `assert!(!…)` lines fail.
+    /// **Mutant: drop the `!` on the `matches!`** ⇒ four tests fail, this one
+    /// among them: the control and the `ChildDetached` line here, plus
+    /// [`a_refused_pair_is_compiled_once_and_then_answered_from_the_cache`] and
+    /// [`a_cached_refusal_does_not_survive_the_topology_that_caused_it`], since
+    /// nothing but a `ChildDetached` is stored any more.
+    #[test]
+    fn store_refusal_declines_what_the_key_does_not_determine() {
+        let (tree, b, y) = two_components();
+        let live = tree.guard().generation();
+        let key = |generation| super::Key {
+            scope: tree.cache_scope(),
+            target: b.get(),
+            source: y.get(),
+            generation,
+        };
+        let disconnected = LookupError::Disconnected {
+            target: b,
+            source: y,
+            cut_at: b,
+        };
+
+        // Control: an ordinary compile refusal at the live generation is exactly
+        // what the cache is *for*, and must be stored.
+        assert!(
+            super::store_refusal(&tree, key(live), disconnected),
+            "control: a refusal at the live generation must be storable"
+        );
+        assert!(
+            !super::store_refusal(&tree, key(live.wrapping_add(1)), disconnected),
+            "a refusal computed under a generation the arena does not have is not \
+             about this key"
+        );
+        assert!(
+            !super::store_refusal(&tree, key(live), LookupError::ChildDetached),
+            "ChildDetached is about the process, not the key"
+        );
+    }
+
+    /// **[`super::with_plan`] actually consults [`super::store_refusal`].**
+    ///
+    /// The other half of the pair above: that test pins the predicate, this one
+    /// pins that the store is gated on it, and neither implies the other. The
+    /// key carries a generation the arena does not have, so `compile` — which
+    /// reads the live generation itself — produces a refusal that is not this
+    /// key's, and it must not be filed under it.
+    ///
+    /// **Mutant: `store_refusal` → `true`** ⇒ the stale probe hits and the final
+    /// assertion fails, while the control above it still passes.
+    #[test]
+    fn a_refusal_is_not_stored_under_a_generation_the_arena_does_not_have() {
+        let (tree, b, y) = two_components();
+        let live = tree.guard().generation();
+
+        // Control, at the live generation: stored, so the repeat hits.
+        assert!(super::with_plan(&tree, b, y, live, |_| ()).0.is_err());
+        assert!(
+            super::with_plan(&tree, b, y, live, |_| ()).1,
+            "control: a refusal at the live generation is cached"
+        );
+
+        let stale = live.wrapping_add(1);
+        assert!(super::with_plan(&tree, b, y, stale, |_| ()).0.is_err());
+        assert!(
+            !super::with_plan(&tree, b, y, stale, |_| ()).1,
+            "a refusal was filed under a generation it was not computed at"
+        );
+    }
+
+    /// **A cached refusal does not survive the topology that produced it.**
+    ///
+    /// The property the whole of #259 rests on, and the one a negative cache
+    /// gets wrong if it gets anything wrong: the key carries the generation, a
+    /// topology mutation bumps it, and a pair that could not be planned before
+    /// the mutation must be planned again after it. Without that, connecting two
+    /// components would leave the pair permanently unresolvable in every thread
+    /// that had already asked.
+    ///
+    /// **Mutant: build the key with `generation: 0`** — the whole mutation, since
+    /// that blinds both [`super::index`] and `Key`'s derived `PartialEq` at once
+    /// ⇒ the third probe *hits*, and this fails on `!hit3` one assertion before
+    /// it would have reached `r3.is_ok()`. (Executed; it takes
+    /// `cache_hits_and_invalidates_on_generation` down with it, which is the
+    /// same property from the success side.)
+    ///
+    /// **Mutant: never store a refusal** ⇒ this fails on its *precondition*
+    /// rather than its subject, which is the assertion doing its job.
+    #[test]
+    fn a_cached_refusal_does_not_survive_the_topology_that_caused_it() {
+        let (tree, b, y) = two_components();
+        let a = tree.frame("a").unwrap();
+
+        let g1 = tree.guard().generation();
+        assert!(super::with_plan(&tree, b, y, g1, |_| ()).0.is_err());
+        assert!(
+            super::with_plan(&tree, b, y, g1, |_| ()).1,
+            "precondition: the refusal is in the cache"
+        );
+
+        // Join the two components. `y` keeps its edge record, so the path
+        // b -> a <- y is two real edges and compiles.
+        tree.reparent(y, a).unwrap();
+        let g2 = tree.guard().generation();
+        assert_ne!(g1, g2, "re-parent must change the generation");
+
+        let (r3, hit3) = super::with_plan(&tree, b, y, g2, |_| ());
+        assert!(!hit3, "a new generation must not hit the old refusal");
+        assert!(
+            r3.is_ok(),
+            "the pair is connected now and still refuses: {:?}",
+            r3.unwrap_err()
+        );
+    }
+
+    /// **An evaluation error is not a compile refusal, and is not cached as
+    /// one.**
+    ///
+    /// `NoData`, `Extrapolation`, `SlotRecycled` and `TopologyChanged` come from
+    /// `Plan::at` — from `f` — and describe the sample history, which the key
+    /// says nothing about. Caching one would pin "this edge has no data" for the
+    /// life of a generation, which is the one class of staleness this cache has
+    /// never been able to produce.
+    ///
+    /// It is structural rather than filtered: an error from `f` travels inside
+    /// `with_plan`'s `R`, which is opaque to this module, and has no path to an
+    /// `Entry`. The test spends [`LookupError::WrongElementType`] to say so,
+    /// precisely because `compile` cannot produce it — so a copy of it coming
+    /// back out of the cache could only have been stored from `f`.
+    ///
+    /// **No mutant, and that is the honest report.** Because the property is
+    /// carried by the *type* rather than by a line, no single-line edit to
+    /// [`super::with_plan`] expresses "cache `f`'s error too"; it takes
+    /// collapsing the two `Result`s into one, which is a redesign. This test is
+    /// a guard on that redesign, not a discriminator between two builds that
+    /// exist. What *was* executed is the control — running `f` before the store
+    /// instead of after leaves all eight cache tests green — which says the test
+    /// is not accidentally sensitive to the order of those two statements.
+    #[test]
+    fn an_error_from_the_evaluation_closure_is_not_cached() {
+        let tree = TreeBuilder::new()
+            .static_edge("a", "b", &Iso3::IDENTITY)
+            .build()
+            .unwrap();
+        let a = tree.frame("a").unwrap();
+        let b = tree.frame("b").unwrap();
+        let g = tree.guard().generation();
+
+        let (r1, hit1) = super::with_plan(&tree, b, a, g, |_| {
+            Err::<(), LookupError>(LookupError::WrongElementType)
+        });
+        assert!(!hit1, "the first compile must be a miss");
+        assert!(r1.unwrap().is_err(), "precondition: the closure did fail");
+
+        let (r2, hit2) = super::with_plan(&tree, b, a, g, |_| Ok::<(), LookupError>(()));
+        assert!(hit2, "the plan itself must still have been cached");
+        assert!(
+            r2.unwrap().is_ok(),
+            "the closure's error was stored as if the compile had refused it"
+        );
+    }
 
     /// The [`super::index`] mask keeps more of a small tree's working set
     /// resident than the obvious alternative, taking the high bits of a final
@@ -365,9 +830,7 @@ mod tests {
         // agrees between the two trees.
         assert_eq!((a1.get(), b1.get(), g1), (a2.get(), b2.get(), g2));
 
-        let probe = |t: &crate::Tree, target, source, g| {
-            super::with_plan(t, target, source, g, |_| ()).unwrap().1
-        };
+        let probe = |t: &crate::Tree, target, source, g| compiled_hit(t, target, source, g);
         assert!(!probe(&first, b1, a1, g1));
         assert!(probe(&first, b1, a1, g1), "the first tree's repeat hits");
         assert!(
@@ -394,12 +857,12 @@ mod tests {
 
         let gen1 = tree.guard().generation();
         let (g1_stamped, hit1) =
-            super::with_plan(&tree, b, a, gen1, tf_tree_core::Plan::generation).unwrap();
+            super::with_plan(&tree, b, a, gen1, tf_tree_core::Plan::generation);
         assert!(!hit1, "first compile is a miss");
-        assert_eq!(g1_stamped, gen1);
+        assert_eq!(g1_stamped.unwrap(), gen1);
 
         // An immediate repeat with the same key hits the per-thread cache.
-        let (_, hit2) = super::with_plan(&tree, b, a, gen1, |_| ()).unwrap();
+        let hit2 = compiled_hit(&tree, b, a, gen1);
         assert!(hit2, "repeat lookup hits the cache");
 
         // A runtime re-parent bumps the generation; the recompiled plan carries it.
@@ -408,9 +871,10 @@ mod tests {
         assert_ne!(gen1, gen2, "re-parent must change the generation");
 
         let (g3_stamped, _hit3) =
-            super::with_plan(&tree, b, a, gen2, tf_tree_core::Plan::generation).unwrap();
+            super::with_plan(&tree, b, a, gen2, tf_tree_core::Plan::generation);
         assert_eq!(
-            g3_stamped, gen2,
+            g3_stamped.unwrap(),
+            gen2,
             "post-change plan is stamped with the new generation"
         );
     }
@@ -520,7 +984,7 @@ mod tests {
             let (mut hits, mut total) = (0usize, 0usize);
             for round in 0..ROUNDS {
                 for tree in &trees {
-                    let (_, hit) = super::with_plan(tree, a, c, g, |_| ()).unwrap();
+                    let hit = compiled_hit(tree, a, c, g);
                     if round > 0 {
                         total += 1;
                         hits += usize::from(hit);
@@ -614,12 +1078,9 @@ mod tests {
         let a = owner.frame("a").unwrap();
         let b = owner.frame("b").unwrap();
         let g = owner.guard().generation();
+        assert!(!compiled_hit(&owner, b, a, g), "cold cache");
         assert!(
-            !super::with_plan(&owner, b, a, g, |_| ()).unwrap().1,
-            "cold cache"
-        );
-        assert!(
-            super::with_plan(&peer, b, a, g, |_| ()).unwrap().1,
+            compiled_hit(&peer, b, a, g),
             "the peer's FIRST lookup must reuse the owner's plan, not recompile"
         );
     }

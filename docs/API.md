@@ -53,6 +53,23 @@ its edge count — so without it a second tree is served the first tree's
 compiled plan. Two handles onto one *shared segment* deliberately share an
 id, because they share a topology; everything else gets its own.
 
+What a slot holds is the **result** of compiling that key, and a refusal is a
+result (#259). A pair that cannot be planned is compiled **at most once per
+key** and answered from the cache thereafter, rather than recompiled per call
+for the life of the process — which is what it used to be, and what `0034` made
+expensive by walking a doomed path to its full length before refusing it. *At
+most*, because the store is conditional: a refusal is filed only when the
+topology did not move under the compile that produced it, so a pair queried
+against a mutating topology still recompiles. That is the conservative
+direction, and it is what keeps the guarantee below unconditional.
+
+This is a property of condition 1, not an exception to it: the generation
+component is what makes a refusal as safe to reuse as a plan, and a topology
+mutation retires both together. Errors raised *after* compilation — `NoData`,
+`Extrapolation`, `SlotRecycled`, `TimeDomainMismatch`, and anything else that
+describes the sample history or the query stamp rather than the topology — are
+**not** cached and must not be; the key says nothing about them.
+
 The tiers are also the migration ladder. A user arrives at tier 3 by way of
 tiers 1 and 2, and every surface — including the shim — must offer a way down.
 
