@@ -608,10 +608,14 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
         "expected ArenaAlreadyLive, got {refused:?}"
     );
 
-    // The refusal left nothing behind: the owner is byte 0 and its two peers
-    // would be 1 and 2, so a refused attach that kept its session would show as
-    // a held byte 1. `join_read_write` then has to be able to take that byte,
-    // which is the same claim from the other side.
+    // **The refusal left nothing behind**, which is the half of the promise that
+    // is not about the error value. The owner holds byte 0, so a refused attach
+    // that kept its session would show as a held byte 1.
+    //
+    // Deterministic, and worth saying why: `Open::open` drops the session — and
+    // with it the OFD lock — *before* it returns `ArenaAlreadyLive`, and that
+    // happens in this process, on this thread, inside the call above. There is
+    // nothing to wait for.
     {
         let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
             .expect("the rendezvous created a lock file");
@@ -623,12 +627,22 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
             "the refused open kept its participant byte"
         );
     }
+
+    // And the rendezvous is not wedged: a genuine joiner is still granted a
+    // read-write attachment. `join_read_write` panics on failure, so reaching
+    // the assertion is most of the claim.
+    //
+    // **Not an assertion about *which* slot**, and it was one until CI said
+    // otherwise. Participant *indices* are assigned by the owner's serving
+    // thread, which frees a departed client's index from `on_hangup` when epoll
+    // reports `RDHUP`/`HUP` (`tf_tree_ipc::OwnerServer::serve`). Whether the
+    // refused attach's index has been freed by the time the next joiner is
+    // accepted is therefore a race between that loop and this thread — the lock
+    // *byte* is released synchronously above, the *index* is not. It read 1 in
+    // 30 of 30 local runs and something else on a shared CI runner, which is the
+    // race resolving both ways rather than a defect either way.
     let peer = join_read_write();
-    assert_eq!(
-        peer.participant_slot(),
-        1,
-        "the byte the refusal released was not reissued"
-    );
+    assert!(peer.is_writable(), "the peer joined read-only");
 
     drop(peer);
     drop(owner);
