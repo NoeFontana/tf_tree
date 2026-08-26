@@ -32,6 +32,12 @@ configuration and say so". Its stated reason, from
 > difference against the header stamp. Nothing records one: `SampleRing::push`
 > stores the stamp the publisher supplied and no second timestamp of its own.
 
+**That is the module doc, and the shipped skip reason agrees with it** — the
+`Tft::Tft004` arm reports *"no per-publisher arena receipt time is recorded — a
+push stores the publisher's stamp and nothing of its own to difference against"*.
+Checked, because a record that argues against a comment while the code says
+something else is arguing with nobody.
+
 ## The stated reason is true and its implication is not
 
 `SampleRing::push` records no timestamp of its own — correct. What the sentence
@@ -101,12 +107,18 @@ receipt time against a *header stamp*, and header stamps are wall-clock-domain
 
 **None yet.** `draft`. The shape that looks right, and is not costed:
 
-**Sample the receipt time rather than taking it every push, using the counter the
-push path already maintains.** `SampleRing::push` already computes `h` and stores
-`h + 1` into `heartbeat`, and `0014` pins `heartbeat == head`, so a predicate of
-the form `h % INTERVAL == 0` reads a value already in a register and costs a mask
-and a branch. At `INTERVAL = 1024` the amortised cost is 38/1024 ≈ **0.04 ns**,
-which is inside the noise of a 3 ns push.
+**Sample the receipt time rather than taking it every push, off a counter the
+push path already computes.** `SampleRing::push` reads `head` into a local `h` and
+stores `h + 1` into `heartbeat`, so a predicate of the form `h % INTERVAL == 0`
+costs a mask and a branch on a value already in a register. At `INTERVAL = 1024`
+the amortised cost is 38/1024 ≈ **0.04 ns**, inside the noise of a 3 ns push.
+
+**`0014`'s `heartbeat == head` pin is *not* what makes this work, and an earlier
+revision of this paragraph cited it as though it were.** The predicate reads the
+local `h`, not `heartbeat`, so the equality is true and irrelevant — and it is a
+`debug_assert`, absent from the release builds a robot runs. Leaning on it would
+have been resting a hot-path decision on a check that does not execute where the
+decision is paid for.
 
 Sampling is not a compromise here — it is what the check wants. §6 asks for a
 **rolling median** of per-publisher offset, which needs a distribution and not
