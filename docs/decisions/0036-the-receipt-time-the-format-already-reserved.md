@@ -2,12 +2,46 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** none yet. **Every open question carries a recommendation with
-its argument, and merging this record ratifies them** — the mechanism
-[`0023`](./0023-the-gate-that-could-not-gate.md) states in as many words
-(*"they are recommendations and not decisions because this record is `draft`: a
-human ratifies by merging"*). Until then `docs/PHASE2.md` §6.4 and
-`docs/PHASE5.md` §0.0 are untouched.
+**Implementation:** **step 1 has landed**, with step 2's amendment to
+`docs/PHASE2.md` §6.4 in the same change — a normative sentence describing code
+should not be one PR behind it. Steps 3–5 are open; `docs/PHASE5.md` §0.0's
+*"sixteen detect"* is therefore unchanged, and only `TFT004`'s *reason* moved.
+The four recommendations below were ratified by merging this record, per the
+mechanism [`0023`](./0023-the-gate-that-could-not-gate.md) states in as many
+words (*"they are recommendations and not decisions because this record is
+`draft`: a human ratifies by merging"*).
+
+> **Implementation notes for step 1, kept because the number this record was
+> written around is the one it got wrong.**
+>
+> * **The sampler costs +1.1 ns per push (~+23%), and the clock read is 3% of
+>   it.** Measured paired, both arms in one process, five sittings
+>   (`just push-sampler-cost`, `crates/tf_tree_bench/benches/push_sampler.rs`):
+>   4.8–5.0 ns without, 5.9–6.1 ns with. `SystemTime::now()` re-measured at
+>   38.4 ns, so at the 1024-push default it contributes 0.04 ns amortised. **The
+>   remaining 97% is the counter** — the load, compare and store through `&self`
+>   that question 1 called *"a non-atomic counter increment and a compare against
+>   a value in a register"* and priced at nothing.
+> * **So the interval is not the knob this record ratified it as.** Question 4
+>   closes *"a reader who thinks 41 ns at p99.9 is too much should move the
+>   interval, not the placement"*. Moving the interval divides the 3%. Anyone who
+>   needs the push path back has to delete the counter, which is a different
+>   change with a different argument.
+> * **The first before/after said +47% and was wrong.** Two `cargo bench` runs
+>   minutes apart, on a host `bench_report`'s fitness probe rejects outright: the
+>   same unsampled push read 5.94 ns and then 4.82 ns, against an effect of
+>   1.1 ns. `benches/push_sampler.rs` exists because of that, and its module doc
+>   says so.
+> * **The counter counts down, not up**, so the hot path compares against an
+>   immediate zero and loads `sample_every` only on the sample. Worth ~0.15 ns
+>   and three runs out of four — kept, and written down as weak evidence rather
+>   than presented as a result.
+> * **`heap`-tree `push` is ~4.9 ns here, not the 3 ns this record's table
+>   says.** That table measured `EdgeWriter::push` on a 1024-slot ring in a
+>   different sitting; the §11.1 fixture's edge is larger. It does not change any
+>   ratio the record argues from — 38.4 against 4.9 is still an order apart —
+>   but the 13× in *Why it is not simply a defect to fix* reads ~8× on this
+>   fixture.
 
 ## Context
 

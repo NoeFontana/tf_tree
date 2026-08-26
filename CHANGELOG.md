@@ -33,6 +33,58 @@ is a bug.
 
 ## [Unreleased]
 
+### Added
+
+- **A per-publisher arena receipt time, from a field that has been in every
+  shipped arena since it was declared** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
+  step 1). `ClaimRecord::last_push_nanos` had four references in the whole
+  workspace — two struct definitions and two zero-initialisers — while
+  `docs/PHASE2.md` §6.4 said normatively that it was *"bumped on every push"*.
+  Nothing wrote it and nothing read it, and that is why `TFT004` (clock skew)
+  reported *"cannot detect anything in any configuration"*: the check needs a
+  receipt time to difference against each publisher's header stamp.
+
+  **`tf_tree`'s `EdgeWriter::push` now stamps it, sampled rather than every
+  push.** A wall-clock read is **38 ns** against a **3 ns** push, measured, so
+  unconditional was never the trade; the interval is derived once per claim from
+  `EdgeRecord::nominal_rate_mhz` as `mhz / 1000`, which makes the *offset sample
+  rate* the constant instead of the push interval — a 1 kHz IMU and a 10 Hz
+  localiser each yield about one receipt per second of published data, and each
+  pay one clock read per second. An edge that declares no rate samples every
+  1024 pushes rather than never, because a tree built without a topology file is
+  the common case and not an exotic one.
+
+  **No arena byte changes and `FORMAT_VERSION` is untouched** — the field is
+  already part of `layout_hash`. **`tf_tree_core` does not change either**: the
+  clock is read in the facade, *after* `Publisher::push` returns, which keeps it
+  outside the seqlock window. Inside it, a writer's diagnostic would become every
+  reader's `SlotContended` retries.
+
+  **What it costs — measured, and not where the record predicted.** `push` goes
+  from **4.8–5.0 ns to 5.9–6.1 ns**: **+1.1 ns, about +23%**, on every push.
+  That is a *paired* delta, both arms in one process, five sittings
+  (`just push-sampler-cost`, `benches/push_sampler.rs`) — because this host
+  fails `bench_report`'s fitness probe and an unpaired before/after across two
+  `cargo bench` runs said **+47%**, which was drift. `just bench-check` passes.
+
+  **Almost none of it is the clock read.** `SystemTime::now()` is 38.4 ns here,
+  which at the 1024-push default is 0.04 ns amortised — **3% of the 1.1 ns**.
+  The rest is the counter: a load, a compare and a store through `&self` on
+  every push, which `0036` described as *"a non-atomic counter increment and a
+  compare against a value in a register"* and priced at nothing. **So the
+  interval is not the knob it was ratified as** — raising it divides the 3%.
+  Anyone who needs this path back has to remove the counter, not lengthen it.
+
+  What stays arithmetic is the *tail*: a 1 kHz publisher's p99.9 push is the
+  sampled one, ~38 ns above its neighbours, and `publish_to_visible` — the row
+  that would say whether that reaches a consumer — is `unavailable` on this host
+  (4 physical cores against the 17 it needs, and no ROS 2). It ships unmeasured,
+  and `docs/PHASE1.md` §11.2 says so in its own terms.
+
+  **`TFT004` is not wired to it yet** (`0036` step 3), so it still skips — but
+  its reason is now about `checks.rs` and no longer about the arena, and
+  `docs/PHASE5.md` §0.0's *"sixteen detect"* is unchanged until that step lands.
+
 ### Fixed
 
 - **`Tree::reparent` no longer steals A2's topology lock from a live mutator

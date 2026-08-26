@@ -43,6 +43,7 @@ must not blur the two.
 | `docker/tf2/native_footprint.cpp` | `just tf2-native-footprint` | The memory comparison with no binding on either side. Not a pass/fail gate — it refuses to print a quotient if the two arms stored different sample counts |
 | `tf_tree_bench/src/backing.rs` (guard rows) | `just guard-cost` | 0022 question 1's 2x2: {release, embedder} x {counters on, off}, on writable arenas |
 | `tf_tree_bench/src/backing.rs` | `just abi-split` | not a gate — reports the ABI ladder; listed here because PHASE4 §7 cites its guard rows |
+| `tf_tree_bench/benches/push_sampler.rs` | `just push-sampler-cost` | not a gate — reports what [`0036`](../decisions/0036-the-receipt-time-the-format-already-reserved.md)'s receipt-time sampler costs `EdgeWriter::push`, as a **paired delta in one process** against `Publisher::push`. Measured **+1.1 ns, ~+23%** (5.9–6.1 ns against 4.8–5.0 ns) on the §11.1 fixture, five sittings. It is a separate artifact from `benches/push.rs` because this host fails `bench_report`'s fitness probe: an unpaired before/after across two `cargo bench` runs read **+47%**, and the difference between the two answers was drift, not the sampler. **Almost none of the cost is the clock** — `SystemTime::now()` is 38.4 ns here, which at the 1024-push default is 0.04 ns amortised, 3% of the delta; the rest is the per-push counter, which `0036` priced at nothing |
 
 ## Probes — findings recorded, re-runnable on demand
 

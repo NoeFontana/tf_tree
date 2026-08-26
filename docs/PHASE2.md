@@ -769,7 +769,15 @@ The owner runs this on socket `HUP`; others run it lazily when a claim appears h
 
 ### 6.4 Heartbeats are diagnostics only — NORMATIVE
 
-`heartbeat` and `last_push_nanos` remain in `ClaimRecord`, bumped on every push, and are **never** a reaping trigger. They detect the *hang* case — a live process that has stopped publishing — which `doctor` reports and an operator resolves.
+`heartbeat` and `last_push_nanos` remain in `ClaimRecord` and are **never** a reaping trigger. They detect the *hang* case — a live process that has stopped publishing — which `doctor` reports and an operator resolves.
+
+**They are written on different schedules, and the difference is a measurement rather than a preference** ([`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md)). `heartbeat` is bumped on **every** push, inside `SampleRing::push`, because it is a counter that path already holds in a register ([`0014`](./decisions/0014-the-push-heartbeat-is-a-store.md)). `last_push_nanos` is a **wall-clock** reading — 38.4 ns against a ~5 ns push — so it is **sampled**: `tf_tree`'s `EdgeWriter` stamps it once every `nominal_rate_mhz / 1000` pushes, which is one receipt per second of published data at any publisher rate, and once every 1024 pushes on an edge that declares no rate. The clock is read **in the facade, after the ring write returns**, and never inside `SampleRing::push`: inside, it would widen the seqlock window and convert one writer's diagnostic into every reader's `SlotContended` retries.
+
+**The sampling costs +1.1 ns per push (~+23%), and only 3% of that is the clock** — measured paired, in one process, by `just push-sampler-cost`; the rest is the per-push counter. §11.2's row and `docs/benchmarks/EVIDENCE.md` carry the numbers. Lengthening the interval divides the 3% and not the 97%, so it is not the knob it looks like.
+
+**This paragraph read *"bumped on every push"* of both until 2026-08-26, and that was half wrong from the day it was written.** `heartbeat` was; `last_push_nanos` was written by nothing at all — four `rg` hits, all of them definitions and zero-initialisers — which is the whole reason `TFT004` (clock skew) could detect nothing.
+
+**A receipt time that is now actually written is exactly what a later reader will reach for as a staleness trigger, and it is still not one.**
 
 Reaping on staleness would be actively unsafe: an edge legitimately published at 0.2 Hz, such as a map-to-odom correction from a slow global localizer, is indistinguishable from a hung writer under any timeout short enough to be useful. With claims as kernel locks there is no reason to offer such a policy at all, so **do not add one**, not even opt-in.
 

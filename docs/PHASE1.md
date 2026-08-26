@@ -921,6 +921,8 @@ Do not benchmark a synthetic two-frame tree. Use:
 
 **p99.9 is the number that matters**, not the mean. A control loop cares about the tail.
 
+**And on the `push` row, the tail is what ships unmeasured.** [`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md) step 1 put a receipt-time sampler on `EdgeWriter::push`: one push in `sample_every` reads a wall clock, 38.4 ns on the development host. The *mean* is measured — `push` went from 4.8–5.0 ns to 5.9–6.1 ns, **+1.1 ns**, paired in one process by `just push-sampler-cost`, and only 3% of that is the clock; the rest is the counter that decides when to read it. The **p99.9** is not measured and is arithmetic: for a publisher at 1 kHz with `sample_every = 1000`, 1-in-1000 *is* the 99.9th percentile, so that percentile is the sampled push and sits ~38 ns above its neighbours. Whether that reaches a consumer is `publish_to_visible`'s question, and that row is `unavailable` on this host — 4 physical cores against the 17 it needs, and no ROS 2 — so **it ships without one**. This paragraph is the disclosure `0036`'s step 5 owes, and it is not a substitute for the measurement.
+
 ### 11.3 Gate
 
 Proceed to Phase 2 if:
