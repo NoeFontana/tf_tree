@@ -956,7 +956,11 @@ same shape one layer up. Each has a home; none is a surprise waiting to be found
 - **`Tree::reparent` decides topology-lock liveness from `/proc` even when the
   tree holds an OFD probe** (issue #213) — the same §5.1 shape this release fixed
   for participant slots, one layer up, on the one path that takes A2's topology
-  lock. `docs/decisions/0029` is the record and it is `draft`.
+  lock. `docs/decisions/0029` is the record. **It was `draft` when this entry
+  was written and is `implemented` as of #269** — re-scoped to *the topology lock
+  is a kernel lock*, and the fix is not the one this entry's phrasing implies:
+  `reparent` does not consult the probe, it takes a kernel lock so that no
+  inference decides the steal.
 
 ## [0.0.3] — 2026-08-19 (first with a source distribution)
 
