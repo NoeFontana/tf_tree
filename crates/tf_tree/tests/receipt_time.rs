@@ -107,8 +107,9 @@ fn a_declared_rate_stamps_the_receipt_once_per_second_of_published_data() {
     let pushes: Vec<i64> = sampled.iter().map(|&(i, _)| i).collect();
     assert_eq!(
         pushes,
-        (1..=10).map(|k| k * SAMPLE_EVERY).collect::<Vec<i64>>(),
-        "a 10 Hz edge sampled on the wrong pushes: sample_every is not \
+        (0..10).map(|k| 1 + k * SAMPLE_EVERY).collect::<Vec<i64>>(),
+        "a 10 Hz edge sampled on the wrong pushes: the claim's first push must \
+         sample, and every sample_every-th one after it, where sample_every is \
          nominal_rate_mhz / 1000"
     );
 
@@ -158,16 +159,25 @@ fn a_rejected_push_neither_stamps_a_receipt_nor_spends_the_interval() {
     let w = tree.claim(odom, map).unwrap();
     let edge = w.edge();
 
-    for i in 1..=9i64 {
+    // The claim's first push samples by construction; drain it, so the interval
+    // under test starts from a known point.
+    w.push(1_000, &pose(0)).unwrap();
+    assert_ne!(
+        take_receipt(&tree, edge),
+        0,
+        "the first push did not sample"
+    );
+
+    for i in 2..=10i64 {
         w.push(i * 1_000, &pose(i as u64)).unwrap();
         assert_eq!(
             take_receipt(&tree, edge),
             0,
-            "push {i} of 9 sampled early: sample_every is not 10"
+            "push {i} sampled early: sample_every is not 10"
         );
     }
 
-    // Push ten would sample. This one regresses the stamp and is rejected.
+    // Push eleven would sample. This one regresses the stamp and is rejected.
     let err = w.push(1, &pose(99)).unwrap_err();
     assert!(
         matches!(err, PushError::NonMonotonicStamp { .. }),
@@ -181,13 +191,13 @@ fn a_rejected_push_neither_stamps_a_receipt_nor_spends_the_interval() {
     );
 
     // …and the interval was not spent either, so the next *accepted* push is
-    // still the tenth and still samples.
-    w.push(10_000, &pose(10)).unwrap();
+    // still the eleventh and still samples.
+    w.push(11_000, &pose(11)).unwrap();
     assert_ne!(
         take_receipt(&tree, edge),
         0,
-        "the tenth accepted push did not sample: the rejected push consumed an \
-         interval it never earned"
+        "the eleventh accepted push did not sample: the rejected push consumed \
+         an interval it never earned"
     );
 }
 
@@ -221,24 +231,24 @@ fn an_edge_with_no_declared_rate_samples_at_the_default_interval() {
 
     assert_eq!(
         sampled,
-        vec![DEFAULT, 2 * DEFAULT],
-        "an undeclared-rate edge did not sample at the documented default of \
-         {DEFAULT} pushes"
+        vec![1, 1 + DEFAULT],
+        "an undeclared-rate edge did not sample on its first push and then \
+         every {DEFAULT} pushes, the documented default"
     );
 }
 
 /// **The interval is per claim, and a re-claim restarts it.**
 ///
-/// `sample_every` is derived once, at claim time, from the edge record — so two
-/// writers of the same edge get the same interval, and neither inherits the
-/// other's position in it. This is the property that makes the derivation a
-/// division per claim rather than a lookup per push, and it is the one a later
-/// reader would break by caching the counter somewhere shared.
+/// `sample_every` is derived once, at claim time, from the edge record, and the
+/// countdown that consumes it lives in the writer. Two writers of the same edge
+/// therefore get the same interval and neither inherits the other's position in
+/// it — the property a later reader would break by caching the counter anywhere
+/// shared, and the one that makes a replacement writer's first push observable
+/// rather than up to `sample_every` pushes away.
 ///
 /// Mutant, run: give `sample_receipt_time` a `thread_local!` counter instead of
-/// `self.since_sample` — any cell shared between writers does it — and this
-/// fails with *"the second writer inherited the first's nine pushes"* while the
-/// other three tests still pass, which is the point of having it.
+/// `self.until_sample` — any cell shared between writers does it — and this
+/// fails with *"the second writer inherited the first's nine pushes"*.
 #[test]
 fn a_second_claim_of_the_same_edge_starts_a_fresh_interval() {
     let tree = tree_with_rate(Some(10.0));
@@ -248,31 +258,80 @@ fn a_second_claim_of_the_same_edge_starts_a_fresh_interval() {
     let edge = {
         let w = tree.claim(odom, map).unwrap();
         let edge = w.edge();
-        for i in 1..=9i64 {
-            w.push(i * 1_000, &pose(i as u64)).unwrap();
-        }
-        assert_eq!(
+        w.push(1_000, &pose(0)).unwrap();
+        assert_ne!(
             take_receipt(&tree, edge),
             0,
-            "sampled inside the first nine"
+            "the first push did not sample"
+        );
+        for i in 2..=9i64 {
+            w.push(i * 1_000, &pose(i as u64)).unwrap();
+            assert_eq!(take_receipt(&tree, edge), 0, "push {i} sampled early");
+        }
+        edge
+    };
+
+    // The second writer is mid-interval by any count the *edge* keeps — push ten
+    // overall — and at the start of its own. It must sample.
+    let w = tree.claim(odom, map).unwrap();
+    w.push(10_000, &pose(10)).unwrap();
+    assert_ne!(
+        take_receipt(&tree, edge),
+        0,
+        "the second writer inherited the first's nine pushes: the countdown is \
+         not per claim"
+    );
+}
+
+/// **A claim clears the receipt time it inherits.**
+///
+/// Nothing else in the system resets `last_push_nanos` — not `release`, not the
+/// reaper, not `tf_tree_core::edge::claim` — so a writer that takes over an edge
+/// whose previous owner is long gone would otherwise publish under *that*
+/// writer's timestamp. `docs/decisions/0036` step 3's planned "nothing sampled
+/// yet" skip is `last_push_nanos == 0`, which would not fire, so `TFT004` would
+/// attribute the dead writer's age to the live one as clock skew.
+///
+/// The window is one push wide now that a claim's first push samples, and one
+/// push is enough: this reads the field between `claim` and the first `push`,
+/// which is exactly where the stale value would be.
+///
+/// Mutant, run: delete `claim_rec.last_push_nanos.store(0, Ordering::Relaxed)`
+/// from `Tree::claim` — *"a fresh claim inherited the previous writer's receipt
+/// time"*.
+#[test]
+fn a_fresh_claim_does_not_inherit_the_previous_writers_receipt_time() {
+    let tree = tree_with_rate(Some(10.0));
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+
+    let edge = {
+        let w = tree.claim(odom, map).unwrap();
+        let edge = w.edge();
+        w.push(1_000, &pose(0)).unwrap();
+        // Deliberately *not* drained: the point is what the next claimant finds.
+        assert_ne!(
+            tree.arena_view()
+                .claim(edge)
+                .unwrap()
+                .last_push_nanos
+                .load(Relaxed),
+            0,
+            "the first writer never stamped a receipt, so this test proves \
+             nothing about the second"
         );
         edge
     };
 
-    let w = tree.claim(odom, map).unwrap();
-    w.push(10_000, &pose(10)).unwrap();
+    let _w = tree.claim(odom, map).unwrap();
     assert_eq!(
-        take_receipt(&tree, edge),
+        tree.arena_view()
+            .claim(edge)
+            .unwrap()
+            .last_push_nanos
+            .load(Relaxed),
         0,
-        "the second writer inherited the first's nine pushes: the counter is \
-         not per claim"
-    );
-    for i in 2..=10i64 {
-        w.push(10_000 + i * 1_000, &pose(i as u64)).unwrap();
-    }
-    assert_ne!(
-        take_receipt(&tree, edge),
-        0,
-        "the second writer never reached its own tenth push"
+        "a fresh claim inherited the previous writer's receipt time: TFT004 \
+         would read the gap between them as this publisher's clock skew"
     );
 }

@@ -785,10 +785,15 @@ impl ArenaBacking {
 ///
 /// The fields below are declared **publisher first, `_lease` second**, and Rust
 /// drops struct fields in declaration order. That yields *clear the record,
-/// then unlock* — the order `0005` §5 specifies. The three receipt-time fields
-/// declared after them own nothing and implement no `Drop`, so they take no
-/// part in this; they are placed last precisely so that the two that do stay
-/// adjacent and the rule above stays readable.
+/// then unlock* — the order `0005` §5 specifies.
+///
+/// **"Publisher first, `_lease` second" is an ordering and not an adjacency**,
+/// and the difference is worth stating because the `fork_gen` doc below has said
+/// otherwise since it was written: `fork_gen` is declared *between* them under
+/// `shm`, and without `shm` there is no `_lease` at all. What must hold is that
+/// no field carrying a `Drop` is declared between the two. The three
+/// receipt-time fields at the end own nothing and implement no `Drop`, which is
+/// why they are at the end and why they are harmless there.
 ///
 /// Reversing it is not catastrophic but is wrong: it leaves a window in which
 /// the byte is free while the record still says held, which is precisely the
@@ -812,8 +817,10 @@ pub struct EdgeWriter<'a> {
     publisher: Publisher<'a>,
     /// The fork generation this writer was claimed in.
     ///
-    /// `Copy`, so it takes no part in the drop order above; it is declared here
-    /// only to keep the two drop-ordered fields adjacent.
+    /// `Copy`, so it takes no part in the drop order above — which is why it is
+    /// allowed to sit between the two fields that do have one. (This comment
+    /// used to claim it was here "to keep the two drop-ordered fields
+    /// adjacent"; it is what makes them *not* adjacent.)
     #[cfg(all(feature = "shm", target_os = "linux"))]
     fork_gen: Option<u64>,
     /// Held purely for its `Drop`, hence the underscore — nothing reads it, and
@@ -905,6 +912,47 @@ impl EdgeWriter<'_> {
     /// That is the price of a `fork` child not writing through a dangling
     /// pointer into an unmapped page, which is not a trade this hot path gets
     /// to decline.
+    ///
+    /// # Cost of the receipt-time sampler, measured
+    ///
+    /// Since `docs/decisions/0036` step 1 this method also stamps a wall-clock
+    /// *receipt time* into the claim record, once every `sample_every` pushes,
+    /// so that `TFT004` can difference it against the publisher's header stamp
+    /// and find clock skew. **This section is on `push` and not on the private
+    /// method that does it, because rustdoc renders this one.**
+    ///
+    /// **+1.1 ns per push, about +23%** — 5.9–6.1 ns against 4.8–5.0 ns, paired
+    /// in-process against [`Publisher::push`] over five sittings
+    /// (`just push-sampler-cost`). The pairing is not fussiness: this host fails
+    /// `bench_report`'s fitness probe, and an unpaired before/after across two
+    /// `cargo bench` runs read +47%, which was drift.
+    ///
+    /// **That measurement is at one interval, and the split it reveals does not
+    /// hold at the others.** The sampler costs a rate-independent counter plus
+    /// `38.4 / sample_every` ns of amortised clock, and the edge it was measured
+    /// on declares no rate, so `sample_every` is 1024 and the clock is 3% of the
+    /// total. Everything below 1024 shifts the balance — arithmetic from the two
+    /// measured constants, not five more benchmarks:
+    ///
+    /// | declared rate | `sample_every` | per push | clock's share | per second of publishing |
+    /// |---|---|---|---|---|
+    /// | none / 1 kHz | 1024 / 1000 | 1.10 ns | 3% | ~1.1 µs |
+    /// | 200 Hz | 200 | 1.25 ns | 15% | ~0.25 µs |
+    /// | 50 Hz | 50 | 1.83 ns | 42% | ~91 ns |
+    /// | 10 Hz | 10 | 4.90 ns | 78% | ~49 ns |
+    /// | ≤ 1 Hz | 1 | 39.5 ns | 97% | ~39 ns |
+    ///
+    /// **Read the last column, not the fourth.** The per-push figure gets worse
+    /// as the rate falls and the absolute cost gets *better*, because a slow
+    /// publisher pays the clock read rarely in wall-clock terms however large a
+    /// fraction of its own cheap push it is. The cost per second of publishing
+    /// is `38.4 + rate x 1.06` ns and never exceeds about a microsecond.
+    ///
+    /// So **the interval is a real knob at low rates and almost none at high
+    /// ones** — the opposite of what an earlier revision of this text said, and
+    /// the reason it is drawn out here: at 1 kHz raising `sample_every` divides
+    /// only the 3%, and the counter is what anyone reclaiming that path would
+    /// have to delete.
     pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         if self.detached() {
@@ -936,27 +984,19 @@ impl EdgeWriter<'_> {
     /// is now actually written is exactly the thing a later reader would reach
     /// for instead.
     ///
-    /// # Cost, measured — and it is not where `0036` expected it
+    /// The cost is on [`EdgeWriter::push`], where rustdoc renders it.
     ///
-    /// **+1.1 ns on every push, about +23%**, paired in-process against
-    /// `Publisher::push` on the §11.1 fixture: **5.9–6.1 ns against
-    /// 4.8–5.0 ns** over five sittings (`benches/push_sampler.rs`, which exists
-    /// because this host fails `bench_report`’s fitness probe — an unpaired
-    /// before/after across two `cargo bench` runs said +47%, and that was drift).
-    ///
-    /// **Almost none of it is the clock.** `SystemTime::now()` +
-    /// `duration_since` is 38.4 ns here, and at the 1024-push default that is
-    /// 0.04 ns amortised — 3% of the 1.1 ns. The rest is the counter itself: a
-    /// load, a compare and a store through `&self` on every push, which `0036`
-    /// question 1 described as *"a non-atomic counter increment and a compare
-    /// against a value in a register"* and priced at nothing. It is not
-    /// nothing; it is the whole cost.
-    ///
-    /// That does not change the decision — 1.1 ns against a publish-to-visible
-    /// budget measured in microseconds is the trade `TFT004` is worth — but it
-    /// does change which knob works. **Raising `sample_every` buys almost
-    /// nothing**, because what it divides is the 3%. Anyone who needs this path
-    /// back has to remove the counter, not lengthen it.
+    /// **The counter is a `Cell` and not the arena's `heartbeat`, and that was
+    /// measured.** `0036` proposed sampling off the counter the push path
+    /// already maintains — `heartbeat & mask == 0`, a load of a line
+    /// `SampleRing::push` has just written. Built and benchmarked against this:
+    /// **+1.4 ns against +1.1 ns**, three sittings, so the atomic load costs
+    /// more than the stack `Cell` it would replace. It also forces
+    /// `sample_every` to a power of two and, because `heartbeat` belongs to the
+    /// edge rather than to the claim, it cannot sample a new writer's first
+    /// push — which is the property that keeps a slow publisher from reading as
+    /// *never sampled* for its first interval. Three reasons, one of them a
+    /// number.
     #[inline]
     fn sample_receipt_time(&self) {
         let remaining = self.until_sample.get();
@@ -989,9 +1029,11 @@ impl EdgeWriter<'_> {
 /// `docs/decisions/0036` costed the fixed-interval alternative at, and it gives
 /// about one offset per second for the kilohertz publishers that are the ones
 /// with a rate worth declaring. **The choice is much less load-bearing than that
-/// record expected**: the amortised clock read it divides turns out to be 3% of
-/// what the sampler costs — see [`EdgeWriter::push`]'s cost section — so moving
-/// this number moves almost nothing.
+/// record expected**, *at this value*: the clock read this interval divides is
+/// 3% of what the sampler costs at 1024, so moving it moves almost nothing here.
+/// At a declared 10 Hz — `sample_every` of 10 — the same read is 78% and the
+/// interval is the whole knob. [`EdgeWriter::push`]'s *Cost of the receipt-time
+/// sampler* section tabulates both ends.
 const DEFAULT_SAMPLE_EVERY: u32 = 1024;
 
 /// Pushes between receipt-time samples for an edge declaring `nominal_rate_mhz`.
@@ -2152,7 +2194,17 @@ impl Tree {
         let eid = EdgeId(edge);
         // A static or tombstoned edge has no ring (`capacity == 0`); publishing to
         // it is a typed error, not a panic on an empty slot slice.
-        let (Some(ring), Some(claim_rec)) = (view.ring(eid), view.claim(eid)) else {
+        //
+        // **The edge record is fetched here and not later**, beside the two it
+        // shares a bounds check with. It is only wanted for `nominal_rate_mhz`,
+        // and the obvious spelling — `view.edge(eid).map_or(0, ..)` at the
+        // construction site — folds a `None` into *"declares no rate"* and hands
+        // back the 1024 default. That is the same class of arena inconsistency
+        // the other two arms name as `NotDynamic`, silently degraded at the one
+        // point in this function that could have reported it.
+        let (Some(ring), Some(claim_rec), Some(edge_rec)) =
+            (view.ring(eid), view.claim(eid), view.edge(eid))
+        else {
             return Err(ClaimApiError::NotDynamic { child, edge: eid });
         };
         // ---- Two-phase acquire (`docs/decisions/0005` §5) --------------
@@ -2176,6 +2228,18 @@ impl Tree {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let lease = self.take_claim_lease(eid, claim_rec, epoch, owner)?;
 
+        // **The receipt time is cleared, because a claim inherits the edge and
+        // not the writer** (`docs/decisions/0036`). Nothing else in the system
+        // resets `last_push_nanos` — not `release`, not the reaper, not
+        // `tf_tree_core::edge::claim` — so without this line a fresh writer
+        // publishes under the *previous* writer's timestamp until its own first
+        // sample lands. `TFT004`'s planned "nothing sampled yet" skip is
+        // `last_push_nanos == 0`, which would not fire, so the check would
+        // report an hours-wide clock skew against a publisher whose clock is
+        // perfect. `Relaxed` for the same reason the sampling store is: it
+        // orders nothing, and the CAS above has already made this edge ours.
+        claim_rec.last_push_nanos.store(0, Ordering::Relaxed);
+
         // §7.1's per-edge population, writer half. This is the moment the edge
         // is taken up, and it is off the publish path — `push` is what must not
         // fault, and it now cannot, for the first lap and every lap after.
@@ -2183,10 +2247,8 @@ impl Tree {
         self.populate_edge_rings(eid);
 
         // `docs/decisions/0036` step 1: one division, here, per claim — never on
-        // the push path. `view` and `eid` are both still in scope at exactly the
-        // point the field is initialised, which is why this needed no plumbing
-        // and no second table lookup.
-        let sample_every = sample_interval(view.edge(eid).map_or(0, |rec| rec.nominal_rate_mhz));
+        // the push path.
+        let sample_every = sample_interval(edge_rec.nominal_rate_mhz);
 
         Ok(EdgeWriter {
             publisher: Publisher::new(ring, claim_rec, epoch, owner),
@@ -2196,7 +2258,15 @@ impl Tree {
             _lease: lease,
             claim: claim_rec,
             sample_every,
-            until_sample: Cell::new(sample_every.saturating_sub(1)),
+            // **Zero, so the claim's *first* push samples**, and every
+            // `sample_every`-th one after it. Starting a full interval away
+            // instead would leave `last_push_nanos == 0` — indistinguishable
+            // from the pre-`0036` state where nothing wrote it — for 102 s on a
+            // 10 Hz edge with no declared rate and about 85 minutes on a 0.2 Hz
+            // one, which are exactly the slow publishers §6.4 is about. It costs
+            // nothing: the same countdown, entered at its end instead of its
+            // start.
+            until_sample: Cell::new(0),
         })
     }
 

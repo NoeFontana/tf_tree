@@ -1155,6 +1155,20 @@ fn fill_spilled(
     let child = tree
         .frame(frames.name(want_child))
         .map_err(|_| IngestError::FrameLost { frame: want_child })?;
+    // **These pushes stamp an arena receipt time, and it is *ingest* time**
+    // (`docs/decisions/0036`). `EdgeWriter::push` samples a host wall clock into
+    // `ClaimRecord::last_push_nanos`, so replaying a 2024 recording in 2026
+    // writes 2026 receipts against 2024 header stamps. That is not wrong — the
+    // field means "when this arena received this sample", and it did — but it is
+    // exactly the shape `TFT004` reads as clock skew, and a bag-sourced tree is
+    // an ordinary live heap `Tree`, so none of that check's frozen-source or
+    // epoch skips catch it. **`0036` step 3 owes a fourth skip for a replayed
+    // source**, recorded in that record; until it lands, `TFT004` reads nothing
+    // at all, so nothing here is currently mis-reported.
+    //
+    // The cost is the sampler's ~1.1 ns per push plus one 38 ns clock read per
+    // interval, on a bulk load of millions of samples: single-digit
+    // milliseconds, against a run that parses a bag.
     let writer = tree.claim(child, parent).map_err(IngestError::Claim)?;
     // The in-memory path's one-element lookahead, spelled as a one-element
     // delay: a merged stream has no random access, so the sample is held back

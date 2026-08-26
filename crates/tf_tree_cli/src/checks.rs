@@ -28,7 +28,10 @@
 //! * **`TFT004`** (clock skew) needs a per-publisher *arena receipt time* to
 //!   difference against the header stamp. **One is now recorded** — `tf_tree`'s
 //!   `EdgeWriter` samples a wall clock into `ClaimRecord::last_push_nanos` once
-//!   per second of published data
+//!   per second of published data where the edge declares a nominal rate, and
+//!   once per 1024 pushes where it does not — 102 s at 10 Hz, and a tree built
+//!   without a topology file is the common case, so this check must not assume
+//!   the per-second figure
 //!   ([`0036`](../../../docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
 //!   step 1) — and **this check is not yet wired to it** (that record's step 3).
 //!   The skip is therefore about this file and no longer about the arena, which
@@ -606,7 +609,8 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
             Tft::Tft004 => CheckOutcome::skipped(
                 check,
                 "a per-publisher arena receipt time is now recorded (ClaimRecord::last_push_nanos, \
-                 sampled once per second of published data) but this check does not yet read it",
+                 sampled once per second of published data on an edge that declares a rate and \
+                 once per 1024 pushes on one that does not) but this check does not yet read it",
             ),
             Tft::Tft005 => tft005(inp),
             Tft::Tft006 => tft006(inp),

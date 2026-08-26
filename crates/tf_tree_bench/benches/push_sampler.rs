@@ -20,10 +20,22 @@
 // **Reaching `Publisher::push` directly is the one thing `EdgeWriter`'s doc
 // tells you not to do**, because it skips the post-`fork` check — and that is
 // exactly why it is the control: it is `EdgeWriter::push` minus the code under
-// test. It is sound here and only here: one process, no `fork`, and this crate
-// builds without `shm`, where the check the arm skips does not exist at all.
+// test. It is sound here and only here: one process, no `fork`.
 // **Do not copy this call shape into anything that is not a control arm.**
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+//
+// **And it is only the right control without `shm`**, which is why the bench
+// refuses to run with it. Under `shm` the fork check exists, `EdgeWriter::push`
+// pays it and `Publisher::push` does not, so the delta silently grows by
+// +0.195 ns — 18% of the ~1.1 ns effect — reported as the sampler's cost.
+// `justfile`'s `cargo clippy -p tf_tree_bench --features shm --all-targets`
+// row *compiles* this file, so a `compile_error!` would break the lint; a
+// refusal at run time blocks the misuse and leaves the lint alone. The shape is
+// `tf2-native-footprint`'s: a benchmark that will not print a number it cannot
+// mean.
+// `clippy::panic` is allowed for one call — the `shm` refusal below. A
+// benchmark that cannot mean its own number should stop, and there is no
+// `Result` for it to return.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 use std::cell::Cell;
 
@@ -32,6 +44,21 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tf_tree_bench::fixture;
 
 fn push_sampler(c: &mut Criterion) {
+    // Neither `compile_error!` nor `assert!(!cfg!(..))`: the first breaks the
+    // `--features shm` clippy row that compiles this file, and clippy rejects
+    // the second as an assertion on a constant. A plain `if` over a `const`
+    // refuses at run time, which is where the harm is, and leaves both lint
+    // passes alone.
+    const CONTAMINATED: bool = cfg!(feature = "shm");
+    if CONTAMINATED {
+        panic!(
+            "push_sampler measures EdgeWriter::push against Publisher::push, and \
+         with `shm` on those two differ by the post-fork check (+0.195 ns) as \
+         well as by the sampler under test — 18% of the effect, reported as \
+         part of it. Run `just push-sampler-cost`, which does not pass the \
+             feature."
+        );
+    }
     let tree = fixture::build_tree().expect("build fixture");
     let parent = tree.frame("base_link").expect("parent");
     let child = tree.frame("imu_link").expect("child");

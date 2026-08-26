@@ -14,19 +14,43 @@ words (*"they are recommendations and not decisions because this record is
 > **Implementation notes for step 1, kept because the number this record was
 > written around is the one it got wrong.**
 >
-> * **The sampler costs +1.1 ns per push (~+23%), and the clock read is 3% of
->   it.** Measured paired, both arms in one process, five sittings
+> * **The sampler costs +1.1 ns per push (~+23%), and at the interval measured
+>   the clock read is 3% of it.** Paired, both arms in one process, six sittings
 >   (`just push-sampler-cost`, `crates/tf_tree_bench/benches/push_sampler.rs`):
 >   4.8–5.0 ns without, 5.9–6.1 ns with. `SystemTime::now()` re-measured at
 >   38.4 ns, so at the 1024-push default it contributes 0.04 ns amortised. **The
 >   remaining 97% is the counter** — the load, compare and store through `&self`
 >   that question 1 called *"a non-atomic counter increment and a compare against
 >   a value in a register"* and priced at nothing.
-> * **So the interval is not the knob this record ratified it as.** Question 4
->   closes *"a reader who thinks 41 ns at p99.9 is too much should move the
->   interval, not the placement"*. Moving the interval divides the 3%. Anyone who
->   needs the push path back has to delete the counter, which is a different
->   change with a different argument.
+> * **The 3% is not a property of the sampler, it is a property of 1024**, and
+>   the first revision of this note said otherwise in five documents. The
+>   benchmarked edge declares no rate, so it runs at the *largest* `sample_every`
+>   the design produces. The cost is `counter + 38.4 / sample_every`, so at a
+>   declared 10 Hz the clock is 78% of a ~4.9 ns per-push overhead. **What is
+>   constant is the cost per second of publishing** — `38.4 + rate x 1.06` ns,
+>   under a microsecond at 1 kHz and ~49 ns at 10 Hz — which is the quantity
+>   question 1 was actually reasoning about. So question 4's *"move the interval,
+>   not the placement"* is right at low rates and nearly useless at 1 kHz, where
+>   the counter is the only thing left to delete. `docs/PHASE1.md` §11.2
+>   tabulates it and marks the one measured row.
+> * **The mechanism this record proposed was built, and it is slower.** *Shape
+>   proposed* says to sample off the counter the push path already maintains —
+>   `heartbeat & mask == 0`, a load of a line `SampleRing::push` has just
+>   written. Implemented and benchmarked against the `Cell`: **+1.4 ns against
+>   +1.1 ns**, three sittings. It also forces `sample_every` to a power of two,
+>   and — because `heartbeat` belongs to the *edge* and not to the claim — it
+>   cannot sample a new writer's first push, which is the property the two notes
+>   below turn on. Rejected on a measurement rather than on the layering argument
+>   question 1 gave.
+> * **A claim's first push samples, and a claim clears the receipt it inherits.**
+>   Neither was in the plan and both are load-bearing. Starting the countdown a
+>   full interval away leaves a 10 Hz undeclared edge reading `0` for 102 seconds
+>   and a 0.2 Hz one for 85 minutes — indistinguishable from the pre-`0036` state
+>   step 3 plans to skip on. And **nothing in the system resets
+>   `last_push_nanos`** — not `release`, not the reaper, not
+>   `tf_tree_core::edge::claim` — so a replacement writer would publish under the
+>   departed one's timestamp and `TFT004` would bill it as that publisher's clock
+>   skew. `Tree::claim` now stores `0` beside the interval derivation.
 > * **The first before/after said +47% and was wrong.** Two `cargo bench` runs
 >   minutes apart, on a host `bench_report`'s fitness probe rejects outright: the
 >   same unsampled push read 5.94 ns and then 4.82 ns, against an effect of
@@ -383,14 +407,23 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    counts, and on wrap reads the clock and does one `Relaxed` store into
    `claim.last_push_nanos`.
 
-   *Verified by:* (a) a declared-rate edge pushed `10 × sample_every` times
-   yields ten distinct receipt values and `sample_every`-spaced gaps; (b) **a
-   push that fails leaves the receipt untouched** — the `?` is what puts the
-   clock read after the ring write, so a `ClaimRevoked` push updating
+   *Verified by* five tests in `crates/tf_tree/tests/receipt_time.rs`, each with
+   a mutant that was **run** rather than predicted: (a) a declared-rate edge
+   samples on its first push and every `sample_every`-th after, and the values
+   land inside the wall-clock window the test itself brackets — which is what
+   pins the clock as `SystemTime` and not `Instant`; (b) **a push that fails
+   leaves the receipt untouched, and does not spend the interval** — the `?` is
+   what puts the clock read after the ring write, so a rejected push stamping
    `last_push_nanos` is the observable form of the read having drifted inside the
    seqlock window, which is question 4's hard constraint and the only part of it
    a test can see; (c) an edge with `nominal_rate_mhz == 0` still samples, at the
-   default. *Mutant:* move the clock read above the `?` — (b) fails.
+   default; (d) a second claim of the same edge starts a fresh interval; (e) a
+   fresh claim does not inherit the previous writer's receipt time.
+
+   Each assertion detects the store by **zeroing the field**, never by comparing
+   two readings: two samples ten pushes apart can land in the same nanosecond on
+   a fast enough build, and a test that counted distinct values would flake in
+   the direction of *"the sampler stopped working"*.
 
 2. **`PHASE2.md` §6.4's amendment**, from *"bumped on every push"* to the sampled
    rule, **with *never a reaping trigger* restated rather than assumed**. A
@@ -402,10 +435,23 @@ per-PR breakdown, so this is that breakdown and not a sketch.
 
 3. **`TFT004` itself.** Per edge: `last_push_nanos` and the newest stamp, offset
    = receipt − stamp; report the fleet spread; **flag nothing until a threshold
-   has evidence** (question 3). Three skips, each with its own reason string:
-   nothing sampled yet (`last_push_nanos == 0` — a publisher that has not reached
-   its first sample is not a skew finding), `TFT005`'s epoch condition via
-   `Clock`, and a frozen `.tft` source. *Verified by:* a fixture with one
+   has evidence** (question 3). **Four** skips, each with its own reason string
+   — the fourth found by review of step 1 and not by this record:
+
+   **A replayed source.** `tf_tree_ingest` publishes through `EdgeWriter::push`
+   like any other writer, so ingesting a 2024 recording in 2026 stamps *2026*
+   receipts against 2024 header stamps. The field is not wrong — it means "when
+   this arena received this sample", and it did — but it is exactly what this
+   check reads as skew, and `doctor --from-bag` hands the catalogue an ordinary
+   live heap `Tree`, so neither the frozen-source skip nor `TFT005`'s epoch
+   condition catches it. **`TFT004` must skip a tree whose samples were replayed
+   rather than published live**, and the ingest path must carry whatever marks
+   it as such.
+
+   And the three this record already named: nothing sampled yet
+   (`last_push_nanos == 0` — a publisher that has not reached its first sample is
+   not a skew finding, now narrowed to *one* push by step 1's first-push rule),
+   `TFT005`'s epoch condition via `Clock`, and a frozen `.tft` source. *Verified by:* a fixture with one
    deliberately skewed publisher, asserting the offset is attributed to *that*
    edge and that the reason string names which skip fired when it fires. *Mutant:*
    drop the `== 0` skip — a fresh arena reports every publisher as maximally

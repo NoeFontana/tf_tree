@@ -45,14 +45,23 @@ is a bug.
   receipt time to difference against each publisher's header stamp.
 
   **`tf_tree`'s `EdgeWriter::push` now stamps it, sampled rather than every
-  push.** A wall-clock read is **38 ns** against a **3 ns** push, measured, so
-  unconditional was never the trade; the interval is derived once per claim from
-  `EdgeRecord::nominal_rate_mhz` as `mhz / 1000`, which makes the *offset sample
-  rate* the constant instead of the push interval — a 1 kHz IMU and a 10 Hz
-  localiser each yield about one receipt per second of published data, and each
-  pay one clock read per second. An edge that declares no rate samples every
-  1024 pushes rather than never, because a tree built without a topology file is
-  the common case and not an exotic one.
+  push.** A wall-clock read is **38.4 ns** against a **~4.9 ns** push, measured,
+  so unconditional was never the trade; the interval is derived once per claim
+  from `EdgeRecord::nominal_rate_mhz` as `max(mhz / 1000, 1)`, which makes the
+  *offset sample rate* the constant instead of the push interval — a 1 kHz IMU
+  and a 10 Hz localiser each yield about one receipt per second of published
+  data, and each pay one clock read per second. An edge that declares no rate
+  samples every 1024 pushes rather than never, because a tree built without a
+  topology file is the common case and not an exotic one.
+
+  **A claim's first push samples, and a claim clears the receipt it inherits.**
+  Both matter more than they look. Starting the countdown a full interval away
+  would leave a 10 Hz undeclared edge reading `0` — indistinguishable from the
+  state this release is fixing — for its first 102 seconds, and a 0.2 Hz one for
+  85 minutes. And **nothing in the system resets `last_push_nanos`** — not
+  `release`, not the reaper, not `tf_tree_core::edge::claim` — so without the
+  clear, a replacement writer publishes under the departed writer's timestamp
+  and a future `TFT004` bills the gap as *this* publisher's clock skew.
 
   **No arena byte changes and `FORMAT_VERSION` is untouched** — the field is
   already part of `layout_hash`. **`tf_tree_core` does not change either**: the
@@ -67,13 +76,22 @@ is a bug.
   fails `bench_report`'s fitness probe and an unpaired before/after across two
   `cargo bench` runs said **+47%**, which was drift. `just bench-check` passes.
 
-  **Almost none of it is the clock read.** `SystemTime::now()` is 38.4 ns here,
-  which at the 1024-push default is 0.04 ns amortised — **3% of the 1.1 ns**.
-  The rest is the counter: a load, a compare and a store through `&self` on
-  every push, which `0036` described as *"a non-atomic counter increment and a
-  compare against a value in a register"* and priced at nothing. **So the
-  interval is not the knob it was ratified as** — raising it divides the 3%.
-  Anyone who needs this path back has to remove the counter, not lengthen it.
+  **Almost none of it is the clock read — at that interval.** `SystemTime::now()`
+  is 38.4 ns here, which at the 1024-push default is 0.04 ns amortised, **3% of
+  the 1.1 ns**. The rest is the counter, which `0036` described as *"a
+  non-atomic counter increment and a compare against a value in a register"* and
+  priced at nothing. But the 3% is a property of **1024**, not of the design:
+  the cost is `counter + 38.4 / sample_every`, so at a declared 10 Hz the clock
+  is 78% of a ~4.9 ns overhead. What stays bounded is the cost **per second of
+  publishing** — `38.4 + rate × 1.06` ns, under a microsecond at 1 kHz and ~49 ns
+  at 10 Hz. `docs/PHASE1.md` §11.2 tabulates both ends and marks the one measured
+  row.
+
+  **The alternative `0036` proposed was built, and it is slower.** Sampling off
+  the arena's `heartbeat` with a mask — the counter the push path already
+  maintains — reads **+1.4 ns against +1.1 ns**, forces `sample_every` to a
+  power of two, and cannot sample a new writer's first push, because `heartbeat`
+  belongs to the edge and not to the claim.
 
   What stays arithmetic is the *tail*: a 1 kHz publisher's p99.9 push is the
   sampled one, ~38 ns above its neighbours, and `publish_to_visible` — the row
