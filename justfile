@@ -1307,6 +1307,21 @@ artifact-versions:
 bench:
     cargo xtask bench-gate
 
+# **What the `0036` receipt-time sampler costs a publisher.** Reports; does not
+# gate — there is no pass/fail criterion in any document, only a number that has
+# to stay honest.
+#
+# It is a separate recipe from `just bench` because the question is a *delta* and
+# this host cannot produce one any other way. `bench_report`'s fitness probe
+# rejects it outright (SMT on, 8 logical CPUs over 4 physical cores, no readable
+# frequency governor), and two `cargo bench` runs minutes apart drift by more
+# than the effect: the same unsampled push read 5.94 ns and then 4.82 ns while
+# the effect under test was ~1.1 ns. A before/after across those two runs said
+# +47%; the paired arms this bench runs back to back in one process said +23%,
+# five times. **Run this, not a before/after, when the sampler changes.**
+push-sampler-cost:
+    cargo bench -p tf_tree_bench --bench push_sampler
+
 # **`docs/PHASE5.md` §9's benchmark artifact.** One command, one `report/`
 # directory: `results.json` (stable schema, CI-diffable), `index.html`, and the
 # provenance header §9.3 requires.

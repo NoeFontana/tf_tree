@@ -240,7 +240,24 @@ pub struct ClaimRecord {
     /// Advisory liveness hint, bumped by the writer on every push. **Never a
     /// reaping trigger on its own** (`docs/PHASE2.md` §6.4).
     pub heartbeat: AtomicU64,
-    /// Arena-local nanoseconds of the last push; diagnostics only.
+    /// **Host wall-clock** nanoseconds since the Unix epoch, at the moment a
+    /// push was received — the *receipt time* `docs/PHASE5.md` §6's `TFT004`
+    /// differences against the publisher's header stamp to find clock skew.
+    /// Diagnostics only, and **never a reaping trigger** (`docs/PHASE2.md`
+    /// §6.4).
+    ///
+    /// **Not the arena's stamp domain, and this doc said "arena-local" until
+    /// 2026-08-26.** The distinction is the whole point of the field: `TFT005`
+    /// exists because an arena's stamps need not share an epoch with the system
+    /// clock, and an implementer who reads both sides of `receipt - stamp` as
+    /// arena-local computes the epoch difference instead of the offset.
+    ///
+    /// **Sampled, not written on every push** (`docs/decisions/0036`): a wall
+    /// clock read costs about eight times a push, so `tf_tree`'s `EdgeWriter`
+    /// stamps this once per second of published data. `0` means *no sample yet*
+    /// — a fresh claim clears it, because a claim inherits the edge and not the
+    /// writer. This crate is `no_std` and writes it nowhere; it cannot read a
+    /// clock at all (D14).
     pub last_push_nanos: AtomicI64,
     _pad: [u8; 32],
 }
@@ -265,7 +282,8 @@ pub struct ClaimRecord {
     pub epoch: AtomicU64,
     /// Writer heartbeat.
     pub heartbeat: AtomicU64,
-    /// Arena-local nanoseconds of the last push.
+    /// Host wall-clock nanoseconds of the last sampled push; `0` means none
+    /// yet. See the production record's field for the whole contract.
     pub last_push_nanos: AtomicI64,
 }
 

@@ -136,6 +136,15 @@ harness = false
 name = "push"
 harness = false
 
+# **The paired A/B for the `0036` receipt-time sampler.** Not a `bench_report`
+# row: `push_sampler` answers "what did the sampler cost", which is a *delta*,
+# and this host fails the report's fitness probe, so only a delta measured
+# against its own control in the same process survives here. See the bench's
+# module doc.
+[[bench]]
+name = "push_sampler"
+harness = false
+
 [[bench]]
 name = "read_scaling"
 harness = false
