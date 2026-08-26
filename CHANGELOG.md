@@ -33,6 +33,16 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
+  `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
+  clock** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
+  A `pub` field that has shipped since `0.0.1` *unwritten* — nothing could have
+  read it for its value, since it was always zero — but a field path or a
+  `ClaimRecord { .. }` literal naming it will not compile. The Added entry below
+  is the whole argument.
+
 ### Added
 
 - **A per-publisher clock offset, from a field that has been in every shipped
@@ -84,14 +94,25 @@ is a bug.
   clear, a replacement writer publishes under the departed writer's number and
   a future `TFT004` bills a dead publisher's skew to this one.
 
-  **No arena byte changes and `FORMAT_VERSION` is untouched** — the field is
-  already part of `layout_hash`. **`tf_tree_core` does not change either**: the
-  clock is read in the facade, *after* `Publisher::push` returns, which keeps it
-  outside the seqlock window. Inside it, a writer's diagnostic would become every
+  **No arena byte moves and `FORMAT_VERSION` is untouched** — the field is
+  already part of `layout_hash`, and `layout_hash` is a stride table, so neither
+  the rename nor the change of meaning perturbs it. **That is worth naming as a
+  cost and not only as a convenience:** eight bytes changed interpretation with
+  nothing able to detect the difference, so two processes built either side of
+  the amendment would read each other's writes in their own units. It is
+  harmless *here* — both commits are inside this same `[Unreleased]` section, so
+  no published artifact ever wrote a receipt time — and it is the reason a
+  future change of meaning to a live field is not automatically free.
+
+  **The engine crate changes only in the field's name and doc.** The clock is
+  read in the facade, *after* `Publisher::push` returns, which keeps it outside
+  the seqlock window; inside it, a writer's diagnostic would become every
   reader's `SlotContended` retries.
 
   **What it costs — measured, and not where the record predicted.** `push` goes
-  from **4.8–5.0 ns to 5.9–6.1 ns**: **+1.1 ns, about +23%**, on every push.
+  from **4.85–5.0 ns to 5.87–6.1 ns**: **+1.0–1.1 ns, about +21%**, on every
+  push, re-derived on the amended sampler and not carried over from the first
+  one.
   That is a *paired* delta, both arms in one process, five sittings
   (`just push-sampler-cost`, `benches/push_sampler.rs`) — because this host
   fails `bench_report`'s fitness probe and an unpaired before/after across two

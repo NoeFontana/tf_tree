@@ -944,7 +944,7 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 | `TFT001` | Multi-publisher conflict on an edge | error | Phase 4 §5.4 counters, or two claim attempts |
 | `TFT002` | Static transform republished with a different value | error | ingest / bridge comparison |
 | `TFT003` | Edge kind changed (static ↔ dynamic) | error | edge record vs incoming |
-| `TFT004` | Clock skew between publishers | warn | per-publisher stamp vs arena receipt time |
+| `TFT004` | Clock skew between publishers | warn | per-publisher `ClaimRecord::clock_offset_nanos` (see §6's amendment) |
 | `TFT005` | Stamps in the future | warn | newest stamp vs now, per edge |
 | `TFT006` | Zero or absurd stamps | error | value check during ingest and push |
 | `TFT007` | Publish rate deviates from nominal | warn | derived from stamps vs `nominal_rate_mhz` |
@@ -964,6 +964,20 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 Output modes: human (default, coloured, grouped by severity), `--json` (stable schema, for CI), and `--exit-code` (non-zero if any error-severity check fires) so `doctor` can gate a robot's startup or a CI job.
 
 **`TFT004` deserves special care** — it is the check most likely to find something nobody knew. Compute per-publisher offset between header stamp and arena receipt time, track a rolling median, and report publishers whose median differs from the fleet median by more than a threshold. On a multi-machine robot with imperfect PTP this finds real problems that present as intermittent extrapolation errors.
+
+> **Amendment (2026-08-26, [`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md)): do not compute the offset here. It is already computed.**
+>
+> The paragraph above says to difference a *receipt time* against the header stamp. **An implementer who does that reproduces a ±1 s noise floor**, and the amendment exists because one nearly did. The write is sampled — one per second of published data — so a stored receipt belongs to the last *sampled* push while the ring's newest stamp belongs to whatever has been published since. Measured, on a 10 Hz publisher whose clock is **exact**: `receipt − newest_stamp` reads `+3 µs` on the sampling push and `−900 ms` nine pushes later, decided by nothing but when `doctor` arrives. The interval is ~1 s for every publisher by construction, so it does not cancel in the fleet comparison either.
+>
+> **The writer does the subtraction**, because it is the only party holding both sides at one instant. `ClaimRecord::clock_offset_nanos` **is** the per-publisher offset. Read it; do not difference it against anything.
+>
+> Three further facts the record establishes and this section did not anticipate:
+>
+> - **`0` means *no sample yet***, and the sampler never writes a `0` — an exact-zero offset is stored as `1`, because on a host whose clock is coarser than a push a self-stamping publisher produces exactly zero every time and would read as never-sampled forever.
+> - **Only `SystemDomain` (tag 0) edges record anything.** `wall clock − stamp` is an offset only where both share an epoch; a `SimDomain` edge would record ~1.79 × 10¹⁸. `TFT005`'s skip is per-*arena* and cannot express one tree holding both.
+> - **Four skips, not the three the plan named**: `== 0`, `TFT005`'s epoch condition, a frozen `.tft`, and a **replayed** source — bag ingest publishes through the same `EdgeWriter`, so a 2024 recording read in 2026 records a two-year offset that is arithmetically right and diagnostically meaningless.
+>
+> The rolling median stays as described and stays unbuilt: `0036` question 3 ships the fleet comparison at one instant, because a rolling median needs the polling loop `tf_tree top` has and `doctor` does not.
 
 > **Amendment — `TFT007` is no longer structurally blind. The declared rate
 > comes from the topology file, and no arena field was added to get it there.**

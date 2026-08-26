@@ -43,9 +43,16 @@ mod common;
 
 use common::pose;
 
-/// A deliberate publisher clock error: five seconds fast. Large enough that no
-/// scheduling delay on any host could be mistaken for it, small enough to be an
-/// error a real robot has.
+/// A deliberate publisher clock error: five seconds **behind** the host, so
+/// every stamp is `now - SKEW_NS` and every recorded offset is `+SKEW_NS`.
+///
+/// **The sign is the point, and these tests are the only executable statement of
+/// it.** `clock_offset_nanos` is `wall clock - stamp`, so a *positive* offset
+/// means the publisher's clock reads *earlier* than this host's — it is behind,
+/// or its samples are old. `TFT004` will read this convention off these tests.
+///
+/// Large enough that no scheduling delay on any host could be mistaken for it,
+/// small enough to be an error a real robot has.
 const SKEW_NS: i64 = 5_000_000_000;
 
 /// How far a recorded offset may sit from the skew injected into the stamps.
@@ -127,8 +134,8 @@ fn a_declared_rate_samples_once_per_second_of_published_data() {
 
     const SAMPLE_EVERY: i64 = 10; // 10 Hz = 10_000 mHz, divided by 1000.
 
-    // A publisher five seconds fast. Stamps advance 1 µs apart so they stay
-    // monotone whatever the host does between iterations.
+    // A publisher five seconds behind the host. Stamps advance 1 µs apart so
+    // they stay monotone whatever the host does between iterations.
     let base = now_nanos() - SKEW_NS;
     let mut sampled: Vec<(i64, i64)> = Vec::new();
     for i in 1..=10 * SAMPLE_EVERY {
@@ -182,7 +189,7 @@ fn the_recorded_offset_does_not_move_with_the_newest_stamp() {
     let w = tree.claim(odom, map).unwrap();
     let edge = w.edge();
 
-    // 10 Hz: stamps 100 ms apart, and the publisher is five seconds fast. The
+    // 10 Hz: stamps 100 ms apart, and the publisher is five seconds behind. The
     // first push samples; the next nine only advance the newest stamp.
     let base = now_nanos() - SKEW_NS;
     w.push(base, &pose(0)).unwrap();
@@ -389,4 +396,52 @@ fn a_fresh_claim_does_not_inherit_the_previous_writers_offset() {
         "a fresh claim inherited the previous writer's offset: TFT004 would \
          bill a departed publisher's skew to this one"
     );
+}
+
+/// **A non-wall-clock edge records nothing at all**, end to end.
+///
+/// The unit test beside `sample_interval` pins the mapping; this pins that the
+/// mapping is *wired* — that `Tree::claim` reads the edge record's domain and
+/// not only its rate. `wall clock - stamp` is an offset only when both sides
+/// share an epoch, and a [`SimDomain`]-tagged edge stamping nanoseconds since
+/// the start of a simulation would record about 1.79e18 — a fifty-six-year skew
+/// that is not a skew.
+///
+/// `TFT005` skips a whole *arena* for this reason and cannot express it per
+/// edge, which is what one tree holding a `SystemDomain` IMU beside a
+/// `SimDomain` replay needs.
+///
+/// Mutant, run: pass `<SystemDomain as Domain>::TAG` instead of
+/// `edge_rec.domain` at the `Tree::claim` call site — *"a SimDomain edge
+/// recorded 17878…"*.
+#[test]
+fn an_edge_outside_the_wall_clock_domain_records_no_offset() {
+    const SIM_TAG: u8 = 2; // `tf_tree_core::plan::SimDomain::TAG`.
+
+    let tree = TreeBuilder::new()
+        .dynamic_edge(
+            "map",
+            "odom",
+            EdgeCfg::new(Capacity::slots(64))
+                .nominal_rate_hz(10.0)
+                .domain(SIM_TAG),
+        )
+        .build()
+        .unwrap();
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let w = tree.claim(odom, map).unwrap();
+    let edge = w.edge();
+
+    // Sim time: nanoseconds since the simulation started, which is what makes
+    // the subtraction meaningless rather than merely skewed.
+    for i in 1..=40i64 {
+        w.push(i * 100_000_000, &pose(i as u64)).unwrap();
+        let recorded = peek_offset(&tree, edge);
+        assert_eq!(
+            recorded, 0,
+            "a SimDomain edge recorded {recorded} on push {i}: the wall clock \
+             and sim time do not share an epoch, so this is not an offset"
+        );
+    }
 }

@@ -27,19 +27,29 @@
 //!   into the arena, which `docs/PHASE5.md` §1.2 does not reserve space for.
 //! * **`TFT004`** (clock skew) needs a per-publisher *clock offset* — host wall
 //!   clock minus header stamp, both taken at the same push. **One is now
-//!   recorded**: `tf_tree`'s `EdgeWriter` samples `ClaimRecord::clock_offset_nanos`
-//!   once per second of published data, and `docs/decisions/0036` step 1 landed
-//!   it. **This check is not yet wired to it** (that record's step 3), so the
+//!   recorded**: `tf_tree`'s `EdgeWriter` samples
+//!   `ClaimRecord::clock_offset_nanos` once per second of published data **on an
+//!   edge that declares a rate**, and once per **1024** pushes on one that does
+//!   not — 102 seconds at 10 Hz, and a tree built without a topology file is the
+//!   common case, so this check must not assume the per-second figure.
+//!   `docs/decisions/0036` step 1 landed it. **This check is not yet wired to it** (that record's step 3), so the
 //!   skip is about this file and no longer about the arena — a smaller claim
 //!   than the one that stood here, which said nothing recorded a receipt time
 //!   and left a reader to conclude the field did not exist. It did, zeroed, in
 //!   every shipped arena.
 //!
-//!   When it is wired, it will need **four** skips and not three: `== 0`
-//!   (nothing sampled yet), `TFT005`'s epoch condition, a frozen `.tft`, and a
-//!   **replayed** source — bag ingest publishes through the same `EdgeWriter`,
-//!   so a 2024 recording read in 2026 records a two-year offset that is
-//!   arithmetically right and diagnostically meaningless.
+//!   Three things it must not re-derive. The stored value **is** the offset —
+//!   differencing it against a stamp again is the ±1 s mistake `0036`'s
+//!   amendment exists to stop. `0` means *nothing sampled yet* and is never
+//!   written by the sampler, so it is a clean skip. And only `SystemDomain`
+//!   (tag 0) edges record at all, so an arena of `SimDomain` edges reports
+//!   nothing rather than 56-year skews.
+//!
+//!   When it is wired, it will need **four** skips and not three: `== 0`,
+//!   `TFT005`'s epoch condition, a frozen `.tft`, and a **replayed** source —
+//!   bag ingest publishes through the same `EdgeWriter`, so a 2024 recording
+//!   read in 2026 records a two-year offset that is arithmetically right and
+//!   diagnostically meaningless.
 //!
 //! And the conditional ones, which depend on what the arena, the engine build
 //! and the host can supply:
@@ -609,8 +619,9 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
             ),
             Tft::Tft004 => CheckOutcome::skipped(
                 check,
-                "a per-publisher clock offset is now recorded (ClaimRecord::clock_offset_nanos) \
-                 but this check does not yet read it",
+                "a per-publisher clock offset is now recorded (ClaimRecord::clock_offset_nanos, \
+                 sampled once per second of published data on an edge that declares a rate and \
+                 once per 1024 pushes on one that does not) but this check does not yet read it",
             ),
             Tft::Tft005 => tft005(inp),
             Tft::Tft006 => tft006(inp),

@@ -422,6 +422,30 @@ writer does the subtraction. `EdgeWriter::push` stores `now_nanos() - stamp`.
 This needs no new field, no format change and no extra clock read; it is the same
 store of the same `i64` in the same place.
 
+**Three consequences the amendment did not anticipate, all found by review of
+the amendment itself.** Each is a way `a - b` fails where storing `a` alone did
+not:
+
+- **A clock this process cannot read is not an offset of zero.** `now_nanos`
+  returned `0` when the host clock predates the epoch — benign while the value
+  was written as a timestamp, where `0` reads as *unknown*. Subtracted, it is a
+  confident −1.79 × 10¹⁸: a fifty-six-year skew reported against a healthy
+  publisher, by a machine with a dead RTC. It now returns `Option` and the
+  sampler declines to write.
+- **`wall clock - stamp` is an offset only where both share an epoch, and that
+  is a per-*edge* fact.** A `SimDomain` edge stamping nanoseconds since a
+  simulation began would record ~1.79 × 10¹⁸. `TFT005` skips a whole arena for
+  this reason and cannot express one tree holding a `SystemDomain` IMU beside a
+  `SimDomain` replay. Sampling is now gated on `<SystemDomain as Domain>::TAG`,
+  read at claim time beside the rate — conservatively, since `Domain` is an open
+  trait and a user's PTP domain at tag 4 cannot be assumed wall-clock.
+- **`0` is a value the subtraction can genuinely produce.** A publisher that
+  stamps with its own clock yields a few hundred nanoseconds where the clock has
+  nanosecond resolution and **exactly zero** where it does not — Windows'
+  `SystemTime::now()` is coarser than a push, so both reads land in one tick.
+  That publisher would read as *never sampled* forever, on a supported platform.
+  An exact-zero offset is stored as `1`.
+
 **What it costs elsewhere, stated rather than discovered later:**
 
 - **`0` stops being unambiguous.** It still means *no sample yet*, and a genuine
@@ -477,18 +501,27 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    difference, and the section above is why**; as written, this step stored the
    clock reading itself.
 
-   *Verified by* five tests in `crates/tf_tree/tests/clock_offset.rs`, each with
-   a mutant that was **run** rather than predicted: (a) a declared-rate edge
-   samples on its first push and every `sample_every`-th after, and the values
-   land inside the wall-clock window the test itself brackets — which is what
-   pins the clock as `SystemTime` and not `Instant`; (b) **a push that fails
-   leaves the receipt untouched, and does not spend the interval** — the `?` is
-   what puts the clock read after the ring write, so a rejected push stamping
-   `clock_offset_nanos` is the observable form of the read having drifted inside the
-   seqlock window, which is question 4's hard constraint and the only part of it
-   a test can see; (c) an edge with `nominal_rate_mhz == 0` still samples, at the
-   default; (d) a second claim of the same edge starts a fresh interval; (e) a
-   fresh claim does not inherit the previous writer's receipt time.
+   *Verified by* seven tests in `crates/tf_tree/tests/clock_offset.rs` and two
+   beside the code in `tree.rs`, each with a mutant that was **run** rather than
+   predicted:
+
+   (a) a declared-rate edge samples on its first push and every
+   `sample_every`-th after, and every recorded value comes back at a deliberate
+   five-second skew injected into the stamps — which pins the quantity, the sign
+   and the clock at once; (b) **a push that fails records nothing and does not
+   spend the interval** — the `?` is what puts the clock read after the ring
+   write, so a rejected push writing `clock_offset_nanos` is the observable form
+   of the read having drifted inside the seqlock window, which is question 4's
+   hard constraint and the only part of it a test can see; (c) an edge with
+   `nominal_rate_mhz == 0` still samples, at the default; (d) a second claim of
+   the same edge starts a fresh interval; (e) a fresh claim does not inherit the
+   previous writer's offset; (f) **the recorded offset does not move with the
+   newest stamp** (the section above); (g) an edge outside the wall-clock domain
+   records nothing at all.
+
+   And two unit tests, because their inputs are values a clock will not produce
+   on demand: `recorded_offset` never returns the `0` sentinel and never wraps,
+   and `sample_interval` returns `0` for every domain tag but `SystemDomain`'s.
 
    Each assertion detects the store by **zeroing the field**, never by comparing
    two readings: two samples ten pushes apart can land in the same nanosecond on
