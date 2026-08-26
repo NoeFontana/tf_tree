@@ -33,7 +33,64 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Tree::reparent` no longer steals A2's topology lock from a live mutator
+  that `/proc` misreports** (#213, [`0029`](docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md)).
+  It was the last place in the system where one process could destroy another's
+  exclusive state on an *inference*: the steal was authorised by the
+  `(pid, start_time, boot_id)` triple, even on a tree holding an `F_OFD_GETLK`
+  probe, and `/proc` has two measured ways to call a running process dead — a
+  PID-namespace collision (`Known(st) != stored`, which is not `ENOENT`-shaped,
+  so the bias against proving death does not fire) and a same-user but
+  **non-dumpable** target under `hidepid`. A false "dead" here puts two live
+  processes in the topology critical section, which `docs/PHASE2.md` §6.2 calls
+  the corrupting direction.
+
+  **`reparent` now takes an exclusive OFD lock on the lock file's byte 1 before
+  it touches the arena word**, and releases them in the other order — the move
+  §6.1 already made for claims and §5.1 for participant records. A live holder is
+  refused by the kernel before any inference runs; a dead one has its byte
+  released by the kernel with no cooperation and no timeout, so nothing wedges.
+  Byte 1 was reserved by §3.3 and is unused, so **no arena byte changes** and
+  `FORMAT_VERSION` is untouched.
+
+  A tree with **no lock file** — a heap tree, a directly-called
+  `TreeBuilder::build_shared`, an `attach_shared` over an inherited fd — is
+  unchanged in both directions: there is no byte for anyone to take, so the
+  `/proc` predicate is still the whole answer there. Nothing acquires a new way
+  to be stolen from.
+
+### Added
+
+- **`tf_tree_ipc::LockFile::try_take_topology` / `release_topology`, and
+  `LockRole::Topology`** — byte 1 of the lock file, A2's topology mutation lock.
+  The §3.3 byte table gains a row and `bytes 1–15 reserved` becomes `bytes 2–15`.
+
 ### Changed — breaking
+
+- **`tf_tree::ReparentError::LockContended`'s `owner_slot` is `Option<u32>`, not
+  `u32`** (#213). Breaking for anything that destructures it. It is `None` when
+  the observation could not name the holder — it took the lock file's topology
+  byte and had not yet published its slot into the arena word, or it released the
+  word between the load and the `compare_exchange`. Both are nanoseconds wide and
+  both mean the same thing to a caller: *a live peer is mutating topology,
+  retry.*
+
+  **The old `u32` carried `tf_tree_core`'s `u32::MAX` sentinel straight through
+  to the message**, which then read *"the topology lock is held by live
+  participant slot 4294967295"* — a sentence an operator has to already know a
+  magic number to disbelieve. `docs/API.md` R5 makes the field the contract and
+  the message a diagnostic, which requires the field to be the thing that is
+  true. `tf_tree_core::topology::TopoLockError` keeps its sentinel; the
+  translation happens once, in `tf_tree`'s `From<TopoLockError>`.
+
+- **`tf_tree::ReparentError` gains `TopologyLease { raw_os_error: i32 }`**
+  (#213). The enum is `#[non_exhaustive]`, so a downstream `match` with a
+  catch-all is unaffected. Deliberately **not** folded into `LockContended`: both
+  refuse, but only one means a peer is doing something, and only one is worth
+  retrying. A refusal that names a live peer when the cause is `EBADF` sends an
+  operator to look for a process that is not there.
 
 - **`tf_tree_core::MAX_DEPTH` is 32, not 16, and it now means what its
   documentation always said** (#251, `0034`). It bounds the *compiled* plan —
@@ -360,7 +417,10 @@ is a bug.
 
   **Not fixed:** the takeover arm (`Open::already_attached`) still reaches
   `register_any` and can still produce the divergence. Its correct slot is
-  `0029` question 3, which is `draft`.
+  `0028` question 3, RESOLVED 2026-08-20 — the heir keeps its existing slot,
+  byte and arena. This entry read "`0029` question 3, which is `draft`" and was
+  wrong twice: `0029`'s question 3 was about the socket-hangup callback, and the
+  question meant here was already answered when this was written.
 
 ### Changed — breaking
 

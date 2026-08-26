@@ -94,6 +94,9 @@ pub enum NameProblem {
 pub enum LockRole {
     /// Byte 0 — ownership. Its holder serves the socket.
     Ownership,
+    /// Byte 1 — A2's topology mutation lock. Held for one `Tree::reparent`, and
+    /// never long enough for a peer to observe except under contention.
+    Topology,
     /// Byte `16 + i` — participant liveness for slot `i`.
     Participant(u32),
     /// A per-edge claim lease (`docs/PHASE2.md` §6.1). The edge id, not a
@@ -476,6 +479,7 @@ impl fmt::Display for IpcError {
             IpcError::LockFailed { role, errno } => {
                 match role {
                     LockRole::Ownership => f.write_str("ownership byte")?,
+                    LockRole::Topology => f.write_str("topology byte")?,
                     LockRole::Participant(slot) => write!(f, "participant byte for slot {slot}")?,
                     LockRole::Claim(edge) => write!(f, "claim byte for edge {edge}")?,
                 }

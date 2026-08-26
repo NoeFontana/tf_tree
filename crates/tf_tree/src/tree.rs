@@ -477,7 +477,7 @@ impl TreeBuilder {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            claim_lock: None,
+            lock_file: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ofd_probe: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -531,7 +531,7 @@ impl TreeBuilder {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            claim_lock: None,
+            lock_file: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ofd_probe: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -1164,6 +1164,39 @@ impl Drop for ClaimLease {
     }
 }
 
+/// Holds A2's topology byte for as long as this value lives
+/// (`docs/decisions/0029`).
+///
+/// **What it excludes is the critical section, not a participant.** The byte is
+/// one byte for the whole arena, so it answers *"is anyone mutating topology"* —
+/// and that is the only question [`Tree::reparent`] has to settle before it may
+/// steal the arena's topology word. Asking instead whether the word's *holder*
+/// is alive is what put a `/proc` inference on this path (#213) and what drags
+/// in the participant table, the slot indirection and `0031`'s byte-less class;
+/// none of them are reachable from here.
+///
+/// **No `fork_gen`, unlike [`ClaimLease`], and the absence is deliberate.** That
+/// guard exists because an `EdgeWriter` outlives the call that made it and can be
+/// dropped in a `fork` child, where the unlock would release the *parent's*
+/// byte. This lease is created and dropped inside one call on one thread: a
+/// child forked from another thread does not run this thread, so this `Drop`
+/// cannot execute there, and [`Tree::reparent`] refuses with
+/// [`ReparentError::ChildDetached`] before reaching this type anyway.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+struct TopologyLease<'a> {
+    lock: &'a tf_tree_ipc::LockFile,
+}
+
+#[cfg(all(feature = "shm", target_os = "linux"))]
+impl Drop for TopologyLease<'_> {
+    fn drop(&mut self) {
+        // Best effort, for `ClaimLease`'s reason: a failed unlock leaves a
+        // process in no state to react, and the kernel releases the byte at exit
+        // regardless — which is the property the lease exists for.
+        let _ = self.lock.release_topology();
+    }
+}
+
 /// This process's answer to "is the participant in slot `n` still running?".
 ///
 /// Boxed and owned by the [`Tree`] because it must outlive every [`ArenaView`]
@@ -1251,18 +1284,37 @@ pub struct Tree {
     /// an inherited fd — none of those went through a rendezvous.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     attachment: Option<crate::open::Attachment>,
-    /// The lock file this tree takes claim leases against (§6.1).
+    /// This tree's open file description on the rendezvous lock file.
     ///
-    /// `None` for a heap tree and for `attach_shared` over an inherited fd —
-    /// neither went through a rendezvous, so there is no lock file, and the
-    /// arena CAS alone is the claim exactly as it was before leases existed.
+    /// **Two roles, one description, and the sharing is the point.** It carries
+    /// this tree's claim leases (§6.1) *and* A2's topology byte
+    /// (`docs/decisions/0029`), and both want the same lifetime: the byte a
+    /// description holds is released by the kernel when that description closes,
+    /// which is exactly at process death by any means. A second description
+    /// would cost an `open(2)` and decide nothing.
+    ///
+    /// It is **not** [`Self::ofd_probe`]'s description, and that one is separate
+    /// for the opposite reason — it must be able to see this process's own bytes,
+    /// which a description cannot do for its own locks. This field is for taking
+    /// locks; that one is for asking about them.
+    ///
+    /// **This was named `claim_lock` until `0029`**, which is the name a reader
+    /// would still expect. It was renamed rather than kept because a field
+    /// spelled for one of its two roles is how a future change puts the topology
+    /// byte on a second description without noticing that it must not be.
+    ///
+    /// `None` for a heap tree, for a directly-called `TreeBuilder::build_shared`
+    /// and for `attach_shared` over an inherited fd — none went through a
+    /// rendezvous, so there is no lock file. There the arena CAS alone is the
+    /// claim, exactly as it was before leases existed, and the arena word alone
+    /// is A2, exactly as it was before this byte existed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    claim_lock: Option<std::sync::Arc<tf_tree_ipc::LockFile>>,
+    lock_file: Option<std::sync::Arc<tf_tree_ipc::LockFile>>,
     /// The kernel-authoritative liveness probe, kept as a *probe* and not only
     /// as the closure it is folded into.
     ///
     /// `None` for every tree that did not come from [`crate::open`], which is
-    /// the same set as `claim_lock`'s and for the same reason: no rendezvous,
+    /// the same set as `lock_file`'s and for the same reason: no rendezvous,
     /// no lock file, no byte to ask about.
     ///
     /// **Why the same object is held twice.** [`Self::use_ofd_liveness`] boxes
@@ -1736,25 +1788,39 @@ impl Tree {
     /// runtime topology mutation; it bumps the topology generation, invalidating
     /// compiled [`crate::Plan`]s so they recompile against the new shape.
     ///
-    /// # Serialization (`docs/PHASE2.md` §1, A2)
+    /// # Serialization (`docs/PHASE2.md` §1, A2; `docs/decisions/0029`)
     ///
-    /// Two locks, doing two different jobs:
+    /// Three locks, doing three different jobs, taken in this order:
     ///
     /// * `self.decl`, a plain `Mutex`, keeps *this* process's threads out of
     ///   each other's way. It serializes nothing across a process boundary and
     ///   never did; it is kept because it is free and stops two threads of one
-    ///   process burning the arena lock's spin budget against each other.
-    /// * The **in-arena** [`TopoLockView`] is the real one. Its word lives in
-    ///   the header, so every participant that mapped the segment contends on
-    ///   the same bytes, and it is stealable from a participant that died
-    ///   holding it — which is why this is no longer refused on a shared arena.
+    ///   process burning the arena lock's spin budget against each other. Two
+    ///   threads of one `Tree` share one lock-file description, so the byte
+    ///   below does not arbitrate between them and this does.
+    /// * **The lock file's topology byte**, where the tree has a lock file. This
+    ///   is what makes A2's exclusion a kernel fact: a holder that dies has it
+    ///   released by the kernel with no cooperation and no timeout, and a holder
+    ///   that lives keeps it however `/proc` describes the process. It is the
+    ///   same move §6.1 already made for claims, one lock over.
+    /// * The **in-arena** [`TopoLockView`] word. It is the only exclusion a tree
+    ///   with no lock file has, so it is not demoted to a diagnostic; and it is
+    ///   what a byte-holding mutator and a byte-less one still contend on.
+    ///
+    /// Holding the byte is what licenses the word's steal: with it held, a
+    /// non-zero word means its holder is either **dead** or **a writer with no
+    /// lock file**, and the `/proc` predicate is left deciding only the second
+    /// of those. That is the whole of what #213 changed — a live holder that
+    /// `/proc` misreports (another PID namespace, a non-dumpable process under
+    /// `hidepid`) is now excluded by the kernel before any inference runs.
     ///
     /// # Errors
     ///
     /// [`ReparentError::NoEdge`] if `child` has no incoming edge to reuse,
     /// [`ReparentError::Topology`] if the move would create a cycle or references
-    /// an out-of-range frame, or [`ReparentError::LockContended`] if a live peer
-    /// holds the topology lock (retry).
+    /// an out-of-range frame, [`ReparentError::LockContended`] if a live peer
+    /// holds the topology lock (retry), or [`ReparentError::TopologyLease`] if
+    /// the lock file could not be asked at all.
     pub fn reparent(&self, child: FrameId, new_parent: FrameId) -> Result<(), ReparentError> {
         if self.detached() {
             return Err(ReparentError::ChildDetached);
@@ -1766,6 +1832,19 @@ impl Tree {
         let view = self.view();
         let header = view.header();
         let lock = TopoLockView::new(&header.topo_lock.owner, &header.topo_lock.acquired_at_nanos);
+
+        // **The byte first, and the guards drop the other way round.** `_lease`
+        // is declared before `_topo`, so Rust's reverse-declaration drop order
+        // releases the word and only then the byte. Reversing that would leave a
+        // window in which the byte is free and the word still names this
+        // process — which is exactly the signature a peer reads as "the holder
+        // is dead or has no lock file", so it would spin out its budget and then
+        // consult `/proc` about a process that is merely finishing. The order is
+        // enforced by scope rather than by this comment; the comment says why
+        // the scope is shaped that way.
+        #[cfg(all(feature = "shm", target_os = "linux"))]
+        let _lease = self.take_topology_lease(&lock)?;
+
         let participants = view.participants();
         let arena_boot = header.boot_id;
         let is_alive = move |slot: u32| participant_is_alive(&participants, slot, &arena_boot);
@@ -1782,6 +1861,65 @@ impl Tree {
         }
         view.topology().set_parent(child, new_parent.get(), edge)?;
         Ok(())
+    }
+
+    /// Take A2's topology byte, where there is a lock file to take it from.
+    ///
+    /// `Ok(None)` for a tree that went through no rendezvous — a heap tree, a
+    /// directly-called `TreeBuilder::build_shared`, an `attach_shared` over an
+    /// inherited fd. Those have no lock file, so the arena word alone is the
+    /// exclusion exactly as it was before this byte existed, and the `/proc`
+    /// predicate is the whole of what decides a steal. That residual is
+    /// `docs/decisions/0029`'s T3 and it is stated there rather than narrowed
+    /// here: narrowing it means refusing those callers, which is a breaking
+    /// change on a public path and a separate decision.
+    ///
+    /// # Why contention is refused rather than resolved
+    ///
+    /// A contended byte means another description is *between* taking it and
+    /// releasing it — which, by the acquire order in [`Self::reparent`], means
+    /// it either holds the topology word or is about to CAS it. Proceeding to
+    /// the word would then be a race with a mutator that has done nothing wrong,
+    /// so there is no verdict to reach and nothing to ask `/proc` about.
+    ///
+    /// The slot named in the error is read from the word, which is the only
+    /// thing that can name one — `F_OFD_GETLK` reports `l_pid = -1` for an OFD
+    /// lock and cannot name a holder at all (`docs/PHASE2.md` §3.3). A holder
+    /// that has the byte and has not yet reached its CAS leaves the word zero,
+    /// and [`TopoLockView::holder`] answers `None` for that, which is what the
+    /// error carries. Nothing here manufactures `u32::MAX`: this path never had
+    /// a reason to, and `slot_of(0)`'s plausible-looking `0` — naming whichever
+    /// process happens to hold slot 0 — is the answer both this and `doctor`
+    /// were fixed to stop giving.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    fn take_topology_lease(
+        &self,
+        topo: &TopoLockView<'_>,
+    ) -> Result<Option<TopologyLease<'_>>, ReparentError> {
+        let Some(file) = self.lock_file.as_ref() else {
+            return Ok(None);
+        };
+        match file.try_take_topology() {
+            Ok(tf_tree_ipc::LockAttempt::Acquired) => Ok(Some(TopologyLease { lock: file })),
+            Ok(tf_tree_ipc::LockAttempt::Contended) => Err(ReparentError::LockContended {
+                owner_slot: topo.holder(),
+            }),
+            // **Not folded into `LockContended`.** Refusing is the safe
+            // direction either way, but a refusal that names a live peer when
+            // the real cause is `EBADF` sends an operator to look for a process
+            // that is not there — the shape of wrong diagnosis `TFT014` and
+            // `TopoLockView::finish` were both fixed for.
+            Err(tf_tree_ipc::IpcError::LockFailed { errno, .. }) => {
+                Err(ReparentError::TopologyLease {
+                    raw_os_error: errno.raw_os_error(),
+                })
+            }
+            // `try_take_topology` produces no other variant. Mapping it to a
+            // zero errno rather than unreachable!(): this is a refusal path, and
+            // a panic here would turn a diagnosable failure into a crash inside
+            // a mutation protocol.
+            Err(_) => Err(ReparentError::TopologyLease { raw_os_error: 0 }),
+        }
     }
 
     /// Claim exclusive write access to the dynamic edge whose child is `child`
@@ -1968,7 +2106,7 @@ impl Tree {
         epoch: u64,
         owner: u64,
     ) -> Result<Option<ClaimLease>, ClaimApiError> {
-        let Some(lock) = self.claim_lock.as_ref() else {
+        let Some(lock) = self.lock_file.as_ref() else {
             // No rendezvous (a heap tree, or an `attach_shared` over an
             // inherited fd). The CAS alone is the claim, exactly as before —
             // the lease adds observability, not correctness.
@@ -2373,7 +2511,7 @@ impl Tree {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             attachment: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            claim_lock: None,
+            lock_file: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ofd_probe: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -2431,7 +2569,7 @@ impl Tree {
             liveness: Box::new(|_, _| false),
             decl: Mutex::new(()),
             attachment: None,
-            claim_lock: None,
+            lock_file: None,
             ofd_probe: None,
             fork_gen,
         }
@@ -2552,7 +2690,7 @@ impl Tree {
     /// Take claim leases against `lock` from now on (§6.1).
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub(crate) fn use_claim_leases(&mut self, lock: std::sync::Arc<tf_tree_ipc::LockFile>) {
-        self.claim_lock = Some(lock);
+        self.lock_file = Some(lock);
     }
 
     /// Reclaim edges whose holder is provably dead (`docs/PHASE2.md` §6.3).
@@ -2605,7 +2743,7 @@ impl Tree {
 
     #[cfg(all(feature = "shm", target_os = "linux"))]
     fn reap_inner(&self, only_slot: Option<u32>) -> usize {
-        let Some(lock) = self.claim_lock.as_ref() else {
+        let Some(lock) = self.lock_file.as_ref() else {
             return 0; // no rendezvous, no leases, nothing provable
         };
         // A read-only tree cannot reap and cannot form an owner word.
@@ -3310,6 +3448,28 @@ fn liveness_for(arena_boot: [u8; 16]) -> BoxedLiveness {
     Box::new(|_slot, rec| record_is_alive(rec))
 }
 
+/// May the topology word held by `slot` be stolen? — the residual, and *only*
+/// the residual (`docs/decisions/0029` T3).
+///
+/// **Not a second spelling of [`Tree::participant_alive`], and the reason is
+/// what it is asked.** That one answers *"is participant `slot` running"* and
+/// answers it from the kernel where it can. This one is consulted by
+/// [`Tree::reparent`] **after** that call has already taken the lock file's
+/// topology byte, and holding the byte means the word's holder is either dead or
+/// a writer that has no lock file. So the only question left is the second
+/// disjunct — *is the byte-less holder still running* — and there is nothing but
+/// `/proc` that can answer it, because a process with no lock file has no byte
+/// to probe. Routing this through the byte predicate instead is not a
+/// simplification: it answers `Some(false)` for "never had a byte", which is
+/// **dead about a live, still-publishing process**, measured (#213, 2026-08-22).
+///
+/// It is therefore consulted in the safe direction only: it can withhold a steal
+/// but it authorises one solely where it can prove death. [`alive_given`] is
+/// where that bias lives.
+///
+/// On a tree with **no** lock file this is unchanged from before #213 and is the
+/// whole predicate, because there is no byte for anyone to have taken. That is
+/// `0029`'s stated residual, not an oversight.
 fn participant_is_alive(
     participants: &tf_tree_core::ParticipantTable<'_>,
     slot: u32,
@@ -3796,15 +3956,46 @@ pub enum ReparentError {
     /// The arena is mapped read-only; it cannot be mutated.
     #[error("arena is mapped read-only")]
     ReadOnly,
-    /// The in-arena topology mutation lock (`docs/PHASE2.md` §1, A2) is held by
-    /// another participant that is still alive.
+    /// The topology mutation lock (`docs/PHASE2.md` §1, A2) is held by another
+    /// participant that is still alive.
     ///
-    /// Not a fault and not a wedge: the lock is bounded-spin and steals from a
-    /// dead holder, so this only ever means a live peer is mid-mutation. Retry.
-    #[error("the topology lock is held by live participant slot {owner_slot}")]
+    /// Not a fault and not a wedge: a holder that dies has its lock byte
+    /// released by the kernel and its word stolen on the next attempt, so this
+    /// only ever means a live peer is mid-mutation. Retry.
+    ///
+    /// `owner_slot` is `None` when the holder could not be named. Two ways to
+    /// reach it, both nanoseconds wide and both meaning the same thing to a
+    /// caller — *a live peer is mutating topology, retry*: the holder took the
+    /// lock file's topology byte and has not yet published its slot into the
+    /// arena word, or it released the word between this attempt's load and its
+    /// `compare_exchange`. See [`Tree::reparent`] for why the byte is what
+    /// refuses and the word is only what names.
+    ///
+    /// **It is an `Option` rather than a `u32::MAX` sentinel**, which
+    /// `tf_tree_core::topology::TopoLockError` still uses and which this variant
+    /// carried until it was noticed that the resulting message read *"held by
+    /// live participant slot 4294967295"* — a sentence an operator has to
+    /// already know a magic number to disbelieve. The translation happens once,
+    /// in this module's `From<TopoLockError>`; `docs/API.md` R5 is the rule it
+    /// follows, that the *field* is the contract and the message is a
+    /// diagnostic, so the field has to be the thing that is true.
+    #[error("the topology lock is held by a live peer{owner_slot}", owner_slot = HolderSuffix(*owner_slot))]
     LockContended {
-        /// Participant slot of the holder observed when the attempt gave up.
-        owner_slot: u32,
+        /// Participant slot of the holder observed when the attempt gave up, or
+        /// `None` if the observation could not name one.
+        owner_slot: Option<u32>,
+    },
+    /// The lock file's topology byte could not be asked about at all — an
+    /// `fcntl` failure that is not contention.
+    ///
+    /// Distinct from [`ReparentError::LockContended`] on purpose: both refuse,
+    /// but only one of them means a peer is doing something. This one means the
+    /// lock file is unusable, which no retry fixes and which sends an operator
+    /// somewhere else entirely.
+    #[error("the topology lock byte could not be taken: fcntl failed with errno {raw_os_error}")]
+    TopologyLease {
+        /// `errno`, or `0` if the OS did not supply one.
+        raw_os_error: i32,
     },
 }
 
@@ -3814,10 +4005,33 @@ impl From<TopologyError> for ReparentError {
     }
 }
 
+/// The `Display` half of [`ReparentError::LockContended`]'s holder, kept out of
+/// the error type so the type stays a `Copy` identifier (`docs/API.md` R5).
+struct HolderSuffix(Option<u32>);
+
+impl core::fmt::Display for HolderSuffix {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(slot) => write!(f, " (participant slot {slot})"),
+            None => f.write_str(" that has not yet published its slot"),
+        }
+    }
+}
+
 impl From<TopoLockError> for ReparentError {
     fn from(e: TopoLockError) -> ReparentError {
         match e {
-            TopoLockError::Contended { owner_slot } => ReparentError::LockContended { owner_slot },
+            // **The one place the core's sentinel is translated.**
+            // `TopoLockView` reports `u32::MAX` for a holder its observation
+            // could not name, because it is `no_std` and its own callers are
+            // engine code that reads its doc comment. A user of this crate is
+            // not, and a magic number that renders as "participant slot
+            // 4294967295" is a message they would have to disbelieve on
+            // authority. Translating here rather than there keeps the sentinel
+            // knowledge in one function instead of on every caller.
+            TopoLockError::Contended { owner_slot } => ReparentError::LockContended {
+                owner_slot: (owner_slot != u32::MAX).then_some(owner_slot),
+            },
         }
     }
 }

@@ -642,3 +642,41 @@ fn span_refuses_a_plan_from_an_older_topology() {
         "{err:?}"
     );
 }
+
+/// **A contended topology lock must not name a participant slot it cannot see.**
+///
+/// `docs/API.md` R5 makes the *field* the contract and the message a diagnostic,
+/// which cuts both ways: nothing may match on this text, and the text may not be
+/// false. It was, briefly — `owner_slot` was a `u32` carrying
+/// `tf_tree_core::topology::TopoLockError`'s `u32::MAX` sentinel straight
+/// through, so a holder that had taken the lock and not yet published its slot
+/// rendered as *"held by live participant slot 4294967295"*. An operator reading
+/// that at 3am has to already know the magic number to disbelieve it, and the
+/// alternative the sentinel exists to avoid — `slot_of(0)`'s plausible-looking
+/// `0` — is worse, because it names a real process that is doing nothing wrong.
+///
+/// So this asserts the two properties that matter and neither of the words:
+/// the named case reaches the reader, and the unnamed case reaches them without
+/// a number in it at all.
+#[test]
+fn a_contended_topology_lock_never_renders_a_sentinel_slot() {
+    let named = tf_tree::ReparentError::LockContended {
+        owner_slot: Some(3),
+    }
+    .to_string();
+    assert!(
+        named.contains('3'),
+        "a holder the observation *could* name must reach the reader: {named}"
+    );
+
+    let unnamed = tf_tree::ReparentError::LockContended { owner_slot: None }.to_string();
+    assert!(
+        !unnamed.chars().any(|c| c.is_ascii_digit()),
+        "an unnamed holder rendered a number, which is a slot claim this error \
+         cannot support: {unnamed}"
+    );
+    assert!(
+        !unnamed.contains("4294967295"),
+        "the u32::MAX sentinel reached a user-facing message: {unnamed}"
+    );
+}

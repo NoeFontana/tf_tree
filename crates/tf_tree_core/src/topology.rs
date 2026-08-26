@@ -210,6 +210,22 @@ impl<'a> TopoLockView<'a> {
     /// Take the lock on behalf of `participant_slot`, stealing it from a dead
     /// holder if the bounded spin runs out.
     ///
+    /// # `is_alive` is whatever the caller can prove, and this crate cannot
+    ///
+    /// Deciding liveness needs a syscall, and this crate's whole dependency
+    /// budget is `libm`, `bytemuck` and `blake3` (`docs/PROJECT.md` §5 D14) with
+    /// no OS to ask. So the predicate is a parameter, and *what fact fills it*
+    /// is a property of the caller rather than of this protocol.
+    ///
+    /// That matters to a reader here because the answer is not the same on every
+    /// tree. `tf_tree::Tree::reparent` takes an exclusive kernel lock **before**
+    /// it calls this, where the tree has a lock file to take one from; with that
+    /// held, a non-zero word means its holder is either dead or a mutator with
+    /// no lock file, and the predicate it passes is deciding only the second of
+    /// those. On a tree with no lock file the same predicate is the whole
+    /// answer. `docs/decisions/0029` states both, and the steal below is sound
+    /// under either — it acts on `false` and never manufactures it.
+    ///
     /// `now_nanos` is stamped into the lock for `doctor`'s staleness report. It
     /// is written *after* the CAS that publishes ownership, because the CAS is
     /// what makes the claim atomic (A3's lesson: a second store is a second

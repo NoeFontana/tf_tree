@@ -10,7 +10,8 @@
 //! | Offset | Meaning |
 //! |---|---|
 //! | byte 0 | **Ownership.** Exclusive. The holder serves the socket. |
-//! | bytes 1–15 | reserved |
+//! | byte 1 | **Topology mutation** (A2). Exclusive, held for one `Tree::reparent`. |
+//! | bytes 2–15 | reserved |
 //! | bytes 16 + *i* | **Participant liveness** for slot *i*, held for the lifetime of the attachment. |
 //! | 4096 + 64·*i* | **Identity record** for slot *i*, written with `pwrite`. Advisory. |
 //!
@@ -49,7 +50,18 @@ pub const MAX_PARTICIPANTS: u32 = 64;
 
 /// Byte 0: ownership.
 const OWNERSHIP_OFFSET: u64 = 0;
-/// Participant liveness starts at byte 16, leaving 1–15 reserved.
+/// Byte 1: A2's topology mutation lock
+/// ([`docs/decisions/0029`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md)).
+///
+/// **One byte, not one per participant.** It is not asked *whether a participant
+/// is alive* — the question a per-slot byte would answer — but *whether anyone
+/// is inside the critical section*, which is the only question a mutator has to
+/// settle before it may steal the arena's topology word. A per-slot byte would
+/// re-create the slot indirection that put `/proc` on this path in the first
+/// place, and buy nothing: `F_OFD_GETLK` cannot name a holder anyway (see the
+/// module documentation), so the identity records are still what names one.
+const TOPOLOGY_OFFSET: u64 = 1;
+/// Participant liveness starts at byte 16, leaving 2–15 reserved.
 const PARTICIPANT_BASE: u64 = 16;
 /// Identity records start on the second page.
 const IDENTITY_BASE: u64 = 4096;
@@ -136,6 +148,59 @@ impl LockFile {
             Range::byte(OWNERSHIP_OFFSET),
             LockKind::Unlock,
             LockRole::Ownership,
+        )
+        .map(|_| ())
+    }
+
+    /// Try to take byte 1 — the right to mutate topology (`docs/PHASE2.md` §1,
+    /// A2).
+    ///
+    /// **This is an acquire, and the difference from a probe is the whole
+    /// point.** [`Self::probe_participant`] answers a question about somebody
+    /// else's byte and races every subsequent take, which is why §5.1 constrains
+    /// the order in which a probe may be composed with an arena word. Holding
+    /// this byte *excludes* every subsequent take for as long as it is held, so
+    /// what the holder reads afterwards cannot be invalidated by a taker: there
+    /// cannot be one.
+    ///
+    /// What that buys the caller is stated as an invariant in `0029` and is the
+    /// reason this exists: if a process holds this byte and then observes a
+    /// non-zero topology word, the word's holder is either **dead** or **a
+    /// writer with no lock file**. A live holder that `/proc` misreports —
+    /// another PID namespace, a non-dumpable process under `hidepid` — is
+    /// excluded by the kernel before any inference runs.
+    ///
+    /// Returns [`LockAttempt::Contended`] when another open file description
+    /// holds it, which means a live peer is mid-mutation. Retry.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`] for any `fcntl` failure that is not contention.
+    pub fn try_take_topology(&self) -> Result<LockAttempt, IpcError> {
+        self.set(
+            Range::byte(TOPOLOGY_OFFSET),
+            LockKind::Exclusive,
+            LockRole::Topology,
+        )
+    }
+
+    /// Release byte 1.
+    ///
+    /// **Order matters, and it is the mirror of the acquire**: release the arena
+    /// topology word *first*, then this byte. The reverse leaves a window in
+    /// which the byte is free and the word still names this process, which is
+    /// the exact signature `0029`'s T2 reads as "the holder is dead or has no
+    /// lock file" — so a peer would spin out its budget and then consult
+    /// `/proc` about a process that is merely finishing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_take_topology`].
+    pub fn release_topology(&self) -> Result<(), IpcError> {
+        self.set(
+            Range::byte(TOPOLOGY_OFFSET),
+            LockKind::Unlock,
+            LockRole::Topology,
         )
         .map(|_| ())
     }
@@ -427,6 +492,7 @@ mod tests {
     #[test]
     fn the_byte_layout_is_the_one_the_spec_tabulates() {
         assert_eq!(OWNERSHIP_OFFSET, 0);
+        assert_eq!(TOPOLOGY_OFFSET, 1);
         assert_eq!(participant_range(0).unwrap(), Range::byte(16));
         assert_eq!(participant_range(63).unwrap(), Range::byte(79));
         assert_eq!(identity_offset(0).unwrap(), 4096);
@@ -438,6 +504,68 @@ mod tests {
         assert!(CLAIM_BASE > identity_offset(MAX_PARTICIPANTS - 1).unwrap());
         assert!(participant_range(MAX_PARTICIPANTS).is_err());
         assert!(identity_offset(MAX_PARTICIPANTS).is_err());
+        // **The topology byte is disjoint from every other role.** It is one
+        // byte in a region the spec calls reserved, so the only thing standing
+        // between it and a participant byte is arithmetic — and a collision here
+        // would let one process hold the topology lock and another believe it
+        // holds a participant slot, which is the "same integer, two meanings"
+        // failure `0035` is about, one region over.
+        assert_ne!(TOPOLOGY_OFFSET, OWNERSHIP_OFFSET);
+        const { assert!(TOPOLOGY_OFFSET < PARTICIPANT_BASE) };
+        for slot in [0, 1, MAX_PARTICIPANTS - 1] {
+            assert_ne!(
+                participant_range(slot).unwrap(),
+                Range::byte(TOPOLOGY_OFFSET)
+            );
+        }
+        assert_ne!(claim_range(0).unwrap(), Range::byte(TOPOLOGY_OFFSET));
+    }
+
+    #[test]
+    fn two_descriptions_contend_for_the_topology_byte_and_a_release_hands_it_over() {
+        // A2's exclusion, as a kernel fact rather than an inference
+        // (`docs/decisions/0029`). Two descriptions stand in for two mutators;
+        // `two_descriptions_in_one_process_still_conflict` is why that is a
+        // faithful stand-in rather than a convenience.
+        let path = scratch("topo-byte");
+        let a = LockFile::open(&path).unwrap();
+        let b = LockFile::open(&path).unwrap();
+
+        assert_eq!(a.try_take_topology().unwrap(), LockAttempt::Acquired);
+        assert_eq!(b.try_take_topology().unwrap(), LockAttempt::Contended);
+
+        // Holding topology must not imply holding anything else. If the offsets
+        // ever collided this is the assertion that catches it, because the
+        // *symptom* would be a peer refused a slot it is entitled to rather than
+        // anything that looks like a lock bug.
+        assert_eq!(b.try_take_ownership().unwrap(), LockAttempt::Acquired);
+        assert_eq!(b.try_take_participant(0).unwrap(), LockAttempt::Acquired);
+        assert_eq!(b.try_take_claim(0).unwrap(), LockAttempt::Acquired);
+
+        a.release_topology().unwrap();
+        assert_eq!(b.try_take_topology().unwrap(), LockAttempt::Acquired);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn closing_a_description_releases_the_topology_byte() {
+        // The property the whole design rests on, asserted for this byte
+        // specifically rather than inherited from
+        // `dropping_the_file_releases_every_lock`: a mutator killed inside A2's
+        // critical section must not wedge the tree, and nothing in `tf_tree`
+        // runs on its behalf to unlock.
+        let path = scratch("topo-death");
+        let survivor = LockFile::open(&path).unwrap();
+        {
+            let corpse = LockFile::open(&path).unwrap();
+            assert_eq!(corpse.try_take_topology().unwrap(), LockAttempt::Acquired);
+            assert_eq!(
+                survivor.try_take_topology().unwrap(),
+                LockAttempt::Contended
+            );
+        }
+        assert_eq!(survivor.try_take_topology().unwrap(), LockAttempt::Acquired);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
