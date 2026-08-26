@@ -316,6 +316,63 @@ merging; nothing normative moves until then.
    A reader who thinks 41 ns at p99.9 is too much should move the interval, not
    the placement.
 
+## Implementation plan
+
+Ordered, each step landable alone. `CLAUDE.md` makes a `ready` record's plan the
+per-PR breakdown, so this is that breakdown and not a sketch.
+
+1. **The sampler, entirely in `tf_tree`.** `EdgeWriter` gains two fields, both
+   set at claim time: `sample_every: u32` = `nominal_rate_mhz / 1000` clamped to
+   at least 1 — `nominal_rate_mhz` is **milli**hertz (`EdgeCfg::nominal_rate_hz`
+   stores `rate_hz * 1000.0`), so that quotient is pushes-per-second and the rule
+   *"one offset per second of published data"* is exactly `sample_every` — with a
+   fixed default where the edge declares no rate; and `since_sample: Cell<u32>`.
+
+   `EdgeWriter::push` calls `self.publisher.push(stamp, iso)?` **first**, then
+   counts, and on wrap reads the clock and does one `Relaxed` store into
+   `claim.last_push_nanos`.
+
+   *Verified by:* (a) a declared-rate edge pushed `10 × sample_every` times
+   yields ten distinct receipt values and `sample_every`-spaced gaps; (b) **a
+   push that fails leaves the receipt untouched** — the `?` is what puts the
+   clock read after the ring write, so a `ClaimRevoked` push updating
+   `last_push_nanos` is the observable form of the read having drifted inside the
+   seqlock window, which is question 4's hard constraint and the only part of it
+   a test can see; (c) an edge with `nominal_rate_mhz == 0` still samples, at the
+   default. *Mutant:* move the clock read above the `?` — (b) fails.
+
+2. **`PHASE2.md` §6.4's amendment**, from *"bumped on every push"* to the sampled
+   rule, **with *never a reaping trigger* restated rather than assumed**. A
+   timestamp that is now actually written is exactly the thing a future reader
+   would reach for as a staleness trigger, which §6.4 exists to forbid; the
+   amendment that adds the first half without repeating the second is the one
+   that gets misread. *Verified by:* the section naming the rule and the refusal
+   in the same paragraph.
+
+3. **`TFT004` itself.** Per edge: `last_push_nanos` and the newest stamp, offset
+   = receipt − stamp; report the fleet spread; **flag nothing until a threshold
+   has evidence** (question 3). Three skips, each with its own reason string:
+   nothing sampled yet (`last_push_nanos == 0` — a publisher that has not reached
+   its first sample is not a skew finding), `TFT005`'s epoch condition via
+   `Clock`, and a frozen `.tft` source. *Verified by:* a fixture with one
+   deliberately skewed publisher, asserting the offset is attributed to *that*
+   edge and that the reason string names which skip fired when it fires. *Mutant:*
+   drop the `== 0` skip — a fresh arena reports every publisher as maximally
+   skewed.
+
+4. **`PHASE5.md` §0.0**, sixteen detecting to seventeen, and `TFT004` out of the
+   "cannot detect anything in any configuration" group into the conditional one.
+   *Verified by:* `tf_tree doctor` on the reference fixture printing the new
+   counts, and §0.0 quoting them.
+
+5. **The cost, on the record rather than in the commit message.** `just
+   bench-check` against the committed baseline, and — if a host that can run
+   `publish_to_visible` is available — the p99.9 figure question 4 owes. If it is
+   not, `PHASE1.md` §11 gains one sentence saying the p99.9 effect is arithmetic
+   and unmeasured, in §11's own terms. **Not a step to skip quietly**: a
+   diagnostic that costs the publish path its p99.9 and says so in a decision
+   record only is the shape `0023` was written about.
+
 ## What merging this ratifies
 
 - The four recommendations above, as decisions.
