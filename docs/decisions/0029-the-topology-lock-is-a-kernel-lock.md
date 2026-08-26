@@ -210,12 +210,35 @@ all.
    pre-existing defect** — `TopoLockView::finish` has always produced `u32::MAX`
    for a lock freed between its load and its CAS — that this change would have
    made much easier to hit.
-4. **An `fcntl` failure that is not contention is its own variant**,
+4. **The byte keeps the word's patience, and does not inherit its budget.**
+   `reparent` re-attempts the byte `TOPO_BYTE_ATTEMPTS` = 32 times before it
+   reports contention. Taking it once and giving up — which is what this change
+   did until review — hands every brief overlap back to the caller as an error,
+   and `TOPO_LOCK_SPIN_LIMIT`'s own documentation is what makes that a
+   regression: it calls the word's 1024 spins "a patience knob, not a timeout",
+   sized so "a *live* holder finishing an ordinary mutation is not mistaken for a
+   dead one". The byte had zero.
+
+   **32 is measured, not chosen.** 2000 iterations apiece on the development
+   workstation: an uncontended `reparent` — the critical section a peer waits out
+   — is **2.94 µs**, one contended `try_take_topology` is **791 ns**, and the
+   word's 1024 `spin_loop`s are **30.29 µs**. So 32 attempts is ≈25 µs: a little
+   under the word's existing patience, and ≈8.6 critical sections of margin. The
+   two budgets are different currencies — syscalls against `PAUSE` — which is why
+   the numbers differ by 32×.
+
+   **The margin can be modest because exhausting the two budgets means opposite
+   things.** The word's exhaustion leads to a **steal**, which is destructive and
+   must not be reached by mistake, so generosity there buys correctness. This
+   one's leads to a **refusal**, which is safe and which the caller retries, so
+   generosity here buys only latency. An `fcntl` error is **not** retried: the
+   loop is waiting out a peer, and an `EBADF` is not a peer.
+5. **An `fcntl` failure that is not contention is its own variant**,
    `ReparentError::TopologyLease { raw_os_error }`. It is not folded into
    `LockContended`: refusing is the safe direction, but a refusal that names a
    live peer when the real cause is `EBADF` is the shape of wrong diagnosis this
    repository has shipped twice.
-5. **The `/proc` predicate stays, unchanged, as the residual.** It is what
+6. **The `/proc` predicate stays, unchanged, as the residual.** It is what
    decides T2's second disjunct. `participant_is_alive` is **not** deleted — see
    *Rationale*.
 
@@ -317,9 +340,35 @@ the caller is where it is stated.
 - A2's exclusion, on every tree obtained from `tf_tree::Open`, is a kernel fact.
   Two of the three paths §0.0's #205 row names are unaffected; **this one shrinks
   the row from three to two.**
-- **One syscall per `reparent`, and one more on the way out.** D3 keeps `reparent`
-  off the query path, so this is not a budget question. It is not free either, and
-  the number is two `fcntl`s, not one.
+- **`reparent` costs 193% more, and `API.md` §7 item 8 is why that number is
+  here rather than discovered later.** Two syscalls per uncontended call, up to
+  32 more under contention. A/B in one run, five interleaved pairs of 20 000
+  calls each, median, the arms differing only in whether the tree carries a lock
+  file (a directly-called `build_shared` takes no byte, which is byte for byte
+  the path as it was before this change):
+
+  | `reparent`, uncontended | median |
+  |---|---|
+  | before — no lock file, no byte | **1.011 µs** |
+  | after — rendezvous tree | **2.96 µs** |
+  | delta | **+1.949 µs, +193%** |
+
+  **The relative number is the honest one and the absolute number is the one
+  that decides.** D3 keeps `reparent` off the query path and §11.3's own note
+  calls topology "near-static after startup", so three microseconds on a docking
+  event or a bringup re-root is not a cost this library's users can perceive;
+  a 193% regression on a lookup would have been unshippable. Two syscalls is
+  also the floor for this design: the acquire cannot be skipped without giving up
+  T1, and the release cannot be deferred without serialising unrelated mutators
+  for a tree's whole life.
+
+  An earlier revision of this bullet estimated "≈1.6 µs" for the acquire and
+  release **without measuring**, and was wrong by 20%. It is corrected here
+  rather than deleted, because guessing a residue and attributing it is the
+  failure mode this project has shipped before. The figures are a one-off
+  measurement recorded in this record, **not** a gated benchmark: no target in
+  `docs/benchmarks/EVIDENCE.md` covers `reparent`, and adding one is not this
+  record's to do.
 - **The residual is stated rather than removed.** A writer with no lock file —
   heap (single-process, where `self.decl` is the whole exclusion and always was),
   a directly-called `build_shared`, `attach_shared` — still decides from the
@@ -420,6 +469,16 @@ the caller is where it is stated.
    under `shm`) pins the message half: the named case reaches the reader, the
    unnamed case reaches them with **no digit in it at all**. Mutant run —
    restoring the sentinel to the `None` arm fails it.
+
+   `the_topology_byte_is_retried_before_contention_is_reported` pins piece 4's
+   budget. It is a **floor against a baseline measured in the same test** — one
+   contended round trip here, then an assertion that the contended `reparent`
+   cost at least eight of them — rather than a microsecond window, because the
+   budget is spent in syscalls and a fixed number would make it a CPU-speed test.
+   A floor is also the only safe direction: noise and preemption can only make
+   the observation longer. Mutant run, `TOPO_BYTE_ATTEMPTS = 1`: *reparent gave
+   up after 2.974µs, under 8 contended fcntl round trips (6.36µs): the retry
+   budget is gone.*
 
    **Mutants run, not asserted.** Replacing the lease acquire with `None`:
    `a live holder was stolen from: Ok(())` and `a live holder of the topology

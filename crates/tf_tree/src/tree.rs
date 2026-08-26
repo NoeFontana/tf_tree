@@ -1164,6 +1164,34 @@ impl Drop for ClaimLease {
     }
 }
 
+/// How many times [`Tree::reparent`] re-attempts A2's topology byte before it
+/// reports contention.
+///
+/// **The byte needs a patience budget for the same reason the word has one**
+/// (`tf_tree_core::topology::TOPO_LOCK_SPIN_LIMIT`, whose doc calls it "a
+/// patience knob, not a timeout"): a live holder finishing an ordinary mutation
+/// must not be reported as contention to a caller that would then have to loop
+/// anyway. Taking the byte once and giving up would have handed every brief
+/// overlap back to the caller as an error, which is a behaviour change the byte
+/// was not introduced to make.
+///
+/// **It is far smaller than 1024 because the two budgets are not the same
+/// currency, and because exhausting them means opposite things.** Each attempt
+/// here is an `fcntl` round trip; each of the word's is a `core::hint::spin_loop`.
+/// Measured on this workstation, `taskset`-free, 2000 iterations apiece: an
+/// uncontended `reparent` — the critical section a peer waits out — is
+/// **2.94 µs**, one contended `try_take_topology` is **791 ns**, and the word's
+/// 1024 spins are **30.29 µs**. So 32 attempts is ≈25 µs, a little under the
+/// word's existing patience and ≈8.6 critical sections of margin.
+///
+/// The margin can be modest because of the asymmetry: exhausting the *word's*
+/// budget leads to a **steal**, which is destructive and must not be reached by
+/// mistake, while exhausting this one leads to a **refusal**, which is safe and
+/// which the caller retries. Generosity buys correctness there and only latency
+/// here.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+const TOPO_BYTE_ATTEMPTS: u32 = 32;
+
 /// Holds A2's topology byte for as long as this value lives
 /// (`docs/decisions/0029`).
 ///
@@ -1874,13 +1902,19 @@ impl Tree {
     /// here: narrowing it means refusing those callers, which is a breaking
     /// change on a public path and a separate decision.
     ///
-    /// # Why contention is refused rather than resolved
+    /// # Why contention is waited out, and then refused rather than resolved
     ///
     /// A contended byte means another description is *between* taking it and
     /// releasing it — which, by the acquire order in [`Self::reparent`], means
     /// it either holds the topology word or is about to CAS it. Proceeding to
     /// the word would then be a race with a mutator that has done nothing wrong,
     /// so there is no verdict to reach and nothing to ask `/proc` about.
+    ///
+    /// So the only two options are to wait or to tell the caller, and this does
+    /// both in that order: [`TOPO_BYTE_ATTEMPTS`] re-tries, then
+    /// [`ReparentError::LockContended`]. The bound is what stops a holder that
+    /// died — or one that is `SIGSTOP`ped, which is alive and which D17 forbids
+    /// distinguishing by timeout — from wedging every mutator behind it.
     ///
     /// The slot named in the error is read from the word, which is the only
     /// thing that can name one — `F_OFD_GETLK` reports `l_pid = -1` for an OFD
@@ -1899,27 +1933,38 @@ impl Tree {
         let Some(file) = self.lock_file.as_ref() else {
             return Ok(None);
         };
-        match file.try_take_topology() {
-            Ok(tf_tree_ipc::LockAttempt::Acquired) => Ok(Some(TopologyLease { lock: file })),
-            Ok(tf_tree_ipc::LockAttempt::Contended) => Err(ReparentError::LockContended {
-                owner_slot: topo.holder(),
-            }),
-            // **Not folded into `LockContended`.** Refusing is the safe
-            // direction either way, but a refusal that names a live peer when
-            // the real cause is `EBADF` sends an operator to look for a process
-            // that is not there — the shape of wrong diagnosis `TFT014` and
-            // `TopoLockView::finish` were both fixed for.
-            Err(tf_tree_ipc::IpcError::LockFailed { errno, .. }) => {
-                Err(ReparentError::TopologyLease {
-                    raw_os_error: errno.raw_os_error(),
-                })
+        // Bounded, for `TOPO_LOCK_SPIN_LIMIT`'s reason: an unbounded wait here
+        // would wedge every mutator behind a holder that is merely slow, and the
+        // whole point of putting this lock in the kernel is that a holder which
+        // *died* needs nobody's patience at all.
+        for _ in 0..TOPO_BYTE_ATTEMPTS {
+            match file.try_take_topology() {
+                Ok(tf_tree_ipc::LockAttempt::Acquired) => {
+                    return Ok(Some(TopologyLease { lock: file }))
+                }
+                Ok(tf_tree_ipc::LockAttempt::Contended) => {}
+                // **Not folded into `LockContended`.** Refusing is the safe
+                // direction either way, but a refusal that names a live peer
+                // when the real cause is `EBADF` sends an operator to look for
+                // a process that is not there — the shape of wrong diagnosis
+                // `TFT014` and `TopoLockView::finish` were both fixed for. Also
+                // **not retried**: the loop is waiting out a peer, and there is
+                // no peer.
+                Err(tf_tree_ipc::IpcError::LockFailed { errno, .. }) => {
+                    return Err(ReparentError::TopologyLease {
+                        raw_os_error: errno.raw_os_error(),
+                    })
+                }
+                // `try_take_topology` produces no other variant. Mapping it to a
+                // zero errno rather than `unreachable!()`: this is a refusal
+                // path, and a panic here would turn a diagnosable failure into a
+                // crash inside a mutation protocol.
+                Err(_) => return Err(ReparentError::TopologyLease { raw_os_error: 0 }),
             }
-            // `try_take_topology` produces no other variant. Mapping it to a
-            // zero errno rather than unreachable!(): this is a refusal path, and
-            // a panic here would turn a diagnosable failure into a crash inside
-            // a mutation protocol.
-            Err(_) => Err(ReparentError::TopologyLease { raw_os_error: 0 }),
         }
+        Err(ReparentError::LockContended {
+            owner_slot: topo.holder(),
+        })
     }
 
     /// Claim exclusive write access to the dynamic edge whose child is `child`

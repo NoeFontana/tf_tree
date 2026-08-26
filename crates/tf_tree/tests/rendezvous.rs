@@ -3942,3 +3942,95 @@ fn a_killed_topology_lock_holder_releases_its_byte_to_the_kernel() {
         .reparent(base, odom)
         .expect("the kernel did not release a killed holder's topology byte");
 }
+
+/// **A held topology byte is waited out before contention is reported**, so the
+/// byte did not quietly cost `reparent` the patience the arena word always had.
+///
+/// `tf_tree_core::topology::TOPO_LOCK_SPIN_LIMIT`'s own documentation calls that
+/// budget "a patience knob, not a timeout", sized so "a *live* holder finishing
+/// an ordinary mutation is not mistaken for a dead one". Taking the byte once
+/// and giving up would have handed every brief overlap back to the caller as an
+/// error — a behaviour change `docs/decisions/0029` did not set out to make, and
+/// one that would have surfaced as `reparent(..).unwrap()` panicking under
+/// contention that is not a fault.
+///
+/// # Why this is a floor against a measured baseline, and not a window
+///
+/// The budget is spent in `fcntl` round trips, whose cost is a property of the
+/// machine — pinning microseconds would make this a CPU-speed test. So the test
+/// measures one contended round trip *here*, then asserts the contended
+/// `reparent` cost at least eight of them. A build that attempts the byte once
+/// spends one; this build spends `TOPO_BYTE_ATTEMPTS`.
+///
+/// A floor is also the only safe direction: noise, preemption and a loaded
+/// machine can only make the observed time *longer*, so this cannot fail
+/// spuriously — it can only fail if the retry loop is gone.
+///
+/// **Mutant, run rather than asserted.** `TOPO_BYTE_ATTEMPTS = 1`:
+///
+/// ```text
+/// thread 'the_topology_byte_is_retried_before_contention_is_reported' panicked:
+/// reparent gave up after 2.974µs, under 8 contended fcntl round trips (6.36µs):
+/// the retry budget is gone
+/// ```
+#[test]
+fn the_topology_byte_is_retried_before_contention_is_reported() {
+    let scratch = Scratch::new("topo-patience");
+    let owner = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            tf_tree::TreeBuilder::new()
+                .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+                .dynamic_edge(
+                    "map",
+                    "base",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                )
+                .dynamic_edge(
+                    "map",
+                    "odom",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                ),
+        )
+        .open()
+        .expect("create the arena");
+
+    let lock_path = scratch.0.join("0/default.lock");
+    let holder = tf_tree_ipc::LockFile::open(&lock_path).expect("open the lock file");
+    assert_eq!(
+        holder.try_take_topology().expect("take the topology byte"),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+
+    // The baseline: one *contended* round trip, from a third description, so it
+    // is the same syscall on the same byte in the same state that the loop under
+    // test makes.
+    let meter = tf_tree_ipc::LockFile::open(&lock_path).expect("open the lock file");
+    const CAL: u32 = 2000;
+    for _ in 0..CAL {
+        let _ = meter.try_take_topology();
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..CAL {
+        let _ = meter.try_take_topology();
+    }
+    let per_attempt = t.elapsed() / CAL;
+
+    let base = owner.frame("base").expect("base");
+    let odom = owner.frame("odom").expect("odom");
+    let t = std::time::Instant::now();
+    let refused = owner.reparent(base, odom);
+    let waited = t.elapsed();
+
+    assert!(
+        matches!(refused, Err(tf_tree::ReparentError::LockContended { .. })),
+        "a held topology byte did not refuse the mutation: {refused:?}"
+    );
+    let floor = per_attempt * 8;
+    assert!(
+        waited >= floor,
+        "reparent gave up after {waited:?}, under 8 contended fcntl round trips \
+         ({floor:?}): the retry budget is gone"
+    );
+}

@@ -55,6 +55,17 @@ is a bug.
   Byte 1 was reserved by §3.3 and is unused, so **no arena byte changes** and
   `FORMAT_VERSION` is untouched.
 
+  **`reparent` keeps the patience it always had.** The byte is re-attempted 32
+  times before contention is reported — sized from measurement (an uncontended
+  `reparent` is 2.94 µs, one contended `fcntl` 791 ns, the arena word's existing
+  1024-spin budget 30.29 µs), so a brief overlap is still absorbed rather than
+  returned to the caller as an error.
+
+  **The cost, measured rather than waved at:** an uncontended `reparent` goes
+  from 1.011 µs to 2.96 µs (**+193%**), which is two `fcntl`s. `reparent` is off
+  the query path (D3) and topology is near-static after startup, so the absolute
+  number is what decides; lookups are untouched.
+
   A tree with **no lock file** — a heap tree, a directly-called
   `TreeBuilder::build_shared`, an `attach_shared` over an inherited fd — is
   unchanged in both directions: there is no byte for anyone to take, so the
@@ -63,9 +74,11 @@ is a bug.
 
 ### Added
 
-- **`tf_tree_ipc::LockFile::try_take_topology` / `release_topology`, and
-  `LockRole::Topology`** — byte 1 of the lock file, A2's topology mutation lock.
-  The §3.3 byte table gains a row and `bytes 1–15 reserved` becomes `bytes 2–15`.
+- **`tf_tree_ipc::LockFile::try_take_topology` / `release_topology`** — byte 1 of
+  the lock file, A2's topology mutation lock. The §3.3 byte table gains a row and
+  `bytes 1–15 reserved` becomes `bytes 2–15`. There is deliberately **no
+  `probe_topology`**: nothing reads it, and an unused `pub fn` on a published
+  crate is surface with no consumer.
 
 ### Changed — breaking
 
@@ -84,6 +97,18 @@ is a bug.
   the message a diagnostic, which requires the field to be the thing that is
   true. `tf_tree_core::topology::TopoLockError` keeps its sentinel; the
   translation happens once, in `tf_tree`'s `From<TopoLockError>`.
+
+- **`tf_tree_ipc::LockRole` gains `Topology`** (#213). That enum is **not**
+  `#[non_exhaustive]`, so this breaks any downstream exhaustive `match` on it —
+  which is why it is here rather than under *Added*, where it was first filed.
+  Nothing in this workspace matches on `LockRole` outside `tf_tree_ipc`, and that
+  is not the standard a published crate is held to.
+
+  Whether the error-shaped enums in `tf_tree_ipc` should carry
+  `#[non_exhaustive]` at all is a **question this release does not answer**: the
+  crate uses it in `wire.rs` and not on `LockRole` or `IpcError`, both of which
+  have now grown breakingly more than once. It belongs with `API.md` §7 rather
+  than in a change about the topology lock.
 
 - **`tf_tree::ReparentError` gains `TopologyLease { raw_os_error: i32 }`**
   (#213). The enum is `#[non_exhaustive]`, so a downstream `match` with a
