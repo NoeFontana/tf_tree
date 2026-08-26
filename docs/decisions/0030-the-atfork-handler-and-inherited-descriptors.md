@@ -338,11 +338,24 @@ about the shape:
   when this list was written, because the answer to question 1 puts a rule on
   every fd-holding field in the seam rather than on the handler alone.
 - The §6.2/§7.3 amendment drafted and agreed, narrowly, against `0029`'s
-  enumeration of which predicate applies to which tree — **NOT MET.** `0029` is
-  still `draft`, and its question 1 moved on 2026-08-22, so the enumeration this
-  amendment is supposed to be written against is itself in flux. **This record
-  should not go `ready` before `0029` does**, and that ordering is now a
-  dependency rather than a preference.
+  enumeration of which predicate applies to which tree — **still NOT MET, but no
+  longer blocked.** [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md) is
+  `implemented` as of #269 and carries no open questions, so the enumeration is
+  no longer in flux and the ordering dependency this item used to state — *"this
+  record should not go `ready` before `0029` does"* — is discharged. What remains
+  unmet is the amendment itself, which nobody has drafted.
+
+  **`0029` also gave this record a third inherited descriptor to account for, and
+  it is the smallest of the three.** The lock file's **byte 1** (A2's topology
+  lock, §3.3) is taken by `Tree::reparent` and inherited by a `fork` like every
+  other OFD lock, so a child can hold a dead parent's topology lock and make it
+  unstealable. **Do not write it up as equivalent to the claim byte.** A claim
+  byte is held for a `Publisher`'s whole life, so any `fork` in a publishing
+  process inherits a held one; byte 1 is held for two `fcntl`s and one topology
+  block copy — measured at 2.94 µs for the whole call — so inheriting a *held*
+  one needs a `fork` from another thread inside that window **and** a parent
+  death before it closes. The mechanism belongs in the amendment; the risk does
+  not belong in the same sentence as the claim byte's.
 
 **Not rejected.** Question 1 was the one that could have closed this record as
 *rejected*, leaving the fork hole a permanent documented limitation of `0028`.

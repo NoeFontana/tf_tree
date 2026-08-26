@@ -102,8 +102,21 @@ close it too.
    `(pid, start_time)` is demonstrably live is not reclaimed however its byte
    reads. This is exactly the `/proc` conjunct that `0028`'s answer to its
    question 1 deliberately deleted on 2026-08-18, so it reopens a decision that
-   was taken with its own argument — and [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md)
-   is a whole record about *not* having a second spelling of liveness.
+   was taken with its own argument.
+
+   **The second half of this objection is retracted (#269).** It read: *"and
+   [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md) is a whole record about
+   *not* having a second spelling of liveness."* That was true of the record's
+   `draft`; it is false of the record that landed. `0029` was re-scoped, and its
+   plan step 2 — *delete `participant_is_alive` as a second spelling* — was
+   **reversed**: after that change the two functions answer different questions,
+   one *"is participant `s` running"* and the other *"may this topology word be
+   stolen"*, and the record says deleting the second would have routed a steal
+   through a predicate measured to be wrong. So `0029` is now a record about
+   liveness predicates being indexed by **what they authorise**, which is an
+   argument *for* option 2's shape rather than against it. This does not decide
+   the option — the cost of a `/proc` conjunct is unchanged and question 2 still
+   gates everything — but it removes a reason that was on the page.
 
 A third option — refuse `build_shared` on an arena that will be served — is not
 obviously expressible: nothing in `build_shared` knows whether an `OwnerServer`
