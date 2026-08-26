@@ -24,6 +24,7 @@
 //! own-claiming  -> "claimed <edge>", then parks holding it
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
+//! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -224,6 +225,34 @@ fn main() {
         // Join, then report whether a *named* peer slot reads alive. This is
         // what separates the kernel's answer from the /proc inference: a
         // SIGSTOPped holder still holds its lock byte.
+        // **A live holder of A2's topology byte, and nothing else**
+        // (`docs/decisions/0029`).
+        //
+        // It takes the byte through `tf_tree_ipc::LockFile` rather than by
+        // joining and calling `reparent`, deliberately: `reparent` holds the
+        // byte for the handful of instructions between two `fcntl`s, which no
+        // parent can catch, and what the parent needs to observe is the *state*
+        // rather than the call. A second open file description is exactly what a
+        // mutator mid-`reparent` presents to the kernel, and this process is a
+        // real one that can be `SIGKILL`ed — which is the half a thread could
+        // not stage, because the property under test is that the kernel releases
+        // the byte with no cooperation from the holder.
+        //
+        // The path is passed rather than resolved, so the parent decides which
+        // rendezvous this is about and a mismatched runtime directory fails
+        // loudly here instead of silently locking the wrong file.
+        "hold-topo" => {
+            let path = std::env::args().nth(2).expect("lock file path");
+            let lock = tf_tree_ipc::LockFile::open(std::path::Path::new(&path))
+                .expect("open the lock file");
+            match lock.try_take_topology().expect("fcntl the topology byte") {
+                tf_tree_ipc::LockAttempt::Acquired => say("holding-topo"),
+                tf_tree_ipc::LockAttempt::Contended => say("topo-contended"),
+            }
+            loop {
+                std::thread::park();
+            }
+        }
         "peer-alive" => {
             let slot: u32 = std::env::args()
                 .nth(2)

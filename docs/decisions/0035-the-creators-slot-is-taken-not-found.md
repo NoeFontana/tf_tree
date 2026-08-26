@@ -180,7 +180,7 @@ Recorded so the compression is visible rather than assumed.
 **The takeover arm.** `Open::already_attached(true)` reaches `register_any` and
 can still produce the divergence (executed: `TookOver`, lock byte 1, arena record
 0). It is public, non-`cfg(test)` API on a published crate. Its correct slot is
-[`0029`](./0029-one-liveness-predicate-per-tree.md) question 3 — whether §3.5's
+[`0029`](./0029-the-topology-lock-is-a-kernel-lock.md) question 3 — whether §3.5's
 heir reuses its slot — and `0029` is `draft` and itself blocked on
 [`0031`](./0031-the-participant-record-with-no-byte.md). Closing it here would be
 answering that question by accident.

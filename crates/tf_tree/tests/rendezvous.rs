@@ -3512,7 +3512,7 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 /// fix-before-release.
 ///
 /// The mechanism is one line below the one the sibling test above pins.
-/// `take_claim_lease` opens `let Some(lock) = self.claim_lock.as_ref() else {
+/// `take_claim_lease` opens `let Some(lock) = self.lock_file.as_ref() else {
 /// return Ok(None) }`, so a `build_shared` publisher holds **no lease byte
 /// either**; `reap_inner` declines only on a byte it can see *held*, and an
 /// unheld byte is indistinguishable from a dead holder's.
@@ -3704,4 +3704,333 @@ fn serve(
         );
     });
     (shutdown, h)
+}
+
+/// **#213's regression, and the one test in the tree that tells the old
+/// behaviour from the new** (`docs/decisions/0029` plan step 4).
+///
+/// A live process holds A2's topology lock. `/proc` says it is dead. Before this
+/// change `Tree::reparent` believed `/proc` and **stole the topology lock from a
+/// live mutator**, which is the direction `docs/PHASE2.md` §6.2 forbids and the
+/// direction the whole liveness bias exists to avoid. After it, the kernel's
+/// answer arrives first and the inference is never consulted.
+///
+/// # What is staged, and what is not
+///
+/// The discriminating input is `alive_given`'s `Known(st) != stored` — a `/proc`
+/// entry that resolves and describes **the wrong process**. This test produces
+/// that input directly, by storing a stale `start_time` into the holder's
+/// participant record. It does **not** stage a PID namespace: `0029`'s appendix
+/// measured `unshare -U --fork --pid` producing exactly this input against the
+/// shipped binaries (a namespaced participant records `pid = 1`, a host reader
+/// resolves that to `systemd`, and the start times differ), and
+/// `docs/decisions/0033` is where that staging lives. Nothing here should be
+/// cited as namespace coverage.
+///
+/// Two other things are staged rather than performed, both faithfully:
+///
+/// * **The word.** `reparent` holds the topology word between two `fcntl`s and
+///   no peer can catch it there, so the word is written directly — the same
+///   technique §11.2's two `..._collects_a_record_left_reserved_by_a_killed_registrant`
+///   tests use, and for the same reason.
+/// * **The byte**, from a second open file description. That is precisely what a
+///   mutator inside A2's critical section presents to the kernel;
+///   `two_descriptions_in_one_process_still_conflict` (`tf_tree_ipc`) is the pin
+///   that a second description is a faithful stand-in rather than a convenience.
+///
+/// # The control is the same test with one variable moved
+///
+/// Release the byte and nothing else changes: same live process, same stale
+/// `start_time`, same word. The steal then happens, which is correct — that is
+/// the state a *crashed* holder leaves — and it is what proves the refusal above
+/// is the byte's doing and not an accident of the fixture.
+///
+/// **Mutant, run rather than asserted.** Replacing `Tree::reparent`'s
+/// `take_topology_lease` call with `None`:
+///
+/// ```text
+/// thread 'a_live_holder_that_proc_calls_dead_keeps_the_topology_lock' panicked:
+/// a live holder was stolen from: Ok(())
+/// ```
+#[test]
+#[cfg(feature = "unstable")]
+fn a_live_holder_that_proc_calls_dead_keeps_the_topology_lock() {
+    use core::sync::atomic::Ordering;
+
+    let scratch = Scratch::new("topo-liveness");
+    let owner = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            tf_tree::TreeBuilder::new()
+                .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+                .dynamic_edge(
+                    "map",
+                    "base",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                )
+                .dynamic_edge(
+                    "map",
+                    "odom",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                ),
+        )
+        .open()
+        .expect("create the arena");
+
+    // A real second participant, so the record the predicate reads is one the
+    // rendezvous produced rather than one this test invented.
+    let holder = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("join as a second participant");
+    let holder_slot = holder.participant_slot();
+    assert_ne!(
+        holder_slot,
+        owner.participant_slot(),
+        "the two attachments share a slot, so `acquire`'s own-slot guard would \
+         refuse before any predicate ran and this test would be vacuous"
+    );
+
+    // Make `/proc` describe the wrong process for this slot. The record still
+    // names a live pid — ours — so `identity()` still resolves and the predicate
+    // still runs; what changes is that the start times no longer agree.
+    let view = owner.arena_view();
+    let rec = view
+        .participants()
+        .get(holder_slot)
+        .expect("the joiner's record");
+    let real_start_time = rec.start_time.load(Ordering::Relaxed);
+    rec.start_time
+        .store(real_start_time ^ 0xDEAD_BEEF, Ordering::Relaxed);
+    // Not asserted through `participant_alive`: that one consults the *byte* on
+    // a rendezvous tree, so it correctly answers "alive" here and would say
+    // nothing about the triple. What proves the triple now reads dead is the
+    // control arm at the end — the steal that happens once the byte is gone.
+
+    // Stage the critical section: the word names the holder, and a second
+    // description holds the byte, which is what a mutator between the two looks
+    // like from anywhere else in the system.
+    let word = &view.header().topo_lock.owner;
+    word.store(u64::from(holder_slot) + 1, Ordering::Release);
+    let lock_path = scratch.0.join("0/default.lock");
+    let held_by = tf_tree_ipc::LockFile::open(&lock_path).expect("open the lock file");
+    assert_eq!(
+        held_by.try_take_topology().expect("take the topology byte"),
+        tf_tree_ipc::LockAttempt::Acquired,
+        "the topology byte was already held; the fixture is not in the state it \
+         claims to be"
+    );
+
+    let map = owner.frame("map").expect("map");
+    let base = owner.frame("base").expect("base");
+    let odom = owner.frame("odom").expect("odom");
+
+    // **The assertion this test exists for.**
+    let refused = owner.reparent(base, odom);
+    assert!(
+        matches!(
+            refused,
+            Err(tf_tree::ReparentError::LockContended { owner_slot })
+                if owner_slot == Some(holder_slot)
+        ),
+        "a live holder was stolen from: {refused:?}"
+    );
+    assert_eq!(
+        word.load(Ordering::Acquire),
+        u64::from(holder_slot) + 1,
+        "the word changed hands despite the refusal — the steal happened and the \
+         error is cosmetic"
+    );
+
+    // **The control: one variable.** Everything above is unchanged except that
+    // the kernel no longer says anyone is in the critical section, which is the
+    // state a crashed holder leaves behind.
+    held_by
+        .release_topology()
+        .expect("release the topology byte");
+    owner
+        .reparent(base, odom)
+        .expect("a byte-free word must still be stealable from a holder /proc calls dead");
+
+    // And the mutation is real, not just a lock acquisition.
+    assert!(
+        owner.plan(base, map).is_ok(),
+        "the topology did not survive the steal"
+    );
+    drop(holder);
+}
+
+/// **A killed topology-lock holder wedges nothing** — `docs/PHASE2.md` §11.3's
+/// `topo.holding_lock` row, performed across a real process boundary.
+///
+/// This is the property that makes the byte an improvement rather than a second
+/// thing to get stuck on: A2's lock became a kernel lock, so a holder that dies
+/// for any reason has it released by the kernel with no cooperation, no timeout
+/// and nothing running on its behalf. A thread cannot stage it — `SIGKILL`
+/// applies to a process, and an inherited descriptor would share the parent's
+/// open file description and make the contention vacuous.
+///
+/// **The `owner_slot: None` is the point of the first assertion, not an
+/// artefact.** The child holds the byte and has published no slot into the arena
+/// word, which is the state every mutator passes through between its two
+/// acquires. `l_pid` is `-1` for an OFD lock (§3.3), so nothing can name the
+/// holder — and the honest answer is the absence rather than `slot_of(0)`'s
+/// plausible-looking `0`, which would name whichever process happens to hold
+/// slot 0. That is the same wrong answer `doctor` was fixed for.
+///
+/// **Mutant, run rather than asserted.** Replacing `Tree::reparent`'s
+/// `take_topology_lease` call with `None` — the arena word is untouched here, so
+/// there is nothing else for the mutation to contend on:
+///
+/// ```text
+/// thread 'a_killed_topology_lock_holder_releases_its_byte_to_the_kernel' panicked:
+/// a live holder of the topology byte did not refuse this mutation: Ok(())
+/// ```
+#[test]
+fn a_killed_topology_lock_holder_releases_its_byte_to_the_kernel() {
+    let scratch = Scratch::new("topo-kill");
+    let owner = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            tf_tree::TreeBuilder::new()
+                .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+                .dynamic_edge(
+                    "map",
+                    "base",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                )
+                .dynamic_edge(
+                    "map",
+                    "odom",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                ),
+        )
+        .open()
+        .expect("create the arena");
+
+    let lock_path = scratch.0.join("0/default.lock");
+    let mut kid = Kid::spawn(
+        &scratch.0,
+        &["hold-topo", lock_path.to_str().expect("utf-8 path")],
+    );
+    assert_eq!(
+        kid.line(),
+        "holding-topo",
+        "the helper did not get the byte, so the refusal below would prove nothing"
+    );
+
+    let base = owner.frame("base").expect("base");
+    let odom = owner.frame("odom").expect("odom");
+    let refused = owner.reparent(base, odom);
+    assert!(
+        matches!(
+            refused,
+            Err(tf_tree::ReparentError::LockContended { owner_slot: None })
+        ),
+        "a live holder of the topology byte did not refuse this mutation: {refused:?}"
+    );
+
+    // No cooperation: the child is not asked to release anything, and it holds
+    // no `Drop` that could.
+    kid.kill();
+
+    owner
+        .reparent(base, odom)
+        .expect("the kernel did not release a killed holder's topology byte");
+}
+
+/// **A held topology byte is waited out before contention is reported**, so the
+/// byte did not quietly cost `reparent` the patience the arena word always had.
+///
+/// `tf_tree_core::topology::TOPO_LOCK_SPIN_LIMIT`'s own documentation calls that
+/// budget "a patience knob, not a timeout", sized so "a *live* holder finishing
+/// an ordinary mutation is not mistaken for a dead one". Taking the byte once
+/// and giving up would have handed every brief overlap back to the caller as an
+/// error — a behaviour change `docs/decisions/0029` did not set out to make, and
+/// one that would have surfaced as `reparent(..).unwrap()` panicking under
+/// contention that is not a fault.
+///
+/// # Why this is a floor against a measured baseline, and not a window
+///
+/// The budget is spent in `fcntl` round trips, whose cost is a property of the
+/// machine — pinning microseconds would make this a CPU-speed test. So the test
+/// measures one contended round trip *here*, then asserts the contended
+/// `reparent` cost at least eight of them. A build that attempts the byte once
+/// spends one; this build spends `TOPO_BYTE_ATTEMPTS`.
+///
+/// A floor is also the only safe direction: noise, preemption and a loaded
+/// machine can only make the observed time *longer*, so this cannot fail
+/// spuriously — it can only fail if the retry loop is gone.
+///
+/// **Mutant, run rather than asserted.** `TOPO_BYTE_ATTEMPTS = 1`:
+///
+/// ```text
+/// thread 'the_topology_byte_is_retried_before_contention_is_reported' panicked:
+/// reparent gave up after 2.974µs, under 8 contended fcntl round trips (6.36µs):
+/// the retry budget is gone
+/// ```
+#[test]
+fn the_topology_byte_is_retried_before_contention_is_reported() {
+    let scratch = Scratch::new("topo-patience");
+    let owner = tf_tree::Open::new()
+        .mode(tf_tree::AttachMode::ReadWrite)
+        .create(tf_tree::CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            tf_tree::TreeBuilder::new()
+                .default_interp(tf_tree::InterpPolicy::LerpSlerp)
+                .dynamic_edge(
+                    "map",
+                    "base",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                )
+                .dynamic_edge(
+                    "map",
+                    "odom",
+                    tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(8)),
+                ),
+        )
+        .open()
+        .expect("create the arena");
+
+    let lock_path = scratch.0.join("0/default.lock");
+    let holder = tf_tree_ipc::LockFile::open(&lock_path).expect("open the lock file");
+    assert_eq!(
+        holder.try_take_topology().expect("take the topology byte"),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+
+    // The baseline: one *contended* round trip, from a third description, so it
+    // is the same syscall on the same byte in the same state that the loop under
+    // test makes.
+    let meter = tf_tree_ipc::LockFile::open(&lock_path).expect("open the lock file");
+    const CAL: u32 = 2000;
+    for _ in 0..CAL {
+        let _ = meter.try_take_topology();
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..CAL {
+        let _ = meter.try_take_topology();
+    }
+    let per_attempt = t.elapsed() / CAL;
+
+    let base = owner.frame("base").expect("base");
+    let odom = owner.frame("odom").expect("odom");
+    let t = std::time::Instant::now();
+    let refused = owner.reparent(base, odom);
+    let waited = t.elapsed();
+
+    assert!(
+        matches!(refused, Err(tf_tree::ReparentError::LockContended { .. })),
+        "a held topology byte did not refuse the mutation: {refused:?}"
+    );
+    let floor = per_attempt * 8;
+    assert!(
+        waited >= floor,
+        "reparent gave up after {waited:?}, under 8 contended fcntl round trips \
+         ({floor:?}): the retry budget is gone"
+    );
 }

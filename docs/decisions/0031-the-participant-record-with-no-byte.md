@@ -102,7 +102,7 @@ close it too.
    `(pid, start_time)` is demonstrably live is not reclaimed however its byte
    reads. This is exactly the `/proc` conjunct that `0028`'s answer to its
    question 1 deliberately deleted on 2026-08-18, so it reopens a decision that
-   was taken with its own argument — and [`0029`](./0029-one-liveness-predicate-per-tree.md)
+   was taken with its own argument — and [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md)
    is a whole record about *not* having a second spelling of liveness.
 
 A third option — refuse `build_shared` on an arena that will be served — is not

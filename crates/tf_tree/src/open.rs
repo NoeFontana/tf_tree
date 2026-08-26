@@ -537,8 +537,11 @@ pub enum OpenError {
     /// still registers through `register_any` — and hand-rolled
     /// `tf_tree_ipc::Open` plus `TreeBuilder::build_shared` construction, which
     /// registers a record with no byte to pair it against. Whether the §3.5 heir
-    /// should reuse its slot is `0029` question 3, which is why `0035` left this
-    /// guard standing rather than deleting it.
+    /// should reuse its slot is **`0028` question 3** — RESOLVED 2026-08-20, the
+    /// heir keeps its existing slot, byte and arena — which is why `0035` left
+    /// this guard standing rather than deleting it. This comment cited `0029`
+    /// question 3 and called it open; that record's question 3 was about the
+    /// socket-hangup callback, and `0029` no longer has open questions at all.
     ///
     /// # What a caller does about it
     ///

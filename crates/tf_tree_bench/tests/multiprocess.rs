@@ -648,15 +648,23 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
     drop(owner);
 }
 
-/// Two independent attachments race `reparent`, and only the **arena** lock can
-/// stop them colliding.
+/// Two independent attachments race `reparent`, and the process-local mutex is
+/// not what stops them colliding.
 ///
-/// Each `Tree` here is its own attachment: its own participant slot and its own
-/// process-local `decl` mutex. That mutex is precisely the thing that does not
-/// generalise across a boundary, so it serializes nothing between these two —
-/// exactly the situation a second process is in. What is left is A2's in-arena
-/// lock, and if it did not work these threads would race the topology block copy
-/// and lose or corrupt mutations.
+/// Each `Tree` here is its own attachment: its own participant slot, its own
+/// process-local `decl` mutex, **and its own open file description on the lock
+/// file**. That mutex is precisely the thing that does not generalise across a
+/// boundary, so it serializes nothing between these two — exactly the situation
+/// a second process is in. What is left is A2, and if A2 did not work these
+/// threads would race the topology block copy and lose or corrupt mutations.
+///
+/// **A2 is two locks since `docs/decisions/0029`, and this test exercises both.**
+/// The lock file's topology byte excludes the two attachments from each other —
+/// they hold two descriptions, and `tf_tree_ipc`'s
+/// `two_descriptions_in_one_process_still_conflict` is why that is not a
+/// loophole — and the in-arena word is what a byte-holder and a byte-less
+/// mutator would still contend on. The generation count below falsifies a
+/// failure of either: it cannot tell them apart, and does not need to.
 ///
 /// Verified in-process rather than across a `fork` because the failure being
 /// tested is a *data race on the shared bytes*, which needs both mutators alive
@@ -683,8 +691,9 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
 ///   values, so still three distinct `Mutex<()>` fields; nothing about the
 ///   transport changes that, and a rewrite that shared one attachment would
 ///   have deleted the test rather than ported it.
-/// * *Only A2's in-arena lock can serialize them.* The racing block is
-///   unchanged, and so is the generation count that falsifies it.
+/// * *Only A2 can serialize them.* The racing block is unchanged, and so is the
+///   generation count that falsifies it. This bullet said "A2's **in-arena**
+///   lock" until `0029` made the byte the first of the two.
 /// * *A third view of the segment.* The owner tree, exactly as before.
 #[test]
 fn concurrent_reparents_from_separate_attachments_are_serialized() {

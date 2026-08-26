@@ -263,13 +263,57 @@ it can only fail to **intern a new one**, because interning writes.
 ### `ReparentError::LockContended { owner_slot }`
 
 Another participant holds the arena's topology lock and is still alive, so this
-re-parent could not proceed. `owner_slot` names the holder; `tf_tree doctor`
-resolves it to a pid.
+re-parent could not proceed. `owner_slot` is `Some(slot)` naming the holder,
+which `tf_tree doctor` resolves to a pid.
 
-The lock is stolen automatically when its holder is **dead**, so seeing this
-means a live process is mutating topology concurrently. Sustained contention is
-a design smell rather than a fault: topology should be near-static after startup
-([`PHASE2.md`](./PHASE2.md) §1, A2).
+**Retry it.** This is contention, not a fault, and it is the one `reparent` error
+that a caller is expected to loop on:
+
+```rust
+loop {
+    match tree.reparent(child, parent) {
+        Ok(()) => break,
+        Err(tf_tree::ReparentError::LockContended { .. }) => std::hint::spin_loop(),
+        Err(other) => return Err(other),
+    }
+}
+```
+
+A bare `reparent(..).unwrap()` will panic the first time two processes mutate
+topology at once, which is why the loop is written out here rather than left to
+be discovered.
+
+The lock is released or stolen automatically when its holder is **dead**, so
+seeing this means a live process is mutating topology concurrently. Sustained
+contention is a design smell rather than a fault: topology should be near-static
+after startup ([`PHASE2.md`](./PHASE2.md) §1, A2).
+
+**`owner_slot` can be `None`, and that is not missing information.** The holder is
+between the lock file's topology byte and the arena word — a window a few
+instructions wide — so it holds the lock but has not yet published *which* slot
+holds it. An OFD lock cannot name its holder (the kernel reports `l_pid = -1`,
+§3.3), so nothing can fill the slot in, and the message says so rather than
+printing a number. Retry, exactly as above; if it persists, `tf_tree doctor` and
+`tf_tree top` list every live participant and one of them is the holder.
+
+**When it will not clear.** A `fork` child inherits its parent's open file
+description and therefore any byte the parent held at the moment of the fork
+(§6.2), so a *dead* parent's topology lock stays held for as long as that child
+lives. This needs a `fork` from one thread while another is inside `reparent` —
+microseconds — so it is far rarer than the same hazard on a **claim** byte, which
+is held for a publisher's whole life. `tf_tree doctor` reports the inheritance as
+`TFT014`; the remedy is that check's, and it is to stop the child or start
+workers with a start method that inherits no descriptors, such as
+multiprocessing's `spawn`.
+
+### `ReparentError::TopologyLease { raw_os_error }`
+
+The lock file's topology byte could not be asked about at all — `fcntl` failed
+for a reason that is not contention. Unlike `LockContended` this is **not**
+retryable: no peer is doing anything, the lock file itself is unusable. Check
+that the runtime directory still exists and is on a local filesystem
+([`PHASE2.md`](./PHASE2.md) §3.1 refuses NFS and CIFS for exactly this class of
+reason), and that the process has not exhausted its descriptors.
 
 ### `LayoutMismatch { found, expected }`
 

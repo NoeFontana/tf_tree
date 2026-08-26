@@ -75,7 +75,7 @@ about the shape:
   In particular it must not be written as "§5.1 forbids deciding liveness from
   anything but the byte" — §5.1 forbids deciding it from `state` or `heartbeat`,
   and §0.0's own §5.1 row records that every tree without a probe keeps `/proc`.
-  [`0029`](./0029-one-liveness-predicate-per-tree.md) is the record that
+  [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md) is the record that
   enumerates which tree gets which fact.
 
 ## Open questions
