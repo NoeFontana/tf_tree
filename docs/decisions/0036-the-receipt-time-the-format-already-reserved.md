@@ -334,6 +334,17 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    two fields are initialised — no plumbing, no second lookup, and nothing to
    thread through `Publisher`.
 
+   **And the `Cell` was checked against the auto traits it could have broken.**
+   `OwnedWriter` is documented **and doctest-pinned** as `Send + !Sync`,
+   inherited from this very field, with the `!Sync` half asserted as a
+   `compile_fail,E0277` that `just test-doc-error-codes` runs on nightly —
+   `0017`'s lifetime extension is what makes those pins load-bearing rather than
+   decorative. `Cell<u32>` is `Send`, so the `Send` pin holds; it is `!Sync`, so
+   the `!Sync` pin holds and is now over-determined rather than weakened
+   (`Publisher` already supplied it). No `unsafe impl` is needed or wanted — that
+   type's doc says there must never be one, because it would keep compiling after
+   somebody swapped the field for something with no business crossing a thread.
+
    `EdgeWriter::push` calls `self.publisher.push(stamp, iso)?` **first**, then
    counts, and on wrap reads the clock and does one `Relaxed` store into
    `claim.last_push_nanos`.
