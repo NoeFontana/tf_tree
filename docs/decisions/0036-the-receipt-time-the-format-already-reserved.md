@@ -1,8 +1,13 @@
 # 0036: the receipt time the format already reserved
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** none. This record authorises nothing.
+**Implementation:** none yet. **Every open question carries a recommendation with
+its argument, and merging this record ratifies them** — the mechanism
+[`0023`](./0023-the-gate-that-could-not-gate.md) states in as many words
+(*"they are recommendations and not decisions because this record is `draft`: a
+human ratifies by merging"*). Until then `docs/PHASE2.md` §6.4 and
+`docs/PHASE5.md` §0.0 are untouched.
 
 ## Context
 
@@ -208,37 +213,124 @@ system, at 13× its current cost.
 
 ## Open questions
 
-1. **Fixed interval or derived from `nominal_rate_mhz`?** The tension above. A
-   fixed interval is one mask; a derived one is a per-edge value the writer would
-   have to hold, and `Publisher` does not carry `EdgeRecord` today. **This is the
-   question to answer first** — the rest of the shape follows from it.
-2. **Which clock, exactly, and what does the check do when the arena's stamps do
-   not share an epoch with it?** `TFT005` already skips on that condition and
-   `Clock` in `tf_tree_cli` is where it is decided; `TFT004` should inherit it
-   rather than invent a second rule. Whether the receipt time should be recorded
-   in the arena's *own* epoch and converted at read time, or in the host wall
-   clock, is not obvious and decides whether a `.tft` freeze carries anything
-   meaningful.
-3. **What does `doctor` do with one offset per edge?** §6 asks for a rolling
-   median per publisher, which needs a series. A single-shot `doctor` sees one
-   value per edge; `tf_tree top` polls and could accumulate. Whether `TFT004`
-   ships as a fleet comparison at one instant (every edge's offset against the
-   fleet median, now) or waits for a series is a scope decision, and the first is
-   much cheaper and already catches the case §6 describes.
-4. **Is a 1-in-`INTERVAL` 38 ns spike acceptable on the publish path at p99.9?**
-   The amortised number is not the number `PHASE1.md` §11 gates on. Nothing here
-   has measured the spike's effect on `publish_to_visible`, and this host cannot
-   (`unavailable` in the baseline, 4 cores against 17 needed).
+Each carries a **recommendation** written in below, in the shape `0023` uses.
+They are recommendations rather than decisions because a human ratifies by
+merging; nothing normative moves until then.
 
-## What would make this `ready`
+1. **Fixed interval, or derived from `nominal_rate_mhz`?**
 
-- Question 1 answered, because it decides the shape.
-- Question 4 measured on a host that can run `publish_to_visible`, or an explicit
-  statement that it ships without that measurement and why.
-- The §6.4 amendment drafted, keeping *never a reaping trigger* intact.
-- A `TFT004` skip reason that is honest about what it is skipping on, in the shape
-  `TFT007`'s two skip conditions were given after review found a `pass` that had
-  compared nothing.
+   **Recommendation: derived — one offset per second of published data, computed
+   once at claim time, and the whole mechanism lives in `tf_tree`'s
+   `EdgeWriter`. `tf_tree_core` does not change.**
+
+   *Why derived.* A fixed interval fixes the wrong quantity. What `TFT004` wants
+   is a comparable number of offsets per publisher per diagnostic window, and
+   publishers differ by two orders of magnitude in rate. Deriving `INTERVAL` from
+   the declared rate makes the *offset sample rate* the constant instead of the
+   push interval: every publisher yields ~1 offset/second, and every publisher
+   pays the same **38 ns per second of publishing** — 3.8 × 10⁻⁶ % duty, at any
+   rate. A fixed interval cannot be chosen to do that for both a 1 kHz IMU and a
+   10 Hz localiser, which is what made this the first question.
+
+   *Why the cost objection dissolves.* The derivation is one division **per
+   claim**, not per push. The push path gains a non-atomic counter increment and
+   a compare against a value in a register.
+
+   *Why the facade and not the core.* `tf_tree_core` is `no_std` and cannot read
+   a clock at all (D14: `libm` + `bytemuck` + `blake3`). Sampling there would
+   mean passing a clock into `Publisher::push` — a signature change on a
+   published crate, for a diagnostic. The facade already owns every
+   std-dependent concern on this path (`ClaimLease`, the fork generation,
+   `0029`'s topology lease), so this belongs there by the rule already in force.
+   The facade also already holds the `EdgeRecord` at claim time, so
+   `nominal_rate_mhz` is in scope exactly where the division happens.
+
+   *Two details that are not free and are not obstacles.* `EdgeWriter::push`
+   takes `&self`, so the counter is a `Cell<u32>`, which is `Send` and not
+   `Sync` — checked: nothing in the workspace asserts `EdgeWriter: Sync`, and D7
+   makes one writer per edge a type-system property, so it has no reason to be.
+   And an edge that declares no rate (`nominal_rate_mhz == 0`, which `TFT007`
+   already skips on) gets a fixed default rather than no sampling, so a tree
+   built without a topology file still produces offsets.
+
+2. **Which clock, and what happens when the epochs do not match?**
+
+   **Recommendation: the host wall clock, in integer nanoseconds; inherit
+   `TFT005`'s epoch skip verbatim; and skip on a frozen `.tft` source.**
+
+   The quantity is a difference against a *header stamp*, and header stamps are
+   wall-clock-domain (`API.md` R3), so a monotonic receipt time is unusable
+   however much cheaper it is (28 ns against 38 ns — the record's own table).
+   `TFT005` already skips when the arena's stamps do not share an epoch with the
+   system clock, and `Clock` in `tf_tree_cli` is where that is decided;
+   `TFT004` must consult the same object rather than grow a second rule, which
+   is what `PROJECT.md` §6 forbids as a second spelling.
+
+   **A frozen `.tft` is a byte copy of the arena**, so its receipt times survive
+   the freeze and mean nothing against a later reader's clock — the same shape as
+   `TFT014`'s frozen-source skip, and it should be spelled the same way.
+
+3. **What does `doctor` do with one offset per edge?**
+
+   **Recommendation: ship the fleet comparison at one instant, and do not wait
+   for a series.**
+
+   Every edge's `(receipt − stamp)` against the fleet median, flagging outliers
+   past a threshold. That needs no history, runs in a single-shot `doctor`, and
+   catches exactly the case §6 describes — *one machine's clock is off from the
+   rest*. §6 asks for a rolling median, and a rolling median is strictly better
+   for a *drifting* clock; it is also a different tool, because it needs the
+   polling loop `tf_tree top` has and `doctor` does not. Shipping the instant
+   comparison first is the difference between a check that exists and a check
+   that is still a paragraph.
+
+   The threshold is deliberately not proposed here: it is the kind of number
+   `0023` shows should be derived from a measured spread rather than chosen, and
+   there is no fleet in this repository to measure one on. **`TFT004` should
+   therefore report the spread and flag nothing until a threshold has evidence**
+   — the shape `TFT007` was corrected into after review found it passing having
+   compared nothing.
+
+4. **Is a 1-in-`INTERVAL` 38 ns spike acceptable on the publish path?**
+
+   **Recommendation: yes, with one hard constraint and one disclosure.**
+
+   **The constraint: the clock read must sit outside the seqlock window.** A
+   longer write window is not merely a slower push — it is more `SlotContended`
+   retries for every reader of that edge, which converts a writer's diagnostic
+   into a reader's latency. Taking the clock in the facade *after*
+   `publisher.push` has returned gives this for free, and it is the reason the
+   placement in question 1 is not just a layering convenience. **Any
+   implementation that moves the read inside `SampleRing::push` gives this up.**
+
+   **The disclosure: at one sample per second, the spike lands at or near p99.9
+   for a 1 kHz publisher, which is the percentile `PHASE1.md` §11 says matters
+   most.** 1-in-1000 *is* the 99.9th percentile, so a p99.9 push goes from ~3 ns
+   to ~41 ns while p50 does not move. That is a real regression at the
+   percentile this project gates on, it is arithmetic rather than a measurement,
+   and it must be stated in `PHASE1.md` §11's terms rather than buried in an
+   amortised mean. It is judged acceptable because the absolute number is 41 ns
+   against a publish-to-visible budget measured in microseconds — but that
+   judgement is an argument, and `publish_to_visible` is `unavailable` on this
+   host, so **it ships unmeasured unless a host that can run it appears.**
+   A reader who thinks 41 ns at p99.9 is too much should move the interval, not
+   the placement.
+
+## What merging this ratifies
+
+- The four recommendations above, as decisions.
+- `PHASE2.md` §6.4's amendment from *"bumped on every push"* to the sampled rule,
+  **keeping *never a reaping trigger* intact** — a better timestamp to be stale
+  against does not weaken §6.4's refusal to reap on staleness, and the amendment
+  must say so or it will be read as licence.
+- `PHASE5.md` §0.0 moving `TFT004` out of the "cannot detect anything in any
+  configuration" group, taking *"sixteen detect"* to seventeen.
+
+**What it does not ratify, and what stays owed:** question 4's p99.9 effect is
+arithmetic and not a measurement, and this host cannot supply one
+(`publish_to_visible` is `unavailable`: 4 physical cores against 17 needed, no
+ROS 2). The implementation owes `just bench-check` on a host that can, or an
+explicit statement in `PHASE1.md` §11 that it shipped without one.
 
 ## Not in this record
 
