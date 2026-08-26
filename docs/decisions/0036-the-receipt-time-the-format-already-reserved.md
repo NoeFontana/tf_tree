@@ -328,6 +328,12 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    *"one offset per second of published data"* is exactly `sample_every` — with a
    fixed default where the edge declares no rate; and `since_sample: Cell<u32>`.
 
+   **The construction site was checked, not assumed.** `Tree::claim` builds
+   `EdgeWriter { .. }` with both `view` and `eid` still in scope, so
+   `view.edge(eid)`'s `nominal_rate_mhz` is reachable at exactly the point the
+   two fields are initialised — no plumbing, no second lookup, and nothing to
+   thread through `Publisher`.
+
    `EdgeWriter::push` calls `self.publisher.push(stamp, iso)?` **first**, then
    counts, and on wrap reads the clock and does one `Relaxed` store into
    `claim.last_push_nanos`.
