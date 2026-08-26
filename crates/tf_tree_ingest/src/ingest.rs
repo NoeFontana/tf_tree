@@ -1155,16 +1155,16 @@ fn fill_spilled(
     let child = tree
         .frame(frames.name(want_child))
         .map_err(|_| IngestError::FrameLost { frame: want_child })?;
-    // **These pushes stamp an arena receipt time, and it is *ingest* time**
-    // (`docs/decisions/0036`). `EdgeWriter::push` samples a host wall clock into
-    // `ClaimRecord::last_push_nanos`, so replaying a 2024 recording in 2026
-    // writes 2026 receipts against 2024 header stamps. That is not wrong — the
-    // field means "when this arena received this sample", and it did — but it is
-    // exactly the shape `TFT004` reads as clock skew, and a bag-sourced tree is
-    // an ordinary live heap `Tree`, so none of that check's frozen-source or
-    // epoch skips catch it. **`0036` step 3 owes a fourth skip for a replayed
-    // source**, recorded in that record; until it lands, `TFT004` reads nothing
-    // at all, so nothing here is currently mis-reported.
+    // **These pushes record a clock offset, and it is measured against *ingest*
+    // time** (`docs/decisions/0036`). `EdgeWriter::push` samples
+    // `wall clock - stamp` into `ClaimRecord::clock_offset_nanos`, so replaying
+    // a 2024 recording in 2026 records an offset of about two years. That is
+    // arithmetically correct and diagnostically meaningless: the publisher's
+    // clock was fine, the recording is simply old. A bag-sourced tree is an
+    // ordinary live heap `Tree`, so neither `TFT004`'s frozen-source skip nor
+    // its epoch condition catches it. **`0036` step 3 owes a fourth skip for a
+    // replayed source**, recorded in that record; until it lands, `TFT004` reads
+    // nothing at all, so nothing here is currently mis-reported.
     //
     // The cost is the sampler's ~1.1 ns per push plus one 38 ns clock read per
     // interval, on a bulk load of millions of samples: single-digit

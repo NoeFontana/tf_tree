@@ -1,4 +1,4 @@
-// What the `docs/decisions/0036` receipt-time sampler costs a publisher —
+// What the `docs/decisions/0036` clock-offset sampler costs a publisher —
 // measured as a **paired delta in one process**, which is the only form of the
 // number this host can produce.
 //

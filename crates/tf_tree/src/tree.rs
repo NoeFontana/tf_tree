@@ -792,7 +792,7 @@ impl ArenaBacking {
 /// otherwise since it was written: `fork_gen` is declared *between* them under
 /// `shm`, and without `shm` there is no `_lease` at all. What must hold is that
 /// no field carrying a `Drop` is declared between the two. The three
-/// receipt-time fields at the end own nothing and implement no `Drop`, which is
+/// clock-offset fields at the end own nothing and implement no `Drop`, which is
 /// why they are at the end and why they are harmless there.
 ///
 /// Reversing it is not catastrophic but is wrong: it leaves a window in which
@@ -831,7 +831,7 @@ pub struct EdgeWriter<'a> {
     /// never writes.
     ///
     /// `Publisher` holds the same reference privately and bumps `heartbeat` on
-    /// every push; `last_push_nanos` sits beside it and is the *receipt time*
+    /// every push; `clock_offset_nanos` sits beside it and is the *clock offset*
     /// `docs/decisions/0036` wires up. It is sampled here rather than there
     /// because reading a wall clock is `std` and the engine crate is `no_std`
     /// (D14) — and because a clock read inside `SampleRing::push` would sit
@@ -841,7 +841,7 @@ pub struct EdgeWriter<'a> {
     /// Borrowing the record a second time costs nothing: it is a `&`, and every
     /// mutation of it is atomic.
     claim: &'a ClaimRecord,
-    /// Pushes between receipt-time samples. Fixed for this writer’s life,
+    /// Pushes between clock-offset samples. Fixed for this writer’s life,
     /// derived once at claim time from the edge’s declared nominal rate.
     ///
     /// The derivation makes the *offset sample rate* the constant instead of
@@ -913,13 +913,14 @@ impl EdgeWriter<'_> {
     /// pointer into an unmapped page, which is not a trade this hot path gets
     /// to decline.
     ///
-    /// # Cost of the receipt-time sampler, measured
+    /// # Cost of the clock-offset sampler, measured
     ///
-    /// Since `docs/decisions/0036` step 1 this method also stamps a wall-clock
-    /// *receipt time* into the claim record, once every `sample_every` pushes,
-    /// so that `TFT004` can difference it against the publisher's header stamp
-    /// and find clock skew. **This section is on `push` and not on the private
-    /// method that does it, because rustdoc renders this one.**
+    /// Since `docs/decisions/0036` step 1 this method also records the
+    /// publisher's *clock offset* — the host wall clock minus `stamp` — into the
+    /// claim record, once every `sample_every` pushes, so that `TFT004` can
+    /// compare publishers and find the machine whose clock has drifted. **This
+    /// section is on `push` and not on the private method that does it, because
+    /// rustdoc renders this one.**
     ///
     /// **+1.1 ns per push, about +23%** — 5.9–6.1 ns against 4.8–5.0 ns, paired
     /// in-process against [`Publisher::push`] over five sittings
@@ -961,28 +962,35 @@ impl EdgeWriter<'_> {
         // **The `?` is load-bearing, not a style choice** (`docs/decisions/0036`
         // plan step 1). It is what places the clock read after the ring write —
         // outside the seqlock window, and skipped entirely on a push that never
-        // happened. A receipt time bumped by a `ClaimRevoked` push would be a
-        // receipt for nothing, and is the observable form of the read having
+        // happened. An offset recorded by a `ClaimRevoked` push would be an
+        // offset for nothing, and is the observable form of the read having
         // drifted inside the window.
         self.publisher.push(stamp, iso)?;
-        self.sample_receipt_time();
+        self.sample_clock_offset(stamp);
         Ok(())
     }
 
-    /// Count this push and, once every `sample_every` of them, stamp the claim
-    /// record with a wall-clock receipt time.
+    /// Count this push and, once every `sample_every` of them, record the
+    /// publisher's clock offset: the host wall clock minus `stamp`.
     ///
-    /// `TFT004` differences this against the *header stamp* the publisher
-    /// supplied to find a clock offset, which is why the clock is the wall clock
-    /// and not `Instant` however much cheaper the latter is: a monotonic reading
-    /// cannot be differenced against a wall-clock stamp (`docs/API.md` R3).
+    /// **The subtraction happens here, and that is the whole design.** A
+    /// receipt time stored on its own cannot be paired with a stamp by anyone
+    /// else: sampling means the ring's newest stamp belongs to a later push than
+    /// the receipt does, so `receipt - newest_stamp` reads anywhere from +3 µs
+    /// to -900 ms on a 10 Hz publisher whose clock is *exact* (measured — see
+    /// [`ClaimRecord::clock_offset_nanos`]). This writer holds both sides at one
+    /// instant and nobody else ever does.
+    ///
+    /// The clock is the wall clock and not `Instant`, however much cheaper the
+    /// latter is: `stamp` is wall-clock-domain (`docs/API.md` R3) and a
+    /// monotonic reading cannot be subtracted from it.
     ///
     /// **Advisory, and never a reaping trigger** (`docs/PHASE2.md` §6.4). A
-    /// stale receipt time means the writer has not reached its next sample; it
-    /// does not mean the writer is gone, and nothing may treat it as though it
-    /// did. Liveness is the socket and the lock byte (D17), and a timestamp that
-    /// is now actually written is exactly the thing a later reader would reach
-    /// for instead.
+    /// stale offset means the writer has not reached its next sample; it does
+    /// not mean the writer is gone, and nothing may treat it as though it did.
+    /// Liveness is the socket and the lock byte (D17), and a field that is now
+    /// actually written is exactly the thing a later reader would reach for
+    /// instead.
     ///
     /// The cost is on [`EdgeWriter::push`], where rustdoc renders it.
     ///
@@ -998,7 +1006,7 @@ impl EdgeWriter<'_> {
     /// *never sampled* for its first interval. Three reasons, one of them a
     /// number.
     #[inline]
-    fn sample_receipt_time(&self) {
+    fn sample_clock_offset(&self, stamp: i64) {
         let remaining = self.until_sample.get();
         if remaining != 0 {
             self.until_sample.set(remaining - 1);
@@ -1010,17 +1018,22 @@ impl EdgeWriter<'_> {
         // and a debug-build panic inside `push` is a bad way to learn that
         // somebody added a second producer of this field.
         self.until_sample.set(self.sample_every.saturating_sub(1));
+        // `saturating_sub`, so a stamp far enough from the epoch to overflow an
+        // `i64` difference clamps instead of wrapping. Wrapping would turn a
+        // nonsense stamp into a *plausible* offset, which is the one failure
+        // mode a diagnostic must not have.
+        //
         // `Relaxed`: this orders nothing. It is a diagnostic scalar read by a
         // separate process that is already tolerating a torn view of the whole
         // arena, and giving it a `Release` would put a fence on the publish path
         // to publish a number nothing waits on.
         self.claim
-            .last_push_nanos
-            .store(now_nanos(), Ordering::Relaxed);
+            .clock_offset_nanos
+            .store(now_nanos().saturating_sub(stamp), Ordering::Relaxed);
     }
 }
 
-/// Pushes between receipt-time samples for an edge that declares **no** nominal
+/// Pushes between clock-offset samples for an edge that declares **no** nominal
 /// rate (`EdgeRecord::nominal_rate_mhz == 0` — *not declared*, which is the
 /// reading `TFT007` already takes of that value).
 ///
@@ -1032,11 +1045,11 @@ impl EdgeWriter<'_> {
 /// record expected**, *at this value*: the clock read this interval divides is
 /// 3% of what the sampler costs at 1024, so moving it moves almost nothing here.
 /// At a declared 10 Hz — `sample_every` of 10 — the same read is 78% and the
-/// interval is the whole knob. [`EdgeWriter::push`]'s *Cost of the receipt-time
+/// interval is the whole knob. [`EdgeWriter::push`]'s *Cost of the clock-offset
 /// sampler* section tabulates both ends.
 const DEFAULT_SAMPLE_EVERY: u32 = 1024;
 
-/// Pushes between receipt-time samples for an edge declaring `nominal_rate_mhz`.
+/// Pushes between clock-offset samples for an edge declaring `nominal_rate_mhz`.
 ///
 /// `nominal_rate_mhz` is **milli**hertz — [`EdgeCfg::nominal_rate_hz`] stores
 /// `rate_hz * 1000.0` — so the quotient by 1000 is pushes per second, and *one
@@ -2228,17 +2241,17 @@ impl Tree {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let lease = self.take_claim_lease(eid, claim_rec, epoch, owner)?;
 
-        // **The receipt time is cleared, because a claim inherits the edge and
+        // **The recorded offset is cleared, because a claim inherits the edge and
         // not the writer** (`docs/decisions/0036`). Nothing else in the system
-        // resets `last_push_nanos` — not `release`, not the reaper, not
+        // resets `clock_offset_nanos` — not `release`, not the reaper, not
         // `tf_tree_core::edge::claim` — so without this line a fresh writer
-        // publishes under the *previous* writer's timestamp until its own first
-        // sample lands. `TFT004`'s planned "nothing sampled yet" skip is
-        // `last_push_nanos == 0`, which would not fire, so the check would
+        // publishes under the *previous* writer's offset until its own first
+        // sample lands. `TFT004`'s "nothing sampled yet" skip is
+        // `clock_offset_nanos == 0`, which would not fire, so the check would
         // report an hours-wide clock skew against a publisher whose clock is
         // perfect. `Relaxed` for the same reason the sampling store is: it
         // orders nothing, and the CAS above has already made this edge ours.
-        claim_rec.last_push_nanos.store(0, Ordering::Relaxed);
+        claim_rec.clock_offset_nanos.store(0, Ordering::Relaxed);
 
         // §7.1's per-edge population, writer half. This is the moment the edge
         // is taken up, and it is off the publish path — `push` is what must not
@@ -2260,7 +2273,7 @@ impl Tree {
             sample_every,
             // **Zero, so the claim's *first* push samples**, and every
             // `sample_every`-th one after it. Starting a full interval away
-            // instead would leave `last_push_nanos == 0` — indistinguishable
+            // instead would leave `clock_offset_nanos == 0` — indistinguishable
             // from the pre-`0036` state where nothing wrote it — for 102 s on a
             // 10 Hz edge with no declared rate and about 85 minutes on a 0.2 Hz
             // one, which are exactly the slow publishers §6.4 is about. It costs
