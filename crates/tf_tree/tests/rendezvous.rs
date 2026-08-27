@@ -820,11 +820,12 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
 /// the question `0028` has to answer before #189's `--force-new` flag would
 /// turn this policy into a documented operator procedure.
 ///
-/// **#201's second path — the takeover arm — is closed.** It took the first
-/// free byte through `register_any`; it now returns the slot the caller
-/// declares through `Open::already_attached_at`, and `register_any` is deleted.
-/// `0028` question 3 is where the answer came from: the heir keeps its existing
-/// slot, byte and arena record. What is pinned below is therefore the
+/// **#201's second path — the takeover arm — is closed by deletion.** It took
+/// the first free byte through `register_any`; both are gone, and
+/// `OpenOutcome::TookOver` now has no producer. `0028` question 3 is why: the
+/// heir keeps its existing slot, byte and arena record, and §3.5 cannot be
+/// wired as a second `Open::open` call. `docs/decisions/0037` records the five
+/// unsound states two rounds of repair produced before that landed. What is pinned below is therefore the
 /// *consequence* of the remaining divergence, on a staged instance of it, and
 /// not its reachability.
 ///

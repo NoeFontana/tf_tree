@@ -17,7 +17,7 @@
 //!
 //!     // 5. Serve.
 //!     ...
-//!     return Created | TookOver
+//!     return Created            // TookOver has no producer; see its doc
 //! }
 //! on timeout -> Err(ArenaHeldButUnreachable { holder_slots, identities })
 //! ```
@@ -148,6 +148,30 @@ pub enum OpenOutcome {
     /// This process already had the arena mapped and has now inherited the
     /// owner role: unlink the stale socket, bind, and serve its *existing* fd.
     /// It must not create a second arena (§3.4 step 3, §3.5).
+    ///
+    /// # Nothing produces this, and that is a decision rather than a gap
+    ///
+    /// [`Open`] had an arm that did, reached by a `already_attached` builder.
+    /// Issue #201 found it handing back the first *free* participant byte while
+    /// the caller's arena record was elsewhere, and every liveness predicate
+    /// indexes the two with one integer. Two attempts to repair it in place
+    /// produced five distinct unsound states — a session over an unheld byte, an
+    /// out-of-range slot, a serving owner overriding the declaration, a
+    /// declaration naming a *peer's* slot (`F_OFD_GETLK` reports conflicts and
+    /// cannot name a holder — `lockfile`'s module doc), and a stranded owner
+    /// grant — so the arm was deleted instead.
+    ///
+    /// The decision behind that is older than the defect:
+    /// `docs/decisions/0028` question 3, resolved 2026-08-20, holds that a heir
+    /// keeps the slot, byte and arena record it already has and that **§3.5
+    /// cannot be wired as a second `Open::open` call**. A builder that declares
+    /// "I am already attached at slot n" is unverifiable from a new file
+    /// description, which is what that resolution implies and what the attempts
+    /// demonstrated.
+    ///
+    /// The variant stays because §3.5 is the protocol's vocabulary and a heir
+    /// still has to be *describable*; `docs/decisions/0037` is where the shape
+    /// that could produce it is being worked out.
     TookOver,
 }
 
@@ -230,7 +254,6 @@ pub struct Open {
     mode: AccessMode,
     create: CreatePolicy,
     timeout: Duration,
-    already_attached: Option<u32>,
 }
 
 /// Default `open_timeout` (§3.4).
@@ -271,7 +294,6 @@ impl Open {
             mode: AccessMode::ReadOnly,
             create: CreatePolicy::IfAbsent,
             timeout: DEFAULT_OPEN_TIMEOUT,
-            already_attached: None,
         }
     }
 
@@ -306,67 +328,6 @@ impl Open {
         self
     }
 
-    /// Declare that this process **already has the arena mapped at participant
-    /// slot `slot`** — it is an existing participant, and this call is a
-    /// takeover after the owner died (§3.4 step 3, §3.5).
-    ///
-    /// This is what makes step 3 short-circuit past the split-brain check: a
-    /// participant that already holds the arena is not at risk of creating a
-    /// second one, it is the one thing that *cannot* be. Declaring it without
-    /// actually holding an arena fd would defeat step 4, which is why it is an
-    /// explicit, separately-named builder method rather than an inferred flag.
-    ///
-    /// # Why it carries the slot, and used to carry a `bool`
-    ///
-    /// Because the takeover arm has to return one, and the only correct value is
-    /// the one the caller already holds.
-    ///
-    /// While this was `already_attached(true)` the arm called `register_any`,
-    /// which takes the first **free** byte — so a survivor holding byte 5 and
-    /// arena record 5 was handed a session on byte 0. **Executed, not derived:**
-    /// `outcome=TookOver  session slot=0  but the caller's arena record is 5`.
-    /// Every liveness predicate in the facade indexes the lock byte and the
-    /// arena record with one integer (`docs/PHASE2.md` §5.1), so that session
-    /// reports a running process as dead — issue #201's corrupting direction,
-    /// and the half [`0035`] left open.
-    ///
-    /// **The correct value was already decided.** `0028` question 3, resolved
-    /// 2026-08-20: *"the heir keeps its existing slot, byte and arena record,
-    /// and takeover is byte 0 plus a `bind` and nothing else"* — byte 0 being
-    /// the **ownership** byte. A heir that acquired a second slot "would arrange
-    /// for its own live claims to be reaped", since the slot is baked into every
-    /// claim it already holds. So the arm registers no participant at all, and
-    /// this parameter is where its slot comes from.
-    ///
-    /// # The declaration is checked, and the first revision of this did not check it
-    ///
-    /// Taking a `u32` rather than a `bool` is not on its own enough, and review
-    /// executed all three ways it was not. `open()` therefore **probes the
-    /// declared byte once, before anything else**, and refuses with
-    /// [`IpcError::NotAttachedAt`] if nobody holds it:
-    ///
-    /// * `already_attached_at(0)` from a process holding nothing returned
-    ///   `TookOver slot=0` with byte 0 **free** — a session naming a record
-    ///   whose byte nobody holds, which `docs/PHASE2.md` §0.0 calls the class
-    ///   that reads dead to every probe-carrying observer.
-    /// * `already_attached_at(u32::MAX)` returned `Ok(4294967295)`. The same
-    ///   probe range-checks, so this now refuses too.
-    /// * Against a **serving** owner, `already_attached_at(5)` returned
-    ///   `Joined slot=1`: the join path assigned its own slot and ignored the
-    ///   declaration. It no longer does — the §3.5 race where the other
-    ///   survivor binds first is exactly when this arm matters most.
-    ///
-    /// With the check and all three arms honouring it, the guarantee is real:
-    /// **no value of this argument produces a session whose slot the caller did
-    /// not choose**, and no session at all unless that slot's byte is held.
-    ///
-    /// [`0035`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0035-the-creators-slot-is-taken-not-found.md
-    #[must_use]
-    pub fn already_attached_at(mut self, slot: u32) -> Open {
-        self.already_attached = Some(slot);
-        self
-    }
-
     /// The resolved rendezvous.
     #[must_use]
     pub fn rendezvous(&self) -> &Rendezvous {
@@ -385,25 +346,6 @@ impl Open {
         self.rendezvous.ensure_dir()?;
         let lock = LockFile::open(self.rendezvous.lock_path())?;
         let identity = Identity::of_self_best_effort(self.mode);
-
-        // **The declared slot is checked once, here, and honoured on every path
-        // below.** `already_attached_at(n)` asserts *"I already hold the arena
-        // at slot `n`"*, and every arm then returns `n` instead of assigning a
-        // slot — so if the assertion is false the session names a participant
-        // record whose lock byte is free, which §0.0 calls the class that reads
-        // dead to every probe-carrying observer. A peer's reaper CASes that
-        // record away while its owner publishes.
-        //
-        // One `F_OFD_GETLK`, and it range-checks too: `probe_participant`
-        // refuses a slot past `MAX_PARTICIPANTS` before probing. Both holes were
-        // executed on the first revision of this change — `TookOver slot=0` with
-        // byte 0 unheld, and `Ok(4294967295)` — which is why the check is up
-        // here rather than in the one arm that first needed it.
-        if let Some(slot) = self.already_attached {
-            if !lock.probe_participant(slot)?.held {
-                return Err(IpcError::NotAttachedAt { slot });
-            }
-        }
 
         let start = Instant::now();
         let mut backoff = MIN_BACKOFF;
@@ -427,27 +369,6 @@ impl Open {
                     // table and will name a different slot. Nothing was written
                     // to the arena, so nothing is left behind — which is the
                     // point of taking the byte before touching it.
-                    // **A declared slot wins here too.** A process that
-                    // already holds the arena at slot `n` is already a
-                    // participant; registering it a second time at the owner's
-                    // chosen byte leaves it holding two bytes with its arena
-                    // record at neither — the §3.5 race where the *other*
-                    // survivor binds first, and the same divergence issue #201
-                    // is about. Executed on the first revision of this change:
-                    // `already_attached_at(5)` against a serving owner returned
-                    // `Joined slot=1`. The owner's assignment is dropped rather
-                    // than taken, which costs it nothing: nothing was written to
-                    // the arena, so its assigner re-probes and grants the byte
-                    // to somebody else.
-                    if let Some(declared) = self.already_attached {
-                        return Ok(Session {
-                            outcome: OpenOutcome::Joined,
-                            lock,
-                            slot: declared,
-                            owner: false,
-                            attached: Some(attached),
-                        });
-                    }
                     if let Some(slot) = self.register_at(&lock, &identity, slot)? {
                         return Ok(Session {
                             outcome: OpenOutcome::Joined,
@@ -467,23 +388,6 @@ impl Open {
                 //    takeover: reuse it, and skip step 4 entirely. A process
                 //    that already holds the arena is the one thing that cannot
                 //    create a second one.
-                if let Some(slot) = self.already_attached {
-                    // **No participant registration.** `0028` question 3: the
-                    // heir keeps the slot, byte and arena record it already has,
-                    // and takeover is the ownership byte plus a `bind`. It is
-                    // already a participant; taking a second byte here is what
-                    // made this arm produce issue #201's divergence, and
-                    // The identity record it would write is already written,
-                    // by whatever attached this process in the first place.
-                    return Ok(Session {
-                        outcome: OpenOutcome::TookOver,
-                        lock,
-                        slot,
-                        owner: true,
-                        attached: None,
-                    });
-                }
-
                 // 4. SPLIT-BRAIN CHECK. A held participant byte means a live
                 //    arena exists whose holder has not taken over yet, so yield
                 //    to it. Deterministic: no grace period, no timing
@@ -544,7 +448,7 @@ impl Open {
     /// **This path is now only for a creator.** A joiner uses
     /// [`Open::register_at`], where §3.3's order *is* restored because the slot
     /// is known before anything is written, and a taker-over registers nothing
-    /// at all — `0028` question 3, and see [`Open::already_attached_at`]. Take
+    /// at all — `0028` question 3, and `docs/decisions/0037`. Take
     /// **the creator's slot**, or report that somebody else holds it.
     ///
     /// # Why this is not a scan for the first free byte
@@ -698,22 +602,8 @@ impl<A> Session<A> {
         self.outcome
     }
 
-    /// This process's participant slot.
-    ///
-    /// **Whether *this* `Session` holds the byte depends on how `open()`
-    /// resolved.** For [`OpenOutcome::Created`] and [`OpenOutcome::Joined`]
-    /// without a declaration, this session took the byte and releases it on
-    /// drop. Where [`Open::already_attached_at`] was used — every
-    /// [`OpenOutcome::TookOver`], and a `Joined` that raced a serving owner —
-    /// the byte is held by whatever attached this process in the first place,
-    /// and **this session neither took it nor releases it**. `open()` verifies
-    /// it is held before returning, so the slot always names a held byte; what
-    /// it does not do is take a second one.
-    ///
-    /// The distinction matters to exactly one caller: a heir must not drop the
-    /// attachment that owns the byte on the strength of holding this session.
-    /// It would leave a `LIVE` arena record over a free byte, which reads dead
-    /// to every probe-carrying observer and is reaped mid-publish.
+    /// This process's participant slot. Its lock byte is held for the lifetime
+    /// of the `Session`, on this session's own file description.
     #[must_use]
     pub fn slot(&self) -> u32 {
         self.slot
@@ -798,16 +688,6 @@ mod tests {
     /// A probe that reports "serving" only after `n` calls, so a test can make
     /// the owner appear mid-loop. Grants slot `1`, since the creator in these
     /// tests already holds slot `0`.
-    /// Probe a participant byte from a *third* description, so the answer is
-    /// about the file rather than about whoever this test is holding.
-    fn lock_probe(path: &Path, slot: u32) -> bool {
-        LockFile::open(path)
-            .unwrap()
-            .probe_participant(slot)
-            .unwrap()
-            .held
-    }
-
     struct ServingAfter(u32);
 
     impl ServerProbe for ServingAfter {
@@ -888,122 +768,6 @@ mod tests {
         // over the instant it notices.
         let taker = LockFile::open(rv.lock_path()).unwrap();
         assert_eq!(taker.try_take_ownership().unwrap(), LockAttempt::Acquired);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// **A declared slot is verified once and honoured on every arm** — issue
-    /// #201, and the three ways the first revision of its fix was wrong.
-    ///
-    /// `already_attached_at(n)` asserts *"I already hold the arena at slot n"*,
-    /// and every path then returns `n` instead of assigning a slot. That is only
-    /// safe if the assertion is true, and the first revision checked nothing:
-    ///
-    /// * **The byte need not have been held.** Executed: `already_attached_at(0)`
-    ///   from a process holding nothing returned `TookOver slot=0` with byte 0
-    ///   free — a session naming a participant record whose byte nobody holds,
-    ///   which `docs/PHASE2.md` §0.0 calls the class that reads dead to every
-    ///   probe-carrying observer. A peer's reaper CASes it away mid-publish.
-    /// * **The slot need not have been in range.** Executed:
-    ///   `already_attached_at(u32::MAX)` returned `Ok(4294967295)`, handed out
-    ///   through public API to a caller that indexes a 64-record table with it.
-    /// * **A serving owner overrode it.** Executed: against `ServingAfter(0)`,
-    ///   `already_attached_at(5)` returned `Joined slot=1` — the §3.5 race where
-    ///   the other survivor binds first, reproducing #201's divergence on the
-    ///   arm that was supposed to have closed it.
-    ///
-    /// Mutants, run: delete the `probe_participant` guard — the first two cases
-    /// return `Ok`; delete the `already_attached` arm in `Reach::Serving` — the
-    /// third returns slot 1.
-    #[test]
-    fn a_declared_slot_is_verified_and_honoured_on_every_arm() {
-        // (a) Declared but unheld: refused rather than minted.
-        let (rv, dir) = rendezvous("declared_unheld");
-        let err = Open::new(rv)
-            .already_attached_at(0)
-            .timeout(Duration::from_millis(50))
-            .open(&mut NoServer)
-            .unwrap_err();
-        assert!(
-            matches!(err, IpcError::NotAttachedAt { slot: 0 }),
-            "a declaration nobody backs must be refused, not turned into a \
-             session whose byte is free: {err:?}"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-
-        // (b) Out of range: the same probe range-checks before it probes.
-        let (rv, dir) = rendezvous("declared_range");
-        let err = Open::new(rv)
-            .already_attached_at(u32::MAX)
-            .timeout(Duration::from_millis(50))
-            .open(&mut NoServer)
-            .unwrap_err();
-        assert!(
-            matches!(err, IpcError::NoParticipantSlots { .. }),
-            "an out-of-range slot reached a Session: {err:?}"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-
-        // (c) A serving owner does not override the declaration.
-        let (rv, dir) = rendezvous("declared_serving");
-        let other = LockFile::open(rv.lock_path()).unwrap();
-        other.try_take_participant(5).unwrap();
-        let s = Open::new(rv)
-            .already_attached_at(5)
-            .timeout(Duration::from_millis(50))
-            .open(&mut ServingAfter(0))
-            .unwrap();
-        assert_eq!(s.outcome(), OpenOutcome::Joined);
-        assert_eq!(
-            s.slot(),
-            5,
-            "a serving owner's slot assignment overrode the caller's own: it \
-             would hold two bytes with its arena record at neither"
-        );
-        drop(s);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_survivor_that_holds_the_arena_takes_over_instead() {
-        // Same world as the previous test, but from the survivor's side: step 3
-        // short-circuits, so it takes over rather than yielding forever.
-        let (rv, dir) = rendezvous("takeover");
-        let lock_path = rv.lock_path().to_path_buf();
-        let other = LockFile::open(rv.lock_path()).unwrap();
-        other.try_take_participant(5).unwrap();
-
-        let s = Open::new(rv)
-            .already_attached_at(5)
-            .timeout(Duration::from_millis(50))
-            .open(&mut NoServer)
-            .unwrap();
-        assert_eq!(s.outcome(), OpenOutcome::TookOver);
-        assert!(s.is_owner());
-        // **The heir keeps its own slot** (`0028` question 3), which is the half
-        // of issue #201 `0035` left open. This arm used to call `register_any`
-        // and hand back the first *free* byte — executed at the time as
-        // `session slot=0` against a caller whose arena record was 5 — and every
-        // liveness predicate indexes the byte and the record with one integer,
-        // so that session reported a running process as dead.
-        assert_eq!(
-            s.slot(),
-            5,
-            "the takeover handed back a slot the caller did not declare: its \
-             lock byte and its arena record now name different participants"
-        );
-        // **And it registered nothing**, which is the change rather than its
-        // consequence: `0028` question 3 makes takeover the ownership byte plus
-        // a `bind`, because the heir already is a participant. Asserting only
-        // the slot leaves a mutant that takes a free byte and then overwrites
-        // the returned value passing.
-        for slot in 0..8 {
-            assert_eq!(
-                lock_probe(&lock_path, slot),
-                slot == 5,
-                "participant byte {slot} after a takeover: the arm took a byte \
-                 it had no business taking"
-            );
-        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

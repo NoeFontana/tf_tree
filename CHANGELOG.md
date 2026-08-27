@@ -35,55 +35,44 @@ is a bug.
 
 ### Changed — breaking
 
-- **`tf_tree_ipc::Open::already_attached(bool)` is now `already_attached_at(u32)`,
-  and the takeover arm it reaches registers no participant** (closes #201).
-
-  The arm called `register_any`, which takes the first **free** lock byte. A
-  survivor holding byte 5 with arena record 5 was therefore handed a session on
-  byte **0** — executed, on the arm itself:
-  `outcome=TookOver  session slot=0  but the caller's arena record is 5`. Every
-  liveness predicate in the facade indexes the lock byte and the arena record
-  with one integer (`docs/PHASE2.md` §5.1), so that session reports a running
-  process as **dead**, which §6.2 calls the corrupting direction.
-
-  **The correct answer was already decided and the deferral was a typo.**
-  [`0035`](docs/decisions/0035-the-creators-slot-is-taken-not-found.md) closed
-  #201's creator path and left this arm open, pinning it to *"`0029` question
-  3"*. That answer is `0028` question 3, **resolved 2026-08-20**: the heir keeps
-  its existing slot, byte and arena record, because the slot is baked into every
-  claim it already holds and a heir with a second slot would arrange for its own
-  live claims to be reaped. `0029` corrected the misdirected citation on
-  2026-08-25, by which time `0035` was frozen.
-
-  So the arm now returns the slot the caller declares and takes no participant
-  byte, and **`register_any` — whose only caller it was — is deleted**.
-  `OpenError::ParticipantSlotDiverged` stays as an assertion neither path can now
-  trip.
-
-  **The declaration is a precondition, and `open()` checks it** — once, before
-  anything else: one `F_OFD_GETLK` on the declared byte, refusing with the new
-  **`IpcError::NotAttachedAt`** if nobody holds it, and range-checking on the way.
-  Carrying a `u32` instead of a `bool` removes the *arm's* freedom to pick a slot
-  but does not make the caller's declaration true, and review executed three ways
-  it was not: a declaration nobody backed minted `TookOver slot=0` over a **free**
-  byte, `already_attached_at(u32::MAX)` returned `Ok(4294967295)`, and a
-  **serving** owner overrode the declaration with `Joined slot=1` — #201's own
-  divergence on the join path, in the §3.5 race this arm exists for. With the
-  check, and with every arm honouring the declaration, no value of that argument
-  produces a session whose slot the caller did not choose, and none at all unless
-  that slot's byte is held.
-
+- **`tf_tree_ipc::Open::already_attached` and the takeover arm it reached are
+  deleted; `OpenOutcome::TookOver` now has no producer** (closes #201,
+  [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
   `LockFile::take_any_participant` survives with no production caller and a
-  caution on it: a participant's byte is never free to choose, so every caller
-  that thought it needed "any free byte" already knew its slot.
+  caution on it. `IpcError` and `OpenOutcome` are unchanged as types; what is
+  gone is the builder, the arm, and `Open::register_any`.
 
-- **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
-  `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
-  clock** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
-  A `pub` field that has shipped since `0.0.1` *unwritten* — nothing could have
-  read it for its value, since it was always zero — but a field path or a
-  `ClaimRecord { .. }` literal naming it will not compile. The Added entry below
-  is the whole argument.
+  The arm handed back the first **free** participant byte while the caller's
+  arena record was elsewhere, and every liveness predicate indexes the two with
+  one integer (`docs/PHASE2.md` §5.1), so a running process read as **dead** —
+  §6.2's corrupting direction. Executed:
+  `outcome=TookOver  session slot=0  but the caller's arena record is 5`.
+
+  **It was approached as a bug with a known answer and is really a protocol that
+  cannot be expressed as an `Open::open` call.**
+  [`0035`](docs/decisions/0035-the-creators-slot-is-taken-not-found.md) deferred
+  the arm, pinning it to "`0029` question 3"; the answer is `0028` question 3,
+  resolved 2026-08-20, and `0029` corrected the misdirected citation on
+  2026-08-25 while `0035` was frozen. But that answer says §3.5 **cannot** be
+  wired as a second `Open::open` call — read as *nothing calls it yet* rather
+  than *nothing can*.
+
+  **The root cause is that no new file description can verify a claim about the
+  caller's own locks.** `F_OFD_GETLK` answers *"does anyone **else** hold this
+  byte"* — `lockfile.rs`'s module doc says so twice, the second time calling it
+  "a trap for any future code that tries to read back its own state" — so a
+  declaration naming a live *peer's* slot is indistinguishable from a true one.
+  Two rounds of repair produced five executed unsound states, four of them
+  introduced while fixing the one before: the original divergence, a session over
+  a **free** byte, an out-of-range slot returned through public API, a serving
+  owner overriding the declaration, and a stranded owner grant that wedges an
+  arena at 64 participants with 64 free bytes.
+
+  `0037` records what a real §3.5 would be — a method on the `Session` the heir
+  already holds, where the invariant is structural rather than checked — and does
+  not schedule it. `OpenError::ParticipantSlotDiverged` stays as an assertion
+  over hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
+  construction, now the only route that can still produce the divergence.
 
 ### Added
 

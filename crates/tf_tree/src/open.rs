@@ -30,7 +30,9 @@
 //!
 //! §3.5 takeover — a *participant* noticing the owner died and promoting itself
 //! — is not here, and **it is not a second pass through [`tf_tree_ipc::Open`]
-//! with `already_attached_at`**, which is what this paragraph used to say.
+//! with a builder declaring it is already attached**, which is what this
+//! paragraph used to say — and that builder is now deleted
+//! (`docs/decisions/0037`).
 //! `docs/decisions/0028` open question 3 settled that the heir keeps its
 //! existing slot, byte and arena record: the participant slot is baked into
 //! every claim and every topology guard it already holds — A3 encodes claim
@@ -589,19 +591,24 @@ pub enum OpenError {
     /// [`Rendezvous`] of the session's own is in scope — so the arm refuses and
     /// the caller keeps whatever it already had.
     ///
-    /// The session is dropped before this is returned, so the ownership byte
-    /// is released: a refused takeover leaves the rendezvous as it found it,
-    /// and since issue #201 it never took a participant byte to release.
+    /// The session is dropped before this is returned, so the ownership byte is
+    /// released: a refused takeover leaves the rendezvous as it found it.
     ///
-    /// **Not reachable through this crate's public surface at all**, and not
-    /// through any feature of it either. `tf_tree_ipc::Open::already_attached_at`
-    /// is the sole producer of the outcome, and this builder deliberately does
-    /// not forward it: after `docs/decisions/0028` open question 3, §3.5
-    /// takeover is *not* a second pass through [`tf_tree_ipc::Open`], so a
-    /// setter here — stable or feature-gated — would publish a route into a
-    /// protocol this project decided not to build. The only thing that reaches
-    /// this variant is a `#[cfg(test)]` field on [`Open`], set by this module's
-    /// own refusal test.
+    /// # Nothing reaches this any more, and the arm stays
+    ///
+    /// `tf_tree_ipc::Open` had the only producer of [`OpenOutcome::TookOver`],
+    /// and issue #275 deleted it: two rounds of trying to make it safe produced
+    /// five executed unsound states, and the reason is structural — a takeover
+    /// cannot be an `Open::open` call at all (`docs/decisions/0037`). So this
+    /// variant is unconstructible today, and the `#[cfg(test)]` seam that used
+    /// to drive it went with the builder it drove.
+    ///
+    /// **The arm is kept rather than replaced with `unreachable!`.** `TookOver`
+    /// is a `pub` variant of a published crate's enum; a future §3.5 gives it a
+    /// producer, and the day it does, this refusal is the thing standing between
+    /// an heir and a `build_shared` that forks the tree. A panic would be the
+    /// wrong shape for that, and deleting the arm would make the match
+    /// non-exhaustive at exactly the wrong moment.
     #[error(
         "the rendezvous resolved to a takeover, and takeover is not wired (docs/PHASE2.md §3.5)"
     )]
@@ -653,20 +660,6 @@ pub struct Open {
     timeout: Duration,
     layout: Option<TreeBuilder>,
     require_create: bool,
-    /// **Test scaffolding — `#[cfg(test)]`, so it exists only when this crate
-    /// is compiled as its own test target, and in no build a user can produce.**
-    ///
-    /// `tf_tree_ipc::Open::already_attached_at` is the sole producer of
-    /// [`OpenOutcome::TookOver`], and this builder has no setter for it on
-    /// purpose ([`OpenError::TakeoverUnsupported`] says why). That leaves the
-    /// refusal arm unreachable, and a refusal nothing can fire is worth less
-    /// than it looks — but the fix is not a `pub` seam behind a feature, which
-    /// would publish the route the missing setter exists to withhold and put
-    /// new API on a crate that publishes. A private field, set directly by the
-    /// unit test at the bottom of this file, costs neither: `just shm-check`
-    /// runs that test (`cargo nextest run -p tf_tree --features shm --lib`).
-    #[cfg(test)]
-    already_attached: Option<u32>,
 }
 
 impl Default for Open {
@@ -707,8 +700,6 @@ impl Open {
             timeout: DEFAULT_OPEN_TIMEOUT,
             layout: None,
             require_create: false,
-            #[cfg(test)]
-            already_attached: None,
         }
     }
 
@@ -970,14 +961,6 @@ impl Open {
             .mode(request.mode)
             .create(self.create)
             .timeout(per_attempt);
-        // Shadowed rather than assigned to a `mut` binding, so a non-test build
-        // carries no trace of the seam at all — not even an unused `mut`. See
-        // the `already_attached` field.
-        #[cfg(test)]
-        let ipc_open = match self.already_attached {
-            Some(slot) => ipc_open.already_attached_at(slot),
-            None => ipc_open,
-        };
         let mut session = ipc_open.open(&mut probe).map_err(OpenError::Rendezvous)?;
 
         match session.outcome() {
@@ -1585,179 +1568,4 @@ fn name_bytes() -> [u8; 32] {
     let comm = tf_tree_ipc::self_comm();
     out[..comm.len()].copy_from_slice(&comm);
     out
-}
-
-/// **`docs/decisions/0028` plan step 9 (#220), and the reason it is a unit test
-/// rather than one in `tests/rendezvous.rs`.**
-///
-/// The arm this pins is reachable from exactly one place: the `#[cfg(test)]`
-/// takeover field on [`Open`], which only code inside this crate,
-/// compiled as this crate's own test target, can set. Step 9 offered two routes
-/// — "through `tf_tree_ipc` or through a `#[cfg(test)]` seam, and must say
-/// which" — and this is the second. Driving `tf_tree_ipc` directly would exercise
-/// the layer that did not change: `tf_tree_ipc::Open` still produces
-/// [`OpenOutcome::TookOver`] happily, and its own
-/// `a_survivor_that_holds_the_arena_takes_over_instead` asserts exactly that.
-/// What changed is the facade's `match`, and only `tf_tree::Open` enters it.
-///
-/// A `pub` seam behind `--features test-hooks` was the third option and is the
-/// wrong one twice over: `tf_tree` is one of the five publishing crates, and the
-/// route it would publish is the one [`Open`] withholds on purpose.
-///
-/// The recipe is `just shm-check`'s
-/// `cargo nextest run -p tf_tree --features shm --lib` — the line that exists
-/// *because* a `#[cfg(feature = "shm")]` unit test in this crate once ran
-/// nowhere. `just test` builds default features, so this is compiled out there.
-#[cfg(all(test, feature = "shm"))]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
-    use super::{Open, OpenError};
-    use crate::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
-
-    /// A scratch runtime directory, removed when the test ends.
-    ///
-    /// **`set_var` is process-wide, and that is safe here only because
-    /// `nextest` gives every test its own process** — the same caveat
-    /// `tests/rendezvous.rs`'s `Scratch` carries, for the same reason. Every
-    /// recipe that runs this target uses `cargo nextest run`.
-    struct Scratch(std::path::PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Scratch {
-            let p = std::env::temp_dir().join(format!("tf_tree_rv-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&p);
-            // Domain 0's directory, because the survivor below opens the lock
-            // file by path before anything in `tf_tree_ipc` has had a chance to
-            // create it.
-            std::fs::create_dir_all(p.join("0")).unwrap();
-            std::env::set_var("TF_TREE_RUNTIME_DIR", &p);
-            Scratch(p)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// **The `TookOver` arm refuses instead of building a second arena.**
-    ///
-    /// [`OpenOutcome::Created`] and [`OpenOutcome::TookOver`] shared one arm,
-    /// and that arm calls `TreeBuilder::build_shared`, which `memfd_create`s a
-    /// **fresh** segment. A taker-over does not need an arena built — it has
-    /// one. `docs/PHASE2.md` §3.5 makes ownership a *role* rather than a
-    /// property of the arena, and `Session::release_ownership` promises lookups
-    /// do not stop across a takeover; an heir routed through the old arm would
-    /// have owned a new, empty arena under the rendezvous name while every
-    /// survivor stayed mapped to the original. That is a forked tree, not an
-    /// inherited one, and it is silent: the heir's own reads all succeed.
-    ///
-    /// **Why it refuses rather than adopting.** `docs/decisions/0028` open
-    /// question 3 resolved that the heir keeps its existing slot, byte and
-    /// arena record, and that takeover is byte 0 plus a `bind` and nothing else
-    /// — so under that answer this outcome never arrives here at all. And it
-    /// could not adopt if it did: at the match there is no fd, no socket path,
-    /// no `Rendezvous` of the session's own, and no route to the arena this
-    /// process already holds.
-    ///
-    /// **The layout is load-bearing.** Without `layout_if_creating` the arm
-    /// returned `NoLayoutToCreate` before this change as well, and this test
-    /// would have passed against the defect it exists to catch.
-    ///
-    /// Mutants applied and run, not reasoned about:
-    ///
-    /// - Recombine the arms (`OpenOutcome::Created | OpenOutcome::TookOver`)
-    ///   and delete the refusal — the pre-patch code — fails at the `.err()`:
-    ///   `a takeover must not produce a Tree`. `open()` returns `Ok`, over a
-    ///   segment `build_shared` created on the spot. Here that segment is the
-    ///   only one, because the takeover declaration is a lie this test tells; in the
-    ///   §3.5 world it models it is the *second*, and the survivors are mapped
-    ///   to the first.
-    /// - `drop(session)` → `std::mem::forget(session)`: fails at `a refused
-    ///   takeover must not keep the ownership byte`, `left: Contended, right:
-    ///   Acquired`.
-    /// - `release_ownership()` then `mem::forget(session)` — the #201
-    ///   partial-leak shape, where byte 0 comes back but the participant byte
-    ///   does not: passes the ownership assertion and fails at `participant
-    ///   byte 0 after a refused takeover`, `left: true, right: false`. That row
-    ///   is why the loop is a loop rather than a single probe.
-    ///
-    /// Deleting `drop(session)` outright is *not* on that list: it passes, and
-    /// the comment on that line says so. `session` is a local, and the `Err`
-    /// return drops it either way.
-    #[test]
-    fn a_takeover_refuses_rather_than_building_a_second_arena() {
-        let scratch = Scratch::new("takeover-refused");
-        let lock_path = scratch.0.join("0/default.lock");
-
-        // A survivor's byte, so this is the §3.5 world rather than an empty
-        // one: the owner is gone, nothing is serving, and a participant is
-        // still here. It is not what reaches the arm — `already_attached`
-        // short-circuits §3.4 step 4 before the split-brain check is consulted
-        // — but it is the state a real heir would be in, and it is what makes
-        // the *ordinary* creator in
-        // `tests/rendezvous.rs`'s `the_escape_hatch_creates_over_a_stranded_participant`
-        // refuse.
-        let survivor = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
-        assert_eq!(
-            survivor.try_take_participant(3).unwrap(),
-            tf_tree_ipc::LockAttempt::Acquired
-        );
-
-        let mut open = Open::new()
-            .mode(AttachMode::ReadWrite)
-            .create(CreatePolicy::IfAbsent)
-            .layout_if_creating(
-                TreeBuilder::new()
-                    .default_interp(InterpPolicy::LerpSlerp)
-                    .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
-            )
-            .timeout(std::time::Duration::from_millis(100));
-        // The seam, and the whole of it: a private field, set from inside the
-        // module that reads it. It asserts to `tf_tree_ipc` that this process
-        // already holds the arena **at slot 3**, which is what makes §3.4 step 3
-        // short-circuit. It does not make a takeover *happen*; setting it
-        // without holding an arena buys exactly the refusal below.
-        //
-        // The slot is carried rather than a `bool` since issue #201: the
-        // takeover arm returns the caller's own slot instead of taking a free
-        // byte, because a heir that acquired a second slot would arrange for its
-        // own live claims to be reaped (`0028` question 3).
-        open.already_attached = Some(3);
-
-        let err = open
-            .open()
-            .err()
-            .expect("a takeover must not produce a Tree");
-        assert_eq!(
-            err,
-            OpenError::TakeoverUnsupported,
-            "expected the takeover refusal, got {err:?}"
-        );
-
-        // And it left the rendezvous as it found it. Byte 0 is what a real heir
-        // takes for itself; a refusal that kept it would wedge every joiner on
-        // `ArenaHeldButUnreachable` for as long as this process lived. Opened
-        // by path, so this is a second open file description and the conflict
-        // is real inside one process.
-        let after = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
-        assert_eq!(
-            after.try_take_ownership().unwrap(),
-            tf_tree_ipc::LockAttempt::Acquired,
-            "a refused takeover must not keep the ownership byte"
-        );
-        // The ownership byte taken on the way to the outcome
-        // goes with it: byte 3 is the survivor's and is the only one still
-        // held.
-        for slot in 0..8 {
-            assert_eq!(
-                after.probe_participant(slot).unwrap().held,
-                slot == 3,
-                "participant byte {slot} after a refused takeover"
-            );
-        }
-        drop(survivor);
-    }
 }
