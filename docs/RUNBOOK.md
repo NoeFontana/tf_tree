@@ -566,8 +566,10 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   integer everywhere in the engine, and #201 is about the paths that break it —
   but this is not one of them, measured rather than reasoned: an owner plus two
   read-write survivors holds bytes `[0, 1, 2]`, and `SIGKILL`ing the owner leaves
-  `[1, 2]`, so the forced creator's `take_any_participant` returns byte **0** and
-  its fresh arena registers it at record **0**. They agree. The kernel frees
+  `[1, 2]`, so the forced creator asks for byte **0** and
+  its fresh arena registers it at record **0**. They agree — and since `0035` the
+  creator *takes* byte 0 rather than scanning for a free one, so it is refused
+  outright if that byte is held rather than handed a different number. The kernel frees
   exactly the byte the new arena reuses, because the owner held record 0 and byte
   0 for its whole life and the owner-side assigner skips slot 0 for every joiner —
   so no survivor can be holding byte 0 when the owner dies.

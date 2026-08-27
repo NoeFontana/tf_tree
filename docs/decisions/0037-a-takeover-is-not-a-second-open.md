@@ -110,7 +110,20 @@ the property `0028` question 3's answer was reaching for.
    need to be an *outcome* at all.
 4. **What happens to `docs/PHASE2.md` §3.5 and `0005` step 5**, both of which
    describe the second-`open()` protocol that will not be built? `0028` question
-   3 already flagged them; nothing has amended them.
+   3 already flagged them; nothing has amended them. §3.4's NORMATIVE
+   pseudo-code *has* been amended by #275, because it mandated the heir taking a
+   participant byte.
+5. **What is `Session::release_ownership` for now?** It is public, shipped, and
+   §3.5's "give up the owner role while staying attached" — and with the takeover
+   arm gone there is no route by which any survivor becomes owner. A fresh
+   `open()` takes ownership at step 2, meets step 4 against the survivors' held
+   bytes, releases, and times out into `ArenaHeldButUnreachable` for as long as
+   any survivor lives. **That was already true of every caller not using the
+   unsound arm**, so deletion did not cause it — it removed the last thing
+   obscuring it. The rendezvous is ownerless until every participant leaves.
+   Whether that makes `release_ownership` a footgun to remove, or the correct
+   half of a pair whose other half is the `Session` method sketched above, is
+   this record's question and not #275's.
 
 ## What the deletion costs, recorded rather than absorbed
 
@@ -132,6 +145,16 @@ test would assert about a state the code cannot enter. **It becomes owed again
 the moment this record gives `TookOver` a producer** — and whoever does that owes
 it before the producer lands, not after, because the refusal is what stands
 between an heir and a forked tree.
+
+**Two more verifications went with it, and both are recorded here rather than
+noticed later.** [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md) states
+that `TookOver` "is reachable from exactly one place, a `#[cfg(test)]` field" and
+names that unit test as "its only user" — both gone, and `0029` is `implemented`
+and frozen, so this is the correction. And
+`crates/tf_tree_ipc/tests/multiprocess.rs`'s `#201` stress test records its
+mutant as *"replace `register_creator` with `register_any` in step 5"*;
+`register_any` is deleted, so that recipe cannot be run. The test still guards
+`0035`'s fix; what is lost is the documented way to show it is not vacuous.
 
 The arm itself is deliberately *not* replaced with `unreachable!`: `TookOver` is
 a `pub` variant of a published crate's enum, and a panic is the wrong shape for

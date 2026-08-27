@@ -777,12 +777,17 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
 ///
 /// [`CreatePolicy::Always`] is the path on which it can break. §3.4 step 4 reads
 /// `if self.create != CreatePolicy::Always && lock.any_participant_held()?`, so
-/// the escape hatch skips the split-brain check *by design* and falls through
-/// to `take_any_participant`, the first **free** byte. With
-/// byte 0 already held the creator gets byte 1, while `build_shared` hands it
-/// arena record **0** on a fresh arena. Nothing reconciles the two afterwards:
-/// `hold_ownership` parks the session and never compares `Session::slot` with
-/// `Tree::participant`.
+/// the escape hatch skips the split-brain check *by design*. **The rest of this
+/// paragraph described what happened before `0035`**, and is kept because the
+/// test below is named for it: the create fell through to
+/// `take_any_participant`, the first **free** byte, so with byte 0 already held
+/// the creator got byte 1 while `build_shared` handed it arena record **0** on a
+/// fresh arena, and nothing reconciled the two afterwards — `hold_ownership`
+/// parks the session and never compares `Session::slot` with
+/// `Tree::participant`. Step 5 is now `register_creator` →
+/// `try_take_participant(0)`, which on `Contended` releases ownership and loops,
+/// so the forced creator is **refused** rather than diverged. That is what this
+/// test's own body asserts, in `first_slot: Some(0)`.
 ///
 /// **How that precondition arises is not known, and #201's answer to it is
 /// measurably wrong.** The issue has the divergence biting "precisely in the
@@ -1243,8 +1248,8 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
         "a refused create must not leave a bound rendezvous socket"
     );
 
-    // **And it left nothing behind.** Byte 1 — the one the forced creator was
-    // handed — is free again, and so is the ownership byte it took
+    // **And it left nothing behind.** Byte 1 — which the forced creator would
+    // have been handed before `0035`, and now never reaches — is free, and so is the ownership byte it took
     // on the way in; only the stranded session's byte 0 is still held, by the
     // process entitled to it. A refusal that returned while its `Session` lived
     // would burn a slot per attempt, which is the failure

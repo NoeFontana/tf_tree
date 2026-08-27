@@ -224,8 +224,9 @@ pub(crate) enum Reclamation {
 /// diverged — *measured*, in
 /// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`. `0035`
 /// has since put the create path on `register_creator`, which takes byte 0
-/// atomically, and issue #201 closed the **takeover** arm, which now returns a
-/// slot the caller declares and `open()` verifies. What this still buys is
+/// atomically, and issue #201 closed the **takeover** arm by deleting it
+/// ([`0037`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
+/// What this still buys is
 /// hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
 /// construction, where the two numbers are chosen by two callers and nothing
 /// pairs them — the route the [`OpenError::ParticipantSlotDiverged`] doc names
@@ -359,10 +360,11 @@ pub(crate) fn reclamation_verdict(
 /// the tests step 2 owes could still not name a slot and read back what the
 /// predicate says about it, and the same argument that put
 /// [`crate::CLAIM_WINDOW_HOOK`] behind this feature applies: a window a test
-/// cannot otherwise stand in. (`Open`'s own `#[cfg(test)]` takeover
-/// seam rejected a `pub` one for a reason that does not reach here — what it
-/// would have published was a route `Open` withholds on purpose, where this
-/// publishes a read-only verdict about a slot.)
+/// cannot otherwise stand in. (`Open` briefly had a `#[cfg(test)]` takeover
+/// seam that rejected a `pub` one for a reason that does not reach here — what
+/// it would have published was a route `Open` withholds on purpose, where this
+/// publishes a read-only verdict about a slot. That seam went with the builder
+/// it drove; `docs/decisions/0037`.)
 ///
 /// `own_slot` is a **parameter rather than `tree.participant_slot()`**, and
 /// that is the point of it: with the tree's real slot passed, the own-slot
@@ -550,10 +552,10 @@ pub enum OpenError {
     ///
     /// # What a caller does about it
     ///
-    /// Not retry through the takeover arm — it no longer diverges (issue #201
-    /// closed it), but it is not a route past this either: it requires a slot
-    /// this process already holds, and a caller seeing this error does not have
-    /// one. Either stop the process still holding the byte (`tf_tree
+    /// Not retry through the takeover arm — there is none; issue #201 closed it
+    /// by deletion, and `docs/decisions/0037` records why a takeover cannot be an
+    /// `Open::open` call at all. Either stop the process still holding the byte
+    /// (`tf_tree
     /// participants` names it from the lock file's identity records), or open
     /// with [`CreatePolicy::IfAbsent`] and let the wedge be diagnosed rather
     /// than created over.
@@ -1071,19 +1073,23 @@ impl Open {
                 //
                 // Drop the session explicitly, mirroring the `Joined` refusal
                 // above. **Explicitness, not necessity:** `session` is a local
-                // of this function, so the `Err` return drops it either way —
-                // delete this line and the unit test below still passes, which
-                // is how that was established rather than reasoned about.
+                // of this function, so the `Err` return drops it either way.
                 //
-                // What the test does pin is that the session is gone *by the
-                // time the caller sees the error*: it holds the ownership byte
-                // and — before issue #201 deleted that step — a participant
-                // byte too, and a return that kept either would leave the
-                // rendezvous owned by a process with no arena behind it, with
-                // every subsequent joiner waiting out its timeout on
-                // `ArenaHeldButUnreachable`. `mem::forget` here fails the test;
-                // the brace does the work, and this line says so where a reader
-                // is looking.
+                // **The three mutant results this comment used to cite are
+                // retired**, and saying so is the point: they were run against a
+                // unit test that reached this arm through a `#[cfg(test)]` seam,
+                // and #275 deleted the seam with the builder it drove
+                // (`docs/decisions/0037`). Nothing can construct `TookOver` now,
+                // so nothing can exercise this arm, and a comment claiming
+                // otherwise would read as tested when it is not.
+                //
+                // What the retired test pinned, and what still has to be true
+                // the day `TookOver` gets a producer: the session is gone *by
+                // the time the caller sees the error*. It holds the ownership
+                // byte, and a return that kept it would leave the rendezvous
+                // owned by a process with no arena behind it, with every
+                // subsequent joiner waiting out its timeout on
+                // `ArenaHeldButUnreachable`.
                 drop(session);
                 Err(OpenError::TakeoverUnsupported)
             }

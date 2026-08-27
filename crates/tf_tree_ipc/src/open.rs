@@ -9,8 +9,9 @@
 //!     // 2. Nobody is serving. Try to become the owner.
 //!     if F_OFD_SETLK(byte 0, exclusive) fails { backoff; continue }
 //!
-//!     // 3. We hold ownership. Do we already have an arena?
-//!     if we hold an arena fd { goto 5 }          // reuse it -- never create a second one
+//!     // 3. Deleted. It short-circuited past step 4 for a process declaring it
+//!     //    already held the arena -- unverifiable from a new file
+//!     //    description (docs/decisions/0037). Do not re-add it.
 //!
 //!     // 4. SPLIT-BRAIN CHECK. Is any participant byte locked?
 //!     if any participant byte is held { release byte 0; backoff; continue }
@@ -384,10 +385,13 @@ impl Open {
 
             // 2. Nobody is serving. Try to become the owner.
             if lock.try_take_ownership()? == LockAttempt::Acquired {
-                // 3. We hold ownership and already have the arena, so this is a
-                //    takeover: reuse it, and skip step 4 entirely. A process
-                //    that already holds the arena is the one thing that cannot
-                //    create a second one.
+                // **Step 3 is gone, and its absence is the decision.** It
+                // short-circuited past step 4 for a process declaring it already
+                // held the arena — a declaration no new file description can
+                // verify, since `F_OFD_GETLK` reports conflicts and cannot name
+                // a holder. Issue #201 and `docs/decisions/0037`: a takeover is
+                // not a second `open()`. **Do not re-add the short-circuit**;
+                // the five unsound states that argument cost are listed there.
                 // 4. SPLIT-BRAIN CHECK. A held participant byte means a live
                 //    arena exists whose holder has not taken over yet, so yield
                 //    to it. Deterministic: no grace period, no timing

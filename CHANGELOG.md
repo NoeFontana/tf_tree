@@ -35,6 +35,14 @@ is a bug.
 
 ### Changed — breaking
 
+- **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
+  `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
+  clock** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
+  A `pub` field that has shipped since `0.0.1` *unwritten* — nothing could have
+  read it for its value, since it was always zero — but a field path or a
+  `ClaimRecord { .. }` literal naming it will not compile. The Added entry below
+  is the whole argument.
+
 - **`tf_tree_ipc::Open::already_attached` and the takeover arm it reached are
   deleted; `OpenOutcome::TookOver` now has no producer** (closes #201,
   [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
@@ -68,9 +76,23 @@ is a bug.
   owner overriding the declaration, and a stranded owner grant that wedges an
   arena at 64 participants with 64 free bytes.
 
+  **One consequence has no counterpart yet.** `Session::release_ownership` is
+  §3.5's "give up the owner role while staying attached", and there is now no
+  route by which any survivor becomes owner: a fresh `open()` takes ownership,
+  meets the split-brain check against the survivors' held bytes, releases, and
+  times out for as long as any survivor lives. That was already true of every
+  caller not using the unsound arm — deleting it removed the last thing
+  obscuring it — and `0037` open question 5 owns it.
+
+  `docs/PHASE2.md` §3.4's NORMATIVE pseudo-code is amended: it mandated the heir
+  taking a participant byte, which is the one act `0028` question 3 forbids.
+  §0.0's §3.5 row moves from "half done" to "no path at all".
+
   `0037` records what a real §3.5 would be — a method on the `Session` the heir
   already holds, where the invariant is structural rather than checked — and does
-  not schedule it. `OpenError::ParticipantSlotDiverged` stays as an assertion
+  not schedule it. It also records what the deletion cost: `0028` plan step 9's
+  refusal test, `0029`'s claim that a `#[cfg(test)]` seam reaches `TookOver`, and
+  the `register_any` mutant recipe in `tf_tree_ipc`'s #201 stress test. `OpenError::ParticipantSlotDiverged` stays as an assertion
   over hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
   construction, now the only route that can still produce the divergence.
 
