@@ -1278,6 +1278,7 @@ fn cmd_doctor(
             src.stream(),
             &snap,
             &obs,
+            inputs.clock,
             &clock_step,
             checks::no_counter_evidence(inputs.counters, inputs.stats),
         ),
@@ -1338,11 +1339,13 @@ fn evidence_notes(
     stream: checks::PushStream,
     snap: &Snapshot,
     obs: &Observations,
+    clock: checks::Clock,
     clock_step: &checks::ClockStepEvidence,
     counter_evidence: Option<&'static str>,
 ) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
     notes.extend(checks::rate_coverage_note(snap, obs));
+    notes.extend(checks::clock_offset_note(snap, stream, clock));
     notes.extend(clock_step.coverage_note(stream));
     match (counter_evidence, stream.no_arrival_delays()) {
         // Both blind: `tft011` skipped and said so itself.
@@ -2225,6 +2228,7 @@ mod tests {
             owner_slot: Some(0),
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
+            clock_offset_nanos: None,
             nominal_rate_mhz: mhz,
         };
         let frame = |id: u32, name: &str, parent: u32, depth: u16| FrameInfo {
@@ -2260,6 +2264,7 @@ mod tests {
             checks::PushStream::Observed,
             &snap,
             &obs,
+            checks::Clock::Wall(0),
             &checks::ClockStepEvidence::capture(&snap, &obs),
             None,
         );
@@ -2312,6 +2317,7 @@ mod tests {
             owner_slot: Some(0),
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
+            clock_offset_nanos: None,
             nominal_rate_mhz: None,
         };
         let frame = |id: u32, name: &str, parent: u32, depth: u16| FrameInfo {
@@ -2352,7 +2358,14 @@ mod tests {
         let obs = Observations::from_samples(back(1).chain(back(2)).collect());
         let ev = checks::ClockStepEvidence::capture(&snap, &obs);
 
-        let notes = evidence_notes(checks::PushStream::Observed, &snap, &obs, &ev, None);
+        let notes = evidence_notes(
+            checks::PushStream::Observed,
+            &snap,
+            &obs,
+            checks::Clock::Wall(0),
+            &ev,
+            None,
+        );
         let note = notes
             .iter()
             .find(|n| n.starts_with("TFT019"))
@@ -2363,9 +2376,16 @@ mod tests {
         );
 
         assert!(
-            !evidence_notes(checks::PushStream::RingsUnderWriter, &snap, &obs, &ev, None)
-                .iter()
-                .any(|n| n.starts_with("TFT019")),
+            !evidence_notes(
+                checks::PushStream::RingsUnderWriter,
+                &snap,
+                &obs,
+                checks::Clock::Wall(0),
+                &ev,
+                None
+            )
+            .iter()
+            .any(|n| n.starts_with("TFT019")),
             "a live arena skipped TFT019 outright, so there is no coverage to disclose"
         );
     }
@@ -2678,6 +2698,7 @@ mod tests {
                     owner_slot: claimed.then_some(0),
                     owner_pid: if claimed { 4711 } else { 0 },
                     newest_stamp: Some(1_000_000_000),
+                    clock_offset_nanos: None,
                     nominal_rate_mhz: None,
                 })
                 .collect(),
@@ -2715,6 +2736,7 @@ mod tests {
             checks::PushStream::RingsUnderWriter,
             &snap,
             &obs,
+            checks::Clock::Wall(0),
             &ev,
             None,
         ));
@@ -2728,6 +2750,7 @@ mod tests {
             checks::PushStream::Observed,
             &snap,
             &obs,
+            checks::Clock::Wall(0),
             &ev,
             Some("this arena has served no lookups"),
         ));
@@ -2743,6 +2766,7 @@ mod tests {
                 checks::PushStream::Recorded,
                 &snap,
                 &obs,
+                checks::Clock::Wall(0),
                 &ev,
                 Some("this arena has served no lookups"),
             )),
@@ -2756,6 +2780,7 @@ mod tests {
                 checks::PushStream::Observed,
                 &snap,
                 &obs,
+                checks::Clock::Wall(0),
                 &ev,
                 None
             )),

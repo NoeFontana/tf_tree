@@ -11,7 +11,7 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — **three** unconditionally, and **eight** more depending on what the
+//! reason — **two** unconditionally, and **nine** more depending on what the
 //! arena, the engine build and the host can supply. A check that silently returns
 //! nothing is indistinguishable from one that found nothing, and those two
 //! answers mean opposite things to whoever is reading:
@@ -25,31 +25,6 @@
 //!   publication history nor its declared kind over time, and `doctor` is a
 //!   different process. Surfacing them needs the bridge to publish its counters
 //!   into the arena, which `docs/PHASE5.md` §1.2 does not reserve space for.
-//! * **`TFT004`** (clock skew) needs a per-publisher *clock offset* — host wall
-//!   clock minus header stamp, both taken at the same push. **One is now
-//!   recorded**: `tf_tree`'s `EdgeWriter` samples
-//!   `ClaimRecord::clock_offset_nanos` once per second of published data **on an
-//!   edge that declares a rate**, and once per **1024** pushes on one that does
-//!   not — 102 seconds at 10 Hz, and a tree built without a topology file is the
-//!   common case, so this check must not assume the per-second figure.
-//!   `docs/decisions/0036` step 1 landed it. **This check is not yet wired to it** (that record's step 3), so the
-//!   skip is about this file and no longer about the arena — a smaller claim
-//!   than the one that stood here, which said nothing recorded a receipt time
-//!   and left a reader to conclude the field did not exist. It did, zeroed, in
-//!   every shipped arena.
-//!
-//!   Three things it must not re-derive. The stored value **is** the offset —
-//!   differencing it against a stamp again is the ±1 s mistake `0036`'s
-//!   amendment exists to stop. `0` means *nothing sampled yet* and is never
-//!   written by the sampler, so it is a clean skip. And only `SystemDomain`
-//!   (tag 0) edges record at all, so an arena of `SimDomain` edges reports
-//!   nothing rather than 56-year skews.
-//!
-//!   When it is wired, it will need **four** skips and not three: `== 0`,
-//!   `TFT005`'s epoch condition, a frozen `.tft`, and a **replayed** source —
-//!   bag ingest publishes through the same `EdgeWriter`, so a 2024 recording
-//!   read in 2026 records a two-year offset that is arithmetically right and
-//!   diagnostically meaningless.
 //!
 //! And the conditional ones, which depend on what the arena, the engine build
 //! and the host can supply:
@@ -59,6 +34,21 @@
 //!   ring remembers the current claim owner and not the sequence of processes
 //!   that wrote into it, and a recording's `/tf` messages are anonymous. See
 //!   [`PushStream`].
+//! * **`TFT004`** (clock skew) is skipped four ways, and two of them are about
+//!   where the arena came from: a **replayed** source records ingest-time
+//!   offsets against a recording's stamps (two years for a 2024 bag read in
+//!   2026, arithmetically right and diagnostically meaningless), and an arena
+//!   **at rest** carries offsets from whenever it was frozen. Then `TFT005`'s
+//!   epoch condition, and nothing sampled yet. See [`PushStream::no_live_receipt`].
+//!
+//!   **What it detects is narrower than `docs/PHASE5.md` §6's opening asks for.**
+//!   A recorded offset is the publisher's clock error *plus* its stamp-to-push
+//!   latency, and one sample cannot separate them, so it fires only past
+//!   [`OFFSET_BEYOND_ANY_PIPELINE_NS`] — where latency is no longer an available
+//!   explanation — and reports the fleet spread through
+//!   [`clock_offset_note`]. The fleet-relative rule §6 wants needs *drift*,
+//!   which is a series, which `tf_tree top` polls for and `doctor` does not
+//!   have.
 //! * **`TFT005`** (stamps in the future) is skipped when the arena's stamps do
 //!   not share an epoch with the system clock — see [`Clock`].
 //! * **`TFT007`** (rate deviates from nominal) is skipped when **no** edge in
@@ -419,6 +409,36 @@ impl PushStream {
         }
     }
 
+    /// Why the clock offsets in this arena were not recorded against *this*
+    /// host's clock, now (`TFT004`), or `None` when they were.
+    ///
+    /// The third of the sibling predicates above, and it splits the variants
+    /// differently from either — which is the argument for it being a method on
+    /// this enum rather than a `matches!` at the call site. `TFT001` divides on
+    /// writer identity, `TFT018` on whether a rejected arrival left a trace, and
+    /// this one on **when and by whom the wall clock was read**. A variant added
+    /// later cannot compile without answering all three.
+    #[must_use]
+    pub fn no_live_receipt(self) -> Option<&'static str> {
+        match self {
+            // The fixture is the publisher and it is running now, so its offsets
+            // were taken against this host's clock moments ago.
+            PushStream::Observed | PushStream::RingsUnderWriter => None,
+            PushStream::Recorded => Some(
+                "this arena was built by replaying a recording, so its clock offsets were \
+                 measured between *ingest* time and the recording's stamps: a 2024 bag read in \
+                 2026 records a two-year offset on every edge, which is arithmetically correct \
+                 and says nothing about any publisher's clock. Point doctor at a live arena \
+                 (--attach) to ask this question",
+            ),
+            PushStream::RingsAtRest => Some(
+                "this arena is at rest — a frozen .tft is a byte copy, offsets included — so its \
+                 recorded offsets are from whenever it was written and not from now. The same \
+                 reason TFT014 skips a frozen source, one field over",
+            ),
+        }
+    }
+
     /// Why this stream cannot contain an arrival invariant 6 would have rejected
     /// (`TFT018`, and therefore `TFT019`), or `None` when it can.
     #[must_use]
@@ -617,12 +637,7 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
                 "detected by tf_tree_bridge::StaticStore during ingest; \
                  EdgeRecord::kind is fixed at declaration, so no arena reader can observe it change",
             ),
-            Tft::Tft004 => CheckOutcome::skipped(
-                check,
-                "a per-publisher clock offset is now recorded (ClaimRecord::clock_offset_nanos, \
-                 sampled once per second of published data on an edge that declares a rate and \
-                 once per 1024 pushes on one that does not) but this check does not yet read it",
-            ),
+            Tft::Tft004 => tft004(inp),
             Tft::Tft005 => tft005(inp),
             Tft::Tft006 => tft006(inp),
             Tft::Tft007 => tft007(inp),
@@ -678,6 +693,159 @@ fn tft001(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT005` — a newest stamp ahead of the wall clock.
+/// The largest `|offset|` any publish pipeline could account for.
+///
+/// **This is a bound on physics, not a tuned constant, and the difference is why
+/// it is allowed to exist at all.** A recorded offset is the publisher's clock
+/// error *plus* the time between stamping a transform and pushing it. The second
+/// term is real and unbounded above by nothing in this codebase — a global
+/// localiser may stamp a transform with the capture time of the scan it matched
+/// — so a small offset proves nothing. But **no transform publisher takes ten
+/// seconds** from stamp to push. Beyond that, latency cannot be the explanation
+/// and a clock can.
+///
+/// So the check that uses this finds a *broken* clock — a machine whose NTP
+/// never came up, whose RTC is dead, whose timezone handling put it in another
+/// century — and **not** the PTP-scale drift `docs/PHASE5.md` §6 opens with.
+/// `TFT004`'s own doc, and this module's header, say so where a reader of
+/// either will meet it.
+pub const OFFSET_BEYOND_ANY_PIPELINE_NS: i64 = 10_000_000_000;
+
+/// What `TFT004` measured, for the report metadata — the fleet's offsets, which
+/// the check itself deliberately does not turn into findings.
+///
+/// **This is the useful half of `TFT004` today.** The check fires only on an
+/// offset no pipeline could explain, which is a broken clock; the *spread* is
+/// what an operator reads to see that one machine sits apart from the others,
+/// and a human can weigh it against a pipeline they know and this process does
+/// not. Emitting it as a note rather than a finding is the shape
+/// `docs/decisions/0036` question 3 ratified: report the spread, flag nothing
+/// until a threshold has evidence.
+///
+/// `None` when the check did not run, so the note never contradicts the skip.
+#[must_use]
+pub fn clock_offset_note(snap: &Snapshot, stream: PushStream, clock: Clock) -> Option<String> {
+    if stream.no_live_receipt().is_some() || !matches!(clock, Clock::Wall(_)) {
+        return None;
+    }
+    let mut offsets: Vec<i64> = snap
+        .edges
+        .iter()
+        .filter_map(|e| e.clock_offset_nanos)
+        .collect();
+    if offsets.is_empty() {
+        return None;
+    }
+    offsets.sort_unstable();
+    let ms = |ns: i64| ns as f64 / 1e6;
+    let median = offsets[offsets.len() / 2];
+    Some(format!(
+        "TFT004 measured {} publisher clock offset(s): median {:.3} ms, range {:.3} ms to \
+         {:.3} ms. An offset is the publisher's clock error *plus* its stamp-to-push latency and \
+         one sample cannot separate them, so only offsets beyond {:.0} s are reported as \
+         findings; read the spread against a pipeline you know",
+        offsets.len(),
+        ms(median),
+        ms(offsets[0]),
+        ms(offsets[offsets.len() - 1]),
+        OFFSET_BEYOND_ANY_PIPELINE_NS as f64 / 1e9,
+    ))
+}
+
+/// `TFT004` — a publisher whose clock cannot be reconciled with this host's.
+///
+/// Reads `ClaimRecord::clock_offset_nanos`, which **is** the offset: the writer
+/// computes `wall clock - stamp` at one push because nobody else can pair the
+/// two afterwards (`docs/decisions/0036`, and `docs/PHASE5.md` §6's amendment).
+/// Differencing it against a stamp again is the mistake that amendment exists to
+/// prevent.
+///
+/// # What it finds, and the larger thing it does not
+///
+/// **It fires only on an offset no publish pipeline could produce**
+/// ([`OFFSET_BEYOND_ANY_PIPELINE_NS`]), in either direction, and it reports the
+/// whole fleet's offsets either way.
+///
+/// It does **not** flag a publisher for differing from the fleet median, which
+/// is what §6 asks for, and the reason is not caution:
+///
+/// > A recorded offset is `clock error + stamp-to-push latency`, and **one
+/// > sample cannot separate them.** A localiser that stamps with its match's
+/// > capture time legitimately sits tens of milliseconds above an odometry
+/// > publisher that stamps at computation time. Flagging that difference would
+/// > report a healthy fleet as skewed, which is the one thing a diagnostic must
+/// > not do.
+///
+/// The signal that *does* separate them is **drift**: a clock error moves over
+/// time and a pipeline latency does not. That needs a series, which
+/// `tf_tree top` polls for and `doctor` does not have — so the fleet-relative
+/// rule is owed by `0036` and named there rather than approximated here.
+/// `docs/decisions/0023` is the argument against picking the threshold it would
+/// need out of the air; there is no fleet in this repository to measure one on.
+///
+/// # Skips
+///
+/// Four, and two of them are about where the arena came from rather than what is
+/// in it. A **replayed** source (`doctor --from-bag`) records ingest-time
+/// offsets against a recording's stamps — two years for a 2024 bag read in 2026,
+/// arithmetically right and diagnostically meaningless. An **arena at rest** (a
+/// frozen `.tft`) carries offsets from whenever it was frozen. Then `TFT005`'s
+/// epoch condition, and finally: nothing sampled yet.
+fn tft004(inp: &Inputs<'_>) -> CheckOutcome {
+    if let Some(why) = inp.stream.no_live_receipt() {
+        return CheckOutcome::skipped(Tft::Tft004, why);
+    }
+    if !matches!(inp.clock, Clock::Wall(_)) {
+        return CheckOutcome::skipped(
+            Tft::Tft004,
+            "the arena's stamps do not share an epoch with the system clock, so a recorded \
+             (wall clock - stamp) is the epoch difference and not a publisher's clock offset; \
+             this is TFT005's condition and deliberately the same one",
+        );
+    }
+
+    let measured: Vec<(&crate::doctor::EdgeInfo, i64)> = inp
+        .snap
+        .edges
+        .iter()
+        .filter_map(|e| e.clock_offset_nanos.map(|ns| (e, ns)))
+        .collect();
+    if measured.is_empty() {
+        return CheckOutcome::skipped(
+            Tft::Tft004,
+            "no edge has recorded a clock offset yet: a writer samples one on its first push and \
+             then once per second of published data, so this arena has had no writer, or none \
+             that has pushed. An arena built from a recording is always in this state",
+        );
+    }
+
+    let out = measured
+        .iter()
+        .filter(|(_, ns)| ns.abs() > OFFSET_BEYOND_ANY_PIPELINE_NS)
+        .map(|(e, ns)| {
+            let secs = *ns as f64 / 1e9;
+            let direction = if *ns > 0 {
+                "behind this host's (or its samples are that old)"
+            } else {
+                "ahead of this host's"
+            };
+            Finding::on_edge(
+                Tft::Tft004,
+                e.id,
+                inp.snap.edge_label(e),
+                format!(
+                    "its clock reads {:.1} s {direction}, measured at a push. No publish \
+                     pipeline accounts for {:.1} s between stamping a transform and pushing it, \
+                     so this is the clock and not latency",
+                    secs.abs(),
+                    secs.abs()
+                ),
+            )
+        })
+        .collect();
+    CheckOutcome::ran(Tft::Tft004, out)
+}
+
 fn tft005(inp: &Inputs<'_>) -> CheckOutcome {
     let Clock::Wall(now) = inp.clock else {
         return CheckOutcome::skipped(
@@ -2246,6 +2414,7 @@ mod tests {
             owner_slot: Some(0),
             owner_pid: 4711,
             newest_stamp: Some(1_000_000_000),
+            clock_offset_nanos: None,
             nominal_rate_mhz: None,
         }
     }
@@ -2311,6 +2480,179 @@ mod tests {
             slots: SlotTable::Current,
             counters: true,
         }
+    }
+
+    /// **`TFT004` fires on a clock no publish pipeline explains, and stays quiet
+    /// on one that a pipeline does.**
+    ///
+    /// The whole design of this check is in the gap between those two edges:
+    /// 200 ms is an ordinary stamp-to-push latency for a localiser that stamps
+    /// with the capture time of the scan it matched, and 3 600 s is a machine
+    /// whose NTP never came up. Only the second is attributable, and a check
+    /// that flagged the first would report a healthy fleet as skewed.
+    ///
+    /// The direction is asserted too, because it is the operator's next action:
+    /// a positive offset means the publisher's clock reads *earlier* than this
+    /// host's.
+    ///
+    /// Mutant, run: `ns.abs() > OFFSET_BEYOND_ANY_PIPELINE_NS` to `ns.abs() > 0`
+    /// — the 200 ms edge is reported as a clock fault.
+    #[test]
+    fn tft004_fires_only_past_any_plausible_pipeline_latency() {
+        let mut plausible = edge(1, 1, 2, 100);
+        plausible.clock_offset_nanos = Some(200_000_000); // 200 ms: a localiser.
+        let snap = two_frame_snapshot(plausible);
+        let obs = Observations::new();
+        let out = tft004(&inputs(&snap, &obs, &[], Clock::Wall(2_000_000_000)));
+        assert!(
+            out.findings.is_empty(),
+            "a 200 ms offset was reported as a clock fault: that is an ordinary \
+             stamp-to-push latency, and flagging it calls a healthy fleet skewed — {:?}",
+            out.findings
+        );
+
+        let mut broken = edge(1, 1, 2, 100);
+        broken.clock_offset_nanos = Some(3_600_000_000_000); // one hour behind.
+        let snap = two_frame_snapshot(broken);
+        let out = tft004(&inputs(&snap, &obs, &[], Clock::Wall(2_000_000_000)));
+        assert_eq!(out.findings.len(), 1, "an hour-wrong clock went unreported");
+        let msg = &out.findings[0].message;
+        assert!(
+            msg.contains("3600.0 s") && msg.contains("behind"),
+            "the finding does not say how far wrong or which way: {msg}"
+        );
+
+        let mut ahead = edge(1, 1, 2, 100);
+        ahead.clock_offset_nanos = Some(-3_600_000_000_000);
+        let snap = two_frame_snapshot(ahead);
+        let out = tft004(&inputs(&snap, &obs, &[], Clock::Wall(2_000_000_000)));
+        assert!(
+            out.findings[0].message.contains("ahead"),
+            "a publisher whose clock is ahead was described as behind: {}",
+            out.findings[0].message
+        );
+    }
+
+    /// **Every reason `TFT004` has no answer, each with its own skip.**
+    ///
+    /// Four, and the two that are about *provenance* are the ones a reader would
+    /// not think of: an arena replayed from a recording records ingest-time
+    /// offsets against the recording's stamps, and a frozen `.tft` carries
+    /// offsets from whenever it was frozen. Both would report years of skew on
+    /// publishers that were fine.
+    ///
+    /// Asserting on the *reason* and not merely on the outcome, because a skip
+    /// whose reason names the wrong condition sends an operator to fix the wrong
+    /// thing — and all four outcomes are otherwise identical.
+    ///
+    /// Mutant, run: make `no_live_receipt` return `None` for
+    /// `PushStream::Recorded` — the first case reports an hour of skew from a
+    /// recording instead of skipping.
+    #[test]
+    fn tft004_skips_name_which_of_the_four_conditions_fired() {
+        let mut e = edge(1, 1, 2, 100);
+        e.clock_offset_nanos = Some(3_600_000_000_000);
+        let snap = two_frame_snapshot(e);
+        let obs = Observations::new();
+        let wall = Clock::Wall(2_000_000_000);
+
+        for (stream, want) in [
+            (PushStream::Recorded, "replaying a recording"),
+            (PushStream::RingsAtRest, "at rest"),
+        ] {
+            let mut inp = inputs(&snap, &obs, &[], wall);
+            inp.stream = stream;
+            let out = tft004(&inp);
+            let Status::Skipped(reason) = &out.status else {
+                panic!(
+                    "a replayed or at-rest source has no live offset: {:?}",
+                    out.status
+                )
+            };
+            assert!(
+                reason.contains(want),
+                "the skip for {stream:?} does not say why: {reason}"
+            );
+            assert!(
+                out.findings.is_empty(),
+                "{stream:?} produced findings from offsets that are not about any publisher's clock"
+            );
+        }
+
+        // The epoch condition, deliberately the same one TFT005 uses.
+        let out = tft004(&inputs(&snap, &obs, &[], Clock::NewestStamp(2_000_000_000)));
+        let Status::Skipped(reason) = &out.status else {
+            panic!(
+                "a non-wall clock cannot support this check: {:?}",
+                out.status
+            )
+        };
+        assert!(
+            reason.contains("do not share an epoch") && reason.contains("TFT005"),
+            "the epoch skip does not point at the rule it shares: {reason}"
+        );
+
+        // Nothing sampled: a fresh arena, or one whose writer has not pushed.
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let out = tft004(&inputs(&snap, &obs, &[], wall));
+        let Status::Skipped(reason) = &out.status else {
+            panic!(
+                "an unsampled arena has nothing to compare: {:?}",
+                out.status
+            )
+        };
+        assert!(
+            reason.contains("no edge has recorded a clock offset yet"),
+            "the unsampled skip does not say so: {reason}"
+        );
+    }
+
+    /// **The fleet spread reaches the report, and says what it is not.**
+    ///
+    /// This note is the useful half of `TFT004` today: the check fires only on a
+    /// broken clock, and the spread is what an operator reads to see one machine
+    /// sitting apart from the others. It must carry the caveat with it — an
+    /// offset is clock error *plus* stamp-to-push latency — or a reader will
+    /// treat the spread as skew and chase a pipeline difference.
+    ///
+    /// Mutant, run: drop the `no_live_receipt` guard from `clock_offset_note` —
+    /// the recorded-source case emits a spread the check itself refused to
+    /// compute, which is a note contradicting a skip.
+    #[test]
+    fn the_clock_offset_spread_reaches_the_report_and_carries_its_caveat() {
+        let mut a = edge(1, 1, 2, 100);
+        a.clock_offset_nanos = Some(1_000_000); // 1 ms
+        let mut b = edge(2, 2, 3, 100);
+        b.clock_offset_nanos = Some(45_000_000); // 45 ms
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+            ],
+            edges: vec![a, b],
+            participants: live_writer(),
+        };
+
+        let note = clock_offset_note(&snap, PushStream::Observed, Clock::Wall(2_000_000_000))
+            .expect("two measured offsets are a spread");
+        assert!(
+            note.contains("2 publisher clock offset(s)")
+                && note.contains("1.000 ms")
+                && note.contains("45.000 ms"),
+            "the note does not carry the fleet's range: {note}"
+        );
+        assert!(
+            note.contains("stamp-to-push latency"),
+            "the note reports a spread without saying an offset is not only clock error, so a \
+             reader will chase a pipeline difference as skew: {note}"
+        );
+
+        assert!(
+            clock_offset_note(&snap, PushStream::Recorded, Clock::Wall(2_000_000_000)).is_none(),
+            "a replayed source emitted a spread the check itself skips on: a note that \
+             contradicts a skip is worse than no note"
+        );
     }
 
     /// **`TFT011` must not fire on a gap past the *newest* end of the window.**
@@ -4005,6 +4347,7 @@ mod tests {
         let snap = two_frame_snapshot(EdgeInfo {
             kind: EdgeKind::Static,
             capacity: 0,
+            clock_offset_nanos: None,
             nominal_rate_mhz: Some(20_000),
             ..edge(1, 1, 2, 0)
         });
