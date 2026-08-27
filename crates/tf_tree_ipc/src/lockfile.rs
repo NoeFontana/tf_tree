@@ -244,6 +244,18 @@ impl LockFile {
     /// # Errors
     ///
     /// [`IpcError::NoParticipantSlots`] when every slot is live.
+    /// **No production caller since issue #201, and that is a property of the
+    /// question rather than of this function.** Its one caller was
+    /// `Open::register_any`, and taking *any* free byte is the wrong way to
+    /// assign a **participant** slot: a participant's byte and its arena record
+    /// are indexed by one integer (`docs/PHASE2.md` §5.1), so the byte is never
+    /// free to choose — a creator's is `0`, a joiner's is the one the owner
+    /// named, and a taker-over already has one. Every caller that thought it
+    /// needed this knew its slot already.
+    ///
+    /// Kept because the primitive is correct and tested, and a lock-file byte is
+    /// not always a participant record. **Do not reach for it to assign a
+    /// participant slot** — that is the shape #201 was filed about.
     pub fn take_any_participant(&self) -> Result<u32, IpcError> {
         for slot in 0..MAX_PARTICIPANTS {
             if self.try_take_participant(slot)? == LockAttempt::Acquired {

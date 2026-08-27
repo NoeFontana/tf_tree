@@ -35,6 +35,37 @@ is a bug.
 
 ### Changed — breaking
 
+- **`tf_tree_ipc::Open::already_attached(bool)` is now `already_attached_at(u32)`,
+  and the takeover arm it reaches registers no participant** (closes #201).
+
+  The arm called `register_any`, which takes the first **free** lock byte. A
+  survivor holding byte 5 with arena record 5 was therefore handed a session on
+  byte **0** — executed, on the arm itself:
+  `outcome=TookOver  session slot=0  but the caller's arena record is 5`. Every
+  liveness predicate in the facade indexes the lock byte and the arena record
+  with one integer (`docs/PHASE2.md` §5.1), so that session reports a running
+  process as **dead**, which §6.2 calls the corrupting direction.
+
+  **The correct answer was already decided and the deferral was a typo.**
+  [`0035`](docs/decisions/0035-the-creators-slot-is-taken-not-found.md) closed
+  #201's creator path and left this arm open, pinning it to *"`0029` question
+  3"*. That answer is `0028` question 3, **resolved 2026-08-20**: the heir keeps
+  its existing slot, byte and arena record, because the slot is baked into every
+  claim it already holds and a heir with a second slot would arrange for its own
+  live claims to be reaped. `0029` corrected the misdirected citation on
+  2026-08-25, by which time `0035` was frozen.
+
+  So the arm now returns the slot the caller declares and takes no participant
+  byte, and **`register_any` — whose only caller it was — is deleted**. Taking a
+  `u32` rather than a `bool` makes the divergence unrepresentable rather than
+  merely absent: no value of that argument produces a session whose slot the
+  caller did not choose. `OpenError::ParticipantSlotDiverged` stays as an
+  assertion neither path can now trip.
+
+  `LockFile::take_any_participant` survives with no production caller and a
+  caution on it: a participant's byte is never free to choose, so every caller
+  that thought it needed "any free byte" already knew its slot.
+
 - **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
   `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
   clock** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).

@@ -1566,10 +1566,10 @@ pub enum SlotLeak {
 /// source that cannot be asked about a byte reports what it always did rather
 /// than falling silent.
 ///
-/// **The one race left in it is `register_any`'s, and it is µs-wide.** That
-/// path takes the byte *before* writing the identity record (a deliberate
-/// deviation from §3.3, argued in `tf_tree_ipc::Open::register_any`), so for a
-/// few microseconds a freshly taken byte sits over the *previous* occupant's
+/// **The one race left in it is the creator's, and it is µs-wide.** That path
+/// takes the byte *before* writing the identity record (a deliberate deviation
+/// from §3.3, argued in `tf_tree_ipc::Open::register_creator`), so for a few
+/// microseconds a freshly taken byte sits over the *previous* occupant's
 /// identity — and if that occupant is dead, this reads (b). A diagnostic that
 /// is momentarily wrong about a slot being re-taken is the cost of that
 /// deviation, and it is priced in the direction of a report rather than a
