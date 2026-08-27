@@ -112,6 +112,31 @@ the property `0028` question 3's answer was reaching for.
    describe the second-`open()` protocol that will not be built? `0028` question
    3 already flagged them; nothing has amended them.
 
+## What the deletion costs, recorded rather than absorbed
+
+**[`0028`](./0028-the-slot-a-killed-participant-keeps.md) plan step 9's
+verification is retired.** That step split the `Created | TookOver` arm so the
+`TookOver` half refuses rather than `build_shared`-ing a fresh segment — an heir
+on that path would hold a new, empty arena under the rendezvous name every
+survivor is still mapped through — and required *"a unit test that the `TookOver`
+arm returns an error rather than a `Tree`"*, reached "through `tf_tree_ipc` or
+through a `#[cfg(test)]` seam, and must say which".
+
+It said which: the seam. #275 deleted the only producer of `TookOver`, so the
+seam had nothing to set and went with it. **The refusal remains and can no longer
+be exercised.**
+
+That is a real loss of coverage on a guard `0028` argued for at length, and it is
+accepted for one reason: the state it guards against is now unreachable, so the
+test would assert about a state the code cannot enter. **It becomes owed again
+the moment this record gives `TookOver` a producer** — and whoever does that owes
+it before the producer lands, not after, because the refusal is what stands
+between an heir and a forked tree.
+
+The arm itself is deliberately *not* replaced with `unreachable!`: `TookOver` is
+a `pub` variant of a published crate's enum, and a panic is the wrong shape for
+the day it comes back.
+
 ## Not in this record
 
 **Any claim that §3.5 is scheduled.** It is not, and this record does not

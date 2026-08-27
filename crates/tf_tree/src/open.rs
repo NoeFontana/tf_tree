@@ -601,7 +601,11 @@ pub enum OpenError {
     /// five executed unsound states, and the reason is structural — a takeover
     /// cannot be an `Open::open` call at all (`docs/decisions/0037`). So this
     /// variant is unconstructible today, and the `#[cfg(test)]` seam that used
-    /// to drive it went with the builder it drove.
+    /// to drive it went with the builder it drove — **which retires
+    /// `docs/decisions/0028` plan step 9's verification**, the unit test that
+    /// this arm returns an error rather than a `Tree`. The refusal remains and
+    /// can no longer be exercised; `0037` records that as a cost rather than
+    /// absorbing it, and it is owed again the day `TookOver` has a producer.
     ///
     /// **The arm is kept rather than replaced with `unreachable!`.** `TookOver`
     /// is a `pub` variant of a published crate's enum; a future §3.5 gives it a
