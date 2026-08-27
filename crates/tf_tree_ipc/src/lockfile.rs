@@ -235,27 +235,23 @@ impl LockFile {
 
     /// Take the lowest free participant slot.
     ///
-    /// **Not the joiner path.** §3.7 landed: the *owner* assigns a joiner's slot
-    /// in its accept loop and returns it in the `HelloResponse`, and
-    /// `Open::register_at` takes exactly that byte. This scan is what a
-    /// **creator or a taker-over** uses — neither has an owner to ask — which is
-    /// also why `Open::register_any` locks before it writes the identity record.
-    ///
-    /// # Errors
-    ///
-    /// [`IpcError::NoParticipantSlots`] when every slot is live.
     /// **No production caller since issue #201, and that is a property of the
     /// question rather than of this function.** Its one caller was
-    /// `Open::register_any`, and taking *any* free byte is the wrong way to
-    /// assign a **participant** slot: a participant's byte and its arena record
-    /// are indexed by one integer (`docs/PHASE2.md` §5.1), so the byte is never
-    /// free to choose — a creator's is `0`, a joiner's is the one the owner
-    /// named, and a taker-over already has one. Every caller that thought it
-    /// needed this knew its slot already.
+    /// `Open::register_any`, now deleted: taking *any* free byte is the wrong
+    /// way to assign a **participant** slot, because a participant's byte and
+    /// its arena record are indexed by one integer (`docs/PHASE2.md` §5.1), so
+    /// the byte is never free to choose. A creator's is `0`, a joiner's is the
+    /// one the owner named in its `HelloResponse` (§3.7, and `Open::register_at`
+    /// takes exactly that byte), and a taker-over already has one. **Every
+    /// caller that reached for "any free byte" already knew its slot.**
     ///
     /// Kept because the primitive is correct and tested, and a lock-file byte is
     /// not always a participant record. **Do not reach for it to assign a
     /// participant slot** — that is the shape #201 was filed about.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::NoParticipantSlots`] when every slot is live.
     pub fn take_any_participant(&self) -> Result<u32, IpcError> {
         for slot in 0..MAX_PARTICIPANTS {
             if self.try_take_participant(slot)? == LockAttempt::Acquired {

@@ -243,6 +243,27 @@ pub enum IpcError {
         /// The number of claim bytes reserved.
         limit: u64,
     },
+    /// [`Open::already_attached_at`] named a slot whose participant byte nobody
+    /// holds, so the declaration is not true.
+    ///
+    /// **The declaration is a precondition, and this is the check.** That
+    /// builder asserts *"I already hold the arena at slot `n`"*, and every path
+    /// through [`Open`] then hands `n` back as the session's slot rather than
+    /// assigning one. If it is not true, the session names a participant record
+    /// whose lock byte is free — the class `docs/PHASE2.md` §0.0 describes as
+    /// reading dead to every probe-carrying observer, so a peer's reaper CASes
+    /// the record away while its owner publishes.
+    ///
+    /// One `F_OFD_GETLK` buys the whole guarantee, and it also range-checks:
+    /// `probe_participant` refuses a slot past `MAX_PARTICIPANTS` before it
+    /// probes anything.
+    ///
+    /// [`Open`]: crate::Open
+    /// [`Open::already_attached_at`]: crate::Open::already_attached_at
+    NotAttachedAt {
+        /// The slot the caller declared.
+        slot: u32,
+    },
     /// Every participant slot is locked, so this process cannot register.
     ///
     /// The limit is a build constant ([`crate::MAX_PARTICIPANTS`]); raising it
@@ -489,6 +510,12 @@ impl fmt::Display for IpcError {
                 f,
                 "edge {edge} is outside the {limit} claim bytes reserved in the lock file; \
                  the arena header is inconsistent"
+            ),
+            IpcError::NotAttachedAt { slot } => write!(
+                f,
+                "already_attached_at({slot}) was declared, but no process holds \
+                 participant byte {slot}: a takeover keeps the slot it already \
+                 has, and this one has none"
             ),
             IpcError::NoParticipantSlots { limit } => write!(
                 f,

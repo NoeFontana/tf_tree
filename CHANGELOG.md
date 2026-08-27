@@ -56,11 +56,22 @@ is a bug.
   2026-08-25, by which time `0035` was frozen.
 
   So the arm now returns the slot the caller declares and takes no participant
-  byte, and **`register_any` — whose only caller it was — is deleted**. Taking a
-  `u32` rather than a `bool` makes the divergence unrepresentable rather than
-  merely absent: no value of that argument produces a session whose slot the
-  caller did not choose. `OpenError::ParticipantSlotDiverged` stays as an
-  assertion neither path can now trip.
+  byte, and **`register_any` — whose only caller it was — is deleted**.
+  `OpenError::ParticipantSlotDiverged` stays as an assertion neither path can now
+  trip.
+
+  **The declaration is a precondition, and `open()` checks it** — once, before
+  anything else: one `F_OFD_GETLK` on the declared byte, refusing with the new
+  **`IpcError::NotAttachedAt`** if nobody holds it, and range-checking on the way.
+  Carrying a `u32` instead of a `bool` removes the *arm's* freedom to pick a slot
+  but does not make the caller's declaration true, and review executed three ways
+  it was not: a declaration nobody backed minted `TookOver slot=0` over a **free**
+  byte, `already_attached_at(u32::MAX)` returned `Ok(4294967295)`, and a
+  **serving** owner overrode the declaration with `Joined slot=1` — #201's own
+  divergence on the join path, in the §3.5 race this arm exists for. With the
+  check, and with every arm honouring the declaration, no value of that argument
+  produces a session whose slot the caller did not choose, and none at all unless
+  that slot's byte is held.
 
   `LockFile::take_any_participant` survives with no production caller and a
   caution on it: a participant's byte is never free to choose, so every caller

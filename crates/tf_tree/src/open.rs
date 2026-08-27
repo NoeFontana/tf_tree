@@ -222,8 +222,13 @@ pub(crate) enum Reclamation {
 /// diverged — *measured*, in
 /// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`. `0035`
 /// has since put the create path on `register_creator`, which takes byte 0
-/// atomically, so that route is closed and the **takeover** arm is what this
-/// still buys. This
+/// atomically, and issue #201 closed the **takeover** arm, which now returns a
+/// slot the caller declares and `open()` verifies. What this still buys is
+/// hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
+/// construction, where the two numbers are chosen by two callers and nothing
+/// pairs them — the route the [`OpenError::ParticipantSlotDiverged`] doc names
+/// as reachable. **Do not delete 0c on the strength of the takeover arm being
+/// fixed.** This
 /// function reads one at the index of the other, so without 0c's assertion
 /// every verdict below is about a different process than the one it names, and
 /// a `Reclaimable` verdict then frees a live participant's record. The
@@ -543,8 +548,10 @@ pub enum OpenError {
     ///
     /// # What a caller does about it
     ///
-    /// Not retry — the takeover arm against the same holder diverges
-    /// identically. Either stop the process still holding the byte (`tf_tree
+    /// Not retry through the takeover arm — it no longer diverges (issue #201
+    /// closed it), but it is not a route past this either: it requires a slot
+    /// this process already holds, and a caller seeing this error does not have
+    /// one. Either stop the process still holding the byte (`tf_tree
     /// participants` names it from the lock file's identity records), or open
     /// with [`CreatePolicy::IfAbsent`] and let the wedge be diagnosed rather
     /// than created over.
