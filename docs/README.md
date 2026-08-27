@@ -1,7 +1,25 @@
 # Docs
 
-Six canonical documents carry the project, plus two that are not phases. Read
-them in this order:
+**Almost nothing in this folder is a tutorial.** These are normative
+specifications: they say what the engine must do and why, and they are written
+for whoever is changing it. If you are *using* `tf_tree`, three of them answer
+most questions and you can ignore the rest.
+
+| If you want to | Read |
+|---|---|
+| Call the API from Rust, Python, C or C++ | [`API.md`](./API.md) §2–§5, after its six rules in §1 |
+| Understand a lookup that failed, or a robot that is misbehaving | [`RUNBOOK.md`](./RUNBOOK.md) — organised by symptom |
+| Know whether a number is measured, and on what | [`benchmarks/`](./benchmarks/) — each row names its command |
+| Know whether a feature exists yet | The `§0.0` table at the head of the phase spec that owns it |
+| Know why it works the way it does | [`PROJECT.md`](./PROJECT.md) §5, the decision log |
+| Know why something was *not* built | [`0009`](./decisions/0009-descoping-phase-6.md), [`PHASE5.md`](./PHASE5.md) §8, [`PHASE7.md`](./PHASE7.md) §0.0 |
+
+The rest of this page is the reading order for changing the project.
+
+---
+
+Six canonical documents carry it, plus two that are not phases. Read them in
+this order:
 
 1. [`PROJECT.md`](./PROJECT.md) — what tf_tree is, the architecture in one page,
    the eight-phase roadmap, and the **decision log D1–D22** (§5) with the rationale

@@ -33,6 +33,34 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — documentation
+
+- **`README.md` is restructured around evaluating and installing the project**,
+  which it previously answered on line 127 and only for Python. Added: registry
+  badges, an **Install** table naming what is published and what is built from a
+  checkout (`cargo install tf_tree` installs no command — the CLI is a separate,
+  unpublished crate, and that surprise now has a line), a **Where it fits, and
+  where it does not** section that collects the six recorded refusals — the `tf2`
+  shim, covariance, multi-parent edges, inter-host, the viewer, `0.0.x` — into
+  one table a reader can self-select out of, and a **Rust** worked example, which
+  the front page of a Rust engine did not have. The status table's paragraph-long
+  cells become a short verdict plus named gaps below it; nothing it claimed was
+  dropped. `docs/` gains a router at the top of its index for people *using*
+  `tf_tree` rather than changing it, and the five crates.io front pages gain
+  badges — `tf_tree` and `tf_tree_math` gain the `cargo add` line neither had.
+
+- **`README.md`'s `rust` fence is now compiled**, by a `#[cfg(doctest)]`
+  `include_str!` in `tf_tree_cli` — the same device
+  `crates/tf_tree/src/lib.rs` already applies to the crates.io front page, and
+  for the same reason: no gate parsed a README, so the next signature change to
+  `claim`, `plan` or `Capacity::history` would have broken the page GitHub
+  renders with every check green. It lives in `tf_tree_cli` rather than in
+  `tf_tree` because the path reaches outside the crate directory and
+  `cargo package` would not put that file in the tarball; `tf_tree_cli` is
+  `publish = false`, so it cannot have that problem. The workspace-tree fence is
+  now tagged `text`, which this makes load-bearing: to rustdoc an untagged fence
+  is Rust.
+
 ### Changed — breaking
 
 - **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
