@@ -777,12 +777,17 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
 ///
 /// [`CreatePolicy::Always`] is the path on which it can break. §3.4 step 4 reads
 /// `if self.create != CreatePolicy::Always && lock.any_participant_held()?`, so
-/// the escape hatch skips the split-brain check *by design* and falls through
-/// to `register_any` → `take_any_participant`, the first **free** byte. With
-/// byte 0 already held the creator gets byte 1, while `build_shared` hands it
-/// arena record **0** on a fresh arena. Nothing reconciles the two afterwards:
-/// `hold_ownership` parks the session and never compares `Session::slot` with
-/// `Tree::participant`.
+/// the escape hatch skips the split-brain check *by design*. **The rest of this
+/// paragraph described what happened before `0035`**, and is kept because the
+/// test below is named for it: the create fell through to
+/// `take_any_participant`, the first **free** byte, so with byte 0 already held
+/// the creator got byte 1 while `build_shared` handed it arena record **0** on a
+/// fresh arena, and nothing reconciled the two afterwards — `hold_ownership`
+/// parks the session and never compares `Session::slot` with
+/// `Tree::participant`. Step 5 is now `register_creator` →
+/// `try_take_participant(0)`, which on `Contended` releases ownership and loops,
+/// so the forced creator is **refused** rather than diverged. That is what this
+/// test's own body asserts, in `first_slot: Some(0)`.
 ///
 /// **How that precondition arises is not known, and #201's answer to it is
 /// measurably wrong.** The issue has the divergence biting "precisely in the
@@ -818,11 +823,16 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
 /// an unreachability argument**, and settling which of the two this is — a
 /// defect no public API can reach, or one nobody has found the route to — is
 /// the question `0028` has to answer before #189's `--force-new` flag would
-/// turn this policy into a documented operator procedure. #201's second path,
-/// the takeover arm that also calls `register_any`, is out of reach for an
-/// unrelated reason: nothing sets `Open::already_attached`. What is pinned
-/// below is therefore the *consequence* of the divergence, on a staged
-/// instance of it, and not its reachability.
+/// turn this policy into a documented operator procedure.
+///
+/// **#201's second path — the takeover arm — is closed by deletion.** It took
+/// the first free byte through `register_any`; both are gone, and
+/// `OpenOutcome::TookOver` now has no producer. `0028` question 3 is why: the
+/// heir keeps its existing slot, byte and arena record, and §3.5 cannot be
+/// wired as a second `Open::open` call. `docs/decisions/0037` records the five
+/// unsound states two rounds of repair produced before that landed. What is pinned below is therefore the
+/// *consequence* of the remaining divergence, on a staged instance of it, and
+/// not its reachability.
 ///
 /// Both signs below are read from a process that is not the creator, because
 /// the creator's own `participant_alive(0)` hits `use_ofd_liveness`'s "never
@@ -1072,7 +1082,8 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
 /// sequence of `tf_tree::Open` calls was known to produce it. One does, and it
 /// is neither of the two paths #201 was filed on — both of those were measured
 /// not to diverge (#214, #215): an owner death frees byte 0 along with the
-/// ownership byte, and nothing sets `Open::already_attached`.
+/// ownership byte, and the takeover arm now returns the caller's own slot
+/// rather than taking a free byte.
 ///
 /// The producer is [`tf_tree_ipc::Session::release_ownership`], which gives up
 /// the **ownership** byte and keeps **participant byte 0**. That is exactly
@@ -1237,8 +1248,8 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
         "a refused create must not leave a bound rendezvous socket"
     );
 
-    // **And it left nothing behind.** Byte 1 — the one `register_any` handed
-    // the forced creator — is free again, and so is the ownership byte it took
+    // **And it left nothing behind.** Byte 1 — which the forced creator would
+    // have been handed before `0035`, and now never reaches — is free, and so is the ownership byte it took
     // on the way in; only the stranded session's byte 0 is still held, by the
     // process entitled to it. A refusal that returned while its `Session` lived
     // would burn a slot per attempt, which is the failure

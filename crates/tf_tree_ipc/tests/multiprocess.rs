@@ -815,7 +815,7 @@ fn claim_bytes_and_participant_bytes_do_not_overlap() {
 /// published API (`LockFile::try_take_participant`): a downstream consumer of
 /// this crate can do it whether or not anything in this workspace does.
 ///
-/// **Mutant:** replace `register_creator` with `register_any` in step 5 — i.e.
+/// **Mutant, no longer applicable:** it was *replace `register_creator` with `register_any` in step 5*, and `register_any` was deleted with the takeover arm (`docs/decisions/0037`). A replacement recipe — `try_take_participant(0)` to `take_any_participant()` in `register_creator` — is the same shape and has not been run — i.e.
 /// the code before the fix — and this fails with a non-zero slot within the
 /// first few dozen iterations. Measured at that revision, 4000 iterations of the
 /// two calls in isolation: 2242 took a non-zero byte.

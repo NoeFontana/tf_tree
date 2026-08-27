@@ -43,6 +43,59 @@ is a bug.
   `ClaimRecord { .. }` literal naming it will not compile. The Added entry below
   is the whole argument.
 
+- **`tf_tree_ipc::Open::already_attached` and the takeover arm it reached are
+  deleted; `OpenOutcome::TookOver` now has no producer** (closes #201,
+  [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
+  `LockFile::take_any_participant` survives with no production caller and a
+  caution on it. `IpcError` and `OpenOutcome` are unchanged as types; what is
+  gone is the builder, the arm, and `Open::register_any`.
+
+  The arm handed back the first **free** participant byte while the caller's
+  arena record was elsewhere, and every liveness predicate indexes the two with
+  one integer (`docs/PHASE2.md` §5.1), so a running process read as **dead** —
+  §6.2's corrupting direction. Executed:
+  `outcome=TookOver  session slot=0  but the caller's arena record is 5`.
+
+  **It was approached as a bug with a known answer and is really a protocol that
+  cannot be expressed as an `Open::open` call.**
+  [`0035`](docs/decisions/0035-the-creators-slot-is-taken-not-found.md) deferred
+  the arm, pinning it to "`0029` question 3"; the answer is `0028` question 3,
+  resolved 2026-08-20, and `0029` corrected the misdirected citation on
+  2026-08-25 while `0035` was frozen. But that answer says §3.5 **cannot** be
+  wired as a second `Open::open` call — read as *nothing calls it yet* rather
+  than *nothing can*.
+
+  **The root cause is that no new file description can verify a claim about the
+  caller's own locks.** `F_OFD_GETLK` answers *"does anyone **else** hold this
+  byte"* — `lockfile.rs`'s module doc says so twice, the second time calling it
+  "a trap for any future code that tries to read back its own state" — so a
+  declaration naming a live *peer's* slot is indistinguishable from a true one.
+  Two rounds of repair produced five executed unsound states, four of them
+  introduced while fixing the one before: the original divergence, a session over
+  a **free** byte, an out-of-range slot returned through public API, a serving
+  owner overriding the declaration, and a stranded owner grant that wedges an
+  arena at 64 participants with 64 free bytes.
+
+  **One consequence has no counterpart yet.** `Session::release_ownership` is
+  §3.5's "give up the owner role while staying attached", and there is now no
+  route by which any survivor becomes owner: a fresh `open()` takes ownership,
+  meets the split-brain check against the survivors' held bytes, releases, and
+  times out for as long as any survivor lives. That was already true of every
+  caller not using the unsound arm — deleting it removed the last thing
+  obscuring it — and `0037` open question 5 owns it.
+
+  `docs/PHASE2.md` §3.4's NORMATIVE pseudo-code is amended: it mandated the heir
+  taking a participant byte, which is the one act `0028` question 3 forbids.
+  §0.0's §3.5 row moves from "half done" to "no path at all".
+
+  `0037` records what a real §3.5 would be — a method on the `Session` the heir
+  already holds, where the invariant is structural rather than checked — and does
+  not schedule it. It also records what the deletion cost: `0028` plan step 9's
+  refusal test, `0029`'s claim that a `#[cfg(test)]` seam reaches `TookOver`, and
+  the `register_any` mutant recipe in `tf_tree_ipc`'s #201 stress test. `OpenError::ParticipantSlotDiverged` stays as an assertion
+  over hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
+  construction, now the only route that can still produce the divergence.
+
 ### Added
 
 - **A per-publisher clock offset, from a field that has been in every shipped

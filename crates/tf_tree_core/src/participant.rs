@@ -261,10 +261,13 @@ impl<'a> ParticipantTable<'a> {
     /// point: the arena record and the `F_OFD_SETLK` byte have to be the *same
     /// integer*, because §5.1's liveness predicate asks the kernel about the
     /// byte and then reads the record it indexes. If the two were allocated
-    /// independently — as they are today, by `register` here and by
-    /// `LockFile::take_any_participant` there — a process would hold byte 3
-    /// while occupying record 7, and every liveness answer would be about
-    /// somebody else.
+    /// independently — which is what `register` here plus a scan for any free
+    /// byte over there would do — a process would hold byte 3 while occupying
+    /// record 7, and every liveness answer would be about somebody else. **No
+    /// path does that any more**: `0035` put the creator on
+    /// `try_take_participant(0)` and issue #201 deleted the takeover arm that
+    /// scanned (`docs/decisions/0037`), leaving `LockFile::take_any_participant`
+    /// with no production caller at all.
     ///
     /// So a *joiner* uses this, with the slot the owner assigned. A creator or
     /// a process taking ownership has no owner to ask and uses `register`.
