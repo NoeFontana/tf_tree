@@ -30,8 +30,9 @@ fits](#where-it-fits-and-where-it-does-not) · [Status](#status) · [Is this a
   the MMU is what enforces it, not convention.
 - **Failures you can act on.** Every error is a `Copy` identifier that names the
   offending edge as data rather than as a formatted string, and `tf_tree doctor`
-  runs a nineteen-code catalogue against a live arena, a frozen index, or an
-  MCAP recording you already have.
+  runs the `TFT001`–`TFT019` catalogue against a live arena, a frozen index, or
+  an MCAP recording you already have. Nineteen ids are reported; seventeen can
+  detect today, and the two that cannot say so rather than reporting a pass.
 
 **Linux-first.** The single-process engine is portable Rust and much of it
 compiles elsewhere; everything that maps memory — attaching to a live arena, the
@@ -47,7 +48,7 @@ error.
 | The Rust engine | `cargo add tf_tree` | crates.io |
 | The Python bindings | `pip install transform_tree`, then `import tf_tree` | PyPI |
 | The `tf_tree` CLI | `cargo install --path crates/tf_tree_cli --features shm`, from a clone | source; the CLI is `publish = false` |
-| C ABI, C++ header, ROS 2 bridge | `just` recipes in a checkout | source |
+| C ABI, C++ header, ROS 2 bridge | `just c-abi-check`, `just cpp-check`, `just ros-build` | source |
 
 Three notes on that table, each of which surprises somebody:
 
@@ -57,8 +58,11 @@ Three notes on that table, each of which surprises somebody:
   records the measurement).
 - **`cargo add tf_tree` gives you the portable engine.** Shared memory and the
   frozen `.tft` reader need `--features shm`, on Linux.
-- **`cargo install tf_tree` installs no command** — the CLI is a separate,
-  unpublished crate. Build it from a checkout as above.
+- **`cargo install tf_tree` installs no command**, and does not fail either:
+  it exits 0 with a warning naming `--features shm`. Adding that flag *does*
+  install `tf_tree_rendezvous_child`, which is a test helper and not a tool —
+  [the crate's own page](./crates/tf_tree/README.md) has the whole story. The
+  CLI is a separate, unpublished crate; build it from a checkout as above.
 
 **`0.0.x` promises nothing between releases.** Cargo treats every `0.0.x` as
 incompatible with every other, so pin exactly and expect a later release to
@@ -148,7 +152,7 @@ use tf_tree::{Capacity, EdgeCfg, Iso3, Quat, Stamp, TreeBuilder, Vec3};
 // Topology is declared up front: `build()` sizes one flat arena from exactly
 // these edges, and nothing allocates after it returns.
 let tree = TreeBuilder::new()
-    .static_edge("base_link", "lidar_top", &Iso3::IDENTITY)
+    .static_edge("base_link", "lidar_top", &Iso3::IDENTITY)   // (parent, child)
     .dynamic_edge("odom", "base_link", EdgeCfg::new(Capacity::history(100.0, 10.0)))
     .build()
     .expect("layout");
@@ -158,6 +162,9 @@ let base_link = tree.frame("base_link").expect("declared");
 let lidar_top = tree.frame("lidar_top").expect("declared");
 
 // One writer per edge, enforced by the claim table rather than by convention.
+// Note the order flips: the builder takes (parent, child), `claim` takes
+// (child, parent). Both are annotated here because getting it wrong builds a
+// silently inverted tree rather than failing.
 let w = tree.claim(base_link, odom).expect("unclaimed");   // (child, parent)
 let at_x = |x| Iso3::new(Quat::IDENTITY, Vec3::new(x, 0.0, 0.0));
 w.push(1_000_000_000, &at_x(0.0)).expect("monotonic");     // integer nanoseconds
@@ -213,7 +220,7 @@ will not be reversed.
 |---|---|---|
 | A drop-in `tf2_ros::Buffer` | Phase 7, gated on operating evidence, not scheduled. What exists is a one-way ingest bridge | [`PHASE7.md`](./docs/PHASE7.md) §0.0 |
 | Covariance or joint uncertainty | A tree cannot compose a correct one; composing marginals as independent is wrong in the optimistic direction. You need a factor graph | [`PROJECT.md`](./docs/PROJECT.md) §1, [`0009`](./docs/decisions/0009-descoping-phase-6.md) |
-| Multi-parent frames, loop closure, copy-on-write branches | Same reason, and each was cut by name rather than deferred | [`0009`](./docs/decisions/0009-descoping-phase-6.md) |
+| Multi-parent frames, loop closure, copy-on-write branches | Multi-parent is the row above. Copy-on-write was cut for reasons of its own: it serves the use case D2 rejects *and* contradicts fixed capacity, one-writer-per-edge and append-only ids at once | [`0009`](./docs/decisions/0009-descoping-phase-6.md), [`PROJECT.md`](./docs/PROJECT.md) §5 D2 |
 | Transforms across hosts | Phase 8. Not started | [`PROJECT.md`](./docs/PROJECT.md) §4 |
 | Shared memory or `.tft` off Linux | The engine compiles; the mapping code does not exist elsewhere | [`SUPPORT.md`](./SUPPORT.md) |
 | A viewer, or point-cloud deskewing | Deliberately absent, argument recorded. `at_adaptive` emits knots; the consumer transforms points where they already live | [`PHASE5.md`](./docs/PHASE5.md) §8, [`PROJECT.md`](./docs/PROJECT.md) §5 D8 |
@@ -427,11 +434,18 @@ Standing numbers and their caveats live in
    obvious-looking simplifications are excluded on purpose, and the reasons are
    there.
 2. The phase spec you are touching: [`PHASE1`](./docs/PHASE1.md) …
-   [`PHASE5`](./docs/PHASE5.md). Each opens with its own status table, and that
-   table outranks every other document including this one.
-3. [`docs/decisions/`](./docs/decisions/) — the records for what the phase specs
+   [`PHASE5`](./docs/PHASE5.md). `PHASE2`, `PHASE4`, `PHASE5` and `PHASE7` open
+   with a `§0.0` status table, and it outranks every other document including
+   this one. `PHASE1` has none because Phase 1 is implemented whole, and
+   `PHASE3` has none because it records deviations inline, in the section each
+   belongs to.
+3. [`docs/API.md`](./docs/API.md) again, and **before** writing any public
+   surface — §1's six rules generate every binding, and §7 is the checklist a
+   new surface passes. It authorizes nothing on its own: its §6 delta table
+   names the phase or decision record each row lands in.
+4. [`docs/decisions/`](./docs/decisions/) — the records for what the phase specs
    do not cover, and where a change of that kind starts.
-4. [`CONTRIBUTING.md`](./CONTRIBUTING.md) — the local gates, and the order to
+5. [`CONTRIBUTING.md`](./CONTRIBUTING.md) — the local gates, and the order to
    run them in.
 
 ## Contributing and support

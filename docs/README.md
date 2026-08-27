@@ -8,9 +8,9 @@ most questions and you can ignore the rest.
 | If you want to | Read |
 |---|---|
 | Call the API from Rust, Python, C or C++ | [`API.md`](./API.md) §2–§5, after its six rules in §1 |
-| Understand a lookup that failed, or a robot that is misbehaving | [`RUNBOOK.md`](./RUNBOOK.md) — organised by symptom |
-| Know whether a number is measured, and on what | [`benchmarks/`](./benchmarks/) — each row names its command |
-| Know whether a feature exists yet | The `§0.0` table at the head of the phase spec that owns it |
+| Understand a lookup that failed, or a robot that is misbehaving | [`RUNBOOK.md`](./RUNBOOK.md) |
+| Know whether a number is measured, and on what | [`benchmarks/`](./benchmarks/) |
+| Know whether a feature exists yet | The `§0.0` table heading `PHASE2`, `PHASE4`, `PHASE5`, `PHASE7`. `PHASE1` has none (implemented whole); `PHASE3` records deviations inline |
 | Know why it works the way it does | [`PROJECT.md`](./PROJECT.md) §5, the decision log |
 | Know why something was *not* built | [`0009`](./decisions/0009-descoping-phase-6.md), [`PHASE5.md`](./PHASE5.md) §8, [`PHASE7.md`](./PHASE7.md) §0.0 |
 
