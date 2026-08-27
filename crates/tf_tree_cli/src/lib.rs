@@ -23,6 +23,27 @@
 //! says so per source rather than per check — a ring holds only the pushes the
 //! engine accepted, so no arena, live or frozen, can answer `TFT018`.
 
+// **The repository's front page, compiled.** `README.md`'s `rust` fence is the
+// example a Rust reader meets first, and no gate parses a README: the next
+// signature change to `claim`, `plan` or `Capacity::history` would break the
+// page GitHub renders with everything green. `crates/tf_tree/src/lib.rs` does
+// the same for the crates.io front page, for the same reason.
+//
+// **Here rather than in `tf_tree`** because `include_str!("../../../README.md")`
+// reaches outside the crate directory, and `cargo package` does not put a file
+// from outside the package into the tarball — a published crate would carry an
+// `include_str!` of a file it does not ship. This crate is `publish = false`,
+// so that failure mode does not exist for it, and `cargo test --doc --workspace`
+// reaches it exactly the same way.
+//
+// It gates the *API*, not the *output*, and only the `rust` fence: rustdoc skips
+// the `sh`, `python` and `text` fences. The workspace tree is tagged `text` for
+// that reason — an untagged fence is Rust to rustdoc, and this module is what
+// makes that tag load-bearing rather than cosmetic.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+mod root_readme {}
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 

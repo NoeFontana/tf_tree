@@ -1,5 +1,9 @@
 # tf_tree_ipc
 
+[![crates.io](https://img.shields.io/crates/v/tf_tree_ipc.svg?logo=rust)](https://crates.io/crates/tf_tree_ipc)
+[![docs.rs](https://img.shields.io/docsrs/tf_tree_ipc?logo=docsdotrs)](https://docs.rs/tf_tree_ipc)
+[![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
+
 Zero-configuration rendezvous for [`tf_tree`](https://crates.io/crates/tf_tree)
 shared arenas: runtime-directory discovery, the OFD lock file, `SOCK_SEQPACKET`
 descriptor passing, and the `open()` decision machine.

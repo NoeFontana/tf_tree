@@ -1,5 +1,9 @@
 # tf_tree_math
 
+[![crates.io](https://img.shields.io/crates/v/tf_tree_math.svg?logo=rust)](https://crates.io/crates/tf_tree_math)
+[![docs.rs](https://img.shields.io/docsrs/tf_tree_math?logo=docsdotrs)](https://docs.rs/tf_tree_math)
+[![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
+
 `no_std` SE(3)/SO(3), quaternion and dual-quaternion math for the
 [`tf_tree`](https://crates.io/crates/tf_tree) transform engine.
 
@@ -10,6 +14,13 @@ or frames, and it is usable on its own if these are the conventions you want.
 **If you want to look up transforms, depend on
 [`tf_tree`](https://crates.io/crates/tf_tree) instead.** This crate is the
 geometry underneath it.
+
+## Install
+
+```sh
+cargo add tf_tree_math          # the geometry alone
+cargo add tf_tree               # the engine, which re-exports what it needs
+```
 
 ## The five conventions, because they are what a bug traces back to
 

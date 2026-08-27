@@ -1,5 +1,9 @@
 # tf_tree_arena
 
+[![crates.io](https://img.shields.io/crates/v/tf_tree_arena.svg?logo=rust)](https://crates.io/crates/tf_tree_arena)
+[![docs.rs](https://img.shields.io/docsrs/tf_tree_arena?logo=docsdotrs)](https://docs.rs/tf_tree_arena)
+[![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
+
 The pointer-free arena and its layout math, for the
 [`tf_tree`](https://crates.io/crates/tf_tree) transform engine. `no_std +
 alloc`.

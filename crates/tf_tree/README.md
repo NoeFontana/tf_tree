@@ -1,5 +1,9 @@
 # tf_tree
 
+[![crates.io](https://img.shields.io/crates/v/tf_tree.svg?logo=rust)](https://crates.io/crates/tf_tree)
+[![docs.rs](https://img.shields.io/docsrs/tf_tree?logo=docsdotrs)](https://docs.rs/tf_tree)
+[![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
+
 A transform tree engine: store time-stamped rigid-body transforms between named
 coordinate frames and answer *"where was frame A relative to frame B at time
 t?"* — fast enough to sit inside a control loop, with diagnostics good enough to
@@ -14,6 +18,27 @@ error id into prose by consulting the arena.
 **It is not `tf2`, not a fork of it, and not affiliated with ROS.** It is an
 independent engine that solves the same problem with a different data structure.
 There is no drop-in `tf2_ros::Buffer` shim and building one is not scheduled.
+
+## Install
+
+```sh
+cargo add tf_tree
+```
+
+That is the portable engine, and it is what the example below uses. Everything
+that maps memory — a shared arena, the frozen `.tft` reader, `tf_tree::open()`'s
+zero-config rendezvous — is behind the default-off `shm` feature and is **Linux
+only**:
+
+```sh
+cargo add tf_tree --features shm
+```
+
+Python users want `pip install transform_tree` and `import tf_tree`: the
+distribution name differs from the module because PyPI refuses `tf_tree` as too
+close to the existing `tftree`. The `tf_tree` CLI is a separate, unpublished
+crate — build it from a checkout with
+`cargo install --path crates/tf_tree_cli --features shm`.
 
 ## In full
 
