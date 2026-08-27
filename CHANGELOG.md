@@ -171,7 +171,9 @@ is a bug.
 
   **What separates clock error from latency is drift**, which needs a series;
   `tf_tree top` polls and `doctor` does not, so the fleet-relative rule is owed
-  and recorded as a `top` feature rather than left as a silent gap.
+  and recorded as a `top` feature — in `top.rs`'s own module header, where
+  whoever builds it will be, rather than only in a decision record they would
+  have no reason to open.
 
   **Four skips, each with its own reason**, and two are about where the arena
   came from rather than what is in it: a **replayed** source (`--from-bag`

@@ -47,6 +47,37 @@
 //! removed from `doctor`, because it lets a single broken publisher define
 //! "now" and invert every staleness reading in the view.
 //!
+//! # The clock-drift rule `TFT004` cannot have belongs here — unbuilt
+//!
+//! **This is the only place in the codebase that could answer it**, which is why
+//! it is written here rather than left in a decision record nobody implementing
+//! `top` would open.
+//!
+//! `ClaimRecord::clock_offset_nanos` carries each publisher's `wall clock -
+//! stamp`, sampled once per second of published data
+//! ([`0036`](../../../docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
+//! `docs/PHASE5.md` §6 asks for the fleet-relative reading of it: report the
+//! publisher whose offset differs from the fleet's. `TFT004` deliberately does
+//! **not**, and the reason is not caution — **an offset is the publisher's clock
+//! error plus its stamp-to-push latency, and one sample cannot separate them.**
+//! A localiser stamping with the capture time of the scan it matched sits tens
+//! of milliseconds above an odometry publisher that stamps at computation time,
+//! and a fleet-relative rule calls that healthy difference skew however well its
+//! threshold is calibrated.
+//!
+//! **What separates them is drift.** A clock error moves over time; a pipeline
+//! latency does not. That needs a *series* of offsets per publisher — which
+//! `doctor` structurally cannot have and this view already collects, every few
+//! hundred milliseconds, for every edge.
+//!
+//! Two cautions for whoever builds it, both learned from the rows above. The
+//! sampling interval is per edge (`nominal_rate_mhz / 1000`, or 1024 where no
+//! rate is declared), so consecutive captures often read the *same* sample and a
+//! naive derivative reads zero; the series has to be de-duplicated against the
+//! value, not the poll. And a column that flickers teaches an operator to ignore
+//! it — the same argument the rate section below makes, and it applies to a
+//! drift estimate more strongly, not less.
+//!
 //! # Frame names are somebody else's bytes
 //!
 //! Everything this view did not author goes through `sanitize` before it is

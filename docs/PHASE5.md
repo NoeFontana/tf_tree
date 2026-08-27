@@ -977,7 +977,7 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > - **Only `SystemDomain` (tag 0) edges record anything.** `wall clock − stamp` is an offset only where both share an epoch; a `SimDomain` edge would record ~1.79 × 10¹⁸. `TFT005`'s skip is per-*arena* and cannot express one tree holding both.
 > - **Four skips, not the three the plan named**: `== 0`, `TFT005`'s epoch condition, a frozen `.tft`, and a **replayed** source — bag ingest publishes through the same `EdgeWriter`, so a 2024 recording read in 2026 records a two-year offset that is arithmetically right and diagnostically meaningless.
 >
-> The rolling median stays as described and stays unbuilt: `0036` question 3 ships the fleet comparison at one instant, because a rolling median needs the polling loop `tf_tree top` has and `doctor` does not.
+> The rolling median stays as described and stays unbuilt: `0036` question 3 ships the fleet comparison at one instant, because a rolling median needs the polling loop `tf_tree top` has and `doctor` does not. **The note that owes it lives in `crates/tf_tree_cli/src/top.rs`'s module header**, not only here — a follow-on named in a spec and nowhere near the code that would implement it is a follow-on nobody finds.
 
 > **Amendment — `TFT007` is no longer structurally blind. The declared rate
 > comes from the topology file, and no arena field was added to get it there.**

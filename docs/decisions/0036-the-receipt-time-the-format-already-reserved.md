@@ -598,8 +598,14 @@ fixed it.
 **What separates them is drift.** A clock error moves over time; a pipeline
 latency does not. That needs a series, which `tf_tree top` polls for and `doctor`
 does not have — so the fleet-relative rule is **owed and unbuilt**, and it is a
-`top` feature rather than a `doctor` threshold. Recorded here rather than left as
-a gap in the catalogue.
+`top` feature rather than a `doctor` threshold.
+
+**Recorded in `crates/tf_tree_cli/src/top.rs`'s module header and not only
+here.** This record is now frozen, and a frozen record is not where somebody
+adding a column to `top` looks. That note carries the argument above plus the two
+cautions this work turned up: consecutive polls often read the *same* sample, so
+a series has to be de-duplicated against the value rather than the poll, and a
+flickering column teaches an operator to ignore it.
 
 **So `TFT004` as shipped fires on one thing only:** an offset past a bound no
 publish pipeline could account for (`checks::OFFSET_BEYOND_ANY_PIPELINE_NS`, ten

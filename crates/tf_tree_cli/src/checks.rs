@@ -779,7 +779,8 @@ pub fn clock_offset_note(snap: &Snapshot, stream: PushStream, clock: Clock) -> O
 /// The signal that *does* separate them is **drift**: a clock error moves over
 /// time and a pipeline latency does not. That needs a series, which
 /// `tf_tree top` polls for and `doctor` does not have — so the fleet-relative
-/// rule is owed by `0036` and named there rather than approximated here.
+/// rule is owed, and [`crate::top`]'s module header carries it, beside the loop
+/// that would collect the series.
 /// `docs/decisions/0023` is the argument against picking the threshold it would
 /// need out of the air; there is no fleet in this repository to measure one on.
 ///
