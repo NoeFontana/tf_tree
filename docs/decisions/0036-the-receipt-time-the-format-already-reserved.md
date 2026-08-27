@@ -15,9 +15,12 @@
 clock, and is called `ClaimRecord::clock_offset_nanos` rather than
 `last_push_nanos`), and #274 (steps 3–4). Step 5's cost is in `docs/PHASE1.md`
 §11.2 with its disclosure. **This record is now frozen**: drift is fixed by a
-record that supersedes it, not by editing here — a normative sentence describing code
-should not be one PR behind it. Steps 3–5 are open; `docs/PHASE5.md` §0.0's
-*"sixteen detect"* is therefore unchanged, and only `TFT004`'s *reason* moved.
+record that supersedes it, not by editing here.
+
+`docs/PHASE5.md` §0.0 now reads *"seventeen detect"*, and `TFT004` is the first
+check to leave its *"cannot detect anything in any configuration"* group since
+the catalogue was written.
+
 The four recommendations below were ratified by merging this record, per the
 mechanism [`0023`](./0023-the-gate-that-could-not-gate.md) states in as many
 words (*"they are recommendations and not decisions because this record is

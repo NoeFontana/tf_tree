@@ -575,8 +575,8 @@ pub fn render_human(report: &Report, meta: &Meta) -> String {
     if skipped > 0 {
         // **Say what was not checked.** A live arena has no recorded push
         // stream, a build without the bridge cannot see a publisher conflict,
-        // and the clock-skew check is not yet wired to the offset the arena now
-        // records — none of which are visible in a
+        // and a bag-sourced arena records ingest-time clock offsets rather than
+        // any publisher's — none of which are visible in a
         // report that lists only findings.
         let _ = writeln!(s, "  not run:");
         for o in &report.outcomes {
