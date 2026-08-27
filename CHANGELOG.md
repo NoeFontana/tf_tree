@@ -47,7 +47,10 @@ is a bug.
   cells become a short verdict plus named gaps below it; nothing it claimed was
   dropped. `docs/` gains a router at the top of its index for people *using*
   `tf_tree` rather than changing it, and the five crates.io front pages gain
-  badges — `tf_tree` and `tf_tree_math` gain the `cargo add` line neither had.
+  badges. `tf_tree` and `tf_tree_math` gain the `cargo add` line neither had;
+  `tf_tree_core`, `tf_tree_arena` and `tf_tree_ipc` deliberately do not, because
+  each already opens by sending the reader to `tf_tree` instead, and an install
+  line would be an invitation away from the crate they should depend on.
 
 - **`README.md`'s `rust` fence is now compiled**, by a `#[cfg(doctest)]`
   `include_str!` in `tf_tree_cli` — the same device
@@ -60,6 +63,18 @@ is a bug.
   `publish = false`, so it cannot have that problem. The workspace-tree fence is
   now tagged `text`, which this makes load-bearing: to rustdoc an untagged fence
   is Rust.
+
+  **What the gate does not reach**, recorded so it is not mistaken for more than
+  it is: `tf_tree_cli` declares `tf_tree`'s `unstable` feature and defaults
+  `counters` on, and `just test-doc` is `cargo test --doc --workspace`, where
+  feature unification is graph-wide. The fence is therefore compiled against a
+  union of features rather than the `cargo add tf_tree` default tier — verified,
+  not assumed: `use tf_tree::unstable::EdgeKind;` inserted into it compiles and
+  passes. No existing workspace member fixes this (all five consumers declare
+  `unstable`) and a new one is a crate boundary, so it is a decision record
+  rather than a docs change. What the gate does catch is what it was added for:
+  a signature change to `claim`, `plan` or `Capacity::history` silently breaking
+  the page GitHub renders.
 
 ### Changed — breaking
 

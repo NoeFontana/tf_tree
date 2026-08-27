@@ -40,6 +40,27 @@
 // the `sh`, `python` and `text` fences. The workspace tree is tagged `text` for
 // that reason — an untagged fence is Rust to rustdoc, and this module is what
 // makes that tag load-bearing rather than cosmetic.
+//
+// **What it does not prove, stated because the weaker reading is easy to miss.**
+// This crate declares `tf_tree = { features = ["unstable"] }` and defaults
+// `counters` on, so the fence compiles against a *union* of features, not
+// against the `cargo add tf_tree` default tier that a README reader has. Same
+// shape as the note on `crates/tf_tree/src/lib.rs`'s own `compile_fail` pins,
+// and verified the same way: `use tf_tree::unstable::EdgeKind;` inserted into
+// this fence compiles and passes. So a future edit that reaches for an
+// `unstable` or `counters`-gated item would stay green here and fail for every
+// reader who pasted it.
+//
+// Closing that needs a host crate depending on `tf_tree` at its default tier,
+// and there is none — all five workspace consumers declare `unstable` — so it
+// needs a *new* `publish = false` crate, which is a crate boundary and
+// therefore a decision record rather than a docs change. Moving this module to
+// another existing member would buy nothing: `just test-doc` is
+// `cargo test --doc --workspace`, and feature unification is graph-wide, so
+// `unstable` is on for every doctest in that invocation whoever hosts it.
+// What this gate catches today is the failure it was added for — a signature
+// change to `claim`, `plan` or `Capacity::history` silently breaking the front
+// page — and that is worth having on its own.
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
 mod root_readme {}

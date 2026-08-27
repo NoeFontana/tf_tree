@@ -36,9 +36,8 @@ cargo add tf_tree --features shm
 
 Python users want `pip install transform_tree` and `import tf_tree`: the
 distribution name differs from the module because PyPI refuses `tf_tree` as too
-close to the existing `tftree`. The `tf_tree` CLI is a separate, unpublished
-crate — build it from a checkout with
-`cargo install --path crates/tf_tree_cli --features shm`.
+close to the existing `tftree`. What `cargo install tf_tree` does — and does not
+— install is in *Version* below, with the measurement; it is not repeated here.
 
 ## In full
 
