@@ -503,3 +503,137 @@ fn the_cli_counters_feature_switches_the_engine() {
         tf_tree::counters_compiled_in()
     );
 }
+
+/// **A publisher's clock offset travels from `EdgeWriter::push` to a `TFT004`
+/// finding, on a real arena.**
+///
+/// The unit tests in `checks.rs` set `EdgeInfo::clock_offset_nanos` by hand,
+/// which proves the check reads its input and proves nothing about whether
+/// anything writes one. Three seams sit between the two and none of them is
+/// visible from either side: `EdgeWriter`'s sampler, `ClaimRecord`'s field, and
+/// `Snapshot::capture` mapping the arena's `0` sentinel to `None`. This is the
+/// test that fails if any of them stops.
+///
+/// Both edges publish with **wall-clock** stamps, because that is the only
+/// configuration in which this check runs at all — the benchmark fixture stamps
+/// from zero, so `Clock::decide` puts it in the `NewestStamp` arm and `TFT004`
+/// skips there for `TFT005`'s reason.
+///
+/// One publisher is healthy. The other stamps an hour into the past, which is a
+/// machine whose NTP never came up — the failure the check exists to name, and
+/// the one an operator cannot attribute from the symptom.
+///
+/// Mutants, run:
+///
+/// * in `Tree::claim`, drop `claim_rec.clock_offset_nanos.store(0, ..)` and the
+///   sampler's store — the check skips with *"no edge has recorded a clock
+///   offset yet"* and the assertion on `Fired` fails.
+/// * in `Snapshot::capture`, map the field as `Some(raw)` rather than matching
+///   the `0` sentinel — the healthy publisher's unsampled sibling arrives as
+///   `Some(0)` and the note reports a fleet member that was never measured.
+#[test]
+fn a_publishers_clock_offset_reaches_a_tft004_finding_on_a_real_arena() {
+    use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
+
+    const HOUR_NS: i64 = 3_600 * 1_000_000_000;
+
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(64)))
+        .dynamic_edge("odom", "base", EdgeCfg::new(Capacity::slots(64)))
+        // **Never claimed and never pushed**, so its `clock_offset_nanos` stays
+        // at the arena's zero. It is here to make the `0 -> None` mapping in
+        // `Snapshot::capture` load-bearing: without a never-sampled edge in the
+        // snapshot, a capture that passed the raw value through would be
+        // indistinguishable from one that maps the sentinel.
+        .dynamic_edge("base", "sensor", EdgeCfg::new(Capacity::slots(64)))
+        .build()
+        .expect("build");
+
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+
+    let map = tree.frame("map").unwrap();
+    let odom = tree.frame("odom").unwrap();
+    let base = tree.frame("base").unwrap();
+
+    // Healthy: stamps track this host's clock.
+    let healthy = tree.claim(odom, map).expect("claim map->odom");
+    // Broken: an hour behind, which no publish pipeline accounts for.
+    let broken = tree.claim(base, odom).expect("claim odom->base");
+    for k in 0..4i64 {
+        healthy
+            .push(now + k * 1_000, &tf_tree::Iso3::IDENTITY)
+            .unwrap();
+        broken
+            .push(now - HOUR_NS + k * 1_000, &tf_tree::Iso3::IDENTITY)
+            .unwrap();
+    }
+
+    let snap = Snapshot::capture(&tree);
+    let obs = Observations::from_arena(&tree, &snap);
+    let stats = checks::collect_edge_stats(&tree, &snap);
+    let clock = Clock::decide(&checks::newest_stamps(&snap), now);
+    assert!(
+        matches!(clock, Clock::Wall(_)),
+        "these stamps are wall-clock time; if Clock::decide disagrees this test \
+         is asserting nothing: {clock:?}"
+    );
+    let report = checks::run(
+        &Inputs {
+            snap: &snap,
+            obs: &obs,
+            stats: &stats,
+            host: None,
+            clock,
+            arena_bytes: tree.arena_size_bytes() as u64,
+            occupancy: checks::occupancy_of(&tree),
+            clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
+            stream: checks::PushStream::RingsUnderWriter,
+            slots: checks::SlotTable::Current,
+            counters: tf_tree::counters_compiled_in(),
+        },
+        &BTreeSet::new(),
+    );
+
+    let o = report
+        .outcomes
+        .iter()
+        .find(|o| o.check == Tft::Tft004)
+        .expect("TFT004 must be in the report");
+    assert_eq!(
+        o.status,
+        Status::Fired,
+        "an hour-wrong publisher on a live arena went unreported: {o:?}"
+    );
+    assert_eq!(
+        o.findings.len(),
+        1,
+        "only one edge is wrong: {:?}",
+        o.findings
+    );
+    assert!(
+        o.findings[0].subject.contains("odom->base"),
+        "the finding names the healthy edge instead of the broken one: {}",
+        o.findings[0].subject
+    );
+    assert!(
+        o.findings[0].message.contains("behind"),
+        "a publisher stamping an hour in the past must be described as behind: {}",
+        o.findings[0].message
+    );
+
+    let note = checks::clock_offset_note(&snap, checks::PushStream::RingsUnderWriter, clock)
+        .expect("two publishers have recorded offsets");
+    assert!(
+        note.contains("2 publisher clock offset(s)"),
+        "the spread should cover the two publishers that pushed and not the \
+         third edge, which has never been claimed and whose offset is the \
+         arena's zero — a fleet member reported as perfectly synchronised \
+         because nobody has ever measured it: {note}"
+    );
+}

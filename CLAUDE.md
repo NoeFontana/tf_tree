@@ -23,7 +23,7 @@ over the README, and over this file.
   criterion is **open and not satisfiable by code**.
 - **Phase 5: partial.** `FORMAT_VERSION = 3` **landed** (`layout_hash`
   `0x3D10_4195`); frozen `.tft`, MCAP ingest, counters, `tf_tree top` done;
-  catalogue detects 16 of 19.
+  catalogue detects 17 of 19.
 - **Published** to crates.io and PyPI since 2026-08-17, on the `0.0.x` line —
   cargo treats every `0.0.x` as incompatible with every other, so *every release
   may break every other* and that is the whole promise. The number itself is not

@@ -141,12 +141,45 @@ is a bug.
   (4 physical cores against the 17 it needs, and no ROS 2). It ships unmeasured,
   and `docs/PHASE1.md` §11.2 says so in its own terms.
 
-  **`TFT004` is not wired to it yet** (`0036` step 3, which now needs a fourth
-  skip for a *replayed* source: bag ingest publishes through the same
-  `EdgeWriter`, so a 2024 recording read in 2026 records a two-year offset that
-  is arithmetically right and diagnostically meaningless), so it still skips — but
-  its reason is now about `checks.rs` and no longer about the arena, and
-  `docs/PHASE5.md` §0.0's *"sixteen detect"* is unchanged until that step lands.
+  **`TFT004` now reads it** — see the entry below — so it still skips only where
+  it has no evidence, and
+  `docs/PHASE5.md` §0.0's *"sixteen detect"* becomes seventeen.
+
+- **`TFT004` detects clock skew** — the first check to move out of §0.0's
+  *"cannot detect anything in any configuration"* group since the catalogue was
+  written ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
+  steps 3–4, closing that record). `docs/PHASE5.md` §6 calls it *"the check most
+  likely to find something nobody knew"*: on a multi-machine robot with imperfect
+  time sync, clock error presents as intermittent extrapolation failures on an
+  edge whose publisher is fine, and nothing else in a ROS 2 stack points at it.
+
+  **What it finds is narrower than §6 asks for, and that is a finding rather than
+  a shortfall.** A recorded offset is the publisher's clock error *plus* its
+  stamp-to-push latency, and **one sample cannot separate them** — a localiser
+  that stamps with the capture time of the scan it matched legitimately sits tens
+  of milliseconds above an odometry publisher. A fleet-relative rule would report
+  that healthy difference as skew however well its threshold were calibrated,
+  because the quantity it compares is not the quantity it names. So `TFT004`
+  fires only past a bound **no publish pipeline could account for** (ten
+  seconds): a machine whose NTP never came up or whose RTC is dead. That is a
+  physical argument, not a tuned constant.
+
+  **The fleet spread is reported as a note** — the offsets, their median and
+  their range, with the caveat attached so a reader does not chase a pipeline
+  difference as skew. That is the useful half today, and it is what `0036`
+  question 3 ratified.
+
+  **What separates clock error from latency is drift**, which needs a series;
+  `tf_tree top` polls and `doctor` does not, so the fleet-relative rule is owed
+  and recorded as a `top` feature — in `top.rs`'s own module header, where
+  whoever builds it will be, rather than only in a decision record they would
+  have no reason to open.
+
+  **Four skips, each with its own reason**, and two are about where the arena
+  came from rather than what is in it: a **replayed** source (`--from-bag`
+  records ingest-time offsets against a recording's stamps — two years for a 2024
+  bag read in 2026), an arena **at rest** (a frozen `.tft` carries offsets from
+  whenever it was frozen), `TFT005`'s epoch condition, and nothing sampled yet.
 
 ### Fixed
 

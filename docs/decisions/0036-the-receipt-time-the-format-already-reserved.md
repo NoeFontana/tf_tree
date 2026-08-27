@@ -1,6 +1,6 @@
 # 0036: the receipt time the format already reserved
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
 
 > **The title says *receipt time* and the decided quantity is the *offset*.**
@@ -10,12 +10,17 @@
 > receipt time could not be paired with a stamp* below is why. Ten documents link
 > here; a rename buys a truer six words and risks every one of them.
 
-**Implementation:** **step 1 has landed, and was then amended** — the field
-stores `wall clock - stamp` rather than the wall clock, and is called
-`ClaimRecord::clock_offset_nanos` rather than `last_push_nanos`. Step 2's
-amendment to `docs/PHASE2.md` §6.4 landed in the same change as step 1 — a normative sentence describing code
-should not be one PR behind it. Steps 3–5 are open; `docs/PHASE5.md` §0.0's
-*"sixteen detect"* is therefore unchanged, and only `TFT004`'s *reason* moved.
+**Implementation:** **all five steps have landed** — #272 (steps 1–2), #273
+(step 1's amendment: the field stores `wall clock - stamp` rather than the wall
+clock, and is called `ClaimRecord::clock_offset_nanos` rather than
+`last_push_nanos`), and #274 (steps 3–4). Step 5's cost is in `docs/PHASE1.md`
+§11.2 with its disclosure. **This record is now frozen**: drift is fixed by a
+record that supersedes it, not by editing here.
+
+`docs/PHASE5.md` §0.0 now reads *"seventeen detect"*, and `TFT004` is the first
+check to leave its *"cannot detect anything in any configuration"* group since
+the catalogue was written.
+
 The four recommendations below were ratified by merging this record, per the
 mechanism [`0023`](./0023-the-gate-that-could-not-gate.md) states in as many
 words (*"they are recommendations and not decisions because this record is
@@ -574,6 +579,45 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    and unmeasured, in §11's own terms. **Not a step to skip quietly**: a
    diagnostic that costs the publish path its p99.9 and says so in a decision
    record only is the shape `0023` was written about.
+
+## What step 3 established that this record could not
+
+**Question 3's recommendation was right and its reason was not the one given.**
+It says to *"report the spread and flag nothing until a threshold has evidence"*,
+and argues from `0023`: a threshold should be derived from a measured spread, and
+there is no fleet in this repository to measure one on. True, and it is not the
+binding reason.
+
+**The binding reason is that one sample cannot separate clock error from
+latency.** A recorded offset is `clock error + stamp-to-push latency`. The second
+term is real and differs legitimately between publishers: a localiser that stamps
+a transform with the capture time of the scan it matched sits tens of
+milliseconds above an odometry publisher that stamps at computation time. A
+fleet-relative rule would report that healthy difference as skew — and it would
+do so *however well calibrated its threshold was*, because the quantity it
+compares is not the quantity it names. A fleet to measure on would not have
+fixed it.
+
+**What separates them is drift.** A clock error moves over time; a pipeline
+latency does not. That needs a series, which `tf_tree top` polls for and `doctor`
+does not have — so the fleet-relative rule is **owed and unbuilt**, and it is a
+`top` feature rather than a `doctor` threshold.
+
+**Recorded in `crates/tf_tree_cli/src/top.rs`'s module header and not only
+here.** This record is now frozen, and a frozen record is not where somebody
+adding a column to `top` looks. That note carries the argument above plus the two
+cautions this work turned up: consecutive polls often read the *same* sample, so
+a series has to be de-duplicated against the value rather than the poll, and a
+flickering column teaches an operator to ignore it.
+
+**So `TFT004` as shipped fires on one thing only:** an offset past a bound no
+publish pipeline could account for (`checks::OFFSET_BEYOND_ANY_PIPELINE_NS`, ten
+seconds). That is a *physical* argument rather than a calibrated constant, which
+is what makes it permissible where a fleet-relative threshold is not. It finds a
+machine whose NTP never came up or whose RTC is dead — common on a robot,
+miserable to attribute from the symptom — and **not** the PTP-scale drift §6
+opens with. `PHASE5.md` §6's amendment and the check's own doc both say so where
+a reader meets them.
 
 ## What merging this ratifies
 

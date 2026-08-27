@@ -187,6 +187,18 @@ pub struct EdgeInfo {
     pub owner_pid: u32,
     /// Newest published stamp, if any samples exist.
     pub newest_stamp: Option<i64>,
+    /// The publisher's clock offset — host wall clock minus header stamp, both
+    /// taken at the same push — or `None` when this edge has recorded none.
+    ///
+    /// `Option` rather than the raw `0`, for the reason `nominal_rate_mhz`
+    /// below gives about its own sentinel: the two answers send `TFT004` in
+    /// opposite directions, and a `0` that a caller forgets to test is a
+    /// publisher reported as perfectly synchronised when in truth it has never
+    /// been measured. **The arena cannot produce a `0` for any other reason** —
+    /// `EdgeWriter`'s sampler stores `1` for an offset that computes to exactly
+    /// zero, precisely so this mapping is lossless
+    /// (`docs/decisions/0036`).
+    pub clock_offset_nanos: Option<i64>,
     /// The rate this edge was **declared** to publish at, in milli-hertz, or
     /// `None` when nothing declared one (`EdgeRecord::nominal_rate_mhz == 0`).
     ///
@@ -600,6 +612,10 @@ impl Snapshot {
                     .and_then(|slot| view.participants().identity(slot))
                     .map_or(0, |(pid, _start, _inc)| pid),
                 newest_stamp,
+                clock_offset_nanos: match claim.clock_offset_nanos.load(Ordering::Relaxed) {
+                    0 => None,
+                    ns => Some(ns),
+                },
                 nominal_rate_mhz: match rec.nominal_rate_mhz {
                     0 => None,
                     mhz => Some(mhz),
@@ -1254,6 +1270,7 @@ mod tests {
             owner_slot: claimed.then_some(0),
             owner_pid: if claimed { 1234 } else { 0 },
             newest_stamp: None,
+            clock_offset_nanos: None,
             nominal_rate_mhz: None,
         }
     }

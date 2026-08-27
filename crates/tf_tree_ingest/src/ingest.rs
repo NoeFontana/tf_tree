@@ -1161,10 +1161,17 @@ fn fill_spilled(
     // a 2024 recording in 2026 records an offset of about two years. That is
     // arithmetically correct and diagnostically meaningless: the publisher's
     // clock was fine, the recording is simply old. A bag-sourced tree is an
-    // ordinary live heap `Tree`, so neither `TFT004`'s frozen-source skip nor
-    // its epoch condition catches it. **`0036` step 3 owes a fourth skip for a
-    // replayed source**, recorded in that record; until it lands, `TFT004` reads
-    // nothing at all, so nothing here is currently mis-reported.
+    // ordinary live heap `Tree`, so neither `TFT004`'s frozen-source skip nor its
+    // epoch condition catches it. **`TFT004` skips a replayed source for exactly
+    // this reason** — `PushStream::no_live_receipt`, added by `0036` step 3 —
+    // which covers `doctor --from-bag` because that path knows it is reading a
+    // recording.
+    //
+    // **What it does not cover is `ros2 bag play` into a live stack**, where the
+    // same old stamps reach a shared arena through the §5 bridge and `doctor
+    // --attach` sees an ordinary live arena. Provenance is a property of the
+    // writer and the arena records none, so that gap is named in `tft004`'s doc
+    // and in the finding text rather than closed here.
     //
     // The cost is the sampler's ~1.1 ns per push plus one 38 ns clock read per
     // interval, on a bulk load of millions of samples: single-digit
