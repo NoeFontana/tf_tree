@@ -792,7 +792,7 @@ impl ArenaBacking {
 /// otherwise since it was written: `fork_gen` is declared *between* them under
 /// `shm`, and without `shm` there is no `_lease` at all. What must hold is that
 /// no field carrying a `Drop` is declared between the two. The three
-/// receipt-time fields at the end own nothing and implement no `Drop`, which is
+/// clock-offset fields at the end own nothing and implement no `Drop`, which is
 /// why they are at the end and why they are harmless there.
 ///
 /// Reversing it is not catastrophic but is wrong: it leaves a window in which
@@ -831,7 +831,7 @@ pub struct EdgeWriter<'a> {
     /// never writes.
     ///
     /// `Publisher` holds the same reference privately and bumps `heartbeat` on
-    /// every push; `last_push_nanos` sits beside it and is the *receipt time*
+    /// every push; `clock_offset_nanos` sits beside it and is the *clock offset*
     /// `docs/decisions/0036` wires up. It is sampled here rather than there
     /// because reading a wall clock is `std` and the engine crate is `no_std`
     /// (D14) — and because a clock read inside `SampleRing::push` would sit
@@ -841,7 +841,7 @@ pub struct EdgeWriter<'a> {
     /// Borrowing the record a second time costs nothing: it is a `&`, and every
     /// mutation of it is atomic.
     claim: &'a ClaimRecord,
-    /// Pushes between receipt-time samples. Fixed for this writer’s life,
+    /// Pushes between clock-offset samples. Fixed for this writer’s life,
     /// derived once at claim time from the edge’s declared nominal rate.
     ///
     /// The derivation makes the *offset sample rate* the constant instead of
@@ -913,17 +913,19 @@ impl EdgeWriter<'_> {
     /// pointer into an unmapped page, which is not a trade this hot path gets
     /// to decline.
     ///
-    /// # Cost of the receipt-time sampler, measured
+    /// # Cost of the clock-offset sampler, measured
     ///
-    /// Since `docs/decisions/0036` step 1 this method also stamps a wall-clock
-    /// *receipt time* into the claim record, once every `sample_every` pushes,
-    /// so that `TFT004` can difference it against the publisher's header stamp
-    /// and find clock skew. **This section is on `push` and not on the private
-    /// method that does it, because rustdoc renders this one.**
+    /// Since `docs/decisions/0036` step 1 this method also records the
+    /// publisher's *clock offset* — the host wall clock minus `stamp` — into the
+    /// claim record, once every `sample_every` pushes, so that `TFT004` can
+    /// compare publishers and find the machine whose clock has drifted. **This
+    /// section is on `push` and not on the private method that does it, because
+    /// rustdoc renders this one.**
     ///
-    /// **+1.1 ns per push, about +23%** — 5.9–6.1 ns against 4.8–5.0 ns, paired
-    /// in-process against [`Publisher::push`] over five sittings
-    /// (`just push-sampler-cost`). The pairing is not fussiness: this host fails
+    /// **+1.0–1.1 ns per push, about +21%** — 5.87–6.1 ns against 4.85–5.0 ns,
+    /// paired in-process against [`Publisher::push`] over six sittings
+    /// (`just push-sampler-cost`), the last of them re-derived after the sampler
+    /// gained its domain gate and cold-path guards. The pairing is not fussiness: this host fails
     /// `bench_report`'s fitness probe, and an unpaired before/after across two
     /// `cargo bench` runs read +47%, which was drift.
     ///
@@ -961,28 +963,35 @@ impl EdgeWriter<'_> {
         // **The `?` is load-bearing, not a style choice** (`docs/decisions/0036`
         // plan step 1). It is what places the clock read after the ring write —
         // outside the seqlock window, and skipped entirely on a push that never
-        // happened. A receipt time bumped by a `ClaimRevoked` push would be a
-        // receipt for nothing, and is the observable form of the read having
+        // happened. An offset recorded by a `ClaimRevoked` push would be an
+        // offset for nothing, and is the observable form of the read having
         // drifted inside the window.
         self.publisher.push(stamp, iso)?;
-        self.sample_receipt_time();
+        self.sample_clock_offset(stamp);
         Ok(())
     }
 
-    /// Count this push and, once every `sample_every` of them, stamp the claim
-    /// record with a wall-clock receipt time.
+    /// Count this push and, once every `sample_every` of them, record the
+    /// publisher's clock offset: the host wall clock minus `stamp`.
     ///
-    /// `TFT004` differences this against the *header stamp* the publisher
-    /// supplied to find a clock offset, which is why the clock is the wall clock
-    /// and not `Instant` however much cheaper the latter is: a monotonic reading
-    /// cannot be differenced against a wall-clock stamp (`docs/API.md` R3).
+    /// **The subtraction happens here, and that is the whole design.** A
+    /// receipt time stored on its own cannot be paired with a stamp by anyone
+    /// else: sampling means the ring's newest stamp belongs to a later push than
+    /// the receipt does, so `receipt - newest_stamp` reads anywhere from +3 µs
+    /// to -900 ms on a 10 Hz publisher whose clock is *exact* (measured — see
+    /// [`ClaimRecord::clock_offset_nanos`]). This writer holds both sides at one
+    /// instant and nobody else ever does.
+    ///
+    /// The clock is the wall clock and not `Instant`, however much cheaper the
+    /// latter is: `stamp` is wall-clock-domain (`docs/API.md` R3) and a
+    /// monotonic reading cannot be subtracted from it.
     ///
     /// **Advisory, and never a reaping trigger** (`docs/PHASE2.md` §6.4). A
-    /// stale receipt time means the writer has not reached its next sample; it
-    /// does not mean the writer is gone, and nothing may treat it as though it
-    /// did. Liveness is the socket and the lock byte (D17), and a timestamp that
-    /// is now actually written is exactly the thing a later reader would reach
-    /// for instead.
+    /// stale offset means the writer has not reached its next sample; it does
+    /// not mean the writer is gone, and nothing may treat it as though it did.
+    /// Liveness is the socket and the lock byte (D17), and a field that is now
+    /// actually written is exactly the thing a later reader would reach for
+    /// instead.
     ///
     /// The cost is on [`EdgeWriter::push`], where rustdoc renders it.
     ///
@@ -998,29 +1007,47 @@ impl EdgeWriter<'_> {
     /// *never sampled* for its first interval. Three reasons, one of them a
     /// number.
     #[inline]
-    fn sample_receipt_time(&self) {
+    fn sample_clock_offset(&self, stamp: i64) {
         let remaining = self.until_sample.get();
         if remaining != 0 {
             self.until_sample.set(remaining - 1);
             return;
         }
-        // `saturating_sub`, though `sample_interval`'s clamp already makes the
-        // subtraction safe: this is the one arithmetic operation in the sampler
-        // that a `0` could reach, it is on the cold path where it costs nothing,
-        // and a debug-build panic inside `push` is a bad way to learn that
-        // somebody added a second producer of this field.
-        self.until_sample.set(self.sample_every.saturating_sub(1));
+        // **Not a wall-clock edge: never sample.** `sample_every == 0` is that
+        // case, and the test is here rather than beside the countdown so the
+        // sampling edges — the ones that pay for this method — see an unchanged
+        // hot path. `until_sample` stays `0`, so such an edge takes this branch
+        // on every push and reaches nothing further.
+        if self.sample_every == 0 {
+            return;
+        }
+
+        // **A clock this process cannot read is not an offset of zero.**
+        // `now_nanos` returns `None` when the host clock predates the epoch, and
+        // subtracting a stamp from a `0` fallback would store a confident
+        // -1.79e18 — a fifty-six-year skew reported against a healthy
+        // publisher. Returning leaves the field at whatever it held, and on a
+        // fresh claim that is `0`, which reads as *no sample yet*.
+        let Some(now) = now_nanos() else {
+            return;
+        };
+
+        // `sample_every` is at least 1 here, so the reload cannot underflow —
+        // `sample_interval` returns either `0` (handled above) or a clamped
+        // positive count.
+        self.until_sample.set(self.sample_every - 1);
+
         // `Relaxed`: this orders nothing. It is a diagnostic scalar read by a
         // separate process that is already tolerating a torn view of the whole
         // arena, and giving it a `Release` would put a fence on the publish path
         // to publish a number nothing waits on.
         self.claim
-            .last_push_nanos
-            .store(now_nanos(), Ordering::Relaxed);
+            .clock_offset_nanos
+            .store(recorded_offset(now, stamp), Ordering::Relaxed);
     }
 }
 
-/// Pushes between receipt-time samples for an edge that declares **no** nominal
+/// Pushes between clock-offset samples for an edge that declares **no** nominal
 /// rate (`EdgeRecord::nominal_rate_mhz == 0` — *not declared*, which is the
 /// reading `TFT007` already takes of that value).
 ///
@@ -1032,26 +1059,72 @@ impl EdgeWriter<'_> {
 /// record expected**, *at this value*: the clock read this interval divides is
 /// 3% of what the sampler costs at 1024, so moving it moves almost nothing here.
 /// At a declared 10 Hz — `sample_every` of 10 — the same read is 78% and the
-/// interval is the whole knob. [`EdgeWriter::push`]'s *Cost of the receipt-time
+/// interval is the whole knob. [`EdgeWriter::push`]'s *Cost of the clock-offset
 /// sampler* section tabulates both ends.
 const DEFAULT_SAMPLE_EVERY: u32 = 1024;
 
-/// Pushes between receipt-time samples for an edge declaring `nominal_rate_mhz`.
+/// Pushes between clock-offset samples for an edge, or **`0` for "never"**.
+///
 ///
 /// `nominal_rate_mhz` is **milli**hertz — [`EdgeCfg::nominal_rate_hz`] stores
 /// `rate_hz * 1000.0` — so the quotient by 1000 is pushes per second, and *one
 /// sample per that many pushes* is exactly the rule `docs/decisions/0036`
 /// question 1 ratifies: one offset per second of published data, at any rate.
 ///
-/// **The clamp changes no behaviour and is kept anyway.** A sub-hertz edge
-/// divides to zero, and a `sample_every` of zero reloads the countdown to
-/// `0.saturating_sub(1) == 0` and so samples on *every* push — which is what `1`
-/// does too, so nothing is being guarded against. What the clamp buys is that
-/// the field means what its name says: a reader who finds `sample_every == 0`
-/// would reasonably read it as *never*, and it is the exact opposite. Sampling
-/// every push is also the right answer for an edge this slow, at one clock read
-/// per two seconds or worse.
-fn sample_interval(nominal_rate_mhz: u32) -> u32 {
+/// **An edge whose stamps are not wall-clock time never samples**, and that is
+/// what the `0` return means. The stored quantity is `wall clock - stamp`, which
+/// is an *offset* only when both sides share an epoch: a [`SimDomain`] edge
+/// stamping nanoseconds since the start of a simulation would record ~1.79e18,
+/// a fifty-six-year skew that is not a skew at all. `TFT005` already skips a
+/// whole arena for this reason, but that is a per-*arena* answer and this is a
+/// per-edge fact — one tree can hold a `SystemDomain` IMU and a `SimDomain`
+/// replay, and only the first has a number worth writing.
+///
+/// **Only tag `0` qualifies, and the conservatism is deliberate.**
+/// [`Domain::TAG`] is an open trait: a driver with a PTP-disciplined clock
+/// declares its own domain at tag 4 or above (`docs/API.md` §2.5), and such a
+/// clock probably *is* wall-clock time — but this crate cannot know that, and a
+/// diagnostic that guesses is worse than one that abstains. The comparison is
+/// against `<SystemDomain as Domain>::TAG` rather than a literal `0` for the
+/// reason [`Domain::TAG`]'s own doc gives: the numbering is read by every
+/// consumer, and a hard-coded `0` here would be a second place to keep it right.
+///
+/// **The clamp on a declared rate changes no behaviour and is kept anyway.** A
+/// sub-hertz edge divides to zero, and one that reached the countdown as zero
+/// would sample on every push — which is what `1` does too. What the clamp buys
+/// is that `0` can mean *never* without ambiguity, which is what the paragraph
+/// above needs. Sampling every push is also the right answer for an edge that
+/// slow, at one clock read per two seconds or worse.
+/// The value the sampler stores for a push received at `now` bearing `stamp`.
+///
+/// Split out of [`EdgeWriter::push`]'s sampler because both of its rules are
+/// about values a clock will not produce on demand, and a test that cannot
+/// construct its input is a test that does not exist.
+///
+/// **`saturating_sub`**, so a stamp far enough from the epoch to overflow an
+/// `i64` difference clamps instead of wrapping. Wrapping would turn a nonsense
+/// stamp into a *plausible* offset, which is the one failure mode a diagnostic
+/// must not have.
+///
+/// **Never `0`**, because `0` is the arena's *no sample yet* and this function's
+/// caller has just taken a sample. A publisher that stamps with its own clock —
+/// `let t = now(); push(t)` — yields a few hundred nanoseconds where the clock
+/// has nanosecond resolution and **exactly zero** where it does not: Windows'
+/// `SystemTime::now()` is coarser than a push, so both reads land in the same
+/// tick. Such a publisher would read as never-sampled forever, silently, on a
+/// platform this crate supports. One nanosecond is a cheaper lie than that, in a
+/// quantity `TFT004` compares in milliseconds.
+fn recorded_offset(now: i64, stamp: i64) -> i64 {
+    match now.saturating_sub(stamp) {
+        0 => 1,
+        offset => offset,
+    }
+}
+
+fn sample_interval(domain: u8, nominal_rate_mhz: u32) -> u32 {
+    if domain != <SystemDomain as Domain>::TAG {
+        return 0;
+    }
     match nominal_rate_mhz {
         0 => DEFAULT_SAMPLE_EVERY,
         mhz => (mhz / 1000).max(1),
@@ -2069,7 +2142,7 @@ impl Tree {
         let participants = view.participants();
         let arena_boot = header.boot_id;
         let is_alive = move |slot: u32| participant_is_alive(&participants, slot, &arena_boot);
-        let _topo = lock.acquire(self.participant, now_nanos(), &is_alive)?;
+        let _topo = lock.acquire(self.participant, now_nanos().unwrap_or(0), &is_alive)?;
 
         let (_p, _depth, edge, _gen) =
             view.topology()
@@ -2228,17 +2301,17 @@ impl Tree {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let lease = self.take_claim_lease(eid, claim_rec, epoch, owner)?;
 
-        // **The receipt time is cleared, because a claim inherits the edge and
+        // **The recorded offset is cleared, because a claim inherits the edge and
         // not the writer** (`docs/decisions/0036`). Nothing else in the system
-        // resets `last_push_nanos` — not `release`, not the reaper, not
+        // resets `clock_offset_nanos` — not `release`, not the reaper, not
         // `tf_tree_core::edge::claim` — so without this line a fresh writer
-        // publishes under the *previous* writer's timestamp until its own first
-        // sample lands. `TFT004`'s planned "nothing sampled yet" skip is
-        // `last_push_nanos == 0`, which would not fire, so the check would
+        // publishes under the *previous* writer's offset until its own first
+        // sample lands. `TFT004`'s "nothing sampled yet" skip is
+        // `clock_offset_nanos == 0`, which would not fire, so the check would
         // report an hours-wide clock skew against a publisher whose clock is
         // perfect. `Relaxed` for the same reason the sampling store is: it
         // orders nothing, and the CAS above has already made this edge ours.
-        claim_rec.last_push_nanos.store(0, Ordering::Relaxed);
+        claim_rec.clock_offset_nanos.store(0, Ordering::Relaxed);
 
         // §7.1's per-edge population, writer half. This is the moment the edge
         // is taken up, and it is off the publish path — `push` is what must not
@@ -2248,7 +2321,7 @@ impl Tree {
 
         // `docs/decisions/0036` step 1: one division, here, per claim — never on
         // the push path.
-        let sample_every = sample_interval(edge_rec.nominal_rate_mhz);
+        let sample_every = sample_interval(edge_rec.domain, edge_rec.nominal_rate_mhz);
 
         Ok(EdgeWriter {
             publisher: Publisher::new(ring, claim_rec, epoch, owner),
@@ -2260,7 +2333,7 @@ impl Tree {
             sample_every,
             // **Zero, so the claim's *first* push samples**, and every
             // `sample_every`-th one after it. Starting a full interval away
-            // instead would leave `last_push_nanos == 0` — indistinguishable
+            // instead would leave `clock_offset_nanos == 0` — indistinguishable
             // from the pre-`0036` state where nothing wrote it — for 102 s on a
             // 10 Hz edge with no declared rate and about 85 minutes on a 0.2 Hz
             // one, which are exactly the slow publishers §6.4 is about. It costs
@@ -3596,7 +3669,9 @@ fn register_participant(view: &ArenaView) -> Result<(u32, u64), ParticipantError
     view.participants().register(
         std::process::id(),
         process_start_time().unwrap_or(UNKNOWN_START_TIME),
-        now_nanos(),
+        // `0` reads as *unknown attach time* in a participant record, which is what
+        // an unreadable clock is. Only the offset sampler cannot use it.
+        now_nanos().unwrap_or(0),
     )
 }
 
@@ -3612,16 +3687,29 @@ fn register_participant_at(view: &ArenaView, slot: u32) -> Result<u64, Participa
         slot,
         std::process::id(),
         process_start_time().unwrap_or(UNKNOWN_START_TIME),
-        now_nanos(),
+        // `0` reads as *unknown attach time* in a participant record, which is what
+        // an unreadable clock is. Only the offset sampler cannot use it.
+        now_nanos().unwrap_or(0),
     )
 }
 
-/// Wall-clock nanoseconds since the epoch, saturating; `0` if the clock is
-/// before the epoch. Diagnostics only — nothing correctness-critical reads it.
-fn now_nanos() -> i64 {
+/// Wall-clock nanoseconds since the epoch, saturating, or `None` if the host
+/// clock is **before** the epoch. Diagnostics only — nothing
+/// correctness-critical reads it.
+///
+/// **The failure is an `Option` and not a `0`, because one caller cannot
+/// tolerate the sentinel.** This used to be `map_or(0, ..)`, which was harmless
+/// while every consumer wrote the reading into a record as a timestamp: a `0`
+/// there reads as *unknown*. `EdgeWriter`'s clock-offset sampler *subtracts* it,
+/// and `0 - stamp` on a machine with a dead RTC is a confident -1.79e18 —
+/// a fifty-six-year clock skew, reported against a publisher that is fine. A
+/// sentinel that is benign in one arithmetic and catastrophic in another has to
+/// be spelled where it is handled.
+fn now_nanos() -> Option<i64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .ok()
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 /// **The liveness predicate** — the single seam where "is participant `slot`
@@ -4434,6 +4522,76 @@ mod tests {
             .register_at(0, pid, start_time, 0)
             .expect("slot 0 of a fresh arena is free");
         f(table.get(0).expect("slot 0 is within every layout's table"));
+    }
+
+    /// **The two rules of [`recorded_offset`] that a clock will not produce on
+    /// demand.**
+    ///
+    /// Both are about values the sampler cannot be steered into from the
+    /// outside: an offset of exactly zero needs the wall clock and the stamp to
+    /// agree to the nanosecond, and a saturating difference needs a stamp near
+    /// the end of the `i64` range. The push path is where they matter and the
+    /// push path cannot be asked for either, so the arithmetic is a function and
+    /// this is its test.
+    ///
+    /// Mutants, run: `0 => 1` to `0 => 0` — *"an exact-zero offset was stored as
+    /// the arena's no-sample-yet sentinel"*; `saturating_sub` to `-` — the
+    /// overflow case panics in debug (`attempt to subtract with overflow`).
+    #[test]
+    fn a_recorded_offset_is_never_the_no_sample_sentinel_and_never_wraps() {
+        // A publisher whose clock reads exactly its own stamp — the coarse-clock
+        // case on a platform whose `SystemTime::now()` is coarser than a push.
+        assert_eq!(
+            super::recorded_offset(1_787_000_000_000_000_000, 1_787_000_000_000_000_000),
+            1,
+            "an exact-zero offset was stored as the arena's no-sample-yet \
+             sentinel: that publisher reads as never sampled, forever"
+        );
+        // Ordinary skew keeps its sign and magnitude, both ways round.
+        assert_eq!(super::recorded_offset(1_000, 400), 600);
+        assert_eq!(super::recorded_offset(400, 1_000), -600);
+        // A stamp near the end of the range clamps rather than wrapping into a
+        // plausible-looking offset.
+        assert_eq!(super::recorded_offset(-1, i64::MAX), i64::MIN);
+        assert_eq!(super::recorded_offset(i64::MAX, -1), i64::MAX);
+    }
+
+    /// **Only the wall-clock domain samples**, `docs/decisions/0036`.
+    ///
+    /// `sample_interval` is the seam, so this is a table over the tags rather
+    /// than a tree built per domain: the fact under test is a mapping, and a
+    /// mapping is best asserted as one.
+    ///
+    /// Mutant, run: delete the `domain != SystemDomain::TAG` early return —
+    /// *"a SimDomain edge sampled"*.
+    #[test]
+    fn only_a_wall_clock_edge_samples_an_offset() {
+        use tf_tree_core::plan::{Domain, SensorDomain, SimDomain, SteadyDomain, SystemDomain};
+
+        assert_eq!(
+            super::sample_interval(<SystemDomain as Domain>::TAG, 10_000),
+            10,
+            "a 10 Hz wall-clock edge must sample every ten pushes"
+        );
+        assert_eq!(
+            super::sample_interval(<SystemDomain as Domain>::TAG, 0),
+            super::DEFAULT_SAMPLE_EVERY,
+            "an undeclared-rate wall-clock edge must sample at the default"
+        );
+        for (tag, name) in [
+            (<SensorDomain as Domain>::TAG, "SensorDomain"),
+            (<SimDomain as Domain>::TAG, "SimDomain"),
+            (<SteadyDomain as Domain>::TAG, "SteadyDomain"),
+            (200, "a user-declared domain"),
+        ] {
+            assert_eq!(
+                super::sample_interval(tag, 10_000),
+                0,
+                "a {name} edge sampled: `wall clock - stamp` is not an offset \
+                 when the two do not share an epoch, and this one would record \
+                 a fifty-six-year skew against a publisher that is fine"
+            );
+        }
     }
 
     /// **The documented bias, as an assertion rather than a comment.**

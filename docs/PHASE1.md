@@ -921,7 +921,7 @@ Do not benchmark a synthetic two-frame tree. Use:
 
 **p99.9 is the number that matters**, not the mean. A control loop cares about the tail.
 
-**And on the `push` row, the tail is what ships unmeasured.** [`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md) step 1 put a receipt-time sampler on `EdgeWriter::push`: one push in `sample_every` reads a wall clock, 38.4 ns on the development host. The *mean* is measured — `push` went from 4.8–5.0 ns to 5.9–6.1 ns, **+1.1 ns**, paired in one process by `just push-sampler-cost`.
+**And on the `push` row, the tail is what ships unmeasured.** [`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md) step 1 put a clock-offset sampler on `EdgeWriter::push`: one push in `sample_every` reads a wall clock and stores `wall clock - stamp`, and the read is 38.4 ns on the development host. The *mean* is measured — `push` went from 4.85–5.0 ns to 5.87–6.1 ns, **+1.0–1.1 ns**, paired in one process by `just push-sampler-cost`, and re-derived after the sampler was amended rather than carried over from the first shape of it.
 
 **That measurement is at one interval, and the shape of the cost is not the same at the others.** The sampler is a rate-independent counter (~1.06 ns) plus `38.4 / sample_every` ns of amortised clock, and it was measured on an edge declaring no rate, where `sample_every` is 1024 and the clock is 3% of the total. The rest of this table is arithmetic from those two measured constants:
 

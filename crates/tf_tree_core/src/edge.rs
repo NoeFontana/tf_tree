@@ -240,25 +240,48 @@ pub struct ClaimRecord {
     /// Advisory liveness hint, bumped by the writer on every push. **Never a
     /// reaping trigger on its own** (`docs/PHASE2.md` §6.4).
     pub heartbeat: AtomicU64,
-    /// **Host wall-clock** nanoseconds since the Unix epoch, at the moment a
-    /// push was received — the *receipt time* `docs/PHASE5.md` §6's `TFT004`
-    /// differences against the publisher's header stamp to find clock skew.
-    /// Diagnostics only, and **never a reaping trigger** (`docs/PHASE2.md`
-    /// §6.4).
+    /// The publisher's **clock offset**, in nanoseconds: host wall clock minus
+    /// the header stamp, both read at the same push. Diagnostics only, and
+    /// **never a reaping trigger** (`docs/PHASE2.md` §6.4).
     ///
-    /// **Not the arena's stamp domain, and this doc said "arena-local" until
-    /// 2026-08-26.** The distinction is the whole point of the field: `TFT005`
-    /// exists because an arena's stamps need not share an epoch with the system
-    /// clock, and an implementer who reads both sides of `receipt - stamp` as
-    /// arena-local computes the epoch difference instead of the offset.
+    /// This is what `docs/PHASE5.md` §6's `TFT004` compares across publishers to
+    /// find the machine whose clock has drifted.
     ///
-    /// **Sampled, not written on every push** (`docs/decisions/0036`): a wall
-    /// clock read costs about eight times a push, so `tf_tree`'s `EdgeWriter`
-    /// stamps this once per second of published data. `0` means *no sample yet*
-    /// — a fresh claim clears it, because a claim inherits the edge and not the
-    /// writer. This crate is `no_std` and writes it nowhere; it cannot read a
-    /// clock at all (D14).
-    pub last_push_nanos: AtomicI64,
+    /// # Why the difference and not the receipt time
+    ///
+    /// Because a receipt time cannot be paired with a stamp by anyone else. The
+    /// write is **sampled** — a wall-clock read costs about eight times a push,
+    /// so `tf_tree`'s `EdgeWriter` takes one per second of published data — and
+    /// by the time a reader looks, the ring's newest stamp belongs to a *later*
+    /// push than the receipt does. `receipt - newest_stamp` is then the offset
+    /// minus however much data has been published since the sample: on a 10 Hz
+    /// publisher with an **exact** clock, measured, it reads anywhere from
+    /// +3 µs to -900 ms depending only on when the reader arrives. That is a
+    /// ±1 s noise floor under a signal `TFT004` must resolve at tens of
+    /// milliseconds, and the sampling interval is ~1 s for every publisher by
+    /// construction, so it does not cancel in a fleet comparison either.
+    ///
+    /// The writer is the only party holding both sides at one instant, so the
+    /// writer is where the subtraction belongs. An earlier revision of this
+    /// field stored the receipt time and was called `last_push_nanos`;
+    /// `docs/decisions/0036` records the measurement that changed it.
+    ///
+    /// # Reading it
+    ///
+    /// `0` means **no sample yet** — a fresh claim clears it, because a claim
+    /// inherits the edge and not the writer. A genuine offset of exactly zero
+    /// nanoseconds is therefore indistinguishable from unset; that is one sample
+    /// in ~10^9 and the next one overwrites it, which is a cheaper price than a
+    /// sentinel a zeroed arena cannot express.
+    ///
+    /// **Both sides must share an epoch, and this field cannot check that.**
+    /// `TFT005` exists because an arena's stamps need not be Unix time; where
+    /// they are not, this number is the epoch difference and not an offset, and
+    /// the check that reads it has to skip for the reason `TFT005` skips.
+    ///
+    /// This crate is `no_std` and writes it nowhere: it cannot read a clock at
+    /// all (D14).
+    pub clock_offset_nanos: AtomicI64,
     _pad: [u8; 32],
 }
 
@@ -282,9 +305,9 @@ pub struct ClaimRecord {
     pub epoch: AtomicU64,
     /// Writer heartbeat.
     pub heartbeat: AtomicU64,
-    /// Host wall-clock nanoseconds of the last sampled push; `0` means none
+    /// The publisher's clock offset at the last sampled push; `0` means none
     /// yet. See the production record's field for the whole contract.
-    pub last_push_nanos: AtomicI64,
+    pub clock_offset_nanos: AtomicI64,
 }
 
 impl ClaimRecord {
@@ -298,7 +321,7 @@ impl ClaimRecord {
                 owner: AtomicU64::new(0),
                 epoch: AtomicU64::new(0),
                 heartbeat: AtomicU64::new(0),
-                last_push_nanos: AtomicI64::new(0),
+                clock_offset_nanos: AtomicI64::new(0),
                 _pad: [0; 32],
             }
         }
@@ -308,7 +331,7 @@ impl ClaimRecord {
                 owner: AtomicU64::new(0),
                 epoch: AtomicU64::new(0),
                 heartbeat: AtomicU64::new(0),
-                last_push_nanos: AtomicI64::new(0),
+                clock_offset_nanos: AtomicI64::new(0),
             }
         }
     }

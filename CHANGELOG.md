@@ -33,44 +33,86 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — breaking
+
+- **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
+  `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
+  clock** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
+  A `pub` field that has shipped since `0.0.1` *unwritten* — nothing could have
+  read it for its value, since it was always zero — but a field path or a
+  `ClaimRecord { .. }` literal naming it will not compile. The Added entry below
+  is the whole argument.
+
 ### Added
 
-- **A per-publisher arena receipt time, from a field that has been in every
-  shipped arena since it was declared** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
-  step 1). `ClaimRecord::last_push_nanos` had four references in the whole
+- **A per-publisher clock offset, from a field that has been in every shipped
+  arena since it was declared** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
+  steps 1–2). `ClaimRecord::last_push_nanos` had four references in the whole
   workspace — two struct definitions and two zero-initialisers — while
   `docs/PHASE2.md` §6.4 said normatively that it was *"bumped on every push"*.
   Nothing wrote it and nothing read it, and that is why `TFT004` (clock skew)
   reported *"cannot detect anything in any configuration"*: the check needs a
-  receipt time to difference against each publisher's header stamp.
+  per-publisher offset against each publisher's header stamp.
 
-  **`tf_tree`'s `EdgeWriter::push` now stamps it, sampled rather than every
+  **BREAKING: the field is now `ClaimRecord::clock_offset_nanos` and holds
+  `wall clock - stamp`, not the wall clock.** A receipt time cannot be paired
+  with a stamp by any reader — the write is sampled, so the ring's newest stamp
+  belongs to a later push than the receipt does. Measured on a 10 Hz publisher
+  whose clock is *exact*: `receipt - newest_stamp` reads **+3 µs on the sampling
+  push and −900 ms nine pushes later**, decided by nothing but when the reader
+  arrives. That is a ±1 s noise floor under a signal `TFT004` must resolve at
+  tens of milliseconds, and question 1 made the interval ~1 s for *every*
+  publisher, so it does not cancel in a fleet comparison either. The writer is
+  the only party holding both sides at one instant, so the writer subtracts. No
+  new field, no format change, no extra clock read. `0` still means *no sample
+  yet*, which now also swallows a genuine offset of exactly zero — one sample in
+  ~10⁹, overwritten by the next.
+
+  The rename is a breaking change to a `pub` field that has shipped since
+  `0.0.1`, unwritten. **Nothing could have been reading it for its value** — it
+  was always zero — but a `ClaimRecord { .. }` literal or a field path naming it
+  will not compile. Leaving the old name over the new quantity was the
+  alternative, and it is the exact doc-versus-code drift that kept `TFT004`
+  blind for the life of the project.
+
+  **`tf_tree`'s `EdgeWriter::push` now records it, sampled rather than on every
   push.** A wall-clock read is **38.4 ns** against a **~4.9 ns** push, measured,
   so unconditional was never the trade; the interval is derived once per claim
   from `EdgeRecord::nominal_rate_mhz` as `max(mhz / 1000, 1)`, which makes the
   *offset sample rate* the constant instead of the push interval — a 1 kHz IMU
-  and a 10 Hz localiser each yield about one receipt per second of published
-  data, and each pay one clock read per second. An edge that declares no rate
+  and a 10 Hz localiser each yield about one offset per second of published
+  data, and each pays one clock read per second. An edge that declares no rate
   samples every 1024 pushes rather than never, because a tree built without a
   topology file is the common case and not an exotic one.
 
-  **A claim's first push samples, and a claim clears the receipt it inherits.**
+  **A claim's first push samples, and a claim clears the offset it inherits.**
   Both matter more than they look. Starting the countdown a full interval away
   would leave a 10 Hz undeclared edge reading `0` — indistinguishable from the
   state this release is fixing — for its first 102 seconds, and a 0.2 Hz one for
-  85 minutes. And **nothing in the system resets `last_push_nanos`** — not
+  85 minutes. And **nothing in the system resets the field** — not
   `release`, not the reaper, not `tf_tree_core::edge::claim` — so without the
-  clear, a replacement writer publishes under the departed writer's timestamp
-  and a future `TFT004` bills the gap as *this* publisher's clock skew.
+  clear, a replacement writer publishes under the departed writer's number and
+  a future `TFT004` bills a dead publisher's skew to this one.
 
-  **No arena byte changes and `FORMAT_VERSION` is untouched** — the field is
-  already part of `layout_hash`. **`tf_tree_core` does not change either**: the
-  clock is read in the facade, *after* `Publisher::push` returns, which keeps it
-  outside the seqlock window. Inside it, a writer's diagnostic would become every
+  **No arena byte moves and `FORMAT_VERSION` is untouched** — the field is
+  already part of `layout_hash`, and `layout_hash` is a stride table, so neither
+  the rename nor the change of meaning perturbs it. **That is worth naming as a
+  cost and not only as a convenience:** eight bytes changed interpretation with
+  nothing able to detect the difference, so two processes built either side of
+  the amendment would read each other's writes in their own units. It is
+  harmless *here* — both commits are inside this same `[Unreleased]` section, so
+  no published artifact ever wrote a receipt time — and it is the reason a
+  future change of meaning to a live field is not automatically free.
+
+  **The engine crate changes only in the field's name and doc.** The clock is
+  read in the facade, *after* `Publisher::push` returns, which keeps it outside
+  the seqlock window; inside it, a writer's diagnostic would become every
   reader's `SlotContended` retries.
 
   **What it costs — measured, and not where the record predicted.** `push` goes
-  from **4.8–5.0 ns to 5.9–6.1 ns**: **+1.1 ns, about +23%**, on every push.
+  from **4.85–5.0 ns to 5.87–6.1 ns**: **+1.0–1.1 ns, about +21%**, on every
+  push, re-derived on the amended sampler and not carried over from the first
+  one.
   That is a *paired* delta, both arms in one process, five sittings
   (`just push-sampler-cost`, `benches/push_sampler.rs`) — because this host
   fails `bench_report`'s fitness probe and an unpaired before/after across two
@@ -99,7 +141,10 @@ is a bug.
   (4 physical cores against the 17 it needs, and no ROS 2). It ships unmeasured,
   and `docs/PHASE1.md` §11.2 says so in its own terms.
 
-  **`TFT004` is not wired to it yet** (`0036` step 3), so it still skips — but
+  **`TFT004` is not wired to it yet** (`0036` step 3, which now needs a fourth
+  skip for a *replayed* source: bag ingest publishes through the same
+  `EdgeWriter`, so a 2024 recording read in 2026 records a two-year offset that
+  is arithmetically right and diagnostically meaningless), so it still skips — but
   its reason is now about `checks.rs` and no longer about the arena, and
   `docs/PHASE5.md` §0.0's *"sixteen detect"* is unchanged until that step lands.
 

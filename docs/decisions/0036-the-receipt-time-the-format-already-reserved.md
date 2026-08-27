@@ -2,8 +2,18 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** **step 1 has landed**, with step 2's amendment to
-`docs/PHASE2.md` §6.4 in the same change — a normative sentence describing code
+
+> **The title says *receipt time* and the decided quantity is the *offset*.**
+> The filename is kept because this record's finding — that the arena format had
+> already reserved the field, so populating it engages no format decision — is
+> what the title names, and it stands. What changed is the payload, and *§ The
+> receipt time could not be paired with a stamp* below is why. Ten documents link
+> here; a rename buys a truer six words and risks every one of them.
+
+**Implementation:** **step 1 has landed, and was then amended** — the field
+stores `wall clock - stamp` rather than the wall clock, and is called
+`ClaimRecord::clock_offset_nanos` rather than `last_push_nanos`. Step 2's
+amendment to `docs/PHASE2.md` §6.4 landed in the same change as step 1 — a normative sentence describing code
 should not be one PR behind it. Steps 3–5 are open; `docs/PHASE5.md` §0.0's
 *"sixteen detect"* is therefore unchanged, and only `TFT004`'s *reason* moved.
 The four recommendations below were ratified by merging this record, per the
@@ -47,7 +57,7 @@ words (*"they are recommendations and not decisions because this record is
 >   full interval away leaves a 10 Hz undeclared edge reading `0` for 102 seconds
 >   and a 0.2 Hz one for 85 minutes — indistinguishable from the pre-`0036` state
 >   step 3 plans to skip on. And **nothing in the system resets
->   `last_push_nanos`** — not `release`, not the reaper, not
+>   `clock_offset_nanos`** — not `release`, not the reaper, not
 >   `tf_tree_core::edge::claim` — so a replacement writer would publish under the
 >   departed one's timestamp and `TFT004` would bill it as that publisher's clock
 >   skew. `Tree::claim` now stores `0` beside the interval derivation.
@@ -116,6 +126,12 @@ carries:
 /// Advisory only. NEVER a reaping trigger on its own (§6.4).
 pub last_push_nanos: AtomicI64,
 ```
+
+*(That is the field as it stood when this record was written. It is now
+`clock_offset_nanos` and holds a difference — see the header note and
+§ *The receipt time could not be paired with a stamp*. The quotations in this
+section are kept as they were, because a Context that is edited to match the
+outcome stops being evidence of anything.)*
 
 `rg last_push_nanos crates/` returns **four** hits, and all four are the two
 struct definitions and their two zero-initialisers. **Nothing writes it, and
@@ -374,6 +390,82 @@ merging; nothing normative moves until then.
    A reader who thinks 41 ns at p99.9 is too much should move the interval, not
    the placement.
 
+## The receipt time could not be paired with a stamp
+
+**Found by implementing step 3, against step 1.** It is recorded here rather
+than in a superseding record because this record is `ready` and mid-flight, and
+because the fault is in one line of its own plan.
+
+Step 3 says: *"Per edge: `last_push_nanos` and the newest stamp, offset =
+receipt − stamp."* Those two are not from the same push. The write is **sampled**
+— that is this record's whole point — so the receipt belongs to the last
+*sampled* push while the ring's newest stamp belongs to whatever has been
+published since. Measured on a 10 Hz publisher stamping with the wall clock, so
+that its true offset is zero at every sample:
+
+```
+push  1: receipt-newest =         3225 ns
+push  2: receipt-newest =    -99996775 ns
+...
+push 10: receipt-newest =   -899996775 ns
+```
+
+**A publisher with an exact clock reads anywhere from +3 µs to −900 ms**, decided
+by nothing but when `doctor` happens to look. The error is one sampling interval
+wide, and question 1 made that interval ~1 s **for every publisher**, so it does
+not cancel in the fleet comparison question 3 ratified either. `TFT004` must
+resolve tens of milliseconds. A ±1 s noise floor is not a degraded check, it is
+`TFT007`'s old defect — a `pass` that compared nothing.
+
+**The writer is the only party that holds both sides at one instant**, so the
+writer does the subtraction. `EdgeWriter::push` stores `now_nanos() - stamp`.
+This needs no new field, no format change and no extra clock read; it is the same
+store of the same `i64` in the same place.
+
+**Three consequences the amendment did not anticipate, all found by review of
+the amendment itself.** Each is a way `a - b` fails where storing `a` alone did
+not:
+
+- **A clock this process cannot read is not an offset of zero.** `now_nanos`
+  returned `0` when the host clock predates the epoch — benign while the value
+  was written as a timestamp, where `0` reads as *unknown*. Subtracted, it is a
+  confident −1.79 × 10¹⁸: a fifty-six-year skew reported against a healthy
+  publisher, by a machine with a dead RTC. It now returns `Option` and the
+  sampler declines to write.
+- **`wall clock - stamp` is an offset only where both share an epoch, and that
+  is a per-*edge* fact.** A `SimDomain` edge stamping nanoseconds since a
+  simulation began would record ~1.79 × 10¹⁸. `TFT005` skips a whole arena for
+  this reason and cannot express one tree holding a `SystemDomain` IMU beside a
+  `SimDomain` replay. Sampling is now gated on `<SystemDomain as Domain>::TAG`,
+  read at claim time beside the rate — conservatively, since `Domain` is an open
+  trait and a user's PTP domain at tag 4 cannot be assumed wall-clock.
+- **`0` is a value the subtraction can genuinely produce.** A publisher that
+  stamps with its own clock yields a few hundred nanoseconds where the clock has
+  nanosecond resolution and **exactly zero** where it does not — Windows'
+  `SystemTime::now()` is coarser than a push, so both reads land in one tick.
+  That publisher would read as *never sampled* forever, on a supported platform.
+  An exact-zero offset is stored as `1`.
+
+**What it costs elsewhere, stated rather than discovered later:**
+
+- **`0` stops being unambiguous.** It still means *no sample yet*, and a genuine
+  offset of exactly zero nanoseconds is now indistinguishable from it. That is
+  one sample in ~10⁹, the next sample overwrites it, and the alternative is a
+  sentinel a zeroed arena cannot express.
+- **The field can no longer answer "when did this writer last publish".**
+  Nothing asked it to: §6.4's hang case is served by `heartbeat`, and `TFT009`
+  already asks how long ago the newest sample was published from the stamp.
+- **The name had to move with the meaning**, so `last_push_nanos` became
+  `clock_offset_nanos`. That is a breaking change to a `pub` field of
+  `tf_tree_core::ClaimRecord`, which the `0.0.x` line permits and the changelog
+  discloses. Leaving the old name over the new quantity would be the exact
+  doc-versus-code drift that kept `TFT004` blind for the life of the project.
+
+*Verified by* `the_recorded_offset_does_not_move_with_the_newest_stamp`, which
+advances the newest stamp 900 ms past the sampled one and requires the reported
+offset not to follow. *Mutant, run:* store `now_nanos()` — it reports
+~1.79 × 10¹⁸ against a 5 × 10⁹ injected skew.
+
 ## Implementation plan
 
 Ordered, each step landable alone. `CLAUDE.md` makes a `ready` record's plan the
@@ -404,21 +496,32 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    somebody swapped the field for something with no business crossing a thread.
 
    `EdgeWriter::push` calls `self.publisher.push(stamp, iso)?` **first**, then
-   counts, and on wrap reads the clock and does one `Relaxed` store into
-   `claim.last_push_nanos`.
+   counts, and on wrap reads the clock and does one `Relaxed` store of
+   `now_nanos() - stamp` into `claim.clock_offset_nanos`. **The store is a
+   difference, and the section above is why**; as written, this step stored the
+   clock reading itself.
 
-   *Verified by* five tests in `crates/tf_tree/tests/receipt_time.rs`, each with
-   a mutant that was **run** rather than predicted: (a) a declared-rate edge
-   samples on its first push and every `sample_every`-th after, and the values
-   land inside the wall-clock window the test itself brackets — which is what
-   pins the clock as `SystemTime` and not `Instant`; (b) **a push that fails
-   leaves the receipt untouched, and does not spend the interval** — the `?` is
-   what puts the clock read after the ring write, so a rejected push stamping
-   `last_push_nanos` is the observable form of the read having drifted inside the
-   seqlock window, which is question 4's hard constraint and the only part of it
-   a test can see; (c) an edge with `nominal_rate_mhz == 0` still samples, at the
-   default; (d) a second claim of the same edge starts a fresh interval; (e) a
-   fresh claim does not inherit the previous writer's receipt time.
+   *Verified by* seven tests in `crates/tf_tree/tests/clock_offset.rs` and two
+   beside the code in `tree.rs`, each with a mutant that was **run** rather than
+   predicted:
+
+   (a) a declared-rate edge samples on its first push and every
+   `sample_every`-th after, and every recorded value comes back at a deliberate
+   five-second skew injected into the stamps — which pins the quantity, the sign
+   and the clock at once; (b) **a push that fails records nothing and does not
+   spend the interval** — the `?` is what puts the clock read after the ring
+   write, so a rejected push writing `clock_offset_nanos` is the observable form
+   of the read having drifted inside the seqlock window, which is question 4's
+   hard constraint and the only part of it a test can see; (c) an edge with
+   `nominal_rate_mhz == 0` still samples, at the default; (d) a second claim of
+   the same edge starts a fresh interval; (e) a fresh claim does not inherit the
+   previous writer's offset; (f) **the recorded offset does not move with the
+   newest stamp** (the section above); (g) an edge outside the wall-clock domain
+   records nothing at all.
+
+   And two unit tests, because their inputs are values a clock will not produce
+   on demand: `recorded_offset` never returns the `0` sentinel and never wraps,
+   and `sample_interval` returns `0` for every domain tag but `SystemDomain`'s.
 
    Each assertion detects the store by **zeroing the field**, never by comparing
    two readings: two samples ten pushes apart can land in the same nanosecond on
@@ -433,8 +536,9 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    that gets misread. *Verified by:* the section naming the rule and the refusal
    in the same paragraph.
 
-3. **`TFT004` itself.** Per edge: `last_push_nanos` and the newest stamp, offset
-   = receipt − stamp; report the fleet spread; **flag nothing until a threshold
+3. **`TFT004` itself.** Per edge: `clock_offset_nanos`, which **is** the offset
+   — see the section above for why this step no longer computes one; report the
+   fleet spread; **flag nothing until a threshold
    has evidence** (question 3). **Four** skips, each with its own reason string
    — the fourth found by review of step 1 and not by this record:
 
@@ -449,8 +553,9 @@ per-PR breakdown, so this is that breakdown and not a sketch.
    it as such.
 
    And the three this record already named: nothing sampled yet
-   (`last_push_nanos == 0` — a publisher that has not reached its first sample is
-   not a skew finding, now narrowed to *one* push by step 1's first-push rule),
+   (`clock_offset_nanos == 0` — a publisher that has not reached its first sample
+   is not a skew finding, now narrowed to *one* push by step 1's first-push
+   rule),
    `TFT005`'s epoch condition via `Clock`, and a frozen `.tft` source. *Verified by:* a fixture with one
    deliberately skewed publisher, asserting the offset is attributed to *that*
    edge and that the reason string names which skip fired when it fires. *Mutant:*
