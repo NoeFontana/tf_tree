@@ -67,9 +67,6 @@ impl HeapRing {
     }
 }
 
-/// Loom test 1: one writer pushing 3 samples, one concurrent reader. The reader
-/// observes a fully-consistent slot, never a torn one.
-
 /// Run a `loom` model under a preemption bound that the environment can raise
 /// but **cannot lower**.
 ///

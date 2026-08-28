@@ -1307,7 +1307,19 @@ impl Plan {
         // walk `latest_common` folds at, so the two agree by construction rather
         // than by two definitions of "common" staying in step.
         let (by_ns, which) = match self.newest_common(g)? {
-            Some((common, which)) => ((nanos - common).max(0), which),
+            // **`saturating_sub`, not `-`.** This is the pattern
+            // `sample::span_ns` was written to eliminate, and its doc comment is
+            // the argument: a plain subtraction of two stamps panicked in a
+            // checked build and *wrapped* in a release one, and the wrap is the
+            // worse half. Here it would be worse still. Under `Hold` or
+            // `ConstantTwist` a query is accepted whenever `t >= t_old`, so a
+            // route publishing near `i64::MIN` queried near `i64::MAX` reaches
+            // this line with the difference outside `i64`. Wrapped negative, the
+            // `.max(0)` below then reports `by_ns == 0` — *"not extrapolated"*
+            // for the most extrapolated answer this type can hold, which is
+            // exactly the confusion `Extrapolated` exists to make impossible.
+            // Saturating says "further than representable", which is true.
+            Some((common, which)) => (nanos.saturating_sub(common).max(0), which),
             // Static-only: nothing can be extrapolated, so nothing was.
             None => (0, EdgeId(0)),
         };

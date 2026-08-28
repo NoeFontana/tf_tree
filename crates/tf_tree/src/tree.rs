@@ -3028,6 +3028,14 @@ impl Tree {
     /// `attach_shared` over an inherited fd. None of them has an owner that can
     /// die out from under it, and the owner cannot lose itself.
     ///
+    /// **It answers "the owner that served *this* attachment is gone", which is
+    /// not the same as "the arena has no owner".** A hangup is a one-way door:
+    /// once another survivor inherits, this keeps answering `true`, because the
+    /// socket it reads is still the dead owner's. So it is a trigger to *try*
+    /// inheriting once, not a standing question — see
+    /// [`Inheritance::Contended`] for what a survivor that loses the race is
+    /// left holding.
+    ///
     /// Lookups are unaffected either way — `Plan::at` touches the mapping and
     /// nothing else, and this is entirely control plane.
     #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -4351,17 +4359,31 @@ impl fmt::Display for Described<'_> {
                 "frame {} has a parent but no edge records the link",
                 tree.frame_name(child),
             ),
+            // Two more that name an edge, and they reached the catch-all until
+            // a review caught it. `docs/decisions/0040`'s comment claimed every
+            // remaining variant "carries no frame or edge this wrapper could
+            // name"; these two carry one, so they were rendering the core's
+            // `edge 3` from the one layer whose whole purpose is resolving it.
+            LookupError::DerivativesUnavailable { edge, interp } => write!(
+                f,
+                "{} interpolates under policy {interp}, which has no derivative to report",
+                tree.edge_name(edge),
+            ),
+            LookupError::NoSegment { edge } => write!(
+                f,
+                "{} has no bracketing segment at that stamp, so there is no twist",
+                tree.edge_name(edge),
+            ),
             // **The arms above are the ones that resolve a *name*, which is the
             // whole reason this wrapper exists. Everything else delegates.**
             //
             // This read `write!(f, "{other:?}")` until `docs/decisions/0040`,
             // and `Debug` is the wrong register for an operator: it rendered
             // `BufferTooSmall { need: 48, got: 16 }` where the core now writes
-            // "output buffer too small: need 48 elements, got 16". The five
-            // variants that reach here — `BufferTooSmall`, `WrongElementType`,
-            // `ChildDetached`, `DerivativesUnavailable`, `NoSegment` — carry no
-            // frame or edge this wrapper could name, so there is nothing for it
-            // to add and the message belongs in one place.
+            // "output buffer too small: need 48 elements, got 16". The three
+            // that reach here — `BufferTooSmall`, `WrongElementType` and
+            // `ChildDetached` — carry no frame or edge, so there is nothing for
+            // this wrapper to add and the message belongs in one place.
             other => write!(f, "{other}"),
         }
     }

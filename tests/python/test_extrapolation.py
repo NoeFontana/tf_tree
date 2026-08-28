@@ -277,3 +277,30 @@ def test_a_twist_layout_cannot_carry_an_extrapolated_pose(plan):
         with pytest.raises(ValueError) as e:
             plan.at_extrapolating(stamps, "hold", layout=layout)
         assert "extrapolat" in str(e.value).lower()
+
+
+def test_by_ns_may_not_alias_stamps(plan):
+    """The one `_into` form whose input and an output share a dtype.
+
+    `stamps` and `by_ns` are both int64, so `f(stamps=a, .., by_ns=a)` satisfies
+    every shape and dtype check — and would give the fold `&[i64]` and
+    `&mut [i64]` over one allocation, which is undefined behaviour reached from
+    safe Python. Every other `_into` on this binding is safe from it by dtype
+    alone, which is why no shared helper looks for it.
+    """
+    stamps = np.array([50_000_000, 200_000_000], dtype=np.int64)
+    poses = np.zeros((2, 4, 4))
+
+    with pytest.raises(tf_tree.BufferError) as e:
+        plan.at_extrapolating_into(stamps, "hold", poses, stamps)
+    assert "alias" in str(e.value)
+
+    # A view of the same memory is refused too — the check is on byte ranges,
+    # not on array identity.
+    with pytest.raises(tf_tree.BufferError):
+        plan.at_extrapolating_into(stamps, "hold", poses, stamps[:])
+
+    # And a separate buffer of the same shape is fine.
+    by_ns = np.zeros(2, dtype=np.int64)
+    plan.at_extrapolating_into(stamps, "hold", poses, by_ns)
+    assert by_ns[-1] > 0

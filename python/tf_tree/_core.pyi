@@ -255,7 +255,8 @@ class Plan:
         extends the screw the two newest samples imply, which is what a control
         loop wants. Raises `ExtrapolationError` under `"error"`.
 
-        `mat4` only, and the edge that ran out of data is not carried — this
+        `mat4` by default and `quat` with `layout=`; an f32 or twist layout is
+        refused. The edge that ran out of data is not carried — this
         binding resolves edge ids to names before a caller sees them, and doing
         that per query would be an arena walk on this path. `Plan.edges()` and
         `tf_tree doctor` are where the per-edge breakdown lives.

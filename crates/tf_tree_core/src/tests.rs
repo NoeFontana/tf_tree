@@ -3341,3 +3341,51 @@ fn an_error_can_leave_a_function_as_box_dyn_error() {
     assert!(two_kinds(0).is_err());
     assert!(two_kinds(1).is_err());
 }
+
+/// `Extrapolated::by_ns` must not wrap when the query and the data are more
+/// than `i64::MAX` nanoseconds apart.
+///
+/// A plain `nanos - common` panics in a checked build — on the wait-free read
+/// path — and wraps in a release one. Wrapped negative it clamps to `0`, which
+/// reports *"not extrapolated"* for the most extrapolated answer the type can
+/// hold: the exact confusion `Extrapolated` exists to prevent, arrived at from
+/// the other side. `sample::span_ns` carries the same argument for the same
+/// reason one layer down.
+///
+/// **Mutant:** restore `(nanos - common).max(0)`. Applied: the release build
+/// asserts with `left: 0, right: 9223372036854775807`, and the debug build
+/// panics with `attempt to subtract with overflow` inside `Plan::at_extrapolating`.
+#[test]
+fn an_extrapolation_distance_saturates_instead_of_wrapping() {
+    let arena = rate_chain_arena([0, 0, 0, 0]);
+    let view = ArenaView::new(&arena);
+    // Seed the chain near the bottom of the range, then query near the top.
+    for i in 1..=4u32 {
+        let edge = EdgeId(i);
+        let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+        let w = Publisher::new(
+            view.ring(edge).unwrap(),
+            view.claim(edge).unwrap(),
+            epoch,
+            owner,
+        );
+        w.push(i64::MIN + 1, &pose(u64::from(i))).unwrap();
+        w.push(i64::MIN + 2, &pose(u64::from(i) + 1)).unwrap();
+    }
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    let far = plan
+        .at_extrapolating(
+            &g,
+            Stamp::<SystemDomain>::from_nanos(i64::MAX),
+            ExtrapPolicy::Hold,
+        )
+        .expect("Hold answers past the newest sample");
+    assert_eq!(
+        far.by_ns,
+        i64::MAX,
+        "a distance wider than i64 must saturate, never wrap to look fresh"
+    );
+}

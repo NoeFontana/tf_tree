@@ -571,8 +571,7 @@ pub struct Session<A = ()> {
 
 impl<A> Session<A> {
     /// How `open()` resolved, and therefore what the caller owes: nothing for
-    /// [`OpenOutcome::Joined`], create-and-bind for [`OpenOutcome::Created`],
-    /// and nothing at all for [`OpenOutcome::Joined`].
+    /// [`OpenOutcome::Joined`], create-and-bind for [`OpenOutcome::Created`].
     #[must_use]
     pub fn outcome(&self) -> OpenOutcome {
         self.outcome
@@ -680,8 +679,8 @@ impl<A> Session<A> {
 
     /// Take what the §3.7 handshake yielded, if this session joined one.
     ///
-    /// `None` for [`OpenOutcome::Created`], which
-    /// already have the arena and never ran a handshake.
+    /// `None` for [`OpenOutcome::Created`], which already has the arena and
+    /// never ran a handshake.
     ///
     /// Taking rather than borrowing, because the payload owns file descriptors —
     /// the segment and the connection whose closure tells the owner this

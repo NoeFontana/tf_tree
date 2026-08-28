@@ -122,12 +122,21 @@ fn run() {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    // **One clock origin, shared.** The writer and the control loop both stamp
+    // against this. Taking an `Instant::now()` in each — which this example did
+    // until a review caught it — makes the reader's stamps trail the writer's by
+    // however long startup took, so `by_ns` measures that startup gap rather
+    // than the age of the estimate, and the number the example exists to teach
+    // becomes an artefact of when two threads happened to begin.
+    let t0 = Instant::now();
 
     // ---- the estimator, publishing on its own thread ----------------------
     let writer = {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
+            // `t0` is `Copy`, and it is the *same* origin the control loop below
+            // stamps against.
             let odom = tree.frame("odom").unwrap();
             let map = tree.frame("map").unwrap();
             let base = tree.frame("base_link").unwrap();
@@ -135,7 +144,6 @@ fn run() {
             let fast = tree.claim(base, odom).expect("claim odom->base_link");
 
             let period = Duration::from_nanos(1_000_000_000 / ESTIMATE_HZ);
-            let t0 = Instant::now();
             let mut n: i64 = 0;
             while !stop.load(Ordering::Relaxed) {
                 let t = t0.elapsed().as_nanos() as i64;
@@ -186,8 +194,7 @@ fn run() {
     let mut last_good = tf_tree::Iso3::IDENTITY;
 
     let period = Duration::from_nanos(1_000_000_000 / CONTROL_HZ);
-    let t0 = Instant::now();
-    let mut next = t0;
+    let mut next = Instant::now();
 
     for _ in 0..CYCLES {
         next += period;

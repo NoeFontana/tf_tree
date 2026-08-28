@@ -1146,8 +1146,33 @@ impl PyPlan {
         })?;
         check_out(dist_arr.as_untyped(), want_dist)?;
 
+        // **Refuse a `by_ns` that aliases `stamps`, before either mutable slice
+        // exists.** This is the only `_into` form on this binding whose input
+        // and one of whose outputs are both `int64`, so it is the only one where
+        // `f(stamps=a, .., by_ns=a)` type-checks all the way down: `check_out`
+        // wants `(N,) int64` and `a` *is* one. The fold would then hold `&[i64]`
+        // and `&mut [i64]` over one allocation — undefined behaviour reached
+        // from safe Python. Every other `_into` is safe from this by dtype
+        // alone, which is why no existing helper checks for it.
+        //
+        // Both buffers are C-contiguous by `check_out`, so comparing byte ranges
+        // is the whole of the question — and it catches a *view* of the same
+        // memory, which comparing array identity would not.
+        if let Some(a) = &src_arr {
+            let (s, d) = (a.data() as usize, dist_arr.data() as usize);
+            let len = core::mem::size_of_val(src);
+            if s < d + len && d < s + len {
+                return Err(BufferError::new_err(
+                    "by_ns must not alias stamps: they are both int64 and this call \
+                     writes one while reading the other. Pass a separate array.",
+                ));
+            }
+        }
+
         // SAFETY: `check_out` proved both C-contiguous, correctly shaped and
-        // writable; aliasing stays the caller's, as `as_slice_mut` documents.
+        // writable, and the range check above rules out `by_ns` aliasing
+        // `stamps`; aliasing beyond that stays the caller's, as `as_slice_mut`
+        // documents.
         let (pd, dd) = unsafe { (pose_arr.as_slice_mut()?, dist_arr.as_slice_mut()?) };
 
         let plan = *self.plan;

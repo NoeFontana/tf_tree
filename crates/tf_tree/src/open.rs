@@ -474,8 +474,17 @@ pub enum Inheritance {
     /// the deleted takeover arm could not provide, because it went looking for a
     /// byte instead of keeping the one it held
     /// ([`0037`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
-    /// A caller that wants to reach the new owner reconnects with backoff, as
-    /// §3.5 says.
+    /// **What §3.5 says next, and what this crate does not yet provide.** The
+    /// spec has the loser "retry connect with backoff"; there is no API here
+    /// that does. The loser keeps its slot, its byte and its mapping, so it
+    /// keeps *reading* with nothing lost — but its attach socket still points at
+    /// the dead owner and stays hung up forever, so `Tree::owner_lost` goes on
+    /// answering `true` and the recommended loop will re-attempt the lock every
+    /// cycle for the life of the process. **A loser should stop calling**, and
+    /// the reason it cannot simply latch is that if the *new* owner also dies it
+    /// ought to be able to inherit then. Reattaching a survivor to a new owner
+    /// is a protocol addition, so it is a decision record rather than a patch;
+    /// `docs/PHASE2.md` §0.0's §3.5 row carries it as owed.
     Contended,
     /// This tree is a read-only attachment, so it cannot serve.
     ///
