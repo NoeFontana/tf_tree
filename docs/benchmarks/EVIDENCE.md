@@ -68,6 +68,7 @@ gated; each backs prose that should read as "was measured", not "is".
 | `query_mix` (bench) | mixed query workload | (uncited) |
 | `at_many` (bench) | batch-fold throughput | (uncited; the *method* `Plan::at_many` is cited widely — different thing) |
 | `read_scaling` (bench) | PHASE1 §11.3's read-scaling curve | xtask bench-gate names it as a manual follow-up |
+| `control_loop` (`tf_tree`) | the runtime path as a node writes it, and a tail reading for `docs/API.md` §8: two queries under one guard at 1 kHz against a 200 Hz estimate, under a concurrent writer. **Host-specific and cited as a claim nowhere** — unpinned, no RT scheduler, and two clock reads around a sub-microsecond operation, so it reads high and says so. Run with `just control-loop` | API.md §8.4, as the thing that stopped being absent |
 | `gen_zstd_conformance` | generates the ingest conformance corpus | (uncited, generator) |
 | `gen_domain_fixture` | generates `testdata/frozen/sensor_domain.tft`, the only non-zero-domain arena Python can reach — [`0038`](../decisions/0038-the-domain-a-binding-cannot-name.md) step 4's verification is unwritable without it | (uncited, generator; the fixture it writes is held to account by `crates/tf_tree/tests/frozen.rs`) |
 

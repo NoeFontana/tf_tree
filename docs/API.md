@@ -1164,8 +1164,16 @@ Stated because the rest of it reads like a guarantee and only part of it is one:
   every host this project has measured on. The published figures in
   `docs/benchmarks/` are medians on a shared-tenancy VM.
 - **"No syscall" and "no lock" are read from the code, not enforced by a test.**
-  Only the allocation claim has an executor. A test that asserted the other two
-  would be worth having and does not exist.
+  Only the allocation claim has an executor (`crates/tf_tree_bench/tests/zero_alloc.rs`).
+  A test that asserted the other two would be worth having and does not exist.
+- **The tail now has a reading, and a reading is not a gate.** `just control-loop`
+  runs `crates/tf_tree/examples/control_loop.rs` — two queries under one guard at
+  1 kHz against a 200 Hz estimate, under a concurrent writer — and reports p50 /
+  p99 / p99.9 / max. It exists because this section previously stated an envelope
+  that nothing executed at all. It is *not* §11.3's criterion: the host is
+  unpinned, there is no real-time scheduler, and two clock reads bracket a
+  sub-microsecond operation, so every one of those inflates the result. Read it
+  for shape, and read §11.3 for the number.
 - **`PHASE4.md` §1's operational exit criterion is still open**: no node has run
   this on real hardware for two weeks. Every claim above is a claim about the
   code, and none of them is that claim.

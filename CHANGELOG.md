@@ -112,6 +112,27 @@ is a bug.
 
 ### Added
 
+- **A control-loop example, which did not exist** —
+  `crates/tf_tree/examples/control_loop.rs`, run by `just control-loop`. The
+  pitch is "fast enough to sit inside a control loop" and the only worked example
+  shipped was an offline dataloader, so a consumer evaluating the runtime path had
+  nothing to copy. It is a 1 kHz controller against a 200 Hz estimate under a
+  concurrent writer, showing plan-once, one guard per *cycle* covering both of its
+  queries, `ExtrapPolicy::ConstantTwist` with `Extrapolated::by_ns` gated against a
+  per-route budget, and `SlotContended` handled as data rather than logged as an
+  error.
+
+  It also gives `docs/API.md` §8 its first executable reading: that section stated
+  a real-time envelope and then admitted only the allocation claim had an
+  executor. The example reports p50/p99/p99.9/max and says in its own output why
+  all three of an unpinned host, no RT scheduler, and two clock reads around a
+  sub-microsecond operation inflate them. **It reports and does not gate** —
+  `docs/PHASE1.md` §11.3 remains the pinned-hardware criterion.
+
+  The lesson it exists to make visible: on a composed route, staleness is set by
+  the *slowest edge*. Its two routes differ by the ratio of their estimator rates,
+  which is why `Extrapolated::by_ns` names the worst edge rather than an average.
+
 - **Every core error type now implements `Display` and `core::error::Error`**
   ([`0040`](docs/decisions/0040-the-error-that-cannot-be-returned.md)).
   `LookupError`, `PushError`, `ClaimError`, `FrameError` and `TopologyError`

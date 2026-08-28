@@ -112,6 +112,14 @@ the ability to query at arbitrary times, or runs a ROS node to serve transforms
 during training. This replaces all three and asks nobody to migrate anything,
 which is also why it is the part that shipped first.
 
+**Running it inside a loop instead?** `just control-loop` is the other half of
+this page — `cargo run --release -p tf_tree --features shm --example control_loop`.
+It is a 1 kHz controller against a 200 Hz estimate, showing the four things a
+runtime consumer has to get right (compile the plan once, hoist the guard,
+extrapolate on purpose and read how far it reached, treat a contended slot as
+data) and printing the tail a deadline is set against. The offline path above
+asks nobody to change their robot; this one is what happens when they do.
+
 **Numbers belong where they can be reproduced**, not in this section.
 `just bench-report` measures your host and writes
 `report/{results.json,index.html}`; the standing figures and their caveats are in

@@ -461,6 +461,24 @@ no-conflict-markers:
 #     `Guard::drop` early-returns on `!is_writable()`.
 #
 # Both arenas here are writable, so this is the dear configuration on purpose.
+# **The runtime path, as a node writes it — and the tail a deadline is set
+# against.**
+#
+# `crates/tf_tree/examples/control_loop.rs` is the example that did not exist:
+# the README's worked example is an offline dataloader, so a consumer evaluating
+# this for a control loop had nothing showing plan-once, hoist-the-guard,
+# extrapolate-on-purpose, or `SlotContended` as data rather than as an error.
+#
+# It reports and does **not** gate. `docs/PHASE1.md` §11.3's latency criteria
+# need core-pinned hardware; this runs on whatever host you have, brackets a
+# sub-microsecond operation with two clock reads, and is preempted by whatever
+# else is running — all three of which inflate the numbers, and all three of
+# which it says in its own output. What it is good for is the *shape*: two
+# queries under one guard, and the staleness of a composed route being set by its
+# slowest edge.
+control-loop:
+    cargo run --release -q -p tf_tree --features shm --example control_loop
+
 guard-cost:
     #!/usr/bin/env bash
     set -euo pipefail
