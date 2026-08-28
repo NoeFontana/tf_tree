@@ -486,10 +486,10 @@ class Tree:
         """Whether this process may publish into this tree."""
 
 def build(
-    edges: list[tuple[str, str]],
+    edges: list[tuple[str, str]] | str,
     *,
-    capacity: int = ...,
-    interp: Literal["sclerp", "lerpslerp"] = ...,
+    capacity: int | None = ...,
+    interp: Literal["sclerp", "lerpslerp"] | None = ...,
     frame_headroom: int = ...,
 ) -> Tree:
     """An in-process tree from `(parent, child)` edges.
@@ -527,9 +527,9 @@ def open_arena(
     name: str | None = ...,
     domain: int | None = ...,
     mode: Literal["ro", "rw"] = ...,
-    create: list[tuple[str, str]] | None = ...,
-    capacity: int = ...,
-    interp: Literal["sclerp", "lerpslerp"] = ...,
+    create: list[tuple[str, str]] | str | None = ...,
+    capacity: int | None = ...,
+    interp: Literal["sclerp", "lerpslerp"] | None = ...,
     frame_headroom: int = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.

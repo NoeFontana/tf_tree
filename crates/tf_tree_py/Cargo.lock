@@ -374,6 +374,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tf_tree_bridge"
+version = "0.0.4"
+dependencies = [
+ "tf_tree",
+]
+
+[[package]]
 name = "tf_tree_core"
 version = "0.0.4"
 dependencies = [
@@ -407,6 +414,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "tf_tree",
+ "tf_tree_bridge",
  "tf_tree_core",
  "tf_tree_math",
 ]

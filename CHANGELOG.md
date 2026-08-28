@@ -112,6 +112,29 @@ is a bug.
 
 ### Added
 
+- **Python can declare a real topology** ([`0041`](docs/decisions/0041-python-declares-a-topology-the-way-everything-else-does.md)).
+  `build`'s `edges` and `open`'s `create` each now accept **either** the existing
+  list of `(parent, child)` pairs **or** the text of a topology config — the same
+  schema `ros/tf_tree_ros` starts a bridge from and `tf_tree topology --discover`
+  writes.
+
+  The list form makes every edge dynamic under one global capacity, so a
+  Python-built tree could not express a **static** edge — a sensor mount became a
+  ring somebody had to publish into forever, which is the latched-topic
+  behaviour `docs/PROJECT.md` §2 lists among the `tf2` problems this engine
+  exists to solve — nor a per-edge size, nor a declared rate (the only evidence
+  `TFT007` has that an observed rate is *wrong* rather than merely what it is),
+  nor a per-edge domain.
+
+  **A Python builder mirroring `TreeBuilder` was the expected answer and is not
+  the one taken.** It would have been the third spelling of one declaration
+  surface — the smell `PROJECT.md` §6 names — and would have drifted from the
+  schema the CLI emits, so a discovered config would have been unusable from the
+  one language most likely to want it. `capacity=` and `interp=` are refused
+  beside a config, since it carries both. The wheel gains a path dependency on
+  `tf_tree_bridge`, whose only dependency is `tf_tree` and whose parser is
+  hand-written — no third-party and nothing Linux-only enters it.
+
 - **`Plan.at_extrapolating` gains `layout=` and an `_into` form** in Python,
   closing the R2 violation the binding half of
   [`0039`](docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md) left.
