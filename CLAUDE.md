@@ -16,8 +16,19 @@ over the README, and over this file.
 
 ## Status
 
-- **Phases 1–3: implemented.** Rendezvous, fd passing, ownership migration,
-  claims-as-leases, reaping, fork poisoning, Python bindings.
+- **Phases 1–3: implemented, §3.5 ownership migration included since
+  2026-08-28.** Rendezvous, fd passing, claims-as-leases, reaping, fork
+  poisoning, Python bindings. **§3.5 is `0037`'s shape, not the one #275
+  deleted**: `Session::take_over_ownership` takes byte 0 on the description the
+  survivor's session already holds — so nothing has to be verified — and
+  `Tree::inherit_ownership` binds and serves the *existing* segment.
+  `Tree::owner_lost` is the trigger, which had never existed at all. **It is
+  caller-driven by design** ([`0019`](./docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)):
+  no background thread, no daemon, so a survivor that never calls it never
+  becomes owner and its arena stays ownerless. `OpenOutcome::TookOver` still has
+  **no producer** — inheritance is a method on an attached session, not an
+  `open()` outcome — and `0037` question 3 answers that the variant does not
+  survive, a removal not yet made. `PHASE2.md` §0.0's row is authoritative.
 - **Phase 4: implemented except** §5.9 affinity knobs and §6.3 replay rows. C ABI
   and C++ wrapper frozen; ROS 2 ingest bridge done. §1's operational exit
   criterion is **open and not satisfiable by code**.

@@ -244,10 +244,13 @@ published — `cargo add tf_tree`. The Python wheel starts at 0.0.2 because the
 
 The gaps, named — because "with gaps" on its own is not a status:
 
-- **Phase 2** — the daemon and recorder surface (§9–§10) and §11.3's fault
-  injection are absent. §3.5's ownership migration has the protocol and not the
-  trigger: kill the arena's owner and lookups keep being served, but no new
-  process can join.
+- **Phase 2** — the daemon and recorder surface (§9–§10) are absent, and
+  §11.3's fault injection is a separate gap still being worked. §3.5's ownership
+  migration **landed on 2026-08-28**: kill the arena's owner and a surviving
+  read-write participant inherits the role, so new processes can join again. Its
+  trigger is caller-driven — `Tree::owner_lost()` is a non-blocking check a
+  survivor makes in its own loop, and nothing makes it for you, because there is
+  no daemon.
 - **Phase 4** — everything except §5.9's affinity knobs and §6.3's replay rows.
   `at_with_derivatives`, both headers, the header-only C++ wrapper with its
   CMake package, and **both halves of the ingest bridge** — the `rclcpp` package

@@ -1895,7 +1895,41 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 
 1. **Three-way bit-identity passes.**
 2. `.tft` open time under **10 ms** for a 233 MB index (it is an `mmap` plus header validation; anything more means work is happening that should not).
-3. Frozen lookup p50 within **20%** of online (accounting for the deeper binary search).
+3. Frozen lookup p50 within **20%** of online (accounting for the deeper binary
+   search). **SUPERSEDED by §2.1, and answered by construction rather than by
+   measurement — nothing measures this, and nothing is owed.**
+
+   The criterion prices a cost the design was expected to have. Its parenthesis
+   says what that cost was: a frozen index searched *deeper* than a live ring,
+   so a 20% allowance kept the deepening bounded rather than open-ended. §2.1 is
+   **NORMATIVE** that there is no such search — "the frozen read path uses the
+   **identical** `Plan::at` code as the online path, against a `PROT_READ`
+   mapping. No offline variant of the lookup, no separate index." That is what
+   the code does: `Tree::open_frozen` maps the file and hands a `FrozenArena` to
+   the same `&dyn Arena` the heap and `memfd` backings go through
+   (`crates/tf_tree/src/frozen.rs:119`, `ArenaBacking` at
+   `crates/tf_tree/src/tree.rs:697`), so the three backings are, in §2.1's
+   words, three ways of holding the same bytes — which is what
+   `a_frozen_lookup_is_bit_identical_to_the_live_one`
+   (`crates/tf_tree/tests/frozen.rs:181`) asserts, gate 1's three-way
+   bit-identity being the same property stated over all three backings.
+
+   So there is no second implementation for a ratio to be taken between, and a
+   `p50` comparison here would be one implementation of the lookup measured
+   twice, once per backing. **The criterion and the statement that answers it
+   landed in the same commit** (#70): this row was never owed, and it read as
+   owed only because it was left standing beside §2.1 without a word.
+
+   **What is genuinely different about a frozen tree is residency, not search**,
+   and it is not this row's business: a `.tft` is deliberately *not* prefaulted
+   — `open_frozen`'s doc comment gives §2.2's reason, that untouched pages
+   costing nothing across sixteen workers is the whole wedge — so a first touch
+   pays a page fault where a shared-memory attach has already paid it under
+   `PHASE2.md` §7.1. That is a first-touch cost rather than a search cost, the
+   sharing it buys is gate 4's subject, and folding it into a lookup-latency
+   ratio would attribute it to a deeper search that does not exist. **Unlike
+   criterion 5, this row is not held by nobody**: it is answered, and there is
+   nothing left to hold.
 4. **16 workers sharing one `.tft`: total Pss within 1.2× of one worker.**
    **MET — 1.024×, measured for the first time by `just gate4`**
    (`crates/tf_tree_bench/src/bin/frozen_workers.rs`). 16 workers cost **235.5

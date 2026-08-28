@@ -222,7 +222,35 @@ actually paid.
 
 The flush is only reached when **both** conditions hold: a guard is built *per
 call*, and the arena is *writable* (`Guard::drop` early-returns on
-`!self.view.is_writable()`, `plan.rs`). No shipped configuration is both:
+`n == 0 || !self.view.is_writable()`, `tf_tree_core/src/plan.rs`).
+
+> **Correction, 2026-08-28: this sentence read "No shipped configuration is
+> both", and one is.** `Tree::lookup` builds a guard per call — `let g =
+> self.guard();` inside its plan-cache closure, `crates/tf_tree/src/tree.rs` —
+> and a `TreeBuilder::build()` tree is writable unconditionally
+> (`ArenaBacking::is_writable` in the same file, whose `Heap(_)` arm is a bare
+> `true`). Symbols rather than line numbers on those two: both files moved
+> twice under concurrent work while this block was being written. So on a heap
+> tree the drop **does** reach the flush, and the two bullets below are the
+> configurations that matter rather than the only ones that exist. The
+> paragraph after them already named the shape — *"a read-write participant
+> doing per-call lookups"* — and then said the engine does not encourage it;
+> what it missed is that the facade ships exactly one such entry point.
+>
+> **The decision is unchanged, and this is a precision fix rather than a
+> reversal.** `Tree::lookup` is `docs/API.md` §1 R1's *collapsed convenience*,
+> admitted only on two NORMATIVE conditions, the second of which is that it is
+> "never the example in the README's hot loop" — it is by construction not the
+> hot tier. The ~16 ns flush sits inside a call that pays a thread-local plan
+> cache probe on top of the entire evaluation, and the fixture it was measured
+> on — `abi_cost.rs`'s three-edge heap tree at `[profile.embedder]` — is a
+> ~245 ns lookup, of which the flush is ~6.5%
+> (`crates/tf_tree_c/examples/abi_cost.rs:125-131`). A few percent of the tier
+> that exists to be convenient does not buy a conditional flush, and it does not
+> buy making the §5 counters lie about the one workload that would trigger it.
+> What was wrong was the word *none*, not the conclusion.
+
+The two configurations that carry the argument:
 
 - **A C or C++ consumer attaches read-only.** `tft_tree_open` maps the arena
   read-only — the header states it twice ("The arena is mapped read-only, so
@@ -239,6 +267,12 @@ So making the flush conditional would buy nothing anyone currently pays, at the
 cost of making the §5 counters lie about the one workload that would trigger
 it — a read-write participant doing per-call lookups, which is a shape the
 engine does not encourage and the C tier cannot express.
+
+> **Read "nothing anyone currently pays" as "nothing on the hot tier"** (same
+> correction, 2026-08-28). `Tree::lookup` on a `TreeBuilder::build()` tree *is*
+> the read-write per-call-lookup shape, so it pays the flush; the engine not
+> encouraging the shape is exactly R1's point about the collapsed tier, not a
+> claim that no caller reaches it.
 
 **Question 1 is withdrawn as a proposal.** What it was reaching for is real —
 ~16 ns — but it is inside the ~35 ns a *counter-free* per-call guard already
@@ -600,6 +634,25 @@ plan:**
    adjective. **A reader who reaches `tft_plan_at` and never learns that
    `tft_plan_at_many` exists is the only way this decision goes wrong**, since
    the decision *is* "batching is the answer".
+
+   > **Status 2026-08-28: half landed, and the half that is missing is the C
+   > header.** `crates/tf_tree_c/include/tf_tree.hpp` has it — `Plan::at`'s doc
+   > comment at `:807-822` says *"On a hot path, prefer `at_many`"* in the first
+   > line of its body (`:809`) and carries the numbers (302 ns scalar against `tft_plan_at_many`'s 261, 41 ns /
+   > 13.6% at n = 256, native Rust 202 ns) and the sort caveat.
+   > `crates/tf_tree_c/include/tf_tree.h` does **not**: `tft_plan_at`'s comment at
+   > `:630-648` documents the layout and the safety contract and never names
+   > `tft_plan_at_many`, which is declared 40 lines further down at `:688`. The
+   > only other mentions of the batch call in that header are at `:72` and `:461`,
+   > both about `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` rather than about cost.
+   >
+   > So the reader this step was written for — a C caller who reaches
+   > `tft_plan_at`, the one this record calls "the only way this decision goes
+   > wrong" — is still unserved, and the C++ caller, who has the ergonomic
+   > alternative anyway, is the one who got the sentence. `just c-header-check`
+   > does not catch this: it checks header/ABI agreement, not that a doc comment
+   > says a particular thing. **The remaining work is one paragraph on
+   > `tf_tree.h:630-648`, and this record is not done until it is there.**
 
 Everything else this record produced is already merged: `just abi-cost`,
 `just abi-split`, `just abi-attached` and `just guard-cost`, plus the corrections
