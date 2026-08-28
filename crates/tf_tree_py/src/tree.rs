@@ -164,6 +164,39 @@ fn extrap_from_str(name: &str) -> PyResult<ExtrapPolicy> {
     }
 }
 
+/// Write one extrapolated pose in `layout`, refusing the twist-carrying one.
+///
+/// **`QuatTwist` is refused, and the C ABI refuses it for the same reason.**
+/// There is no extrapolating `at_with_derivatives`, so a twist beside an
+/// extrapolated pose would be computed under `ExtrapPolicy::Error` while the
+/// pose beside it was computed under the caller's — two policies in one
+/// 13-`f64` row, which is not a row anybody can interpret.
+fn write_pose_unchecked(pose: &tf_tree::Iso3, layout: Layout, dst: &mut [f64]) {
+    match layout {
+        Layout::Quat => tf_tree::write_quat(pose, dst),
+        // `write_extrapolated` has already refused everything else, and it is
+        // called once per *call* rather than once per element — this runs inside
+        // the fold, under `detach`, where a `PyResult` cannot be constructed.
+        _ => tf_tree::write_mat4(pose, dst),
+    }
+}
+
+fn write_extrapolated(pose: &tf_tree::Iso3, layout: Layout, dst: &mut [f64]) -> PyResult<()> {
+    match layout {
+        Layout::Mat4 => tf_tree::write_mat4(pose, dst),
+        Layout::Quat => tf_tree::write_quat(pose, dst),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "layout {other:?} cannot carry an extrapolated pose: an f32 layout \
+                 needs at_extrapolating's f32 sibling, and a twist layout would pair \
+                 a twist computed under 'error' with a pose computed under your \
+                 policy. Use 'mat4' or 'quat'."
+            )))
+        }
+    }
+    Ok(())
+}
+
 /// A transform tree.
 #[pyclass(name = "Tree", module = "tf_tree", frozen)]
 pub struct PyTree {
@@ -975,14 +1008,19 @@ impl PyPlan {
     /// pays an `O(log n)` bracket search per stamp per step rather than riding
     /// the monotone cursor, plus one `newest_stamp` load per dynamic edge per
     /// stamp for the distance.
-    #[pyo3(signature = (stamps, policy, /))]
+    #[pyo3(signature = (stamps, policy, /, *, layout = None))]
     fn at_extrapolating<'py>(
         &self,
         py: Python<'py>,
         stamps: &Bound<'py, PyAny>,
         policy: &str,
+        layout: Option<&str>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         let policy = extrap_from_str(policy)?;
+        let layout = match layout {
+            Some(name) => layout_from_str(name)?,
+            None => Layout::Mat4,
+        };
         // `at`'s dispatch, to the letter: `PyInt` first because a failed
         // `cast::<PyArray1<i64>>` builds and throws away a `DowncastError`, and
         // the array cast is *fallen through* rather than `else`-d so a `float`
@@ -990,7 +1028,7 @@ impl PyPlan {
         // (§3) instead of a complaint about array dtypes.
         if !stamps.is_instance_of::<pyo3::types::PyInt>() {
             if let Ok(arr) = stamps.cast::<PyArray1<i64>>() {
-                return self.extrapolate_batch(py, arr, policy);
+                return self.extrapolate_batch(py, arr, policy, layout);
             }
         }
         let stamp = stamp_from_any(stamps)?;
@@ -999,12 +1037,137 @@ impl PyPlan {
             .plan
             .at_extrapolating_tagged(&g, stamp, self.domain, policy)
             .map_err(|e| lookup_err(self.tree(), e))?;
-        let out = PyArray2::<f64>::zeros(py, [4, 4], false);
-        // SAFETY: freshly allocated by us, so nothing else holds a reference and
-        // the slice is exactly 16 contiguous f64.
-        let slice = unsafe { out.as_slice_mut()? };
-        tf_tree::write_mat4(&x.pose, slice);
-        Ok((out.into_any(), x.by_ns.into_pyobject(py)?.into_any()))
+        // `mat4` keeps `at`'s `(4, 4)` shape; every other layout is the flat
+        // `(elems,)` row `at(.., layout=..)` already returns, so the two methods
+        // agree on shape for the same `layout` argument.
+        let out = if layout == Layout::Mat4 {
+            let a = PyArray2::<f64>::zeros(py, [4, 4], false);
+            // SAFETY: freshly allocated here, so nothing else holds a reference
+            // and the slice is exactly 16 contiguous f64.
+            write_extrapolated(&x.pose, layout, unsafe { a.as_slice_mut()? })?;
+            a.into_any()
+        } else {
+            let a = PyArray1::<f64>::zeros(py, [layout.elems()], false);
+            // SAFETY: as above, `layout.elems()` contiguous f64.
+            write_extrapolated(&x.pose, layout, unsafe { a.as_slice_mut()? })?;
+            a.into_any()
+        };
+        Ok((out, x.by_ns.into_pyobject(py)?.into_any()))
+    }
+
+    /// [`PyPlan::at_extrapolating`] writing into caller memory.
+    ///
+    /// **`docs/API.md` R2 makes this NORMATIVE, not optional**: *"every batch
+    /// entry point has an `_into` form writing into caller memory"*, and its
+    /// justification is this exact caller — the allocation *"is noise at
+    /// n = 65536 and half the call at n = 64, and n = 64 is the control loop"*.
+    /// `at_extrapolating` is the method a controller reaches for, so shipping it
+    /// without this was the rule broken on the one path the rule was written
+    /// about.
+    ///
+    /// `poses` takes the shape `at_extrapolating` would have returned —
+    /// `(4, 4)` or `(elems,)` for a scalar stamp, `(N, 4, 4)` or `(N, elems)`
+    /// for an array — and `by_ns` is `()`-shaped or `(N,)` `int64`.
+    ///
+    /// # A partial write is possible, and that is the trade
+    ///
+    /// The allocating form fills arrays it owns, so a failure part-way drops
+    /// them and the caller sees only the exception. Here the buffers are the
+    /// caller's, so a `LookupError` on element *k* leaves `0..k` written and the
+    /// rest as they were. That is the same contract `at_into` carries and the
+    /// reason both exist: a caller who wants all-or-nothing uses the allocating
+    /// form and pays the allocation for it.
+    #[pyo3(signature = (stamps, policy, poses, by_ns, /, *, layout = None))]
+    fn at_extrapolating_into(
+        &self,
+        py: Python<'_>,
+        stamps: &Bound<'_, PyAny>,
+        policy: &str,
+        poses: &Bound<'_, PyAny>,
+        by_ns: &Bound<'_, PyAny>,
+        layout: Option<&str>,
+    ) -> PyResult<()> {
+        let policy = extrap_from_str(policy)?;
+        let layout = match layout {
+            Some(name) => layout_from_str(name)?,
+            None => Layout::Mat4,
+        };
+        // Refuse the layout before touching either buffer, for the same reason
+        // `extrapolate_batch` does: the fold cannot refuse per element.
+        write_extrapolated(&tf_tree::Iso3::IDENTITY, layout, &mut [0.0; 16])?;
+        let e = layout.elems();
+
+        // `at`'s stamp dispatch, to the letter — see `at_extrapolating`.
+        let src_arr = if stamps.is_instance_of::<pyo3::types::PyInt>() {
+            None
+        } else {
+            stamps.cast::<PyArray1<i64>>().ok()
+        };
+        let scalar = src_arr.is_none();
+        let src_owned = match &src_arr {
+            Some(arr) => {
+                if !arr.is_c_contiguous() {
+                    return Err(BufferError::new_err(
+                        "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                         explicitly if you meant to copy",
+                    ));
+                }
+                [0i64]
+            }
+            None => [stamp_from_any(stamps)?],
+        };
+        // SAFETY: checked C-contiguous above; the borrow is held across the
+        // fold below for §6.2's reason.
+        let src: &[i64] = match &src_arr {
+            Some(a) => unsafe { a.as_slice()? },
+            None => &src_owned,
+        };
+        let n = src.len();
+
+        let want_poses: &[usize] = if scalar {
+            if layout == Layout::Mat4 {
+                &[4, 4]
+            } else {
+                &[e]
+            }
+        } else if layout == Layout::Mat4 {
+            &[n, 4, 4]
+        } else {
+            &[n, e]
+        };
+        let want_dist: &[usize] = if scalar { &[] } else { &[n] };
+
+        let pose_arr = poses.cast::<numpy::PyArrayDyn<f64>>().map_err(|_| {
+            BufferError::new_err("poses must be a C-contiguous, writable float64 array")
+        })?;
+        check_out(pose_arr.as_untyped(), want_poses)?;
+        let dist_arr = by_ns.cast::<numpy::PyArrayDyn<i64>>().map_err(|_| {
+            BufferError::new_err("by_ns must be a C-contiguous, writable int64 array")
+        })?;
+        check_out(dist_arr.as_untyped(), want_dist)?;
+
+        // SAFETY: `check_out` proved both C-contiguous, correctly shaped and
+        // writable; aliasing stays the caller's, as `as_slice_mut` documents.
+        let (pd, dd) = unsafe { (pose_arr.as_slice_mut()?, dist_arr.as_slice_mut()?) };
+
+        let plan = *self.plan;
+        let tree = self.tree();
+        let domain = self.domain;
+        let mut run = move || -> Result<(), tf_tree::LookupError> {
+            let g = tree.guard();
+            for (i, &t) in src.iter().enumerate() {
+                let x = plan.at_extrapolating_tagged(&g, t, domain, policy)?;
+                write_pose_unchecked(&x.pose, layout, &mut pd[i * e..(i + 1) * e]);
+                dd[i] = x.by_ns;
+            }
+            Ok(())
+        };
+        let res = if release_the_gil(n, self.plan.len()) {
+            py.detach(run)
+        } else {
+            run()
+        };
+        res.map_err(|err| lookup_err(self.tree(), err))
     }
 
     /// The most recent transform on this path.
@@ -1195,6 +1358,7 @@ impl PyPlan {
         py: Python<'py>,
         stamps: &Bound<'py, PyArray1<i64>>,
         policy: ExtrapPolicy,
+        layout: Layout,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         if !stamps.is_c_contiguous() {
             return Err(BufferError::new_err(
@@ -1202,8 +1366,21 @@ impl PyPlan {
                  explicitly if you meant to copy",
             ));
         }
+        // **Refuse the layout once, here, before anything is allocated.** The
+        // fold below runs under `detach` where no `PyResult` can be built, so
+        // `write_pose_unchecked` cannot refuse per element — this is the check
+        // that makes "unchecked" true rather than hopeful.
+        write_extrapolated(&tf_tree::Iso3::IDENTITY, layout, &mut [0.0; 16])?;
+
         let n = stamps.len();
-        let poses = PyArray3::<f64>::zeros(py, [n, 4, 4], false);
+        let e = layout.elems();
+        // `(N, 4, 4)` for `mat4`, `(N, elems)` otherwise — the same pair of
+        // shapes `at` returns for the same `layout`.
+        let poses = if layout == Layout::Mat4 {
+            PyArray3::<f64>::zeros(py, [n, 4, 4], false).into_any()
+        } else {
+            PyArray2::<f64>::zeros(py, [n, e], false).into_any()
+        };
         let dist = PyArray1::<i64>::zeros(py, [n], false);
         {
             // SAFETY: `stamps` was checked C-contiguous above; `poses` and
@@ -1211,10 +1388,11 @@ impl PyPlan {
             // reference to either and both are contiguous by construction. The
             // borrows are held across the `detach` below for §6.2's reason —
             // NumPy refuses to resize an array while a buffer is exported.
+            let flat = poses.cast::<numpy::PyArrayDyn<f64>>()?;
             let (src, pd, dd) = unsafe {
                 (
                     stamps.as_slice()?,
-                    poses.as_slice_mut()?,
+                    flat.as_slice_mut()?,
                     dist.as_slice_mut()?,
                 )
             };
@@ -1228,7 +1406,7 @@ impl PyPlan {
                 let g = tree.guard();
                 for (i, &t) in src.iter().enumerate() {
                     let x = plan.at_extrapolating_tagged(&g, t, domain, policy)?;
-                    tf_tree::write_mat4(&x.pose, &mut pd[i * 16..(i + 1) * 16]);
+                    write_pose_unchecked(&x.pose, layout, &mut pd[i * e..(i + 1) * e]);
                     dd[i] = x.by_ns;
                 }
                 Ok(())

@@ -112,6 +112,15 @@ is a bug.
 
 ### Added
 
+- **`Plan.at_extrapolating` gains `layout=` and an `_into` form** in Python,
+  closing the R2 violation the binding half of
+  [`0039`](docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md) left.
+  R2 is NORMATIVE that every batch entry point has an `_into` form and justifies
+  it with this exact caller — the allocation is "half the call at n = 64, and
+  n = 64 is the control loop" — so extrapolation, the method a controller reaches
+  for, was the one path the rule was written about and the one that did not obey
+  it. A `quat_twist` layout is refused as it is in C, and for the same reason.
+
 - **Both bindings reach the time domain and extrapolation** — the halves
   [`0038`](docs/decisions/0038-the-domain-a-binding-cannot-name.md) and
   [`0039`](docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md) left

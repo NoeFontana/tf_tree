@@ -225,3 +225,55 @@ def test_the_pose_never_arrives_without_the_distance(plan):
     assert isinstance(result, tuple) and len(result) == 2
     assert isinstance(result[1], int), "the scalar distance is a plain int"
     assert result[1] > 0
+
+
+def test_at_extrapolating_into_writes_the_callers_buffers(plan):
+    """R2's `_into` form, which `0039`'s binding step left out.
+
+    `docs/API.md` R2 is NORMATIVE that every batch entry point has one, and its
+    justification names this caller: the allocation "is noise at n = 65536 and
+    half the call at n = 64 — and n = 64 is the control loop". Extrapolation is
+    the method a controller reaches for, so it was the one path the rule was
+    written about and the one that did not obey it.
+    """
+    stamps = np.array([50_000_000, 200_000_000, 250_000_000], dtype=np.int64)
+    want_poses, want_by = plan.at_extrapolating(stamps, "constant_twist")
+
+    poses = np.zeros((3, 4, 4))
+    by_ns = np.zeros(3, dtype=np.int64)
+    plan.at_extrapolating_into(stamps, "constant_twist", poses, by_ns)
+
+    assert np.array_equal(poses, want_poses)
+    assert np.array_equal(by_ns, want_by)
+    # The distance still comes back per element, not collapsed.
+    assert by_ns[0] == 0 and by_ns[-1] > 0
+
+
+def test_at_extrapolating_takes_a_layout_like_at_does(plan):
+    """The asymmetry against C, closed: a C caller could extrapolate into a
+    non-mat4 layout and a Python caller could not."""
+    stamps = np.array([200_000_000], dtype=np.int64)
+    quat, by_ns = plan.at_extrapolating(stamps, "hold", layout="quat")
+    assert quat.shape == (1, 7)
+    assert by_ns.shape == (1,)
+
+    into = np.zeros((1, 7))
+    dist = np.zeros(1, dtype=np.int64)
+    plan.at_extrapolating_into(stamps, "hold", into, dist, layout="quat")
+    assert np.array_equal(into, quat)
+
+    # A scalar keeps `at`'s shapes too.
+    one, d = plan.at_extrapolating(200_000_000, "hold")
+    assert one.shape == (4, 4) and isinstance(d, int)
+
+
+def test_a_twist_layout_cannot_carry_an_extrapolated_pose(plan):
+    """The same refusal the C ABI makes, for the same reason: there is no
+    extrapolating `at_with_derivatives`, so a twist would be computed under
+    `error` beside a pose computed under the caller's policy — two policies in
+    one 13-float row."""
+    stamps = np.array([200_000_000], dtype=np.int64)
+    for layout in ("quat_twist", "affine32"):
+        with pytest.raises(ValueError) as e:
+            plan.at_extrapolating(stamps, "hold", layout=layout)
+        assert "extrapolat" in str(e.value).lower()

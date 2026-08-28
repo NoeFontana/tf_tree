@@ -208,13 +208,18 @@ class Plan:
 
     @overload
     def at_extrapolating(
-        self, stamps: int, policy: ExtrapPolicy, /
+        self, stamps: int, policy: ExtrapPolicy, /, *, layout: Layout | None = ...
     ) -> tuple[NDArray[np.float64], int]:
         """One stamp in; `((4, 4)` float64, `by_ns` as an `int)` out."""
 
     @overload
     def at_extrapolating(
-        self, stamps: NDArray[np.int64], policy: ExtrapPolicy, /
+        self,
+        stamps: NDArray[np.int64],
+        policy: ExtrapPolicy,
+        /,
+        *,
+        layout: Layout | None = ...,
     ) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
         """`(N,)` stamps in; `((N, 4, 4)` float64, `(N,)` int64) out.
 
@@ -227,7 +232,12 @@ class Plan:
 
     @overload
     def at_extrapolating(
-        self, stamps: int | NDArray[np.int64], policy: ExtrapPolicy, /
+        self,
+        stamps: int | NDArray[np.int64],
+        policy: ExtrapPolicy,
+        /,
+        *,
+        layout: Layout | None = ...,
     ) -> tuple[NDArray[np.float64], int | NDArray[np.int64]]:
         """Evaluate past the newest sample, and learn how far past that was.
 
@@ -252,6 +262,33 @@ class Plan:
 
         The batch is a loop over the scalar form under one guard, not the
         engine's batch fold, which carries no policy.
+        """
+
+    def at_extrapolating_into(
+        self,
+        stamps: int | NDArray[np.int64],
+        policy: ExtrapPolicy,
+        poses: object,
+        by_ns: object,
+        /,
+        *,
+        layout: Layout | None = ...,
+    ) -> None:
+        """`at_extrapolating` writing into two caller-provided arrays.
+
+        `poses` takes the shape the allocating form would have returned —
+        `(4, 4)` or `(layout_elems,)` for a scalar stamp, `(N, 4, 4)` or
+        `(N, layout_elems)` for an array — and `by_ns` is `()`-shaped or
+        `(N,)` int64.
+
+        Allocate both once, outside the loop. `docs/API.md` R2 makes an `_into`
+        form NORMATIVE for every batch entry point and justifies it with this
+        caller: the allocation is half the call at n = 64, and n = 64 is the
+        control loop.
+
+        **A failure part-way leaves the buffers part-written**, the same
+        contract `at_into` carries. A caller who needs all-or-nothing uses the
+        allocating form and pays the allocation for it.
         """
 
     def latest(self) -> NDArray[np.float64]:
