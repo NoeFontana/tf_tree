@@ -348,13 +348,41 @@ fn claim_race_exactly_one_wins() {
 /// packed word and A2's in-arena mutation lock — mirroring
 /// `topology::{TopologyView, TopoLockView}` step for step.
 ///
-/// It is a reimplementation rather than a call into the real code because
-/// `crate::topology` is `#[cfg(not(loom))]`: its `depth` array is an
-/// `AtomicU16`, which loom does not provide, and the lock word lives in a
-/// `#[repr(C)]` arena header, which loom atomics cannot inhabit. Everything that
-/// matters is preserved — the same orderings, the same single publishing store,
-/// the same bounded spin and liveness-gated steal. Keep the two in step; the
-/// real code is the one that ships.
+/// It is a reimplementation rather than a call into the real code because the
+/// lock word and the topology blocks live in a `#[repr(C)]` arena header, and
+/// loom's atomics cannot inhabit one: they carry instrumentation state and are
+/// not constructible from the zeroed bytes an arena hands out. That is the same
+/// constraint `buffer::PoseSlot` meets, and it is why `crate::topology` is
+/// `#[cfg(not(loom))]` in the first place. Everything that matters is preserved
+/// — the same orderings, the same single publishing store, the same bounded spin
+/// and liveness-gated steal. Keep the two in step; the real code is the one that
+/// ships.
+///
+/// **This paragraph gave a second reason until 2026-08-28 and that reason was
+/// false**: *"its `depth` array is an `AtomicU16`, which loom does not provide"*.
+/// loom 0.7 exports `AtomicU16` beside `AtomicU8`/`U32`/`U64`/`Usize`
+/// (`loom::sync::atomic`), so the width was never the obstacle. Recorded rather
+/// than deleted, because the false reason is the one that makes the twin look
+/// unavoidable — the real one is about `#[repr(C)]`, and anybody trying to
+/// delete this model has to answer *that*.
+///
+/// # The control run, which is what stops this being a theorem about itself
+///
+/// A model that idealises the exclusion it is checking proves the safety
+/// property by construction. So the predicate was **disabled and the model
+/// re-run**: with `is_alive`'s refusal removed — every holder read as dead, so
+/// every contended acquire steals — `two_mutators_race_the_lock_and_a_reader_sees_no_mix`
+/// fails with *"two mutators inside the critical section"*, while
+/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes,
+/// because it wants the steal.
+///
+/// That is the pair that matters. The first test passes `|_| true`, so its
+/// holder is **live and unstealable**, and the liveness gate is the only thing
+/// keeping the second mutator out; the second test's holder is a corpse, so the
+/// gate is the only thing letting the rescuer in. One of them fails whichever
+/// way the predicate is broken, which is what makes the green run mean
+/// something. `MODEL_SPIN_LIMIT` being small enough to reach the steal path is
+/// load-bearing for the first half of that, exactly as its own comment says.
 ///
 /// `MODEL_BLOCKS` matches production's [`tf_tree_arena::TOPO_BLOCKS`] and that is
 /// **load-bearing, not decoration**. A first draft of this model used two blocks
