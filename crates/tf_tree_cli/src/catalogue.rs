@@ -53,10 +53,20 @@
 //! future check without an id takes, which is the state this catalogue spent its
 //! first revision in.
 //!
-//! Going the other way, some ids have no detection *here*: three cannot detect
-//! anything in any configuration, and seven more depend on what this arena, this
-//! engine build and this host can supply. Each is reported [`Status::Skipped`]
-//! with the reason stated in [`crate::checks`], never silently passed.
+//! Going the other way, some ids have no detection *here*: **two** cannot detect
+//! anything in any configuration — `TFT002` and `TFT003`, owned by
+//! `tf_tree_bridge::StaticStore`, whose state is process-local — and **ten** more
+//! depend on what this arena, this engine build and this host can supply. Each is
+//! reported [`Status::Skipped`] with the reason stated in [`crate::checks`], never
+//! silently passed.
+//!
+//! **This said "three ... and seven more" until 2026-08-28, and both numbers were
+//! stale.** `TFT004` left the first group when #274 gave it a `ClaimRecord`
+//! offset to read, and that PR's own message records the move — *"sixteen
+//! detecting becomes seventeen"* — while updating a different comment in this
+//! file and not this one. `docs/PHASE5.md` §0.0 is the source of truth over this
+//! module's prose (`CLAUDE.md`), it has said seventeen since that PR, and these
+//! counts are now read off it.
 //!
 //! # Severity is a property of the check, not of the finding
 //!

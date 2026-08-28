@@ -1361,8 +1361,10 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > **No new id, and no new arena field.** `TFT014`'s title already claims this
 > ground; a second id would be the second spelling `CLAUDE.md` forbids, and
 > `0027` has `TFT020`. Severity stays **warn**, because it is warn in the table
-> above. §0.0's "sixteen detect" is unchanged: `TFT014` was already in that set
-> — what changes is how much of its own row it covers.
+> above. §0.0's detecting count was unchanged by this amendment — it read
+> "sixteen" when this was written and reads "seventeen" since `TFT004` joined the
+> set in #274 — because `TFT014` was already in it, and what changes here is how
+> much of its own row it covers.
 >
 > **It is detection, and stops there.** `0028` is `draft` and its header exists
 > so that no reclamation lands before its predicate is settled; a `doctor` check
@@ -1556,7 +1558,8 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > (step 5), and a `doctor` check that mutated a robot's arena as a side effect of
 > being asked a question would be the tool overstepping in the direction D18
 > exists to define. `TFT014`'s title already claims this ground, `0027` has
-> `TFT020`, and §0.0's "sixteen detect" is unchanged.
+> `TFT020`, and §0.0's detecting count was unchanged by this amendment (it read
+> "sixteen" when this was written; #274 later moved `TFT004` into the set).
 
 ---
 
