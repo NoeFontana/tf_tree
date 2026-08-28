@@ -586,14 +586,17 @@ impl Plan {
     /// both are gone once there is one array — this one, inside the `Plan` that
     /// will be returned — written once, in place. Re-disassembled after:
     /// `fold_into` calls no `memcpy` at all, and the only one left on the path is
-    /// copy 3's 4160.
+    /// copy 3 — **2064 bytes today**, and 4160 when the table above was taken,
+    /// because `0042` halved `Step`. The three figures in the table are the
+    /// measurement as it stood; the surviving copy is the one that moved.
     ///
     /// **Copy 3 stays, and was not left alone for lack of trying.** It is
     /// `compile` returning by value into its caller's `sret` slot, not a
     /// temporary; the local `Plan` is address-taken across a real call to
     /// `fold_into`, and LLVM declines to place it in the `sret` memory. Marking
-    /// `fold_into` `#[inline]` was measured and changes nothing — the same 4160
-    /// `memcpy`, the same instruction count in both functions. Removing it needs
+    /// `fold_into` `#[inline]` was measured and changes nothing — the same
+    /// `memcpy` (4160 bytes when measured, 2064 since `0042`), the same
+    /// instruction count in both functions. Removing it needs
     /// an out-parameter on [`compile`], which is `pub`: a `docs/API.md` §7
     /// change for the remaining third, and not one this took.
     ///
@@ -1633,10 +1636,12 @@ impl Plan {
 
     /// Evaluate a batch **directly into a caller's buffer**, in `layout`.
     ///
-    /// The point of this over [`Self::at_many`] is that `Iso3` is
-    /// `repr(C, align(64))` and so cannot alias any layout a consumer wants
-    /// (see [`crate::layout`]). Writing through it costs an intermediate buffer
-    /// and a second pass; this writes once, in place, and allocates nothing.
+    /// The point of this over [`Self::at_many`] is that an `Iso3` buffer does
+    /// not alias the layout a consumer wants — a 4x4 `f64` matrix or a 3x4 `f32`
+    /// affine — so writing through one costs an intermediate buffer and a second
+    /// pass; this writes once, in place, and allocates nothing. Since `0042` the
+    /// `Quat` layout is the exception and shares `Iso3`'s bytes exactly; see
+    /// [`crate::layout`], which carries what that does and does not change.
     ///
     /// `out` is a flat `f64` slice of at least `stamps.len() * layout.elems()`.
     /// Use [`Self::at_many_into_f32`] for [`Layout::Affine32`].

@@ -608,10 +608,12 @@ Fixed array, no `SmallVec`, no allocation, no dependency.
 
 **Two bounds, and they price different slots** ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)).
 `MAX_DEPTH` bounds the *compiled* plan, counted **after** §7.2's folding: a slot
-there is a `Step`, **128 bytes measured**, carried by value in every `Plan` and
-in a 16-slot thread-local cache. `MAX_PATH_EDGES` bounds the *raw walk*: a slot
-there is a `u32` in `compile`'s stack frame. 128 bytes against 4 is why one
-number cannot price both, and this section said otherwise until `0034` — it read
+there is a `Step`, **64 bytes measured** (128 until
+[`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md) dropped
+`Iso3`'s cacheline padding), carried by value in every `Plan` and in a 16-slot
+thread-local cache. `MAX_PATH_EDGES` bounds the *raw walk*: a slot there is a
+`u32` in `compile`'s stack frame. 64 bytes against 4 is why one number cannot
+price both, and this section said otherwise until `0034` — it read
 "combined depth exceeding 16 is `TreeTooDeep` — generous, since real trees are
 4–8", which is sound about a moving `/tf` graph and wrong about a rigid
 assembly, where a 20-link fixed chain folds to **one step** and was refused
@@ -683,6 +685,11 @@ each. Disassembled at `MAX_DEPTH = 32`, none of the three copies on the
 | 1 | `fold` returning `out` into the caller's `sret` buffer | 4096 |
 | 2 | `Plan::new` copying its parameter into `self.steps` | 4096 |
 | 3 | `compile`'s `Plan` into `Tree::plan`'s `sret` slot | 4160 |
+
+**Measured at `MAX_DEPTH = 32` with the then-current `Step`.**
+[`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md) has since
+halved `Step`, so the surviving copy 3 is **2064 bytes**; copies 1 and 2 were
+deleted by this change and their figures are history either way.
 
 12 352 bytes of `memcpy` to compile a plan that is usually six steps long, none
 of it proportional to the path. So `Plan::identity` makes the buffer and

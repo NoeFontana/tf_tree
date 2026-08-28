@@ -3389,3 +3389,49 @@ fn an_extrapolation_distance_saturates_instead_of_wrapping() {
         "a distance wider than i64 must saturate, never wrap to look fresh"
     );
 }
+
+/// The three sizes `0042` moved, pinned so they cannot drift back silently.
+///
+/// `Iso3` was `#[repr(C, align(64))]` with an 8-byte pad, on the stated grounds
+/// that *"the Phase 2 shared-memory arena can store slots without re-deriving
+/// layout"*. The arena re-derived it anyway — `buffer::PoseSlot` is its own
+/// `align(64)` of atomics, because the seqlock payload has to be atomics to be
+/// sound — and no arena structure has ever had an `Iso3` field. So the alignment
+/// bought the arena nothing and cost every in-memory use eight bytes and a
+/// 64-byte stride.
+///
+/// These are *figures*, not invariants: `MAX_DEPTH` moving would move `Plan`, and
+/// that is expected. What this catches is the figures moving for a reason nobody
+/// intended — a field added to `Iso3`, or an alignment attribute coming back —
+/// which is silent otherwise and doubles a per-thread cache when it happens.
+///
+/// **Mutant:** add an 8-byte field to `Iso3` and fix its two constructors — the
+/// realistic way this drifts back. Applied: fails here with `left: 64, right:
+/// 56`, and `Plan` doubles behind it.
+///
+/// **Restoring `align(64)` is not the mutant to use, and finding that out is
+/// worth recording**: it does not compile either way. With the `_pad` back, the
+/// constructors no longer initialise every field; without it, `align(64)` over
+/// 56 bytes of fields leaves trailing padding and the `Pod` derive refuses. So
+/// the alignment cannot come back silently at all — which is a stronger
+/// guarantee than this test, and not one this test provides.
+#[test]
+fn the_sizes_0042_halved_stay_halved() {
+    use core::mem::{align_of, size_of};
+
+    assert_eq!(size_of::<Iso3>(), 56, "Iso3 was 64 with an 8-byte pad");
+    assert_eq!(align_of::<Iso3>(), 8, "Iso3 was align(64)");
+    assert_eq!(
+        size_of::<crate::plan::Step>(),
+        64,
+        "a Step was 128: Iso3's 64 plus a discriminant that forced a second cacheline"
+    );
+    assert_eq!(
+        size_of::<crate::plan::Plan>(),
+        2064,
+        "a Plan was 4160, and the facade caches sixteen of them per thread"
+    );
+    // The property the `Pod` derive rests on, which the pad used to guarantee
+    // for free: seven f64 and nothing else.
+    assert_eq!(size_of::<Iso3>(), 7 * size_of::<f64>());
+}

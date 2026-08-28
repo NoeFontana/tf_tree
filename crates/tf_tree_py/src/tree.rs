@@ -573,12 +573,22 @@ type Knots<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray3<f64>>);
 
 /// # A `#[pyclass]` may not contain an over-aligned type
 ///
-/// `Plan` is `align(64), size 4160` — it holds `[Step; MAX_DEPTH]` and `Step`
-/// carries an `Iso3`, which is one cacheline by design. (2112 before `0034`
-/// moved `MAX_DEPTH` 16 → 32; the alignment, which is what this section is
-/// about, is unchanged and is what forces the `Box`.) **CPython's object
-/// allocator guarantees 16-byte alignment at best**, so storing a `Plan`
-/// directly in a pyclass makes every field access a misaligned dereference.
+/// **This section's premise lapsed with
+/// [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md),
+/// and the `Box` has not been revisited.** `Plan` was `align(64), size 4160`,
+/// because `Step` carried an `Iso3` that was one padded cacheline by design;
+/// **CPython's object allocator guarantees 16-byte alignment at best**, so
+/// storing one directly in a pyclass made every field access a misaligned
+/// dereference. `Plan` is now `align(8), size 2064` — 8 is under CPython's 16,
+/// so the over-alignment this is about no longer exists.
+///
+/// The `Box` stays for now regardless, and deliberately: removing it is an
+/// allocation-per-plan optimisation with its own measurement and its own PyO3
+/// questions, not a side effect of a layout change. What is recorded here is
+/// that the *reason written down* is no longer the reason it is here — which is
+/// the state this repository's stale-rationale defects all started from.
+///
+/// The rest of this section is the history, and still explains the shape:
 /// Under a debug build that aborts the interpreter outright:
 ///
 /// ```text

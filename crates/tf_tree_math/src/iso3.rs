@@ -130,17 +130,39 @@ impl Vec3 {
 /// `t`. `T_parent_child` — applying it to a point in `child` yields the point in
 /// `parent`.
 ///
-/// Laid out as exactly one 64-byte cacheline (`align(64)`) with an 8-byte pad so
-/// the Phase 2 shared-memory arena can store slots without re-deriving layout.
-#[repr(C, align(64))]
+/// Seven `f64` in canonical order — 56 bytes, `align(8)`, no padding.
+///
+/// # It used to be a padded 64-byte cacheline, and the reason did not survive
+///
+/// This was `#[repr(C, align(64))]` with an 8-byte `_pad`, *"so the Phase 2
+/// shared-memory arena can store slots without re-deriving layout"*. The arena
+/// re-derived it anyway: `tf_tree_core::buffer::PoseSlot` is its own
+/// `#[repr(C, align(64))]` of `{ AtomicU32, u32, [AtomicU64; 7] }` with its own
+/// compile-time size assertion, and an `Iso3` reaches it through
+/// [`Iso3::to_bits`] and back through [`Iso3::from_bits`]. No arena structure
+/// has ever had an `Iso3` field, so the alignment bought the arena nothing and
+/// cost every *in-memory* use of the type eight wasted bytes and a 64-byte
+/// stride ([`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
+///
+/// What it cost, measured: `Step` was 128 bytes rather than 64, so a `Plan`'s
+/// `[Step; MAX_DEPTH]` was 4 KiB rather than 2, and the facade's 16-slot
+/// thread-local plan cache was 65 KiB per thread rather than 33. A second
+/// consumer had already routed around it —
+/// `tf_tree_ingest::ingest`'s `SAMPLE_BYTES` buffers a bare `[f64; 7]` beside
+/// its stamp precisely because *"`Iso3` is `align(64)`, so a `(i64, Iso3)` pair
+/// occupies 128 bytes and would double the memory this module is trying to
+/// bound"*.
+///
+/// **`Pod` still holds**, and that is the property to keep an eye on: 4 + 3
+/// `f64` is 56 bytes with no interior padding at `align(8)`, so the derive is
+/// as valid as it was at 64. A field added here must keep that true.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Iso3 {
     /// Rotation part (unit quaternion).
     pub q: Quat,
     /// Translation part.
     pub t: Vec3,
-    /// Padding to a full cacheline. Always zero.
-    _pad: [u8; 8],
 }
 
 impl Iso3 {
@@ -148,7 +170,6 @@ impl Iso3 {
     pub const IDENTITY: Self = Self {
         q: Quat::IDENTITY,
         t: Vec3::ZERO,
-        _pad: [0; 8],
     };
 
     /// Construct from a rotation and translation. No normalization is performed;
@@ -156,7 +177,7 @@ impl Iso3 {
     #[inline]
     #[must_use]
     pub const fn new(q: Quat, t: Vec3) -> Self {
-        Self { q, t, _pad: [0; 8] }
+        Self { q, t }
     }
 
     /// The inverse transform. For `T = (q, t)`, `T⁻¹ = (q*, −q*·t)`.
@@ -365,8 +386,12 @@ mod tests {
         assert_eq!(align_of::<Vec3>(), 8);
         assert_eq!(size_of::<Quat>(), 32);
         assert_eq!(align_of::<Quat>(), 8);
-        assert_eq!(size_of::<Iso3>(), 64);
-        assert_eq!(align_of::<Iso3>(), 64);
+        // `0042`: 56 bytes at align 8, no interior padding — which is what
+        // keeps the `Pod` derive valid and what halves `Step`, `Plan` and the
+        // facade's plan cache. It was a padded 64-byte cacheline for an arena
+        // that never stored one.
+        assert_eq!(size_of::<Iso3>(), 56);
+        assert_eq!(align_of::<Iso3>(), 8);
     }
 
     #[test]
@@ -374,7 +399,8 @@ mod tests {
         let iso = Iso3::new(Quat::new(0.5, 0.5, 0.5, 0.5), Vec3::new(1.0, -2.0, 3.0));
         // Pod cast to bytes and back is identity.
         let bytes: &[u8] = bytemuck::bytes_of(&iso);
-        assert_eq!(bytes.len(), 64);
+        // 4 + 3 `f64`, and nothing else — `0042` removed the pad.
+        assert_eq!(bytes.len(), 56);
         let back: Iso3 = *bytemuck::from_bytes::<Iso3>(bytes);
         assert_eq!(back, iso);
         // Zeroable identity.
