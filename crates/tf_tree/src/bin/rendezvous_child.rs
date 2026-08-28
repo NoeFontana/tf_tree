@@ -25,8 +25,9 @@
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
-//! join-heir     -> "joined", then on stdin: "<owner_lost> <inheritance>",
-//!                  then parks — serving, if it inherited (§3.5)
+//! join-heir     -> "joined <slot>", then on stdin:
+//!                  "<owner_lost> <inheritance> <slot>", then parks —
+//!                  serving, if it inherited (§3.5)
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -299,7 +300,10 @@ fn main() {
                 .create(CreatePolicy::Never)
                 .open()
                 .expect("join");
-            say("joined");
+            // The slot is printed on both lines so the parent can assert it did
+            // not move across the takeover — the invariant the whole shape rests
+            // on, and the one the deleted arm could not hold.
+            say(&format!("joined {}", tree.participant_slot()));
 
             let mut line = String::new();
             std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).expect("read");
@@ -308,7 +312,7 @@ fn main() {
                 Ok(o) => format!("{o:?}"),
                 Err(e) => format!("error {e}"),
             };
-            say(&format!("{lost} {outcome}"));
+            say(&format!("{lost} {outcome} {}", tree.participant_slot()));
             loop {
                 std::thread::park();
             }

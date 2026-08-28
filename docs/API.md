@@ -1079,3 +1079,79 @@ Applied to the shim in `PHASE7.md` §7, and to anything after it.
    a type carrying a lifetime that a user will want to store?
 8. **Losses.** Does the benchmark table have a row where this surface is
    *worse* than the alternative it replaces? If not, it is not finished.
+
+## 8. The real-time envelope — NORMATIVE
+
+The project's one-line pitch is *"fast enough to sit inside a control loop"*, and
+until this section existed **nothing stated what that means**. A mean latency does
+not answer it. A control loop is a deadline, so what it needs is the worst case
+and the list of things that cannot happen on the query path — and it needs each
+claim attached to whatever re-derives it, per `docs/benchmarks/EVIDENCE.md`'s
+rule that a maintained claim owes an executor.
+
+### 8.1 What the query path does not do
+
+For `Plan::at`, `Plan::at_many_into`, `Plan::at_with_derivatives` and
+`Plan::at_extrapolating`, evaluated under a `Guard` the caller already holds:
+
+| Does not | Why, and what checks it |
+|---|---|
+| **Allocate** | The plan is a fixed `[Step; MAX_DEPTH]` by value and every batch form has an `_into` writing into caller memory (R2). Checked: `crates/tf_tree_bench/tests/zero_alloc.rs` counts allocations through a wrapping global allocator across a lookup loop, and again over a 1537-frame tree across ring wraparound |
+| **Take a lock** | Reads are seqlock reads. A reader never blocks a writer and a writer never waits for a reader; there is no mutex on the path at any depth |
+| **Read a clock** | `tf_tree_core` is `no_std` and has no clock to read. The query's stamp is the caller's, always (R3) |
+| **Resolve a name** | Frames are interned to integer ids at compile time (R1, D3). No hashing, no string comparison, no arena name-store access |
+| **Make a syscall** | Nothing above needs one. The arena is already mapped; evaluation touches that mapping and nothing else |
+| **Branch on the transport** | The same code runs against a heap arena, a `MAP_SHARED` memfd and a frozen `.tft`; `docs/PHASE5.md` §2.1 makes that NORMATIVE and the relocation gate tests it |
+
+### 8.2 The worst case is bounded, and here is the bound
+
+**A reader that meets a slot mid-write retries `SEQ_RETRY_LIMIT` (64) times and
+then returns `LookupError::SlotContended`.** It does not spin indefinitely and it
+does not block. That is the property that makes the read path usable from a
+`SCHED_FIFO` thread: a writer preempted inside its two-store publish window
+cannot hold a higher-priority reader past a fixed bound, so there is no unbounded
+priority inversion to reason about. The reader is handed an error naming the
+edge, and deciding what a control loop does about a contended slot is the
+caller's — which is the point of returning rather than waiting.
+
+`docs/decisions/0018` is the same principle stated for waits: no blocking wait,
+futex or notification primitive lives in the arena.
+
+**What is *not* on this path, and must not be put there:** `Tree::lookup`
+resolves names and consults the plan cache (tier 1 — R1 says so, and it is never
+the example in a hot loop); `Tree::reparent` takes the topology lock with a
+bounded spin (A2, `0029`); `Publisher::push` reads the wall clock on a countdown
+(`0036`'s receipt-time sampler, every `sample_every` pushes — priced at ~1 ns
+amortised by `just push-sampler-cost`). None of the three is a query.
+
+### 8.3 Page faults are the residual, and they are the embedder's to remove
+
+The arena is a `memfd`. An untouched page costs a minor fault on first touch,
+which inside a control cycle is a deadline miss rather than a slowdown. Two
+things address it and a third does not exist:
+
+- **Per-edge population at take-up** (`docs/PHASE2.md` §7.1, `0024`) faults the
+  pages an edge uses when the edge is claimed, not when it is first read.
+- **`mlockall(MCL_CURRENT | MCL_FUTURE)` in the embedding process** is what pins
+  the mapping, and it is the *application's* call, not this library's — a library
+  that locks memory on its caller's behalf is deciding an `RLIMIT_MEMLOCK` budget
+  it cannot see. `TFT016` reports the limit against the arena size so the failure
+  is found before the control loop meets it.
+- **There is no `LockPolicy` and no `mlock` call in this codebase.** `MLOCK_ONFAULT`
+  would not prefault, so it adds nothing over §7.1; and on a swapless host — which
+  is what a real-time robot runs — the pages are not reclaimable anyway.
+
+### 8.4 What this section does not claim
+
+Stated because the rest of it reads like a guarantee and only part of it is one:
+
+- **No number here is a latency guarantee.** `docs/PHASE1.md` §11.3's latency
+  criteria need dedicated core-pinned hardware and are recorded UNAVAILABLE on
+  every host this project has measured on. The published figures in
+  `docs/benchmarks/` are medians on a shared-tenancy VM.
+- **"No syscall" and "no lock" are read from the code, not enforced by a test.**
+  Only the allocation claim has an executor. A test that asserted the other two
+  would be worth having and does not exist.
+- **`PHASE4.md` §1's operational exit criterion is still open**: no node has run
+  this on real hardware for two weeks. Every claim above is a claim about the
+  code, and none of them is that claim.

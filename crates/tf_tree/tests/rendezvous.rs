@@ -4093,7 +4093,10 @@ fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
     // A survivor, attached before the owner dies. It holds a participant byte,
     // which is precisely what turns later joiners away.
     let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
-    assert_eq!(heir.line(), "joined", "the survivor did not attach");
+    assert!(
+        heir.line().starts_with("joined "),
+        "the survivor did not attach"
+    );
 
     owner.kill();
 
@@ -4122,10 +4125,10 @@ fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
     // that never existed — nothing watched the client socket, so no participant
     // ever reached the takeover path even while one was implemented.
     heir.poke();
-    assert_eq!(
-        heir.line(),
-        "true Inherited",
-        "the survivor did not see the hangup, or did not inherit"
+    let report = heir.line();
+    assert!(
+        report.starts_with("true Inherited "),
+        "the survivor did not see the hangup, or did not inherit: {report}"
     );
 
     // And now the thing that could not happen before: a new process joins the
@@ -4146,4 +4149,97 @@ fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
         expected.to_bits(),
         "the inherited arena served different bytes than the dead owner wrote"
     );
+}
+
+/// **Two survivors race for the vacant owner role, and the loser keeps its slot.**
+///
+/// [`0037`](../../docs/decisions/0037-a-takeover-is-not-a-second-open.md)
+/// question 2. There is no arbitration protocol here and there is deliberately
+/// none: both survivors call the same method, the kernel grants byte 0 to
+/// exactly one uncontended `F_OFD_SETLK`, and the other is told so. What makes
+/// that safe is the thing the deleted arm could not do — the lock is taken on
+/// **the file description the session already holds**, so a loser's participant
+/// slot cannot move, because nothing went looking for a byte in the first place.
+///
+/// The old arm's five unsound states were all versions of that going wrong: it
+/// handed back the first *free* byte, or a byte over a free slot, or an
+/// out-of-range one. This test is the assertion those failures would have
+/// tripped: **both survivors report the same slot before and after**, whichever
+/// one won.
+///
+/// **Mutant:** in `Session::take_over_ownership`, return `Ok(true)` on
+/// `LockAttempt::Contended` as well — i.e. let both survivors believe they are
+/// the owner. Applied: the outcome pair becomes `Inherited`/`Inherited` and the
+/// `exactly one` assertion fails, which is the split-brain §3.4 exists to
+/// prevent, reached from the other direction.
+#[test]
+fn two_survivors_race_and_exactly_one_inherits() {
+    use tf_tree::AttachMode;
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-race");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    let mut a = Kid::spawn(&dir.0, &["join-heir"]);
+    let a_joined = a.line();
+    let mut b = Kid::spawn(&dir.0, &["join-heir"]);
+    let b_joined = b.line();
+    let slot_of = |line: &str| line.split_whitespace().nth(1).unwrap_or("?").to_string();
+    let (a_slot, b_slot) = (slot_of(&a_joined), slot_of(&b_joined));
+    assert_ne!(a_slot, b_slot, "two participants were given one slot");
+
+    owner.kill();
+
+    a.poke();
+    b.poke();
+    let (ra, rb) = (a.line(), b.line());
+
+    let outcome = |r: &str| r.split_whitespace().nth(1).unwrap_or("?").to_string();
+    let after = |r: &str| r.split_whitespace().nth(2).unwrap_or("?").to_string();
+    let (oa, ob) = (outcome(&ra), outcome(&rb));
+
+    // Both saw the hangup — the trigger is a kernel fact, not a race.
+    assert!(
+        ra.starts_with("true "),
+        "survivor A missed the hangup: {ra}"
+    );
+    assert!(
+        rb.starts_with("true "),
+        "survivor B missed the hangup: {rb}"
+    );
+
+    // Exactly one inherited. The other is `Contended`, which is not an error:
+    // it means somebody else is mid-bind, and §3.5 says reconnect with backoff.
+    let inherited = [&oa, &ob].iter().filter(|o| ***o == *"Inherited").count();
+    assert_eq!(
+        inherited, 1,
+        "expected exactly one heir, got A={oa} B={ob} (two would be split brain)"
+    );
+    assert_eq!(
+        [&oa, &ob].iter().filter(|o| ***o == *"Contended").count(),
+        1,
+        "the loser must be told it lost, not handed an error: A={oa} B={ob}"
+    );
+
+    // The invariant: neither survivor's slot moved, winner or loser.
+    assert_eq!(
+        after(&ra),
+        a_slot,
+        "survivor A's slot moved: {a_joined} -> {ra}"
+    );
+    assert_eq!(
+        after(&rb),
+        b_slot,
+        "survivor B's slot moved: {b_joined} -> {rb}"
+    );
+
+    // And the arena is joinable again, which is the point of any of it.
+    tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("after a contested inheritance the arena must still be joinable");
 }
