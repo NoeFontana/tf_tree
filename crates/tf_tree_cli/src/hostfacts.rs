@@ -14,10 +14,20 @@
 //!   only the first file reported a host as healthy while `MADV_HUGEPAGE` on the
 //!   arena's `MAP_SHARED` `memfd` was a silent no-op, which is the failure
 //!   `TFT016` exists to catch.
-//! * **`RLIMIT_MEMLOCK`.** Locking the arena is how a hard-real-time consumer
+//! * **`RLIMIT_MEMLOCK`.** Pinning the arena is how a hard-real-time consumer
 //!   keeps a page fault out of its control loop. A limit below the arena size
-//!   means `mlock` will fail, and it fails at the worst possible moment —
-//!   during the first deadline miss, when somebody is trying to work out why.
+//!   means the pinning fails, and it fails at the worst possible moment — during
+//!   the first deadline miss, when somebody is trying to work out why.
+//!
+//!   **`tf_tree` never calls `mlock`, and this row does not imply that it does.**
+//!   `docs/PHASE2.md` §7.4 specifies a `LockPolicy::Locked` that exists nowhere
+//!   in this codebase (§0.0 carries the row), and `docs/API.md` §8.3 records why
+//!   it is not simply missing work: `MLOCK_ONFAULT`, the flag §7.4 names, does
+//!   not prefault, so it adds nothing over §7.1's shipped per-edge
+//!   `MADV_POPULATE_*` — and pinning a whole address space is
+//!   `mlockall(MCL_CURRENT|MCL_FUTURE)` in the *embedding application*, which is
+//!   the only place that can see the `RLIMIT_MEMLOCK` budget it is spending.
+//!   So this is a limit reported **for the consumer to act on**, not for us.
 //!
 //! # Why `/proc/self/limits` rather than `getrlimit`
 //!
