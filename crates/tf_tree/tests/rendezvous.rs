@@ -74,6 +74,14 @@ impl Kid {
     }
 
     /// Wait for a child that is expected to die on its own, and report how.
+    ///
+    /// Only `a_killed_heir_leaves_the_role_for_the_next_survivor` calls this,
+    /// and it is the only test that has a child which dies by itself — every
+    /// other one either parks until [`Kid::kill`] or answers on stdout. Gated on
+    /// the same feature as that test, because without it the crash point is
+    /// compiled out, no child dies, and this becomes dead code that fails
+    /// `just shm-check`'s `--features shm` clippy row.
+    #[cfg(feature = "crash-points")]
     fn wait(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait for the child")
     }
