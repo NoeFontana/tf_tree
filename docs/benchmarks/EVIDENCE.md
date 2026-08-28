@@ -57,6 +57,7 @@ gated; each backs prose that should read as "was measured", not "is".
 | `heap_vs_shared` | heap vs `MAP_SHARED` vs attached RO (51.1/51.3/51.2 ns). **Its stamp is an exact grid hit — see the file header; superseded for the mapping question by `just abi-split`** | tf2.md ×2 |
 | `step_cost` | per-edge fold cost | tf2.md ×2 |
 | `interp_cost` | interpolation policy costs | (uncited) |
+| `interp_accuracy` | what `ScLerp` buys over `LerpSlerp` by publish rate — position only (both SLERP the rotation), chord-vs-arc, lever × θ²/8. **D5's owed measurement.** `just interp-accuracy` | `docs/PROJECT.md` §5 D5 |
 | `adjoint_cost` | adjoint chain cost for derivatives | PHASE4 |
 | `deriv_cost` | `sample_with_derivatives` cost | PHASE4 |
 | `autovec_probe` | SLP/autovectorisation of the fold — `0016`'s amendment | 0016 |

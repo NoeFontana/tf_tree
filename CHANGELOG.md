@@ -112,6 +112,16 @@ is a bug.
 
 ### Added
 
+- **D5's owed measurement, taken at last** — `just interp-accuracy`
+  (`crates/tf_tree_bench/examples/interp_accuracy.rs`). D5 ends *"do not make it
+  the default without a measurement justifying it"*, which was read as a rule
+  about *changing* the default and is also a standing obligation on the default
+  that shipped: `ScLerp` costs more than `LerpSlerp` and nothing had priced what
+  it buys. It buys position and only position — both policies SLERP the rotation,
+  measured at ≤0.06 µrad, which is `f64` noise. The rest is chord-vs-arc: lever
+  arm × θ²/8. At 1 kHz that is 0.001 mm; at 10 Hz, 6.16 mm. The trade points one
+  way, and `docs/PROJECT.md` §5 D5 now carries the table.
+
 - **A control-loop example, which did not exist** —
   `crates/tf_tree/examples/control_loop.rs`, run by `just control-loop`. The
   pitch is "fast enough to sit inside a control loop" and the only worked example

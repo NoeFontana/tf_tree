@@ -476,6 +476,13 @@ no-conflict-markers:
 # which it says in its own output. What it is good for is the *shape*: two
 # queries under one guard, and the staleness of a composed route being set by its
 # slowest edge.
+# **What the default interpolator buys, as a function of publish rate** —
+# `docs/PROJECT.md` §5 D5's owed measurement. Pairs with `just interp-cost`'s
+# three regimes: that one prices the policies, this one prices the difference
+# between their answers. Reports; gates nothing.
+interp-accuracy:
+    cargo run --release -q -p tf_tree_bench --example interp_accuracy
+
 control-loop:
     cargo run --release -q -p tf_tree --features shm --example control_loop
 

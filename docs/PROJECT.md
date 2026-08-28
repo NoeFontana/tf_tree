@@ -96,6 +96,34 @@ Drives: no pointers in the arena, fixed capacity, `#[repr(C)]` everywhere, seqlo
 **D5 — ScLerp is the default interpolator.**
 LERP+SLERP is left-invariant but *not* right-invariant: interpolating `T₀C, T₁C` does not equal `interp(T₀,T₁)·C`. ScLerp is the SE(3) geodesic and is invariant under both. `LerpSlerp` stays available for bit-compatible differential testing against `tf2` and for latency-critical plans. *Do not* remove `LerpSlerp`; *do not* make it the default without a measurement justifying it.
 
+> **The measurement D5 asks for now exists, and it upholds the default**
+> (`just interp-accuracy`, `crates/tf_tree_bench/examples/interp_accuracy.rs`).
+> D5's closing sentence — *"do not make it the default without a measurement
+> justifying it"* — was read for years as a rule about *changing* the default,
+> and it is also a standing obligation on the default that shipped:
+> `ScLerp` costs more than `LerpSlerp` and nothing had priced what it buys.
+>
+> It buys **position**, and only position. Both policies SLERP the rotation, so
+> they cannot disagree about it — measured at ≤0.06 µrad at every rate, which is
+> `f64` noise. The whole difference is that `LerpSlerp` draws a straight line
+> where the truth is a helix, so the error is a chord-vs-arc sagitta: lever arm
+> × θ²/8, where θ is the angle turned between samples. For a sensor 0.5 m off
+> the turn centre on a body at 180 °/s:
+>
+> | publish rate | angle/sample | position error |
+> |---|---|---|
+> | 1 kHz | 3.1 mrad | 0.001 mm |
+> | 100 Hz | 31.4 mrad | 0.062 mm |
+> | 10 Hz | 314 mrad | 6.16 mm |
+>
+> The model predicts 6.17 mm at the last row against 6.156 measured, so the
+> scaling is understood rather than merely observed. **The trade points one
+> way**: at the rates where `LerpSlerp` would save anything, the two answers are
+> identical to well under a micrometre — and `interp_cost` shows both taking the
+> transcendental-free series path there, so the saving is small too. At the rates
+> where the gap is millimetres, it is a map or SLAM edge where nobody is counting
+> nanoseconds. The default stands, and now on evidence.
+
 **D6 — f64 only in v1.**
 A generic `T: RealField` doubles the test matrix and the monomorphized code size for an unmeasured benefit. f32 for short-range high-rate edges may be worth it later; decide with numbers.
 
