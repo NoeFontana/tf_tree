@@ -7,7 +7,9 @@ use pyo3::types::PyAnyMethods;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree};
+use tf_tree::{
+    Capacity, EdgeCfg, ExtrapPolicy, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree,
+};
 
 #[cfg(target_os = "linux")]
 use crate::errors::open_err;
@@ -131,6 +133,33 @@ fn layout_from_str(name: &str) -> PyResult<Layout> {
             "unknown layout {other:?}; expected one of 'mat4' (N, 4, 4) float64, \
              'quat' (N, 7) float64, 'affine32' (N, 12) float32, 'quat_twist' \
              (N, 13) float64"
+        ))),
+    }
+}
+
+/// Parse the `policy` argument of [`PyPlan::at_extrapolating`] into the core's
+/// [`ExtrapPolicy`].
+///
+/// **Strings, not the four integer constants `0038` exported for domains**, and
+/// the two cases are genuinely different. A domain tag is an *open* set — the
+/// trait invites a driver to declare its own from `4` up — so a closed
+/// vocabulary there would have to leave a hole. `ExtrapPolicy` is a closed set
+/// this crate dispatches on, so the vocabulary is complete by construction, and
+/// a string keyword is what this binding already uses for every other closed
+/// choice (`layout=`, `interp=`).
+///
+/// No default and no inference, for `layout_from_str`'s reason one axis over:
+/// the three policies differ in what the answer *is*, not in how it is
+/// written, so an unrecognised spelling is refused rather than guessed at.
+fn extrap_from_str(name: &str) -> PyResult<ExtrapPolicy> {
+    match name {
+        "error" => Ok(ExtrapPolicy::Error),
+        "hold" => Ok(ExtrapPolicy::Hold),
+        "constant_twist" => Ok(ExtrapPolicy::ConstantTwist),
+        other => Err(PyValueError::new_err(format!(
+            "unknown extrapolation policy {other:?}; expected 'error' (refuse, \
+             what at() does), 'hold' (the newest pose) or 'constant_twist' \
+             (extend the screw the two newest samples imply)"
         ))),
     }
 }
@@ -880,6 +909,104 @@ impl PyPlan {
         self.fill(py, stamps, arr, n)
     }
 
+    /// Evaluate past the newest sample under an explicit policy, and get back
+    /// how far past it that was.
+    ///
+    /// `at()` refuses a stamp newer than every published sample on the route,
+    /// which is right for a caller that must not act on invented data and
+    /// wrong for a controller running at 1 kHz against a 100 Hz state
+    /// estimate — that one is *always* asking past the newest sample, and the
+    /// honest answer is a bounded prediction with its bound attached
+    /// (`docs/decisions/0039`).
+    ///
+    /// Returns `(poses, by_ns)`. **There is no spelling that returns the pose
+    /// alone**, which is the whole design rather than an inconvenience: the
+    /// danger in extrapolation is a pose that looks fresh, so the distance
+    /// comes back in the same value and ignoring it takes a deliberate `[0]`.
+    ///
+    /// `policy` is `"error"` (refuse — what `at` does, with a distance
+    /// attached on success), `"hold"` (the newest pose, for a latched or
+    /// displayed value) or `"constant_twist"` (extend the screw the two newest
+    /// samples imply, which is what a controller wants). It is **required**:
+    /// extrapolation is opt-in per query, and a default would make it
+    /// something a caller could get without asking.
+    ///
+    /// `at` is untouched and still refuses. This is a second entry point, not
+    /// a mode on the first.
+    ///
+    /// # `by_ns` is per stamp, and in a batch that means an array
+    ///
+    /// | `stamps` | `poses` | `by_ns` |
+    /// | --- | --- | --- |
+    /// | `int` | `(4, 4)` float64 | `int` |
+    /// | `(N,)` int64 | `(N, 4, 4)` float64 | `(N,)` **int64 array** |
+    ///
+    /// **A scalar `by_ns` for a batch would be wrong, not merely coarse.** The
+    /// distance is `max(0, stamp - newest_common)`, so it is a function of the
+    /// stamp; a batch that straddles the newest sample has interpolated
+    /// elements (`0`) and extrapolated ones in the same call. Collapsing that
+    /// to one number means either a `max`, which marks fresh elements stale,
+    /// or a `min`, which marks stale ones fresh — and the second is exactly
+    /// the failure this surface exists to prevent. The array costs 8 bytes per
+    /// element beside a 128-byte pose, and `by_ns.max()` is the one-liner a
+    /// caller who genuinely wants the scalar writes.
+    ///
+    /// # What it does not carry, and where the breakdown lives
+    ///
+    /// The Rust `Extrapolated` also names the **edge** that ran out of data
+    /// first. That is an `EdgeId`, and this binding has never handed one to
+    /// Python — `crates/tf_tree_py/src/errors.rs` resolves every id to
+    /// `edge "parent" -> "child"` before a caller sees it, and doing that
+    /// resolution per query would be an arena walk on the path this method
+    /// exists for. `Plan.edges()` is the route's dynamic edges and
+    /// `tf_tree doctor` is the per-edge breakdown; `0039` points at the same
+    /// two for the same reason.
+    ///
+    /// Only the default `mat4` layout. The Rust method this mirrors returns
+    /// one pose type, and the `layout=` dispatch belongs to the batch fold,
+    /// which carries no policy.
+    ///
+    /// # Cost
+    ///
+    /// The batch is a loop over the scalar form under one `Guard`, not the
+    /// engine's batch fold: `Plan::at_many_into` passes `ExtrapPolicy::Error`
+    /// and `0039` §4 deliberately did not thread a runtime policy through it,
+    /// because that would leave the match live on `at`'s hot path. So this
+    /// pays an `O(log n)` bracket search per stamp per step rather than riding
+    /// the monotone cursor, plus one `newest_stamp` load per dynamic edge per
+    /// stamp for the distance.
+    #[pyo3(signature = (stamps, policy, /))]
+    fn at_extrapolating<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyAny>,
+        policy: &str,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let policy = extrap_from_str(policy)?;
+        // `at`'s dispatch, to the letter: `PyInt` first because a failed
+        // `cast::<PyArray1<i64>>` builds and throws away a `DowncastError`, and
+        // the array cast is *fallen through* rather than `else`-d so a `float`
+        // still meets `stamp_from_any`'s `TypeError` with the 238 ns ULP in it
+        // (§3) instead of a complaint about array dtypes.
+        if !stamps.is_instance_of::<pyo3::types::PyInt>() {
+            if let Ok(arr) = stamps.cast::<PyArray1<i64>>() {
+                return self.extrapolate_batch(py, arr, policy);
+            }
+        }
+        let stamp = stamp_from_any(stamps)?;
+        let g = self.tree().guard();
+        let x = self
+            .plan
+            .at_extrapolating_tagged(&g, stamp, self.domain, policy)
+            .map_err(|e| lookup_err(self.tree(), e))?;
+        let out = PyArray2::<f64>::zeros(py, [4, 4], false);
+        // SAFETY: freshly allocated by us, so nothing else holds a reference and
+        // the slice is exactly 16 contiguous f64.
+        let slice = unsafe { out.as_slice_mut()? };
+        tf_tree::write_mat4(&x.pose, slice);
+        Ok((out.into_any(), x.by_ns.into_pyobject(py)?.into_any()))
+    }
+
     /// The most recent transform on this path.
     fn latest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let g = self.tree().guard();
@@ -1054,6 +1181,71 @@ impl PyPlan {
             run()
         };
         res.map_err(|e| lookup_err(tree, e))
+    }
+
+    /// [`PyPlan::at_extrapolating`]'s array half: `(N, 4, 4)` poses and `(N,)`
+    /// distances, allocated here and filled together.
+    ///
+    /// Both arrays are ours until this returns, so a failure part-way through
+    /// drops them and the caller sees only the exception — the partial-write
+    /// question `at_into` has to answer does not arise, because there is no
+    /// caller buffer to half-fill.
+    fn extrapolate_batch<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyArray1<i64>>,
+        policy: ExtrapPolicy,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        if !stamps.is_c_contiguous() {
+            return Err(BufferError::new_err(
+                "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                 explicitly if you meant to copy",
+            ));
+        }
+        let n = stamps.len();
+        let poses = PyArray3::<f64>::zeros(py, [n, 4, 4], false);
+        let dist = PyArray1::<i64>::zeros(py, [n], false);
+        {
+            // SAFETY: `stamps` was checked C-contiguous above; `poses` and
+            // `dist` were just allocated here, so nothing else holds a
+            // reference to either and both are contiguous by construction. The
+            // borrows are held across the `detach` below for §6.2's reason —
+            // NumPy refuses to resize an array while a buffer is exported.
+            let (src, pd, dd) = unsafe {
+                (
+                    stamps.as_slice()?,
+                    poses.as_slice_mut()?,
+                    dist.as_slice_mut()?,
+                )
+            };
+            let plan = *self.plan;
+            let tree = self.tree();
+            // Read out beside `plan` and `tree` rather than through `self`
+            // inside the closure: `detach`'s body must touch no Python object
+            // at all (§6.2).
+            let domain = self.domain;
+            let mut run = move || -> Result<(), tf_tree::LookupError> {
+                let g = tree.guard();
+                for (i, &t) in src.iter().enumerate() {
+                    let x = plan.at_extrapolating_tagged(&g, t, domain, policy)?;
+                    tf_tree::write_mat4(&x.pose, &mut pd[i * 16..(i + 1) * 16]);
+                    dd[i] = x.by_ns;
+                }
+                Ok(())
+            };
+            // The same threshold `at` uses. It under-counts this path — a
+            // distance costs one `newest_stamp` load per dynamic edge per
+            // stamp on top of the fold — so it errs towards releasing the GIL
+            // for work that is longer than it estimated, which is the harmless
+            // direction.
+            let res = if release_the_gil(n, self.plan.len()) {
+                py.detach(run)
+            } else {
+                run()
+            };
+            res.map_err(|e| lookup_err(tree, e))?;
+        }
+        Ok((poses.into_any(), dist.into_any()))
     }
 
     /// [`PyPlan::at`]'s `layout=` path: allocate the right shape and fill it.

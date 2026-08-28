@@ -68,6 +68,15 @@ float64 as `[qw qx qy qz tx ty tz]`; `"affine32"` is `(12,)` / `(N, 12)`
 float64, `"quat"` with the body twist `[wx wy wz vx vy vz]` appended.
 """
 
+ExtrapPolicy = Literal["error", "hold", "constant_twist"]
+"""What `Plan.at_extrapolating` does past the newest published sample.
+
+`"error"` refuses (what `at` does); `"hold"` returns the newest pose; and
+`"constant_twist"` extends the screw the two newest samples imply. A closed
+set, unlike the domain tags: this one is dispatched on inside the engine rather
+than declared by a driver, so a string vocabulary is complete by construction.
+"""
+
 class Plan:
     """A compiled lookup path. Build with `Tree.plan`."""
 
@@ -195,6 +204,54 @@ class Plan:
         Returns `(stamps, poses)` of shapes `(K,)` and `(K, 4, 4)`, strictly
         increasing. LERP between adjacent knots on whatever device they live
         on; the reconstruction error is bounded by construction.
+        """
+
+    @overload
+    def at_extrapolating(
+        self, stamps: int, policy: ExtrapPolicy, /
+    ) -> tuple[NDArray[np.float64], int]:
+        """One stamp in; `((4, 4)` float64, `by_ns` as an `int)` out."""
+
+    @overload
+    def at_extrapolating(
+        self, stamps: NDArray[np.int64], policy: ExtrapPolicy, /
+    ) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
+        """`(N,)` stamps in; `((N, 4, 4)` float64, `(N,)` int64) out.
+
+        `by_ns` is an **array**, one distance per stamp. The distance is
+        `max(0, stamp - newest_common)`, so a batch straddling the newest
+        sample has interpolated elements (`0`) and extrapolated ones in the
+        same call; a scalar would be a `max` that marks fresh elements stale or
+        a `min` that marks stale ones fresh.
+        """
+
+    @overload
+    def at_extrapolating(
+        self, stamps: int | NDArray[np.int64], policy: ExtrapPolicy, /
+    ) -> tuple[NDArray[np.float64], int | NDArray[np.int64]]:
+        """Evaluate past the newest sample, and learn how far past that was.
+
+        `at` refuses a stamp newer than every published sample. A controller
+        running faster than its state estimate is always asking for one, and
+        the honest answer is a bounded prediction with its bound attached.
+
+        Returns `(poses, by_ns)`, and **there is no spelling that returns the
+        pose alone**: the danger in extrapolation is a pose that looks fresh,
+        so ignoring the distance takes a deliberate `[0]`.
+
+        `policy` is required — extrapolation is opt-in per query. `"error"` is
+        what `at` does, with the distance attached on success; `"hold"` is the
+        newest pose, for a latched or displayed value; `"constant_twist"`
+        extends the screw the two newest samples imply, which is what a control
+        loop wants. Raises `ExtrapolationError` under `"error"`.
+
+        `mat4` only, and the edge that ran out of data is not carried — this
+        binding resolves edge ids to names before a caller sees them, and doing
+        that per query would be an arena walk on this path. `Plan.edges()` and
+        `tf_tree doctor` are where the per-edge breakdown lives.
+
+        The batch is a loop over the scalar form under one guard, not the
+        engine's batch fold, which carries no policy.
         """
 
     def latest(self) -> NDArray[np.float64]:

@@ -604,6 +604,34 @@ struct layout_of<Mat4Row> {
 static_assert(sizeof(Mat4Row) == 128, "Mat4Row must be tightly packed");
 
 // ---------------------------------------------------------------------------
+// Extrapolation — docs/decisions/0039
+// ---------------------------------------------------------------------------
+
+/// A pose, and how far past the route's newest common sample it was
+/// extrapolated.
+///
+/// `Plan::at_extrapolating` returns this and there is **no member that yields
+/// the pose alone**, which is the same shape the Rust `Extrapolated` has and
+/// for the same reason: the danger in extrapolation is a pose that looks
+/// fresh, so the distance is handed over in the same value. Reading the pose
+/// without the distance takes a deliberate `.pose`, not a forgotten check.
+///
+/// C++ can hold the property that C can only ask for. The C entry point takes
+/// `tft_extrapolated *info` and refuses NULL; here the two arrive together
+/// because they are one object, so there is nothing to forget to pass.
+template <typename T>
+struct Extrapolated {
+    /// The pose, in whatever layout `T` selects.
+    T pose;
+    /// Nanoseconds past the newest stamp every dynamic edge on the route has
+    /// data for. `0` means the answer was interpolated, not invented.
+    std::int64_t by_ns;
+    /// The edge that ran out of data first, or `TFT_INVALID_ID` when `by_ns`
+    /// is `0`. See `tft_extrapolated::edge` for why the sentinel is there.
+    std::uint32_t edge;
+};
+
+// ---------------------------------------------------------------------------
 // Eigen interop — §4.2
 // ---------------------------------------------------------------------------
 
@@ -866,6 +894,58 @@ public:
         if (s != TFT_OK) {
             TF_TREE_FAIL_INTO(out, s);
         }
+        return out;
+    }
+
+    /// Evaluate at `stamp` under `policy`, and learn how far that went past
+    /// the newest sample.
+    ///
+    /// `at()` refuses a stamp newer than every published sample, which is
+    /// right for a caller that must not act on invented data and wrong for a
+    /// controller running at 1 kHz against a 100 Hz state estimate — that one
+    /// is *always* asking past the newest sample, and the honest answer is a
+    /// bounded prediction with its bound attached (`docs/decisions/0039`).
+    ///
+    /// `TFT_EXTRAP_CONSTANT_TWIST` is what a controller wants and
+    /// `TFT_EXTRAP_HOLD` what a latched or displayed value wants;
+    /// `TFT_EXTRAP_ERROR` is `at()`'s refusal with a distance attached on
+    /// success. **All three report identically**, which is the point: the
+    /// returned `Extrapolated<T>` has no member yielding the pose alone, so a
+    /// held pose cannot pass for a fresh one by omission.
+    ///
+    /// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` — that is, `T = Quat7Twist6` — is
+    /// refused with `TFT_ERR_BAD_ENUM`: the engine has no extrapolating form
+    /// of `at_with_derivatives`, and emitting a twist under one policy beside
+    /// a pose under another would put two different answers in one row.
+    template <typename T>
+    result<Extrapolated<T>> at_extrapolating(std::int64_t stamp,
+                                             tft_extrap_policy policy) const
+    {
+        static_assert(raw_writable<T>::value,
+                      "T cannot receive a raw layout write; specialise tf_tree::raw_writable<T> "
+                      "if its storage really is a plain scalar array at offset 0");
+        static_assert(sizeof(T) >= payload_bytes(layout_of<T>::value),
+                      "T is smaller than the layout it selects, so the write would overrun it");
+        // `at()`'s NRVO discipline, unchanged: this local IS the return slot,
+        // every `return` names it, and the C ABI writes the pose once into the
+        // caller's storage. See `at` and `value_ptr`.
+        result<Extrapolated<T>> out = make_result<Extrapolated<T>>();
+        tft_extrapolated info;
+        info.struct_size = sizeof(info);
+        const tft_status s =
+            tft_plan_at_extrapolating(h_.get(), stamp, policy, layout_of<T>::value,
+                                      &value_ptr(out)->pose, &info);
+        if (s != TFT_OK) {
+            TF_TREE_FAIL_INTO(out, s);
+        }
+        // Two scalar stores, not a branch: §4.1's "no logic in the wrapper"
+        // rule is about decisions this header could get wrong, and there is
+        // none here. The alternative — embedding `tft_extrapolated` in
+        // `Extrapolated<T>` and pointing the ABI at it — saves twelve bytes of
+        // copy and costs every caller a `.info.` in the middle of the field
+        // name they actually want.
+        value_ptr(out)->by_ns = info.by_ns;
+        value_ptr(out)->edge = info.edge;
         return out;
     }
 

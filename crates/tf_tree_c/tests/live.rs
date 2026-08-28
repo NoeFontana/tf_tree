@@ -1456,3 +1456,334 @@ fn the_default_domain_is_what_tft_plan_create_always_meant() {
     }
     assert_eq!(a, b, "the two spellings are one entry point");
 }
+
+// ---------------------------------------------------------------------------
+// Extrapolation — `docs/decisions/0039`
+// ---------------------------------------------------------------------------
+
+/// The fixture's newest sample: `tft_test_domain_tree_create` pushes 32 samples
+/// 10 ms apart starting at zero, so `map -> odom` has data over `0..=310 ms`.
+const NEWEST_NS: i64 = 310_000_000;
+/// A stamp past the newest sample by a round 90 ms — the case a control loop
+/// running faster than its state estimate is in on every tick.
+const PAST_NS: i64 = 400_000_000;
+
+/// A blank [`tft_extrapolated`] with `struct_size` set, as a C caller writes it.
+fn extrap_out() -> tft_extrapolated {
+    // SAFETY: `tft_extrapolated` is a POD of three integers with no niche and
+    // no validity invariant, so an all-zero bit pattern is a valid value of it.
+    let mut e: tft_extrapolated = unsafe { core::mem::zeroed() };
+    e.struct_size = core::mem::size_of::<tft_extrapolated>() as u32;
+    e
+}
+
+/// Evaluate `plan` at `stamp` under `policy` into `MAT4_ROW`.
+fn at_extrapolating(
+    plan: *const tft_plan,
+    stamp: i64,
+    policy: tft_extrap_policy,
+) -> (tft_status, [u8; 128], tft_extrapolated) {
+    let mut out = [0u8; 128];
+    let mut info = extrap_out();
+    // SAFETY: live plan; `out` is 128 bytes, MAT4_ROW's exact payload; `info`
+    // is a live local with `struct_size` set.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan,
+            stamp,
+            policy,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+            &mut info,
+        )
+    };
+    (rc, out, info)
+}
+
+/// **All three policies, and the third assertion is what earns the test.**
+///
+/// `docs/decisions/0039` step 3 asks for exactly this shape: a query past the
+/// newest sample is `Err(Extrapolation)` under `Error`, the newest pose with a
+/// positive `by_ns` under `Hold`, and a *different* pose with the same `by_ns`
+/// under `ConstantTwist`. Without the last one a binding that ignored its
+/// `policy` argument and always held would pass every other assertion here.
+///
+/// The route is `map <- sensor`, which folds the fixture's static
+/// `odom -> sensor` on top of its dynamic `map -> odom`: a static step
+/// contributes no sample and must therefore contribute nothing to `by_ns`
+/// either, which is what makes the 90 ms below the *dynamic* edge's distance
+/// rather than a number that happens to be right.
+///
+/// Mutant: make this entry point pass `ExtrapPolicy::Hold` whatever it was
+/// given ⇒ `the two policies must differ ...` fails, and so does the `Error`
+/// arm. Run, not reasoned about.
+#[test]
+fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    // `Error` refuses, and writes neither buffer. This is `tft_plan_at`'s
+    // behaviour with a distance attached on success and nothing changed on
+    // failure.
+    let (rc, out, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_ERROR);
+    assert_eq!(
+        rc, TFT_ERR_EXTRAPOLATION,
+        "Error refuses a stamp past newest"
+    );
+    assert_eq!(out, [0u8; 128], "a refused call writes no pose");
+    assert_eq!(info.by_ns, 0, "and no distance");
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_EXTRAPOLATION);
+    assert_eq!(
+        e.newest, NEWEST_NS,
+        "the detail names the window that ended"
+    );
+
+    // `Hold` answers with the newest pose. Compared against `tft_plan_at` at
+    // the newest stamp rather than against a hand-written matrix: "held" means
+    // "the pose the plan gives at `newest`", and asserting it against the
+    // engine's own answer there is what makes that a definition rather than a
+    // second implementation of it.
+    let (rc, held, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_HOLD);
+    assert_eq!(rc, TFT_OK, "Hold answers past the newest sample");
+    assert_eq!(
+        info.by_ns,
+        PAST_NS - NEWEST_NS,
+        "the distance is measured from the newest common stamp"
+    );
+    assert_ne!(
+        info.edge, TFT_INVALID_ID,
+        "an extrapolated answer names the edge that ran out of data"
+    );
+    let mut newest = [0u8; 128];
+    // SAFETY: live plan; `newest` is MAT4_ROW's exact payload.
+    let rc = unsafe {
+        tft_plan_at(
+            plan.0,
+            NEWEST_NS,
+            TFT_LAYOUT_MAT4_ROW,
+            newest.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(rc, TFT_OK);
+    assert_eq!(held, newest, "Hold is the pose at the newest sample");
+
+    // `ConstantTwist` extends the screw the two newest samples imply, so it is
+    // *not* the held pose — and it is measured at the same stamp, so the two
+    // differ in the policy and in nothing else.
+    let (rc, twisted, twist_info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_CONSTANT_TWIST);
+    assert_eq!(rc, TFT_OK, "ConstantTwist answers past the newest sample");
+    assert_eq!(
+        twist_info.by_ns, info.by_ns,
+        "the distance is a property of the arena, not of the policy"
+    );
+    assert_eq!(twist_info.edge, info.edge, "and so is the edge it names");
+    assert_ne!(
+        twisted, held,
+        "the two policies must differ, or the argument is being ignored"
+    );
+    // Still a rigid transform, not a corrupted one: bottom row [0 0 0 1].
+    assert_eq!(read_f64(&twisted, 12), 0.0);
+    assert_eq!(read_f64(&twisted, 13), 0.0);
+    assert_eq!(read_f64(&twisted, 14), 0.0);
+    assert_eq!(read_f64(&twisted, 15), 1.0);
+    // It kept going the way the samples were going: the fixture's translation
+    // grows monotonically with the stamp, so extending the screw past the last
+    // sample must land further along than holding it does.
+    assert!(
+        read_f64(&twisted, 3) > read_f64(&held, 3),
+        "ConstantTwist did not extend the motion: {} against {}",
+        read_f64(&twisted, 3),
+        read_f64(&held, 3)
+    );
+}
+
+/// **`by_ns == 0` is the interpolated case, and it is reported as one.**
+///
+/// A stamp inside every edge's window is not extrapolation whatever policy was
+/// asked for, so the three policies must agree there and the distance must be
+/// zero. This is the half of the surface that says "the answer you got is
+/// fresh" — without it, a caller could not tell an extrapolating call that did
+/// not need to extrapolate from one that did.
+///
+/// The `edge` sentinel is the C side's sharpening of the Rust value it mirrors:
+/// `Extrapolated::edge` is documented *meaningless when `by_ns == 0`*, and a
+/// plausible edge id for an answer nothing invented is exactly the kind of
+/// meaningless a diagnostic gets logged as fact. `TFT_INVALID_ID` is what the
+/// rest of this header already means by "does not apply".
+///
+/// Mutant: pass `x.edge.get()` through unconditionally ⇒ `an interpolated
+/// answer has no stale edge to name` fails with `edge` = the fixture's dynamic
+/// edge id.
+#[test]
+fn an_in_window_stamp_reports_no_extrapolation_under_any_policy() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    let mut plain = [0u8; 128];
+    // SAFETY: live plan; `plain` is MAT4_ROW's exact payload.
+    let rc = unsafe {
+        tft_plan_at(
+            plan.0,
+            150_000_000,
+            TFT_LAYOUT_MAT4_ROW,
+            plain.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(rc, TFT_OK);
+
+    for policy in [TFT_EXTRAP_ERROR, TFT_EXTRAP_HOLD, TFT_EXTRAP_CONSTANT_TWIST] {
+        let (rc, out, info) = at_extrapolating(plan.0, 150_000_000, policy);
+        assert_eq!(rc, TFT_OK, "policy {policy} inside the window");
+        assert_eq!(
+            out, plain,
+            "policy {policy} must not change an interpolated answer"
+        );
+        assert_eq!(info.by_ns, 0, "policy {policy} extrapolated nothing");
+        assert_eq!(
+            info.edge, TFT_INVALID_ID,
+            "an interpolated answer has no stale edge to name"
+        );
+    }
+}
+
+/// **The distance is not optional, and that is the whole design.**
+///
+/// `docs/decisions/0039` §1: the Rust return type has no accessor yielding the
+/// pose alone. C cannot enforce that in the type system, so the closest honest
+/// analogue is a required out-parameter — there is no second spelling of this
+/// call without it, and NULL is refused before anything is evaluated.
+///
+/// Mutant: treat a NULL `info` as "the caller does not want it" and skip the
+/// write ⇒ the first assertion fails with `TFT_OK`, and the property the whole
+/// surface exists for is gone.
+#[test]
+fn the_extrapolation_distance_cannot_be_declined() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+    let mut out = [0u8; 128];
+
+    // SAFETY: live plan and a valid `out`; `info` is deliberately NULL, which
+    // is the case under test.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan.0,
+            PAST_NS,
+            TFT_EXTRAP_HOLD,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, TFT_ERR_NULL_ARG, "there is no pose-only spelling");
+    assert_eq!(
+        out, [0u8; 128],
+        "and nothing was written on the way to saying so"
+    );
+
+    // A caller that forgot `struct_size` is refused rather than served: §3.6's
+    // append mechanism only works if the size is checked, and this is the
+    // check `tft_error` already makes.
+    let mut info = extrap_out();
+    info.struct_size = 4;
+    // SAFETY: live plan, valid `out`, live `info` — with a deliberately wrong
+    // `struct_size`, which is the case under test.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan.0,
+            PAST_NS,
+            TFT_EXTRAP_HOLD,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+            &mut info,
+        )
+    };
+    assert_eq!(rc, TFT_ERR_BAD_STRUCT_SIZE);
+    assert_eq!(
+        out, [0u8; 128],
+        "nothing is written for a struct we cannot fill"
+    );
+}
+
+/// **Two enum arguments, two refusals, and neither is a silent fallback.**
+///
+/// A policy discriminant this build does not define is `TFT_ERR_BAD_ENUM`
+/// rather than a quiet `TFT_EXTRAP_ERROR`: the policies differ in what the
+/// answer *is*, so serving a different one than the caller named is a wrong
+/// pose, not a wrong format.
+///
+/// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is refused for a different reason — it is a
+/// layout this build defines and this entry point does not take, exactly as
+/// `tft_publisher_push` refuses the write-only `AFFINE12_ROW_F32`. The engine
+/// has no extrapolating `at_with_derivatives`, and emitting a twist under
+/// `Error` beside a pose under the caller's policy would put two answers in
+/// one thirteen-`f64` row.
+#[test]
+fn an_unknown_policy_and_the_twist_layout_are_both_refused() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    let (rc, out, _) = at_extrapolating(plan.0, PAST_NS, 3);
+    assert_eq!(rc, TFT_ERR_BAD_ENUM, "an undefined policy is not Error");
+    assert_eq!(out, [0u8; 128]);
+
+    let mut row = [0u8; 104];
+    let mut info = extrap_out();
+    // SAFETY: live plan; `row` is the twist layout's exact payload; `info` is a
+    // live local with `struct_size` set.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan.0,
+            PAST_NS,
+            TFT_EXTRAP_HOLD,
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            row.as_mut_ptr().cast(),
+            &mut info,
+        )
+    };
+    assert_eq!(rc, TFT_ERR_BAD_ENUM, "there is no extrapolating twist");
+    assert_eq!(row, [0u8; 104], "and nothing was written");
+    let e = fetch_error();
+    let msg = String::from_utf8_lossy(
+        &e.message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+    assert!(
+        msg.contains("TWIST6"),
+        "the message says which layout, not just 'an enum': {msg}"
+    );
+}
+
+/// **The handle's time domain reaches this entry point too.**
+///
+/// `docs/decisions/0038` put the tag on the plan handle and routed the three
+/// evaluate entry points through the tagged core methods. A fourth evaluate
+/// entry point that reconstructed `SystemDomain` would be that defect again,
+/// one call over, and it would be invisible on every tag-0 arena.
+///
+/// Mutant: call `at_extrapolating` (the typed form, hard-coding
+/// `SystemDomain::TAG`) instead of `at_extrapolating_tagged` ⇒ `TFT_ERR_TIME_DOMAIN`
+/// here.
+#[test]
+fn extrapolating_carries_the_plans_time_domain() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "odom", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    let (rc, _, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_CONSTANT_TWIST);
+    assert_eq!(rc, TFT_OK, "a tag-1 plan extrapolates in domain 1");
+    assert_eq!(info.by_ns, PAST_NS - NEWEST_NS);
+}

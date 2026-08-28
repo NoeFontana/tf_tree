@@ -754,6 +754,69 @@ static void check_domain()
 }
 
 // ---------------------------------------------------------------------------
+// Extrapolation — docs/decisions/0039
+// ---------------------------------------------------------------------------
+
+/// `Plan::at_extrapolating` hands back the pose and the distance as one value.
+///
+/// The property the record is for survives into C++ better than into C: there
+/// is no member of `Extrapolated<T>` that yields the pose alone, so a caller
+/// who wanted only the pose has to write `.pose` and see the sibling field
+/// beside it. The C entry point can only *ask* for somewhere to put the
+/// distance; this holds the two together.
+///
+/// The third comparison is what earns the check. `Error` refusing and `Hold`
+/// answering would both pass against a wrapper that ignored its policy
+/// argument and always held; only `ConstantTwist != Hold` at the same stamp
+/// says the argument reached the engine.
+static void check_extrapolation()
+{
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_domain_tree_create(1, &raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+
+    auto plan_r = tree.plan_in_domain("map", "sensor", 1);
+    CHECK_R(plan_r, "plan_in_domain map <- sensor");
+    tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
+
+    // The fixture publishes 32 samples 10 ms apart, so 310 ms is the newest and
+    // 400 ms is 90 ms past it.
+    auto hold_r = plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_HOLD);
+    CHECK_R(hold_r, "Hold answers past the newest sample");
+    const tf_tree::Extrapolated<tf_tree::Quat7> hold = VALUE_OF(hold_r);
+    CHECK(hold.by_ns == 90000000, "the distance comes back with the pose");
+    CHECK(hold.edge != TFT_INVALID_ID, "and names the edge that ran out of data");
+
+    auto twist_r =
+        plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_CONSTANT_TWIST);
+    CHECK_R(twist_r, "ConstantTwist answers past the newest sample");
+    const tf_tree::Extrapolated<tf_tree::Quat7> twist = VALUE_OF(twist_r);
+    CHECK(twist.by_ns == hold.by_ns, "the distance does not depend on the policy");
+    CHECK(twist.pose.tx != hold.pose.tx,
+          "ConstantTwist must differ from Hold, or the policy is being ignored");
+
+    // Inside the window the answer is interpolated, and says so.
+    auto near_r = plan.at_extrapolating<tf_tree::Quat7>(150000000, TFT_EXTRAP_HOLD);
+    CHECK_R(near_r, "an in-window stamp answers under any policy");
+    CHECK(VALUE_OF(near_r).by_ns == 0, "and reports that nothing was invented");
+
+#ifdef TF_TREE_NO_EXCEPTIONS
+    auto refused = plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_ERROR);
+    CHECK(!refused, "TFT_EXTRAP_ERROR refuses, exactly as at() does");
+    CHECK(refused.error().code() == TFT_ERR_EXTRAPOLATION, "and says which refusal");
+#else
+    bool threw = false;
+    try {
+        (void)plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_ERROR);
+    } catch (const tf_tree::Error& e) {
+        threw = true;
+        CHECK(e.code() == TFT_ERR_EXTRAPOLATION, "and says which refusal");
+    }
+    CHECK(threw, "TFT_EXTRAP_ERROR refuses, exactly as at() does");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Publishing
 // ---------------------------------------------------------------------------
 
@@ -873,6 +936,7 @@ int main()
 #endif
     check_read_path();
     check_domain();
+    check_extrapolation();
 #if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
     check_at_writes_into_the_returned_object();
 #endif

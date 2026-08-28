@@ -257,7 +257,8 @@ def test_a_tag_one_arena_answers_a_tag_one_query(tag1):
     "carried the handle's tag" from "hard-coded 0", because
     `check_domain_tag` compares 0 against 0 in every other case.
     """
-    assert tag1.plan("odom", "map", domain=tf_tree.SENSOR_DOMAIN).at(75_000_000) is not None
+    odom_from_map = tag1.plan("odom", "map", domain=tf_tree.SENSOR_DOMAIN)
+    assert odom_from_map.at(75_000_000) is not None
 
     # And the refusal, on the same arena: tag 0 is now the wrong answer, which
     # is the state `ros/tf_tree_ros` warns an operator they are creating.
@@ -282,33 +283,35 @@ def test_every_query_shape_carries_the_tag_on_a_tag_one_arena(tag1):
     p = tag1.plan("lidar", "map", domain=tf_tree.SENSOR_DOMAIN)
     stamps = np.array([50_000_000, 75_000_000, 100_000_000], dtype=np.int64)
 
-    scalar = p.at(75_000_000)                      # at_tagged
+    scalar = p.at(75_000_000)  # at_tagged
     assert scalar.shape == (4, 4)
     assert np.isfinite(scalar).all()
 
-    batch = p.at(stamps)                           # at_many_into_tagged
+    batch = p.at(stamps)  # at_many_into_tagged
     assert batch.shape == (3, 4, 4)
     assert np.isfinite(batch).all()
 
     out = np.zeros((4, 4))
-    p.at_into(75_000_000, out)                     # at_tagged, caller buffer
+    p.at_into(75_000_000, out)  # at_tagged, caller buffer
     assert np.array_equal(out, scalar)
 
     into = np.zeros((3, 4, 4))
-    p.at_into(stamps, into)                        # at_many_into_tagged
+    p.at_into(stamps, into)  # at_many_into_tagged
     assert np.array_equal(into, batch)
 
-    quat = p.at(75_000_000, layout="quat")         # the f64 layout path
+    quat = p.at(75_000_000, layout="quat")  # the f64 layout path
     assert quat.shape == (7,)
 
-    aff = p.at(stamps, layout="affine32")          # at_many_into_f32_tagged
+    aff = p.at(stamps, layout="affine32")  # at_many_into_f32_tagged
     assert aff.dtype == np.float32
 
-    knots, poses = p.adaptive(50_000_000, 100_000_000)   # at_adaptive_tagged
+    knots, poses = p.adaptive(50_000_000, 100_000_000)  # at_adaptive_tagged
     assert len(knots) == len(poses) >= 2
 
     # The convenience tier takes the same tag, per call rather than per plan.
-    assert tag1.lookup("odom", "map", 75_000_000, domain=tf_tree.SENSOR_DOMAIN) is not None
+    assert (
+        tag1.lookup("odom", "map", 75_000_000, domain=tf_tree.SENSOR_DOMAIN) is not None
+    )
 
 
 def test_a_composed_route_is_not_the_identity(tag1):

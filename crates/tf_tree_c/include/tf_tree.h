@@ -125,8 +125,29 @@ typedef struct tft_publisher tft_publisher;
  * program that got an answer before stops getting one — there was no such
  * program, which is the defect `0038` exists to fix — and the alternative
  * (leaving the check to the hot loop) throws away the frame names.
+ *
+ * `6` → `7`: one appended entry point, [`tft_plan_at_extrapolating`], with
+ * the two values it needs — [`tft_extrap_policy`] and [`tft_extrapolated`]
+ * (`docs/decisions/0039`). A new *symbol*, so `3` → `4`'s argument applies
+ * unchanged: the minor is what a caller compares to find out whether the
+ * symbols its header declares are present in the library it linked, and
+ * without the bump a caller compiled against this header links a `0.6`
+ * library, passes [`tft_check_abi`], and then fails at the loader.
+ *
+ * **No existing declaration moves, and no status code is added.** The
+ * refusal a caller can now ask *not* to receive, [`TFT_ERR_EXTRAPOLATION`],
+ * has been in this header since 1.0 — which is what keeps this bump smaller
+ * than `4` → `5`'s: there is no code an older caller could be handed and
+ * could not name. [`tft_plan_at`] keeps its signature and its meaning; it
+ * refuses, as it always has, and this function with [`TFT_EXTRAP_ERROR`] is
+ * that same refusal with a distance attached on success.
+ *
+ * **A `0.6` caller can observe nothing at all.** Unlike `5` → `6`, which
+ * moved a refusal earlier on arenas that were already failing, nothing here
+ * changes the behaviour of any call that existed before: the new policy is
+ * reachable only through a symbol an older caller cannot name.
  */
-#define TFT_ABI_VERSION_MINOR 6
+#define TFT_ABI_VERSION_MINOR 7
 
 /**
  * Sentinel for an id field that does not apply to this error.
@@ -147,6 +168,70 @@ typedef int32_t tft_status;
  * How to write a transform into caller memory.
  */
 typedef uint32_t tft_layout;
+
+/**
+ * What to do when the requested stamp is newer than every published sample on
+ * the route.
+ *
+ * A `uint32_t` typedef with named constants rather than a C `enum`, matching
+ * [`tft_layout`] exactly — §3.6 needs the width of every ABI value stated, and
+ * a C `enum`'s underlying type is the implementation's business. Every entry
+ * point that takes one **rejects a discriminant it does not define** with
+ * [`TFT_ERR_BAD_ENUM`], for [`layout::payload_bytes`]'s reason: an unknown
+ * policy from a newer header must be an error, never a silent fallback to the
+ * one this build happens to think is safest.
+ */
+typedef uint32_t tft_extrap_policy;
+
+/**
+ * How far past the route's newest common sample an answer was extrapolated.
+ *
+ * **The caller has to pass one of these to get a pose at all**, and that is
+ * the whole design rather than an out-parameter that happened to be
+ * convenient (`docs/decisions/0039` §1). In Rust the property is a type with
+ * no pose-only accessor; C has no such enforcement, so the closest honest
+ * analogue is a *required* out-parameter — [`tft_plan_at_extrapolating`]
+ * returns [`TFT_ERR_NULL_ARG`] when `info` is NULL and writes nothing. There
+ * is deliberately no second spelling of that call without this argument, so
+ * "forgot to check the staleness" is not reachable by omission; it takes a
+ * caller who read `by_ns` and ignored it.
+ *
+ * `struct_size` is §3.6's append mechanism, and it is checked exactly as
+ * [`tft_error`]'s is: set it to `sizeof(tft_extrapolated)` before the call or
+ * the call returns [`TFT_ERR_BAD_STRUCT_SIZE`]. It is written back on success,
+ * so the struct a caller passes twice needs setting once per *object*, not
+ * once per call.
+ */
+typedef struct {
+  /**
+   * `sizeof(tft_extrapolated)` at the time this build was compiled — §3.6.
+   */
+  uint32_t struct_size;
+  /**
+   * Nanoseconds past the newest stamp that **every** dynamic edge on this
+   * plan has data for.
+   *
+   * `0` means every edge bracketed the query: the answer was interpolated
+   * between published samples, not invented past them, and the policy did
+   * not come into it. A positive value is the worst case over the route,
+   * because the edge that runs out of data first is what bounds how invented
+   * a composed answer is (`docs/decisions/0039` §3).
+   */
+  int64_t by_ns;
+  /**
+   * The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query,
+   * or [`TFT_INVALID_ID`] when `by_ns` is `0`.
+   *
+   * **The sentinel is this side's, and it is deliberately sharper than the
+   * Rust value it mirrors.** `tf_tree::Extrapolated::edge` carries a real
+   * `EdgeId` documented as *meaningless when `by_ns == 0`*; a C caller
+   * handed `0` there would be looking at a plausible edge id for an answer
+   * that was never extrapolated. [`TFT_INVALID_ID`] is what the rest of this
+   * header already means by "this field does not apply" ([`tft_error`]), so
+   * the sentence is checkable rather than only documented.
+   */
+  uint32_t edge;
+} tft_extrapolated;
 
 /**
  * Structured detail for the most recent failure **on this thread**.
@@ -203,6 +288,33 @@ typedef struct {
    */
   char message[TFT_MESSAGE_LEN];
 } tft_error;
+
+/**
+ * Refuse: the lookup returns [`TFT_ERR_EXTRAPOLATION`] and writes nothing.
+ *
+ * `0`, so a zeroed struct or a forgotten initialiser produces the refusal
+ * rather than an invented pose. It is also `tf_tree::ExtrapPolicy`'s own
+ * `Default`, and what [`tft_plan_at`] has always done.
+ */
+#define TFT_EXTRAP_ERROR 0
+
+/**
+ * Hold the newest sample constant — `tf2`'s behaviour under some settings.
+ *
+ * The honest primitive for a latched or displayed value. It is not the silent
+ * staleness `tf2` is criticised for, because [`tft_extrapolated::by_ns`] comes
+ * back in the same call and the caller had to pass somewhere to put it.
+ */
+#define TFT_EXTRAP_HOLD 1
+
+/**
+ * Extend the constant screw twist implied by the two newest samples.
+ *
+ * What a controller running faster than its state estimate wants
+ * (`docs/decisions/0039` *Context*). Falls back to [`TFT_EXTRAP_HOLD`] on an
+ * edge that retains a single sample: there is no twist to extend.
+ */
+#define TFT_EXTRAP_CONSTANT_TWIST 2
 
 /**
  * Success.
@@ -797,6 +909,63 @@ tft_status tft_plan_at_many(const tft_plan *plan,
  * `0` is a safe sentinel here precisely because no real layout has size zero.
  */
 size_t tft_layout_size(tft_layout layout);
+
+/**
+ * [`tft_plan_at`], permitting extrapolation past the newest sample under
+ * `policy`, and reporting how far the answer was extrapolated.
+ *
+ * The capability existed in the engine's sampler from the beginning and was
+ * reachable from no shipped surface until `docs/decisions/0039`; this is the C
+ * half of reaching it. A controller running at 1 kHz against a 100 Hz state
+ * estimate is *always* asking for a stamp past the newest sample, and the
+ * honest answer is a bounded prediction with its bound attached — not a
+ * refusal, and not a silent stale pose.
+ *
+ * **`info` is required.** That is the property the whole surface is for: the
+ * distance is handed back in the same call as the pose, so a caller cannot get
+ * one without the other. Passing NULL is [`TFT_ERR_NULL_ARG`] and nothing is
+ * written, in either buffer.
+ *
+ * [`tft_plan_at`] is untouched, still refuses, and remains what a caller that
+ * must not act on invented data should call. This function with
+ * [`TFT_EXTRAP_ERROR`] is that same refusal with a distance attached on
+ * success.
+ *
+ * The plan is evaluated in the domain it was compiled for
+ * ([`tft_plan_create_in_domain`]); the tag is on the handle, not on this call.
+ *
+ * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is not accepted here
+ *
+ * Asking for that layout is asking for derivatives, and the engine has no
+ * extrapolating form of `at_with_derivatives` — `docs/decisions/0039` adds one
+ * pose-returning method and deliberately no second one. So the layout is
+ * refused with [`TFT_ERR_BAD_ENUM`] and nothing is written, exactly as
+ * [`tft_publisher_push`] refuses the write-only `TFT_LAYOUT_AFFINE12_ROW_F32`:
+ * the discriminant is defined, and this entry point does not take it. The
+ * alternative — emitting a twist evaluated under `ExtrapPolicy::Error` beside
+ * a pose extrapolated under the caller's — would put two different policies in
+ * one thirteen-`f64` row.
+ *
+ * # Errors
+ *
+ * Everything [`tft_plan_at`] returns. Under [`TFT_EXTRAP_ERROR`] a stamp past
+ * the newest sample is [`TFT_ERR_EXTRAPOLATION`]; under the other two it is
+ * not, and `info->by_ns` says how far. [`TFT_ERR_BAD_STRUCT_SIZE`] if
+ * `info->struct_size` is not `sizeof(tft_extrapolated)`.
+ *
+ * # Safety
+ *
+ * `plan` must be a handle from [`tft_plan_create`] that has not been freed.
+ * `out` must point to at least `tft_layout_size(layout)` writable bytes.
+ * `info` must point to a writable `tft_extrapolated` whose `struct_size` this
+ * caller has set.
+ */
+tft_status tft_plan_at_extrapolating(const tft_plan *plan,
+                                     int64_t stamp,
+                                     tft_extrap_policy policy,
+                                     tft_layout layout,
+                                     void *out,
+                                     tft_extrapolated *info);
 
 /**
  * Copy this thread's most recent error into `out`.
