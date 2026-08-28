@@ -286,3 +286,48 @@ fn the_two_too_deep_messages_name_the_bound_that_refused() {
         "the walk did not refuse this path and must not be blamed for it: {msg}"
     );
 }
+
+/// **`Described` stops rendering as `Debug` for the variants it cannot name.**
+///
+/// `docs/decisions/0040` decision 3. `Described`'s fallback arm was
+/// `write!(f, "{other:?}")`, so the five `LookupError` variants that carry no
+/// frame and no edge — `BufferTooSmall`, `WrongElementType`, `ChildDetached`,
+/// `DerivativesUnavailable`, `NoSegment` — reached an operator as a struct
+/// literal. There is nothing for this wrapper to *add* to them, because it adds
+/// names and they have none; so the arm now delegates to `core`'s `Display` and
+/// the message is written once.
+///
+/// **Mutant:** restore `write!(f, "{other:?}")`. Applied: fails on the
+/// `assert!(!msg.contains("BufferTooSmall"))` below with
+/// `BufferTooSmall { need: 32, got: 4 }` — the Rust type name and field syntax
+/// in an operator-facing message, which is what the delegation removes.
+#[test]
+fn describe_delegates_rather_than_debug_printing_what_it_cannot_name() {
+    let tree = TreeBuilder::new()
+        .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(16)))
+        .build()
+        .unwrap();
+
+    // Reached through a real call, not constructed: the point is what a caller
+    // meets, and `at_many_into` is where a too-small buffer actually comes from.
+    let g = tree.guard();
+    let plan = tree
+        .plan(tree.frame("map").unwrap(), tree.frame("base").unwrap())
+        .unwrap();
+    let mut too_small = [0.0f64; 4];
+    let err = plan
+        .at_many_into::<tf_tree::SystemDomain>(&g, &[0, 1], tf_tree::Layout::Mat4, &mut too_small)
+        .unwrap_err();
+
+    let msg = tree.describe(err).to_string();
+    assert!(
+        !msg.contains("BufferTooSmall"),
+        "the wrapper is still Debug-printing what it cannot name: {msg}"
+    );
+    assert!(
+        msg.contains("32") && msg.contains('4'),
+        "the delegated message must keep the numbers the variant carries: {msg}"
+    );
+    // And it is the same sentence `core` writes, because it is written once.
+    assert_eq!(msg, format!("{err}"));
+}

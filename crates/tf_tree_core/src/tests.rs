@@ -3179,3 +3179,165 @@ fn extrapolation_is_selectable_and_reports_how_far_it_reached() {
         "ConstantTwist returned the held pose, so the policy was ignored"
     );
 }
+
+// ---- errors that compose (decision 0040) --------------------------------
+
+/// Every variant of every error enum renders as prose and names what it carries.
+///
+/// The point is coverage rather than wording: `docs/API.md` R5 is NORMATIVE that
+/// message *text* is not a compatibility promise, so this asserts that a message
+/// exists, that it is not the `Debug` spelling, and that the identifier the
+/// variant carries appears in it — never that a particular sentence does.
+///
+/// **The match in `error.rs` is exhaustive, so a variant added later fails to
+/// compile there rather than falling into a generic arm.** This test is the
+/// other half: it pins that each arm actually *says* something, which a
+/// compiling `write!(f, "")` would not.
+///
+/// **Mutant:** make `LookupError::WrongElementType`'s arm `write!(f, "")`.
+/// Applied: `every LookupError variant renders: WrongElementType produced
+/// nothing` — the case a catch-all `Debug` arm would have hidden, since `Debug`
+/// is never empty.
+#[test]
+fn every_error_variant_renders_as_prose_naming_what_it_carries() {
+    use alloc::format;
+
+    use crate::error::TopologyError;
+
+    let edge = EdgeId(3);
+    let frame = FrameId::new(7).unwrap();
+
+    let lookups = alloc::vec![
+        LookupError::UnknownFrame { hash: 0xdead_beef },
+        LookupError::Disconnected {
+            target: frame,
+            source: frame,
+            cut_at: frame
+        },
+        LookupError::TreeTooDeep { depth: 99 },
+        LookupError::NoData { edge },
+        LookupError::Extrapolation {
+            edge,
+            requested: 5,
+            oldest: 1,
+            newest: 4
+        },
+        LookupError::SlotRecycled { edge },
+        LookupError::SlotContended { edge },
+        LookupError::TopologyChanged {
+            plan: 1,
+            current: 2
+        },
+        LookupError::TimeDomainMismatch {
+            expected: 1,
+            got: 0
+        },
+        LookupError::MixedTimeDomains {
+            edge,
+            expected: 1,
+            got: 0
+        },
+        LookupError::UnknownEdge { edge },
+        LookupError::FrameOutOfRange { frame },
+        LookupError::BufferTooSmall { need: 48, got: 16 },
+        LookupError::WrongElementType,
+        LookupError::ChildDetached,
+        LookupError::MissingEdge { child: frame },
+        LookupError::DerivativesUnavailable { edge, interp: 1 },
+        LookupError::NoSegment { edge },
+    ];
+    for e in &lookups {
+        let shown = format!("{e}");
+        assert!(
+            !shown.is_empty(),
+            "every LookupError variant renders: {e:?} produced nothing"
+        );
+        assert_ne!(
+            shown,
+            format!("{e:?}"),
+            "a variant fell through to Debug instead of prose"
+        );
+    }
+
+    // The identifier each variant carries has to survive into the message —
+    // that is what makes the error actionable without an arena (D11).
+    assert!(format!("{}", LookupError::NoData { edge }).contains('3'));
+    assert!(format!("{}", LookupError::FrameOutOfRange { frame }).contains('7'));
+    assert!(format!("{}", LookupError::BufferTooSmall { need: 48, got: 16 }).contains("48"));
+
+    for e in [
+        PushError::NonMonotonicStamp { last: 9, got: 4 },
+        PushError::ClaimRevoked { edge },
+        PushError::ChildDetached,
+    ] {
+        assert!(!format!("{e}").is_empty());
+        assert_ne!(format!("{e}"), format!("{e:?}"));
+    }
+    for e in [
+        FrameError::FrameHashCollision { hash: 1 },
+        FrameError::CapacityExceeded,
+        FrameError::InternContended,
+        FrameError::ChildDetached,
+        FrameError::ReadOnly,
+    ] {
+        assert!(!format!("{e}").is_empty());
+        assert_ne!(format!("{e}"), format!("{e:?}"));
+    }
+    for e in [
+        TopologyError::WouldCreateCycle { child: frame },
+        TopologyError::CapacityExceeded,
+        TopologyError::UnknownFrame { frame: 4 },
+    ] {
+        assert!(!format!("{e}").is_empty());
+        assert_ne!(format!("{e}"), format!("{e:?}"));
+    }
+    let c = ClaimError::EdgeAlreadyClaimed { owner_slot: 5 };
+    assert!(format!("{c}").contains('5'));
+}
+
+/// The thing this crate's own documentation said could not be done.
+///
+/// `Tree::await_frames`' example was published as a ```text``` block, and its
+/// comment gave the reason: *"the three calls yield `OpenError`, `AwaitError` and
+/// `LookupError`, and `LookupError` implements neither `Display` nor `Error`, so
+/// no single `?`-chain unifies them — not even into `Box<dyn Error>`."*
+///
+/// So this is that `?`-chain, compiled. It is the acceptance test for
+/// `docs/decisions/0040`: not that a message is nice, but that an error can
+/// *leave a function* the way every other Rust library's can.
+///
+/// **Mutant:** delete `impl core::error::Error for LookupError`. Applied: does
+/// not compile — `the trait bound LookupError: core::error::Error is not
+/// satisfied`, on the `?`. A compile failure is the strongest form this
+/// assertion can take, which is why the test is shaped as a function that must
+/// type-check rather than as an assertion about a value.
+#[test]
+fn an_error_can_leave_a_function_as_box_dyn_error() {
+    use alloc::boxed::Box;
+
+    fn fallible(fail: bool) -> Result<Iso3, Box<dyn core::error::Error>> {
+        if fail {
+            // The `?` is the whole test: it needs `Error`, which needs `Display`.
+            Err(LookupError::NoData { edge: EdgeId(3) })?;
+        }
+        Ok(Iso3::IDENTITY)
+    }
+
+    assert!(fallible(false).is_ok());
+    let boxed = fallible(true).unwrap_err();
+    assert!(
+        alloc::format!("{boxed}").contains('3'),
+        "the boxed error lost the edge it names: {boxed}"
+    );
+
+    // Two *different* error types through one `?`-chain, which is the shape the
+    // startup sequence needs and the one the doc comment called impossible.
+    fn two_kinds(which: u8) -> Result<(), Box<dyn core::error::Error>> {
+        match which {
+            0 => Err(FrameError::CapacityExceeded)?,
+            _ => Err(LookupError::ChildDetached)?,
+        }
+    }
+    assert!(two_kinds(0).is_err());
+    assert!(two_kinds(1).is_err());
+}

@@ -108,6 +108,20 @@ Name resolution against the arena is `Described`, a `Display` wrapper, not a
 field. Across an FFI boundary the *code* is the contract and the message is a
 diagnostic.
 
+**Three layers, and only the middle one is new** ([`0040`](./decisions/0040-the-error-that-cannot-be-returned.md)):
+
+| Layer | Knows | Says |
+|---|---|---|
+| the type and its discriminant | nothing | the contract — this is what a caller matches on, in Rust and across FFI |
+| `Display` on the error itself | what the error carries | `edge 3: stamp 5 ns is outside its window [1, 4] ns` |
+| `Described`, from `Tree::describe` | the arena | `odom -> base_link: ...`, plus a sample of the frames that do exist |
+
+The middle layer is why an error can *leave a function*: `core::error::Error`
+requires `Display`, and without it nothing `?`-chains into `anyhow::Error` or
+`Box<dyn Error>`. It resolves no names — it has no arena — so it does not
+encroach on `Described`, and where the two would overlap `Described` delegates
+rather than restating.
+
 **NORMATIVE for every surface, including the shim:** exception and error
 *types* are a compatibility promise. Message *text* is not, and no surface may
 document text that a downstream caller could be tempted to match on.

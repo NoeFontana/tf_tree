@@ -1923,11 +1923,23 @@ impl Tree {
     /// ```
     ///
     /// And the consumer this method exists for — `docs/decisions/0019` §2b's
-    /// startup sequence. **`text`, not `rust`, and that is the record's own
-    /// deliberate choice**: the three calls yield `OpenError`, `AwaitError` and
-    /// [`LookupError`], and `LookupError` implements neither `Display` nor
-    /// `Error`, so no single `?`-chain unifies them — not even into
-    /// `Box<dyn Error>`. It also needs a live arena and `--features shm`.
+    /// startup sequence. **Still `text` rather than `rust`, but for one reason
+    /// now instead of two.**
+    ///
+    /// The reason that is gone: this comment used to say the three calls yield
+    /// `OpenError`, `AwaitError` and [`LookupError`], and that `LookupError`
+    /// implements neither `Display` nor `Error`, so *"no single `?`-chain
+    /// unifies them — not even into `Box<dyn Error>`"*. Since
+    /// [`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)
+    /// all three implement both, and the `?`-chain below is exactly the shape a
+    /// consumer can now write. `LookupError`'s own rustdoc carries a compiling
+    /// doctest of it.
+    ///
+    /// The reason that remains: it needs a live arena and `--features shm`, and
+    /// `just test` runs doctests on **default** features — so as `rust` this
+    /// would not compile there, and as `no_run` behind a `cfg_attr` it would be
+    /// a doctest no recipe executes. `docs/benchmarks/EVIDENCE.md` is about
+    /// exactly that failure class, so it stays honest text.
     ///
     /// ```text
     /// // Two waits, because they are two different absences.
@@ -4339,7 +4351,18 @@ impl fmt::Display for Described<'_> {
                 "frame {} has a parent but no edge records the link",
                 tree.frame_name(child),
             ),
-            other => write!(f, "{other:?}"),
+            // **The arms above are the ones that resolve a *name*, which is the
+            // whole reason this wrapper exists. Everything else delegates.**
+            //
+            // This read `write!(f, "{other:?}")` until `docs/decisions/0040`,
+            // and `Debug` is the wrong register for an operator: it rendered
+            // `BufferTooSmall { need: 48, got: 16 }` where the core now writes
+            // "output buffer too small: need 48 elements, got 16". The five
+            // variants that reach here — `BufferTooSmall`, `WrongElementType`,
+            // `ChildDetached`, `DerivativesUnavailable`, `NoSegment` — carry no
+            // frame or edge this wrapper could name, so there is nothing for it
+            // to add and the message belongs in one place.
+            other => write!(f, "{other}"),
         }
     }
 }

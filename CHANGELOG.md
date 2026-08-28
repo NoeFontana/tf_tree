@@ -112,6 +112,25 @@ is a bug.
 
 ### Added
 
+- **Every core error type now implements `Display` and `core::error::Error`**
+  ([`0040`](docs/decisions/0040-the-error-that-cannot-be-returned.md)).
+  `LookupError`, `PushError`, `ClaimError`, `FrameError` and `TopologyError`
+  implemented neither, so none of them could be `?`-chained into
+  `anyhow::Error` or even `Box<dyn Error>` — a consumer's first function could
+  not be `-> anyhow::Result<_>`. This crate's own rustdoc cited that as the
+  reason `0019` §2b's startup sequence is published as a `text` block rather
+  than as compiling Rust.
+
+  Nothing about the representation changes: `Display` writes into the caller's
+  formatter, so the errors stay `Copy`, `String`-free and returnable from the
+  wait-free read path (D11), and `core::error::Error` rather than
+  `std::error::Error` keeps `tf_tree_core` `no_std`. The messages print
+  **identifiers** — `edge 3`, not `odom -> base_link` — because resolving a name
+  needs the arena; `Tree::describe` remains the layer that has one, and its
+  fallback arm now delegates here instead of `Debug`-printing the five variants
+  it cannot name. Message text is a diagnostic and not a compatibility promise
+  (`docs/API.md` R5, which gains the three-layer table).
+
 - **`Tree::inherit_ownership` and `Tree::owner_lost` — `docs/PHASE2.md` §3.5,
   which had never run** ([`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md),
   now `implemented`). Kill an arena's owner and lookups keep being served, exactly
