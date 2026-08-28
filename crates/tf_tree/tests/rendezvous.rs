@@ -4243,3 +4243,72 @@ fn two_survivors_race_and_exactly_one_inherits() {
         .open()
         .expect("after a contested inheritance the arena must still be joinable");
 }
+
+/// **A fleet of read-only consumers cannot rescue itself, and that is D18
+/// working rather than failing.**
+///
+/// An owner writes the participant table on every grant, so serving needs a
+/// writable mapping. A `PROT_READ` attachment — the consumer default, and the
+/// only real security boundary this design has — therefore cannot be an heir.
+/// `Tree::inherit_ownership` says so as data rather than as an error, because a
+/// read-only consumer meeting a dead owner has not done anything wrong: it keeps
+/// reading the arena it has, exactly as §3.5 promises, and some read-write
+/// participant must be the one to inherit.
+///
+/// This is the operational shape behind `docs/RUNBOOK.md`'s owner-death remedy:
+/// the recovery needs a survivor that is *both* attached and writable, and a
+/// deployment of nothing but `tf_tree top --attach` and read-only nodes has none.
+///
+/// **Mutant:** drop the `is_writable` guard from `inherit_ownership`. Applied:
+/// the read-only tree reports `Inherited` instead of `ReadOnly` — it takes the
+/// ownership byte it cannot serve behind, which is the state that makes an arena
+/// unjoinable and the exact failure the guard exists to prevent.
+#[test]
+fn a_read_only_survivor_reports_that_it_cannot_inherit() {
+    use tf_tree::{AttachMode, Inheritance};
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-read-only");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    // This process is the read-only survivor.
+    let mut ro = tf_tree::Open::new()
+        .mode(AttachMode::ReadOnly)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("a read-only consumer must be able to join");
+    assert!(!ro.is_writable(), "the attachment was not read-only");
+
+    // While the owner lives, nothing is attempted at all.
+    assert_eq!(ro.inherit_ownership().unwrap(), Inheritance::OwnerAlive);
+
+    owner.kill();
+
+    // The owner's death is visible to a read-only consumer too — the socket is
+    // the liveness signal regardless of the mapping's protection (D17).
+    assert!(ro.owner_lost(), "a read-only attachment missed the hangup");
+    assert_eq!(
+        ro.inherit_ownership().unwrap(),
+        Inheritance::ReadOnly,
+        "a PROT_READ attachment must refuse the role rather than take a byte it cannot serve behind"
+    );
+
+    // And the promise that survives all of it: lookups do not stop.
+    let g = ro.guard();
+    let target = ro.frame("map").unwrap();
+    let source = ro.frame("base").unwrap();
+    let plan = ro.plan(target, source).unwrap();
+    let iso = plan
+        .at(
+            &g,
+            tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(1_500),
+        )
+        .expect("a dead owner must not stop a reader");
+    assert_eq!(
+        iso.to_bits(),
+        tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]).to_bits()
+    );
+}
