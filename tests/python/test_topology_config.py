@@ -157,3 +157,109 @@ def test_open_refuses_capacity_beside_a_config(runtime_dir):
     with pytest.raises(ValueError) as e:
         tf_tree.open(create=CONFIG, mode="rw", name="cfg_arena2", capacity=64)
     assert "config carries" in str(e.value)
+
+
+CYCLIC = """
+[[edge]]
+parent = "map"
+child = "odom"
+kind = "dynamic"
+capacity = 64
+
+[[edge]]
+parent = "odom"
+child = "base_link"
+kind = "dynamic"
+capacity = 64
+
+[[edge]]
+parent = "base_link"
+child = "map"
+kind = "dynamic"
+capacity = 64
+"""
+
+
+def test_a_cycle_names_the_frame_not_an_arena_index():
+    """The preflight `tf_tree_cli` and `tf_tree_c` both run against this schema.
+
+    The parser rejects a self-edge and a duplicate child but **not** a multi-hop
+    cycle, which is exactly why `TopologyConfig::cycle_child` is a separate
+    method. Without it, `build()` finds the cycle and reports
+    `WouldCreateCycle { child: FrameId(1) }` — an index into an arena that was
+    never constructed, to somebody holding a text file. Python was the third
+    consumer of this schema and the only one that had regressed the diagnostic.
+    """
+    with pytest.raises(ValueError) as e:
+        tf_tree.build(CYCLIC)
+    msg = str(e.value)
+    assert "base_link" in msg or "odom" in msg or "map" in msg, (
+        f"the cycle must name a frame from the file: {msg}"
+    )
+    assert "FrameId" not in msg, f"an arena index leaked to a config caller: {msg}"
+
+
+def test_a_cycle_through_open_does_not_blame_the_library(runtime_dir):
+    """`open`'s config path must not reach `open_err`'s edge-list prose.
+
+    That prose is written about the `create=` pair list and the `capacity=`
+    keyword. Handed the empty list a config path has, its topology arm concluded
+    *"That is a bug in tf_tree rather than in your call"* — about a cycle the
+    caller wrote — and its sizing arm advised lowering a keyword this path
+    refuses.
+    """
+    with pytest.raises(Exception) as e:
+        tf_tree.open(create=CYCLIC, mode="rw", name="cyclic_arena")
+    msg = str(e.value)
+    assert "bug in tf_tree" not in msg, f"the library blamed itself: {msg}"
+    assert "0 pairs" not in msg and "capacity=" not in msg, (
+        f"edge-list prose reached a config caller: {msg}"
+    )
+
+
+def test_open_reports_a_non_cycle_build_failure_in_config_terms(runtime_dir):
+    """The half the cycle test cannot reach, and did not.
+
+    A cycle is now caught by the preflight *before* `open_err` is consulted, so
+    `test_a_cycle_through_open_does_not_blame_the_library` passes whether or not
+    the config path still routes its build errors through the edge-list prose —
+    which a mutation confirmed by staying green. This exercises the path that is
+    actually left: a build failure that is not a cycle.
+    """
+    huge = """
+[[edge]]
+parent = "map"
+child = "odom"
+kind = "dynamic"
+capacity = 2147483648
+"""
+    with pytest.raises(Exception) as e:
+        tf_tree.open(create=huge, mode="rw", name="huge_arena")
+    msg = str(e.value)
+    assert "0 pairs" not in msg, f"edge-list prose reached a config caller: {msg}"
+    assert "lower capacity=" not in msg, (
+        f"advice to lower a keyword this path refuses: {msg}"
+    )
+    assert "config" in msg, f"the message should be about the config: {msg}"
+
+
+def test_both_construction_forms_raise_a_catchable_family(runtime_dir):
+    """`except tf_tree.TfTreeError` around a build must catch either form.
+
+    The list path has always raised `TfTreeError`; the config path raised
+    `ValueError` for a build failure, so a caller's existing handler silently
+    missed it. `ValueError` for a *parse* failure is right and stays — a
+    malformed file is a bad argument.
+    """
+    huge = """
+[[edge]]
+parent = "map"
+child = "odom"
+kind = "dynamic"
+capacity = 2147483648
+"""
+    with pytest.raises(tf_tree.TfTreeError) as e:
+        tf_tree.build(huge)
+    # And the message is about the config's own sizing, not about a `capacity=`
+    # keyword this path refuses.
+    assert "config" in str(e.value)
