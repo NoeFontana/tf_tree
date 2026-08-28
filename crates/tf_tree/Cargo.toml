@@ -38,6 +38,13 @@ counters = ["tf_tree_core/counters"]
 # directly to reach it. Same shape as `counters` above, and for the same reason:
 # the feature belongs to the crate that owns the dependency.
 pure-hash = ["tf_tree_core/pure-hash"]
+# `docs/PHASE2.md` §11.3's fault injection. Forwarded like the two above, and
+# additionally arms this crate's *own* sites: §11.3's table spans three crates,
+# and `takeover.after_ownership_lock_before_bind` is the row that lands here
+# because §3.5's ownership acquisition and the bind that follows it are both in
+# `crate::open`. `tf_tree_core::crash::SITES` is deliberately scoped to that
+# crate; `crate::CRASH_SITES` is this one's half.
+crash-points = ["tf_tree_core/crash-points"]
 # Phase 2 shared memory: `TreeBuilder::build_shared` / `Tree::attach_shared`.
 # Linux-only and off by default — the single-process build must not grow a
 # syscall dependency it never uses.

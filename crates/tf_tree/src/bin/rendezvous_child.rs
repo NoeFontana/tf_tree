@@ -25,7 +25,8 @@
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
-//! join-heir     -> "joined <slot>", then on stdin:
+//! join-heir     -> "joined <slot>", then on stdin:  (arm §11.3's takeover
+//!                  crash point with TF_TREE_CRASH_AT to kill it mid-inherit)
 //!                  "<owner_lost> <inheritance> <slot>", then parks —
 //!                  serving, if it inherited (§3.5)
 //! ```

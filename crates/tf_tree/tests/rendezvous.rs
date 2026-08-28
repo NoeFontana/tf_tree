@@ -50,6 +50,12 @@ struct Kid(Child, Option<BufReader<std::process::ChildStdout>>);
 
 impl Kid {
     fn spawn(dir: &PathBuf, args: &[&str]) -> Kid {
+        Kid::spawn_with_env(dir, args, &[])
+    }
+
+    /// [`Self::spawn`] with extra environment — `TF_TREE_CRASH_AT`, which is how
+    /// `docs/PHASE2.md` §11.3 arms a named crash point in a child.
+    fn spawn_with_env(dir: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> Kid {
         // The bin target carries the crate's name, not the file's: this crate is
         // published, and `--features shm` installs whatever is here into the
         // user's `bin/`. The manifest argues it; the source stays
@@ -60,10 +66,16 @@ impl Kid {
             .env("TF_TREE_RUNTIME_DIR", dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .envs(env.iter().copied())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn the rendezvous child helper");
         Kid(child, None)
+    }
+
+    /// Wait for a child that is expected to die on its own, and report how.
+    fn wait(&mut self) -> std::process::ExitStatus {
+        self.0.wait().expect("wait for the child")
     }
 
     /// The child's next line. It flushes before it parks, so this returning is
@@ -4311,4 +4323,83 @@ fn a_read_only_survivor_reports_that_it_cannot_inherit() {
         iso.to_bits(),
         tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]).to_bits()
     );
+}
+
+/// **`docs/PHASE2.md` §11.3, `takeover.after_ownership_lock_before_bind`: the
+/// crash-matrix row §3.5 owes.**
+///
+/// D15 is that no mutation protocol lands without a named crash point and a walk
+/// through the matrix, and §3.5's acquisition is a mutation protocol: between
+/// taking byte 0 and binding the socket, a process is the owner and is not
+/// serving — which is exactly the state that makes an arena unjoinable, and the
+/// state a survivor's inheritance exists to end.
+///
+/// §11.3's repair claim for this row is *"ownership released; another
+/// participant takes over; joiners retry"*, and what makes it true rather than
+/// hopeful is that the byte is an OFD lock: the kernel releases it at process
+/// death with no cooperation from the corpse, and `inherit_ownership` never
+/// registers anything a dead heir would have to clean up.
+///
+/// So: two survivors, the first killed *inside* the window by
+/// `TF_TREE_CRASH_AT`, and the assertion that the second still inherits and the
+/// arena is joinable afterwards. The crash is real — `abort()`, not a `panic!`,
+/// so no destructor runs and nothing gives the byte back politely.
+///
+/// **Mutant:** none is offered, because the honest one is the crash point's
+/// *placement*, and moving it after `spawn_owner_server` makes this test pass
+/// for a different reason (the heir dies owning *and* serving, and the socket's
+/// closure is what the survivor then sees). What this pins is the row's repair,
+/// not the placement; the placement is argued at the call site.
+#[cfg(feature = "crash-points")]
+#[test]
+fn a_killed_heir_leaves_the_role_for_the_next_survivor() {
+    use tf_tree::AttachMode;
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-crash");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    // The doomed heir: armed to abort with byte 0 held and nothing listening.
+    let mut doomed = Kid::spawn_with_env(
+        &dir.0,
+        &["join-heir"],
+        &[(
+            "TF_TREE_CRASH_AT",
+            "takeover.after_ownership_lock_before_bind:1",
+        )],
+    );
+    assert!(doomed.line().starts_with("joined "));
+
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    assert!(heir.line().starts_with("joined "));
+
+    owner.kill();
+
+    // The doomed one goes first and dies holding the role.
+    doomed.poke();
+    let status = doomed.wait();
+    assert_eq!(
+        status.code(),
+        None,
+        "the armed heir exited normally instead of aborting: {status:?}"
+    );
+
+    // The repair: the next survivor takes the role the corpse was holding.
+    heir.poke();
+    let report = heir.line();
+    assert!(
+        report.starts_with("true Inherited "),
+        "the kernel did not release the dead heir's ownership byte, or the \
+         survivor could not take it: {report}"
+    );
+
+    // And joiners retry successfully, which is the row's last clause.
+    tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("after the heir's death and the next survivor's takeover, a joiner must succeed");
 }

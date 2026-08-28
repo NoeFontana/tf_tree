@@ -466,6 +466,19 @@ pub(crate) enum Attachment {
     },
 }
 
+/// Every `docs/PHASE2.md` §11.3 crash point compiled into **this crate**.
+///
+/// The companion to [`tf_tree_core::crash::SITES`], which is scoped to that
+/// crate for the same reason: §11.3's table spans three crates, and a harness
+/// that arms a site at random (§11.4) must read the literals from wherever they
+/// are placed rather than re-spelling them, because a typo silently arms nothing
+/// and the run then looks clean.
+///
+/// One entry today. The `attach.*`, `open.*`, `hangup.*` and `reclaim.*` rows are
+/// still unplaced.
+#[cfg(feature = "crash-points")]
+pub const CRASH_SITES: &[&str] = &["takeover.after_ownership_lock_before_bind"];
+
 /// How [`Tree::inherit_ownership`] resolved (§3.5).
 ///
 /// Anything but [`Inheritance::Inherited`] means this process is **not** the
@@ -605,6 +618,16 @@ impl Tree {
             }));
             return Ok(Inheritance::Contended);
         }
+
+        // `docs/PHASE2.md` §11.3: **`takeover.after_ownership_lock_before_bind`**.
+        // The row's repair claim is "ownership released; another participant
+        // takes over; joiners retry", and this is the instruction it names — byte
+        // 0 held, nothing listening. A process killed here has its byte released
+        // by the kernel with no cooperation, which is what makes that claim true
+        // rather than hopeful, and `a_killed_heir_leaves_the_role_for_the_next_survivor`
+        // is what executes it.
+        #[cfg(feature = "crash-points")]
+        tf_tree_core::crash::maybe_abort(CRASH_SITES[0]);
 
         match spawn_owner_server(&rendezvous, self) {
             Ok(server) => {

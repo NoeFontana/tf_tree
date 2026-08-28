@@ -314,6 +314,8 @@ pub fn counters_compiled_in() -> bool {
 mod open;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::Inheritance;
+#[cfg(all(feature = "crash-points", feature = "shm", target_os = "linux"))]
+pub use open::CRASH_SITES;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
 

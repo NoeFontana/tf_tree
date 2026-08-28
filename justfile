@@ -39,6 +39,15 @@ test-rust:
     # the ordinary reason `shm` is Linux-only and this recipe runs on the
     # aarch64 matrix.
     cargo nextest run -p tf_tree_c --features bridge
+    # **`crash-points` (`docs/PHASE2.md` §11.3) — eight tests `--workspace` does
+    # not run.** Same shape as the `bridge` row above and `just shm-check`: a
+    # default-off feature is invisible to `--workspace`, and a test nobody runs
+    # is not a test. These re-execute the test binary as a child, arm one named
+    # site through `TF_TREE_CRASH_AT`, and assert the child died of `SIGABRT` at
+    # that site and that the state it left is repairable — so they are the only
+    # thing standing between a mis-placed `crash_point!` and a fault-injection
+    # harness that proves nothing.
+    cargo nextest run -p tf_tree_core --features crash-points
 
 test-doc:
     cargo test --doc --workspace
@@ -1079,6 +1088,20 @@ lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-ver
     # that belongs.
     cargo clippy -p tf_tree_core --features pure-hash --all-targets -- -D warnings
     cargo clippy -p tf_tree --features pure-hash --all-targets -- -D warnings
+    # **`crash-points` (`docs/PHASE2.md` §11.3), for the same reason as every row
+    # above it.** The feature is default-off and places named `abort()` sites in
+    # the mutation protocols; the workspace pass compiles all of it out, so
+    # without this row the module and its eight feature-gated tests are code no
+    # gate can see — the state `tf_tree_py` was in when it shipped a
+    # `transmute` that silently discarded a claim lease.
+    #
+    # Two passes, not one, because the feature takes `std` for itself
+    # (`#[cfg(any(test, feature = "crash-points"))] extern crate std;`) and the
+    # crate is `#![no_std]` unconditionally. The `--no-default-features` arm is
+    # what catches a `crash.rs` edit that reaches for something only `alloc`
+    # plus a default feature provides.
+    cargo clippy -p tf_tree_core --features crash-points --all-targets -- -D warnings
+    cargo clippy -p tf_tree_core --no-default-features --features crash-points --all-targets -- -D warnings
 
 # **`tf_tree_py` is excluded from the workspace, so nothing else builds it.**
 #
@@ -2135,6 +2158,18 @@ shm-check:
     # purpose: that is what compiles this crate's test targets with `unstable`
     # *off*, the shape a packager building the tarball gets.
     cargo nextest run -p tf_tree --features shm,unstable --test frozen
+    # **`docs/PHASE2.md` §11.3's `takeover.after_ownership_lock_before_bind`, the
+    # crash-matrix row §3.5 owes.** Three features and none is optional: `shm`
+    # for the rendezvous, `unstable` because `rendezvous_child`'s
+    # `join-rw-report` arm needs `Tree::arena_view`, and `crash-points` because
+    # without it the site is compiled out and the armed child never dies — which
+    # would leave `a_killed_heir_leaves_the_role_for_the_next_survivor` waiting
+    # on a `wait()` that never returns rather than failing. Every other recipe
+    # compiles at least one of the three out, so this line is the only one that
+    # runs it, which is the same argument the `--test frozen` line above makes
+    # about `unstable`.
+    cargo nextest run -p tf_tree --features shm,unstable,crash-points --test rendezvous
+    cargo clippy -p tf_tree --features shm,unstable,crash-points --all-targets -- -D warnings
     # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
     # paragraphs above being obeyed rather than restated.** Half of
     # `tests/owned_writer.rs` is `#[cfg(all(feature = "shm", target_os =
