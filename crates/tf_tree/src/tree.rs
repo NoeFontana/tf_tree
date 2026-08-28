@@ -2536,9 +2536,11 @@ impl Tree {
         // # Why this hangs off the callback instead of walking the returned plan
         //
         // Not style, and it was not predicted. `Plan` is a `[Step; MAX_DEPTH]`,
-        // 4160 bytes by value — 2112 when this was measured, before `0034`
-        // moved `MAX_DEPTH` 16 → 32, which makes the argument stronger and not
-        // weaker — and this method is a tail expression so the
+        // 2064 bytes by value — 2112 when this was measured, then 4160 after
+        // `0034` moved `MAX_DEPTH` 16 → 32, then halved again by `0042`. The
+        // argument survives every one of those: a copy this size is worth the
+        // 80 ns whatever the exact figure — and this method is a tail
+        // expression so the
         // compiler builds the result straight into the caller's slot. Binding it
         // to a local in order to iterate `plan.steps()` costs a copy of all of
         // it, and that copy is worth **80 ns on `first lookup after attach`**:

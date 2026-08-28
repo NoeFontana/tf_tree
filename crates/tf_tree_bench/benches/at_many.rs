@@ -40,9 +40,14 @@ fn at_many(c: &mut Criterion) {
     // The layout kernels (`docs/decisions/0005` Milestone B). The comparison
     // that matters is not kernel-vs-kernel but **kernel vs. the two-pass
     // alternative** a consumer is otherwise forced into: evaluate into an
-    // `Iso3` buffer, then convert. `Iso3` is 64 B with 8 of padding and no
-    // layout below shares its stride, so that second pass is not avoidable by
-    // any amount of care on the caller's side.
+    // `Iso3` buffer, then convert. `Iso3` is 56 B since `0042`, and `Mat4`
+    // (128 B) and `Affine32` (48 B) share neither its stride nor its element
+    // type, so for those two the second pass is not avoidable by any amount of
+    // care on the caller's side. **`Quat` is the exception and was not before**:
+    // it is now exactly `Iso3`'s bytes, so `into_quat_1024` below measures a
+    // two-pass alternative a caller is no longer forced into. The row is kept
+    // as the kernel's own cost; making the `Quat` kernel a copy is a separate
+    // change with its own measurement.
     // Raw nanoseconds: `at_many_into` takes `&[i64]` so an FFI caller does not
     // have to allocate a `Vec<Stamp>` to use it.
     let nanos: Vec<i64> = stamps.iter().map(|s| s.nanos()).collect();

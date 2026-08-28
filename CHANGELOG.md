@@ -50,6 +50,13 @@ is a bug.
   matching on the struct's fields or relying on `size_of::<Iso3>() == 64` will
   notice; nothing in the arena does, because nothing in the arena ever held one.
 
+  **The public surface widens with it**: `_pad` was private and was the only
+  thing preventing `Iso3 { q, t }` and exhaustive destructuring from another
+  crate. Both are supported now, which makes `Iso3` consistent with `Vec3` and
+  `Quat` — plain `repr(C)` structs with public fields — and makes a future added
+  field breaking for a second reason. Accepted deliberately; `0042` carries the
+  argument for not reaching for `#[non_exhaustive]`.
+
   The alignment existed *"so the Phase 2 shared-memory arena can store slots
   without re-deriving layout"*. The arena re-derived it anyway — `PoseSlot` is
   its own `align(64)` of atomics, which it has to be for the seqlock to be sound

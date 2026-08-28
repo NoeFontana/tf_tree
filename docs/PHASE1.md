@@ -126,13 +126,26 @@ pub struct Vec3 { pub x: f64, pub y: f64, pub z: f64 }              // 24 B
 pub struct Quat { pub w: f64, pub x: f64, pub y: f64, pub z: f64 }  // 32 B
 
 /// T_parent_child. Applying to a point in `child` yields the point in `parent`.
-#[repr(C, align(64))] #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Iso3 { pub q: Quat, pub t: Vec3, _pad: [u8; 8] }         // 64 B
+#[repr(C)] #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Iso3 { pub q: Quat, pub t: Vec3 }                        // 56 B
 ```
+
+> **`Iso3` was `#[repr(C, align(64))]` with an `_pad: [u8; 8]` here until
+> [`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md).** The
+> stated reason was that the Phase 2 arena could then store slots without
+> re-deriving layout; it re-derived them anyway — `PoseSlot` is its own
+> `align(64)` of atomics, which the seqlock requires — and no arena structure
+> ever held an `Iso3`. The padding cost `Step` 64 bytes, `Plan` 2 KiB and the
+> facade's per-thread plan cache 33 KiB, for nothing.
 
 **Convention lock-in.** Hamilton (not JPL). `w` first (not last — note this differs from Eigen's storage order; the C++ wrapper in Phase 4 must transpose). Active rotations. `Iso3` composition `a * b` means `T_a_x * T_x_b`. Adjoint convention is right-perturbation: `T = T̂ · exp(ξ^)`. Write these five facts in the crate-level doc comment; every downstream bug in this project will trace back to one of them.
 
-Assert layout in a test: `assert_eq!(size_of::<Iso3>(), 64)`, `assert_eq!(align_of::<Iso3>(), 64)`.
+Assert layout in a test: `assert_eq!(size_of::<Iso3>(), 56)`, `assert_eq!(align_of::<Iso3>(), 8)` —
+`crates/tf_tree_math/src/iso3.rs` and `tf_tree_core`'s
+`the_sizes_0042_halved_stay_halved` are those tests. **This line said 64 and 64
+until `0042`**, which is worth leaving visible: a contributor following the spec
+would have written an assertion that fails, and `0042`'s own Context claimed
+nothing outside `tf_tree_math` asserted the size. This did.
 
 ### 3.2 SE(3) exponential and logarithm
 

@@ -53,9 +53,10 @@ pub enum Layout {
     Mat4,
     /// `[qw, qx, qy, qz, tx, ty, tz]`, `f64`. 7 elements.
     ///
-    /// The engine's own representation minus the padding, so this is the
-    /// cheapest layout to emit and the one to prefer when the consumer does not
-    /// specifically need a matrix.
+    /// **Byte-for-byte the engine's own `Iso3`** since `0042` removed its
+    /// padding — same size, same order, same alignment — so this is the cheapest
+    /// layout to emit and the one to prefer when the consumer does not
+    /// specifically need a matrix. It read "minus the padding" until then.
     Quat,
     /// Row-major 3x4 affine, `f32`. 12 elements.
     ///

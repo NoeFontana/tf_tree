@@ -665,7 +665,11 @@ figures printed side by side.
 The two per-sample figures differ because tf_tree's rings are sized by *declared
 capacity*, not by what is stored: `Capacity::history` rounds each ring up to a
 power of two, so a 1 kHz edge over 10 s asks for 10,000 slots and reserves
-16,384. At 72.9 B/slot (a 64 B cacheline-padded `Iso3` plus an 8 B stamp)
+16,384. At 72.9 B/slot (a 64 B `PoseSlot` plus an 8 B stamp — **the slot is a
+`PoseSlot`, not an `Iso3`**, and this read "a 64 B cacheline-padded `Iso3`" until
+[`0042`](../decisions/0042-the-cacheline-the-arena-never-asked-for.md), which is
+the misattribution that record exists to correct: the arena stores atomics the
+seqlock requires and an `Iso3` never enters it. The 72.9 figure is unchanged)
 tf_tree is 1.56x denser than tf2 per unit of capacity, and this fixture's
 rounding hands almost all of that back. Fixed capacity that never reallocates is
 the point of the design; the rounding is what it costs.

@@ -110,6 +110,21 @@ bytes of nothing, and `Pod` would then require it be initialised anyway.
   padding, so the padding *was* its cost. It is rewritten against `Key`'s size.
 - The wasted eight bytes are gone from every `Iso3` in memory, which includes
   every `Step`, every buffered ingest sample, and every pose a consumer holds.
+- **The public surface widened, and that is accepted rather than overlooked.**
+  `_pad` was private, and it was the only thing stopping a downstream crate
+  writing `Iso3 { q, t }` or destructuring the struct exhaustively. Both are now
+  permanently supported, so adding a field later is breaking for a second reason
+  on top of `Pod`'s no-padding rule.
+
+  Accepted, and not closed with `#[non_exhaustive]`, for two reasons. `Vec3` and
+  `Quat` are plain `#[repr(C)]` structs with public fields and no marker, so
+  `Iso3` now *matches its siblings* — the encapsulation was a side effect of the
+  alignment rather than a design choice anybody made. And `Iso3` is
+  mathematically closed: SE(3) is a rotation and a translation, D6 fixes the
+  scalar at `f64`, and [`0009`](./0009-descoping-phase-6.md) cut the one field
+  anybody proposed adding. A marker that costs every downstream caller the
+  literal, to protect against a field this type should not gain, is the wrong
+  trade — but it is a trade, so it is written down.
 
 ## Implementation plan
 
