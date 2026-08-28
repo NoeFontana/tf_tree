@@ -36,910 +36,251 @@ is a bug.
 ### Changed — documentation
 
 - **`README.md` is restructured around evaluating and installing the project**,
-  which it previously answered on line 127 and only for Python. Added: registry
-  badges, an **Install** table naming what is published and what is built from a
-  checkout (`cargo install tf_tree` installs no command — the CLI is a separate,
-  unpublished crate, and that surprise now has a line), a **Where it fits, and
-  where it does not** section that collects the six recorded refusals — the `tf2`
-  shim, covariance, multi-parent edges, inter-host, the viewer, `0.0.x` — into
-  one table a reader can self-select out of, and a **Rust** worked example, which
-  the front page of a Rust engine did not have. The status table's paragraph-long
-  cells become a short verdict plus named gaps below it; nothing it claimed was
-  dropped. `docs/` gains a router at the top of its index for people *using*
-  `tf_tree` rather than changing it, and the five crates.io front pages gain
-  badges. `tf_tree` and `tf_tree_math` gain the `cargo add` line neither had;
-  `tf_tree_core`, `tf_tree_arena` and `tf_tree_ipc` deliberately do not, because
-  each already opens by sending the reader to `tf_tree` instead, and an install
-  line would be an invitation away from the crate they should depend on.
-
-- **`README.md`'s `rust` fence is now compiled**, by a `#[cfg(doctest)]`
-  `include_str!` in `tf_tree_cli` — the same device
-  `crates/tf_tree/src/lib.rs` already applies to the crates.io front page, and
-  for the same reason: no gate parsed a README, so the next signature change to
-  `claim`, `plan` or `Capacity::history` would have broken the page GitHub
-  renders with every check green. It lives in `tf_tree_cli` rather than in
-  `tf_tree` because the path reaches outside the crate directory and
-  `cargo package` would not put that file in the tarball; `tf_tree_cli` is
-  `publish = false`, so it cannot have that problem. The workspace-tree fence is
-  now tagged `text`, which this makes load-bearing: to rustdoc an untagged fence
-  is Rust.
-
-  **What the gate does not reach**, recorded so it is not mistaken for more than
-  it is: `tf_tree_cli` declares `tf_tree`'s `unstable` feature and defaults
-  `counters` on, and `just test-doc` is `cargo test --doc --workspace`, where
-  feature unification is graph-wide. The fence is therefore compiled against a
-  union of features rather than the `cargo add tf_tree` default tier — verified,
-  not assumed: `use tf_tree::unstable::EdgeKind;` inserted into it compiles and
-  passes. No existing workspace member fixes this (all five consumers declare
-  `unstable`) and a new one is a crate boundary, so it is a decision record
-  rather than a docs change. What the gate does catch is what it was added for:
-  a signature change to `claim`, `plan` or `Capacity::history` silently breaking
-  the page GitHub renders.
+  which it previously answered on line 127 and only for Python (#276): registry
+  badges, an **Install** table (`cargo install tf_tree` installs no command), a
+  seven-row **Look elsewhere when** table, and a **Rust** worked example — now
+  **compiled**, by a `#[cfg(doctest)]` `include_str!` in `tf_tree_cli`, whose
+  module records what that gate does **not** reach.
 
 ### Changed — breaking
 
 - **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
   `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
-  clock** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
-  A `pub` field that has shipped since `0.0.1` *unwritten* — nothing could have
-  read it for its value, since it was always zero — but a field path or a
-  `ClaimRecord { .. }` literal naming it will not compile. The Added entry below
-  is the whole argument.
-
-- **`tf_tree_ipc::Open::already_attached` and the takeover arm it reached are
-  deleted; `OpenOutcome::TookOver` now has no producer** (closes #201,
-  [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
-  `LockFile::take_any_participant` survives with no production caller and a
-  caution on it. `IpcError` and `OpenOutcome` are unchanged as types; what is
-  gone is the builder, the arm, and `Open::register_any`.
-
-  The arm handed back the first **free** participant byte while the caller's
-  arena record was elsewhere, and every liveness predicate indexes the two with
-  one integer (`docs/PHASE2.md` §5.1), so a running process read as **dead** —
-  §6.2's corrupting direction. Executed:
-  `outcome=TookOver  session slot=0  but the caller's arena record is 5`.
-
-  **It was approached as a bug with a known answer and is really a protocol that
-  cannot be expressed as an `Open::open` call.**
-  [`0035`](docs/decisions/0035-the-creators-slot-is-taken-not-found.md) deferred
-  the arm, pinning it to "`0029` question 3"; the answer is `0028` question 3,
-  resolved 2026-08-20, and `0029` corrected the misdirected citation on
-  2026-08-25 while `0035` was frozen. But that answer says §3.5 **cannot** be
-  wired as a second `Open::open` call — read as *nothing calls it yet* rather
-  than *nothing can*.
-
-  **The root cause is that no new file description can verify a claim about the
-  caller's own locks.** `F_OFD_GETLK` answers *"does anyone **else** hold this
-  byte"* — `lockfile.rs`'s module doc says so twice, the second time calling it
-  "a trap for any future code that tries to read back its own state" — so a
-  declaration naming a live *peer's* slot is indistinguishable from a true one.
-  Two rounds of repair produced five executed unsound states, four of them
-  introduced while fixing the one before: the original divergence, a session over
-  a **free** byte, an out-of-range slot returned through public API, a serving
-  owner overriding the declaration, and a stranded owner grant that wedges an
-  arena at 64 participants with 64 free bytes.
-
-  **One consequence has no counterpart yet.** `Session::release_ownership` is
-  §3.5's "give up the owner role while staying attached", and there is now no
-  route by which any survivor becomes owner: a fresh `open()` takes ownership,
-  meets the split-brain check against the survivors' held bytes, releases, and
-  times out for as long as any survivor lives. That was already true of every
-  caller not using the unsound arm — deleting it removed the last thing
-  obscuring it — and `0037` open question 5 owns it.
-
-  `docs/PHASE2.md` §3.4's NORMATIVE pseudo-code is amended: it mandated the heir
-  taking a participant byte, which is the one act `0028` question 3 forbids.
-  §0.0's §3.5 row moves from "half done" to "no path at all".
-
-  `0037` records what a real §3.5 would be — a method on the `Session` the heir
-  already holds, where the invariant is structural rather than checked — and does
-  not schedule it. It also records what the deletion cost: `0028` plan step 9's
-  refusal test, `0029`'s claim that a `#[cfg(test)]` seam reaches `TookOver`, and
-  the `register_any` mutant recipe in `tf_tree_ipc`'s #201 stress test. `OpenError::ParticipantSlotDiverged` stays as an assertion
-  over hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
-  construction, now the only route that can still produce the divergence.
-
-### Added
-
-- **A per-publisher clock offset, from a field that has been in every shipped
-  arena since it was declared** ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
-  steps 1–2). `ClaimRecord::last_push_nanos` had four references in the whole
-  workspace — two struct definitions and two zero-initialisers — while
-  `docs/PHASE2.md` §6.4 said normatively that it was *"bumped on every push"*.
-  Nothing wrote it and nothing read it, and that is why `TFT004` (clock skew)
-  reported *"cannot detect anything in any configuration"*: the check needs a
-  per-publisher offset against each publisher's header stamp.
-
-  **BREAKING: the field is now `ClaimRecord::clock_offset_nanos` and holds
-  `wall clock - stamp`, not the wall clock.** A receipt time cannot be paired
-  with a stamp by any reader — the write is sampled, so the ring's newest stamp
-  belongs to a later push than the receipt does. Measured on a 10 Hz publisher
-  whose clock is *exact*: `receipt - newest_stamp` reads **+3 µs on the sampling
-  push and −900 ms nine pushes later**, decided by nothing but when the reader
-  arrives. That is a ±1 s noise floor under a signal `TFT004` must resolve at
-  tens of milliseconds, and question 1 made the interval ~1 s for *every*
-  publisher, so it does not cancel in a fleet comparison either. The writer is
-  the only party holding both sides at one instant, so the writer subtracts. No
-  new field, no format change, no extra clock read. `0` still means *no sample
-  yet*, which now also swallows a genuine offset of exactly zero — one sample in
-  ~10⁹, overwritten by the next.
-
-  The rename is a breaking change to a `pub` field that has shipped since
-  `0.0.1`, unwritten. **Nothing could have been reading it for its value** — it
-  was always zero — but a `ClaimRecord { .. }` literal or a field path naming it
-  will not compile. Leaving the old name over the new quantity was the
-  alternative, and it is the exact doc-versus-code drift that kept `TFT004`
-  blind for the life of the project.
-
-  **`tf_tree`'s `EdgeWriter::push` now records it, sampled rather than on every
-  push.** A wall-clock read is **38.4 ns** against a **~4.9 ns** push, measured,
-  so unconditional was never the trade; the interval is derived once per claim
-  from `EdgeRecord::nominal_rate_mhz` as `max(mhz / 1000, 1)`, which makes the
-  *offset sample rate* the constant instead of the push interval — a 1 kHz IMU
-  and a 10 Hz localiser each yield about one offset per second of published
-  data, and each pays one clock read per second. An edge that declares no rate
-  samples every 1024 pushes rather than never, because a tree built without a
-  topology file is the common case and not an exotic one.
-
-  **A claim's first push samples, and a claim clears the offset it inherits.**
-  Both matter more than they look. Starting the countdown a full interval away
-  would leave a 10 Hz undeclared edge reading `0` — indistinguishable from the
-  state this release is fixing — for its first 102 seconds, and a 0.2 Hz one for
-  85 minutes. And **nothing in the system resets the field** — not
-  `release`, not the reaper, not `tf_tree_core::edge::claim` — so without the
-  clear, a replacement writer publishes under the departed writer's number and
-  a future `TFT004` bills a dead publisher's skew to this one.
-
-  **No arena byte moves and `FORMAT_VERSION` is untouched** — the field is
-  already part of `layout_hash`, and `layout_hash` is a stride table, so neither
-  the rename nor the change of meaning perturbs it. **That is worth naming as a
-  cost and not only as a convenience:** eight bytes changed interpretation with
-  nothing able to detect the difference, so two processes built either side of
-  the amendment would read each other's writes in their own units. It is
-  harmless *here* — both commits are inside this same `[Unreleased]` section, so
-  no published artifact ever wrote a receipt time — and it is the reason a
-  future change of meaning to a live field is not automatically free.
-
-  **The engine crate changes only in the field's name and doc.** The clock is
-  read in the facade, *after* `Publisher::push` returns, which keeps it outside
-  the seqlock window; inside it, a writer's diagnostic would become every
-  reader's `SlotContended` retries.
-
-  **What it costs — measured, and not where the record predicted.** `push` goes
-  from **4.85–5.0 ns to 5.87–6.1 ns**: **+1.0–1.1 ns, about +21%**, on every
-  push, re-derived on the amended sampler and not carried over from the first
-  one.
-  That is a *paired* delta, both arms in one process, five sittings
-  (`just push-sampler-cost`, `benches/push_sampler.rs`) — because this host
-  fails `bench_report`'s fitness probe and an unpaired before/after across two
-  `cargo bench` runs said **+47%**, which was drift. `just bench-check` passes.
-
-  **Almost none of it is the clock read — at that interval.** `SystemTime::now()`
-  is 38.4 ns here, which at the 1024-push default is 0.04 ns amortised, **3% of
-  the 1.1 ns**. The rest is the counter, which `0036` described as *"a
-  non-atomic counter increment and a compare against a value in a register"* and
-  priced at nothing. But the 3% is a property of **1024**, not of the design:
-  the cost is `counter + 38.4 / sample_every`, so at a declared 10 Hz the clock
-  is 78% of a ~4.9 ns overhead. What stays bounded is the cost **per second of
-  publishing** — `38.4 + rate × 1.06` ns, under a microsecond at 1 kHz and ~49 ns
-  at 10 Hz. `docs/PHASE1.md` §11.2 tabulates both ends and marks the one measured
-  row.
-
-  **The alternative `0036` proposed was built, and it is slower.** Sampling off
-  the arena's `heartbeat` with a mask — the counter the push path already
-  maintains — reads **+1.4 ns against +1.1 ns**, forces `sample_every` to a
-  power of two, and cannot sample a new writer's first push, because `heartbeat`
-  belongs to the edge and not to the claim.
-
-  What stays arithmetic is the *tail*: a 1 kHz publisher's p99.9 push is the
-  sampled one, ~38 ns above its neighbours, and `publish_to_visible` — the row
-  that would say whether that reaches a consumer — is `unavailable` on this host
-  (4 physical cores against the 17 it needs, and no ROS 2). It ships unmeasured,
-  and `docs/PHASE1.md` §11.2 says so in its own terms.
-
-  **`TFT004` now reads it** — see the entry below — so it still skips only where
-  it has no evidence, and
-  `docs/PHASE5.md` §0.0's *"sixteen detect"* becomes seventeen.
-
-- **`TFT004` detects clock skew** — the first check to move out of §0.0's
-  *"cannot detect anything in any configuration"* group since the catalogue was
-  written ([`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)
-  steps 3–4, closing that record). `docs/PHASE5.md` §6 calls it *"the check most
-  likely to find something nobody knew"*: on a multi-machine robot with imperfect
-  time sync, clock error presents as intermittent extrapolation failures on an
-  edge whose publisher is fine, and nothing else in a ROS 2 stack points at it.
-
-  **What it finds is narrower than §6 asks for, and that is a finding rather than
-  a shortfall.** A recorded offset is the publisher's clock error *plus* its
-  stamp-to-push latency, and **one sample cannot separate them** — a localiser
-  that stamps with the capture time of the scan it matched legitimately sits tens
-  of milliseconds above an odometry publisher. A fleet-relative rule would report
-  that healthy difference as skew however well its threshold were calibrated,
-  because the quantity it compares is not the quantity it names. So `TFT004`
-  fires only past a bound **no publish pipeline could account for** (ten
-  seconds): a machine whose NTP never came up or whose RTC is dead. That is a
-  physical argument, not a tuned constant.
-
-  **The fleet spread is reported as a note** — the offsets, their median and
-  their range, with the caveat attached so a reader does not chase a pipeline
-  difference as skew. That is the useful half today, and it is what `0036`
-  question 3 ratified.
-
-  **What separates clock error from latency is drift**, which needs a series;
-  `tf_tree top` polls and `doctor` does not, so the fleet-relative rule is owed
-  and recorded as a `top` feature — in `top.rs`'s own module header, where
-  whoever builds it will be, rather than only in a decision record they would
-  have no reason to open.
-
-  **Four skips, each with its own reason**, and two are about where the arena
-  came from rather than what is in it: a **replayed** source (`--from-bag`
-  records ingest-time offsets against a recording's stamps — two years for a 2024
-  bag read in 2026), an arena **at rest** (a frozen `.tft` carries offsets from
-  whenever it was frozen), `TFT005`'s epoch condition, and nothing sampled yet.
-
-### Fixed
-
-- **`Tree::reparent` no longer steals A2's topology lock from a live mutator
-  that `/proc` misreports** (#213, [`0029`](docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md)).
-  It was the last place in the system where one process could destroy another's
-  exclusive state on an *inference*: the steal was authorised by the
-  `(pid, start_time, boot_id)` triple, even on a tree holding an `F_OFD_GETLK`
-  probe, and `/proc` has two measured ways to call a running process dead — a
-  PID-namespace collision (`Known(st) != stored`, which is not `ENOENT`-shaped,
-  so the bias against proving death does not fire) and a same-user but
-  **non-dumpable** target under `hidepid`. A false "dead" here puts two live
-  processes in the topology critical section, which `docs/PHASE2.md` §6.2 calls
-  the corrupting direction.
-
-  **`reparent` now takes an exclusive OFD lock on the lock file's byte 1 before
-  it touches the arena word**, and releases them in the other order — the move
-  §6.1 already made for claims and §5.1 for participant records. A live holder is
-  refused by the kernel before any inference runs; a dead one has its byte
-  released by the kernel with no cooperation and no timeout, so nothing wedges.
-  Byte 1 was reserved by §3.3 and is unused, so **no arena byte changes** and
-  `FORMAT_VERSION` is untouched.
-
-  **`reparent` keeps the patience it always had.** The byte is re-attempted 32
-  times before contention is reported — sized from measurement (an uncontended
-  `reparent` is 2.94 µs, one contended `fcntl` 791 ns, the arena word's existing
-  1024-spin budget 30.29 µs), so a brief overlap is still absorbed rather than
-  returned to the caller as an error.
-
-  **The cost, measured rather than waved at:** an uncontended `reparent` goes
-  from 1.011 µs to 2.96 µs (**+193%**), which is two `fcntl`s. `reparent` is off
-  the query path (D3) and topology is near-static after startup, so the absolute
-  number is what decides; lookups are untouched.
-
-  A tree with **no lock file** — a heap tree, a directly-called
-  `TreeBuilder::build_shared`, an `attach_shared` over an inherited fd — is
-  unchanged in both directions: there is no byte for anyone to take, so the
-  `/proc` predicate is still the whole answer there. Nothing acquires a new way
-  to be stolen from.
-
-### Added
-
-- **`tf_tree_ipc::LockFile::try_take_topology` / `release_topology`** — byte 1 of
-  the lock file, A2's topology mutation lock. The §3.3 byte table gains a row and
-  `bytes 1–15 reserved` becomes `bytes 2–15`. There is deliberately **no
-  `probe_topology`**: nothing reads it, and an unused `pub fn` on a published
-  crate is surface with no consumer.
-
-### Changed — breaking
-
-- **`tf_tree::ReparentError::LockContended`'s `owner_slot` is `Option<u32>`, not
-  `u32`** (#213). Breaking for anything that destructures it. It is `None` when
-  the observation could not name the holder — it took the lock file's topology
-  byte and had not yet published its slot into the arena word, or it released the
-  word between the load and the `compare_exchange`. Both are nanoseconds wide and
-  both mean the same thing to a caller: *a live peer is mutating topology,
-  retry.*
-
-  **The old `u32` carried `tf_tree_core`'s `u32::MAX` sentinel straight through
-  to the message**, which then read *"the topology lock is held by live
-  participant slot 4294967295"* — a sentence an operator has to already know a
-  magic number to disbelieve. `docs/API.md` R5 makes the field the contract and
-  the message a diagnostic, which requires the field to be the thing that is
-  true. `tf_tree_core::topology::TopoLockError` keeps its sentinel; the
-  translation happens once, in `tf_tree`'s `From<TopoLockError>`.
-
-- **`tf_tree_ipc::LockRole` gains `Topology`** (#213). That enum is **not**
-  `#[non_exhaustive]`, so this breaks any downstream exhaustive `match` on it —
-  which is why it is here rather than under *Added*, where it was first filed.
-  Nothing in this workspace matches on `LockRole` outside `tf_tree_ipc`, and that
-  is not the standard a published crate is held to.
-
-  Whether the error-shaped enums in `tf_tree_ipc` should carry
-  `#[non_exhaustive]` at all is a **question this release does not answer**: the
-  crate uses it in `wire.rs` and not on `LockRole` or `IpcError`, both of which
-  have now grown breakingly more than once. It belongs with `API.md` §7 rather
-  than in a change about the topology lock.
-
-- **`tf_tree::ReparentError` gains `TopologyLease { raw_os_error: i32 }`**
-  (#213). The enum is `#[non_exhaustive]`, so a downstream `match` with a
-  catch-all is unaffected. Deliberately **not** folded into `LockContended`: both
-  refuse, but only one means a peer is doing something, and only one is worth
-  retrying. A refusal that names a live peer when the cause is `EBADF` sends an
-  operator to look for a process that is not there.
-
-- **`tf_tree_core::MAX_DEPTH` is 32, not 16, and it now means what its
-  documentation always said** (#251, `0034`). It bounds the *compiled* plan —
-  `Plan`'s `[Step; MAX_DEPTH]` array, counted **after** adjacent static links
-  fold into one step. It used to be enforced on the **raw walk** instead, which
-  is a different quantity: a 17-link rigid chain that compiles to a *single*
-  constant was refused at exactly the length a 17-joint arm was. A new
-  **`tf_tree_core::MAX_PATH_EDGES` = 64** bounds the walk. Both are `pub const`
-  and re-exported by `tf_tree`, so on the `0.0.x` line this is a semver-relevant
-  change to a value **and** to a meaning, on five published crates.
-
-  **Two bounds because one number cannot price both slots.** A compiled slot is
-  a `Step` — **128 bytes**, measured — carried by value in every `Plan`, in a
-  16-slot thread-local plan cache, and behind every Python `Plan`. A raw slot is
-  a `u32` edge id in `compile`'s stack frame: 4 bytes, paid once, on a call D3
-  already places off the query path.
-
-  **The values come from a survey, not from an intuition.** 91 distinct real
-  robot structures from 26 repositories, and the binding quantity is the graph
-  **diameter** in joints — up to the common ancestor and back down, which is
-  what a lookup walks — not root-to-leaf depth: max 30, p95 24, median 10.
-  Root-to-leaf depth maxes at 18, so a survey that measured *that* would have
-  concluded 24 was ample. At `MAX_DEPTH = 16` the old engine refused at least one
-  frame pair on **26 of the 91**. `MAX_PATH_EDGES = 64` is ~1.9× the floor a
-  deployment sets (a 30-joint diameter plus `map → odom → base_footprint`), and
-  deliberately not 256: this constant sets the worst *accepted* compile — 1.09 µs
-  at 64 against 3.97 µs at 256 — and a refused pair is not cached (#259), so it
-  recompiles on every lookup with nothing amortising it.
-
-- **`LookupError::TreeTooDeep { depth }` reports one quantity per bound, and the
-  two are disjoint** (`0034`). It reported three different things: the bound for
-  a one-sided chain, the truth for a balanced two-sided path, and neither for a
-  lopsided one. Now `MAX_PATH_EDGES + 1` means the **walk** refused — the walk
-  stops when it runs out of buffer and never learns the real length, so that is
-  the only value above the bound this field takes — and anything at or below
-  `MAX_PATH_EDGES` is the **exact** folded step count. No new variant and no new
-  `tft_status`: the C ABI's status table is frozen, and `TFT_ERR_TREE_TOO_DEEP`
-  still covers both. Its header prose no longer names `TFT_MAX_DEPTH`, a macro
-  referenced in two places and **defined nowhere** since Phase 4; it is still not
-  defined, because `0034` split the quantity it was vaguely about into two and
-  freezing that one name now would make it ambiguous rather than merely absent.
-
-- **Error precedence on a too-long path.** `fold` now runs before the compiled
-  bound is checked, so `UnknownEdge` and `MixedTimeDomains` are raised for a
-  defect that sits **past** the bound rather than being hidden behind the path's
-  length; `MissingEdge` is unchanged and still wins by its position in the walk.
-  Nothing in the workspace pinned precedence, which is why this was invisible;
-  `error_precedence_over_defect_kind_position_and_foldability` is the table that
-  pins it now, verified by building the cheaper implementation and watching the
-  two discriminating rows go red.
-
-  The Rust and Python `TreeTooDeep` messages are rewritten with it. The Rust
-  facade rendered **"path depth 16 exceeds the maximum of 16"** — self-
-  contradictory, and shipped for the whole of Phases 1–5 because nothing
-  asserted the text — and now names which bound refused and, for the compiled
-  one, `TreeBuilder::static_edge` as a remedy. Python's does **not** name that
-  remedy: `tf_tree.build` declares every edge dynamic, so a static edge is
-  unreachable from Python and `docs/API.md` R5 puts a binding-specific remedy in
-  the binding's own prose layer. Both renderings are now asserted
-  (`crates/tf_tree/tests/lookup.rs`, `tests/python/test_errors.py`).
-
-### Fixed
-
-- **A `Tree::lookup` that cannot be planned recompiled on every call, forever**
-  (#259). `with_plan` stored a compiled `Plan` and propagated a *failed* compile
-  with `?` — which returns before the store — so a frame pair that cannot be
-  planned paid the full compile per lookup for the life of the process. The
-  cache now holds the **result** of compiling a key, refusal included.
-
-  The pairs this covers are the ones whose *topology* refuses: `Disconnected`
-  (a declared frame whose parent link was never established, or one `reparent`ed
-  out of the queried subtree), `MissingEdge` (a link carrying the `0` edge
-  sentinel), `TreeTooDeep`, and a defective edge anywhere on the path. It is
-  **not** a typo'd frame name — `Tree::lookup` resolves names with a lookup, not
-  an intern, so an undeclared name is `UnknownFrame` before any compile — and it
-  is not an edge that simply has no samples yet, which compiles fine and fails
-  in `Plan::at` with `NoData`.
-
-  It was invisible while it was cheap. At `MAX_DEPTH = 16`, checked *during* the
-  walk, a 40-edge path was refused after 16 edges. `0034` separated the raw-walk
-  bound from the compiled-plan bound, so a path that is going to be refused is
-  now walked to its full length and — under the fold that gives `0034` its
-  stated error precedence — folded in full as well. Measured on a 60-edge chain
-  that walks inside `MAX_PATH_EDGES` and folds past `MAX_DEPTH`, medians of 5
-  rounds of 20 000 reps, `taskset -c 2`, builds interleaved: **579.0 ns →
-  291.5 ns, −49.6%**, ranges [576-585] against [291-297], landing on top of what
-  a *shallow* refusal costs — what is left is resolving the two names. A third
-  build carrying only #264's change moved this metric −0.9%, so the win is this
-  one's.
-
-  Safe for the same reason a cached plan is: the key carries the topology
-  generation, and every refusal `compile` can produce is a verdict on the reads
-  that key fixes. The two that are not — `Plan::at`'s `NoData`/`Extrapolation`
-  and `Tree::plan`'s post-`fork` `ChildDetached` — are respectively out of reach
-  by construction and declined explicitly. Nothing is stored unless the
-  generation is still the key's when the compile returns, which makes that an
-  invariant the code checks rather than an argument three facts deep. It costs
-  no memory: `Result<Plan, LookupError>` is `size_of::<Plan>()`, the `Err`
-  variant riding a niche in the `[Step; MAX_DEPTH]` array, pinned by a test. The
-  successful-hit path is unchanged and measured flat (+0.1%, inside its range).
-
-- **`Tree::plan` moved a `Plan`-sized array three times, none of it
-  proportional to the path** (#264). Disassembled at `MAX_DEPTH = 32`, all three
-  copies had survived optimisation: `fold` returning its `[Step; MAX_DEPTH]` out
-  through the caller's `sret` buffer (4096 B), `Plan::new` copying that same
-  array from its by-value parameter into `self.steps` (4096 B), and `compile`'s
-  `Plan` into `Tree::plan`'s `sret` slot (4160 B) — **12 352 bytes of `memcpy`
-  to compile a plan that is usually six steps long.**
-
-  The array is now written once, in place: `Plan::identity` makes the buffer and
-  `fold_into` fills it through `&mut Plan`, writing the steps *and* the four
-  fields that are a function of them (`len`, `domain`, `dyn_count`, `first_dyn`),
-  accumulated as the steps are appended rather than by a second pass over what
-  was just written. That deletes the first two copies — re-disassembled,
-  `fold_into` calls no `memcpy` at all. A 6-step `Tree::plan` goes
-  **265.0 ns → 118.7 ns, −55.2%** (same protocol as above; ranges [261-267]
-  against [114-122]). Refused paths barely move, because a refusal returns `Err`
-  and never constructs a `Plan`.
-
-  `Plan::identity` is the only constructor, so a `Plan` is a complete value the
-  moment it exists and there is no half-built state a later arm could forget to
-  complete — which would otherwise answer `Iso3::IDENTITY` for every stamp where
-  a refusal belongs.
-
-  The third copy stays: it is `compile` returning by value, and removing it means
-  an out-parameter on a `pub` function. Marking `fold_into` `#[inline]` was
-  measured and changes nothing.
-
-- **`docs/decisions/README.md` carried an unresolved merge conflict on `main`,
-  and every gate was green on it.** `<<<<<<< Updated upstream`, `||||||| Stash
-  base`, `=======` and `>>>>>>> Stashed changes` sat in the middle of the
-  decision status table with three copies of the `0033`/`0034`/`0035` rows, two
-  of them stale. The cause was a `git rebase` on a dirty worktree: the autostash
-  popped into a conflict *after* the rebase had already printed "Successfully
-  rebased", and `git status` was clean afterwards because the markers were inside
-  a file staged in the same command.
-
-  All eighteen CI checks passed on it, `just lint` included.
-  `scripts/artifact-versions.py` reads that very table on every run and counts
-  cells per row against the header — and a conflict marker is not a table row,
-  while the duplicated rows it *did* see were well-formed. Nothing else in the
-  workspace reads a Markdown table for anything but its shape.
-
-  Resolved by keeping `main`'s `0033` and `0035` rows, which were newer than the
-  stash base, and the stash's `0034` row, which was the edit that pull request was
-  making.
-
-  `just no-conflict-markers` is the new gate, fifth in the family that starts
-  with `just msrv`'s third arm and now runs first in `just lint` beside
-  `no-build-output`. Three markers and not four: `=======` alone is half of every
-  conflict and also a Markdown setext heading underline, and this repository is
-  more prose than code — every conflict git writes carries the
-  `<<<<<<<`/`>>>>>>>` pair, so dropping the ambiguous one costs no coverage.
-  Measured against the whole tracked corpus before it was written, per
-  `no-build-output`'s standard: the three matched the one corrupted file and
-  nothing else. It fails on the parent commit and passes on this one.
-
-- **`doctor`'s `TFT014` no longer calls a healthy participant in another PID
-  namespace a fork inheritor and tell the operator to stop it** (#239, `0033`).
-  The two faults have opposite remediations and, until this, the same sentence:
-  a live participant inside `unshare -U --fork --pid`, seen from the host,
-  rendered *"slot 1 pid 1, byte still HELD: a fork inheritor — byte still HELD,
-  recorded pid gone … Stop the child"* — text **byte-identical** to a genuine
-  surviving fork inheritor's, 1092 bytes each once the slot number and the
-  interpolated pid are normalised. The accused process was alive, `state=S`, and
-  owned by the user reading the report.
-
-  The cause is that a recorded pid is namespace-local while `/proc` is not. A
-  namespaced participant records pid 1, and pid 1 on the host is `systemd` with
-  a different start time, so `recorded_given`'s *"the number is in use and the
-  start time differs, therefore the pid was recycled"* arm fires — an arm that
-  is correct for the case it was written for. Nothing in the identity record
-  could tell: `boot_id` is identical across every namespace on one host and the
-  kernel has no per-namespace boot id.
-
-  **The namespace is recorded at registration, not derived at diagnosis**, and
-  that is the whole design. Probing `/proc/<recorded_pid>/ns/pid` fails *open*:
-  measured, it read an unrelated same-uid process at the recorded number, found
-  a matching namespace, and would have *confirmed* the fork verdict with false
-  confidence — the same successful-read-of-the-wrong-process class as the bug
-  this classifier was last fixed for. So `Identity` carries the writer's own
-  `/proc/self/ns/pid` inode and `doctor` compares it against its **own**.
-
-  Four arms staged, all four firing before and only the right one after:
-  **A** a namespaced participant seen from the host (`unshare -U --fork --pid`,
-  unprivileged); **B** a host participant seen from a container over a
-  bind-mounted runtime dir, which reaches the same verdict through `ENOENT`
-  instead — which is why the guard sits before the whole `match probe` and not
-  as an arm ahead of one branch; **C** a genuine surviving fork inheritor, the
-  true positive, which fires before and after; **D** participant *and* `doctor`
-  inside one bare `unshare -U --fork --pid`, where every namespace matches and
-  `doctor` reported **its own participant slot** — *"slot 1 pid 1, byte still
-  HELD … The record is FREE (no arena record: a read-only participant, D18)"* —
-  telling the operator to stop the process printing the report. D needs a second
-  guard, `readlink("/proc/self")` against `getpid()`, because there the pids are
-  namespace-local and the `/proc` resolving them is the parent's; the first
-  guard is structurally blind to it. Measured separately: with only the
-  namespace guard, A, B and C behave and D still fires; with only the `/proc`
-  guard, D behaves and A and B still fire. Neither carries the other's arms.
-  Real stagings ran `6 passed, 5 fired` before and `7 passed, 4 fired` after on
-  A, B and D, against isolating host controls that were `7 passed, 4 fired`
-  throughout; C stayed `6 passed, 5 fired`. `tests/attach.rs`'s
-  `tft014_namespace_arm_*` are the in-tree four, behind `just shm-check`, and
-  arm D skips loudly where `unshare -U` is refused.
-
-  **What this does not fix**, said here because it will otherwise be read as
-  fixed: the arena's `ParticipantRecord` gains no namespace discriminator, so
-  the three paths `docs/PHASE2.md` §0.0 already calls corrupting still resolve a
-  namespace-local pid against the observer's `/proc`. Those are arena fields and
-  a `FORMAT_VERSION` bump; this is the lock file, and neither `FORMAT_VERSION`
-  nor `layout_hash` moved. One verdict does move that was not the point: a slot
-  with a non-`FREE` record, a *free* byte, and a recorded process that read
-  `Running` now reads `Unknown` and so becomes a *byte free* report. Reaching it
-  needs the host process at the recorded namespace-local pid to have a matching
-  start time, which is the pid-reuse collision the identity triple exists to
-  exclude — accepted, and named so it is not a surprise. **The second guard is
-  wider than that**, and the record did not price it: where the first degrades
-  one record, the `/proc`-is-mine check degrades *every* slot in the file at
-  once, because if `/proc` is not the observer's namespace's then no recorded
-  pid in it is comparable — including the observer's own. Still the right
-  trade, since on such a `/proc` the alternative reading of that same slot is an
-  accusation, but it is a difference and it is written onto `recorded_given`'s
-  doc rather than left to be found.
-
-  **Two assertions here exist because a review proved the fix was otherwise
-  ungated, and both were mutated to check.** Replacing the production writer's
-  namespace read with a literal `0` — the fix recording nothing, in the field it
-  exists to fill — left `tf_tree_ipc` 91/91, `tf_tree_cli --features shm --lib`
-  124/124, `--test attach` 16/16 and `--test rendezvous` 31/31 green, because
-  every `TFT014` arm hand-writes the field into a synthetic record and
-  `of_self` (the constructor that *was* pinned) has one caller in the workspace
-  and it is a test. Reverting `name_str`'s fallback to `unwrap_or(32)` was
-  likewise green everywhere, because the compatibility record's `"node"` has a
-  NUL at byte 36 and never reaches the fallback. `best_effort_never_fails` now
-  asserts the recorded inode against a fresh read, and the compatibility test
-  gained a sixteen-byte name with no NUL — which is what an 18-to-20-byte
-  pre-`0033` name leaves in `32..48`, and which panics on the old spelling.
-
-- **Stopping and continuing an owner — Ctrl-Z then `fg`, or a `gdb -p` attach
-  and detach — no longer strands its arena.** `OwnerServer::serve`'s
-  `epoll_wait` propagated `EINTR` like any other
-  errno. `signal(7)` lists `epoll_wait` among the interfaces that fail with
-  `EINTR` after a stop signal followed by `SIGCONT` **with no signal handler
-  installed anywhere**, so "this crate installs none" was never a reason it could
-  not happen.
-
-  What it cost is out of all proportion to the cause. `serve` returned `Err`, the
-  server's `Drop` unlinked the published socket, and the process *lived on*
-  holding participant byte 0 and the ownership byte. §3.4 then has no exit for
-  anybody: nothing serves, so no new process can join, and step 4 refuses to
-  create a second arena because a participant byte is held by a process that
-  genuinely is alive. The arena was permanently unreachable and the only remedy
-  was killing an otherwise-healthy publisher. Nothing reported it either — the
-  facade's owner thread discards the result (`let _ = server.serve(...)`).
-
-  Measured on a staged owner: `SIGSTOP` + `SIGCONT` took it from two threads to
-  one, `default.sock` disappeared, and a join returned *"an arena is alive but
-  unreachable: participant slots 0x1 still hold their lock bytes (slot 0, pid
-  of a living process)"*. Three controls say it is the stop/continue **pair**
-  and not the act of signalling: no signal for the same interval, three
-  `SIGWINCH`es
-  (default-ignored), and a bare `SIGCONT` to a never-stopped owner each left
-  two threads, the socket in place, and the join succeeding.
-
-  **Two triggers are measured, and the obvious third is not.** Ctrl-Z + `fg`
-  (`SIGTSTP` + `SIGCONT`) reproduces it. A debugger reproduces it too, but by a
-  different mechanism and only one way round: `PTRACE_ATTACH` + `PTRACE_DETACH`
-  over every tid in `/proc/<pid>/task`, which is what `gdb -p` does, wedges the
-  pre-fix build, while attaching to the main thread alone does not — that tracee
-  sits in ptrace-stop and the syscall restarts. A container freeze/thaw is the
-  one everybody will assume and **nobody has run**: `signal(7)`'s list is scoped
-  to stop signals resumed by `SIGCONT`, and a cgroup freezer is a different
-  mechanism, so it is left as a suspicion rather than written down as a cause.
-
-  The fix retries that one errno and returns every other, so an `EBADF` is still
-  loud rather than an infinite spin. The regression test is
-  `a_stopped_and_continued_owner_still_serves_the_rendezvous`
-  (`just shm-rendezvous`): it stops and continues a real
-  owner and then has a second process join, and on the parent commit it fails on
-  both halves independently — the thread count (`left: Some(1), right: Some(2)`)
-  and the join.
-
-  **Not fixed, and deliberately out of scope:** what an owner should *do* when
-  its server dies for a reason that is not `EINTR`. It still keeps its bytes
-  silently. That is a protocol question, not a retry.
-
-- **A creator now takes participant slot 0 atomically, so it cannot end up
-  holding one integer while its arena record holds another** (#201, `0035`).
-  §3.4 step 4's split-brain scan and step 5's slot acquire were two passes over
-  the same bytes. `any_participant_held` probes byte 0 **first** and then up to
-  63 more before returning, so byte 0 could change hands for the rest of that
-  scan — and the facade indexes the lock byte and the arena record with one
-  number, so a creator on any other byte hands out a tree whose liveness
-  predicates disagree with themselves.
-
-  Measured, 4000 iterations of exactly the two calls steps 4 and 5 make, against
-  a second open file description toggling byte 0: **2242 took a non-zero byte**.
-  Control with the racer off: 4000 took byte 0, none diverged.
-
-  No in-tree production path occupies that window today. It is fixed anyway
-  because `LockFile::try_take_participant` is public API on a published crate, so
-  a downstream consumer can — and "no caller in our own tree does this" is not an
-  invariant a library can offer.
-
-  The fix is smaller and faster than what it replaces: one `F_OFD_SETLK` on byte
-  0 instead of a scan, so the check and the take are a single kernel-atomic
-  operation and there is no window because there is no gap. Losing that acquire
-  is not a new failure mode — it is step 4's condition arriving late, and takes
-  step 4's existing branch.
-
-  Since `0028` this was **detected** rather than silent: the facade refused with
-  `OpenError::ParticipantSlotDiverged`, which is not in `is_retryable`, so a
-  transient race became a permanent failure (measured end to end: 210 of 400).
-  That path is now unreachable from a create. The guard stays where it is, as an
-  assertion.
-
-  `--force-new` (`CreatePolicy::Always`) is deliberately not exempted. It skips
-  step 4, so a contended byte 0 there means a *live* participant holds it, and
-  forcing a fresh arena past one is the split brain the flag exists to resolve.
-  Byte 0 is free in exactly the case the hatch is for because it is the
-  **owner's** slot, held for the owner's whole life while joiners are assigned
-  `>= 1` — not, as this entry first said, because the wedged arena's participants
-  are dead. That was false in both directions and is corrected below (#257).
-
-  **Not fixed:** the takeover arm (`Open::already_attached`) still reaches
-  `register_any` and can still produce the divergence. Its correct slot is
-  `0028` question 3, RESOLVED 2026-08-20 — the heir keeps its existing slot,
-  byte and arena. This entry read "`0029` question 3, which is `draft`" and was
-  wrong twice: `0029`'s question 3 was about the socket-hangup callback, and the
-  question meant here was already answered when this was written.
-
-### Changed — breaking
+  clock** (#273, [`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).
+  It shipped since `0.0.1` *unwritten*, so nothing could have read it for its
+  value, but a field path or a `ClaimRecord { .. }` literal naming it will not
+  compile. No arena byte moves.
+
+- **`tf_tree_ipc::Open::already_attached`, the takeover arm it reached, and
+  `Open::register_any` are deleted; `OpenOutcome::TookOver` now has no producer**
+  (#275, closes #201, [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
+  `LockFile::take_any_participant` survives with no production caller; `IpcError`
+  and `OpenOutcome` are unchanged as types; and `tf_tree`'s `TookOver` arm keeps
+  the `OpenError::TakeoverUnsupported` refusal it has carried since #229
+  (`0028` step 9), now unreachable and kept deliberately rather than made
+  `unreachable!()` — it is what stands between an heir and a forked tree the day
+  §3.5 gives the variant a producer (`crates/tf_tree/src/open.rs`).
+  The arm handed back the first **free**
+  participant byte while the caller's arena record was elsewhere, and could not be
+  repaired in place — `0037` carries the five executed unsound states, the
+  `F_OFD_GETLK` root cause, and the shape a real §3.5 would take.
+
+  **Ownership migration (§3.5) was therefore not implemented, and had no path at
+  all — until the entry below.** `0037` moved from `draft` to `implemented` in
+  the same release: the deletion recorded here is half of the change, and
+  `Session::take_over_ownership` is the other half. What is written above about
+  the deleted arm stands; what no longer holds is that `TakeoverUnsupported` is
+  "what stands between an heir and a forked tree", because the heir that shipped
+  keeps its existing mapping and never constructs an arena at all.
+
+- **The topology lock's error surface changes shape** (#213, `0029`).
+  `ReparentError::LockContended`'s `owner_slot` is `Option<u32>`, not `u32`, so
+  it stops passing `tf_tree_core`'s `u32::MAX` sentinel to the operator's message
+  (`docs/API.md` R5); `ReparentError` gains `TopologyLease { raw_os_error: i32 }`;
+  and `tf_tree_ipc::LockRole` gains `Topology`, which breaks a downstream
+  exhaustive `match`, that enum not being `#[non_exhaustive]` (`docs/API.md` §7).
+
+- **Both depth bounds move, and one changes meaning** (#251,
+  [`0034`](docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md)).
+  `tf_tree_core::MAX_DEPTH` is 32, not 16, and bounds the *compiled* plan; the
+  new `MAX_PATH_EDGES` = 64 bounds the raw walk. Both are `pub const` and
+  re-exported by `tf_tree`: a change to a value **and** to a meaning, on five
+  published crates. `LookupError::TreeTooDeep { depth }` reports one quantity per
+  bound, with no new variant and no new `tft_status`.
 
 - **`tf_tree_ipc::self_comm` returns `[u8; 16]`, not `[u8; 32]`, and
   `tf_tree_ipc::Identity` gains `pid_ns_inode: u64` while `name` narrows to
-  `[u8; 16]`** (#239, `0033`). This is a public break on a **publishing** crate,
-  taken on the `0.0.x` line where every release may break every other, and said
-  here rather than left to a compile error downstream. In-tree there are exactly
-  three callers of `self_comm` and every `Identity` literal is a compile error
-  until it names the new field, so nothing about this is silent — except two
-  sites that are not, and both are in `tf_tree_ipc` itself: `name_str`'s
-  `unwrap_or(32)` becomes an out-of-bounds slice on a `pub` method, and
-  `to_bytes`'s `out[32..64].copy_from_slice(&self.name)` is slice-to-slice, so
-  it type-checks and then panics on *every* registering `open()`. Both now spell
-  the bound `self.name.len()`.
-
-  **The on-disk record did not grow and did not move.** `name` is `32..48`,
-  `pid_ns_inode` is `48..56`, the 64-byte stride is unchanged, and the second
-  page of the lock file is still exactly one page. It is free because the kernel
-  caps `comm` at 15 bytes plus its NUL (`TASK_COMM_LEN`) — a real record written
-  by a process whose binary basename is 52 characters used 15 of the 32, with
-  `47..64` zero — so the eight bytes taken were padding in every record ever
-  written. In both directions the change is compatible without a version field:
-  every reader NUL-trims, so an old decoder reads a new record's name correctly
-  and never sees the inode, and a new decoder reads `0` in an old record, which
-  is already this field's *unknown namespace*.
-
-  `tf_tree`'s handshake is **not** affected and pads back to 32:
-  `HelloRequest::client_name` is wire bytes `56..88` of an 88-byte datagram,
-  pinned by `the_byte_layout_is_pinned` and by `docs/PHASE2.md` §3.7. The two
-  32s were never the same 32, which is why that one site looks redundant and is
-  not.
+  `[u8; 16]`** (#239, [`0033`](docs/decisions/0033-the-identity-record-cannot-name-a-namespace.md)).
+  A public break on a **publishing** crate; the on-disk record did not grow or
+  move, and the 88-byte handshake is unaffected (`docs/PHASE2.md` §3.7).
 
 - **`IpcError::ArenaHeldButUnreachable` gains an `ownership_held: bool`, and its
   message now tells an operator which of three states they are in** (#257).
-  `--force-new` (`CreatePolicy::Always`) is not the empty promise the issue
-  assumed and not the unconditional remedy `RUNBOOK.md` offered. Measured, it
-  creates iff **nothing is serving**, **the ownership byte is free** and
-  **participant byte 0 is free** — and since byte 0 is the creator's slot
-  (`0035`), held by the owner for its whole life while joiners are assigned
-  `>= 1`, that reduces to *the owner is gone and non-owner participants survive*,
-  which is exactly the stranded-participant case `PHASE2.md` §3.4 offers it for.
-  `the_escape_hatch_creates_over_a_stranded_participant` has pinned it working
-  since it was written.
-
-  Until now the error could not tell those states apart. A live byte 0 and a
-  stranded byte 3 produced the same sentence, differing only in a slot number
-  whose meaning appeared nowhere in the message — so the honest answer ("stop
-  that process; no force can pass it") and the useful one ("force will create
-  here") were indistinguishable. The bool is read with one `F_OFD_GETLK` at the
-  deadline, next to the identity record already read there, and is advisory in
-  the same way: it says what was true at that instant. `Display` spends it on
-  three arms, and splits the pre-existing empty-mask arm in two — its text
-  claimed the ownership byte was "held for the whole open timeout", which the
-  probe cannot say when it comes back free, so that case now gets its own
-  sentence. That split is the one branch in this change nothing stages: reaching
-  it needs a holder that lets go between the last acquire attempt and the probe,
-  and its reachability is read rather than measured.
-
-  The slot-0 arm's remedy branches on the rest of the mask, and it has to. "Stop
-  that process and an ordinary open will create" is true only when byte 0 is the
-  *only* byte held; with a joiner still on byte 2, stopping the byte-0 holder
-  leaves `IfAbsent` refusing and makes the forced create the one thing that
-  works — the opposite advice. Measured, and pinned by the `0b101` arm of
-  `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass`.
-
-  **This is a breaking change on a published crate**: `IpcError` is not
-  `#[non_exhaustive]`, so a downstream `match` that destructures this variant
-  field-by-field stops compiling until it adds the field or a `..`. Taken
-  deliberately — every `0.0.x` is incompatible with every other, which is this
-  file's opening promise, and the alternative is an error that recommends a
-  recovery that cannot work.
-
-  Two new tests pin the boundary from both sides, each with the control that
-  makes it non-vacuous:
-  `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` (both policies
-  return the *same* error; move the held byte to 3 and `Always` creates) and
-  `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through`
-  (release only the ownership byte and the same forced create succeeds).
-
-- **A false sentence about `--force-new` is corrected in the four live places it
-  was copied to** (#257): `PHASE2.md` §3.4, `Open::register_creator`'s doc
-  comment, `docs/decisions/README.md`'s `0035` row, and the `[Unreleased]` entry
-  above. Each said the wedged arena the hatch exists for has *dead* participants
-  whose bytes the kernel released when they died. It
-  is false, and backwards: a wedge **requires** a live holder, because an arena
-  all of whose holders are dead holds no participant byte at all, so §3.4 step 4
-  never fires and an ordinary `CreatePolicy::IfAbsent` open already creates with
-  no force involved. §3.4 also contradicted itself — the paragraph four lines
-  below described the wedge as a `SIGSTOP`ped participant, which is alive and
-  holding its byte.
-
-  A fifth site said something different and equally wrong:
-  `CreatePolicy::Always`'s own doc comment described what it abandons as "an
-  arena whose holders are alive and whose owner is not serving", which is
-  precisely the state it cannot abandon — the holder of byte 0 *is* the owner
-  that is not serving. It now says: an arena whose owner is gone and whose
-  non-owner holders are alive.
-
-  `docs/decisions/0035` is `implemented` and is left alone: it quotes the
-  sentence in order to retract it, and `PHASE2.md` §0.0's `--force-new` row is
-  where this project corrects a frozen record's copies. That row now also records
-  that `0035`'s own correction over-reached — its "None of the three delivers the
-  documented escape hatch" generalises from one staged state, a live holder of
-  byte 0, and is refuted by the stranded-participant test passing at this
-  revision.
-
-- **`RUNBOOK.md`'s `ArenaHeldButUnreachable` section stops telling operators to
-  expect an error that path can no longer return** (#257). It said a forced
-  create against a live holder of byte 0 returns
-  `OpenError::ParticipantSlotDiverged`; since `0035` the create never gets that
-  far, and the operator sees `ArenaHeldButUnreachable { first_slot: Some(0), .. }`
-  instead — so anyone grepping their logs for the string the runbook named found
-  nothing. Its escape-hatch recipe also offered `CreatePolicy::Always`
-  unconditionally; it now states the two states in which that is refused.
+  Breaking: `IpcError` is not `#[non_exhaustive]`. With it, a false sentence
+  about `--force-new` — that the arena the hatch exists for has *dead*
+  participants, where a wedge **requires** a live holder — is corrected in the
+  four live places it was copied to, the entry below included, and `RUNBOOK.md`
+  stops promising an error that path no longer returns. `docs/PHASE2.md` §0.0's
+  `--force-new` row carries the rule.
 
 ### Added
 
+- **`Tree::inherit_ownership` and `Tree::owner_lost` — `docs/PHASE2.md` §3.5,
+  which had never run** ([`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md),
+  now `implemented`). Kill an arena's owner and lookups keep being served, exactly
+  as §3.5 promises — but until now **no new process could join**, for as long as
+  any survivor lived. A joiner won the ownership byte, met §3.4's split-brain
+  check against the survivors' held participant bytes, backed off, and timed out
+  with `ArenaHeldButUnreachable`. That is what a supervised robot does every time
+  it restarts one node.
+
+  `tf_tree_ipc::Session::take_over_ownership` takes byte 0 on the file
+  description the session **already holds**, so the slot, the participant byte
+  and the arena record cannot move — the invariant is structural rather than
+  checked, which is why this is a `Session` method and not a second `open()`.
+  `tf_tree_ipc::peer_hung_up` and `Tree::owner_lost` are §3.5's trigger, which
+  never existed: nothing watched the client socket, so no participant ever
+  *reached* the takeover path even while one was implemented. The trigger is
+  caller-driven by design — no background thread, no daemon
+  ([`0019`](docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)) —
+  so a fleet whose survivors never call it still ends up ownerless.
+
+- **`Plan::at_extrapolating` and `Extrapolated`** ([`0039`](docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)).
+  `ExtrapPolicy::{Hold, ConstantTwist}` were implemented, tested and reachable
+  from nothing: all five fold sites passed the `Error` literal and the facade did
+  not re-export the type. Extrapolation is now selected **per query** — a `Hold`
+  right for a 10 Hz map edge is wrong for the 1 kHz edge beside it — and
+  `Extrapolated` has no accessor yielding the pose alone, so how far past
+  `latest_common` an answer reached is handed over with the answer. `Plan::at` is
+  unchanged and still refuses. `ExtrapPolicy` is now re-exported from `tf_tree`.
+
+- **A tagged sibling for every query shape**, and `Tree::lookup_tagged`
+  ([`0038`](docs/decisions/0038-the-domain-a-binding-cannot-name.md)):
+  `Plan::{at_tagged, at_with_derivatives_tagged, at_many_into_tagged,
+  at_many_into_f32_tagged, at_adaptive_tagged}`. `Domain` is an **open trait**, so
+  a foreign binding cannot name the type `at::<D>` needs and must carry the tag as
+  data. The typed forms are now one-line delegations; behaviour is unchanged for
+  every existing caller.
+
+- **`docs/API.md` §8, the real-time envelope.** The pitch is "fast enough to sit
+  inside a control loop" and nothing stated what that meant. §8 records what the
+  query path does not do, the bound that makes it usable from `SCHED_FIFO`
+  (`SEQ_RETRY_LIMIT` = 64, then `SlotContended`), that page residency is the
+  residual and `mlockall` is the embedder's call — and, in §8.4, that only the
+  allocation claim has an executor and that `PHASE4.md` §1's operational criterion
+  is still open.
+
+- **A per-publisher clock offset, from a field that has been in every shipped
+  arena since it was declared, and a `TFT004` that reads it** (#272, #273, #274,
+  [`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md),
+  closing that record). Nothing wrote `ClaimRecord::last_push_nanos` and nothing
+  read it, which is why `TFT004` could detect nothing in any configuration.
+  `EdgeWriter::push` now records `wall clock - stamp`, sampled rather than on
+  every push, and a claim clears the offset it inherits. **It costs about
+  +1.1 ns per push** — `0036` carries the measurements, the percentage and the
+  sampling interval, `docs/PHASE1.md` §11.2 the cost per second of publishing.
+  `TFT004` is the **second** check to leave `docs/PHASE5.md` §0.0's *"cannot
+  detect anything in any configuration"* group — `TFT007` left it first, on §6's
+  declared-rate amendment — so *"sixteen detect"* becomes seventeen;
+  what it deliberately does not claim to detect, and the four skips, are `0036`
+  question 3.
+
+- **`tf_tree_ipc::LockFile::try_take_topology` / `release_topology`** (#213) —
+  byte 1 of the lock file, A2's topology mutation lock, so §3.3's byte table
+  gains a row and `bytes 1–15 reserved` becomes `bytes 2–15`. Deliberately **no
+  `probe_topology`**: an unused `pub fn` is surface with no consumer.
+
 - **`tf_tree_py` gains a `pure-hash` passthrough, and `just py-cross-check`
-  compiles it** (#180). `macos-15-intel` is the last x86_64 macOS image GitHub
-  Actions will offer and it disappears in August 2027; the fallback is
-  cross-building x86_64 from the arm64 runner, and that was written off because
-  blake3's C backend needs a target C toolchain.
+  compiles it** (#180). `pure-hash` (#243) removed blake3's target-C-toolchain
+  requirement for the Rust crates but was never forwarded to the binding, so a
+  cross build of the *wheel* died in blake3's build script. Six of the seven
+  things #180's 2027 fallback needs now hold; the seventh needs a real runner.
 
-  `pure-hash` (#243) removed that for `tf_tree_core` and `tf_tree` but was never
-  forwarded to the binding, so a cross build of the *wheel* still died in
-  blake3's build script before pyo3 was reached. Measured both ways from Linux:
-  without the feature, `cargo check --target x86_64-apple-darwin` exits 101 in
-  `cc` on `-arch x86_64`; with it, all three of `{x86_64,aarch64}-apple-darwin`
-  and `x86_64-pc-windows-msvc` exit 0. A full `cargo build --lib` for
-  `x86_64-apple-darwin` compiles all 178 objects and stops at exactly one step —
-  the final link, wanting an Apple linker driver and the macOS SDK.
-
-  So option 2 needs seven things and **six are now true**; the seventh is whether
-  the arm64 runner's SDK carries x86_64 slices, which is a five-minute check on a
-  real runner and cannot be answered from Linux.
-
-  Two findings from the same experiment worth recording. **libpython is a
-  non-issue** — maturin writes its own cross PyO3 config from the abi3 feature and
-  passes `-C link-arg=-undefined dynamic_lookup`, so no target interpreter is
-  needed. And **`shm` never enters a macOS build at all**: `tf_tree` declares
-  `tf_tree_ipc` under a target table, so it is absent from the non-Linux
-  dependency graph. The macOS wheel has always been deliberately different and
-  says so at runtime through `has_shared_memory()` and a refusing
-  `#[cfg(not(target_os = "linux"))]` arm on `open_arena` — nothing was quietly
-  different.
+- **`just artifact-versions` reads the five crates.io front pages, and `just
+  msrv`'s prose arm now covers them too** (#238). Neither gate could see a claim
+  written in prose, so four of the five publishable crates said `0.0.1` for three
+  releases while all five stated an unchecked MSRV. The version rule is a
+  three-component `v?X.Y.Z` outside an inline code span; the MSRV arm stays a
+  *presence* test, which is written down next to the loop.
 
 ### Fixed
 
+- **The `Guard`'s packed search cursor went permanently inert past 2^32 pushes**
+  — 49.7 days of unbroken 1 kHz publishing on one edge. The cursor is the low 32
+  bits of a logical index and `head` is monotone and never masked, so beyond that
+  point every stored hint was smaller than `lo_logical` and the clamp pinned it to
+  the **oldest** retained sample on every call, reverting the resumed gallop to a
+  walk from the far end of the window — worse than the midpoint restart it exists
+  to beat. Never a wrong answer, which is why nothing caught it.
+  `sample::rebase_hint` lifts the truncated value back; the readable window is
+  strictly narrower than 2^32, so the lift is exact rather than a heuristic, and
+  below 2^32 it is the identity.
+
+- **`TFT016` told an operator to raise a limit nothing in this codebase spends.**
+  Its finding read `mlock() of the arena will fail`, and `tf_tree` calls `mlock`
+  nowhere — `docs/PHASE2.md` §7.4's `LockPolicy` exists in no line of code (§0.0
+  now carries the row). The check fires on the same condition; it now addresses
+  the embedding application, which is the only place that can see the
+  `RLIMIT_MEMLOCK` budget it would spend (`docs/API.md` §8.3).
+
+- **`Tree::reparent` no longer steals A2's topology lock from a live mutator that
+  `/proc` misreports** (#213,
+  [`0029`](docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md)). It takes
+  an exclusive OFD lock on the lock file's byte 1 before touching the arena word
+  and releases them in the other order, so a live holder is refused by the kernel
+  before any inference runs. No arena byte changes, and the two added `fcntl`s sit
+  on a call D3 puts off the query path.
+
+- **A `Tree::lookup` that cannot be planned recompiled on every call, forever**
+  (#259). `with_plan` propagated a *failed* compile with `?`, which returns
+  before the store; the cache now holds the **result** of compiling a key,
+  refusal included — **−49.6%** on a refused 60-edge chain. Why that is safe is
+  on `crates/tf_tree/src/cache.rs`.
+
+- **`Tree::plan` moved a `Plan`-sized array three times, none of it proportional
+  to the path** (#264) — 12 352 bytes of `memcpy` per compile, all three copies
+  confirmed by disassembly. It is now written once in place, by `Plan::identity`
+  plus `fold_into`: **−55.2%** on a 6-step `Tree::plan` (`docs/PHASE1.md` §7.2).
+
+- **`docs/decisions/README.md` carried an unresolved merge conflict on `main`,
+  and all eighteen CI checks were green on it** (#266) — a `git rebase` on a
+  dirty worktree whose autostash popped into a conflict *after* the rebase
+  reported success. `just no-conflict-markers` is the new gate, first in
+  `just lint`; the script says why it matches three markers and not four.
+
+- **`doctor`'s `TFT014` no longer calls a healthy participant in another PID
+  namespace a fork inheritor and tells the operator to stop it** (#239,
+  [`0033`](docs/decisions/0033-the-identity-record-cannot-name-a-namespace.md)).
+  A recorded pid is namespace-local while `/proc` is not, so `Identity` now
+  carries the writer's own `/proc/self/ns/pid` inode — recorded at registration,
+  for `0033`'s reason — and `doctor` compares it against its own, behind a second
+  guard for what the first is blind to. It fixes `doctor` and only `doctor`: the
+  three paths `docs/PHASE2.md` §0.0 calls corrupting read `ParticipantRecord`,
+  which gains no discriminator.
+
+- **Stopping and continuing an owner — Ctrl-Z then `fg`, or a `gdb -p` attach and
+  detach — no longer strands its arena** (#260). `OwnerServer::serve`'s
+  `epoll_wait` propagated `EINTR`, so `serve` returned `Err`, its `Drop` unlinked
+  the published socket, and the process lived on holding participant byte 0 and
+  the ownership byte — §3.4 then has no exit for anybody. The fix retries that one
+  errno; `crates/tf_tree_ipc/src/server.rs` carries the `signal(7)` argument and
+  which triggers are measured.
+
+- **A creator now takes participant slot 0 atomically, so it cannot end up
+  holding one integer while its arena record holds another** (#201,
+  [`0035`](docs/decisions/0035-the-creators-slot-is-taken-not-found.md)). §3.4
+  step 4's split-brain scan and step 5's slot acquire were two passes over the
+  same bytes; it is now one `F_OFD_SETLK` on byte 0, and `--force-new` is
+  deliberately not exempted. `docs/PHASE2.md` §0.0's participant-registry row
+  carries the measurement and the reachability argument.
+
+  > **Amended by #275.** This entry ended *"Not fixed: the takeover arm
+  > (`Open::already_attached`) still reaches `register_any` and can still produce
+  > the divergence"*, and that is no longer true: the arm, its builder and
+  > `register_any` are deleted. It was right that `0028` question 3 had settled
+  > the arm's correct slot and wrong about what it settled — §3.5 **cannot** be an
+  > `Open::open` call at all, which
+  > [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md) records.
+
 - **A stamp far from the origin overflowed two arithmetic sites, and a release
-  build answered wrongly rather than panicking.** An all-static path is
-  answerable at *any* stamp — `Plan::span` returns `Ok(None)` and says so — which
-  makes `i64::MIN` and `i64::MAX` ordinary arguments rather than pathological
-  ones. Two places subtracted them signed:
-
-  * `plan::subdivide`'s segment width. `at_adaptive(i64::MIN, i64::MAX)` on an
-    all-static plan panicked in a checked build. In a release build the width
-    wrapped negative, failed the `> 1` split test, and returned a two-knot
-    straight line: measured on a dynamic path spanning ±2^62, endpoints -0.4989
-    and -0.9953 against a true midpoint of -17.2030, for a requested tolerance of
-    1e-6. No error, no panic.
-  * `sample.rs`'s interpolation parameter, on the hot path, for two bracketing
-    samples more than `i64::MAX` apart. A wrapped denominator makes `s` negative,
-    so `Interp::eval` runs backwards past the older sample and returns a pose from
-    outside the bracket entirely. Measured in release: `t.x = -4.55e43` where the
-    two samples were 0 and 10, returned as `Ok`.
-
-  Every stamp difference in `sample.rs` now goes through one `span_ns` helper that
-  subtracts in `u64`, which is exact for every ordered `i64` pair rather than a
-  truncation of it. Five call sites; the ordering each relies on is established
-  immediately above it. This is not an endorsement of 292-year sample gaps — if a
-  segment-width bound is wanted it belongs in `push` as an error naming the edge
-  (R5), not in an accident of two's complement.
-
-  Found by measuring the static/dynamic isolation guarantee rather than by reading
-  the code, and the second site was found by the first one's skeptic after the
-  original report scoped it to "all-static plans only" on a control that varied
-  two things at once.
-
-- **The stamp-independence of an all-static path is now pinned** (`wide_stamps.rs`).
-  It was true and untested at the extremes: perturbing a folded static step for
-  `t != 0` is caught near the origin by three existing tests in `lookup.rs`, and
-  by nothing at `i64::MIN`. The new test asserts bit-identical results across the
-  full range.
+  build answered wrongly rather than panicking** (#247). `plan::subdivide`'s
+  segment width and `sample.rs`'s interpolation parameter both subtracted stamps
+  signed, returning — as `Ok` — a two-knot straight line and a pose from outside
+  the bracket. Every stamp difference in `sample.rs` now subtracts in `u64`
+  through one `span_ns` helper, and `crates/tf_tree/tests/wide_stamps.rs` pins an
+  all-static path's stamp-independence, true and untested there until now.
 
 - **358 MiB of committed cargo build output is untracked, and a gate now makes
-  the class unmergeable.** Four `CARGO_TARGET_DIR` siblings — `target-p`,
-  `target-x`, `target-miri`, `target-stable`, 1386 files — were committed and
-  merged across #237, #242 and #243. `.gitignore`'s `/target/` is *anchored*, so
-  it matched a child named `target/` and none of its siblings; `git status`
-  stayed clean because the files were tracked, and no test, lint or release gate
-  looks at what is tracked. A fresh clone cost 112 MiB instead of 5 MiB, and the
-  v0.0.4 GitHub source tarball 119 MiB instead of 9 MiB.
-
-  **No published artifact was affected.** `cargo publish` and `maturin sdist`
-  both package from a crate root, and the junk sat above every one of them —
-  verified against the registries: the five 0.0.4 crates are 0.06–0.23 MiB each
-  and the `transform_tree` 0.0.4 sdist is 0.67 MiB with zero `target-*` entries.
-
-  History was left intact deliberately, so every published SHA and the `v0.0.4`
-  tag still resolve. The 358 MiB therefore remains reachable in the history and a
-  clone still pays it; removing it needs a force-push that would move the release
-  tag, and that trade was declined.
-
-  Two fixes, and the second is the one that matters: `.gitignore` now says
-  `/target*/`, and `just no-build-output` rejects any tracked file carrying a
-  cargo build-output signature (`CACHEDIR.TAG`, `.fingerprint/`,
-  `.rustc_info.json`, the two lock files) regardless of what the directory is
-  called. `.gitignore` had already been patched twice for this same trap, once
-  per spelling — no ignore rule anticipates the next one.
+  the class unmergeable** (#246). Four `CARGO_TARGET_DIR` siblings merged across
+  #237, #242 and #243, because `.gitignore`'s `/target/` is *anchored* and
+  nothing in the pipeline looks at what is tracked. **No published artifact was
+  affected**, verified against the registries, and history is left intact so every
+  published SHA and the `v0.0.4` tag still resolve. `just no-build-output` rejects
+  a cargo build-output signature whatever the directory is called.
 
 - **`CLAUDE.md` and `ci.yml` both said `just lint` runs six clippy passes; it
-  runs eight.** `pure-hash` (#243) added two and neither prose site was updated —
-  including a comment that explicitly claimed to have counted rather than
-  remembered.
-
-### Added
-
-- **`just artifact-versions` now reads the five crates.io front pages** (#238).
-  The gate is "one release, one version", and it could not see a version written
-  in prose — so four of the five publishable crates' `README.md` opened their
-  Version section with `0.0.1` for three releases while the workspace was `0.0.3`.
-  `tf_tree_math` had hit it first and fixed it the right way, by deleting the
-  number and recording why, and **that fix reached one crate of five**: a lesson
-  written into prose only propagates if the next person reads the prose.
-
-  The rule is narrower than the obvious one, because the obvious one flaps. "No
-  version-shaped literal" fails 57 times today on correct prose (`MSRV is
-  **1.87**`, `Apache-2.0`, `tf_tree_math`'s SE(3) examples); a bare
-  three-component rule still fails 9 times, and all 9 are deliberate — including
-  the very sentence #236 added to record this bug. What ships is **a
-  three-component `v?X.Y.Z` outside an inline code span**, which is 0 hits today
-  and exactly 4 against `abd2fd9^`, on exactly the four defective files, with
-  `tf_tree_math` silent. The exemption is safe because the defect was never in
-  code: it was bold. Fenced blocks stay in scope, so a future versioned install
-  snippet is covered.
-
-  Scope is derived rather than listed — `PUBLISHABLE` plus each manifest's
-  `[package] readme` — so option 2's stated cost of encoding "these five files"
-  is not paid, and a crate that publishes without a `readme` key fails.
-
-  **It has nothing to check today**, and that is the honest description: after
-  #236 no tracked Markdown file makes a live claim about the current version.
-  It is a regression guard.
-
-- **`just msrv`'s prose arm now covers those same five front pages.** All five
-  state `MSRV is **1.87**` and none was checked. Found while closing #238, in the
-  same five files, in the same class. That arm remains a *presence* test — a
-  document stating the right floor and a wrong one alongside it still passes,
-  which is a separate gap and is now written down next to the loop.
+  runs eight** — `pure-hash` (#243) added two and neither prose site was updated,
+  including a comment that claimed to have counted rather than remembered.
 
 ---
 
