@@ -783,6 +783,24 @@ public:
     explicit operator bool() const noexcept { return static_cast<bool>(h_); }
 
     inline result<Plan> plan(const char* target, const char* source) const;
+
+    /// Compile a plan that will be queried in time domain `domain`.
+    ///
+    /// `plan(target, source)` is this with `domain = 0` — the tag a real-time
+    /// tree publishes in, and the right call for most arenas. A **simulated**
+    /// tree is told to carry its own domain (`docs/PHASE4.md` §5.5), and until
+    /// `docs/decisions/0038` there was no argument this wrapper could pass to
+    /// say so: every lookup against such an arena returned
+    /// `TFT_ERR_TIME_DOMAIN`, permanently, with no way round it from C++.
+    ///
+    /// The tag is an integer rather than a type because the Rust `Domain` trait
+    /// is **open** — a driver with a PTP-disciplined clock declares its own tag
+    /// from `4` upwards — so no fixed set of C++ types could stand for it. Pass
+    /// what the publisher configured; the mismatch is reported here, once, and
+    /// not on every `at()`.
+    inline result<Plan> plan_in_domain(const char* target, const char* source,
+                                       std::uint8_t domain) const;
+
     inline result<Publisher> claim(const char* child, const char* parent) const;
 
 private:
@@ -990,6 +1008,18 @@ inline result<Plan> Tree::plan(const char* target, const char* source) const
     // guaranteed to be, and it would have written the C handle over whatever the
     // compiler chose to put first.
     TF_TREE_TRY(tft_plan_create(h_.get(), target, source, p.h_.out()));
+    return p;
+}
+
+inline result<Plan> Tree::plan_in_domain(const char* target, const char* source,
+                                        std::uint8_t domain) const
+{
+    // A separate member, not a defaulted argument on `plan`: §4.1 wants every
+    // function here to be a thin inline over *one* C entry point, and the two
+    // C spellings are what a reader greps for when a lookup returns
+    // `TFT_ERR_TIME_DOMAIN`.
+    Plan p;
+    TF_TREE_TRY(tft_plan_create_in_domain(h_.get(), target, source, domain, p.h_.out()));
     return p;
 }
 

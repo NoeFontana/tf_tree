@@ -237,21 +237,44 @@ class Publisher:
 class Tree:
     """A transform tree. Obtain with `tf_tree.open()` or `tf_tree.build()`."""
 
-    def plan(self, target: str, source: str, /) -> Plan:
+    def plan(self, target: str, source: str, /, *, domain: int = ...) -> Plan:
         """Compile a path from `source` to `target`.
 
         Compile once and reuse: the path walk and per-edge metadata lookup
         happen here, not per sample.
+
+        `domain` is the **time domain** every query on the returned plan will
+        carry — `SYSTEM_DOMAIN` (the default, `0`), `SENSOR_DOMAIN`,
+        `SIM_DOMAIN`, `STEADY_DOMAIN`, or an integer from `4` up that a driver
+        declared for its own clock. A tree under `use_sim_time` is read with
+        `domain=tf_tree.SIM_DOMAIN`.
+
+        A disagreement with the path's own domain raises `TfTreeError` **here**,
+        naming both frames, rather than on every `at()` — a domain is a property
+        of a route, not of an instant, so it cannot legitimately vary between
+        two queries on one plan.
+
+        The default is `0` and not the path's own domain, deliberately:
+        defaulting to the path's would make a mistaken caller silently correct
+        as well as a correct one.
+
+        Not `open(domain=...)`, which selects which *arena* to attach to.
         """
 
     def publisher(self, child: str, parent: str, /) -> Publisher:
         """Claim `child`'s edge. Argument order is **(child, parent)**."""
 
-    def lookup(self, target: str, source: str, stamp_ns: int, /) -> NDArray[np.float64]:
+    def lookup(
+        self, target: str, source: str, stamp_ns: int, /, *, domain: int = ...
+    ) -> NDArray[np.float64]:
         """One transform, without compiling a plan first.
 
         The plan is cached per *thread*. Prefer `tree.plan(...)` in a loop —
         this pays a cache probe per call and a compiled plan pays nothing.
+
+        `domain` is `plan`'s, with the same default and the same meaning. It is
+        checked per call here rather than once, because there is no handle to
+        hang the check on.
         """
 
     def freeze(
@@ -428,6 +451,11 @@ def open_arena(
     `mode="rw"`** and is refused otherwise, so a read-only consumer still
     cannot bring an arena into existence.
 
+    `domain` here is the **rendezvous** domain — which arena to attach to,
+    `$ROS_DOMAIN_ID`'s analogue — and is not `Tree.plan`'s `domain`, which is
+    the time-domain tag of the edges inside it. Two unrelated numbers that share
+    a word; this one selects the arena, that one selects the clock.
+
     `capacity` and `interp` describe the edges being created; both are
     `build`'s, with the same defaults. Without `create` they describe nothing —
     but `interp` is still validated, so a misspelling raises here exactly as it
@@ -511,6 +539,29 @@ def from_ros(stamp: object, /) -> int:
 
 def has_shared_memory() -> bool:
     """Whether this build can share a tree between processes."""
+
+SYSTEM_DOMAIN: int
+"""Wall clock — `CLOCK_REALTIME`, ROS `/clock` off. Tag `0`, and the default.
+
+The four names exist so a caller writes one rather than a magic number. They
+are plain `int`s and not an enum because the domain trait is **open**: tags
+from `4` up belong to whoever declares them, so a closed set standing in for an
+open one would either make a driver's own tag unrepresentable or hand it back
+as an `int` that compares equal to nothing in the enum.
+"""
+
+SENSOR_DOMAIN: int
+"""A sensor's own oscillator, undisciplined against the host. Tag `1`."""
+
+SIM_DOMAIN: int
+"""Simulated time — ROS `use_sim_time`, `/clock`. Tag `2`.
+
+The tag a simulated tree is given so a consumer can tell it from a real-time
+one. Reading such a tree needs `plan(..., domain=tf_tree.SIM_DOMAIN)`.
+"""
+
+STEADY_DOMAIN: int
+"""A monotonic clock — `CLOCK_MONOTONIC`, boot-relative, never stepped. Tag `3`."""
 
 __version__: str
 """This extension's version, compiled in from the crate manifest.

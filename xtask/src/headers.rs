@@ -206,6 +206,13 @@ const STABLE: &[&str] = &[
     "tft_tree_open",
     "tft_tree_free",
     "tft_plan_create",
+    // `docs/decisions/0038`. **Stable, and for the same reason
+    // `tft_stamp_from_parts` is**: it is the only way a C caller can read an
+    // arena whose dynamic edges are not tag `0`, and `docs/PHASE4.md` §5.5
+    // tells operators to configure exactly such an arena. A caller who has to
+    // define `TFT_ENABLE_UNSTABLE` to follow the project's own deployment
+    // advice will instead write the lookup that fails.
+    "tft_plan_create_in_domain",
     "tft_plan_free",
     "tft_plan_at",
     "tft_plan_at_many",
@@ -331,6 +338,10 @@ const OPAQUE: &[&str] = &[
 /// Compiled only under `--features test-hooks`; never in a shipped header.
 const TEST_ONLY: &[&str] = &[
     "tft_test_tree_create",
+    // The tag-1 fixture `docs/decisions/0038` step 3 is verified against. A
+    // fourth fixture because the other three publish in domain `0`, where the
+    // mismatch it exists to exercise cannot arise.
+    "tft_test_domain_tree_create",
     "tft_test_publishable_tree_create",
     "tft_test_lerpslerp_tree_create",
     "tft_test_panic",

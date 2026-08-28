@@ -15,8 +15,8 @@ use crate::errors::open_err;
 use tf_tree::AttachMode;
 
 use crate::errors::{
-    build_err, claim_err, edge_label_of, lookup_err, push_err, push_msg, resolve_frame,
-    unknown_frame_err, BufferError, TfTreeError,
+    build_err, claim_err, edge_label_of, lookup_err, plan_domain_err, push_err, push_msg,
+    resolve_frame, unknown_frame_err, BufferError, TfTreeError,
 };
 
 /// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
@@ -162,6 +162,23 @@ pub struct PyTree {
     pub(crate) inner: Arc<Tree>,
 }
 
+/// Whether this plan samples anything at evaluation time.
+///
+/// `Plan::has_dynamic` is private to `tf_tree_core`, and it is the condition
+/// `Plan::check_domain_tag` runs on. `docs/decisions/0038` §4 is explicit that
+/// the check *moves* to plan time without changing when it fires, so this
+/// reproduces the predicate from the public `steps()` rather than approximating
+/// it with `Plan::domain() != domain` alone. The difference is a whole class of
+/// plan: an all-static path has no domain of its own — `Plan::domain()` answers
+/// `0` for one, and the core folds it without consulting a clock — so refusing
+/// `plan("a", "b", domain=SIM_DOMAIN)` over one would be a *new* refusal
+/// smuggled in beside an earlier one.
+fn samples_anything(plan: &tf_tree::Plan) -> bool {
+    plan.steps()
+        .iter()
+        .any(|s| matches!(s, tf_tree::Step::Dyn { .. }))
+}
+
 /// Reject a `float` stamp with the measurement that justifies it (§3).
 ///
 /// This is the most-questioned decision in the API, so the exception carries
@@ -185,8 +202,39 @@ impl PyTree {
     ///
     /// Compiling once and reusing is the whole point: the path walk and the
     /// per-edge metadata lookup happen here, not per sample.
-    #[pyo3(signature = (target, source, /))]
-    fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str) -> PyResult<PyPlan> {
+    ///
+    /// # `domain=`
+    ///
+    /// The time domain the *queries* on this plan will be in
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`). `tf_tree::Domain`
+    /// is an open trait and its tag is a `const`, so Python cannot name the type
+    /// a Rust caller would instantiate; it carries the tag as data instead, and
+    /// [`SYSTEM_DOMAIN`](crate::SYSTEM_DOMAIN) and its three siblings are the
+    /// names for the four built-in tags. A user-declared domain is just the
+    /// integer it chose, from `4` up (`docs/API.md` §2.5).
+    ///
+    /// **The default stays `0` rather than the plan's own domain**, which is the
+    /// tempting one-line version and is wrong: it would make a mistaken caller
+    /// silently correct too, deleting the check for the population D9 exists to
+    /// protect (`0038`'s *Rationale*). On a sim or sensor arena the default is
+    /// wrong, and loudly so — which is the point.
+    ///
+    /// **Not [`open_arena`]'s `domain=`.** That one is the `u32` *rendezvous*
+    /// domain — which arena to attach to, `$ROS_DOMAIN_ID`'s analogue — and this
+    /// one is the `u8` time-domain tag of the edges inside it. They are
+    /// unrelated numbers that share a word; the arena's own docs call the first
+    /// a namespace and `docs/API.md` R3 calls the second a clock.
+    ///
+    /// # Checked here, not per query
+    ///
+    /// A mismatch is refused at plan time, with both frame names still in hand,
+    /// rather than on every `at()` in the hot loop — a domain is a property of a
+    /// route through the tree, not of an instant, so it cannot legitimately vary
+    /// between two queries on one plan. The core still re-checks on every call
+    /// (`0038` §4: the check moves, it does not disappear); nothing here is an
+    /// "I already checked" fast path.
+    #[pyo3(signature = (target, source, /, *, domain = 0))]
+    fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str, domain: u8) -> PyResult<PyPlan> {
         let this = slf.get();
         // [`resolve_frame`], not `Tree::frame`: compiling a plan is a read, and
         // `Tree::frame` interns. A typo here used to declare the typo — see that
@@ -197,8 +245,16 @@ impl PyTree {
             .inner
             .plan(t, s)
             .map_err(|e| lookup_err(&this.inner, e))?;
+        // The one place a domain disagreement is cheap to report *and* nameable:
+        // `target` and `source` are still strings here. Guarded on
+        // [`samples_anything`] so this fires exactly where the core's own
+        // `check_domain_tag` fires and not one call earlier.
+        if samples_anything(&plan) && plan.domain() != domain {
+            return Err(plan_domain_err(target, source, plan.domain(), domain));
+        }
         Ok(PyPlan {
             plan: Box::new(plan),
+            domain,
             // The refcount that makes the borrow real.
             tree: slf.clone().unbind(),
         })
@@ -373,17 +429,32 @@ impl PyTree {
     ///
     /// Prefer `tree.plan(...)` in a loop: this pays a cache probe per call, and
     /// a plan compiled once pays nothing.
-    #[pyo3(signature = (target, source, stamp_ns, /))]
+    ///
+    /// # `domain=`
+    ///
+    /// [`PyTree::plan`]'s, with the same default and the same meaning, and
+    /// keyword-only for the same reason. It is here because this entry point
+    /// hard-coded tag `0` exactly as the plan path did, and a convenience tier
+    /// that cannot reach a sim arena is a second half of the same defect
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`) — not a
+    /// smaller one, since this is the tier a notebook reaches for first.
+    ///
+    /// The check cannot move to plan time here: there is no handle to hang it
+    /// on, the plan being cached rather than returned. So it stays where the
+    /// core does it, per call, and the refusal names two tags rather than a
+    /// route.
+    #[pyo3(signature = (target, source, stamp_ns, /, *, domain = 0))]
     fn lookup<'py>(
         &self,
         py: Python<'py>,
         target: &str,
         source: &str,
         stamp_ns: i64,
+        domain: u8,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let iso = self
             .inner
-            .lookup(target, source, Stamp::<SystemDomain>::from_nanos(stamp_ns))
+            .lookup_tagged(target, source, stamp_ns, domain)
             // **The one arm that has to be caught at the call site**, because it
             // is the one whose identity the error cannot carry:
             // `LookupError::UnknownFrame` holds a BLAKE3 prefix, BLAKE3 does not
@@ -463,6 +534,22 @@ type Knots<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray3<f64>>);
 #[pyclass(name = "Plan", module = "tf_tree", frozen)]
 pub struct PyPlan {
     plan: Box<tf_tree::Plan>,
+    /// The time-domain tag every query through this handle carries
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
+    ///
+    /// Fixed at [`PyTree::plan`] and validated there against
+    /// [`tf_tree::Plan::domain`], so by the time it reaches a `*_tagged` core
+    /// method it already agrees with the route — which is what makes the
+    /// per-query check the core still performs a predictable-branch no-op rather
+    /// than a diagnostic anybody reads.
+    ///
+    /// **It costs the pyclass eight bytes, not one** — measured, because the
+    /// "it lands in the padding" guess is wrong here: the two pointers beside it
+    /// pack to 16 with none to spare, so `align(8)` rounds 17 up to 24. That is
+    /// a `tree.plan(...)` — a setup call that already allocates a 4 KiB `Plan`
+    /// behind the `Box` above — and nothing per sample, which is the only reason
+    /// it is affordable. See this type's own note on what may be added here.
+    domain: u8,
     /// A **reference-counted handle** to the tree this plan reads through.
     ///
     /// An earlier version held a `*const Tree` and a doc comment asserting it
@@ -594,7 +681,7 @@ impl PyPlan {
         let g = self.tree().guard();
         let iso = self
             .plan
-            .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
+            .at_tagged(&g, stamp, self.domain)
             .map_err(|e| lookup_err(self.tree(), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated by us, so nothing else holds a reference and
@@ -750,7 +837,7 @@ impl PyPlan {
             let g = self.tree().guard();
             let iso = self
                 .plan
-                .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
+                .at_tagged(&g, stamp, self.domain)
                 .map_err(|e| lookup_err(self.tree(), e))?;
             // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
             // slice is exactly 16 writable f64. Aliasing remains the caller's
@@ -836,14 +923,24 @@ impl PyPlan {
                 "lin and ang must be finite and positive",
             ));
         }
+        // **`SystemDomain` here is storage, not the query.** `at_adaptive_tagged`
+        // keeps a type parameter and it means something different there: `D`
+        // fixes the element type of `scratch` and of the returned stamp slice
+        // and is read by nothing in the fold, while `self.domain` is what is
+        // checked. `0038` weighs this against the three alternatives — a second
+        // public marker domain, a `repr(transparent)` slice cast, or deleting
+        // `Stamp<D>` from the typed return — and carrying one documented phantom
+        // is the smallest. The stamps become plain integers eight lines below,
+        // so the phantom never reaches Python.
         let mut scratch = tf_tree::AdaptiveScratch::<SystemDomain>::new();
         let tol = tf_tree::ErrBound::new(ang, lin);
         let g = self.tree().guard();
         let (stamps, poses) = self
             .plan
-            .at_adaptive(
+            .at_adaptive_tagged(
                 &g,
                 (Stamp::from_nanos(start_ns), Stamp::from_nanos(end_ns)),
+                self.domain,
                 tol,
                 &mut scratch,
             )
@@ -935,13 +1032,19 @@ impl PyPlan {
 
         let plan = *self.plan;
         let tree = self.tree();
+        // Read out beside `plan` and `tree` above rather than through `self`
+        // inside the closure: one load, on the near side of a `detach` whose
+        // body must touch no Python object at all (§6.2).
+        let domain = self.domain;
 
         let mut run = || {
             let g = tree.guard();
-            // Raw nanoseconds: `at_many_into` takes `&[i64]` precisely so this
-            // path does not have to allocate a `Vec<Stamp>` — which would be
-            // the intermediate buffer `at_into` exists to avoid.
-            plan.at_many_into::<SystemDomain>(&g, src, Layout::Mat4, dst)
+            // Raw nanoseconds: `at_many_into_tagged` takes `&[i64]` precisely so
+            // this path does not have to allocate a `Vec<Stamp>` — which would
+            // be the intermediate buffer `at_into` exists to avoid. The batch
+            // forms never had a use for their type parameter beyond the domain
+            // check (`0038` §1), so the tagged spelling loses nothing.
+            plan.at_many_into_tagged(&g, src, domain, Layout::Mat4, dst)
         };
         let res = if release_the_gil(n, self.plan.len()) {
             // `detach` is PyO3 0.29's name for what was `allow_threads`.
@@ -1117,9 +1220,10 @@ impl PyPlan {
     ) -> PyResult<()> {
         let plan = *self.plan;
         let tree = self.tree();
+        let domain = self.domain;
         let mut run = || {
             let g = tree.guard();
-            plan.at_many_into::<SystemDomain>(&g, src, layout, dst)
+            plan.at_many_into_tagged(&g, src, domain, layout, dst)
         };
         let res = if release_the_gil(src.len(), self.plan.len()) {
             py.detach(run)
@@ -1139,9 +1243,10 @@ impl PyPlan {
     ) -> PyResult<()> {
         let plan = *self.plan;
         let tree = self.tree();
+        let domain = self.domain;
         let mut run = || {
             let g = tree.guard();
-            plan.at_many_into_f32::<SystemDomain>(&g, src, layout, dst)
+            plan.at_many_into_f32_tagged(&g, src, domain, layout, dst)
         };
         let res = if release_the_gil(src.len(), self.plan.len()) {
             py.detach(run)
@@ -1618,6 +1723,13 @@ pub fn push(
 /// transform tree, which a `PROT_READ` mapping enforces with the MMU. And a
 /// notebook started before the robot must fail loudly rather than create an
 /// empty arena the real publisher then refuses to join.
+///
+/// **`domain=` here is the rendezvous domain**, a `u32` naming which arena to
+/// attach to (`$ROS_DOMAIN_ID`'s analogue). It is *not* `tf_tree.Tree.plan`'s
+/// `domain=`, which is the `u8` time-domain tag of the edges inside that arena
+/// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`). Two unrelated
+/// numbers that share a word, and the pair is spelled out in both places
+/// because a caller who conflates them gets an empty arena rather than an error.
 ///
 /// # Creating
 ///

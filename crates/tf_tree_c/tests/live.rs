@@ -1175,3 +1175,284 @@ fn a_private_arena_reports_no_instance_uuid_rather_than_zeros() {
         "nothing may be written when there is no uuid"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Time domains — `docs/decisions/0038`
+// ---------------------------------------------------------------------------
+
+/// A fixture whose dynamic edge publishes in a caller-chosen time domain:
+/// `map -> odom` dynamic, `odom -> sensor` static.
+struct DomainTree(*mut tft_tree);
+
+impl DomainTree {
+    fn new(domain: u8) -> DomainTree {
+        let mut p: *mut tft_tree = ptr::null_mut();
+        // SAFETY: `p` is a live local.
+        let rc = unsafe { tft_test_domain_tree_create(domain, &mut p) };
+        assert_eq!(rc, TFT_OK);
+        assert!(!p.is_null());
+        DomainTree(p)
+    }
+}
+
+impl Drop for DomainTree {
+    fn drop(&mut self) {
+        // SAFETY: created above, freed exactly once.
+        unsafe { tft_tree_free(self.0) };
+    }
+}
+
+/// Plan `target <- source` in `domain`, returning the status and the handle.
+///
+/// The handle is returned even on failure so the caller can assert it was left
+/// alone: a refused plan must not hand back something a C caller will later
+/// free.
+fn plan_in(
+    tree: *mut tft_tree,
+    target: &str,
+    source: &str,
+    domain: u8,
+) -> (tft_status, *mut tft_plan) {
+    let t = std::ffi::CString::new(target).unwrap();
+    let s = std::ffi::CString::new(source).unwrap();
+    let mut p: *mut tft_plan = ptr::null_mut();
+    // SAFETY: live handle, both strings NUL-terminated, `p` a live local.
+    let rc = unsafe { tft_plan_create_in_domain(tree, t.as_ptr(), s.as_ptr(), domain, &mut p) };
+    (rc, p)
+}
+
+/// **The arena the project tells operators to build is readable from C.**
+///
+/// `ros/tf_tree_ros/src/bridge_node.cpp` warns an operator running
+/// `use_sim_time` to give the simulated tree its own domain (`docs/PHASE4.md`
+/// §5.5). Before `docs/decisions/0038` following that advice made the arena
+/// unreadable from C, C++ and Python by construction: every query site
+/// constructed a `Stamp<SystemDomain>`, so `Plan::check_domain` compared tag `0`
+/// against the arena's and refused — permanently, with no argument the caller
+/// could pass.
+///
+/// Both halves are the test. Domain 1 reads a transform; domain 0 — which is
+/// what `tft_plan_create` means and all a C caller *could* say before — is
+/// refused with the code §5.5 already defined.
+///
+/// Mutant: route `tft_plan_at` back through the typed `Plan::at` (hard-coding
+/// `SystemDomain::TAG`) ⇒ the domain-1 lookup below returns
+/// `TFT_ERR_TIME_DOMAIN`. Confirmed by running it, not by reading it.
+#[test]
+fn a_plan_in_a_non_default_domain_reads_a_transform() {
+    let tree = DomainTree::new(1);
+
+    // What a caller could say before this decision, and what it gets.
+    let (rc, p) = plan_in(tree.0, "map", "odom", 0);
+    assert_eq!(
+        rc, TFT_ERR_TIME_DOMAIN,
+        "domain 0 cannot read a tag-1 arena"
+    );
+    assert!(p.is_null(), "a refused plan hands back no handle to free");
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_TIME_DOMAIN);
+    let msg = String::from_utf8_lossy(
+        &e.message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+    // The reason the check is at plan time and not in the hot loop: the frame
+    // names are still in hand here and are gone by the first lookup.
+    assert!(msg.contains("map"), "the message names the route: {msg}");
+    assert!(msg.contains("odom"), "the message names the route: {msg}");
+
+    // The same refusal through the frozen spelling, which `0038` defines as
+    // this call with `domain = 0`.
+    let t = std::ffi::CString::new("map").unwrap();
+    let s = std::ffi::CString::new("odom").unwrap();
+    let mut legacy: *mut tft_plan = ptr::null_mut();
+    // SAFETY: live handle, NUL-terminated names, `legacy` a live local.
+    let rc = unsafe { tft_plan_create(tree.0, t.as_ptr(), s.as_ptr(), &mut legacy) };
+    assert_eq!(rc, TFT_ERR_TIME_DOMAIN, "tft_plan_create is domain 0");
+    assert!(legacy.is_null());
+
+    // And what the decision adds: the tag the publisher actually configured.
+    let (rc, raw) = plan_in(tree.0, "map", "odom", 1);
+    assert_eq!(rc, TFT_OK, "domain 1 is what this arena publishes in");
+    let plan = Plan(raw);
+
+    let mut out = [0u8; 128];
+    // SAFETY: live plan; `out` is 128 bytes and MAT4_ROW needs exactly that.
+    let rc = unsafe {
+        tft_plan_at(
+            plan.0,
+            150_000_000,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(rc, TFT_OK, "a tagged plan evaluates");
+    // A real transform, not arbitrary bytes: bottom row [0 0 0 1], and the
+    // translation is the fixture's at t = 0.15 s (15 samples of 0.05 m each,
+    // interpolated: x is between the 15th and 16th knot).
+    assert_eq!(read_f64(&out, 12), 0.0);
+    assert_eq!(read_f64(&out, 13), 0.0);
+    assert_eq!(read_f64(&out, 14), 0.0);
+    assert_eq!(read_f64(&out, 15), 1.0);
+    assert!(
+        read_f64(&out, 3) > 0.7 && read_f64(&out, 3) < 0.8,
+        "x at t=0.15s is between the 15th and 16th knot, got {}",
+        read_f64(&out, 3)
+    );
+
+    // The batch and derivative paths carry the same tag: three entry points
+    // route through the handle, and a test that only drove the scalar one would
+    // leave two of them able to regress silently.
+    let stamps = [100_000_000i64, 150_000_000, 200_000_000];
+    let mut rows = [0f64; 3 * 13];
+    // SAFETY: live plan; three stamps; `rows` is 3 x 13 f64, tightly packed.
+    let rc = unsafe {
+        tft_plan_at_many(
+            plan.0,
+            stamps.as_ptr(),
+            3,
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            rows.as_mut_ptr().cast(),
+            0,
+        )
+    };
+    assert_eq!(rc, TFT_OK, "the batch fold takes the handle's tag too");
+
+    let mut row = [0f64; 13];
+    let mut twist = [0f64; 6];
+    // SAFETY: live plan; 13 f64 of pose+twist and 6 f64 of twist.
+    let rc = unsafe {
+        tft_plan_at_with_derivatives(
+            plan.0,
+            150_000_000,
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            row.as_mut_ptr().cast(),
+            twist.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, TFT_OK, "so does the unstable derivatives entry point");
+    assert_eq!(
+        row[7..],
+        twist[..],
+        "the tail of the row is the twist it wrote separately"
+    );
+}
+
+/// **A static route accepts any domain**, because the engine accepts it too.
+///
+/// `Plan::check_domain_tag` fires only when the plan has a dynamic edge, so a
+/// lookup over `odom -> sensor` succeeds whatever tag it is asked in. Refusing
+/// it at plan time would be a refusal the lookup would never have made — and a
+/// caller holding one domain for a whole arena cannot know which of its routes
+/// happen to be static.
+///
+/// Mutant: replace the plan-time predicate with a bare
+/// `plan.domain() != domain` ⇒ the `1` and `7` arms below return
+/// `TFT_ERR_TIME_DOMAIN`. Confirmed by running it.
+#[test]
+fn a_static_route_is_readable_from_any_domain() {
+    let tree = DomainTree::new(1);
+    for domain in [0u8, 1, 7] {
+        let (rc, raw) = plan_in(tree.0, "odom", "sensor", domain);
+        assert_eq!(rc, TFT_OK, "a static route has no domain to disagree with");
+        let plan = Plan(raw);
+        let mut out = [0u8; 128];
+        // SAFETY: live plan; `out` is 128 bytes, MAT4_ROW's exact payload.
+        let rc = unsafe {
+            tft_plan_at(
+                plan.0,
+                150_000_000,
+                TFT_LAYOUT_MAT4_ROW,
+                out.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(rc, TFT_OK, "and it evaluates in domain {domain}");
+    }
+}
+
+/// **A tag-0 dynamic route is refused at plan time too, not only at lookup.**
+///
+/// The other half of `a_static_route_is_readable_from_any_domain`, and the one
+/// a `plan.domain()`-only predicate gets wrong. `Plan::domain` reports `0` for
+/// both "no dynamic edge" and "dynamic edge in domain 0", so a check written
+/// against it alone has to let this case through and leave the engine to refuse
+/// every evaluate call — with `TimeDomainMismatch { expected: 0, got: 7 }` and
+/// no frame names, which is the diagnostic `docs/decisions/0038` moved the
+/// check to recover. Asking `Plan::steps` for a `Step::Dyn` separates the two.
+///
+/// Mutant: drop the `has_dynamic &&` conjunct's *other* direction — i.e. gate
+/// the refusal on `plan.domain() != 0` instead — ⇒ `TFT_OK` here, and the
+/// message assertions below never run.
+#[test]
+fn a_tag_zero_dynamic_route_is_refused_before_the_first_lookup() {
+    // `Tree::new()`'s fixture publishes in domain 0 and `map <- sensor` crosses
+    // its dynamic edges, so this is a genuine mismatch the engine would refuse.
+    let tree = Tree::new();
+    let (rc, p) = plan_in(tree.0, "map", "sensor", 7);
+    assert_eq!(
+        rc, TFT_ERR_TIME_DOMAIN,
+        "a dynamic tag-0 route cannot be read in domain 7"
+    );
+    assert!(p.is_null(), "a refused plan hands back no handle to free");
+
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_TIME_DOMAIN);
+    let msg = String::from_utf8_lossy(
+        &e.message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+    assert!(msg.contains("map"), "the message names the route: {msg}");
+    assert!(msg.contains("sensor"), "the message names the route: {msg}");
+
+    // And the refusal is the engine's, not a stricter one invented here: the
+    // same fixture, the same route, in the domain it actually publishes in.
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 0);
+    assert_eq!(rc, TFT_OK);
+    drop(Plan(raw));
+}
+
+/// **The tag-0 arenas everything already used are untouched.**
+///
+/// `tft_plan_create` is `tft_plan_create_in_domain` with `domain = 0`, so the
+/// fixture every other test in this file drives must behave identically through
+/// either spelling — same status, same bytes. This is the half of the ABI
+/// promise a new parameter is most likely to break.
+#[test]
+fn the_default_domain_is_what_tft_plan_create_always_meant() {
+    let tree = Tree::new();
+    let old = tree.plan("map", "sensor");
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 0);
+    assert_eq!(rc, TFT_OK);
+    let new = Plan(raw);
+
+    let (mut a, mut b) = ([0u8; 128], [0u8; 128]);
+    // SAFETY: two live plans over the same route; each buffer is MAT4_ROW-sized.
+    unsafe {
+        assert_eq!(
+            tft_plan_at(
+                old.0,
+                250_000_000,
+                TFT_LAYOUT_MAT4_ROW,
+                a.as_mut_ptr().cast()
+            ),
+            TFT_OK
+        );
+        assert_eq!(
+            tft_plan_at(
+                new.0,
+                250_000_000,
+                TFT_LAYOUT_MAT4_ROW,
+                b.as_mut_ptr().cast()
+            ),
+            TFT_OK
+        );
+    }
+    assert_eq!(a, b, "the two spellings are one entry point");
+}

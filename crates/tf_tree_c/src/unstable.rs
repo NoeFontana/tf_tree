@@ -23,8 +23,6 @@
 
 use core::ffi::{c_char, c_void};
 
-use tf_tree::{Stamp, SystemDomain};
-
 use crate::error::{guard, record_lookup, set_error};
 use crate::layout;
 use crate::{bad_enum, bad_handle, null_arg};
@@ -105,10 +103,11 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
         // SAFETY: `check_plan` confirmed the magic word.
         let h = unsafe { &*plan };
         let g = h.share.tree.guard();
-        let sample = match h
-            .plan
-            .at_with_derivatives(&g, Stamp::<SystemDomain>::from_nanos(stamp))
-        {
+        // Tagged, with the handle's domain, exactly as `tft_plan_at` is: this
+        // is a *query* site, so hard-coding `SystemDomain` here would leave the
+        // derivatives entry point unreadable on the arenas `docs/decisions/0038`
+        // makes readable everywhere else.
+        let sample = match h.plan.at_with_derivatives_tagged(&g, stamp, h.domain) {
             Ok(s) => s,
             Err(e) => return record_lookup(e),
         };

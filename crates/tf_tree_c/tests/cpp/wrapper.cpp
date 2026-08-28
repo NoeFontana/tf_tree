@@ -21,6 +21,7 @@
 extern "C" {
 tft_status tft_test_publishable_tree_create(tft_tree** out);
 tft_status tft_test_tree_create(tft_tree** out);
+tft_status tft_test_domain_tree_create(std::uint8_t domain, tft_tree** out);
 }
 
 // **A linker-level shim that records where the C ABI was told to write.**
@@ -704,6 +705,55 @@ static void check_errors()
 }
 
 // ---------------------------------------------------------------------------
+// Time domains — docs/decisions/0038
+// ---------------------------------------------------------------------------
+
+/// `Tree::plan_in_domain` is the only way a C++ caller can read a simulated
+/// tree.
+///
+/// `docs/PHASE4.md` §5.5 tells an operator to give such a tree its own domain,
+/// and until `0038` doing so made the arena unreadable from here: `Tree::plan`
+/// means domain 0, so every `at()` came back `TFT_ERR_TIME_DOMAIN` with no
+/// argument this header could pass. Both arms are the test — the tag the
+/// publisher configured reads a transform, and the default one is refused with
+/// the code §5.5 defines, at plan time rather than on every lookup.
+static void check_domain()
+{
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_domain_tree_create(1, &raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+
+    auto plan_r = tree.plan_in_domain("map", "odom", 1);
+    CHECK_R(plan_r, "plan_in_domain map <- odom");
+    tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
+
+    auto q_r = plan.at<tf_tree::Quat7>(150000000);
+    CHECK_R(q_r, "at<Quat7> on a tag-1 arena");
+    const tf_tree::Quat7 q = VALUE_OF(q_r);
+    CHECK(q.tx > 0.7 && q.tx < 0.8, "a tagged plan reads a transform");
+
+    // A static route has no domain to disagree with, in either wrapper.
+    auto st_r = tree.plan_in_domain("odom", "sensor", 7);
+    CHECK_R(st_r, "a static route takes any domain");
+    (void)VALUE_OF(st_r);
+
+#ifdef TF_TREE_NO_EXCEPTIONS
+    auto bad = tree.plan("map", "odom");
+    CHECK(!bad, "domain 0 cannot read a tag-1 arena");
+    CHECK(bad.error().code() == TFT_ERR_TIME_DOMAIN, "and says which agreement broke");
+#else
+    bool threw = false;
+    try {
+        (void)tree.plan("map", "odom");
+    } catch (const tf_tree::Error& e) {
+        threw = true;
+        CHECK(e.code() == TFT_ERR_TIME_DOMAIN, "and says which agreement broke");
+    }
+    CHECK(threw, "domain 0 cannot read a tag-1 arena");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Publishing
 // ---------------------------------------------------------------------------
 
@@ -822,6 +872,7 @@ int main()
     check_eigen_storage_premise();
 #endif
     check_read_path();
+    check_domain();
 #if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
     check_at_writes_into_the_returned_object();
 #endif

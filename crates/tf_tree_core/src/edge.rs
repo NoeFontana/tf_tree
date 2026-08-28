@@ -11,6 +11,7 @@ use core::marker::PhantomData;
 use tf_tree_math::Iso3;
 
 use crate::buffer::SampleRing;
+use crate::crash::crash_point;
 use crate::error::{ClaimError, EdgeId, PushError};
 use crate::sync::{AtomicI64, AtomicU64, Ordering};
 
@@ -375,6 +376,23 @@ pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), Cla
     let epoch = rec.epoch.fetch_add(1, Ordering::AcqRel) + 1;
     let word = pack_owner(epoch, participant_slot);
     rec.owner.store(word, Ordering::Release);
+
+    // §11.3 `claim.after_cas`: "claim held by a dead participant -> reapable via
+    // slot indirection (A3)". The site is after the owner *word* is installed,
+    // not after the `compare_exchange` two lines above, because the row names
+    // the state and the state it names is a claim whose owner resolves to a
+    // participant slot — A3's model is one CAS publishing "the state and the
+    // full identity" together, and the store above is where this implementation
+    // finishes doing that. The earlier window leaves `CLAIMING`, which A3
+    // explicitly calls "distinguishable garbage, not a plausible owner" and
+    // which a reaper clears on sight; it is a different row's state, and there
+    // is no §11.3 row for it.
+    //
+    // The caller has not built its `Publisher` yet, so nothing here will ever
+    // run `Drop` — which is exactly the leak A3 exists to make repairable, and
+    // exactly why §11.3 forbids `panic!`.
+    crash_point!("claim.after_cas");
+
     Ok((epoch, word))
 }
 

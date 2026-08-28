@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 extern tft_status tft_test_publishable_tree_create(tft_tree **out);
+extern tft_status tft_test_domain_tree_create(uint8_t domain, tft_tree **out);
 #ifdef __cplusplus
 }
 #endif
@@ -91,6 +92,9 @@ static void check_null_is_never_dereferenced(void)
     CHECK(tft_plan_at(NULL, 0, TFT_LAYOUT_MAT4_ROW, buf) == TFT_ERR_BAD_HANDLE,
           "a NULL plan must be a bad handle, not a segfault");
     CHECK(tft_last_error(NULL) == TFT_ERR_NULL_ARG, "NULL out");
+    /* The new spelling validates before it dereferences, as the old one does. */
+    CHECK(tft_plan_create_in_domain(NULL, "a", "b", 0, NULL) == TFT_ERR_BAD_HANDLE,
+          "a NULL tree must be a bad handle, not a segfault");
     /* Freeing NULL is documented as a no-op. If it is not, this crashes. */
     tft_tree_free(NULL);
     tft_plan_free(NULL);
@@ -400,12 +404,56 @@ static void check_bridge_prefix(void)
 }
 #endif /* TFT_HAVE_BRIDGE */
 
+/*
+ * The domain a binding could not name — docs/decisions/0038.
+ *
+ * `docs/PHASE4.md` §5.5 tells an operator to give a simulated tree its own time
+ * domain, and until this entry point existed following that advice made the
+ * arena unreadable from C: every query site hard-coded tag 0, so every lookup
+ * returned TFT_ERR_TIME_DOMAIN forever. It is checked from *here*, and not only
+ * from Rust, because the new declaration is the whole delta and a header nobody
+ * compiles is not a checked header.
+ */
+static void check_domain(void)
+{
+    tft_tree *tree = NULL;
+    tft_plan *plan = NULL;
+    double out[7];
+
+    CHECK(tft_test_domain_tree_create(1, &tree) == TFT_OK, why());
+    if (tree == NULL) {
+        return;
+    }
+
+    /* All a C caller could say before: the tag-0 assumption, refused at plan
+     * time now rather than on every lookup afterwards. */
+    CHECK(tft_plan_create(tree, "map", "odom", &plan) == TFT_ERR_TIME_DOMAIN,
+          "domain 0 cannot read a tag-1 arena");
+    CHECK(plan == NULL, "a refused plan hands back no handle");
+
+    /* And what it can say now. */
+    CHECK(tft_plan_create_in_domain(tree, "map", "odom", 1, &plan) == TFT_OK, why());
+    CHECK(tft_plan_at(plan, 150000000, TFT_LAYOUT_QVEC7_WXYZ, out) == TFT_OK, why());
+    /* 15 knots of 0.05 m, interpolated: a real pose, not a zeroed buffer. */
+    CHECK(out[4] > 0.7 && out[4] < 0.8, "a tagged plan reads a transform");
+    tft_plan_free(plan);
+
+    /* A route with no dynamic edge on it has no domain to disagree with. */
+    plan = NULL;
+    CHECK(tft_plan_create_in_domain(tree, "odom", "sensor", 7, &plan) == TFT_OK, why());
+    CHECK(tft_plan_at(plan, 150000000, TFT_LAYOUT_QVEC7_WXYZ, out) == TFT_OK, why());
+    tft_plan_free(plan);
+
+    tft_tree_free(tree);
+}
+
 int main(void)
 {
     check_version_and_constants();
     check_null_is_never_dereferenced();
     check_struct_size_gate();
     check_round_trip();
+    check_domain();
 #if defined(TFT_HAVE_BRIDGE)
     check_bridge();
     check_bridge_prefix();

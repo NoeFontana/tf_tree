@@ -69,6 +69,7 @@
 //! nothing is corrupted. Closing it needs a wider `claiming` word carrying
 //! `ParticipantRecord::incarnation`, which is a layout change beyond A8.
 
+use crate::crash::crash_point;
 use crate::error::FrameError;
 use crate::sync::{spin, AtomicU32, AtomicU64, Ordering};
 
@@ -571,6 +572,28 @@ pub fn intern_core(
                         // before we recorded ourselves. It publishes; we wait.
                         continue;
                     }
+
+                    // §11.3 `intern.after_hash_cas_before_id_store`: "hash slot
+                    // claimed, id unpublished -> next interner spins then ...".
+                    // The recovery §11.3 specifies is A8's, and A8 is quoted
+                    // there as "verify the participant that claimed it — record
+                    // `claiming_slot` **alongside the hash**": in the
+                    // amendment's model the claimant is recorded *by* the hash
+                    // CAS, so "after the hash CAS" is after both words are set.
+                    // No 128-bit CAS exists, so this implementation splits it in
+                    // two and the site goes after the second — leaving hash
+                    // claimed, `claiming` naming this participant, `ids[i]` still
+                    // `ID_UNPUBLISHED`, and `frame_count` untouched, because
+                    // `finish` below is what allocates the id, writes the record
+                    // and publishes.
+                    //
+                    // The narrower window above (hash claimed, claimant *not* yet
+                    // recorded) is the state `intern_recovers_when_the_claimant_
+                    // died_before_recording_itself` covers; it is a different
+                    // state with a different rescuer branch and §11.3 has no row
+                    // naming it.
+                    crash_point!("intern.after_hash_cas_before_id_store");
+
                     return table.finish(i, hash, &name_matches, &write_record);
                 }
                 // Lost the race for this slot: re-read it (someone else's hash is

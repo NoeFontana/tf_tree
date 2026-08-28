@@ -289,7 +289,6 @@ fn main() {
         // `false` covers both "the record was cleared" and "the record is still
         // LIVE and its process is gone", and telling those two apart is the
         // whole question.
-        #[cfg(feature = "unstable")]
         // §3.5's survivor. Joins, then on a poke reports whether the owner is
         // gone and what inheriting produced, then parks — **holding the tree**,
         // because if it inherited then this process is now the server and
@@ -317,6 +316,7 @@ fn main() {
                 std::thread::park();
             }
         }
+        #[cfg(feature = "unstable")]
         "join-rw-report" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)

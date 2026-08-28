@@ -108,8 +108,25 @@ typedef struct tft_publisher tft_publisher;
  * `struct_size` names the `0.4` layout has no such field — its bytes end where
  * the field begins, and `read_options` zero-fills the rest. So a `0.4` caller
  * provably cannot receive it, rather than merely being expected not to.
+ *
+ * `5` → `6`: one appended entry point, [`tft_plan_create_in_domain`]
+ * (`docs/decisions/0038`). It is `3` → `4`'s case exactly — a new *symbol*, so
+ * the minor has to move or a caller compiled against this header links a `0.5`
+ * library, passes `tft_check_abi`, and then fails at the loader. Nothing
+ * moved, changed type or changed meaning: [`tft_plan_create`] keeps its
+ * signature and its meaning, which `0038` defines as this function with
+ * `domain = 0`.
+ *
+ * **What a `0.5` caller can observe is a refusal arriving earlier**, and only
+ * on an arena where it was already receiving that refusal. On a tree whose
+ * dynamic edges carry a non-zero domain, `tft_plan_create` used to return
+ * `TFT_OK` and then answer [`TFT_ERR_TIME_DOMAIN`] to every lookup for the
+ * life of the plan; it now returns that same code from the plan call. No
+ * program that got an answer before stops getting one — there was no such
+ * program, which is the defect `0038` exists to fix — and the alternative
+ * (leaving the check to the hot loop) throws away the frame names.
  */
-#define TFT_ABI_VERSION_MINOR 5
+#define TFT_ABI_VERSION_MINOR 6
 
 /**
  * Sentinel for an id field that does not apply to this error.
@@ -608,6 +625,15 @@ void tft_tree_free(tft_tree *tree);
  * path (D3). A C caller should compile once and evaluate many times, exactly as
  * a Rust one would.
  *
+ * **This is [`tft_plan_create_in_domain`] with `domain = 0`**, which is the tag
+ * a real-time tree publishes in and therefore the right call for most arenas.
+ * On an arena whose dynamic edges carry any other tag — a simulated tree, which
+ * `docs/PHASE4.md` §5.5 tells an operator to configure — it now returns
+ * [`TFT_ERR_TIME_DOMAIN`] here instead of on every lookup afterwards. That is
+ * the same refusal moved earlier, not a new one: before `docs/decisions/0038`
+ * such a plan compiled and then failed every single evaluate call, with no
+ * argument a C caller could pass to say otherwise.
+ *
  * # Safety
  *
  * `tree` must be a live handle. `target` and `source` must be NUL-terminated
@@ -617,6 +643,67 @@ tft_status tft_plan_create(const tft_tree *tree,
                            const char *target,
                            const char *source,
                            tft_plan **out);
+
+/**
+ * Compile a plan for `target <- source` that will be queried in time domain
+ * `domain`.
+ *
+ * The domain a binding could not name (`docs/decisions/0038`).
+ * [`tf_tree::Domain`] is an **open trait** — `SystemDomain` through
+ * `SteadyDomain` hold `0`–`3` and a driver
+ * with a PTP-disciplined clock declares its own tag from `4` upwards
+ * (`docs/API.md` §2.5) — so a foreign caller can neither enumerate the domains
+ * it may be asked about nor name the type it would have to instantiate. It
+ * carries the tag as data instead, and the engine's tagged entry points do the
+ * comparison they always did.
+ *
+ * Pass the integer the publisher configured. `0` is [`tft_plan_create`].
+ *
+ * # The check is here, and it is not removed from the lookup
+ *
+ * A mismatch is reported once, at plan time, while the frame *names* are still
+ * in hand — instead of on every lookup in a hot loop, where the engine can
+ * only say which two integers disagreed. Every evaluate entry point still
+ * passes this handle's tag to the engine on every call and the engine still
+ * compares it: there is no "already checked" fast path, which would be the
+ * footgun `0038` exists to remove rather than a smaller version of it.
+ *
+ * # Errors
+ *
+ * Everything [`tft_plan_create`] returns, plus [`TFT_ERR_TIME_DOMAIN`] when
+ * this route has a dynamic edge and that edge's tag is not `domain`. `*out` is
+ * not written and no handle is created.
+ *
+ * **That condition is the engine's, spelled the same way**, and the equality
+ * matters more than it looks. `0038` §4 says the check moves rather than
+ * changes: `Plan::check_domain_tag` fires on `has_dynamic() && domain !=
+ * self.domain`, so anything refused here is refused by every lookup and
+ * anything accepted here is accepted by every lookup. Neither direction is
+ * free to drift.
+ *
+ * * Refuse *more* than the engine and a **static** route becomes unreadable —
+ *   `tf_tree::Plan::domain` reports `0` for a route with no dynamic edge on
+ *   it, so a bare `domain != plan.domain()` would reject `base -> sensor` for
+ *   any caller holding one non-zero tag across a whole arena, a lookup the
+ *   engine serves and a route the caller cannot know is static in advance.
+ * * Refuse *less* and the diagnostic silently degrades: a route whose dynamic
+ *   edges are tag `0`, asked about in domain `1`, would compile and then fail
+ *   every evaluate call with only two integers to show for it. `plan.domain()`
+ *   cannot tell "all static" from "dynamic, tag 0" on its own — this asks
+ *   [`tf_tree::Plan::steps`] whether any [`tf_tree::Step::Dyn`] is present,
+ *   which is the same question `has_dynamic` answers, and pays for it once per
+ *   plan rather than once per lookup.
+ *
+ * # Safety
+ *
+ * As [`tft_plan_create`]: `tree` must be a live handle, `target` and `source`
+ * NUL-terminated UTF-8, and `out` NULL or a writable `*mut tft_plan`.
+ */
+tft_status tft_plan_create_in_domain(const tft_tree *tree,
+                                     const char *target,
+                                     const char *source,
+                                     uint8_t domain,
+                                     tft_plan **out);
 
 /**
  * Release a plan handle. Freeing NULL is a no-op.
@@ -631,6 +718,17 @@ void tft_plan_free(tft_plan *plan);
  * Evaluate `plan` at `stamp`, writing the result into `out` in `layout`.
  *
  * `out` must have room for at least `tft_layout_size(layout)` bytes.
+ *
+ * **On a hot path, prefer [`tft_plan_at_many`].** The C signature has nowhere
+ * to keep a `Guard` between calls, so this one builds a fresh one per lookup
+ * and the batch entry point pays it once per call instead: 261 ns/element
+ * against 302 on the depth-3 fixture at n = 256 (`docs/decisions/0022`, whose
+ * implementation plan asks for this pointer in both headers — batching is the
+ * whole of the available win, and a reader who never finds `tft_plan_at_many`
+ * is the only way that decision goes wrong).
+ *
+ * The plan is evaluated in the domain it was compiled for
+ * ([`tft_plan_create_in_domain`]); the tag is on the handle, not on this call.
  *
  * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
  *

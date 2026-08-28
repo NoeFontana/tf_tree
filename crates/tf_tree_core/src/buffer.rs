@@ -27,6 +27,7 @@
 
 use tf_tree_math::Iso3;
 
+use crate::crash::crash_point;
 use crate::error::{EdgeId, LookupError, PushError};
 use crate::sync::{fence, spin, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
@@ -268,15 +269,39 @@ impl SampleRing<'_> {
         slot.seq.store(odd, Ordering::Relaxed); // -> odd (idempotent if already)
         fence(Ordering::Release);
 
+        // §11.3 `push.after_seq_odd`: "slot odd, `head` unbumped -> A5 self-heals
+        // on next claim". The parity is flipped and its Release fence has run;
+        // not one byte of payload has been written. This is A5's own pseudo-code
+        // boundary — its snippet has `// ...write stamp and pose data...` on the
+        // line after the fence — and it is what separates this site from
+        // `after_data_before_seq_even`, which leaves the same seq and head with
+        // the payload written.
+        crash_point!("push.after_seq_odd");
+
         self.stamps[idx].store(stamp, Ordering::Relaxed);
         let bits = iso.to_bits();
         for (i, w) in bits.iter().enumerate() {
             slot.data[i].store(*w, Ordering::Relaxed);
         }
 
+        // §11.3 `push.after_data_before_seq_even`: "as above; sample invisible
+        // because `head` never moved". Stamp and all seven payload words are in
+        // the slot, the seq is still odd, and `head` is untouched — the last
+        // instant at which the slot is *torn* as far as a reader is concerned.
+        crash_point!("push.after_data_before_seq_even");
+
         // Back to even publishes the payload; the head store publishes the
         // sample to the bracket search.
         slot.seq.store(odd.wrapping_add(1), Ordering::Release); // -> even
+
+        // §11.3 `push.after_seq_even_before_head`: "sample fully written but
+        // unpublished -> invisible, then overwritten". Between the two publishing
+        // stores: the slot is consistent and readable under its seqlock, and
+        // `head` has not moved, so no correct reader addresses it (the bracket
+        // search only ever looks below `head`) and the next push lands on the
+        // same physical slot.
+        crash_point!("push.after_seq_even_before_head");
+
         self.head.store(h + 1, Ordering::Release);
 
         // **A store, not a locked read-modify-write.** The heartbeat counts
