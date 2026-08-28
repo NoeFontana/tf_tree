@@ -2647,6 +2647,31 @@ impl Tree {
         source: &str,
         stamp: Stamp<D>,
     ) -> Result<Iso3, LookupError> {
+        self.lookup_tagged(target, source, stamp.nanos(), D::TAG)
+    }
+
+    /// [`Self::lookup`], with the query's domain carried as a runtime tag.
+    ///
+    /// The convenience tier's tagged sibling, for the reason
+    /// `docs/decisions/0038-the-domain-a-binding-cannot-name.md` gives: [`Domain`]
+    /// is an open trait, so a foreign binding cannot name the type the typed
+    /// form needs and carries the tag as data instead. The check, the cache and
+    /// the evaluation are all [`Self::lookup`]'s, unchanged.
+    ///
+    /// A Rust caller wants [`Self::lookup`], where a domain mistake is a compile
+    /// error — and, before either, wants [`Self::plan`], because this tier
+    /// resolves the topology on every call (`docs/API.md` §1 R1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lookup`].
+    pub fn lookup_tagged(
+        &self,
+        target: &str,
+        source: &str,
+        nanos: i64,
+        domain: u8,
+    ) -> Result<Iso3, LookupError> {
         if self.detached() {
             return Err(LookupError::ChildDetached);
         }
@@ -2663,7 +2688,7 @@ impl Tree {
         // inner one is the evaluation, which it never answers for.
         cache::with_plan(self, t, s, generation, |plan| {
             let g = self.guard();
-            plan.at(&g, stamp)
+            plan.at_tagged(&g, nanos, domain)
         })
         .0?
     }

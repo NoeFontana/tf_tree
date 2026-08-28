@@ -159,10 +159,11 @@ pub use participant::{ParticipantError, ParticipantRecord, ParticipantTable};
 
 #[cfg(not(loom))]
 pub use plan::{
-    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
-    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
-    MAX_KNOTS,
+    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Extrapolated, Guard, InterpPolicy, Plan,
+    Query, Sample, SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain,
+    MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
 };
+pub use sample::ExtrapPolicy;
 
 /// Maximum length of a **compiled** plan: the number of [`plan::Step`] slots a
 /// [`plan::Plan`] carries, counted *after* constant folding.

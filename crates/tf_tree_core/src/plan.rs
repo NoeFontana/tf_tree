@@ -428,6 +428,39 @@ impl InterpPolicy {
 // Sampled pose plus derivatives
 // ---------------------------------------------------------------------------
 
+/// A pose, and how far past the plan's newest common sample it was extrapolated.
+///
+/// Returned by [`Plan::at_extrapolating`]. **There is no accessor that yields the
+/// pose alone, and that is the design rather than an oversight**
+/// ([`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)):
+/// the danger in extrapolation is a pose that looks fresh, so the distance is
+/// handed over in the same value. Reading the pose without the distance takes a
+/// deliberate `.pose`, not a forgotten check.
+///
+/// `Copy` and allocation-free, like every other value on this path
+/// (`docs/API.md` §1 R2). It is not an error type: extrapolation under an
+/// explicit policy is a requested outcome, and [`ExtrapPolicy::Error`] is how a
+/// caller asks for it to be a failure instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Extrapolated {
+    /// The pose.
+    pub pose: Iso3,
+    /// Nanoseconds past the newest stamp that *every* dynamic edge on this plan
+    /// has data for.
+    ///
+    /// `0` means every edge bracketed the query — the answer is interpolated
+    /// between published samples, not invented past them. A positive value is
+    /// the worst case over the route, because the edge that runs out of data
+    /// first is what bounds the composed answer.
+    pub by_ns: i64,
+    /// The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query.
+    ///
+    /// Meaningless when `by_ns == 0`. Named as data rather than formatted,
+    /// exactly as the errors are (`docs/PROJECT.md` §5 D11): a caller that wants
+    /// to log which sensor stopped publishing resolves it against the arena.
+    pub edge: EdgeId,
+}
+
 /// A pose and its derivatives at one instant — `docs/PHASE4.md` §2.2.
 ///
 /// Returned by [`Plan::at_with_derivatives`]. The twist is **body-frame
@@ -687,11 +720,11 @@ impl Plan {
     }
 
     #[inline]
-    fn check_domain<D: Domain>(&self) -> Result<(), LookupError> {
-        if self.has_dynamic() && D::TAG != self.domain {
+    fn check_domain_tag(&self, domain: u8) -> Result<(), LookupError> {
+        if self.has_dynamic() && domain != self.domain {
             return Err(LookupError::TimeDomainMismatch {
                 expected: self.domain,
-                got: D::TAG,
+                got: domain,
             });
         }
         Ok(())
@@ -712,6 +745,40 @@ impl Plan {
                 Step::Static(m) => acc * *m,
                 Step::Dyn { edge, inverted } => {
                     let p = g.sample_hinted(k, *edge, t, ExtrapPolicy::Error)?;
+                    if *inverted {
+                        acc.mul_inv(&p)
+                    } else {
+                        acc * p
+                    }
+                }
+            };
+        }
+        Ok(acc)
+    }
+
+    /// [`Self::fold_at`] under a caller-chosen extrapolation policy.
+    ///
+    /// **A deliberate second copy of a fifteen-line loop, and the reason is
+    /// constant folding.** [`Self::fold_at`] passes the `ExtrapPolicy::Error`
+    /// *literal*, which lets LLVM prune the `Hold` and `ConstantTwist` arms out
+    /// of the inlined `SampleRing::sample_from` on the path every existing
+    /// caller takes. Giving `fold_at` a policy parameter would replace that
+    /// literal with a variable and leave the match live on
+    /// [`Self::at`]'s hot path — paying, in the default case, for a capability
+    /// the default case does not use.
+    ///
+    /// So the specialisation is the point rather than an oversight, and
+    /// `docs/PROJECT.md` §6's rule against a second spelling of an existing path
+    /// does not apply: these are one path compiled twice, not two paths.
+    /// [`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)
+    /// §4 is the commitment this keeps.
+    fn fold_at_policy(&self, g: &Guard, t: i64, policy: ExtrapPolicy) -> Result<Iso3, LookupError> {
+        let mut acc = Iso3::IDENTITY;
+        for (k, step) in self.steps().iter().enumerate() {
+            acc = match step {
+                Step::Static(m) => acc * *m,
+                Step::Dyn { edge, inverted } => {
+                    let p = g.sample_hinted(k, *edge, t, policy)?;
                     if *inverted {
                         acc.mul_inv(&p)
                     } else {
@@ -866,8 +933,30 @@ impl Plan {
     /// and the second is the one that runs on every change.
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
+        self.at_tagged(g, t.nanos(), D::TAG)
+    }
+
+    /// [`Self::at`], with the query's domain carried as a runtime tag.
+    ///
+    /// The domain arrives as a runtime tag instead of a type parameter.
+    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
+    /// upwards — so a foreign binding cannot enumerate the domains it may be
+    /// asked about and cannot dispatch to the typed form. It carries the tag as
+    /// data instead ([`0038`]).
+    ///
+    /// The check is [`Self::at`]'s, unchanged: same condition, same
+    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
+    /// differs. Rust callers should use [`Self::at`], where a domain
+    /// mistake is a compile error.
+    ///
+    /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at`].
+    pub fn at_tagged(&self, g: &Guard, nanos: i64, domain: u8) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
-        self.check_domain::<D>()?;
+        self.check_domain_tag(domain)?;
         // **The counter calls bracket the fold, not the whole function.**
         //
         // The two checks above fail on properties of the *query* — a plan
@@ -876,7 +965,7 @@ impl Plan {
         // publisher that is working correctly, which is worse than not counting
         // them at all (`docs/PHASE5.md` §5.2's attribution argument, applied in
         // the other direction).
-        self.note(g, self.first_dynamic_edge(), self.fold_at(g, t.nanos()))
+        self.note(g, self.first_dynamic_edge(), self.fold_at(g, nanos))
     }
 
     /// Record one evaluation's outcome against the diagnostic counters.
@@ -1065,12 +1154,39 @@ impl Plan {
         g: &Guard,
         t: Stamp<D>,
     ) -> Result<Sample, LookupError> {
+        self.at_with_derivatives_tagged(g, t.nanos(), D::TAG)
+    }
+
+    /// [`Self::at_with_derivatives`], with the query's domain as a runtime tag.
+    ///
+    /// The domain arrives as a runtime tag instead of a type parameter.
+    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
+    /// upwards — so a foreign binding cannot enumerate the domains it may be
+    /// asked about and cannot dispatch to the typed form. It carries the tag as
+    /// data instead ([`0038`]).
+    ///
+    /// The check is [`Self::at_with_derivatives`]'s, unchanged: same condition, same
+    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
+    /// differs. Rust callers should use [`Self::at_with_derivatives`], where a domain
+    /// mistake is a compile error.
+    ///
+    /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at_with_derivatives`].
+    pub fn at_with_derivatives_tagged(
+        &self,
+        g: &Guard,
+        nanos: i64,
+        domain: u8,
+    ) -> Result<Sample, LookupError> {
         self.check_generation(g)?;
-        self.check_domain::<D>()?;
+        self.check_domain_tag(domain)?;
         let (pose, twist) = self.note(
             g,
             self.first_dynamic_edge(),
-            self.fold_at_with_derivatives(g, t.nanos()),
+            self.fold_at_with_derivatives(g, nanos),
         )?;
         Ok(Sample {
             pose,
@@ -1128,6 +1244,80 @@ impl Plan {
         Ok(acc)
     }
 
+    /// [`Self::at`], permitting extrapolation past the newest sample under
+    /// `policy`, and reporting how far the answer was extrapolated.
+    ///
+    /// The capability existed in the sampler from the beginning and was
+    /// reachable from no shipped surface until
+    /// [`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md).
+    /// It is per *query*, not per edge, because a `Hold` that is right for a
+    /// 10 Hz map edge is wrong for the 1 kHz odometry edge on the same route —
+    /// so the caller who bears the consequence chooses, not whoever published.
+    ///
+    /// A controller running faster than its state estimate is *always* asking
+    /// for a stamp past the newest sample. [`ExtrapPolicy::ConstantTwist`] is
+    /// the honest answer there and [`ExtrapPolicy::Hold`] the honest one for a
+    /// latched or displayed value; both hand back
+    /// [`Extrapolated::by_ns`] so neither can be mistaken for fresh data.
+    ///
+    /// [`ExtrapPolicy::Error`] here is [`Self::at`] with a distance attached on
+    /// success. [`Self::at`] itself is unchanged and remains the default: it
+    /// refuses, and refusing is right for a caller that must not act on invented
+    /// data.
+    ///
+    /// # The distance is not free, and is not on [`Self::at`]'s path
+    ///
+    /// `by_ns` costs one `newest_stamp` load per dynamic edge, taken *after* the
+    /// fold and only here. Nothing is threaded through `fold_at` or the seqlock
+    /// read, so [`Self::at`]'s generated code is unmoved.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at`]. Under [`ExtrapPolicy::Error`] a query past the newest
+    /// sample is [`LookupError::Extrapolation`]; under the other two it is not.
+    pub fn at_extrapolating<D: Domain>(
+        &self,
+        g: &Guard,
+        t: Stamp<D>,
+        policy: ExtrapPolicy,
+    ) -> Result<Extrapolated, LookupError> {
+        self.at_extrapolating_tagged(g, t.nanos(), D::TAG, policy)
+    }
+
+    /// [`Self::at_extrapolating`], with the query's domain carried as a runtime
+    /// tag — the binding surface, for
+    /// [`0038`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md)'s
+    /// reason.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at_extrapolating`].
+    pub fn at_extrapolating_tagged(
+        &self,
+        g: &Guard,
+        nanos: i64,
+        domain: u8,
+        policy: ExtrapPolicy,
+    ) -> Result<Extrapolated, LookupError> {
+        self.check_generation(g)?;
+        self.check_domain_tag(domain)?;
+        let edge = self.first_dynamic_edge();
+        let pose = self.note(g, edge, self.fold_at_policy(g, nanos, policy))?;
+        // After the fold, and only on this path. `newest_common` is the same
+        // walk `latest_common` folds at, so the two agree by construction rather
+        // than by two definitions of "common" staying in step.
+        let (by_ns, which) = match self.newest_common(g)? {
+            Some((common, which)) => ((nanos - common).max(0), which),
+            // Static-only: nothing can be extrapolated, so nothing was.
+            None => (0, EdgeId(0)),
+        };
+        Ok(Extrapolated {
+            pose,
+            by_ns,
+            edge: which,
+        })
+    }
+
     /// Sample every dynamic edge at the newest stamp common to all of them (the
     /// `min` of their newest stamps) — tf2's `Time(0)` semantics.
     ///
@@ -1144,18 +1334,44 @@ impl Plan {
     /// [`Self::latest_common`]'s fold, split out for the same reason as
     /// [`Self::fold_latest`].
     fn fold_latest_common(&self, g: &Guard) -> Result<Iso3, LookupError> {
+        let Some((common, _)) = self.newest_common(g)? else {
+            return Ok(self.static_only());
+        };
+        self.fold_at(g, common)
+    }
+
+    /// The newest stamp every dynamic edge on this plan has data for, and the
+    /// edge that produced it — `None` when the plan is static-only.
+    ///
+    /// The minimum over the plan's dynamic edges, which is what
+    /// [`Self::latest_common`] folds at and what
+    /// [`Self::at_extrapolating`] measures its distance from: the edge that runs
+    /// out of data first is the one that bounds how invented a composed answer
+    /// is. Factored out so the two callers share one walk and one definition of
+    /// "common" ([`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)).
+    #[cfg(test)]
+    pub(crate) fn newest_common_for_test(
+        &self,
+        g: &Guard,
+    ) -> Result<Option<(i64, EdgeId)>, LookupError> {
+        self.newest_common(g)
+    }
+
+    fn newest_common(&self, g: &Guard) -> Result<Option<(i64, EdgeId)>, LookupError> {
         let mut common = i64::MAX;
+        let mut which = EdgeId(0);
         let mut any = false;
         for step in self.steps() {
             if let Step::Dyn { edge, .. } = step {
-                common = common.min(g.newest_stamp(*edge)?);
+                let newest = g.newest_stamp(*edge)?;
+                if !any || newest < common {
+                    common = newest;
+                    which = *edge;
+                }
                 any = true;
             }
         }
-        if !any {
-            return Ok(self.static_only());
-        }
-        self.fold_at(g, common)
+        Ok(any.then_some((common, which)))
     }
 
     /// The **outer bound outside which this plan certainly cannot answer**, or
@@ -1385,7 +1601,7 @@ impl Plan {
     ) -> Result<(), LookupError> {
         assert!(out.len() >= stamps.len(), "out too short for stamps");
         self.check_generation(g)?;
-        self.check_domain::<D>()?;
+        self.check_domain_tag(D::TAG)?;
 
         // Hoisted: loop-invariant, and an O(plan length) scan (see [`Self::note`]).
         let edge = self.first_dynamic_edge();
@@ -1460,6 +1676,35 @@ impl Plan {
         layout: Layout,
         out: &mut [f64],
     ) -> Result<(), LookupError> {
+        self.at_many_into_tagged(g, stamps, D::TAG, layout, out)
+    }
+
+    /// [`Self::at_many_into`], with the query's domain as a runtime tag.
+    ///
+    /// The domain arrives as a runtime tag instead of a type parameter.
+    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
+    /// upwards — so a foreign binding cannot enumerate the domains it may be
+    /// asked about and cannot dispatch to the typed form. It carries the tag as
+    /// data instead ([`0038`]).
+    ///
+    /// The check is [`Self::at_many_into`]'s, unchanged: same condition, same
+    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
+    /// differs. Rust callers should use [`Self::at_many_into`], where a domain
+    /// mistake is a compile error.
+    ///
+    /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at_many_into`].
+    pub fn at_many_into_tagged(
+        &self,
+        g: &Guard,
+        stamps: &[i64],
+        domain: u8,
+        layout: Layout,
+        out: &mut [f64],
+    ) -> Result<(), LookupError> {
         if layout.is_f32() {
             return Err(LookupError::WrongElementType);
         }
@@ -1471,7 +1716,7 @@ impl Plan {
             });
         }
         self.check_generation(g)?;
-        self.check_domain::<D>()?;
+        self.check_domain_tag(domain)?;
 
         let n = layout.elems();
         // The layout is matched once, here. Putting it inside the loop would
@@ -1507,6 +1752,35 @@ impl Plan {
         layout: Layout,
         out: &mut [f32],
     ) -> Result<(), LookupError> {
+        self.at_many_into_f32_tagged(g, stamps, D::TAG, layout, out)
+    }
+
+    /// [`Self::at_many_into_f32`], with the query's domain as a runtime tag.
+    ///
+    /// The domain arrives as a runtime tag instead of a type parameter.
+    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
+    /// upwards — so a foreign binding cannot enumerate the domains it may be
+    /// asked about and cannot dispatch to the typed form. It carries the tag as
+    /// data instead ([`0038`]).
+    ///
+    /// The check is [`Self::at_many_into_f32`]'s, unchanged: same condition, same
+    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
+    /// differs. Rust callers should use [`Self::at_many_into_f32`], where a domain
+    /// mistake is a compile error.
+    ///
+    /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at_many_into_f32`].
+    pub fn at_many_into_f32_tagged(
+        &self,
+        g: &Guard,
+        stamps: &[i64],
+        domain: u8,
+        layout: Layout,
+        out: &mut [f32],
+    ) -> Result<(), LookupError> {
         if !layout.is_f32() {
             return Err(LookupError::WrongElementType);
         }
@@ -1518,7 +1792,7 @@ impl Plan {
             });
         }
         self.check_generation(g)?;
-        self.check_domain::<D>()?;
+        self.check_domain_tag(domain)?;
 
         let n = layout.elems();
         self.fold_batch(g, stamps, write_affine32, n, out)
@@ -1656,8 +1930,45 @@ impl Plan {
         tol: ErrBound,
         scratch: &'s mut AdaptiveScratch<D>,
     ) -> Result<(&'s [Stamp<D>], &'s [Iso3]), LookupError> {
+        self.at_adaptive_tagged(g, span, D::TAG, tol, scratch)
+    }
+
+    /// [`Self::at_adaptive`], with the query's domain carried as a runtime tag.
+    ///
+    /// The tagged sibling of the adaptive shape, for the same reason as
+    /// [`Self::at_tagged`]: [`Domain`] is an open trait, so a foreign binding
+    /// cannot name the type it would have to instantiate
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
+    ///
+    /// # `D` here is storage, and `domain` is the query
+    ///
+    /// This is the one shape where the two cannot be collapsed. `D` fixes the
+    /// element type of the caller's `scratch` and of the returned stamp slice —
+    /// it is a phantom over the buffer and is read by nothing in the fold, which
+    /// never consults `D::TAG`. The *query's* domain is `domain`, and `domain`
+    /// is what is checked. A binding therefore passes any `D` it can name
+    /// (`SystemDomain`) and the real tag as data, then converts the returned
+    /// stamps to integers immediately.
+    ///
+    /// **A Rust caller wants [`Self::at_adaptive`]**, where the two are the same
+    /// value by construction and a domain mistake is a compile error. Passing a
+    /// `D` here whose tag disagrees with `domain` is legal, does not affect the
+    /// result, and produces a stamp slice whose phantom means nothing — which is
+    /// exactly why the typed form exists and is the default.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::at_adaptive`].
+    pub fn at_adaptive_tagged<'s, D: Domain>(
+        &self,
+        g: &Guard,
+        span: (Stamp<D>, Stamp<D>),
+        domain: u8,
+        tol: ErrBound,
+        scratch: &'s mut AdaptiveScratch<D>,
+    ) -> Result<(&'s [Stamp<D>], &'s [Iso3]), LookupError> {
         self.check_generation(g)?;
-        self.check_domain::<D>()?;
+        self.check_domain_tag(domain)?;
         // Counted **once per call, not once per fold.** `subdivide` evaluates
         // the plan up to `MAX_KNOTS` times for a single caller-visible lookup,
         // and crediting each bisection separately would make this one entry
@@ -1901,9 +2212,20 @@ pub struct Guard<'a> {
     /// same `t`; only the search path differs. So a stale, wrong or absent
     /// cursor is a bad *hint* and never a wrong answer. That is what makes this
     /// safe to keep in a cache that nothing invalidates, and it is also why the
-    /// index may be packed into 32 bits: a logical index past `u32::MAX` — 49
-    /// days of unbroken 1 kHz publishing — truncates to a wrong hint, which the
-    /// gallop corrects.
+    /// index may be packed into 32 bits: a logical index past `u32::MAX` — 49.7
+    /// days of unbroken 1 kHz publishing — truncates, and the gallop corrects it.
+    ///
+    /// **Correctness was never the issue there, and cost was.** A truncated hint
+    /// is smaller than `lo_logical` for every subsequent query, so the clamp in
+    /// [`SampleRing::bracket_from`](crate::buffer::SampleRing) used to pin it to
+    /// the *oldest* retained sample on every call — permanently reverting the
+    /// resumed gallop to a walk from the far end of the window, which is worse
+    /// than the midpoint restart it exists to beat. A cliff rather than a decay:
+    /// before 2^32 exact, after it inert, and no test could see the difference
+    /// because a bad hint still yields the right answer.
+    /// `sample::rebase_hint` lifts the truncated value back onto the live
+    /// window; the window is strictly narrower than 2^32, so the lift is exact
+    /// rather than a heuristic.
     ///
     /// # Why a `Cell`, and why on the `Guard`
     ///

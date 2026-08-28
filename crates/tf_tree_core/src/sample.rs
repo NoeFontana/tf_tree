@@ -363,7 +363,7 @@ impl SampleRing<'_> {
     /// example pinned, because nothing else in the suite will notice.
     #[inline(always)]
     fn bracket_from(&self, lo_logical: u64, newest: u64, t: i64, hint: u64) -> u64 {
-        let hint = hint.clamp(lo_logical, newest);
+        let hint = rebase_hint(hint, lo_logical, newest).clamp(lo_logical, newest);
         let (lo, hi) = if self.stamp_at(hint) <= t {
             // Gallop upward while the probe stays <= t.
             let mut step = 1u64;
@@ -382,6 +382,16 @@ impl SampleRing<'_> {
         // Binary search within the galloped bracket, branchless — see
         // [`Self::bracket`]. Invariant: stamp[lo] <= t < stamp[hi].
         self.bracket(lo, hi, t)
+    }
+
+    /// The oldest logical index a reader may still touch, and the newest, for a
+    /// ring known to be non-empty. Test-only; the sampling paths compute both
+    /// from the `head` they already loaded rather than loading it twice.
+    #[cfg(test)]
+    pub(crate) fn window_for_test(&self) -> (u64, u64) {
+        let h = self.head.load(Ordering::Acquire);
+        let n = h.min(self.retained());
+        (h - n, h - 1)
     }
 
     /// Sample at `t` **and** the body twist there, in units of 1/second —
@@ -615,5 +625,63 @@ impl SampleRing<'_> {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
         Ok(result)
+    }
+}
+
+/// Lift a hint whose high bits may have been discarded back onto the live
+/// window.
+///
+/// # Why a hint arrives truncated
+///
+/// [`Guard`](crate::plan::Guard) packs a per-step search cursor and its edge tag
+/// into one `u64` cell, so the cursor it stores is the low 32 bits of a logical
+/// index. `head` is monotone for the life of the arena and is never masked, so
+/// once an edge passes 2^32 pushes — 49.7 days of unbroken 1 kHz publishing —
+/// every stored hint is smaller than `lo_logical`, and a plain
+/// `clamp(lo_logical, newest)` pins it to the *oldest* retained sample on every
+/// call thereafter. The resumed gallop then walks the whole window from the far
+/// end: still correct (a hint can never change a result), but permanently worse
+/// than the midpoint restart it was added to beat, and permanently past the
+/// point where any test would notice. That is a cliff, not a decay — before
+/// 2^32 the cursor is exact and after it, it is inert forever.
+///
+/// # Why the lift is exact rather than a heuristic
+///
+/// The readable window is `retained` wide and `retained = capacity - 1` with
+/// `capacity: u32` ([`Capacity`](crate::edge::EdgeCfg)), so the window is
+/// *strictly* narrower than 2^32 and can straddle at most one multiple of it.
+/// A truncated index therefore has exactly one preimage in the window: the one
+/// in `newest`'s 2^32 block, or — when the window straddles the boundary and the
+/// hint's low bits sit above `newest`'s — the one in the block below. Both are
+/// recovered here with two arithmetic operations and no load.
+///
+/// # Why this is not a behaviour change below 2^32
+///
+/// The lift is reached only when `hint < lo_logical`, and while `head < 2^32`
+/// the block base of `newest` is `0`, so `lifted == hint` and the subsequent
+/// clamp pins it to `lo_logical` exactly as before. Every existing caller —
+/// including [`SampleRing::sample_from`]'s public cursor contract, which is an
+/// absolute logical index — sees identical behaviour until the regime where the
+/// old behaviour was already useless.
+#[inline(always)]
+pub(crate) fn rebase_hint(hint: u64, lo_logical: u64, newest: u64) -> u64 {
+    /// One more than the largest value `Guard`'s packed cursor can represent.
+    const BLOCK: u64 = 1 << 32;
+    if hint >= lo_logical {
+        // Already absolute and inside (or ahead of) the window; the caller's
+        // clamp handles the `> newest` end. This is the hot case — a warm
+        // cursor from the previous query on the same edge — so it costs one
+        // predictable compare.
+        return hint;
+    }
+    let lifted = (newest & !(BLOCK - 1)) | (hint & (BLOCK - 1));
+    if lifted > newest {
+        // The window straddles a 2^32 boundary and this hint belongs to the
+        // block below it. `newest >= lifted - BLOCK` cannot underflow: `lifted`
+        // and `newest` share a block base, so `lifted > newest` implies
+        // `newest >= BLOCK`.
+        lifted - BLOCK
+    } else {
+        lifted
     }
 }

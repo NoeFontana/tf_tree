@@ -342,9 +342,16 @@ pub mod unstable;
 pub use tf_tree_core::edge::Publisher;
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 pub use tf_tree_core::plan::{
-    AdaptiveScratch, Domain, ErrBound, Guard, InterpPolicy, Plan, Query, Sample, SensorDomain,
-    SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
+    AdaptiveScratch, Domain, ErrBound, Extrapolated, Guard, InterpPolicy, Plan, Query, Sample,
+    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
+    MAX_KNOTS,
 };
+// **`ExtrapPolicy` was unnameable from this crate until `0039`.** All three of
+// its variants were implemented and tested in the sampler and every fold site
+// passed the `Error` literal, so `Hold` and `ConstantTwist` were dead from every
+// shipped surface. `Plan::at_extrapolating` is what reaches them, and
+// `Extrapolated` above is what stops a held pose passing for a fresh one.
+pub use tf_tree_core::sample::ExtrapPolicy;
 pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH, MAX_PATH_EDGES,
 };
