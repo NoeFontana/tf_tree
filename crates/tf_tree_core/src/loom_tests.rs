@@ -69,9 +69,60 @@ impl HeapRing {
 
 /// Loom test 1: one writer pushing 3 samples, one concurrent reader. The reader
 /// observes a fully-consistent slot, never a torn one.
+
+/// Run a `loom` model under a preemption bound that the environment can raise
+/// but **cannot lower**.
+///
+/// # Why this is not `loom::model` directly
+///
+/// `loom::model` reads `LOOM_MAX_PREEMPTIONS` and uses `None` — unbounded — when
+/// it is unset. Unbounded sounds strictly stronger and is not. Measured on
+/// `two_mutators_race_the_lock_and_a_reader_sees_no_mix` with its liveness
+/// predicate deliberately broken, so a real violation is present to find:
+///
+/// | `LOOM_MAX_PREEMPTIONS` | result | wall clock |
+/// |---|---|---|
+/// | unset (loom's `None`) | **ok — the violation is missed** | 8143 ms |
+/// | 0, 1, 2 | ok — missed | fast |
+/// | 3 | **FAILED, correctly** | 373 ms |
+///
+/// So the unbounded search runs **22x longer and still finds nothing**, which is
+/// preemption-bounded search behaving as designed: it enumerates every schedule
+/// with at most *k* preemptions before going deeper, and almost every real
+/// concurrency bug needs few. An unbounded depth-first walk can descend one
+/// branch of an enormous space and never come back to the shallow interleaving
+/// that exhibits the fault.
+///
+/// **The consequence is that the bound was load-bearing and lived outside the
+/// code.** `xtask loom` sets 3; a developer running
+/// `RUSTFLAGS='--cfg loom' cargo test -p tf_tree_core` by hand — which is what
+/// debugging one model looks like — got a materially weaker check *and* a much
+/// slower one, with nothing to say so. A test whose power depends on an
+/// environment variable set by one caller is the shape
+/// `docs/benchmarks/EVIDENCE.md` exists to catch, one layer down.
+///
+/// The floor is a floor, not a value: `LOOM_MAX_PREEMPTIONS=5` still explores
+/// more, because a deliberate deeper run is a thing somebody should be able to
+/// ask for.
+fn model(f: impl Fn() + Sync + Send + 'static) {
+    /// Enough to reach the topology lock's steal path, which needs the spin
+    /// budget (`MODEL_SPIN_LIMIT`) exhausted while another thread holds the
+    /// word. Raising it is safe; lowering it silently removes that path.
+    const PREEMPTION_FLOOR: usize = 3;
+
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(
+        builder
+            .preemption_bound
+            .unwrap_or(PREEMPTION_FLOOR)
+            .max(PREEMPTION_FLOOR),
+    );
+    builder.check(f);
+}
+
 #[test]
 fn writer_three_pushes_reader_never_torn() {
-    loom::model(|| {
+    model(|| {
         let hr = Arc::new(HeapRing::new(4));
         let zero = Iso3::from_bits(&[0u64; 7]).to_bits();
         let p1 = pose(2).to_bits();
@@ -130,7 +181,7 @@ fn writer_three_pushes_reader_never_torn() {
 /// any other value the reader could return is a splice.
 #[test]
 fn writer_wraps_reader_gets_valid_or_recycled() {
-    loom::model(|| {
+    model(|| {
         let hr = Arc::new(HeapRing::new(4));
         // The only legal `Ok`: stamps 20 and 30 bracket t = 25 at s = 0.5.
         let expect = <LerpSlerp as tf_tree_math::Interp>::eval(&pose(2), &pose(3), 0.5).to_bits();
@@ -216,7 +267,7 @@ impl HeapInternTable {
 /// `FrameId`.
 #[test]
 fn intern_race_same_id() {
-    loom::model(|| {
+    model(|| {
         // Interning table: 4 hash slots (mask 3), capacity 3 usable frames.
         let t = Arc::new(HeapInternTable::new(4));
         let hash: u64 = 0xdead_beef_0000_0001;
@@ -264,7 +315,7 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
     /// The survivor's own `claiming` value.
     const ME: u32 = 2;
 
-    loom::model(|| {
+    model(|| {
         let t = Arc::new(HeapInternTable::new(4));
         let hash: u64 = 0xdead_beef_0000_0001;
         let slot = (hash & 3) as usize;
@@ -328,7 +379,7 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
 /// Loom test 4: two threads racing `claim` on the same edge — exactly one wins.
 #[test]
 fn claim_race_exactly_one_wins() {
-    loom::model(|| {
+    model(|| {
         let rec = Arc::new(ClaimRecord::new());
 
         let a = Arc::clone(&rec);
@@ -383,6 +434,13 @@ fn claim_race_exactly_one_wins() {
 /// way the predicate is broken, which is what makes the green run mean
 /// something. `MODEL_SPIN_LIMIT` being small enough to reach the steal path is
 /// load-bearing for the first half of that, exactly as its own comment says.
+///
+/// **The control only fires under a preemption bound, and finding that out is
+/// why [`model`] exists.** Run with `LOOM_MAX_PREEMPTIONS` unset — which is what
+/// invoking `cargo test` by hand used to do — the broken predicate went
+/// undetected after 8 seconds of unbounded search, against 0.37 s to catch it at
+/// a bound of 3. [`model`] now pins that as a floor the environment can raise
+/// and cannot lower, so this control holds however the suite is invoked.
 ///
 /// `MODEL_BLOCKS` matches production's [`tf_tree_arena::TOPO_BLOCKS`] and that is
 /// **load-bearing, not decoration**. A first draft of this model used two blocks
@@ -545,7 +603,7 @@ fn topology_read_sees_old_or_new_never_mixed() {
     const P_NEW: u32 = 9;
     const D_NEW: u32 = 3;
 
-    loom::model(|| {
+    model(|| {
         let topo = Arc::new(TopoModel::new());
 
         let w = Arc::clone(&topo);
@@ -587,7 +645,7 @@ fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
     const P_B: u32 = 22;
     const D_B: u32 = 4;
 
-    loom::model(|| {
+    model(|| {
         let topo = Arc::new(TopoModel::new());
 
         let spawn_mutator = |topo: Arc<TopoModel>, slot: u32, parent: u32, depth: u32| {
@@ -664,7 +722,7 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     /// the test cannot pass by stealing indiscriminately.
     const DEAD_SLOT: u32 = 0;
 
-    loom::model(|| {
+    model(|| {
         let topo = Arc::new(TopoModel::new());
 
         // Participant 0 dies holding the lock, mid-copy: it took the lock and
@@ -735,7 +793,7 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
     const P_LATE: u32 = 111;
     const P_NEW: u32 = 222;
 
-    loom::model(|| {
+    model(|| {
         let table = Arc::new(alloc::vec![ParticipantRecord::default()]);
         let (slot, inc) = ParticipantTable::new(&table)
             .register(P_LATE, 1, 0)
@@ -791,7 +849,7 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
     const P_A: u32 = 101;
     const P_B: u32 = 202;
 
-    loom::model(|| {
+    model(|| {
         // Four slots, so a losing thread has somewhere it *could* have gone —
         // the assertion is that it does not go there, because `register_at`
         // takes the named slot or nothing.
@@ -1006,7 +1064,7 @@ fn reclaim_races_register_model(shape: Sweep) {
         (fired, state_of(observed) == LIVE)
     }
 
-    loom::model(move || {
+    model(move || {
         let table = Arc::new(alloc::vec![
             ParticipantRecord::default(),
             ParticipantRecord::default()
