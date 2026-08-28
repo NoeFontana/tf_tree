@@ -17,30 +17,6 @@
 //! - **Created** — this process brought the arena into existence, so it owes
 //!   the service: bind the socket and answer handshakes for as long as it
 //!   lives.
-//! - **TookOver** — **refused**, with [`OpenError::TakeoverUnsupported`]. It
-//!   shared the `Created` arm until `docs/decisions/0028` plan step 9, and that
-//!   arm `memfd_create`s a *fresh* segment: an heir running it would own a new,
-//!   empty arena under the rendezvous name every survivor is still mapped to
-//!   the original through — forking the tree rather than inheriting it. The arm
-//!   cannot be taught to adopt instead, either, because nothing in scope at it
-//!   names the arena this process already holds: no fd, no socket path, no
-//!   [`Rendezvous`] of the session's own.
-//!
-//! # What this module does not do yet
-//!
-//! §3.5 takeover — a *participant* noticing the owner died and promoting itself
-//! — is not here, and **it is not a second pass through [`tf_tree_ipc::Open`]
-//! with a builder declaring it is already attached**, which is what this
-//! paragraph used to say — and that builder is now deleted
-//! (`docs/decisions/0037`).
-//! `docs/decisions/0028` open question 3 settled that the heir keeps its
-//! existing slot, byte and arena record: the participant slot is baked into
-//! every claim and every topology guard it already holds — A3 encodes claim
-//! ownership as `participant_slot + 1` — so an heir that registered a second
-//! time would arrange for its own live claims to be reaped. What §3.5 needs is
-//! a watcher on the client socket plus a narrower operation on the session that
-//! already exists — take byte 0, unlink, bind, serve — which is why the
-//! outcome above has no adopting arm to route to and refuses instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -783,47 +759,6 @@ pub enum OpenError {
     /// lock file by anything entitled to see them.
     #[error("this process's participant lock byte and its arena participant record are different slots; the arena was not published")]
     ParticipantSlotDiverged,
-
-    /// The rendezvous resolved to [`OpenOutcome::TookOver`], and §3.5 takeover
-    /// is not wired (`docs/decisions/0028` plan step 9).
-    ///
-    /// **A refusal rather than the arena this used to build.** `TookOver`
-    /// shared the `Created` arm, which calls [`TreeBuilder::build_shared`] — a
-    /// `memfd_create` of a *fresh* segment. An heir taking that path would hold
-    /// a new, empty arena under the rendezvous name while every survivor stayed
-    /// mapped to the old one: `docs/PHASE2.md` §3.5 makes ownership a role
-    /// rather than a property of the arena, so a takeover that swaps the arena
-    /// has forked the tree instead of inheriting it. Adopting is not available
-    /// at that point in [`Open::open`] — no fd, no socket path, no
-    /// [`Rendezvous`] of the session's own is in scope — so the arm refuses and
-    /// the caller keeps whatever it already had.
-    ///
-    /// The session is dropped before this is returned, so the ownership byte is
-    /// released: a refused takeover leaves the rendezvous as it found it.
-    ///
-    /// # Nothing reaches this any more, and the arm stays
-    ///
-    /// `tf_tree_ipc::Open` had the only producer of [`OpenOutcome::TookOver`],
-    /// and issue #275 deleted it: two rounds of trying to make it safe produced
-    /// five executed unsound states, and the reason is structural — a takeover
-    /// cannot be an `Open::open` call at all (`docs/decisions/0037`). So this
-    /// variant is unconstructible today, and the `#[cfg(test)]` seam that used
-    /// to drive it went with the builder it drove — **which retires
-    /// `docs/decisions/0028` plan step 9's verification**, the unit test that
-    /// this arm returns an error rather than a `Tree`. The refusal remains and
-    /// can no longer be exercised; `0037` records that as a cost rather than
-    /// absorbing it, and it is owed again the day `TookOver` has a producer.
-    ///
-    /// **The arm is kept rather than replaced with `unreachable!`.** `TookOver`
-    /// is a `pub` variant of a published crate's enum; a future §3.5 gives it a
-    /// producer, and the day it does, this refusal is the thing standing between
-    /// an heir and a `build_shared` that forks the tree. A panic would be the
-    /// wrong shape for that, and deleting the arm would make the match
-    /// non-exhaustive at exactly the wrong moment.
-    #[error(
-        "the rendezvous resolved to a takeover, and takeover is not wired (docs/PHASE2.md §3.5)"
-    )]
-    TakeoverUnsupported,
 }
 
 impl From<IpcError> for OpenError {
@@ -1116,7 +1051,7 @@ impl Open {
     /// returns either `Ok` (no retry) or [`OpenError::NoLayoutToCreate`], which
     /// `is_retryable` classifies as terminal, so a second attempt never finds it
     /// missing where the first found it present. That was **wrong**. On the
-    /// same arm — `Created`, and `Created | TookOver` when this was written —
+    /// same arm — `Created` —
     /// `spawn_owner_server` returns
     /// `OpenError::Rendezvous(IpcError::ArenaAbsent)` when `tree.shared_fd()` is
     /// `None`, and `is_retryable` calls that **retryable** — so `await_open`
@@ -1266,37 +1201,6 @@ impl Open {
                 let server = spawn_owner_server(&rv, &tree)?;
                 tree.hold_ownership(session, server);
                 Ok(tree)
-            }
-            OpenOutcome::TookOver => {
-                // **Split from `Created`, which is the whole of
-                // `docs/decisions/0028` plan step 9.** That arm `build_shared`s
-                // a *fresh* segment, so an heir routed through it would inherit
-                // the *role* and lose the *arena* — the one thing §3.5 says a
-                // takeover must not do. Nothing here can adopt instead: the
-                // session carries no fd and no socket path, and the arena this
-                // process already holds is not in scope at all.
-                //
-                // Drop the session explicitly, mirroring the `Joined` refusal
-                // above. **Explicitness, not necessity:** `session` is a local
-                // of this function, so the `Err` return drops it either way.
-                //
-                // **The three mutant results this comment used to cite are
-                // retired**, and saying so is the point: they were run against a
-                // unit test that reached this arm through a `#[cfg(test)]` seam,
-                // and #275 deleted the seam with the builder it drove
-                // (`docs/decisions/0037`). Nothing can construct `TookOver` now,
-                // so nothing can exercise this arm, and a comment claiming
-                // otherwise would read as tested when it is not.
-                //
-                // What the retired test pinned, and what still has to be true
-                // the day `TookOver` gets a producer: the session is gone *by
-                // the time the caller sees the error*. It holds the ownership
-                // byte, and a return that kept it would leave the rendezvous
-                // owned by a process with no arena behind it, with every
-                // subsequent joiner waiting out its timeout on
-                // `ArenaHeldButUnreachable`.
-                drop(session);
-                Err(OpenError::TakeoverUnsupported)
             }
         }
     }

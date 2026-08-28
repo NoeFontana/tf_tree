@@ -217,7 +217,6 @@ fn main() {
                     let what = match s.outcome() {
                         OpenOutcome::Joined => "joined",
                         OpenOutcome::Created => "created",
-                        OpenOutcome::TookOver => "tookover",
                     };
                     say(&format!("{what} {}", s.slot()));
                     park();

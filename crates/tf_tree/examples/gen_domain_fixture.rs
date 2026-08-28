@@ -37,7 +37,12 @@
 //! rather than its bytes — a `.tft` header carries `created_unix_ns`,
 //! `creator_pid`, `boot_id` and `instance_uuid`, so two freezes of the same tree
 //! are never byte-identical and a `memcmp` gate here would fail on every run.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 
 fn main() {
     #[cfg(all(feature = "shm", target_os = "linux"))]

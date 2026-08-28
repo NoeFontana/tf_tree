@@ -18,7 +18,7 @@
 //!
 //!     // 5. Serve.
 //!     ...
-//!     return Created            // TookOver has no producer; see its doc
+//!     return Created
 //! }
 //! on timeout -> Err(ArenaHeldButUnreachable { holder_slots, identities })
 //! ```
@@ -146,34 +146,6 @@ pub enum OpenOutcome {
     /// owner that died leaves behind, it holds no state, and §3.9 makes it the
     /// job of whoever wins ownership to remove it.
     Created,
-    /// This process already had the arena mapped and has now inherited the
-    /// owner role: unlink the stale socket, bind, and serve its *existing* fd.
-    /// It must not create a second arena (§3.4 step 3, §3.5).
-    ///
-    /// # Nothing produces this, and that is a decision rather than a gap
-    ///
-    /// [`Open`] had an arm that did, reached by a `already_attached` builder.
-    /// Issue #201 found it handing back the first *free* participant byte while
-    /// the caller's arena record was elsewhere, and every liveness predicate
-    /// indexes the two with one integer. Two attempts to repair it in place
-    /// produced five distinct unsound states — a session over an unheld byte, an
-    /// out-of-range slot, a serving owner overriding the declaration, a
-    /// declaration naming a *peer's* slot (`F_OFD_GETLK` reports conflicts and
-    /// cannot name a holder — `lockfile`'s module doc), and a stranded owner
-    /// grant — so the arm was deleted instead.
-    ///
-    /// The decision behind that is older than the defect:
-    /// `docs/decisions/0028` question 3, resolved 2026-08-20, holds that a heir
-    /// keeps the slot, byte and arena record it already has and that **§3.5
-    /// cannot be wired as a second `Open::open` call**. A builder that declares
-    /// "I am already attached at slot n" is unverifiable from a new file
-    /// description, which is what that resolution implies and what the attempts
-    /// demonstrated.
-    ///
-    /// The variant stays because §3.5 is the protocol's vocabulary and a heir
-    /// still has to be *describable*; `docs/decisions/0037` is where the shape
-    /// that could produce it is being worked out.
-    TookOver,
 }
 
 /// Whether a server is reachable at the socket path, and what it gave us.
@@ -600,7 +572,7 @@ pub struct Session<A = ()> {
 impl<A> Session<A> {
     /// How `open()` resolved, and therefore what the caller owes: nothing for
     /// [`OpenOutcome::Joined`], create-and-bind for [`OpenOutcome::Created`],
-    /// bind-only for [`OpenOutcome::TookOver`].
+    /// and nothing at all for [`OpenOutcome::Joined`].
     #[must_use]
     pub fn outcome(&self) -> OpenOutcome {
         self.outcome
@@ -708,7 +680,7 @@ impl<A> Session<A> {
 
     /// Take what the §3.7 handshake yielded, if this session joined one.
     ///
-    /// `None` for [`OpenOutcome::Created`] and [`OpenOutcome::TookOver`]: both
+    /// `None` for [`OpenOutcome::Created`], which
     /// already have the arena and never ran a handshake.
     ///
     /// Taking rather than borrowing, because the payload owns file descriptors —

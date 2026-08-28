@@ -51,8 +51,15 @@ is a bug.
   value, but a field path or a `ClaimRecord { .. }` literal naming it will not
   compile. No arena byte moves.
 
+- **`OpenOutcome::TookOver` and `tf_tree::OpenError::TakeoverUnsupported` are
+  deleted** ([`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)
+  question 3, answered `no`). A takeover is not an outcome of `open()` — it is a
+  method on the session that already holds the byte — so neither the variant nor
+  the arm that refused it had anything left to describe. A `match` on
+  `OpenOutcome` that named `TookOver` will not compile; nothing else moves.
+
 - **`tf_tree_ipc::Open::already_attached`, the takeover arm it reached, and
-  `Open::register_any` are deleted; `OpenOutcome::TookOver` now has no producer**
+  `Open::register_any` are deleted**
   (#275, closes #201, [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
   `LockFile::take_any_participant` survives with no production caller; `IpcError`
   and `OpenOutcome` are unchanged as types; and `tf_tree`'s `TookOver` arm keeps
