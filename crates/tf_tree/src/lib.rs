@@ -313,6 +313,8 @@ pub fn counters_compiled_in() -> bool {
 #[cfg(all(feature = "shm", target_os = "linux"))]
 mod open;
 #[cfg(all(feature = "shm", target_os = "linux"))]
+pub use open::Inheritance;
+#[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
 
 /// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation

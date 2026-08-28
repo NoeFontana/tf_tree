@@ -2986,11 +2986,75 @@ impl Tree {
         &mut self,
         session: crate::open::JoinedSession,
         socket: std::os::fd::OwnedFd,
+        rendezvous: tf_tree_ipc::Rendezvous,
     ) {
         self.attachment = Some(crate::open::Attachment::Joined {
-            _session: session,
-            _socket: socket,
+            session,
+            socket,
+            rendezvous,
         });
+    }
+
+    /// Whether the process that owns this arena has gone away (§3.5).
+    ///
+    /// A participant holds its attach socket for the lifetime of the attachment
+    /// and the owner reads that socket's closure as death (D17). This is the
+    /// same fact from the other end — the owner's death closes it too, and the
+    /// kernel reports `POLLHUP` in microseconds, exactly and with no timeout to
+    /// tune.
+    ///
+    /// **Nothing watched this before**, which is why §3.5 never ran even while a
+    /// takeover path existed: `docs/PHASE2.md` §0.0 records that the trigger
+    /// never existed either. A survivor calls this when convenient — in its own
+    /// loop, between control cycles — and there is deliberately no background
+    /// thread and no daemon doing it, per
+    /// [`0019`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md).
+    /// The cost is one non-blocking `poll` of one descriptor.
+    ///
+    /// **`false` for anything that is not a joined rendezvous attachment**: a
+    /// heap tree, a frozen `.tft`, a tree this process already owns, or an
+    /// `attach_shared` over an inherited fd. None of them has an owner that can
+    /// die out from under it, and the owner cannot lose itself.
+    ///
+    /// Lookups are unaffected either way — `Plan::at` touches the mapping and
+    /// nothing else, and this is entirely control plane.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[must_use]
+    pub fn owner_lost(&self) -> bool {
+        use std::os::fd::AsFd;
+        match &self.attachment {
+            Some(crate::open::Attachment::Joined { socket, .. }) => {
+                // A `poll` failure is not a hangup. Reporting one would send a
+                // survivor to take ownership of an arena whose owner is alive
+                // and serving, which is the split-brain §3.4 exists to prevent.
+                tf_tree_ipc::peer_hung_up(socket.as_fd()).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Borrow the parked attachment, for `crate::open`'s §3.5 seam.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn attachment_ref(&self) -> Option<&crate::open::Attachment> {
+        self.attachment.as_ref()
+    }
+
+    /// Take the parked attachment out.
+    ///
+    /// **The caller owes a matching [`Tree::put_attachment`] on every path**,
+    /// including error paths: what is taken here holds this process's
+    /// participant lock byte and its attach socket, and dropping it releases
+    /// both. It exists so `Tree::inherit_ownership` can hand `&self` to
+    /// `spawn_owner_server` while it owns the session.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn take_attachment(&mut self) -> Option<crate::open::Attachment> {
+        self.attachment.take()
+    }
+
+    /// Put back what [`Tree::take_attachment`] removed.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn put_attachment(&mut self, a: Option<crate::open::Attachment>) {
+        self.attachment = a;
     }
 
     /// Park the owner's session and serving thread.
@@ -3010,8 +3074,8 @@ impl Tree {
         server: crate::open::OwnerThread,
     ) {
         self.attachment = Some(crate::open::Attachment::Owner {
+            _server: server,
             _session: session,
-            server,
         });
     }
 

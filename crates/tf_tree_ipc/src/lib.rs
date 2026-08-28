@@ -108,7 +108,7 @@ mod runtime_dir;
 mod server;
 mod wire;
 
-pub use client::{attach, Attached, SocketProbe};
+pub use client::{attach, peer_hung_up, Attached, SocketProbe};
 pub use error::{
     EnvVar, IpcError, LockRole, NameProblem, ProcError, ProcParseError, RuntimeDirSource,
 };

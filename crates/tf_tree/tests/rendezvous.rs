@@ -4045,3 +4045,105 @@ fn the_topology_byte_is_retried_before_contention_is_reported() {
          ({floor:?}): the retry budget is gone"
     );
 }
+
+/// **§3.5, end to end: owner death stops being terminal for new joiners.**
+///
+/// This is the failure `docs/PHASE2.md` §0.0 records, measured with
+/// `shm_torture` and true for the whole life of the project: kill the arena's
+/// owner and lookups keep working for everyone already attached, exactly as
+/// §3.5 promises — but **no new process can ever join**. A joiner wins the
+/// ownership byte, meets §3.4's split-brain check against the surviving
+/// participants' held bytes, backs off, and times out with
+/// `ArenaHeldButUnreachable` for as long as any survivor lives. That is the
+/// shape a supervised robot has every time it restarts one node.
+///
+/// The takeover half was deleted by #275
+/// ([`0037`](../../docs/decisions/0037-a-takeover-is-not-a-second-open.md)),
+/// because the declaration it rested on — *"I already hold the arena at slot
+/// n"* — cannot be verified from a new file description: `F_OFD_GETLK` answers
+/// *does anyone else hold this byte*, so a caller holding it on another
+/// description and a live peer holding it are indistinguishable. The
+/// replacement is a method on the `Session` that already holds the byte, where
+/// the invariant is structural rather than checked.
+///
+/// **The test asserts the failure before it asserts the repair**, because a
+/// test that only shows the joiner succeeding at the end would pass just as
+/// well against a build where the owner never really died.
+///
+/// **Mutant:** make `Tree::inherit_ownership` return `Ok(Inheritance::OwnerAlive)`
+/// unconditionally. Applied: `left: "true OwnerAlive", right: "true Inherited"`.
+/// Note *which* half of that line moves — `owner_lost` still answers `true`,
+/// because the hangup is a kernel fact and the mutation is downstream of it. The
+/// test therefore fails at the inheritance and not at the trigger, which is the
+/// discrimination it is for: a build that sees the death and does nothing is the
+/// pre-#275 world, and it is the one this test has to reject.
+#[test]
+fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
+    use tf_tree::{AttachMode, Stamp};
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-ownership");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(
+        owner.line().starts_with("owning"),
+        "the owner did not come up"
+    );
+
+    // A survivor, attached before the owner dies. It holds a participant byte,
+    // which is precisely what turns later joiners away.
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    assert_eq!(heir.line(), "joined", "the survivor did not attach");
+
+    owner.kill();
+
+    let joiner = || {
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::Never)
+            .timeout(std::time::Duration::from_millis(200))
+    };
+
+    // The documented failure, reproduced. Nothing is serving, and the heir's
+    // held byte makes the arena look occupied to everyone outside it.
+    let err = joiner()
+        .open()
+        .err()
+        .expect("with the owner dead and nothing serving, a joiner must be turned away");
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. })
+        ),
+        "expected the pre-§3.5 wedge, got {err:?}"
+    );
+
+    // The repair: the survivor notices and inherits. `owner_lost` is the trigger
+    // that never existed — nothing watched the client socket, so no participant
+    // ever reached the takeover path even while one was implemented.
+    heir.poke();
+    assert_eq!(
+        heir.line(),
+        "true Inherited",
+        "the survivor did not see the hangup, or did not inherit"
+    );
+
+    // And now the thing that could not happen before: a new process joins the
+    // same arena, under a new owner, and reads what the dead owner published.
+    let tree = joiner()
+        .open()
+        .expect("after inheritance a new process must be able to join");
+    let g = tree.guard();
+    let target = tree.frame("map").unwrap();
+    let source = tree.frame("base").unwrap();
+    let plan = tree.plan(target, source).unwrap();
+    let iso = plan
+        .at(&g, Stamp::<tf_tree::SystemDomain>::from_nanos(1_500))
+        .unwrap();
+    let expected = tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]);
+    assert_eq!(
+        iso.to_bits(),
+        expected.to_bits(),
+        "the inherited arena served different bytes than the dead owner wrote"
+    );
+}

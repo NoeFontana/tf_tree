@@ -25,6 +25,8 @@
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
+//! join-heir     -> "joined", then on stdin: "<owner_lost> <inheritance>",
+//!                  then parks — serving, if it inherited (§3.5)
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -287,6 +289,30 @@ fn main() {
         // LIVE and its process is gone", and telling those two apart is the
         // whole question.
         #[cfg(feature = "unstable")]
+        // §3.5's survivor. Joins, then on a poke reports whether the owner is
+        // gone and what inheriting produced, then parks — **holding the tree**,
+        // because if it inherited then this process is now the server and
+        // dropping the tree would stop it.
+        "join-heir" => {
+            let mut tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::Never)
+                .open()
+                .expect("join");
+            say("joined");
+
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).expect("read");
+            let lost = tree.owner_lost();
+            let outcome = match tree.inherit_ownership() {
+                Ok(o) => format!("{o:?}"),
+                Err(e) => format!("error {e}"),
+            };
+            say(&format!("{lost} {outcome}"));
+            loop {
+                std::thread::park();
+            }
+        }
         "join-rw-report" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
