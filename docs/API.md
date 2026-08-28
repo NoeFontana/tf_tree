@@ -781,6 +781,8 @@ All of these run at tier 1 or tier 2 frequency, so R2 is not in tension:
 |---|---|---|
 | `at_with_derivatives` absent from Python | Rust and C have it since Phase 4 (`tft_plan_at_with_derivatives`, unstable tier); `PHASE4.md` §0 scoped Python out | **Phase 5**, as `Layout::QuatTwist` — see below |
 | `Publisher` holds an extended borrow by hand | `tf_tree_py/src/tree.rs` | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) |
+| `at_extrapolating` takes no `layout=` and has no `_into` form | `tf_tree_py`; C can extrapolate into `affine32` and Python cannot | **Open.** R2 makes `_into` NORMATIVE for *batch* entry points, and this is one, so the asymmetry is owed rather than declined. It was scoped out of [`0039`](./decisions/0039-extrapolation-you-cannot-fail-to-notice.md)'s binding step rather than argued away |
+| Python cannot declare a static edge, a per-edge capacity, a rate, or a domain | `tf_tree.build(edges, capacity, interp)` makes every edge dynamic under one capacity | **Open.** A sensor mount published as a dynamic edge is the latched-topic behaviour `PROJECT.md` §2 lists as a problem `tf_tree` solves, so a Python-built tree cannot reach one of the engine's headline wins. Needs a builder mirroring `TreeBuilder`, which is new public API and therefore a decision record |
 
 **`at_with_derivatives` ships as a layout, not a method.** `Layout::QuatTwist`
 is a contiguous `(N, 13)` write of `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`.
@@ -862,6 +864,41 @@ this verbatim.
 
 **Layout by type** (`layout_of<T>`, `raw_writable<T>`) is R4's strongest form
 and is the model for any future typed binding.
+
+### 4.1 The two capabilities the bindings could not reach — NORMATIVE (doc)
+
+Both were implemented in the engine, tested, and callable from Rust only. They
+are recorded here because the *shape* each took generalises to any future
+capability that has to cross this boundary.
+
+**The time domain** ([`0038`](./decisions/0038-the-domain-a-binding-cannot-name.md)).
+`Domain` is an open trait whose tag is a `const`, so a binding cannot name the
+type `at::<D>` needs and must carry the tag as data. Every query site in both
+bindings hardcoded `SystemDomain`, which made any arena not on tag 0 unreadable
+from C, C++ and Python — while `ros/tf_tree_ros` warns an operator to configure
+one under `use_sim_time`. The tag lives on the **plan handle**, not on the call:
+the ABI is frozen so a new creation entry point costs one declaration where a new
+call would cost three; a domain is a property of a route rather than of an
+instant; and validating at plan time is where the frame *names* are still in hand,
+so the diagnostic says which route disagreed rather than which two integers did.
+
+**Extrapolation** ([`0039`](./decisions/0039-extrapolation-you-cannot-fail-to-notice.md)).
+`Plan::at_extrapolating` returns a value with no pose-only accessor, so a caller
+cannot read the pose without the distance it was extrapolated by. **C cannot
+enforce that, so the analogue is a required out-parameter**: a null `info` is
+`TFT_ERR_NULL_ARG`, nothing is written, and there is deliberately no second
+spelling of the call without it. Two places where C is *sharper* than the Rust it
+mirrors, both because C has no way to say "meaningless": `edge` is
+`TFT_INVALID_ID` when `by_ns == 0`, since a plausible edge id attached to an
+answer nothing invented would be logged as fact; and the twist-carrying layout is
+refused rather than served under `Error`, which would put two extrapolation
+policies in one 13-`f64` row.
+
+**In Python the batch distance is an `(N,)` array and not a scalar**, and that is
+the same property a third time. A batch straddling the newest sample holds
+interpolated and extrapolated elements together, so collapsing it is either a
+`max` that marks fresh elements stale or a `min` that marks stale ones fresh —
+and the second is exactly the failure `0039` exists to prevent.
 
 ---
 

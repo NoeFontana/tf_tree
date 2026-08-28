@@ -112,6 +112,34 @@ is a bug.
 
 ### Added
 
+- **Both bindings reach the time domain and extrapolation** — the halves
+  [`0038`](docs/decisions/0038-the-domain-a-binding-cannot-name.md) and
+  [`0039`](docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md) left
+  unwired, and the ones that matter most for a robot node, since C++ is the
+  language a control loop is written in.
+
+  **C ABI** (frozen at 1.0, so both are appended and nothing moves;
+  `TFT_ABI_VERSION_MINOR` 5 → 7): `tft_plan_create_in_domain` puts the query
+  domain on the plan handle, validated at creation where the frame names are
+  still in hand; `tft_plan_at_extrapolating` takes a policy and a **required**
+  `tft_extrapolated *info` out-parameter — a null `info` is `TFT_ERR_NULL_ARG`
+  and nothing is written, because C cannot express "no pose-only accessor" any
+  other way. `edge` is `TFT_INVALID_ID` when `by_ns == 0`, deliberately sharper
+  than the Rust field it mirrors. The C++ wrapper returns the pose and the
+  distance as one object, which C can only ask for.
+
+  **Python**: `Tree.plan(target, source, domain=0)`,
+  `Tree.lookup(..., domain=)`, the four domain tags as module-level ints, and
+  `plan.at_extrapolating(stamps, policy, /) -> (poses, by_ns)` with `policy`
+  required. **Batch `by_ns` is an `(N,)` array, not a scalar**: a batch
+  straddling the newest sample holds interpolated and extrapolated elements
+  together, and collapsing it would mark one or the other wrongly.
+
+  `docs/API.md` §4.1 records both shapes and why each took the form it did; §3.3
+  records the two parity gaps still open — Python's `at_extrapolating` has no
+  `layout=` or `_into` form, and Python still cannot declare a static edge, a
+  per-edge capacity, a rate or a domain.
+
 - **D5's owed measurement, taken at last** — `just interp-accuracy`
   (`crates/tf_tree_bench/examples/interp_accuracy.rs`). D5 ends *"do not make it
   the default without a measurement justifying it"*, which was read as a rule
