@@ -43,7 +43,7 @@ default = ["compression"]
 # is Linux-only and behind `shm` because it reuses the same mapping code. Ingest
 # into an in-process `Tree` needs none of that and is always available, which is
 # what keeps the two-pass logic under plain `cargo nextest run --workspace`.
-shm = ["tf_tree/shm", "dep:blake3"]
+shm = ["tf_tree/shm"]
 # The synthetic MCAP fixture writer. **Off by default**: it is test scaffolding,
 # not a product surface, and it fabricates recordings — a name a user could
 # reach for by accident is a name they will eventually mistake for real data.
@@ -142,7 +142,15 @@ crc32fast = { version = "1", default-features = false }
 # `docs/PHASE5.md` §2.3's `source_digest`, which is specified as BLAKE3 of the
 # source recording. Already in the lock file via `tf_tree_core`, so it costs
 # nothing new; `default-features = false` keeps it consistent with that use.
-blake3 = { workspace = true, optional = true }
+#
+# **Not optional, and it was until `docs/decisions/0046`.** It used to be pulled
+# in by `shm`, because the only caller was `tft::freeze_bag` and the frozen
+# backend is Linux-only. `digest_file` is now at the crate root and unconditional
+# so that `tf_tree_py`'s `ingest_bag` can report a recording's digest on every
+# platform the wheel builds for, including those with no frozen backend. This
+# adds nothing to any build: `cargo tree -p tf_tree_ingest --no-default-features`
+# already lists blake3, because `tf_tree_core` requires it (D14).
+blake3 = { workspace = true }
 
 [dev-dependencies]
 # Self-reference so the fixture writer is compiled for this crate's own tests

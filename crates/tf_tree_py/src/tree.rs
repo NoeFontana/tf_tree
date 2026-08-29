@@ -222,6 +222,89 @@ pub struct PyTree {
     /// that then does a seqlock read and a depth-N fold. If it is ever worth a
     /// number, `at`'s scalar `mat4` path is where to take it.
     pub(crate) inner: Arc<Tree>,
+    /// Where this tree came from, when it came from a recording.
+    ///
+    /// `None` for every tree not produced by [`crate::ingest::ingest_bag`] — a
+    /// tree built in Python or opened from a `.tft` has no recording to name,
+    /// which is the same fact `Tree::freeze_to`'s all-zero `source_digest`
+    /// already encodes ([`0046`]).
+    ///
+    /// Immutable after construction. What changes is [`Self::source_live`].
+    pub(crate) source: Option<SourceInfo>,
+    /// Whether [`Self::source`] still describes this tree's contents.
+    ///
+    /// **Cleared the first time the tree can be written to**, i.e. in
+    /// `publisher()`. A caller may ingest a recording, add a computed
+    /// calibration edge and freeze; the `.tft` would then carry a digest
+    /// asserting it is that recording while holding samples the recording does
+    /// not. `docs/PHASE5.md` §2.3 gives the field one job — answering *"was
+    /// this index built from that file"* without re-ingesting — and a false
+    /// *yes* defeats exactly the investigation it exists for, whereas the zero
+    /// is documented as "there was no recording". **A wrong digest is worse
+    /// than an absent one**, so this errs to absent.
+    ///
+    /// `AtomicBool` and not a `RefCell` because the pyclass is `frozen`: fields
+    /// are reachable through `&self` from any thread, and 3.14t runs them
+    /// concurrently for real (`just py-test-freethreaded`).
+    pub(crate) source_live: std::sync::atomic::AtomicBool,
+}
+
+/// The recording a [`PyTree`] was ingested from — [`PyTree::source`]'s contents.
+///
+/// A plain struct rendered to a `dict` at the boundary rather than a second
+/// pyclass: every field is a number or a string, the caller logs or asserts on
+/// it, and a new field is then additive for every consumer, which an attribute
+/// on a class is not.
+pub(crate) struct SourceInfo {
+    /// The recording's path as given to `ingest_bag`.
+    pub(crate) path: String,
+    /// BLAKE3 of the recording's **bytes** — the file, not the transforms — so
+    /// it answers "was this index built from *that* file" without a re-ingest.
+    pub(crate) digest: [u8; 32],
+    /// `Survey::transforms_read`.
+    pub(crate) transforms: u64,
+    /// How many declared edges the recording carried no sample for.
+    pub(crate) edges_without_samples: usize,
+    /// The interval the **recording** covers, which is not the interval the
+    /// tree can answer: a ring retains what fits, so the queryable window is at
+    /// most this and usually narrower. `Tree.span()` is the one to plan
+    /// against. Named `recording_*` in the dict for that reason.
+    pub(crate) recording_ns: Option<(i64, i64)>,
+}
+
+impl PyTree {
+    /// Wrap an engine with no recording behind it.
+    pub(crate) fn wrap(inner: Arc<Tree>) -> Self {
+        Self {
+            inner,
+            source: None,
+            source_live: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Wrap an engine that was just read out of a recording.
+    pub(crate) fn from_recording(inner: Arc<Tree>, source: SourceInfo) -> Self {
+        Self {
+            inner,
+            source: Some(source),
+            source_live: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// [`Self::source`], if it still describes this tree.
+    ///
+    /// `Acquire` against `publisher()`'s `Release`: once that call has returned
+    /// on one thread, any freeze ordered after it sees the cleared flag. It
+    /// does **not** make a freeze racing a concurrent `publisher()` well
+    /// defined — nothing here could, since the two are genuinely concurrent —
+    /// and that is the caller's race to avoid, not this flag's to resolve.
+    pub(crate) fn provenance(&self) -> Option<&SourceInfo> {
+        if self.source_live.load(std::sync::atomic::Ordering::Acquire) {
+            self.source.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// Whether this plan samples anything at evaluation time.
@@ -332,6 +415,14 @@ impl PyTree {
     #[pyo3(signature = (child, parent, /))]
     fn publisher(slf: &Bound<'_, PyTree>, child: &str, parent: &str) -> PyResult<PyPublisher> {
         let this = slf.get();
+        // **This tree stops being the recording the moment it can be written
+        // to.** Cleared here rather than on the first `push` because the
+        // publisher is the capability: once it exists, the samples may diverge
+        // at any point, and a `.tft` written in between would carry a digest
+        // claiming a file whose contents it no longer matches. `Release` pairs
+        // with `provenance()`'s `Acquire`; see [`PyTree::source_live`].
+        this.source_live
+            .store(false, std::sync::atomic::Ordering::Release);
         // Read-only resolution even on this, the one *write* entry point of the
         // three: topology is builder-time (decision `0004`), so a name with no
         // record has no edge either and interning it could not produce one — it
@@ -367,9 +458,61 @@ impl PyTree {
     /// which is not optional at the sizes a freeze is for: the copy is the whole
     /// arena, and holding the GIL across it would stall every other thread in
     /// the interpreter for the duration.
+    ///
+    /// **The container's `source_digest` comes from `Tree.source` when this
+    /// tree was ingested from a recording**, and is all-zero otherwise. That is
+    /// what makes `ingest_bag(p).freeze(out)` produce a traceable index with
+    /// nothing extra to remember, and it is why there is no second `freeze_bag`
+    /// spelling beside it. An explicit `source=` overrides the *label* only;
+    /// the digest is a fact about the bytes and is not the caller's to
+    /// relabel.
     #[pyo3(signature = (path, /, *, source = None))]
     fn freeze(&self, py: Python<'_>, path: PathBuf, source: Option<&str>) -> PyResult<()> {
-        crate::offline::freeze_impl(py, &self.inner, &path, source)
+        let prov = self.provenance();
+        let digest = prov.map_or([0u8; 32], |s| s.digest);
+        let label = source.or_else(|| prov.map(|s| s.path.as_str()));
+        crate::offline::freeze_impl(py, &self.inner, &path, label, digest)
+    }
+
+    /// The recording this tree was ingested from, or `None`.
+    ///
+    /// `None` for a tree built in Python or opened with `open_file` — neither
+    /// has a recording to name — **and `None` again once `publisher()` has been
+    /// called on it**, because from that moment the tree may hold samples the
+    /// recording does not and the digest would be asserting something false.
+    ///
+    /// The keys are `path`, `digest` (hex), `transforms`,
+    /// `edges_without_samples`, `recording_start_ns` and `recording_end_ns`.
+    ///
+    /// **`recording_*`, not `span_*`, and the distinction is the point.** These
+    /// are the bounds of the *recording*; the interval this tree can answer is
+    /// at most that and usually narrower, because a ring retains what fits. The
+    /// first end-to-end run of this API took the upper stamp from here, queried
+    /// it, and got `ExtrapolationError` from an edge whose retained history had
+    /// stopped 10 ms earlier. Use `Tree.span(target, source)` to plan queries.
+    #[getter]
+    fn source<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let Some(src) = self.provenance() else {
+            return Ok(None);
+        };
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("path", &src.path)?;
+        d.set_item("digest", hex32(src.digest))?;
+        d.set_item("transforms", src.transforms)?;
+        d.set_item("edges_without_samples", src.edges_without_samples)?;
+        match src.recording_ns {
+            // `None` when the recording carried no dated transform at all,
+            // which is a different fact from a zero-length interval.
+            Some((lo, hi)) => {
+                d.set_item("recording_start_ns", lo)?;
+                d.set_item("recording_end_ns", hi)?;
+            }
+            None => {
+                d.set_item("recording_start_ns", py.None())?;
+                d.set_item("recording_end_ns", py.None())?;
+            }
+        }
+        Ok(Some(d))
     }
 
     /// The interval over which `tree.plan(target, source)` is answerable.
@@ -2245,9 +2388,7 @@ pub fn build(
         b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
     }
     let inner = b.build().map_err(|e| build_err(&edges, capacity, e))?;
-    Ok(PyTree {
-        inner: Arc::new(inner),
-    })
+    Ok(PyTree::wrap(Arc::new(inner)))
 }
 
 /// Build from topology-config text — `0041`.
@@ -2294,9 +2435,7 @@ fn build_from_config(text: &str, frame_headroom: u32) -> PyResult<PyTree> {
         // about an *edge list* the caller passed, and a config caller passed
         // none — see its own doc for the three ways that goes wrong.
         .map_err(config_build_err)?;
-    Ok(PyTree {
-        inner: Arc::new(inner),
-    })
+    Ok(PyTree::wrap(Arc::new(inner)))
 }
 
 /// A `BuildError` from a config, phrased for somebody holding a text file.
@@ -2523,9 +2662,7 @@ pub fn open_arena(
         o = o.name(n).map_err(&map_err)?;
     }
     let inner = o.open().map_err(&map_err)?;
-    Ok(PyTree {
-        inner: Arc::new(inner),
-    })
+    Ok(PyTree::wrap(Arc::new(inner)))
 }
 
 /// See [`open_arena`]. The shared arena is Linux-only, like the `memfd` it maps.
@@ -2558,4 +2695,17 @@ pub fn open_arena(
         "a shared tf_tree arena needs the mmap-backed backend, which is \
          Linux-only in this build; tf_tree.build(...) works everywhere",
     ))
+}
+
+/// Thirty-two bytes as 64 lowercase hex characters.
+///
+/// `Tree.source`'s `digest` is a string rather than `bytes` because the thing a
+/// caller does with it is compare it to what `tf_tree doctor` printed, or paste
+/// it into an issue.
+fn hex32(bytes: [u8; 32]) -> String {
+    use core::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }

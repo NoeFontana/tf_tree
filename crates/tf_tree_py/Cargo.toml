@@ -113,6 +113,28 @@ tf_tree_math = { path = "../tf_tree_math", version = "0.0.4" }
 # `target_os` and no `shm` — so nothing third-party and nothing Linux-only
 # enters the wheel, and `just py-cross-check` keeps building.
 tf_tree_bridge = { path = "../tf_tree_bridge" }
+# `docs/PHASE5.md` §3, for the consumer §0.0's §3 row says this crate was made a
+# library *for* — "§4's offline Python API needs the same logic and cannot depend
+# on a binary crate" (`docs/decisions/0046`).
+#
+# **Unconditional, and behind no feature of this crate's own.** It was optional
+# behind a default-on `ingest` feature, justified as letting `just
+# py-cross-check` drop it. That justification was checked and is false: the
+# recipe passes `--features pure-hash,...` without `--no-default-features`, so
+# it compiles the ingest half for all three non-Linux targets — and that is
+# *coverage*, since it proves `mcap`, `ruzstd` and `lz4_flex` cross-compile to
+# macOS and Windows. Turning it off would have lost that. What remained was a
+# feature no gate ever exercised in its off position, which is exactly the
+# unchecked configuration `just shm-check` and `just ingest-check` exist to
+# prevent — so the feature is gone rather than given a gate nobody ships.
+#
+# **No `shm` either**, and that is not an oversight: this binding calls
+# `tf_tree_ingest::run` and `tf_tree_ingest::digest_file`, both unconditional.
+# The `tft` module is `#[cfg(all(feature = "shm", target_os = "linux"))]` and is
+# not used here — `Tree.freeze` writes the digest itself, which is why there is
+# no `freeze_bag` in the Python surface. `tf_tree` above still carries `shm`,
+# which is what makes `Tree.freeze` exist at all.
+tf_tree_ingest = { path = "../tf_tree_ingest" }
 # 0.29 is the floor: `abi3t` / `abi3t-py315` and the free-threading story do not
 # exist below it (`docs/PHASE3.md` §10.1).
 pyo3 = { version = "0.29", features = ["macros"] }

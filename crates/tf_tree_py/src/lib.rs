@@ -120,6 +120,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 mod errors;
+mod ingest;
 mod offline;
 mod tree;
 
@@ -341,6 +342,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree::push, m)?)?;
     m.add_function(wrap_pyfunction!(tree::open_arena, m)?)?;
     m.add_function(wrap_pyfunction!(offline::open_file, m)?)?;
+    // One entry point, not two: `Tree.freeze` writes the digest `ingest_bag`
+    // recorded, so `ingest_bag(p).freeze(out)` is the whole bag-to-`.tft` path
+    // and a `freeze_bag` beside it would be a second spelling of it
+    // (`docs/decisions/0046`).
+    m.add_function(wrap_pyfunction!(ingest::ingest_bag, m)?)?;
     m.add_class::<PyTree>()?;
     m.add_class::<PyPlan>()?;
     m.add_class::<PyPublisher>()?;
