@@ -3023,20 +3023,42 @@ impl Tree {
     /// loop, between control cycles — and there is deliberately no background
     /// thread and no daemon doing it, per
     /// [`0019`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md).
-    /// The cost is one non-blocking `poll` of one descriptor.
+    /// The cost is one non-blocking `poll` of one descriptor, plus — only once
+    /// that `poll` reports a hangup — one `F_OFD_GETLK`.
     ///
     /// **`false` for anything that is not a joined rendezvous attachment**: a
     /// heap tree, a frozen `.tft`, a tree this process already owns, or an
     /// `attach_shared` over an inherited fd. None of them has an owner that can
     /// die out from under it, and the owner cannot lose itself.
     ///
-    /// **It answers "the owner that served *this* attachment is gone", which is
-    /// not the same as "the arena has no owner".** A hangup is a one-way door:
-    /// once another survivor inherits, this keeps answering `true`, because the
-    /// socket it reads is still the dead owner's. So it is a trigger to *try*
-    /// inheriting once, not a standing question — see
-    /// [`crate::Inheritance::Contended`] for what a survivor that loses the race is
-    /// left holding.
+    /// # It answers "the arena has no owner", and the socket is only the first
+    /// half
+    ///
+    /// A hangup says **this process's channel** is dead. It does not say the
+    /// role is vacant, and after any takeover every survivor but the winner is
+    /// in exactly that state: socket pointing at a corpse, a live owner serving,
+    /// nothing wrong. Until
+    /// [`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)
+    /// this returned `true` there — permanently — so §3.5's recommended loop
+    /// re-attempted an `F_OFD_SETLK` on byte 0 every control cycle for the life
+    /// of the process, to be told each time that somebody else owns it.
+    ///
+    /// So a hangup is followed by `F_OFD_GETLK` on byte 0 of the lock file this
+    /// session already holds, and the three states separate:
+    ///
+    /// | | socket | byte 0 | this |
+    /// |---|---|---|---|
+    /// | owner alive | up | held | `false` — **one syscall**, no probe |
+    /// | owner dead, role vacant | hung up | free | `true` — inherit |
+    /// | owner dead, somebody took over or is mid-bind | hung up | held | `false` |
+    ///
+    /// **And the loser stays eligible.** If the new owner dies too, the kernel
+    /// releases byte 0 with no cooperation, and the next call answers `true`
+    /// again. Inheritance chains with nothing latched and no backoff to tune,
+    /// which is what §3.5's `retry connect with backoff` was reaching for.
+    ///
+    /// The cost in a healthy deployment is unchanged: the `poll` is `false` and
+    /// the probe never runs.
     ///
     /// Lookups are unaffected either way — `Plan::at` touches the mapping and
     /// nothing else, and this is entirely control plane.
@@ -3045,11 +3067,27 @@ impl Tree {
     pub fn owner_lost(&self) -> bool {
         use std::os::fd::AsFd;
         match &self.attachment {
-            Some(crate::open::Attachment::Joined { socket, .. }) => {
+            Some(crate::open::Attachment::Joined {
+                socket, session, ..
+            }) => {
                 // A `poll` failure is not a hangup. Reporting one would send a
                 // survivor to take ownership of an arena whose owner is alive
                 // and serving, which is the split-brain §3.4 exists to prevent.
-                tf_tree_ipc::peer_hung_up(socket.as_fd()).unwrap_or(false)
+                if !tf_tree_ipc::peer_hung_up(socket.as_fd()).unwrap_or(false) {
+                    return false;
+                }
+                // Hung up, which says **our channel** is dead and not that the
+                // role is vacant. After any takeover every survivor but the
+                // winner is in exactly this state, permanently, and answering
+                // `true` from here is what made the §3.5 loop re-attempt an
+                // `F_OFD_SETLK` every control cycle for the life of the process
+                // ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+                //
+                // The kernel knows which. A probe failure reads as *held* for
+                // the same reason the `poll` failure above reads as *no hangup*:
+                // both errors default to the answer that does not send a second
+                // process at the role.
+                !session.ownership_held().unwrap_or(true)
             }
             _ => false,
         }

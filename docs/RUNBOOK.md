@@ -512,6 +512,19 @@ if tree.owner_lost() {
 }
 ```
 
+**Write it exactly like that — no latch, no backoff, no "only once" flag.**
+`owner_lost()` asks whether the arena has an owner, not whether *this* socket is
+dead, so on a fleet of *N* read-write survivors the *N−1* that do not inherit
+stop paying anything after the winner binds: the `poll` reports a hangup, one
+`F_OFD_GETLK` reports byte 0 held, and the call returns `false` without touching
+the ownership lock. That was not true before 2026-08-29
+([`0043`](./decisions/0043-owner-lost-is-a-question-about-the-owner.md)), when it
+answered `true` for the life of the process and this loop re-attempted an
+`F_OFD_SETLK` every cycle — so **if you already wrote a latch around this call to
+stop that, delete it**: a latched survivor cannot inherit when the *second* owner
+dies, and the live probe handles that case by itself. In a healthy deployment the
+whole thing is one non-blocking `poll` that answers `false`.
+
 **The catch, and it decides whether your fleet can recover at all: nothing calls
 this for you.** There is no background thread and no daemon watching the socket
 — that is [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)

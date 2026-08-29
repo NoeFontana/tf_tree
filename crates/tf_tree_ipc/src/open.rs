@@ -677,6 +677,41 @@ impl<A> Session<A> {
         }
     }
 
+    /// Does **anyone else** hold the ownership byte (§3.3 byte 0)?
+    ///
+    /// The kernel's answer, from `F_OFD_GETLK` on the description this session
+    /// already holds. It is the second half of the question
+    /// `tf_tree::Tree::owner_lost` asks: a hung-up attach socket says *this
+    /// process's channel is dead*, and only this says whether the **role** is
+    /// vacant ([`0043`]).
+    ///
+    /// # A survivor never sees its own byte
+    ///
+    /// [`crate::LockProbe::held`] reports *conflicting* locks, and nothing
+    /// conflicts with itself — so an owner asking this gets `false` about a byte
+    /// it is holding. That is why the caller in the facade reaches here only
+    /// from the `Joined` arm, where by construction this session is not the
+    /// owner. A caller that wants "am I the owner" wants
+    /// [`Self::take_over_ownership`]'s return, not this.
+    ///
+    /// # Why not read the participant table instead
+    ///
+    /// It carries pids and start times, and judging them needs the `/proc`
+    /// heuristic [`0033`] has already shown cannot name a namespace. The byte is
+    /// the authority for liveness everywhere else in this protocol (§5.1, §6.1,
+    /// [`0029`]); it is the authority here.
+    ///
+    /// [`0029`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md
+    /// [`0033`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0033-the-identity-record-cannot-name-a-namespace.md
+    /// [`0043`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`] for any `fcntl` failure.
+    pub fn ownership_held(&self) -> Result<bool, IpcError> {
+        Ok(self.lock.probe_ownership()?.held)
+    }
+
     /// Take what the §3.7 handshake yielded, if this session joined one.
     ///
     /// `None` for [`OpenOutcome::Created`], which already has the arena and
@@ -901,6 +936,69 @@ mod tests {
         // The participant byte is still held: releasing the role is not
         // detaching.
         assert!(heir.probe_participant(s.slot()).unwrap().held);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `Session::ownership_held` reports the *kernel's* answer, live
+    /// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+    ///
+    /// **Mutant, run:** replace the body with `Ok(!self.owner)` — the
+    /// session-state answer instead of the kernel's. This fails, on the **first**
+    /// assertion (`nobody holds byte 0 once the creator released it`), because a
+    /// session that released the role is not the owner and `!self.owner` is
+    /// already `true` there. That is one assertion earlier than the note here
+    /// first claimed, which is why it was run.
+    ///
+    /// **The third assertion has no one-line mutant, and is here anyway.** It
+    /// guards against a *caching* implementation — a `Cell<bool>` latched on the
+    /// first `true`, which is the change somebody makes to save the `fcntl` — and
+    /// a cache is not a substitution a single edit expresses. Without it the
+    /// property `Tree::owner_lost` depends on is untested: a loser must stop
+    /// answering `true` after a takeover **and start again** if the new owner
+    /// dies, and only a live probe does both.
+    #[test]
+    fn ownership_held_tracks_the_byte_and_not_a_latch() {
+        let (rv, dir) = rendezvous("ownprobe");
+        let mut s = Open::new(rv.clone()).open(&mut NoServer).unwrap();
+        // Give up the role but keep the session — this is the survivor's shape.
+        s.release_ownership().unwrap();
+        assert!(
+            !s.ownership_held().unwrap(),
+            "nobody holds byte 0 once the creator released it"
+        );
+
+        let heir = LockFile::open(rv.lock_path()).unwrap();
+        assert_eq!(heir.try_take_ownership().unwrap(), LockAttempt::Acquired);
+        assert!(
+            s.ownership_held().unwrap(),
+            "another description holds byte 0 and this session must see it"
+        );
+
+        heir.release_ownership().unwrap();
+        assert!(
+            !s.ownership_held().unwrap(),
+            "the byte is free again, so the answer must move back"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An owner asking about its own byte is told `false`, and that is the
+    /// kernel's rule rather than this method's.
+    ///
+    /// `F_OFD_GETLK` reports *conflicting* locks and nothing conflicts with
+    /// itself, so this cannot be used as "am I the owner". `Tree::owner_lost`
+    /// reaches it only from the `Joined` arm, where by construction this session
+    /// is not the owner — and this test is what stops a later reader deleting
+    /// that scoping as unnecessary.
+    #[test]
+    fn an_owner_does_not_see_its_own_ownership_byte() {
+        let (rv, dir) = rendezvous("ownself");
+        let s = Open::new(rv).open(&mut NoServer).unwrap();
+        assert!(s.is_owner());
+        assert!(
+            !s.ownership_held().unwrap(),
+            "a description never conflicts with itself"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

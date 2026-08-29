@@ -100,11 +100,19 @@ impl Kid {
     /// `SIGKILL`, then reap. After `wait` returns the kernel has torn down the
     /// process's descriptors, so its locks are gone with no cooperation from
     /// it — which is the entire point.
-    /// Nudge a child that is waiting on stdin.
+    /// Nudge a child that is waiting on stdin, **keeping the pipe**.
+    ///
+    /// It used to `take` the pipe and drop it, which closed the child's stdin as
+    /// a side effect of nudging it. That was invisible while every helper read
+    /// one line and parked; it is a trap now that `join-heir` answers one line
+    /// per poke, because the second `poke` silently does nothing, the child sees
+    /// EOF, and the caller blocks in [`Self::line`] forever. Keeping the pipe is
+    /// what [`Self::ask`] already does for the same reason.
     fn poke(&mut self) {
         use std::io::Write;
-        if let Some(mut stdin) = self.0.stdin.take() {
+        if let Some(stdin) = self.0.stdin.as_mut() {
             let _ = writeln!(stdin, "go");
+            let _ = stdin.flush();
         }
     }
 
@@ -4222,27 +4230,46 @@ fn two_survivors_race_and_exactly_one_inherits() {
     let after = |r: &str| r.split_whitespace().nth(2).unwrap_or("?").to_string();
     let (oa, ob) = (outcome(&ra), outcome(&rb));
 
-    // Both saw the hangup — the trigger is a kernel fact, not a race.
-    assert!(
-        ra.starts_with("true "),
-        "survivor A missed the hangup: {ra}"
-    );
-    assert!(
-        rb.starts_with("true "),
-        "survivor B missed the hangup: {rb}"
-    );
-
-    // Exactly one inherited. The other is `Contended`, which is not an error:
-    // it means somebody else is mid-bind, and §3.5 says reconnect with backoff.
+    // Exactly one inherited. Two would be split brain, which is the failure
+    // this whole shape exists to make impossible.
     let inherited = [&oa, &ob].iter().filter(|o| ***o == *"Inherited").count();
     assert_eq!(
         inherited, 1,
         "expected exactly one heir, got A={oa} B={ob} (two would be split brain)"
     );
-    assert_eq!(
-        [&oa, &ob].iter().filter(|o| ***o == *"Contended").count(),
-        1,
-        "the loser must be told it lost, not handed an error: A={oa} B={ob}"
+
+    // **The other survivor has three correct answers, and which one it gives is
+    // the scheduler's business.** `0043` made `owner_lost` ask the kernel
+    // whether byte 0 is held before answering, and the child reports two values
+    // sampled at two instants — `owner_lost()` first, then whatever
+    // `inherit_ownership()` decided, which re-evaluates the same predicate. So:
+    //
+    // * `true Contended` — polled while the byte was free, attempted, lost the
+    //   race. The only outcome reachable before `0043`, and it was *permanent*,
+    //   which is that record's subject.
+    // * `false OwnerAlive` — polled after the winner took the byte; never
+    //   attempted the lock at all, which is the cost `0043` removes.
+    // * `true OwnerAlive` — polled while the byte was free, and the winner took
+    //   it in between. **This one is a consequence of `0043` that its record did
+    //   not predict**, and `ubuntu-24.04-arm` found it where x86-64 had not: two
+    //   observations at two instants, and a takeover fits between them.
+    //
+    // Pairing the two values was the mistake. They are not one observation, so
+    // what this asserts is only what is actually invariant: the survivor is
+    // *told* rather than handed an error, whichever instant it looked at.
+    let loser = if oa == "Inherited" { &ob } else { &oa };
+    assert!(
+        loser == "Contended" || loser == "OwnerAlive",
+        "the survivor that did not inherit must be told so, not handed an \
+         error: A={ra} B={rb}"
+    );
+
+    // The winner did see a hangup — for it the two instants cannot disagree,
+    // because it is the process that took the byte.
+    let winner = if oa == "Inherited" { &ra } else { &rb };
+    assert!(
+        winner.starts_with("true "),
+        "the heir inherited without observing the owner's hangup: {winner}"
     );
 
     // The invariant: neither survivor's slot moved, winner or loser.
@@ -4264,6 +4291,101 @@ fn two_survivors_race_and_exactly_one_inherits() {
         .timeout(std::time::Duration::from_millis(500))
         .open()
         .expect("after a contested inheritance the arena must still be joinable");
+}
+
+/// The loser stops being told the owner is gone, and starts again if it is
+/// ([`0043`](../../../docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+///
+/// `two_survivors_race_and_exactly_one_inherits` stops at the race. This is what
+/// happens to the other survivor **next**, and until `0043` the answer was:
+/// forever. `owner_lost` polled only this process's attach socket, which points
+/// at the dead owner and stays hung up for the life of the process — so the loop
+/// §3.5 recommends
+///
+/// ```ignore
+/// if tree.owner_lost() { let _ = tree.inherit_ownership()?; }
+/// ```
+///
+/// re-attempted an `F_OFD_SETLK` on byte 0 every control cycle, to be told each
+/// time that somebody else owned it. On a fleet of *N* read-write survivors that
+/// is *N−1* processes doing a syscall per cycle in the loop this library exists
+/// to keep quiet.
+///
+/// **The race is taken out of this test on purpose.** A is poked and *read*
+/// before B is poked at all, so A has certainly inherited by the time B looks —
+/// which makes B's answer a fact about the code rather than about the scheduler.
+/// The genuine tie is `two_survivors_race_and_exactly_one_inherits`'s subject.
+///
+/// **Mutant, run:** revert `Tree::owner_lost` to the socket poll alone
+/// (`peer_hung_up(...).unwrap_or(false)` as the whole body). The last poke still
+/// passes — the socket is hung up there too, which is exactly the problem — and
+/// the middle one fails on `still being told the owner is gone`. That asymmetry
+/// is the point: the old code was right about the state anybody tested and wrong
+/// about the one a deployment sits in.
+#[test]
+fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
+    let dir = Scratch::new("inherit-loser");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    let heir_joined = heir.line();
+    let mut other = Kid::spawn(&dir.0, &["join-heir"]);
+    let other_joined = other.line();
+    assert_ne!(
+        heir_joined, other_joined,
+        "two participants were given one slot"
+    );
+
+    owner.kill();
+
+    // Serialised: the heir takes the role and is serving before the other one
+    // is asked anything.
+    heir.poke();
+    let taken = heir.line();
+    assert!(
+        taken.starts_with("true Inherited "),
+        "the first survivor should have inherited from the dead owner: {taken}"
+    );
+
+    // **The defect.** The other survivor's socket is hung up and always will be.
+    // The role is not vacant, and it must say so — otherwise it spins on the
+    // ownership byte for the life of the process.
+    other.poke();
+    let second = other.line();
+    assert!(
+        second.starts_with("false "),
+        "a survivor is still being told the owner is gone while the heir is \
+         alive and serving, so the §3.5 loop never stops retrying: {second}"
+    );
+    let outcome = |r: &str| r.split_whitespace().nth(1).unwrap_or("?").to_string();
+    assert_eq!(
+        outcome(&second),
+        "OwnerAlive",
+        "an owner is alive, so inheriting must not even be attempted: {second}"
+    );
+    assert_eq!(
+        second.split_whitespace().nth(2).unwrap_or("?"),
+        other_joined.split_whitespace().nth(1).unwrap_or("!"),
+        "the survivor's slot moved: {other_joined} -> {second}"
+    );
+
+    // The chain. Kill the heir; the kernel frees byte 0 with no cooperation, and
+    // the survivor must notice **by itself** — which a latched flag could not do,
+    // and is why this is a live probe.
+    heir.kill();
+    other.poke();
+    let third = other.line();
+    assert!(
+        third.starts_with("true "),
+        "the second owner died and the survivor did not notice: {third}"
+    );
+    assert_eq!(
+        outcome(&third),
+        "Inherited",
+        "the survivor should have taken the role the dead heir left: {third}"
+    );
 }
 
 /// **A fleet of read-only consumers cannot rescue itself, and that is D18
