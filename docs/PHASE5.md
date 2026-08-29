@@ -978,7 +978,11 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 | `TFT018` | Stamps arriving out of monotonic order | error | observed push stream (added by the amendment below) |
 | `TFT019` | A wall-clock domain stepped backwards — `TFT018`'s cause, not a publisher fault | warn | `TFT018`'s evidence + the edge's domain tag (added by the amendment below) |
 
-Output modes: human (default, coloured, grouped by severity), `--json` (stable schema, for CI), and `--exit-code` (non-zero if any error-severity check fires) so `doctor` can gate a robot's startup or a CI job.
+Output modes: human (default, coloured, grouped by severity), `--json` (stable schema, for CI), and `--exit-code[=error|warn]` so `doctor` can gate a robot's startup or a CI job.
+
+> **Amendment (2026-08-29): `--exit-code` gained a `warn` tier, and the reason is that its error tier is narrower on a live arena than it reads.** Six ids carry `Error`, and on a live arena four of them structurally skip — `TFT001`, `TFT002`, `TFT003` and `TFT018` all need evidence an arena does not carry — so `--exit-code` reduced to `TFT006` (impossible stamps) and `TFT012` (cycle or disconnected subtree). Those are the right *errors*; both make every lookup fail. But almost everything an operator is paged about is `Warn`: a dynamic edge with no live writer, an undersized ring, rate collapse, gaps, clock skew, a slot leak, an arena at 100% capacity. All of it exited 0.
+>
+> **The capability was already there and only the exit code was missing.** `doctor --json | jq -e '.summary.warn == 0 and .summary.error == 0'` gates on exactly that today, and §6 names `--json` as the CI mode; `Report::is_healthy` was written and unit-tested for it and had **no caller**. Bare `--exit-code` still means `error`, so no existing invocation changes, and `warn` is *warn-and-above* rather than warn-only — an arena with a cycle must not pass it because nothing warned. `--suppress` is the escape hatch for a warn a particular fleet has decided to live with.
 
 **`TFT004` deserves special care** — it is the check most likely to find something nobody knew. Compute per-publisher offset between header stamp and arena receipt time, track a rolling median, and report publishers whose median differs from the fleet median by more than a threshold. On a multi-machine robot with imperfect PTP this finds real problems that present as intermittent extrapolation errors.
 

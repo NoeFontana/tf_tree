@@ -35,6 +35,24 @@ is a bug.
 
 ### Added
 
+- **`doctor --exit-code[=error|warn]`.** Bare `--exit-code` still means `error`,
+  so no existing invocation changes. The `warn` tier is what was missing.
+
+  Six ids carry `Error`, and on a **live** arena four of them structurally skip
+  (`TFT001`, `TFT002`, `TFT003`, `TFT018` all need evidence an arena does not
+  carry) — so `--exit-code` reduced to `TFT006` and `TFT012`. Those are the right
+  errors: both make every lookup fail. But almost everything an operator is
+  paged about is `Warn` — a dynamic edge with no live writer, an undersized ring,
+  rate collapse, gaps, clock skew, a slot leak, an arena at 100% capacity — and
+  all of it exited 0.
+
+  **The capability was already there and only the exit code was missing.**
+  `doctor --json | jq -e '.summary.warn == 0 and .summary.error == 0'` gates on
+  exactly that today, and `Report::is_healthy` was written and unit-tested for it
+  with **no caller**. `warn` is *warn-and-above*, so an arena with a cycle does
+  not pass it because nothing warned; `--suppress` remains the escape hatch for a
+  warn a fleet has decided to live with.
+
 - **Every row of `docs/PHASE2.md` §11.3's crash matrix is now placed, executed,
   or argued not to be a crash point.** Six more sites land here:
   `topo.holding_lock`, `open.after_ownership_lock_before_bind`,

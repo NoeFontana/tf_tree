@@ -145,6 +145,58 @@ fn every_id_is_reported_and_every_skip_states_a_reason() {
 /// **The JSON carries every catalogue id, and its summary agrees with the exit
 /// status.**
 ///
+/// **`--exit-code` has two tiers, and the default one is unchanged.**
+///
+/// Six ids carry `Error`, and on a *live* arena four of them structurally skip —
+/// so `--exit-code error` reduces to `TFT006` (impossible stamps) and `TFT012`
+/// (cycle or disconnected subtree). Those are the right errors: both make every
+/// lookup fail. But almost everything an operator is paged about is `Warn` — an
+/// edge with no live writer, an undersized ring, rate collapse, gaps, clock
+/// skew, a slot leak, an arena at capacity — and all of it exited 0.
+///
+/// **The capability existed and the exit code did not.** `doctor --json | jq -e
+/// '.summary.warn == 0 and .summary.error == 0'` gates on exactly that today,
+/// and `Report::is_healthy` was written and unit-tested for it with **no
+/// caller**. This connects them.
+///
+/// The three assertions are the three things that had to stay true: a bare
+/// `--exit-code` means what it always meant, `error` is that spelled out, and
+/// `warn` is *warn-and-above* rather than warn-only — an arena with a cycle in
+/// it must not pass `--exit-code warn` just because nothing warned.
+///
+/// **Mutant:** write the `warn` arm as `report.count_at(Severity::Warn) > 0`.
+/// The first two assertions still hold and the tier stops being a ladder; this
+/// test does not catch it, which is why the arm's comment argues it and the
+/// unit test in `catalogue.rs` pins `is_healthy` against an error-only report.
+#[test]
+fn the_exit_code_gate_has_a_warn_tier_and_an_unchanged_default() {
+    use std::process::Command;
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tf_tree"))
+            .arg("doctor")
+            .args(args)
+            .output()
+            .expect("run tf_tree doctor")
+            .status
+            .success()
+    };
+
+    // The fixture is healthy at error severity and not at warn — which is what
+    // makes it a fixture that can tell the two tiers apart at all.
+    assert!(run(&["--exit-code"]), "a bare --exit-code must still pass");
+    assert!(
+        run(&["--exit-code", "error"]),
+        "`error` must mean what the bare flag always meant"
+    );
+    assert!(
+        !run(&["--exit-code", "warn"]),
+        "the fixture reports warn-severity findings, so the warn tier must gate \
+         on them — if this passes, either the tier is not wired or the fixture \
+         stopped being able to distinguish the two"
+    );
+}
+
 /// `--json` is what a CI job consumes and `--exit-code` is what it gates on. If
 /// the two disagree, a job either fails while its report says everything is
 /// fine, or passes while the report lists errors — and both are worse than
