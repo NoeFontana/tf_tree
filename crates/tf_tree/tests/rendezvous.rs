@@ -2448,11 +2448,87 @@ fn a_reaper_does_not_reap_its_own_live_claim() {
     );
 }
 
+/// **A killed publisher's claims are revoked by the owner, with nobody calling
+/// a reaper.**
+///
+/// `a_killed_writers_edge_is_reaped_and_can_be_reclaimed` proves the *capability*
+/// — and it proves it by poking a helper that calls `Tree::reap()` on demand.
+/// **In production nothing pokes it.** `Tree::reap_participant` was written for
+/// this exact site (its doc: "the owner learns a participant died from
+/// `EPOLLHUP` on its socket, and therefore knows *which slot* went away") and
+/// had no caller outside a benchmark and a test helper; there is no reap surface
+/// in `tf_tree_c` or `tf_tree_py` and no CLI subcommand that reaps. So the
+/// hangup callback freed the dead writer's participant *record* and left its
+/// claims standing, which `docs/PHASE2.md` §3.9 already said it should not.
+///
+/// The shape that costs is the ordinary supervised restart, and it is what this
+/// test runs: publisher dies, publisher comes back, **is granted its
+/// predecessor's slot**, and asks for its own edge. `reap_claims` skips
+/// `own_slot` — it must, because `F_OFD_GETLK` does not report a description's
+/// own byte — so the restarted node is precisely the process that cannot repair
+/// the stale claim. Before this, it was told `EdgeAlreadyClaimed` and there was
+/// nothing it could do about it.
+///
+/// **Mutant:** delete the `reap_claims` call from the hangup callback in
+/// `crate::open`. The second joiner then reports `refused` and this fails on the
+/// claim, which is the defect stated as a test.
+#[test]
+fn a_restarted_publisher_gets_its_predecessors_slot_and_can_still_claim() {
+    let scratch = Scratch::new("restart-claim");
+
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    let mut first = Kid::spawn(&scratch.0, &["join-claiming"]);
+    let claimed = first.line();
+    assert!(
+        claimed.starts_with("claimed "),
+        "the first publisher did not claim: {claimed}"
+    );
+
+    // `kill` waits, so the kernel has released this process's claim lease and
+    // closed its attach socket before anything else runs. The owner's `epoll`
+    // has a hangup to process.
+    first.kill();
+
+    // The restart. Same edge, and — because the assigner reclaims the byte the
+    // kernel freed — very likely the same slot, which is the whole hazard.
+    let mut second = Kid::spawn(&scratch.0, &["join-claiming"]);
+    let retried = second.line();
+    assert!(
+        retried.starts_with("claimed "),
+        "a restarted publisher could not reclaim its own edge, and on its \
+         predecessor's slot it is the one process that cannot repair it: \
+         {retried}"
+    );
+    assert_eq!(
+        retried, claimed,
+        "the restarted publisher claimed a different edge than its predecessor \
+         held, so this test is not exercising the reuse it is about"
+    );
+}
+
 /// A killed writer's edge is reclaimed, and then reclaimable.
 ///
 /// Reaping that clears the record but leaves the edge unclaimable would be
 /// worse than not reaping: the operator sees a freed record and still cannot
 /// publish.
+///
+/// **The `reaped` count is deliberately not asserted, and getting that wrong cost
+/// a flaky run.** Until the hangup callback reaped claims, an explicit
+/// `Tree::reap()` was the only collector and this test asserted `reaped 1`. The
+/// callback does it now, so the sweep usually finds `reaped 0` — and the first
+/// rewrite asserted *that*, which is a race: the poke arrives on the owner's
+/// **main** thread through stdin while the hangup is processed on its **serving**
+/// thread, and nothing orders the two. It failed about one run in ten.
+///
+/// So this asserts what is invariant either way — the owner's own live claim
+/// survives a sweep that had every opportunity to revoke it, and the dead peer's
+/// edge ends up genuinely free. **The callback itself is pinned by
+/// `a_restarted_publisher_gets_its_predecessors_slot_and_can_still_claim`**,
+/// which pokes no sweep at all: there, the kill and the successor's `connect`
+/// reach the same `epoll` on one thread in that order, so the hangup is
+/// processed first by construction rather than by luck.
 #[test]
 fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
     let scratch = Scratch::new("reap-dead");
@@ -2470,12 +2546,21 @@ fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
 
     peer.kill();
 
-    // The owner sweeps. Its own claim survives; the dead peer's is reclaimed.
+    // The owner sweeps. Its own claim survives, which is what this sweep is
+    // really for.
     owner.poke();
     let line = owner.line();
     assert!(
-        line.starts_with("reaped 1 ") && line.ends_with("still_ours true"),
-        "expected exactly the dead peer's edge to be reaped, got {line}"
+        line.ends_with("still_ours true"),
+        "the sweep revoked the owner's own live claim: {line}"
+    );
+
+    // And the edge is genuinely free: a fresh publisher takes it.
+    let mut successor = Kid::spawn(&scratch.0, &["join-claiming"]);
+    let retaken = successor.line();
+    assert_eq!(
+        retaken, claimed,
+        "the dead peer's edge was cleared but not reclaimable: {retaken}"
     );
 }
 

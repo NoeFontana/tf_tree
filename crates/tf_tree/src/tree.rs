@@ -3254,40 +3254,7 @@ impl Tree {
         // revokes them.
         let own_slot = self.participant;
 
-        let view = self.view();
-        let max_edges = view.header().max_edges;
-        let mut reaped = 0;
-
-        for edge in 0..max_edges {
-            let Some(rec) = view.claim(EdgeId(edge)) else {
-                continue;
-            };
-            // The cheap filter that keeps this from being one syscall per edge:
-            // an unclaimed edge costs a relaxed load and nothing else.
-            let owner = rec.owner.load(Ordering::Acquire);
-            if owner == 0 {
-                continue;
-            }
-            // `u32::MAX` for a claim still in flight (the `CLAIMING` sentinel),
-            // which is never ours and *should* be reaped: it is distinguishable
-            // garbage a killed claimer leaves behind. A live claimer caught in
-            // that few-instruction window is protected from the other side, by
-            // the epoch re-check in `claim`.
-            let owner_slot = tf_tree_core::edge::slot_of(owner);
-            if owner_slot == own_slot {
-                continue;
-            }
-            if only_slot.is_some_and(|s| owner_slot != s) {
-                continue;
-            }
-            // Unreadable reads as held (§6.2): fail safe.
-            if lock.probe_claim(edge).map_or(true, |p| p.held) {
-                continue;
-            }
-            tf_tree_core::edge::reap(rec);
-            reaped += 1;
-        }
-        reaped
+        reap_claims(&self.view(), lock, only_slot, own_slot)
     }
 
     /// Reclaim the participant records of processes the kernel says are gone
@@ -4668,6 +4635,71 @@ impl ClaimErrorExt for tf_tree_core::ClaimError {
             _ => 0,
         }
     }
+}
+
+/// Revoke every claim whose holder the kernel says is gone.
+///
+/// The body [`Tree::reap_inner`] used to inline, lifted out because **the owner's
+/// socket-hangup callback needs the same walk and had no way to reach a
+/// `Tree`** — it runs on the serving thread, which deliberately holds its own
+/// mapping and its own lock-file description rather than borrowing the handle a
+/// caller owns. `docs/PHASE2.md` §3.9 says a dead participant's "arena-side
+/// records" are the owner's to reap; until this was callable from there, the
+/// callback freed the participant *record* and left every claim that participant
+/// held, forever.
+///
+/// * `only_slot` — `Some(slot)` for the D17 fast path: the hangup names the slot
+///   that went away, which turns an `O(edges)` sweep of `fcntl` calls into
+///   `O(edges)` relaxed loads plus one syscall per edge that slot actually held.
+/// * `own_slot` — never collected. `F_OFD_GETLK` reports only *conflicting*
+///   locks, so a description does not see its own byte and every edge this
+///   process holds would read free.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub(crate) fn reap_claims(
+    view: &tf_tree_core::arena_view::ArenaView<'_>,
+    lock: &tf_tree_ipc::LockFile,
+    only_slot: Option<u32>,
+    own_slot: u32,
+) -> usize {
+    let max_edges = view.header().max_edges;
+    let mut reaped = 0;
+
+    for edge in 0..max_edges {
+        let Some(rec) = view.claim(EdgeId(edge)) else {
+            continue;
+        };
+        // The cheap filter that keeps this from being one syscall per edge:
+        // an unclaimed edge costs a relaxed load and nothing else.
+        let owner = rec.owner.load(Ordering::Acquire);
+        if owner == 0 {
+            continue;
+        }
+        // `u32::MAX` for a claim still in flight (the `CLAIMING` sentinel),
+        // which is never ours and *should* be reaped: it is distinguishable
+        // garbage a killed claimer leaves behind. A live claimer caught in
+        // that few-instruction window is protected from the other side, by
+        // the epoch re-check in `claim`.
+        //
+        // Compare the *slot*, not the word. `pack_owner` is
+        // `(epoch << 16) | (slot + 1)`, so a whole-word comparison against
+        // `slot + 1` matches only at epoch 0 — which `claim` never produces.
+        // A reaper making that mistake does not recognise its own claims and
+        // revokes them.
+        let owner_slot = tf_tree_core::edge::slot_of(owner);
+        if owner_slot == own_slot {
+            continue;
+        }
+        if only_slot.is_some_and(|s| owner_slot != s) {
+            continue;
+        }
+        // Unreadable reads as held (§6.2): fail safe.
+        if lock.probe_claim(edge).map_or(true, |p| p.held) {
+            continue;
+        }
+        tf_tree_core::edge::reap(rec);
+        reaped += 1;
+    }
+    reaped
 }
 
 #[cfg(test)]

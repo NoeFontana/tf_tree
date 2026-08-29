@@ -534,6 +534,45 @@ fn quat_twist_agrees_between_the_cursor_and_fallback_batch_loops() {
     );
 }
 
+/// **`at_many` refuses a short buffer instead of panicking**, which every one of
+/// its siblings already did.
+///
+/// It was an `assert!` with a `# Panics` section, and the `# Errors` section two
+/// lines above it called that check "debug-time". `assert!` is unconditional, so
+/// in release a short buffer unwound — and under the `panic = "abort"` profile a
+/// control loop is built with, aborted the process — where
+/// `at_many_into`/`at_many_into_f32` next door returned the `Copy` identifier
+/// `docs/API.md` R5 requires. `clippy::panic`, which the workspace denies
+/// exactly to keep this out of the engine, does not lint `assert!`.
+///
+/// **Mutant:** put the `assert!` back. This test then panics instead of
+/// returning, and `unwrap_err` is never reached.
+#[test]
+fn at_many_refuses_a_short_buffer_rather_than_panicking() {
+    use tf_tree::LookupError;
+
+    let c = Chain::new(8, 1000);
+    let plan = c.tree.plan(c.base, c.map).unwrap();
+    let g = c.tree.guard();
+    let stamps: Vec<Stamp> = (0..4).map(|k| ns(k * 1000)).collect();
+
+    let mut out = vec![Iso3::IDENTITY; 3]; // one short of the four stamps
+    let err = plan.at_many(&g, &stamps, &mut out).unwrap_err();
+    assert_eq!(err, LookupError::BufferTooSmall { need: 4, got: 3 });
+    assert!(
+        out.iter().all(|p| p.to_bits() == Iso3::IDENTITY.to_bits()),
+        "the buffer was written before validation rejected the call"
+    );
+
+    // The exact-fit case still works, so the check is a bound and not an
+    // off-by-one that refuses a correct call.
+    let mut exact = vec![Iso3::IDENTITY; 4];
+    plan.at_many(&g, &stamps, &mut exact).unwrap();
+    assert!(exact
+        .iter()
+        .any(|p| p.to_bits() != Iso3::IDENTITY.to_bits()));
+}
+
 /// Validation happens before a single element is written (`PHASE3.md` §5.3).
 ///
 /// A half-written output is worse than none, because it looks like data: the

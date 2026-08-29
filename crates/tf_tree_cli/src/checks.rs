@@ -1779,14 +1779,17 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 ///   this one is reachable from the ordinary #184 flow.** The claim's owner word
 ///   carries the `ClaimRecord`'s own per-edge epoch, not the participant's
 ///   incarnation (`tf_tree_core::edge::pack_owner`), so nothing in it says
-///   *which occupancy* of the slot took the claim. The hangup reap frees the
-///   dead writer's slot but not its claims — nothing calls
-///   `Tree::reap_participant` on hangup — so once a later joiner is granted that
-///   slot, the stale claim joins to a live participant and the edge reads
-///   healthy while no process is writing it. Not a regression: the
+///   *which occupancy* of the slot took the claim. **The producer this sentence
+///   named is gone as of 2026-08-29**: it read "the hangup reap frees the dead
+///   writer's slot but not its claims — nothing calls `Tree::reap_participant`
+///   on hangup", and the owner's callback now revokes that slot's claims before
+///   it frees the record, so the ordinary #184 flow no longer leaves one. Two
+///   producers remain and this check is still blind to both: a **dead owner**,
+///   whose own hangup nobody sees, and a `TreeBuilder::build_shared`
+///   participant, which has no socket to hang up. Not a regression: the
 ///   `owner_pid == 0` predicate was silent here too, for the same reason.
-///   Closing it needs the incarnation *inside* the claim word, which is an
-///   arena format change and not one `0028` proposes.
+///   Closing the *detection* still needs the incarnation *inside* the claim
+///   word, which is an arena format change and not one `0028` proposes.
 /// * **A claim caught mid-handoff (`CLAIMING`) is excluded.** It names no slot,
 ///   exactly as a dead owner's claim names no slot, so from a snapshot the two
 ///   are the same shape. `Tree::reap` may act on `CLAIMING` because it probes

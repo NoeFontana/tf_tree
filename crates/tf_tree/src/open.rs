@@ -104,6 +104,13 @@ impl LivenessProbe {
     /// `None` rather than a guess: §6.2 requires this to fail safe, and the
     /// caller turns "cannot tell" back into the `/proc` inference rather than
     /// into a "dead" verdict that would steal a working process's claim.
+    /// The description this probe holds, for the callers that need a lock other
+    /// than the participant bytes — the hangup callback reaps *claim* leases
+    /// through it.
+    pub(crate) fn lock(&self) -> &tf_tree_ipc::LockFile {
+        &self.lock
+    }
+
     pub(crate) fn is_held(&self, slot: u32) -> Option<bool> {
         // Counted before the syscall, not after: what a test asks is whether
         // the kernel was *reached*, and an `Err` from the probe is still a
@@ -1647,6 +1654,38 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     // out between the two — they run on this one thread, but the
                     // ordering costs nothing and does not rely on that.
                     let view = tf_tree_core::arena_view::ArenaView::new(&table_arena);
+
+                    // **`docs/PHASE2.md` §3.9's other half, and it had no
+                    // caller.** The section says a dead participant's *"arena-side
+                    // records"* are the owner's to reap; this callback freed the
+                    // participant record and left every **claim** that
+                    // participant held. `Tree::reap_participant` was written for
+                    // exactly this site — its doc says "the owner learns a
+                    // participant died from `EPOLLHUP` … and therefore knows
+                    // which slot went away" — and nothing in the workspace
+                    // called it outside a benchmark and a test helper.
+                    //
+                    // What that cost is the ordinary supervised restart: a
+                    // killed publisher's edges stay claimed, the supervisor
+                    // restarts the node, the assigner hands it **its
+                    // predecessor's slot** — and `reap_claims` skips
+                    // `own_slot`, so the one process that needs those edges is
+                    // the one that cannot repair them. `tf_tree_cli`'s
+                    // `checks.rs` states the same gap from the detection side:
+                    // "once a later joiner is granted that slot, the stale claim
+                    // joins to a live participant and the edge reads healthy
+                    // while no process is writing it."
+                    //
+                    // **Before the record is freed**, so the slot cannot be
+                    // re-granted with its predecessor's claims still standing.
+                    // `own_slot` is passed for the same reason every other
+                    // caller passes it: `F_OFD_GETLK` does not report a
+                    // description's own byte, so an owner sweeping without it
+                    // would revoke its own live claims.
+                    let revoked =
+                        crate::tree::reap_claims(&view, lock_probe.lock(), Some(slot), own_slot);
+                    let _ = revoked;
+
                     let table = view.participants();
                     if let Some(rec) = table.get(slot) {
                         let observed = rec.state.load(Ordering::Acquire);

@@ -70,7 +70,33 @@ reason and is what the bindings call. `Plan::at` is untouched, still passes
 `Error`, and remains what the README's hot loop shows. `ExtrapPolicy` and
 `Extrapolated` are re-exported from `tf_tree` so the facade can name them.
 
-### 3. `by_ns` is measured against `latest_common`, not per edge
+### 3. `by_ns` is measured against `latest_common`, not per edge, and **before
+the fold**
+
+> **Amendment (2026-08-29).** This section originally said the distance is
+> derived *"after the fold"*, and §4 below still gives the reason — it keeps
+> `Plan::at`'s generated code unchanged. **After the fold is where it was wrong.**
+> A `push` landing between the fold and the walk, carrying a stamp at or past the
+> query, lifts `common` to `>= nanos`, and `nanos.saturating_sub(common).max(0)`
+> then reports **`by_ns == 0` — "not extrapolated" — for a pose the fold
+> genuinely invented.** That is the single claim this type exists to make
+> unmissable, and a 100 Hz edge under a 1 kHz query crosses the stamp often
+> enough that it is a race a robot runs.
+>
+> The walk now runs **before** the fold. `SampleRing::newest_stamp` is
+> non-decreasing — `head` only advances and `push` refuses a stamp strictly older
+> than the newest — so `common_before <= common_during`, and the error inverts
+> into the safe direction: `by_ns` may over-report a query that was in fact
+> bracketed, and `by_ns == 0` means every edge already held data past the query
+> before the fold began. Nothing else moves: still one extra walk, still only on
+> this path, still `Plan::at` untouched, still not `note`d (a second `note` would
+> double the `lookups_ok` that `TFT010`/`TFT011` divide by).
+>
+> `by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented` is the test, and the
+> pose is its witness — `by_ns` alone cannot tell an honest `0` from a dishonest
+> one. Its first harness did not discriminate, and its note said it did; the
+> mutant is run.
+
 
 The distance reported is `max(0, t - min over dynamic edges of newest_stamp)` —
 the *worst* edge on the route, which is the number that bounds the answer's
