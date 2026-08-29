@@ -457,9 +457,11 @@ pub(crate) enum Attachment {
 /// are placed rather than re-spelling them, because a typo silently arms nothing
 /// and the run then looks clean.
 ///
-/// The `attach.*`, `hangup.*` and `reclaim.*` rows are still unplaced, and
-/// `reclaim.probe_then_reoccupied` is argued at that row not to be an abort site
-/// at all — it names an *interleaving* between two live processes, and a
+/// `attach.after_slot_assigned_before_publish` is in
+/// [`tf_tree_core::crash::SITES`] instead: the window it names is inside
+/// `participant::fill_slot`, and the arena record is that crate's even though
+/// `tf_tree_ipc` takes the byte. `reclaim.probe_then_reoccupied` is argued at
+/// its row not to be an abort site at all — it names an *interleaving* between two live processes, and a
 /// mechanism that kills one of them cannot produce it.
 #[cfg(feature = "crash-points")]
 pub const CRASH_SITES: &[&str] = &[
@@ -467,6 +469,8 @@ pub const CRASH_SITES: &[&str] = &[
     "topo.holding_lock",
     "open.after_ownership_lock_before_bind",
     "open.after_create_before_bind",
+    "reclaim.after_probe_before_cas",
+    "hangup.after_probe_before_cas",
 ];
 
 /// How [`Tree::inherit_ownership`] resolved (§3.5).
@@ -1753,6 +1757,24 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                             // The return is dropped deliberately: `false` means
                             // the word moved under this verdict, which is the
                             // case where there is nothing left to do.
+                            // `docs/PHASE2.md` §11.3:
+                            // **`hangup.after_probe_before_cas`**. The owner has
+                            // loaded `state` and not yet CASed, and this is the
+                            // instruction that row names.
+                            //
+                            // **Its repair claim is the weakest in the table and
+                            // the row says so**: one CAS, so there is no torn
+                            // intermediate — the reclamation either happened or
+                            // it did not, and what is lost is the reclamation
+                            // rather than consistency. Under the hangup callback
+                            // *alone* the honest entry would be "not repairable".
+                            // What makes it repairable is that two other
+                            // collectors form the same verdict later: the
+                            // assigner at the next grant, and any surviving
+                            // read-write participant's `Tree::reap_participants`.
+                            #[cfg(feature = "crash-points")]
+                            tf_tree_core::crash::maybe_abort(CRASH_SITES[5]);
+
                             let _ = table.reclaim(slot, observed);
                         }
                     }

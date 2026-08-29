@@ -22,6 +22,7 @@
 //! as long as the machine is up, and [`crate::arena_view::ArenaView`]'s header
 //! carries the boot id that scopes it (§5.1).
 
+use crate::crash::crash_point;
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Slot is unused.
@@ -177,6 +178,18 @@ fn fill_slot(rec: &ParticipantRecord, pid: u32, start_time: u64, now_nanos: i64)
     rec.state
         .compare_exchange(FREE, RESERVED, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
+    // `docs/PHASE2.md` §11.3: **`attach.after_slot_assigned_before_publish`**.
+    // The slot is `RESERVED` and nothing has been published into it — the exact
+    // state that row is about, and one this repository could not previously
+    // produce: the window is ~12 ns (measured in `0028` open question 4), so
+    // nothing outside fault injection can kill a process inside it.
+    //
+    // **That is why §11.2's two `..._collects_a_record_left_reserved_by_a_killed_registrant`
+    // tests *stage* the word** — `register_at`, then the publishing store rewound
+    // — and why their own comments call that coverage of the recovery rather than
+    // of the crash. This site is the difference: a real process really dies here,
+    // and the record it leaves is produced rather than arranged.
+    crash_point!("attach.after_slot_assigned_before_publish");
     // Exclusively ours: no other registrant can be here, and no reader trusts a
     // non-LIVE slot.
     rec.pid.store(pid, Ordering::Relaxed);

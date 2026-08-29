@@ -26,8 +26,10 @@
 //! The sites compiled into this crate are listed in `SITES` (which exists only
 //! under the feature, like the sites themselves); the other rows of
 //! §11.3's table live in the crates that own those protocols
-//! (`attach.*`/`open.*`/`hangup.*`/`reclaim.*`/`takeover.*` in the rendezvous,
-//! `topo.holding_lock` in the facade's `reparent`).
+//! (`open.*`, `hangup.*`, `reclaim.*` and `takeover.*` in the rendezvous, and
+//! `topo.holding_lock` in the facade's `reparent`). `attach.*` is here, because
+//! the window it names is inside `participant::fill_slot` — `tf_tree_ipc` takes
+//! the byte, but the arena record is this crate's.
 //!
 //! # Why `abort`, not `panic!`
 //!
@@ -66,6 +68,7 @@ pub const SITES: &[&str] = &[
     "topo.after_copy_before_publish",
     "claim.after_cas",
     "intern.after_hash_cas_before_id_store",
+    "attach.after_slot_assigned_before_publish",
 ];
 
 /// The environment variable that arms a site: `TF_TREE_CRASH_AT=<name>:<nth>`.
