@@ -292,6 +292,7 @@ const ARMED_BY_TESTS: &[&str] = &[
     "topo.after_copy_before_publish",
     "claim.after_cas",
     "intern.after_hash_cas_before_id_store",
+    "attach.after_slot_assigned_before_publish",
 ];
 
 /// A finished child run: how it died and what it managed to say first.
@@ -510,6 +511,45 @@ fn claim_after_cas_aborts_at_the_named_point() {
     );
 }
 
+/// `attach.after_slot_assigned_before_publish` — slot `RESERVED`, nothing
+/// published into it.
+///
+/// **This is the row whose state the repository could previously only stage.**
+/// The window is the `FREE -> RESERVED` CAS to the `live_word` store, measured
+/// at ~12 ns in [`0028`] open question 4, so nothing outside fault injection can
+/// kill a process inside it — which is why §11.2's two
+/// `..._collects_a_record_left_reserved_by_a_killed_registrant` tests build the
+/// word by hand (`register_at`, then the publishing store rewound) and say in
+/// their own comments that this is coverage of the recovery and not of the
+/// crash. With the site placed, a real process really dies there.
+///
+/// Repair: those same two collectors, which accept any observed word including
+/// `RESERVED` (`0028` plan step 1) — the owner's hangup callback and its slot
+/// assigner. What this test adds is that the state they collect is now
+/// *produced* rather than arranged.
+///
+/// [`0028`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0028-the-slot-a-killed-participant-keeps.md
+///
+/// **Mutant:** delete the `crash_point!` line from `participant::fill_slot`.
+/// The armed child then registers twice and exits cleanly, and this fails with
+/// "expected SIGABRT at attach.after_slot_assigned_before_publish".
+#[cfg(all(feature = "crash-points", unix))]
+#[test]
+fn attach_after_slot_assigned_before_publish_aborts_at_the_named_point() {
+    assert_clean_run("child_attach", &["attach 0 done", "attach 1 done"]);
+    let run = run_child(
+        "child_attach",
+        Some("attach.after_slot_assigned_before_publish:2"),
+    );
+    assert_aborted_at(
+        &run,
+        "attach.after_slot_assigned_before_publish",
+        2,
+        &["attach 0 done"],
+        &["attach 1 done"],
+    );
+}
+
 /// `intern.after_hash_cas_before_id_store` — hash claimed, claimant recorded, id
 /// unpublished.
 ///
@@ -609,6 +649,25 @@ fn child_claim() {
         // and the state this workload exists to leave is a *held* one.
         let _ = claim(view.claim(edge).unwrap(), slot).unwrap();
         report(std::format!("claim {i} done"));
+    }
+}
+
+/// Two registrations into the participant table. Marker after each.
+///
+/// `register` is `fill_slot`, which is where the §11.3 `attach.*` window is: the
+/// `FREE -> RESERVED` CAS, then the identity fields, then the publishing store
+/// of `live_word`.
+#[test]
+#[ignore = "child workload for the §11.3 attach crash point"]
+fn child_attach() {
+    let arena = two_edge_arena();
+    let view = ArenaView::new(&arena);
+    for i in 0..2u32 {
+        // Distinct pids, so the two registrations cannot be confused for one
+        // retried. The slot index is not asserted here — the parent asserts the
+        // *markers*, and which slot a registrar wins is the assigner's business.
+        view.participants().register(DEAD_PID + i, 7, 0).unwrap();
+        report(std::format!("attach {i} done"));
     }
 }
 

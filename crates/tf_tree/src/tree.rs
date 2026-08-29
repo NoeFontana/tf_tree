@@ -3470,6 +3470,19 @@ impl Tree {
             if let crate::open::Reclamation::Reclaimable { observed } =
                 crate::open::reclamation_verdict(probe, self.participant, slot, rec)
             {
+                // `docs/PHASE2.md` §11.3: **`reclaim.after_probe_before_cas`**.
+                // The verdict is formed and the CAS has not run — the row's
+                // "nothing published → idempotent".
+                //
+                // It is the *general* sweeper's version; the owner's hangup
+                // callback has its own row and its own site, because what makes
+                // that one repairable is different (two other collectors form
+                // the same verdict later, where this sweep is itself one of
+                // them). A process killed here has published nothing at all, so
+                // the state it leaves is the state it found.
+                #[cfg(feature = "crash-points")]
+                tf_tree_core::crash::maybe_abort(crate::open::CRASH_SITES[4]);
+
                 // `false` when the slot moved under us — reclaimed by a racing
                 // sweeper, or re-occupied. Not counted, because nothing was
                 // collected: racing reclaimers are harmless and at most one

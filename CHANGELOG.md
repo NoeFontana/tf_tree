@@ -35,11 +35,25 @@ is a bug.
 
 ### Added
 
-- **Three more of `docs/PHASE2.md` §11.3's crash points are placed and
-  executed**: `topo.holding_lock`, `open.after_ownership_lock_before_bind` and
-  `open.after_create_before_bind`. Seven of fourteen rows now have a site and a
-  test; `takeover.after_ownership_lock_before_bind` was the only one outside
+- **Every row of `docs/PHASE2.md` §11.3's crash matrix is now placed, executed,
+  or argued not to be a crash point.** Six more sites land here:
+  `topo.holding_lock`, `open.after_ownership_lock_before_bind`,
+  `open.after_create_before_bind`, `attach.after_slot_assigned_before_publish`,
+  `reclaim.after_probe_before_cas` and `hangup.after_probe_before_cas`.
+  `takeover.after_ownership_lock_before_bind` was the only one outside
   `tf_tree_core` before this.
+
+  **`attach.after_slot_assigned_before_publish` closes a gap the table itself
+  stated.** Its window — the `FREE -> RESERVED` CAS to the `live_word` store — is
+  ~12 ns, so nothing outside fault injection could kill a process inside it, and
+  §11.2's two collector tests therefore *staged* the word by hand and said so.
+  They still do, and they are still the repair; what changes is that the state
+  they collect is now produced by a real death.
+
+  Two of the six carry a site and no test yet, and the rows say which:
+  `hangup.after_probe_before_cas` needs a joiner to hang up while the owner is
+  armed, and `reclaim.after_probe_before_cas` is the general sweeper's version of
+  the same shape.
 
   `topo.holding_lock` sits **before** `set_parent`, deliberately: after it, the
   surviving state is indistinguishable from a completed reparent whose guard had
