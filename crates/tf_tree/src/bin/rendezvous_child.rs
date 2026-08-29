@@ -315,7 +315,7 @@ fn main() {
         // because if it inherited then this process is now the server and
         // dropping the tree would stop it.
         "join-heir" => {
-            let mut tree = tf_tree::Open::new()
+            let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
                 .create(CreatePolicy::Never)
                 .open()

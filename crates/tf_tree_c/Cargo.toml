@@ -76,3 +76,10 @@ required-features = ["bridge"]
 [[bin]]
 name = "bridge_reader"
 required-features = ["shm"]
+
+# The owner `tests/recovery.rs` kills. A separate **process**, because owner
+# death is what `docs/decisions/0044` is about and a thread cannot be killed
+# the way the kernel kills a process — releasing its locks with no cooperation.
+[[bin]]
+name = "arena_owner"
+required-features = ["shm"]

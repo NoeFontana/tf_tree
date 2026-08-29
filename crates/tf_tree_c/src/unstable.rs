@@ -364,3 +364,278 @@ pub unsafe extern "C" fn tft_tree_instance_uuid(tree: *const tft_tree, out: *mut
         TFT_OK
     })
 }
+
+// ---------------------------------------------------------------------------
+// Recovery — `docs/decisions/0044`
+// ---------------------------------------------------------------------------
+
+/// How [`tft_tree_inherit_ownership`] resolved. Mirrors `tf_tree::Inheritance`.
+///
+/// **A value you do not recognise means *this process is not the owner*.** The
+/// Rust enum is `#[non_exhaustive]`, so a future variant can appear here, and a
+/// `switch` that falls off its cases must treat that as "keep behaving as a
+/// plain participant" — which is never wrong, because inheriting is an
+/// escalation and not a requirement. Only `TFT_INHERITED` says otherwise.
+pub type tft_inheritance = u8;
+
+/// This process is now the owner and is serving the rendezvous.
+pub const TFT_INHERITED: tft_inheritance = 0;
+/// The owner is alive. Nothing was attempted.
+pub const TFT_OWNER_ALIVE: tft_inheritance = 1;
+/// Another survivor won the ownership byte and is binding. This process kept
+/// its slot and keeps reading; it will be told again if that survivor dies too.
+pub const TFT_CONTENDED: tft_inheritance = 2;
+/// A read-only attachment cannot serve, so it cannot be the heir (D18).
+pub const TFT_READ_ONLY: tft_inheritance = 3;
+/// Nothing to inherit from: a heap tree, a frozen `.tft`, or a tree this
+/// process already owns.
+pub const TFT_NOT_APPLICABLE: tft_inheritance = 4;
+
+/// Join a shared arena by name, **read-write** if asked.
+///
+/// **`tft_tree_open` is the whole of the frozen tier's opening surface, and it
+/// is `tf_tree::open()` — read-only, name from `$TF_TREE_ARENA`.** So until this
+/// existed a C or C++ consumer could only ever hold a read-only attachment, and
+/// [`tft_tree_inherit_ownership`] would answer `TFT_READ_ONLY` every time: an
+/// owner writes the participant table on every grant and a `PROT_READ` mapping
+/// cannot, which is D18 working. The recovery entry points beside this one are
+/// decoration without it, and that was found while writing their test rather
+/// than while writing their record
+/// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+///
+/// * `name` — NULL for the environment's default, exactly as `tft_tree_open`
+///   resolves it. A named arena is what a robot with more than one tree has.
+/// * `read_write` — `false` is the consumer default and stays the right choice
+///   for anything that only reads (D18: the MMU, not convention, is what stops a
+///   consumer corrupting a robot's transform tree). Pass `true` only for a
+///   process that publishes, reaps, or must be able to inherit the owner role.
+///
+/// **It never creates.** `CreatePolicy::Never`, because creating needs a layout
+/// and there is no way to express one across this boundary — a C creator is
+/// `tft_bridge_create`, which brings its own topology. A missing arena is
+/// `TFT_ERR_ARENA_UNAVAILABLE`, not an empty tree.
+///
+/// # Safety
+///
+/// `name` must be NULL or a NUL-terminated string valid for the call; `out` must
+/// point to a writable `*mut tft_tree`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn tft_tree_open_named(
+    name: *const c_char,
+    read_write: bool,
+    out: *mut *mut tft_tree,
+) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("tft_tree_open_named");
+        }
+        let mut open = tf_tree::Open::new().mode(if read_write {
+            tf_tree::AttachMode::ReadWrite
+        } else {
+            tf_tree::AttachMode::ReadOnly
+        });
+        if !name.is_null() {
+            // SAFETY: the caller contracts a NUL-terminated string.
+            let raw = unsafe { core::ffi::CStr::from_ptr(name) };
+            let Ok(text) = raw.to_str() else {
+                set_error(
+                    crate::TFT_ERR_BAD_CONFIG,
+                    "arena name is not valid UTF-8",
+                    |_| {},
+                );
+                return crate::TFT_ERR_BAD_CONFIG;
+            };
+            match open.name(text) {
+                Ok(o) => open = o,
+                Err(e) => {
+                    set_error(
+                        crate::TFT_ERR_BAD_CONFIG,
+                        &format!("arena name refused: {e}"),
+                        |_| {},
+                    );
+                    return crate::TFT_ERR_BAD_CONFIG;
+                }
+            }
+        }
+        match open.open() {
+            Ok(tree) => {
+                let h = Box::new(tft_tree {
+                    magic: crate::MAGIC_TREE,
+                    share: std::sync::Arc::new(crate::TreeShare {
+                        tree: std::sync::Arc::new(tree),
+                    }),
+                });
+                // SAFETY: the caller contracts a writable slot at `out`.
+                unsafe { out.write(Box::into_raw(h)) };
+                TFT_OK
+            }
+            Err(e) => {
+                set_error(
+                    crate::TFT_ERR_ARENA_UNAVAILABLE,
+                    &format!("could not open the arena: {e}"),
+                    |_| {},
+                );
+                crate::TFT_ERR_ARENA_UNAVAILABLE
+            }
+        }
+    })
+}
+
+/// Has the process that owns this arena gone away (`docs/PHASE2.md` §3.5)?
+///
+/// One non-blocking `poll` of the attach socket, plus — only once that reports a
+/// hangup — one `F_OFD_GETLK` on the ownership byte. So it answers *"the arena
+/// has no owner"*, not *"my socket is dead"*, and a survivor that did not
+/// inherit stops being told to try
+/// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+/// `false` for anything that is not a joined rendezvous attachment.
+///
+/// Pair it with [`tft_tree_inherit_ownership`] in your own loop — there is no
+/// background thread and no daemon, per `0019`, so **nothing calls this for
+/// you**, and an arena whose survivors never call it stays ownerless.
+///
+/// # Safety
+///
+/// `tree` must be NULL or a live handle; `out` must be a writable `bool`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn tft_tree_owner_lost(tree: *const tft_tree, out: *mut bool) -> tft_status {
+    guard(|| {
+        // SAFETY: validated before any field access.
+        if !unsafe { crate::check_tree(tree) } {
+            return bad_handle("tft_tree_owner_lost");
+        }
+        if out.is_null() {
+            return null_arg("tft_tree_owner_lost");
+        }
+        // SAFETY: `check_tree` confirmed the magic word.
+        let h = unsafe { &*tree };
+        let lost = h.share.tree.owner_lost();
+        // SAFETY: the caller contracts a writable `bool` at `out`.
+        unsafe { out.write(lost) };
+        TFT_OK
+    })
+}
+
+/// Inherit the owner role from a departed owner and begin serving
+/// (`docs/PHASE2.md` §3.5).
+///
+/// **This is the call an all-C++/Python fleet did not have.** Until it existed,
+/// an arena whose owner was `SIGKILL`ed could not be rejoined by anything: the
+/// survivors keep their participant bytes, §3.4's split-brain check refuses
+/// every new create with `TFT_ERR_ARENA_UNAVAILABLE`, and the only thing that
+/// ends that state was a Rust method. The documented recovery was to stop every
+/// attached process
+/// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+///
+/// Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **Anything
+/// but `TFT_INHERITED` means this process is not the owner, and none of them is
+/// a reason to stop reading** — lookups are unaffected by ownership in every one
+/// of these states, and unaffected *during* a takeover as well.
+///
+/// On failure the process keeps its participant slot, its byte and its mapping,
+/// and gives back the ownership byte if it had taken one — so a failed attempt
+/// leaves a plain participant rather than an arena with an owner that is not
+/// serving.
+///
+/// # Safety
+///
+/// `tree` must be NULL or a live handle; `out` must be a writable
+/// `tft_inheritance`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn tft_tree_inherit_ownership(
+    tree: *const tft_tree,
+    out: *mut tft_inheritance,
+) -> tft_status {
+    guard(|| {
+        // SAFETY: validated before any field access.
+        if !unsafe { crate::check_tree(tree) } {
+            return bad_handle("tft_tree_inherit_ownership");
+        }
+        if out.is_null() {
+            return null_arg("tft_tree_inherit_ownership");
+        }
+        // SAFETY: `check_tree` confirmed the magic word.
+        let h = unsafe { &*tree };
+        // `&self` since `0044` step 1 — the handle holds an `Arc`, and
+        // `Arc::get_mut` fails whenever a plan or publisher holds a clone.
+        match h.share.tree.inherit_ownership() {
+            Ok(o) => {
+                let code = match o {
+                    tf_tree::Inheritance::Inherited => TFT_INHERITED,
+                    tf_tree::Inheritance::OwnerAlive => TFT_OWNER_ALIVE,
+                    tf_tree::Inheritance::Contended => TFT_CONTENDED,
+                    tf_tree::Inheritance::ReadOnly => TFT_READ_ONLY,
+                    // `Inheritance` is `#[non_exhaustive]`, so a variant added
+                    // later lands here rather than failing to compile. Reporting
+                    // it as "not applicable" is the safe reading: it is the one
+                    // value that tells a caller to keep behaving as a plain
+                    // participant, which is never wrong.
+                    _ => TFT_NOT_APPLICABLE,
+                };
+                // SAFETY: the caller contracts a writable byte at `out`.
+                unsafe { out.write(code) };
+                TFT_OK
+            }
+            Err(e) => {
+                set_error(
+                    crate::TFT_ERR_ARENA_UNAVAILABLE,
+                    &format!("could not inherit the owner role: {e}"),
+                    |_| {},
+                );
+                crate::TFT_ERR_ARENA_UNAVAILABLE
+            }
+        }
+    })
+}
+
+/// Collect what dead participants left behind, and report how many records were
+/// freed.
+///
+/// Both sweeps, summed: the claim leases no live process holds
+/// (`Tree::reap_dead`) and the participant records whose lock bytes the kernel has
+/// released (`Tree::reap_participants`). They differ in which arena table they
+/// walk, and a caller in C has no basis to choose between them — the Rust
+/// surface keeps them separate for a supervisor that does.
+///
+/// **The name overlaps a narrower Rust one on purpose, and it is worth knowing
+/// which you have.** `tf_tree::Tree::reap_dead` is the *claim* sweep alone;
+/// this is that plus `reap_participants`. Two functions here would be two
+/// things a C caller has to learn the difference between in order to call both
+/// of them every time.
+///
+/// **Most of the time there is nothing to do, and that is the design.** The
+/// owner's socket-hangup callback already revokes a dead participant's claims
+/// and frees its record, so an ordinary killed-and-restarted publisher needs no
+/// reaper. Two producers have no hangup for anyone to observe — a dead **owner**,
+/// and a `TreeBuilder::build_shared` participant with no socket — and this is
+/// their only collector.
+///
+/// Returns `0` written to `out` for a read-only tree, a heap tree, or a tree
+/// with no rendezvous: none of them can prove a holder is gone, and none of them
+/// may write the arena.
+///
+/// # Safety
+///
+/// `tree` must be NULL or a live handle; `out` must be a writable `uint32_t`.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[no_mangle]
+pub unsafe extern "C" fn tft_tree_reap_dead(tree: *const tft_tree, out: *mut u32) -> tft_status {
+    guard(|| {
+        // SAFETY: validated before any field access.
+        if !unsafe { crate::check_tree(tree) } {
+            return bad_handle("tft_tree_reap_dead");
+        }
+        if out.is_null() {
+            return null_arg("tft_tree_reap_dead");
+        }
+        // SAFETY: `check_tree` confirmed the magic word.
+        let h = unsafe { &*tree };
+        let n = h.share.tree.reap_dead() + h.share.tree.reap_participants();
+        // SAFETY: the caller contracts a writable `u32` at `out`.
+        unsafe { out.write(u32::try_from(n).unwrap_or(u32::MAX)) };
+        TFT_OK
+    })
+}

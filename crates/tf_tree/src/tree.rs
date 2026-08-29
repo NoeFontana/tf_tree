@@ -476,7 +476,7 @@ impl TreeBuilder {
             liveness,
             decl: Mutex::new(()),
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            attachment: None,
+            attachment: std::sync::Mutex::new(None),
             #[cfg(all(feature = "shm", target_os = "linux"))]
             lock_file: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -530,7 +530,7 @@ impl TreeBuilder {
             liveness,
             decl: Mutex::new(()),
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            attachment: None,
+            attachment: std::sync::Mutex::new(None),
             #[cfg(all(feature = "shm", target_os = "linux"))]
             lock_file: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -1577,7 +1577,34 @@ pub struct Tree {
     /// `None` for a heap tree, for `build_shared`, and for `attach_shared` over
     /// an inherited fd — none of those went through a rendezvous.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    attachment: Option<crate::open::Attachment>,
+    /// The rendezvous attachment, behind a lock so recovery needs only `&self`.
+    ///
+    /// **`Mutex` and not a bare `Option`, for one reason**
+    /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)):
+    /// [`Tree::inherit_ownership`] takes the attachment out, mutates it and puts
+    /// it back, so it needed `&mut self` — and **both bindings hold the tree in
+    /// an `Arc`** (`tft_tree` an `Arc<TreeShare>`, `PyTree` the `Arc<Tree>`
+    /// `claim_owned` requires), where `Arc::get_mut` fails the moment any plan or
+    /// publisher holds a clone. That is always, in a binding. So §3.5's recovery
+    /// was unreachable from C, C++ and Python — the languages a robot's nodes are
+    /// written in — and the lock is what makes it reachable.
+    ///
+    /// **It costs the read path nothing, and that is structural rather than
+    /// measured-and-hoped.** `Plan::at` lives in `tf_tree_core`, folds over the
+    /// mapping and the `Guard`, and cannot name this field; every site that
+    /// touches it is control plane. `docs/PHASE2.md` §3.5's "lookups do not stop,
+    /// slow down, or observe anything during a takeover" is the same claim from
+    /// the other end.
+    ///
+    /// Drop order is unchanged: a `Mutex` drops its contents by the ordinary
+    /// rule, so `Attachment::Owner`'s field declaration order — the serving
+    /// thread before the session, which is §3.5 requirement 5 — still holds.
+    ///
+    /// A poisoned lock is taken anyway (`unwrap_or_else(PoisonError::into_inner)`):
+    /// the payload is a session and a socket, a panic elsewhere does not make
+    /// them invalid, and refusing to recover an arena because some other thread
+    /// unwound is the opposite of what this field is for.
+    attachment: std::sync::Mutex<Option<crate::open::Attachment>>,
     /// This tree's open file description on the rendezvous lock file.
     ///
     /// **Two roles, one description, and the sharing is the point.** It carries
@@ -2896,7 +2923,7 @@ impl Tree {
             liveness,
             decl: Mutex::new(()),
             #[cfg(all(feature = "shm", target_os = "linux"))]
-            attachment: None,
+            attachment: std::sync::Mutex::new(None),
             #[cfg(all(feature = "shm", target_os = "linux"))]
             lock_file: None,
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -2955,7 +2982,7 @@ impl Tree {
             // conservative guess here, it is the fact.
             liveness: Box::new(|_, _| false),
             decl: Mutex::new(()),
-            attachment: None,
+            attachment: std::sync::Mutex::new(None),
             lock_file: None,
             ofd_probe: None,
             fork_gen,
@@ -3002,11 +3029,11 @@ impl Tree {
         socket: std::os::fd::OwnedFd,
         rendezvous: tf_tree_ipc::Rendezvous,
     ) {
-        self.attachment = Some(crate::open::Attachment::Joined {
+        self.put_attachment(Some(crate::open::Attachment::Joined {
             session,
             socket,
             rendezvous,
-        });
+        }));
     }
 
     /// Whether the process that owns this arena has gone away (§3.5).
@@ -3066,7 +3093,7 @@ impl Tree {
     #[must_use]
     pub fn owner_lost(&self) -> bool {
         use std::os::fd::AsFd;
-        match &self.attachment {
+        match &*self.attachment.lock().unwrap_or_else(|e| e.into_inner()) {
             Some(crate::open::Attachment::Joined {
                 socket, session, ..
             }) => {
@@ -3093,10 +3120,18 @@ impl Tree {
         }
     }
 
-    /// Borrow the parked attachment, for `crate::open`'s §3.5 seam.
+    /// Is this a joined rendezvous attachment — the only shape §3.5 can inherit
+    /// from?
+    ///
+    /// A predicate rather than the borrow this used to hand back: the attachment
+    /// lives behind a lock now, and its one caller only ever asked a yes/no
+    /// question of it.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    pub(crate) fn attachment_ref(&self) -> Option<&crate::open::Attachment> {
-        self.attachment.as_ref()
+    pub(crate) fn is_joined(&self) -> bool {
+        matches!(
+            *self.attachment.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(crate::open::Attachment::Joined { .. })
+        )
     }
 
     /// Take the parked attachment out.
@@ -3107,14 +3142,17 @@ impl Tree {
     /// both. It exists so `Tree::inherit_ownership` can hand `&self` to
     /// `spawn_owner_server` while it owns the session.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    pub(crate) fn take_attachment(&mut self) -> Option<crate::open::Attachment> {
-        self.attachment.take()
+    pub(crate) fn take_attachment(&self) -> Option<crate::open::Attachment> {
+        self.attachment
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Put back what [`Tree::take_attachment`] removed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    pub(crate) fn put_attachment(&mut self, a: Option<crate::open::Attachment>) {
-        self.attachment = a;
+    pub(crate) fn put_attachment(&self, a: Option<crate::open::Attachment>) {
+        *self.attachment.lock().unwrap_or_else(|e| e.into_inner()) = a;
     }
 
     /// Park the owner's session and serving thread.
@@ -3133,10 +3171,10 @@ impl Tree {
         session: crate::open::JoinedSession,
         server: crate::open::OwnerThread,
     ) {
-        self.attachment = Some(crate::open::Attachment::Owner {
+        self.put_attachment(Some(crate::open::Attachment::Owner {
             _server: server,
             _session: session,
-        });
+        }));
     }
 
     /// Replace the `/proc` liveness heuristic with the kernel's answer (§5.1).
