@@ -90,9 +90,10 @@ cd "tf_tree-${TAG}-x86_64-unknown-linux-musl"
 
 Both released builds carry `--features shm`, so the same binary also attaches to
 a robot that is already running (`--attach`, `tf_tree top`, `tf_tree
-participants`). Prefer the `-gnu` archive if you are running `tf_tree bench`,
-where musl's allocator would be measuring itself; it needs glibc 2.34 or newer,
-which is Ubuntu 22.04 / ROS 2 Humble and later. From a clone the equivalent is
+participants`). The `-gnu` archive is the dynamically-linked build and needs
+glibc 2.34 or newer (Ubuntu 22.04 / ROS 2 Humble and later); take it if you
+would rather a glibc security fix reach this binary through your distribution
+than wait for a new release. Otherwise take musl. From a clone the equivalent is
 `cargo install --path crates/tf_tree_cli --features shm`.
 
 `drive.tft` is a **frozen transform index**, and it is the arena itself written

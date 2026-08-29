@@ -239,8 +239,9 @@ is a bug.
   **Both libc flavours, because neither subsumes the other.** Measured, the gnu
   build's floor is `GLIBC_2.34`: fine on ROS 2 Humble (Ubuntu 22.04, glibc 2.35),
   too high for 20.04 or a `bullseye`-based container. The musl builds are static
-  and have no floor at all. The gnu one is still the one to take for `tf_tree
-  bench`, where musl's allocator would be measuring itself. Both carry
+  and have no floor at all. The gnu rows earn their place on libc updates rather
+  than on speed: a dynamic build picks up a glibc security fix from the
+  distribution, a static one needs a new release to carry it. Both carry
   `--features shm`, so `--attach`, `tf_tree top` and `tf_tree participants` work
   against a live arena.
 

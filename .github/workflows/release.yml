@@ -160,10 +160,18 @@ jobs:
   # **Why gnu *and* musl.** Measured on the development host, the gnu build's
   # floor is `GLIBC_2.34`: fine on ROS 2 Humble (22.04, glibc 2.35) and too high
   # for 20.04 (2.31), a container built `FROM debian:bullseye`, or anything
-  # older. The musl rows are statically linked and have no floor at all. Neither
-  # row subsumes the other — musl's allocator is the slower of the two, and
-  # `tf_tree bench` is in this binary, so an operator taking a measurement wants
-  # the gnu build.
+  # older. The musl rows are statically linked and have no floor at all.
+  #
+  # **The gnu rows earn their place on libc updates, not on speed.** A dynamic
+  # build picks up a glibc security fix from the distribution; a static one needs
+  # a new `tf_tree` release to carry it. An earlier revision of this comment said
+  # instead that musl's allocator is slower and that `tf_tree bench` therefore
+  # wants the gnu build — **both halves were wrong**. `cmd_bench` runs a
+  # correctness differential against a naive-Rust reference and prints
+  # `max_error` against a tolerance; it reports no timing at all and defers the
+  # perf gate to `cargo xtask bench-gate`, so there is nothing there for an
+  # allocator to distort. No performance difference between the two has been
+  # measured for this binary, and none is claimed.
   #
   # Not gated on the tag: this job runs on the pull-request trigger too, for the
   # reason in this file's header — a release path first run on the day it
@@ -479,9 +487,10 @@ jobs:
           - **`-musl`** is statically linked and depends on no system library.
             Use it inside a container, on Ubuntu 20.04, or wherever the glibc
             build refuses to start.
-          - **`-gnu`** needs glibc 2.34 or newer (Ubuntu 22.04 / ROS 2 Humble
-            and later). Prefer it if you are running `tf_tree bench`, where
-            musl's allocator would be measuring itself.
+          - **`-gnu`** is dynamically linked and needs glibc 2.34 or newer
+            (Ubuntu 22.04 / ROS 2 Humble and later). Take it if you would rather
+            a glibc security fix reach this binary through your distribution
+            than wait for a new release. If you have no preference, take musl.
 
           Both are built with `--features shm`, so `--attach`, `tf_tree top`
           and `tf_tree participants` can see a live arena.
