@@ -2271,6 +2271,33 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
     cargo build --release --features shm -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture {{ARGS}}
 
+# **§11.4's "a random crash point armed in 10% of children" — `docs/PHASE2.md`
+# §11.3 and §11.4 meeting for the first time.**
+#
+# `shm-torture` above kills children with `SIGKILL`, which lands wherever the
+# scheduler puts it: a real fault, and a much shallower set of mid-protocol
+# states than §11.3's named ones. This arms a random site from
+# `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES` in about a tenth of
+# children, so a run kills processes *at named instructions* and then checks the
+# same invariants.
+#
+# **The build needs the feature and the flag refuses without it**, because the
+# children are this same executable: a site compiled out here is compiled out in
+# every child, and the flag would arm nothing while looking like it had.
+#
+# **Read the `§11.3:` line, not the exit status.** It reports children armed and
+# children that aborted at a site, and those differ — an armed child the driver's
+# `SIGKILL` reached first never got there. `armed N, aborted 0` is a run that
+# exercised nothing, which is why both numbers are printed. Measured on this
+# host at 40s/10 children/2 Hz: 11 armed, 4 aborted, at four distinct sites,
+# 0 violations.
+#
+# Longer and gentler than the plain soak on purpose: a high kill rate wins the
+# race against the site more often than not.
+shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
+    cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
+    ./target/release/shm_torture --crash-points {{ARGS}}
+
 # **The torture harness's own gate**, seconds rather than minutes, so it belongs
 # on a branch rather than in a nightly.
 #

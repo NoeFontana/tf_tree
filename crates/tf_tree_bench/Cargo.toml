@@ -32,6 +32,13 @@ tf2 = ["dep:tf_tree_tf2_sys"]
 # Phase 2 shared memory: the multi-process integration test and benchmark.
 # Linux-only; needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
 shm = ["tf_tree/shm"]
+# **`docs/PHASE2.md` §11.4's "a random crash point armed in 10% of children".**
+# The children of `shm_torture` are this same binary, so arming a site means
+# *this* build carries them — hence a passthrough rather than a runtime switch.
+# Default-off, like every other fault-injection knob: a soak that aborts a tenth
+# of its children on purpose is not the soak an operator runs to measure an
+# arena, and §11.3's own module doc says the sites must cost nothing when off.
+crash-points = ["tf_tree/crash-points", "tf_tree_core/crash-points"]
 # **`docs/decisions/0015`'s *Invariants to maintain* — the C ABI half of the fork
 # test.** `fork_child`'s fourth mode drives `tft_bridge_offer`,
 # `tft_bridge_get_stats` and `tft_bridge_free` on a handle inherited across

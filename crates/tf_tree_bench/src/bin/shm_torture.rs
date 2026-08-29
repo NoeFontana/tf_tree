@@ -260,6 +260,7 @@ mod imp {
         kill_hz: f64,
         inject: bool,
         readers_only: bool,
+        crash_points: bool,
     }
 
     /// `30m`, `120s`, `500ms`, `1h`, or a bare number of seconds.
@@ -293,6 +294,7 @@ mod imp {
             children: 6,
             seed: 0x7085_1234_ABCD_0001,
             kill_hz: 4.0,
+            crash_points: false,
             inject: false,
             readers_only: false,
         };
@@ -321,23 +323,42 @@ mod imp {
                 // asserts the run *fails*. It measures the harness, never the
                 // arena, so it has no place in a real soak.
                 "--readers-only" => a.readers_only = true,
-                "--crash-points" => bail!(
-                    "--crash-points would arm `docs/PHASE2.md` §11.3's fault-injection sites, \
-                     and there are none: the `crash-points` feature and `TF_TREE_CRASH_AT` are \
-                     recorded as not implemented in §0.0, so there is nothing to arm. This \
-                     harness kills children with SIGKILL, which reaches a different (and \
-                     scheduler-chosen) set of mid-protocol states. Accepting the flag and \
-                     running the SIGKILL test anyway would report §11.3 coverage that does \
-                     not exist."
-                ),
+                // **This used to refuse unconditionally**, on the grounds that
+                // "the `crash-points` feature and `TF_TREE_CRASH_AT` are
+                // recorded as not implemented in §0.0, so there is nothing to
+                // arm". That was true when written and stopped being true when
+                // the sites landed; the §0.0 row it cited had gone stale too.
+                //
+                // What survives from that refusal is the part that was never
+                // about implementation status: **`SIGKILL` is not §11.3
+                // coverage.** It lands wherever the scheduler puts it, which is
+                // a different and much shallower set of mid-protocol states, so
+                // a run *without* this flag still must not be quoted as §11.3.
+                // The flag is what makes the difference real rather than
+                // rhetorical.
+                "--crash-points" => {
+                    if !cfg!(feature = "crash-points") {
+                        bail!(
+                            "--crash-points needs this binary built with the `crash-points` \
+                             feature: the children are this same executable, so a site that \
+                             is compiled out here is compiled out in every child and the \
+                             flag would arm nothing while looking like it had. Rebuild with \
+                             `--features shm,crash-points`."
+                        );
+                    }
+                    a.crash_points = true;
+                }
                 "-h" | "--help" => {
                     println!(
                         "usage: shm_torture [--duration 30s] [--children 6] [--seed N] \
-                         [--kill-hz 4] [--inject-violation] [--readers-only]"
+                         [--kill-hz 4] [--inject-violation] [--readers-only] \
+                         [--crash-points]"
                     );
                     println!(
-                        "  --crash-points is PHASE2 §11.3's fault injection and is refused: \
-                         the feature it would arm does not exist."
+                        "  --crash-points arms PHASE2 §11.3's fault injection in ~10% of \
+                         children (§11.4). Needs --features crash-points; without it the \
+                         sites are compiled out and the flag is refused rather than \
+                         silently arming nothing."
                     );
                     return Ok(());
                 }
@@ -386,12 +407,66 @@ mod imp {
         }
     }
 
+    /// `armed_site` where the feature exists, `None` where it does not.
+    ///
+    /// The `cfg` lives here rather than at the two call sites, so a build with
+    /// the feature off compiles the same control flow.
+    fn crash_spec(enabled: bool, rng: &mut Rng, armed: &mut usize) -> Option<String> {
+        #[cfg(feature = "crash-points")]
+        {
+            if enabled {
+                let spec = armed_site(rng);
+                if spec.is_some() {
+                    *armed += 1;
+                }
+                return spec;
+            }
+        }
+        let _ = (enabled, rng, armed);
+        None
+    }
+
+    /// Every §11.3 site this build carries, in one list.
+    ///
+    /// **Read from the published consts, never re-spelled.** Both
+    /// `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES` exist for exactly
+    /// this — a typo in a literal here would arm nothing, and the run would look
+    /// clean, which is the failure this harness exists to not have.
+    ///
+    /// Two lists because §11.3's table spans two crates: the mutation protocols
+    /// are core's, the rendezvous is the facade's.
+    #[cfg(feature = "crash-points")]
+    fn all_sites() -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = tf_tree_core::crash::SITES.to_vec();
+        v.extend_from_slice(tf_tree::CRASH_SITES);
+        v
+    }
+
+    /// `docs/PHASE2.md` §11.4: "a random crash point armed in 10% of children".
+    ///
+    /// Returns `TF_TREE_CRASH_AT`'s value, or `None` for the other ~90%. The
+    /// `nth_hit` is drawn too: a site armed at `:1` fires on the first
+    /// participant that reaches it, which for a child that attaches and then
+    /// loops is almost always during start-up — so the states past the first
+    /// would never be sampled.
+    #[cfg(feature = "crash-points")]
+    fn armed_site(rng: &mut Rng) -> Option<String> {
+        if rng.below(10) != 0 {
+            return None;
+        }
+        let sites = all_sites();
+        let site = sites[rng.below(sites.len() as u64) as usize];
+        let nth = 1 + rng.below(4);
+        Some(std::format!("{site}:{nth}"))
+    }
+
     fn spawn(
         exe: &std::path::Path,
         dir: &PathBuf,
         seed: u64,
         inject: bool,
         readers_only: bool,
+        crash_at: Option<String>,
     ) -> Result<Kid> {
         let mut cmd = Command::new(exe);
         cmd.arg("child")
@@ -408,6 +483,12 @@ mod imp {
         }
         if readers_only {
             cmd.arg("--readers-only");
+        }
+        // **Per child, not per run.** §11.4 asks for a random site in 10% of
+        // children, and `crash::spec` parses the variable once per process, so
+        // the environment is the only place this can go.
+        if let Some(spec) = crash_at {
+            cmd.env("TF_TREE_CRASH_AT", spec);
         }
         let proc = cmd.spawn().context("spawning a torture child")?;
         Ok(Kid { proc, seed, inject })
@@ -454,6 +535,12 @@ mod imp {
         // Kids are held in fixed slots, not a list, so "slot 0 injects" survives
         // slot 0 being killed and replaced.
         let mut kids: Vec<Option<Kid>> = Vec::with_capacity(a.children);
+        // How many children died at an armed §11.3 site, and how many were armed
+        // at all. Both, because "armed 4, none fired" and "armed 4, all fired"
+        // are different runs and only one of them exercised anything.
+        let mut aborted = 0usize;
+        let mut armed = 0usize;
+
         for i in 0..a.children {
             // Only *one* slot injects, and only when asked: a corrupt sample
             // from every writer would let a child detect its own corruption,
@@ -464,6 +551,7 @@ mod imp {
                 rng.next_u64(),
                 a.inject && i == 0,
                 a.readers_only,
+                crash_spec(a.crash_points, &mut rng, &mut armed),
             )?));
         }
 
@@ -503,7 +591,7 @@ mod imp {
                 window = Health::default();
             }
             rounds += 1;
-            reap_finished(&mut kids, &mut violations);
+            reap_finished(&mut kids, &mut violations, &mut aborted);
             if !violations.is_empty() {
                 break;
             }
@@ -516,6 +604,7 @@ mod imp {
                         seed,
                         a.inject && slot == 0,
                         a.readers_only,
+                        crash_spec(a.crash_points, &mut rng, &mut armed),
                     )?);
                 }
             }
@@ -535,7 +624,7 @@ mod imp {
         reads.add(observe(&observer, &mut rng, &mut violations, &mut round));
         health.add(round);
         rounds += 1;
-        reap_finished(&mut kids, &mut violations);
+        reap_finished(&mut kids, &mut violations, &mut aborted);
         // Kill every remaining child *before* the recovery check: "no claim is
         // held by a dead participant" is only a statement about a quiescent
         // arena, and a live writer would fail it correctly and uselessly.
@@ -574,6 +663,24 @@ mod imp {
             "shm_torture: {kills} kills, {} violation(s)",
             violations.len()
         );
+        // **`--crash-points` says what it did, and both numbers are needed.**
+        // "armed 4, fired 0" and "armed 4, fired 4" are different runs, and only
+        // the second exercised §11.3 at all — an armed child that the driver's
+        // `SIGKILL` reached first never got to its site. Printing only "armed"
+        // would be the flag-that-arms-nothing failure this replaces, one level
+        // up.
+        if a.crash_points {
+            println!(
+                "  §11.3: {armed} child(ren) armed with a random site, {aborted} aborted at one"
+            );
+            if armed > 0 && aborted == 0 {
+                println!(
+                    "         (none fired: the driver's SIGKILL reached them first, or the \
+                     armed site is on a path this workload does not take — raise --duration \
+                     or lower --kill-hz)"
+                );
+            }
+        }
         for v in &violations {
             println!("  {v}");
         }
@@ -693,11 +800,28 @@ mod imp {
     /// joiner whose owner was killed mid-handshake fails to open, and that is
     /// the run working as intended. Only [`EXIT_VIOLATION`] means the arena lied
     /// to somebody.
-    fn reap_finished(kids: &mut [Option<Kid>], violations: &mut Vec<String>) {
+    fn reap_finished(kids: &mut [Option<Kid>], violations: &mut Vec<String>, aborted: &mut usize) {
         for slot in kids.iter_mut() {
             let Some(kid) = slot.as_mut() else { continue };
             match kid.proc.try_wait() {
                 Ok(Some(status)) => {
+                    // **A child that aborted at an armed §11.3 site**, counted
+                    // so a `--crash-points` run can say the sites *fired*
+                    // rather than only that they were armed. Not a failure:
+                    // firing is the point, and the invariant checks that follow
+                    // are what decides whether the state it left was repairable.
+                    //
+                    // `SIGABRT` and not an exit code, because §11.3 is explicit
+                    // that a crash point must `abort()` rather than `panic!` —
+                    // a panic unwinds and runs the `Drop`s that would repair the
+                    // damage the test exists to observe.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt as _;
+                        if status.signal() == Some(libc::SIGABRT) {
+                            *aborted += 1;
+                        }
+                    }
                     if status.code() == Some(EXIT_VIOLATION) {
                         violations.push(format!(
                             "child (seed {}{}) reported an invariant violation; its \
