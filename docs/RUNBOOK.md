@@ -544,10 +544,24 @@ check when owner death has wedged a live system:
   `tf_tree::open()` and `Open::new()` both start at `AttachMode::ReadOnly`
   (`crates/tf_tree/src/open.rs:886`) and you get read-write only by asking for it.
   If every survivor is a consumer, the recovery below (stop everything) is still
-  the only one you have. Pinned by
+  the only one you have — **and that is a reason to open one process read-write**
+  even if it never publishes, since read-write is what makes a survivor eligible
+  rather than what makes it a writer. Pinned by
   `a_read_only_survivor_reports_that_it_cannot_inherit`
   (`crates/tf_tree/tests/rendezvous.rs`), which also shows the consumer reading
   straight through the owner's death.
+- **What language is that survivor written in?** Until 2026-08-29 the answer had
+  to be Rust, and if it was not, the fleet could not recover at all: the whole
+  recovery surface was Rust-only, and worse, a C consumer could not even hold a
+  read-write attachment —  `tft_tree_open` was the entire opening surface of the
+  C ABI and it is `tf_tree::open()`, read-only. ROS 2 nodes are C++ and Python.
+  [`0044`](./decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)
+  closed it: **C and C++** get `tft_tree_open_named`, `tft_tree_owner_lost`,
+  `tft_tree_inherit_ownership` and `tft_tree_reap_dead` in the *unstable* header
+  (`#define TFT_ENABLE_UNSTABLE`); **Python** gets `tree.owner_lost()`,
+  `tree.inherit_ownership()` — which returns the outcome's name as a string —
+  and `tree.reap_dead()`, with `tf_tree.open(mode="rw")` for the attachment.
+  A node built against an older release still cannot, which is the next bullet.
 - **Does that survivor call it?** A publisher built against a release before
   2026-08-28, or one that simply never polls, is indistinguishable from one that
   cannot. `tf_tree participants` shows you who is attached; it cannot show you

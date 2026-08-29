@@ -269,3 +269,127 @@ def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_d
         f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
     )
     assert os.WEXITSTATUS(wstatus) == 0
+
+
+@shm
+def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
+    """**Recovery from Python — `docs/decisions/0044`.**
+
+    Until these three methods existed, an all-Python fleet whose arena owner was
+    `SIGKILL`ed *could not rejoin it*. The survivors keep their participant
+    bytes, so `docs/PHASE2.md` §3.4 step 4 refuses every new create with
+    `ArenaHeldButUnreachable`, and the one call that ends that state was Rust
+    only — and took `&mut self`, which `PyTree`'s `Arc<Tree>` cannot satisfy.
+    The documented recovery was to stop every attached process.
+
+    The owner has to be a **separate process**: only the kernel takes its locks
+    away without its cooperation, which is the whole state under test. It is
+    started with `subprocess`, not `multiprocessing`, because a fork of this
+    (multi-threaded) process is the *other* failure this file tests.
+    """
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import tf_tree, time;"
+            "t = tf_tree.open(mode='rw', create=[('map','base'),('base','cam')]);"
+            "print('owning', flush=True);"
+            "time.sleep(3600)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TF_TREE_RUNTIME_DIR": runtime_dir},
+    )
+    try:
+        assert owner.stdout.readline().strip() == "owning", "the owner did not come up"
+
+        tree = tf_tree.open(mode="rw")
+
+        # The owner is alive: the loop is cheap and does nothing.
+        assert not tree.owner_lost()
+        assert tree.inherit_ownership() == "OwnerAlive"
+
+        # `wait` after `kill`, so the kernel has torn the descriptors down — its
+        # ownership byte and its participant byte are released with no
+        # cooperation from it.
+        owner.kill()
+        owner.wait(timeout=30)
+
+        assert tree.owner_lost(), "the owner is gone and its socket hung up"
+        assert tree.inherit_ownership() == "Inherited", (
+            "the sole read-write survivor should have taken the vacant role"
+        )
+
+        # And it settles rather than re-attempting the ownership lock every
+        # cycle: this process is the owner now (`docs/decisions/0043`).
+        assert not tree.owner_lost(), (
+            "an owner that reads its own death would retry the lock forever"
+        )
+
+        # The dead owner's own participant record is collected — one of exactly
+        # two states the owner's hangup callback structurally cannot reach,
+        # because nothing hangs up on an owner. Asserted as a number because the
+        # number is the evidence.
+        assert tree.reap_dead() == 1, "the dead owner's record should be collected"
+        assert tree.reap_dead() == 0, "and a second sweep must find nothing"
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=30)
+
+
+@shm
+def test_a_read_only_consumer_is_told_it_cannot_inherit(runtime_dir):
+    """D18 working, said out loud rather than by silence.
+
+    An owner writes the participant table on every grant and a `PROT_READ`
+    mapping cannot, so a fleet of read-only consumers cannot rescue itself — and
+    read-only is the consumer *default*. A Python caller needs that to be a
+    value it can branch on, not an exception it has to parse.
+
+    **The owner has to be dead for this to be observable**, and finding that out
+    is what the first version of this test was for: `inherit_ownership` checks
+    "is there anything to inherit" *before* "could I do it if there were", so a
+    read-only consumer beside a live owner is told `"OwnerAlive"`. That ordering
+    is right — reporting a capability limit when there is nothing to do anyway
+    would send an operator looking for a fleet-wide problem that does not exist
+    — so the test kills the owner rather than the code changing.
+    """
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import tf_tree, time;"
+            "t = tf_tree.open(mode='rw', create=[('map','base'),('base','cam')]);"
+            "print('owning', flush=True);"
+            "time.sleep(3600)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TF_TREE_RUNTIME_DIR": runtime_dir},
+    )
+    try:
+        assert owner.stdout.readline().strip() == "owning"
+
+        ro = tf_tree.open(mode="ro")
+        assert ro.inherit_ownership() == "OwnerAlive", (
+            "with an owner alive there is nothing to inherit, whatever this "
+            "consumer's mapping permits"
+        )
+
+        owner.kill()
+        owner.wait(timeout=30)
+
+        assert ro.owner_lost(), "the owner is gone"
+        assert ro.inherit_ownership() == "ReadOnly", (
+            "a read-only mapping cannot write the participant table, so it "
+            "cannot be the heir — and it must be told so, not left guessing"
+        )
+        assert ro.reap_dead() == 0, "a read-only mapping may not write the arena"
+        # And it keeps reading straight through, which is the half of D18 that
+        # makes the refusal acceptable.
+        assert ro.plan("base", "map") is not None
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=30)

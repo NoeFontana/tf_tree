@@ -865,11 +865,13 @@ this verbatim.
 **Layout by type** (`layout_of<T>`, `raw_writable<T>`) is R4's strongest form
 and is the model for any future typed binding.
 
-### 4.1 The two capabilities the bindings could not reach — NORMATIVE (doc)
+### 4.1 The three capabilities the bindings could not reach — NORMATIVE (doc)
 
-Both were implemented in the engine, tested, and callable from Rust only. They
+Each was implemented in the engine, tested, and callable from Rust only. They
 are recorded here because the *shape* each took generalises to any future
-capability that has to cross this boundary.
+capability that has to cross this boundary — and because there have now been
+three, which makes "is this reachable from C and Python?" a question §7's
+checklist has to ask rather than a thing to notice afterwards.
 
 **The time domain** ([`0038`](./decisions/0038-the-domain-a-binding-cannot-name.md)).
 `Domain` is an open trait whose tag is a `const`, so a binding cannot name the
@@ -893,6 +895,34 @@ mirrors, both because C has no way to say "meaningless": `edge` is
 answer nothing invented would be logged as fact; and the twist-carrying layout is
 refused rather than served under `Error`, which would put two extrapolation
 policies in one 13-`f64` row.
+
+**Recovery from owner death**
+([`0044`](./decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+`Tree::owner_lost`, `Tree::inherit_ownership` and the reapers were Rust-only, so
+an all-C++/Python fleet whose arena owner was `SIGKILL`ed could not rejoin it at
+all — the documented recovery was to stop every attached process, and ROS 2 nodes
+are written in C++ and Python. **Two shapes generalise from it.**
+
+The first is that a `&mut self` is a boundary refusal in disguise: both bindings
+hold the tree in an `Arc` and `Arc::get_mut` fails as soon as any plan or
+publisher holds a clone, so a method that takes `&mut self` is unreachable from
+either, whatever the header says. `Tree::attachment` moved behind a `Mutex` and
+the method takes `&self`. **A new mutating method on `Tree` should assume the
+same, and R6's read-only default is what keeps that rare.**
+
+The second is that a capability is only as reachable as the *state* it needs. The
+record shipped naming three functions; the C test would not compile, because
+`tft_tree_open` was the entire arena-opening surface of the C ABI and it is
+`tf_tree::open()` — read-only. So `tft_tree_inherit_ownership` would have
+answered `TFT_READ_ONLY` every time (D18: an owner writes the participant table
+and a `PROT_READ` mapping cannot), and all three would have been decoration.
+`tft_tree_open_named` is part of the surface for that reason. **Check the
+precondition, not only the call.**
+
+All four are in the **unstable** tier, because §3.5's protocol is days old and has
+already produced one outcome its own record did not predict, while the frozen
+header is a promise about a decade. `tft_tree_plan_in_domain` went into the
+stable tier because it is a query shape rather than a protocol.
 
 **In Python the batch distance is an `(N,)` array and not a scalar**, and that is
 the same property a third time. A batch straddling the newest sample holds
