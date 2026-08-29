@@ -6,8 +6,7 @@
 
 A transform tree engine: store time-stamped rigid-body transforms between named
 coordinate frames and answer *"where was frame A relative to frame B at time
-t?"* — fast enough to sit inside a control loop, with diagnostics good enough to
-debug at 3 a.m.
+t?"* — from a control loop, from many processes at once, or offline.
 
 **This is the crate to depend on.** It is the `std` facade: it re-exports the
 `no_std` engine ([`tf_tree_core`](https://crates.io/crates/tf_tree_core)) and
@@ -104,9 +103,7 @@ Three things in there are deliberate and surprise people:
 
 The single-process engine above is portable Rust. Everything that maps memory —
 attaching to a live arena shared with other processes, the frozen `.tft`
-backend — is **Linux-only and behind the default-off `shm` feature**. That
-sentence is here rather than only in `SUPPORT.md` because nobody should meet it
-as a build error.
+backend — is **Linux-only and behind the default-off `shm` feature**.
 
 ## Features
 
