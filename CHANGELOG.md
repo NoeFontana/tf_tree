@@ -33,6 +33,23 @@ is a bug.
 
 ## [Unreleased]
 
+### Added
+
+- **`just two-processes`** — the capability the README leads with, as something
+  you can run. `crates/tf_tree/examples/` held two files and neither showed a
+  second *process*: `control_loop.rs`'s reader is a thread, deliberately,
+  because that example is about latency and a thread keeps the measurement about
+  the fold. The only publisher/consumer pair in the repository was the test
+  harness, whose own README says it "is not a tool and nothing about it is
+  stable".
+
+  One target with a `--publish`/`--consume` switch, so it stays one recipe. It
+  shows the two things a newcomer gets wrong: `require_create(true)`, without
+  which a publisher racing a second copy of itself silently *joins* the other's
+  arena and publishes into a topology it did not declare; and `await_open`
+  rather than `open`, because launch order is not something a launch file
+  guarantees.
+
 ### Fixed
 
 - **`doctor`'s zero-counter skip reason named three causes and missed the one a
