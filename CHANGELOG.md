@@ -35,6 +35,77 @@ is a bug.
 
 ### Added
 
+- **`docs/PHASE2.md` §11.3's last two untested crash sites now have tests**, and
+  the facade's site list has the completeness gate it never had.
+  `reclaim.after_probe_before_cas` and `hangup.after_probe_before_cas` were the
+  two the §0.0 row recorded as "a site and no test", and the reason they were
+  *those* two is structural: they are both in `tf_tree::CRASH_SITES`, the list
+  with no counterpart to
+  `crash_tests::the_published_site_list_is_the_one_the_tests_arm`.
+
+  `the_facade_site_list_is_pinned_by_index_and_every_site_has_a_test` closes it
+  and **pins index to name**, not set membership: the facade arms its sites *by
+  index* (`CRASH_SITES[0]`…`[5]`), so a set-equality assertion would still pass
+  after a reorder that left `reap_participants` arming the *hangup* name and the
+  hangup callback arming the *reclaim* name — every test still green, every
+  crash point lying about where it fired.
+
+  `reclaim.*` needed a sweeper that is **not the test binary** (every
+  `reap_participants` call in `tests/rendezvous.rs` runs in-process, where arming
+  the site aborts the runner), hence `rendezvous_child`'s new `join-sweep` arm;
+  and its fixture has to kill the **owner**, because a joiner's death fires the
+  hangup callback that collects its record before any sweep can find it.
+  `hangup.*` needed the **owner** armed, where every other crash test arms a
+  joiner.
+
+  **Both were verified against a disarmed site**, and `Kid::wait_within` exists
+  because of what that showed: with the unbounded `Kid::wait`, a site that stops
+  firing produces a 180-second nextest timeout, which says "something hung"
+  rather than "the crash point is now a no-op". Disarmed, the two tests now fail
+  in 0.03 s and 20 s with messages that name the finding.
+
+- **`just owner-migration`** — `docs/PHASE2.md` §12.2's two ownership-migration
+  rows and **§12.3 gate 4b**, which had no artifact. §3.5's migration shipped on
+  2026-08-28 with correctness tests in `crates/tf_tree/tests/rendezvous.rs`, and
+  nothing under `crates/tf_tree_bench/` referenced `owner_lost` or
+  `inherit_ownership` — so a *normative* criterion of a phase recorded
+  **Implemented** could not be evaluated, and `docs/benchmarks/EVIDENCE.md`
+  carried no row for it.
+
+  Five processes, and the split is the design: an **owner** that only serves the
+  rendezvous (killing a publishing owner would stop the data stream, so "zero
+  failed lookups" would be measuring the writer's death), a **writer** that is
+  never killed, an **heir** running §3.5's caller-driven trigger, and read-only
+  **readers** that make no control-plane call at all.
+
+  Measured on this host: kill → a fresh process can join again at **0.6–1.2 ms
+  p50, 1.1–2.0 ms p99**, and **zero failed lookups** in every run.
+
+  **The p99.9 quotient is only weakly evaluable, and the row it feeds says so
+  rather than quoting a number.** It reads 0.976–1.093 at the default five
+  migrations — one run of five past gate 4b's 1.05 — and exactly 1.000 at
+  `--repeat 15`. Those are the same fact: any window wide enough to contain the
+  migration is dominated by steady-state samples, so the quotient's sensitivity
+  *falls* as its sample count rises. It cannot be made both stable and sensitive
+  by tuning the window or the repeat count, and picking the count that passes
+  would be choosing the vacuous end on purpose. The default therefore stays at
+  the sensitive-but-noisy end, the recipe is wired into **no CI workflow**, and
+  re-cutting the criterion is a decision record — `0023` did exactly that for
+  `PHASE4` §7 gate 1, which is the same shape of finding. What is load-bearing
+  and did not move: zero failed lookups, and a per-phase stall count of 510–542
+  per million steady against 517–531 during.
+
+  **Three things it refuses to do quietly.** A run whose writer this host
+  starved exits `INVALID`, not `FAIL` — that is a statement about the scheduler,
+  and charging it to the arena is the misattribution this project has shipped
+  before. A composed-path refusal reporting an *inverted* window is counted and
+  printed separately rather than absorbed. And the gate's arithmetic is asserted
+  to be capable of failing (`gate_arithmetic_is_not_vacuous`), because the first
+  revision used a 750 ms window, made the during-histogram 99.7% steady-state
+  samples, and printed exactly `1.000` on three consecutive runs — a gate that
+  cannot fail, which is the same vacuous-green shape `shm_torture`'s first
+  revision had.
+
 - **`shm_torture --crash-points`** — `docs/PHASE2.md` §11.4's *"a random crash
   point armed in 10% of children"*, which §11.3 and §11.4 could not do for each
   other until both existed. A random site from `tf_tree_core::crash::SITES` and
@@ -151,6 +222,33 @@ is a bug.
   guarantees.
 
 ### Fixed
+
+- **Three release-readiness claims that the 2026-08-17 publish falsified.**
+  `docs/PHASE3.md`'s Appendix B stated in bold that
+  `.github/workflows/wheels.yml` "**has still never executed**" and that its
+  cross-platform rows — musllinux, macOS, Windows, aarch64 — were "unproven".
+  It has run **five times** and was green on `v0.0.3` (2026-08-19) and `v0.0.4`
+  (2026-08-22), with every wheel row succeeding, `abi3.abi3t` present and
+  skipped exactly as §14 specifies, and `publish` succeeding. §14's matching
+  checkbox carried the same stale parenthetical.
+
+  `docs/PHASE3.md` §14 also left **PEP 740 attestations** unticked: they are
+  published, and have been since the first green tag — `wheels.yml`'s `publish`
+  job carries `attestations: write` and `attestations: true` under Trusted
+  Publishing. The row is split rather than ticked, because its SBOM half is
+  genuinely absent.
+
+  `docs/PHASE5.md` §10 listed "release automation (`cargo-dist`, PEP 740
+  attestations, signed tags)" as not done, on the stated premise that "all three
+  are ceremony **until there is a release**" — a premise that expired when the
+  project started publishing. Release automation exists and has run; attestations
+  are published; `cargo-dist` is not owed, because the only binary in the
+  workspace is `publish = false` by decision. **Signed tags are the one item of
+  the three genuinely open** — all four tags are unsigned, checked.
+
+  What remains under §10 is therefore the mdBook site, the SBOM, and signed
+  tags, and the honest reason for the first two is no longer "until there is a
+  release".
 
 - **`doctor`'s zero-counter skip reason named three causes and missed the one a
   running robot is usually in.** `Guard::drop` and `note_err` both early-return

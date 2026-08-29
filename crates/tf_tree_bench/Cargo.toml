@@ -380,3 +380,14 @@ path = "src/bin/dds_report.rs"
 name = "tf2_ratio"
 path = "src/bin/tf2_ratio.rs"
 required-features = ["tf2"]
+
+# **`docs/PHASE2.md` §12.2's two ownership-migration rows, and §12.3 gate 4b** —
+# the normative criterion that had no artifact. §3.5's migration landed on
+# 2026-08-28 with correctness tests in `crates/tf_tree/tests/rendezvous.rs`, but
+# nothing under this crate referenced `owner_lost` or `inherit_ownership`, so the
+# gate's number could not be produced at all. Needs `shm` because ownership is a
+# rendezvous concept and the rendezvous is Linux + `shm`.
+[[bin]]
+name = "owner_migration"
+path = "src/bin/owner_migration.rs"
+required-features = ["shm"]

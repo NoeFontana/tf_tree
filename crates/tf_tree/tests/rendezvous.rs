@@ -75,15 +75,44 @@ impl Kid {
 
     /// Wait for a child that is expected to die on its own, and report how.
     ///
-    /// Only `a_killed_heir_leaves_the_role_for_the_next_survivor` calls this,
-    /// and it is the only test that has a child which dies by itself — every
-    /// other one either parks until [`Kid::kill`] or answers on stdout. Gated on
+    /// Every caller is a crash-point test — a child armed through
+    /// `TF_TREE_CRASH_AT` that aborts at a named instruction instead of parking:
+    /// `a_killed_heir_leaves_the_role_for_the_next_survivor`,
+    /// `a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind`,
+    /// `a_killed_sweeper_leaves_the_record_for_the_next_one` and
+    /// `a_killed_owner_in_its_hangup_callback_leaves_the_role_inheritable`.
+    /// Every other test's child parks until [`Kid::kill`] or answers on stdout.
+    /// **This comment said "Only `a_killed_heir…` calls this" while three other
+    /// tests did** — a doc comment naming its callers has to be re-read when one
+    /// is added, and this one was not. Gated on
     /// the same feature as that test, because without it the crash point is
     /// compiled out, no child dies, and this becomes dead code that fails
     /// `just shm-check`'s `--features shm` clippy row.
     #[cfg(feature = "crash-points")]
     fn wait(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait for the child")
+    }
+
+    /// Wait for a child to die **within a bound**, returning `None` if it is
+    /// still alive at the deadline.
+    ///
+    /// [`Self::wait`] blocks forever, which is the right shape when the child is
+    /// certain to die and the wrong one for a crash-point test: if the site
+    /// stops firing, the armed child reaches its park instead of its abort and
+    /// the test becomes a 180-second nextest timeout. A timeout says "something
+    /// hung"; this says "the site did not fire", which is the actual finding.
+    /// Both new §11.3 tests use it, and both were verified to fail under a
+    /// deliberately disarmed site.
+    #[cfg(feature = "crash-points")]
+    fn wait_within(&mut self, bound: std::time::Duration) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match self.0.try_wait().expect("try_wait") {
+                Some(status) => return Some(status),
+                None if std::time::Instant::now() >= deadline => return None,
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
     }
 
     /// The child's next line. It flushes before it parks, so this returning is
@@ -4756,6 +4785,252 @@ fn a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind() {
             "the surviving arena is not the one the second creator declared"
         );
     }
+}
+
+/// **The facade's half of `crash_tests::the_published_site_list_is_the_one_the_tests_arm`.**
+///
+/// `tf_tree_core` has that gate; `tf_tree` did not, and the two sites that had a
+/// site and no test were both in the list with no completeness check. That is
+/// not a coincidence — it is the loophole.
+///
+/// **It pins index to name, not just the set**, and that is the whole point.
+/// The facade arms its sites *by index* — `CRASH_SITES[0]` at `open.rs`'s
+/// takeover, `[1]` at `tree.rs`'s topology lock, `[4]` at `reap_participants`,
+/// `[5]` at the hangup callback — so a set-equality assertion would still pass
+/// after somebody reordered the array, at which point `reap_participants` arms
+/// the *hangup* name and the hangup callback arms the *reclaim* name. Every
+/// test in this file would keep passing while every crash point lied about
+/// where it fired.
+#[cfg(feature = "crash-points")]
+#[test]
+fn the_facade_site_list_is_pinned_by_index_and_every_site_has_a_test() {
+    // The order is load-bearing: these are the indices the `maybe_abort` calls
+    // use. Changing one here without changing its call site is the drift this
+    // test exists to catch.
+    const EXPECTED: &[&str] = &[
+        "takeover.after_ownership_lock_before_bind",
+        "topo.holding_lock",
+        "open.after_ownership_lock_before_bind",
+        "open.after_create_before_bind",
+        "reclaim.after_probe_before_cas",
+        "hangup.after_probe_before_cas",
+    ];
+    assert_eq!(
+        tf_tree::CRASH_SITES.len(),
+        EXPECTED.len(),
+        "a site was added to or removed from tf_tree::CRASH_SITES without updating \
+         this gate - and every arming site names an *index*, so the new list must be \
+         checked against its call sites, not just against this array"
+    );
+    for (i, want) in EXPECTED.iter().enumerate() {
+        assert_eq!(
+            &tf_tree::CRASH_SITES[i],
+            want,
+            "CRASH_SITES[{i}] moved. The `maybe_abort(CRASH_SITES[{i}])` call site \
+             now arms a different protocol point than its name says."
+        );
+    }
+
+    // **Which test arms each site, as data.** This cannot *prove* a test fires
+    // a site — a unit test cannot observe that — and an earlier revision
+    // pretended otherwise: it asserted set membership against a list
+    // character-for-character identical to `EXPECTED` above, which the index
+    // loop had already checked element by element. That half could never fail
+    // while the first half passed. It was a tautology inside the very test
+    // whose docstring claims to close a vacuous-gate loophole.
+    //
+    // What it does instead is make the mapping *reviewable*, and force an edit:
+    // a seventh site fails the length assertion above, and whoever fixes that
+    // has to name the test that arms it here or leave the name empty, which
+    // fails below. The enforcement is a person reading a diff, and saying so is
+    // better than a green assertion that checks nothing.
+    const ARMED_BY: &[(&str, &str)] = &[
+        (
+            "takeover.after_ownership_lock_before_bind",
+            "a_killed_heir_leaves_the_role_for_the_next_survivor",
+        ),
+        (
+            "topo.holding_lock",
+            "a_killed_topology_holder_leaves_a_word_the_next_acquirer_steals",
+        ),
+        (
+            "open.after_ownership_lock_before_bind",
+            "a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind",
+        ),
+        (
+            "open.after_create_before_bind",
+            "a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind",
+        ),
+        (
+            "reclaim.after_probe_before_cas",
+            "a_killed_sweeper_leaves_the_record_for_the_next_one",
+        ),
+        (
+            "hangup.after_probe_before_cas",
+            "a_killed_owner_in_its_hangup_callback_leaves_the_role_inheritable",
+        ),
+    ];
+    assert_eq!(
+        ARMED_BY.len(),
+        tf_tree::CRASH_SITES.len(),
+        "a site was added without naming the test that arms it"
+    );
+    for (i, (site, test)) in ARMED_BY.iter().enumerate() {
+        assert_eq!(
+            site,
+            &tf_tree::CRASH_SITES[i],
+            "the arming table is out of order with CRASH_SITES at index {i}"
+        );
+        assert!(
+            !test.is_empty(),
+            "{site} is published in tf_tree::CRASH_SITES with no test named for it. \
+             A site nothing fires is a crash point whose repair claim has never been \
+             executed - which is what docs/PHASE2.md §11.3 recorded for two sites \
+             until 2026-08-29."
+        );
+    }
+}
+
+/// §11.3 `reclaim.after_probe_before_cas`: a sweeper killed between judging a
+/// record dead and claiming it.
+///
+/// **The site had no test because every sweep in this suite runs in-process**,
+/// where arming it would abort the test runner rather than the participant under
+/// test. `join-sweep` (`src/bin/rendezvous_child.rs`) is the missing half: a
+/// *separate* process that calls `Tree::reap_participants` on demand.
+///
+/// The repair claim §11.3 makes is that the record survives the sweeper's death
+/// intact — the reclaim is a CAS that either happened or did not, and a corpse
+/// between the probe and the CAS leaves the table exactly as it found it. So a
+/// second sweeper afterwards must still find work to do.
+#[cfg(all(feature = "crash-points", feature = "unstable"))]
+#[test]
+fn a_killed_sweeper_leaves_the_record_for_the_next_one() {
+    let dir = Scratch::new("reclaim-crash");
+
+    // **The corpse must be the owner, and that is the whole fixture.** A
+    // *joiner*'s death fires the owner's hangup callback, which collects its
+    // record within milliseconds - so a sweeper started afterwards finds nothing
+    // to reclaim, never reaches the site, and parks instead of aborting. Nothing
+    // hangs up on an owner, so an owner's slot is the one that sits stale until
+    // somebody sweeps. `a_survivor_reaps_the_killed_owners_slot_which_no_hangup_can`
+    // establishes the same fixture for the un-armed case.
+    let mut doomed_owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(doomed_owner.line().starts_with("owning"));
+
+    // Both sweepers join while the owner is still serving.
+    let mut doomed = Kid::spawn_with_env(
+        &dir.0,
+        &["join-sweep"],
+        &[("TF_TREE_CRASH_AT", "reclaim.after_probe_before_cas:1")],
+    );
+    assert!(doomed.line().starts_with("joined "));
+    let mut second = Kid::spawn(&dir.0, &["join-sweep"]);
+    assert!(second.line().starts_with("joined "));
+
+    // Now the record that no hangup will ever collect.
+    doomed_owner.kill();
+
+    // The armed sweeper reaches the site because there is finally something to
+    // reclaim, and dies between the probe and the CAS.
+    doomed.poke();
+    let status = doomed
+        .wait_within(std::time::Duration::from_secs(20))
+        .expect("the armed sweeper neither aborted nor finished within 20s");
+    assert_eq!(
+        status.code(),
+        None,
+        "the armed sweeper exited normally instead of aborting: {status:?}. It \
+         reaches the site only if the sweep finds a reclaimable record, so an \
+         orderly exit here means either the fixture produced none, or \
+         `reclaim.after_probe_before_cas` has stopped firing."
+    );
+
+    // The repair: the first sweeper died before its CAS landed, so the record is
+    // still there and the next sweeper still has work.
+    second.poke();
+    let report = second.line();
+    let swept: usize = report
+        .strip_prefix("swept ")
+        .expect("the second sweeper did not report")
+        .trim()
+        .parse()
+        .expect("a count");
+    // **Two, not one, and the difference is the whole assertion.** The armed
+    // sweeper aborted, which releases *its own* byte and leaves *its own*
+    // record reclaimable — so `swept >= 1` holds whether or not the killed
+    // sweep lost the owner's record, and an earlier revision asserted exactly
+    // that and could not fail. Mutating `reap_participants` to publish its
+    // reclaim before the CAS would have kept it green.
+    //
+    // Two records are reclaimable here and only two: the killed owner's (which
+    // no hangup collects) and the killed sweeper's. Nothing else in this test
+    // has died, and nothing else sweeps.
+    assert!(
+        swept >= 2,
+        "the second sweeper reclaimed {swept} record(s), expected the killed \
+         owner's *and* the killed sweeper's ({report:?}). One means the armed \
+         sweeper's half-finished reclaim consumed the owner's record instead of \
+         leaving it for the next sweep - which is the repair claim
+         `reclaim.after_probe_before_cas` makes."
+    );
+}
+
+/// §11.3 `hangup.after_probe_before_cas`: the **owner** killed inside its own
+/// hangup callback, between judging a departed peer's record and reclaiming it.
+///
+/// The site had no test for a different reason than the reclaim one: every
+/// existing crash test arms a *joiner*, and this window only opens in the
+/// process that is serving the rendezvous. `Kid::spawn_with_env` on the `own`
+/// arm is all it needed.
+///
+/// §11.3's repair claim is that the owner's death releases byte 0 with no
+/// cooperation, so the role is inheritable and the half-reclaimed record is
+/// left for the next sweep rather than corrupted.
+#[cfg(all(feature = "crash-points", feature = "unstable"))]
+#[test]
+fn a_killed_owner_in_its_hangup_callback_leaves_the_role_inheritable() {
+    let dir = Scratch::new("hangup-crash");
+
+    // The owner is the armed one this time.
+    let mut owner = Kid::spawn_with_env(
+        &dir.0,
+        &["own"],
+        &[("TF_TREE_CRASH_AT", "hangup.after_probe_before_cas:1")],
+    );
+    assert!(owner.line().starts_with("owning"));
+
+    // A survivor that can inherit once the owner dies.
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    assert!(heir.line().starts_with("joined "));
+
+    // A joiner whose departure fires the owner's hangup callback - and the
+    // owner is armed to abort inside it.
+    let mut departing = Kid::spawn(&dir.0, &["join-heir"]);
+    assert!(departing.line().starts_with("joined "));
+    departing.kill();
+
+    let status = owner
+        .wait_within(std::time::Duration::from_secs(20))
+        .expect(
+            "the armed owner was still alive 20s after a joiner departed: its hangup \
+         callback either never ran or no longer passes \
+         `hangup.after_probe_before_cas`",
+        );
+    assert_eq!(
+        status.code(),
+        None,
+        "the armed owner exited normally instead of aborting inside its hangup \
+         callback: {status:?}"
+    );
+
+    // The repair: byte 0 was released by the kernel, so the survivor inherits.
+    heir.poke();
+    let report = heir.line();
+    assert!(
+        report.contains("Inherited") || report.contains("Contended"),
+        "no survivor could take the role after the owner died mid-hangup: {report:?}"
+    );
 }
 
 #[cfg(feature = "crash-points")]
