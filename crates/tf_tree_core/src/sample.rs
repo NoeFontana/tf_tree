@@ -127,14 +127,17 @@ impl SampleRing<'_> {
                     oldest: t_old,
                     newest: t_new,
                 }),
-                ExtrapPolicy::Hold => self.read_slot((newest & self.mask) as usize),
+                ExtrapPolicy::Hold => self
+                    .read_slot((newest & self.mask) as usize)
+                    .and_then(|p| self.revalidated(newest, retained, p)),
                 ExtrapPolicy::ConstantTwist => self
                     .constant_twist(lo_logical, newest, t, t_new)
                     .map(|(pose, _)| pose),
             };
         }
         if t == t_new {
-            return self.read_slot((newest & self.mask) as usize);
+            let p = self.read_slot((newest & self.mask) as usize)?;
+            return self.revalidated(newest, retained, p);
         }
 
         let i = self.bracket(lo_logical, newest, t);
@@ -161,6 +164,34 @@ impl SampleRing<'_> {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
         Ok(result)
+    }
+
+    /// Hand back `v` unless the ring lapped past logical index `i` while it was
+    /// being read.
+    ///
+    /// **One spelling of the check, because there are seven places that need it
+    /// and six of them did not have it.** The interpolating tail of
+    /// [`Self::sample`] and the main path of [`Self::constant_twist`] performed
+    /// it inline; every arm that *short-circuits* — `Hold`, an exact hit on the
+    /// newest stamp, `constant_twist`'s single-sample case — returned
+    /// `read_slot` directly, so a reader descheduled long enough for the ring to
+    /// lap got a pose belonging to a different stamp. Silently, and next to a
+    /// path that returns [`LookupError::SlotRecycled`] for the same race four
+    /// lines away.
+    ///
+    /// The exact-newest arms are the sharp ones: a caller that named a stamp can
+    /// be handed the pose of a different one, where naming an *interior* stamp
+    /// is refused. A 64-slot ring — `Capacity::slots(64)`, which the ABI cost
+    /// fixture uses — laps in 64 ms at 1 kHz, which is one ordinary preemption.
+    ///
+    /// The bound is `retained`, not `capacity`: `head - i == capacity` already
+    /// means slot `i` is the one `push` is overwriting.
+    #[inline(always)]
+    fn revalidated<T>(&self, i: u64, retained: u64, v: T) -> Result<T, LookupError> {
+        if self.head.load(Ordering::Acquire) - i > retained {
+            return Err(LookupError::SlotRecycled { edge: self.edge });
+        }
+        Ok(v)
     }
 
     /// Sample at stamp `t` like [`Self::sample`], but resume the bracket search
@@ -213,7 +244,9 @@ impl SampleRing<'_> {
                     oldest: t_old,
                     newest: t_new,
                 }),
-                ExtrapPolicy::Hold => self.read_slot((newest & self.mask) as usize),
+                ExtrapPolicy::Hold => self
+                    .read_slot((newest & self.mask) as usize)
+                    .and_then(|p| self.revalidated(newest, retained, p)),
                 ExtrapPolicy::ConstantTwist => self
                     .constant_twist(lo_logical, newest, t, t_new)
                     .map(|(pose, _)| pose),
@@ -221,7 +254,8 @@ impl SampleRing<'_> {
         }
         if t == t_new {
             *cursor = newest;
-            return self.read_slot((newest & self.mask) as usize);
+            let p = self.read_slot((newest & self.mask) as usize)?;
+            return self.revalidated(newest, retained, p);
         }
 
         // Here t_old <= t < t_new, so the window endpoints already bracket `t`
@@ -516,7 +550,8 @@ impl SampleRing<'_> {
                 ExtrapPolicy::Hold => {
                     // The pose is pinned, so the velocity really is zero. This is
                     // not a fallback — it is the derivative of what Hold does.
-                    return Ok((self.read_slot((newest & self.mask) as usize)?, Twist::ZERO));
+                    let p = self.read_slot((newest & self.mask) as usize)?;
+                    return self.revalidated(newest, retained, (p, Twist::ZERO));
                 }
                 ExtrapPolicy::ConstantTwist => {
                     // Degraded to Hold: there is a pose to extend from but no
@@ -602,7 +637,8 @@ impl SampleRing<'_> {
     ) -> Result<(Iso3, Twist), LookupError> {
         if newest == lo_logical {
             // Only one sample retained: no twist to extend.
-            return Ok((self.read_slot((newest & self.mask) as usize)?, Twist::ZERO));
+            let p = self.read_slot((newest & self.mask) as usize)?;
+            return self.revalidated(newest, self.retained(), (p, Twist::ZERO));
         }
         let prev = newest - 1;
         let t_prev = self.stamp_at(prev);

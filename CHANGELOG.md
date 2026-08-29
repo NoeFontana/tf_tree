@@ -35,6 +35,23 @@ is a bug.
 
 ### Fixed
 
+- **An exact query returns the pose of the stamp it named, or refuses.**
+  `SampleRing::sample`'s `# Errors` promises `SlotRecycled` when the ring lapped
+  the reader mid-read, and the interpolating tail enforced it — but every arm
+  that *short-circuits* returned the slot directly: `ExtrapPolicy::Hold`, an
+  exact hit on the **newest** stamp (in both `sample` and `sample_from`),
+  `sample_with_twist_seeking`'s `Hold`, and `constant_twist`'s single-sample
+  case. Six return sites. A reader descheduled long enough for the ring to lap
+  got a complete, valid pose belonging to a **different stamp** — the seqlock
+  catches a torn slot, not a recycled one — while naming an *interior* stamp
+  four lines away was refused for exactly the same race.
+
+  The sharp one is the exact-newest pair: a caller that names a stamp can be
+  handed the pose of another. A 64-slot ring — `Capacity::slots(64)`, what the
+  ABI cost fixture uses — laps in 64 samples, which is one ordinary preemption
+  at 1 kHz. One shared `revalidated` helper now covers all six, so there is one
+  spelling of the check rather than seven.
+
 - **`tf_tree tree`'s `age(ms)` column is measured against a real clock.** It
   was `fixture::NOW_NS - newest` — the in-process benchmark rig's synthetic
   "now", `9_900_000_000`. Against a live arena that number is arbitrary

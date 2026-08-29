@@ -92,6 +92,98 @@ fn push_then_sample_exact_and_interpolated() {
     assert_eq!(mid.to_bits(), expect.to_bits());
 }
 
+/// **An exact query returns the pose of the stamp it named, or refuses.**
+///
+/// `SampleRing::sample`'s `# Errors` promises `SlotRecycled` when "the ring
+/// lapped the reader mid-read", and the interpolating tail enforced it. Every
+/// arm that *short-circuits* did not: `Hold`, an exact hit on the **newest**
+/// stamp, and `constant_twist`'s single-sample case returned `read_slot`
+/// directly. So a reader descheduled long enough for the ring to lap got a
+/// complete, valid pose belonging to a **different stamp** — the seqlock catches
+/// a torn slot, not a recycled one — while naming an *interior* stamp four lines
+/// away was refused for exactly the same race.
+///
+/// The witness is the pose itself: `x == stamp`, so "the pose of the stamp I
+/// asked for" is a value the reader can check.
+///
+/// **Mutant, run:** revert `sample`'s exact-newest arm to a bare
+/// `self.read_slot((newest & self.mask) as usize)`. **8 runs of 8 fail** with a
+/// pose whose `x` names a different stamp; with the check restored, 8 of 8 pass
+/// the full 200 000 iterations.
+///
+/// **`CAP` is 8 and that is the measurement, not a guess.** At 64 the same
+/// mutant failed only 2 runs of 3 — a detector that misses one time in three is
+/// one a tired reader deletes as flaky. A short ring laps sooner, so the window
+/// between resolving `newest` from `head` and reading its slot is crossed far
+/// more often. Nothing about the defect depends on the capacity: a 64-slot ring
+/// — `Capacity::slots(64)`, what the ABI cost fixture uses — laps in 64 samples,
+/// which is one ordinary preemption at 1 kHz.
+#[test]
+fn an_exact_query_never_returns_another_stamps_pose() {
+    use core::sync::atomic::{AtomicBool, AtomicI64, Ordering as O};
+
+    const CAP: usize = 8;
+    const ROUNDS: i64 = 200_000;
+
+    let hr = HeapRing::new(CAP);
+    let at = |k: i64| Iso3 {
+        q: tf_tree_math::Quat::IDENTITY,
+        t: tf_tree_math::Vec3 {
+            x: k as f64,
+            y: 0.0,
+            z: 0.0,
+        },
+    };
+
+    let stop = AtomicBool::new(false);
+    let bad = AtomicI64::new(-1);
+    hr.ring().push(0, &at(0)).unwrap();
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // Until told to stop: a writer that finishes first leaves a ring
+            // that cannot lap, which is the state where this race cannot happen.
+            let ring = hr.ring();
+            let mut k = 1i64;
+            while !stop.load(O::Relaxed) {
+                ring.push(k, &at(k)).unwrap();
+                k += 1;
+            }
+        });
+
+        let ring = hr.ring();
+        for _ in 0..ROUNDS {
+            let Some(newest) = ring.newest_stamp() else {
+                continue;
+            };
+            for policy in [ExtrapPolicy::Error, ExtrapPolicy::Hold] {
+                // `newest` may already be stale by now, which is the point: the
+                // ring is allowed to have lapped, and the only two acceptable
+                // answers are the right pose or a refusal.
+                match ring.sample::<LerpSlerp>(newest, policy) {
+                    Ok(p) if (p.t.x - newest as f64).abs() > 1e-9 => {
+                        bad.store(newest, O::Release);
+                        stop.store(true, O::Release);
+                    }
+                    _ => {}
+                }
+            }
+            if stop.load(O::Relaxed) {
+                break;
+            }
+        }
+        stop.store(true, O::Release);
+    });
+
+    let k = bad.load(O::Acquire);
+    assert_eq!(
+        k, -1,
+        "an exact query for stamp {k} was answered with another stamp's pose: \
+         the ring lapped past the slot mid-read and the short-circuit arm \
+         returned it anyway, where the interpolating path returns SlotRecycled"
+    );
+}
+
 #[test]
 fn empty_ring_is_no_data() {
     let hr = HeapRing::new(4);
