@@ -3132,7 +3132,14 @@ fn a_tagged_query_is_the_typed_query_with_the_domain_as_data() {
 /// Probabilistic even so: the window is one fold. The monotonicity argument at
 /// the call site is what carries the guarantee; this is what would notice the
 /// order being changed back.
+/// **Ignored under Miri**, which is not a gap in coverage: the harness runs
+/// 200 000 rounds against a writer thread that spins until told to stop, and
+/// Miri interprets every atomic. It does not finish — measured at 28 minutes and
+/// still running against a job that normally takes five, which is how it was
+/// found. The property this guards is an *ordering* one and Miri is not the tool
+/// for it; `just loom` is where interleavings are argued.
 #[test]
+#[cfg_attr(miri, ignore = "200k rounds against a spinning writer does not finish")]
 fn by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented() {
     use core::sync::atomic::{AtomicBool, AtomicI64, Ordering as O};
 
