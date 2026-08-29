@@ -43,8 +43,13 @@ is a bug.
   `IngestError::Mcap` — "the file is not a well-formed MCAP recording" — about a
   file that may be perfectly well formed.
 
-  The variant carries `declared` **and** `ceiling`, so the number to pass to
-  `--max-record-size` is in the error rather than guessable. The default is
+  The variant carries `declared` **and** `ceiling`, so the size refused and the
+  limit it met are both in the error rather than guessable. **They are bytes, and
+  `--max-record-size` takes MiB** (`value_name = "MIB"`, multiplied by 1024x1024
+  in `tf_tree_cli`): pasting `ceiling` straight into the flag asks for a limit
+  1048576 times larger than intended. An earlier revision of this entry said "the
+  number to pass to `--max-record-size` is in the error", which is exactly the
+  mistake that phrasing would cause. The default is
   `DEFAULT_MAX_RECORD_BYTES` = 256 MiB, **unchanged**, so no existing caller's
   behaviour moves; what changes is that the person who meets it can raise it
   without forking the crate — which is the argument `ChunkLimits` already won for
@@ -313,7 +318,7 @@ is a bug.
   exactly the investigation it exists for, where the zero is the documented
   "there was no recording". **A wrong digest is worse than an absent one.**
 
-  Five of `IngestOptions`' ten fields are keywords. `max_record_bytes` is among
+  Five of `IngestOptions`' eleven fields are keywords. `max_record_bytes` is among
   them for `docs/decisions/0010`'s own stated reason — it was added so "the
   person who meets it can raise it without forking the crate", which does not
   hold for §4's audience if the knob is reachable only from Rust.
@@ -807,12 +812,17 @@ is a bug.
 - **`tf_tree_ipc::Open::already_attached`, the takeover arm it reached, and
   `Open::register_any` are deleted**
   (#275, closes #201, [`0037`](docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
-  `LockFile::take_any_participant` survives with no production caller; `IpcError`
-  and `OpenOutcome` are unchanged as types; and `tf_tree`'s `TookOver` arm keeps
-  the `OpenError::TakeoverUnsupported` refusal it has carried since #229
-  (`0028` step 9), now unreachable and kept deliberately rather than made
-  `unreachable!()` — it is what stands between an heir and a forked tree the day
-  §3.5 gives the variant a producer (`crates/tf_tree/src/open.rs`).
+  `LockFile::take_any_participant` survives with no production caller.
+
+  **The rest of this entry was written before #278 and is corrected here rather
+  than left contradicting the entry ten lines above.** It said `IpcError` and
+  `OpenOutcome` were "unchanged as types" and that `tf_tree` keeps an
+  `OpenError::TakeoverUnsupported` refusal. All three are false at this release:
+  `OpenOutcome::TookOver` is deleted, `OpenError::TakeoverUnsupported` is deleted
+  (both recorded above), and `IpcError::ArenaHeldButUnreachable` gained an
+  `ownership_held: bool` field. On a `0.0.x` line this section is a consumer's
+  whole migration guide, so an entry telling them a deleted variant survives is
+  the costliest kind of stale claim.
   The arm handed back the first **free**
   participant byte while the caller's arena record was elsewhere, and could not be
   repaired in place — `0037` carries the five executed unsound states, the
@@ -821,10 +831,13 @@ is a bug.
   **Ownership migration (§3.5) was therefore not implemented, and had no path at
   all — until the entry below.** `0037` moved from `draft` to `implemented` in
   the same release: the deletion recorded here is half of the change, and
-  `Session::take_over_ownership` is the other half. What is written above about
-  the deleted arm stands; what no longer holds is that `TakeoverUnsupported` is
-  "what stands between an heir and a forked tree", because the heir that shipped
-  keeps its existing mapping and never constructs an arena at all.
+  `Session::take_over_ownership` is the other half. **This paragraph used to say
+  "what is written above about the deleted arm stands", retracting only the
+  rationale** — which preserved the very claim that was wrong, since
+  `TakeoverUnsupported` had been deleted by #278 by then. The refusal does not
+  exist, and it was never "what stands between an heir and a forked tree" either:
+  the heir that shipped keeps its existing mapping and never constructs an arena
+  at all.
 
 - **The topology lock's error surface changes shape** (#213, `0029`).
   `ReparentError::LockContended`'s `owner_slot` is `Option<u32>`, not `u32`, so

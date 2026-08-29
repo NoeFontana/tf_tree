@@ -566,6 +566,13 @@ jobs:
             echo "release ${tag} exists; updating notes and re-uploading assets"
             gh release edit "$tag" --notes-file NOTES.md
             gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+            # **`--draft=false` here too, and its absence made this whole branch
+            # a trap.** The state a re-run actually lands in is the one the
+            # `else` arm creates and then fails to finish: a *draft* with some
+            # assets. Without this line the recovery path uploaded the rest,
+            # left the release invisible, and exited 0 — reporting success for a
+            # release nobody can see. Idempotent when it is already published.
+            gh release edit "$tag" --draft=false
           else
             # **`--draft`, then publish once the assets are up.** `gh release
             # create` creates a *published* release and then uploads the five

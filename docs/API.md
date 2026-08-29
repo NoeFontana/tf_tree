@@ -686,7 +686,7 @@ while it was enforced on the raw walk.
 
 | constant | bounds | a slot costs | value |
 |---|---|---|---|
-| `MAX_DEPTH` | the **compiled** plan — `Plan`'s `[Step; MAX_DEPTH]`, counted after folding | **128 B**, in every `Plan`, in a 16-slot thread-local cache, and behind every Python `Plan` | **32** |
+| `MAX_DEPTH` | the **compiled** plan — `Plan`'s `[Step; MAX_DEPTH]`, counted after folding | **64 B** per `Step` since [`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md) dropped `Iso3`'s `align(64)` (`Step` 128 → 64, `Plan` 4160 → 2064, the 16-slot thread-local cache 66.0 → 32.6 KiB); this cell said 128 B, which was the pre-`0042` figure | **32** |
 | `MAX_PATH_EDGES` | the **raw walk** — edges visited on both sides of the common ancestor | **4 B**, in `compile`'s stack frame, on a call D3 already places off the hot path | **64** |
 
 **A binding may not invent a third bound and may not hide these two.** Both are
