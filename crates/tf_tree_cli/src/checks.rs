@@ -525,7 +525,26 @@ impl PushStream {
 /// where it is *guaranteed*: `tf_tree_ingest::run` pushes and never reads, so it
 /// hands back an arena that has served no lookups at all. The reference fixture
 /// does the same (`fixture::spin_up` publishes; nothing calls `Plan::at`), and a
-/// live arena at bringup, before its first consumer, is in the same state. So
+/// live arena at bringup, before its first consumer, is in the same state.
+///
+/// **A fourth state was missing from the message until 2026-08-29, and it is the
+/// one a running robot is usually in.** `Guard::drop` and `note_err` both
+/// early-return on a non-writable view, so a **read-only** participant records
+/// nothing — writing a counter is a write. Read-only is the consumer default
+/// (D18), so a publish-only publisher beside read-only consumers leaves every
+/// counter at zero *while consumers are actively looking up*. The message named
+/// only the three source-shaped causes and closed with "a live arena reaches it
+/// before its first consumer", which carries the false implicature that the
+/// state ends once a consumer attaches. It does not. The predicate is right —
+/// it reads the evidence, not the source — and the prose sent the operator to
+/// the wrong remedy.
+///
+/// `docs/PHASE5.md` §5.5's amendment justifies the design with "`doctor` reports
+/// what the *writable* participants recorded, which on a real robot is the
+/// bridge and every publisher — the processes whose failures the counters are
+/// mostly about". That does not hold for `TFT010` and `TFT011`, which are about
+/// **consumer** behaviour: a counter is incremented by a *lookup*, and a bridge
+/// does not look up. So
 /// the predicate is read off **the evidence itself** rather than off the source
 /// — which is what keeps a fifth `Source` from silently reintroducing the bug,
 /// and what makes the answer right for a live arena nobody is reading yet.
@@ -559,11 +578,18 @@ pub fn no_counter_evidence(counters: bool, stats: &[EdgeStats]) -> Option<&'stat
         .sum();
     if lookups == 0 {
         return Some(
-            "this arena has served no lookups — every EdgeCounter reads zero — so the counters \
-             cannot distinguish a healthy arena from an unexercised one, and a pass here would \
-             be an all-clear about nothing. An arena built from a recording (--from-bag, \
-             tf_tree ingest, tf_tree freeze) is written and never read, so it is always in this \
-             state; a live arena reaches it before its first consumer",
+            "no *writable* participant has served a lookup — every EdgeCounter reads zero — so \
+             the counters cannot distinguish a healthy arena from an unexercised one, and a \
+             pass here would be an all-clear about nothing. Four states produce it, and the \
+             fourth is the one a running robot is usually in: an arena built from a recording \
+             (--from-bag, tf_tree ingest, tf_tree freeze) is written and never read; a live \
+             arena reaches it before its first consumer; a publish-only node never looks up \
+             what it writes; and **a read-only consumer cannot record a counter at all** — \
+             writing one is a write, and read-only is the consumer default (D18). So consumers \
+             may be hammering this arena while every counter reads zero. `tf_tree \
+             participants` shows which attachments are rw and which are ro; if they are all \
+             ro, attaching one read-write consumer is what produces evidence, at the cost of \
+             the MMU protection D18 exists for",
         );
     }
     None
@@ -4918,10 +4944,29 @@ mod tests {
         }];
         let inp = inputs(&snap, &obs, &unexercised, Clock::Wall(0));
         match tft010(&inp).status {
-            Status::Skipped(why) => assert!(
-                why.contains("served no lookups"),
-                "the skip must name the reason a reader can act on: {why}"
-            ),
+            Status::Skipped(why) => {
+                assert!(
+                    why.contains("served a lookup"),
+                    "the skip must name the reason a reader can act on: {why}"
+                );
+                // **The read-only cause specifically**, because it is the one a
+                // running robot is usually in and the one the message omitted
+                // until 2026-08-29: a `PROT_READ` consumer cannot record a
+                // counter — writing one is a write — and read-only is the
+                // consumer default. Without this clause the message named three
+                // source-shaped causes and closed with "a live arena reaches it
+                // before its first consumer", which reads as *the state ends
+                // when a consumer attaches*. It does not.
+                assert!(
+                    why.contains("read-only consumer cannot record a counter"),
+                    "the deployment-shaped cause is the one an operator meets: {why}"
+                );
+                assert!(
+                    why.contains("tf_tree participants"),
+                    "a reason without the command that tells rw from ro is not \
+                     actionable: {why}"
+                );
+            }
             other => panic!("an arena nobody has read must not report a verdict: {other:?}"),
         }
 
@@ -4965,7 +5010,7 @@ mod tests {
         match tft011(&inp).status {
             Status::Skipped(why) => {
                 assert!(
-                    why.contains("served no lookups"),
+                    why.contains("served a lookup"),
                     "the counter half's reason is missing: {why}"
                 );
                 assert!(
@@ -5013,7 +5058,7 @@ mod tests {
             ..EdgeStats::default()
         }];
         let on = no_counter_evidence(true, &unexercised).expect("zero counters carry no verdict");
-        assert!(on.contains("served no lookups"), "{on}");
+        assert!(on.contains("served a lookup"), "{on}");
 
         // A failed lookup counts as exercise just as much as a successful one:
         // it is the same increment site.

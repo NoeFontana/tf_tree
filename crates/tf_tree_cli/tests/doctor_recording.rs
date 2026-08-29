@@ -403,7 +403,7 @@ fn a_bag_built_arena_skips_the_counter_checks_rather_than_passing_them() {
 
     // The counter half's expected sentence, whichever build this is.
     let counter_reason = if json.contains("\"counters_compiled_in\": true") {
-        "served no lookups"
+        "served a lookup"
     } else {
         "`counters` feature"
     };
