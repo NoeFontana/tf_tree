@@ -79,9 +79,27 @@ build — `crates/tf_tree/tests/batch.rs` compares batch against scalar in the
 moves. Anyone adopting the flag owes a **cross-build** differential, and it must
 carry a non-vacuity guard, because two identical codegens agree trivially: this
 record's own words about the spike were "without that guard the whole exercise is
-vacuous. Any implementation must keep it." Counting `%ymm` in the disassembly —
-zero at baseline, non-zero under the flag — is the guard that shows the two
-builds really differ.
+vacuous. Any implementation must keep it."
+
+**The obvious spelling of that guard does not work, and this paragraph carried it
+for one commit.** It said to count `%ymm` in the disassembly and require *zero at
+baseline*. Measured on this host, a baseline `target/release` binary of
+`owner_migration` — no `-C target-cpu` — contains **3 463** `%ymm` instructions,
+and per-symbol attribution accounts for every one of them:
+`_blake3_hash_many_avx2` 1 475, `_blake3_hash_many_avx512` 1 008,
+`_blake3_xof_many_avx512` 980. `blake3` ships hand-written AVX2 and AVX-512
+kernels and dispatches to them at **runtime**, so `-C target-cpu` never selects
+them and their instructions are present whatever the flag says. A whole-binary
+count therefore fails the guard on its first run at baseline, forever — and
+softening it to "the count increased" fails the other way, because the delta is
+dominated by a dependency the flag does not touch and can move, or fail to move,
+for reasons unrelated to the arithmetic under test.
+
+**The guard has to be attributable to the functions being compared.** Count
+`%ymm` **per symbol**, over only the symbols the differential evaluates —
+`LerpSlerp::eval`, `ScLerp::eval`, `slerp`, `exp_se3`/`log_se3` — which
+`objdump -d | awk` by symbol gives directly, and which is how the 3 463 above was
+attributed in the first place.
 
 **Corrected on the way out.** `crates/tf_tree_math/src/lib.rs` claimed its
 "property tests run under Miri in seconds". They do not, and never have: `just
