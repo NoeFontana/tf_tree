@@ -94,9 +94,11 @@ Three things in there are deliberate and surprise people:
   it many times is the fast path; `lookup()` by name is the convenience that
   caches a plan for you.
 * **Errors are `Copy` identifiers that name the offending edge**, not formatted
-  strings — a program branches on them, and the prose is a separate layer. Note
-  what that costs: `LookupError` deliberately does **not** implement
-  `std::error::Error`, so it does not convert into `Box<dyn Error>` with `?`.
+  strings — a program branches on them, and the prose is a separate layer. They
+  implement `Display` and `std::error::Error` as well, so `?` into
+  `Box<dyn Error>` works and the identifier is still there to match on. The
+  prose layer, `Described`, is what resolves a `FrameId` to the name a human
+  reads.
 
 ## Linux-first
 

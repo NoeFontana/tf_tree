@@ -1109,10 +1109,22 @@ fn cmd_tree(live: Live<'_>) -> Result<()> {
     );
 
     // Index edges by child frame so we can annotate each frame with its edge.
+    // **The reference clock, not `fixture::NOW_NS`.** The age column measured
+    // against the benchmark fixture's synthetic constant (9.9 s), so on any
+    // arena a robot actually runs — whose stamps are Unix nanoseconds, eighteen
+    // orders of magnitude larger — `(NOW_NS - s).max(0)` clamped to `0` for
+    // every edge, and the column read `0` whether the publisher had stopped a
+    // second or a month ago. `Clock::decide` is the estimator `doctor` and `top`
+    // already share: the wall clock when the arena's stamps vote for it, the
+    // median stamp when they do not, which keeps the fixture's own numbers
+    // meaningful too. `cmd_echo` had solved the same problem ad hoc, one
+    // function below.
+    let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
     println!(
         "  {:<22} {:>5} {:<8} {:>9} {:>12} {:>10} {:>8}",
         "frame", "depth", "kind", "rate(Hz)", "occupancy", "age(ms)", "writer"
     );
+    println!("  age(ms) is measured against the {}\n", clock.label());
     for f in &snap.frames {
         let indent = "  ".repeat(f.depth as usize);
         let edge = snap.edges.iter().find(|e| e.child == f.id);
@@ -1141,7 +1153,7 @@ fn cmd_tree(live: Live<'_>) -> Result<()> {
                 };
                 let age = e
                     .newest_stamp
-                    .map(|s| format!("{}", (fixture::NOW_NS - s).max(0) / 1_000_000))
+                    .map(|s| format!("{}", (clock.nanos() - s).max(0) / 1_000_000))
                     .unwrap_or_default();
                 let writer = if e.claimed {
                     format!("pid {}", e.owner_pid)

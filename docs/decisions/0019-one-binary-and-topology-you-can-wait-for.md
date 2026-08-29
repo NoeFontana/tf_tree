@@ -185,13 +185,18 @@ let [target, source] =
 let plan = tree.plan(target, source)?;
 ```
 
-> **`text`, not `rust`, deliberately.** The three calls yield `OpenError`,
-> `AwaitError` and `LookupError`, and `LookupError` implements neither `Display`
-> nor `Error` — `tf_tree_core` has no `Display` impl anywhere and no `thiserror`
-> — so no single `?`-chain unifies them, not even into `Box<dyn Error>`. The
-> first revision of this record printed this block as compilable Rust. It is
-> not, and fixing that belongs to a separate decision about giving
-> `tf_tree_core`'s errors real `Display` impls, not to this one.
+> **`text`, not `rust`, deliberately — and the reason has since expired.** The
+> three calls yield `OpenError`, `AwaitError` and `LookupError`, and at the time
+> `LookupError` implemented neither `Display` nor `Error`, so no single
+> `?`-chain unified them, not even into `Box<dyn Error>`. The first revision of
+> this record printed this block as compilable Rust; it was not.
+>
+> [`0040`](./0040-the-error-that-cannot-be-returned.md) is the separate decision
+> this paragraph deferred to, and it landed: all five `tf_tree_core` error enums
+> now implement `Display` and `core::error::Error`, by hand and with no
+> `thiserror`. So a `?`-chain into `Box<dyn Error>` does unify them today. The
+> fence is left as `text` because this record is `implemented` and its code
+> blocks are history, not because the limitation still holds.
 
 **Why two calls follows from a decision already made.** `CreatePolicy::Never`
 against an absent arena fails *fast* with `IpcError::ArenaAbsent` by design

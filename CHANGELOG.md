@@ -35,6 +35,28 @@ is a bug.
 
 ### Fixed
 
+- **`tf_tree tree`'s `age(ms)` column is measured against a real clock.** It
+  was `fixture::NOW_NS - newest` — the in-process benchmark rig's synthetic
+  "now", `9_900_000_000`. Against a live arena that number is arbitrary
+  (measured: ~8 750 ms of age for a transform pushed milliseconds earlier), and
+  against a robot stamping Unix nanoseconds the subtraction clamps and every
+  edge reads `0` however long its publisher has been dead. It now uses
+  `Clock::decide`, the estimator `doctor` and `top` already share, and the
+  header says which clock it picked.
+
+- **The runbook stopped naming a command that does not exist.** Its
+  startup-ordering section offered `tf_tree serve --config` as the supervised
+  remedy; `docs/PHASE2.md` §0.0 records `tf_tree serve` as not implemented. The
+  remedy is the topology config itself, which the ROS bridge, the CLI's
+  `topology --discover`, and Python all already speak.
+
+- **The `tf_tree` crates.io front page stopped telling adopters that
+  `LookupError` does not implement `std::error::Error`.**
+  [`0040`](docs/decisions/0040-the-error-that-cannot-be-returned.md) made that
+  false and did not touch the README, so the first page a Rust adopter reads
+  talked them out of `?` and into hand-rolled match arms over a limitation that
+  no longer exists. `0019`'s Context carried the same expired clause.
+
 - **`TFT009` reports a publisher that has *stopped*, which no check could see.**
   Every rule in the catalogue measured intervals *between retained stamps*, so a
   publisher that died three weeks ago left a full ring of perfectly spaced
