@@ -119,7 +119,7 @@ use tf_tree_bridge::statics::{StaticStore, StaticVerdict};
 use tf_tree_bridge::Publisher;
 
 use crate::decompress::ChunkLimits;
-use crate::source::{read_tf, ChunkPolicy, OnBadChunk, RawRecord, TopicRoles};
+use crate::source::{read_tf, OnBadChunk, RawRecord, ReadPolicy, TopicRoles};
 use crate::spill;
 use crate::{FrameId, IngestError};
 
@@ -171,6 +171,25 @@ pub const DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 /// allocate.
 pub const DEFAULT_MAX_CHUNK_EXPANSION_RATIO: u64 = 1024;
 
+/// Default ceiling on one top-level MCAP record's declared body length, in bytes.
+///
+/// **256 MiB, unchanged from the private constant this replaces** — an order of
+/// magnitude above any real record, since a chunk is typically 1–8 MiB, so no
+/// existing caller's behaviour moves. What changed is that the person who meets
+/// it can now raise it. `source.rs` sized `body` against a `const` and
+/// `docs/decisions/0010`'s open question 1 asked whether it should be a knob;
+/// its own doc comment called the difference "a gap rather than a decision",
+/// which is what this closes.
+///
+/// **The number itself is not re-derived here and is owed a measurement.**
+/// `0010`'s question 2 asks whether 256 MiB is still right against recordings
+/// with large *attachments*, which are also top-level records, and the reader
+/// has no opcode-based skip — it sizes and fills the body for every record
+/// before it looks at the opcode, so an oversized attachment aborts the whole
+/// ingest rather than being skipped past. A knob is what makes that survivable
+/// while the measurement is outstanding.
+pub const DEFAULT_MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
+
 /// How ingest should handle a backward clock jump (§3.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClockResetPolicy {
@@ -218,6 +237,23 @@ pub struct IngestOptions {
     /// records **by borrow** and allocates nothing, so there is no allocation for
     /// a ceiling to bound — see `crate::decompress::chunk_records`.
     pub max_chunk_uncompressed_bytes: u64,
+    /// Ceiling on one top-level record's declared body length, in bytes.
+    /// Defaults to [`DEFAULT_MAX_RECORD_BYTES`].
+    ///
+    /// **A knob for the same reason [`max_chunk_uncompressed_bytes`] is one:
+    /// the person who meets a limit is the person who cannot patch the crate.**
+    /// This bounds the allocation the reader makes from a length read straight
+    /// off disk, before anything has validated it — so it is a guard against a
+    /// corrupt or hostile file, not a statement about what a legitimate
+    /// recording may contain. A recording with a 400 MiB attachment is unusual
+    /// and is not corrupt.
+    ///
+    /// It is unrelated to [`max_chunk_uncompressed_bytes`], which bounds a
+    /// *decompressed chunk*: the two buffers are sized by different numbers and
+    /// the reader's resident cost is their sum, not twice either.
+    ///
+    /// [`max_chunk_uncompressed_bytes`]: IngestOptions::max_chunk_uncompressed_bytes
+    pub max_record_bytes: u64,
     /// Ceiling on one chunk's `uncompressed_size / compressed_size`. Defaults to
     /// [`DEFAULT_MAX_CHUNK_EXPANSION_RATIO`].
     ///
@@ -246,6 +282,7 @@ impl Default for IngestOptions {
             future_horizon_ns: DEFAULT_FUTURE_HORIZON_NS,
             tf_prefix: None,
             max_chunk_uncompressed_bytes: DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES,
+            max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_chunk_expansion_ratio: DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
             spill_dir: None,
         }
@@ -267,12 +304,13 @@ impl IngestOptions {
         }
     }
 
-    /// Everything [`read_tf`] needs to know about how to treat a chunk.
+    /// Everything [`read_tf`] needs before it believes a length off disk.
     #[must_use]
-    pub fn chunk_policy(&self) -> ChunkPolicy {
-        ChunkPolicy {
+    pub fn read_policy(&self) -> ReadPolicy {
+        ReadPolicy {
             on_bad: self.on_bad_chunk,
             limits: self.chunk_limits(),
+            max_record_bytes: self.max_record_bytes,
         }
     }
 }
@@ -517,7 +555,7 @@ pub fn survey(
         remaps: Vec::new(),
     };
 
-    let skips = read_tf(path, &opts.roles, opts.chunk_policy(), |rec| {
+    let skips = read_tf(path, &opts.roles, opts.read_policy(), |rec| {
         out.transforms_read += 1;
         let Some((parent, child)) = normalize_pair(&mut normalizer, &rec, frames) else {
             out.anomalies.empty_names += 1;
@@ -882,7 +920,7 @@ pub fn fill(
             None => NameNormalizer::new(),
         };
 
-        read_tf(path, &opts.roles, opts.chunk_policy(), |rec| {
+        read_tf(path, &opts.roles, opts.read_policy(), |rec| {
             if rec.is_static || rec.stamp_ns == 0 {
                 return Ok(());
             }
@@ -1061,7 +1099,7 @@ fn fill_spilled(
     };
     stats.passes += 1;
 
-    read_tf(path, &opts.roles, opts.chunk_policy(), |rec| {
+    read_tf(path, &opts.roles, opts.read_policy(), |rec| {
         if rec.is_static || rec.stamp_ns == 0 {
             return Ok(());
         }

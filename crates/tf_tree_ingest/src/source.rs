@@ -37,20 +37,6 @@ use crate::IngestError;
 /// `rosbag2` has written it.
 const TF_SCHEMAS: [&str; 2] = ["tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"];
 
-/// Largest single MCAP record this reader will allocate for: **256 MiB**.
-///
-/// A bound on a corrupt length field, not a format limit: a record header is a
-/// `u64` straight off disk, and without this a rewritten one asks for a
-/// multi-gigabyte allocation before anything validates it.
-///
-/// **A private constant and not an [`crate::IngestOptions`] knob**, unlike the two
-/// chunk ceilings — which is a gap rather than a decision. 256 MiB is an order of
-/// magnitude above any real record (a chunk is typically 1–8 MiB), so nobody has
-/// met it yet; the day somebody does, they get [`IngestError::Mcap`] and no number
-/// to raise. See the sibling argument at [`crate::ChunkLimits`], which is why those
-/// two became options.
-const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
-
 /// Length of MCAP's file magic, at both ends of a complete recording.
 const MAGIC_LEN: usize = 8;
 
@@ -192,22 +178,37 @@ pub enum OnBadChunk {
     Halt,
 }
 
-/// How this reader treats a chunk: the skip policy, and the bounds it will
-/// decompress one within.
+/// What this reader will do before it believes a length read off disk: the
+/// record ceiling, the chunk skip policy, and the bounds it will decompress a
+/// chunk within.
 ///
-/// **One argument rather than two, and the reason is a smell this type exists to
-/// stop growing.** `read_chunk` already carries
-/// `#[allow(clippy::too_many_arguments)]`; adding the decompression bounds beside
-/// [`OnBadChunk`] as a second scalar would have made that eight and nine, and
-/// would have re-indented every `read_tf` call site for a parameter that belongs
-/// with the one next to it. Both halves answer the same question — what this
-/// reader does when a chunk is not what its header says — so they travel together.
+/// **One argument rather than three, and the reason is a smell this type exists
+/// to stop growing.** `read_chunk` already carries
+/// `#[allow(clippy::too_many_arguments)]`; adding these beside [`OnBadChunk`] as
+/// loose scalars would have made that eight, nine and ten, and would have
+/// re-indented every `read_tf` call site for parameters that belong with the one
+/// next to them. Every field answers the same question — what this reader does
+/// when the file is not what its headers say — so they travel together.
+///
+/// **It was `ChunkPolicy` until `max_record_bytes` joined it.** A top-level
+/// record is not a chunk, so the old name would have been a type whose name
+/// covered two of its three fields. The crate is `publish = false`, so the
+/// rename cost nothing outside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChunkPolicy {
+pub struct ReadPolicy {
     /// What to do about a chunk that does not decompress or does not check out.
     pub on_bad: OnBadChunk,
     /// What this reader will decompress a chunk into, before it believes a header.
     pub limits: decompress::ChunkLimits,
+    /// Largest top-level record body this reader will allocate for, in bytes.
+    ///
+    /// A record header is a length straight off disk; without this bound a
+    /// corrupt or hostile `len` is a multi-gigabyte allocation before anything
+    /// validates it. `docs/decisions/0010` made it a knob
+    /// ([`crate::IngestOptions::max_record_bytes`]) rather than the private
+    /// constant it was, whose own doc comment called that "a gap rather than a
+    /// decision".
+    pub max_record_bytes: u64,
 }
 
 /// Counts of what the reader declined to decode.
@@ -304,7 +305,7 @@ fn is_sqlite(input: &mut BufReader<File>) -> Result<bool, IngestError> {
 pub fn read_tf<F>(
     path: &Path,
     roles: &TopicRoles,
-    policy: ChunkPolicy,
+    policy: ReadPolicy,
     mut f: F,
 ) -> Result<SkipCounts, IngestError>
 where
@@ -333,12 +334,12 @@ where
     let mut skips = SkipCounts::default();
     // One buffer for the whole file, reused for every record body, and a second
     // for decompression. **They are bounded by different numbers.** `body` never
-    // grows past `MAX_RECORD_BYTES`, checked below. `scratch` is sized to a
+    // grows past `policy.max_record_bytes`, checked below. `scratch` is sized to a
     // chunk's declared `uncompressed_size` and is bounded by
     // `policy.limits.max_uncompressed_bytes` — a caller knob (`--max-chunk-size`,
-    // 64 MiB by default) that has no relation to `MAX_RECORD_BYTES` and that the
+    // 64 MiB by default) that has no relation to `max_record_bytes` and that the
     // CLI will saturate to `u64::MAX`. Neither buffer is ever shrunk, so the
-    // resident cost of this function is `MAX_RECORD_BYTES + that knob`, not twice
+    // resident cost of this function is `max_record_bytes + that knob`, not twice
     // the former.
     let mut body: Vec<u8> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
@@ -386,14 +387,28 @@ where
         // A record header is a length straight off disk. Without this bound a
         // corrupt one asks for a multi-gigabyte allocation before anything
         // validates it — the same failure `cdr::ImplausibleCount` stops one layer
-        // down. 256 MiB is far above any real record (a chunk is typically
+        // down. The default is far above any real record (a chunk is typically
         // 1–8 MiB) and far below a length that can exhaust memory.
-        let Ok(want) = usize::try_from(declared) else {
-            return Err(IngestError::Mcap);
-        };
-        if want > MAX_RECORD_BYTES {
-            return Err(IngestError::Mcap);
+        //
+        // **Compared in `u64`, before the `usize` narrowing.** On a 32-bit
+        // target `usize::try_from` would reject a declared length the caller's
+        // ceiling might legitimately admit, so the ceiling has to be applied in
+        // the width the file speaks.
+        if declared > policy.max_record_bytes {
+            return Err(IngestError::RecordTooLarge {
+                declared,
+                ceiling: policy.max_record_bytes,
+            });
         }
+        // The 32-bit narrowing. Same refusal, because from the caller's side it
+        // is the same fact — this reader will not allocate that much — and a
+        // second variant would make the remedy depend on the host's word size.
+        let Ok(want) = usize::try_from(declared) else {
+            return Err(IngestError::RecordTooLarge {
+                declared,
+                ceiling: policy.max_record_bytes,
+            });
+        };
         // **No `clear()` before this, deliberately** — the argument
         // `decompress::decode_zstd` records for its own buffer, one module over.
         // `resize` alone zero-fills only the shortfall and merely truncates when
@@ -405,7 +420,7 @@ where
         // removes them.
         //
         // **Grown exactly**, which is what makes the "never grows past
-        // `MAX_RECORD_BYTES`" above true rather than approximately true: `resize`
+        // `max_record_bytes`" above true rather than approximately true: `resize`
         // reserves the shortfall through `Vec`'s doubling path, so a record one
         // kilobyte larger than the previous one doubles the buffer — and this
         // buffer is never shrunk. `reserve_exact(0)` is a no-op, so the steady
@@ -500,7 +515,7 @@ fn read_chunk<F>(
     body: &[u8],
     complete: bool,
     ordinal: u64,
-    policy: ChunkPolicy,
+    policy: ReadPolicy,
     scratch: &mut Vec<u8>,
     book: &mut Bookkeeping,
     roles: &TopicRoles,

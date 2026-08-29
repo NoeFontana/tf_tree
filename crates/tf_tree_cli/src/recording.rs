@@ -164,7 +164,7 @@ pub fn arrival_observations(
     let cap = (max_bytes / core::mem::size_of::<PushSample>() as u64).max(1);
     let mut overflowed = false;
 
-    read_tf(bag, &opts.roles, opts.chunk_policy(), |rec| {
+    read_tf(bag, &opts.roles, opts.read_policy(), |rec| {
         if rec.is_static || rec.stamp_ns == 0 {
             return Ok(());
         }

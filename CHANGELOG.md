@@ -35,6 +35,45 @@ is a bug.
 
 ### Added
 
+- **`IngestOptions::max_record_bytes` and `IngestError::RecordTooLarge`** —
+  `docs/decisions/0010`, now **`ready`**. Both halves of that record were unbuilt:
+  the ceiling on one top-level MCAP record was a private constant whose own doc
+  comment called that "**a gap rather than a decision**", and the variant the
+  record's *Decision* specifies did not exist, so meeting the ceiling gave you
+  `IngestError::Mcap` — "the file is not a well-formed MCAP recording" — about a
+  file that may be perfectly well formed.
+
+  The variant carries `declared` **and** `ceiling`, so the number to pass to
+  `--max-record-size` is in the error rather than guessable. The default is
+  `DEFAULT_MAX_RECORD_BYTES` = 256 MiB, **unchanged**, so no existing caller's
+  behaviour moves; what changes is that the person who meets it can raise it
+  without forking the crate — which is the argument `ChunkLimits` already won for
+  the same class of limit.
+
+  The ceiling is compared in `u64` **before** the `usize` narrowing. On a 32-bit
+  target the old order would have rejected a length the caller's ceiling
+  legitimately admits, because the narrowing fired first.
+
+  `source.rs`'s `ChunkPolicy` is now `ReadPolicy`: a top-level record is not a
+  chunk, so once `max_record_bytes` joined it the old name covered two of its
+  three fields. The crate is `publish = false`, so the rename cost nothing
+  outside it.
+
+  `crates/tf_tree_ingest/tests/record_ceiling.rs` asserts the knob in **both**
+  directions on one file — refused at a low ceiling, accepted at the default —
+  because the first half alone would pass against a reader that refused
+  everything. Verified against the mutant of ignoring the knob and hard-coding
+  the old constant, which fails it.
+
+  **`0010`'s question 2 is measured, and the hypothesis it rests on did not
+  reproduce.** Against 41 published SLAM recordings (`DapengFeng/MCAP` —
+  FAST-LIVO, R3LIVE, MARS-LVIG, ~100 GiB): a full framing walk of three of them
+  (27 974 top-level records) puts the largest single record at **1.2 MiB, always
+  a `Chunk`** — 0.47% of the 256 MiB ceiling — and a footer-and-summary survey of
+  all 41 finds **zero attachments in every one**. The corpus has one provenance,
+  so this is evidence the ceiling is not tight rather than proof no producer
+  meets it, and the record says so.
+
 - **`docs/PHASE2.md` §11.3's last two untested crash sites now have tests**, and
   the facade's site list has the completeness gate it never had.
   `reclaim.after_probe_before_cas` and `hangup.after_probe_before_cas` were the

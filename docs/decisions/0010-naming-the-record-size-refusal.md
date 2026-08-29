@@ -1,8 +1,13 @@
 # 0010: Naming the record-size refusal — `IngestError::RecordTooLarge`
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** landed 2026-08-29 — `IngestError::RecordTooLarge { declared,
+ceiling }`, `IngestOptions::max_record_bytes` (default
+`DEFAULT_MAX_RECORD_BYTES` = 256 MiB, unchanged), `--max-record-size` at the CLI,
+and `crates/tf_tree_ingest/tests/record_ceiling.rs`. `source.rs`'s
+`ChunkPolicy` became `ReadPolicy` in the same change: a top-level record is not a
+chunk, so the old name covered two of its three fields.
 
 ## Context
 
@@ -124,11 +129,61 @@ message false.
 
 ## Open questions
 
-1. **Should `MAX_RECORD_BYTES` become an `IngestOptions` knob at the same time?**
-   The *Decision* above says no and gives the reason, but the counter-argument is
-   real: `ChunkLimits` made exactly the opposite call for the same class of
-   limit, and a user who meets this ceiling still cannot get past it. Resolving
-   this either confirms the split or folds step 1 into a larger change.
-2. **Is 256 MiB still the right number?** It was chosen against "a chunk is
-   typically 1–8 MiB". Nothing has re-measured it against a recording with large
-   attachments, which are also records.
+1. ~~**Should `MAX_RECORD_BYTES` become an `IngestOptions` knob at the same
+   time?**~~ **RESOLVED 2026-08-29 by the owner: yes — the split is overturned.**
+   The *Decision* section above still reads as written and is superseded by this
+   line rather than rewritten, because what it argued was a *sequencing* claim —
+   "take it when somebody has a recording that needs it" — and the counter-argument
+   it acknowledged is the one that won: `ChunkLimits` made the opposite call for
+   the same class of limit, and the code's own doc comment called the difference
+   "a gap rather than a decision" rather than defending it.
+
+   `IngestOptions::max_record_bytes` defaults to `DEFAULT_MAX_RECORD_BYTES`,
+   which is 256 MiB — **the number does not move**, so no existing caller's
+   behaviour changes; what changes is that the person who meets the ceiling can
+   raise it without forking the crate. `--max-record-size` is the CLI spelling,
+   with its `default_value_t` derived from the constant so the two cannot drift.
+
+2. ~~**Is 256 MiB still the right number?**~~ **MEASURED 2026-08-29. Nothing in
+   reach challenges it, and the attachment hypothesis this question rests on did
+   not reproduce at all.**
+
+   Corpus: the 41 recordings of
+   [`DapengFeng/MCAP`](https://huggingface.co/datasets/DapengFeng/MCAP) — real
+   published SLAM datasets (FAST-LIVO, R3LIVE, MARS-LVIG; HKU/HKUST campus, HK
+   airport and island), 844 MiB to 9.5 GiB each, ~100 GiB in total.
+
+   **Two measurements, because they answer different halves.**
+
+   * **Full framing walk of three recordings** (2.8 GiB, 27 974 top-level
+     records): the largest single record is **1.2 MiB, in every one of them, and
+     it is always a `Chunk`** — 1.198, 1.204 and 1.208 MiB. That is **0.47% of
+     the 256 MiB ceiling**, a 212× margin, and it confirms the "a chunk is
+     typically 1–8 MiB" premise the number was chosen against, at the low end of
+     that range.
+   * **Footer-and-summary survey of all 41**, which is O(KB) per file rather than
+     O(GB): read the footer for `summary_start`, then walk the summary for
+     `AttachmentIndex` records, each of which carries its attachment's length.
+     **41 of 41 carry zero attachments.**
+
+   So the specific worry — "a recording with large attachments, which are also
+   records" — **is not observable in this corpus at all**, and the ceiling is two
+   orders of magnitude above anything measured.
+
+   **What this does not establish, stated because the corpus has one
+   provenance.** All 41 files come from one dataset collection and were, on the
+   evidence of their identical ~1.2 MiB chunk targets, written by one conversion
+   pipeline. A converter that does not emit attachments produces zero of them
+   whatever the source contained, so this measures one writer's output rather
+   than "robotics recordings" in general. It is evidence that 256 MiB is not
+   *tight*, not proof that no producer exists that would meet it — and question 1
+   is what makes that residual risk a flag rather than a fork.
+
+   The tooling is two short scripts, not committed: a streaming framing walker
+   and the summary survey, both validated against the `OneAttachment` case in
+   `foxglove/mcap`'s conformance corpus, whose published ground truth they
+   reproduce exactly. An earlier revision of the survey also read
+   `Statistics.attachment_count` at a guessed offset and printed `0` where that
+   ground truth says `1`; the guess was deleted rather than reported, and
+   `AttachmentIndex` — which is self-describing — is what the numbers above come
+   from.
