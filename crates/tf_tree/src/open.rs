@@ -457,10 +457,17 @@ pub(crate) enum Attachment {
 /// are placed rather than re-spelling them, because a typo silently arms nothing
 /// and the run then looks clean.
 ///
-/// One entry today. The `attach.*`, `open.*`, `hangup.*` and `reclaim.*` rows are
-/// still unplaced.
+/// The `attach.*`, `hangup.*` and `reclaim.*` rows are still unplaced, and
+/// `reclaim.probe_then_reoccupied` is argued at that row not to be an abort site
+/// at all — it names an *interleaving* between two live processes, and a
+/// mechanism that kills one of them cannot produce it.
 #[cfg(feature = "crash-points")]
-pub const CRASH_SITES: &[&str] = &["takeover.after_ownership_lock_before_bind"];
+pub const CRASH_SITES: &[&str] = &[
+    "takeover.after_ownership_lock_before_bind",
+    "topo.holding_lock",
+    "open.after_ownership_lock_before_bind",
+    "open.after_create_before_bind",
+];
 
 /// How [`Tree::inherit_ownership`] resolved (§3.5).
 ///
@@ -1180,10 +1187,48 @@ impl Open {
                 Ok(tree)
             }
             OpenOutcome::Created => {
+                // `docs/PHASE2.md` §11.3: **`open.after_ownership_lock_before_bind`**.
+                // The ownership byte is held — `Open::open` took it to reach this
+                // arm — and nothing has been created or bound. The row's repair
+                // claim is "ownership lock released by the kernel; the next
+                // `open()` proceeds; **no arena created twice**", and this is the
+                // instruction it names.
+                //
+                // What makes the claim true rather than hopeful is that the byte
+                // is an OFD lock: a killed process gives it back with no
+                // cooperation, and the next `open()` finds byte 0 free, no socket
+                // to connect to, and no participant byte held — so §3.4 step 4's
+                // split-brain check does not fire and it creates. The *second*
+                // half of the claim is the interesting one: nothing was created
+                // here, so there is no first arena for a second to race.
+                #[cfg(feature = "crash-points")]
+                tf_tree_core::crash::maybe_abort(CRASH_SITES[2]);
+
                 // `clone`, not `take` — see this method's doc comment. A retry
                 // must find the layout exactly as the first attempt found it.
                 let builder = self.layout.clone().ok_or(OpenError::NoLayoutToCreate)?;
                 let mut tree = builder.build_shared(rv.name().as_str())?;
+
+                // `docs/PHASE2.md` §11.3: **`open.after_create_before_bind`**.
+                // The arena exists, the ownership byte is held, and nothing is
+                // serving. The row: "arena exists, nothing serving, no
+                // participant byte held → next `open()` finds nothing alive and
+                // creates fresh; **the orphan memfd is freed with its last
+                // mapping**."
+                //
+                // That last clause is the one this placement exists to exercise,
+                // and it is the reason `memfd` was chosen over `shm_open` (§3.9):
+                // the segment has no name in any filesystem, so when this
+                // process's mapping goes with it there is no stale object for
+                // anybody to find, clean up, or accidentally attach to. A
+                // `shm_open` arena killed here would leave a file.
+                //
+                // **Before `use_ofd_liveness`/`use_claim_leases`**, so the tree
+                // this abort abandons holds only the segment — which is exactly
+                // what the row's "no participant byte held" asserts.
+                #[cfg(feature = "crash-points")]
+                tf_tree_core::crash::maybe_abort(CRASH_SITES[3]);
+
                 tree.use_ofd_liveness(LivenessProbe::open(&rv)?);
                 tree.use_claim_leases(open_claim_lock(&rv)?);
 

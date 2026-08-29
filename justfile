@@ -2197,8 +2197,10 @@ shm-check:
     # purpose: that is what compiles this crate's test targets with `unstable`
     # *off*, the shape a packager building the tarball gets.
     cargo nextest run -p tf_tree --features shm,unstable --test frozen
-    # **`docs/PHASE2.md` §11.3's `takeover.after_ownership_lock_before_bind`, the
-    # crash-matrix row §3.5 owes.** Three features and none is optional: `shm`
+    # **`docs/PHASE2.md` §11.3's crash matrix — four rows now, not one.**
+    # `takeover.after_ownership_lock_before_bind` (the row §3.5 owes),
+    # `topo.holding_lock`, `open.after_ownership_lock_before_bind` and
+    # `open.after_create_before_bind`. Three features and none is optional: `shm`
     # for the rendezvous, `unstable` because `rendezvous_child`'s
     # `join-rw-report` arm needs `Tree::arena_view`, and `crash-points` because
     # without it the site is compiled out and the armed child never dies — which

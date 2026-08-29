@@ -2212,6 +2212,26 @@ impl Tree {
         let is_alive = move |slot: u32| participant_is_alive(&participants, slot, &arena_boot);
         let _topo = lock.acquire(self.participant, now_nanos().unwrap_or(0), &is_alive)?;
 
+        // `docs/PHASE2.md` §11.3: **`topo.holding_lock`**. Both locks held and
+        // the topology not yet mutated — the state that row is about, and the
+        // one instruction where a death leaves *the kernel* holding the repair.
+        //
+        // The row's claim: "byte released by the kernel; word left stale and
+        // overwritten by the next acquirer". A process killed here gives its
+        // byte back with no cooperation — that is what an OFD lock is — so the
+        // next acquirer takes byte 1, finds the arena word still naming the
+        // corpse, spins out its budget and steals. **Stealing needs no
+        // rollback**, which is A1's payoff: `set_parent` has not run, so there
+        // is no half-written topology, and even after it there is none, because
+        // A1 made the publish a single word store.
+        //
+        // Placed *before* the mutation rather than after, deliberately. After it,
+        // the surviving state is indistinguishable from a completed reparent
+        // whose guard had not yet dropped, and the test would pass on a build
+        // where the byte was never taken at all.
+        #[cfg(feature = "crash-points")]
+        tf_tree_core::crash::maybe_abort(crate::open::CRASH_SITES[1]);
+
         let (_p, _depth, edge, _gen) =
             view.topology()
                 .read_frame(child)
