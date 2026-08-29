@@ -486,13 +486,23 @@ class Tree:
         """Whether this process may publish into this tree."""
 
 def build(
-    edges: list[tuple[str, str]],
+    edges: list[tuple[str, str]] | str,
     *,
-    capacity: int = ...,
-    interp: Literal["sclerp", "lerpslerp"] = ...,
+    capacity: int | None = ...,
+    interp: Literal["sclerp", "lerpslerp"] | None = ...,
     frame_headroom: int = ...,
 ) -> Tree:
-    """An in-process tree from `(parent, child)` edges.
+    """An in-process tree from `(parent, child)` edges, or from a topology config.
+
+    `edges` takes **either** a list of `(parent, child)` pairs — every edge
+    dynamic, all sharing `capacity` — **or** a `str` holding topology-config
+    text, which is the same schema the ROS bridge starts from and
+    `tf_tree topology --discover` writes. Only the config form can declare a
+    **static** edge, a per-edge size, a declared rate, or a per-edge domain, so
+    it is the one to use for anything shaped like a robot.
+
+    `capacity=` and `interp=` are **refused** beside a config: it carries both,
+    per edge, and there would be no saying which won.
 
     Topology is builder-time (decision `0004`), so there is no `declare_*` on a
     live tree: the layout is a property of the arena, fixed when it is created.
@@ -527,9 +537,9 @@ def open_arena(
     name: str | None = ...,
     domain: int | None = ...,
     mode: Literal["ro", "rw"] = ...,
-    create: list[tuple[str, str]] | None = ...,
-    capacity: int = ...,
-    interp: Literal["sclerp", "lerpslerp"] = ...,
+    create: list[tuple[str, str]] | str | None = ...,
+    capacity: int | None = ...,
+    interp: Literal["sclerp", "lerpslerp"] | None = ...,
     frame_headroom: int = ...,
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
@@ -539,7 +549,11 @@ def open_arena(
     before the robot must fail loudly rather than create an empty arena the
     real publisher then refuses to join.
 
-    Pass `create=[(parent, child), ...]` — the same edge list `build` takes —
+    Pass `create=` the same thing `build`'s `edges` takes: a list of
+    `(parent, child)` pairs, or the text of a topology config. `capacity` and
+    `interp` are refused beside a config, which carries both.
+
+    The list form — the same edge list `build` takes —
     to create the arena when it is absent. An arena is sized from its declared
     edges, so there is no way to create one without saying what is in it; that
     is why this is an edge list rather than a boolean. **It requires
@@ -551,10 +565,11 @@ def open_arena(
     the time-domain tag of the edges inside it. Two unrelated numbers that share
     a word; this one selects the arena, that one selects the clock.
 
-    `capacity` and `interp` describe the edges being created; both are
-    `build`'s, with the same defaults. Without `create` they describe nothing —
-    but `interp` is still validated, so a misspelling raises here exactly as it
-    does in `build` rather than being silently discarded.
+    `capacity` and `interp` describe the edges being created **from a pair
+    list**; both are `build`'s, with the same defaults, and both are refused
+    beside a config. Without `create` they describe nothing — but `interp` is
+    still validated, so a misspelling raises here exactly as it does in `build`
+    rather than being silently discarded.
     """
 
 def open_file(path: str | os.PathLike[str], /) -> Tree:

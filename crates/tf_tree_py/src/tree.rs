@@ -2047,16 +2047,51 @@ pub(crate) fn interp_name(policy: InterpPolicy) -> &'static str {
 /// There is deliberately **no `edge_headroom`**, on `docs/PHASE5.md` §5.8's
 /// amendment: nothing declares an edge at runtime, so the slots it reserves can
 /// only ever be empty (the ROS bridge's config makes the same call).
+/// # `edges` also takes a topology config, and that is the only way to declare
+/// a real robot
+///
+/// A list of `(parent, child)` pairs makes every edge **dynamic** under one
+/// capacity, which cannot express a static edge, a per-edge size, a declared
+/// rate, or a per-edge domain. Passing the *text* of a topology config instead
+/// — the same schema `ros/tf_tree_ros` starts from and `tf_tree topology
+/// --discover` writes — expresses all four
+/// ([`0041`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0041-python-declares-a-topology-the-way-everything-else-does.md)).
+///
+/// `capacity=` and `interp=` are refused beside a config, because the config
+/// carries both and there would otherwise be no saying which won.
 #[pyfunction]
-#[pyo3(signature = (edges, *, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
+#[pyo3(signature = (edges, *, capacity = None, interp = None, frame_headroom = 0))]
 pub fn build(
-    edges: Vec<(String, String)>,
-    capacity: u32,
-    interp: &str,
+    edges: &Bound<'_, PyAny>,
+    capacity: Option<u32>,
+    interp: Option<&str>,
     frame_headroom: u32,
 ) -> PyResult<PyTree> {
+    // A `str` is never a valid edge list, so the dispatch is unambiguous and
+    // needs no second keyword (`0041`).
+    // `String`, not `&str`: `extract::<&str>` ties the borrow to the `Bound` in a
+    // way PyO3 0.29 will not resolve under every feature set this crate is built
+    // with — `just py-cross-check`'s Apple and Windows targets refuse it. One
+    // allocation on a construction path is not a cost worth a `cfg`.
+    if let Ok(text) = edges.extract::<String>() {
+        if capacity.is_some() || interp.is_some() {
+            return Err(PyValueError::new_err(
+                "capacity= and interp= are not accepted with a topology config: the \
+                 config carries both, per-edge, and there would be no saying which won. \
+                 Set them in the config, or pass a list of (parent, child) pairs.",
+            ));
+        }
+        return build_from_config(&text, frame_headroom);
+    }
+    let edges: Vec<(String, String)> = edges.extract().map_err(|_| {
+        PyTypeError::new_err(
+            "edges must be a list of (parent, child) string pairs, or the text of a \
+             topology config",
+        )
+    })?;
+    let capacity = capacity.unwrap_or(1024);
     let mut b = tf_tree::TreeBuilder::new()
-        .default_interp(interp_from_str(interp)?)
+        .default_interp(interp_from_str(interp.unwrap_or("sclerp"))?)
         .frame_headroom(frame_headroom);
     for (parent, child) in &edges {
         b = b.dynamic_edge(parent, child, EdgeCfg::new(Capacity::slots(capacity)));
@@ -2064,6 +2099,84 @@ pub fn build(
     let inner = b.build().map_err(|e| build_err(&edges, capacity, e))?;
     Ok(PyTree {
         inner: Arc::new(inner),
+    })
+}
+
+/// Build from topology-config text — `0041`.
+///
+/// **The error is rendered here, while `text` is still alive.** `ConfigError`
+/// borrows from the config source so it can name the offending frame without
+/// allocating (`config.rs`'s own argument), which means it cannot outlive this
+/// function. Formatting it into the Python exception is what converts a borrowed
+/// diagnostic into an owned one.
+fn config_builder(text: &str, frame_headroom: u32) -> PyResult<tf_tree::TreeBuilder> {
+    let cfg = tf_tree_bridge::TopologyConfig::parse(text)
+        .map_err(|e| PyValueError::new_err(format!("topology config: {e}")))?;
+
+    // **Ask the config before asking the builder**, exactly as
+    // `tf_tree_cli::topology` and `tf_tree_c::bridge` do against this same
+    // schema. The parser rejects a self-edge and a duplicate child but not a
+    // multi-hop cycle, and `build()` finds that one and reports it as
+    // `WouldCreateCycle { child: FrameId(1) }` — an index into an arena that was
+    // never constructed, which is the one thing a caller holding a *text file*
+    // cannot resolve. `cycle_child` exists for this and its own doc says so;
+    // Python was the third consumer of the schema and the only one that had
+    // regressed the diagnostic.
+    if let Some(child) = cfg.cycle_child() {
+        return Err(PyValueError::new_err(format!(
+            "topology config: the declared topology has a cycle through frame \
+             {child:?} — following its parent links returns to it"
+        )));
+    }
+
+    let mut b = cfg.builder();
+    // The config has its own `frame_headroom`; a non-zero argument overrides it,
+    // and zero — the default — leaves whatever the config asked for.
+    if frame_headroom != 0 {
+        b = b.frame_headroom(frame_headroom);
+    }
+    Ok(b)
+}
+
+/// Build a heap tree from topology-config text — `0041`.
+fn build_from_config(text: &str, frame_headroom: u32) -> PyResult<PyTree> {
+    let inner = config_builder(text, frame_headroom)?
+        .build()
+        // `config_build_err`, not `build_err`: the latter's prose is written
+        // about an *edge list* the caller passed, and a config caller passed
+        // none — see its own doc for the three ways that goes wrong.
+        .map_err(config_build_err)?;
+    Ok(PyTree {
+        inner: Arc::new(inner),
+    })
+}
+
+/// A `BuildError` from a config, phrased for somebody holding a text file.
+///
+/// **Not `build_err`.** That function's prose is written about the `edges=` list
+/// and the `capacity=` keyword: given the empty list and placeholder capacity a
+/// config path would have to hand it, it says "0 pairs", advises "lower
+/// capacity=1024" — a keyword this path *refuses* — and, for a topology error it
+/// cannot find a cycle in, concludes *"that is a bug in tf_tree rather than in
+/// your call"* about a cycle the caller wrote themselves.
+///
+/// `TfTreeError` and not `PyValueError`, so `except tf_tree.TfTreeError` catches
+/// a build failure from either construction form. The list path has always
+/// raised it, and a config path that raised something else would be caught by
+/// nobody's existing handler.
+fn config_build_err(e: tf_tree::BuildError) -> PyErr {
+    crate::errors::TfTreeError::new_err(match e {
+        tf_tree::BuildError::Topology(inner) => format!(
+            "the declared topology does not wire up: {inner}. Every frame but the \
+             root needs exactly one parent, and the parent links must reach it."
+        ),
+        tf_tree::BuildError::TooManyFrames | tf_tree::BuildError::TooManyEdges => {
+            "the declared topology is too large for the u32 id space".to_string()
+        }
+        other => format!(
+            "the declared topology does not build: {other:?}. Its sizing comes \
+             from the config's own rate_hz/history_secs or capacity, per edge."
+        ),
     })
 }
 
@@ -2162,14 +2275,14 @@ pub fn push(
 // with the reason.
 #[cfg(target_os = "linux")]
 #[pyfunction]
-#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = None, interp = None, frame_headroom = 0))]
 pub fn open_arena(
     name: Option<&str>,
     domain: Option<u32>,
     mode: &str,
-    create: Option<Vec<(String, String)>>,
-    capacity: u32,
-    interp: &str,
+    create: Option<&Bound<'_, PyAny>>,
+    capacity: Option<u32>,
+    interp: Option<&str>,
     frame_headroom: u32,
 ) -> PyResult<PyTree> {
     let attach = match mode {
@@ -2187,16 +2300,51 @@ pub fn open_arena(
              the arena it would have created",
         ));
     }
-    // **Parsed unconditionally, before `create` is consulted.** A misspelled
+    // **Validated whether or not a layout is being created.** A misspelled
     // policy is a startup error under `build` and must be one here too; folding
     // this into the `if let` below made `open(interp="screw")` a silent no-op,
     // which is the one shape of a keyword nobody notices they got wrong.
-    let policy = interp_from_str(interp)?;
+    //
+    // This read "before `create` is consulted" and sat directly above the
+    // `interp_from_str` call. `0041` put the `create=` type dispatch between the
+    // two, so the wording stopped being true of the lines under it and the
+    // ordering changed with it: `open(create=42, interp="screw")` now reports
+    // the `create=` type error rather than the misspelled policy. Both are
+    // startup errors naming a keyword the caller got wrong, so which comes first
+    // is not worth reordering the dispatch for — but the comment claimed an
+    // order it no longer had, which is worse than either.
+    // `create=` takes the same two forms `build`'s `edges` does (`0041`): a list
+    // of pairs, or the text of a topology config. A `str` is never a valid edge
+    // list, so the dispatch needs no second keyword.
+    // Owned, for the same reason `build` takes an owned one.
+    let config: Option<String> = create.and_then(|c| c.extract::<String>().ok());
+    if config.is_some() && (capacity.is_some() || interp.is_some()) {
+        return Err(PyValueError::new_err(
+            "capacity= and interp= are not accepted with a topology config: the config \
+             carries both, per-edge. Set them in the config, or pass a list of \
+             (parent, child) pairs.",
+        ));
+    }
+    let pairs: Option<Vec<(String, String)>> = match (create, &config) {
+        (Some(c), None) => Some(c.extract().map_err(|_| {
+            PyTypeError::new_err(
+                "create= must be a list of (parent, child) string pairs, or the text of \
+                 a topology config",
+            )
+        })?),
+        _ => None,
+    };
+    let capacity = capacity.unwrap_or(1024);
+    let policy = interp_from_str(interp.unwrap_or("sclerp"))?;
     let mut o = tf_tree::Open::new().mode(attach).create(match &create {
         None => tf_tree::CreatePolicy::Never,
         Some(_) => tf_tree::CreatePolicy::IfAbsent,
     });
-    if let Some(edges) = &create {
+    if let Some(text) = &config {
+        // The same preflight and the same builder `build` uses, so the two
+        // construction forms cannot diverge on a diagnostic.
+        o = o.layout_if_creating(config_builder(text, frame_headroom)?);
+    } else if let Some(edges) = &pairs {
         let mut b = tf_tree::TreeBuilder::new()
             .default_interp(policy)
             .frame_headroom(frame_headroom);
@@ -2212,11 +2360,21 @@ pub fn open_arena(
     // an `OpenError` too — a rejected arena name is `Rendezvous(IpcError)`, and
     // that arm was already prose. What was not is `Build`, which carries every
     // one of `BuildError`'s Debug dumps into the call a consumer makes first.
-    let created = create.as_deref().unwrap_or(&[]);
+    // **A config path must not reach `open_err`'s build prose.** That prose is
+    // written about the `create=` edge list and the `capacity=` keyword, and a
+    // config caller passed neither — so it would report "0 pairs", advise
+    // lowering a keyword this path refuses, and, for a topology error, blame
+    // `tf_tree` for a cycle the caller wrote. Rendezvous failures are shared:
+    // they are about the arena, not about how the layout was declared.
+    let created: &[(String, String)] = pairs.as_deref().unwrap_or(&[]);
+    let map_err = |e: tf_tree::OpenError| match (&config, e) {
+        (Some(_), tf_tree::OpenError::Build(inner)) => config_build_err(inner),
+        (_, e) => open_err(created, capacity, e),
+    };
     if let Some(n) = name {
-        o = o.name(n).map_err(|e| open_err(created, capacity, e))?;
+        o = o.name(n).map_err(&map_err)?;
     }
-    let inner = o.open().map_err(|e| open_err(created, capacity, e))?;
+    let inner = o.open().map_err(&map_err)?;
     Ok(PyTree {
         inner: Arc::new(inner),
     })
@@ -2230,15 +2388,21 @@ pub fn open_arena(
 /// give.
 #[cfg(not(target_os = "linux"))]
 #[pyfunction]
-#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = 1024, interp = "sclerp", frame_headroom = 0))]
+#[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = None, interp = None, frame_headroom = 0))]
 #[allow(clippy::needless_pass_by_value)]
 pub fn open_arena(
     name: Option<&str>,
     domain: Option<u32>,
     mode: &str,
-    create: Option<Vec<(String, String)>>,
-    capacity: u32,
-    interp: &str,
+    // **These must track the Linux signature, or the stub defeats itself.** It
+    // exists so a macOS or Windows caller meets the message below rather than a
+    // PyO3 conversion error at a line that has nothing to do with the reason —
+    // and a `str` config (a sequence of one-character strings) cannot extract to
+    // `Vec<(String, String)>`, so a stale signature would have given exactly the
+    // generic `TypeError` this stub is here to prevent.
+    create: Option<&Bound<'_, PyAny>>,
+    capacity: Option<u32>,
+    interp: Option<&str>,
     frame_headroom: u32,
 ) -> PyResult<PyTree> {
     let _ = (name, domain, mode, create, capacity, interp, frame_headroom);
