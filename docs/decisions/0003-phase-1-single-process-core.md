@@ -9,8 +9,13 @@
 > The architecture and decision log moved to
 > **[`docs/PROJECT.md`](../PROJECT.md)** §5.
 >
-> Phase 1 amendments A1–A8, which are **not yet applied**, live in
-> [`docs/PHASE2.md`](../PHASE2.md) §1.
+> Phase 1 amendments A1–A8 live in [`docs/PHASE2.md`](../PHASE2.md) §1. **This
+> line said they were "not yet applied" until 2026-08-29, and they have all been
+> applied since `FORMAT_VERSION` 2** — corrected in place rather than left as
+> history, because it is the only mention of A1–A8 in this record and it points
+> at the section `CLAUDE.md` names as the reason several atomic orderings in the
+> concurrency core look odd. A reader who believed it would take those orderings
+> for accidents.
 >
 > It is kept unedited as history. New work must cite `docs/PHASE1.md`.
 

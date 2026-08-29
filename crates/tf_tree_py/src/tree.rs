@@ -271,7 +271,7 @@ impl PyTree {
     /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`). `tf_tree::Domain`
     /// is an open trait and its tag is a `const`, so Python cannot name the type
     /// a Rust caller would instantiate; it carries the tag as data instead, and
-    /// [`SYSTEM_DOMAIN`](crate::SYSTEM_DOMAIN) and its three siblings are the
+    /// `tf_tree.SYSTEM_DOMAIN` and its three siblings are the
     /// names for the four built-in tags. A user-declared domain is just the
     /// integer it chose, from `4` up (`docs/API.md` §2.5).
     ///
@@ -363,9 +363,10 @@ impl PyTree {
     /// `source` is the recording these poses came from, and is recorded in the
     /// manifest as `null` when there is none.
     ///
-    /// `path` is any `os.PathLike`, and **the GIL is released for the copy** —
-    /// see [`freeze_impl`](crate::offline::freeze_impl) for why that is not
-    /// optional at the sizes a freeze is for.
+    /// `path` is any `os.PathLike`, and **the GIL is released for the copy**,
+    /// which is not optional at the sizes a freeze is for: the copy is the whole
+    /// arena, and holding the GIL across it would stall every other thread in
+    /// the interpreter for the duration.
     #[pyo3(signature = (path, /, *, source = None))]
     fn freeze(&self, py: Python<'_>, path: PathBuf, source: Option<&str>) -> PyResult<()> {
         crate::offline::freeze_impl(py, &self.inner, &path, source)
@@ -374,9 +375,17 @@ impl PyTree {
     /// The interval over which `tree.plan(target, source)` is answerable.
     ///
     /// `(t0, t1)` in nanoseconds, or `None` when every step on the path is
-    /// static and the plan therefore answers at any stamp. See
-    /// [`span_impl`](crate::offline::span_impl) for the three cases and why an
-    /// empty intersection is returned rather than raised.
+    /// static and the plan therefore answers at any stamp.
+    ///
+    /// Three cases: all-static gives `None`; one or more dynamic edges give the
+    /// **intersection** of their retained windows; and if that intersection is
+    /// empty — the edges' windows do not overlap — it is *returned* as an empty
+    /// interval rather than raised, because "no common window" is a fact about
+    /// the arena a caller acts on, not a failure of the call.
+    ///
+    /// **It is an outer bound, not a guarantee of coverage.** A publisher that
+    /// died for 30 s in the middle of a 100 Hz edge moves neither end, so a span
+    /// can be almost entirely gap and still look healthy.
     #[pyo3(signature = (target, source, /))]
     fn span(&self, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
         crate::offline::span_impl(&self.inner, target, source)
@@ -389,9 +398,12 @@ impl PyTree {
     /// — one list, once, at import frequency — so R2's "the hot tier never
     /// allocates" is not in tension with the `String`s it builds.
     ///
-    /// See [`frames_impl`](crate::offline::frames_impl) for what the list
-    /// promises on a *live* arena, why a slot mid-intern is skipped, and why a
-    /// tree inherited across a `fork()` raises instead of answering `[]`.
+    /// **On a live arena the list is a snapshot, not a promise.** A frame
+    /// interned by a peer after this returns is simply not in it. A slot caught
+    /// mid-intern — claimed but not yet published — is skipped rather than
+    /// reported under a name that is not final. And a tree inherited across a
+    /// `fork()` raises rather than answering `[]`, because an empty list is
+    /// indistinguishable from an empty tree.
     fn frames(&self) -> PyResult<Vec<String>> {
         crate::offline::frames_impl(&self.inner)
     }
@@ -406,9 +418,12 @@ impl PyTree {
     /// `(parent, child)` is `tf_tree.build`'s order, so the list can be handed
     /// straight back to it — but that rebuilds the *graph* only: this list does
     /// not report an edge's kind and `tf_tree.build` cannot declare a static
-    /// edge, so a static edge comes back dynamic and empty. See
-    /// [`edges_impl`](crate::offline::edges_impl), which also covers the one
-    /// case where the pair and the live topology can disagree.
+    /// edge, so a static edge comes back dynamic and empty.
+    ///
+    /// **One case where the pair and the live topology can disagree:** a peer
+    /// that re-parents a frame between this walk and your next lookup leaves the
+    /// list naming a parent that is no longer current. The list is a snapshot;
+    /// `plan()` is what resolves against the topology as it is.
     fn edges(&self) -> PyResult<Vec<(String, String)>> {
         crate::offline::edges_impl(&self.inner)
     }
@@ -473,8 +488,8 @@ impl PyTree {
     ///
     /// # Errors
     ///
-    /// [`TfTreeError`](crate::errors::TfTreeError) if the `fcntl` fails or the
-    /// rendezvous socket cannot be bound. On every failure this process keeps
+    /// `TfTreeError` if the `fcntl` fails or the rendezvous socket cannot be
+    /// bound. On every failure this process keeps
     /// its participant slot, its byte and its mapping, and gives back the
     /// ownership byte if it had taken one — so a failed attempt leaves a plain
     /// participant rather than an arena with an owner that is not serving.
@@ -559,10 +574,8 @@ impl PyTree {
     ///
     /// # Errors
     ///
-    /// [`detached_err`](crate::errors::detached_err) on a tree inherited across
-    /// a `fork()`. `Tree::instance_uuid` is `self.view().header().instance_uuid`
-    /// and [`Tree::view`](tf_tree::Tree) substitutes the zeroed poison arena for
-    /// a detached tree, so answering would report the one arena identity whose
+    /// `TfTreeError` on a tree inherited across a `fork()`. The engine
+    /// substitutes a zeroed poison arena for a detached tree, so answering would report the one arena identity whose
     /// entire job is to be comparable as *all-zero* — the spelling this binding
     /// documents as "in-process". Two peers debugging a split brain would
     /// conclude they were never shared. Same refusal as
@@ -1424,10 +1437,8 @@ impl PyPlan {
     ///
     /// Shorter than [`depth`](Self::depth) whenever the path crosses a static
     /// edge: those are folded into a constant at compile time and their
-    /// identities do not survive the fold. See
-    /// [`plan_edges_impl`](crate::offline::plan_edges_impl) — the alternative
-    /// to saying so is fabricating ids for edges the plan genuinely no longer
-    /// knows about.
+    /// identities do not survive the fold. The alternative to saying so is
+    /// fabricating ids for edges the plan genuinely no longer knows about.
     fn edges(&self) -> PyResult<Vec<(String, String)>> {
         crate::offline::plan_edges_impl(self.tree(), &self.plan)
     }

@@ -1,8 +1,8 @@
 # 0040: the error that cannot be returned
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #278
 
 ## Context
 

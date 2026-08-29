@@ -166,3 +166,45 @@ def test_every_public_method_is_declared():
         obj = getattr(tf_tree, cls)
         missing = _public(obj) - _stub_members(cls)
         assert not missing, f"{cls}: undeclared methods {sorted(missing)}"
+
+
+def test_no_docstring_points_where_a_wheel_user_cannot_go():
+    """**`help()` is what a Python user reads, and it does not render markdown.**
+
+    `tf_tree_py`'s methods are documented with Rust `///` comments, which PyO3
+    copies into `__doc__` verbatim. An intra-doc link written for
+    rustdoc —
+    ``[`span_impl`](crate::offline::span_impl)`` — therefore reaches a wheel user
+    as those characters, pointing at a private path in a crate that is
+    `publish = false`. `help(Tree.span)` printed exactly that.
+
+    Six methods delegated their substance that way, so the answer to *"what are
+    the three cases?"* was a link to something no wheel user can open. This is
+    the gate that keeps the next one from shipping: a rustdoc link is fine
+    anywhere the reader is a Rust developer, and a PyO3 docstring is not such a
+    place.
+    """
+    import inspect
+
+    offenders = []
+    for owner_name in ("Tree", "Plan", "Publisher"):
+        owner = getattr(tf_tree, owner_name, None)
+        if owner is None:
+            continue
+        members = [("<class>", owner)] + inspect.getmembers(owner)
+        for name, member in members:
+            doc = getattr(member, "__doc__", None)
+            if not isinstance(doc, str):
+                continue
+            if "](crate::" in doc or "](tf_tree::" in doc or "](tf_tree_core::" in doc:
+                offenders.append(f"{owner_name}.{name}")
+    # Module-level functions and constants too.
+    for name in dir(tf_tree):
+        doc = getattr(getattr(tf_tree, name), "__doc__", None)
+        if isinstance(doc, str) and ("](crate::" in doc or "](tf_tree::" in doc):
+            offenders.append(name)
+
+    assert not offenders, (
+        "these docstrings carry a rustdoc intra-doc link, which help() prints as "
+        f"raw markdown pointing at a path no wheel user can reach: {offenders}"
+    )

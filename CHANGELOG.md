@@ -33,6 +33,29 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — documentation
+
+- **Six Python docstrings pointed where a wheel user cannot go.** PyO3 copies a
+  Rust `///` comment into `__doc__` verbatim, so an intra-doc link written for
+  rustdoc reaches a Python user as those characters: `help(Tree.span)` printed
+  ``[`span_impl`](crate::offline::span_impl)`` — a private path in a crate that
+  is `publish = false`. Six methods (`span`, `frames`, `edges`, `freeze`,
+  `Plan.edges`, `instance_uuid`) delegated their *substance* that way, so the
+  answer to "what are the three cases?" was a link to something nobody outside
+  this repository can open. Each now says the thing.
+
+  A test walks every `__doc__` in the module and fails on a rustdoc link, so the
+  next one does not ship. A rustdoc link is fine anywhere the reader is a Rust
+  developer; a PyO3 docstring is not such a place.
+
+- **`docs/decisions/0003` said Phase 1 amendments A1–A8 are "not yet applied".**
+  They have all been applied since `FORMAT_VERSION` 2. It is the only mention of
+  A1–A8 in that record, and it points at the section `CLAUDE.md` names as the
+  reason several atomic orderings in the concurrency core look odd — so a reader
+  who believed it would take those orderings for accidents. Corrected in place
+  rather than left as history, which is what the rest of that superseded record
+  is.
+
 ### Added
 
 - **`just two-processes`** — the capability the README leads with, as something
