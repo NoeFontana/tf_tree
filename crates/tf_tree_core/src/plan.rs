@@ -1524,15 +1524,30 @@ impl Plan {
     /// ```text
     /// loop {
     ///     let g = tree.guard();
-    ///     match plan.span(&g)? {
-    ///         None                                  => return plan.at(&g, wanted),
-    ///         Some((_, newest)) if newest >= wanted  => return plan.at(&g, wanted),
-    ///         Some((_, newest)) => sleep(min(deadline_remaining,
-    ///                                        (wanted - newest) + one_period)),
+    ///     match plan.span(&g) {
+    ///         Ok(None)                                  => return plan.at(&g, wanted),
+    ///         Ok(Some((_, newest))) if newest >= wanted  => return plan.at(&g, wanted),
+    ///         Ok(Some((_, newest))) => sleep(min(deadline_remaining,
+    ///                                           (wanted - newest) + one_period)),
+    ///         // *The startup case this loop exists for.* An edge that has
+    ///         // never published raises NoData, and "has not started yet" takes
+    ///         // the same branch as a shortfall: sleep one period and re-check.
+    ///         Err(NoData { .. }) => sleep(min(deadline_remaining, one_period)),
+    ///         Err(e) => return Err(e),
     ///     }
     ///     if now >= deadline { return Err(Timeout) }
     /// }
     /// ```
+    ///
+    /// **The `NoData` arm is the one this block dropped**, and it is the case
+    /// the wait exists for: `Self::span` calls `Guard::window` on every dynamic
+    /// step, and that raises [`LookupError::NoData`] for an edge that has never
+    /// published — which is *"the publisher has not started yet"*. Written with
+    /// `?` on `span`, as this snippet was until 2026-08-29, the loop returns an
+    /// error on its first iteration instead of sleeping, at exactly the moment a
+    /// consumer is waiting for a publisher to come up.
+    /// [`0018`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0018-blocking-waits-belong-in-the-shim.md)
+    /// has the arm; this copy of the same block had lost it.
     ///
     /// where `one_period` is `1e9 / (mhz / 1000)` nanoseconds from *this*
     /// method. It is a **prediction, not a poll interval**: the shortfall is
