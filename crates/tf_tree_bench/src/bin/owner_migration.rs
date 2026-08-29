@@ -550,24 +550,35 @@ mod imp {
                             if stamp.nanos() > newest {
                                 "stale"
                             } else if oldest > newest {
-                                // **An inverted window, and it proves its own
-                                // cause.** A single ring's `oldest` is never
-                                // past its `newest`, so this can only be the
-                                // composed path intersecting the four edges'
-                                // windows and finding the intersection empty:
-                                // it reports `max(oldest)` and `min(newest)`,
-                                // which inverts. `shm_torture`'s
-                                // `common_window` documents the same state as
-                                // "disjoint right now, not an error".
+                                // **A torn bounds pair, from one ring — not,
+                                // as this comment first claimed, an empty
+                                // intersection across the composed path.**
+                                // `LookupError::Extrapolation` names a single
+                                // `edge` (`tf_tree_core::error`), so these are
+                                // one ring's bounds and never an intersection.
                                 //
-                                // Measured here at roughly one in 4e7 lookups,
-                                // inverted by exactly two publish periods, and
-                                // **as common in the steady phase as in the
-                                // migration window** - which is what makes it a
-                                // fixture transient rather than anything
-                                // ownership did. It is counted and printed
-                                // separately; it is never silently dropped.
-                                "disjoint"
+                                // `SampleCursor::sample` reads them with two
+                                // independent `Relaxed` loads —
+                                // `stamp_at(lo_logical)` then
+                                // `stamp_at(newest)`, no seqlock, deliberately,
+                                // because they are bounds probes rather than
+                                // sample reads. A writer that laps the ring
+                                // between the two leaves the older slot holding
+                                // a *newer* stamp than the one already read,
+                                // and the pair inverts by however many slots it
+                                // advanced: two, at the 4 ms seen against a
+                                // 2 ms publish period.
+                                //
+                                // The refusal is still correct; only the
+                                // reported pair is inconsistent. Roughly one in
+                                // 4e7 lookups, and as common in the steady
+                                // phase as in the migration window - which is
+                                // what makes it a property of the ring rather
+                                // than anything ownership did. Counted and
+                                // printed separately; never silently dropped.
+                                // `docs/PHASE2.md` §12.3 carries the analysis
+                                // and why the fix is a decision record.
+                                "torn-bounds"
                             } else {
                                 "early"
                             }
@@ -593,7 +604,7 @@ mod imp {
                         .map_or(0, |(_, n)| *n)
                 };
                 let stale = count_of("stale");
-                let disjoint = count_of("disjoint");
+                let disjoint = count_of("torn-bounds");
                 let mut lock = out.lock();
                 if !kinds.is_empty() {
                     writeln!(lock, "k {}", kinds.join(","))?;
@@ -1039,8 +1050,7 @@ mod imp {
         println!("  p99.9 during / p99.9 steady = {ratio:.3}   (gate: <= 1.05)");
         println!(
             "  failed lookups (raw)        = {fails}   [steady {steady_fails}, during \
-             {during_fails}; {stale} a starved writer, {disjoint} an inverted composed \
-             window]"
+             {during_fails}; {stale} a starved writer, {disjoint} a torn bounds pair]"
         );
         println!(
             "  readers {}, migrations {}, window {} ms",
@@ -1069,26 +1079,28 @@ mod imp {
             );
         }
 
-        // **The transient composed-window gap, stated rather than absorbed.**
-        // `disjoint` counts refusals whose reported window was inverted
-        // (`oldest > newest`), which only the composed path can produce and
-        // which occurs at the same rate in both phases. Subtracting it from the
-        // 4b count is a judgement, so it is printed as arithmetic the reader can
-        // check, and the unsubtracted totals are printed above it.
+        // **The torn bounds pair, stated rather than absorbed.** `disjoint`
+        // counts refusals whose reported window was inverted (`oldest >
+        // newest`) — one ring's two bounds read by two independent `Relaxed`
+        // loads with a writer lapping between them, not, as this comment first
+        // claimed, an empty intersection across the composed path. It occurs at
+        // the same rate in both phases. Subtracting it from the 4b count is a
+        // judgement, so the arithmetic is printed and the unsubtracted totals
+        // appear above it.
         if disjoint > 0 {
             println!(
-                "\n  note: {disjoint} refusal(s) reported an inverted composed window \
-                 (oldest > newest)."
+                "\n  note: {disjoint} refusal(s) reported a torn bounds pair (oldest > \
+                 newest) - one ring's"
             );
             println!(
-                "        Only the composed path can produce that, it appears in both phases, \
-                 and it is"
+                "        two bounds read by two Relaxed loads with a writer lapping between \
+                 them. Equally"
             );
             println!(
-                "        not attributable to ownership - excluded from the 4b count below, \
-                 and recorded"
+                "        common in both phases, so not attributable to ownership; excluded \
+                 from the 4b"
             );
-            println!("        in docs/PHASE2.md §12.2 as an open question.");
+            println!("        count below. docs/PHASE2.md §12.3 carries the analysis.");
         }
         let fails = fails.saturating_sub(disjoint);
         println!("  failed lookups (gated)      = {fails}   (gate: 0)");
