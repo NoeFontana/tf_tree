@@ -195,8 +195,28 @@ fn main() {
             // distinguishable from the one it should reap.
             let child = tree.frame("cam").unwrap();
             let parent = tree.frame("base").unwrap();
-            let w = tree.claim(child, parent).expect("claim");
-            say(&format!("claimed {}", w.edge().get()));
+            // **Reported, not `expect`ed.** A refusal is a state a test needs to
+            // read and assert on — a killed predecessor's claim that nothing
+            // reaped presents exactly here — and a panicking child hands the
+            // parent a closed pipe instead of a verdict.
+            //
+            // **Bound for the scope, and that is not incidental.** Writing this
+            // as `Ok(w) => say(...)` drops the `EdgeWriter` at the end of the
+            // arm, which releases the claim the moment it is reported — so this
+            // process parks holding nothing, and every test that kills it to
+            // observe what a dead holder leaves behind observes an already-clean
+            // record and passes vacuously. Measured: the claim word read `0`
+            // while this child was supposedly holding it.
+            let _held = match tree.claim(child, parent) {
+                Ok(w) => {
+                    say(&format!("claimed {}", w.edge().get()));
+                    Some(w)
+                }
+                Err(e) => {
+                    say(&format!("refused {e:?}"));
+                    None
+                }
+            };
             loop {
                 std::thread::park();
             }

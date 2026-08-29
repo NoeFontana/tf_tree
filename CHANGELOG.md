@@ -35,6 +35,49 @@ is a bug.
 
 ### Fixed
 
+- **A killed publisher's claims are revoked by the owner, so a restarted node
+  can take its own edges back.** `docs/PHASE2.md` §3.9 says a dead
+  participant's *"arena-side records"* are the owner's to reap; the hangup
+  callback freed the participant **record** and left every **claim** that
+  participant held. `Tree::reap_participant` had been written for that call
+  site — its doc names `EPOLLHUP` as how the owner learns *which slot* went
+  away — and had **no caller** in the workspace outside a benchmark and a test
+  helper. There is no reap surface in `tf_tree_c` or `tf_tree_py` and no CLI
+  subcommand that reaps, so nothing in a deployment invoked it.
+
+  What that cost is the ordinary supervised restart. The publisher is killed,
+  the supervisor restarts it, the assigner hands it **its predecessor's slot** —
+  and `reap_claims` skips `own_slot`, because `F_OFD_GETLK` does not report a
+  description's own byte. So the one process that needs those edges is the one
+  that cannot repair them, and it is refused `EdgeAlreadyClaimed` forever.
+  Measured before the fix: `refused AlreadyClaimed { owner_slot: 1 }`, with the
+  claim word still reading `0x10002` after the holder was `SIGKILL`ed.
+
+  Two producers of a stale claim remain and are **not** closed by this: a dead
+  **owner**, whose hangup nobody observes, and a `TreeBuilder::build_shared`
+  participant, which has no socket. `Tree::reap()` from a surviving read-write
+  participant is still the only collector for those, and it is reachable from
+  Rust only.
+
+- **`Extrapolated::by_ns` could report `0` for a pose the fold invented.** The
+  distance was derived from a walk that ran *after* the fold, so a `push`
+  landing in between with a stamp at or past the query lifted the common newest
+  stamp past it — and `0` means *"every edge bracketed the query — interpolated,
+  not invented"*, which is the one claim the type exists to make unmissable. A
+  1 kHz controller reading a 100 Hz estimator crosses that stamp regularly. The
+  walk now runs **before** the fold; `SampleRing::newest_stamp` is
+  non-decreasing, so the error inverts into the safe direction — `by_ns` may
+  over-report a query that was in fact bracketed, and `0` is sound. No signature
+  change, and `Plan::at` is untouched.
+
+- **`Plan::at_many` returns `LookupError::BufferTooSmall` instead of panicking**
+  on a short output buffer, as `at_many_into` and `at_many_into_f32` already
+  did. It was an `assert!` — unconditional, so it unwound in release and aborts
+  outright under the `panic = "abort"` profile a control loop is built with —
+  while the `# Errors` section two lines above called the check "debug-time".
+  `clippy::panic`, which the workspace denies precisely to keep this out of the
+  engine, does not lint `assert!`.
+
 - **`Tree::owner_lost` answers a question about the owner, not about this
   process's socket** ([`0043`](docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
   It polled only the attach socket, which points at the dead owner and stays hung

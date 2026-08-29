@@ -452,6 +452,17 @@ pub struct Extrapolated {
     /// between published samples, not invented past them. A positive value is
     /// the worst case over the route, because the edge that runs out of data
     /// first is what bounds the composed answer.
+    ///
+    /// # It errs toward over-reporting, and that direction is deliberate
+    ///
+    /// On a live arena the distance is measured just *before* the fold, so a
+    /// sample arriving mid-fold can make the answer better than the label: a
+    /// query that was in fact bracketed may still report a positive `by_ns`. The
+    /// reverse never happens, and that asymmetry is the point — `0` is a claim a
+    /// controller acts on, so it is only ever made when the data was already
+    /// there. Measuring after the fold made `0` reachable for an invented pose,
+    /// which is what `at_extrapolating_tagged`'s comment on the ordering is
+    /// about.
     pub by_ns: i64,
     /// The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query.
     ///
@@ -1305,11 +1316,36 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain_tag(domain)?;
         let edge = self.first_dynamic_edge();
+        // **Before the fold, and the order is the guarantee.** `newest_common`
+        // is the same walk `latest_common` folds at, so the two agree by
+        // construction rather than by two definitions of "common" staying in
+        // step — but *when* it runs decides whether `by_ns == 0` is sound.
+        //
+        // It used to run after. A `push` landing between the fold and this walk,
+        // with a stamp at or past `nanos`, lifts `common` to `>= nanos` — and
+        // the `saturating_sub().max(0)` below then reports **`by_ns == 0`, "not
+        // extrapolated", for a pose the fold genuinely invented**. That is the
+        // one claim this type exists to make unmissable, and a 100 Hz edge under
+        // a 1 kHz query crosses the stamp regularly enough that it is a race a
+        // robot runs, not a thought experiment.
+        //
+        // Measuring first inverts the error into the safe direction, because
+        // `SampleRing::newest_stamp` is non-decreasing (`head` only advances and
+        // `push` refuses a stamp strictly older than the newest). So
+        // `common_before <= common_during`, and:
+        //
+        // * `by_ns > 0` may over-report — a sample that arrived mid-fold made the
+        //   answer better than the label. Harmless: the caller treats a real
+        //   answer as extrapolated.
+        // * `by_ns == 0` means every edge already held data past `nanos`
+        //   *before* the fold began, so the fold certainly bracketed. Sound.
+        //
+        // Not `note`d, exactly as it was not before: the fold's `note` below is
+        // this query's one counter event, and a second would double `lookups_ok`
+        // — the denominator `doctor`'s TFT010 and TFT011 divide by.
+        let common = self.newest_common(g);
         let pose = self.note(g, edge, self.fold_at_policy(g, nanos, policy))?;
-        // After the fold, and only on this path. `newest_common` is the same
-        // walk `latest_common` folds at, so the two agree by construction rather
-        // than by two definitions of "common" staying in step.
-        let (by_ns, which) = match self.newest_common(g)? {
+        let (by_ns, which) = match common? {
             // **`saturating_sub`, not `-`.** This is the pattern
             // `sample::span_ns` was written to eliminate, and its doc comment is
             // the argument: a plain subtraction of two stamps panicked in a
@@ -1602,19 +1638,32 @@ impl Plan {
     ///
     /// # Errors
     ///
-    /// As [`Self::at`], plus a debug-time length check that `out.len() >=
-    /// stamps.len()` (extra `out` slots are left untouched).
+    /// As [`Self::at`], plus [`LookupError::BufferTooSmall`] when
+    /// `out.len() < stamps.len()` — checked before anything is written, so a
+    /// refusal leaves `out` untouched. Extra `out` slots are left untouched on
+    /// success too.
     ///
-    /// # Panics
-    ///
-    /// If `out.len() < stamps.len()` (there is nowhere to write a result).
+    /// **This was an `assert!` and a `# Panics` section until 2026-08-29**, and
+    /// the `# Errors` section above it called the check "debug-time" — which it
+    /// never was: `assert!` is unconditional, so a short buffer unwound in
+    /// release, or aborted outright under the `panic = "abort"` profile an
+    /// embedder picks for a control loop. Every sibling on this path already
+    /// returned the `Copy` identifier `docs/API.md` R5 requires
+    /// ([`Self::at_many_into`], [`Self::at_many_into_f32`]); this was the one
+    /// batch entry point that did not, and `clippy::panic` — which the workspace
+    /// denies precisely to keep this out of the engine — does not lint `assert!`.
     pub fn at_many<D: Domain>(
         &self,
         g: &Guard,
         stamps: &[Stamp<D>],
         out: &mut [Iso3],
     ) -> Result<(), LookupError> {
-        assert!(out.len() >= stamps.len(), "out too short for stamps");
+        if out.len() < stamps.len() {
+            return Err(LookupError::BufferTooSmall {
+                need: stamps.len(),
+                got: out.len(),
+            });
+        }
         self.check_generation(g)?;
         self.check_domain_tag(D::TAG)?;
 

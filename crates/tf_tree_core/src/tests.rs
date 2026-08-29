@@ -3097,6 +3097,154 @@ fn a_tagged_query_is_the_typed_query_with_the_domain_as_data() {
 /// assertion — `ExtrapPolicy::Error` returns the held pose instead of refusing —
 /// so the `ConstantTwist` assertion at the end is never reached under this
 /// mutant. It is reached, and needed, under the narrower mutant of passing
+/// **`by_ns == 0` must mean the fold bracketed, and the *order* of two walks is
+/// the whole of that guarantee.**
+///
+/// `Extrapolated`'s doc says `0` means "every edge bracketed the query — the
+/// answer is interpolated, not invented". `at_extrapolating_tagged` used to fold
+/// the pose and *then* walk `newest_common`. A `push` landing between the two,
+/// with a stamp at or past the query, lifts `common` to `>= nanos` — so the
+/// distance reads `0` for a pose that was invented, which is the one claim this
+/// type exists to make unmissable. Measuring first inverts the error into the
+/// safe direction, because `SampleRing::newest_stamp` is non-decreasing.
+///
+/// **The pose is the witness, and it has to be**: `by_ns` alone cannot tell an
+/// honest `0` (data really did arrive before the walk) from a dishonest one. One
+/// dynamic edge, translation `x == stamp / STEP` exactly, and the query at a
+/// half-step. A *held* answer is then integral in `x`; an *interpolated* one is
+/// `k + 0.5`. So `by_ns == 0` with an integral `x` is the defect, caught
+/// whichever thread won.
+///
+/// **Mutant, run:** move `newest_common` back below the fold — the shipped order
+/// until this test existed. 3 runs of 3 fail, each in about 10 ms; with the walk
+/// first, 6 runs of 6 pass the full 200 000 iterations. So it discriminates, and
+/// quickly.
+///
+/// **The first version of this harness did not, and the note here claimed it
+/// did.** The writer ran a fixed count, finished in microseconds, and the reader
+/// then queried a frontier nothing was moving — every answer honestly
+/// interpolated, mutant green. The writer now runs *until stopped* and the
+/// reader owns the iteration count, and `t` is read from the frontier
+/// immediately before the call rather than from a lagging value. A stress test
+/// whose race cannot occur is indistinguishable from a passing one, which is why
+/// the mutant is run rather than reasoned about.
+///
+/// Probabilistic even so: the window is one fold. The monotonicity argument at
+/// the call site is what carries the guarantee; this is what would notice the
+/// order being changed back.
+#[test]
+fn by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented() {
+    use core::sync::atomic::{AtomicBool, AtomicI64, Ordering as O};
+
+    const STEP: i64 = 1_000_000; // 1 ms, so a 1 kHz query on a 1 kHz edge
+    const ROUNDS: i64 = 200_000;
+
+    let layout = ArenaLayout::new(4, 2, alloc::vec![0, 64]).unwrap();
+    let mut arena = HeapArena::new(&layout, 4242, 0, [0u8; 16]);
+    {
+        let mut builder = ArenaBuilder::new(&mut arena);
+        let f0 = builder.view().intern("f0").unwrap();
+        let f1 = builder.view().intern("f1").unwrap();
+        builder
+            .declare_edge(
+                EdgeId(1),
+                EdgeRecord::dynamic(f0.get(), f1.get(), 64, 0, 0, 0, 0),
+            )
+            .unwrap();
+        builder
+            .view()
+            .topology()
+            .set_parent(f1, f0.get(), 1)
+            .unwrap();
+    }
+
+    // `x == k` at stamp `k * STEP`, and nothing else moves: a blend at the
+    // half-step is `k + 0.5` and a hold is `k`, which is the whole discriminator.
+    let at = |k: i64| Iso3 {
+        q: tf_tree_math::Quat::IDENTITY,
+        t: tf_tree_math::Vec3 {
+            x: k as f64,
+            y: 0.0,
+            z: 0.0,
+        },
+    };
+
+    let (root, leaf) = {
+        let view = ArenaView::new(&arena);
+        (view.intern("f0").unwrap(), view.intern("f1").unwrap())
+    };
+
+    let published = AtomicI64::new(-1);
+    let stop = AtomicBool::new(false);
+    let bad = AtomicI64::new(-1);
+
+    std::thread::scope(|s| {
+        // The `Publisher` is built **inside** the writer: D7 makes it `!Send`,
+        // which is one writer per edge enforced in the type system and is why
+        // this cannot be hoisted out of the closure.
+        s.spawn(|| {
+            let view = ArenaView::new(&arena);
+            let (epoch, owner) = claim(view.claim(EdgeId(1)).unwrap(), 7).unwrap();
+            let pubr = Publisher::new(
+                view.ring(EdgeId(1)).unwrap(),
+                view.claim(EdgeId(1)).unwrap(),
+                epoch,
+                owner,
+            );
+            // Until told to stop, **not** a fixed count: a writer that finishes
+            // first leaves the reader querying a frontier nothing is moving,
+            // which is the state in which this race cannot happen at all.
+            let mut k = 0i64;
+            while !stop.load(O::Relaxed) {
+                pubr.push(k * STEP, &at(k)).unwrap();
+                published.store(k, O::Release);
+                k += 1;
+            }
+        });
+
+        let view = ArenaView::new(&arena);
+        let plan = compile_chain(&view, root, leaf);
+        for _ in 0..ROUNDS {
+            // Read the frontier **immediately** before the call, so `t` is half
+            // a step past what exists right now and the writer's very next push
+            // crosses it. A lagging `k` puts the writer thousands of steps ahead
+            // and every answer is honestly interpolated.
+            let k = published.load(O::Acquire);
+            if k < 0 {
+                continue; // the writer has not published its first sample yet
+            }
+            // Half a step past the newest sample this reader has seen: past it,
+            // and short of the next one the writer will publish.
+            let t = k * STEP + STEP / 2;
+            let g = Guard::new(ArenaView::new(&arena));
+            let Ok(e) =
+                plan.at_extrapolating(&g, Stamp::<SystemDomain>::from_nanos(t), ExtrapPolicy::Hold)
+            else {
+                continue;
+            };
+            if e.by_ns != 0 {
+                continue;
+            }
+            // Claimed bracketed. Then the fold must have had a sample at or past
+            // `t`, and a blend at the half-step is not integral.
+            let x = e.pose.t.x.abs();
+            if (x - x.round()).abs() < 1e-9 {
+                bad.store(k, O::Release);
+                break;
+            }
+        }
+        stop.store(true, O::Release);
+    });
+
+    let k = bad.load(O::Acquire);
+    assert_eq!(
+        k, -1,
+        "at round {k} `by_ns == 0` was reported for a held pose: the distance \
+         was measured from a walk that ran after the fold, so a push inside \
+         that window relabelled an invented answer as interpolated"
+    );
+}
+
 /// `Hold` only where `ConstantTwist` was asked for.
 #[test]
 fn extrapolation_is_selectable_and_reports_how_far_it_reached() {
