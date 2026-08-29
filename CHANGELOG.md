@@ -223,6 +223,32 @@ is a bug.
 
 ### Fixed
 
+- **The "inverted composed window" recorded one commit ago was the wrong
+  mechanism, and the error carried the refutation in its own shape.**
+  `docs/PHASE2.md` §12.3 said "only the composed path can produce it … it
+  intersects the four edges' windows". `LookupError::Extrapolation` names a
+  *single* `edge` (`crates/tf_tree_core/src/error.rs:156`), so its
+  `oldest`/`newest` are one ring's bounds and never an intersection.
+
+  The real mechanism is a sampling race in how those bounds are read.
+  `SampleCursor::sample` loads `head`, then reads the two stamps with **two
+  independent `Relaxed` loads** (`crates/tf_tree_core/src/sample.rs:139-141`);
+  `stamp_at` is a bare `Relaxed` load with no seqlock (`:323-325`), deliberately,
+  because these are bounds probes rather than sample reads. A writer that laps
+  the ring between the two loads leaves the older slot holding a stamp *newer*
+  than the one already read for `newest`, and the pair inverts by exactly the
+  number of slots it advanced — two, at the 4 ms observed against a 2 ms publish
+  period.
+
+  The refusal itself stays correct and conservative; only the reported pair is
+  inconsistent. It is consumed, though: a torn pair files as `extrap_before` and
+  its `gap` reaches `worst_extrap_gap_ns`, which `TFT011` reads against the
+  ring's retained span. **Measured bound, rather than an assumed one: it did not
+  come close to mattering** — ~50 ms of bogus gap against an ~8 s span. Making
+  the two bounds mutually consistent is a hot-path change under a concurrent
+  writer, so it is a decision record rather than a PR. `owner_migration` now
+  calls the class `torn-bounds` instead of `disjoint`.
+
 - **Three release-readiness claims that the 2026-08-17 publish falsified.**
   `docs/PHASE3.md`'s Appendix B stated in bold that
   `.github/workflows/wheels.yml` "**has still never executed**" and that its
