@@ -1298,8 +1298,92 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
                 ),
             ));
         }
+        // **The gap that has not ended yet**, which every rule above is blind to
+        // because they all measure *between* retained stamps. A publisher that
+        // stopped three weeks ago leaves a full ring of perfectly spaced samples,
+        // so the median is healthy, `worst` is one period, and nothing fires —
+        // while the most common fault in the field is exactly that: a node died
+        // or wedged and the transform is frozen. `tf_tree top` already reports it
+        // under this same id, but it needs two ticks to see a `head` that did not
+        // move; a single snapshot has to compare the newest stamp against a
+        // clock instead.
+        //
+        // The interval is `now - newest`: the trailing edge of the same
+        // inter-arrival distribution the rules above measure, judged by the same
+        // `GAP_FACTOR` against the same median. Nothing new is calibrated.
+        if let Some(now) = live_wall_now(inp) {
+            // Monotone by the check above, so the last retained stamp is the
+            // newest.
+            let newest = samples.last().map_or(0, |s| s.stamp_ns);
+            let silent = now.saturating_sub(newest);
+            if silent > median.saturating_mul(GAP_FACTOR) {
+                out.push(Finding::on_edge(
+                    Tft::Tft009,
+                    edge,
+                    format!("edge#{edge}"),
+                    format!(
+                        "no sample for {:.1} s, {:.1}x the median period {:.1} ms — its \
+                         publisher has stopped, and every retained sample still reads healthy",
+                        silent as f64 / 1e9,
+                        silent as f64 / median as f64,
+                        median as f64 / 1e6
+                    ),
+                ));
+            }
+        }
     }
     CheckOutcome::ran(Tft::Tft009, out)
+}
+
+/// The reference instant to measure a *trailing* silence against, or `None` when
+/// there is no such thing for this source.
+///
+/// Two conditions, and both are about whether "how long since the last sample"
+/// is a question with an answer:
+///
+/// * **The clock must share an epoch with the stamps** ([`Clock::Wall`]), for
+///   `TFT005`'s reason in the opposite direction.
+/// * **Something must be writing.** On a frozen `.tft` or a bag the newest stamp
+///   is as old as the recording, so `now - newest` measures how long ago the file
+///   was made — which would fire on every archive `doctor` is pointed at, and is
+///   the false positive that makes an operator stop reading the report.
+///   [`PushStream::RingsUnderWriter`] is `doctor --attach`, the live case, and is
+///   the only one where a silent edge means a publisher stopped rather than a
+///   file being old.
+fn live_wall_now(inp: &Inputs<'_>) -> Option<i64> {
+    match (inp.clock, inp.stream) {
+        (Clock::Wall(now), PushStream::RingsUnderWriter) => Some(now),
+        _ => None,
+    }
+}
+
+/// Why `TFT009` could not look for a publisher that **stopped**, or `None` when
+/// it could.
+///
+/// The retained-gap half of `TFT009` runs on every source; the trailing-silence
+/// half needs a live arena and a comparable clock (`live_wall_now`). A check that
+/// quietly does half its work is indistinguishable from one that passed, which is
+/// the whole reason [`crate::catalogue::Status::Skipped`] carries a mandatory
+/// reason — and `TFT009` is not *skipped* here, so the disclosure has to be a
+/// note.
+#[must_use]
+pub fn silence_coverage_note(clock: Clock, stream: PushStream) -> Option<String> {
+    match (clock, stream) {
+        (Clock::Wall(_), PushStream::RingsUnderWriter) => None,
+        (_, PushStream::RingsUnderWriter) => Some(
+            "TFT009 measured gaps between retained samples but not the gap since the newest one: \
+             this arena's stamps do not share an epoch with the system clock, so \"how long since \
+             the last sample\" has no answer here. A publisher that stopped leaves a full ring \
+             that still reads healthy"
+                .into(),
+        ),
+        _ => Some(
+            "TFT009 measured gaps between retained samples but not the gap since the newest one: \
+             nothing is writing this source, so that distance is the age of the recording rather \
+             than a stopped publisher"
+                .into(),
+        ),
+    }
 }
 
 /// `TFT010` — an edge whose consumers keep asking outside its window.
@@ -2559,6 +2643,138 @@ mod tests {
             stream: PushStream::Observed,
             slots: SlotTable::Current,
             counters: true,
+        }
+    }
+
+    /// [`inputs`] as `doctor --attach` sees it: an arena somebody is writing.
+    ///
+    /// A separate helper rather than a fifth parameter, because `inputs`'
+    /// four-argument shape is load-bearing across thirty-odd call sites and
+    /// `PushStream` is the *only* thing the trailing-silence half of `TFT009`
+    /// needs differently.
+    fn live_inputs<'a>(
+        snap: &'a Snapshot,
+        obs: &'a Observations,
+        stats: &'a [EdgeStats],
+        clock: Clock,
+    ) -> Inputs<'a> {
+        Inputs {
+            stream: PushStream::RingsUnderWriter,
+            ..inputs(snap, obs, stats, clock)
+        }
+    }
+
+    /// **A publisher that stopped is the most common fault in the field, and
+    /// every rule in `TFT009` was blind to it.**
+    ///
+    /// The rules above measure intervals *between retained stamps*. A publisher
+    /// that died three weeks ago leaves a full ring of perfectly spaced samples:
+    /// the median is healthy, the largest gap is one period, and nothing fires —
+    /// while the transform every consumer is reading has been frozen since.
+    /// `tf_tree top` reports it under this id already, but it needs two ticks to
+    /// see a `head` that did not move; a single snapshot has to compare the
+    /// newest stamp against a clock.
+    ///
+    /// **The two halves are asserted against the same fixture**, which is what
+    /// makes this a statement about the blindness rather than about a fixture
+    /// chosen to fire: the identical 100 Hz stream is `Pass` when nothing is
+    /// writing and `Fired` when something is, and the difference is entirely
+    /// "how long ago was the last one".
+    ///
+    /// **Mutant:** delete the `live_wall_now` block from `tft009`. The first
+    /// assertion still passes (it is the old behaviour) and the second fails on
+    /// `Status::Pass`, which is the defect stated as a test.
+    #[test]
+    fn a_publisher_that_stopped_is_reported_where_every_retained_stamp_reads_healthy() {
+        const MS: i64 = 1_000_000;
+        // A flawless 100 Hz stream, ending 8 seconds ago: ~800 missed samples.
+        let stamps: Vec<i64> = (0..40).map(|k| k * 10 * MS).collect();
+        let newest = *stamps.last().unwrap();
+        let obs = Observations::from_samples(
+            stamps
+                .iter()
+                .map(|&ns| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: ns,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        let now = Clock::Wall(newest + 8_000 * MS);
+
+        // What shipped: nothing is writing, so the trailing distance is the age
+        // of the recording and means nothing. Every retained stamp reads healthy
+        // and the check passes — correctly, for this source.
+        let o = tft009(&inputs(&snap, &obs, &[], now));
+        assert_eq!(
+            o.status,
+            Status::Pass,
+            "the retained samples are flawless, so the between-stamps rules must \
+             stay quiet: {o:?}"
+        );
+        assert!(
+            silence_coverage_note(now, PushStream::Observed).is_some(),
+            "a source this half cannot run on must say so"
+        );
+
+        // The same stream on a live arena, which is what `doctor --attach`
+        // reads. Now the silence is a stopped publisher.
+        let o = tft009(&live_inputs(&snap, &obs, &[], now));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 1, "{o:?}");
+        let msg = &o.findings[0].message;
+        assert!(
+            msg.contains("no sample for 8.0 s") && msg.contains("publisher has stopped"),
+            "the finding must name the silence and what it means: {msg}"
+        );
+        assert!(
+            silence_coverage_note(now, PushStream::RingsUnderWriter).is_none(),
+            "the half ran, so there is nothing to disclose"
+        );
+
+        // A live arena whose stamps are not wall-clock cannot be judged this
+        // way, and says so rather than guessing.
+        let o = tft009(&live_inputs(&snap, &obs, &[], Clock::NewestStamp(newest)));
+        assert_eq!(
+            o.status,
+            Status::Pass,
+            "a non-wall clock has no answer for \"how long since the last sample\": {o:?}"
+        );
+        assert!(
+            silence_coverage_note(Clock::NewestStamp(newest), PushStream::RingsUnderWriter)
+                .is_some()
+        );
+    }
+
+    /// **A live publisher at its declared cadence is not reported as stopped**,
+    /// which is the false positive that would make an operator stop reading.
+    #[test]
+    fn a_publisher_still_publishing_is_not_reported_as_stopped() {
+        const MS: i64 = 1_000_000;
+        let stamps: Vec<i64> = (0..40).map(|k| k * 10 * MS).collect();
+        let newest = *stamps.last().unwrap();
+        let obs = Observations::from_samples(
+            stamps
+                .iter()
+                .map(|&ns| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: ns,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        // One period late, then just under the factor. Neither is a fault.
+        for late in [10 * MS, GAP_FACTOR * 10 * MS] {
+            let o = tft009(&live_inputs(&snap, &obs, &[], Clock::Wall(newest + late)));
+            assert_eq!(
+                o.status,
+                Status::Pass,
+                "a publisher {late} ns past its last sample is publishing, not stopped: {o:?}"
+            );
         }
     }
 

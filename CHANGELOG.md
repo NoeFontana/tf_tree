@@ -35,6 +35,65 @@ is a bug.
 
 ### Fixed
 
+- **An exact query returns the pose of the stamp it named, or refuses.**
+  `SampleRing::sample`'s `# Errors` promises `SlotRecycled` when the ring lapped
+  the reader mid-read, and the interpolating tail enforced it — but every arm
+  that *short-circuits* returned the slot directly: `ExtrapPolicy::Hold`, an
+  exact hit on the **newest** stamp (in both `sample` and `sample_from`),
+  `sample_with_twist_seeking`'s `Hold`, and `constant_twist`'s single-sample
+  case. Six return sites. A reader descheduled long enough for the ring to lap
+  got a complete, valid pose belonging to a **different stamp** — the seqlock
+  catches a torn slot, not a recycled one — while naming an *interior* stamp
+  four lines away was refused for exactly the same race.
+
+  The sharp one is the exact-newest pair: a caller that names a stamp can be
+  handed the pose of another. A 64-slot ring — `Capacity::slots(64)`, what the
+  ABI cost fixture uses — laps in 64 samples, which is one ordinary preemption
+  at 1 kHz. One shared `revalidated` helper now covers all six, so there is one
+  spelling of the check rather than seven.
+
+- **`tf_tree tree`'s `age(ms)` column is measured against a real clock.** It
+  was `fixture::NOW_NS - newest` — the in-process benchmark rig's synthetic
+  "now", `9_900_000_000`. Against a live arena that number is arbitrary
+  (measured: ~8 750 ms of age for a transform pushed milliseconds earlier), and
+  against a robot stamping Unix nanoseconds the subtraction clamps and every
+  edge reads `0` however long its publisher has been dead. It now uses
+  `Clock::decide`, the estimator `doctor` and `top` already share, and the
+  header says which clock it picked.
+
+- **The runbook stopped naming a command that does not exist.** Its
+  startup-ordering section offered `tf_tree serve --config` as the supervised
+  remedy; `docs/PHASE2.md` §0.0 records `tf_tree serve` as not implemented. The
+  remedy is the topology config itself, which the ROS bridge, the CLI's
+  `topology --discover`, and Python all already speak.
+
+- **The `tf_tree` crates.io front page stopped telling adopters that
+  `LookupError` does not implement `std::error::Error`.**
+  [`0040`](docs/decisions/0040-the-error-that-cannot-be-returned.md) made that
+  false and did not touch the README, so the first page a Rust adopter reads
+  talked them out of `?` and into hand-rolled match arms over a limitation that
+  no longer exists. `0019`'s Context carried the same expired clause.
+
+- **`TFT009` reports a publisher that has *stopped*, which no check could see.**
+  Every rule in the catalogue measured intervals *between retained stamps*, so a
+  publisher that died three weeks ago left a full ring of perfectly spaced
+  samples: the median period reads healthy, the largest gap is one period, and
+  `doctor` reported nothing — while the transform every consumer reads had been
+  frozen since. That is the most common fault in the field, and the only thing
+  in the project that saw it was `tf_tree top`, which needs two ticks to notice
+  a `head` that did not move.
+
+  A single snapshot compares the newest stamp against the reference clock
+  instead. Same id (so `doctor` and `top` agree), same `GAP_FACTOR`, same
+  per-edge median — the trailing gap is just the open end of the same
+  inter-arrival distribution, so nothing new is calibrated.
+
+  It runs only on a **live** arena with a **wall-comparable** clock: on a frozen
+  `.tft` or a bag the distance is the age of the recording, and firing there is
+  the false positive that makes an operator stop reading the report. When it
+  cannot run, `doctor`'s report metadata says so — a check that quietly does
+  half its work is indistinguishable from one that passed.
+
 - **A killed publisher's claims are revoked by the owner, so a restarted node
   can take its own edges back.** `docs/PHASE2.md` §3.9 says a dead
   participant's *"arena-side records"* are the owner's to reap; the hangup

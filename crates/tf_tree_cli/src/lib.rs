@@ -1109,10 +1109,22 @@ fn cmd_tree(live: Live<'_>) -> Result<()> {
     );
 
     // Index edges by child frame so we can annotate each frame with its edge.
+    // **The reference clock, not `fixture::NOW_NS`.** The age column measured
+    // against the benchmark fixture's synthetic constant (9.9 s), so on any
+    // arena a robot actually runs — whose stamps are Unix nanoseconds, eighteen
+    // orders of magnitude larger — `(NOW_NS - s).max(0)` clamped to `0` for
+    // every edge, and the column read `0` whether the publisher had stopped a
+    // second or a month ago. `Clock::decide` is the estimator `doctor` and `top`
+    // already share: the wall clock when the arena's stamps vote for it, the
+    // median stamp when they do not, which keeps the fixture's own numbers
+    // meaningful too. `cmd_echo` had solved the same problem ad hoc, one
+    // function below.
+    let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
     println!(
         "  {:<22} {:>5} {:<8} {:>9} {:>12} {:>10} {:>8}",
         "frame", "depth", "kind", "rate(Hz)", "occupancy", "age(ms)", "writer"
     );
+    println!("  age(ms) is measured against the {}\n", clock.label());
     for f in &snap.frames {
         let indent = "  ".repeat(f.depth as usize);
         let edge = snap.edges.iter().find(|e| e.child == f.id);
@@ -1141,7 +1153,7 @@ fn cmd_tree(live: Live<'_>) -> Result<()> {
                 };
                 let age = e
                     .newest_stamp
-                    .map(|s| format!("{}", (fixture::NOW_NS - s).max(0) / 1_000_000))
+                    .map(|s| format!("{}", (clock.nanos() - s).max(0) / 1_000_000))
                     .unwrap_or_default();
                 let writer = if e.claimed {
                     format!("pid {}", e.owner_pid)
@@ -1389,6 +1401,7 @@ fn evidence_notes(
     notes.extend(checks::rate_coverage_note(snap, obs));
     notes.extend(checks::clock_offset_note(snap, stream, clock));
     notes.extend(clock_step.coverage_note(stream));
+    notes.extend(checks::silence_coverage_note(clock, stream));
     match (counter_evidence, stream.no_arrival_delays()) {
         // Both blind: `tft011` skipped and said so itself.
         (Some(_), Some(_)) => {}
@@ -2317,6 +2330,96 @@ mod tests {
         assert!(
             note.contains("compared 1 of 2"),
             "the note must state the coverage it reached the operator with: {note}"
+        );
+    }
+
+    /// **The `TFT009` silence note reaches `Meta.notes`, and is silent when the
+    /// half actually ran.**
+    ///
+    /// Same argument as the two tests around it: `checks::silence_coverage_note`
+    /// is unit tested, and the line that *calls* it is not reachable from those
+    /// tests. Deleting the call leaves every bag and every frozen `.tft` reading
+    /// as though `doctor` had looked for a stopped publisher, which is the one
+    /// fault an operator most often opens the report to find.
+    ///
+    /// Mutant: delete `notes.extend(checks::silence_coverage_note(clock, stream));`
+    /// from `evidence_notes`. Applied: the `expect` fires with "no TFT009
+    /// silence note".
+    #[test]
+    fn the_silence_coverage_note_reaches_the_report_metadata() {
+        use doctor::{EdgeInfo, FrameInfo};
+        use tf_tree::InterpPolicy;
+
+        let snap = Snapshot {
+            frames: vec![
+                FrameInfo {
+                    id: 1,
+                    name: "map".to_owned(),
+                    parent: 0,
+                    depth: 0,
+                    edge_of_child: 0,
+                },
+                FrameInfo {
+                    id: 2,
+                    name: "odom".to_owned(),
+                    parent: 1,
+                    depth: 1,
+                    edge_of_child: 0,
+                },
+            ],
+            edges: vec![EdgeInfo {
+                id: 1,
+                parent: 1,
+                child: 2,
+                kind: EdgeKind::Dynamic,
+                capacity: 512,
+                interp: InterpPolicy::ScLerp,
+                domain: 0,
+                head: 100,
+                claimed: true,
+                claiming: false,
+                owner_slot: Some(0),
+                owner_pid: 4711,
+                newest_stamp: Some(1_000_000_000),
+                clock_offset_nanos: None,
+                nominal_rate_mhz: Some(20_000),
+            }],
+            participants: live_writer(),
+        };
+        let obs = Observations::new();
+        let step = checks::ClockStepEvidence::capture(&snap, &obs);
+
+        // A source nothing is writing: the trailing distance is the age of the
+        // recording, so the half cannot run and must say so.
+        let notes = evidence_notes(
+            checks::PushStream::RingsAtRest,
+            &snap,
+            &obs,
+            checks::Clock::Wall(0),
+            &step,
+            None,
+        );
+        let note = notes
+            .iter()
+            .find(|n| n.starts_with("TFT009"))
+            .expect("no TFT009 silence note: a half-run would read as a full one");
+        assert!(
+            note.contains("nothing is writing"),
+            "the note must say which of the two reasons applied: {note}"
+        );
+
+        // And on the live case it ran, so there is nothing to disclose.
+        let notes = evidence_notes(
+            checks::PushStream::RingsUnderWriter,
+            &snap,
+            &obs,
+            checks::Clock::Wall(0),
+            &step,
+            None,
+        );
+        assert!(
+            !notes.iter().any(|n| n.starts_with("TFT009")),
+            "the half ran; a note about coverage it did reach is noise: {notes:?}"
         );
     }
 

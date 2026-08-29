@@ -130,6 +130,59 @@ fn attach_shows_the_live_publishers_topology() {
     );
 }
 
+/// **The `age(ms)` column is measured against a real clock, not a benchmark
+/// constant.**
+///
+/// It was `(fixture::NOW_NS - newest).max(0)`, and `fixture::NOW_NS` is
+/// `9_900_000_000` — the in-process benchmark rig's synthetic "now". Against a
+/// live arena that number is arbitrary: this publisher stamps around 1.0–1.15 s,
+/// so the column reported **~8 750 ms of age for a transform pushed
+/// milliseconds ago**, and against a robot stamping Unix nanoseconds the
+/// subtraction clamps and every edge reads `0` however long its publisher has
+/// been dead. Either way the number was about the fixture rather than the arena,
+/// which is worse than an empty column: it is a plausible one.
+///
+/// `Clock::decide` is the estimator `doctor` and `top` already share, and the
+/// header now discloses which clock it picked — the same disclosure discipline
+/// the rest of the report follows.
+///
+/// **Mutant:** put `fixture::NOW_NS` back. The `8_7` assertion fires, because
+/// that is the shipped output.
+#[test]
+fn the_age_column_is_measured_against_a_real_clock() {
+    let scratch = Scratch::new("age");
+    let _pubr = publish(&scratch);
+
+    let (ok, out) = cli(&scratch.0, &["tree", "--attach"]);
+    assert!(ok, "tf_tree tree --attach failed:\n{out}");
+
+    let row = out
+        .lines()
+        .find(|l| l.contains("base") && !l.contains("cam") && l.contains("dynamic"))
+        .unwrap_or_else(|| panic!("no dynamic `base` row:\n{out}"));
+    let age: i64 = row
+        .split_whitespace()
+        .rev()
+        .nth(2)
+        .and_then(|f| f.parse().ok())
+        .unwrap_or_else(|| panic!("no parsable age in `{row}`:\n{out}"));
+
+    // The publisher pushed its newest sample at 1.15 s and nothing else has
+    // written since, so against any honest reference clock this edge is the
+    // newest thing in the arena and its age is small. `fixture::NOW_NS` put it
+    // at ~8 750.
+    assert!(
+        age < 1_000,
+        "age {age} ms for the newest edge in the arena — the column is measured \
+         against something other than this arena's own clock:\n{out}"
+    );
+    assert!(
+        out.contains("age(ms) is measured against the"),
+        "the column must say which clock it used, as every other derived number \
+         in this tool does:\n{out}"
+    );
+}
+
 /// A lookup through the shipped binary must return the publisher's transform.
 #[test]
 fn echo_attaches_and_resolves() {

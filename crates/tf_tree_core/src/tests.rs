@@ -92,6 +92,64 @@ fn push_then_sample_exact_and_interpolated() {
     assert_eq!(mid.to_bits(), expect.to_bits());
 }
 
+/// **`revalidated` is the lap check, and it fires exactly at the bound.**
+///
+/// `SampleRing::sample`'s `# Errors` promises `SlotRecycled` when the ring
+/// lapped the reader mid-read. The interpolating tail enforced it; six arms that
+/// *short-circuit* did not — `Hold` in `sample` and `sample_from`, the exact hit
+/// on the newest stamp in both, `sample_with_twist_seeking`'s `Hold`, and
+/// `constant_twist`'s single-sample case — so a reader descheduled long enough
+/// for the ring to lap got a complete, valid pose belonging to a **different
+/// stamp**. The seqlock catches a torn slot, not a recycled one. All six now go
+/// through one helper, and this pins what that helper decides.
+///
+/// The bound is `retained`, not `capacity`: `head - i == capacity` already means
+/// slot `i` is the one `push` is overwriting, so `retained == capacity - 1` is
+/// the last index still safe to have read.
+///
+/// **This is deterministic, and two stress harnesses were deleted to get here.**
+/// The first queried the exact newest stamp and demanded that stamp's pose back;
+/// it fails, and not because of this fix — `bracket` binary-searches `stamp_at`
+/// with `Relaxed` loads, one concurrent `push` overwrites the oldest retained
+/// slot, and the search can then land on an index that is *still in the window*
+/// (so the trailing check passes) whose stamps do not bracket the request. The
+/// second used `newest_stamp()` as its baseline, which is the same unguarded
+/// read: its head load and its stamp load race, so it can report a stamp from a
+/// later lap and make an honest answer look stale. A concurrent test of this
+/// needs a baseline that cannot over-report, and from outside the ring there is
+/// none. Both hazards are written up at [`crate::sample`]'s module docs; neither
+/// is smuggled into an assertion that would go red for the wrong reason.
+#[test]
+fn revalidated_fires_exactly_at_the_retained_bound() {
+    const CAP: usize = 8;
+    let hr = HeapRing::new(CAP);
+    let ring = hr.ring();
+    for k in 0..CAP as i64 {
+        ring.push(k, &pose(k as u64)).unwrap();
+    }
+    let retained = CAP as u64 - 1;
+    let head = CAP as u64;
+
+    // The newest index is always safe; the oldest still-retained one is the last
+    // safe one; one older than that is the slot `push` is overwriting.
+    assert!(ring.revalidated_for_test(head - 1, retained).is_ok());
+    assert!(ring.revalidated_for_test(head - retained, retained).is_ok());
+    assert_eq!(
+        ring.revalidated_for_test(head - retained - 1, retained),
+        Err(LookupError::SlotRecycled { edge: EdgeId(0) }),
+        "the index `push` is overwriting must be refused, not returned"
+    );
+
+    // And one more push moves the bound by exactly one, which is what makes this
+    // a bound rather than a constant.
+    ring.push(CAP as i64, &pose(CAP as u64)).unwrap();
+    assert_eq!(
+        ring.revalidated_for_test(head - retained, retained),
+        Err(LookupError::SlotRecycled { edge: EdgeId(0) }),
+        "the slot that was the oldest safe one is now the one being overwritten"
+    );
+}
+
 #[test]
 fn empty_ring_is_no_data() {
     let hr = HeapRing::new(4);

@@ -13,9 +13,12 @@ you arrive.
 and `/tf` ingest are not. **There is no `tf_treed`, and there will not be** —
 [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) replaces
 it with `tf_tree serve`, and more usefully removes the reason the rows below
-used to point at a daemon at all. Any row you find still marked
-*(needs `tf_treed`)* is a defect in this document: it is telling you to run a
-program that has never existed. The seven `doctor` checks are `cycle`,
+used to point at a daemon at all. **`tf_tree serve` is not built either** —
+`docs/PHASE2.md` §0.0 records it as not implemented, and `0019` makes it an
+escalation rather than a prerequisite — so nothing below may name it as a
+remedy. Any row you find still marked *(needs `tf_treed`)*, or pointing at
+`tf_tree serve`, is a defect in this document: it is telling you to run a
+program that does not exist. The seven `doctor` checks are `cycle`,
 `unclaimed-dynamic`, `multi-writer`, `short-buffer`, `inconsistent-rate`,
 `unreachable`, `out-of-order`.
 
@@ -806,9 +809,22 @@ Reach for it in a consumer's startup path instead of planning immediately.
 frames, a sensor that appears late — that is `frame_headroom` / `edge_headroom`,
 sized at build time. Exhaustion is a typed error naming the knob.
 
-A supervised deployment that wants none of this ambiguity can pre-declare the
-whole static structure up front with `tf_tree serve --config`, which is what
-that subcommand is for. It is an option, not a prerequisite.
+A supervised deployment that wants none of this ambiguity pre-declares the whole
+static structure up front, in the topology config
+(`crates/tf_tree_bridge/src/config.rs`'s schema) that
+`ros/tf_tree_ros` starts a bridge from, `tf_tree topology --discover` writes, and
+Python's `build`/`open` accept
+([`0041`](./decisions/0041-python-declares-a-topology-the-way-everything-else-does.md)).
+Whichever process creates the arena passes it as `layout_if_creating`, and every
+consumer can then plan before any publisher runs.
+
+**This paragraph used to say `tf_tree serve --config`, and there is no such
+subcommand.** [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)
+proposes `tf_tree serve` — a subcommand that owns a topology and stays running —
+in place of §9's `tf_treed`, and `docs/PHASE2.md` §0.0 records it as **not
+implemented**. Naming it here as the remedy sent an operator to a command that
+does not exist; the remedy is the config, which does, and which `serve` would
+merely be a place to put.
 
 ### `TopologyChurn`
 

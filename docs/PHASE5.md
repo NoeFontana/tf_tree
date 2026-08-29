@@ -949,7 +949,7 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 | `TFT006` | Zero or absurd stamps | error | value check during ingest and push |
 | `TFT007` | Publish rate deviates from nominal | warn | derived from stamps vs `nominal_rate_mhz` |
 | `TFT008` | Jitter: p99 inter-arrival ≫ nominal | warn | derived from stamps |
-| `TFT009` | Gaps / dropouts | warn | derived from stamps |
+| `TFT009` | Gaps / dropouts, **including the one that has not ended** | warn | derived from stamps; the trailing gap `now - newest` needs a live arena and a wall-comparable clock, and discloses when it could not run |
 | `TFT010` | Extrapolation hotspot | warn | `EdgeCounters` + participant attribution (skips on an arena that has served no lookups — see the amendment below) |
 | `TFT011` | Ring capacity too small for observed consumer lag | warn | worst extrapolation gap vs buffer span, **or** `capacity × period` vs observed publish latency; skips only when neither has evidence |
 | `TFT012` | Disconnected subtree | error | topology walk |
