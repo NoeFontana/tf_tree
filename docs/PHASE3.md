@@ -658,10 +658,10 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 - [ ] `os.register_at_fork` poisoning tested under all three start methods
 - [ ] Hand-written stubs; `mypy --strict` and `pyright --strict` clean over stubs and examples
 - [x] CI asserts no public symbol exists in the generated stubs but not the hand-written ones (§9)
-- [x] Wheels for every row of §10 — two invocations each — with the `abi3.abi3t` job present and skipped (`.github/workflows/wheels.yml`; **never executed**, see below)
+- [x] Wheels for every row of §10 — two invocations each — with the `abi3.abi3t` job present and skipped (`.github/workflows/wheels.yml`; **executed and green on the `v0.0.3` and `v0.0.4` tags**, `abi3.abi3t` skipped as specified — see Appendix B, which claimed the opposite until 2026-08-29)
 - [ ] Toolchain floors of §10.1 pinned in `pyproject.toml`; `[tool.ruff.format] exclude` covers `**/*.md`
 - [ ] `.github/dependabot.yml` regains its `uv` entry when `pyproject.toml` lands (the Phase 1 scaffold removed both)
-- [ ] PEP 740 attestations and SBOM published with the first release
+- [~] **PEP 740 attestations are published; the SBOM is not.** `wheels.yml`'s `publish` job carries `attestations: write` and `attestations: true` under Trusted Publishing, and it has run green on two tags — so the attestation half of this row has been met since 2026-08-19 while the box stayed unticked. The SBOM half is genuinely absent (`PHASE5.md` §10's *Not done* list). Split rather than ticked: half a checkbox is what a reader needs to see
 - [ ] §12.2 gate met, or a written explanation of which criterion failed and by how much
 - [ ] `docs/PHASE4.md` written, carrying §13 forward with the measured numbers
 
@@ -677,15 +677,22 @@ drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
 verified to import and run on 3.14.
 
-**`.github/workflows/wheels.yml` has still never executed**, and that is now
-for a different reason than it was. Actions produced no run for this repository
-between 2026-07-23 and 2026-08-16 — an account-level state on private
-repositories, confirmed when making this one public restored runs immediately.
-It runs again, but `wheels.yml` triggers only on a `v*` tag, and no tag has been
-pushed. Its YAML parses and every maturin
-invocation in it was run by hand on this host for the rows this host can build,
-but the cross-platform rows — musllinux, macOS, Windows, aarch64 — are
-unproven. Treat the first real run as a first run.
+**`.github/workflows/wheels.yml` has executed, and this paragraph said the
+opposite until 2026-08-29.** It read "**has still never executed** … no tag has
+been pushed … the cross-platform rows — musllinux, macOS, Windows, aarch64 — are
+unproven. Treat the first real run as a first run." Every clause of that expired
+when the tags went out, and it is kept here rather than deleted because a
+*bolded* negative claim in an appendix is what a reader quotes.
+
+Five runs, two of them green: `v0.0.1` (2026-08-17, failure), `v0.0.2`
+(2026-08-17, cancelled), a `workflow_dispatch` the same day (failure), then
+**`v0.0.3` on 2026-08-19 and `v0.0.4` on 2026-08-22, both success**. On the
+`v0.0.4` run every wheel row succeeded — `abi3` and `cp314t` across x86_64,
+aarch64 and x64, plus `sdist` — `abi3.abi3t` was **present and skipped**
+exactly as §14's row specifies, and `publish` succeeded. So the cross-platform
+rows are proven, and what is *not* proven is narrower: the first two tags did
+not produce wheels, so **the 0.0.2 wheels on PyPI did not come from this
+workflow**, and the first successful automated publish is `v0.0.3`.
 
 Not implemented: `at_adaptive`'s `adaptive_into` variant — the Rust side
 returns slices borrowed from an internal scratch, so a Python `adaptive_into`

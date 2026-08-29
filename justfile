@@ -2015,6 +2015,15 @@ tsan:
 shm-test:
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
+    # **`owner_migration`'s unit tests and lint, which run in no other recipe.**
+    # The binary is `required-features = ["shm"]`, so `just lint`'s workspace
+    # pass compiles it out entirely; without these two lines the gate that states
+    # §12.3 4b would be linted by nothing and its non-vacuity test
+    # (`gate_arithmetic_is_not_vacuous`) executed nowhere. The measurement itself
+    # is `just owner-migration` — minutes long, and scheduler-sensitive, so it
+    # does not belong in a per-branch gate.
+    cargo clippy -p tf_tree_bench --features shm --bin owner_migration --all-targets -- -D warnings
+    cargo nextest run -p tf_tree_bench --features shm --bin owner_migration
 
 # N reader processes on one shared arena, plus the memory that sharing saves.
 # RUN THIS ON AN IDLE MACHINE — the 8-process row oversubscribes 4 cores 2:1.
@@ -2307,6 +2316,32 @@ shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
 # Without it, a harness that quietly stopped reading would print the same
 # "0 violations" forever — which is exactly what the first revision of this
 # harness did, and how the writer pacing in `work` came to exist.
+# **`docs/PHASE2.md` §12.2's two ownership-migration rows, and §12.3 gate 4b** —
+# the normative criterion that had no artifact until 2026-08-29. §3.5's migration
+# shipped on 2026-08-28 with correctness tests; nothing measured its *latency*,
+# and `docs/benchmarks/EVIDENCE.md` had no row for 4b, so "lookup p99.9 during a
+# migration within 5% of steady state, and zero failed lookups" could not be
+# stated from anything.
+#
+# Five processes, five migrations: an owner that only serves (so killing it does
+# not stop the data stream), a never-killed writer, an heir running §3.5's
+# caller-driven trigger, and read-only readers that make no control-plane call at
+# all. Exits non-zero on FAIL, and **separately** on INVALID — a run whose writer
+# the host starved cannot state the gate, and saying so beats blaming the arena.
+#
+# Latency here is partly a measurement of the scheduler: run it on an idle
+# machine. `--repeat` buys tail samples, which is the figure that needs them.
+#
+# `*ARGS` like `shm-torture-crash-points`: `--repeat` is the knob the tail figure
+# needs, and a recipe that names it in its own comment must be able to pass it.
+# `${CARGO_TARGET_DIR:-target}` because a set `CARGO_TARGET_DIR` sends
+# `cargo build` elsewhere and a hard-coded `./target/release/` would then exec a
+# stale binary or none — the trap `bench-check` and `c-header-check` already
+# carry.
+owner-migration *ARGS:
+    cargo build --release -q --features shm -p tf_tree_bench --bin owner_migration
+    "${CARGO_TARGET_DIR:-target}/release/owner_migration" {{ARGS}}
+
 shm-torture-self-test:
     cargo nextest run -p tf_tree_bench --features shm --release --test torture
 

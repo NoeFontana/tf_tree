@@ -26,6 +26,10 @@
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! join-reparent -> "joined", then on stdin: "reparented" | "refused <e>"
 //!                  (arm §11.3's topo.holding_lock to die inside the section)
+//! join-sweep    -> "joined <slot>", then on one stdin poke: "swept <n>", and
+//!                  exits — a participant-table sweep in a process that is not
+//!                  the test binary (arm §11.3's reclaim.after_probe_before_cas
+//!                  to die between the verdict and the CAS)
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
 //! join-heir     -> "joined <slot>", then one line per stdin poke:  (arm
 //!                  §11.3's takeover crash point with TF_TREE_CRASH_AT to kill
@@ -291,6 +295,35 @@ fn main() {
             loop {
                 std::thread::park();
             }
+        }
+        // Join read-write, then sweep the *participant table* on demand.
+        //
+        // **`reap_participants`, not `reap_dead`** — `own-reap` above is the
+        // claims sweep, and this is the records one. It exists so
+        // `reclaim.after_probe_before_cas` can be armed in a process that is not
+        // the test binary: every other sweep in the suite runs in-process
+        // (`tests/rendezvous.rs`), where arming the site would abort the test
+        // runner itself rather than the participant under test. That is the
+        // whole reason §11.3's row had a site and no test.
+        "join-sweep" => {
+            let tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::Never)
+                .timeout(std::time::Duration::from_secs(5))
+                .open()
+                .expect("join");
+            say(&format!("joined {}", tree.participant_slot()));
+            // **One sweep, then exit — deliberately not `park`.** An armed
+            // sweeper aborts inside `reap_participants`, so it never gets here;
+            // a *disarmed* one reaches this line and exits 0. That is what lets
+            // the test assert `status.code() == None` and fail in a second when
+            // the site stops firing. Parking instead would turn a disarmed site
+            // into a 180-second nextest timeout, which is a much worse way to
+            // learn that a crash point has become a no-op.
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
+            let n = tree.reap_participants();
+            say(&format!("swept {n}"));
         }
         "hold-topo" => {
             let path = std::env::args().nth(2).expect("lock file path");
