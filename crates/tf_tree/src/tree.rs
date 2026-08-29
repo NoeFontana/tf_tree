@@ -3033,7 +3033,7 @@ impl Tree {
     /// once another survivor inherits, this keeps answering `true`, because the
     /// socket it reads is still the dead owner's. So it is a trigger to *try*
     /// inheriting once, not a standing question — see
-    /// [`Inheritance::Contended`] for what a survivor that loses the race is
+    /// [`crate::Inheritance::Contended`] for what a survivor that loses the race is
     /// left holding.
     ///
     /// Lookups are unaffected either way — `Plan::at` touches the mapping and
