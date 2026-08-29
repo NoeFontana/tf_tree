@@ -16,8 +16,18 @@
 //!    [`log_se3`] returns the twist `ξ = [ω, v]` of the right-multiplied
 //!    increment and [`exp_se3`] consumes the same ordering.
 //!
-//! This crate is `#![forbid(unsafe_code)]`: its property tests run under Miri in
-//! seconds precisely because it holds no `unsafe` and no arena.
+//! This crate is `#![forbid(unsafe_code)]`, which is why its *library* code is
+//! cheap for Miri to interpret: no `unsafe`, no arena, no provenance to track.
+//! It is reached under Miri as a callee of `tf_tree_core`'s tests.
+//!
+//! **Its own test suite is not run under Miri, and this comment said otherwise
+//! until 2026-08-29** — it read "its property tests run under Miri in seconds",
+//! which was true of no command in this repository. `just miri` selects
+//! `-p tf_tree_arena -p tf_tree_core`, and building those two produces no
+//! `tf_tree_math` test target, so neither `tests/proptests.rs` nor
+//! `tests/slerp_public.rs` has ever been interpreted. The claim is corrected
+//! rather than deleted because this crate publishes, so the sentence was on its
+//! docs.rs front page.
 //!
 //! # Numerics
 //!
