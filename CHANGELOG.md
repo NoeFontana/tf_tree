@@ -31,7 +31,7 @@ is a bug.
 
 ---
 
-## [Unreleased]
+## [0.0.5] — 2026-08-29 (the entry paths that need no toolchain)
 
 ### Added
 

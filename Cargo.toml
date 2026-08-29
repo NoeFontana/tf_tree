@@ -45,7 +45,7 @@ exclude = [
 # an MSRV raise reaches nobody who did not opt into it by editing a manifest.
 # The rule comes back into force at 0.1.0, where a minor slot exists again.
 # `SUPPORT.md`'s MSRV section carries the same statement in its own voice.
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 # **1.87, and each step was forced by a dependency rather than chosen.**
 #
@@ -122,8 +122,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.dependencies]
 # Intra-workspace crates (version pinned so publishable crates carry a real
 # requirement, not a path wildcard).
-tf_tree_math = { path = "crates/tf_tree_math", version = "0.0.4" }
-tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.0.4" }
+tf_tree_math = { path = "crates/tf_tree_math", version = "0.0.5" }
+tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.0.5" }
 # Phase 2 shared memory (see docs/PHASE2.md §2). Linux-only, opt-in via the
 # `shm` feature; `linux_raw` backend so there is no libc crate and no C build.
 # Only `tf_tree_ipc`, and only for `fcntl(F_OFD_*)`: rustix has no OFD locking
@@ -138,9 +138,9 @@ rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "s
 # measurement — the "counters off" row was measuring the counters-on engine.
 # Every crate that wants them re-enables them through its own `counters`
 # feature, which is what makes the switch actually switch.
-tf_tree_core = { path = "crates/tf_tree_core", version = "0.0.4", default-features = false }
-tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.0.4" }
-tf_tree = { path = "crates/tf_tree", version = "0.0.4", default-features = false }
+tf_tree_core = { path = "crates/tf_tree_core", version = "0.0.5", default-features = false }
+tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.0.5" }
+tf_tree = { path = "crates/tf_tree", version = "0.0.5", default-features = false }
 # publish = false crates, wired by path only (no version requirement published).
 # **`default-features = false` for the same load-bearing reason as `tf_tree`
 # above, and it is easy to miss here.** `tf_tree_bench` has its own

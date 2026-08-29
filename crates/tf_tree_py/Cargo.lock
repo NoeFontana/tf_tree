@@ -553,7 +553,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tf_tree"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "tf_tree_arena",
  "tf_tree_core",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_arena"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bytemuck",
  "rustix",
@@ -572,14 +572,14 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_bridge"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "tf_tree",
 ]
 
 [[package]]
 name = "tf_tree_core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_ingest"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_ipc"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "libc",
  "rustix",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_math"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bytemuck",
  "libm",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_py"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "numpy",
  "pyo3",

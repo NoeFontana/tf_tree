@@ -40,7 +40,7 @@ description = "PyO3 bindings for tf_tree (docs/PHASE3.md)"
 # the wheel *installed* to have anything to compare, so it skips under a bare
 # `cargo test` and only bites in `just py-test`. Bump this field and
 # `pyproject.toml` in the same commit.
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 # Tracks the workspace floor by hand: this crate is outside the workspace (it
 # links libpython), so it cannot inherit `[workspace.package]`. See the note on
@@ -104,9 +104,9 @@ pure-hash = ["tf_tree/pure-hash"]
 # tables of a frozen `.tft` through `Tree::arena_view`, which is now the Rust
 # unstable tier. The wheel is built and shipped from this workspace with the
 # engine, so it is a consumer that cannot skew from it.
-tf_tree = { path = "../tf_tree", version = "0.0.4", features = ["shm", "unstable"] }
-tf_tree_core = { path = "../tf_tree_core", version = "0.0.4" }
-tf_tree_math = { path = "../tf_tree_math", version = "0.0.4" }
+tf_tree = { path = "../tf_tree", version = "0.0.5", features = ["shm", "unstable"] }
+tf_tree_core = { path = "../tf_tree_core", version = "0.0.5" }
+tf_tree_math = { path = "../tf_tree_math", version = "0.0.5" }
 # **The topology config `ros/tf_tree_ros` and `tf_tree_cli` already read**
 # (`docs/decisions/0041`). Its only dependency is `tf_tree`, its parser is
 # hand-written with no `serde` and no `toml` crate, and it carries no
