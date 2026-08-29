@@ -22,7 +22,7 @@ the README about: the README states the claim, and this script decides whether
 the engine still honours it.
 
 What this does **not** do is check that the snippet is good documentation, or
-that `## First five minutes` is still the section a newcomer should read. It
+that the section it reads is still the one a newcomer should start from. It
 checks that the code in it runs and prints what it says it prints.
 """
 
@@ -40,7 +40,7 @@ README = ROOT / "README.md"
 # The section a newcomer is pointed at. Matched by prefix so the rest of the
 # heading ("…, with no data at all") can be rewritten without breaking the gate
 # — the same latitude `just msrv` gives the sentence that states the MSRV.
-HEADING = "## First five minutes"
+HEADING = "## Start with no data at all"
 
 PY_FENCE_RE = re.compile(r"^```python\n(.*?)^```", re.S | re.M)
 EXPECTATION_RE = re.compile(r"#\s*->\s*(.+?)\s*$", re.M)
